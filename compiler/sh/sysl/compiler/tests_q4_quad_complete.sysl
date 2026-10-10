@@ -1,0 +1,444 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{Search, replace_all}
+import sysl.math.bigint.from_int
+
+// `f128` where it used to be refused: as text (`print`, `str`, a hole, a specifier), as a `const`
+// and a `const` function's value, as a `c const` measured from C, and read out of a variadic tail.
+//
+// **The oracles are other implementations, never this one.** Every rendered string was worked out by
+// exact rational arithmetic in Python (the binary128 value as a fraction, every candidate decimal
+// rounded back); a `const` function's value is compared against the same function run by the
+// program, whose arithmetic is `sysl.softfloat` or LLVM's APFloat; a `c const` against the encoding
+// clang itself writes for the C expression; and a variadic walk against clang's own `va_arg` for a
+// `long double` or a `__float128` on the same machine, and against the answer the program prints on
+// the machines that can run it.
+
+private q4_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What a program prints, built for `target` (the host where none) and run where it can be.
+private q4_run_on(text: string, target: Option[string], runner: Option[string]) -> string
+    val root = make_temp_dir("sysl-q4").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    val said = build_native_program(s"$root/main.sysl", target, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(_) ->
+            val ran = runner match
+                Some(arch) -> capture("/usr/bin/arch", [arch, exe], "", [], true)
+                None -> capture(exe, [], "", [], true)
+
+            ran match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end q4_run_on
+
+private q4_run(text: string) -> string = q4_run_on(text, None, None)
+
+// The LLVM text of one file for a machine, through the driver -- so a `c const` is measured -- or
+// everything it said instead.
+private q4_ir(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-q4").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", target) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) -> if made.report.is_empty() then made.text else s"refused: ${analysis_report(made.report)}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end q4_ir
+
+private q4_has(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private q4_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// The body of the function `symbol` defines in an LLVM text.
+private q4_define(ir: string, symbol: string) -> string
+    for item in func_texts(ir)
+        if item.0 == symbol then return item.1
+
+    s"nothing defines '$symbol' in:\n$ir"
+end q4_define
+
+// -- as text --------------------------------------------------------------------------------------
+
+private q4_values() -> string = raw"""
+    val one: f128 = 1.0
+    val tenth: f128 = 0.1
+    val largest: f128 = 1.18973149535723176508575932662800702e4932
+    val least_normal: f128 = 3.36210314311209350626267781732175260e-4932
+    val least: f128 = 6.47517511943802511092443895822764655e-4966
+    val minus_zero: f128 = -0.0
+    val long = f128.from_bits(0x40c2fffe9d411ae9850c030f59fc4975)
+    """
+
+@test("print writes an f128 in the fewest digits that read back as it, at every end of the range")
+q4_print_is_the_shortest_reading()
+    if !q4_ready() then return
+
+    assert_eq(q4_run(q4_values() + "print(one, tenth, largest, least_normal, least, minus_zero)\n" +
+                     "print(long, f128.infinity, -f128.infinity, f128.nan)\n"),
+              "1 0.1 1.189731495357231765085759326628007e+4932 3.3621031431120935062626778173217526e-4932 " +
+              "6e-4966 -0\n1.00432565957246469963337794898610185e+59 inf -inf nan\n")
+
+@test("str and a plain hole write the same text, and a specifier the exact value's digits")
+q4_str_holes_and_specifiers()
+    if !q4_ready() then return
+
+    assert_eq(q4_run(q4_values() + raw"""
+        print(str(tenth), str(minus_zero), str(long).bytes.len)
+        print(s"$tenth and ${largest}")
+        val w = 9
+        print(f"${tenth}%.40e|${one}%08.3f|${largest}%g|${tenth}%-${w}.2f|${least}%.3e|")
+        print(format(tenth, "%.36e"))
+        """),
+              "0.1 -0 41\n0.1 and 1.189731495357231765085759326628007e+4932\n" +
+              "1.0000000000000000000000000000000000481482e-01|0001.000|1.18973e+4932|0.10     |6.475e-4966|\n" +
+              "1.000000000000000000000000000000000048e-01\n")
+
+@test("what str writes reads back, through the compiler's own exact reader, as the same f128")
+q4_text_reads_back()
+    if !q4_ready() then return
+
+    val patterns = ["3fff0000000000000000000000000000", "3ffb999999999999999999999999999a",
+                    "7ffeffffffffffffffffffffffffffff", "00010000000000000000000000000000",
+                    "00000000000000000000000000000001", "80000000000000000000000000000000",
+                    "40c2fffe9d411ae9850c030f59fc4975", "c0ccfffc3069446607e80efbb29cd55c",
+                    "0000ffffffffffffffffffffffffffff", "3ffd5555555555555555555555555555"]
+
+    var first = ""
+
+    for p in patterns
+        first = first + s"print(str(f128.from_bits(0x$p)))\n"
+
+    val texts = split_lines(q4_run(first))
+    var second = "import sysl.fmt.hex\n"
+
+    // Each text written back as an f128 literal: a whole number takes a point to be a float literal.
+    for i in 0..<texts.len()
+        val t = texts.at(i)
+        val lit = if t.contains(".") || t.contains("e") then t else t + ".0"
+
+        second = second + s"val x$i: f128 = $lit\nprint(hex(x$i.bits(), 32))\n"
+    end for
+
+    var want = ""
+
+    for p in patterns
+        want = want + p + "\n"
+
+    assert_eq(q4_run(second), want)
+end q4_text_reads_back
+
+private split_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('\n')
+            out.push(text[start..<i])
+            start = i + 1
+
+    out
+end split_lines
+
+@test("a negative zero written as an f128 literal keeps its sign")
+q4_a_negative_zero_literal()
+    if !q4_ready() then return
+
+    assert_eq(q4_run("import sysl.fmt.hex\nval z: f128 = -0.0\nprint(hex(z.bits(), 32), hex((-0.0f128).bits(), 32))\n"),
+              "80000000000000000000000000000000 80000000000000000000000000000000\n")
+
+// -- as a constant -------------------------------------------------------------------------------
+
+// A `const` function over binary128 that touches every operator, the subnormals, the top of the range
+// and both conversions, so that one wrong rounding anywhere in it moves the final bits.
+private q4_mix() -> string = raw"""
+    import sysl.fmt.hex
+
+    const mix(seed: int) -> f128
+        var x: f128 = f128(seed) / 7.0
+        var acc: f128 = 1.0e-4950
+
+        for i in 0..<60
+            acc = acc * x + f128(i) / 3.0
+
+            if acc > 1.0e30 || acc < -1.0e30 then acc = acc / 1.0e4900
+            if acc < 1.0e-4000 && acc > -1.0e-4000 then acc = acc * 1.0e4920 - x
+
+            x = x - acc / 11.0 + f128(long(acc) % 5)
+
+            if x > 1.0e10 || x < -1.0e10 then x = x / 1.0e12
+
+        acc
+    end mix
+
+    const third(x: f128) -> f128 = x / 3.0
+    """
+
+@test("a const function computes at f128, folding to the bits the program computes at run time")
+q4_a_const_function_folds_exactly()
+    if !q4_ready() then return
+
+    val text = q4_mix() + raw"""
+        const A: f128 = mix(3)
+        const B: f128 = mix(-11)
+        const C: f128 = mix(40)
+        const T: f128 = third(1.0)
+
+        var s = 3
+        print(hex(A.bits(), 32), hex(mix(s).bits(), 32))
+        s = -11
+        print(hex(B.bits(), 32), hex(mix(s).bits(), 32))
+        s = 40
+        print(hex(C.bits(), 32), hex(mix(s).bits(), 32))
+        print(hex(T.bits(), 32))
+        """
+
+    val lines = split_lines(q4_run(text))
+
+    assert_eq(lines.len(), 4)
+
+    for i in 0..<lines.len() - 1
+        val pair = lines.at(i)
+
+        assert(pair.bytes.len == 65 && pair[0..<32] == pair[33..<65], s"const and run time differ: $pair")
+
+    // A third of one, rounded once at binary128 -- not a double's third widened.
+    assert_eq(lines.at(3), "3ffd5555555555555555555555555555")
+end q4_a_const_function_folds_exactly
+
+@test("the folded value is laid down as a literal, with no call left to make")
+q4_a_const_function_leaves_no_call()
+    if !q4_ready() then return
+
+    val ir = q4_ir(q4_mix() + "const T: f128 = third(1.0)\nprint(T)\n", None)
+
+    q4_has(ir, "fp128 0xL55555555555555553FFD555555555555")
+    q4_lacks(q4_define(ir, "main"), "third")
+
+@test("special values, signed zeros and the conversions follow binary128 while compiling")
+q4_const_specials()
+    if !q4_ready() then return
+
+    assert_eq(q4_run(raw"""
+        import sysl.fmt.hex
+
+        const over(x: f128, y: f128) -> f128 = x / y
+        const sum(x: f128, y: f128) -> f128 = x + y
+        const whole(x: f128) -> long = long(x)
+        const wide(n: long) -> f128 = f128(n)
+        const narrow(x: f128) -> real = real(x)
+
+        const INF: f128 = over(1.0, 0.0)
+        const NAN: f128 = over(0.0, 0.0)
+        const NZ: f128 = sum(-0.0, -0.0)
+        const PZ: f128 = sum(-1.0, 1.0)
+        const BIG: long = whole(1.0e30)
+        const TRUNC: long = whole(-2.75)
+        const EXACT: f128 = wide(1152921504606846977)
+        const NEAR: real = narrow(0.1)
+
+        print(INF, NAN != NAN, hex(NZ.bits(), 32), hex(PZ.bits(), 32))
+        print(BIG, TRUNC, EXACT, NEAR == 0.1)
+        """),
+              "inf true 80000000000000000000000000000000 00000000000000000000000000000000\n" +
+              "9223372036854775807 -2 1152921504606846977 true\n")
+
+// -- measured from C -----------------------------------------------------------------------------
+
+private q4_c_consts() -> string = raw"""
+    c const
+        THIRD: f128 = "1.0L / 3"
+        NEG: f128 = "-2.5L"
+        LEAST: f128 = "0x1p-16382L"
+        BIG: f128 = "1e4000L"
+
+    val third: f128 = THIRD
+    val neg: f128 = NEG
+    val least: f128 = LEAST
+    val big: f128 = BIG
+    print(third, neg, least, big)
+    """
+
+@test("a c const at f128 reads C's long double exactly where it is binary128")
+q4_c_const_on_a_binary128_machine()
+    if !q4_ready() then return
+
+    // The encodings clang writes for the same `long double` expressions on these machines -- which a
+    // newer clang spells as a short decimal where one reads back, and as the bit pattern otherwise.
+    for target in ["aarch64-freestanding", "riscv64-freestanding", "riscv32-freestanding"]
+        val ir = q4_ir(q4_c_consts(), Some(target))
+
+        q4_has(ir, "fp128 0xL55555555555555553FFD555555555555")
+        q4_has(ir, "fp128 0xL0000000000000000C000400000000000")
+        q4_has(ir, "fp128 0xL00000000000000000001000000000000")
+        q4_has(ir, "fp128 0xL18C21AB905450CC373E6A3750647FCAB")
+end q4_c_const_on_a_binary128_machine
+
+@test("on x86 the x87 long double widens into f128 exactly, as clang widens it to a __float128")
+q4_c_const_widens_the_x87_format()
+    if !q4_ready() then return
+
+    // `(__float128)(1.0L / 3)` and `(__float128)1e4000L` on x86-64: the x87 values, every one of
+    // their 64 bits kept.
+    val ir = q4_ir(q4_c_consts(), Some("x86_64-freestanding"))
+
+    q4_has(ir, "fp128 0xL55560000000000003FFD555555555555")
+    q4_has(ir, "fp128 0xL18C200000000000073E6A3750647FCAB")
+
+    // The same value read from the decimal a newer clang writes for it, rounded at x87's width.
+    assert_eq(x87_of_decimal(from_int(1), 4000), (0x73E6A3750647FCAB, 0x18C2000000000000))
+
+@test("where long double is a double, the c const is that double, widened")
+q4_c_const_where_long_double_is_a_double()
+    if !q4_ready() then return
+
+    // A `double` holds no 1e4000, so the largest constant is one it does hold.
+    val ir = q4_ir(replace_all(q4_c_consts(), "1e4000L", "1e300L"), Some("aarch64-macos"))
+
+    // The double third, 0x3FD5555555555555, with its 52 bits of fraction moved up and nothing added.
+    q4_has(ir, "fp128 0xL50000000000000003FFD555555555555")
+    q4_lacks(ir, "refused")
+
+@test("a c const at f128 that is not finite is refused, as at every other width")
+q4_c_const_refuses_what_is_not_finite()
+    if !q4_ready() then return
+
+    q4_has(q4_ir("c const\n    X: f128 = \"1.0L / 0.0L\"\nval x: f128 = X\nprint(x)\n", Some("aarch64-freestanding")),
+           "'1.0L / 0.0L' is Infinity here, and a 'c const' carries a finite number")
+    q4_has(q4_ir("c const\n    X: f128 = \"__builtin_nanl(\\\"\\\")\"\nval x: f128 = X\nprint(x)\n",
+                 Some("aarch64-freestanding")),
+           "is not a number here, and a 'c const' carries one")
+
+// -- through a variadic tail ---------------------------------------------------------------------
+
+private q4_va_decl() -> string = raw"""
+    quads(n: int, ...) -> f128
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: f128 = 0.0
+
+        for i in 0..<n
+            val k: int = va_arg(ap)
+            val q: f128 = va_arg(ap)
+            val x: real = va_arg(ap)
+
+            total = total * 10.0 + f128(k) + q + f128(x)
+
+        va_end(ap)
+        total
+    end quads
+    """
+
+private q4_va_calls() -> string = raw"""
+
+    print(quads(5, 1, 0.25f128, 0.5, 2, 1.0e-30f128, 0.25, 3, 0.125f128, 0.0, 4, 2.0f128, 1.0, 5, 0.0f128, 0.5))
+    print(quads(1, 7, 0.1f128, 0.0))
+    print(quads(9, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0,
+                1, 1.0f128, 0.0, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0, 1, 1.0f128, 0.0))
+    """
+
+// Worked by hand: each step is `total * 10 + k + q + x`, so a value read from the wrong slot moves
+// its line; the third call passes more of each class than any machine's registers hold.
+private q4_va_expected() -> string =
+    "20138.000000000000000000000000001003\n7.1\n222222222\n"
+
+@test("va_arg reads an f128 where clang's va_arg reads a long double or a __float128")
+q4_va_arg_walks_like_clang()
+    if !q4_ready() then return
+
+    val text = q4_va_decl() + "\nprint(quads(1, 7, 0.1f128, 0.0))\n"
+
+    // AAPCS64: the vector save area, sixteen bytes a register, and a sixteen-byte stack slot.
+    val arm = q4_define(cab_ir_for("aarch64-linux", text), "quads")
+
+    q4_lacks(arm, "va_arg ptr")
+    q4_has(arm, "i64 28")
+    q4_has(arm, "and i64")
+    q4_has(arm, "load fp128")
+
+    // x86-64 System V: one SSE register, from fp_offset four bytes in, while one of the eight is left.
+    val sysv = q4_define(cab_ir_for("x86_64-linux", text), "quads")
+
+    q4_lacks(sysv, "va_arg ptr, fp128")
+    q4_has(sysv, "i64 4")
+    q4_has(sysv, "icmp ule i32")
+    q4_has(sysv, ", 160\n")
+    q4_has(sysv, "load fp128")
+
+    // RV64 and Apple's AArch64: the next sixteen-byte boundary of the one cursor.
+    for target in ["riscv64-linux", "aarch64-macos"]
+        val body = q4_define(cab_ir_for(target, text), "quads")
+
+        q4_lacks(body, "va_arg ptr, fp128")
+        q4_has(body, "and i64")
+        q4_has(body, "load fp128")
+    end for
+
+    // RV32 and Windows x64 pass it by address: the slot holds a pointer to the value.
+    for target in ["riscv32-freestanding", "x86_64-windows"]
+        val body = q4_define(cab_ir_for(target, text), "quads")
+
+        q4_has(body, "va_arg ptr %")
+        q4_has(body, ", ptr\n")
+        q4_has(body, "load fp128")
+    end for
+end q4_va_arg_walks_like_clang
+
+@test("an f128 read out of a variadic tail is the one passed, on this machine")
+q4_va_arg_runs_here()
+    if !q4_ready() then return
+
+    assert_eq(q4_run(q4_va_decl() + q4_va_calls()), q4_va_expected())
+
+@test("and on x86-64 System V, under Rosetta")
+q4_va_arg_runs_on_x86_64()
+    if !q4_ready() then return
+
+    if !capture("/usr/bin/arch", ["-x86_64", "/usr/bin/true"]).map((o) -> o.status.ok()).unwrap_or(false)
+        skip("this machine cannot run an x86-64 program")
+
+    assert_eq(q4_run_on(q4_va_decl() + q4_va_calls(), Some("x86_64-macos"), Some("-x86_64")), q4_va_expected())
+
+@test("and on an AAPCS64 board, where the register save areas are walked")
+q4_va_arg_runs_on_an_aarch64_board()
+    val b = QemuBoard("aarch64-virt", "aarch64-freestanding", "qemu-system-aarch64",
+                      q4_words(["-M", "virt", "-cpu", "cortex-a53", "-nographic", "-semihosting-config",
+                                "enable=on,target=native", "-kernel"]),
+                      "start_aarch64.s", "bsp_aarch64.c", "aarch64.ld")
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", q4_va_decl() + q4_va_calls()))
+
+    qemu_boot(b, files) match
+        Err(why) -> assert(false, why)
+        Ok(r) ->
+            assert(r.status.ok(), qemu_said(b, r))
+            assert_eq(r.out, q4_va_expected())
+end q4_va_arg_runs_on_an_aarch64_board
+
+private q4_words(xs: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+
+    out
+end q4_words

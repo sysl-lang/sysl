@@ -1,7 +1,7 @@
 module sysl.text
 
 import sysl.Big
-import sysl.bits_of64
+import sysl.{bits_of64, bits_of128}
 
 // Decimal text to the nearest float, correctly rounded, in sysl and with integer arithmetic only.
 //
@@ -352,7 +352,7 @@ private settle(b: []const u8, first: usize, whole_end: usize, digits_end: usize,
     val e = (if biased == 0 then 1 else biased) - f.bias - f.significand
     var rhs: Big[90] = Big([0; 90], 0)
 
-    rhs.set(2 * m + 1)
+    rhs.set(u128(2 * m + 1))
 
     val lhs_twos = q2
     val rhs_twos = e - 1
@@ -550,3 +550,318 @@ private hex_value(c: u8) -> int
 
     -1
 end hex_value
+
+// -- binary128 ------------------------------------------------------------------------------------
+
+/** The longest prefix of `b` that reads as an `f128`, the value it reads as, and how many bytes it is
+ * -- what `real_prefix` reads, spelled the same way, rounded once to binary128 rather than through a
+ * `real`, whose 53 bits would leave sixty of the 113 wrong.
+ *
+ * **The answer is exact, and found the slow way**: the decimal's digits are one big integer and the
+ * power of ten another, and their ratio is divided out bit by bit to one bit past the significand,
+ * the remainder saying whether anything is left below it. Up to 11,600 significant digits are read
+ * into the integer -- more than the 11,563 the longest half-way point between two binary128 values
+ * has -- and any digit past them that is not a zero is remembered, which is all a tie needs to know.
+ */
+f128_prefix(b: []const u8) -> (f128, usize)
+    val got = scan_quad(b)
+
+    (f128.from_bits(got.0), got.1)
+
+// The significant digits a decimal is read to, and the limbs every integer the rounding builds fits
+// in: the digits less the smallest exponent that can still round to a subnormal, about 55,000 bits.
+private const QuadDigits: usize = 11600
+private const QuadLimbs: usize = 1760
+
+// The bits of the value and the length of the prefix, the sign bit at the top.
+private scan_quad(b: []const u8) -> (u128, usize)
+    val infinity = u128(0x7FFF) << 112
+    var i: usize = 0
+
+    while i < b.len && is_space(b[i])
+        i += 1
+
+    var sign: u128 = 0
+
+    if i < b.len && (b[i] == u8('+') || b[i] == u8('-'))
+        if b[i] == u8('-') then sign = u128(1) << 127
+
+        i += 1
+    end if
+
+    if word_at(b, i, "inf")
+        val end = if word_at(b, i, "infinity") then i + 8 else i + 3
+
+        return (sign | infinity, end)
+    end if
+
+    if word_at(b, i, "nan")
+        val quiet = u128(1) << 111
+        var end = i + 3
+        var payload: u128 = 0
+
+        if end < b.len && b[end] == u8('(')
+            var j = end + 1
+
+            while j < b.len && (is_alnum(b[j]) || b[j] == u8('_'))
+                j += 1
+
+            if j < b.len && b[j] == u8(')')
+                payload = u128(nan_payload(b[end + 1..<j])) & (quiet - 1)
+                end = j + 1
+            end if
+        end if
+
+        return (sign | infinity | quiet | payload, end)
+    end if
+
+    if i + 1 < b.len && b[i] == u8('0') && (b[i + 1] | 0x20) == u8('x')
+        val hex = scan_quad_hex(b, i + 2)
+
+        if hex.1 > 0 then return (sign | hex.0, hex.1)
+    end if
+
+    val got = scan_quad_decimal(b, i)
+
+    if got.1 == 0 then return (0, 0)
+
+    (sign | got.0, got.1)
+end scan_quad
+
+// A decimal from `start`, as `scan_decimal` reads one: the bits of its magnitude and where it ends,
+// or an end of zero where there is no digit to read.
+private scan_quad_decimal(b: []const u8, start: usize) -> (u128, usize)
+    var num: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
+    var i = start
+    var kept: usize = 0
+    var shift = 0
+    var dropped = false
+    var any = false
+    var point = false
+    var chunk: u32 = 0
+    var chunk_len = 0
+
+    loop
+        if i >= b.len then break
+
+        if b[i] == u8('.') && !point
+            point = true
+            i += 1
+            continue
+        end if
+
+        if !is_digit(b[i]) then break
+
+        val d = u32(b[i] - u8('0'))
+
+        any = true
+        i += 1
+
+        if kept == 0 && d == 0
+            if point then shift -= 1
+        elif kept < QuadDigits
+            chunk = chunk * 10 + d
+            chunk_len += 1
+            kept += 1
+
+            if point then shift -= 1
+
+            if chunk_len == 9
+                num.mul_small(1000000000)
+                num.add_small(chunk)
+                chunk = 0
+                chunk_len = 0
+            end if
+        else
+            if d != 0 then dropped = true
+            if !point then shift += 1
+        end if
+    end loop
+
+    // A lone point is not a number.
+    if !any then return (0, 0)
+
+    if chunk_len > 0
+        var scale: u32 = 1
+
+        for _ in 0..<chunk_len
+            scale *= 10
+
+        num.mul_small(scale)
+        num.add_small(chunk)
+    end if
+
+    var written = 0
+
+    if i < b.len && (b[i] | 0x20) == u8('e')
+        var j = i + 1
+        var negative = false
+
+        if j < b.len && (b[j] == u8('+') || b[j] == u8('-'))
+            negative = b[j] == u8('-')
+            j += 1
+        end if
+
+        if j < b.len && is_digit(b[j])
+            while j < b.len && is_digit(b[j])
+                if written < 100000 then written = written * 10 + int(b[j] - u8('0'))
+
+                j += 1
+
+            if negative then written = -written
+
+            i = j
+        end if
+    end if
+
+    if num.is_zero() then return (0, i)
+
+    val q = written + shift
+    val digits = int(kept)
+
+    // Settled before any power is taken: 10^4933 is past the largest finite value, and 10^-4966
+    // below half the smallest subnormal.
+    if digits - 1 + q > 4932 then return (u128(0x7FFF) << 112, i)
+    if digits + q < -4966 then return (0, i)
+
+    (quad_rounded(&num, q, 0, dropped), i)
+end scan_quad_decimal
+
+// A hexadecimal float's digits from `start`, after its `0x`, as `scan_hex` reads them.
+private scan_quad_hex(b: []const u8, start: usize) -> (u128, usize)
+    var i = start
+    var m: u128 = 0
+    var exp = 0
+    var sticky = false
+    var any = false
+
+    while i < b.len && hex_value(b[i]) >= 0
+        val d = u128(hex_value(b[i]))
+
+        any = true
+
+        if (m >> 124) == 0
+            m = m * 16 + d
+        else
+            exp += 4
+
+            if d != 0 then sticky = true
+        end if
+
+        i += 1
+    end while
+
+    if i < b.len && b[i] == u8('.')
+        var j = i + 1
+        var fraction = false
+
+        while j < b.len && hex_value(b[j]) >= 0
+            val d = u128(hex_value(b[j]))
+
+            fraction = true
+
+            if (m >> 124) == 0
+                m = m * 16 + d
+                exp -= 4
+            elif d != 0
+                sticky = true
+
+            j += 1
+        end while
+
+        if any || fraction
+            any = true
+            i = j
+        end if
+    end if
+
+    if !any then return (0, 0)
+
+    if i < b.len && (b[i] | 0x20) == u8('p')
+        var j = i + 1
+        var negative = false
+        var written = 0
+
+        if j < b.len && (b[j] == u8('+') || b[j] == u8('-'))
+            negative = b[j] == u8('-')
+            j += 1
+        end if
+
+        if j < b.len && is_digit(b[j])
+            while j < b.len && is_digit(b[j])
+                if written < 100000 then written = written * 10 + int(b[j] - u8('0'))
+
+                j += 1
+
+            exp += if negative then -written else written
+            i = j
+        end if
+    end if
+
+    if m == 0 then return (0, i)
+
+    val length = int(bits_of128(m))
+
+    if length - 1 + exp > 16383 then return (u128(0x7FFF) << 112, i)
+    if length + exp < -16495 then return (0, i)
+
+    var num: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
+
+    num.set(m)
+    (quad_rounded(&num, 0, exp, sticky), i)
+end scan_quad_hex
+
+// `num × 10^q10 × 2^q2` -- not zero, and inside the range the callers settled -- rounded to nearest
+// binary128 with ties to even, `sticky` saying something non-zero was dropped below `num`'s last
+// digit. The ratio is brought into [1, 2) and its bits divided out one at a time, to one past the
+// significand; what is left of the division joins `sticky`.
+private quad_rounded(num: *Big[QuadLimbs], q10: int, q2: int, sticky: bool) -> u128
+    var den = *num
+
+    den.set(1)
+
+    if q10 >= 0 then num.mul_pow10(q10) else den.mul_pow10(-q10)
+    if q2 >= 0 then num.shl(q2) else den.shl(-q2)
+
+    var e = int(num.bit_len()) - int(den.bit_len())
+
+    if e >= 0 then den.shl(e) else num.shl(-e)
+
+    if num.cmp(&den) < 0
+        num.shl(1)
+        e -= 1
+    end if
+
+    if e > 16383 then return u128(0x7FFF) << 112
+
+    // The power of two the significand's last bit stands for: 2^(e - 112) for a normal value, and
+    // the subnormals' fixed 2^-16494 below that.
+    val unit = if e - 112 < -16494 then -16494 else e - 112
+    val below = e - unit
+
+    if below < -1 then return 0
+
+    var q = u128(num.digit(&den))
+
+    for _ in 0..<(below + 1)
+        num.shl(1)
+        q = (q << 1) | u128(num.digit(&den))
+
+    var sig = q >> 1
+    var at = unit
+
+    if (q & 1) != 0 && (sticky || !num.is_zero() || (sig & 1) != 0) then sig += 1
+
+    if (sig >> 113) != 0
+        sig >>= 1
+        at += 1
+    end if
+
+    if (sig >> 112) == 0 then return sig
+
+    val biased = at + 112 + 16383
+
+    if biased >= 0x7FFF then return u128(0x7FFF) << 112
+
+    (u128(biased) << 112) | (sig & ((u128(1) << 112) - 1))
+end quad_rounded

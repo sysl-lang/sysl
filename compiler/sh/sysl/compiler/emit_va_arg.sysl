@@ -22,13 +22,20 @@ import sysl.math.bigint.from_int
 // register pair, so the caller passes its address, and the instruction would read the address's
 // bytes as the integer.
 gen_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
+    val quad = is_quad(ty)
+
     if e.target.cpu == Aarch64 && e.target.os != MacOS then return aapcs64_va_arg(e, ap, ty)
     if e.target.cpu == X86_64 && e.target.os != Windows && va_wide(ty)
         return sysv_pair_va_arg(e, ap, ty)
 
+    // A `__float128` is one SSE register on x86-64 System V, so it is read from the vector half of
+    // the save area, as a `real` is -- a walk LLVM's instruction does not make for it.
+    if e.target.cpu == X86_64 && e.target.os != Windows && quad then return sysv_sse_va_arg(e, ap, ty)
+
     // RV32 passes a scalar wider than two registers by address, a variadic one included, so the
-    // slot holds a pointer to the 128-bit integer rather than the integer itself.
-    if e.target.cpu == Riscv32 && va_wide(ty)
+    // slot holds a pointer to the 128-bit value rather than the value itself; Windows x64 passes
+    // anything wider than eight bytes that way.
+    if (e.target.cpu == Riscv32 && (va_wide(ty) || quad)) || (e.target.cpu == X86_64 && quad)
         val at = fresh_reg(e)
 
         emit(e, InVaArg(at, ap, LPtr))
@@ -37,6 +44,22 @@ gen_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
 
         emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
         return r
+    end if
+
+    // RV64 puts a binary128 value on the next sixteen-byte boundary of the one cursor -- a register
+    // pair beginning on an even register is that boundary in the spilled save area -- which is the
+    // walk clang writes out for a `long double`. Apple's AArch64 puts every variadic argument on the
+    // stack, and a binary128 one in a sixteen-byte slot on that boundary, where LLVM's instruction
+    // cannot be lowered for it at all. A 32-bit Arm machine passes one as four words wherever the
+    // next word is, on no boundary of its own, which is how LLVM's call lays it down.
+    if quad && (e.target.cpu == Riscv64 || (e.target.cpu == Aarch64 && e.target.os == MacOS) ||
+                e.target.cpu == Thumb)
+        val slot = alloca(e, fresh_reg(e), LPtr)
+        val aligned = e.target.cpu != Thumb
+
+        emit(e, InStore(LPtr, va_stack_next(e, ap, 16, aligned), slot, AccPlain, None))
+        return va_read(e, slot, ty)
+    end if
 
     val r = fresh_reg(e)
 
@@ -64,7 +87,10 @@ private aapcs64_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
         Floating(_, _) -> true
         _ -> false
     val wide = va_wide(ty)
-    val size = if wide then 16 else 8
+    // A binary128 value fills a whole vector register's slot, and on the stack a sixteen-byte slot on
+    // a sixteen-byte boundary, as a 128-bit integer does.
+    val sixteen = wide || is_quad(ty)
+    val size = if sixteen then 16 else 8
 
     val offs_at = va_field(e, ap, if fp then 28 else 24)
     val slot = alloca(e, fresh_reg(e), LPtr)
@@ -119,7 +145,7 @@ private aapcs64_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
     emit_term(e, InBr(end_l))
 
     emit_label(e, stack_l)
-    emit(e, InStore(LPtr, va_stack_next(e, ap, size, wide), slot, AccPlain, None))
+    emit(e, InStore(LPtr, va_stack_next(e, ap, size, sixteen), slot, AccPlain, None))
     emit_term(e, InBr(end_l))
 
     emit_label(e, end_l)
@@ -170,40 +196,86 @@ private sysv_pair_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
     va_read(e, slot, ty)
 end sysv_pair_va_arg
 
+// The x86-64 System V walk for a `__float128`. It is one SSE register, so it comes from the vector
+// half of the register save area -- `fp_offset`, four bytes into the list, runs from 48 to 176 in
+// sixteen-byte steps -- while one is left, and otherwise from the stack on a sixteen-byte boundary.
+private sysv_sse_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
+    val slot = alloca(e, fresh_reg(e), LPtr)
+    val reg_l = fresh_label(e, "va.in_reg")
+    val stack_l = fresh_label(e, "va.on_stack")
+    val end_l = fresh_label(e, "va.end")
+
+    val offs_at = va_field(e, ap, 4)
+    val fp = fresh_reg(e)
+
+    emit(e, InLoad(fp, l_i32(), offs_at, AccPlain, Some(4)))
+
+    val fits = fresh_reg(e)
+
+    emit(e, InIntCmp(fits, IUle, l_i32(), fp, va_const(176 - 16)))
+    emit_term(e, InCondBr(fits, reg_l, stack_l))
+
+    emit_label(e, reg_l)
+
+    val area = fresh_reg(e)
+
+    emit(e, InLoad(area, LPtr, va_field(e, ap, 16), AccPlain, Some(8)))
+
+    val wide_fp = fresh_reg(e)
+
+    emit(e, InCast(wide_fp, CastZExt, l_i32(), fp, LInt(64)))
+    emit(e, InStore(LPtr, va_step(e, area, wide_fp), slot, AccPlain, None))
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, l_i32(), fp, va_const(16)))
+    emit(e, InStore(l_i32(), next, offs_at, AccPlain, Some(4)))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, stack_l)
+    emit(e, InStore(LPtr, va_stack_next(e, va_field(e, ap, 8), 16, true), slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, end_l)
+    va_read(e, slot, ty)
+end sysv_sse_va_arg
+
 // Takes the next argument off a stack cursor held at `cursor`: rounds it up to sixteen bytes where
 // the argument wants that boundary, moves the cursor past the argument's slot, and answers where the
 // argument is.
 private va_stack_next(e: *Emit, cursor: Val, size: int, wide: bool) -> Val
     val sp = fresh_reg(e)
+    val word = LInt(e.word_bits)
 
-    emit(e, InLoad(sp, LPtr, cursor, AccPlain, Some(8)))
+    emit(e, InLoad(sp, LPtr, cursor, AccPlain, Some(e.word_bits / 8)))
 
     var at = sp
 
     if wide
         val n = fresh_reg(e)
 
-        emit(e, InCast(n, CastPtrToInt, LPtr, sp, LInt(64)))
+        emit(e, InCast(n, CastPtrToInt, LPtr, sp, word))
 
         val up = fresh_reg(e)
 
-        emit(e, InBin(up, OpAdd, LInt(64), n, va_const(15)))
+        emit(e, InBin(up, OpAdd, word, n, va_const(15)))
 
         val even = fresh_reg(e)
 
-        emit(e, InBin(even, OpAnd, LInt(64), up, va_const(-16)))
+        emit(e, InBin(even, OpAnd, word, up, va_const(-16)))
 
         val p = fresh_reg(e)
 
-        emit(e, InCast(p, CastIntToPtr, LInt(64), even, LPtr))
+        emit(e, InCast(p, CastIntToPtr, word, even, LPtr))
         at = p
+    end if
 
-    emit(e, InStore(LPtr, va_step(e, at, va_const(size)), cursor, AccPlain, Some(8)))
+    emit(e, InStore(LPtr, va_step(e, at, va_const(size)), cursor, AccPlain, Some(e.word_bits / 8)))
     at
 end va_stack_next
 
 // The argument itself, read from wherever the walk found it. A register save slot is eight bytes
-// apart, so even a pair is read on an eight-byte boundary.
+// apart, so even a pair is read on an eight-byte boundary -- and on a 32-bit machine a slot is four.
 private va_read(e: *Emit, slot: Val, ty: Type) -> Val
     val at = fresh_reg(e)
 
@@ -211,7 +283,7 @@ private va_read(e: *Emit, slot: Val, ty: Type) -> Val
 
     val r = fresh_reg(e)
 
-    emit(e, InLoad(r, lty(e, ty), at, AccPlain, Some(8)))
+    emit(e, InLoad(r, lty(e, ty), at, AccPlain, Some(if e.word_bits == 32 then 4 else 8)))
     r
 end va_read
 

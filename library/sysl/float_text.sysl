@@ -13,7 +13,9 @@ module sysl
 //
 // A double's expansion is at most 767 significant digits and 309 whole ones, so a buffer of 800
 // always holds every digit that is not a zero, and a precision past that pads with zeros the
-// arithmetic never had to produce. The big integers are at most 1,080 bits.
+// arithmetic never had to produce. The big integers are at most 1,080 bits. An `f128` is the same
+// arithmetic over wider integers: its expansion runs to 11,563 significant digits and 4,933 whole
+// ones, and its big integers to about 16,600 bits.
 
 /** A non-negative integer in 32-bit limbs, least significant first: the arithmetic exact decimal
  * conversion needs, in both directions, at a size fixed when it is declared, so it lives on the stack
@@ -26,7 +28,7 @@ private[sysl] struct Big[const N: usize]
     limbs: [N]u32
     len: usize
 
-    set(*self, v: u64)
+    set(*self, v: u128)
         self.len = 0
         var x = v
 
@@ -56,6 +58,23 @@ private[sysl] struct Big[const N: usize]
             self.limbs[self.len] = u32(carry)
             self.len += 1
     end mul_small
+
+    /** The value plus `other`. */
+    add(*self, other: *Big[N])
+        var carry: u64 = 0
+        var i: usize = 0
+
+        while i < other.len || carry != 0
+            val mine = if i < self.len then u64(self.limbs[i]) else 0
+            val theirs = if i < other.len then u64(other.limbs[i]) else 0
+            val sum = mine + theirs + carry
+
+            self.limbs[i] = u32(sum & 0xffffffff)
+            carry = sum >> 32
+            i += 1
+
+            if i > self.len then self.len = i
+    end add
 
     /** The value plus `k`. */
     add_small(*self, k: u32)
@@ -217,6 +236,9 @@ end bits_of
 private[sysl] bits_of64(x: u64) -> usize =
     if (x >> 32) != 0 then 32 + bits_of(u32(x >> 32)) else bits_of(u32(x))
 
+private[sysl] bits_of128(x: u128) -> usize =
+    if (x >> 64) != 0 then 64 + bits_of64(u64(x >> 64)) else bits_of64(u64(x))
+
 private small_pow5(n: int) -> u32
     var p: u32 = 1
 
@@ -232,7 +254,7 @@ end small_pow5
 private[sysl] struct FloatValue
     negative: bool
     kind: FloatKind
-    m: u64
+    m: u128
     e: int
 
 private[sysl] enum FloatKind
@@ -253,9 +275,9 @@ private[sysl] real_value(x: real) -> FloatValue
     if biased == 0
         if fraction == 0 then return FloatValue(negative, Zero, 0, 0)
 
-        return FloatValue(negative, Finite, fraction, -1074)
+        return FloatValue(negative, Finite, u128(fraction), -1074)
 
-    FloatValue(negative, Finite, fraction | (u64(1) << 52), biased - 1075)
+    FloatValue(negative, Finite, u128(fraction | (u64(1) << 52)), biased - 1075)
 end real_value
 
 private[sysl] f32_value(x: f32) -> FloatValue
@@ -270,10 +292,30 @@ private[sysl] f32_value(x: f32) -> FloatValue
     if biased == 0
         if fraction == 0 then return FloatValue(negative, Zero, 0, 0)
 
-        return FloatValue(negative, Finite, fraction, -149)
+        return FloatValue(negative, Finite, u128(fraction), -149)
 
-    FloatValue(negative, Finite, fraction | (u64(1) << 23), biased - 150)
+    FloatValue(negative, Finite, u128(fraction | (u64(1) << 23)), biased - 150)
 end f32_value
+
+/** An `f128` taken apart at its own width: 112 bits of fraction under a fifteen-bit exponent, so the
+ * significand needs a `u128` and nothing about it passes through a narrower float.
+ */
+private[sysl] quad_value(x: f128) -> FloatValue
+    val bits = x.bits()
+    val negative = bits >> 127 != 0
+    val biased = int((bits >> 112) & 0x7fff)
+    val fraction = bits & ((u128(1) << 112) - 1)
+
+    if biased == 0x7fff
+        return FloatValue(negative, if fraction == 0 then Infinite else NotANumber, 0, 0)
+
+    if biased == 0
+        if fraction == 0 then return FloatValue(negative, Zero, 0, 0)
+
+        return FloatValue(negative, Finite, fraction, -16494)
+
+    FloatValue(negative, Finite, fraction | (u128(1) << 112), biased - 16495)
+end quad_value
 
 /** The decimal digits of `m * 2^e` (`m` not zero), rounded half to even at one position, written into
  * `into` as ASCII with no trailing zeros. It answers how many it wrote and the power of ten the first
@@ -284,12 +326,35 @@ end f32_value
  * -- and the power reported is the one after the carry. A value that rounds to nothing answers no
  * digits; one that rounds up to the position's unit answers `"1"` there.
  *
- * `into` holds every digit asked for that is not a zero, or 800 for any request at all.
+ * `into` holds every digit asked for that is not a zero: 800 for any request at all of a `real` or an
+ * `f32`, and 11,600 of an `f128`, whose subnormals run to 11,563 significant digits.
+ *
+ * **The big integers are sized by the value**: a `real`'s and an `f32`'s fit in 1,280 bits, and an
+ * `f128`'s -- whose exponent reaches 2^16383 and 2^-16494 -- take up to 16,800, so only a value
+ * outside the narrower range pays for the wider arithmetic.
  */
-private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []u8) -> (usize, int)
-    var r: Big[40] = Big([0; 40], 0)
-    var s: Big[40] = Big([0; 40], 0)
+private[sysl] float_digits(m: u128, e: int, significant: int, last: int, into: []u8) -> (usize, int)
+    if (m >> 64) == 0 && e >= -1100 && e <= 1000
+        var r: Big[40] = Big([0; 40], 0)
+        var s: Big[40] = Big([0; 40], 0)
 
+        return decimal_digits(&r, &s, m, e, significant, last, into)
+    end if
+
+    var r: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
+    var s: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
+
+    decimal_digits(&r, &s, m, e, significant, last, into)
+end float_digits
+
+/** How many 32-bit limbs hold every integer exact conversion of an `f128` builds: its largest value
+ * and its smallest subnormal, each scaled by the power of ten that brings it into [1, 10), and ten
+ * times that for the comparison against the next power.
+ */
+private[sysl] const QuadLimbs: usize = 530
+
+private decimal_digits[const N: usize](r: *Big[N], s: *Big[N], m: u128, e: int, significant: int,
+                                       last: int, into: []u8) -> (usize, int)
     r.set(m)
     s.set(1)
 
@@ -297,20 +362,20 @@ private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []
 
     // The power of ten of the first digit: floor(log10(v)), estimated from floor(log2(v)) and then
     // corrected so that r / s lands in [1, 10).
-    var k = ((int(bits_of64(m)) - 1 + e) * 78913) >> 18
+    var k = ((int(bits_of128(m)) - 1 + e) * 78913) >> 18
 
     if k >= 0 then s.mul_pow10(k) else r.mul_pow10(-k)
 
-    while r.cmp(&s) < 0
+    while r.cmp(s) < 0
         r.mul_small(10)
         k -= 1
 
-    var ten = s
+    var ten = *s
 
     ten.mul_small(10)
 
     while r.cmp(&ten) >= 0
-        s = ten
+        *s = ten
         ten.mul_small(10)
         k += 1
 
@@ -320,7 +385,7 @@ private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []
         // Every digit is below the position. Only a value of at least half its unit rounds to it,
         // which needs the first digit one place below: then v / 10^stop is r / 10s, in [0.1, 1).
         if stop == k + 1
-            var twice = r
+            var twice = *r
 
             twice.shl(1)
 
@@ -336,7 +401,7 @@ private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []
     var at = k
 
     loop
-        into[count] = u8('0') + u8(r.digit(&s))
+        into[count] = u8('0') + u8(r.digit(s))
         count += 1
 
         if at == stop || r.is_zero() || count == into.len then break
@@ -345,11 +410,11 @@ private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []
         at -= 1
 
     if !r.is_zero()
-        var twice = r
+        var twice = *r
 
         twice.shl(1)
 
-        val c = twice.cmp(&s)
+        val c = twice.cmp(s)
         val odd = (into[count - 1] - u8('0')) % 2 == 1
 
         if c > 0 || (c == 0 && odd)
@@ -376,7 +441,7 @@ private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []
         count -= 1
 
     (count, k)
-end float_digits
+end decimal_digits
 
 /** What a float conversion was asked for: `%e`, `%f` or `%g` (or the upper-case `%E`, `%F`, `%G`),
  * a minimum field width, a precision (-1 where none was written) and C's five flags.

@@ -2505,9 +2505,27 @@ c const
 'bf16' is not a width a 'c const' is measured at
 ```
 
-**`f128` is refused here too, for the opposite reason**: the measurement crosses back as a `double`,
-which holds 53 of binary128's 113 bits, so the constant would arrive with the rest made up. An `f128`
-constant is written as an `f128` literal, which is read from its text exactly.
+**`f128` is measured as a `long double`, and nothing it holds is lost**: binary128 holds every value
+of each of the three formats a `long double` is — binary128 itself on AArch64 Linux, RISC-V and
+WebAssembly, the x87 format on x86, a `double` on Apple's arm64 and on Windows — so the constant is
+exactly the value C computes on the machine being built for. `"1.0L / 3"` is binary128's third where
+`long double` is binary128 and a `double`'s third, widened, where C itself has nothing wider; a value
+every one of the formats holds reads the same everywhere:
+
+```sysl
+c const
+    NUDGED: f128 = "0.5L + 0x1p-50L"
+
+val nudged: f128 = NUDGED
+
+print(nudged, nudged == 0.5 + 1.0 / 1125899906842624.0)
+```
+
+```output
+0.5000000000000008881784197001252323 true
+```
+
+As at every width, a value C settles as an infinity or a NaN is refused.
 
 **For `float` and `double` the type is a different question from the value.** They are IEEE binary32
 and binary64 on every machine sysl targets — so `f32` and `f64` by name really are the whole answer

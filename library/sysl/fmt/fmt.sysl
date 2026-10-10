@@ -11,7 +11,8 @@ module sysl.fmt
 
 import sysl.text.from_utf8_unchecked
 import sysl.buf.byte_sink
-import sysl.{FloatField, FloatValue, f32_value, real_value, shortest_f32, shortest_real, write_float_field}
+import sysl.{FloatField, FloatValue, f32_value, quad_value, real_value, shortest_f32, shortest_quad,
+             shortest_real, write_float_field}
 
 /** An integer rendered through a printf specifier, written here rather than handed to C's
  * `snprintf`, so a target with no C library formats `${n}%d` exactly as a hosted one does.
@@ -166,6 +167,34 @@ format_real(x: real, spec: string, width: int, precision: int) -> string =
  */
 format_f32(x: f32, spec: string, width: int, precision: int) -> string =
     float_text(f32_value(x), spec, width, precision)
+
+/** An `f128` under a printf specifier, rendered as `format_real` renders a `real` -- every digit the
+ * exact value's, rounded half to even where the conversion says -- and taken apart at its own width,
+ * so `${x}%.30e` prints thirty digits binary128 really holds rather than a `double`'s seventeen and
+ * noise. A value that is not a `double`'s works in wider integers, and the digits buffer holds the
+ * 11,563 significant digits the longest one has.
+ */
+format_f128(x: f128, spec: string, width: int, precision: int) -> string
+    var sink = byte_sink()
+    var digits: [11600]u8
+
+    write_float_field(&sink, quad_value(x), float_field(spec, width, precision), digits[..])
+    from_utf8_unchecked(sink.text())
+end format_f128
+
+/** An `f128` as `str` and a plain hole write it: the fewest digits that read back as the same `f128`,
+ * spelled as `shortest` spells a `real`. The compiler calls it; a program writes `str(x)` or
+ * `shortest(x)`.
+ */
+format_f128_shortest(x: f128) -> string
+    var buf: [48]u8
+
+    from_utf8_unchecked(buf[0..<shortest_quad(x, buf[..])])
+
+/** The fewest digits that read back as the same `f128` -- `0.1` for `0.1f128`, and up to thirty-six
+ * for a value that needs them.
+ */
+shortest(x: f128) -> string = format_f128_shortest(x)
 
 /** The fewest digits that read back as `x` -- among those, the closest to it, and a tie to the even
  * digit -- spelled as `%g` spells a number: `0.1`, `1e+23`, `5e-324`, `-0`, `inf`, `nan`. It is the

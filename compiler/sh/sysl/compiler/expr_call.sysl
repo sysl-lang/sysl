@@ -715,7 +715,10 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
         val v = type_expr_bare(cx, args.at(0))
 
-        if is_quad(texpr_type(v)) then return Some(quad_text_refused(cx, span))
+        // An `f128` is the one float `str` writes in the fewest digits that read back, rather than
+        // `%g`'s six: a program holds the type for the digits past a `real`'s.
+        if is_quad(texpr_type(v)) then
+            return Some(library_result_call(cx, span, "format_f128_shortest", at_quad(span, v)))
 
         if float_valued(texpr_type(v)) && library_key(cx, "format_real").is_some() then
             return Some(float_format_call(cx, span, v, "%g", buf()))
@@ -1396,8 +1399,6 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     val ty = texpr_type(v)
     var counts: Buf[TExpr] = buf()
 
-    if is_quad(ty) then return quad_text_refused(cx, span)
-
     for w in written.view()
         val n = format_count(cx, w)
 
@@ -1419,6 +1420,10 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     // library's renderer, and `gen_format` records a gap for it there.
     if fits && spec_is_int(c) && library_key(cx, "format_int").is_some() then
         return int_format_call(cx, span, v, ty, spec, counts)
+
+    // An `f128` is rendered at its own width, by a renderer of its own, whose digits are binary128's.
+    if fits && spec_is_float(c) && is_quad(ty) then
+        return library_format_call(cx, span, "format_f128", one_arg(at_quad(span, v)), spec, counts)
 
     if fits && spec_is_float(c) && library_key(cx, "format_real").is_some() then
         return float_format_call(cx, span, v, spec, counts)
@@ -1509,6 +1514,10 @@ private library_format_call(cx: &Analyzer, span: Span, renderer: string, lead: B
 
     library_result_call_of(cx, span, renderer, args)
 end library_format_call
+
+// An `f128` value, or one of a subtype over it, as the `f128` its renderer takes.
+private at_quad(span: Span, v: TExpr) -> TExpr =
+    if texpr_type(v) == Floating(128, false) then v else TExpr(span, TCast(v, Floating(128, false)))
 
 // One argument, as the list a renderer's call starts from.
 private one_arg(v: TExpr) -> Buf[TExpr]

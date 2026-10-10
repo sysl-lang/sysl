@@ -1,0 +1,86 @@
+module sysl.fmt
+@tests
+
+import sysl.text.{Search, parse_f128}
+
+// `f128` as text and back. **Every expected string was worked out by exact rational arithmetic in a
+// second implementation** -- the binary128 value as a fraction, each candidate decimal rounded back
+// to binary128 and compared, the shortest that comes back kept -- rather than read off this one.
+
+private quad_of(bits: u128) -> f128 = f128.from_bits(bits)
+
+@test("an f128's shortest reading is the fewest digits that come back as it")
+quad_shortest_readings()
+    assert_eq(shortest(quad_of(0x3fff0000000000000000000000000000)), "1")
+    assert_eq(shortest(quad_of(0x3ffb999999999999999999999999999a)), "0.1")
+    assert_eq(shortest(quad_of(0x3ffd5555555555555555555555555555)), "0.3333333333333333333333333333333333")
+    assert_eq(shortest(quad_of(0x40000000000000000000000000000000)), "2")
+
+@test("the ends of the range: the largest finite value, the smallest normal and the smallest subnormal")
+quad_shortest_at_the_ends()
+    assert_eq(shortest(quad_of(0x7ffeffffffffffffffffffffffffffff)), "1.189731495357231765085759326628007e+4932")
+    assert_eq(shortest(quad_of(0x00010000000000000000000000000000)), "3.3621031431120935062626778173217526e-4932")
+    // The smallest subnormal owns everything from half of itself to half way to twice itself.
+    assert_eq(shortest(quad_of(1)), "6e-4966")
+
+@test("a value that needs all thirty-six digits gets them")
+quad_shortest_thirty_six_digits()
+    assert_eq(shortest(quad_of(0x40c2fffe9d411ae9850c030f59fc4975)), "1.00432565957246469963337794898610185e+59")
+    assert_eq(shortest(quad_of(0x40ccfffc3069446607e80efbb29cd55c)), "1.02841044661603723137143214065741275e+62")
+
+@test("the zeros keep their signs, and the values that are not numbers have names")
+quad_shortest_specials()
+    assert_eq(shortest(quad_of(0)), "0")
+    assert_eq(shortest(quad_of(u128(1) << 127)), "-0")
+    assert_eq(shortest(f128.infinity), "inf")
+    assert_eq(shortest(-f128.infinity), "-inf")
+    assert_eq(shortest(f128.nan), "nan")
+
+@test("every reading parses back to the same f128, over the whole exponent range")
+quad_readings_round_trip()
+    var state: u64 = 0x9E3779B97F4A7C15
+
+    for i in 0..<600
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+
+        val hi = state
+
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+
+        // Exponents spread over the whole field, subnormals and the top binade included.
+        val exponent = u128(i * 55 % 0x7fff)
+        var b = (exponent << 112) | (((u128(hi) << 64) | u128(state)) & ((u128(1) << 112) - 1))
+
+        if i % 7 == 0 then b &= ~((u128(1) << 112) - 1)
+
+        val text = shortest(quad_of(b))
+
+        assert_eq(parse_f128(text).unwrap().bits(), b)
+end quad_readings_round_trip
+
+@test("a specifier renders the exact value's digits, correctly rounded")
+quad_specifiers()
+    val tenth = quad_of(0x3ffb999999999999999999999999999a)
+
+    assert_eq(format_f128(tenth, "%.40e", 0, -1), "1.0000000000000000000000000000000000481482e-01")
+    assert_eq(format_f128(quad_of(0x7ffeffffffffffffffffffffffffffff), "%.35e", 0, -1),
+              "1.18973149535723176508575932662800702e+4932")
+    assert_eq(format_f128(quad_of(1), "%.20e", 0, -1), "6.47517511943802511092e-4966")
+    assert_eq(format_f128(quad_of(0x3ffd5555555555555555555555555555), "%.40f", 0, -1),
+              "0.3333333333333333333333333333333333172839")
+    assert_eq(format_f128(tenth, "%g", 0, -1), "0.1")
+    assert_eq(format_f128(tenth, "%+10.3f", 0, -1), "    +0.100")
+    assert_eq(format_f128(f128.infinity, "%e", 0, -1), "inf")
+
+@test("a specifier's fixed form holds every whole digit of the largest value")
+quad_fixed_holds_the_largest()
+    val text = format_f128(quad_of(0x7ffeffffffffffffffffffffffffffff), "%.0f", 0, -1)
+
+    // The largest value is an integer, (2^113 - 1) x 2^16271, so every digit is exact.
+    assert_eq(text.bytes.len, 4933)
+    assert(text.starts_with("1189731495357231765085759326628007016196"), text)
+    assert(text.ends_with("3137363968"), text)

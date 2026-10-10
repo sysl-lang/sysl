@@ -334,24 +334,74 @@ bare-metal image has no runtime library at all. A program, an archive or a kerne
 in `f128` is linked with them, and one that does not carries none. They round to nearest, ties to
 even, always.
 
-**An `f128` has no text form yet** — `print`, `str`, an interpolation hole and a format specifier all
-refuse it, saying what to write instead, since narrowing it silently would print a number the
-program does not hold:
+**`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
+it** — never narrowed to a `real`, which would print a number the program does not hold, and never
+`%g`'s six digits, which would throw away the twenty-eight the type was chosen for. A format
+specifier renders the exact value's digits, correctly rounded at the precision it asks for, as it
+does for a `real`. All of it is the standard module's own arithmetic, so it needs no C library and
+works on a bare machine:
 
 ```sysl
-val x: f128 = 2.5
+val tenth: f128 = 0.1
+val third: f128 = 1.0 / 3.0
 
-print(x)
+print(tenth, third, -0.0f128, f128.infinity)
+print(str(third).bytes.len, s"$tenth", f"${third}%.40f", f"${tenth}%.3e")
 ```
 
-```error
-an 'f128' has no text form yet
+```output
+0.1 0.3333333333333333333333333333333333 -0 inf
+36 0.1 0.3333333333333333333333333333333333172839 1.000e-01
 ```
 
-Nor is it a [vector](/reference/vectors/) lane, a value a `const` function computes with, or a
-width a `c const` is measured at. **C's `long double` is a different question from `f128`**: it is
-binary128 on AArch64 Linux, RISC-V and WebAssembly, a `double` on Apple's arm64 and on Windows, and
-x87's 80-bit format on x86. A [`c type`](/reference/ffi/#c-type--a-width-only-the-c-compiler-can-work-out)
+The text comes back exactly: `sysl.text.parse_f128` reads a decimal, rounded once to the nearest
+binary128 value, so every `str` of an `f128` parses to the same `f128`. `sysl.fmt.shortest` takes
+an `f128` as it takes a `real`.
+
+```sysl
+import sysl.text.parse_f128
+
+val x: f128 = 2.0 / 7.0
+
+print(parse_f128(str(x)).unwrap().bits() == x.bits())
+```
+
+```output
+true
+```
+
+**A `const` computes at `f128` too**, a `const` function included: every step is the exact result
+rounded once to binary128, as the machine would round it, and what is laid down is the encoding that
+came out — so `third` below is binary128's third, not a `double`'s widened:
+
+```sysl
+const third(x: f128) -> f128 = x / 3.0
+
+const harmonic(n: int) -> f128
+    var sum: f128 = 0.0
+
+    for k in 1..n
+        sum = sum + 1.0 / f128(k)
+
+    sum
+end harmonic
+
+const T: f128 = third(1.0)
+const H: f128 = harmonic(20)
+
+print(T.bits() == 0x3FFD5555555555555555555555555555, H)
+```
+
+```output
+true 3.597739657143681911483769068908388
+```
+
+A `c const` may be declared `f128`, and it is measured as a `long double`, every bit of it kept
+([ffi](/reference/ffi/#c-const--a-value-only-the-c-compiler-can-work-out)); and an `f128` passes
+through a variadic `...` and is read back with `va_arg`, by each machine's own convention. It is
+not a [vector](/reference/vectors/) lane. **C's `long double` is a different question from `f128`**:
+it is binary128 on AArch64 Linux, RISC-V and WebAssembly, a `double` on Apple's arm64 and on
+Windows, and x87's 80-bit format on x86. A [`c type`](/reference/ffi/#c-type--a-width-only-the-c-compiler-can-work-out)
 measured as `"long double"` is the one spelling that matches it on every machine.
 
 ## `usize` and `isize`

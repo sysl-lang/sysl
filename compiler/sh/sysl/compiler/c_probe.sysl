@@ -441,8 +441,9 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
 
     for i in 0..<consts.len()
         val carrier = plan.at(i) match
-            KnownNow(_, signed, floating, _) ->
-                if floating then "double" else if signed then "long long" else "unsigned long long"
+            KnownNow(bits, signed, floating, _) ->
+                if floating then (if bits == 128 then "long double" else "double")
+                else if signed then "long long" else "unsigned long long"
             // A constant declared at a `c type` is carried unsigned, because the signedness that
             // would have chosen the carrier is one of the answers this same probe is being asked
             // for. Nothing is lost: the IR prints an `i64` bit pattern whichever carrier is written.
@@ -555,7 +556,8 @@ private marked(globals: Buf[CGlobal], marker: string, index: usize) -> Option[CG
 
     for g in globals
         if g.index == index && g.ty.starts_with(want) && g.ty != "char-signed"
-            if want != "" || (g.ty == "i64" || g.ty == "double") then return Some(g)
+            if want != "" || (g.ty == "i64" || g.ty == "double" || g.ty == "fp128" || g.ty == "x86_fp80")
+                return Some(g)
 
     None
 end marked
@@ -674,14 +676,9 @@ private floating_kind(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: s
                 "widths that read back without guessing are 'f32' and 'f64'")
         return KnownNow(32, true, false, name)
 
-    // The measurement crosses back as a `double`, so a binary128 constant would arrive with a
-    // double's 53 bits and the rest made up.
-    if bits == 128
-        a.fault(at, c.span, s"'$name' is not a width a 'c const' is measured at — the value comes " +
-                "back through a 'double', which holds 53 of binary128's 113 bits of significand. " +
-                "Write the constant as an 'f128' literal")
-        return KnownNow(32, true, false, name)
-
+    // An `f128` is measured as a `long double`, which carries every bit C has: binary128 where that
+    // is the machine's `long double`, the x87 format on x86 -- whose every value binary128 holds --
+    // and a `double` on Apple's arm64 and on Windows, where that is all the C expression computes in.
     KnownNow(bits, true, true, name)
 end floating_kind
 
@@ -791,6 +788,8 @@ private out_of_range(a: &Analysis, at: Scope, c: CConstDecl, value: string, name
 // is not finite, or a finite one that narrows to an infinity or to a zero it was not, which has been
 // thrown away rather than rounded.
 private fraction(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: string, raw: CGlobal) -> Stmt
+    if bits == 128 then return quad_fraction(a, at, c, raw)
+
     if raw.ty != "double"
         a.fault(at, c.span, s"the C compiler answered for '${c.c}' with a " +
                 s"'${raw.ty}', and this line asks for a float")
@@ -835,6 +834,119 @@ private fraction(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: string
     // comparing it against the same expression measured at full width was told they differ.
     held(c, expr(c.span, FloatLit(float_text(narrowed), "")))
 end fraction
+
+// One measured `long double`, held at `f128`. **Nothing rounds**: binary128 holds every value of each
+// of the three formats a `long double` is, so the constant is C's own value, carried as the
+// thirty-six significant digits that read back as exactly that binary128 value. Only a value that is
+// not a finite number is refused, as it is at the other widths.
+private quad_fraction(a: &Analysis, at: Scope, c: CConstDecl, raw: CGlobal) -> Stmt
+    val q = quad_operand(raw.ty, raw.operand) match
+        None ->
+            if raw.ty == "fp128" || raw.ty == "x86_fp80" || raw.ty == "double" then return silent_float(a, at, c)
+
+            a.fault(at, c.span, s"the C compiler answered for '${c.c}' with a " +
+                    s"'${raw.ty}', and this line asks for a float")
+            return held(c, expr(c.span, FloatLit("0.0", "")))
+        Some(found) -> found
+
+    if quad_is_nan(q)
+        a.fault(at, c.span, s"'${c.c}' is not a number here, and a 'c const' carries " +
+                "one — a value the C compiler settles as a NaN has no constant to be folded into a " +
+                "program")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    val negative = q.0 >= 0x8000000000000000
+    val magnitude = (q.0 & 0x7FFFFFFFFFFFFFFF, q.1)
+
+    if magnitude.0 >= 0x7FFF000000000000
+        a.fault(at, c.span, s"'${c.c}' is ${if negative then "-" else ""}Infinity here, and a " +
+                "'c const' carries a finite number — either the C expression overflowed while it was " +
+                "being worked out, or it names an infinity outright")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    val lit = expr(c.span, FloatLit(if magnitude.0 == 0 && magnitude.1 == 0 then "0.0" else quad_text(magnitude), ""))
+
+    held(c, if negative then expr(c.span, Unary("-", lit)) else lit)
+end quad_fraction
+
+// A `long double` operand as LLVM printed it, as the binary128 pattern of the same value: `fp128`'s
+// `0xL` gives the low word's sixteen digits and then the high word's, and `f0x` the high word's
+// first; `x86_fp80`'s `0xK` (or `f0x`) the sign and
+// exponent in four digits and the 64-bit significand, explicit integer bit and all, in sixteen -- the
+// same bias as binary128, so widening it moves the fraction up and nothing else; and a `double` is
+// widened exactly.
+private quad_operand(ty: string, written: string) -> Option[(u64, u64)]
+    val operand = if written.ends_with(",") then written[0..<written.bytes.len - 1] else written
+
+    if ty == "double" then return float_operand(operand).map((x) -> quad_of_double(x.bits()))
+    if ty != "fp128" && ty != "x86_fp80" then return None
+
+    if operand == "+inf" || operand == "-inf" then return Some(quad_infinity(operand == "-inf"))
+    if operand.ends_with("qnan") || operand.ends_with("snan") then return Some(quad_nan())
+
+    // **As of LLVM 23 a value whose short decimal reads back as itself is written as that decimal**,
+    // `-2.500000e+00`, as a `double` always was -- read back at the operand's own format, since that
+    // is the format the decimal was chosen to name.
+    if !operand.starts_with("0x") && !operand.starts_with("f0x")
+        val exact = exact_of_text(operand)
+
+        if exact.is_none() then return None
+
+        val (coef, exp) = exact.unwrap()
+
+        if coef.is_zero() then return Some((if operand.starts_with("-") then 0x8000000000000000 else 0, 0))
+
+        return Some(if ty == "fp128" then quad_of_decimal(coef, exp) else x87_of_decimal(coef, exp))
+    end if
+
+    // Otherwise both are written as their whole bit pattern after `f0x`, most significant digit
+    // first -- for `fp128` the reverse of the older `0xL`'s word order.
+    val raw = operand.bytes.len == 35 && operand.starts_with("f0x")
+
+    if ty == "fp128"
+        if operand.bytes.len != 35 || (!raw && !operand.starts_with("0xL")) then return None
+
+        val first = hex_word(operand[3..<19])
+        val second = hex_word(operand[19..<35])
+
+        if first.is_none() || second.is_none() then return None
+
+        return if raw then Some((first.unwrap(), second.unwrap())) else Some((second.unwrap(), first.unwrap()))
+    end if
+
+    if ty == "x86_fp80"
+        if operand.bytes.len != 23 || (!operand.starts_with("0xK") && !operand.starts_with("f0x")) then return None
+
+        val top = hex_word(operand[3..<7])
+        val m = hex_word(operand[7..<23])
+
+        if top.is_none() || m.is_none() then return None
+
+        // The integer bit is explicit here and implied in binary128, so only the 63 below it move.
+        val fraction = m.unwrap() & 0x7FFFFFFFFFFFFFFF
+
+        return Some(((top.unwrap() << 48) | (fraction >> 15), fraction << 49))
+    end if
+
+    None
+end quad_operand
+
+// Sixteen or fewer hexadecimal digits as the word they spell.
+private hex_word(digits: string) -> Option[u64]
+    var bits: u64 = 0
+
+    for i in 0..<digits.bytes.len
+        val b = digits.bytes[i]
+
+        val d = if b >= u8('0') && b <= u8('9') then u64(b - u8('0'))
+        else if b >= u8('A') && b <= u8('F') then u64(b - u8('A')) + 10
+        else if b >= u8('a') && b <= u8('f') then u64(b - u8('a')) + 10
+        else return None
+
+        bits = (bits << 4) | d
+
+    Some(bits)
+end hex_word
 
 // The two `f32` limits as the refusals quote them, in the spelling `float_text` gives every other
 // number in these messages -- the largest finite `f32` and the smallest one above zero, each the
