@@ -750,10 +750,9 @@ taking what its 'extern' in 'sysl.process.sys' declares and answering a process 
 id, a length or zero, or the code of an 'IoError' negated
 ```
 
-**A program that only calls `exec` still answers `sysl_proc_wait`, `sysl_proc_kill` and
-`sysl.fs.sys`'s `sysl_fs_unlink`**: `Child`'s destructor is kept wherever the module is reached, and
-it waits for a child, stops one, and removes the file its output was captured into. A kernel with
-process calls answers those anyway; one without may answer them `UNSUPPORTED`.
+**A program answers only the hooks it reaches.** One that only calls `exec` answers `sysl_proc_exec`
+and nothing else: `Child`'s destructor, which waits for a child, stops one and removes the file its
+output was captured into, is kept only where the program makes a `Child`.
 
 ## What is not here
 

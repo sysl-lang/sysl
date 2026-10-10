@@ -155,20 +155,6 @@ private val pex_program: string = raw"""
     img_free(p: *u8) = ()
     """
 
-// What reaching `sysl.process` at all costs beside: `Child`'s destructor is a root wherever its module
-// is reached, and it waits for, stops and removes the capture file of a child -- so a program using
-// only `exec` still answers these, as a kernel with process calls does anyway.
-private val pex_child_hooks: string = raw"""
-    @export("sysl_proc_wait")
-    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = -38
-
-    @export("sysl_proc_kill")
-    k_kill(pid: i64, signal: int) -> int = -38
-
-    @export("sysl_fs_unlink")
-    k_unlink(path: *u8, len: usize) -> int = -38
-    """
-
 // The hook, answered as a kernel's `execve` would answer one that failed.
 private val pex_hook: string = raw"""
     @export("sysl_proc_exec")
@@ -190,7 +176,7 @@ private pex_build_c(root: string) -> (int, string) =
 pex_freestanding_answers_the_hook()
     if !lbr_ready() then return
 
-    val root = pex_tree(pex_program + pex_child_hooks + pex_hook)
+    val root = pex_tree(pex_program + pex_hook)
     val said = pex_build_c(root)
 
     assert(said.0 == 0, said.1)
@@ -207,7 +193,9 @@ pex_freestanding_answers_the_hook()
     assert(listed.text.contains(" T sysl_proc_exec"), listed.text)
     assert(listed.text.contains(" T become_shell"), listed.text)
 
-    for name in ["sysl_proc_posix_exec", "execve", "execvp", "fork"]
+    // A program that makes no `Child` keeps no `Child` destructor, so it owes none of the hooks one calls.
+    for name in ["sysl_proc_posix_exec", "execve", "execvp", "fork", "sysl_proc_wait", "sysl_proc_kill",
+                 "sysl_fs_unlink"]
         for line in lines_of(listed.text)
             assert(!line.ends_with(s" $name"), s"'$name' is in the archive: $line")
 end pex_freestanding_answers_the_hook
@@ -216,7 +204,7 @@ end pex_freestanding_answers_the_hook
 pex_unanswered_hook_is_refused()
     if !lbr_ready() then return
 
-    val root = pex_tree(pex_program + pex_child_hooks)
+    val root = pex_tree(pex_program)
     val said = pex_build_c(root)
 
     lbr_drop([root])
