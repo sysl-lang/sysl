@@ -58,7 +58,7 @@ private val prh_program: string = raw"""
 // so nothing after the first allocation folds away), the memory functions LLVM calls on a target
 // with no C library, `putchar` and `exit`, and the six `sysl.fs.sys` hooks that writing a file,
 // reading one back and handing one to a child as its input (which gives back what was read ahead) reach.
-private val prh_runtime: string = raw"""
+private val prh_runtime_core: string = raw"""
     @export("kstart")
     kstart() -> never
         val n = go()
@@ -114,12 +114,17 @@ private val prh_runtime: string = raw"""
     @export("sysl_fs_close")
     k_close(fd: int) -> int = 0
 
-    @export("sysl_fs_unlink")
-    k_unlink(path: *u8, len: usize) -> int = -38
-
     @export("sysl_fs_seek")
     k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
     """
+
+// The sixth, which a capture file reaches -- and `Child`'s destructor, which removes one.
+private val prh_unlink: string = raw"""
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
+    """
+
+private val prh_runtime: string = prh_runtime_core + prh_unlink
 
 // The four hooks, answered as a kernel's process calls would be.
 private val prh_hooks: string = raw"""
@@ -201,6 +206,7 @@ prh_answered_hooks_link()
     // The program's own answers are the ones in the image, defined strong.
     for hook in ["sysl_proc_spawn", "sysl_proc_wait", "sysl_proc_kill", "sysl_proc_temp_path"]
         assert(all.contains(s" T $hook"), all)
+
 
     // And nothing of the hosted answer came with them.
     for name in ["posix_spawn", "posix_spawnp", "fork", "execvp", "waitpid", "kill", "mkstemp",
@@ -287,16 +293,10 @@ private val prh_identity_program: string = raw"""
     end go
     """
 
-// The three hooks, answered as a kernel with one user per process would answer them -- and `kill`
-// and `wait`, which `Child`'s destructor reaches: a library destructor is a root wherever its module
-// is reached, so a program reaching `sysl.process` for its identity alone still answers those two.
+// The three hooks, answered as a kernel with one user per process would answer them -- and nothing
+// for `kill` or `wait`: `Child`'s destructor reaches those two, and a destructor is kept only where
+// the program holds a value of its type, which a program asking who it is never does.
 private val prh_identity_hooks: string = raw"""
-    @export("sysl_proc_kill")
-    k_kill(pid: i64, signal: int) -> int = 0
-
-    @export("sysl_proc_wait")
-    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
-
     @export("sysl_proc_get_id")
     k_get_id(which: int) -> i64 = 1000
 
@@ -340,8 +340,7 @@ prh_identity_hooks_unanswered()
     assert(said.0 != 0, "built with the identity hooks unanswered")
     assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$prh_target' has no " +
         "operating system under it for the standard library to answer a process or a user with, so " +
-        "the program answers it: define 'sysl_proc_get_id', 'sysl_proc_kill', 'sysl_proc_set_id', " +
-        "'sysl_proc_wait' with '@export'"), said.1)
+        "the program answers it: define 'sysl_proc_get_id', 'sysl_proc_set_id' with '@export'"), said.1)
     assert(said.1.contains(s"error: this program reaches 'sysl.fs', and '$prh_target' has no " +
         "operating system under it for the standard library to answer a filesystem with, so the " +
         "program answers it: define 'sysl_fs_chown' with '@export'"), said.1)
@@ -377,3 +376,89 @@ prh_hosted_identity_answers_weakly()
     for c in ["@geteuid(", "@setuid(", "@chown("]
         assert(said.1.contains(c), s"the hosted answer does not call $c")
 end prh_hosted_identity_answers_weakly
+
+// -- a destructor is kept by its type, not by its module ---------------------------------------------
+
+// A program reaching `sysl.process` for a pipe and its own identity, and never for a child: the
+// module's `Child` has a destructor that waits, kills and removes a capture file, and none of it
+// is the program's to answer, since no value of the type is ever made.
+private val prh_no_child_program: string = raw"""
+    import sysl.process.{pipe, user}
+
+    go() -> int
+        var n = 0
+
+        if user() == 1000 then n += 1
+
+        pipe() match
+            Ok(_) -> n += 2
+            Err(_) -> ()
+
+        n
+    end go
+    """
+
+private val prh_no_child_hooks: string = raw"""
+    @export("sysl_proc_get_id")
+    k_get_id(which: int) -> i64 = 1000
+
+    @export("sysl_proc_pipe")
+    k_pipe(read_end: *int, write_end: *int) -> int = -38
+    """
+
+@test("a program that never makes a Child links without the hooks Child's destructor reaches")
+prh_no_child_no_child_hooks()
+    if !prh_link_ready() then return
+
+    val p = prh_tree(prh_no_child_program + prh_runtime_core + prh_no_child_hooks)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = prh_symbols(elf, false)
+
+    assert_eq(prh_symbols(elf, true).trim(), "")
+    for hook in ["sysl_proc_wait", "sysl_proc_kill", "sysl_fs_unlink", "sysl_proc_spawn"]
+        assert(!prh_names(all, hook), s"'$hook' is in the image")
+
+    for hook in ["sysl_proc_get_id", "sysl_proc_pipe"]
+        assert(all.contains(s" T $hook"), all)
+
+    lbr_drop([p, out])
+end prh_no_child_no_child_hooks
+
+@test("and with no hooks at all it is refused naming only the two it reaches, not the destructor's")
+prh_no_child_unanswered()
+    if !lbr_ready() then return
+
+    val p = prh_tree(prh_no_child_program + prh_runtime_core)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 != 0, "built with the process hooks unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$prh_target' has no " +
+        "operating system under it for the standard library to answer a process or a user with, so " +
+        "the program answers it: define 'sysl_proc_get_id', 'sysl_proc_pipe' with '@export'"), said.1)
+    assert(!said.1.contains("sysl_fs_unlink"), said.1)
+
+    lbr_drop([p, out])
+end prh_no_child_unanswered
+
+// The text handed to the back end, where an optimizer cannot have folded a destructor away: a program
+// that makes a `Child` names `Child.drop` (defined, or declared where the library is precompiled),
+// and one that never does names none.
+@test("Child's destructor is in the program that makes a Child and in no other")
+prh_child_drop_follows_the_type()
+    if !lbr_ready() then return
+
+    val with_child = prh_tree(prh_program + prh_runtime + prh_hooks)
+    val made = lbr_cli(["sysl", "emit-llvm", "--target", prh_target, with_child])
+    val without = prh_tree(prh_no_child_program + prh_runtime_core + prh_no_child_hooks)
+    val never = lbr_cli(["sysl", "emit-llvm", "--target", prh_target, without])
+
+    lbr_drop([with_child, without])
+    assert(made.0 == 0, made.1)
+    assert(never.0 == 0, never.1)
+    assert(made.1.contains("void @sysl.process$Child.drop("), made.1)
+    assert(!never.1.contains("Child.drop"), never.1)
+end prh_child_drop_follows_the_type

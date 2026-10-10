@@ -1,0 +1,179 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A destructor is kept where its TYPE is reached (`reachability.sysl`'s `destructors_reached`): a
+// value of the type held anywhere the program reaches -- a local, a field, a container's element, an
+// enum payload, a closure's capture -- keeps the destructor its release calls. Each shape here holds
+// the type only one way, and is built with the heap counted: a destructor that ran prints, and a
+// program that gave everything back says nothing more than it printed.
+
+private struct DbtRun
+    ok: bool
+    out: string
+    err: string
+
+private dbt_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end dbt_ready
+
+private dbt_run(text: string) -> DbtRun
+    val root = make_temp_dir("sysl-dbt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DbtRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> DbtRun(false, "could not be started", "")
+        Ok(o) -> DbtRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end dbt_run
+
+// A handle whose destructor prints and lets go of a box of its own, so a destructor that never ran
+// is both a missing line and a live allocation.
+private dbt_handle() -> string = raw"""
+    struct Note
+        text: string
+
+    struct Handle
+        id: int
+        note: &Note
+
+    impl Drop for Handle
+        drop(self) = print("drop", self.id, self.note.text)
+
+    handle(id: int) -> &Handle = Handle(id, Note(s"n$id"))
+
+    """
+
+private dbt_clean(run: DbtRun, expected: string)
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end dbt_clean
+
+@test("a type held only as a field of another keeps its destructor")
+dbt_only_as_a_field()
+    if !dbt_ready() then return
+
+    dbt_clean(dbt_run(dbt_handle() + raw"""
+        struct Outer
+            inner: &Handle
+
+        hold()
+            val o: &Outer = Outer(handle(1))
+            print("held")
+
+        hold()
+        print("out")
+        """), "held\ndrop 1 n1\nout\n")
+
+@test("a type held only as the element of a Buf keeps its destructor")
+dbt_only_in_a_buf()
+    if !dbt_ready() then return
+
+    dbt_clean(dbt_run(dbt_handle() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        hold()
+            var xs: Buf[&Handle] = buf()
+
+            xs.push(handle(2))
+            print("held", xs.len())
+
+        hold()
+        print("out")
+        """), "held 1\ndrop 2 n2\nout\n")
+
+@test("a type held only as an enum's payload keeps its destructor")
+dbt_only_as_a_payload()
+    if !dbt_ready() then return
+
+    dbt_clean(dbt_run(dbt_handle() + raw"""
+        enum Slot
+            Empty
+            Full(h: &Handle)
+
+        hold()
+            val s = Slot.Full(handle(3))
+
+            s match
+                Slot.Full(_) -> print("full")
+                Slot.Empty -> print("empty")
+
+        hold()
+        print("out")
+        """), "full\ndrop 3 n3\nout\n")
+
+@test("a type held only by a closure's capture keeps its destructor")
+dbt_only_by_a_capture()
+    if !dbt_ready() then return
+
+    dbt_clean(dbt_run(dbt_handle() + raw"""
+        make() -> &Fn() -> int
+            val h = handle(4)
+
+            () -> h.id
+
+        hold()
+            val f = make()
+
+            print("called", f())
+
+        hold()
+        print("out")
+        """), "called 4\ndrop 4 n4\nout\n")
+
+// The other half: a type with a destructor that nothing reached is not in the program at all.
+@test("a destructor of a type nothing reaches is not emitted")
+dbt_unreached_type_has_no_destructor()
+    if !dbt_ready() then return
+
+    val root = make_temp_dir("sysl-dbt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, dbt_handle() + raw"""
+        struct Unused
+            n: int
+
+        impl Drop for Unused
+            drop(self) = print("unused", self.n)
+
+        val h = handle(5)
+        print(h.id)
+        """).unwrap()
+
+    val ir = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> made.text
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(ir.contains("define void @Handle.drop("), ir)
+    assert(!ir.contains("Unused.drop"), ir)
+end dbt_unreached_type_has_no_destructor

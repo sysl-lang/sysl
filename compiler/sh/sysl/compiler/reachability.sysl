@@ -9,12 +9,13 @@ import sysl.container.{Map, map, Set, set}
 // the lowering: a declaration nothing can reach is still one the program declared, and checking it
 // is what makes a mistake in it a mistake at all.
 //
-// **The roots are not only what the program runs.** Four kinds of function are reached from
+// **The roots are not only what the program runs.** Three kinds of function are reached from
 // somewhere no walk can see -- an interrupt handler, entered by the processor; an `@export`, called
-// by something outside; a `@section` definition, found by a linker script; and a destructor, called
-// by the release hook the emitter builds. Each is a root, and each is a root only where the program
-// reaches its module: a handed source root is compiled whole rather than by what the program
-// imports, so an unconditional root would put an unimported module's contribution into the output.
+// by something outside; and a `@section` definition, found by a linker script. Each is a root, and
+// each is a root only where the program reaches its module: a handed source root is compiled whole
+// rather than by what the program imports, so an unconditional root would put an unimported module's
+// contribution into the output. **A destructor is called by the release hook the emitter builds**,
+// and is reached where its type is rather than where its module is (`destructors_reached`).
 
 // What one walk found: every function it can arrive at and every `val` it reads.
 //
@@ -67,6 +68,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
     var more = true
+    val scan = type_scan()
 
     while more
         live = reached_from(p, index, roots_of(p, entries, extra))
@@ -77,7 +79,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
         for item in extra
             add_call(live, item.name)
 
-        more = false
+        more = destructors_reached(p, index, live, scan, &extra)
 
         for i in 0..<p.externs.len()
             val x = p.externs.at(i)
@@ -510,6 +512,137 @@ private add_named(xs: *Buf[string], seen: *Set[string], name: string) -> bool
     true
 end add_named
 
+// -- the destructors of the types the program reaches ------------------------------------------------
+
+// **A destructor is reached exactly where its TYPE is**, not where its module is: the release hook
+// that calls it is laid down only for a value of the type, so a program that calls `sysl.process.pid`
+// and never makes a `Child` has no use for `Child.drop` -- nor for the hooks it would reach.
+//
+// A type is reached where anything reached holds one: a reached function's parameters, result,
+// locals and every expression of its body; module storage; a table's type; and, from each of those,
+// whatever the type holds in turn -- a field, an enum payload, a type argument, the target of a
+// `&T`, a `weak T`, a `*T`, the element of an array or a slice. **The question errs on the side of
+// keeping**: a destructor wrongly dropped is a silent leak, where one wrongly kept costs a function.
+//
+// The scan is kept across the rounds of the walk, each function's body being read once however many
+// rounds reach it.
+private struct TypeScan
+    funcs: Set[string]
+    keys: Set[string]
+    fixed: bool
+end TypeScan
+
+private type_scan() -> &TypeScan = TypeScan(set(), set(), false)
+
+// Adds to `extra` the destructor of every type the walk has reached whose destructor it has not,
+// answering whether there was one -- which is another round, since a destructor's body reaches
+// types of its own.
+private destructors_reached(p: TProgram, index: FuncIndex, live: &Live, scan: &TypeScan,
+                            extra: *Buf[TFunc]) -> bool
+    if p.destructors.is_empty() then return false
+
+    if !scan.fixed
+        scan.fixed = true
+        walk_stmts(p.main, types_walk(scan))
+
+        for v in p.vals
+            take_type(scan, v.ty)
+
+            v.init match
+                Some(x) -> walk_texpr(x, types_walk(scan))
+                None -> ()
+
+        for t in p.vtables
+            take_type(scan, t.for_type)
+    end if
+
+    val none = p.funcs.len()
+
+    for name in live.calls
+        if !scan.funcs.add(name) then continue
+
+        var at = index.first.get_or(name, none)
+
+        while at < none
+            scan_func(scan, p.funcs.at(at))
+
+            at = index.next.at(at)
+
+    var more = false
+
+    for d in p.destructors
+        if !scan.keys.has(d.0) || live.call_set.has(d.1) || holds_func(*extra, d.1) then continue
+
+        var at = index.first.get_or(d.1, none)
+
+        while at < none
+            extra.push(p.funcs.at(at))
+            more = true
+
+            at = index.next.at(at)
+
+    more
+end destructors_reached
+
+private scan_func(scan: &TypeScan, f: TFunc)
+    for param in f.params
+        take_type(scan, param.1)
+
+    take_type(scan, f.ret_ty)
+    walk_block_stmts(f.body, types_walk(scan))
+end scan_func
+
+private types_walk(scan: &TypeScan) -> &TWalk =
+    TWalk(true, e -> take_type(scan, texpr_type(e)), w -> (), s -> take_decl_type(scan, s))
+
+private take_decl_type(scan: &TypeScan, s: TStmt) = s match
+    TVarDecl(_, ty, _, _) -> take_type(scan, ty)
+    _ -> ()
+
+// A type, and everything a value of it holds.
+private take_type(scan: &TypeScan, t: Type) = t match
+    Struct(d) -> if scan.keys.add(mangle(t)) then take_parts(scan, d.targs, d.fields)
+    Results(d) -> if scan.keys.add(mangle(t)) then take_parts(scan, d.targs, d.fields)
+    Enum(d) ->
+        if scan.keys.add(mangle(t))
+            for item in d.targs
+                take_type(scan, item)
+
+            for v in d.variants
+                take_parts(scan, buf(), v.fields)
+        end if
+    Constrained(d) -> if scan.keys.add(mangle(t)) then take_type(scan, d.base)
+    Ref(inner, _) -> take_type(scan, *inner)
+    Weak(inner) -> take_type(scan, *inner)
+    Ptr(inner) -> take_type(scan, *inner)
+    Volatile(inner) -> take_type(scan, *inner)
+    Slice(elem, _) -> take_type(scan, *elem)
+    Array(_, elem) -> take_type(scan, *elem)
+    Vector(_, elem) -> take_type(scan, *elem)
+    Pack(es) ->
+        for item in es
+            take_type(scan, item)
+    Trait(_, args, assocs) ->
+        for item in args
+            take_type(scan, item)
+
+        for item in assocs
+            take_type(scan, item.1)
+    CFn(params, ret) ->
+        for item in params
+            take_type(scan, item)
+
+        take_type(scan, *ret)
+    _ -> ()
+
+private take_parts(scan: &TypeScan, targs: Buf[Type], fields: Buf[(string, Type)])
+    for item in targs
+        take_type(scan, item)
+
+    for item in fields
+        take_type(scan, item.1)
+end take_parts
+
 // -- the roots nothing in the program names -----------------------------------------------------------
 
 // The functions that are roots because **nothing in the program names them**, whatever the walk
@@ -521,17 +654,11 @@ end add_named
 entry_points(p: TProgram, own: Buf[string]) -> Buf[TFunc]
     val reached = reached_modules(p, own)
 
-    var destructors: Set[string] = set()
-
-    for item in p.destructors
-        destructors.add(item.1)
-
     var out: Buf[TFunc] = buf()
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
-        val kind = f.conv.is_some() || f.exported.is_some() || f.section.is_some() ||
-                   destructors.has(f.name)
+        val kind = f.conv.is_some() || f.exported.is_some() || f.section.is_some()
 
         if kind && contributes(reached, f.name) then out.push(f)
 
@@ -607,9 +734,8 @@ end reached_modules
 // A module name added to a set, where **the root module's name is the empty string and is a name
 // like any other**. `add_named` refuses one, which is right for a call graph -- nothing is called
 // by no name -- and wrong here: refused, the root module is not among the ones a compilation counts
-// roots in, so a program's own destructor, `@export`, `@section` or interrupt handler written with
-// no module header is pruned before it can be emitted -- and a destructor pruned is a symbol the
-// release hook calls and nothing defines.
+// roots in, so a program's own `@export`, `@section` or interrupt handler written with no module
+// header is pruned before it can be emitted.
 private add_module(order: *Buf[string], seen: *Set[string], name: string)
     if seen.add(name) then order.push(name)
 
@@ -635,10 +761,10 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
 // test -- which is every one of them, since nothing calls a hook -- would be pruned out from under
 // its own arm.
 //
-// **The roots nothing in the program names are roots here too.** A handler, an export and a
-// destructor are each reached from somewhere no walk can see, so replacing the roots does not make
-// them reachable from the tests instead: it makes them reachable from nothing, and a destructor
-// dropped that way leaves the release hook calling a function the tree no longer holds.
+// **The roots nothing in the program names are roots here too.** A handler and an export are each
+// reached from somewhere no walk can see, so replacing the roots does not make them reachable from
+// the tests instead: it makes them reachable from nothing. A destructor is reached by its type here
+// exactly as in a program, so a test that makes a value keeps the destructor its release calls.
 //
 // **Only the program's own tests are kept** (`strip_handed`): a dependency's suite is not the
 // consumer's to run, and a failing test in it would otherwise fail the consumer's `sysl test`. With
@@ -647,18 +773,31 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
 tests_only(p: TProgram, own: Buf[string]) -> TProgram
     val kept = without_program_entry(strip_handed(p, own))
     val entries = entry_points(kept, own)
-    val root = roots_of(kept, entries, buf())
+    val index = func_index(kept)
+    val scan = type_scan()
 
-    for item in kept.tests
-        add_call(root, item.func)
+    var extra: Buf[TFunc] = buf()
+    var live = no_reached()
+    var more = true
 
-    for item in kept.hooks
-        add_call(root, item.func)
+    while more
+        val root = roots_of(kept, entries, extra)
 
-    val live = reached_from(kept, func_index(kept), root)
+        for item in kept.tests
+            add_call(root, item.func)
 
-    for entrie in entries
-        add_call(live, entrie.name)
+        for item in kept.hooks
+            add_call(root, item.func)
+
+        live = reached_from(kept, index, root)
+
+        for entrie in entries
+            add_call(live, entrie.name)
+
+        for item in extra
+            add_call(live, item.name)
+
+        more = destructors_reached(kept, index, live, scan, &extra)
 
     var externs: Buf[TExtern] = buf()
 

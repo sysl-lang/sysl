@@ -2049,7 +2049,11 @@ could have prevented. Where both would work, the destructor is the better one: i
 and a caller cannot forget it.
 
 **It costs nothing to have.** Release already calls through a per-payload hook, and a destructor is a
-call at the top of that hook. A type without one produces exactly the hook it always did.
+call at the top of that hook. A type without one produces exactly the hook it always did. And a
+destructor is in the program only where the program holds a value of its type — made, stored, carried
+in a field, a container, an enum payload or a closure — so a library type's destructor costs a program
+that never makes one nothing at all: one that calls `sysl.process.pid` carries no `Child.drop`, and on
+a bare-metal target is not asked to answer the hooks that destructor would call.
 
 ### The four limits, each a consequence of where it runs
 
