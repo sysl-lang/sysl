@@ -1,0 +1,68 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **A job starts with the job-control signals at their defaults.**
+//
+// A child started in a group other than `Inherit` begins its program with `SIGINT`, `SIGQUIT`,
+// `SIGTSTP`, `SIGTTIN`, `SIGTTOU` and `SIGCHLD` at their defaults and an empty signal mask, whatever
+// the program starting it ignores for itself. A job started in the background goes through
+// `posix_spawn` on this host, which `library/sysl/signal/tests.sysl`'s `jsg_` tests cover; a job
+// given the terminal goes through `fork`, the one path that can hand the terminal over before the
+// program runs, and needs a terminal to be asked at all -- so it is run here under `script`, as
+// `tests_pgr_process_groups.sysl`'s terminal test is.
+
+// The program the terminal test runs: it ignores INT and QUIT for itself, as a shell does, starts a
+// foreground job that sends itself each, and reports how each ended; a child left in its group is the
+// control, surviving the same signal.
+private val jsg_job: string = raw"""
+    import sysl.process.{Group, Status, capture, process_group, run, set_foreground_group}
+    import sysl.signal.{INT, QUIT, ignore}
+
+    ignore(INT).unwrap()
+    ignore(QUIT).unwrap()
+
+    val me = process_group()
+    val int_job = run("sh", ["-c", "kill -INT $$"], group = Group.New, foreground = true).unwrap()
+
+    set_foreground_group(me).unwrap()
+
+    val quit_job = run("sh", ["-c", "kill -QUIT $$"], group = Group.New, foreground = true).unwrap()
+
+    set_foreground_group(me).unwrap()
+    print(s"int ${int_job == Status.Signalled(INT)}")
+    print(s"quit ${quit_job == Status.Signalled(QUIT)}")
+
+    val plain = capture("sh", ["-c", "kill -INT $$; echo survived"]).unwrap()
+
+    print(s"plain ${plain.text}")
+    """
+
+@test("under a terminal, a foreground job ends on the INT and QUIT its starter ignores; a plain child does not")
+jsg_foreground_job_resets_signals()
+    if !lbr_ready() then return
+    if !is_file("/usr/bin/script") then skip("there is no script(1) to give the program a terminal")
+
+    val p = lbr_program(jsg_job)
+    val out = lbr_temp("sysl-jsg-job")
+    val exe = s"$out/job"
+    val built = lbr_cli(["sysl", "build", "-o", exe, p])
+
+    assert(built.0 == 0, built.1)
+
+    val uname = capture("uname").unwrap().text.trim()
+    val line = if uname == "Darwin" then s"/usr/bin/script -q /dev/null '$exe' < /dev/null"
+    else s"/usr/bin/script -q -e -c '$exe' /dev/null < /dev/null"
+    val ran = capture("sh", ["-c", line], timeout = 30000).unwrap()
+    val text = ran.text
+
+    lbr_drop([p, out])
+    assert(ran.status.ok(), s"${ran.status}: $text")
+    assert(text.contains("int true"), text)
+    assert(text.contains("quit true"), text)
+    assert(text.contains("plain survived"), text)
+end jsg_foreground_job_resets_signals

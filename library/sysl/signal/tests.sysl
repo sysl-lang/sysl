@@ -4,7 +4,7 @@ module sysl.signal
 
 import sysl.fs.{IoError, make_temp_dir, read_text, remove_dir_all}
 import sysl.posix.time.sleep
-import sysl.process.{Status, capture, run, start}
+import sysl.process.{Group, Status, capture, run, start}
 import sysl.text.{Search, parse_int}
 import sysl.time.millis
 
@@ -145,6 +145,51 @@ sg_ignore_and_default_reach_a_child()
     restore_default(USR2).unwrap()
     assert_eq(run("sh", ["-c", "kill -USR2 $$; echo alive"]).unwrap(), Status.Signalled(USR2))
 end sg_ignore_and_default_reach_a_child
+
+// ## A job starts with the job-control signals at their defaults
+//
+// A shell ignores the terminal's keys for itself, and an ignore survives the start of a program, so a
+// child started in a group -- a job -- has them put back to their defaults. One left in this
+// program's group keeps what it was given.
+
+// A shell that sends itself `sig` and, if it lives, says so.
+private jsg_kill_self(sig: string) -> string = "kill -" + sig + " $$; echo survived"
+
+@test("an INT this program ignores still ends a child started in a new group")
+jsg_new_group_resets_int()
+    ignore(INT).unwrap()
+    assert_eq(run("sh", ["-c", jsg_kill_self("INT")], group = Group.New).unwrap(), Status.Signalled(INT))
+
+@test("an INT this program ignores stays ignored in a child left in this program's group")
+jsg_inherit_keeps_int_ignored()
+    ignore(INT).unwrap()
+    assert_eq(capture("sh", ["-c", jsg_kill_self("INT")]).unwrap().text, "survived\n")
+
+@test("a QUIT this program ignores still ends a child that joins an existing group, and a captured one")
+jsg_join_group_resets_quit()
+    ignore(QUIT).unwrap()
+
+    val leader = start("sh", ["-c", "exec sleep 5"], group = Group.New).unwrap()
+    val joined = run("sh", ["-c", jsg_kill_self("QUIT")], group = Group.Join(leader.group())).unwrap()
+
+    send(i64(leader.group()), KILL).unwrap()
+    leader.wait().unwrap()
+
+    assert_eq(joined, Status.Signalled(QUIT))
+    assert_eq(capture("sh", ["-c", jsg_kill_self("QUIT")], group = Group.New).unwrap().status,
+              Status.Signalled(QUIT))
+end jsg_join_group_resets_quit
+
+@test("a TSTP this program ignores stops a job, which the deadline then ends; inherited, it is ignored")
+jsg_new_group_resets_tstp()
+    ignore(TSTP).unwrap()
+    assert_eq(capture("sh", ["-c", jsg_kill_self("TSTP")]).unwrap().text, "survived\n")
+
+    val stopped = capture("sh", ["-c", jsg_kill_self("TSTP")], group = Group.New, timeout = 1000).unwrap()
+
+    assert_eq(stopped.status, Status.TimedOut)
+    assert_eq(stopped.text, "")
+end jsg_new_group_resets_tstp
 
 // ## Another process
 
