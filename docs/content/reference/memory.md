@@ -2253,6 +2253,57 @@ on_timer()
 Without the annotation the same archive builds, and the race it describes is the reader's to know
 about.
 
+### A guarded value crosses with its lock
+
+A `Map` shared through a count that is not atomic may not be reached from another domain — **but a
+`Mutex[Map[...]]` may**, whatever it holds. `Mutex[T]` is declared `@guards(value)`: its own members
+are the only way to the `T`, and each takes the lock first, so sharing the lock does not share the
+value:
+
+```sysl
+import sysl.container.{map, Map}
+import sysl.posix.threads.Mutex
+
+static var names: Mutex[Map[string, int]] = Mutex.new(map())
+
+lookup(s: string) -> int = names.with((t) -> t.get(s).unwrap_or(0))
+
+val job: &sync Fn() -> unit = () -> print(lookup("a"))
+
+job()
+```
+
+```output
+0
+```
+
+**What leaves through `with` or `try_with` is what is held instead**, at the call: once the lock is
+let go, the value it answered belongs to whoever holds the lock next as much as to the caller, so it
+is held to the rule a capture is. An `int` or a `bool` passes on its type, and so does a value built
+fresh inside the closure — a string literal, which is immortal, or a `.copy()` of a string, which
+gives the bytes an owner of their own. A string read out of the map still shares its count with the
+one inside, and is refused:
+
+```sysl
+import sysl.container.{map, Map}
+import sysl.posix.threads.Mutex
+
+static var names: Mutex[Map[string, string]] = Mutex.new(map())
+
+print(names.with((t) -> t.get("a").unwrap_or("none")))
+```
+
+```error
+'sysl.posix.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
+```
+
+`t.get("a").unwrap_or("none").copy()` is accepted, and so is the `Map` itself held as a `&sync
+Mutex[...]` and captured. A struct of a program's own opts in the same way — `@guards(items)` above
+it names a field that is `private`, and every member that answers something is held to the rule at
+its calls. **What is not checked** is a closure that *stores* something read out of the guarded
+value where it outlives the call — through a pointer it captured, say: nothing follows a counted
+value from the field to the store, so that one is the reader's to know about.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility
