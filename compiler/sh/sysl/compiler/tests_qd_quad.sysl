@@ -658,23 +658,26 @@ qd_an_archive_without_f128_carries_no_runtime()
 
 // -- refusals ---------------------------------------------------------------------------------------
 
-@test("an f128 has no text form yet, and says what to write instead")
-qd_no_text_form()
+@test("an f128 has a text form: print, str, a plain hole and a specifier all take one")
+qd_text_form()
     if !qd_ready() then return
 
-    for program in ["val x: f128 = 1.0\nprint(x)\n", "val x: f128 = 1.0\nval s = str(x)\n",
-                    "val x: f128 = 1.0\nval s = s\"$x\"\n", "val x: f128 = 1.0\nval s = f\"${x}%.3f\"\n"]
-        qd_has(qd_err(program), "an 'f128' has no text form yet")
+    for program in ["val x: f128 = 1.0\nprint(x)\n", "val x: f128 = 1.0\nprint(str(x))\n",
+                    "val x: f128 = 1.0\nprint(s\"$x\")\n", "val x: f128 = 1.0\nprint(f\"${x}%.3f\")\n"]
+        qd_has(qd_ir_for(None, program), "define")
 
-@test("a const function, a c const, a vector lane and va_arg each refuse f128 by name")
+    assert_eq(qd_run("val x: f128 = 1.5\nprint(x, str(x), s\"$x\", f\"${x}%.3f\")\n"), "1.5 1.5 1.5 1.500\n")
+
+@test("a const function, a c const and va_arg each take f128; a vector lane still refuses it by name")
 qd_the_other_refusals()
     if !qd_ready() then return
 
-    qd_has(qd_err("const half(x: f128) -> f128 = x / 2.0\n"), "'f128' values are not evaluated while compiling yet")
-    qd_has(qd_err("c const\n    pi: f128 = \"3.14\"\n"), "'f128' is not a width a 'c const' is measured at")
+    qd_has(qd_ir_for(None, "const half(x: f128) -> f128 = x / 2.0\nconst H: f128 = half(3.0)\nprint(H)\n"),
+           "fp128 0xL00000000000000003FFF800000000000")
+    assert_eq(qd_err("c const\n    pi: f128 = \"3.14\"\nval p: f128 = pi\nprint(p)\n"), "")
     qd_has(qd_err("val v: <2>f128 = [1.0, 2.0]\n"), "f128")
-    qd_has(qd_err("f(n: int, ...) -> f128\n    var ap: va_list\n    va_start(ap)\n    val x = va_arg[f128](ap)\n    va_end(ap)\n    x\n"),
-           "reading an 'f128' out of a variadic argument list is not built")
+    assert_eq(qd_err("f(n: int, ...) -> f128\n    var ap: va_list\n    va_start(ap)\n    val x = va_arg[f128](ap)\n    va_end(ap)\n    x\nprint(f(1, 2.0f128))\n"),
+              "")
 
 @test("an export refused for an unsettled type says so once, not again as '?' (FINDINGS 62c)")
 qd_an_unknown_type_is_not_refused_twice()

@@ -169,6 +169,20 @@ const_float_value(cx: &Analyzer, e: Expr, ty: Type) -> Option[real]
         _ -> None
 end const_float_value
 
+// The same for an `f128` constant, whose value is its encoding: computed at binary128 at every step,
+// as the program would compute it, and never through a `real`.
+const_quad_value(cx: &Analyzer, e: Expr, ty: Type) -> Option[(u64, u64)]
+    if !cx.an.evaluation.ready || !mentions_const_call(cx.an, e) then return None
+
+    val typed = typed_call(cx, e, Some(ty))
+
+    if typed.is_none() then return None
+
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+        EvValue(Some(ConstQuad(hi, lo))) -> Some((hi, lo))
+        _ -> None
+end const_quad_value
+
 // A module `val`'s initializer as the literal it comes to, where it calls a `const` function: such a
 // value is laid down on every target, the compiler having run the call. A trap is refused at the
 // initializer. Where the evaluation meets something it does not hold, the initializer stays code,
@@ -559,7 +573,7 @@ private unheld(t: Type) -> Option[string] = t match
     Constrained(d) -> unheld(d.base)
     Integer(_, _, _) -> None
     Floating(bits, brain) ->
-        if !brain && (bits == 32 || bits == 64) then None
+        if !brain && (bits == 32 || bits == 64 || bits == 128) then None
         else Some("'f16' and 'bf16' are not evaluated while compiling yet")
     Bool -> None
     Char -> None
@@ -574,6 +588,7 @@ private unheld(t: Type) -> Option[string] = t match
 private value_text(v: Const, t: Type) -> string = v match
     ConstInt(n) -> if underlying(t) == Char then s"'${char(u32(n.to_long().unwrap_or(0)))}'" else to_string(n)
     ConstFloat(f) -> real_text(f)
+    ConstQuad(hi, lo) -> quad_text((hi, lo))
     ConstBool(b) -> if b then "true" else "false"
     ConstChar(c) -> s"'$c'"
     ConstStr(s) -> s
@@ -588,6 +603,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstInt(n) -> Some(TExpr(span, TIntLit(n, t)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
+    ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
     _ -> None
 
 // The `double` pattern a float literal carries. A NaN is the canonical quiet one: which NaN a
@@ -750,6 +766,7 @@ private inc_dec_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
 private eval_rest(r: &EvRun, e: TExpr) -> Flow
     *e.kind match
         TFloatLit(bits, ty) -> EvGave(ConstFloat(float_at(real_of_bits(bits), ty)))
+        TQuadLit(hi, lo, _) -> EvGave(ConstQuad(hi, lo))
         TZero(ty) -> zero_value(r, e.span, ty)
         TGlobal(symbol, ty, writable) -> global_value(r, e.span, symbol, ty, writable)
         TResult(_) ->
@@ -815,6 +832,7 @@ end eval_bool
 private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Integer(_, _, _) -> EvGave(ConstInt(from_int(0)))
     Char -> EvGave(ConstInt(from_int(0)))
+    Floating(128, _) -> EvGave(ConstQuad(0, 0))
     Floating(_, _) -> EvGave(ConstFloat(0.0))
     Bool -> EvGave(ConstBool(false))
     Unit -> EvNone
@@ -858,6 +876,14 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 
     val base = underlying(ty)
 
+    // **An `f128` is read from the literal it was written as**, since the untyped fold above reads a
+    // float through a `double`.
+    if is_quad(base)
+        return quad_of_init(d.unwrap().init.unwrap()) match
+            Some((hi, lo)) -> EvGave(ConstQuad(hi, lo))
+            None -> refuse_form(r, at, s"'$shown' is filled when the program runs")
+    end if
+
     folded match
         Some(ConstInt(n)) -> base match
             Integer(bits, signed, _) ->
@@ -870,6 +896,16 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
         Some(ConstChar(c)) -> EvGave(ConstInt(from_int(long(u32(c)))))
         _ -> refuse_form(r, at, s"'$shown' is filled when the program runs")
 end global_value
+
+// The binary128 value an initializer written as a number literal, or a negated one, stands for.
+private quad_of_init(e: Expr) -> Option[(u64, u64)] = *e.kind match
+    FloatLit(text, _) -> quad_of_text(text)
+    IntLit(digits, base, _) -> Some(quad_of_int(literal_value(digits, base)))
+    Unary(op, operand) ->
+        if op != "-" then return None
+
+        quad_of_init(operand).map((q) -> quad_negated(q.0, q.1))
+    _ -> None
 
 @noinline
 private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
@@ -886,6 +922,12 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
             _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
         ConstFloat(f) ->
             if op == "-" then EvGave(ConstFloat(run_float_negate(f)))
+            else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
+        ConstQuad(hi, lo) ->
+            if op == "-"
+                val (nh, nl) = quad_negated(hi, lo)
+
+                EvGave(ConstQuad(nh, nl))
             else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
         ConstBool(b) -> if op == "!" then EvGave(ConstBool(!b)) else refuse_form(r, at, s"'$op' on bool")
         _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
@@ -922,6 +964,7 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
         (ConstFloat(a), ConstFloat(b)) -> underlying(lt) match
             Floating(bits, _) -> run_float_binary(op, a, b, bits)
             _ -> Err(s"'$op' on ${type_show(lt)}")
+        (ConstQuad(ah, al), ConstQuad(bh, bl)) -> run_quad_binary(op, (ah, al), (bh, bl))
         (ConstBool(a), ConstBool(b)) ->
             if op == "&" || op == "&&" then Ok(ConstBool(a && b))
             else if op == "|" || op == "||" then Ok(ConstBool(a || b))
@@ -1037,6 +1080,11 @@ private ev_float_end(e: RangeEnd) -> real = e match
 
         if negative then -inf else inf
 
+// An end of an `f128` range, read from its text at binary128 rather than through a `double`.
+private ev_quad_end(e: RangeEnd) -> (u64, u64) = e match
+    EndAt(d) -> quad_of_text(s"$d").unwrap_or(quad_nan())
+    EndInfinite(negative) -> quad_infinity(negative)
+
 // Whether a value is one a constrained type's range admits -- the checks a produce site runs.
 private admitted(d: &ConstrainedType, v: Const) -> bool = v match
     ConstInt(n) ->
@@ -1054,6 +1102,17 @@ private admitted(d: &ConstrainedType, v: Const) -> bool = v match
             None -> true
         val hi_ok = d.hi match
             Some(hi) -> if d.exclusive_hi then f < ev_float_end(hi) else f <= ev_float_end(hi)
+            None -> true
+
+        lo_ok && hi_ok
+    ConstQuad(qh, ql) ->
+        val q = (qh, ql)
+        val lo_ok = d.lo match
+            Some(lo) -> quad_compare(q, ev_quad_end(lo)).map((c) -> c >= 0).unwrap_or(false)
+            None -> true
+        val hi_ok = d.hi match
+            Some(hi) -> quad_compare(q, ev_quad_end(hi)).map((c) -> if d.exclusive_hi then c < 0 else c <= 0)
+                .unwrap_or(false)
             None -> true
 
         lo_ok && hi_ok
@@ -1354,6 +1413,7 @@ end postconditions
 private below(a: Const, b: Const) -> bool = (a, b) match
     (ConstInt(x), ConstInt(y)) -> cmp(x, y) < 0
     (ConstFloat(x), ConstFloat(y)) -> x < y
+    (ConstQuad(xh, xl), ConstQuad(yh, yl)) -> quad_compare((xh, xl), (yh, yl)) == Some(-1)
     _ -> false
 
 // The key a run of a callee is kept by: the callee, and each argument's exact value.
@@ -1365,6 +1425,7 @@ private memo_key(name: string, vals: Buf[Const]) -> string
         out = out + "|" + (vals.at(i) match
             ConstInt(n) -> to_string(n)
             ConstFloat(f) -> s"f${float_pattern_exact(f)}"
+            ConstQuad(hi, lo) -> s"q${hi}_$lo"
             ConstBool(b) -> if b then "t" else "f"
             ConstChar(c) -> s"c${u32(c)}"
             ConstStr(s) -> s)

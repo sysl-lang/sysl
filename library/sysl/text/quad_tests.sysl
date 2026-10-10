@@ -1,0 +1,57 @@
+module sysl.text
+@tests
+
+// Text to `f128`, rounded once. **The expected encodings were worked out by exact rational arithmetic
+// in a second implementation**, the decimal as a fraction rounded to nearest binary128 with ties to
+// even -- including the half-way points between neighbours, written out in full, and a digit either
+// side of them.
+
+private bits_of(text: string) -> u128 = parse_f128(text).unwrap().bits()
+
+@test("a decimal reads as the nearest f128, not as the nearest real widened")
+quad_parse_is_binary128()
+    assert_eq(bits_of("0.1"), 0x3ffb999999999999999999999999999a)
+    assert_eq(bits_of("1"), 0x3fff0000000000000000000000000000)
+    assert_eq(bits_of("-2.5"), 0xc0004000000000000000000000000000)
+    assert_eq(bits_of("1.189731495357231765085759326628007e+4932"), 0x7ffeffffffffffffffffffffffffffff)
+    assert_eq(bits_of("6e-4966"), 1)
+
+@test("the ends: past the largest is infinity, below half the smallest subnormal is zero")
+quad_parse_ends()
+    assert_eq(bits_of("1.2e4932"), 0x7fff0000000000000000000000000000)
+    assert_eq(bits_of("3.3e-4966"), 1)
+    assert_eq(bits_of("3.2e-4966"), 0)
+    assert_eq(bits_of("-0.0"), u128(1) << 127)
+
+@test("a half-way point goes to the even neighbour, and a digit past it either way to the nearer one")
+quad_parse_ties()
+    // Half way between 1 and the next f128 up, 1 + 2^-113, written out exactly.
+    val half = "1.00000000000000000000000000000000009629649721936179265279889712924636592690508241076940976199693977832794189453125"
+
+    assert_eq(bits_of(half), 0x3fff0000000000000000000000000000)
+    assert_eq(bits_of(half + "1"), 0x3fff0000000000000000000000000001)
+    assert_eq(bits_of(half[0..<half.bytes.len - 3] + "124"), 0x3fff0000000000000000000000000000)
+
+    // And half way between 1 + 2^-112 and 1 + 2^-111, whose even neighbour is the upper one.
+    val odd_half = "1.00000000000000000000000000000000028888949165808537795839669138773909778071524723230822928599081933498382568359375"
+
+    assert_eq(bits_of(odd_half), 0x3fff0000000000000000000000000002)
+
+@test("inf, nan, a hexadecimal float, and the shapes strtod reads")
+quad_parse_shapes()
+    assert_eq(bits_of("inf"), 0x7fff0000000000000000000000000000)
+    assert_eq(bits_of("-Infinity"), 0xffff0000000000000000000000000000)
+    assert(parse_f128("nan").unwrap() != parse_f128("nan").unwrap())
+    assert_eq(bits_of("0x1.8p1"), 0x40008000000000000000000000000000)
+    assert_eq(bits_of(".5"), 0x3ffe0000000000000000000000000000)
+    assert_eq(bits_of("1."), 0x3fff0000000000000000000000000000)
+
+@test("trailing text and an empty field are refused, as parse_real refuses them")
+quad_parse_refuses()
+    assert_eq(refusal(parse_f128("1.5x")), "not a digit at byte 3")
+    assert_eq(refusal(parse_f128("")), "no digits to read")
+    assert_eq(refusal(parse_f128(".")), "not a digit at byte 0")
+
+private refusal(r: Result[f128, ParseError]) -> string = r match
+    Ok(x) -> s"read as ${x}"
+    Err(e) -> str(e)

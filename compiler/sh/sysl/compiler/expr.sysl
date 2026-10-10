@@ -751,10 +751,17 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     // A float constant whose value calls a `const` function is run over the tree typed at the
     // constant's own width, so a `f32` is rounded at every step as it would be at run time.
     //
-    // **An `f128` constant is never run through either**: both compute in `real`, which would hand
-    // every use a double's 53 bits. Its literal is already exact, so the typed initializer is what a
-    // use reads.
-    if is_quad(ty) then return TExpr(span, *type_expr(inner, d.init.unwrap(), Some(ty)).kind)
+    // **An `f128` constant is never run through the untyped fold**, which computes in `real` and
+    // would hand every use a double's 53 bits. One that calls a `const` function is run at binary128
+    // and laid down as the exact encoding that came out; any other is the typed initializer, whose
+    // literals are already exact.
+    if is_quad(ty)
+        val ran = const_quad_value(inner, d.init.unwrap(), ty)
+
+        if ran.is_some() then return TExpr(span, TQuadLit(ran.unwrap().0, ran.unwrap().1, underlying(ty)))
+
+        return TExpr(span, *type_expr(inner, d.init.unwrap(), Some(ty)).kind)
+    end if
 
     underlying(ty) match
         Floating(_, _) ->

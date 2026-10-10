@@ -1,0 +1,183 @@
+module sysl
+
+// The shortest decimal that reads back as a given `f128` -- the same question `shortest.sysl` answers
+// for a `real`, asked of a significand of 113 bits.
+//
+// **Ryu does not reach this width without tables twice as wide**: its trick is one multiplication of
+// the significand by a 125-bit power of five, and a 113-bit significand would need 250-bit powers and
+// 256-bit products. So the question is answered exactly instead, with the free-format algorithm of
+// Steele and White as Burger and Dybvig state it ("Printing Floating-Point Numbers Quickly and
+// Accurately", 1996), over the big integers `float_text.sysl` already has. The value and the half-way
+// points to both neighbours are written as integers over one common denominator; digits are produced
+// one at a time, and the first digit at which the remaining value lies inside the half-way interval
+// on either side is the last digit needed.
+//
+// The answer is the one `shortest_real` gives a `real`: the fewest significant digits that read back
+// as the same `f128`; among those, the one closest to it; and a tie between two equally close ones to
+// the even digit. A tie in the reader goes to the even significand, so an even value owns both edges
+// of its interval and an odd one owns neither.
+
+/** The shortest reading of an `f128`, written into `into` the way `shortest_real` spells a `real` --
+ * `%g`'s shape, with the digits that read back -- answering how many bytes it wrote. Forty-eight bytes
+ * is always enough: thirty-six digits at most, a sign, a point and a five-digit exponent.
+ */
+private[sysl] shortest_quad(x: f128, into: []u8) -> usize
+    val v = quad_value(x)
+    var at: usize = 0
+
+    if v.kind == NotANumber then return quad_word(into, 0, "nan")
+
+    if v.negative
+        into[0] = u8('-')
+        at = 1
+
+    if v.kind == Infinite then return quad_word(into, at, "inf")
+
+    if v.kind == Zero
+        into[at] = u8('0')
+        return at + 1
+
+    var digits: [40]u8
+    val found = quad_shortest_digits(v.m, v.e, digits[..])
+
+    spell_digits(into, at, digits[0..<found.0], found.1)
+end shortest_quad
+
+private quad_word(into: []u8, at: usize, word: string) -> usize
+    for i in 0..<word.bytes.len
+        into[at + i] = word.bytes[i]
+
+    at + word.bytes.len
+end quad_word
+
+/** The fewest digits naming `m * 2^e` (finite, not zero), written into `into`, and the power of ten the
+ * first of them stands for.
+ */
+private quad_shortest_digits(m: u128, e: int, into: []u8) -> (usize, int)
+    var r: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
+    var s = r
+    var up = r
+    var down = r
+
+    val edges = (m & 1) == 0
+
+    // Below a power of two the neighbour is half as far away -- except at the smallest exponent, where
+    // the subnormals go on at the same spacing.
+    val uneven = m == (u128(1) << 112) && e > -16494
+    val twice = if uneven then 2 else 1
+
+    // The value is r / s, and the half-way points are (r - down) / s and (r + up) / s.
+    r.set(m)
+    up.set(1)
+    down.set(1)
+
+    if e >= 0
+        r.shl(e + twice)
+        s.set(u128(2 * twice))
+        up.shl(e + twice - 1)
+        down.shl(e)
+    else
+        r.shl(twice)
+        s.set(1)
+        s.shl(twice - e)
+        up.shl(twice - 1)
+    end if
+
+    // The power of ten just past the upper edge: estimated from the bit length, then corrected in
+    // whichever direction the estimate was off.
+    var k = (((int(bits_of128(m)) - 1 + e) * 78913) >> 18) + 1
+
+    if k >= 0
+        s.mul_pow10(k)
+    else
+        r.mul_pow10(-k)
+        up.mul_pow10(-k)
+        down.mul_pow10(-k)
+    end if
+
+    loop
+        var high = r
+
+        high.add(&up)
+
+        val c = high.cmp(&s)
+
+        if c < 0 || (c == 0 && !edges) then break
+
+        s.mul_small(10)
+        k += 1
+    end loop
+
+    loop
+        var high = r
+
+        high.add(&up)
+        high.mul_small(10)
+
+        val c = high.cmp(&s)
+
+        if c > 0 || (c == 0 && edges) then break
+
+        r.mul_small(10)
+        up.mul_small(10)
+        down.mul_small(10)
+        k -= 1
+    end loop
+
+    var count: usize = 0
+
+    loop
+        r.mul_small(10)
+        up.mul_small(10)
+        down.mul_small(10)
+
+        var d = r.digit(&s)
+        val below = r.cmp(&down)
+        var high = r
+
+        high.add(&up)
+
+        val above = high.cmp(&s)
+        val low = below < 0 || (below == 0 && edges)
+        val high_hit = above > 0 || (above == 0 && edges)
+
+        if !low && !high_hit
+            into[count] = u8('0') + u8(d)
+            count += 1
+        else
+            if low && high_hit
+                var doubled = r
+
+                doubled.shl(1)
+
+                val c = doubled.cmp(&s)
+
+                if c > 0 || (c == 0 && d % 2 == 1) then d += 1
+            elif high_hit
+                d += 1
+            end if
+
+            return quad_last_digit(into, count, d, k - 1)
+        end if
+    end loop
+end quad_shortest_digits
+
+// The final digit written after `count` others, carrying where rounding it up made a ten.
+private quad_last_digit(into: []u8, count: usize, d: u32, point: int) -> (usize, int)
+    if d < 10
+        into[count] = u8('0') + u8(d)
+        return (count + 1, point)
+
+    var i = count
+
+    while i > 0
+        i -= 1
+
+        if into[i] != u8('9')
+            into[i] += 1
+            return (i + 1, point)
+    end while
+
+    into[0] = u8('1')
+    (1, point + 1)
+end quad_last_digit

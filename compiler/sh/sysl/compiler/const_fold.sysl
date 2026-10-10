@@ -24,6 +24,8 @@ enum Const
     ConstChar(value: char)
     ConstStr(value: string)
     ConstFloat(value: real)
+    // An `f128`, as its encoding's two words: a `real` holds 53 of its 113 bits.
+    ConstQuad(hi: u64, lo: u64)
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -221,6 +223,9 @@ private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) ->
             _ -> None
         ConstStr(x) -> b.unwrap() match
             ConstStr(y) -> str_binary(op, x, y)
+            _ -> None
+        ConstQuad(hi, lo) -> b.unwrap() match
+            ConstQuad(yh, yl) -> run_quad_binary(op, (hi, lo), (yh, yl)).ok()
             _ -> None
 end const_binary
 
@@ -597,6 +602,7 @@ private const_text(v: Const) -> string = v match
     ConstChar(c) -> s"'$c'"
     ConstStr(s) -> s"\"$s\""
     ConstFloat(f) -> real_text(f)
+    ConstQuad(hi, lo) -> quad_text((hi, lo))
 
 // A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
 // rather than as the `inf` and `nan` the C formatting underneath would print.
@@ -641,6 +647,7 @@ const_kind(v: Const) -> string = v match
     ConstChar(_) -> "a character"
     ConstStr(_) -> "a string"
     ConstFloat(_) -> "a float"
+    ConstQuad(_, _) -> "a float"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
@@ -780,6 +787,7 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstBool(_) -> if ty == Bool then Some(v) else None
     ConstStr(_) -> if ty == Str then Some(v) else None
     ConstChar(_) -> None
+    ConstQuad(hi, lo) -> if is_quad(ty) && !quad_is_nan((hi, lo)) then Some(v) else None
 
 // Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
 private scalar_value(n: BigInt) -> bool =
@@ -827,6 +835,7 @@ private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Con
             ConstStr(y) -> str_binary(op, x, y)
             _ -> None
         ConstChar(_) -> None
+        ConstQuad(_, _) -> None
 end typed_binary
 
 // The integer operators, answered only where run time answers the same: never a division by zero,
@@ -887,7 +896,12 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
                 Char -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
                 _ -> None
             Char -> if scalar_value(n) then Some(ConstInt(n)) else None
-            // Rounded once, straight to the width, as the machine's conversion rounds it.
+            // Rounded once, straight to the width, as the machine's conversion rounds it -- an `f128`
+            // too, which holds an integer a `real` would round.
+            Floating(128, _) ->
+                val (hi, lo) = quad_of_int(n)
+
+                Some(ConstQuad(hi, lo))
             Floating(bits, _) -> Some(ConstFloat(int_to_float(n, bits)))
             _ -> None
         ConstFloat(f) -> to match
@@ -899,6 +913,7 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
         ConstBool(b) -> if to == Bool then Some(ConstBool(b)) else None
         ConstStr(s) -> if to == Str then Some(ConstStr(s)) else None
         ConstChar(_) -> None
+        ConstQuad(_, _) -> None
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n
@@ -1021,6 +1036,27 @@ end run_float_binary
 // A float negated, which flips the sign of a zero as the machine's `fneg` does.
 run_float_negate(x: real) -> real = -x
 
+// An `f128` operator, exact and rounded once (`quad_arith.sysl`) -- never through a `real`. A
+// comparison with a NaN is false, except `!=`, which is true.
+run_quad_binary(op: string, x: (u64, u64), y: (u64, u64)) -> Result[Const, string]
+    if op == "+" || op == "-" || op == "*" || op == "/"
+        val (hi, lo) = quad_arith(op, x, y)
+
+        return Ok(ConstQuad(hi, lo))
+    end if
+
+    val sign = quad_compare(x, y) match
+        Some(s) -> s
+        None ->
+            if op == "!=" then return Ok(ConstBool(true))
+
+            return if compared(op, 0).is_some() then Ok(ConstBool(false)) else Err(s"'$op' on a float")
+
+    compared(op, sign) match
+        Some(v) -> Ok(v)
+        None -> Err(s"'$op' on a float")
+end run_quad_binary
+
 // A written conversion between scalars, as the lowering converts (`emit_expr.sysl`'s `convert`): an
 // integer narrowed wraps, an integer becomes a float rounded once to the width, a float becomes an
 // integer saturating at the width's ends with a NaN as zero, and an integer becomes a `char` only
@@ -1029,6 +1065,10 @@ run_float_negate(x: real) -> real = -x
 run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
     ConstInt(n) -> (from, to) match
         (_, Integer(bits, signed, _)) -> Ok(ConstInt(wrap(n, bits, signed)))
+        (_, Floating(128, _)) ->
+            val (hi, lo) = quad_of_int(n)
+
+            Ok(ConstQuad(hi, lo))
         (_, Floating(bits, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
         (Char, Char) -> Ok(v)
         (_, Char) ->
@@ -1039,7 +1079,16 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstFloat(f) -> to match
         Integer(bits, signed, _) -> Ok(ConstInt(saturated(f, bits, signed)))
+        Floating(128, _) ->
+            val (hi, lo) = quad_of_double(f.bits())
+
+            Ok(ConstQuad(hi, lo))
         Floating(bits, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
+        _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
+    ConstQuad(hi, lo) -> to match
+        Integer(bits, signed, _) -> Ok(ConstInt(quad_to_int((hi, lo), bits, signed)))
+        Floating(128, _) -> Ok(v)
+        Floating(bits, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstBool(_) -> if to == Bool then Ok(v) else Err(s"a conversion from bool to ${type_show(to)}")
     _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")

@@ -1,0 +1,271 @@
+module sh.sysl.compiler
+
+import sysl.math.bigint.{BigInt, from_int, from_u64, to_u64, negate, cmp as big_cmp, add as big_add,
+                         mul as big_mul, pow as big_pow, div_rem_floor, is_odd, shl, shr, bit_length,
+                         to_string as big_text}
+
+// Binary128 arithmetic while compiling: what a `const` function computing at `f128` is run with.
+//
+// **Every operation is exact first and rounded once**, which is what IEEE 754 asks of `+`, `-`, `*`
+// and `/`: a finite operand is `m × 2^e` with integer `m`, so a sum and a product are integers times
+// a power of two and a quotient is a ratio of two, and `quad_of_ratio` rounds any of them to nearest
+// with ties to even. Nothing passes through a `double`, which would hand back 53 of the 113 bits. The
+// special values follow the standard's table: a NaN in is a NaN out, `inf - inf`, `0 × inf`, `0 / 0`
+// and `inf / inf` are NaN, and an exact zero sum is `+0` unless both addends were `-0`.
+
+// A binary128 value taken apart: its sign, which kind of value it is, and for a finite non-zero one
+// the integers `m` and `e` with the value `m × 2^e`.
+private struct QuadParts
+    negative: bool
+    kind: QuadKind
+    m: BigInt
+    e: int
+
+private enum QuadKind
+    QuadZero
+    QuadFinite
+    QuadInfinite
+    QuadNan
+
+private quad_parts(q: (u64, u64)) -> QuadParts
+    val negative = q.0 >= 0x8000000000000000
+    val biased = int((q.0 >> 48) & 0x7FFF)
+    val fraction = big_add(shl(from_u64(q.0 & 0x0000FFFFFFFFFFFF), 64), from_u64(q.1))
+
+    if biased == 0x7FFF
+        return QuadParts(negative, if fraction.is_zero() then QuadInfinite else QuadNan, from_int(0), 0)
+
+    if biased == 0
+        if fraction.is_zero() then return QuadParts(negative, QuadZero, from_int(0), 0)
+
+        return QuadParts(negative, QuadFinite, fraction, -16494)
+    end if
+
+    QuadParts(negative, QuadFinite, big_add(fraction, shl(from_int(1), 112)), biased - 16495)
+end quad_parts
+
+// `m × 2^e`, rounded to binary128 and given `negative`'s sign.
+private quad_of_scaled(negative: bool, m: BigInt, e: int) -> (u64, u64) =
+    if e >= 0 then quad_of_ratio(negative, shl(m, usize(e)), from_int(1))
+    else quad_of_ratio(negative, m, shl(from_int(1), usize(-e)))
+
+private quad_zero(negative: bool) -> (u64, u64) = (if negative then 0x8000000000000000 else 0, 0)
+
+// The signed integer `±m`, scaled up by `2^by`.
+private signed_scaled(p: QuadParts, by: int) -> BigInt
+    val m = shl(p.m, usize(by))
+
+    if p.negative then negate(m) else m
+end signed_scaled
+
+// Whether a pattern is a NaN.
+quad_is_nan(q: (u64, u64)) -> bool = quad_parts(q).kind == QuadNan
+
+// `a op b` for one of `+`, `-`, `*` and `/`, correctly rounded.
+quad_arith(op: string, a: (u64, u64), b: (u64, u64)) -> (u64, u64)
+    if op == "-" then return quad_sum(a, quad_negated(b.0, b.1))
+    if op == "*" then return quad_product(a, b)
+    if op == "/" then return quad_quotient(a, b)
+
+    quad_sum(a, b)
+end quad_arith
+
+private quad_sum(a: (u64, u64), b: (u64, u64)) -> (u64, u64)
+    val x = quad_parts(a)
+    val y = quad_parts(b)
+
+    if x.kind == QuadNan || y.kind == QuadNan then return quad_nan()
+
+    if x.kind == QuadInfinite
+        if y.kind == QuadInfinite && x.negative != y.negative then return quad_nan()
+
+        return a
+    end if
+
+    if y.kind == QuadInfinite then return b
+    if x.kind == QuadZero && y.kind == QuadZero then return quad_zero(x.negative && y.negative)
+    if x.kind == QuadZero then return b
+    if y.kind == QuadZero then return a
+
+    val e = if x.e < y.e then x.e else y.e
+    val s = big_add(signed_scaled(x, x.e - e), signed_scaled(y, y.e - e))
+
+    if s.is_zero() then return quad_zero(false)
+
+    val negative = s.sign() < 0
+
+    quad_of_scaled(negative, if negative then negate(s) else s, e)
+end quad_sum
+
+private quad_product(a: (u64, u64), b: (u64, u64)) -> (u64, u64)
+    val x = quad_parts(a)
+    val y = quad_parts(b)
+    val negative = x.negative != y.negative
+
+    if x.kind == QuadNan || y.kind == QuadNan then return quad_nan()
+
+    if x.kind == QuadInfinite || y.kind == QuadInfinite
+        if x.kind == QuadZero || y.kind == QuadZero then return quad_nan()
+
+        return quad_infinity(negative)
+    end if
+
+    if x.kind == QuadZero || y.kind == QuadZero then return quad_zero(negative)
+
+    quad_of_scaled(negative, big_mul(x.m, y.m), x.e + y.e)
+end quad_product
+
+private quad_quotient(a: (u64, u64), b: (u64, u64)) -> (u64, u64)
+    val x = quad_parts(a)
+    val y = quad_parts(b)
+    val negative = x.negative != y.negative
+
+    if x.kind == QuadNan || y.kind == QuadNan then return quad_nan()
+
+    if x.kind == QuadInfinite
+        return if y.kind == QuadInfinite then quad_nan() else quad_infinity(negative)
+
+    if y.kind == QuadInfinite then return quad_zero(negative)
+
+    if y.kind == QuadZero
+        return if x.kind == QuadZero then quad_nan() else quad_infinity(negative)
+
+    if x.kind == QuadZero then return quad_zero(negative)
+
+    val d = x.e - y.e
+
+    if d >= 0 then quad_of_ratio(negative, shl(x.m, usize(d)), y.m)
+    else quad_of_ratio(negative, x.m, shl(y.m, usize(-d)))
+end quad_quotient
+
+// -1, 0 or 1 as `a` is below, equal to or above `b`, or nothing where either is a NaN. The two
+// zeros are equal.
+quad_compare(a: (u64, u64), b: (u64, u64)) -> Option[int]
+    val x = quad_parts(a)
+    val y = quad_parts(b)
+
+    if x.kind == QuadNan || y.kind == QuadNan then return None
+
+    Some(big_cmp(quad_rank(x), quad_rank(y)))
+end quad_compare
+
+// A value as a number the comparison can order: a finite one exactly, scaled far enough up that
+// every finite value is an integer, and an infinity past all of them.
+private quad_rank(p: QuadParts) -> BigInt
+    val past = shl(from_int(1), 32800)
+
+    val magnitude = p.kind match
+        QuadZero -> from_int(0)
+        QuadInfinite -> past
+        _ -> shl(p.m, usize(p.e + 16494))
+
+    if p.negative then negate(magnitude) else magnitude
+end quad_rank
+
+// An integer as the nearest binary128 value.
+quad_of_int(n: BigInt) -> (u64, u64)
+    if n.is_zero() then return (0, 0)
+
+    val negative = n.sign() < 0
+
+    quad_of_ratio(negative, if negative then negate(n) else n, from_int(1))
+end quad_of_int
+
+// A binary128 value as an integer of a width: truncated toward zero, saturating at the width's ends,
+// and a NaN as zero -- the conversion the lowering makes.
+quad_to_int(q: (u64, u64), bits: int, signed: bool) -> BigInt
+    val p = quad_parts(q)
+
+    val whole = p.kind match
+        QuadNan -> return from_int(0)
+        QuadZero -> from_int(0)
+        QuadInfinite -> if p.negative then min_of(bits, signed) else max_of(bits, signed)
+        _ ->
+            val t = if p.e >= 0 then shl(p.m, usize(p.e)) else shr(p.m, usize(-p.e))
+
+            if p.negative then negate(t) else t
+
+    if big_cmp(whole, min_of(bits, signed)) < 0 then min_of(bits, signed)
+    else if big_cmp(whole, max_of(bits, signed)) > 0 then max_of(bits, signed)
+    else whole
+end quad_to_int
+
+// A binary128 value narrowed to a float of `bits` -- 64 or 32 -- rounded once, to nearest with ties
+// to even, as the pattern of that width.
+quad_narrowed(q: (u64, u64), bits: int) -> u64
+    val p = quad_parts(q)
+    val fraction = if bits == 32 then 23 else 52
+    val top = if bits == 32 then 127 else 1023
+    val sign = if p.negative then u64(1) << u64(bits - 1) else 0
+    val all_ones = u64(2 * top + 1) << u64(fraction)
+
+    p.kind match
+        QuadNan -> return sign | all_ones | (u64(1) << u64(fraction - 1))
+        QuadInfinite -> return sign | all_ones
+        QuadZero -> return sign
+        _ -> ()
+
+    val num = if p.e >= 0 then shl(p.m, usize(p.e)) else p.m
+    val den = if p.e >= 0 then from_int(1) else shl(from_int(1), usize(-p.e))
+    val (biased, field) = binary_of_ratio(num, den, fraction, 1 - top, top)
+
+    sign | (u64(biased) << u64(fraction)) | to_u64(field).unwrap_or(0)
+end quad_narrowed
+
+// The same, as the `real` a constant of that width is held as.
+narrowed_real(q: (u64, u64), bits: int) -> real =
+    if bits == 32 then real(f32.from_bits(u32(quad_narrowed(q, 32)))) else real.from_bits(quad_narrowed(q, 64))
+
+// A binary128 value as a reader writes it in a message: thirty-six significant digits, the value's
+// own rounded to nearest, with no trailing zeros -- or `inf`, `-inf`, `nan`.
+quad_text(q: (u64, u64)) -> string
+    val p = quad_parts(q)
+    val sign = if p.negative then "-" else ""
+
+    p.kind match
+        QuadNan -> return "nan"
+        QuadInfinite -> return s"${sign}inf"
+        QuadZero -> return s"${sign}0"
+        _ -> ()
+
+    // The power of ten of the first digit, estimated from the bit length and corrected where the
+    // estimate, or a rounding that carried, left other than thirty-six digits.
+    var k = ((int(bit_length(p.m)) - 1 + p.e) * 78913) >> 18
+    var text = big_text(quad_digits(p, 35 - k))
+
+    if text.bytes.len < 36
+        k -= 1
+        text = big_text(quad_digits(p, 35 - k))
+    end if
+
+    if text.bytes.len > 36
+        k += 1
+        text = big_text(quad_digits(p, 35 - k))
+    end if
+
+    var end_at = text.bytes.len
+
+    while end_at > 1 && text.bytes[end_at - 1] == u8('0')
+        end_at -= 1
+
+    val shown = text[0..<end_at]
+    val rest = if end_at > 1 then "." + shown[1..] else ""
+
+    s"$sign${shown[0..<1]}${rest}e$k"
+end quad_text
+
+// `m × 2^e × 10^scale`, rounded to the nearest integer.
+private quad_digits(p: QuadParts, scale: int) -> BigInt
+    var num = p.m
+    var den = from_int(1)
+
+    if scale >= 0 then num = big_mul(num, big_pow(from_int(10), usize(scale)))
+    else den = big_pow(from_int(10), usize(-scale))
+
+    if p.e >= 0 then num = shl(num, usize(p.e)) else den = shl(den, usize(-p.e))
+
+    val (q, r) = div_rem_floor(num, den)
+    val c = big_cmp(shl(r, 1), den)
+
+    if c > 0 || (c == 0 && is_odd(q)) then big_add(q, from_int(1)) else q
+end quad_digits
