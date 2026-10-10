@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **C accepts three shapes of `main` -- `int main(void)`, `int main(int, char **)` and
+// `int main(int, char **, char **)` -- so a C runtime written in sysl declares whichever the program
+// it starts was written with** (`check_main_extern`). A `build-c` archive naming its entry is such a
+// runtime, and there the `extern` takes any of the three; every other shape is refused, the refusal
+// listing the three. An image defines its own `main` at the two-argument shape, so a call there stays
+// held to that one.
+
+private val xme_target: string = "aarch64-freestanding"
+
+private val xme_stub: string = raw"""
+    asm
+        [aarch64]
+            ".globl _start"
+            "_start:"
+            "b crt_start"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    @export("crt_start")
+    crt_start() -> never
+    """
+
+private xme_manifest(entry: string) -> string =
+    "package { name = \"crt\", version = \"0.0.1\" }\n" +
+    "codegen {\n  general_regs_only = true\n  strict_align = true\n}\n" +
+    s"targets {\n  $xme_target {\n    entry = \"$entry\"\n  }\n}\n"
+
+// The runtime declaring `main` at `signature` and calling it as `call`.
+private xme_runtime(signature: string, call: string) -> string
+    s"extern \"main\" program_main$signature\n\n${xme_stub}    var code = $call\n\n    loop\n        code += 1\n"
+end xme_runtime
+
+private xme_build(program: string) -> (int, string)
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", xme_manifest("_start")))
+    var args: [7]string = ["sysl", "build-c", "--target", xme_target, "-o", s"$p/crt.a", p]
+    val built = lbr_cli(args[..])
+
+    lbr_drop([p])
+    built
+end xme_build
+
+private val xme_refusal: string =
+    "'main' is C's, and C accepts three signatures for it — '() -> int', '(int, **byte) -> int' and " +
+    "'(int, **byte, **byte) -> int', the argument count, the argument vector and the environment — so " +
+    "an 'extern' naming it takes one of those, where this one is '"
+
+@test("an archive's runtime may declare main taking no arguments")
+xme_no_arguments()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("() -> int", "program_main()"))
+
+    assert(built.0 == 0, built.1)
+end xme_no_arguments
+
+@test("or the count and the vector")
+xme_count_and_vector()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8) -> int", "program_main(0, null)"))
+
+    assert(built.0 == 0, built.1)
+end xme_count_and_vector
+
+@test("or the count, the vector and the environment")
+xme_count_vector_and_environment()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8, envp: **u8) -> int",
+                                      "program_main(0, null, null)"))
+
+    assert(built.0 == 0, built.1)
+end xme_count_vector_and_environment
+
+@test("a fourth argument is refused, the refusal listing the three shapes")
+xme_four_arguments_refused()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8, envp: **u8, aux: **u8) -> int",
+                                      "program_main(0, null, null, null)"))
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(xme_refusal + "(int, **byte, **byte, **byte) -> int'"), built.1)
+end xme_four_arguments_refused
+
+@test("a wrong argument type is refused")
+xme_wrong_type_refused()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8, envp: int) -> int", "program_main(0, null, 0)"))
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(xme_refusal + "(int, **byte, int) -> int'"), built.1)
+end xme_wrong_type_refused
+
+@test("a wrong result type is refused")
+xme_wrong_result_refused()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8, envp: **u8) -> u8", "int(program_main(0, null, null))"))
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(xme_refusal + "(int, **byte, **byte) -> byte'"), built.1)
+end xme_wrong_result_refused
+
+@test("a one-argument main is refused")
+xme_one_argument_refused()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int) -> int", "program_main(0)"))
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(xme_refusal + "(int) -> int'"), built.1)
+end xme_one_argument_refused
+
+@test("a variadic main is refused")
+xme_variadic_refused()
+    if !lbr_ready() then return
+
+    val built = xme_build(xme_runtime("(argc: int, argv: **u8, ...) -> int", "program_main(0, null)"))
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(xme_refusal + "(int, **byte, ...) -> int'"), built.1)
+end xme_variadic_refused
+
+@test("an image's own main stays the two-argument shape: the environment form is refused there")
+xme_image_stays_two_arguments()
+    if !lbr_ready() then return
+
+    val start = "extern \"main\" program_main(argc: int, argv: **u8, envp: **u8) -> int\n\n" +
+        "@export(\"kstart\")\nkstart() -> never\n    var code = program_main(0, null, null)\n\n    loop\n" +
+        "        code += 1\n"
+    val manifest = s"package { name = \"img\", version = \"0.0.1\" }\ntargets {\n  $xme_target {\n" +
+        "    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+    var files = lbr_two("main.sysl", start, "package.hocon", manifest)
+
+    files.push(("link.ld", "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { *(.text .text.*) }\n}\n"))
+
+    val p = lbr_tree(files)
+    val said = emit_llvm_text(p, Some(xme_target)) match
+        Err(why) -> failure_text(why)
+        Ok(emitted) -> analysis_report(emitted.report)
+
+    assert(said.contains("'main' is defined at C's signature, '(int, **byte) -> int'"), said)
+    assert(said.contains("where this one is '(int, **byte, **byte) -> int'"), said)
+    lbr_drop([p])
+end xme_image_stays_two_arguments
+
+// The runtime hands `main` a count, a vector and an environment; the C program answers 7 where all
+// three arrive intact, so the exit code proves the environment was passed, not only declared.
+private val xme_crt_program: string = raw"""
+    asm
+        [aarch64]
+            ".globl _start"
+            "_start:"
+            "ldr x9, =__stack_top"
+            "mov sp, x9"
+            "mov x0, #1"
+            "adr x1, crt_argv"
+            "adr x2, crt_envp"
+            "bl crt_start"
+            "b ."
+            ".balign 8"
+            "crt_argv: .quad crt_arg0, 0"
+            "crt_envp: .quad crt_env0, 0"
+            "crt_arg0: .asciz \"prog\""
+            "crt_env0: .asciz \"K=V\""
+            ".balign 4"
+            ".globl crt_exit"
+            "crt_exit:"
+            "sub sp, sp, #16"
+            "mov x9, #0x26"
+            "movk x9, #2, lsl #16"
+            "stp x9, x0, [sp]"
+            "mov x1, sp"
+            "mov x0, #0x20"
+            "hlt #0xf000"
+            "b ."
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    extern "main" program_main(argc: int, argv: **u8, envp: **u8) -> int
+    extern crt_exit(code: int) -> never
+
+    @export("crt_start")
+    crt_start(argc: int, argv: **u8, envp: **u8) -> never = crt_exit(program_main(argc, argv, envp))
+    """
+
+private val xme_c_program: string =
+    "int main(int argc, char **argv, char **envp) {\n" +
+    "    return argc == 1 && envp && envp[0] && envp[0][0] == 'K' && envp[0][2] == 'V' && !envp[1] ? 7 : 1;\n}\n"
+
+private val xme_script: string =
+    "ENTRY(_start)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss : { *(.bss .bss.*) *(COMMON) }\n    . = ALIGN(16);\n    . += 0x10000;\n" +
+    "    __stack_top = .;\n}\n"
+
+private xme_tool_runs(program: string) -> bool = capture(program, ["--version"], "", [], true, 10000) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+private xme_tool(program: string, args: []string) -> string = capture(program, args, "", [], true, 120000) match
+    Err(_) -> s"'$program' could not be started"
+    Ok(o) -> if o.status.ok() then "" else s"$program: ${o.text}${o.err.unwrap_or("")}"
+
+@test("a C main taking the environment is called by the sysl runtime and reads it back")
+xme_the_environment_reaches_main()
+    if !lbr_ready() then return
+    if !xme_tool_runs("ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+    if !xme_tool_runs("qemu-system-aarch64") then skip("qemu-system-aarch64 is not installed")
+
+    val cc = find_clang(target_named(xme_target).unwrap(), None) match
+        Err(why) -> skip(s"no clang here has a back end for $xme_target: $why")
+        Ok(found) -> found
+
+    var files = lbr_two("main.sysl", xme_crt_program, "package.hocon", xme_manifest("_start"))
+
+    files.push(("c/prog.c", xme_c_program))
+    files.push(("c/link.ld", xme_script))
+
+    val p = lbr_tree(files)
+    var args: [7]string = ["sysl", "build-c", "--target", xme_target, "-o", s"$p/crt.a", p]
+    val built = lbr_cli(args[..])
+
+    assert(built.0 == 0, built.1)
+
+    var compile: [8]string = ["--target=aarch64-none-elf", "-ffreestanding", "-nostdlib",
+                              "-mgeneral-regs-only", "-O1", "-c", s"$p/c/prog.c", s"-o$p/prog.o"]
+    val compiled = xme_tool(cc, compile[..])
+
+    assert(compiled == "", compiled)
+
+    var link: [6]string = ["-T", s"$p/c/link.ld", s"$p/prog.o", s"$p/crt.a", "-o", s"$p/prog.elf"]
+    val linked = xme_tool("ld.lld", link[..])
+
+    assert(linked == "", linked)
+
+    var qemu: [10]string = ["-M", "virt", "-cpu", "cortex-a72", "-nographic", "-semihosting-config",
+                            "enable=on,target=native", "-kernel", s"$p/prog.elf", "-no-reboot"]
+    val ran = capture("qemu-system-aarch64", qemu[..], "", [], true, 20000).unwrap()
+    val code = ran.status match
+        Exited(c) -> c
+        _ -> -1
+
+    assert_eq(code, 7, s"${ran.text}${ran.err.unwrap_or("")}")
+    lbr_drop([p])
+end xme_the_environment_reaches_main
