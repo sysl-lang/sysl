@@ -13,14 +13,9 @@ carries no capability, so a symbol that needs an operating system filed there wo
 requirement written where nothing declares one -- which is the argument `sysl.posix.tty` already
 makes about its own `isatty`.
 
-It asks for `os` rather than `posix`, which is the weaker of the two and the true one: `getenv` is
-ISO C rather than a POSIX addition, so any target with a C library and a process environment can
-answer it.
-
-**`vars` is the exception, and carries `@needs(posix)` on its own.** Listing every variable needs
-`environ`, which POSIX declares and ISO C does not, so the module as a whole stays at `os` and only
-a caller of `vars` is asked for `posix` -- `get` keeps working on a target with a C library and no
-POSIX.
+It asks for `os` and nothing more: an environment is something an operating system hands a process,
+and what reads it is whatever answers the hooks below -- a C library's `getenv` and `environ` on a
+hosted target, a kernel's own `@export`s on a bare one, which needs neither POSIX nor a C library.
 
 ## Answered by whatever is underneath
 
@@ -97,9 +92,10 @@ vars() -> Buf[(string, string)]
 
 Every variable in the environment, as `(name, value)` pairs, in the order the process holds them.
 
-**It is the one function here that needs `posix`**, the rest of the module being ISO C: C can
-answer what one name is set to, and only POSIX's `environ` can say which names there are. A module
-that has given up `posix` is refused at the call rather than at the link.
+**It goes through the `sysl_env_count` and `sysl_env_entry` hooks and needs nothing beyond them.**
+On a hosted target their answer is POSIX's `environ`, ISO C having no way to say which names there
+are, so a hosted target without POSIX answers an empty list; a kernel answering the two hooks lists
+its own.
 
 **The value is everything after the FIRST `=`**, so `A=b=c` is `("A", "b=c")` -- a name cannot hold
 an `=` and a value can. `VAR=` is kept as `("VAR", "")`, set-to-empty being a variable that is set,

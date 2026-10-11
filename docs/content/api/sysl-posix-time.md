@@ -5,7 +5,7 @@ headingShift: 0
 slugStyle: github
 module: sysl.posix.time
 summary: "Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do."
-requires: "requires { posix }"
+requires: "requires { libc }, requires { posix }"
 ---
 
 **This is a module of its own so that `sysl.time` is not.** The calendar and the arithmetic ask for
@@ -49,7 +49,7 @@ decide.
 
 ## Index
 
-[`default_zoneinfo_root`](#default_zoneinfo_root) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_wall_us`](#supply_wall_us) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
+[`default_zoneinfo_root`](#default_zoneinfo_root) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
 
 ## Constants
 
@@ -179,12 +179,14 @@ the clock a person and an `ntpd` are both allowed to set. Use it to stamp someth
 sleep(d: Duration)
 ```
 
-Wait for `d`, however many attempts that takes.
+Wait for `d`, however many attempts that takes -- `sysl.time.sleep`, which waits through the seam
+this module answers on a host.
 
 **A signal cuts a wait short, and this one carries on.** `nanosleep(2)` returns early with `EINTR`
 and the time still owed, so a wait written as one call is a wait that is quietly shorter than it
 asked for whenever anything arrives -- which is exactly when a test that depends on it starts
-looking flaky. This retries with the remainder until nothing is left.
+looking flaky. The seam answers the remainder and `sysl.time.sleep` asks again for it until nothing
+is left.
 
 **It answers nothing, because there is nothing left to say**: it returns when the time has passed.
 A caller that wants to *know* it was interrupted wants `nanosleep` below.
@@ -202,6 +204,18 @@ supply_monotonic_us() -> long
 
 Answers `sysl.time`'s monotonic seam. **Call `monotonic` instead** -- this exists to be linked
 rather than called, and `supply_wall_us` beside it says why it is public.
+
+### `supply_sleep_us`
+
+```sysl
+supply_sleep_us(us: long) -> long
+```
+
+Answers `sysl.time`'s sleep seam: one `nanosleep(2)` of `us` microseconds, answering the
+microseconds still owed when it stopped. **Call `sleep` instead** -- this exists to be linked.
+
+A remainder is rounded up to the next microsecond, so an interrupted wait is never reported as
+finished while a fraction of one is still owed.
 
 ### `supply_wall_us`
 

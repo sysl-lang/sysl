@@ -14,7 +14,27 @@ rendering itself through `Display` is handed the `FormatSpec` the same count mak
 
 ## Index
 
-[`binary`](#binary) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2)
+[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
+
+## Constants
+
+### `f128_scratch_len`
+
+```sysl
+const f128_scratch_len: usize = 11600
+```
+
+A scratch this long is enough for `write_f128` under any specifier: an `f128`'s subnormals run to
+11,563 significant digits.
+
+### `float_scratch_len`
+
+```sysl
+const float_scratch_len: usize = 800
+```
+
+A scratch this long is enough for `write_real` and `write_f32` under any specifier: the longest
+exact `real` runs to 767 significant digits.
 
 ## Functions
 
@@ -230,3 +250,67 @@ shortest(x: f32) -> string
 
 The fewest digits that read back as the same `f32`, which is shorter than its widened `real`
 needs: `shortest(f32(0.1))` is `0.1`, and `shortest(real(f32(0.1)))` is `0.10000000149011612`.
+
+### `write_f128`
+
+```sysl
+write_f128(x: f128, out: *Writer, spec: string, width: int, precision: int, scratch: []u8) -> Result[unit, FormatError]
+```
+
+An `f128` under a printf float conversion, written as `format_f128` renders it: every digit the
+exact value's, so `%.30Le` prints thirty digits binary128 really holds. `f128_scratch_len` bytes
+are always enough.
+
+### `write_f32`
+
+```sysl
+write_f32(x: f32, out: *Writer, spec: string, width: int, precision: int, scratch: []u8) -> Result[unit, FormatError]
+```
+
+An `f32` under a printf float conversion, written as `write_real` writes the same value -- which is
+what C prints for a `float`, promoted to `double` -- and taken apart at its own width.
+
+### `write_real`
+
+```sysl
+write_real(x: real, out: *Writer, spec: string, width: int, precision: int, scratch: []u8) -> Result[unit, FormatError]
+```
+
+`x` under a printf float conversion, written to `out` -- what `format_real` answers, without the
+string, so a program that may not allocate, a C library's `printf` among them, prints a float
+exactly. It allocates nothing: the digits are worked out in `scratch`, which the caller lends.
+
+`spec` is the whole specifier, `%` to conversion letter: C's flags (`-`, `+`, space, `#`, `0`), a
+width, a precision, an `l` or `L` that is read and ignored (so a C format's own specifier can be
+handed over as it stands), and one of `f F e E g G a A`. A `*` reads `width` or `precision` as
+`format_real`'s does, and no precision at all is six digits for `%e`, `%f` and `%g` and every digit
+the value holds for `%a`. The digits are the exact value's, rounded half to even. `%a` writes a
+first digit of 1 for every value but zero, a subnormal included (`0x1p-1074`), as Apple's and musl's
+C libraries do.
+
+`float_scratch_len` bytes of scratch are always enough, and most requests need far fewer: `%.17g`
+needs 17, and `%a`, an infinity, a NaN and a zero need none. A scratch that is too short is refused
+with `Short` before anything is written, naming a length that would do; a specifier that is not a
+float conversion is `BadSpec`.
+
+## Types
+
+### `FormatError`
+
+```sysl
+enum FormatError
+    BadSpec
+    Short(needed: usize)
+```
+
+Why `write_real`, `write_f32` or `write_f128` wrote nothing.
+
+## Implementations
+
+### Display for FormatError
+
+```sysl
+impl Display for FormatError
+```
+
+The rendering, so that a refusal can be printed without matching on it.

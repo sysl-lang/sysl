@@ -13,8 +13,8 @@ strongly that operation is ordered against the ordinary accesses around it; and 
 mutual exclusion for code that cannot block — an interrupt handler, a signal handler, a board with
 no scheduler.
 
-**This module requires nothing, which is what puts it below `sysl.posix.threads` rather than
-inside it.** The threads a program spawns are POSIX's and are behind a capability; the ordering
+**This module requires nothing, which is what puts it below `sysl.threads` rather than
+inside it.** The threads a program spawns need an operating system's scheduler; the ordering
 rules are the machine's, and a freestanding program that shares a word with an interrupt needs
 them exactly as much as a hosted one that shares it with a thread.
 

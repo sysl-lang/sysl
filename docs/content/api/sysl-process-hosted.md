@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.process.hosted
-requires: "requires { posix }"
+requires: "requires { libc }, requires { posix }"
 ---
 
 ## Index

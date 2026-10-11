@@ -5,7 +5,7 @@ headingShift: 0
 slugStyle: github
 module: sysl.posix.rand
 summary: "A seed taken from the host, for a program that wants a different sequence on every run."
-requires: "no alloc, requires { posix }"
+requires: "no alloc, requires { libc }, requires { posix }"
 ---
 
 **This is a module of its own so that `sysl.rand` is not.** A directory is a module, so a second

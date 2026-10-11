@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.env.hosted
-requires: "requires { os }"
+requires: "requires { libc }, requires { os }"
 ---
 
 ## Index

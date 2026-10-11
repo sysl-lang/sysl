@@ -5,7 +5,7 @@ headingShift: 0
 slugStyle: github
 module: sysl.posix.tty
 summary: "Whether escapes should be written at all."
-requires: "requires { posix }"
+requires: "requires { libc }, requires { posix }"
 ---
 
 `sysl.term` names the sequences and deliberately answers nothing about them, because the answer
@@ -46,7 +46,7 @@ the answer cannot change under a running program in any way that matters:
 
 ## Index
 
-[`tty_sink`](#tty_sink) [`color`](#color) [`color_err`](#color_err) [`color_on`](#color_on) [`color_wanted`](#color_wanted) [`cooked`](#cooked) [`flush`](#flush) [`is_tty`](#is_tty) [`raw`](#raw) [`tty_writer`](#tty_writer) [`TtyWriter`](#ttywriter) [Fallible for TtyWriter](#fallible-for-ttywriter) [Writer for TtyWriter](#writer-for-ttywriter)
+[`tty_sink`](#tty_sink) [`color`](#color) [`color_err`](#color_err) [`color_on`](#color_on) [`color_wanted`](#color_wanted) [`cooked`](#cooked) [`flush`](#flush) [`hidden`](#hidden) [`is_tty`](#is_tty) [`raw`](#raw) [`tty_writer`](#tty_writer) [`TtyWriter`](#ttywriter) [Fallible for TtyWriter](#fallible-for-ttywriter) [Writer for TtyWriter](#writer-for-ttywriter)
 
 ## Values
 
@@ -103,13 +103,7 @@ can be asked without a terminal, which is what makes it answerable in a test.
 cooked()
 ```
 
-Put back what `raw` changed, and only what it changed.
-
-**Exactly what was there**, which is what the shim's saved `struct termios` holds. The shell
-version could not do this: it named `icanon echo isig` to put back, which restores a *different*
-terminal from the one it found if anything else had been changed in between -- and `stty sane`,
-the other option, resets settings this program never chose and has no business having an opinion
-about. Doing nothing when `raw` was never called or has already been undone is the same rule.
+Put back what `raw` or `hidden` changed, and only what they changed -- `sysl.tty.cooked`.
 
 ### `flush`
 
@@ -122,6 +116,14 @@ Push out everything the C library is holding, on every stream.
 **A caller needs this for its own prompt.** The editor's sink below flushes what the *editor*
 writes; a prompt printed by the program before handing over is the program's own output, and
 nothing has written a newline after it. `prints("ogol> ")` then `flush()` is the whole idiom.
+
+### `hidden`
+
+```sysl
+hidden() -> bool
+```
+
+Put the terminal into password mode: whole lines, nothing echoed -- `sysl.tty.hidden`.
 
 ### `is_tty`
 
@@ -141,22 +143,13 @@ suppressing when output is a pipe, and none of them is about colour.
 raw() -> bool
 ```
 
-Put the terminal into cbreak mode: keystrokes arrive as they are typed and nothing is echoed.
+Put the terminal into cbreak mode: keystrokes arrive as they are typed and nothing is echoed --
+`sysl.tty.raw`. **Answers whether it worked**; it fails where there is no terminal to change.
 
-**Answers whether it worked**, and a caller should look. It fails where there is no terminal to
-change -- input redirected from a file or a pipe -- and that is not an error so much as a different
-situation, in which `sysl.io.console_lines` is the facility that fits and no mode has to change.
-
-if raw()
-var ed = editor(&input, &output)
-for line in ed do ...
-cooked()
-
-`min 1 time 0` is what makes a read block until at least one byte arrives instead of returning
-immediately with none; without `icanon` the terminal has no other rule about when to answer, and a
-reader spinning on empty reads is the shape that gets mistaken for a hung program.
-
-Calling it twice is not an error and does nothing the second time.
+    if raw()
+        var ed = editor(&input, &output)
+        for line in ed do ...
+        cooked()
 
 ### `tty_writer`
 

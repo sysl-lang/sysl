@@ -4,6 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.io.hosted
+requires: "requires { libc }"
 ---
 
 ## Index
