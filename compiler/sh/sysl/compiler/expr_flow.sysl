@@ -112,8 +112,16 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             // stand alone either, neither branch settles anything and the second reading of the
             // *then* raises what the first one swallowed -- the same words, at the branch the
             // reader wrote first.
+            //
+            // **Where neither stands alone, each may still know a part of one type** -- `Err(E.Bad)`
+            // the `E` of a `Result` and `Ok(n)` its `T` -- and the parts are pooled.
             val sibling = attempt_block(cx, else_body.unwrap(), None, discarded)
-            val side = then_side(cx, span, cond, then_body, sibling.and_then(b -> settles(b)), discarded)
+            var want = sibling.and_then(b -> settles(b))
+
+            if sibling.is_none() then
+                want = merged_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
+
+            val side = then_side(cx, span, cond, then_body, want, discarded)
 
             tc = side.0
             then_block = side.1
@@ -370,6 +378,10 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
 
     if want.is_none() then want = first_settled(read)
 
+    // Where no arm settles the whole type, arms that each settle a PART of one generic enum's --
+    // `Err(E.Bad)` knowing `E` beside `Ok(n)` knowing `T` -- come to it together.
+    if want.is_none() && any_unread(read) then want = merged_arm_type(cx, scrut, arms, discarded)
+
     for i in 0..<arms.len()
         read.at(i) match
             Some(t) -> out.push(t)
@@ -391,6 +403,137 @@ private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
     common_offer(shaped.len(), (i, want) -> trial(cx, () -> analyze_arm(cx, scrut, shaped.at(i), want,
                                                                          discarded).body))
 end shared_arm_type
+
+private any_unread(arms: Buf[Option[TArm]]) -> bool
+    for i in 0..<arms.len()
+        if arms.at(i).is_none() then return true
+
+    false
+end any_unread
+
+// The type a match's arms come to by POOLING what each settles of one generic enum's arguments,
+// where none of them settles all of it: every arm is read once on its own, thrown away whole, and
+// what each generic variant it ends in knew is merged.
+private merged_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discarded: bool) -> Option[Type]
+    var leaves: Buf[Expr] = buf()
+
+    for i in 0..<arms.len()
+        leaf_values(&leaves, arms.at(i).body)
+
+    if leaves.is_empty() then return None
+
+    val start = cx.partials.len()
+
+    cx.merging += 1
+
+    for i in 0..<arms.len()
+        val _ = trial(cx, () -> analyze_arm(cx, scrut, arms.at(i), None, discarded).body)
+
+    cx.merging -= 1
+    merged_partials(cx, leaves, start)
+end merged_arm_type
+
+// The same for an `if` and its `else`, an `elif` chain being an `if` nested in the `else`.
+private merged_branch_type(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
+                           else_body: Buf[Stmt], discarded: bool) -> Option[Type]
+    var leaves: Buf[Expr] = buf()
+
+    leaf_values(&leaves, then_body)
+    leaf_values(&leaves, else_body)
+
+    if leaves.is_empty() then return None
+
+    val start = cx.partials.len()
+
+    cx.merging += 1
+
+    val _ = trial(cx, () -> then_side(cx, span, cond, then_body, None, discarded).1)
+    val _ = trial(cx, () -> type_value_block(cx, else_body, None, discarded))
+
+    cx.merging -= 1
+    merged_partials(cx, leaves, start)
+end merged_branch_type
+
+// The expressions a value block comes to, looking through an `if` or a `match` it ends in to the
+// branches' own values: the places a variant's construction gives the block its type.
+private leaf_values(out: *Buf[Expr], stmts: Buf[Stmt])
+    val v = block_value(stmts)
+
+    if v.is_none() then return
+
+    val e = v.unwrap()
+
+    *e.kind match
+        IfExpr(_, then_body, else_body, _) ->
+            leaf_values(out, then_body)
+
+            if else_body.is_some() then leaf_values(out, else_body.unwrap())
+        MatchExpr(_, arms) ->
+            for arm in arms
+                leaf_values(out, arm.body)
+        _ -> out.push(e)
+end leaf_values
+
+// What the constructions at `leaves` settled between them, from the partial readings recorded since
+// `start`: one enum, and each of its type arguments taken from the first construction that knew it.
+// Nothing where they name two enums, or where a parameter is settled by none of them -- which is
+// then refused, as before, at the construction that could not say.
+//
+// A construction that settles a parameter DIFFERENTLY from an earlier one is not a reason to give
+// up: it is read against the merged type with the rest, and refused there for its own value.
+private merged_partials(cx: &Analyzer, leaves: Buf[Expr], start: usize) -> Option[Type]
+    var key = ""
+    var targs: Buf[Type] = buf()
+    var at = leaves.at(0).span
+    var mixed = false
+
+    for leaf in leaves
+        val p = partial_at(cx, leaf, start)
+
+        if p.is_some()
+            val k = p.unwrap().0
+            val ts = p.unwrap().1
+
+            if key == ""
+                key = k
+                at = leaf.span
+
+                for t in ts
+                    targs.push(if mentions_unknown(t) then Unknown else t)
+            elif k != key
+                mixed = true
+            else
+                for j in 0..<targs.len()
+                    if targs.at(j) == Unknown && j < ts.len() && !mentions_unknown(ts.at(j)) then
+                        targs.set(j, ts.at(j))
+            end if
+        end if
+
+    // The pool belongs to the outermost merge, whose trial readings recorded its inner ones' too.
+    if cx.merging == 0 then cx.partials.clear()
+    if key == "" || mixed then return None
+
+    for t in targs
+        if t == Unknown then return None
+
+    val ty = reinstantiate_at(cx.an, cx.scope, at, key, targs)
+
+    if ty == Unknown then None else Some(ty)
+end merged_partials
+
+//
+// A construction is typed at its anchor -- the callee, for a call -- so that is the span it was
+// recorded under; its whole extent is asked too.
+private partial_at(cx: &Analyzer, leaf: Expr, start: usize) -> Option[(string, Buf[Type])]
+    val anchor = anchor_of(leaf)
+
+    for i in start..<cx.partials.len()
+        val p = cx.partials.at(i)
+
+        if p.0 == anchor || p.0 == leaf.span then return Some((p.1, p.2))
+
+    None
+end partial_at
 
 // What the first arm read so far that settles anything settles.
 private first_settled(arms: Buf[Option[TArm]]) -> Option[Type]

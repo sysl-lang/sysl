@@ -1,0 +1,280 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Sibling arms of a `match`, or branches of an `if`, that each settle only PART of one generic
+// enum's type -- `Err(E.Bad)` its `E`, `Ok(n)` its `T` -- come to the whole type together, in
+// either order. A parameter no arm settles is still "cannot infer", and an arm settling one
+// differently from an earlier arm is refused at its own value.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mam_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+private mam_skip_run() -> bool
+    if mam_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private mam_write(main: string) -> string
+    val root = make_temp_dir("sysl-mam").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+private mam_ran(main: string) -> string
+    val root = mam_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mam_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private mam_refused(main: string, message: string, at: string)
+    val root = mam_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+private mam_enum() -> string = "enum E\n    Bad\n    Worse\n\n"
+
+private mam_show() -> string = raw"""
+    show(r: Result[int, E]) -> string = r match
+        Ok(v) -> s"ok $v"
+        Err(E.Bad) -> "bad"
+        Err(E.Worse) -> "worse"
+
+    """
+
+// -- a match --------------------------------------------------------------------------------------
+
+@test("an Err arm first and an Ok arm after meet at the whole Result")
+mam_err_then_ok()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + mam_show() + raw"""
+        pick(n: int) -> Result[int, E]
+            val r = n match
+                0 -> Err(E.Bad)
+                _ -> Ok(n)
+            r
+
+        print(show(pick(0)))
+        print(show(pick(4)))
+        """), "bad\nok 4\n")
+
+@test("an Ok arm first and an Err arm after meet the same way")
+mam_ok_then_err()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + mam_show() + raw"""
+        pick(n: int) -> Result[int, E]
+            val r = n match
+                0 -> Ok(n)
+                _ -> Err(E.Worse)
+            r
+
+        print(show(pick(0)))
+        print(show(pick(5)))
+        """), "ok 0\nworse\n")
+
+@test("an Ok over a bare literal settles its parameter at the literal's default")
+mam_literal_ok()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + mam_show() + raw"""
+        pick(n: int) -> Result[int, E]
+            val r = n match
+                0 -> Ok(1)
+                _ -> Err(E.Bad)
+            r
+
+        print(show(pick(0)))
+        print(show(pick(1)))
+        """), "ok 1\nbad\n")
+
+@test("three arms, the parameters settled by different arms")
+mam_three_arms()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + raw"""
+        pick(n: int) -> Result[(int, string), E]
+            val r = n match
+                0 -> Err(E.Bad)
+                1 -> Ok((n, "one"))
+                _ -> Err(E.Worse)
+            r
+
+        print(pick(1).unwrap().1)
+        print(pick(0).is_err())
+        print(pick(2).is_err())
+        """), "one\ntrue\ntrue\n")
+
+@test("an arm reading what its pattern bound still settles its part")
+mam_pattern_binding()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + raw"""
+        pick(o: Option[string]) -> Result[string, E]
+            val r = o match
+                Some(s) -> Ok(s)
+                None -> Err(E.Bad)
+            r
+
+        print(pick(Some("x")).unwrap())
+        print(pick(None).is_err())
+        """), "x\ntrue\n")
+
+@test("a payload-free None beside a carrying Some still reads, in a match")
+mam_option_none_beside_some()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(raw"""
+        pick(n: int) -> Option[int]
+            val o = n match
+                0 -> None
+                _ -> Some(n)
+            o
+
+        print(pick(0).is_none())
+        print(pick(3).unwrap())
+        """), "true\n3\n")
+
+@test("an arm settling a parameter differently from an earlier arm is refused at its value")
+mam_conflicting_arm()
+    if mam_skip() then return
+
+    mam_refused(mam_enum() + raw"""
+        pick(n: int)
+            val r = n match
+                0 -> Ok(1)
+                1 -> Ok("s")
+                _ -> Err(E.Bad)
+            print(r.is_ok())
+
+        pick(2)
+        """, "'value' of 'Ok' is int, but string was given", "8:17")
+
+@test("where no arm settles a parameter it is still cannot infer")
+mam_nothing_settles_t()
+    if mam_skip() then return
+
+    mam_refused(mam_enum() + raw"""
+        pick(n: int)
+            val r = n match
+                0 -> Err(E.Bad)
+                _ -> Err(E.Worse)
+            print(r.is_ok())
+
+        pick(2)
+        """, "cannot infer the type argument 'T' of 'Err' here — annotate the expected type", "7:14")
+
+@test("two Ok arms that disagree, with nothing settling E, are still cannot infer")
+mam_two_oks_no_err()
+    if mam_skip() then return
+
+    mam_refused(raw"""
+        pick(n: int)
+            val r = n match
+                0 -> Ok(1)
+                _ -> Ok("s")
+            print(r.is_ok())
+
+        pick(2)
+        """, "cannot infer the type argument 'E' of 'Ok' here — annotate the expected type", "3:14")
+
+// -- an if ----------------------------------------------------------------------------------------
+
+@test("an if whose branches each settle half a Result reads, in either order")
+mam_if_branches()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + mam_show() + raw"""
+        one(c: bool, n: int) -> Result[int, E]
+            val r = if c then Err(E.Bad) else Ok(n)
+            r
+
+        two(c: bool, n: int) -> Result[int, E]
+            val r = if c then Ok(n) else Err(E.Worse)
+            r
+
+        print(show(one(true, 1)))
+        print(show(one(false, 2)))
+        print(show(two(true, 3)))
+        print(show(two(false, 4)))
+        """), "bad\nok 2\nok 3\nworse\n")
+
+@test("an elif chain pools its parts across every branch")
+mam_elif_chain()
+    if mam_skip_run() then return
+
+    assert_eq(mam_ran(mam_enum() + mam_show() + raw"""
+        pick(n: int) -> Result[int, E]
+            val r = if n == 0 then Ok(n) elif n == 1 then Err(E.Bad) else Err(E.Worse)
+            r
+
+        print(show(pick(0)))
+        print(show(pick(1)))
+        print(show(pick(2)))
+        """), "ok 0\nbad\nworse\n")
+
+// The `elif` tail -- `Ok("s")` beside `Err(E.Bad)` -- is a whole `Result[string, E]` on its own,
+// so it is the branch that knows, and the `Ok(1)` before it is what disagrees.
+@test("an if whose branches settle a parameter two ways is refused where they disagree")
+mam_if_conflict()
+    if mam_skip() then return
+
+    mam_refused(mam_enum() + raw"""
+        pick(n: int)
+            val r = if n == 0 then Ok(1) elif n == 1 then Ok("s") else Err(E.Bad)
+            print(r.is_ok())
+
+        pick(2)
+        """, "'value' of 'Ok' is string, but int was given", "6:31")
+
+@test("an if whose branches are both Err is still cannot infer")
+mam_if_nothing_settles()
+    if mam_skip() then return
+
+    mam_refused(mam_enum() + raw"""
+        pick(c: bool)
+            val r = if c then Err(E.Bad) else Err(E.Worse)
+            print(r.is_ok())
+
+        pick(true)
+        """, "cannot infer the type argument 'T' of 'Err' here — annotate the expected type", "6:23")
