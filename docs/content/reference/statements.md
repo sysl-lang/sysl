@@ -347,6 +347,52 @@ None
 
 Where neither branch can be read alone, the refusal above is unchanged.
 
+**Branches that each settle a different part of one generic enum's type meet at the whole of it.**
+`Err(E.Bad)` says what a `Result` fails with and nothing about what it succeeds with; `Ok(n)` says
+the opposite. Neither stands alone, and together they are one `Result[int, E]`, in either order,
+across a `match`'s arms or an `elif` chain:
+
+```sysl
+enum E
+    Bad
+
+pick(n: int) -> Result[int, E]
+    val r = n match
+        0 -> Err(E.Bad)
+        _ -> Ok(n)
+
+    r
+
+check(n: int) -> Result[int, E]
+    val r = if n < 0 then Ok(-n) elif n == 0 then Err(E.Bad) else Ok(n)
+    r
+
+print(pick(0).is_err(), pick(4).unwrap(), check(-3).unwrap(), check(0).is_err())
+```
+
+```output
+true 4 3 true
+```
+
+Each parameter takes the first branch that settles it, and a later branch settling it differently is
+refused at its own value. A parameter no branch settles is still a question nobody answered:
+
+```sysl
+enum E
+    Bad
+    Worse
+
+f(c: bool)
+    val r = if c then Err(E.Bad) else Err(E.Worse)
+    print(r.is_err())
+
+f(true)
+```
+
+```error
+cannot infer the type argument 'T' of 'Err' here — annotate the expected type
+```
+
 ## Loops
 
 Five forms, and each is an expression.
