@@ -1,0 +1,107 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.join
+
+// A closure written in a generic body, built as a library. The body is read once at stand-ins where
+// it is written, and the closure that reading lowers has its environment filed among the
+// instantiations the reading then takes back -- so a `call` body left behind named a struct no
+// artifact defined, which a program never noticed (it emits only what it reaches) and a library build
+// did (it emits every body it holds): clang refused the IR with "load operand must be a pointer to a
+// first class type".
+
+private blg_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end blg_run
+
+private blg_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `sysl build-lib` over a root holding one module, `demo`, written as `src`.
+private blg_checked(src: string)
+    val root = lbr_temp("sysl-blg-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", src).unwrap()
+
+    val got = blg_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+end blg_checked
+
+// What a program prints, built against `src` as a library root.
+private blg_ran(src: string, program: string) -> string
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", src))
+    val prog = lbr_program(program)
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    said
+end blg_ran
+
+private val blg_apply: string = "module demo\n\napply(f: &Fn(u64) -> u64) -> u64 = f(1)\n\n"
+
+@test("a capturing closure in a generic function builds as a library")
+blg_a_generic_capturing_closure_builds()
+    if !blg_ready() then return
+
+    blg_checked(blg_apply + "add[T](x: T, v: u64) -> u64 = apply((n) -> n + v)\n")
+
+@test("and a program instantiating it links against the library and runs the closure it lowered")
+blg_the_instantiation_still_runs()
+    if !blg_ready() then return
+
+    assert_eq(blg_ran(blg_apply + "add[T](x: T, v: u64) -> u64 = apply((n) -> n + v)\n",
+                      "import demo.*\n\nprint(add(\"x\", 41), add(7, 1))\n"), "42 2\n")
+
+@test("two capturing closures in one generic body build, the second capturing what the first does not")
+blg_two_closures_build()
+    if !blg_ready() then return
+
+    val src = blg_apply + "both[T](x: T, v: u64, w: u64) -> u64 = apply((n) -> n + v) + apply((n) -> n * w)\n"
+
+    blg_checked(src)
+    assert_eq(blg_ran(src, "import demo.*\n\nprint(both(0, 2, 5))\n"), "8\n")
+
+@test("a generic type's member capturing its receiver's field builds as a library")
+blg_a_generic_member_builds()
+    if !blg_ready() then return
+
+    val src = blg_apply + "struct Cell[T]\n    item: T\n    bump: u64\n\n" +
+        "    plus(self, k: u64) -> u64 = apply((n) -> n + k + self.bump)\n"
+
+    blg_checked(src)
+    assert_eq(blg_ran(src, "import demo.*\n\nprint(Cell(\"a\", 10).plus(5))\n"), "16\n")
+
+// A `some` result is read off the body once to learn its type and the reading is thrown away, so a
+// closure it lowered is the same orphan.
+@test("a capturing closure in a 'some' member's body builds as a library")
+blg_a_some_body_builds()
+    if !blg_ready() then return
+
+    val src = blg_apply + "trait Render\n    render(self) -> u64\n\nstruct Got\n    n: u64\n\n" +
+        "impl Render for Got\n    render(self) -> u64 = self.n\n\n" +
+        "trait Seq\n    type Item: Render\n    head(self) -> Self::Item\n\nstruct Box\n    v: u64\n\n" +
+        "impl Seq for Box\n    head(self) -> some Render = Got(apply((n) -> n + self.v))\n"
+
+    blg_checked(src)
+    assert_eq(blg_ran(src, "import demo.*\n\nprint(Box(4).head().render())\n"), "5\n")
+
+// The closure leaves the emitted list, not the checks: it is part of the body the generic was written
+// as, and a module that gave the allocator up still answers for it with nothing instantiating it.
+@test("a closure that allocates in an uninstantiated generic is still refused under the module's @no_alloc")
+blg_the_closure_still_answers_to_no_alloc()
+    if !azb_ready() then return
+
+    azb_refused([("lib", "lib.sysl", "module lib\n@no_alloc\n\napply(f: u64 -> u64) -> u64 = f(1)\n\n" +
+                  "add[T](x: T, v: u64) -> u64 = apply((n) ->\n    val b: &u64 = n + v\n    *b)\n\n" +
+                  "one() -> u64 = 1\n"),
+                 ("", "main.sysl", "import lib.*\n\nprint(one())\n")],
+                ["a reference needs an allocator", "lib/lib.sysl"])

@@ -741,6 +741,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val structs = a.tables.struct_insts.len()
     val enums = a.tables.enum_insts.len()
     val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
@@ -798,6 +799,18 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     a.restore_complaints(mark)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
 
+    // **A closure the reading lowered goes with the struct it was lowered against.** Its environment
+    // was filed among the instantiations just rewound, so a `call` body left on the list is one whose
+    // `self` names a type no artifact defines -- invisible to a program, which emits only what it
+    // reaches, and fatal to a library build, which emits every body it holds. The counter is not
+    // rewound: the name stays this body's, so the checks below cannot mistake it for a later one.
+    var lowered: Buf[TFunc] = buf()
+
+    for k in closures..<a.closure_funcs.len()
+        lowered.push(a.closure_funcs.at(k))
+
+    a.closure_funcs.truncate(closures)
+
     // **The tree is kept although everything the reading registered is not**, and the two are not in
     // tension: a whole-program check about a module's own conduct is answered by the body a generic
     // was WRITTEN as, and this is the only walk that types one -- an instantiation belongs to
@@ -815,6 +828,10 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
                                   None, None, no_marks(), cx.owner, d.const_fn, Some(scope.src), false))
+
+    // Its closures are part of the body it was written as, and answer for it beside it.
+    for closure_func in lowered
+        a.tables.abstracts.push(closure_func)
 end check_abstract_body
 
 // What a `some` member's body produces, read speculatively and taken back: the one reading that
@@ -843,6 +860,8 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     val structs = a.tables.struct_insts.len()
     val enums = a.tables.enum_insts.len()
     val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
+    val counted = a.closure_count
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
@@ -878,6 +897,10 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     a.release(trial)
     a.restore_complaints(mark)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
+
+    // The closures it lowered go with the environments just rewound; the real reading lowers its own.
+    a.closure_funcs.truncate(closures)
+    a.closure_count = counted
 
     if clean then body.ty else Unknown
 end opaque_body_type
