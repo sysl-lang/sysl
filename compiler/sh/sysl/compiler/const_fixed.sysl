@@ -1,0 +1,141 @@
+module sh.sysl.compiler
+
+import sysl.math.bigint.{BigInt, from_int, cmp as big_cmp, add as big_add, sub as big_sub,
+                         mul as big_mul, pow as big_pow, div_rem_floor}
+
+// Fixed-point arithmetic while compiling: what `emit_fixed.sysl` lowers, worked out over the raw
+// integers a `const` function's evaluation holds a fixed-point value as.
+//
+// **Each rule is the run-time one stated over exact values.** The lowering computes every operation
+// at a width that holds its exact result, and only then rounds and settles it, so the exact result
+// rounded and settled the same way is the value the program computes -- bit for bit, on every target:
+//
+// - `+` and `-` saturate at both ends of the format, or wrap into a `wrapping` one;
+// - `*` and `/` form the exact result at the result's fraction, round it to nearest with a half going
+//   toward +inf, and settle it once; dividing by zero traps;
+// - `x << k` scales by 2^k and saturates (or wraps), `x >> k` floors, and a count at or past the
+//   width, or below zero, is a full shift;
+// - a conversion into a format rounds to nearest with a half going up and saturates (a NaN is zero);
+//   one into an integer truncates toward zero and saturates; one into a float rounds the raw integer
+//   once and scales it by a power of two, which is exact.
+
+private fe_pow2(k: int) -> BigInt = big_pow(from_int(2), usize(k))
+
+private fe_zero() -> BigInt = from_int(0)
+
+// `x / 2^k`, rounded to nearest with a half going toward +inf.
+private fe_round_off(x: BigInt, k: int) -> BigInt = div_rem_floor(big_add(x, fe_pow2(k - 1)), fe_pow2(k)).0
+
+// `x · 2^k` for a `k` of either sign, rounded where bits are dropped.
+private fe_scaled(x: BigInt, k: int) -> BigInt = if k >= 0 then big_mul(x, fe_pow2(k)) else fe_round_off(x, -k)
+
+private fe_clamped(v: BigInt, bits: int, signed: bool) -> BigInt
+    val lo = min_of(bits, signed)
+    val hi = max_of(bits, signed)
+
+    if big_cmp(v, lo) < 0 then lo else if big_cmp(v, hi) > 0 then hi else v
+end fe_clamped
+
+// An exact result brought into the format `ty`: clamped, or reduced modulo 2^W into a `wrapping` one.
+private fe_settle(v: BigInt, ty: Type) -> BigInt
+    val (bits, _, signed) = fixed_format(ty).unwrap_or((64, 0, true))
+
+    if fixed_wraps(ty) then wrap(v, bits, signed) else fe_clamped(v, bits, signed)
+end fe_settle
+
+// `x op y` where either side is fixed-point: `lt` and `rt` are the operands' types and `ty` the
+// result's -- for a product or a quotient perhaps a third format the position chose, and for a scale
+// the fixed-point operand's own. An integer operand is a format with no fraction. `Err` is a trap, or
+// an operator fixed-point does not have.
+fixed_eval_binary(op: string, lt: Type, rt: Type, ty: Type, x: BigInt, y: BigInt) -> Result[BigInt, string]
+    val (_, fa, _) = fixed_format(lt).unwrap_or((64, 0, true))
+    val (_, fb, _) = fixed_format(rt).unwrap_or((64, 0, true))
+    val (_, ft, _) = fixed_format(ty).unwrap_or((64, 0, true))
+
+    op match
+        "+" -> Ok(fe_settle(big_add(x, y), ty))
+        "-" -> Ok(fe_settle(big_sub(x, y), ty))
+        "*" -> Ok(fe_settle(fe_scaled(big_mul(x, y), ft - fa - fb), ty))
+        "/" -> fe_quotient(x, y, ft - fa + fb, ty)
+        "<<" -> Ok(fe_shift(true, x, y, lt))
+        ">>" -> Ok(fe_shift(false, x, y, lt))
+        _ -> Err(s"'$op' on ${type_show(lt)}")
+end fixed_eval_binary
+
+// `x · 2^sh / y`, rounded to nearest with a half going up and settled into `ty`. The divisor is made
+// positive first, so the remainder of the floor division is in `[0, y)` and the rounding is `2r >= y`.
+private fe_quotient(x: BigInt, y: BigInt, sh: int, ty: Type) -> Result[BigInt, string]
+    if big_cmp(y, fe_zero()) == 0 then return Err("fixed-point division by zero")
+
+    var num = if sh > 0 then big_mul(x, fe_pow2(sh)) else x
+    var den = if sh < 0 then big_mul(y, fe_pow2(-sh)) else y
+
+    if big_cmp(den, fe_zero()) < 0
+        num = big_sub(fe_zero(), num)
+        den = big_sub(fe_zero(), den)
+    end if
+
+    val (q, rem) = div_rem_floor(num, den)
+    val up = big_cmp(big_mul(rem, from_int(2)), den) >= 0
+
+    Ok(fe_settle(if up then big_add(q, from_int(1)) else q, ty))
+end fe_quotient
+
+// `x << c` or `x >> c` in `x`'s own format `lt`. A count below zero or at least the width is the
+// whole width, which the lowering's unsigned comparison of the count makes it.
+private fe_shift(left: bool, x: BigInt, c: BigInt, lt: Type) -> BigInt
+    val (bits, _, signed) = fixed_format(lt).unwrap_or((64, 0, true))
+    val whole = from_int(long(bits))
+    val k = if big_cmp(c, fe_zero()) < 0 || big_cmp(c, whole) >= 0 then bits else int(c.to_long().unwrap_or(0))
+
+    if !left then return div_rem_floor(x, fe_pow2(k)).0
+
+    if fixed_wraps(lt) then wrap(big_mul(x, fe_pow2(k)), bits, signed)
+    else fe_clamped(big_mul(x, fe_pow2(k)), bits, signed)
+end fe_shift
+
+// `-x`, saturating -- the negation of the most negative value is the largest one -- or wrapping.
+fixed_eval_negate(ty: Type, x: BigInt) -> BigInt = fe_settle(big_sub(fe_zero(), x), ty)
+
+// A conversion with a fixed-point type on either side, or nothing where neither is. `Err` names a
+// conversion this does not work out.
+fixed_eval_convert(v: Const, from: Type, to: Type) -> Option[Result[Const, string]]
+    if !is_fixed(from) && !is_fixed(to) then return None
+
+    val f = underlying(from)
+    val t = underlying(to)
+    val unsupported: Result[Const, string] = Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
+
+    Some((v, f, t) match
+        (ConstInt(raw), Fixed(_, f1, _), Fixed(b2, f2, s2)) ->
+            Ok(ConstInt(fe_clamped(fe_scaled(raw, f2 - f1), b2, s2)))
+        (ConstInt(n), Integer(_, _, _), Fixed(b2, f2, s2)) ->
+            Ok(ConstInt(fe_clamped(big_mul(n, fe_pow2(f2)), b2, s2)))
+        (ConstInt(raw), Fixed(_, f1, _), Integer(b2, s2, _)) ->
+            // Toward zero: a negative value is biased up by one unit less than a whole before the
+            // floor.
+            val below = big_cmp(raw, fe_zero()) < 0
+            val biased = if below then big_add(raw, big_sub(fe_pow2(f1), from_int(1))) else raw
+
+            Ok(ConstInt(fe_clamped(div_rem_floor(biased, fe_pow2(f1)).0, b2, s2)))
+        (ConstFloat(x), Floating(_, _), Fixed(b2, f2, s2)) -> Ok(ConstInt(fe_of_float(x, b2, f2, s2)))
+        (ConstInt(raw), Fixed(_, f1, _), Floating(fbits, _)) ->
+            if fbits != 32 && fbits != 64 then return Some(unsupported)
+
+            // The raw integer rounded once at the destination's width, then scaled by a power of
+            // two, which is exact.
+            val scaled = int_to_float(raw, fbits) * real_of_bits(long(1023 - f1) << 52)
+
+            Ok(ConstFloat(if fbits == 32 then real(f32(scaled)) else scaled))
+        _ -> unsupported)
+end fixed_eval_convert
+
+// A float as a format's raw value: `x · 2^F`, rounded to nearest with a half going up, saturated; a
+// NaN is zero and an infinity an end.
+private fe_of_float(x: real, bits: int, frac: int, signed: bool) -> BigInt
+    if x != x then return fe_zero()
+    if x > 0.0 && x * 0.5 == x then return max_of(bits, signed)
+    if x < 0.0 && x * 0.5 == x then return min_of(bits, signed)
+
+    fe_clamped(fixed_raw_of_double(real_bits(x), frac).unwrap_or(fe_zero()), bits, signed)
+end fe_of_float
