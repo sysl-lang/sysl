@@ -1,0 +1,124 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `print` of a fixed-point value allocates nothing. A fixed value is a scalar, and `print` renders
+// every other scalar through a character path that never makes a string; a fixed one now writes its
+// digits into a buffer in the caller's frame and hands `putbytes` a view of them. So it prints under
+// `@no_alloc`, and what it prints is byte for byte what `str(x)` and `s"$x"` make of it.
+
+private fqp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end fqp_ready
+
+private fqp_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fqp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end fqp_root
+
+// What a one-file program prints, or why it did not build, with the directory written as `@`.
+private fqp_ran(text: string) -> string
+    val root = fqp_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fqp_ran
+
+// Everything the lowering has to say, or the LLVM text where it had nothing to say.
+private fqp_lowered(text: string) -> (string, string)
+    val root = fqp_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> (replace_all(failure_text(why), root, "@"), "")
+        Ok(made) ->
+            if made.report.is_empty() then ("", made.text)
+            else (replace_all(analysis_report(made.report), root, "@"), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fqp_lowered
+
+// Each value printed by a `@no_alloc` function, then the same value as `str` and an interpolation
+// render it: the three lines of each value must agree, and all must be the expected text.
+private fqp_agrees(ty: string, values: string, expected: []string)
+    if !fqp_ready() then return
+
+    val text = "tell(x: " + ty + ")\n    print(str(x))\n    print(s\"<${x}>\")\n\n" +
+               "@no_alloc\nshow(x: " + ty + ")\n    print(x)\n\n" +
+               "for x in [" + values + "]\n    show(x)\n    tell(x)\n"
+
+    var want = ""
+
+    for e in expected
+        want = want + e + "\n" + e + "\n<" + e + ">\n"
+
+    assert_eq(fqp_ran(text), want)
+end fqp_agrees
+
+@test("a q15 prints under @no_alloc exactly as str renders it, Min and Max included")
+fqp_q15_no_alloc()
+    fqp_agrees("q15", "q15(0.25), q15(-0.25), q15::Max, q15::Min, q15::Small, q15(0), q15(0.6)",
+               ["0.25", "-0.25", "0.99997", "-1", "0.00003", "0", "0.6"])
+
+@test("a q31 prints under @no_alloc exactly as str renders it")
+fqp_q31_no_alloc()
+    fqp_agrees("q31", "q31(0.6), q31::Max, q31::Min, q31::Small, q31(-0.5)",
+               ["0.6", "0.9999999995", "-1", "0.0000000005", "-0.5"])
+
+@test("an unsigned format prints under @no_alloc exactly as str renders it")
+fqp_unsigned_no_alloc()
+    fqp_agrees("u8q8", "u8q8(0.25), u8q8::Max, u8q8::Min, u8q8(0.5)", ["0.25", "0.996", "0", "0.5"])
+    fqp_agrees("u32q32", "u32q32(0.5), u32q32::Small", ["0.5", "0.0000000002"])
+
+@test("a format with whole digits prints under @no_alloc, negative values with their sign")
+fqp_whole_no_alloc()
+    fqp_agrees("i32q16", "i32q16(3), i32q16(-2), i32q16(-1.5), i32q16::Max, i32q16::Min",
+               ["3", "-2", "-1.5", "32767.99998", "-32768"])
+    fqp_agrees("i64q62", "0.1i64q62, -1.75i64q62", ["0.1", "-1.75"])
+
+@test("printing a fixed value lowers to the frame renderer, never to the string one")
+fqp_print_makes_no_string()
+    if !fqp_ready() then return
+
+    val out = fqp_lowered("val n = 1\n\n@no_alloc\nshow(x: q15)\n    print(x)\n\nshow(q15(0.25))\n")
+
+    assert_eq(out.0, "")
+    assert(out.1.contains("@sysl.print.fixed."), out.1)
+    assert(!out.1.contains("@sysl.str.fixed."), out.1)
+
+@test("rendering a fixed value into a string under @no_alloc is still refused")
+fqp_string_still_refused()
+    if !fqp_ready() then return
+
+    val out = fqp_lowered("val n = 1\n\n@no_alloc\nshow(x: q15)\n    print(s\"${x}\")\n\nshow(q15(0.25))\n")
+
+    assert(out.0.contains("needs an allocator"), out.0)

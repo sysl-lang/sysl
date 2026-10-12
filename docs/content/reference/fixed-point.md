@@ -325,6 +325,24 @@ print(q15::Bits(16384), (0.5i32q31).bits)
 `print` and `str` write the **shortest decimal that reads back as the same value**, never in
 exponent form: `0.0000000005` says which place the one bit is in.
 
+**Printing one allocates nothing**: a fixed value is a scalar, and `print` writes its digits from a
+buffer in the caller's own frame, as it does an integer's — so it prints under `@no_alloc`, and on a
+board with no heap. `str(x)` and `s"$x"` make a `string` of the same characters, and so allocate.
+
+```sysl
+@no_alloc
+
+val levels: [2]q15 = [q15::Min, 0.75]
+
+for x in levels
+    print("level", x)
+```
+
+```output
+level -1
+level 0.75
+```
+
 ### Under a format specifier
 
 An f-string hole takes a float conversion — `%f`, `%e`, `%g` and their upper-case forms, with every
