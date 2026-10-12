@@ -915,3 +915,116 @@ fvl_lanes_on_m4()
 
     assert_eq(fx2_count(mac, "smlabb") + fx2_count(mac, "smlatt") + 2 * fx2_count(mac, "smlad"), 2, mac)
     assert_eq(fx2_foreign_calls(mac, "fvl_mac"), 0, mac)
+
+// -- a narrow float into a narrow format, in single precision ---------------------------------------
+
+// An `f32` (or narrower) converted to a format of at most 24 bits is worked in `f32`, every other
+// pair in `double` -- and the two must agree bit for bit. The `double` path is reached from the same
+// program by converting `real(x)`, so each value is checked against exactly what the conversion
+// computed before.
+@test("f32 and f16 into narrow formats agree bit for bit with the double path, over a wide sweep")
+ffc_single_matches_double()
+    fx2_prints(raw"""
+        same(x: f32) -> bool
+            val r = real(x)
+
+            if q15(x).bits != q15(r).bits then return false
+            if q7(x).bits != q7(r).bits then return false
+            if u16q16(x).bits != u16q16(r).bits then return false
+            if i16q8(x).bits != i16q8(r).bits then return false
+            if u8q8(x).bits != u8q8(r).bits then return false
+            if i32q16(x).bits != i32q16(r).bits then return false
+
+            true
+        end same
+
+        // The odd multiples of half a unit, `(2k + 1) / den` -- every tie a format has.
+        halves(den: real, lo: int, hi: int) -> int
+            var bad = 0
+
+            for k in lo..<hi
+                if !same(f32(real(2 * k + 1) / den)) then bad += 1
+
+            bad
+        end halves
+
+        var bad = 0
+        var first: u32 = 0
+
+        val edges: [16]u32 = [0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x3F7FFFFF, 0xBF7FFFFF,
+                              0x7F7FFFFF, 0xFF7FFFFF, 0x7FC00000, 0xFFC00000, 0x7F800000, 0xFF800000,
+                              0x00000001, 0x80000001, 0x00800000, 0x807FFFFF]
+
+        for i in 0..<edges.len
+            if !same(f32.from_bits(edges[i])) then bad += 1
+
+        bad += halves(65536.0, -40000, 40000)
+        bad += halves(256.0, -300, 300)
+        bad += halves(512.0, -70000, 70000)
+        bad += halves(131072.0, -10, 70000)
+
+        var w: u64 = 0
+
+        while w < 4294967296
+            if !same(f32.from_bits(u32(w)))
+                if bad == 0 then first = u32(w)
+                bad += 1
+
+            w += 4099
+
+        var near: u32 = 0x3E000000
+
+        while near < 0x40000000
+            if !same(f32.from_bits(near)) then bad += 1
+            if !same(f32.from_bits(near | 0x80000000)) then bad += 1
+            near += 7
+
+        for h in 0..<65536
+            val x = f16.from_bits(u16(h))
+            val r = real(x)
+
+            if q15(x).bits != q15(r).bits || i16q8(x).bits != i16q8(r).bits then bad += 1
+
+        print(bad, first)
+        """, "0 0\n")
+
+@test("f32 into q15 is single precision: no double anywhere in it")
+ffc_f32_to_q15_is_single()
+    if !fx2_ready() then return
+
+    val f = fx2_function(raw"""
+        @export("ffc_to_q15")
+        to_q15(f: f32) -> q15 = q15(f)
+        """, "to_q15")
+
+    // The function's own text, without the type definitions laid down ahead of it.
+    val defines = split(f, "\ndefine ")
+    val body = defines[defines.len - 1]
+
+    assert(body.contains("@llvm.fptosi.sat.i18.f32("), body)
+    assert(!body.contains("double"), body)
+
+    val wide = fx2_function(raw"""
+        @export("ffc_to_q31")
+        to_q31(f: f32) -> q31 = q31(f)
+        """, "to_q31")
+
+    assert(wide.contains("@llvm.fptosi.sat.i34.f64("), wide)
+
+@test("on a Cortex-M4F f32 into q15 is the FPU's own instructions and no library call")
+ffc_f32_to_q15_on_m4()
+    val code = fx2_board_code(raw"""
+        @export("ffc_to_q15")
+        to_q15(f: f32) -> q15 = q15(f)
+
+        @export("main")
+        boot() -> i32 = 0
+        """, "thumbv7em-freestanding", "ffc_to_q15")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+
+    assert(f.contains("vcvt"), f)
+    assert(!f.contains("__aeabi"), f)
+    assert_eq(fx2_foreign_calls(f, "ffc_to_q15"), 0, f)
