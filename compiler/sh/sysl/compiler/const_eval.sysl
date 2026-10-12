@@ -187,17 +187,27 @@ end const_quad_value
 // value is laid down on every target, the compiler having run the call. A trap is refused at the
 // initializer. Where the evaluation meets something it does not hold, the initializer stays code,
 // computed before the program's statements, as it always was.
-const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr]
-    if !calls_const_fn(cx.an, init) then return None
+const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr] = const_val_run(cx, name, init) match
+    Ok(image) -> image
+    Err(_) -> None
+
+// The same, telling a trap -- already refused at the initializer -- from an evaluation that stopped
+// at something it does not hold, so a caller trying the parts next does not run, and refuse, the
+// same call twice.
+const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr], unit]
+    if !calls_const_fn(cx.an, init) then return Ok(None)
 
     evaluate(cx.an, cx.scope, s"'$name'", init) match
-        EvValue(Some(v)) -> value_literal(init.span, v, texpr_type(init))
+        EvValue(Some(v)) -> Ok(value_literal(init.span, v, texpr_type(init)))
         EvFail(message, trapped) ->
-            if trapped then cx.fault(init.span, message)
+            if trapped
+                cx.fault(init.span, message)
+                return Err(())
+            end if
 
-            None
-        _ -> None
-end const_val_image
+            Ok(None)
+        _ -> Ok(None)
+end const_val_run
 
 // What a `const` initializer that calls a function owes its reader, where the function is not
 // `const`: the advice to mark it. Empty where the initializer is anything else.

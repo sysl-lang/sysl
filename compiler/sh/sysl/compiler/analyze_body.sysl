@@ -1682,7 +1682,7 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 if !imaged
                     val run = const_val_image(cx, d.name, init.unwrap())
-                    val image = if run.is_some() then run else static_image(cx, init.unwrap())
+                    val image = if run.is_some() then run else static_image(cx, d.name, init.unwrap())
 
                     if image.is_some() && !(writable && builds_view(image.unwrap()))
                         init = image
@@ -2059,20 +2059,37 @@ end any_builds_view
 // may be written as, `reference/modules.md § const — a value` -- and the arrays, structs and variants
 // carrying nothing that are built from them, written back as the literals they come to so the
 // object file can carry them. `i32(0.6 * 2147483648.0)`, `Q31(R * 2)` over a `const R` and
-// `[1 << 4, ~0]` are all constant data; a call is not, whatever its arguments are.
+// `[1 << 4, ~0]` are all constant data. A call is not, whatever its arguments are -- unless it is a
+// call to a `const` function, which is run here wherever it sits: the whole initializer, an
+// element, a field, the value a conversion converts (`[half(0.5), q15(half(1.5))]`).
+//
+// **One rule at every depth**: a scalar that folds, a conversion of one, and a `const` call over
+// them are constant data whether they are the initializer or one element of it, so a table a
+// `const` function generates is laid down exactly as the one written out by hand.
 //
 // Where any scalar in it would come to something else at run time than the fold says -- an
 // overflow, a division by zero (`const_fold_typed`) -- the answer is `None` and the initializer
-// stays code, filled before the program's statements as any other computed one.
-private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
-    TArrayLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
-    TArrayFill(value, ty) -> static_image(cx, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
-    TBufLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
-    TStructNew(decl, args) -> static_images(cx, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
-    TCast(inner, to) -> cast_image(t, inner, to, cx.an.tables.layout.little_endian)
-    TConstrainedCheck(value, target) -> constrained_image(cx, t, value, target)
+// stays code, filled before the program's statements as any other computed one. `name` is the
+// storage's, which a `const` call that traps names in its refusal.
+private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *t.kind match
+    TArrayLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
+    TArrayFill(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
+    TBufLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
+    TStructNew(decl, args) -> static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
+    TCast(inner, to) -> cast_image(cx, name, t, inner, to)
+    TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
     TAddrOf(place, ty) -> place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
-    _ -> if laid_down(t) then Some(t) else scalar_image(t, cx.an.tables.layout.little_endian)
+    _ -> leaf_image(cx, name, t)
+
+// A scalar that is not an aggregate, a conversion or an address: a literal as it stands, an
+// expression the typed fold settles, or a `const` call the evaluator runs.
+private leaf_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr]
+    if laid_down(t) then return Some(t)
+
+    val folded = scalar_image(t, cx.an.tables.layout.little_endian)
+
+    if folded.is_some() then folded else const_val_image(cx, name, t)
+end leaf_image
 
 // **The address of module storage is constant data**, and so is the address of an element or a field
 // inside it: C's `FILE *stdout = &files[1]` is a relocation the linker fills in, so the object file
@@ -2114,14 +2131,15 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
 // range is asked of the folded value here, while compiling: a value it admits is laid down, and one
 // it does not is refused, the check a startup fill would have trapped on being decidable now. A
 // `where` predicate is a function, and storage behind one stays code.
-private constrained_image(cx: &Analyzer, t: TExpr, value: TExpr, target: Type) -> Option[TExpr]
+private constrained_image(cx: &Analyzer, name: string, t: TExpr, value: TExpr,
+                          target: Type) -> Option[TExpr]
     val d = target match
         Constrained(found) -> found
         _ -> return None
 
     if d.pred_fn.is_some() then return None
 
-    val inner = static_image(cx, value)
+    val inner = static_image(cx, name, value)
 
     if inner.is_none() then return None
 
@@ -2141,26 +2159,49 @@ private constrained_image(cx: &Analyzer, t: TExpr, value: TExpr, target: Type) -
     inner
 end constrained_image
 
-// A conversion: to a scalar it is folded like any other operator, and to a pointer it is a device
-// address -- written as arithmetic over constants, it is still one number.
-private cast_image(t: TExpr, inner: TExpr, to: Type, little: bool) -> Option[TExpr]
+// A conversion: to a scalar it is folded like any other operator, to a fixed-point type it is the
+// rounding and saturation `q15(0.6)` over a literal already gets (`fixed_fold`), and to a pointer it
+// is a device address -- written as arithmetic over constants, it is still one number. **The value
+// converted is imaged first**, so a conversion over arithmetic, over another conversion or over a
+// `const` call folds as one over a literal does.
+private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type) -> Option[TExpr]
+    val little = cx.an.tables.layout.little_endian
     val pointerish = to match
         Ptr(_) -> true
         CFn(_, _) -> true
         _ -> false
 
-    if !pointerish then return scalar_image(t, little)
+    val from = static_image(cx, name, inner)
 
-    const_fold_typed(inner, little) match
-        Some(ConstInt(n)) -> Some(TExpr(t.span, TCast(TExpr(inner.span, TIntLit(n, texpr_type(inner))), to)))
-        _ -> None
+    if from.is_none() then return None
+
+    if pointerish then return address_image(t, inner, from.unwrap(), to, little)
+
+    if is_fixed(to) then return fixed_image(t, from.unwrap(), to)
+
+    scalar_image(TExpr(t.span, TCast(from.unwrap(), to)), little)
 end cast_image
 
-private static_images(cx: &Analyzer, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
+// A device address: the integer folded, the conversion kept.
+private address_image(t: TExpr, inner: TExpr, from: TExpr, to: Type, little: bool) -> Option[TExpr] =
+    const_fold_typed(from, little) match
+        Some(ConstInt(n)) -> Some(TExpr(t.span, TCast(TExpr(inner.span, TIntLit(n, texpr_type(inner))), to)))
+        _ -> None
+
+// A conversion to a fixed-point type over a value that came to a literal, at the type as written --
+// a `new` type over `q15` keeps its own name on the raw value.
+private fixed_image(t: TExpr, from: TExpr, to: Type) -> Option[TExpr] =
+    fixed_fold(t.span, from, underlying(to)) match
+        Some(folded) -> *folded.kind match
+            TIntLit(raw, _) -> Some(TExpr(t.span, TIntLit(raw, to)))
+            _ -> None
+        None -> None
+
+private static_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
     var out: Buf[TExpr] = buf()
 
     for item in xs
-        val x = static_image(cx, item)
+        val x = static_image(cx, name, item)
 
         if x.is_none() then return None
 
