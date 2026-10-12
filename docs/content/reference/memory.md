@@ -2332,6 +2332,98 @@ its calls. **What is not checked** is a closure that *stores* something read out
 value where it outlives the call — through a pointer it captured, say: nothing follows a counted
 value from the field to the store, so that one is the reader's to know about.
 
+### A table whose every record has its own lock
+
+A buffer cache, an inode table, a page cache: each record is locked on its own, so two processors
+touch two records at once. **`sysl.sync.Guarded[L, T]` is that record** — a value, not a box, with
+the lock laid inline beside the `T` — and it is declared `@guards(value)` exactly as `Mutex[T]` is.
+The lock is any type implementing the `Lock` trait (`acquire`, `try_acquire`, `release`, each taking
+`*self`): a `SpinLock`, a `sysl.threads.SleepLock`, or a lock a package writes for itself.
+
+**Nothing new decides that the table crosses: an array is its elements**, so sharing a
+`[4]Guarded[...]` shares four locks, and sharing a lock does not share what it guards. The records
+may hold a `Buf`, a string, a `&T` — whatever they hold is reached only through `with`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Guarded, SpinLock}
+
+struct Item
+    hits: int
+    log: Buf[int]
+
+static var table: [4]Guarded[SpinLock, Item] = [
+    Guarded.new(SpinLock(0), Item(0, buf())), Guarded.new(SpinLock(0), Item(0, buf())),
+    Guarded.new(SpinLock(0), Item(0, buf())), Guarded.new(SpinLock(0), Item(0, buf()))]
+
+touch(i: int) -> int = table[i].with((r) ->
+    r.hits += 1
+    r.log.push(i)
+    r.hits)
+
+val job: &sync Fn() -> unit = () -> print(touch(2))
+
+job()
+job()
+```
+
+```output
+1
+2
+```
+
+The same table of bare `Item`s is refused, naming the `Buf` that two domains would share:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Item
+    hits: int
+    log: Buf[int]
+
+static var table: [2]Item = [Item(0, buf()), Item(0, buf())]
+
+touch(i: int) = table[i].log.push(i)
+
+val job: &sync Fn() -> unit = () -> touch(1)
+
+job()
+```
+
+```error
+the module storage 'table' it reaches, which 'touch' reads, holds a 'sysl.buf.Buf[int]' in its 'log', which is shared through a count that is not atomic
+```
+
+**`with` hands the closure the record in place** — its address, lent for the call — so a field
+written inside it is a store into the table: the record is not copied and nothing it counts is
+retained. What leaves `with` (and `try_with`) is held to the rule `Mutex.with`'s result is, at the
+call, so the `Buf` itself may not come out:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Guarded, SpinLock}
+
+struct Item
+    log: Buf[int]
+
+var cell = Guarded.new(SpinLock(0), Item(buf()))
+
+val b = cell.with((r) -> r.log)
+```
+
+```error
+'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'sysl.buf.Buf[int]'
+```
+
+A slice or a `Buf` of guarded records is asked the same way: what is in the way is the view's or the
+`Buf`'s own count, not the records, so one reached through a `*T` or held where it is constant data
+crosses, and one shared through its own ordinary count does not.
+
+**On a freestanding target the table is not module storage**: `Guarded.new` is a call the compiler
+does not run while compiling, and module storage a freestanding image reaches has to be constant data
+laid into the object file. A kernel keeps the table in memory it sets up at boot and reaches it
+through a `*[N]Guarded[...]`.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility

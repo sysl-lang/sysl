@@ -51,8 +51,9 @@ had when it was pthreads by symbol, kept for the programs that import it.
 | `Thread.join` | waits for one, answering whether it waited |
 | `current()` | the calling thread's own handle |
 | `yield_now()` | offers the processor away — a hint, not a wait |
-| `Lock` | a sleeping lock that guards nothing of its own |
+| `SleepLock` | a sleeping lock that guards nothing of its own, and implements `sysl.sync.Lock` |
 | `Mutex[T]` | mutual exclusion that owns what it protects |
+| `Guarded[SleepLock, T]` | one record with a lock of its own, for a table locked record by record (`sysl.sync`) |
 | `Condvar` | sleeping until another thread says something changed |
 | `Channel[T]` | a bounded queue two threads hand values across |
 | `tls_room()`, `tls_place(room)` | one thread's block of `@thread_local` storage, laid by hand |
@@ -343,7 +344,7 @@ The private field does a second job: it puts the **positional constructor** out 
 ```sysl
 import sysl.threads.*
 
-var built = Mutex(Lock.new(), 5)
+var built = Mutex(SleepLock.new(), 5)
 
 built.with((p) -> print(*p))
 ```
@@ -457,7 +458,7 @@ what makes the data safe to touch.
 
 ### It is a futex lock written in sysl, not a `pthread_mutex_t`
 
-The lock under `Mutex[T]` is a `Lock`: one `Atomic[u32]` and the two futex hooks, **the classic
+The lock under `Mutex[T]` is a `SleepLock`: one `Atomic[u32]` and the two futex hooks, **the classic
 three-state lock**. The word is zero when free, one when held, and two when held with somebody asleep
 on it; an uncontended take and release are one atomic operation each and never reach the system, a
 contended take marks the word two and sleeps in `sysl_futex_wait`, and only a release that finds a
@@ -468,15 +469,15 @@ A `pthread_mutex_t` was never the answer, and the reason is a **build property**
 a header and differs between two libcs on the *same* platform — 64 bytes on Darwin, 40 under glibc on
 x86-64, 48 on aarch64, 40 again under musl — and the standard library reads no header. The futex is
 what every system that has threads keeps underneath its own mutex, so it is one word the library
-lays out itself, and the same `Lock` runs on a kernel answering the hooks as on a hosted target.
+lays out itself, and the same `SleepLock` runs on a kernel answering the hooks as on a hosted target.
 
-`Lock` is public for the hold `Mutex[T]` does not express — a lock beside data the program names
+`SleepLock` is public for the hold `Mutex[T]` does not express — a lock beside data the program names
 itself, as `SpinLock` is, for code that may sleep:
 
 ```sysl
 import sysl.threads.*
 
-var l = Lock.new()
+var l = SleepLock.new()
 
 print(l.try_lock(), l.try_lock())
 l.unlock()
@@ -487,6 +488,47 @@ print(l.try_lock())
 true false
 true
 ```
+
+### A table locked record by record is `Guarded[L, T]`
+
+`Mutex[T]` is one lock over one value. **A table whose every record has a lock of its own** — a
+buffer cache, an inode table — is an array of `sysl.sync.Guarded[L, T]`: the record and its lock
+side by side, inline, with no box. `L` is any type implementing `sysl.sync.Lock` (`acquire`,
+`try_acquire`, `release`), and `SleepLock` and `SpinLock` both do. `with` takes the record's own lock,
+hands the closure the record in place, and releases on every way out; two threads holding two
+records run at once:
+
+```sysl
+import sysl.sync.Guarded
+import sysl.threads.*
+
+struct Slot
+    hits: int
+
+var slots: [2]Guarded[SleepLock, Slot] = [Guarded.new(SleepLock.new(), Slot(0)),
+                                          Guarded.new(SleepLock.new(), Slot(0))]
+
+bump(arg: *unit) -> *unit
+    for _ in 0..<1000
+        slots[0].with((s) -> s.hits += 1)
+        slots[1].with((s) -> s.hits += 2)
+
+    null
+
+val a = spawn(bump, null).unwrap()
+val b = spawn(bump, null).unwrap()
+
+a.join()
+b.join()
+print(slots[0].with((s) -> s.hits), slots[1].with((s) -> s.hits))
+```
+
+```output
+2000 4000
+```
+
+The table crosses because each record is `@guards(value)` and an array is shared element by element
+— the rule is `reference/memory.md` § *A table whose every record has its own lock*.
 
 ## `Condvar`
 
@@ -536,7 +578,7 @@ print(r.m.with((n) -> *n))
 ```
 
 `wait_for(&m, ns)` is the same with a limit, answering `false` where the time ran out first, and
-`wait_raw(&lock)` waits over a bare `Lock`.
+`wait_raw(&lock)` waits over a bare `SleepLock`.
 
 ## `Channel[T]`
 

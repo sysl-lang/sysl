@@ -1,0 +1,88 @@
+module sysl.sync
+@no_alloc
+
+/** What every lock does, whatever it waits by: take the lock, try to take it, let it go.
+ *
+ * **A lock is told apart by how it waits, and nothing that holds one needs to know which.** A
+ * `SpinLock` spins, a `sysl.threads.SleepLock` sleeps on a futex, and a kernel's own lock may mask
+ * interrupts on the processor taking it -- and `Guarded[L, T]` is written once over all of them. The
+ * trait asks for nothing a board lacks, so a package can implement it for a lock it defines itself.
+ *
+ * **`acquire` returns with the lock held and everything the last holder wrote visible**, which is
+ * an `Acquire` ordering on whatever word the lock takes, and **`release` publishes everything the
+ * holder wrote** to whoever acquires next, which is a `Release` on it. That pairing is the whole of
+ * what makes data behind the lock safe to touch, and it is the implementation's to keep.
+ *
+ * `try_acquire` takes the lock only where it can without waiting, and answers whether it did. A lock
+ * that never waits -- one that masks interrupts on a single processor -- answers `true` every time.
+ */
+trait Lock
+    acquire(*self)
+    try_acquire(*self) -> bool
+    release(*self)
+
+impl Lock for SpinLock
+    acquire(*self) = self.lock()
+    try_acquire(*self) -> bool = self.try_lock()
+    release(*self) = self.unlock()
+
+/** A record and its own lock, stored together, with **the record reachable only while the lock is
+ * held**.
+ *
+ * **This is the shape of a table whose every entry has a lock of its own** -- a buffer cache, an
+ * inode table, a page cache -- and it is a value, not a box: the lock is laid out inline beside the
+ * record, so `[64]Guarded[SpinLock, Inode]` is sixty-four locks and sixty-four inodes in one array,
+ * with no allocation and no count anywhere but inside the records themselves.
+ *
+ * **`@guards(value)` is what lets such a table cross into another domain** whatever its records
+ * hold (`reference/memory.md § A guarded value crosses with its lock`): both fields are private, so
+ * sharing the table shares the locks and not the records, and an array is shared element by
+ * element. What leaves through `with` or `try_with` is held to the `&sync` rule at the call -- an
+ * `int` or a `.copy()` of a string, not a `Buf` still sharing a count with the one inside.
+ *
+ * ```
+ * cache[i].with((b) -> b.dirty = true)
+ * ```
+ *
+ * It differs from `sysl.threads.Mutex[T]` in two ways: the lock is any `Lock`, so a board with no
+ * scheduler can use one; and it offers no `lock_raw` -- a hold that cannot be written as a block is
+ * the case `Mutex[T]` exists for.
+ */
+@guards(value)
+struct Guarded[L: Lock, T]
+
+    // The lock. Private because the type's whole promise is that the record is only ever reached
+    // with it held, and a lock that could be released from outside would break that.
+    private lock: L
+
+    // The record. Private is what "guarded" means: with it public, `g.value` would be an
+    // unsynchronized read of exactly the data the lock exists to protect.
+    private value: T
+
+    /** A record behind a lock, which must be free. */
+    const new(lock: L, value: T) -> Guarded[L, T] = Guarded(lock, value)
+
+    /** Takes the lock, waiting however `L` waits, runs `body` with the address of the record in
+     * place, releases the lock on every way out, and answers what `body` answered.
+     *
+     * The record is not copied, and nothing it holds is retained: `body` writes the record itself.
+     * The address is lent (`@lends`), so `body` may read and write through it and pass it to a
+     * callee that only uses it, but not return it, store it, or hand it to something that keeps it --
+     * using it after the release is the one mistake a block cannot otherwise rule out.
+     */
+    @lends(body)
+    with[R](*self, body: *T -> R) -> R
+        self.lock.acquire()
+
+        defer self.lock.release()
+        body(&self.value)
+
+    /** The same, if the lock can be taken without waiting: `Some` of what `body` answered, or `None`. */
+    @lends(body)
+    try_with[R](*self, body: *T -> R) -> Option[R]
+        if !self.lock.try_acquire() then return None
+
+        defer self.lock.release()
+        Some(body(&self.value))
+
+end Guarded

@@ -1,0 +1,288 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// A table whose every record has a lock of its own (`sysl.sync.Guarded[L, T]`, the `Lock` trait):
+// `@guards(value)` leaves each record out of what sharing the table shares, and an array is shared
+// element by element, so `[4]Guarded[SpinLock, Item]` in module storage crosses into a `&sync`
+// whatever `Item` holds -- while the same table of bare `Item`s is refused. What leaves `with` is
+// held to the `&sync` rule at the call, the lock is any `Lock` a program writes, and the record is
+// written in place: no copy of it, no retain of what it counts.
+
+// What a program built from one file does: what it printed, and whether it built, ran and exited
+// zero. A refused build answers the driver's whole report.
+private gdr_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-gdr").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end gdr_outcome
+
+private gdr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private gdr_ran(text: string) -> string
+    val out = gdr_outcome(text)
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+
+private gdr_err(text: string) -> string
+    val out = gdr_outcome(text)
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+
+// A message holds the words, or the test says what it held instead.
+private gdr_says(said: string, words: string)
+    if !said.contains(words) then assert_eq(said, words)
+
+// The record every table here holds: a count and a `Buf`, which is shared through a count that is
+// not atomic -- the thing that keeps a bare `Item` out of another domain.
+private gdr_item() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.sync.{Guarded, SpinLock}
+
+    struct Item
+        hits: int
+        log: Buf[int]
+
+    """
+
+private gdr_table() -> string = gdr_item() + raw"""
+    static var table: [4]Guarded[SpinLock, Item] = [
+        Guarded.new(SpinLock(0), Item(0, buf())), Guarded.new(SpinLock(0), Item(0, buf())),
+        Guarded.new(SpinLock(0), Item(0, buf())), Guarded.new(SpinLock(0), Item(0, buf()))]
+
+    """
+
+@test("a module table of guarded records holding a 'Buf' is reached from a '&sync' closure")
+gdr_the_guarded_table_crosses()
+    if !gdr_ready() then return
+
+    assert_eq(gdr_ran(gdr_table() + raw"""
+        touch(i: int) -> int = table[i].with((r) ->
+            r.hits += 1
+            r.log.push(i)
+            r.hits)
+
+        val job: &sync Fn() -> unit = () -> print(touch(2))
+
+        job()
+        job()
+        print(table[2].with((r) -> r.log.len()), table[0].with((r) -> r.hits))
+        """), "1\n2\n2 0\n")
+end gdr_the_guarded_table_crosses
+
+@test("the same table of bare records is refused, naming the 'Buf' that is shared")
+gdr_the_bare_table_is_refused()
+    if !gdr_ready() then return
+
+    gdr_says(gdr_err(gdr_item() + raw"""
+        static var table: [2]Item = [Item(0, buf()), Item(0, buf())]
+
+        touch(i: int) = table[i].log.push(i)
+
+        val job: &sync Fn() -> unit = () -> touch(1)
+
+        job()
+        """), "a closure shared between two domains may be called from either, so every count it " +
+                "reaches has to be atomic — but the module storage 'table' it reaches, which 'touch' " +
+                "reads, holds a 'sysl.buf.Buf[int]' in its 'log', which is shared through a count " +
+                "that is not atomic")
+end gdr_the_bare_table_is_refused
+
+@test("a 'with' answering the record's 'Buf' is refused at the call")
+gdr_answering_the_buf_is_refused()
+    if !gdr_ready() then return
+
+    gdr_says(gdr_err(gdr_table() + raw"""
+        val b = table[0].with((r) -> r.log)
+        print(b.len())
+        """), "'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the " +
+              "guard is let go that value is shared with whoever holds it next, so every count it " +
+              "reaches has to be atomic — but this answers a 'sysl.buf.Buf[int]', whose 'core' " +
+              "reaches a '&sysl.buf.BufCore[int]', whose count is not atomic")
+end gdr_answering_the_buf_is_refused
+
+@test("a 'try_with' answering the record's 'Buf' is refused the same way")
+gdr_try_with_answering_the_buf_is_refused()
+    if !gdr_ready() then return
+
+    gdr_says(gdr_err(gdr_table() + raw"""
+        print(table[0].try_with((r) -> r.log).is_some())
+        """), "'sysl.sync.Guarded.try_with' answers a value out of the 'value' it guards")
+end gdr_try_with_answering_the_buf_is_refused
+
+@test("a count out of the record leaves 'with' and 'try_with', the type alone admitting it")
+gdr_a_count_leaves()
+    if !gdr_ready() then return
+
+    assert_eq(gdr_ran(gdr_table() + raw"""
+        table[1].with((r) -> r.log.push(7))
+        print(table[1].with((r) -> r.log.len()), table[1].try_with((r) -> r.log.at(0)))
+        """), "1 Some(7)\n")
+end gdr_a_count_leaves
+
+@test("the record is reached only through 'with': its field is private to the library's file")
+gdr_the_record_field_is_private()
+    if !gdr_ready() then return
+
+    gdr_says(gdr_err(gdr_table() + "print(table[0].value.hits)\n"),
+             "field 'value' of 'sysl.sync.Guarded' is private to 'library/sysl/sync/lock.sysl'")
+end gdr_the_record_field_is_private
+
+@test("a lock type that does not implement 'Lock' is refused at the type")
+gdr_a_non_lock_is_refused()
+    if !gdr_ready() then return
+
+    gdr_says(gdr_err("import sysl.sync.Guarded\n\nvar g = Guarded.new(5, \"x\")\n"),
+             "'sysl.sync.Guarded' requires its type parameter 'L' to implement 'sysl.sync.Lock', " +
+             "but int does not")
+end gdr_a_non_lock_is_refused
+
+@test("a program's own 'Lock' guards a record: taken by 'with', released on the way out, tried")
+gdr_a_lock_of_the_programs_own()
+    if !gdr_ready() then return
+
+    // `try_with` succeeding after `with` is the release having run; a lock built held refuses it.
+    assert_eq(gdr_ran(raw"""
+        import sysl.sync.{Guarded, Lock}
+
+        struct Flag
+            held: bool
+            takes: int
+
+        impl Lock for Flag
+            acquire(*self)
+                self.held = true
+                self.takes += 1
+
+            try_acquire(*self) -> bool
+                if self.held then return false
+
+                self.acquire()
+                true
+
+            release(*self) = self.held = false
+
+        var free = Guarded.new(Flag(false, 0), 5)
+        var busy = Guarded.new(Flag(true, 0), 7)
+
+        print(free.with((n) -> *n + 1))
+        print(free.try_with((n) -> *n), busy.try_with((n) -> *n))
+        """), "6\nSome(5) None\n")
+end gdr_a_lock_of_the_programs_own
+
+// The text of every function the module defines whose name holds `part`, `define` to closing brace.
+private gdr_bodies(out: string, part: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains(part) then inside = true
+
+        if inside
+            b.push(line)
+            b.push_char('\n')
+
+            if line == "}" then inside = false
+
+    b.finish()
+end gdr_bodies
+
+@test("a field write inside 'with' writes the record in place: no copy of it and no retain")
+gdr_the_record_is_written_in_place()
+    if !gdr_ready() || !clang_available() then return
+
+    val root = make_temp_dir("sysl-gdr-ir").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.sync.{Guarded, SpinLock}
+
+        struct Item
+            cells: [64]i64
+            log: Buf[int]
+            hits: int
+
+        @noinline
+        bump(g: *Guarded[SpinLock, Item]) = g.with((r) -> r.hits += 1)
+
+        var g = Guarded.new(SpinLock(0), Item([0; 64], buf(), 0))
+        bump(&g)
+        """).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val held = gdr_bodies(out, "Guarded.with")
+    val body = gdr_bodies(out, ".call(ptr %self.param, ptr %r.param)")
+
+    assert(held.contains("call void @sysl.sync$SpinLock.acquire("), out)
+    assert(held.contains("call void @sysl.sync$SpinLock.release("), held)
+    assert(body.contains("getelementptr %struct.Item, ptr %t1, i32 0, i32 2"), body)
+
+    for text in [held, body]
+        assert(!text.contains("memcpy"), text)
+        assert(!text.contains("@arc."), text)
+        assert(!text.contains("alloca %struct.Item"), text)
+end gdr_the_record_is_written_in_place
+
+@test("on a board, 'with' over a guarded record is the spinlock's exchange and two in-place stores")
+gdr_on_a_board()
+    val code = fx2_board_code(raw"""
+        import sysl.sync.{Guarded, SpinLock}
+
+        struct Item
+            hits: int
+            last: u8
+
+        @export("gdr_tick")
+        gdr_tick(t: *[4]Guarded[SpinLock, Item], i: usize, b: u8) = (*t)[i].with((r) ->
+            r.hits += 1
+            r.last = b)
+        """, "thumbv7em-freestanding", "gdr_tick")
+
+    if code.is_none() then return
+
+    val text = code.unwrap()
+
+    // The lock word is the record's first word, the count the second and the byte the third: twelve
+    // bytes a record, the lock laid inline with no box to reach through.
+    assert(text.contains("ldrex"), text)
+    assert(text.contains("strex"), text)
+    assert(text.contains("[r0, #4]"), text)
+    assert(text.contains("strb"), text)
+    assert(text.contains("lsl #2"), text)
+    assert(fx2_foreign_calls(text, "gdr_tick") <= 1, text)
+end gdr_on_a_board
