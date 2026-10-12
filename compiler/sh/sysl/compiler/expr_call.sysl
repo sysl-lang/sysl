@@ -1391,8 +1391,11 @@ private written_integer(t: Type) -> bool = t match
     Integer(_, _, _) -> true
     _ -> false
 
+// A float conversion renders a fixed-point value too: it is a number with a fraction, which is what
+// `%f`, `%e` and `%g` are about, and its value is exact in decimal, so nothing is lost by asking.
 private written_floating(t: Type) -> bool = t match
     Floating(_, _) -> true
+    Fixed(_, _, _) -> true
     _ -> false
 
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written: Buf[Expr]) -> TExpr
@@ -1425,6 +1428,9 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     // An `f128` is rendered at its own width, by a renderer of its own, whose digits are binary128's.
     if fits && spec_is_float(c) && is_quad(ty) then
         return library_format_call(cx, span, "format_f128", one_arg(at_quad(span, v)), spec, counts)
+
+    if fits && spec_is_float(c) && is_fixed(ty) && library_key(cx, "format_fixed").is_some() then
+        return fixed_format_call(cx, span, v, ty, spec, counts)
 
     if fits && spec_is_float(c) && library_key(cx, "format_real").is_some() then
         return float_format_call(cx, span, v, spec, counts)
@@ -1488,6 +1494,32 @@ private float_format_call(cx: &Analyzer, span: Span, v: TExpr, spec: string,
     library_format_call(cx, span, if single then "format_f32" else "format_real", one_arg(value), spec,
                         counts)
 end float_format_call
+
+// **A fixed-point value under a float specifier is rendered from its raw integer by `format_fixed`**,
+// never through a `real`: the value is `raw · 2^-F` exactly, so its decimal is exact too and a `q31`
+// or an `i64q60` keeps every bit a `double` would round away. The raw integer crosses at `i128` as an
+// integer's does, beside the format's width, its signedness and its fraction. A format wider than
+// 128 bits has no `i128` to cross at, and is refused rather than rounded.
+private fixed_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: string,
+                          counts: Buf[TExpr]) -> TExpr
+    val shape: (int, int, bool) = underlying(ty) match
+        Fixed(b, f, s) -> (b, f, s)
+        _ -> (32, 31, true)
+
+    if shape.0 > 128 then
+        return cx.err(span, s"format '$spec' renders a fixed-point value of at most 128 bits, and " +
+                      s"'${type_show(ty)}' has ${shape.0}")
+
+    val raw = fixed_bits_of(span, v, ty)
+    var lead: Buf[TExpr] = buf()
+
+    lead.push(TExpr(span, TCast(raw, Integer(128, true, false))))
+    lead.push(TExpr(span, TIntLit(from_int(long(shape.0)), int_type())))
+    lead.push(TExpr(span, TBoolLit(shape.2)))
+    lead.push(TExpr(span, TIntLit(from_int(long(shape.1)), int_type())))
+
+    library_format_call(cx, span, "format_fixed", lead, spec, counts)
+end fixed_format_call
 
 // **Every specifier lowers to one call of a library renderer** -- `format_int`, `format_str`,
 // `format_real` or `format_f32` -- taking the value (and, for an integer, its width) ahead of the

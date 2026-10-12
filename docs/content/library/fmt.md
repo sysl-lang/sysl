@@ -232,11 +232,32 @@ digit of 1 for every value but zero, a subnormal included (`0x1p-1074`), and rou
 even, as glibc and musl do. `write_f32` and `write_f128` are the same at the other widths, and an
 `f128`'s scratch is `f128_scratch_len`.
 
+**`write_fixed` is the same for a fixed-point value**, handed the raw integer and the format it is
+read at — width, signedness, fraction — since one function serves every `iWqF`. Its digits are the
+exact value's, as an f-string hole's are, and `float_scratch_len` is enough for any format up to 128
+bits:
+
+```sysl
+import sysl.fmt.{write_fixed, float_scratch_len}
+
+val x = i64q63::Max
+var scratch: [float_scratch_len]u8
+
+write_fixed(i128(x.bits), 64, true, 63, stdout(), "%.25f", 0, -1, scratch[..]).unwrap()
+print("")
+```
+
+```output
+0.9999999999999999998915798
+```
+
 | | |
 |---|---|
 | `format_real(x, spec, width, precision)` | a `real` under a printf specifier; `width` and `precision` are what a `*` reads |
 | `format_f32(x, spec, width, precision)` | the same for an `f32`, taken apart at its own width |
 | `write_real(x, out, spec, width, precision, scratch)` | the same text written to a `*Writer`, allocating nothing; `write_f32` and `write_f128` at the other widths |
+| `format_fixed(raw, bits, signed, frac, spec, width, precision)` | a fixed-point value under a float specifier, from its raw integer: what `${x}%.4f` lowers to |
+| `write_fixed(raw, bits, signed, frac, out, spec, width, precision, scratch)` | the same text written to a `*Writer`, allocating nothing |
 | `float_scratch_len`, `f128_scratch_len` | scratch lengths that are always enough |
 | `shortest(x)` | the fewest digits that read back as `x`, a `real` or an `f32` |
 | `format_real_plain(x)` | a `real` as `str` and a plain hole write it: Rust's `{}`; `format_f32_plain`, `format_f16_plain`, `format_bf16_plain` and `format_f128_plain` at the other widths |

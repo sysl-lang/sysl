@@ -14,7 +14,7 @@ rendering itself through `Display` is handed the `FormatSpec` the same count mak
 
 ## Index
 
-[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
+[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
 
 ## Constants
 
@@ -120,6 +120,24 @@ format_f32_plain(x: f32) -> string
 ```
 
 An `f32` as `str` writes it: `format_real_plain`'s rule in the digits an `f32` needs.
+
+### `format_fixed`
+
+```sysl
+format_fixed(raw: i128, bits: int, signed: bool, frac: int, spec: string, width: int, precision: int) -> string
+```
+
+A fixed-point value under a printf float conversion -- what `${x}%.4f` lowers to when `x` is a `q31`,
+an `i32q16` or any other `iWqF`/`uWqF`. A program does not call it; it writes the hole.
+
+`raw` is the integer the value is stored as (`x.bits`) at `i128` -- a `u128` above `i128`'s maximum
+arriving as its two's complement, which `bits` and `signed` read back -- and the value is
+`raw * 2^-frac`. **That is a dyadic rational, so its decimal expansion is finite and is printed
+exactly**, by the machinery `format_real` uses: the digits are the true value's, rounded half to
+even at the position the conversion names, never a `double`'s approximation of it. A `q31` or an
+`i64q60` keeps every one of its bits -- `${q31::Max}%.12f` is `0.999999999534`, and `%.20f` of an
+`i64q60` prints digits no `double` holds. `spec`, `width` and `precision` are read as `format_real`
+reads them, flag for flag.
 
 ### `format_int`
 
@@ -269,6 +287,19 @@ write_f32(x: f32, out: *Writer, spec: string, width: int, precision: int, scratc
 
 An `f32` under a printf float conversion, written as `write_real` writes the same value -- which is
 what C prints for a `float`, promoted to `double` -- and taken apart at its own width.
+
+### `write_fixed`
+
+```sysl
+write_fixed(raw: i128, bits: int, signed: bool, frac: int, out: *Writer, spec: string, width: int, precision: int, scratch: []u8) -> Result[unit, FormatError]
+```
+
+A fixed-point value under a printf float conversion, written as `format_fixed` renders it and as
+`write_real` writes a float -- into `out`, with nothing allocated, so a `@no_alloc` program prints
+a `q31` exactly. `raw`, `bits`, `signed` and `frac` say what the value is (`i128(x.bits)`, the
+format's width, whether it is an `iWqF`, and its `F`); the rest is `write_real`'s.
+`float_scratch_len` bytes of scratch are always enough: the longest exact value of a 128-bit format
+runs to under two hundred digits.
 
 ### `write_real`
 

@@ -325,6 +325,47 @@ print(q15::Bits(16384), (0.5i32q31).bits)
 `print` and `str` write the **shortest decimal that reads back as the same value**, never in
 exponent form: `0.0000000005` says which place the one bit is in.
 
+### Under a format specifier
+
+An f-string hole takes a float conversion — `%f`, `%e`, `%g` and their upper-case forms, with every
+flag, width and precision ([Format specifiers](/reference/strings/#format-specifiers)) — over a
+fixed-point value exactly as over a float. **The digits are the exact value's**: a fixed-point value
+is its raw integer times 2^-F, whose decimal expansion is finite, so it is rounded half to even at the
+position the conversion names and never passes through a `double`. A format wider than a `double`'s 53
+bits keeps every one of them:
+
+```sysl
+val gain: q31 = 0.6
+val t: i64q60 = 0.1
+
+print(f"[${gain}%.4f] [${gain}%+10.3e] [${q15::Max}%g] [${i32q16::Min}%08.1f]")
+print(f"${t}%.25f")
+print(f"${real(t)}%.25f")
+```
+
+```output
+[0.6000] [+6.000e-01] [0.999969] [-32768.0]
+0.1000000000000000003469447
+0.1000000000000000055511151
+```
+
+The second line is `t`'s own value; the third is the nearest `double` to it. An integer or a string
+conversion is still refused — the bits are `.bits`, under `%d` or `%x`:
+
+```sysl
+val x: q15 = 0.5
+
+print(f"${x}%d")
+```
+
+```error
+format '%d' expects an integer, but the value has type q15
+```
+
+A format up to 128 bits wide renders this way; a wider one is refused under a float conversion. The
+hole lowers to `sysl.fmt.format_fixed`, and a program that may not allocate writes the same text with
+[`write_fixed`](/library/fmt/#writing-one-without-allocating).
+
 ## A range
 
 A fixed-point type is a scalar, so `within` narrows it like any other — the ends are decimals, held

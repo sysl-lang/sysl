@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A fixed-point value in an f-string hole under a printf float conversion -- `${x}%.4f`, `%e`, `%g`,
+// with every flag, width and count a float takes. It is rendered from the raw integer and the
+// format's fraction by `sysl.fmt.format_fixed`, so the digits are the exact value's, rounded half to
+// even, never a `double`'s. Every expected line for a format of 53 bits or fewer is what C's `printf`
+// prints for the same (exact) double; the wider ones are the exact decimal worked out by Python's
+// `decimal` at 400 digits, beside what the nearest double would have printed.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ffx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ffx_ready
+
+private ffx_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ffx").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end ffx_root
+
+// What a one-file program prints, or why it did not build with the directory written as `@`.
+private ffx_ran(text: string) -> string
+    val root = ffx_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ffx_ran
+
+private ffx_prints(text: string, expected: string)
+    if !ffx_ready() then return
+
+    assert_eq(ffx_ran(text), expected)
+end ffx_prints
+
+private ffx_refused(text: string, message: string, at: string)
+    if !ffx_ready() then return
+
+    val root = ffx_root(text)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end ffx_refused
+
+// -- the conversions -----------------------------------------------------------------------------
+
+@test("q15, q31, u16q16 and i32q16 render under %f, %e and %g with every flag, as C renders a float")
+ffx_formats_under_every_conversion()
+    ffx_prints("val a: q15 = -0.375\nval b: q31 = 0.6\nval c: u16q16 = 0.75\nval d: i32q16 = -1234.5678\n" +
+               "print(f\"[${a}%f] [${a}%.0f] [${a}%.10f] [${a}%e] [${a}%g]\")\n" +
+               "print(f\"[${b}%f] [${b}%.0f] [${b}%.10f] [${b}%e] [${b}%g]\")\n" +
+               "print(f\"[${c}%f] [${c}%.0f] [${c}%.10f] [${c}%e] [${c}%g]\")\n" +
+               "print(f\"[${d}%f] [${d}%.0f] [${d}%.10f] [${d}%e] [${d}%g]\")\n" +
+               "print(f\"[${a}%+12.4f] [${b}%-12.4f] [${d}%012.4f] [${c}%10.3e] [${b}%-+10.2g]\")\n",
+               "[-0.375000] [-0] [-0.3750000000] [-3.750000e-01] [-0.375]\n" +
+               "[0.600000] [1] [0.6000000001] [6.000000e-01] [0.6]\n" +
+               "[0.750000] [1] [0.7500000000] [7.500000e-01] [0.75]\n" +
+               "[-1234.567795] [-1235] [-1234.5677947998] [-1.234568e+03] [-1234.57]\n" +
+               "[     -0.3750] [0.6000      ] [-001234.5678] [ 7.500e-01] [+0.6      ]\n")
+end ffx_formats_under_every_conversion
+
+@test("each format's Min and Max render exactly")
+ffx_min_and_max()
+    ffx_prints("print(f\"${q15::Min}%.12f ${q15::Max}%.12f ${q15::Max}%e ${q15::Max}%.20g\")\n" +
+               "print(f\"${q31::Min}%.12f ${q31::Max}%.12f ${q31::Max}%e ${q31::Max}%.20g\")\n" +
+               "print(f\"${u16q16::Min}%f ${u16q16::Max}%.12f ${u16q16::Max}%g\")\n" +
+               "print(f\"${i32q16::Min}%f ${i32q16::Max}%.12f ${i32q16::Max}%e ${i32q16::Max}%.20g\")\n",
+               "-1.000000000000 0.999969482422 9.999695e-01 0.999969482421875\n" +
+               "-1.000000000000 0.999999999534 1.000000e+00 0.99999999953433871269\n" +
+               "0.000000 0.999984741211 0.999985\n" +
+               "-32768.000000 32767.999984741211 3.276800e+04 32767.999984741210938\n")
+end ffx_min_and_max
+
+@test("a format wider than a double's 53 bits prints its own exact digits, not its nearest double's")
+ffx_wide_format_is_exact()
+    ffx_prints("val t: i64q60 = 0.1\nval m = i64q63::Max\n" +
+               "print(f\"${t}%.25f ${real(t)}%.25f\")\n" +
+               "print(f\"${t}%.20e ${m}%.25f ${real(m)}%.25f\")\n" +
+               "print(f\"${u64q64::Max}%.22f ${i128q100::Min}%.12e\")\n",
+               "0.1000000000000000003469447 0.1000000000000000055511151\n" +
+               "1.00000000000000000347e-01 0.9999999999999999998915798 1.0000000000000000000000000\n" +
+               "0.9999999999999999999458 -1.342177280000e+08\n")
+end ffx_wide_format_is_exact
+
+@test("a width and a precision written as holes are read for a fixed-point value as for a float")
+ffx_counts_as_holes()
+    ffx_prints("val x: q15 = 0.5\nfor n in [0, 2, 6]\n    print(f\"[${x}%.${n}f] [${x}%${n + 6}.1f]\")\n",
+               "[0] [   0.5]\n[0.50] [     0.5]\n[0.500000] [         0.5]\n")
+end ffx_counts_as_holes
+
+@test("a tie at a fixed-point value goes to the even digit")
+ffx_tie_to_even()
+    ffx_prints("val a: u8q1 = 2.5\nval b: u8q1 = 3.5\nval c: q15 = q15::Small\n" +
+               "print(f\"${a}%.0f ${b}%.0f ${c}%.14f\")\n",
+               "2 4 0.00003051757812\n")
+end ffx_tie_to_even
+
+@test("write_fixed renders a fixed-point value from a '@no_alloc' function")
+ffx_write_fixed_allocates_nothing()
+    ffx_prints("import sysl.fmt.{write_fixed, float_scratch_len}\n\n" +
+               "@no_alloc\nshow(x: q31)\n    var scratch: [float_scratch_len]u8\n\n" +
+               "    write_fixed(i128(x.bits), 32, true, 31, stdout(), \"%+.12f\", 0, -1, scratch[..]).unwrap()\n\n" +
+               "show(q31::Max)\nprint(\"\")\n",
+               "+0.999999999534\n")
+end ffx_write_fixed_allocates_nothing
+
+// -- what stays refused --------------------------------------------------------------------------
+
+@test("an integer or a string conversion over a fixed-point value is refused")
+ffx_wrong_conversion_refused()
+    ffx_refused("val x: q15 = 0.5\nprint(f\"${x}%d\")\n",
+                "format '%d' expects an integer, but the value has type q15", "2:7")
+    ffx_refused("val x: q15 = 0.5\nprint(f\"${x}%s\")\n",
+                "format '%s' expects a string, but the value has type q15", "2:7")
+end ffx_wrong_conversion_refused
+
+@test("a fixed-point format wider than 128 bits is refused under a float conversion")
+ffx_too_wide_refused()
+    ffx_refused("val x: i256q8 = 0.5\nprint(f\"${x}%f\")\n",
+                "format '%f' renders a fixed-point value of at most 128 bits, and 'i256q8' has 256", "2:7")
+end ffx_too_wide_refused

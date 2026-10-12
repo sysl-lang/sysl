@@ -547,7 +547,8 @@ print(f"${n}%s")
 format '%s' expects a string, but the value has type int
 ```
 
-`%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float, and `%s` a string. An unsigned
+`%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float or a
+[fixed-point](/reference/fixed-point/#under-a-format-specifier) value, and `%s` a string. An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
 `ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. Under `%s` a
 width and a precision count **bytes**, as C's do, and an interior NUL ends the field there, as it
@@ -577,16 +578,17 @@ print(f"[${name}%-6s] [${name}%6s] [${name}%.${cut}s] [${name}%-8.${cut}s]")
 **Every conversion is rendered by sysl itself**, flag for flag as C renders it — an integer by
 `sysl.fmt.format_int`, a string by `sysl.fmt.format_str`, a float by
 [`format_real`](/library/fmt/#floats), whose digits are the exact value's, rounded half to even at
-whatever precision is asked — so a specifier works the same on a target with no C library. An
-integer, a string and a float specifier, a plain hole of a float and `str` of one all build for a
+whatever precision is asked, and a fixed-point value by `format_fixed`, from its raw integer and
+equally exactly — so a specifier works the same on a target with no C library. An
+integer, a string, a float and a fixed-point specifier, a plain hole of a float and `str` of one all build for a
 bare board, with no `snprintf` for its link to find:
 
 ```sysl target=aarch64-freestanding build=c
 @export("probe")
-probe(n: int, x: real, y: f32) -> usize
+probe(n: int, x: real, y: f32, g: q31) -> usize
     val s = if n > 0 then "up" else "down"
 
-    f"[${n}%-6d] [${s}%8s] ${x}%.3f ${y}%e".bytes.len + s"$x".bytes.len + str(y).bytes.len
+    f"[${n}%-6d] [${s}%8s] ${x}%.3f ${y}%e ${g}%.4f".bytes.len + s"$x".bytes.len + str(y).bytes.len
 ```
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
