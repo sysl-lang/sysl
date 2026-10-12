@@ -563,7 +563,7 @@ gen_fixed_str(e: *Emit, arg: TExpr, bits: int, frac: int, signed: bool) -> Val
 
     val name = s"sysl.str.fixed.${fixed_canonical(bits, frac, signed)}"
     val fn = request_text(e, name, str_fixed_text(name, bits, frac, signed, s"i${e.word_bits}",
-                                                  l_render(lty(e, Str))))
+                                                  l_render(lty(e, Str)), false))
     val v = gen_expr(e, arg)
     val r = fresh_reg(e)
 
@@ -573,6 +573,61 @@ gen_fixed_str(e: *Emit, arg: TExpr, bits: int, frac: int, signed: bool) -> Val
     emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
     r
 end gen_fixed_str
+
+// `print(x)` of a fixed-point value: the same characters `str(x)` makes, written into a buffer in
+// the caller's own frame and answered as a view of them, owned by nothing. Nothing is allocated, so
+// a fixed value prints under `@no_alloc` -- and on a board with no heap -- as the integer it is
+// stored as does. The view lives as long as the frame, which outlasts the `putbytes` it is handed to.
+gen_fixed_text(e: *Emit, v: Val, fixed_ty: Type, view_ty: Type) -> Val
+    val parts = underlying(fixed_ty) match
+        Fixed(b, f, s) -> (b, f, s)
+        other -> return gap_at(e, s"print of ${type_show(other)}")
+
+    val bits = parts.0
+    val frac = parts.1
+    val signed = parts.2
+    val word = s"i${e.word_bits}"
+    val cap = fixed_text_cap(bits, frac)
+    val name = s"sysl.print.fixed.${fixed_canonical(bits, frac, signed)}"
+    val fn = request_text(e, name, str_fixed_text(name, bits, frac, signed, word, word, true))
+    val slot = emit_alloca(e, fresh_reg(e), LArr(cap, LInt(8)), None)
+    val n = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(bits), v))
+    args.push(ir_arg(LPtr, slot))
+    emit(e, ir_call(Some(n), word_lty(e), VGlobal(fn), args))
+
+    // The digits end at the buffer's end, so they start `len` bytes before it.
+    val off = fresh_reg(e)
+
+    emit(e, InBin(off, OpSub, word_lty(e), VInt(from_int(long(cap))), n))
+
+    val p = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), off))
+    emit(e, InGep(p, LInt(8), slot, idx))
+
+    val lt = lty(e, view_ty)
+    val v0 = fresh_reg(e)
+
+    emit(e, InInsert(v0, lt, VUndef, LPtr, VNull, index_list(0)))
+
+    val v1 = fresh_reg(e)
+
+    emit(e, InInsert(v1, lt, v0, LPtr, p, index_list(1)))
+
+    val v2 = fresh_reg(e)
+
+    emit(e, InInsert(v2, lt, v1, word_lty(e), n, index_list(2)))
+    v2
+end gen_fixed_text
+
+// The most characters a format's decimal can take: its whole digits, its fraction's, a dot and a sign.
+private fixed_text_cap(bits: int, frac: int) -> int = bits * 3 / 10 + frac * 3 / 10 + 12
 
 // The width the renderer works at: room for the magnitude and a carry into it (`W + 1`), and for the
 // fraction scaled by ten (`F + 1` bits times ten, plus the power of ten that bounds it) -- rounded up
@@ -598,8 +653,11 @@ end render_width
 // byte: the diagnostics quote one and `print` writes the other.
 //
 // Then the digits are written backwards into a stack buffer -- the fraction's `k` places, the dot,
-// the whole part, the sign -- and copied out into a string, as the integer renderer does.
-str_fixed_text(name: string, bits: int, frac: int, signed: bool, word: string, text_ty: string) -> string
+// the whole part, the sign -- and copied out into a string, as the integer renderer does. With `into`
+// the buffer is the caller's (`fixed_text_cap` bytes, the digits ending at its end) and what comes
+// back is how many were written, which is the whole of `print`'s path: no string is ever made.
+str_fixed_text(name: string, bits: int, frac: int, signed: bool, word: string, text_ty: string,
+               into: bool) -> string
     val n = render_width(bits, frac)
     val it = s"i$n"
     val wt = s"i$bits"
@@ -607,12 +665,14 @@ str_fixed_text(name: string, bits: int, frac: int, signed: bool, word: string, t
     val mask = to_string(big_sub(fx_pow2(frac), from_int(1)))
     val two_f1 = to_string(fx_pow2(frac + 1))
     val mask2 = to_string(big_sub(fx_pow2(frac + 1), from_int(1)))
-    val cap = bits * 3 / 10 + frac * 3 / 10 + 12
+    val cap = fixed_text_cap(bits, frac)
+    val head = if into then s"define private $word @$name($wt %v, ptr %buf) {\nentry:"
+    else s"define private $text_ty @$name($wt %v) {\nentry:\n  %buf = alloca [$cap x i8]"
+    val tail = if into then s"ret $word %len"
+    else s"%res = call $text_ty @sysl.str.from_bytes(ptr %start, $word %len)\n  ret $text_ty %res"
 
     s"""
-    define private $text_ty @$name($wt %v) {
-    entry:
-      %buf = alloca [$cap x i8]
+    $head
       %end = getelementptr i8, ptr %buf, $word $cap
       %wide = $ext $wt %v to $it
       %isneg = icmp slt $it %wide, 0
@@ -717,8 +777,7 @@ str_fixed_text(name: string, bits: int, frac: int, signed: bool, word: string, t
       %si = ptrtoint ptr %start to $word
       %ei = ptrtoint ptr %end to $word
       %len = sub $word %ei, %si
-      %res = call $text_ty @sysl.str.from_bytes(ptr %start, $word %len)
-      ret $text_ty %res
+      $tail
     }
     """
 end str_fixed_text
