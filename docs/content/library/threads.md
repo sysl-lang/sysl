@@ -508,15 +508,13 @@ struct Slot
 var slots: [2]Guarded[SleepLock, Slot] = [Guarded.new(SleepLock.new(), Slot(0)),
                                           Guarded.new(SleepLock.new(), Slot(0))]
 
-bump(arg: *unit) -> *unit
+bump(t: *[2]Guarded[SleepLock, Slot])
     for _ in 0..<1000
-        slots[0].with((s) -> s.hits += 1)
-        slots[1].with((s) -> s.hits += 2)
+        (*t)[0].with((s) -> s.hits += 1)
+        (*t)[1].with((s) -> s.hits += 2)
 
-    null
-
-val a = spawn(bump, null).unwrap()
-val b = spawn(bump, null).unwrap()
+val a = spawn(&bump, &slots).unwrap()
+val b = spawn(&bump, &slots).unwrap()
 
 a.join()
 b.join()
