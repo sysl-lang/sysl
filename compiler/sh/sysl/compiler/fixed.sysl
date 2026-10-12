@@ -594,6 +594,22 @@ fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
     if op != "*" && op != "/" then return None
     if a == Unknown || b == Unknown then return None
 
+    // Two registers of one width multiply lane by lane, and each lane's product takes its format the
+    // way a scalar's does -- `<2>q15 * <2>q15` written where a `<2>i32q30` is wanted is the two exact
+    // products. Registers of two widths are left to the ordinary rule, which names both, and so is a
+    // quotient, which a register of lanes does not have.
+    (repr(a), repr(b)) match
+        (Vector(n, la), Vector(m, lb)) ->
+            if op == "/" || n != m || (!is_fixed(*la) && !is_fixed(*lb)) then return None
+
+            val lane = fixed_operator_type(cx, span, op, *la, *lb, lane_of_width(expected, n))
+
+            if lane.is_none() then return None
+            if lane.unwrap() == Unknown then return lane
+
+            return Some(Vector(n, lane.unwrap()))
+        _ -> ()
+
     val fa = is_fixed(a)
     val fb = is_fixed(b)
 
@@ -638,6 +654,15 @@ fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
              s"it is exactly ${if signed then "an" else "a"} $exact; give it a type")
     Some(Unknown)
 end fixed_operator_type
+
+// The lane type a position asks for, where it asks for a register of `n` lanes.
+private lane_of_width(expected: Option[Type], n: int) -> Option[Type]
+    if expected.is_none() then return None
+
+    repr(expected.unwrap()) match
+        Vector(k, lane) -> if k == n then Some(*lane) else None
+        _ -> None
+end lane_of_width
 
 // A product or a quotient beside a fixed-point operand of another format, read again at that
 // operand's type -- which is what makes `acc + b0 * x` and `b0 * x + acc` the same sum. Only a

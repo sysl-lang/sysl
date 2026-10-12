@@ -39,8 +39,12 @@ is_vector(t: Type) -> bool = t match
 //
 // **`f128` is not a lane**: no machine sysl targets has a register holding two of them, so a vector
 // of binary128 would be a loop of library calls dressed as one instruction.
+//
+// **A fixed-point type is a lane**: it is a scalar held as its raw integer, so `<2>q15` is LLVM's
+// `<2 x i16>` and its saturating `+` is one `QADD16` on a core with the DSP extension.
 can_be_lane(t: Type) -> bool = underlying(t) match
     Integer(_, _, _) -> true
+    Fixed(_, _, _) -> true
     Floating(bits, _) -> bits != 128
     Bool -> true
     Char -> true
@@ -101,6 +105,8 @@ vec_compare(cx: &Analyzer, span: Span, ts: Buf[TExpr], ops: Buf[string]) -> TExp
     val equality = op == "==" || op == "!="
     val ok = lanes.1 match
         Integer(_, _, _) -> true
+        // A fixed-point lane compares as the integer it is held as, one scale on both sides.
+        Fixed(_, _, _) -> true
         Floating(_, _) -> true
         Bool -> equality
         _ -> false
@@ -156,9 +162,19 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     // The float minimum is `fmin` rather than `fminimum`: it is the one that matches `sysl.math`'s
     // `min`, answering the other operand at a NaN instead of propagating it, so a program does not
     // get two different answers depending on whether it reduced or folded.
+    // A fixed-point lane orders as the integer it is held as, so its `min` and `max` are the
+    // integer's. **Its `sum` is refused**: a fixed-point `+` saturates, and saturation is not
+    // associative -- `(max + max) + min` and `max + (max + min)` differ -- so a sum of lanes has no
+    // answer that does not depend on an order the reduction is free to choose.
+    if is_fixed(lane) && name == "sum" then
+        return cx.err(span, s"'sum' is not defined for ${type_show(v)} — a fixed-point '+' saturates, " +
+                      "so the lanes' sum depends on the order they are added in; add 'v[0] + v[1]' " +
+                      "in the order you mean")
+
     val op = lane match
         Floating(_, _) -> if name == "sum" then "fadd" else s"f$name"
         Integer(_, signed, _) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
+        Fixed(_, _, signed) -> s"${signed_tag(signed)}$name"
         _ -> ""
 
     if op == "" then return cx.err(span, s"'$name' is not defined for ${type_show(v)}")

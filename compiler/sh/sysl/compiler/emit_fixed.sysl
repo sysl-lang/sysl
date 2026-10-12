@@ -61,8 +61,11 @@ private fx_clamp(e: *Emit, bits: int, v: Val, lo: BigInt, hi: BigInt) -> Val
 end fx_clamp
 
 // A two-operand saturating intrinsic -- `llvm.sadd.sat.i32` and its three siblings.
-private fx_sat(e: *Emit, name: string, bits: int, a: Val, b: Val) -> Val
-    val it = LInt(bits)
+private fx_sat(e: *Emit, name: string, bits: int, a: Val, b: Val) -> Val = fx_sat_at(e, name, LInt(bits), a, b)
+
+// The same intrinsic at any integer type, a register of lanes included -- `llvm.sadd.sat.v2i16` is
+// one `QADD16` on a core with the DSP extension.
+private fx_sat_at(e: *Emit, name: string, it: LType, a: Val, b: Val) -> Val
     val fn = llvm_sat_entry(name).unwrap().at([it])
 
     var params: Buf[IrParam] = buf()
@@ -80,7 +83,7 @@ private fx_sat(e: *Emit, name: string, bits: int, a: Val, b: Val) -> Val
 
     emit(e, ir_call(Some(r), it, VGlobal(fn), args))
     r
-end fx_sat
+end fx_sat_at
 
 private fx_parts(t: Type) -> (int, int, bool) = underlying(t) match
     Fixed(b, f, s) -> (b, f, s)
@@ -99,6 +102,10 @@ fixed_arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val =
 // **A `wrapping` type wraps where every other saturates**: its `+` and `-` are the plain integer
 // instructions, and a product or quotient into it is truncated to its width rather than clamped.
 fixed_binary(e: *Emit, op: string, lt: Type, rt: Type, ty: Type, lv: Val, rv: Val) -> Val
+    underlying(ty) match
+        Vector(n, lane) -> return fixed_lanes(e, op, lt, rt, n, *lane, lv, rv)
+        _ -> ()
+
     val wraps = fixed_wraps(ty)
     val (bits, frac, signed) = fx_parts(ty)
     val result = FixedSide(bits, frac, signed, min_of(bits, signed), max_of(bits, signed))
@@ -120,6 +127,67 @@ fixed_binary(e: *Emit, op: string, lt: Type, rt: Type, ty: Type, lv: Val, rv: Va
             gap_here(e, s"fixed-point arith '$op'")
             lv
 end fixed_binary
+
+// A vector's lane type, or the type itself where it is not a vector. The lane is kept as written, so a
+// `wrapping` lane still wraps.
+private fx_lane(t: Type) -> Type = underlying(t) match
+    Vector(_, lane) -> *lane
+    other -> other
+
+// `a op b` lane by lane over `<n>` registers of fixed-point lanes.
+//
+// **A sum or a difference of one format is one instruction at the register's width** --
+// `llvm.sadd.sat.v2i16`, which a Cortex-M4 selects as one `QADD16` -- since saturating each lane is
+// exactly what the intrinsic does to each lane. Everything else (a product, which rescales and rounds,
+// or a sum whose operands are of another format) is the scalar operation applied to each lane in
+// turn, so a lane's answer is the scalar answer by construction and the back end is left to put the
+// lanes back together.
+private fixed_lanes(e: *Emit, op: string, lt: Type, rt: Type, n: int, lane: Type, lv: Val,
+                    rv: Val) -> Val
+    val a = fx_lane(lt)
+    val b = fx_lane(rt)
+    val (bits, _, signed) = fx_parts(lane)
+    val vt = LVec(n, LInt(bits))
+    val one_format = type_eq(repr(a), repr(lane)) && type_eq(repr(b), repr(lane))
+
+    if (op == "+" || op == "-") && one_format
+        if fixed_wraps(lane) then return fx_bin_at(e, if op == "+" then OpAdd else OpSub, vt, lv, rv)
+
+        val kind = if op == "+" then "add" else "sub"
+
+        return fx_sat_at(e, s"${if signed then "s" else "u"}$kind", vt, lv, rv)
+    end if
+
+    val (abits, _, _) = fixed_format(a).unwrap_or((bits, 0, true))
+    val (bbits, _, _) = fixed_format(b).unwrap_or((bits, 0, true))
+    var acc: Val = VPoison
+
+    for i in 0..<n
+        val x = fx_extract(e, LVec(n, LInt(abits)), lv, i)
+        val y = fx_extract(e, LVec(n, LInt(bbits)), rv, i)
+        val z = fixed_binary(e, op, a, b, lane, x, y)
+        val r = fresh_reg(e)
+
+        emit(e, InInsertElement(r, vt, acc, LInt(bits), z, ir_arg(l_i32(), fx_small(long(i)))))
+        acc = r
+
+    acc
+end fixed_lanes
+
+private fx_bin_at(e: *Emit, op: BinOp, ty: LType, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, op, ty, a, b))
+    r
+end fx_bin_at
+
+// Lane `i` of a register.
+private fx_extract(e: *Emit, vt: LType, v: Val, i: int) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InExtractElement(r, vt, v, ir_arg(l_i32(), fx_small(long(i)))))
+    r
+end fx_extract
 
 // One side of a fixed-point product or quotient -- or its result: a format, and the raw values the
 // side can hold, which is the format's whole range, or a single value where the side is a constant.
@@ -372,13 +440,20 @@ private fixed_shift(e: *Emit, op: string, lt: Type, ct: Type, wraps: bool, lv: V
 end fixed_shift
 
 // `-x`, saturating: the negation of the most negative value is the largest one -- or, for a
-// `wrapping` type, that value itself, as an integer's negation is.
-fixed_neg(e: *Emit, ty: Type, wraps: bool, v: Val) -> Val
-    val (bits, _, _) = fx_parts(ty)
+// `wrapping` type, that value itself, as an integer's negation is. A register of lanes negates every
+// lane in the one instruction, from a zero register.
+fixed_neg(e: *Emit, ty: Type, v: Val) -> Val
+    val lane = fx_lane(ty)
+    val wraps = fixed_wraps(ty) || fixed_wraps(lane)
+    val (bits, _, _) = fx_parts(lane)
 
-    if wraps then return fx_bin(e, OpSub, bits, fx_small(0), v)
+    val (it, zero) = underlying(ty) match
+        Vector(n, _) -> (LVec(n, LInt(bits)), VZero)
+        _ -> (LInt(bits), fx_small(0))
 
-    fx_sat(e, "ssub", bits, fx_small(0), v)
+    if wraps then return fx_bin_at(e, OpSub, it, zero, v)
+
+    fx_sat_at(e, "ssub", it, zero, v)
 end fixed_neg
 
 // `x.abs()`: `x < 0 ? -x : x`, with the type's own `-` -- so it saturates where that does, and
@@ -510,33 +585,45 @@ private fx_wider(a: int, b: int) -> int = if a > b then a else b
 private pow2_double(k: int) -> Val = VFloat(long(1023 + k) << 52)
 
 // `x · 2^F`, rounded to nearest with ties toward +inf, saturated, NaN to zero. Everything happens in
-// `double`: a narrower float widens exactly, and multiplying by a power of two is exact.
+// one float type: a narrower float widens exactly, and multiplying by a power of two is exact.
 //
 // The rounding is `floor(y + 1/2)` without adding the half in floating point -- which would round a
 // value past 2^52 a second time. Instead `t = trunc(y)` (saturating, so a NaN is zero and an
 // infinity an end), `fr = y - t` exactly, a floor correction where `fr < 0`, and a step up where what
 // is left is at least a half. `t` is first held to one past either end of the format, so the steps
 // that follow cannot wrap it. With `floor` the step up is not taken: the floor itself is the answer.
+//
+// **The float type is `f32` where the source is no wider and the format at most 24 bits, and
+// `double` otherwise.** Every step is then as exact in `f32` as in `double`: the scale only grows a
+// value, so it cannot lose a bit (and one past `f32`'s range saturates either way); `t`, held to one
+// past the format, is an integer of at most 24 bits, which `f32` holds exactly; and `y - t` is the
+// fraction `y` already carries. So the answer is the same bit for bit, and a Cortex-M4F computes it
+// on its own single-precision unit rather than through a dozen soft-double library calls.
 private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool, floor: bool,
                        v: Val) -> Val
-    val dbl = LFloat(64, false)
-    val wide = convert(e, from, real_type(), v)
+    val narrow_source = from match
+        Floating(b, _) -> b <= 32
+        _ -> false
+    val single = narrow_source && bits <= 24 && frac >= 0 && frac <= 24
+    val work = if single then Floating(32, false) else real_type()
+    val fty = lty(e, work)
+    val wide = if type_eq(from, work) then v else convert(e, from, work, v)
     val y = fresh_reg(e)
 
-    emit(e, InBin(y, OpFMul, dbl, wide, pow2_double(frac)))
+    emit(e, InBin(y, OpFMul, fty, wide, pow2_double(frac)))
 
     val k = bits + 2
     val kt = LInt(k)
-    val sat = llvm_fptosi_sat_entry().at([kt, dbl])
+    val sat = llvm_fptosi_sat_entry().at([kt, fty])
 
     var params: Buf[IrParam] = buf()
 
-    params.push(ir_param(dbl))
+    params.push(ir_param(fty))
     request_intrinsic(e, ir_sig(sat, ir_fn_type(kt, params)))
 
     var ops: Buf[IrArg] = buf()
 
-    ops.push(ir_arg(dbl, y))
+    ops.push(ir_arg(fty, y))
 
     val t = fresh_reg(e)
 
@@ -547,15 +634,15 @@ private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool,
     val tc = fx_clamp(e, k, t, lo, hi)
     val back = fresh_reg(e)
 
-    emit(e, InCast(back, CastSIToFP, kt, tc, dbl))
+    emit(e, InCast(back, CastSIToFP, kt, tc, fty))
 
     val fr = fresh_reg(e)
 
-    emit(e, InBin(fr, OpFSub, dbl, y, back))
+    emit(e, InBin(fr, OpFSub, fty, y, back))
 
     val isneg = fresh_reg(e)
 
-    emit(e, InFloatCmp(isneg, FOlt, dbl, fr, VFloat(0)))
+    emit(e, InFloatCmp(isneg, FOlt, fty, fr, VFloat(0)))
 
     val t_down = fx_bin(e, OpSub, k, tc, fx_small(1))
     val t1 = fx_select(e, isneg, k, t_down, tc)
@@ -564,15 +651,15 @@ private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool,
 
     val fr_up = fresh_reg(e)
 
-    emit(e, InBin(fr_up, OpFAdd, dbl, fr, pow2_double(0)))
+    emit(e, InBin(fr_up, OpFAdd, fty, fr, pow2_double(0)))
 
     val fr1 = fresh_reg(e)
 
-    emit(e, InSelect(fr1, isneg, dbl, fr_up, fr, l_i1()))
+    emit(e, InSelect(fr1, isneg, fty, fr_up, fr, l_i1()))
 
     val up = fresh_reg(e)
 
-    emit(e, InFloatCmp(up, FOge, dbl, fr1, pow2_double(-1)))
+    emit(e, InFloatCmp(up, FOge, fty, fr1, pow2_double(-1)))
 
     val t_next = fx_bin(e, OpAdd, k, t1, fx_small(1))
     val t2 = fx_select(e, up, k, t_next, t1)

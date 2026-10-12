@@ -562,6 +562,65 @@ print(g)
 4
 ```
 
+## Lanes
+
+A fixed-point type is a vector lane like any other scalar (see [Vectors](/reference/vectors/)):
+`<2>q15` is two `q15`s in one register, and `+`, `-`, `*` and unary `-` compute every lane exactly as
+the scalar operator does — saturating, and rounding a product to nearest with a half going up. A
+scalar beside a register fills every lane, a comparison yields a mask, and `min()` and `max()` reduce:
+
+```sysl
+val a: <2>q15 = [0.75, -0.25]
+val b: <2>q15 = 0.5
+
+val s = a + b
+val p = a * b
+
+print(s[0], s[1], p[0], p[1], (a < b)[1], a.max())
+```
+
+```output
+0.99997 0.25 0.375 -0.125 true 0.75
+```
+
+**A product takes its lanes' format from its position**, as a scalar product does — so two `<2>q15`
+registers multiplied where a `<2>i32q30` is wanted are the two exact products, nothing rounded. With a
+`wrapping` accumulator that is a dot product of pairs:
+
+```sysl
+type Acc = new i32q30 wrapping
+
+dot2(x: <2>q15, y: <2>q15, acc: Acc) -> Acc
+    val p: <2>Acc = x * y
+    acc + p[0] + p[1]
+
+val x: <2>q15 = [0.5, 0.25]
+val y: <2>q15 = [0.5, -0.5]
+
+print(dot2(x, y, Acc(0.0)))
+```
+
+```output
+0.125
+```
+
+On a Cortex-M4 a `<2>q15` sum is `QADD16` and each exact product added into the accumulator is a
+16×16 multiply-accumulate (`SMLABB`), with no call.
+
+Three things a scalar has and a register of lanes does not. **`/`** traps on a zero divisor, and a
+register traps as a whole rather than per lane, so it is refused as integer division is. **A shift**
+of a register is not defined. **`sum()`** is refused because a fixed-point `+` saturates, and
+saturation is not associative — `(max + max) + min` is not `max + (max + min)` — so a sum of lanes has
+no answer that does not depend on the order it is added in:
+
+```sysl
+f(v: <2>q15) -> q15 = v.sum()
+```
+
+```error
+'sum' is not defined for <2>q15 — a fixed-point '+' saturates, so the lanes' sum depends on the order they are added in
+```
+
 ---
 
 Next: [strings](/reference/strings/).
