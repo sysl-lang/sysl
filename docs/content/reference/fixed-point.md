@@ -92,6 +92,22 @@ val TABLE: [3]q31 = [0.5, -0.25, q31::Max]
 tone_at(i: i32) -> i32 = (TABLE[i] * X).bits
 ```
 
+**So is a table a `const` function computes.** A conversion of any constant expression is folded, and
+a call to a `const` function over constants is run while compiling wherever it sits — the whole
+initializer, one element, one field — so a table generated rather than written out is laid down the
+same way, rounded and saturated exactly as the run-time conversion would:
+
+```sysl build=c target=thumbv6m-freestanding
+module ramp
+
+const step(i: int) -> real = real(i) / 4.0 - 0.5
+
+val RAMP: [4]q15 = [q15(step(0)), q15(step(1)), q15(step(2)), q15(step(3))]
+
+@export("ramp_at")
+ramp_at(i: i32) -> i32 = i32(RAMP[i].bits)
+```
+
 ## The operators
 
 `+`, `-`, `*`, `/` and unary `-` over two values of **one** format answer the representable value
