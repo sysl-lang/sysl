@@ -1,0 +1,330 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A whole view read at a fixed-point format (user-approved, gap C of the fixed-point audio survey):
+// `q15::Bits(pcm)` over a `[]i16` is a `[]q15` over the same storage, and `samples.bits` over a
+// `[]q15` is the `[]i16` -- the two words the scalar forms already use, extended from one value to a
+// run of them. Nothing is copied; the view keeps its owner as any view does; whether it may be
+// written is the argument's.
+//
+// Every program here is built with the counted heap, so a view that lost or doubled its owner's count
+// says so at exit as well as in what it prints.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fvw_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end fvw_ready
+
+private fvw_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fvw").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end fvw_root
+
+// What a one-file program built with the counted heap prints, and what it says on stderr -- or why
+// it did not build.
+private fvw_ran(text: string) -> (string, string)
+    val root = fvw_root(text)
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, "did not build")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("", "could not be started")
+        Ok(o) -> (o.text, if o.status.ok() then o.err.unwrap_or("") else "exited badly")
+end fvw_ran
+
+// The program prints exactly this, exits cleanly and gives back every allocation.
+private fvw_prints(text: string, expected: string)
+    if !fvw_ready() then return
+
+    val ran = fvw_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, "")
+end fvw_prints
+
+// Refused, with this whole message at this place.
+private fvw_refused(text: string, message: string, at: string)
+    if !fvw_ready() then return
+
+    val root = fvw_root(text)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end fvw_refused
+
+// -- one storage, two readings --------------------------------------------------------------------
+
+@test("'q15::Bits' over a '[]i16' is a '[]q15' over the same storage, written through both ways")
+fvw_bits_views_the_integers()
+    fvw_prints(raw"""
+        var pcm: [4]i16 = [0, 16384, -32768, 32767]
+        val pv: []i16 = pcm[..]
+        val v = q15::Bits(pv)
+
+        print(v[1], v[2], v[3], v.len)
+        v[0] = 0.25
+        print(pcm[0])
+        pv[1] = -8192
+        print(v[1])
+        """, "0.5 -1 0.99997 4\n8192\n-0.25\n")
+
+@test("'.bits' over a view of q15 is the '[]i16' it is stored as, and writes reach the samples")
+fvw_bits_of_a_view()
+    fvw_prints(raw"""
+        var s: [3]q15 = [0.5, -0.25, 0.125]
+        val sv: []q15 = s[..]
+        val raw = sv.bits
+
+        print(raw[0], raw[1], raw[2], raw.len)
+        raw[2] = -32768
+        print(s[2])
+        """, "16384 -8192 4096 3\n-1\n")
+
+@test("an array is read through the view 'a[..]' would take of it, by both forms")
+fvw_an_array_through_its_view()
+    fvw_prints(raw"""
+        var pcm: [2]i16 = [8192, -16384]
+        val v = q15::Bits(pcm)
+
+        v[1] = 0.5
+        print(v[0], pcm[1])
+
+        var s: [2]q15 = [0.25, -1.0]
+        val raw = s.bits
+
+        raw[0] = 16384
+        print(raw[1], s[0])
+        """, "0.25 16384\n-32768 0.5\n")
+
+@test("the round trip is the identity: the bits of the view of the bits are the integers")
+fvw_round_trip()
+    fvw_prints(raw"""
+        var pcm: [3]i16 = [-32768, 1, 32767]
+        val back = q15::Bits(pcm).bits
+
+        print(back[0], back[1], back[2])
+        """, "-32768 1 32767\n")
+
+// -- formats --------------------------------------------------------------------------------------
+
+@test("every format views its own storage: q7, q31, an unsigned format, and F below the top")
+fvw_every_format()
+    fvw_prints(raw"""
+        var b: [3]i8 = [-128, 64, 127]
+        val q7s = q7::Bits(b)
+        print(q7s[0], q7s[1], q7s[2])
+
+        var w: [2]i32 = [-2147483648, 1073741824]
+        val q31s = q31::Bits(w)
+        print(q31s[0], q31s[1])
+
+        var u: [2]u16 = [65535, 384]
+        val us = u16q8::Bits(u)
+        print(us[0], us[1])
+
+        var i: [2]i32 = [-2147483648, 98304]
+        val is = i32q16::Bits(i)
+        print(is[0], is[1])
+
+        var x: [2]u16q8 = [1.5, u16q8::Max]
+        val xb = x.bits
+        print(xb[0], xb[1])
+        """, "-1 0.5 0.99\n-1 0.5\n255.996 1.5\n-32768 1.5\n384 65535\n")
+
+// -- what the argument decides --------------------------------------------------------------------
+
+@test("a read-only view of the integers is a read-only view of the format, and stays one")
+fvw_const_carries_through()
+    fvw_prints(raw"""
+        peak(pcm: []const i16) -> q15
+            var m: q15 = -1.0
+
+            for x in q15::Bits(pcm)
+                if x > m then m = x
+
+            m
+        end peak
+
+        val a: [3]i16 = [-16384, 8192, 4096]
+        print(peak(a[..]), peak(q15::Bits(a).bits))
+        """, "0.25 0.25\n")
+
+    fvw_refused(raw"""
+        val a: [2]i16 = [1, 2]
+        val w: []q15 = q15::Bits(a)
+        """, "a '[]const q15' views elements it may not write, and a '[]q15' is a licence to write " +
+             "them — so the one does not become the other. Copy what you need into a '[]q15' of " +
+             "your own, or take the parameter as '[]const q15' if it is only read", "2:19")
+
+@test("a view of a heap buffer keeps the buffer alive past every name for it")
+fvw_keeps_its_owner()
+    fvw_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        make() -> []q15
+            var b: Buf[i16] = buf()
+
+            b.push(8192)
+            b.push(-16384)
+            q15::Bits(b.view())
+        end make
+
+        val v = make()
+        print(v[0], v[1], v.len)
+        """, "0.25 -0.5 2\n")
+
+// A view of a frame's array that gets out of the frame moves the array to the heap, and the escape
+// analysis has to see through the reading to find the array -- the stack under it is clobbered by a
+// second call before the view is read, so a dangling view prints something else.
+@test("a view of a local array returned through 'Bits' moves the array off the frame")
+fvw_escapes_through_the_view()
+    fvw_prints(raw"""
+        make() -> []q15
+            var a: [2]i16 = [8192, -16384]
+
+            q15::Bits(a)
+        end make
+
+        bits_of() -> []i16
+            var s: [2]q15 = [0.5, -0.25]
+
+            s.bits
+        end bits_of
+
+        clobber() -> int
+            var junk: [64]int = [7; 64]
+
+            for i in 0..<64
+                junk[i] = i * 31
+
+            junk[63]
+        end clobber
+
+        val v = make()
+        val r = bits_of()
+        val c = clobber()
+
+        print(v[0], v[1], r[0], r[1], c)
+        """, "0.25 -0.5 16384 -8192 1953\n")
+
+@test("reading a view at a format allocates nothing, so it is legal under '@no_alloc'")
+fvw_no_alloc()
+    fvw_prints(raw"""
+        @no_alloc
+        gain(pcm: []i16, by: q15)
+            for i in 0..<pcm.len
+                val s = q15::Bits(pcm)
+
+                s[i] = s[i] * by
+
+        var pcm: [2]i16 = [16384, -32768]
+
+        gain(pcm[..], 0.5)
+        print(pcm[0], pcm[1])
+        """, "8192 -16384\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a view of integers of another width is refused, naming the one the format is stored as")
+fvw_wrong_width()
+    fvw_refused(raw"""
+        var a: [2]i32 = [1, 2]
+        print(q15::Bits(a)[0])
+        """, "'q15::Bits' over a view takes a '[]short' — the short a q15 is stored as — not [2]int",
+        "2:17")
+
+@test("a view of the other signedness is refused the same way")
+fvw_wrong_signedness()
+    fvw_refused(raw"""
+        var a: [2]u16 = [1, 2]
+        val v: []u16 = a[..]
+        print(q15::Bits(v)[0])
+        """, "'q15::Bits' over a view takes a '[]short' — the short a q15 is stored as — not []ushort",
+        "3:17")
+
+@test("something that is neither the integer nor a view of them is refused, saying both")
+fvw_not_a_view()
+    fvw_refused("print(q15::Bits(\"ab\"))\n",
+                "'q15::Bits' takes the short a q15 is stored as, or a view of them, not string", "1:17")
+
+    fvw_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: Buf[i16] = buf()
+        print(q15::Bits(b))
+        """, "'q15::Bits' takes the short a q15 is stored as, or a view of them, not " +
+        "sysl.buf.Buf[short]",
+        "4:17")
+
+@test("the bits of a writable view of a checking subtype are refused; a read-only one is read")
+fvw_checked_subtype()
+    fvw_refused(raw"""
+        type Gain = i32q27 within 0.0..8.0
+
+        var g: [1]Gain = [4.0]
+        val raw = g.bits
+        """, "the bits of a '[]Gain' would be writable, and a write through them would skip Gain's " +
+             "check — read them through a '[]const Gain'", "4:13")
+
+    fvw_prints(raw"""
+        type Gain = i32q27 within 0.0..8.0
+
+        val g: [1]Gain = [4.0]
+        print(g.bits[0])
+        """, "536870912\n")
+
+@test("a view read at a format may not cross a domain, any more than the view it was")
+fvw_does_not_cross()
+    if !fvw_ready() then return
+
+    val root = fvw_root(raw"""
+        struct Frame
+            samples: []q15
+
+        var pcm: [2]i16 = [1, 2]
+        val f: &sync Frame = Frame(q15::Bits(pcm))
+        """)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains("which owns its elements through a count that is not atomic"), said)
+end fvw_does_not_cross

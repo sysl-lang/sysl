@@ -410,7 +410,8 @@ end exact_of_double
 // -- type attributes -------------------------------------------------------------------------------
 
 // `T::Min`, `T::Max`, `T::Small` and `T::Bits(n)` -- the two ends, one unit, and a value made from
-// its raw bits. Each of the first three is a raw integer at the type, so it is constant data too.
+// its raw bits (or, over a view of those integers, the view read as `T`). Each of the first three is a
+// raw integer at the type, so it is constant data too.
 fixed_attr(cx: &Analyzer, span: Span, written: string, ty: Type, attr: string,
            args: Buf[Expr]) -> TExpr
     val (bits, signed) = ty match
@@ -426,9 +427,12 @@ fixed_attr(cx: &Analyzer, span: Span, written: string, ty: Type, attr: string,
 
         if xt == Unknown then return x
 
+        // A view of the integers is the same storage read as the format, element by element.
+        if is_view_or_array(xt) then return fixed_view_of_bits(cx, span, written, x, ty, raw_ty)
+
         if disagree(xt, raw_ty) then
             return cx.err(args.at(0).span, s"'$written::Bits' takes the ${type_show(raw_ty)} a " +
-                          s"${type_show(ty)} is stored as, not ${type_show(xt)}")
+                          s"${type_show(ty)} is stored as, or a view of them, not ${type_show(xt)}")
 
         return TExpr(span, TIntOp("fixed_from_bits", x, None, raw_ty, ty))
     end if
@@ -449,6 +453,72 @@ fixed_bits_of(span: Span, value: TExpr, ty: Type) -> TExpr
 
     TExpr(span, TIntOp("fixed_bits", value, None, raw_ty, raw_ty))
 end fixed_bits_of
+
+// -- the bits of a whole view -----------------------------------------------------------------------
+//
+// `T::Bits(v)` and `v.bits` read a run of elements the way the scalar forms read one: a `[]i16` from a
+// codec is a `[]q15` over the same storage, with the same owner and length, and nothing is copied.
+// Writing through either view writes the other's elements. Whether the view may be written is the
+// argument's -- a `[]const i16` gives a `[]const q15` -- and an array is read through the view `a[..]`
+// would take of it, read-only where a `val` holds it.
+
+// The element a view or an array holds, where the type is one.
+private view_elem(t: Type) -> Option[Type] = t match
+    Slice(e, _) -> Some(*e)
+    _ -> array_elem(t)
+
+private is_view_or_array(t: Type) -> bool = view_elem(t).is_some()
+
+// The value as a view: itself, or the whole-array view an array coerces to.
+private as_view(cx: &Analyzer, x: TExpr) -> TExpr = texpr_type(x) match
+    Slice(_, _) -> x
+    other -> array_view(cx, x, view_elem(other).unwrap(), false).unwrap_or(x)
+
+// `T::Bits(v)` over a view of the integer `T` is stored as.
+private fixed_view_of_bits(cx: &Analyzer, span: Span, written: string, x: TExpr, ty: Type,
+                           raw_ty: Type) -> TExpr
+    val v = as_view(cx, x)
+
+    val (elem, read_only) = texpr_type(v) match
+        Slice(e, ro) -> (*e, ro)
+        _ -> (Unknown, false)
+
+    if disagree(elem, raw_ty) then
+        return cx.err(x.span, s"'$written::Bits' over a view takes a '[]${type_show(raw_ty)}' — the " +
+                      s"${type_show(raw_ty)} a ${type_show(ty)} is stored as — not " +
+                      s"${type_show(texpr_type(x))}")
+
+    TExpr(span, TViewAs(v, Slice(ty, read_only)))
+end fixed_view_of_bits
+
+// `v.bits` over a view of a fixed-point type, or `None` where the receiver is not one.
+//
+// **A writable view of a checking subtype is refused**: a write through the integers would put a value
+// into the elements that nothing held to the subtype's range, so only a read-only view is handed out.
+fixed_view_bits(cx: &Analyzer, span: Span, tr: TExpr) -> Option[TExpr]
+    val elem = view_elem(texpr_type(tr))
+
+    if elem.is_none() || !is_fixed(elem.unwrap()) then return None
+
+    val v = as_view(cx, tr)
+
+    val (e, read_only) = texpr_type(v) match
+        Slice(inner, ro) -> (*inner, ro)
+        _ -> return None
+
+    val raw_ty = fixed_storage(e)
+
+    val checked = e match
+        Fixed(_, _, _) -> false
+        _ -> true
+
+    if checked && !read_only then
+        return Some(cx.err(span, s"the bits of a '[]${type_show(e)}' would be writable, and a write " +
+                           s"through them would skip ${type_show(e)}'s check — read them through a " +
+                           s"'[]const ${type_show(e)}'"))
+
+    Some(TExpr(span, TViewAs(v, Slice(raw_ty, read_only))))
+end fixed_view_bits
 
 // -- mixed formats: what `*` and `/` answer ------------------------------------------------------
 
