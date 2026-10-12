@@ -340,6 +340,18 @@ private vector_arith(cx: &Analyzer, span: Span, op: string, a: Type, lane: Type,
 
             if integer_op(op) then result else undefined_for(cx, span, op, a)
         Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        // A fixed-point lane has its scalar's `+`, `-` and `*`, each saturating and rounding exactly
+        // as the scalar does. Its `/` traps on a zero divisor as an integer's does, which a register
+        // cannot do for one lane, so it is refused for the same reason.
+        Fixed(_, _, _) ->
+            if op == "/" then
+                cx.fault(span, s"'/' is not defined on ${type_show(a)} — a fixed-point quotient traps " +
+                         "on a zero divisor per lane and a register traps as a whole, so divide the " +
+                         "lanes one at a time")
+
+                return Unknown
+
+            if op == "+" || op == "-" || op == "*" then result else undefined_for(cx, span, op, a)
         Bool ->
             if op == "&" || op == "|" || op == "^" then return result
 

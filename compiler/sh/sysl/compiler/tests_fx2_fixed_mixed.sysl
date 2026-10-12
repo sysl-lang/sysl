@@ -736,3 +736,182 @@ fx2_biquad_on_m4()
 
     assert_eq(fx2_count(f, "smull") + fx2_count(f, "smlal"), 5, f)
     assert_eq(fx2_foreign_calls(f, "fx2_step"), 0, f)
+
+// -- a register of fixed-point lanes ---------------------------------------------------------------
+
+// `reference/fixed-point.md` calls a fixed-point type a scalar, and `reference/vectors.md` gives every
+// scalar a vector: `<2>q15` is two q15 lanes, each computing exactly what the scalar computes.
+
+@test("a <2>q15 adds, subtracts and multiplies lane by lane, saturating and rounding as a q15 does")
+fvl_lanes_compute_as_scalars()
+    fx2_prints(raw"""
+        val a: <2>q15 = 0.75
+        val b: <2>q15 = [0.5, -0.25]
+        val s = a + b
+        val d = b - a
+        val p = a * b
+        val n = -b
+        val big: <2>q15 = -1.0
+        val neg = -big
+        val sq = big * big
+
+        print(s[0], s[1], d[0], d[1], p[0], p[1], n[0], n[1], neg[0], sq[1])
+        """, "0.99997 0.5 -0.25 -1 0.375 -0.1875 -0.5 0.25 0.99997 0.99997\n")
+
+@test("a lane-wise product rounds to nearest with ties toward +inf, as the scalar product does")
+fvl_lane_product_rounds_like_the_scalar()
+    fx2_prints(raw"""
+        val a: <2>q15 = [q15::Bits(3), q15::Bits(-3)]
+        val b: <2>q15 = 0.5
+        val p = a * b
+
+        print(p[0].bits, p[1].bits, (q15::Bits(3) * q15(0.5)).bits, (q15::Bits(-3) * q15(0.5)).bits)
+        """, "2 -1 2 -1\n")
+
+@test("a scalar beside a fixed-point register fills every lane, and compound assignment works")
+fvl_splat_and_compound()
+    fx2_prints(raw"""
+        val a: <2>q15 = [0.25, -0.5]
+        val c = a + 0.125
+        var acc = a
+
+        acc += a
+        acc -= 0.25
+
+        print(c[0], c[1], acc[0], acc[1])
+        """, "0.375 -0.375 0.25 -1\n")
+
+@test("a fixed-point register compares lane-wise and has min and max")
+fvl_compare_min_max()
+    fx2_prints(raw"""
+        val a: <2>q15 = [0.25, -0.5]
+        val b: <2>q15 = [0.5, -0.75]
+        val m = a < b
+
+        print(m[0], m[1], (a == a).all(), b.min(), b.max(), (a > b).select(a, b)[1])
+        """, "true false true -0.75 0.5 -0.5\n")
+
+@test("a product of fixed-point registers takes its lanes' format from its position")
+fvl_product_format_from_position()
+    fx2_prints(raw"""
+        type Acc = new i32q30 wrapping
+
+        val a: <2>q15 = [q15::Bits(-32768), q15::Bits(3)]
+        val b: <2>q15 = [q15::Bits(-32768), q15::Bits(5)]
+        val wide: <2>i32q30 = a * b
+        val acc: <2>Acc = a * b
+
+        print(wide[0].bits, wide[1].bits, acc[0].bits)
+        """, "1073741824 15 1073741824\n")
+
+@test("a 'wrapping' lane wraps where a saturating one saturates")
+fvl_wrapping_lane_wraps()
+    fx2_prints(raw"""
+        type W = new q15 wrapping
+
+        val a: <2>W = [W(0.75), W(-0.75)]
+        val s = a + a
+
+        print(s[0].bits, s[1].bits)
+        """, "-16384 16384\n")
+
+@test("a <2>q15 sum is the vector saturating intrinsic, a wrapping one the plain vector add")
+fvl_lowered_to_vector_intrinsics()
+    if !fx2_ready() then return
+
+    val s = fx2_function(raw"""
+        @export("fvl_add")
+        add(a: *<2>q15, b: *<2>q15, out: *<2>q15)
+            *out = *a + *b
+        """, "add")
+
+    assert(s.contains("@llvm.sadd.sat.v2i16(<2 x i16>"), s)
+
+    val w = fx2_function(raw"""
+        type W = new q15 wrapping
+
+        @export("fvl_add")
+        add(a: *<2>W, b: *<2>W, out: *<2>W)
+            *out = *a - *b
+        """, "add")
+
+    assert(w.contains("sub <2 x i16>"), w)
+    assert(!w.contains(".sat."), w)
+
+@test("lanes of two formats do not mix, and a product of two with nowhere to go is refused")
+fvl_mixed_formats_refused()
+    if !fx2_ready() then return
+
+    val sum = fx2_lowered(raw"""
+        f(a: <2>q15, b: <2>q31) -> unit
+            val c = a + b
+        """).0
+
+    assert(sum.contains("'+' needs matching types, got <2>q15 and <2>q31"), sum)
+
+    val product = fx2_lowered(raw"""
+        f(a: <2>q15, b: <2>q31) -> unit
+            val c = a * b
+        """).0
+
+    assert(product.contains("the product of q15 and q31 has no format of its own — it is exactly an " +
+                            "i48q46; give it a type"), product)
+
+@test("a fixed-point register has no '/', no shift and no sum, each said so")
+fvl_what_a_lane_lacks()
+    if !fx2_ready() then return
+
+    val quotient = fx2_lowered("f(a: <2>q15) -> unit\n    val c = a / a\n").0
+
+    assert(quotient.contains("'/' is not defined on <2>q15 — a fixed-point quotient traps on a zero " +
+                             "divisor per lane"), quotient)
+
+    val shift = fx2_lowered("f(a: <2>q15) -> unit\n    val c = a << a\n").0
+
+    assert(shift.contains("operator '<<' is not defined for <2>q15"), shift)
+
+    val sum = fx2_lowered("f(a: <2>q15) -> unit\n    val c = a.sum()\n").0
+
+    assert(sum.contains("'sum' is not defined for <2>q15 — a fixed-point '+' saturates"), sum)
+
+@test("a lane that is not a scalar is still refused, and the message lists fixed point among lanes")
+fvl_a_lane_is_still_a_scalar()
+    if !fx2_ready() then return
+
+    val said = fx2_lowered("f() -> unit\n    var v: <2>[2]q15\n").0
+
+    assert(said.contains("a vector's lanes are scalars, and [2]q15 is not one — an integer, a " +
+                         "fixed-point type, a float, 'bool' or 'char' may be a lane"), said)
+
+@test("on a Cortex-M4 a <2>q15 sum is QADD16 and a lane-wise MAC is two 16x16 multiply-adds, no call")
+fvl_lanes_on_m4()
+    val code = fx2_board_code(raw"""
+        @export("fvl_vadd")
+        vadd(a: *<2>q15, b: *<2>q15, out: *<2>q15)
+            *out = *a + *b
+
+        @export("main")
+        boot() -> i32 = 0
+        """, "thumbv7em-freestanding", "fvl_vadd")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+
+    assert(fx2_count(f, "qadd16") >= 1, f)
+    assert_eq(fx2_foreign_calls(f, "fvl_vadd"), 0, f)
+
+    val mac = fx2_board_code(raw"""
+        type Acc = new i32q30 wrapping
+
+        @export("fvl_mac")
+        mac(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc
+            val p: <2>Acc = *x * *y
+            acc + p[0] + p[1]
+
+        @export("main")
+        boot() -> i32 = 0
+        """, "thumbv7em-freestanding", "fvl_mac").unwrap()
+
+    assert_eq(fx2_count(mac, "smlabb") + fx2_count(mac, "smlatt") + 2 * fx2_count(mac, "smlad"), 2, mac)
+    assert_eq(fx2_foreign_calls(mac, "fvl_mac"), 0, mac)

@@ -90,6 +90,7 @@ same vector, or one side a scalar that broadcasts:
 |---|---|
 | an integer | `+` `-` `*` `&` <code>&#124;</code> `^` `<<` `>>`, and unary `-` `~` |
 | a float | `+` `-` `*` `/`, and unary `-` |
+| a fixed-point type | `+` `-` `*`, and unary `-` — saturating and rounding as the scalar does |
 | `bool` (a mask) | `&` <code>&#124;</code> `^` |
 
 **Integer `/` and `%` are refused**, and it is worth knowing why rather than reading it as an
@@ -451,7 +452,9 @@ how a vector reaches a C function differs by target
 
 ## Lanes
 
-A lane is a scalar: an integer, a float, `bool` or `char`. An aggregate cannot be one — there is no
+A lane is a scalar: an integer, a fixed-point type, a float, `bool` or `char`. A fixed-point lane
+computes as its scalar does, a `<2>q15` sum being `QADD16` on a Cortex-M4; [Fixed-point
+numbers](/reference/fixed-point/) has what it does and does not have. An aggregate cannot be one — there is no
 such thing as a vector of structs — and neither can a `volatile` type, since per-lane access ordering
 is not something a single load can give. `volatile <4>u32` is the spelling that means something, and
 it qualifies the whole register.
