@@ -363,24 +363,53 @@ print(s[0], s[1], p[0], p[1], (a < b)[1], a.max())
 ```
 
 **A product takes its lanes' format from its position**, as a scalar product does — so two `<2>q15`
-registers multiplied where a `<2>i32q30` is wanted are the two exact products, nothing rounded. With a
-`wrapping` accumulator that is a dot product of pairs:
+registers multiplied where a `<2>i32q30` is wanted are the two exact products, nothing rounded.
+
+**A `wrapping` lane has `sum()`**, because wrapping addition is associative: the lanes' sum has one
+answer whatever order it is added in. And `sum()` hands its position's type to the product it is read
+off, so `(x * y).sum()` written where an `Acc` is wanted multiplies at `<2>Acc` — the two exact
+products, added. With a `wrapping` accumulator that is a dot product of pairs:
 
 ```sysl
 type Acc = new i32q30 wrapping
 
-dot2(x: <2>q15, y: <2>q15, acc: Acc) -> Acc
-    val p: <2>Acc = x * y
-    acc + p[0] + p[1]
+dot(xs: [4]q15, ys: [4]q15) -> Acc
+    var acc = Acc(0.0)
 
-val x: <2>q15 = [0.5, 0.25]
-val y: <2>q15 = [0.5, -0.5]
+    for i in 0..<2
+        val x: <2>q15 = [xs[2 * i], xs[2 * i + 1]]
+        val y: <2>q15 = [ys[2 * i], ys[2 * i + 1]]
 
-print(dot2(x, y, Acc(0.0)))
+        acc += (x * y).sum()
+
+    acc
+end dot
+
+val xs: [4]q15 = [0.5, 0.25, -1.0, 0.75]
+val ys: [4]q15 = [0.5, -0.5, -1.0, 0.5]
+
+print(dot(xs, ys), real(Acc(1.5) + Acc(1.0)))
 ```
 
 ```output
-0.125
+1.5 -1.5
+```
+
+The accumulator wraps rather than saturating, as `wrapping` says: `Acc(1.5) + Acc(1.0)` is 2.5, past
+an `i32q30`'s largest value, and comes back as -1.5. So does a single pair — `-1 × -1` twice is 2,
+which an `i32q30` holds as -2:
+
+```sysl
+type Acc = new i32q30 wrapping
+
+val m: <2>q15 = [-1.0, -1.0]
+val s: Acc = (m * m).sum()
+
+print(s)
+```
+
+```output
+-2
 ```
 
 **On a core with Arm's DSP extension a register that fills one 32-bit word is one packed
@@ -394,33 +423,45 @@ manifest's `codegen { extensions = ["dsp"] }` says the core has it. There:
 | `<4>q7` `+` / `-` / unary `-` | `QADD8` / `QSUB8` |
 | `<2>u16q16`, `<4>u8q8` `+` / `-` | `UQADD16` / `UQSUB16`, `UQADD8` / `UQSUB8` |
 | a `wrapping` lane's `+` / `-` | `SADD16` / `SSUB16`, `SADD8` / `SSUB8` |
-| a lane-wise product, exact into a `wrapping` accumulator | one `SMLABB` per lane |
+| `(x * y).sum()` of two `<2>q15` at a `wrapping` `i32q30` | `SMUAD` |
+| `acc + (x * y).sum()`, `acc += (x * y).sum()` | `SMLAD` |
+| `acc + p[0] + p[1]` over `val p: <2>Acc = x * y` | one `SMLABB` per lane |
 | a register of more than one word (`<4>q15`) | the generic form, a halfword at a time |
 
 and the operands are loaded and stored a word at a time — `LDR`, `LDR`, `QADD16`, `STR` for a sum
-through three pointers:
+through three pointers, and `LDR`, `LDR`, `SMLAD` for a step of a dot product:
 
 ```sysl build=c target=thumbv7em-freestanding
+type Acc = new i32q30 wrapping
+
 @export("mix")
 mix(a: *<2>q15, b: *<2>q15, out: *<2>q15)
     *out = *a + *b
+
+@export("mac")
+mac(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc = acc + (*x * *y).sum()
 ```
+
+The dual multiply-add is chosen where it is the same arithmetic: two signed 16-bit lanes whose product
+is exact at a `wrapping` 32-bit signed format — the product's fraction being the two lanes' fractions
+added, as `q15 × q15` at `i32q30` is. A product into any other format rescales or rounds each lane
+first, and keeps the generic form.
 
 Each instruction does to each lane exactly what the generic form does, so a program's answers are the
 same bits on every machine; only the instructions differ.
 
 Three things a scalar has and a register of lanes does not. **`/`** traps on a zero divisor, and a
 register traps as a whole rather than per lane, so it is refused as integer division is. **A shift**
-of a register is not defined. **`sum()`** is refused because a fixed-point `+` saturates, and
-saturation is not associative — `(max + max) + min` is not `max + (max + min)` — so a sum of lanes has
-no answer that does not depend on the order it is added in:
+of a register is not defined. **`sum()` of saturating lanes** is refused because a fixed-point `+`
+saturates, and saturation is not associative — `(max + max) + min` is not `max + (max + min)` — so a
+sum of lanes has no answer that does not depend on the order it is added in:
 
 ```sysl
 f(v: <2>q15) -> q15 = v.sum()
 ```
 
 ```error
-'sum' is not defined for <2>q15 — a fixed-point '+' saturates, so the lanes' sum depends on the order they are added in
+'sum' is not defined for <2>q15 — a fixed-point '+' saturates, so the lanes' sum depends on the order they are added in; add 'v[0] + v[1]' in the order you mean, or hold the lanes in a 'wrapping' type, whose sum has one
 ```
 
 ---

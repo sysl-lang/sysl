@@ -394,7 +394,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TLane(receiver, lane, _) -> gen_lane(e, receiver, lane)
     TVecCompare(op, l, r, _) -> gen_vec_compare(e, op, l, r)
     TSelect(mask, when_true, when_false, ty) -> gen_select(e, mask, when_true, when_false, ty)
-    TReduce(op, receiver, ty) -> gen_reduce(e, op, receiver, ty)
+    TReduce(op, receiver, ty) -> fixed_dot_pair(e, x) match
+        Some((a, b)) -> fixed_dot(e, a, b, None, None)
+        None -> gen_reduce(e, op, receiver, ty)
     TVecLoad(receiver, index, vec_ty) -> gen_vec_load(e, receiver, index, vec_ty, x.span)
     TVecStore(receiver, index, value) -> gen_vec_store(e, receiver, index, value, x.span)
 
@@ -594,6 +596,17 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
         Ptr(_) ->
             if op == "-" then return gen_ptr_diff(e, l, r, lt)
         _ -> ()
+
+    // `acc + (x * y).sum()`, either way round, is one dual multiply-accumulate on a DSP core.
+    if op == "+" && is_fixed(ty)
+        fixed_dot_pair(e, r) match
+            Some((a, b)) -> return fixed_dot(e, a, b, Some(gen_expr(e, l)), None)
+            None -> ()
+
+        fixed_dot_pair(e, l) match
+            Some((a, b)) -> return fixed_dot(e, a, b, None, Some(r))
+            None -> ()
+    end if
 
     val bt = lt
     val lv = gen_expr(e, l)
@@ -855,8 +868,11 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
                    dispatch: Option[TDispatch], check: Option[Type]) -> Val
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
-    val v = gen_expr(e, value)
-    val updated = combine(e, op, ty, texpr_type(value), dispatch, cur, v)
+    val dot = fixed_dot_update(e, op, cur, value)
+    var updated: Val = VPoison
+
+    if dot.is_some() then updated = dot.unwrap()
+    else updated = combine(e, op, ty, texpr_type(value), dispatch, cur, gen_expr(e, value))
 
     check match
         Some(c) -> emit_constraint_checks(e, updated, c)

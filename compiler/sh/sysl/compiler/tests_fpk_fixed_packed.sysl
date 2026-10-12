@@ -40,6 +40,20 @@ private fpk_ops() -> string = raw"""
     mid2(a: *<2>i16q8, b: *<2>i16q8) -> <2>i16q8 = *a + *b
     wide4(a: *<4>q15, b: *<4>q15) -> <4>q15 = *a + *b
 
+    type Acc = new i32q30 wrapping
+
+    dot1(x: *<2>q15, y: *<2>q15) -> Acc = (*x * *y).sum()
+    mac1(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc = acc + (*x * *y).sum()
+    mac2(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc = (*x * *y).sum() + acc
+
+    mac3(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc
+        var s = acc
+        s += (*x * *y).sum()
+        s
+    end mac3
+
+    pa(v: Acc) = put(int(v.bits))
+
     acc2(a: *<2>q15, b: *<2>q15) -> <2>q15
         var s = *a
         s += *b
@@ -127,6 +141,17 @@ private fpk_calls() -> string = raw"""
     pw4(wsub4(&ba, &bb))
     pm2(mid2(&ma, &mb))
     p4w(wide4(&qa, &qb))
+
+    var mm: <2>q15 = [-1.0, -1.0]
+    var qx: <2>q15 = [q15::Max, q15::Max]
+
+    pa(dot1(&mm, &mm))
+    pa(dot1(&a, &b))
+    pa(mac1(&a, &b, Acc(1.5)))
+    pa(mac2(&m, &b, Acc(0.25)))
+    pa(mac3(&mm, &mm, Acc(-2.0)))
+    pa(dot1(&qx, &qx))
+    pa(dot1(&qx, &mm))
     """
 
 // Every raw value the calls above print, worked out by hand: saturation at both ends of each signed
@@ -150,7 +175,14 @@ private fpk_expected() -> []const string =
      "-96", "96", "96", "-96",            // a wrapping q7 sum
      "32", "-32", "32", "96",             // a wrapping q7 difference
      "32767", "-320",                     // i16q8: 150 saturates, -1.5 + 0.25
-     "32767", "-32768", "24576", "0"]     // <4>q15, two words
+     "32767", "-32768", "24576", "0",     // <4>q15, two words
+     "-2147483648",                       // (-1)(-1) + (-1)(-1) = 2, which i32q30 wraps to -2
+     "805306368",                         // 0.375 + 0.375 = 0.75
+     "-1879048192",                       // 1.5 + 0.75 = 2.25 wraps to -1.75
+     "-536870912",                        // (-1)(0.5) + (0.5)(-0.5) + 0.25 = -0.5, the sum on the left
+     "0",                                 // -2 += 2 wraps through -4 to 0
+     "2147352578",                        // the largest pair: 2 * 32767^2, short of wrapping
+     "-2147418112"]                       // 2 * 32767 * -32768
 
 // -- the harness ------------------------------------------------------------------------------------
 
@@ -222,6 +254,11 @@ fpk_every_form_ir() -> string = fpk_ir(raw"""
         *d = *d + *d - *d
         *w = *w + *w - *w
         *x = *x + *x - *x
+
+    type Acc = new i32q30 wrapping
+
+    @export("fpk_dot")
+    dot(a: *<2>q15, b: *<2>q15, acc: Acc) -> Acc = acc + (*a * *b).sum() - (*b * *a).sum()
     """, Some("thumbv7em-freestanding"))
 
 // -- the instruction is chosen for the core, and only there -----------------------------------------
@@ -431,3 +468,112 @@ fpk_boards_agree_with_the_host()
     assert(ran > packed, "no board without the DSP extension was booted")
     assert(bad.is_empty(), join(bad.view(), "\n"))
 end fpk_boards_agree_with_the_host
+
+// -- the dot product: sum() of wrapping lanes, and SMLAD --------------------------------------------
+
+private fpk_acc() -> string = "type Acc = new i32q30 wrapping\n\n"
+
+@test("a wrapping lane has sum(), the integer reduction; a saturating one is still refused, saying why")
+fpk_sum_of_wrapping_lanes()
+    if !fpk_ready() then return
+
+    val ok = fpk_function(fpk_ir(fpk_acc() + "@export(\"fpk_s\")\ns(p: *<2>Acc) -> Acc = (*p).sum()\n", None), "s")
+
+    assert(ok.contains("@llvm.vector.reduce.add.v2i32("), ok)
+
+    val refused = fpk_ir("f(v: <2>q15) -> unit\n    val c = v.sum()\n", None)
+
+    assert(refused.contains("error: 'sum' is not defined for <2>q15 — a fixed-point '+' saturates, so the " +
+                            "lanes' sum depends on the order they are added in; add 'v[0] + v[1]' in the " +
+                            "order you mean, or hold the lanes in a 'wrapping' type, whose sum has one\n"),
+           refused)
+
+@test("a product's sum() with nowhere to take a wrapping format from is still refused")
+fpk_sum_needs_a_position()
+    if !fpk_ready() then return
+
+    val bare = fpk_ir("f(x: <2>q15, y: <2>q15) -> unit\n    val c = (x * y).sum()\n", None)
+
+    assert(bare.contains("error: 'sum' is not defined for <2>q15 — a fixed-point '+' saturates"), bare)
+
+    // A saturating format at the position is no help: its lanes' sum has no single answer either.
+    val saturating = fpk_ir("f(x: <2>q15, y: <2>q15) -> unit\n    val c: i32q30 = (x * y).sum()\n", None)
+
+    assert(saturating.contains("error: 'sum' is not defined for <2>"), saturating)
+
+@test("on the host (x * y).sum() is the exact products at the position's lanes and the add reduction")
+fpk_dot_host_ir()
+    if !fpk_ready() then return
+
+    val f = fpk_function(fpk_ir(fpk_acc() +
+                                "@export(\"fpk_m\")\nm(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc = acc + (*x * *y).sum()\n",
+                                None), "m")
+
+    assert(f.contains("@llvm.vector.reduce.add.v2i32("), f)
+    assert(!f.contains("llvm.arm."), f)
+
+@test("on a Cortex-M4 (x * y).sum() is SMUAD, and added to an accumulator SMLAD, every way it is written")
+fpk_dot_m4_ir()
+    if !fpk_ready() then return
+
+    val m4 = Some("thumbv7em-freestanding")
+    val sig = "(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc"
+    val alone = fpk_function(fpk_ir(fpk_acc() + s"@export(\"fpk_m\")\nm$sig = (*x * *y).sum()\n", m4), "m")
+
+    assert(alone.contains("call i32 @llvm.arm.smuad(i32 "), alone)
+    assert(!alone.contains("llvm.vector.reduce"), alone)
+
+    val left = fpk_function(fpk_ir(fpk_acc() + s"@export(\"fpk_m\")\nm$sig = acc + (*x * *y).sum()\n", m4), "m")
+
+    assert(left.contains("call i32 @llvm.arm.smlad(i32 "), left)
+
+    val right = fpk_function(fpk_ir(fpk_acc() + s"@export(\"fpk_m\")\nm$sig = (*x * *y).sum() + acc\n", m4), "m")
+
+    assert(right.contains("call i32 @llvm.arm.smlad(i32 "), right)
+
+    val compound = fpk_function(fpk_ir(fpk_acc() + s"@export(\"fpk_m\")\nm(x: *<2>q15, y: *<2>q15, " +
+                                       "acc: *Acc)\n    *acc += (*x * *y).sum()\n", m4), "m")
+
+    assert(compound.contains("call i32 @llvm.arm.smlad(i32 "), compound)
+
+@test("on a Cortex-M4 a product the dual multiply-add would compute differently keeps the generic form")
+fpk_dot_m4_not_every_format()
+    if !fpk_ready() then return
+
+    val m4 = Some("thumbv7em-freestanding")
+
+    // At i32q31 each lane's product is shifted and rounded first, which SMUAD does not do.
+    val shifted = fpk_function(fpk_ir("type Acc = new i32q31 wrapping\n\n@export(\"fpk_m\")\n" +
+                                      "m(x: *<2>q15, y: *<2>q15) -> Acc = (*x * *y).sum()\n", m4), "m")
+
+    assert(!shifted.contains("llvm.arm.sm"), shifted)
+    assert(shifted.contains("@llvm.vector.reduce.add.v2i32("), shifted)
+
+    // A sum of lanes that are not a product is the reduction.
+    val lanes = fpk_function(fpk_ir(fpk_acc() + "@export(\"fpk_m\")\nm(p: *<2>Acc) -> Acc = (*p).sum()\n", m4),
+                             "m")
+
+    assert(!lanes.contains("llvm.arm.sm"), lanes)
+
+@test("on a Cortex-M4 a step of a dot product is LDR, LDR, SMLAD -- and SMUAD with no accumulator")
+fpk_dot_m4_board()
+    val mac = fpk_board(fpk_acc() + raw"""
+        @export("fpk_mac")
+        mac(x: *<2>q15, y: *<2>q15, acc: Acc) -> Acc = acc + (*x * *y).sum()
+        """, "fpk_mac")
+
+    if mac.is_none() then return
+
+    val f = mac.unwrap()
+
+    assert_eq(fx2_count(f, "\tsmlad\t"), 1, f)
+    assert_eq(fx2_count(f, "\tsmlabb") + fx2_count(f, "\tldrsh"), 0, f)
+    assert_eq(fx2_foreign_calls(f, "fpk_mac"), 0, f)
+
+    val dot = fpk_board(fpk_acc() + raw"""
+        @export("fpk_dot")
+        dot(x: *<2>q15, y: *<2>q15) -> Acc = (*x * *y).sum()
+        """, "fpk_dot").unwrap()
+
+    assert_eq(fx2_count(dot, "\tsmuad\t"), 1, dot)
+    assert_eq(fx2_count(dot, "\tldrsh"), 0, dot)

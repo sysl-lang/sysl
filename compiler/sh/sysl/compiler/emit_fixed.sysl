@@ -197,25 +197,106 @@ end fx_packed_name
 // `name` over the word a register of lanes fills: both operands read as one `i32`, and the answer read
 // back as lanes.
 private fx_packed(e: *Emit, name: string, vt: LType, a: Val, b: Val) -> Val
+    val word = l_i32()
+    val r = fx_word_call(e, name, [fx_bitcast(e, vt, a, word), fx_bitcast(e, vt, b, word)])
+
+    fx_bitcast(e, word, r, vt)
+end fx_packed
+
+// One Arm DSP intrinsic over words: every operand and the answer an `i32`.
+private fx_word_call(e: *Emit, name: string, operands: []const Val) -> Val
     val fn = llvm_arm_dsp_entry(name).unwrap().base
     val word = l_i32()
 
     var params: Buf[IrParam] = buf()
-
-    params.push(ir_param(word))
-    params.push(ir_param(word))
-    request_intrinsic(e, ir_sig(fn, ir_fn_type(word, params)))
-
     var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(word, fx_bitcast(e, vt, a, word)))
-    args.push(ir_arg(word, fx_bitcast(e, vt, b, word)))
+    for i in 0..<operands.len
+        params.push(ir_param(word))
+        args.push(ir_arg(word, operands[i]))
+
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(word, params)))
 
     val r = fresh_reg(e)
 
     emit(e, ir_call(Some(r), word, VGlobal(fn), args))
-    fx_bitcast(e, word, r, vt)
-end fx_packed
+    r
+end fx_word_call
+
+// -- the dual multiply-accumulate -----------------------------------------------------------------
+
+// The two registers of `(x * y).sum()` where the core can compute it as one dual multiply-add, or
+// nothing.
+//
+// **`SMUAD` is `x0*y0 + x1*y1` over the signed halves of two words, the sum wrapping at 32 bits**, and
+// `SMLAD` the same added to a third word. That is exactly what the generic form computes where the
+// product's lanes are a `wrapping` 32-bit signed format whose fraction is the two lanes' fractions
+// added -- each lane's product is then the exact integer product, which a 16×16 product always fits,
+// and the reduction is the wrapping `add` -- so on those formats, and only those, the answer is the
+// same bits. A product into any other format rescales or rounds per lane and keeps the generic form.
+fixed_dot_pair(e: *Emit, t: TExpr) -> Option[(TExpr, TExpr)]
+    if !arm_dsp(e.target) then return None
+
+    *t.kind match
+        TReduce(op, recv, ty) ->
+            if op != "add" then return None
+
+            *recv.kind match
+                TBinary(bop, x, y, vty) ->
+                    if bop != "*" then return None
+
+                    val fx = dot_half(texpr_type(x))
+                    val fy = dot_half(texpr_type(y))
+
+                    if fx < 0 || fy < 0 then return None
+
+                    // The lane as written, `wrapping` and all -- `vector_lane_of` would strip it.
+                    val lane = fx_lane(vty)
+
+                    if !fixed_wraps(lane) || !type_eq(repr(lane), repr(ty)) then return None
+
+                    val (w, f, s) = fixed_format(lane).unwrap_or((0, 0, false))
+
+                    if w == 32 && s && f == fx + fy then Some((x, y)) else None
+                _ -> None
+        _ -> None
+end fixed_dot_pair
+
+// `acc += (x * y).sum()`, with `acc` already read as `cur`: one `SMLAD` where the core has it.
+fixed_dot_update(e: *Emit, op: string, cur: Val, value: TExpr) -> Option[Val]
+    if op != "+=" then return None
+
+    fixed_dot_pair(e, value) match
+        Some((a, b)) -> Some(fixed_dot(e, a, b, Some(cur), None))
+        None -> None
+end fixed_dot_update
+
+// The fraction of a `<2>` register of signed 16-bit fixed-point lanes, or -1 where it is not one.
+private dot_half(t: Type) -> int
+    underlying(t) match
+        Vector(n, lane) ->
+            if n != 2 then return -1
+
+            val (w, f, s) = fixed_format(*lane).unwrap_or((0, 0, false))
+
+            if w == 16 && s then f else -1
+        _ -> -1
+end dot_half
+
+// `(x * y).sum()` as one `SMUAD`, or -- where `acc` is the other operand of a `+` -- one `SMLAD`.
+// Everything is evaluated in the order it was written: the accumulator first where it was read
+// before the sum (`before`), after it otherwise (`after`).
+fixed_dot(e: *Emit, x: TExpr, y: TExpr, before: Option[Val], after: Option[TExpr]) -> Val
+    val word = l_i32()
+    val vt = lty(e, texpr_type(x))
+    val a = fx_bitcast(e, vt, gen_expr(e, x), word)
+    val b = fx_bitcast(e, vt, gen_expr(e, y), word)
+
+    if before.is_some() then return fx_word_call(e, "smlad", [a, b, before.unwrap()])
+    if after.is_some() then return fx_word_call(e, "smlad", [a, b, gen_expr(e, after.unwrap())])
+
+    fx_word_call(e, "smuad", [a, b])
+end fixed_dot
 
 private fx_bitcast(e: *Emit, from: LType, v: Val, to: LType) -> Val
     val r = fresh_reg(e)
