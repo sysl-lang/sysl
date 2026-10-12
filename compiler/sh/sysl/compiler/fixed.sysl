@@ -664,6 +664,24 @@ private lane_of_width(expected: Option[Type], n: int) -> Option[Type]
         _ -> None
 end lane_of_width
 
+// The receiver of `.sum()` read again at the position's type, lane for lane -- so `(x * y).sum()`
+// written where an `Acc` is wanted is the sum of the products at `<2>Acc`, each exact where `Acc` holds
+// it, as `val p: <2>Acc = x * y; p.sum()` is. Only a product or a quotient is read again, those being
+// the operations whose format comes from where they are written, and only a re-reading that succeeds
+// replaces the first.
+sum_receiver(cx: &Analyzer, receiver: Expr, tr: TExpr, member: string, args: Buf[Expr],
+             expected: Option[Type]) -> TExpr
+    if member != "sum" || !args.is_empty() || expected.is_none() || !rescaled(receiver) then return tr
+
+    val want = expected.unwrap()
+
+    if !is_fixed(want) then return tr
+
+    repr(texpr_type(tr)) match
+        Vector(n, lane) -> if is_fixed(*lane) then reread(cx, tr, receiver, Vector(n, want)) else tr
+        _ -> tr
+end sum_receiver
+
 // A product or a quotient beside a fixed-point operand of another format, read again at that
 // operand's type -- which is what makes `acc + b0 * x` and `b0 * x + acc` the same sum. Only a
 // re-reading that succeeds replaces the first one, so nothing here can turn a sound expression

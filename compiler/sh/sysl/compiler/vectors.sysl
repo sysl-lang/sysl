@@ -165,16 +165,18 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     // A fixed-point lane orders as the integer it is held as, so its `min` and `max` are the
     // integer's. **Its `sum` is refused**: a fixed-point `+` saturates, and saturation is not
     // associative -- `(max + max) + min` and `max + (max + min)` differ -- so a sum of lanes has no
-    // answer that does not depend on an order the reduction is free to choose.
-    if is_fixed(lane) && name == "sum" then
+    // answer that does not depend on an order the reduction is free to choose. **A `wrapping` lane's
+    // `+` wraps, and wrapping addition is associative**, so its sum has one answer and is the integer
+    // reduction -- which is what lets `acc += (x * y).sum()` be a dot product.
+    if is_fixed(lane) && name == "sum" && !fixed_wraps(elem) then
         return cx.err(span, s"'sum' is not defined for ${type_show(v)} — a fixed-point '+' saturates, " +
                       "so the lanes' sum depends on the order they are added in; add 'v[0] + v[1]' " +
-                      "in the order you mean")
+                      "in the order you mean, or hold the lanes in a 'wrapping' type, whose sum has one")
 
     val op = lane match
         Floating(_, _) -> if name == "sum" then "fadd" else s"f$name"
         Integer(_, signed, _) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
-        Fixed(_, _, signed) -> s"${signed_tag(signed)}$name"
+        Fixed(_, _, signed) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
         _ -> ""
 
     if op == "" then return cx.err(span, s"'$name' is not defined for ${type_show(v)}")
