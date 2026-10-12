@@ -383,8 +383,31 @@ print(dot2(x, y, Acc(0.0)))
 0.125
 ```
 
-On a Cortex-M4 a `<2>q15` sum is `QADD16` and each exact product added into the accumulator is a
-16×16 multiply-accumulate (`SMLABB`), with no call.
+**On a core with Arm's DSP extension a register that fills one 32-bit word is one packed
+instruction.** Every v7E-M core has the extension (Cortex-M4, M7, the `thumbv7em-freestanding`
+target); on v8-M Mainline (Cortex-M33, the `thumb-freestanding` targets) it is optional, and a
+manifest's `codegen { extensions = ["dsp"] }` says the core has it. There:
+
+| written | on a Cortex-M4 |
+|---|---|
+| `<2>q15`, `<2>i16q8` `+` / `-` / unary `-` | `QADD16` / `QSUB16` |
+| `<4>q7` `+` / `-` / unary `-` | `QADD8` / `QSUB8` |
+| `<2>u16q16`, `<4>u8q8` `+` / `-` | `UQADD16` / `UQSUB16`, `UQADD8` / `UQSUB8` |
+| a `wrapping` lane's `+` / `-` | `SADD16` / `SSUB16`, `SADD8` / `SSUB8` |
+| a lane-wise product, exact into a `wrapping` accumulator | one `SMLABB` per lane |
+| a register of more than one word (`<4>q15`) | the generic form, a halfword at a time |
+
+and the operands are loaded and stored a word at a time — `LDR`, `LDR`, `QADD16`, `STR` for a sum
+through three pointers:
+
+```sysl build=c target=thumbv7em-freestanding
+@export("mix")
+mix(a: *<2>q15, b: *<2>q15, out: *<2>q15)
+    *out = *a + *b
+```
+
+Each instruction does to each lane exactly what the generic form does, so a program's answers are the
+same bits on every machine; only the instructions differ.
 
 Three things a scalar has and a register of lanes does not. **`/`** traps on a zero divisor, and a
 register traps as a whole rather than per lane, so it is refused as integer division is. **A shift**

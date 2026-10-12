@@ -1,0 +1,433 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A register of fixed-point lanes that fills one 32-bit word -- `<2>q15`, `<4>q7`, and their unsigned
+// and `wrapping` relatives -- adds and subtracts as ONE packed instruction on an Arm core with the DSP
+// extension (`QADD16`, `QSUB8`, `UQADD16`, `SADD16`, ...), loaded and stored as one word. LLVM has no
+// legal vector of halves on an M-profile core, so the generic `llvm.sadd.sat.v2i16` it is handed
+// everywhere else is taken apart into a load, a `QADD16` and a store per lane.
+//
+// **The claim worth most here is that the answers do not change**: the same program is run on the host
+// (the generic intrinsic) and booted on every Arm board QEMU has (packed on the two v7E-M ones, generic
+// on the others), and every board must print exactly what the host printed.
+
+// -- the program both sides run ---------------------------------------------------------------------
+
+// The arithmetic, behind pointers so each operation is a function of its own on the board.
+private fpk_ops() -> string = raw"""
+    type W = new q15 wrapping
+    type B = new q7 wrapping
+
+    add2(a: *<2>q15, b: *<2>q15) -> <2>q15 = *a + *b
+    sub2(a: *<2>q15, b: *<2>q15) -> <2>q15 = *a - *b
+    neg2(a: *<2>q15) -> <2>q15 = -*a
+    add4(a: *<4>q7, b: *<4>q7) -> <4>q7 = *a + *b
+    sub4(a: *<4>q7, b: *<4>q7) -> <4>q7 = *a - *b
+    neg4(a: *<4>q7) -> <4>q7 = -*a
+    uadd2(a: *<2>u16q16, b: *<2>u16q16) -> <2>u16q16 = *a + *b
+    usub2(a: *<2>u16q16, b: *<2>u16q16) -> <2>u16q16 = *a - *b
+    uadd4(a: *<4>u8q8, b: *<4>u8q8) -> <4>u8q8 = *a + *b
+    usub4(a: *<4>u8q8, b: *<4>u8q8) -> <4>u8q8 = *a - *b
+    wadd2(a: *<2>W, b: *<2>W) -> <2>W = *a + *b
+    wsub2(a: *<2>W, b: *<2>W) -> <2>W = *a - *b
+    wadd4(a: *<4>B, b: *<4>B) -> <4>B = *a + *b
+    wsub4(a: *<4>B, b: *<4>B) -> <4>B = *a - *b
+    mid2(a: *<2>i16q8, b: *<2>i16q8) -> <2>i16q8 = *a + *b
+    wide4(a: *<4>q15, b: *<4>q15) -> <4>q15 = *a + *b
+
+    acc2(a: *<2>q15, b: *<2>q15) -> <2>q15
+        var s = *a
+        s += *b
+        s
+    end acc2
+
+    p2(v: <2>q15)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+
+    p4(v: <4>q7)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+        put(int(v[2].bits))
+        put(int(v[3].bits))
+
+    pu2(v: <2>u16q16)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+
+    pu4(v: <4>u8q8)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+        put(int(v[2].bits))
+        put(int(v[3].bits))
+
+    pw2(v: <2>W)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+
+    pw4(v: <4>B)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+        put(int(v[2].bits))
+        put(int(v[3].bits))
+
+    pm2(v: <2>i16q8)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+
+    p4w(v: <4>q15)
+        put(int(v[0].bits))
+        put(int(v[1].bits))
+        put(int(v[2].bits))
+        put(int(v[3].bits))
+
+    """
+
+// The calls, as an entry file's statements.
+private fpk_calls() -> string = raw"""
+    var a: <2>q15 = [0.75, -0.75]
+    var b: <2>q15 = [0.5, -0.5]
+    var m: <2>q15 = [-1.0, 0.5]
+    var a4: <4>q7 = [0.75, -0.75, 0.5, -1.0]
+    var b4: <4>q7 = [0.5, -0.5, 0.25, 0.25]
+    var ua: <2>u16q16 = [0.75, 0.25]
+    var ub: <2>u16q16 = [0.5, 0.5]
+    var ua4: <4>u8q8 = [0.75, 0.25, 0.5, 0.0]
+    var ub4: <4>u8q8 = [0.5, 0.5, 0.5, 0.25]
+    var wa: <2>W = [W(0.75), W(-0.75)]
+    var wb: <2>W = [W(0.5), W(-0.5)]
+    var wn: <2>W = [W(-0.5), W(0.5)]
+    var ba: <4>B = [B(0.75), B(-0.75), B(0.5), B(-1.0)]
+    var bb: <4>B = [B(0.5), B(-0.5), B(0.25), B(0.25)]
+    var ma: <2>i16q8 = [100.0, -1.5]
+    var mb: <2>i16q8 = [50.0, 0.25]
+    var qa: <4>q15 = [0.75, -0.75, 0.5, 0.0]
+    var qb: <4>q15 = [0.5, -0.5, 0.25, 0.0]
+
+    p2(add2(&a, &b))
+    p2(sub2(&a, &b))
+    p2(sub2(&m, &b))
+    p2(neg2(&m))
+    p2(acc2(&a, &b))
+    p4(add4(&a4, &b4))
+    p4(sub4(&a4, &b4))
+    p4(neg4(&a4))
+    pu2(uadd2(&ua, &ub))
+    pu2(usub2(&ua, &ub))
+    pu4(uadd4(&ua4, &ub4))
+    pu4(usub4(&ua4, &ub4))
+    pw2(wadd2(&wa, &wb))
+    pw2(wsub2(&wa, &wn))
+    pw4(wadd4(&ba, &bb))
+    pw4(wsub4(&ba, &bb))
+    pm2(mid2(&ma, &mb))
+    p4w(wide4(&qa, &qb))
+    """
+
+// Every raw value the calls above print, worked out by hand: saturation at both ends of each signed
+// format, at the top and at zero of each unsigned one, a `wrapping` lane wrapping, a format whose
+// fraction is not at the top, and a `<4>q15` that is two words and so never packed.
+private fpk_expected() -> []const string =
+    ["32767", "-32768",                   // 0.75 + 0.5 and -0.75 - 0.5, saturated
+     "8192", "-8192",                     // 0.75 - 0.5
+     "-32768", "32767",                   // -1 - 0.5 and 0.5 + 0.5, saturated
+     "32767", "-16384",                   // -(-1) saturates; -(0.5)
+     "32767", "-32768",                   // += is the same sum
+     "127", "-128", "96", "-96",          // q7 sums
+     "32", "-32", "32", "-128",           // q7 differences
+     "-96", "96", "-64", "127",           // q7 negations, -(-1) saturating
+     "65535", "49152",                    // u16q16 sums, the top clamped
+     "16384", "0",                        // u16q16 differences, the bottom clamped at zero
+     "255", "192", "255", "64",           // u8q8 sums
+     "64", "0", "0", "0",                 // u8q8 differences
+     "-24576", "24576",                   // a wrapping q15 sum: 0.75 + 0.5 wraps
+     "-24576", "24576",                   // and a wrapping difference
+     "-96", "96", "96", "-96",            // a wrapping q7 sum
+     "32", "-32", "32", "96",             // a wrapping q7 difference
+     "32767", "-320",                     // i16q8: 150 saturates, -1.5 + 0.25
+     "32767", "-32768", "24576", "0"]     // <4>q15, two words
+
+// -- the harness ------------------------------------------------------------------------------------
+
+private fpk_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fpk_ready
+
+// A directory holding `main.sysl`, and a `package.hocon` where `manifest` is not empty.
+private fpk_root(text: string, manifest: string = "") -> string
+    val root = replace_all(make_temp_dir("sysl-fpk").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if manifest != "" then write_text(s"$root/package.hocon", manifest).unwrap()
+
+    root
+end fpk_root
+
+// The LLVM text of a one-file program for `target` (the host where it is `None`), or what it said.
+private fpk_ir(text: string, target: Option[string], manifest: string = "") -> string
+    val root = fpk_root(text, manifest)
+
+    val out = emit_llvm_text(s"$root/main.sysl", target) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> if made.report.is_empty() then made.text else replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fpk_ir
+
+// The LLVM definition of `name` in `ir`.
+private fpk_function(ir: string, name: string) -> string
+    val parts = split(ir, "\n}\n")
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        for j in 0..<lines.len
+            if lines[j].starts_with("define") && lines[j].contains(s"@$name(") then return parts[i]
+
+    assert(false, ir)
+    ""
+end fpk_function
+
+private fpk_add2() -> string = "@export(\"fpk_add2\")\nadd2(a: *<2>q15, b: *<2>q15, out: *<2>q15)\n    *out = *a + *b\n"
+
+// The LLVM text of a Cortex-M4 program reaching every packed instruction the compiler emits --
+// `tests_irp_llvm_registry.sysl`'s census of what the compiler emits reads it.
+fpk_every_form_ir() -> string = fpk_ir(raw"""
+    type W = new q15 wrapping
+    type B = new q7 wrapping
+
+    @export("fpk_all")
+    all(a: *<2>q15, b: *<4>q7, c: *<2>u16q16, d: *<4>u8q8, w: *<2>W, x: *<4>B)
+        *a = *a + *a - *a
+        *b = *b + *b - *b
+        *c = *c + *c - *c
+        *d = *d + *d - *d
+        *w = *w + *w - *w
+        *x = *x + *x - *x
+    """, Some("thumbv7em-freestanding"))
+
+// -- the instruction is chosen for the core, and only there -----------------------------------------
+
+@test("on the host a <2>q15 sum is still the generic vector intrinsic, and nothing Arm's")
+fpk_host_unchanged()
+    if !fpk_ready() then return
+
+    val f = fpk_function(fpk_ir(fpk_add2(), None), "add2")
+
+    assert(f.contains("@llvm.sadd.sat.v2i16(<2 x i16>"), f)
+    assert(!f.contains("llvm.arm."), f)
+
+@test("on a Cortex-M4 a <2>q15 sum is QADD16 over the word, through the register and back")
+fpk_m4_chooses_qadd16()
+    if !fpk_ready() then return
+
+    val f = fpk_function(fpk_ir(fpk_add2(), Some("thumbv7em-freestanding")), "add2")
+
+    assert(f.contains("call i32 @llvm.arm.qadd16(i32 "), f)
+    assert(f.contains("bitcast <2 x i16> "), f)
+    assert(f.contains(" to <2 x i16>"), f)
+    assert(!f.contains("llvm.sadd.sat"), f)
+
+@test("every lane shape that fills a word picks its own instruction: Q, UQ, and S for a wrapping lane")
+fpk_every_shape()
+    if !fpk_ready() then return
+
+    val ir = fpk_every_form_ir()
+    val names = ["qadd16", "qsub16", "qadd8", "qsub8", "uqadd16", "uqsub16", "uqadd8", "uqsub8", "sadd16",
+                 "ssub16", "sadd8", "ssub8"]
+
+    for i in 0..<names.len
+        assert(ir.contains(s"call i32 @llvm.arm.${names[i]}(i32 "), s"${names[i]} in:\n$ir")
+
+    assert(!ir.contains("llvm.sadd.sat") && !ir.contains("llvm.uadd.sat"), ir)
+
+@test("a register that is not one word, and a product, are left as they were on a Cortex-M4")
+fpk_not_one_word()
+    if !fpk_ready() then return
+
+    val wide = fpk_function(fpk_ir("@export(\"fpk_w\")\nw(a: *<4>q15, b: *<4>q15, out: *<4>q15)\n    *out = *a + *b\n",
+                                   Some("thumbv7em-freestanding")), "w")
+
+    assert(wide.contains("@llvm.sadd.sat.v4i16("), wide)
+    assert(!wide.contains("llvm.arm."), wide)
+
+    val product = fpk_function(fpk_ir("@export(\"fpk_p\")\np(a: *<2>q15, b: *<2>q15, out: *<2>q15)\n    *out = *a * *b\n",
+                                      Some("thumbv7em-freestanding")), "p")
+
+    assert(!product.contains("llvm.arm."), product)
+
+@test("a v8-M Mainline core packs only where the manifest names the dsp extension")
+fpk_v8m_needs_the_extension()
+    if !fpk_ready() then return
+
+    val plain = fpk_function(fpk_ir(fpk_add2(), Some("thumb-freestanding")), "add2")
+
+    assert(!plain.contains("llvm.arm."), plain)
+    assert(plain.contains("@llvm.sadd.sat.v2i16("), plain)
+
+    val dsp = fpk_function(fpk_ir(fpk_add2(), Some("thumb-freestanding"),
+                                  "codegen {\n  extensions = [\"dsp\"]\n}\n"), "add2")
+
+    assert(dsp.contains("call i32 @llvm.arm.qadd16(i32 "), dsp)
+
+@test("what a register of lanes lacks is still refused on a DSP core")
+fpk_refusals_unchanged()
+    if !fpk_ready() then return
+
+    val sum = fpk_ir("f(a: <2>q15) -> unit\n    val c = a.sum()\n", Some("thumbv7em-freestanding"))
+
+    assert(sum.contains("'sum' is not defined for <2>q15 — a fixed-point '+' saturates"), sum)
+
+    val quotient = fpk_ir("f(a: <2>q15) -> unit\n    val c = a / a\n", Some("thumbv7em-freestanding"))
+
+    assert(quotient.contains("'/' is not defined on <2>q15"), quotient)
+
+// -- the board's own code ---------------------------------------------------------------------------
+
+private fpk_board(text: string, symbol: string) -> Option[string] =
+    fx2_board_code(text + "\n@export(\"main\")\nboot() -> i32 = 0\n", "thumbv7em-freestanding", symbol)
+
+// One instruction per operation, and the operands loaded and stored a word at a time -- no halfword or
+// byte access at all.
+private fpk_one(code: string, mnemonic: string, symbol: string)
+    assert_eq(fx2_count(code, s"\t$mnemonic\t"), 1, code)
+    assert_eq(fx2_count(code, "\tldrsh") + fx2_count(code, "\tldrh") + fx2_count(code, "\tstrh") +
+              fx2_count(code, "\tldrsb") + fx2_count(code, "\tldrb") + fx2_count(code, "\tstrb"), 0, code)
+    assert_eq(fx2_foreign_calls(code, symbol), 0, code)
+
+@test("on a Cortex-M4 a <2>q15 sum through pointers is LDR, LDR, QADD16, STR")
+fpk_m4_board_q15()
+    val code = fpk_board(raw"""
+        @export("fpk_vadd")
+        vadd(a: *<2>q15, b: *<2>q15, out: *<2>q15)
+            *out = *a + *b
+        """, "fpk_vadd")
+
+    if code.is_none() then return
+
+    fpk_one(code.unwrap(), "qadd16", "fpk_vadd")
+
+@test("on a Cortex-M4 a <4>q7 difference is one QSUB8, and a <2>q15 negation one QSUB16")
+fpk_m4_board_q7_and_neg()
+    val sub = fpk_board(raw"""
+        @export("fpk_vsub")
+        vsub(a: *<4>q7, b: *<4>q7, out: *<4>q7)
+            *out = *a - *b
+        """, "fpk_vsub")
+
+    if sub.is_none() then return
+
+    fpk_one(sub.unwrap(), "qsub8", "fpk_vsub")
+
+    val neg = fpk_board(raw"""
+        @export("fpk_vneg")
+        vneg(a: *<2>q15, out: *<2>q15)
+            *out = -*a
+        """, "fpk_vneg").unwrap()
+
+    fpk_one(neg, "qsub16", "fpk_vneg")
+
+@test("on a Cortex-M4 an unsigned pair is UQADD16 and a wrapping one SADD16")
+fpk_m4_board_unsigned_and_wrapping()
+    val u = fpk_board(raw"""
+        @export("fpk_uadd")
+        uadd(a: *<2>u16q16, b: *<2>u16q16, out: *<2>u16q16)
+            *out = *a + *b
+        """, "fpk_uadd")
+
+    if u.is_none() then return
+
+    fpk_one(u.unwrap(), "uqadd16", "fpk_uadd")
+
+    val w = fpk_board(raw"""
+        type W = new q15 wrapping
+
+        @export("fpk_wadd")
+        wadd(a: *<2>W, b: *<2>W, out: *<2>W)
+            *out = *a + *b
+        """, "fpk_wadd").unwrap()
+
+    fpk_one(w, "sadd16", "fpk_wadd")
+
+// -- the answers do not change ----------------------------------------------------------------------
+
+@test("the host computes every lane the way the hand-worked values say")
+fpk_host_answers()
+    if !fpk_ready() then return
+
+    val root = fpk_root(fpk_ops() + "put(n: int) = print(n)\n\n" + fpk_calls())
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            assert(false, said)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = ran match
+        Ok(out) -> out.text
+        Err(_) -> "the program that was built could not be run"
+
+    assert_eq(text, join(fpk_expected(), "\n") + "\n")
+
+// The same program booted on every Arm board: packed on the Cortex-M4 and M7, the generic intrinsic on
+// the M0, M3 and M33 -- and every one of them must print the host's answers exactly.
+@test("every Arm board QEMU has, packed or not, prints exactly the host's answers")
+fpk_boards_agree_with_the_host()
+    val want = join(fpk_expected(), " ") + " "
+    val board_put = raw"""
+        put(n: int)
+            val w = console()
+
+            n.display(w, FormatSpec(0, -1, false))
+            w.write(" ".bytes)
+        """
+    var bad: Buf[string] = buf()
+    var packed: usize = 0
+    var ran: usize = 0
+    val boards = qemu_boards()
+
+    for b in boards
+        if target_named(b.target).unwrap().cpu == Thumb
+            var files: Buf[(string, string)] = buf()
+
+            files.push(("p.sysl", "import board.*\n\n" + fpk_ops() + board_put + "\n" + fpk_calls()))
+            files.push(("board/board.sysl", qemu_board_module(b)))
+
+            qemu_boot(b, files, 60) match
+                Err(why) -> bad.push(s"${b.name}: $why")
+                Ok(r) -> if !r.status.ok() || !r.out.contains(want) then bad.push(s"wanted '$want': ${qemu_said(b, r)}")
+
+            ran += 1
+
+            if b.target == "thumbv7em-freestanding" then packed += 1
+        end if
+
+    assert(packed > 0, "no board with the DSP extension was booted")
+    assert(ran > packed, "no board without the DSP extension was booted")
+    assert(bad.is_empty(), join(bad.view(), "\n"))
+end fpk_boards_agree_with_the_host

@@ -137,8 +137,9 @@ private fx_lane(t: Type) -> Type = underlying(t) match
 // `a op b` lane by lane over `<n>` registers of fixed-point lanes.
 //
 // **A sum or a difference of one format is one instruction at the register's width** --
-// `llvm.sadd.sat.v2i16`, which a Cortex-M4 selects as one `QADD16` -- since saturating each lane is
-// exactly what the intrinsic does to each lane. Everything else (a product, which rescales and rounds,
+// `llvm.sadd.sat.v2i16` -- since saturating each lane is exactly what the intrinsic does to each lane;
+// on a core with Arm's DSP extension a register filling one word is the packed instruction instead
+// (`fx_packed_name`). Everything else (a product, which rescales and rounds,
 // or a sum whose operands are of another format) is the scalar operation applied to each lane in
 // turn, so a lane's answer is the scalar answer by construction and the back end is left to put the
 // lanes back together.
@@ -151,9 +152,11 @@ private fixed_lanes(e: *Emit, op: string, lt: Type, rt: Type, n: int, lane: Type
     val one_format = type_eq(repr(a), repr(lane)) && type_eq(repr(b), repr(lane))
 
     if (op == "+" || op == "-") && one_format
-        if fixed_wraps(lane) then return fx_bin_at(e, if op == "+" then OpAdd else OpSub, vt, lv, rv)
-
         val kind = if op == "+" then "add" else "sub"
+        val packed = fx_packed_name(e, kind, n, bits, signed, fixed_wraps(lane))
+
+        if packed != "" then return fx_packed(e, packed, vt, lv, rv)
+        if fixed_wraps(lane) then return fx_bin_at(e, if op == "+" then OpAdd else OpSub, vt, lv, rv)
 
         return fx_sat_at(e, s"${if signed then "s" else "u"}$kind", vt, lv, rv)
     end if
@@ -173,6 +176,53 @@ private fixed_lanes(e: *Emit, op: string, lt: Type, rt: Type, n: int, lane: Type
 
     acc
 end fixed_lanes
+
+// The Arm DSP instruction a sum or difference of lanes is, or `""` where there is none to use.
+//
+// **Only a register that is exactly one 32-bit word, on a core with the DSP extension** -- two 16-bit
+// lanes or four 8-bit ones. LLVM has no legal vector of halves or bytes on an M-profile core, so it
+// takes `llvm.sadd.sat.v2i16` apart: a load per lane, a `QADD16` per lane, a store per lane. Handed
+// the word itself, it loads it with one `LDR`, adds it with one `QADD16` and stores it with one `STR`.
+// Each instruction does to each lane what the generic intrinsic does -- `Q` saturates signed, `UQ`
+// unsigned, and `SADD`/`SSUB` wrap, which for a `wrapping` lane of either signedness is the answer --
+// so the bits are the same everywhere and only the instructions differ.
+private fx_packed_name(e: *Emit, kind: string, n: int, bits: int, signed: bool, wraps: bool) -> string
+    if !arm_dsp(e.target) || n * bits != 32 || (bits != 16 && bits != 8) then return ""
+
+    val prefix = if wraps then "s" elif signed then "q" else "uq"
+
+    s"$prefix$kind$bits"
+end fx_packed_name
+
+// `name` over the word a register of lanes fills: both operands read as one `i32`, and the answer read
+// back as lanes.
+private fx_packed(e: *Emit, name: string, vt: LType, a: Val, b: Val) -> Val
+    val fn = llvm_arm_dsp_entry(name).unwrap().base
+    val word = l_i32()
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(word))
+    params.push(ir_param(word))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(word, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(word, fx_bitcast(e, vt, a, word)))
+    args.push(ir_arg(word, fx_bitcast(e, vt, b, word)))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), word, VGlobal(fn), args))
+    fx_bitcast(e, word, r, vt)
+end fx_packed
+
+private fx_bitcast(e: *Emit, from: LType, v: Val, to: LType) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastBitCast, from, v, to))
+    r
+end fx_bitcast
 
 private fx_bin_at(e: *Emit, op: BinOp, ty: LType, a: Val, b: Val) -> Val
     val r = fresh_reg(e)
@@ -441,7 +491,7 @@ end fixed_shift
 
 // `-x`, saturating: the negation of the most negative value is the largest one -- or, for a
 // `wrapping` type, that value itself, as an integer's negation is. A register of lanes negates every
-// lane in the one instruction, from a zero register.
+// lane in the one instruction, from a zero register -- `QSUB16` from zero on a DSP core.
 fixed_neg(e: *Emit, ty: Type, v: Val) -> Val
     val lane = fx_lane(ty)
     val wraps = fixed_wraps(ty) || fixed_wraps(lane)
@@ -451,6 +501,11 @@ fixed_neg(e: *Emit, ty: Type, v: Val) -> Val
         Vector(n, _) -> (LVec(n, LInt(bits)), VZero)
         _ -> (LInt(bits), fx_small(0))
 
+    val packed = underlying(ty) match
+        Vector(n, _) -> fx_packed_name(e, "sub", n, bits, true, wraps)
+        _ -> ""
+
+    if packed != "" then return fx_packed(e, packed, it, zero, v)
     if wraps then return fx_bin_at(e, OpSub, it, zero, v)
 
     fx_sat_at(e, "ssub", it, zero, v)

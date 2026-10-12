@@ -93,6 +93,18 @@ llvm_sat_entry(op: string) -> Result[LlvmIntrinsic, string] =
 
 private sat_ops() -> []const string = ["sadd", "uadd", "ssub", "usub", "sshl", "ushl"]
 
+// Arm's DSP-extension instructions over the lanes packed into one 32-bit register -- two 16-bit
+// halves or four bytes -- each taking and answering an `i32`. LLVM does not select `llvm.sadd.sat.v2i16`
+// as one of these, since no vector of two halves is a legal type on an M-profile core, so a register of
+// lanes that fills one word is handed to them directly.
+llvm_arm_dsp_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(arm_dsp_ops(), op) then Ok(LlvmIntrinsic(s"llvm.arm.$op"))
+    else Err(s"no Arm DSP operation '$op' is declared")
+
+private arm_dsp_ops() -> []const string =
+    ["qadd16", "qsub16", "qadd8", "qsub8", "uqadd16", "uqsub16", "uqadd8", "uqsub8", "sadd16", "ssub16",
+     "sadd8", "ssub8"]
+
 // The coroutine operations an `async` function is lowered through.
 llvm_coro_entry(op: string) -> Result[LlvmIntrinsic, string] =
     if contains_name(coro_ops(), op) then Ok(LlvmIntrinsic(s"llvm.coro.$op"))
@@ -157,6 +169,7 @@ llvm_callable() -> Buf[string]
     push_family(&out, reduce_ops(), "llvm.vector.reduce.")
     push_family(&out, coro_ops(), "llvm.coro.")
     push_family(&out, barrier_ops(), "llvm.aarch64.")
+    push_family(&out, arm_dsp_ops(), "llvm.arm.")
     out.push(llvm_read_volatile_register_entry().base)
     out.push(llvm_write_register_entry().base)
 
