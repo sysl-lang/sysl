@@ -870,13 +870,20 @@ end gen_store
 
 private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
                    dispatch: Option[TDispatch], check: Option[Type]) -> Val
+    // **A place reached through a call -- a container's `index_place` -- is addressed after the
+    // value is computed**, as a plain store's is: the value may grow the container, and an address
+    // taken first would then name the storage the growth gave up. A fused dot product reads the
+    // accumulator first by its own rule, so it keeps the written order.
+    val first = reaches_through_call(place) && fixed_dot_pair(e, value).is_none()
+    val early = if first then Some(gen_expr(e, value)) else None
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
-    val dot = fixed_dot_update(e, op, cur, value)
+    val dot = if early.is_some() then None else fixed_dot_update(e, op, cur, value)
     var updated: Val = VPoison
 
     if dot.is_some() then updated = dot.unwrap()
-    else updated = combine(e, op, ty, texpr_type(value), dispatch, cur, gen_expr(e, value))
+    else updated = combine(e, op, ty, texpr_type(value), dispatch, cur,
+                           if early.is_some() then early.unwrap() else gen_expr(e, value))
 
     check match
         Some(c) -> emit_constraint_checks(e, updated, c)
@@ -885,6 +892,16 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
     store_over(e, place, p, updated, Some(cur))
     updated
 end gen_update
+
+// Whether a place's address is computed by a call somewhere along its path, which is how a
+// container's subscript names its element.
+private reaches_through_call(place: TExpr) -> bool = *place.kind match
+    TField(recv, _, _) -> reaches_through_call(recv)
+    TIndex(recv, _, _) -> reaches_through_call(recv)
+    TDeref(operand, _) -> *operand.kind match
+        TCall(_, _, _, _) -> true
+        _ -> reaches_through_call(operand)
+    _ -> false
 
 private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
                     check: Option[Type]) -> Val

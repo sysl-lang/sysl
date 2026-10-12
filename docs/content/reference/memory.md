@@ -1075,9 +1075,33 @@ demo()
 read and not written, exactly as the `val` may. Stating it twice would only create the chance to
 state it wrong.
 
-**A user type's subscript is not a place.** `b[i]` on a container goes through the `Index` trait,
-which is a call rather than a walk to an address, so there is nothing there for a name to mean. A ref
-reaches the built-in subscript, which is the one that indexes storage.
+**A user type's subscript is a place when the type implements `IndexPlace`**, whose method answers
+the element's address: `b[i]` is `*b.index_place(i)`, a dereference, so a ref names the element
+where it lives. `Buf` is one ([arrays](/reference/arrays/)). Through `Index` alone the subscript is a
+call answering a value, and there is nothing there for a name to mean.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Item
+    block: u64
+    data: Buf[u8]
+
+var items: Buf[Item] = buf()
+
+items.push(Item(1, buf()))
+
+ref t = items[0]
+
+t.block = 41
+t.block += 1
+
+print(items[0].block)
+```
+
+```output
+42
+```
 
 ### The one rule: what may move underneath it
 
@@ -1159,9 +1183,58 @@ Deciding otherwise would mean reading the callee's body, and a module compiles a
 signatures and never their bodies. The cost is one refusal in a program that could have written the
 ref one line later.
 
+**A container's storage moves under a `@relocates` member, whatever its receiver mode.** A `Buf`
+is a handle, so its `push` takes `self` and still reallocates what the handle points at. Each member
+that can move the storage or give an element up is marked, and the mark is what the check asks:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+ref first = b[0]
+
+b.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
+```
+
 **What this does not do is make a `*T` safe**, and it does not try. A ref's place may be rooted at a
-pointer, and whether *that* points anywhere is the raw tier's ordinary bargain. What the rule buys is
-that the storage a ref names cannot be released by the block that named it.
+pointer, and whether *that* points anywhere is the raw tier's ordinary bargain.
+
+**The check is local, so it sees what the block writes through the ref's own path and nothing
+else.** A second name for the same object, or a callee handed it, can still move or free the storage
+— through a `&T` exactly as through a `Buf`. Here `n` is a second name for `h.node`, and `alias` a
+callee given it; both release the array `e` stands in, and both are accepted, so `e = 5` writes freed
+memory:
+
+```sysl
+struct Node
+    cell: []int
+
+struct H
+    node: &Node
+
+alias(n: &Node) = n.cell = [0; 8]
+
+var h = H(Node([1, 2, 3]))
+
+ref e = h.node.cell[0]
+
+val n = h.node
+
+n.cell = [7; 8]
+alias(h.node)
+```
+
+What the rule buys is narrower than "a ref never dangles": no statement written through the ref's own
+path can release the storage it names. Keeping every other name for that storage still while the ref
+is live is the program's part, as it is for a view handed out by `Buf.view()`.
 
 ### A ref to a slot that holds a reference
 

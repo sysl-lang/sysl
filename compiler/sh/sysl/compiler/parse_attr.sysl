@@ -150,7 +150,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -169,7 +169,8 @@ end layout_attr_on_member
 private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
-    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks"]
+    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
+                 "relocates"]
         if word == w then return true
 
     false
@@ -264,6 +265,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
 
     // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
     // number the declaration has.
+    if word == "relocates" then return no_inlining_args(p, Relocates, "a call either may move its receiver's storage or it may not")
     if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
@@ -656,6 +658,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Pins -> m.marks.pins = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
+            Relocates -> m.marks.relocates = true
             _ -> ()
 end apply_member_attrs
 
@@ -821,7 +824,7 @@ private may_carry(form: string, a: Attr) -> bool
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
-    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards"
+    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" && attr_word(a) != "relocates"
 end may_carry
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
@@ -836,6 +839,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
+
+    if any_is(attrs, "relocates")
+        return "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"

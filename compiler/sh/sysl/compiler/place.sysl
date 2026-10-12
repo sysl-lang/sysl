@@ -338,7 +338,38 @@ private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
     TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
     TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
     TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
+    TCall(_, _, _, _) -> placed_by(t) match
+        Some(recv) -> key_step(place_key(cx, recv), "[]")
+        None -> None
     _ -> None
+
+// The container a call addresses an element of, where the call is a subscript through
+// `IndexPlace` -- `b[i]` is `*b.index_place(i)`, so the step before the element is `b`.
+private placed_by(t: TExpr) -> Option[TExpr] = *t.kind match
+    // The lowered name carries the instantiation after the member's (`Buf.index_place.Item`).
+    // A `*self` receiver arrives as the address of the container, so the step is the container.
+    TCall(name, args, _, _) ->
+        if args.is_empty() || !name.contains(".index_place") then return None
+
+        *args.at(0).kind match
+            TAddrOf(inner, _) -> Some(inner)
+            _ -> Some(args.at(0))
+    _ -> None
+
+// Whether a container's own value holds an address, so that overwriting it -- or a `@relocates`
+// member called on it -- can let go of the storage its elements live in. A `Buf` holds its storage
+// behind a `&`; a container whose elements are a fixed array inside it holds none and moves nothing.
+private holds_storage(t: Type) -> bool
+    if owning_step(t) then return true
+
+    repr(t) match
+        Struct(d) ->
+            for f in d.fields
+                if holds_storage(f.1) then return true
+
+            false
+        _ -> false
+end holds_storage
 
 private key_step(base: Option[string], step: string) -> Option[string] = base match
     Some(k) -> Some(s"$k/$step")
@@ -358,6 +389,7 @@ private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
     TField(recv, _, _) -> Some(recv)
     TIndex(recv, _, _) -> Some(recv)
     TDeref(operand, _) -> Some(operand)
+    TCall(_, _, _, _) -> placed_by(place)
     _ -> None
 
 // The places a `ref` over `place` holds still: the **owning steps the path goes through**.
@@ -371,15 +403,22 @@ private ref_hazards(cx: &Analyzer, place: TExpr) -> Buf[string]
     var out: Buf[string] = buf()
     var at = step_before(place)
 
+    var through_call = false
+
     while at.is_some()
         val step = at.unwrap()
 
-        if owning_step(texpr_type(step))
+        // A container an element was addressed through by `index_place` is an owning step when its
+        // value holds the storage, which a `Buf`'s does.
+        val container = through_call && holds_storage(texpr_type(step))
+
+        if owning_step(texpr_type(step)) || container
             val key = place_key(cx, step)
 
             if key.is_some() then out.push(key.unwrap())
         end if
 
+        through_call = placed_by(step).is_some()
         at = step_before(step)
 
     out
@@ -416,7 +455,11 @@ end check_ref_guards
 // not that method reassigns anything**: deciding otherwise means reading the body, and a module
 // compiles against its imports' signatures and never their bodies. The receiver reaches a hazard
 // when the hazard is the receiver or lies inside it -- `t.grow()` reaches `t.cell`.
-check_ref_call(cx: &Analyzer, at: Span, place: TExpr)
+//
+// **A `@relocates` member is asked the same question whatever its receiver mode**: a `Buf`'s `push`
+// takes its handle by value and still moves the storage behind it, so `relocating` names the member
+// and the refusal says which call it is.
+check_ref_call(cx: &Analyzer, at: Span, place: TExpr, relocating: string = "")
     val key = place_key(cx, place)
 
     if key.is_none() then return
@@ -434,6 +477,14 @@ check_ref_call(cx: &Analyzer, at: Span, place: TExpr)
         val hazards = ref_hazards(cx, l.stands_for.unwrap())
 
         for item in hazards
+            if (item == key.unwrap() || item.starts_with(inside)) && relocating != ""
+                cx.fault(at, s"'${l.name}' is a 'ref' standing on an element whose storage " +
+                         s"'$relocating' could move or give up, since it is '@relocates' — so the " +
+                         "name could be left pointing at freed memory. Make the call before the " +
+                         "'ref', or put the 'ref' in a block that closes first")
+                return
+            end if
+
             if item == key.unwrap() || item.starts_with(inside)
                 cx.fault(at, s"'${l.name}' is a 'ref' standing on storage this call could " +
                          "release, since a '*self' method may write its receiver — so the name " +

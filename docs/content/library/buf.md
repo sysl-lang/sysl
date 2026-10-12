@@ -186,14 +186,71 @@ impl[T] IndexSet[usize, T] for Buf[T]
     index_set(self, i: usize, v: T) = self.set(i, v)
 ```
 
-`b[i]` on a `Buf` means `b.at(i)`, and that is worth more than the syntax. The backing slice is
-longer than the count — subscripting the *storage* would happily read a slot the buffer does not
-consider live, and every bounds check in the language would pass. Routing `[]` through `at` is what
-makes `b[i]` unable to see spare capacity.
+```sysl
+impl[T] IndexPlace[usize, T] for Buf[T]
+    index_place(self, i: usize) -> *T
+```
 
-**`index_set` takes `self`, where the trait declares `*self`**, which an implementation may do
-([traits](/reference/traits/)): a `Buf` is a handle, so a copy of one writes the buffer the original
-names, and `b[i] = x` works on a `val` as `b(i) = x` does on a Scala `val ArrayBuffer`:
+**`b[i]` on a `Buf` is `*b.index_place(i)` — the element where it lives**, checked against the
+count. The backing slice is longer than the count — subscripting the *storage* would happily read a
+slot the buffer does not consider live, and every bounds check in the language would pass. Checking
+against the count is what makes `b[i]` unable to see spare capacity, and answering an address is
+what makes it a [place](/reference/memory/#places): `b[i].f` reads one field without copying the
+element, so a counted field of it is neither retained nor released, and `b[i].f = v`, `b[i] += 1`
+and `ref e = b[i]` write the element itself. `Index` and `IndexSet` stay, for code generic over them.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Item
+    block: u64
+    data: Buf[u8]
+
+var items: Buf[Item] = buf()
+
+items.push(Item(7, buf()))
+items[0].block += 1
+items[0].data.push(9)
+
+ref it = items[0]
+
+it.block *= 10
+
+print(items[0].block, items[0].data.len())
+```
+
+```output
+80 1
+```
+
+An index past the count panics, as `at` does — `panic: index 3 past the 1 elements of a Buf`.
+
+**A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
+`truncate`, `clear`, `remove` and `release` — and is refused on a buffer a live `ref` has an element
+of, since growing reallocates and shrinking gives the element up:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+ref first = b[0]
+
+b.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
+```
+
+The check is local, as every `ref` check is ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)):
+a second name for the same buffer, or a function handed it, can still push while the `ref` is live.
+
+**`index_place` takes `self`**: a `Buf` is a handle, so a copy of one writes the buffer the
+original names, and `b[i] = x` works on a `val` as `b(i) = x` does on a Scala `val ArrayBuffer`:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -210,26 +267,6 @@ print(c[0])
 ```output
 5
 ```
-
-The cost is that reading through [`Index`](/library/core/) is a **call**, so it yields a value rather
-than a place:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-var b: Buf[int] = buf()
-
-b.push(1)
-b[0] += 1
-```
-
-```error
-'+=' on an element read through 'sysl.Index' would evaluate the receiver and the index twice
-```
-
-`b[0] = b[0] + 1` is the spelling, and writing it out is the point: the expansion the compiler
-declines to make would evaluate `b` twice and the index twice, which for a receiver that is a call,
-or an index that advances a cursor, is wrong rather than merely wasteful.
 
 Two other shapes a first program tries. `len` is a **method**, unlike `StrBuilder`'s property:
 

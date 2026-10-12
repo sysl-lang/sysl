@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A subscript through `IndexPlace` is a place (`reference/memory.md § ref`, `reference/arrays.md`):
+// `b[i]` is `*b.index_place(i)`, so a field of a `Buf` element is read where it lives -- no copy of
+// the element, so no count taken on its counted fields -- a write lands in the element, and a `ref`
+// names it. A `@relocates` member is refused while a `ref` stands on an element of its receiver.
+
+private bpl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end bpl_ready
+
+private bpl_root(text: string) -> string
+    val root = make_temp_dir("sysl-buf-place").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, and whether it exited zero.
+private bpl_outcome(text: string) -> (string, bool)
+    val root = bpl_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end bpl_outcome
+
+private bpl_ran(text: string) -> string
+    val out = bpl_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+// The emitted module, or what the compiler said instead.
+private bpl_ir(text: string) -> string
+    val root = bpl_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+// One function's text, from its `define` to the brace that closes it.
+private bpl_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end bpl_body
+
+private bpl_refused(text: string, part: string)
+    val out = bpl_ir(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private bpl_item() -> string =
+    "import sysl.buf.{Buf, buf}\n\nstruct Item\n    block: u64\n    data: Buf[u8]\n\n" +
+    "struct Holder\n    items: Buf[Item]\n\n"
+
+private bpl_probe() -> string =
+    bpl_item() + "probe_index(h: *Holder, i: usize) -> u64 = h.items[i].block\n\n" +
+    "probe_ref(h: *Holder, i: usize) -> u64 =\n    ref t = h.items[i]\n    t.block\n\n" +
+    "probe_len(h: *Holder, i: usize) -> usize = h.items[i].data.len()\n\n" +
+    "var h = Holder(buf())\nh.items.push(Item(3, buf()))\nh.items[0].data.push(1)\n" +
+    "print(probe_index(&h, 0), probe_ref(&h, 0), probe_len(&h, 0))\n"
+
+@test("a field of a 'Buf' element is read in place, with no count taken on the element")
+bpl_field_read_takes_no_count()
+    if !bpl_ready() then return
+
+    val ir = bpl_ir(bpl_probe())
+
+    for name in ["probe_index", "probe_ref", "probe_len"]
+        val body = bpl_body(ir, name)
+
+        assert(body.contains("index_place"), body)
+        assert(!body.contains("arc."), body)
+
+@test("and the probe runs: a ref to an element is accepted and a nested field reads through it")
+bpl_probe_runs()
+    if !bpl_ready() then return
+
+    assert_eq(bpl_ran(bpl_probe()), "3 3 1\n")
+
+@test("a write through a ref, an assignment, and a compound assignment all land in the element")
+bpl_writes_land()
+    if !bpl_ready() then return
+
+    val src = bpl_item() + "var h = Holder(buf())\nh.items.push(Item(1, buf()))\n" +
+              "ref t = h.items[0]\nt.block = 40\nt.data.push(7)\nh.items[0].block += 2\n" +
+              "h.items[0].data[0] *= 3\nprint(h.items[0].block, h.items[0].data[0], t.block)\n"
+
+    assert_eq(bpl_ran(src), "42 21 42\n")
+
+@test("reading a whole element into a binding is still a copy")
+bpl_binding_copies()
+    if !bpl_ready() then return
+
+    val src = bpl_item() + "var h = Holder(buf())\nh.items.push(Item(1, buf()))\n" +
+              "var c = h.items[0]\nc.block = 9\nprint(h.items[0].block, c.block)\n"
+
+    assert_eq(bpl_ran(src), "1 9\n")
+
+@test("the value is computed before a compound assignment takes the element's address")
+bpl_value_before_address()
+    if !bpl_ready() then return
+
+    val src = "import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\n" +
+              "grow(b: Buf[int]) -> int\n    for i in 0..<100\n        b.push(i)\n    1\n\n" +
+              "b.push(5)\nb[0] += grow(b)\nprint(b[0], b.len())\n"
+
+    assert_eq(bpl_ran(src), "6 101\n")
+
+@test("an index past the count panics")
+bpl_bounds_panic()
+    if !bpl_ready() then return
+
+    val out = bpl_outcome("import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\nb[3] = 2\n")
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("panic: index 3 past the 1 elements of a Buf"), out.0)
+
+@test("a '@relocates' member is refused while a ref stands on an element, and names the call")
+bpl_relocates_refused()
+    if !bpl_ready() then return
+
+    bpl_refused("import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\n\nref first = b[0]\n\nb.push(2)\nfirst = 5\n",
+                "'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'")
+
+@test("every growing or shrinking member of 'Buf' is '@relocates'")
+bpl_every_relocating_member()
+    if !bpl_ready() then return
+
+    for call in ["b.extend([1])", "print(b.pop().is_some())", "b.truncate(0)", "b.clear()", "b.insert(0, 1)",
+                 "print(b.remove(0))"]
+        bpl_refused(s"import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\n\nref first = b[0]\n\n$call\nfirst = 5\n",
+                    "is '@relocates'")
+
+@test("the same call is accepted once the ref's block has closed")
+bpl_relocates_after_block()
+    if !bpl_ready() then return
+
+    val src = "import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\n" +
+              "if true\n    ref first = b[0]\n    first = 5\nb.push(2)\nprint(b[0], b[1])\n"
+
+    assert_eq(bpl_ran(src), "5 2\n")
+
+@test("assigning the 'Buf' a ref stands in is refused, as for any owning step")
+bpl_assigning_the_buf_refused()
+    if !bpl_ready() then return
+
+    bpl_refused("import sysl.buf.{Buf, buf}\n\nstruct H\n    xs: Buf[int]\n\nvar h = H(buf())\n" +
+                "h.xs.push(1)\nref e = h.xs[0]\nh.xs = buf()\ne = 2\n",
+                "'e' is a 'ref' standing on storage this assignment would release")
+
+@test("a program's own container takes 'IndexPlace', and its elements are places")
+bpl_user_container()
+    if !bpl_ready() then return
+
+    val src = "struct Ring\n    cells: [4]int\n    head: usize\n\n" +
+              "impl IndexPlace[usize, int] for Ring\n" +
+              "    index_place(*self, i: usize) -> *int = &self.cells[(self.head + i) % 4]\n\n" +
+              "var r = Ring([1, 2, 3, 4], 2)\n\nr[0] *= 10\n\nref last = r[1]\n\nlast = 0\n\nprint(r.cells, r[0])\n"
+
+    assert_eq(bpl_ran(src), "[1, 2, 30, 0] 30\n")
+
+@test("'@relocates' marks a method, and nothing else")
+bpl_relocates_on_a_function()
+    if !bpl_ready() then return
+
+    bpl_refused("@relocates\nf() = ()\n",
+                "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none")
