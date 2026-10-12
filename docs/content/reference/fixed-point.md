@@ -325,6 +325,46 @@ print(q15::Bits(16384), (0.5i32q31).bits)
 `print` and `str` write the **shortest decimal that reads back as the same value**, never in
 exponent form: `0.0000000005` says which place the one bit is in.
 
+### A view of the bits
+
+A codec or a DMA engine hands samples over as integers. The same two words read a whole view:
+`T::Bits(v)` over a view of the integer `T` is stored as — a `[]i16` for `q15` — is a `[]q15` over
+**the same storage**, and `.bits` over a `[]q15` is the way back. Nothing is copied: a write through
+either view is seen through the other, and the view keeps its owner alive as any view does.
+
+```sysl
+var pcm: [4]i16 = [0, 16384, -32768, 32767]
+val samples = q15::Bits(pcm)
+
+print(samples[1], samples[2], samples[3])
+
+samples[0] = 0.25
+print(pcm[0], samples.bits[0])
+```
+
+```output
+0.5 -1 0.99997
+8192 8192
+```
+
+Whether the view may be written is the argument's: a `[]const i16` gives a `[]const q15`, and an
+array is read through the view `a[..]` would take of it — read-only where a `val` holds it. The
+elements have to be exactly the integer the format is stored as, width and signedness both:
+
+```sysl
+var frame: [64]i32 = [0; 64]
+val samples = q15::Bits(frame)
+```
+
+```error
+'q15::Bits' over a view takes a '[]short' — the short a q15 is stored as — not [64]int
+```
+
+A view read this way is a view like any other, so it allocates nothing — it is legal under
+`@no_alloc` and on a board — and it no more crosses into a `&sync` than the view it was made from.
+The bits of a writable view of a checking subtype (`[]Gain` below) are refused, since a write
+through them would skip the check; a `[]const Gain` reads them.
+
 ## A range
 
 A fixed-point type is a scalar, so `within` narrows it like any other — the ends are decimals, held
