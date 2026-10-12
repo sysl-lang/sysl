@@ -235,7 +235,10 @@ even, as glibc and musl do. `write_f32` and `write_f128` are the same at the oth
 **`write_fixed` is the same for a fixed-point value**, handed the raw integer and the format it is
 read at — width, signedness, fraction — since one function serves every `iWqF`. Its digits are the
 exact value's, as an f-string hole's are, and `float_scratch_len` is enough for any format up to 128
-bits:
+bits. A wider format has `format_fixed_wide(raw, frac, spec, width, precision)` and
+`write_fixed_wide(raw, frac, out, spec, width, precision, scratch)`, which take `x.bits` at its own
+integer type (`fixed_scratch_len(bits)` bytes of scratch always suffice); the f-string hole chooses
+between the two:
 
 ```sysl
 import sysl.fmt.{write_fixed, float_scratch_len}
@@ -258,7 +261,8 @@ print("")
 | `write_real(x, out, spec, width, precision, scratch)` | the same text written to a `*Writer`, allocating nothing; `write_f32` and `write_f128` at the other widths |
 | `format_fixed(raw, bits, signed, frac, spec, width, precision)` | a fixed-point value under a float specifier, from its raw integer: what `${x}%.4f` lowers to |
 | `write_fixed(raw, bits, signed, frac, out, spec, width, precision, scratch)` | the same text written to a `*Writer`, allocating nothing |
-| `float_scratch_len`, `f128_scratch_len` | scratch lengths that are always enough |
+| `format_fixed_wide(raw, frac, spec, width, precision)`, `write_fixed_wide(raw, frac, out, spec, width, precision, scratch)` | the same for a fixed-point value wider than 128 bits, `raw` at its own integer type |
+| `float_scratch_len`, `f128_scratch_len`, `fixed_scratch_len(bits)` | scratch lengths that are always enough |
 | `shortest(x)` | the fewest digits that read back as `x`, a `real` or an `f32` |
 | `format_real_plain(x)` | a `real` as `str` and a plain hole write it: Rust's `{}`; `format_f32_plain`, `format_f16_plain`, `format_bf16_plain` and `format_f128_plain` at the other widths |
 

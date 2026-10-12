@@ -38,6 +38,17 @@ private[sysl] struct Big[const N: usize]
             x >>= 32
     end set
 
+    /** The value of `src`, 32-bit limbs least significant first, which must fit. */
+    set_limbs(*self, src: []const u32)
+        self.len = src.len
+
+        for i in 0..<src.len
+            self.limbs[i] = src[i]
+
+        while self.len > 0 && self.limbs[self.len - 1] == 0
+            self.len -= 1
+    end set_limbs
+
     is_zero(self) -> bool = self.len == 0
 
     /** How many bits the value takes, zero for zero. */
@@ -371,13 +382,30 @@ private[sysl] const QuadLimbs: usize = 530
 private decimal_digits[const N: usize](r: *Big[N], s: *Big[N], m: u128, e: int, significant: int,
                                        last: int, into: []u8) -> (usize, int)
     r.set(m)
+    digits_of_set(r, s, int(bits_of128(m)), e, significant, last, into)
+end decimal_digits
+
+/** The digits of a magnitude of any width, given as 32-bit limbs least significant first, times
+ * `2^e`: `float_digits` for a fixed-point value too wide for a `u128`. `N` limbs must hold the value
+ * and a few bits more -- the working integers never pass the value's width by more than a handful of
+ * bits -- so `bits / 32 + 6` is always enough. `r` and `s` are the caller's working integers.
+ */
+private[sysl] wide_digits[const N: usize](r: *Big[N], s: *Big[N], limbs: []const u32, e: int,
+                                          significant: int, last: int, into: []u8) -> (usize, int)
+    r.set_limbs(limbs)
+    digits_of_set(r, s, int(r.bit_len()), e, significant, last, into)
+end wide_digits
+
+// `decimal_digits` once `r` holds the magnitude, `mbits` bits wide.
+private digits_of_set[const N: usize](r: *Big[N], s: *Big[N], mbits: int, e: int, significant: int,
+                                      last: int, into: []u8) -> (usize, int)
     s.set(1)
 
     if e >= 0 then r.shl(e) else s.shl(-e)
 
     // The power of ten of the first digit: floor(log10(v)), estimated from floor(log2(v)) and then
     // corrected so that r / s lands in [1, 10).
-    var k = ((int(bits_of128(m)) - 1 + e) * 78913) >> 18
+    var k = ((mbits - 1 + e) * 78913) >> 18
 
     if k >= 0 then s.mul_pow10(k) else r.mul_pow10(-k)
 
@@ -456,7 +484,7 @@ private decimal_digits[const N: usize](r: *Big[N], s: *Big[N], m: u128, e: int, 
         count -= 1
 
     (count, k)
-end decimal_digits
+end digits_of_set
 
 /** What a float conversion was asked for: `%e`, `%f`, `%g` or `%a` (or the upper-case `%E`, `%F`,
  * `%G`, `%A`), a minimum field width, a precision (-1 where none was written) and C's five flags.
@@ -480,7 +508,30 @@ private[sysl] struct FloatField
  * worked out; it has to hold `float_scratch_need(v, f)` bytes, which 800 always is for a `real` or an
  * `f32` and 11,600 for an `f128`.
  */
-private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into: []u8)
+private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into: []u8) =
+    write_float_laid(out, v, f, into, None)
+
+/** The digits a conversion asks of a finite value: how many significant ones and the last position,
+ * as `float_digits` takes them -- `%g` its precision, `%f` down to the precision's place and `%e` one
+ * more than its precision. What `write_float_laid` is handed ahead of time for a value `float_digits`
+ * cannot hold.
+ */
+private[sysl] float_request(f: FloatField) -> (int, int)
+    val conv = f.conv | 0x20
+    val prec = if f.prec < 0 then 6 else f.prec
+
+    if conv == u8('g') then return (if prec == 0 then 1 else prec, 0)
+    if conv == u8('f') then return (0, -prec)
+
+    (prec + 1, 0)
+end float_request
+
+/** `write_float_field` with the digits of a finite value already worked out, which is how a value too
+ * wide for `FloatValue`'s `u128` is written: `digits` is what `wide_digits` answered for
+ * `float_request(f)`, and `v` is the value's sign and kind with any `m`. `%a` is not offered one.
+ */
+private[sysl] write_float_laid(out: *Writer, v: FloatValue, f: FloatField, into: []u8,
+                               digits: Option[(usize, int)])
     val conv = f.conv | 0x20
     val upper = f.conv != conv
 
@@ -514,7 +565,7 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
         val p = if prec == 0 then 1 else prec
 
         if v.kind == Finite
-            val got = float_digits(v.m, v.e, p, 0, into)
+            val got = if digits.is_some() then digits.unwrap() else float_digits(v.m, v.e, p, 0, into)
 
             count = got.0
             k = got.1
@@ -529,7 +580,8 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
             if needed < frac then frac = if needed > 0 then needed else 0
         end if
     elif v.kind == Finite
-        val got = if fixed then float_digits(v.m, v.e, 0, -prec, into)
+        val got = if digits.is_some() then digits.unwrap()
+        else if fixed then float_digits(v.m, v.e, 0, -prec, into)
         else float_digits(v.m, v.e, prec + 1, 0, into)
 
         count = got.0
@@ -581,7 +633,7 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
     end if
 
     if f.left then display_fill(out, 32, pad)
-end write_float_field
+end write_float_laid
 
 /** How many bytes of `into` `write_float_field` needs to render `v` under `f` -- an upper bound on the
  * digits it works out: the precision's count for `%e` and `%g`, the places from the first digit down
@@ -589,12 +641,16 @@ end write_float_field
  * request of a `real` or an `f32` and 11,600 of an `f128`. A zero, an infinity, a NaN and every `%a`
  * need none.
  */
-private[sysl] float_scratch_need(v: FloatValue, f: FloatField) -> usize
+private[sysl] float_scratch_need(v: FloatValue, f: FloatField) -> usize =
+    scratch_need_of(v, int(bits_of128(v.m)), f)
+
+/** `float_scratch_need` for a value whose magnitude is `mbits` bits wide, however wide. */
+private[sysl] scratch_need_of(v: FloatValue, mbits: int, f: FloatField) -> usize
     val conv = f.conv | 0x20
 
     if v.kind != Finite || conv == u8('a') then return 0
 
-    val bits = long(bits_of128(v.m))
+    val bits = long(mbits)
     val e = long(v.e)
     val prec = if f.prec < 0 then long(6) else long(f.prec)
 
@@ -611,7 +667,7 @@ private[sysl] float_scratch_need(v: FloatValue, f: FloatField) -> usize
     val need = if asked < held then asked else held
 
     if need < 1 then 1 else usize(need)
-end float_scratch_need
+end scratch_need_of
 
 // `%a`: `v` as a hexadecimal significand and a binary exponent, C's `[-]0xh.hhhp±d`. The first digit is
 // 1 for every value but zero, a subnormal included, and the fraction is every hexadecimal digit the

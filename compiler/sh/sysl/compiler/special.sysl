@@ -503,6 +503,29 @@ library_result_call_of(cx: &Analyzer, span: Span, name: string, args: Buf[TExpr]
                                       f.unwrap().decl.needs), false))
 end library_result_call_of
 
+// The same for a library function that is generic, made real at `targs`: the instantiation is
+// registered and the call goes to it. Used where a renderer is generic over an integer type the
+// hole's value has, which no declared parameter list can spell for a direct call by key.
+library_generic_call_of(cx: &Analyzer, span: Span, name: string, targs: Buf[Type],
+                        args: Buf[TExpr]) -> TExpr
+    val key = library_key(cx, name)
+
+    if key.is_none()
+        return cx.err(span, s"this is written in terms of the library's '$name', which the " +
+                      "standard module this compilation was given does not declare")
+
+    val f = cx.an.tables.funcs.get(key.unwrap())
+
+    if f.is_none() then return bad_expr(span)
+
+    val inst = instantiate_func(cx.an, f.unwrap().scope, f.unwrap().decl, targs, false)
+
+    cx.an.uses(inst)
+    TExpr(span, TCall(inst, args,
+                      declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type,
+                                      f.unwrap().decl.needs), false))
+end library_generic_call_of
+
 // `str_cast(bytes)` -- the bytes taken as a string, with nothing checked.
 //
 // **A program does not write this; it writes `sysl.text.from_utf8_unchecked`**, which is an
