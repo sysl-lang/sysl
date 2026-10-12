@@ -1,0 +1,182 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **One rule at every depth**: a module `val` over a constant expression is laid into the object file
+// whether the constant part is the whole initializer, one element of an array or one field of a
+// struct -- and a conversion of a constant expression, and a call to a `const` function over
+// constants, are constant expressions. So a table a `const` function generates is laid down exactly
+// as the one written out by hand, which is what lets a freestanding image carry it in `.rodata`.
+// A call to a function that is not `const`, or a `const` call over storage, is still code.
+
+private csf_no_library(t: Target) -> bool
+    if csf_library_for(t).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end csf_no_library
+
+private csf_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end csf_library_for
+
+private csf_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end csf_first_of
+
+// A freestanding archive, as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to.
+private csf_freestanding(text: string) -> string
+    val t = target_named("thumbv6m-freestanding").unwrap()
+    var units = csf_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = csf_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = csf_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end csf_freestanding
+
+private csf_skip() -> bool = csf_no_library(target_named("thumbv6m-freestanding").unwrap())
+
+// The storage is the constant the object file carries, and nothing runs before `main` to fill it.
+private csf_laid_down(out: string, global: string)
+    assert(out.contains(global), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end csf_laid_down
+
+private csf_refusal(name: string) -> string =
+    s"'main_entry' is exported and reaches '$name', which is module storage an initializer fills " +
+    "before the program's own statements run. This artifact has no entry point to fill it in, and " +
+    "'thumbv6m-freestanding' is freestanding — there is no loader to run a constructor either, so " +
+    "the function would read whatever the image left. Build for a hosted target, where the storage " +
+    "is filled before any export can run, or make the initializer constant data, which is laid " +
+    "straight into the object file"
+
+private val csf_half: string = "const half(x: real) -> real = x * 0.5\n\n"
+private val csf_main: string = "\n\n@export(\"main\")\nmain_entry() -> int = "
+
+@test("a fixed-point conversion over float arithmetic is laid down, as one over a literal is")
+csf_a_fixed_conversion_over_arithmetic()
+    if csf_skip() then return
+
+    csf_laid_down(csf_freestanding("val T: q15 = q15(0.25 * 0.5)" + csf_main + "int(T.bits)\n"),
+                  "@T = private constant i16 4096\n")
+end csf_a_fixed_conversion_over_arithmetic
+
+@test("'const' calls as the elements of an array are laid down, as one alone is")
+csf_const_calls_as_elements()
+    if csf_skip() then return
+
+    csf_laid_down(csf_freestanding(csf_half + "val T: [2]real = [half(0.5), half(1.5)]" + csf_main +
+                                   "int(T[0] + T[1])\n"),
+                  "@T = private constant [2 x double] [double 0x3FD0000000000000, double 0x3FE8000000000000]\n")
+end csf_const_calls_as_elements
+
+@test("a conversion over a 'const' call, as an element beside a literal, is laid down")
+csf_a_conversion_over_a_const_call_element()
+    if csf_skip() then return
+
+    csf_laid_down(csf_freestanding(csf_half + "val T: [2]i16 = [i16(half(4.0)), 1]" + csf_main +
+                                   "int(T[0] + T[1])\n"),
+                  "@T = private constant [2 x i16] [i16 2, i16 1]\n")
+end csf_a_conversion_over_a_const_call_element
+
+@test("a fixed-point table a 'const' function generates is laid down, rounded and saturated as at run time")
+csf_a_generated_fixed_table()
+    if csf_skip() then return
+
+    csf_laid_down(csf_freestanding(csf_half +
+                                   "val S: [4]q15 = [q15(half(0.5)), q15(-half(2.0)), q15(half(4.0)), " +
+                                   "q15(half(0.00006103515625))]" + csf_main + "int(S[0].bits)\n"),
+                  "@S = private constant [4 x i16] [i16 8192, i16 -32768, i16 32767, i16 1]\n")
+end csf_a_generated_fixed_table
+
+@test("a struct's fields over conversions of 'const' calls are laid down")
+csf_struct_fields_over_const_calls()
+    if csf_skip() then return
+
+    csf_laid_down(csf_freestanding(csf_half + "struct P\n    a: q15\n    b: i32\n\n" +
+                                   "val X: P = P(q15(half(0.5)), i32(half(8.0)))" + csf_main + "X.b\n"),
+                  "@X = private constant %struct.P { i16 8192, i32 4 }\n")
+end csf_struct_fields_over_const_calls
+
+@test("an element calling a function that is not 'const' is still storage a freestanding archive refuses")
+csf_a_plain_call_element_is_refused()
+    if csf_skip() then return
+
+    assert_eq(csf_freestanding("double(x: int) -> int = x * 2\n\nval T: [2]int = [double(3), 1]" +
+                               csf_main + "T[0]\n"),
+              csf_refusal("T"))
+end csf_a_plain_call_element_is_refused
+
+@test("a 'const' call over storage, as an element, is still storage a freestanding archive refuses")
+csf_a_const_call_over_storage_is_refused()
+    if csf_skip() then return
+
+    assert_eq(csf_freestanding(csf_half + "var k: real = 1.0\n\nval T: [2]real = [half(k), 0.5]" +
+                               csf_main + "int(T[0])\n"),
+              csf_refusal("T"))
+end csf_a_const_call_over_storage_is_refused
+
+@test("an element whose 'const' call traps is refused at the initializer, once")
+csf_a_trapping_element_is_refused_once()
+    if !enm_ready() then return
+
+    val said = isc_diags("const per(n: int, k: int) -> int = n / k\n\n" +
+                         "static val Z: [2]int = [1, per(1, 0)]\n\nprint(Z[0])\n")
+    val trap = "traps while it is being compiled"
+
+    assert(said.index_of(trap).is_some(), said)
+    assert_eq(said.index_of(trap), said.last_index_of(trap), said)
+    assert(said.contains("'Z' traps while it is being compiled: integer division by zero"), said)
+end csf_a_trapping_element_is_refused_once
+
+@test("the laid-down values are the values the same expressions compute at run time")
+csf_the_values_are_the_run_time_values()
+    if !enm_ready() then return
+
+    val prog = csf_half +
+               "static val T: [2]real = [half(0.5), half(1.5)]\n" +
+               "static val S: [4]q15 = [q15(half(0.5)), q15(-half(2.0)), q15(half(4.0)), q15(0.25 * 0.5)]\n" +
+               "static val I: [2]i16 = [i16(half(4.0)), 1]\n\n" +
+               "var k = 0.5\n\n" +
+               "print(T[0] == half(k), T[1] == half(k * 3.0))\n" +
+               "print(S[0].bits, S[1].bits, S[2].bits, S[3].bits)\n" +
+               "print(q15(half(k)).bits, q15(-half(k * 4.0)).bits, q15(half(k * 8.0)).bits, q15(k * 0.25).bits)\n" +
+               "print(I[0], I[1])\n"
+
+    assert_eq(enm_ran(prog), "true true\n8192 -32768 32767 4096\n8192 -32768 32767 4096\n2 1\n")
+end csf_the_values_are_the_run_time_values
