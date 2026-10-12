@@ -332,6 +332,39 @@ fixed_fold(span: Span, t: TExpr, to: Type) -> Option[TExpr]
     Some(TExpr(span, TIntLit(clamped(raw, fixed_min_raw(bits, signed), fixed_max_raw(bits, signed)), to)))
 end fixed_fold
 
+// `q15(0.7q31, Floor)`, `int(-1.5q15, Floor)`, `q15(0.6, Floor)` -- a conversion toward negative
+// infinity over a literal, worked out with the run-time rule: the exact value times 2^F (0 for an
+// integer), floored, then saturated. Nothing for an infinity or a NaN, which the run time settles.
+fixed_floor_fold(span: Span, t: TExpr, to: Type) -> Option[TExpr]
+    val (bits, frac, signed) = to match
+        Fixed(b, f, s) -> (b, f, s)
+        Integer(b, s, _) -> (b, 0, s)
+        _ -> return None
+
+    // The literal's exact value as `coef × 2^exp`.
+    val (coef, exp) = *t.kind match
+        TIntLit(v, ty) -> underlying(ty) match
+            Fixed(_, f, _) -> (v, -f)
+            Integer(_, _, _) -> (v, 0)
+            _ -> return None
+        TFloatLit(fbits, _) -> exact_of_double(fbits) match
+            Some(x) -> x
+            None -> return None
+        _ -> return None
+
+    val shift = exp + frac
+    var raw = coef
+
+    if shift >= 0
+        raw = big_mul(coef, big_pow(from_int(2), usize(shift)))
+    else
+        val (q, _) = div_rem_floor(coef, big_pow(from_int(2), usize(-shift)))
+
+        raw = q
+
+    Some(TExpr(span, TIntLit(clamped(raw, min_of(bits, signed), max_of(bits, signed)), to)))
+end fixed_floor_fold
+
 // A double times 2^F, rounded to nearest with ties toward +inf -- the conversion call's rounding --
 // and not yet saturated. Nothing for an infinity or a NaN.
 fixed_raw_of_double(fbits: long, frac: int) -> Option[BigInt]

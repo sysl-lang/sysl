@@ -242,23 +242,17 @@ in a database column or sending one over a wire takes it apart.
 | `is_zero` | `is_zero(self) -> bool` | Whether the value is zero, at whatever scale it is written to. |
 | `sign` | `sign(self) -> int` | `-1`, `0` or `1`, which the scale cannot affect: a positive power of ten does not change a sign. |
 
+## Aliases
+
 ### `Rounding`
 
 ```sysl
-enum Rounding
-    HalfEven
-    HalfUp
-    Down
-    Up
-    Floor
-    Ceiling
+type Rounding = sysl.Rounding
 ```
 
-How to resolve a division that does not come out exactly.
-
-`HalfEven` is the default and is what money code should use: rounding halves consistently up
-biases a long run of sums upward, and rounding them to the nearest even value does not. It is what
-IEEE 754 does with binary floating point and what accountants call banker's rounding.
+How to resolve a division that does not come out exactly -- the standard module's `Rounding`,
+named here too so that `import sysl.math.decimal.Rounding` keeps reading. `HalfEven` is the one
+an operator picks.
 
 ## Implementations
 

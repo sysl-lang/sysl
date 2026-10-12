@@ -939,6 +939,8 @@ special_form_word(name: string) -> bool =
 // or changes representation without being written.
 private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
                      args: Buf[Expr]) -> TExpr
+    if args.len() == 2 then return rounded_convert(cx, span, written, to, args)
+
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
@@ -970,6 +972,114 @@ convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string])
 
     TExpr(span, TCast(t, to))
 end convert_to
+
+// `q15(x, Floor)` -- a conversion told how to settle the bits it drops, the mode a `sysl.Rounding`
+// variant written at the call. **Only a conversion into or out of a fixed-point type reads one**, and
+// each row takes its own default and `Floor`: into a fixed-point type the default is `HalfUp` (to
+// nearest, a half toward +inf), out of one into an integer it is `Down` (toward zero, as a float's
+// is). `Floor` is an arithmetic shift right where `HalfUp` adds a half first -- the narrowing C and
+// CMSIS code does -- and both saturate. Into a float there is nothing to choose: a float rounds to
+// nearest. A mode where nothing is dropped (a fraction that grows, an integer into a fixed format) is
+// accepted and changes nothing, so a generic body may write one for every width it is handed.
+private rounded_convert(cx: &Analyzer, span: Span, written: string, to: Type, args: Buf[Expr]) -> TExpr
+    val t = type_expr_bare(cx, args.at(0))
+
+    if texpr_type(t) == Unknown then return t
+
+    val from = underlying(texpr_type(t))
+    val target = underlying(to)
+
+    // A conversion with no fixed-point side has nothing to choose and keeps its one-value refusal.
+    if !is_fixed(from) && !is_fixed(target) then
+        return cx.err(span, s"a '$written' conversion takes exactly one value")
+
+    val mode = rounding_mode(cx, written, args.at(1))
+
+    if mode.is_none() then return bad_expr(span)
+
+    val word = mode.unwrap()
+    val default = rounding_default(from, target)
+
+    if default.is_none()
+        // Into a float, or a pair no conversion joins -- which the conversion itself refuses.
+        target match
+            Floating(_, _) ->
+                return cx.err(args.at(1).span, s"a conversion from ${type_show(texpr_type(t))} " +
+                              "into a float rounds to nearest, so it takes no rounding mode")
+            _ -> return convert_to(cx, span, t, to, None)
+    end if
+
+    if word != default.unwrap() && word != "Floor"
+        return cx.err(args.at(1).span, s"a conversion from ${type_show(texpr_type(t))} to " +
+                      s"${type_show(to)} rounds '${default.unwrap()}' or 'Floor', not '$word'")
+
+    val plain = convert_to(cx, span, t, to, None)
+
+    if word != "Floor" || texpr_type(plain) == Unknown then return plain
+
+    // Nothing is dropped where the fraction grows or the source is an integer, and there the
+    // ordinary conversion is already exact.
+    val drops = (from, target) match
+        (Fixed(_, f1, _), Fixed(_, f2, _)) -> f1 > f2
+        (Integer(_, _, _), _) -> false
+        _ -> true
+
+    if !drops then return plain
+
+    val folded = fixed_floor_fold(span, t, target)
+
+    if folded.is_some() then return TExpr(span, TIntLit(int_lit_value(folded.unwrap()), to))
+
+    TExpr(span, TFloorCast(t, to))
+end rounded_convert
+
+private int_lit_value(t: TExpr) -> BigInt = *t.kind match
+    TIntLit(v, _) -> v
+    _ -> from_int(0)
+
+// The rounding a conversion takes when none is written, where the conversion reads one at all.
+private rounding_default(from: Type, to: Type) -> Option[string] = (from, to) match
+    (Fixed(_, _, _), Fixed(_, _, _)) -> Some("HalfUp")
+    (Floating(_, _), Fixed(_, _, _)) -> Some("HalfUp")
+    (Integer(_, _, _), Fixed(_, _, _)) -> Some("HalfUp")
+    (Fixed(_, _, _), Integer(_, _, _)) -> Some("Down")
+    _ -> None
+
+// The mode, which has to be one of `sysl.Rounding`'s names written here: the conversion is laid down
+// with that rounding in it, so a mode held in a variable has nothing to be lowered to.
+private rounding_mode(cx: &Analyzer, written: string, arg: Expr) -> Option[string]
+    val key = module_qualify(AutoImportedModule, "Rounding")
+
+    if !cx.an.tables.types.has(key)
+        cx.fault(arg.span, s"'$written' takes a rounding mode from 'sysl.Rounding', and this library " +
+                 "has none")
+        return None
+    end if
+
+    val rty = resolve_type(cx.an, cx.scope, named_type(arg.span, "sysl.Rounding"), no_bindings())
+    val t = type_expr(cx, arg, Some(rty))
+
+    if texpr_type(t) == Unknown then return None
+
+    *t.kind match
+        TEnumNew(en, variant, _) ->
+            en match
+                Enum(d) -> if d.base == key then return Some(variant.name)
+                _ -> ()
+        _ -> ()
+
+    underlying(texpr_type(t)) match
+        Enum(d) ->
+            if d.base == key
+                cx.fault(arg.span, s"'$written' lays its rounding into the conversion, so it has to " +
+                         "be one of Rounding's names written here — not a value carrying one")
+                return None
+        _ -> ()
+
+    cx.fault(arg.span, s"'$written' takes a rounding mode second, one of the names of 'sysl.Rounding' — " +
+             "'Floor' to drop the low bits toward negative infinity")
+    None
+end rounding_mode
 
 private refusal(asked: Option[string], from: Type, to: Type) -> string = asked match
     Some(name) -> s"cannot make $name from ${type_show(from)}"
