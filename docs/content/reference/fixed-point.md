@@ -297,15 +297,55 @@ Every conversion is a call, as for every other number:
 
 | from → to | written | what it does |
 |---|---|---|
-| fixed → fixed | `q15(x)`, `q31(y)` | exact when finer; otherwise round to nearest (a half up), saturate |
-| float → fixed | `q31(f)` | round to nearest, saturate, NaN → 0 |
+| fixed → fixed | `q15(x)`, `q15(x, Floor)` | exact when finer; otherwise round to nearest (a half up), or with `Floor` toward −∞; saturate |
+| float → fixed | `q31(f)`, `q31(f, Floor)` | round to nearest, or with `Floor` toward −∞; saturate, NaN → 0 |
 | fixed → float | `real(x)`, `f32(x)` | round to nearest (exact into `real` up to 53 bits) |
 | integer → fixed | `i32q16(n)` | the value `n`, saturating |
-| fixed → integer | `int(x)` | toward zero, saturating — as a float does |
+| fixed → integer | `int(x)`, `int(x, Floor)` | toward zero, or with `Floor` toward −∞; saturating — as a float does |
 
 Over a literal a conversion is worked out while compiling with the same rounding, so `q31(0.6)` is
 constant data too — and it saturates where the literal `1.0` at `q31` is refused: `q31(1.0)` is
 `q31::Max`.
+
+### Choosing the rounding
+
+The second argument is a [`Rounding`](/api/sysl/#rounding), written bare. **`Floor` is the bit-exact
+narrowing C and CMSIS code does** — an arithmetic shift right, dropping the low bits toward −∞ —
+where the default adds a half first. A port that has to match its reference sample for sample wants
+`Floor`; it still saturates:
+
+```sysl
+val x = q31::Bits(-98304)          // -1.5 steps of a q15, held finer
+print(q15(x).bits, q15(x, Floor).bits)
+print(q15(q31::Bits(98303)).bits, q15(q31::Bits(98303), Floor).bits)
+print(int(-1.5i32q16), int(-1.5i32q16, Floor))
+print(q15(-0.00001).bits, q15(-0.00001, Floor).bits, q15(i32q20::Max, Floor))
+```
+
+```output
+-1 -2
+1 1
+-1 -2
+0 -1 0.99997
+```
+
+Into a fixed-point type a conversion takes `HalfUp` (its default, the same as writing nothing) or
+`Floor`; out of one into an integer, `Down` (its default) or `Floor`. Where nothing is dropped — a
+fraction that grows, an integer into a fixed format — the mode changes nothing, so a generic body
+may write it for every width it is handed. Into a float there is nothing to choose, and the mode is
+written at the call rather than carried in a variable, since it is laid into the instruction:
+
+```sysl
+print(real(0.5i16q15, Floor))
+```
+
+```error
+a conversion from q15 into a float rounds to nearest, so it takes no rounding mode
+```
+
+On a Cortex-M4, `q15(x, Floor)` from a `q31` is one `ASR` — sixteen bits shifted out of a 32-bit
+value always fit, so the saturation folds away — and from an `i32q20`, whose integer bits a `q15`
+cannot hold, the shift and an `SSAT`.
 
 ## Attributes, and the bits
 

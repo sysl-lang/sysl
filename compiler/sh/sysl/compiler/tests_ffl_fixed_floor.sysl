@@ -1,0 +1,348 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+
+// A conversion told how to round: `q15(x, Floor)` (user-approved, 2026-10-11). `Rounding` lives in
+// the standard module, so the variant is written bare; into a fixed-point type a conversion takes
+// `HalfUp` (its default) or `Floor`, out of one into an integer `Down` (its default) or `Floor`, into
+// a float nothing. `Floor` drops the low bits toward negative infinity -- an arithmetic shift, the
+// narrowing C and CMSIS code does -- and still saturates. Every expected value is worked out by hand
+// from the raw integers.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ffl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ffl_ready
+
+private ffl_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ffl").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end ffl_root
+
+private ffl_ran(text: string) -> (string, int)
+    val root = ffl_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end ffl_ran
+
+private ffl_prints(text: string, expected: string)
+    if !ffl_ready() then return
+
+    val ran = ffl_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+end ffl_prints
+
+private ffl_lowered(text: string) -> (string, string)
+    val root = ffl_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> (replace_all(failure_text(why), root, "@"), "")
+        Ok(made) ->
+            if made.report.is_empty() then ("", made.text)
+            else (replace_all(analysis_report(made.report), root, "@"), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ffl_lowered
+
+private ffl_refused(text: string, message: string, at: string)
+    if !ffl_ready() then return
+
+    val said = ffl_lowered(text).0
+
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end ffl_refused
+
+private ffl_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end ffl_cli
+
+private ffl_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/bin/arm-none-eabi-objdump", "/usr/local/bin/arm-none-eabi-objdump",
+                      "/usr/bin/arm-none-eabi-objdump"]
+
+    for i in 0..<candidates.len
+        if exists(candidates[i]) then return Some(candidates[i])
+
+    None
+end ffl_objdump
+
+// One exported function's disassembly as `sysl build-c` archives it for a board. A missing tool is a
+// failure rather than a skip, as in `tests_fx2_fixed_mixed.sysl`.
+private ffl_board_code(program: string, target: string, symbol: string) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    assert(clang_available(), "this test reads a board's code and there is no clang on this machine")
+
+    val tool = ffl_objdump()
+
+    assert(tool.is_some(), "this test reads a board's code and there is no arm-none-eabi-objdump")
+    assert(find_backend_clang(target_named(target).unwrap()).is_ok(),
+           s"this test reads a board's code and no clang here has the back end '$target' needs")
+
+    val root = ffl_root(program)
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = ffl_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val dis = capture(tool.unwrap(), ["-d", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = dis match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    val blocks = split(text, "\n\n")
+    var found = ""
+
+    for i in 0..<blocks.len
+        if blocks[i].contains(s"<$symbol>:") || blocks[i].contains(s"<$symbol" + "$") then
+            found = found + blocks[i] + "\n"
+
+    assert(found != "", text)
+    Some(found)
+end ffl_board_code
+
+private ffl_count(text: string, word: string) -> usize = split(text, word).len - 1
+
+// -- fixed to fixed -------------------------------------------------------------------------------
+
+@test("q31 to q15: Floor and the default differ exactly where the dropped bits are not zero")
+ffl_q31_to_q15_floor_against_nearest()
+    // Raw q31 values in units of 2^16 (one q15 step): 1.5, just under 1.5, -1.5, just under -1.5,
+    // just under 1, just above -1, and the two ends. The default rounds to nearest with a half up;
+    // Floor shifts right arithmetically.
+    ffl_prints(raw"""
+        near(x: q31) -> q15 = q15(x)
+        down(x: q31) -> q15 = q15(x, Floor)
+        written(x: q31) -> q15 = q15(x, HalfUp)
+
+        val xs: [9]i32 = [98304, 98303, -98304, -98305, 65535, -65535, -2147483648, 2147483647, 131072]
+        for x in xs
+            val v = q31::Bits(x)
+            print(x, near(v).bits, down(v).bits, written(v).bits)
+        """, "98304 2 1 2\n98303 1 1 1\n-98304 -1 -2 -1\n-98305 -2 -2 -2\n65535 1 0 1\n" +
+             "-65535 -1 -1 -1\n-2147483648 -32768 -32768 -32768\n2147483647 32767 32767 32767\n" +
+             "131072 2 2 2\n")
+
+@test("a format whose fraction is not at the top floors and saturates too")
+ffl_iwqf_floor_and_saturation()
+    // i32q20 to q15 drops 5 bits and has 11 integer bits a q15 cannot hold.
+    ffl_prints(raw"""
+        down(x: i32q20) -> q15 = q15(x, Floor)
+        to_q16(x: q31) -> i32q16 = i32q16(x, Floor)
+
+        print(down(i32q20::Bits(-1)).bits, down(i32q20::Bits(31)).bits, down(i32q20::Bits(32)).bits)
+        print(down(i32q20::Max).bits, down(i32q20::Min).bits, down(i32q20::Bits(-1048576)).bits)
+        print(to_q16(q31::Bits(-1)).bits, to_q16(q31::Bits(-32768)).bits, to_q16(q31::Bits(-32769)).bits)
+        """, "-1 0 1\n32767 -32768 -32768\n-1 -1 -2\n")
+
+@test("unsigned and q7 formats floor by the shift too")
+ffl_unsigned_and_q7()
+    ffl_prints(raw"""
+        u(x: u16q16) -> u8q8 = u8q8(x, Floor)
+        n(x: u16q16) -> u8q8 = u8q8(x)
+        s(x: q15) -> q7 = q7(x, Floor)
+
+        print(u(u16q16::Bits(383)).bits, n(u16q16::Bits(383)).bits, u(u16q16::Max).bits)
+        print(s(q15::Bits(-129)).bits, s(q15::Bits(-127)).bits, s(q15::Bits(255)).bits, q7(q15::Bits(-127)).bits)
+        """, "1 1 255\n-1 -1 0 0\n")
+
+@test("a mode on a conversion that drops nothing is accepted and changes nothing")
+ffl_exact_conversions_take_a_mode()
+    ffl_prints(raw"""
+        wide(x: q15) -> q31 = q31(x, Floor)
+        from_int(n: int) -> i32q16 = i32q16(n, Floor)
+
+        print(wide(q15::Bits(-3)).bits, from_int(-3), from_int(100000))
+        """, "-196608 -3 32767.99998\n")
+
+// -- float and integer ----------------------------------------------------------------------------
+
+@test("a float into a fixed format floors after scaling, saturating, and a NaN is zero")
+ffl_float_to_fixed_floor()
+    ffl_prints(raw"""
+        down(x: real) -> q15 = q15(x, Floor)
+        down32(x: f32) -> q15 = q15(x, Floor)
+
+        print(down(-0.00001).bits, q15(-0.00001).bits, down(0.99999).bits, q15(0.99999).bits)
+        print(down(2.0).bits, down(-2.0).bits, down(nan).bits, down(-infinity).bits)
+        print(down32(f32(-0.5)).bits, down32(f32(0.75)).bits)
+        """, "-1 0 32767 32767\n32767 -32768 0 -32768\n-16384 24576\n")
+
+@test("a fixed value into an integer floors where Down truncates toward zero")
+ffl_fixed_to_int_floor()
+    ffl_prints(raw"""
+        down(x: i32q16) -> int = int(x, Floor)
+        zero(x: i32q16) -> int = int(x, Down)
+        narrow(x: i32q16) -> i8 = i8(x, Floor)
+
+        print(down(i32q16::Bits(-98304)), zero(i32q16::Bits(-98304)), int(i32q16::Bits(-98304)))
+        print(down(i32q16::Bits(98304)), down(i32q16::Bits(-1)), narrow(i32q16::Min), narrow(i32q16::Bits(-1)))
+        """, "-2 -1 -1\n1 -1 -128 -1\n")
+
+// -- over constants --------------------------------------------------------------------------------
+
+@test("over a literal the conversion is worked out while compiling with the same rule")
+ffl_folds_over_literals()
+    ffl_prints(raw"""
+        val a = q15(-0.7i32q31, Floor)
+        val b = q15(-0.00001, Floor)
+        val c = int(-1.5i32q16, Floor)
+        val d = q15(i32q20::Max, Floor)
+
+        print(a.bits, b.bits, c, d.bits)
+        """, "-22938 -1 -2 32767\n")
+
+@test("a folded floor is the constant itself in the lowered text")
+ffl_fold_is_constant_data()
+    if !ffl_ready() then return
+
+    val out = ffl_lowered(raw"""
+        val a = q15(-0.7i32q31, Floor)
+        print(a.bits)
+        """)
+
+    assert_eq(out.0, "")
+    assert(out.1.contains("i16 -22938"), out.1)
+
+// -- refusals --------------------------------------------------------------------------------------
+
+@test("a mode a conversion does not read is refused, naming the ones it does")
+ffl_wrong_mode_is_refused()
+    ffl_refused("print(q15(0.5i32q31, Down))\n",
+                "a conversion from q31 to q15 rounds 'HalfUp' or 'Floor', not 'Down'", "1:22")
+    ffl_refused("print(int(0.5i16q15, HalfUp))\n",
+                "a conversion from q15 to int rounds 'Down' or 'Floor', not 'HalfUp'", "1:22")
+
+@test("a conversion into a float takes no rounding mode")
+ffl_into_float_is_refused()
+    ffl_refused("print(real(0.5i16q15, Floor))\n",
+                "a conversion from q15 into a float rounds to nearest, so it takes no rounding mode",
+                "1:23")
+
+@test("a conversion with no fixed-point side still takes exactly one value")
+ffl_no_fixed_side_is_refused()
+    ffl_refused("print(int(2.5, Floor))\n", "a 'int' conversion takes exactly one value", "1:7")
+    ffl_refused("print(bool(0.5i16q15, Floor))\n", "cannot convert q15 to bool", "1:7")
+
+@test("a mode held in a variable, or something that is not a mode, is refused")
+ffl_mode_must_be_written()
+    ffl_refused("val m = Floor\nprint(q15(0.5i32q31, m))\n",
+                "'q15' lays its rounding into the conversion, so it has to be one of Rounding's " +
+                "names written here — not a value carrying one", "2:22")
+    ffl_refused("print(q15(0.5i32q31, 3))\n",
+                "'q15' takes a rounding mode second, one of the names of 'sysl.Rounding' — 'Floor' " +
+                "to drop the low bits toward negative infinity", "1:22")
+    ffl_refused("print(q15(0.5i32q31, Floor, Floor))\n", "a 'q15' conversion takes exactly one value",
+                "1:7")
+
+@test("a program's own Floor variant does not take the conversion's away")
+ffl_own_floor_variant()
+    ffl_prints(raw"""
+        enum Level
+            Floor
+            Roof
+
+        val l: Level = Floor
+        print(l == Floor, q15(q31::Bits(-1), Floor).bits)
+        """, "true -1\n")
+
+// -- Rounding in the standard module ---------------------------------------------------------------
+
+@test("decimal's Rounding is the standard module's, by name and through its wildcard")
+ffl_decimal_rounding_is_the_root_one()
+    ffl_prints(raw"""
+        import sysl.math.decimal.{Rounding, divide, from_int, to_string}
+
+        val m: sysl.Rounding = Rounding.Down
+        print(to_string(divide(from_int(-1), from_int(8), 2, m)), to_string(divide(from_int(-1), from_int(8), 2, Floor)))
+        """, "-0.12 -0.13\n")
+    ffl_prints(raw"""
+        import sysl.math.decimal.*
+
+        val r: Rounding = Down
+        print(r, to_string(divide(from_int(-1), from_int(8), 2, Rounding.Floor)))
+        """, "Down -0.13\n")
+
+// -- on a board ------------------------------------------------------------------------------------
+
+// q31 to q15 drops sixteen bits of a 32-bit value, so what is left always fits and the clamp folds
+// away: one shift. From a format with integer bits a q15 cannot hold, the clamp is an SSAT.
+@test("q15(x, Floor) on a Cortex-M4 is one shift, and a shift and an SSAT where it can overflow")
+ffl_floor_on_m4()
+    val program = raw"""
+        @export("ffl_narrow")
+        narrow(x: q31) -> q15 = q15(x, Floor)
+
+        @export("ffl_wide")
+        wide(x: i32q20) -> q15 = q15(x, Floor)
+
+        @export("main")
+        boot() -> i32 = 0
+        """
+    val narrow = ffl_board_code(program, "thumbv7em-freestanding", "ffl_narrow")
+
+    if narrow.is_none() then return
+
+    val n = narrow.unwrap()
+    val w = ffl_board_code(program, "thumbv7em-freestanding", "ffl_wide").unwrap()
+
+    assert(n.contains("asr"), n)
+    assert_eq(ffl_count(n, "ssat"), 0, n)
+    assert_eq(ffl_count(w, "ssat"), 1, w)
+    assert(w.contains("asr"), w)
+
+    for code in [n, w]
+        assert(!code.contains("\tadd"), code)
+        assert(!code.contains("\tbl\t"), code)
