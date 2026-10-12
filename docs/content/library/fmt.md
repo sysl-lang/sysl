@@ -143,8 +143,20 @@ print(f"${5e-324}%.3e")
 ```
 
 An infinity is `inf` and a NaN is `nan`, upper case under `%E`, `%F` or `%G`; neither is padded with
-zeros, and a NaN carries no sign. The width and the precision may be holes of their own, as an
+zeros, and each is signed as C signs it — a NaN whose sign bit is set is `-nan`, and `+` or a space
+marks one that is not. A plain hole is not a C conversion, and there a NaN is `NaN` whatever its
+bits, as Rust's `{}` writes it. The width and the precision may be holes of their own, as an
 integer's may (`${x}%.${n}f`).
+
+```sysl
+val neg = -real.nan
+
+print(f"[${neg}%f] [${real.nan}%+6.2e] [${real.nan}% G] [${neg}%08f] [$neg]")
+```
+
+```output
+[-nan] [  +nan] [ NAN] [    -nan] [NaN]
+```
 
 **One host differs, and it is the host that is wrong.** Where `%g` rounds a tie *down* to the even
 digit, macOS's C library leaves the trailing zeros C requires dropped — its `printf("%g", 1000005.0)`

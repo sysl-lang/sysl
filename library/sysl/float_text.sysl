@@ -317,6 +317,13 @@ private[sysl] quad_value(x: f128) -> FloatValue
     FloatValue(negative, Finite, fraction | (u128(1) << 112), biased - 16495)
 end quad_value
 
+/** `v` with a NaN's sign bit set aside: what a plain hole renders, as Rust's `{}` does, where a NaN is
+ * one value with no sign however its bits were left. A C conversion keeps the sign; this is for the
+ * other convention.
+ */
+private[sysl] unsigned_nan(v: FloatValue) -> FloatValue
+    if v.kind == NotANumber then FloatValue(false, NotANumber, 0, 0) else v
+
 /** The decimal digits of `m * 2^e` (`m` not zero), rounded half to even at one position, written into
  * `into` as ASCII with no trailing zeros. It answers how many it wrote and the power of ten the first
  * one stands for: `("125", 2)` is 125, `("125", -1)` is 0.125.
@@ -459,8 +466,9 @@ private[sysl] struct FloatField
 /** `v` rendered under `f` into `out`, flag for flag as C renders a `double`: `%f` is fixed point, `%e`
  * one digit, a point and an exponent of at least two digits, and `%g` whichever of the two the
  * precision and the exponent choose, with its trailing zeros dropped unless `#` keeps them. An
- * infinity is `inf` and a NaN `nan` (upper case under an upper-case conversion), a NaN carrying no
- * sign, and neither is padded with zeros. `%a` is `write_hex_field`'s. `into` is where the digits are
+ * infinity is `inf` and a NaN `nan` (upper case under an upper-case conversion), each signed as a
+ * number is -- C's `[-]nan`, so a NaN whose sign bit is set is `-nan` and `+` or a space marks one
+ * that is not -- and neither is padded with zeros. `%a` is `write_hex_field`'s. `into` is where the digits are
  * worked out; it has to hold `float_scratch_need(v, f)` bytes, which 800 always is for a `real` or an
  * `f32` and 11,600 for an `f128`.
  */
@@ -468,10 +476,7 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
     val conv = f.conv | 0x20
     val upper = f.conv != conv
 
-    var sign: [1]u8 = [0]
-
-    if v.kind != NotANumber
-        sign[0] = if v.negative then u8('-') else if f.plus then u8('+') else if f.space then u8(' ') else 0
+    var sign: [1]u8 = [if v.negative then u8('-') else if f.plus then u8('+') else if f.space then u8(' ') else 0]
 
     val signs = if sign[0] != 0 then 1 else 0
 

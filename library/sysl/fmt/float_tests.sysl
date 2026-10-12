@@ -1,7 +1,8 @@
 module sysl.fmt
 @tests
 
-import sysl.{float_digits, real_value}
+import sysl.{display_f128, display_f32, display_real, float_digits, real_value}
+import sysl.buf.byte_sink
 import sysl.text.{Search, from_utf8, repeat}
 
 // Floats under a specifier, and the shortest reading. The oracle for the specifiers is this host's
@@ -20,8 +21,28 @@ private[fmt] c_format(x: real, spec: string) -> string
 
     val n = c_snprintf(&out[0], 2048, &f[0], x)
 
-    conforming(from_utf8(out[0..<usize(n)]).unwrap(), spec)
+    val text = from_utf8(out[0..<usize(n)]).unwrap()
+
+    if x != x then signed_nan(text, x.bits() >> 63 != 0, spec) else conforming(text, spec)
 end c_format
+
+// **macOS's C library drops a NaN's sign too, and the oracle is corrected for that the same way.**
+// Its `printf("%f", -nan)` is `nan` and its `%+f` of any NaN is `nan`, though C converts a NaN in the
+// style `[-]nan` and gives `+` and space their usual meaning on one, and glibc and musl print `-nan`,
+// `+nan` and ` nan`. So C's word is taken without whatever sign it wrote, signed from the bits and
+// the flags, and its width put back.
+private signed_nan(text: string, negative: bool, spec: string) -> string
+    val body = text.trim()
+    val word = if body.starts_with("-") || body.starts_with("+") then body[1..] else body
+    val sign = if negative then "-" elif spec.index_of("+").is_some() then "+"
+    elif spec.index_of(" ").is_some() then " " else ""
+    val shown = sign + word
+    val pad = if text.bytes.len > shown.bytes.len then text.bytes.len - shown.bytes.len else 0
+
+    if pad == 0 then shown
+    elif spec.index_of("-").is_some() then shown + repeat(" ", pad)
+    else repeat(" ", pad) + shown
+end signed_nan
 
 // **macOS's C library has one defect here, and the oracle is corrected for it rather than copied.**
 // Where `%g` rounds a tie down to the even digit, it leaves the trailing zeros in place --
@@ -152,15 +173,35 @@ long_precisions_match_c()
         for spec in ["%.60f", "%.330f", "%.1100f", "%.760e", "%.800e", "%.400g", "%#.800g"]
             assert_eq(format_real(x, spec, 0, -1), c_format(x, spec))
 
-// The non-finite values are words, so `0` does not pad them and a NaN shows no sign.
-@test("an infinity and a NaN are words: no zero padding, and no sign on a NaN")
+// The non-finite values are words, so `0` does not pad them; a NaN is signed as a number is.
+@test("an infinity and a NaN are words: no zero padding, and a NaN signed as C signs one")
 non_finite_words()
     assert_eq(format_real(real.infinity, "%08.2f", 0, -1), "     inf")
     assert_eq(format_real(-real.infinity, "%e", 0, -1), "-inf")
     assert_eq(format_real(real.infinity, "%+G", 0, -1), "+INF")
     assert_eq(format_real(real.nan, "%-6f", 0, -1), "nan   ")
     assert_eq(format_real(real.nan, "%E", 0, -1), "NAN")
-    assert_eq(format_real(-real.nan, "%+f", 0, -1), "nan")
+    assert_eq(format_real(-real.nan, "%+f", 0, -1), "-nan")
+    assert_eq(format_real(-real.nan, "%f", 0, -1), "-nan")
+    assert_eq(format_real(real.nan, "%+f", 0, -1), "+nan")
+
+@test("a negative NaN is '-nan' under a C conversion and 'NaN' in a plain or precision hole")
+nan_sign_by_convention()
+    val neg = real.from_bits(0xfff8000000000001)
+
+    assert_eq(f"${neg}%f", "-nan")
+    assert_eq(f"${real.nan}% e", " nan")
+    assert_eq(s"$neg", "NaN")
+    assert_eq(str(neg), "NaN")
+    var sink = byte_sink()
+
+    display_real(neg, &sink, FormatSpec(6, 3, false))
+    display_f32(f32.from_bits(0xffc00001), &sink, FormatSpec(0, 2, false))
+    display_f128(-f128.nan, &sink, FormatSpec(0, 2, true))
+    assert_eq(from_utf8(sink.text()).unwrap(), "   nannannan")
+    assert_eq(format_f32(f32.from_bits(0xffc00001), "%+G", 0, -1), "-NAN")
+    assert_eq(format_f128(-f128.nan, "%8e", 0, -1), "    -nan")
+    assert_eq(format_f128(f128.nan, "%+-6a", 0, -1), "+nan  ")
 
 @test("flags, width and the counts a '*' reads place the field as C places it")
 float_flags_and_counts()
