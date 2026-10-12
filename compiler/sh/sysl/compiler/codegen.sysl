@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.{str_builder, StrBuilder, Search}
 
 // Lowering a whole program to a module of intermediate representation.
@@ -27,13 +28,18 @@ end codegen_module
 
 // The same, with the census of the bodies that were left out beside it: each one's key and the form
 // it reached.
-codegen_with_gaps(p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(string, string)])
+//
+// `imports` asks for the copies a build that optimizes wants of the precompiled functions it may
+// inline (`importable`); a module that will not be optimized, or whose text is printed, has none.
+codegen_with_gaps(p: TProgram, t: Target, pr: Promotions,
+                  imports: bool = false) -> (IrModule, Buf[(string, string)])
     var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t, pr)
+    codegen_into(&e, p, t, pr, imports)
 end codegen_with_gaps
 
-private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(string, string)])
+private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
+                     imports: bool = false) -> (IrModule, Buf[(string, string)])
     val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
@@ -76,13 +82,16 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
     var funcs: Buf[IrFunc] = buf()
     var gaps: Buf[(string, string)] = buf()
+    var imported: Set[string] = set()
 
     // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
     // that may are the ones a body never reaches.
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost && !declared_elsewhere(p, f)
+        if f.ghost then continue
+
+        if !declared_elsewhere(p, f)
             set_promoted(e, pr.for_func(f.name))
 
             e.main_thread_checks = e.off_main.has(f.name)
@@ -90,6 +99,17 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
             gen_function(e, f) match
                 Some(built) -> funcs.push(built)
                 None -> gaps.push((f.name, gap_text(e)))
+        elif imports && importable(f)
+            set_promoted(e, pr.for_func(f.name))
+
+            e.main_thread_checks = e.off_main.has(f.name)
+
+            gen_function(e, f) match
+                Some(built) ->
+                    if keeps_import(f, built)
+                        funcs.push(built with { sig = built.sig with { linkage = LinkAvailableExternally } })
+                        imported.add(f.name)
+                None -> ()
 
     // What is written from here on -- the thunks, the entry point, the helpers -- runs where its
     // caller does, and the caller's body is the one that checked.
@@ -250,7 +270,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         globals.push(vtables.at(i))
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, layout), enum_defs(p, layout),
-                     box_defs(e, word_bits), imported_sigs(e, p), globals, helpers, funcs, thunks,
+                     box_defs(e, word_bits), imported_sigs(e, p, imported), globals, helpers, funcs, thunks,
                      entry, used_of(p, funcs), init, module_asm_lines(p.module_asm))
 
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
@@ -387,6 +407,44 @@ end allocates
 private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
     !f.internal && holds_string(p.precompiled, f.name)
 
+// The most instructions a precompiled function's lowered body may hold and still be copied into a
+// program that calls it without being marked `@inline`. Lowered text is unoptimized -- every local a
+// slot, every read a load -- so this is a body of a handful of statements: a fixed-point multiply, an
+// accessor, a comparison.
+private const ImportLimit: usize = 48
+
+// **Whether a precompiled function is also given to this module to inline**, as rustc gives a crate's
+// `#[inline]` and small functions to every crate that calls them. The body stays where the archive
+// put it; this module carries an `available_externally` copy the optimizer may inline and never
+// emits, so the link still takes the one definition, and a function the optimizer leaves out of line
+// is called exactly as a declared one is.
+//
+// Asked of the declaration first, then of the lowered body (`keeps_import`). Never one marked
+// `@noinline` or `@cold`, nor an `async` body, an interrupt handler, a function placed in a section,
+// or a variadic one: a copy of any of them is either refused by what it asks for or worth nothing.
+private importable(f: TFunc) -> bool =
+    !f.marks.noinline && (f.marks.inline || !f.marks.cold) && !f.marks.is_async() &&
+        f.conv.is_none() && f.section.is_none() && !f.variadic
+
+// Whether a lowered precompiled body is kept as a copy: one marked `@inline` whatever its length,
+// otherwise one of at most `ImportLimit` instructions.
+//
+// **A copy is the same function as the archive's** because a precompiled body keeps no storage of
+// its own: one reaching module storage is never precompiled (`root_artifact.sysl`), and what a body
+// lays down while it is lowered is constant -- its strings, its tables -- which two copies may each
+// hold without anyone telling them apart.
+private keeps_import(f: TFunc, built: IrFunc) -> bool
+    if built.sig.linkage != LinkDefault then return false
+    if f.marks.inline then return true
+
+    var count: usize = 0
+
+    for b in built.blocks
+        count += b.instrs.len() + 1
+
+    count <= ImportLimit
+end keeps_import
+
 // The declarations a library's already-compiled functions get, in the order the program filed them.
 //
 // They are **not** up with the `extern`s, and they have to be after the type definitions: a named
@@ -394,13 +452,16 @@ private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
 // by value. Their signatures are built the way the *definition* would have built them rather than
 // through the C convention, because these are sysl's convention and not C's -- getting that wrong
 // passes arguments the other way, which is a corrupt run rather than a link error.
-private imported_sigs(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
+//
+// One this module carries a copy of (`importable`) is not declared as well: the copy is the
+// declaration.
+private imported_sigs(e: *Emit, p: TProgram, copied: Set[string]) -> Buf[IrFuncSig]
     var out: Buf[IrFuncSig] = buf()
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if declared_elsewhere(p, f)
+        if declared_elsewhere(p, f) && !copied.has(f.name)
             out.push(declared_sig(e,symbol_of(e, f.name),
                             sysl_fn_type(e, defined_result(f), f.params, f.variadic, None)))
 

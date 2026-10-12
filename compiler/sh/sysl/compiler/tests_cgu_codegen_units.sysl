@@ -132,7 +132,15 @@ end cgu_a_split_copies_helpers_and_promotes_globals
 
 @test("a function defined in another unit is declared from its definition's first line")
 cgu_a_function_elsewhere_is_declared()
-    val parts = split_module(cgu_module(), 4).unwrap()
+    // The same module with each `@fN` too long to be copied (`importable_define`), so a call from
+    // another unit has only the declaration to go by.
+    var long = ""
+
+    for i in 0..<120
+        long = long + s"  %pad$i = add i32 %a, $i\n"
+
+    val parts = split_module(replace_all(cgu_module(), "entry:\n  %b = call", s"entry:\n$long  %b = call"),
+                             4).unwrap()
     var declared = 0
 
     for k in 0..<8
@@ -148,6 +156,25 @@ cgu_a_function_elsewhere_is_declared()
     assert(declared >= 1, "a call across units")
     assert(declared <= 8, s"$declared declarations")
 end cgu_a_function_elsewhere_is_declared
+
+@test("and a short one is copied into the unit that calls it, besides being defined in its own")
+cgu_a_short_function_elsewhere_is_copied()
+    val parts = split_module(cgu_module(), 4).unwrap()
+    var copied = 0
+
+    for k in 0..<8
+        var defined = 0
+
+        for item in parts
+            if item.contains(s"define available_externally i32 @f$k(i32 %a) {\n") then copied += 1
+            if item.contains(s"define i32 @f$k(i32 %a) {\n") then defined += 1
+            assert(!item.contains(s"declare i32 @f$k("), "a copy is not declared as well")
+
+        assert_eq(defined, 1)
+
+    assert(copied >= 1, "a call across units")
+    assert(copied <= 8, s"$copied copies")
+end cgu_a_short_function_elsewhere_is_copied
 
 @test("the same text is cut into the same units every time")
 cgu_the_cut_is_deterministic()

@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{cstring, str_builder, Search}
+
+// **Small and `@inline` functions inline across a package's precompiled half and across codegen
+// units** (`reference/attributes.md § @noinline, @inline and @cold`). A `--lib` root's functions are
+// compiled once into an archive the program only declares, and a program cut into units sees one
+// unit at a time; either is a wall the optimizer cannot inline through. The answer is rustc's: the
+// caller's module carries an `available_externally` copy of the body (`codegen.sysl`'s `importable`,
+// `codegen_units.sysl`'s `importable_define`), which the optimizer may inline and never emits, so the
+// link still takes the one definition. What is inlined is asked of clang's `-O2` output, as
+// `tests_inlining_attr.sysl` does; that the link holds one definition, of the objects it links.
+
+private extern "setenv" xin_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" xin_c_unsetenv(name: *u8) -> int
+
+private xin_setenv(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    xin_c_setenv(n.ptr, v.ptr, 1)
+end xin_setenv
+
+private xin_unsetenv(name: string)
+    val n = cstring(name)
+
+    xin_c_unsetenv(n.ptr)
+end xin_unsetenv
+
+// A cache directory of the case's own, so a root is kept (and so declared) without touching the
+// machine's cache.
+private xin_begin() -> string
+    val cache = lbr_temp("sysl-xin-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+    cache
+end xin_begin
+
+private xin_end(cache: string, trees: []string)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    remove_dir_all(cache).unwrap_or(())
+    lbr_drop(trees)
+end xin_end
+
+// The text a linking build of `path` at `level` hands clang.
+private xin_text(path: string, libs: []string, level: string) -> string
+    lbr_hand(libs)
+
+    val text = emit_llvm_text(path, None, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end xin_text
+
+// What a build of `path` at `-O2` prints.
+private xin_run(path: string, libs: []string, exe: string) -> string
+    lbr_hand(libs)
+
+    val said = build_native_program(path, None, None, "2", Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    said
+end xin_run
+
+// Each line of `text` that starts with `head` and holds `part`.
+private xin_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end xin_lines
+
+private xin_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end xin_calls
+
+// `text` through clang at `-O2`, as LLVM text.
+private xin_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-xin-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end xin_optimized
+
+private xin_geom(twice: string) -> string = lbr_tree(lbr_one("geom/geom.sysl",
+    s"module geom\n\ntwice(n: int) -> int = $twice\n\n@noinline\nhalve(n: int) -> int = n / 2\n\n" +
+    "table() -> []int = [1, 2, 3]\n"))
+
+private xin_app() -> string =
+    lbr_program("print(geom.twice(21))\nprint(geom.halve(42))\nprint(geom.table()[1])\n")
+
+// -- across a precompiled root -----------------------------------------------------------------------
+
+@test("a root's small function is copied into the program and inlined there, and '@noinline' is still a call")
+xin_root_small_function_inlines()
+    if !lbr_ready() then return
+
+    val cache = xin_begin()
+    val geom = xin_geom("n * 2")
+    val app = xin_app()
+    val text = xin_text(app, [geom], "2")
+
+    // The copy, and no declaration beside it; the `@noinline` one is only declared.
+    assert_eq(xin_lines(text, "define available_externally ", "$twice("), 1)
+    assert_eq(xin_lines(text, "declare ", "$twice("), 0)
+    assert_eq(xin_lines(text, "declare ", "$halve("), 1)
+    assert_eq(xin_lines(text, "define", "$halve("), 0)
+
+    val out = xin_optimized(text)
+
+    // clang's own printing quotes a name holding `$`: `@"geom$halve"(`.
+    assert(!xin_calls(out, "geom$twice"), "the copied function was inlined")
+    assert(xin_calls(out, "geom$halve"), "the '@noinline' function is still called")
+    assert_eq(root_artifact_counts().1, 1)
+    xin_end(cache, [geom, app])
+end xin_root_small_function_inlines
+
+@test("at -O0 a root's function is only declared: nothing would read a copy")
+xin_root_no_copy_at_o0()
+    if !lbr_ready() then return
+
+    val cache = xin_begin()
+    val geom = xin_geom("n * 2")
+    val app = xin_app()
+    val text = xin_text(app, [geom], "0")
+
+    assert_eq(xin_lines(text, "define available_externally ", ""), 0)
+    assert_eq(xin_lines(text, "declare ", "$twice("), 1)
+    xin_end(cache, [geom, app])
+end xin_root_no_copy_at_o0
+
+@test("an edit to a root's inlined function is what the next build prints, as an uncached build does")
+xin_root_edit_reaches_the_copy()
+    if !lbr_ready() then return
+
+    val cache = xin_begin()
+    val geom = xin_geom("n * 2")
+    val app = xin_app()
+    val work = lbr_temp("sysl-xin-exe")
+
+    assert_eq(xin_run(app, [geom], s"$work/a"), "42\n21\n2\n")
+    write_text(s"$geom/geom/geom.sysl", "module geom\n\ntwice(n: int) -> int = n * 3\n\n" +
+        "@noinline\nhalve(n: int) -> int = n / 2\n\ntable() -> []int = [1, 2, 3]\n").unwrap()
+    clear_root_artifact_counts()
+    assert_eq(xin_run(app, [geom], s"$work/b"), "63\n21\n2\n")
+    assert_eq(root_artifact_counts().1, 1)
+
+    xin_setenv("SYSL_NO_CACHE", "1")
+
+    val uncached = xin_run(app, [geom], s"$work/c")
+
+    xin_unsetenv("SYSL_NO_CACHE")
+    assert_eq(uncached, "63\n21\n2\n")
+    remove_dir_all(work).unwrap_or(())
+    xin_end(cache, [geom, app])
+end xin_root_edit_reaches_the_copy
+
+// -- across codegen units ---------------------------------------------------------------------------
+
+// A module of sixteen callers of four functions: `@big`, external and marked `inlinehint`; `@small`,
+// external and short; `@slow`, external and `noinline`; `@helper`, internal, `inlinehint` and longer
+// than a local is copied for. `main` returns `c0(3)` = 4 + 6 + 2 + 103.
+private xin_module() -> string
+    var b = str_builder()
+
+    b.push("define i32 @big(i32 %x) inlinehint {\n  %r = add i32 %x, 1\n  ret i32 %r\n}\n")
+    b.push("define i32 @small(i32 %x) {\n  %r = mul i32 %x, 2\n  ret i32 %r\n}\n")
+    b.push("define i32 @slow(i32 %x) noinline {\n  %r = sub i32 %x, 1\n  ret i32 %r\n}\n")
+    b.push("define internal i32 @helper(i32 %x) inlinehint {\n  %v0 = add i32 %x, 1\n")
+
+    for i in 1..<100
+        b.push(s"  %v$i = add i32 %v${i - 1}, 1\n")
+
+    b.push("  ret i32 %v99\n}\n")
+
+    for k in 0..<16
+        b.push(s"define i32 @c$k(i32 %x) {\n  %a = call i32 @big(i32 %x)\n  %b = call i32 @small(i32 %x)\n")
+        b.push("  %c = call i32 @slow(i32 %x)\n  %d = call i32 @helper(i32 %x)\n")
+        b.push("  %s1 = add i32 %a, %b\n  %s2 = add i32 %s1, %c\n  %s3 = add i32 %s2, %d\n  ret i32 %s3\n}\n")
+
+    b.push("define i32 @main() {\n  %r = call i32 @c0(i32 3)\n  ret i32 %r\n}\n")
+    b.finish()
+end xin_module
+
+@test("a unit calling an '@inline' or small function defined in another carries a copy, and a 'noinline' one a declaration")
+xin_units_copy_what_inlines()
+    val parts = split_module(xin_module(), 4).unwrap()
+
+    var copies = 0
+    var homes = 0
+
+    for p in parts
+        if xin_lines(p, "define i32 @big(", "") == 1 then homes += 1
+
+        if xin_calls(p, "@big(")
+            assert_eq(xin_lines(p, "define i32 @big(", "") + xin_lines(p, "define available_externally i32 @big(", ""), 1)
+            copies += xin_lines(p, "define available_externally i32 @big(", "")
+
+        if xin_calls(p, "@small(")
+            assert_eq(xin_lines(p, "define i32 @small(", "") + xin_lines(p, "define available_externally i32 @small(", ""), 1)
+
+        if xin_calls(p, "@slow(") && xin_lines(p, "define i32 @slow(", "") == 0
+            assert_eq(xin_lines(p, "declare i32 @slow(", ""), 1)
+            assert_eq(xin_lines(p, "define available_externally i32 @slow(", ""), 0)
+
+        // The long local marked `inlinehint` is copied as it is, never shared under a hidden name.
+        if xin_calls(p, "@helper(") then assert_eq(xin_lines(p, "define internal i32 @helper(", ""), 1)
+        assert(!p.contains("sysl.cgu:"), "nothing was promoted")
+
+    assert_eq(homes, 1)
+    assert(copies >= 1, "some unit called '@big' from outside its home")
+end xin_units_copy_what_inlines
+
+@test("the copy is inlined by clang -O2, and the units link to the one program, each body defined once")
+xin_units_inline_and_link()
+    if !clang_available() then return
+
+    val parts = split_module(xin_module(), 4).unwrap()
+    val dir = make_temp_dir("sysl-xin-units").unwrap()
+    var args: Buf[string] = buf()
+
+    for i in 0..<parts.len()
+        val p = parts.at(i)
+
+        if xin_lines(p, "define available_externally i32 @big(", "") == 1
+            val out = xin_optimized(p)
+
+            assert(!xin_calls(out, "@big("), "the copy was inlined")
+            assert(!xin_calls(out, "@helper("), "the '@inline' local was inlined")
+            assert(xin_calls(out, "@slow("), "the 'noinline' function is still a call")
+            assert_eq(xin_lines(out, "define", "@big("), 0)
+
+        val file = s"$dir/u$i.ll"
+
+        write_text(file, p).unwrap()
+        args.push(file)
+
+    args.push("-O2")
+    args.push("-o")
+    args.push(s"$dir/prog")
+
+    val built = capture("clang", args.view(), "", [], true).unwrap()
+
+    assert(built.status.ok(), s"the units did not link:\n${built.err.unwrap_or("")}")
+
+    val ran = capture(s"$dir/prog", [], "", [], true).unwrap()
+
+    assert(ran.status == Status.Exited(115), "the program returned c0(3)")
+    remove_dir_all(dir).unwrap_or(())
+end xin_units_inline_and_link
