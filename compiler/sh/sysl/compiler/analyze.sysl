@@ -452,13 +452,54 @@ offered_by(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -
 
     if bound.is_some() && has(bound.unwrap()) then return out
 
+    // Targets already offered, so that a re-export and what it names are one offer.
+    var named: Buf[string] = buf()
+
     for item in im.wildcards
         val key = module_qualify(item, name)
 
-        if !holds_string(out, key) && has(key) && reachable_key(a, key, scope) then out.push(key)
+        if !holds_string(out, key) && has(key) && reachable_key(a, key, scope)
+            val target = reexported(a, key)
+
+            if !holds_string(named, target)
+                out.push(key)
+                named.push(target)
 
     out
 end offered_by
+
+// **A transparent alias written as another module's qualified name is that declaration offered a
+// second time, not a rival to it**: `sysl.math.decimal`'s `type Rounding = sysl.Rounding` keeps an
+// import by name reading after the enum moved to the standard module, and a file importing both
+// wildcards means one type by `Rounding`. The key the alias finally names, or the key itself. Only a
+// dotted name is followed, which is what a re-export writes and what cannot lead back through a
+// wildcard to here.
+private reexported(a: &Analysis, key: string) -> string
+    var at = key
+
+    for _ in 0..<8
+        val d = a.tables.types.get(at)
+
+        if d.is_none() then return at
+
+        val next = d.unwrap().kind match
+            TypeOf(t) ->
+                if !is_plain_alias(t) || !t.tp.names.is_empty() then return at
+
+                *t.base.kind match
+                    NamedType(written, args) ->
+                        if !args.is_empty() || last_dot_in(written).is_none() then return at
+
+                        lookup_type_key(a, d.unwrap().scope, written)
+                    _ -> return at
+            _ -> return at
+
+        if next.is_none() then return at
+
+        at = next.unwrap()
+
+    at
+end reexported
 
 // **The imports a written name is answered from: the innermost level that binds it or offers it.**
 // A block's imports are asked before an outer block's and those before the file's, and within one

@@ -410,10 +410,34 @@ fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
             val clamped = fx_clamp(e, n, y, min_of(b2, s2), max_of(b2, s2))
 
             fx_resize(e, n, true, b2, clamped)
-        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, v)
+        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, false, v)
         (Fixed(b1, f1, s1), Floating(_, _)) -> fixed_to_float(e, b1, f1, s1, to, v)
         _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
 end fixed_convert
+
+// `q15(x, Floor)`: the same conversions with the dropped bits taken toward negative infinity rather
+// than rounded -- an arithmetic shift right, which is what C and CMSIS code narrowing a `q31` does --
+// and still saturating. Where nothing is dropped (a fraction that grows, an integer into a fixed
+// format) it is the ordinary conversion, which is exact there.
+fixed_floor_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
+    (from, to) match
+        (Fixed(b1, f1, s1), Fixed(b2, f2, s2)) ->
+            val k = f1 - f2
+
+            if k <= 0 then return fixed_convert(e, from, to, v)
+
+            val n = fx_wider(fx_bits_for(min_of(b1, s1), max_of(b1, s1)), b2 + 1)
+            val x = fx_resize(e, b1, s1, n, v)
+
+            narrowed(e, n, b2, s2, fx_bin(e, OpAShr, n, x, fx_small(long(k))))
+        (Fixed(b1, f1, s1), Integer(b2, s2, _)) ->
+            val n = (if b1 > b2 then b1 else b2) + 2
+            val y = fx_bin(e, OpAShr, n, fx_resize(e, b1, s1, n, v), fx_small(long(f1)))
+
+            narrowed(e, n, b2, s2, y)
+        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, true, v)
+        _ -> fixed_convert(e, from, to, v)
+end fixed_floor_convert
 
 // One fixed-point format brought to another: exact where the fraction grows, rounded to nearest with
 // ties toward +inf where it shrinks, and clamped once.
@@ -465,8 +489,9 @@ private pow2_double(k: int) -> Val = VFloat(long(1023 + k) << 52)
 // value past 2^52 a second time. Instead `t = trunc(y)` (saturating, so a NaN is zero and an
 // infinity an end), `fr = y - t` exactly, a floor correction where `fr < 0`, and a step up where what
 // is left is at least a half. `t` is first held to one past either end of the format, so the steps
-// that follow cannot wrap it.
-private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool, v: Val) -> Val
+// that follow cannot wrap it. With `floor` the step up is not taken: the floor itself is the answer.
+private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool, floor: bool,
+                       v: Val) -> Val
     val dbl = LFloat(64, false)
     val wide = convert(e, from, real_type(), v)
     val y = fresh_reg(e)
@@ -507,6 +532,9 @@ private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool,
 
     val t_down = fx_bin(e, OpSub, k, tc, fx_small(1))
     val t1 = fx_select(e, isneg, k, t_down, tc)
+
+    if floor then return narrowed(e, k, bits, signed, t1)
+
     val fr_up = fresh_reg(e)
 
     emit(e, InBin(fr_up, OpFAdd, dbl, fr, pow2_double(0)))
