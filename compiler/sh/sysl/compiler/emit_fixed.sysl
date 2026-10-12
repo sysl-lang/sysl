@@ -381,6 +381,33 @@ fixed_neg(e: *Emit, ty: Type, wraps: bool, v: Val) -> Val
     fx_sat(e, "ssub", bits, fx_small(0), v)
 end fixed_neg
 
+// `x.abs()`: `x < 0 ? -x : x`, with the type's own `-` -- so it saturates where that does, and
+// `q15::Min.abs()` is `q15::Max` (a `wrapping` type answers `Min` again, as an integer's does).
+fixed_abs(e: *Emit, ty: Type, wraps: bool, v: Val) -> Val
+    val (bits, _, _) = fx_parts(ty)
+    val neg = fixed_neg(e, ty, wraps, v)
+    val below = fx_cmp(e, ISlt, bits, v, fx_small(0))
+
+    fx_select(e, below, bits, neg, v)
+end fixed_abs
+
+// `x.signum()`: `-1`, `0` or `1` in the format, each the nearest value the format holds -- a `q15`
+// holds `-1.0` exactly and stops one unit short of `1.0`, so its positive answer is `q15::Max`.
+fixed_signum(e: *Emit, ty: Type, v: Val) -> Val
+    val (bits, frac, signed) = fx_parts(ty)
+    val unit = fx_pow2(frac)
+    val hi = max_of(bits, signed)
+    val lo = min_of(bits, signed)
+    val one = if big_cmp(unit, hi) > 0 then hi else unit
+    val minus = big_sub(from_int(0), unit)
+    val minus_one = if big_cmp(minus, lo) < 0 then lo else minus
+    val above = fx_cmp(e, ISgt, bits, v, fx_small(0))
+    val below = fx_cmp(e, ISlt, bits, v, fx_small(0))
+    val upper = fx_select(e, above, bits, fx_int(one), fx_small(0))
+
+    fx_select(e, below, bits, fx_int(minus_one), upper)
+end fixed_signum
+
 // -- conversions ---------------------------------------------------------------------------------
 
 // One scalar read as another where either side is fixed-point. Every row rounds to nearest (ties

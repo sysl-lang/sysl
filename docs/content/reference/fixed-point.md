@@ -325,6 +325,72 @@ print(q15::Bits(16384), (0.5i32q31).bits)
 `print` and `str` write the **shortest decimal that reads back as the same value**, never in
 exponent form: `0.0000000005` says which place the one bit is in.
 
+## Generic code: `Zero` and `Signed`
+
+**Every fixed-point type is a `Zero`**, its zero being the raw bits `0`, so a body written once over
+`[T: Zero]` — a mixer's accumulator, a filter's reset, a buffer of silence — takes a `q15` beside an
+`int` and an `f32`. It is not a `One`: a `q15` stops one unit short of `1.0`.
+
+```sysl
+reset[T: Zero](state: []T)
+    for i in 0..<state.len
+        state[i] = T.zero()
+
+sum[T: Add + Zero](xs: []const T) -> T
+    var acc = T.zero()
+    for x in xs
+        acc = acc + x
+    acc
+
+var history: [3]q15 = [0.25, 0.5, 0.125]
+print(sum(history[..]))
+reset(history[..])
+print(history[0], history[1], history[2], sum(history[..]))
+```
+
+```output
+0.875
+0 0 0 0
+```
+
+**Every signed fixed-point type is a `sysl.math.Signed`**, on the integers' terms and with its own
+arithmetic: `abs` is `x < 0 ? -x : x` with the type's own saturating `-`, so the magnitude of the most
+negative value is the largest one, as `-q15::Min` is. `signum` answers `-1`, `0` or `1` in the format,
+each the nearest value it holds — a `q15` holds `-1.0` exactly and its `1` is `q15::Max`:
+
+```sysl
+import sysl.math.Signed
+
+magnitude[T: Signed](x: T) -> T = x.abs()
+
+val a: q15 = -0.25
+val z: q15 = 0.0
+print(magnitude(a), q15::Min.abs(), z.abs())
+print(a.signum(), (-a).signum(), z.signum())
+val b: i32q16 = -3.5
+print(magnitude(b), b.signum(), i32q16::Min.abs() == i32q16::Max)
+```
+
+```output
+0.25 0.99997 0
+-1 0.99997 0
+3.5 -1 true
+```
+
+A `wrapping` type's `abs` wraps instead, as its `-` does: the most negative value answers itself. An
+unsigned format has no sign to take off, so it is not a member:
+
+```sysl
+import sysl.math.Signed
+
+val g: u16q16 = 0.5
+print(g.abs())
+```
+
+```error
+type 'u16q16' has no method 'abs' — 'abs' is 'sysl.math.Signed''s, and an unsigned value has no sign to take off
+```
+
 ## A range
 
 A fixed-point type is a scalar, so `within` narrows it like any other — the ends are decimals, held

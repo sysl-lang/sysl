@@ -1,0 +1,380 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+
+// Fixed-point types in generic code: every fixed-point format is a `Zero` (its zero is raw bits 0),
+// and every SIGNED one is a `sysl.math.Signed`, on the integers' terms but with its own arithmetic --
+// `abs` saturates where the type's `-` does, so `q15::Min.abs()` is `q15::Max`, and `signum`'s `1` is
+// the nearest value to one the format holds. An unsigned format is a `Zero` and not a `Signed`, and
+// `One` stays the integers' alone, a `q15` holding no `1.0`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fzr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fzr_ready
+
+private fzr_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fzr").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end fzr_root
+
+// What a one-file program prints and the status it exits with -- or why it did not build, with the
+// directory written as `@`, and `-1`.
+private fzr_ran(text: string) -> (string, int)
+    val root = fzr_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end fzr_ran
+
+private fzr_prints(text: string, expected: string)
+    if !fzr_ready() then return
+
+    val ran = fzr_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+end fzr_prints
+
+// What a one-file program has to say for itself through the analysis, with the directory as `@`.
+private fzr_said(text: string) -> string
+    val root = fzr_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> if made.report.is_empty() then "" else replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fzr_said
+
+private fzr_refused(text: string, message: string, at: string)
+    if !fzr_ready() then return
+
+    val said = fzr_said(text)
+
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end fzr_refused
+
+private fzr_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end fzr_cli
+
+private fzr_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/bin/arm-none-eabi-objdump", "/usr/local/bin/arm-none-eabi-objdump",
+                      "/usr/bin/arm-none-eabi-objdump"]
+
+    for i in 0..<candidates.len
+        if exists(candidates[i]) then return Some(candidates[i])
+
+    None
+end fzr_objdump
+
+// The disassembly of one exported function as `sysl build-c` archives it for a board. A missing tool
+// is a failure rather than a skip, so a pass always means a board's code was read.
+private fzr_board_code(program: string, target: string, symbol: string) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    assert(clang_available(), "this test reads a board's code and there is no clang on this machine")
+
+    val tool = fzr_objdump()
+
+    assert(tool.is_some(), "this test reads a board's code and there is no arm-none-eabi-objdump " +
+           "on this machine (Homebrew's arm-none-eabi-binutils has one)")
+    assert(find_backend_clang(target_named(target).unwrap()).is_ok(),
+           s"this test reads a board's code and no clang here has the back end '$target' needs")
+
+    val root = fzr_root(program)
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = fzr_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val dis = capture(tool.unwrap(), ["-d", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = dis match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    val blocks = split(text, "\n\n")
+    var found = ""
+
+    for i in 0..<blocks.len
+        if blocks[i].contains(s"<$symbol>:") || blocks[i].contains(s"<$symbol" + "$") then
+            found = found + blocks[i] + "\n"
+
+    assert(found != "", text)
+    Some(found)
+end fzr_board_code
+
+// -- Zero ------------------------------------------------------------------------------------------
+
+@test("T.zero() at a fixed-point type is raw bits zero, at every format")
+fzr_zero_is_raw_zero()
+    fzr_prints(raw"""
+        z[T: Zero]() -> T = T.zero()
+
+        val a: q7 = z()
+        val b: q15 = z()
+        val c: q31 = z()
+        val d: i32q16 = z()
+        val e: u16q16 = z()
+        val f: i16q4 = z()
+        print(a.bits, b.bits, c.bits, d.bits, e.bits, f.bits)
+        print(a, b, c, d, e, f)
+        """, "0 0 0 0 0 0\n0 0 0 0 0 0\n")
+
+@test("a generic accumulator over Add + Zero sums q15, q31, i32q16 and u16q16 samples")
+fzr_generic_sum()
+    fzr_prints(raw"""
+        sum[T: Add + Zero](xs: []const T) -> T
+            var acc = T.zero()
+            for x in xs
+                acc = acc + x
+            acc
+
+        val a: [3]q15 = [0.25, 0.5, 0.125]
+        val b: [2]q31 = [0.5, -0.75]
+        val c: [2]i32q16 = [100.5, -3.25]
+        val d: [2]u16q16 = [0.25, 0.5]
+        print(sum(a[..]), sum(b[..]), sum(c[..]), sum(d[..]))
+        """, "0.875 -0.25 97.25 0.75\n")
+
+@test("a generic accumulator over Zero saturates as the format's own + does")
+fzr_generic_sum_saturates()
+    fzr_prints(raw"""
+        sum[T: Add + Zero](xs: []const T) -> T
+            var acc = T.zero()
+            for x in xs
+                acc = acc + x
+            acc
+
+        val a: [3]q15 = [0.75, 0.75, -0.5]
+        print(sum(a[..]) == q15::Max - 0.5)
+        """, "true\n")
+
+@test("a generic reset over Zero clears a buffer of fixed-point samples")
+fzr_generic_reset()
+    fzr_prints(raw"""
+        reset[T: Zero](state: []T)
+            for i in 0..<state.len
+                state[i] = T.zero()
+
+        var h: [3]q15 = [0.25, -0.5, 0.125]
+        var u: [2]u16q16 = [0.25, 0.5]
+        reset(h[..])
+        reset(u[..])
+        print(h[0].bits, h[1].bits, h[2].bits, u[0].bits, u[1].bits)
+        """, "0 0 0 0 0\n")
+
+@test("a fixed-point type is not a One: q15 holds no 1.0")
+fzr_not_a_one()
+    fzr_refused(raw"""
+        o[T: One]() -> T = T.one()
+        val a: q15 = o()
+        """, "'o' requires its type parameter 'T' to implement 'sysl.One', but q15 does not", "2:14")
+
+@test("an impl Zero for a fixed-point type is told the type already has one")
+fzr_impl_zero_is_redundant()
+    if !fzr_ready() then return
+
+    val said = fzr_said(raw"""
+        impl Zero for q15
+            zero() -> q15 = 0.0
+        """)
+
+    assert(said.contains("error: "), said)
+    assert(said.contains("Zero"), said)
+
+// -- Signed: abs ------------------------------------------------------------------------------------
+
+@test("abs of a negative, zero, Max and Min at q15, saturating at Min")
+fzr_abs_q15()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        val a: q15 = -0.25
+        val z: q15 = 0.0
+        print(a.abs(), z.abs(), q15::Max.abs() == q15::Max, q15::Min.abs() == q15::Max)
+        print(q15::Min.abs().bits, (-q15::Min).bits)
+        """, "0.25 0 true true\n32767 32767\n")
+
+@test("abs at q7, q31, i32q16 and i16q4, each saturating at its own Min")
+fzr_abs_formats()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        val a: q7 = -0.5
+        val b: q31 = -0.75
+        val c: i32q16 = -3.5
+        val d: i16q4 = -2.0625
+        print(a.abs(), b.abs(), c.abs(), d.abs())
+        print(q7::Min.abs() == q7::Max, q31::Min.abs() == q31::Max, i32q16::Min.abs() == i32q16::Max,
+              i16q4::Min.abs() == i16q4::Max)
+        """, "0.5 0.75 3.5 2.06\ntrue true true true\n")
+
+@test("a wrapping fixed-point type's abs wraps at Min, as its - does")
+fzr_abs_wrapping()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        type Acc = new i32q16 wrapping
+
+        val w: Acc = Acc(i32q16::Min)
+        val n: Acc = Acc(-2.5)
+        print(w.abs() == w, (-w) == w, n.abs() == Acc(2.5))
+        """, "true true true\n")
+
+@test("a generic function over Signed takes q15, q31 and i32q16")
+fzr_generic_signed()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        magnitude[T: Signed](x: T) -> T = x.abs()
+        direction[T: Signed](x: T) -> T = x.signum()
+
+        val a: q15 = -0.25
+        val b: q31 = -0.5
+        val c: i32q16 = -7.75
+        print(magnitude(a), magnitude(b), magnitude(c), magnitude(q15::Min) == q15::Max)
+        print(direction(a), direction(b), direction(c), direction(-c))
+        """, "0.25 0.5 7.75 true\n-1 -1 -1 1\n")
+
+// -- Signed: signum ---------------------------------------------------------------------------------
+
+@test("signum's 1 is the nearest value to one the format holds, and -1 is exact")
+fzr_signum()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        val p: q15 = 0.5
+        val n: q15 = -0.5
+        val z: q15 = 0.0
+        print(p.signum() == q15::Max, n.signum() == q15::Min, z.signum().bits)
+        val q: q31 = 0.000001
+        print(q.signum() == q31::Max, q31::Min.signum() == q31::Min)
+        val i: i32q16 = 0.25
+        print(i.signum(), (-i).signum(), i.signum().bits)
+        """, "true true 0\ntrue true\n1 -1 65536\n")
+
+@test("signum's -1 saturates where the format cannot hold it")
+fzr_signum_narrow()
+    fzr_prints(raw"""
+        import sysl.math.Signed
+
+        val t: i8q8 = -0.25
+        val u: i8q8 = 0.25
+        print(t.signum() == i8q8::Min, u.signum() == i8q8::Max)
+        """, "true true\n")
+
+// -- the refusals -------------------------------------------------------------------------------------
+
+@test("abs on an unsigned fixed-point type is refused, saying why")
+fzr_abs_unsigned_refused()
+    fzr_refused(raw"""
+        import sysl.math.Signed
+
+        val g: u16q16 = 0.5
+        print(g.abs())
+        """, "type 'u16q16' has no method 'abs' — 'abs' is 'sysl.math.Signed''s, and an unsigned " +
+             "value has no sign to take off: it is its own magnitude", "4:9")
+
+@test("signum on an unsigned integer is refused in the same words")
+fzr_signum_unsigned_integer_refused()
+    fzr_refused(raw"""
+        import sysl.math.Signed
+
+        val n: u32 = 3
+        print(n.signum())
+        """, "type 'uint' has no method 'signum' — 'signum' is 'sysl.math.Signed''s, and an unsigned " +
+             "value has no sign to take off: it is its own magnitude", "4:9")
+
+@test("an unsigned fixed-point type does not satisfy a Signed bound")
+fzr_unsigned_bound_refused()
+    fzr_refused(raw"""
+        import sysl.math.Signed
+
+        magnitude[T: Signed](x: T) -> T = x.abs()
+
+        val g: u16q16 = 0.5
+        print(magnitude(g))
+        """, "'magnitude' requires its type parameter 'T' to implement 'sysl.math.Signed', but " +
+             "u16q16 does not", "6:7")
+
+@test("abs on a fixed-point value needs Signed in scope, as on an integer")
+fzr_abs_needs_the_trait()
+    fzr_refused(raw"""
+        val a: q15 = -0.5
+        print(a.abs())
+        """, "type 'q15' has no method 'abs'", "2:9")
+
+// -- the board -------------------------------------------------------------------------------------
+
+@test("a q15 abs on a Cortex-M4 is a predicated QSUB16 with no branch and no call")
+fzr_abs_on_the_m4()
+    val code = fzr_board_code(raw"""
+        import sysl.math.Signed
+
+        @export("q15_abs")
+        q15_abs(x: q15) -> q15 = x.abs()
+
+        @export("main")
+        main_entry() -> int
+            val a: q15 = -0.5
+            int(q15_abs(a).bits)
+        """, "thumbv7em-freestanding", "q15_abs")
+
+    if code.is_none() then return
+
+    val text = code.unwrap()
+
+    assert(text.contains("qsub16"), text)
+    assert(!text.contains("\tb.") && !text.contains("\tbl\t") && !text.contains("\tbeq") &&
+           !text.contains("\tbne") && !text.contains("\tbmi") && !text.contains("\tbpl"), text)
+end fzr_abs_on_the_m4
