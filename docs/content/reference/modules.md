@@ -1588,11 +1588,11 @@ const n: Even = 4
 **A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
 arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
 a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** whose
-arguments are constant expressions. Integers, floats, `bool` and `char` fold.
+arguments are constant expressions. Integers, floats, `bool` and `char` fold, and a `string` constant
+is a **literal** or a `const` function's call — `const LABEL: string = label(3)` — which builds the
+string the same call builds when the program runs.
 
-**A call to any other function is refused**, and a `string` constant's initializer must be a
-**literal** — since `+` on strings allocates, and a compile-time concatenation would be a different
-operation wearing the same spelling:
+**A call to any other function is refused:**
 
 ```sysl
 size() -> int = 4
@@ -1663,10 +1663,15 @@ print(k)
 checks run, and **fixed arrays, structs and enums** of any of these at any depth — an array built by a
 literal or a fill, read and written by element, walked by `for x in`; a struct built by its
 constructor, read and written by field, its `invariant` run; an enum value built by its variant,
-payload-carrying ones included, taken apart by `match`; all passed and returned by value. A string,
-a pointer or a reference stops the run with *"a 'P' is not evaluated while compiling yet — integers,
-floats, fixed-point, 'bool', 'char', and fixed arrays, structs and enums of them are"*; the program's
-own run-time call is unaffected.
+payload-carrying ones included, taken apart by `match`; all passed and returned by value. A tuple is a
+struct of its own. **A string** is held as its text — built by `+`, interpolation, `str` and an
+`f"…"` specifier over an integer, a string or a fixed-point value (rendered by the library's own
+renderers, so the text is the program's to the byte), indexed by byte, sliced where characters start,
+compared by bytes and matched. **A slice** is held as a view of an array or a string the run holds,
+read, walked by `for x in`, sub-sliced and written through; a call handed one is run afresh rather
+than remembered. A pointer or a reference stops the run with *"a 'P' is not evaluated while
+compiling yet — integers, floats, fixed-point, 'bool', 'char', strings, and fixed arrays, structs,
+enums and slices of them are"*; the program's own run-time call is unaffected.
 
 **A table is the reason arrays are evaluated.** A module `val` whose initializer calls a `const`
 function returning an array is laid into the object file as the elements the call came to — a sine
@@ -1729,8 +1734,11 @@ rest
 ```
 
 A payload whose fields have no one fixed bit pattern — an `i128`, a bitfield struct — is not laid
-down; the value stays code, and a freestanding artifact's refusal says so. Making an array costs a
-step per element, so the same 16,000,000 steps bound how large a table may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
+down; the value stays code, and a freestanding artifact's refusal says so. **A string is laid down as
+the literal it came to**, its bytes constant data owned by nothing — a table of `(string, int)` tuples
+is `.rodata` on a bare board. **A slice is not laid down**: it views storage rather than holding a
+value, so a `val` over a call answering one stays code. Making an array costs a step per element and
+a string a step per byte, so the same 16,000,000 steps bound how large a table or a string may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
 call cannot be run — it reaches an `extern`, storage filled at run time, or more steps than the bound
 — the initializer stays code, filled before the program's statements; a freestanding artifact, which
 has nothing to fill it, refuses the storage and says what stopped the call: *"'T' did not finish

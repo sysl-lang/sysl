@@ -1,0 +1,189 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A `const` function holds strings, slices and tuples.** A string is built by `+`, by an
+// interpolation, by `str` and by an `f"…"` specifier over an integer, a string or a fixed-point value,
+// indexed, sliced, compared and matched; a slice is a view of an array or a string the evaluation
+// holds, read, walked and written through, and sub-sliced; a tuple is a struct of its own. A module
+// `val` over such a call is laid down as the literal it comes to -- a string's bytes are constant
+// data, so a table of `(string, int)` tuples is `.rodata` on a Cortex-M4 with nothing run before
+// `main` -- and every value is the one the same call makes when the program runs.
+
+private val csl_strings: string = raw"""
+    const greet(n: int) -> string = s"n=${n}!"
+
+    const count(s: string) -> int
+        var k = 0
+
+        for i in 0..<s.len
+            if s[i] == u8('a') then k += 1
+
+        k
+
+    const upper(s: string) -> string
+        var out = ""
+
+        for b in s.bytes
+            out = out + string(char(u32(if b >= u8('a') && b <= u8('z') then b - 32 else b)))
+
+        out
+
+    const fmt(n: int, q: q15) -> string = f"[${n}%05d|${n}%#x|${"ab"}%-4s|${q}%.3f|$q|${'é'}|${n > 3}]"
+
+    const pick(s: string) -> int = s match
+        "one" -> 1
+        "two" -> 2
+        _ -> if s < "m" then 10 else 20
+
+    const mid(s: string) -> string = s[1..<s.len - 1]
+
+    const wide(n: i128) -> string = f"${n}%d"
+
+    """
+
+private val csl_slices: string = raw"""
+    const total(xs: []const int) -> int
+        var t = 0
+
+        for x in xs
+            t += x
+
+        t + xs[0] * 100
+
+    const bump(xs: []int)
+        for i in 0..<xs.len
+            xs[i] += 1
+
+    const sums() -> int
+        var a: [4]int = [1, 2, 3, 4]
+        val v = a[1..<4]
+
+        bump(v[1..<3])
+        a = [a[0] * 10, a[1], a[2], a[3]]
+        total(a[..<2]) + total(v) * 1000
+
+    static val TABLE: [3]int = [5, 6, 7]
+
+    const over_table() -> int = total(TABLE[1..<3]) + int(TABLE.len)
+
+    const pair(n: int) -> (int, bool) = (n * 2, n > 3)
+
+    const tuples(n: int) -> int
+        val (a, b) = pair(n)
+        var t = (a, 0)
+
+        t.1 = 5
+        t.0 + t.1 + (if b then 100 else 0)
+
+    """
+
+@test("strings a 'const' function builds are the strings the same calls build at run time")
+csl_strings_are_the_run_time_strings()
+    if !enm_ready() then return
+
+    val prog = csl_strings +
+               "static val G: string = greet(42)\nstatic val C: int = count(\"banana\")\n" +
+               "static val U: string = upper(\"Hello, world\")\nstatic val F: string = fmt(7, q15(0.25))\n" +
+               "static val P: int = pick(\"two\") + pick(\"apple\") + pick(\"zebra\")\n" +
+               "static val M: string = mid(\"[abc]\")\nstatic val W: string = wide(-170141183460469231731687303715884105728)\n" +
+               "const K: string = greet(1)\n\n" +
+               "print(G, C, U, F, P, M, W, K)\n" +
+               "print(greet(42), count(\"banana\"), upper(\"Hello, world\"), fmt(7, q15(0.25)), " +
+               "pick(\"two\") + pick(\"apple\") + pick(\"zebra\"), mid(\"[abc]\"), " +
+               "wide(-170141183460469231731687303715884105728), greet(1))\n"
+
+    val line = "n=42! 3 HELLO, WORLD [00007|0x7|ab  |0.250|0.25|é|true] 32 abc " +
+               "-170141183460469231731687303715884105728 n=1!\n"
+
+    assert_eq(enm_ran(prog), line + line)
+end csl_strings_are_the_run_time_strings
+
+@test("slices and tuples a 'const' function works with are the program's")
+csl_slices_and_tuples_are_the_run_time_values()
+    if !enm_ready() then return
+
+    val prog = csl_slices +
+               "static val S: int = sums()\nstatic val O: int = over_table()\nstatic val T: int = tuples(4)\n" +
+               "static val Q: (int, bool) = pair(1)\n\n" +
+               "print(S, O, T, Q.0, Q.1)\nprint(sums(), over_table(), tuples(4), pair(1).0, pair(1).1)\n"
+
+    // `bump` writes through a view of a view into `a`; `v` sees the elements `a` was given after.
+    assert_eq(enm_ran(prog), "212012 616 113 2 false\n212012 616 113 2 false\n")
+end csl_slices_and_tuples_are_the_run_time_values
+
+@test("a table of (string, int) tuples a 'const' function fills is laid down for a Cortex-M4")
+csl_a_string_table_is_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding("const label(i: int) -> string = s\"ch${i}:\" + (if i % 2 == 0 then \"even\" else \"odd\")\n\n" +
+                               "const table() -> [3](string, int)\n    var t: [3](string, int) = [(\"\", 0); 3]\n\n" +
+                               "    for i in 0..<3\n        t[i] = (label(i), i * i)\n\n    t\n\n" +
+                               "val TABLE: [3](string, int) = table()\nval NAME: string = label(7)" +
+                               ctb_main + "int(TABLE[2].0.len + NAME.len) + TABLE[1].1\n")
+
+    ctb_laid_down(out, "@TABLE = private constant [3 x %struct.$tuple2.string.int] [%struct.$tuple2.string.int " +
+                  "{ { ptr, ptr, i32 } { ptr null, ptr @.str")
+    assert(out.contains("c\"ch0:even\\00\""), out)
+    assert(out.contains("c\"ch1:odd\\00\""), out)
+    assert(out.contains("c\"ch7:odd\\00\""), out)
+    assert(out.contains("i32 7 }, i32 1 }"), out)
+end csl_a_string_table_is_laid_down
+
+@test("a slice of a call's own storage is refused when it is answered")
+csl_a_dangling_slice_is_refused()
+    if ctb_skip() then return
+
+    val said = ctb_freestanding("const local() -> []const int\n    val a: [3]int = [1, 2, 3]\n    a[..]\n\n" +
+                                "const first() -> int = local()[0]\n\nval K: int = first()" + ctb_main + "K\n")
+
+    assert(said.starts_with("'main_entry' is exported and reaches 'K', which is module storage"), said)
+    assert(said.ends_with(". 'K' cannot be computed while compiling: 'local' answers a slice of storage local " +
+                          "to its call, which ends when the call returns — a slice answered while compiling may " +
+                          "view only what its caller handed in, or module storage (main.sysl:5:24) — inside " +
+                          "'first()', called at main.sysl:7:14"), said)
+end csl_a_dangling_slice_is_refused
+
+@test("a slice answered is not laid down, and the refusal says why")
+csl_a_slice_value_stays_code()
+    if ctb_skip() then return
+
+    val said = ctb_freestanding("static val T: [3]int = [1, 2, 3]\n\nconst tail() -> []const int = T[1..<3]\n\n" +
+                                "val V: []const int = tail()" + ctb_main + "V[0]\n")
+
+    assert(said.ends_with(". 'V' came to a slice, which views storage rather than holding a value, and is not " +
+                          "laid down as constant data"), said)
+end csl_a_slice_value_stays_code
+
+@test("a string sliced inside a character traps at the initializer")
+csl_a_split_character_traps()
+    if ctb_skip() then return
+
+    assert_eq(ctb_freestanding("const cut(s: string) -> string = s[0..<1]\n\nval K: string = cut(\"é\")" +
+                               ctb_main + "int(K.len)\n"),
+              "'K' traps while it is being compiled: the range 0..<1 of a string of 2 bytes does not fall " +
+              "where characters start (main.sysl:1:35) — inside 'cut(\"é\")', called at main.sysl:3:17")
+end csl_a_split_character_traps
+
+@test("a slice's range past its end traps, as an index does")
+csl_a_range_past_the_end_traps()
+    if ctb_skip() then return
+
+    assert_eq(ctb_freestanding("const sum(xs: []const int) -> int = xs[1..<4][0]\n\n" +
+                               "const run() -> int\n    val a: [3]int = [1, 2, 3]\n    sum(a[..])\n\n" +
+                               "val K: int = run()" + ctb_main + "K\n"),
+              "'K' traps while it is being compiled: the range 1..<4 is out of bounds for 3 elements " +
+              "(main.sysl:1:38) — inside 'sum([1, 2, 3])', called at main.sysl:5:5; inside 'run()', " +
+              "called at main.sysl:7:14")
+end csl_a_range_past_the_end_traps
+
+@test("a float rendered as text is a library call, and is refused as one")
+csl_a_float_rendered_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome("const f(x: real) -> string = s\"${x}\"\n\nprint(f(1.5))\n").0
+
+    assert(said.contains("'f' is 'const', so it runs while compiling, and it calls 'sysl."), said)
+    assert(said.contains("the standard library marks nothing 'const' yet"), said)
+end csl_a_float_rendered_is_refused

@@ -1337,8 +1337,10 @@ a trait's member is not marked 'const' — whether a call can run while compilin
 
 **What its body may hold.** Every integer width, `f32` and `real`, `bool`, `char` and `unit`, and
 structs, tuples, fixed arrays and enums made of them — payload-carrying ones included — all by value;
-constrained and `new` types; locals, assignment into a local's fields and elements; `if`, `match`,
-`loop`, `while`, `do … while`, the C `for`, `for i in a..<b` and `for x in` a fixed array; `break`,
+strings, built by `+`, interpolation, `str` and an `f"…"` specifier, indexed, sliced, compared and
+matched; slices of arrays and of strings; constrained and `new` types; locals, assignment into a
+local's fields and elements and through a slice; `if`, `match`, `loop`, `while`, `do … while`, the C
+`for`, `for i in a..<b` and `for x in` a fixed array or a slice; `break`,
 `continue`, an early `return`, recursion; `?`; `require`, `ensure`, a struct's `invariant` and a loop's
 `invariant` and `variant`. It may call another `const` function, read a `const` and a `val` laid into
 the object file, and reach the LLVM operations whose result is exactly specified (`llvm.sqrt`,
@@ -1374,10 +1376,60 @@ print(area(Square(3)), plus(3), int(hyp(3.0, 4.0)))
 9 9 5
 ```
 
-What the compiler *evaluates* while compiling — scalars, fixed-point values, and fixed arrays,
-structs and enums of them, not yet tuples or strings — is set out in [modules §
+What the compiler *evaluates* while compiling — scalars, fixed-point values, strings, and fixed
+arrays, tuples, structs, enums and slices of them — is set out in [modules §
 const](/reference/modules/), with how a table a `const` function fills in a loop becomes constant
 data.
+
+**A string is a value the compiler holds**, so a `const` function may build one, take one apart and
+answer one, and a `val` over the call is laid down as the literal it came to:
+
+```sysl
+const label(i: int) -> string = s"ch$i:" + (if i % 2 == 0 then "even" else "odd")
+
+const vowels(s: string) -> int
+    var n = 0
+
+    for b in s.bytes
+        if b == u8('a') || b == u8('e') || b == u8('i') || b == u8('o') || b == u8('u') then n += 1
+
+    n
+
+const hex(n: int) -> string = f"0x${n}%04x"
+
+static val NAMES: [3](string, int) = [(label(0), vowels("table")), (label(1), 0), (label(2), 0)]
+static val H: string = hex(255)
+
+print(NAMES[0].0, NAMES[0].1, NAMES[1].0, H, label(5)[0..<3])
+```
+
+```output
+ch0:even 2 ch1:odd 0x00ff ch5
+```
+
+**A slice is a view** of an array or a string the evaluation holds, so a write through a `[]T` lands
+in the array its caller passed. A slice may be answered only where it views what the caller handed
+in, or module storage — a slice of the call's own local would outlive it:
+
+```sysl
+const bump(xs: []int)
+    for i in 0..<xs.len
+        xs[i] += 1
+
+const local() -> []const int
+    var a: [3]int = [1, 2, 3]
+
+    bump(a[1..<3])
+    a[..]
+
+const head() -> int = local()[0]
+
+const K: int = head()
+```
+
+```error
+'local' answers a slice of storage local to its call, which ends when the call returns
+```
 
 **A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere,
 and such a pointer can only point at a local of the evaluation that made the call:
@@ -1415,13 +1467,13 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
-| a box, a buffer, a string built | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`, `builds a string`) |
+| a box, a buffer, a value rendered through its type's own method | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`, `renders a value through the method its type supplies`) |
+| a float rendered as text | `… it calls 'sysl.fmt.format_real', which is not — the standard library marks nothing 'const' yet, so compute this at run time` |
 | a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
 | a pointer answered | `… its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at` |
 | a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
 | atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
-| `string` and `[]T` | `… its parameter 's' is a 'string' — strings and slices are not evaluated while compiling yet` |
 | `f16`, `bf16` | `… its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while compiling yet` |
 
 One worked refusal for each of the commonest:
@@ -1502,13 +1554,13 @@ print(f())
 ```
 
 ```sysl
-const f(s: string) -> int = 1
+const f(x: real) -> string = f"${x}%.2f"
 
-print(f("a"))
+print(f(1.5))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and its parameter 's' is a 'string' — strings and slices are not evaluated while compiling yet
+'f' is 'const', so it runs while compiling, and it calls 'sysl.fmt.format_real', which is not — the standard library marks nothing 'const' yet, so compute this at run time
 ```
 
 **A generic `const` function is checked at its definition** for everything that does not go through a

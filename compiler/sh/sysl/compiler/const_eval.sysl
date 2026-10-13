@@ -4,8 +4,9 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.math.bigint.{BigInt, add, cmp, from_int, negate, sub, to_string,
-                         not as big_not}
-import sysl.text.Search
+                         not as big_not, shl as big_shl, shr as big_shr}
+import sysl.text.{Search, from_utf8_unchecked}
+import sysl.fmt.{format_int, format_str, format_fixed}
 
 // The evaluator: a `const` function run while compiling.
 //
@@ -123,6 +124,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
         // An array is storage, not a constant's value: it is laid down only as a `val`'s data.
         EvValue(Some(ConstArray(_))) -> None
+        EvValue(Some(ConstView(_, _, _, _))) -> None
         EvValue(v) ->
             val out = v.map(c -> folded_form(c, texpr_type(typed.unwrap())))
 
@@ -210,6 +212,13 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
 
     evaluate(cx.an, cx.scope, s"'$name'", init) match
         EvValue(Some(v)) ->
+            // A slice is a view of storage, and what it views is not a value the call answered.
+            if holds_view(v)
+                cx.an.evaluation.last_stop = s"'$name' came to a slice, which views storage rather than " +
+                                             "holding a value, and is not laid down as constant data"
+                return Ok(None)
+            end if
+
             val image = value_literal(init.span, v, texpr_type(init))
 
             if image.is_some() && payloads_laid(cx.an.tables.layout, image.unwrap()) then return Ok(image)
@@ -634,9 +643,10 @@ private unheld(t: Type) -> Option[string] = t match
     Unit -> None
     Never -> None
     Unknown -> None
-    Str -> Some("a 'string' is not evaluated while compiling yet")
+    Str -> None
+    Slice(elem, _) -> unheld(*elem)
     _ -> Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, " +
-              "fixed-point, 'bool', 'char', and fixed arrays, structs and enums of them are")
+              "fixed-point, 'bool', 'char', strings, and fixed arrays, structs, enums and slices of them are")
 
 // The first field whose type the evaluation does not hold, as `unheld` says it.
 private unheld_fields(fields: Buf[(string, Type)]) -> Option[string]
@@ -657,9 +667,20 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstQuad(hi, lo) -> quad_text((hi, lo))
     ConstBool(b) -> if b then "true" else "false"
     ConstChar(c) -> s"'$c'"
-    ConstStr(s) -> s
+    ConstStr(s) -> s"\"$s\""
     ConstArray(xs) -> array_text(xs, element_type(t))
     ConstRecord(variant, fields) -> record_text(variant, fields, t)
+    ConstView(xs, lo, n, _) -> array_text(viewed(xs, lo, n), element_type(t))
+
+// The elements a slice sees, as a buffer of their own.
+private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
+    var out: Buf[Const] = buf()
+
+    for i in 0..<n
+        out.push(xs.at(lo + i))
+
+    out
+end viewed
 
 // A struct as `Name(a, b)`, an enum value as its variant's name and what it carries.
 @noinline
@@ -696,9 +717,10 @@ private array_text(xs: Buf[Const], elem: Type) -> string
     out + "]"
 end array_text
 
-// The element type of a fixed array type, or `Unknown`.
+// The element type of a fixed array or a slice type, or `Unknown`.
 private element_type(t: Type) -> Type = underlying(t) match
     Array(_, elem) -> *elem
+    Slice(elem, _) -> *elem
     _ -> Unknown
 
 // A value a place takes, as a copy of its own: an array's elements are a buffer, and two places
@@ -724,6 +746,52 @@ private copied_all(xs: Buf[Const]) -> Buf[Const]
 
     out
 
+// Whether a value is or holds a slice anywhere in it.
+private holds_view(v: Const) -> bool = v match
+    ConstView(_, _, _, _) -> true
+    ConstArray(xs) -> any_view(xs)
+    ConstRecord(_, fields) -> any_view(fields)
+    _ -> false
+
+private any_view(xs: Buf[Const]) -> bool
+    for x in xs
+        if holds_view(x) then return true
+
+    false
+
+// Whether a value holds a slice of the storage of a call at `depth` or deeper -- one that would
+// outlive the storage it views, once that call returns.
+private dangles(v: Const, depth: int) -> bool = v match
+    ConstView(_, _, _, owner) -> owner >= depth
+    ConstArray(xs) -> any_dangles(xs, depth)
+    ConstRecord(_, fields) -> any_dangles(fields, depth)
+    _ -> false
+
+private any_dangles(xs: Buf[Const], depth: int) -> bool
+    for x in xs
+        if dangles(x, depth) then return true
+
+    false
+
+// A value written over the one a local holds, **in the same storage** where the two have the same
+// shape: a slice taken of the local views that storage, and sees the new elements as the program's
+// would. Where the shapes differ, nothing is written and the caller replaces the value.
+private overwrite(old: Const, new: Const) -> bool = (old, new) match
+    (ConstArray(xs), ConstArray(ys)) -> overwrite_all(xs, ys)
+    (ConstRecord(a, xs), ConstRecord(b, ys)) -> a == b && overwrite_all(xs, ys)
+    _ -> false
+
+private overwrite_all(xs: Buf[Const], ys: Buf[Const]) -> bool
+    if xs.len() != ys.len() then return false
+
+    var held = xs
+
+    for i in 0..<ys.len()
+        if !overwrite(xs.at(i), ys.at(i)) then held.set(i, copied(ys.at(i)))
+
+    true
+end overwrite_all
+
 // A settled value as `const_fold`'s callers read one: a `char` is a character there.
 private folded_form(v: Const, t: Type) -> Const = v match
     ConstInt(n) -> if underlying(t) == Char then ConstChar(char(u32(n.to_long().unwrap_or(0)))) else v
@@ -733,6 +801,8 @@ private folded_form(v: Const, t: Type) -> Const = v match
 private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstInt(n) -> Some(TExpr(span, TIntLit(n, t)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
+    // A string is laid down as the literal it came to: its bytes are constant data, owned by nothing.
+    ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
     ConstArray(xs) -> array_literal(span, xs, t)
@@ -960,7 +1030,14 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TQuantifier(universal, name, _, lo, hi, inclusive, pred) ->
             quantifier(r, e.span, universal, name, lo, hi, inclusive, pred)
         TSeq(exprs) -> seq(r, exprs)
-        TStrLit(_) -> refuse_form(r, e.span, "a 'string' is not evaluated while compiling yet")
+        TStrLit(s) -> EvGave(ConstStr(s))
+        TStr(arg) -> rendered(r, e.span, arg)
+        TLen(receiver, _) -> length(r, receiver)
+        TBytes(receiver) -> bytes_of(r, receiver)
+        TSlice(base, lo, hi, inclusive, _) -> sliced(r, e.span, base, lo, hi, inclusive)
+        TFromBytes(arg) -> text_of(r, arg)
+        TStrView(arg) -> text_of(r, arg)
+        TConstView(arg) -> eval(r, arg)
         TStructNew(decl, args) -> record_new(r, e.span, -1, args, Struct(decl))
         TEnumNew(enum_ty, variant, args) -> record_new(r, e.span, variant_position(enum_ty, variant), args, enum_ty)
         TArrayLit(elems, ty) -> array_lit(r, e.span, elems, ty)
@@ -1018,6 +1095,8 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Fixed(_, _, _) -> EvGave(ConstInt(from_int(0)))
     Bool -> EvGave(ConstBool(false))
     Unit -> EvNone
+    Str -> EvGave(ConstStr(""))
+    Slice(_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
     Array(n, elem) ->
         if !sized(r, at, long(n)) then return EvStop
 
@@ -1063,8 +1142,11 @@ end filled
 
 // Charges the steps an array of `n` elements costs, and stops the run where they are more than are
 // left -- naming the size, which is what to change.
+private sized(r: &EvRun, at: Span, n: long) -> bool = charged(r, at, n, s"an array of $n elements")
+
+// The same for any value made a step per element or byte: `what` names it.
 @noinline
-private sized(r: &EvRun, at: Span, n: long) -> bool
+private charged(r: &EvRun, at: Span, n: long, what: string) -> bool
     if r.steps + n <= EvStepLimit
         r.steps += n
         return true
@@ -1072,12 +1154,12 @@ private sized(r: &EvRun, at: Span, n: long) -> bool
 
     if r.kind == EvRunning
         r.kind = EvLimit
-        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — an array of " +
-                    s"$n elements at ${place_text(here(r), at)} is past the steps that were left"
+        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $what at " +
+                    s"${place_text(here(r), at)} is past the steps that were left"
     end if
 
     false
-end sized
+end charged
 
 @noinline
 private array_lit(r: &EvRun, at: Span, elems: Buf[TExpr], ty: Type) -> Flow
@@ -1132,14 +1214,20 @@ end element_index
 // `a[i]`, read: the array is read where it is held, without a copy.
 @noinline
 private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
-    val xs = eval_value(r, receiver) match
-        Ok(ConstArray(found)) -> found
+    val (xs, lo, n) = eval_value(r, receiver) match
+        Ok(ConstArray(found)) -> (found, usize(0), found.len())
+        Ok(ConstView(found, from, count, _)) -> (found, from, count)
+        // A string's subscript is a byte.
+        Ok(ConstStr(s)) -> return element_index(r, index, s.bytes.len) match
+            Ok(i) -> EvGave(ConstInt(from_int(long(s.bytes[i]))))
+            Err(f) -> f
         Ok(_) -> return refuse_form(r, receiver.span, s"an element of a '${type_show(texpr_type(receiver))}' " +
-                                    "is not evaluated while compiling yet — a fixed array's is")
+                                    "is not evaluated while compiling yet — a fixed array's, a slice's and a " +
+                                    "string's are")
         Err(f) -> return f
 
-    element_index(r, index, xs.len()) match
-        Ok(i) -> EvGave(xs.at(i))
+    element_index(r, index, n) match
+        Ok(i) -> EvGave(xs.at(lo + i))
         Err(f) -> f
 end element_read
 
@@ -1147,22 +1235,21 @@ end element_read
 @noinline
 private ev_for_each(r: &EvRun, at: Span, name: string, items: TExpr, body: Buf[TStmt],
                     else_block: Option[TBlock]) -> Flow
-    val xs = eval_value(r, items) match
-        Ok(ConstArray(found)) -> copied(ConstArray(found))
+    // An array's elements as they were when the loop began; a slice's are read where they are held,
+    // as each turn comes to them.
+    val (elems, lo, n) = eval_value(r, items) match
+        Ok(ConstArray(found)) -> (copied_all(found), usize(0), found.len())
+        Ok(ConstView(found, from, count, _)) -> (found, from, count)
         Ok(_) -> return refuse_form(r, at, s"a 'for' over a '${type_show(texpr_type(items))}' is not " +
-                                    "evaluated while compiling yet — one over a fixed array or a range is")
+                                    "evaluated while compiling yet — one over a fixed array, a slice or a range is")
         Err(f) -> return f
-
-    val elems = xs match
-        ConstArray(found) -> found
-        _ -> return EvStop
 
     enter_loop(r, at)
 
-    for x in elems
+    for i in 0..<n
         if !tick(r) then return left(r, EvStop)
 
-        assign(r, name, x)
+        assign(r, name, elems.at(lo + i))
 
         turn(stmts(r, body)) match
             TurnOn -> ()
@@ -1171,6 +1258,238 @@ private ev_for_each(r: &EvRun, at: Span, name: string, items: TExpr, body: Buf[T
 
     ran_out(r, else_block)
 end ev_for_each
+
+// -- strings and slices ------------------------------------------------------------------------------
+//
+// **A string is held as its text**, built by `+`, by an interpolation and by `str`, and laid down as
+// the literal it comes to -- its bytes constant data, owned by nothing, as a written literal's are.
+// Building one costs a step per byte, so the step bound is the bound on how long a string may grow.
+//
+// **A slice is held as a view**: a run of the elements of the buffer an array's value holds, shared
+// with it, so a write through a `[]T` lands in the array the caller passed and a write into the array
+// is seen through the slice, as when the program runs. A string's bytes are a view nothing owns.
+
+// A string made by the run, its bytes charged.
+private built(r: &EvRun, at: Span, text: string) -> Flow =
+    if charged(r, at, long(text.bytes.len), s"a string of ${text.bytes.len} bytes") then EvGave(ConstStr(text))
+    else EvStop
+
+// `+` joins two strings; the comparisons are by bytes, as the program's are.
+@noinline
+private str_operate(r: &EvRun, at: Span, op: string, a: string, b: string) -> Flow
+    if op == "+" then return built(r, at, a + b)
+
+    val sign = if a < b then -1 else if a == b then 0 else 1
+
+    if op == "==" then EvGave(ConstBool(sign == 0))
+    else if op == "!=" then EvGave(ConstBool(sign != 0))
+    else if op == "<" then EvGave(ConstBool(sign < 0))
+    else if op == "<=" then EvGave(ConstBool(sign <= 0))
+    else if op == ">" then EvGave(ConstBool(sign > 0))
+    else if op == ">=" then EvGave(ConstBool(sign >= 0))
+    else refuse_form(r, at, s"'$op' on string is not evaluated while compiling")
+end str_operate
+
+// `str(x)`, and an interpolation's hole, over a value that renders itself: the text the program's
+// renderer writes -- an integer in decimal, a fixed-point value as the shortest decimal that reads back
+// as it (`fixed_text`, which the run-time renderer agrees with to the byte), a `char` as its UTF-8.
+@noinline
+private rendered(r: &EvRun, at: Span, arg: TExpr) -> Flow
+    val v = eval_value(r, arg) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val ty = texpr_type(arg)
+
+    val text = (v, underlying(ty)) match
+        (ConstStr(s), _) -> s
+        (ConstBool(b), _) -> if b then "true" else "false"
+        (ConstChar(c), _) -> s"$c"
+        (ConstInt(n), Char) -> s"${char(u32(n.to_long().unwrap_or(0)))}"
+        (ConstInt(n), Fixed(_, frac, _)) -> fixed_text(n, frac)
+        (ConstInt(n), Integer(_, _, _)) -> to_string(n)
+        _ -> return refuse_form(r, at, s"a '${type_show(ty)}' rendered as text is not evaluated while compiling")
+
+    built(r, at, text)
+end rendered
+
+// `.len`: a string's bytes, a slice's elements, an array's.
+@noinline
+private length(r: &EvRun, receiver: TExpr) -> Flow = eval_value(r, receiver) match
+    Ok(ConstStr(s)) -> EvGave(ConstInt(from_int(long(s.bytes.len))))
+    Ok(ConstView(_, _, n, _)) -> EvGave(ConstInt(from_int(long(n))))
+    Ok(ConstArray(xs)) -> EvGave(ConstInt(from_int(long(xs.len()))))
+    Ok(_) -> refuse_form(r, receiver.span, s"the length of a '${type_show(texpr_type(receiver))}' is not " +
+                         "evaluated while compiling")
+    Err(f) -> f
+
+// `s.bytes`: a read-only view of a string's bytes, which outlive every call.
+@noinline
+private bytes_of(r: &EvRun, receiver: TExpr) -> Flow
+    val s = eval_value(r, receiver) match
+        Ok(ConstStr(found)) -> found
+        Ok(_) -> return refuse_form(r, receiver.span, s"the bytes of a '${type_show(texpr_type(receiver))}' " +
+                                    "are not evaluated while compiling")
+        Err(f) -> return f
+
+    val b = s.bytes
+
+    if !charged(r, receiver.span, long(b.len), s"a string of ${b.len} bytes") then return EvStop
+
+    var out: Buf[Const] = buf()
+
+    for x in b
+        out.push(ConstInt(from_int(long(x))))
+
+    EvGave(ConstView(out, 0, b.len, -1))
+end bytes_of
+
+// `a[lo..<hi]` and its other spellings: a view of an array or of a slice, or the string between two
+// byte positions. A range outside what it slices traps, and so does a string's that does not fall
+// where a character starts, as both do when the program runs.
+@noinline
+private sliced(r: &EvRun, at: Span, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool) -> Flow
+    val v = eval_value(r, base) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val n: usize = v match
+        ConstStr(s) -> s.bytes.len
+        ConstView(_, _, count, _) -> count
+        ConstArray(xs) -> xs.len()
+        _ -> return refuse_form(r, at, s"a slice of a '${type_show(texpr_type(base))}' is not evaluated while compiling")
+
+    val from = slice_end(r, lo, from_int(0), false) match
+        Ok(i) -> i
+        Err(f) -> return f
+
+    val to = slice_end(r, hi, from_int(long(n)), inclusive) match
+        Ok(i) -> i
+        Err(f) -> return f
+
+    if cmp(from, from_int(0)) < 0 || cmp(from, to) > 0 || cmp(to, from_int(long(n))) > 0 then
+        return trap(r, at, s"the range ${to_string(from)}..<${to_string(to)} is out of bounds for $n elements")
+
+    val a = usize(from.to_long().unwrap_or(0))
+    val b = usize(to.to_long().unwrap_or(0))
+
+    v match
+        ConstStr(s) ->
+            if !starts_char(s, a) || !starts_char(s, b) then
+                return trap(r, at, s"the range $a..<$b of a string of $n bytes does not fall where characters start")
+
+            EvGave(ConstStr(s[a..<b]))
+        ConstView(xs, first, _, owner) -> EvGave(ConstView(xs, first + a, b - a, owner))
+        ConstArray(xs) ->
+            // An array that is no local's -- a value a call answered -- is a temporary of this call.
+            val held = if is_place(base) then xs else copied_all(xs)
+
+            EvGave(ConstView(held, a, b - a, owner_of(r, base)))
+        _ -> EvStop
+end sliced
+
+// One end of a range a slice is taken over, or `missing` where it was not written.
+private slice_end(r: &EvRun, e: Option[TExpr], missing: BigInt, inclusive: bool) -> Result[BigInt, Flow]
+    if e.is_none() then return Ok(missing)
+
+    eval_value(r, e.unwrap()) match
+        Ok(ConstInt(i)) -> Ok(if inclusive then add(i, from_int(1)) else i)
+        Ok(_) -> Err(refuse_form(r, e.unwrap().span, "a slice's bound that is not an integer"))
+        Err(f) -> Err(f)
+end slice_end
+
+// Whether byte `at` of a string is where a character starts, or its end.
+private starts_char(s: string, at: usize) -> bool = at == s.bytes.len || (s.bytes[at] & 0xC0) != 0x80
+
+// Whether an expression names storage -- a local, module storage, an element or a field of one.
+private is_place(e: TExpr) -> bool = *e.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TIndex(receiver, _, _) -> is_place(receiver)
+    TField(receiver, _, _) -> is_place(receiver)
+    _ -> false
+
+// Which call's storage a slice of this array views: module storage outlives every call (-1), and
+// anything else is the running call's -- a local, an element or field of one, or a temporary.
+private owner_of(r: &EvRun, e: TExpr) -> int = *e.kind match
+    TGlobal(_, _, _) -> -1
+    TIndex(receiver, _, _) -> owner_of(r, receiver)
+    TField(receiver, _, _) -> owner_of(r, receiver)
+    _ -> int(r.frames.len()) - 1
+
+// A string from bytes the analyzer knows are UTF-8: `string(bytes)`, and a view of a `[]u8` as one.
+@noinline
+private text_of(r: &EvRun, arg: TExpr) -> Flow
+    val (xs, lo, n) = eval_value(r, arg) match
+        Ok(ConstStr(s)) -> return EvGave(ConstStr(s))
+        Ok(ConstView(found, from, count, _)) -> (found, from, count)
+        Ok(ConstArray(found)) -> (found, usize(0), found.len())
+        Ok(_) -> return refuse_form(r, arg.span, s"a string from a '${type_show(texpr_type(arg))}' is not " +
+                                    "evaluated while compiling")
+        Err(f) -> return f
+
+    var b: Buf[u8] = buf()
+
+    for i in 0..<n
+        xs.at(lo + i) match
+            ConstInt(x) -> b.push(u8(x.to_long().unwrap_or(0)))
+            _ -> return refuse_form(r, arg.span, "a string from something other than bytes")
+
+    built(r, arg.span, from_utf8_unchecked(b.view()))
+end text_of
+
+// The renderers an `f"…"` hole with a specifier lowers to. **The compiler runs the library's own
+// functions** -- the ones it was built with -- so the text is the program's, flag for flag: an integer
+// under `%d`, `%x` and the rest, a string under `%s`, and a fixed-point value under a float
+// conversion, which is a dyadic rational printed exactly. A float under one is not among them: its
+// rendering is a library call this list does not name, and is refused as one.
+const_renderer(shown: string) -> bool =
+    shown == "sysl.fmt.format_int" || shown == "sysl.fmt.format_str" || shown == "sysl.fmt.format_fixed"
+
+@noinline
+private library_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> Flow
+    val text = if shown == "sysl.fmt.format_int" then
+        format_int(wide_arg(vals, 0), small_arg(vals, 1), text_arg(vals, 2), small_arg(vals, 3), small_arg(vals, 4))
+    else if shown == "sysl.fmt.format_str" then
+        format_str(text_arg(vals, 0), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
+    else
+        format_fixed(wide_arg(vals, 0), small_arg(vals, 1), flag_arg(vals, 2), small_arg(vals, 3),
+                     text_arg(vals, 4), small_arg(vals, 5), small_arg(vals, 6))
+
+    built(r, at, text)
+end library_render
+
+private small_arg(vals: Buf[Const], i: usize) -> int = vals.at(i) match
+    ConstInt(n) -> int(n.to_long().unwrap_or(0))
+    _ -> 0
+
+private text_arg(vals: Buf[Const], i: usize) -> string = vals.at(i) match
+    ConstStr(s) -> s
+    _ -> ""
+
+private flag_arg(vals: Buf[Const], i: usize) -> bool = vals.at(i) match
+    ConstBool(b) -> b
+    _ -> false
+
+// An integer argument at `i128`, which is the width the renderers take every integer at.
+private wide_arg(vals: Buf[Const], i: usize) -> i128
+    val n = vals.at(i) match
+        ConstInt(x) -> x
+        _ -> return 0
+
+    val narrow = n.to_long()
+
+    if narrow.is_some() then return i128(narrow.unwrap())
+
+    // Past a `long`: the high 64 bits (rounded toward negative infinity), then the low 64 in halves.
+    val high = big_shr(n, 64)
+    val rest = sub(n, big_shl(high, 64))
+    val mid = big_shr(rest, 32)
+    val low = sub(rest, big_shl(mid, 32))
+
+    (i128(high.to_long().unwrap_or(0)) << 64) | (i128(mid.to_long().unwrap_or(0)) << 32) |
+        i128(low.to_long().unwrap_or(0))
+end wide_arg
 
 // -- structs and enums -------------------------------------------------------------------------------
 //
@@ -1324,13 +1643,25 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
         if item == symbol then
             return refuse_form(r, at, s"'$shown' is read while its own value is being worked out")
 
+    val base = underlying(ty)
+
     ev.vals_reading.push(symbol)
+
+    // A string, an array, a struct or an enum value is what its initializer comes to when it is run
+    // here, which is the value laid down for it: a literal, or a `const` call.
+    if held_whole(base)
+        val whole = whole_value(r.a, d.unwrap(), shown, ty)
+
+        ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+
+        return whole match
+            Some(v) -> EvGave(v)
+            None -> refuse_form(r, at, s"'$shown' is filled when the program runs")
+    end if
 
     val folded = const_fold(analyzer_for(r.a, d.unwrap().scope), d.unwrap().init.unwrap())
 
     ev.vals_reading.truncate(ev.vals_reading.len() - 1)
-
-    val base = underlying(ty)
 
     // **An `f128` is read from the literal it was written as**, since the untyped fold above reads a
     // float through a `double`.
@@ -1352,6 +1683,27 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
         Some(ConstChar(c)) -> EvGave(ConstInt(from_int(long(u32(c)))))
         _ -> refuse_form(r, at, s"'$shown' is filled when the program runs")
 end global_value
+
+// Whether module storage of this type is read by running its initializer rather than by folding it.
+private held_whole(t: Type) -> bool = t match
+    Str -> true
+    Array(_, _) -> true
+    Struct(_) -> true
+    Enum(_) -> true
+    _ -> false
+
+// A module `val`'s value, by running its initializer in a run of its own -- typed at the storage's
+// type, as the program types it -- or nothing where that run does not come to a value it holds.
+@noinline
+private whole_value(a: &Analysis, d: ValueDecl, shown: string, ty: Type) -> Option[Const]
+    val typed = typed_call(analyzer_for(a, d.scope), d.init.unwrap(), Some(ty))
+
+    if typed.is_none() then return None
+
+    evaluate(a, d.scope, s"'$shown'", typed.unwrap()) match
+        EvValue(Some(v)) -> if holds_view(v) then None else Some(v)
+        _ -> None
+end whole_value
 
 // The binary128 value an initializer written as a number literal, or a negated one, stands for.
 private quad_of_init(e: Expr) -> Option[(u64, u64)] = *e.kind match
@@ -1465,6 +1817,7 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
                 else if op == "!=" then Ok(ConstBool(a != b))
                 else Err(s"'$op' on ${type_show(lt)}")
             _ -> Err(s"'$op' on ${type_show(lt)}")
+        (ConstStr(a), ConstStr(b)) -> return str_operate(r, at, op, a, b)
         _ -> Err(s"'$op' on ${type_show(lt)}")
 
     out match
@@ -1703,6 +2056,10 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
             Ok(v) -> vals.push(v)
             Err(f) -> return f
 
+    val shown = qualified_name(name)
+
+    if const_renderer(shown) then return library_render(r, at, shown, vals)
+
     run_call(r, at, name, vals)
 end call
 
@@ -1772,6 +2129,8 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
         Ok(fr) -> fr
         Err(fl) -> return fl
 
+    val depth = int(r.frames.len())
+
     // A direct self-call is where a function's `variant` is checked: the measure over the arguments
     // about to be passed has to be below the measure over the parameters as they stand.
     val measured = f.variant.is_some() && running(r).func == name
@@ -1789,6 +2148,21 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
     val out = run_frame(r, at, f, measured, before)
 
     r.frames.truncate(r.frames.len() - 1)
+
+    // A slice of the call's own storage would outlive it: the program's run keeps that storage alive
+    // on the heap, and a run while compiling has no heap to keep it on.
+    val dangling = out match
+        EvGave(v) -> dangles(v, depth)
+        _ -> false
+
+    if dangling then
+        return refuse_form(r, at, s"'${qualified_name(name)}' answers a slice of storage local to its call, " +
+                           "which ends when the call returns — a slice answered while compiling may view " +
+                           "only what its caller handed in, or module storage")
+
+    // A call handed a slice is not remembered: what it reads is wherever the slice points, which a
+    // later call with an equal-looking slice need not find the same.
+    if key == "" then return out
 
     out match
         EvGave(v) -> r.a.evaluation.memo.put(key, Some(v))
@@ -1814,7 +2188,7 @@ private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
 
     if result_why.is_some() then return Err(refuse_form(r, at, result_why.unwrap()))
 
-    val known = r.a.evaluation.memo.get(key)
+    val known = if key == "" then None else r.a.evaluation.memo.get(key)
 
     if known.is_some() then return Err(gave(known.unwrap()))
 
@@ -1922,6 +2296,8 @@ private below(a: Const, b: Const) -> bool = (a, b) match
 // The key a run of a callee is kept by: the callee, and each argument's exact value.
 @noinline
 private memo_key(name: string, vals: Buf[Const]) -> string
+    if any_view(vals) then return ""
+
     var out = name
 
     for i in 0..<vals.len()
@@ -1936,7 +2312,9 @@ private key_part(v: Const) -> string = v match
     ConstQuad(hi, lo) -> s"q${hi}_$lo"
     ConstBool(b) -> if b then "t" else "f"
     ConstChar(c) -> s"c${u32(c)}"
-    ConstStr(s) -> s
+    ConstStr(s) -> s"s${s.bytes.len}:$s"
+    // Never part of a key: a call handed a slice is not remembered (`run_call`).
+    ConstView(_, _, _, _) -> "v"
     ConstArray(xs) ->
         var out = "["
 
@@ -2131,12 +2509,14 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
                 Ok(s) -> slot_value(r, receiver.span, s)
                 Err(f) -> return Err(f)
 
-            val xs = held match
-                Ok(ConstArray(found)) -> found
+            // A slice's element is a place in the array it views.
+            val (xs, lo, n) = held match
+                Ok(ConstArray(found)) -> (found, usize(0), found.len())
+                Ok(ConstView(found, from, count, _)) -> (found, from, count)
                 Ok(_) -> return Err(no_place(r, place))
                 Err(f) -> return Err(f)
 
-            element_index(r, index, xs.len()).map(i -> SlotElem(xs, i))
+            element_index(r, index, n).map(i -> SlotElem(xs, lo + i))
         // A field is a slot in the struct's own fields, so a write into it lands where it is held.
         TField(receiver, index, _) ->
             val held = slot_of(r, receiver) match
@@ -2167,8 +2547,14 @@ private slot_write(r: &EvRun, s: EvSlot, v: Const) = s match
 
         held.set(i, copied(v))
 
-private assign(r: &EvRun, name: string, v: Const) =
-    r.frames.at(r.frames.len() - 1).locals.put(name, copied(v))
+private assign(r: &EvRun, name: string, v: Const)
+    val frame = r.frames.at(r.frames.len() - 1)
+    val old = frame.locals.get(name)
+
+    if old.is_some() && overwrite(old.unwrap(), v) then return
+
+    frame.locals.put(name, copied(v))
+end assign
 
 private no_place(r: &EvRun, place: TExpr) -> Flow =
     refuse_form(r, place.span, "a write into anything but a local, an element or a field is not evaluated " +

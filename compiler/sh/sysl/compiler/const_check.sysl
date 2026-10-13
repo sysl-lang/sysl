@@ -10,8 +10,9 @@ import sysl.text.{Search, from_utf8_unchecked}
 // exists at that moment: values, and code the compiler can see. What is refused is everything that
 // only exists once the program runs -- an address, the heap, module storage that is filled at
 // startup, code outside the program, and a call whose target is chosen at run time -- plus the few
-// kinds of value the compiler does not evaluate yet (strings, slices, vectors, the two sixteen-bit
-// floats). Each refusal is anchored where the thing was written and says which of these it is.
+// kinds of value the compiler does not evaluate yet (vectors, the two sixteen-bit floats). A string is
+// a value the compiler holds -- built, joined, sliced, rendered from an integer or a fixed-point value
+// -- and a slice is a view of an array or a string the evaluation holds. Each refusal is anchored where the thing was written and says which of these it is.
 //
 // **A call through a type parameter's bound is not asked about here.** Which body answers it is
 // settled by the instantiation, so a generic body is checked at its definition for everything else
@@ -173,11 +174,9 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
     TBox(_, _) -> Some(s"it boxes a value, which allocates — ${const_heap()}")
     TBufLit(_, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
     TBufFill(_, _, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
-    TStr(_) -> Some(s"it builds a string, which allocates — ${const_heap()}")
-    TFormat(_, _, _) -> Some(s"it builds a string, which allocates — ${const_heap()}")
-    TRender(_, _, _, _) -> Some(s"it builds a string, which allocates — ${const_heap()}")
-    TBinary(_, _, _, ty) ->
-        if ty == Str then Some(s"it builds a string, which allocates — ${const_heap()}") else None
+    // A value a type renders through its own method writes into a buffer the method is handed.
+    TRender(_, _, _, _) -> Some(s"it renders a value through the method its type supplies, which writes " +
+                                s"into a buffer — ${const_heap()}")
 
     TCast(operand, ty) ->
         if names_an_address(ty) || names_an_address(texpr_type(operand)) then
@@ -252,6 +251,9 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
 
     if printer || shown == "sysl.stdout" || shown == "sysl.stderr" then
         return Some(s"it prints, which is outside the program — ${const_outside()}")
+
+    // An `f"…"` specifier's renderers are run by the compiler itself (`const_eval.sysl`).
+    if const_renderer(shown) then return None
 
     if std_module(module_of(origin)) then
         return Some(s"it calls '$shown', which is not — the standard library marks nothing " +
@@ -393,8 +395,7 @@ const_type_refusal(t: Type) -> Option[string] = t match
     Floating(bits, _) ->
         // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), so it is in.
         if bits == 16 then Some(not_yet("'f16' and 'bf16' are")) else None
-    Str -> Some(not_yet("strings and slices are"))
-    Slice(_, _) -> Some(not_yet("strings and slices are"))
+    Slice(elem, _) -> const_type_refusal(*elem)
     Vector(_, _) -> Some(not_yet("vectors are"))
     VaList -> Some(not_yet("C variadic arguments are"))
     Ref(inner, _) -> *inner match
