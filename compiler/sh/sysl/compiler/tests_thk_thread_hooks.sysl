@@ -402,6 +402,60 @@ thk_image_without_tls()
     assert_eq(thk_value(listing, "__sysl_tls_align"), 1)
 end thk_image_without_tls
 
+// The program's text is compiled a section per definition, so an export nothing reaches is dropped
+// even where the entry calls an ordinary function laid beside it -- and the thread-local storage that
+// export touches goes with it. One `.text` for the whole module kept every export the moment any
+// neighbour was reached.
+@test("an export nothing reaches leaves the image even beside a function the entry calls")
+thk_unreached_export_is_dropped()
+    if !thk_nm_ready() then return
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+
+    val (code, said, listing) = thk_image(raw"""
+        @noinline
+        step(n: *u64) -> unit
+            val d: *volatile u64 = ptr_cast(n)
+
+            d[0] = d[0] + 3
+
+        @export("kstart")
+        kstart() -> never
+            var n: u64 = 1
+
+            loop
+                step(&n)
+        """)
+
+    assert(code == 0, said)
+    assert(thk_names(listing, "step"), listing)
+    assert(!thk_names(listing, "tl_bump"), listing)
+    assert(!thk_names(listing, "k_join"), listing)
+    assert_eq(thk_value(listing, "__sysl_tls_data"), 0)
+end thk_unreached_export_is_dropped
+
+// A placed definition is a root the linker is told about too, so it is how an export nothing reaches
+// is kept in a freestanding image.
+@test("an export nothing reaches stays in the image when it is placed with @section")
+thk_placed_export_is_kept()
+    if !thk_nm_ready() then return
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+
+    val (code, said, listing) = thk_image(raw"""
+        @section(".text.kept")
+        @export("k_kept")
+        k_kept(n: int) -> int = n + 1
+
+        @export("kstart")
+        kstart() -> never
+            loop
+                ()
+        """)
+
+    assert(code == 0, said)
+    assert(listing.contains(" T k_kept"), listing)
+    assert(!thk_names(listing, "tl_bump"), listing)
+end thk_placed_export_is_kept
+
 // -- a generic alias that only renames ---------------------------------------------------------------
 
 @test("an associated function is reached through a generic alias that only renames its type")

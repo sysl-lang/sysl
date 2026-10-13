@@ -694,6 +694,14 @@ begins. A test build swaps the roots, putting the tests where the entry point wa
 are roots there too. They have to be: leaving them out would not make them reachable from the tests
 instead, it would make them reachable from nothing.
 
+**A freestanding image is the one place an `@export` is not a root.** The compiler still emits it,
+but the image is linked from its entry, a function at a time, and the linker drops every function
+nothing the entry reaches calls — an export nobody calls included, with the thread-local storage and
+the rest of what only it touched. An archive keeps every export, since what links it decides. An
+export the image must keep though nothing in it calls it — a routine a debugger or a boot
+ROM jumps to by name — is given a `@section` (below): a placed definition is marked for the linker
+as well as the optimizer, and stays.
+
 A [destructor](/reference/memory/) is entered from somewhere no walk sees as well — the release hook
 generated from a payload type — but it is kept by its **type** rather than as a root: wherever
 anything kept holds a value of the type, in a test build exactly as in a program, the destructor its

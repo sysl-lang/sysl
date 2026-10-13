@@ -653,6 +653,12 @@ libc_start(argc: int, argv: **u8) -> never = halt(program_main(argc, argv))
 because the image's entry names `_start`. Only `entry` is read for an archive — `linker` and
 `linker_script` are the C program's link's to say.
 
+**An image `sysl build` links itself keeps only what its `entry` reaches.** Its text is compiled a
+section per function and the link collects the garbage, so an `@export` nothing reached from the
+entry calls is dropped there — the archive keeps it, the image does not — and with it any
+thread-local storage only it touched. An export an image must keep anyway takes a `@section`, which
+marks it for the linker (see [attributes](/reference/attributes/)).
+
 An archive naming no entry, or naming `main`, is refused, with the way to declare it:
 
 ```

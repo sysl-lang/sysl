@@ -672,6 +672,14 @@ link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: 
 
     out.push(dead_strip(target))
 
+    // **And the program's own text is compiled a section per definition**, the half of the pair
+    // `compile_c` gives a tree's C: without it the module is one `.text`, kept whole by the first
+    // call into it, so an export nothing reaches -- and the thread-local storage it touches -- stays
+    // in the image whenever its neighbour is reached. Mach-O strips by atom and needs neither.
+    if target.os != MacOS
+        out.push("-ffunction-sections")
+        out.push("-fdata-sections")
+
     val machine = machine_flags(target)
 
     for item in machine
@@ -1037,7 +1045,8 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     if units > 1
         split_module(ir, units) match
             Some(parts) ->
-                val made = compile_units(cc, parts, exe, target, level, false, defines_libcall(ir))?
+                val made = compile_units(cc, parts, exe, target, level, target.os != MacOS,
+                                         defines_libcall(ir))?
                 var rest: Buf[string] = buf()
 
                 for i in 1..<made.len()
