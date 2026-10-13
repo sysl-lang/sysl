@@ -155,22 +155,26 @@ private aah_project(program: string) -> string =
     lbr_tree(lbr_two("main.sysl", program, "package.hocon", aah_own_pair()))
 
 // What a project's program prints, or what refused it.
-private aah_ran(p: string) -> string
+private aah_ran(p: string) -> string = aah_ran_ending(p).0
+
+// What a project's program prints, and whether it ended by exiting zero. A refused build and a
+// program that could not be run both answer false.
+private aah_ran_ending(p: string) -> (string, bool)
     val out = lbr_temp("sysl-aah-exe")
     val said = lbr_cli(["sysl", "build", "-o", s"$out/program", p])
 
     if said.0 != 0
         lbr_drop([out])
-        return s"refused: ${said.1}"
+        return (s"refused: ${said.1}", false)
     end if
 
-    val printed = capture(s"$out/program", [], "", [], true) match
-        Ok(o) -> o.text
-        Err(_) -> "the program that was built could not be run"
+    val ran = capture(s"$out/program", [], "", [], true) match
+        Ok(o) -> (o.text, o.status.ok())
+        Err(_) -> ("the program that was built could not be run", false)
 
     lbr_drop([out])
-    printed
-end aah_ran
+    ran
+end aah_ran_ending
 
 @test("a manifest-named pair still boxes an ordinary type through itself")
 aah_a_named_pair_still_works()
@@ -198,10 +202,12 @@ aah_a_failed_box_allocation_traps()
     assert(ir.contains("call ptr @own_alloc("), ir)
     assert(ir.contains("icmp ne ptr"), ir)
 
-    val said = aah_ran(p)
+    val ran = aah_ran_ending(p)
+    val said = ran.0
 
     assert(!said.starts_with("refused: "), said)
     assert(!said.contains("42"), said)
+    assert(!ran.1, "the program ended by exiting zero instead of trapping: " + said)
     lbr_drop([p])
 
 @test("a manifest-named pair with an over-aligned box and no aligned hook is refused")

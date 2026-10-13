@@ -1,0 +1,35 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get, get_or}
+import sysl.fs.is_file
+import sysl.process.{capture, Var}
+import sysl.text.Search
+
+// **A test that must call the compiler calls the one that is running it.** `sysl test` and `sysl run`
+// give the program `SYSL`, the absolute path of the compiler doing the running, and
+// `sysl.testing.compiler()` reads it (its own test is in the library).
+
+@test("a test is told the absolute path of the compiler running it")
+tcm_a_test_is_told_its_compiler()
+    val given = get("SYSL")
+
+    assert(given.is_some(), "SYSL is not in the environment of a test")
+    assert(given.unwrap().starts_with("/"), given.unwrap())
+    assert(is_file(given.unwrap()), given.unwrap())
+
+@test("the compiler a test is told answers --version")
+tcm_the_compiler_answers_version()
+    val answer = capture(get_or("SYSL", "sysl"), ["--version"]).unwrap()
+
+    assert(answer.status.ok(), answer.text)
+    assert(answer.text.starts_with("sysl"), answer.text)
+
+@test("sysl run replaces a SYSL already in the environment with its own path")
+tcm_run_replaces_an_inherited_sysl()
+    val me = get_or("SYSL", "sysl")
+    val file = lbr_program("import sysl.env.get_or\n\nmain()\n    print(get_or(\"SYSL\", \"unset\"))\n")
+    val ran = capture(me, ["run", file], "", [Var("SYSL", "/outer/sysl")]).unwrap()
+
+    assert(ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+    assert(ran.text.trim() == me, ran.text)

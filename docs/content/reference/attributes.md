@@ -636,6 +636,24 @@ board.sysl
 **A test that printed a note and returned would have been reported `ok`**: a pass that checked
 nothing. `skip` makes the run say so on the line a reader looks at last.
 
+### A test may call the compiler that is running it
+
+`sysl test` and `sysl run` start the program with **`SYSL`** in its environment: the absolute path of
+the compiler doing the running. It is always set, replacing a `SYSL` the environment already held,
+because one left by an outer run names the outer compiler. **`sysl.testing.compiler()`** reads it and
+answers `"sysl"` where it is absent (a built program run by hand), so a test that builds a fixture or
+asks for `--version` runs the compiler under test and not whichever `sysl` the search path finds:
+
+```sysl
+import sysl.process.capture
+import sysl.testing.compiler
+
+@test
+asks_the_running_compiler_its_version()
+    val answer = capture(compiler(), ["--version"]).unwrap()
+    assert(answer.status.is_ok(), "the compiler answers --version")
+```
+
 - **`skip` is imported, not ambient.** It lives in `sysl.testing` rather than the root module, so a
   test file that also imports `sysl.harness.*` — which has a `skip` of its own, for the on-target
   runner — is not told the two collide.
