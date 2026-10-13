@@ -577,3 +577,23 @@ fpk_dot_m4_board()
 
     assert_eq(fx2_count(dot, "\tsmuad\t"), 1, dot)
     assert_eq(fx2_count(dot, "\tldrsh"), 0, dot)
+
+@test("sum() of a product of lanes in two formats with no position says the register's exact format; a named position compiles")
+mxs_mixed_product_sum()
+    if !fpk_ready() then return
+
+    val bare = fpk_ir("f(x: <2>q15, y: <2>q31) -> unit\n    val c = (x * y).sum()\n", None)
+
+    assert(bare.contains("error: the product of <2>q15 and <2>q31 has no format of its own — " +
+                         "it is exactly an <2>i48q46; give it a type"), bare)
+
+    val named = fpk_ir("type Acc = new i64q61 wrapping\n\n@export(\"mxs_s\")\n" +
+                       "s(x: *<2>q15, y: *<2>q31) -> Acc = (*x * *y).sum()\n", None)
+
+    assert(!named.contains("error"), named)
+    assert(named.contains("@llvm.vector.reduce.add.v2i64("), named)
+
+    // Lanes of one format keep the saturating-lane refusal.
+    val same = fpk_ir("f(x: <2>q15, y: <2>q15) -> unit\n    val c = (x * y).sum()\n", None)
+
+    assert(same.contains("error: 'sum' is not defined for <2>q15"), same)

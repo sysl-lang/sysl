@@ -602,7 +602,25 @@ fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
         (Vector(n, la), Vector(m, lb)) ->
             if op == "/" || n != m || (!is_fixed(*la) && !is_fixed(*lb)) then return None
 
-            val lane = fixed_operator_type(cx, span, op, *la, *lb, lane_of_width(expected, n))
+            // Lanes of two formats with no position to name the product's: the message speaks of the
+            // registers, and gives the exact format as a register of that many lanes.
+            val named = lane_of_width(expected, n)
+
+            if named.is_none() && is_fixed(*la) && is_fixed(*lb) && !derived_type(*la) && !derived_type(*lb)
+                val (wa, qa, sa) = fixed_format(*la).unwrap()
+                val (wb, qb, sb) = fixed_format(*lb).unwrap()
+
+                if wa != wb || qa != qb || sa != sb
+                    val signed = sa || sb
+                    val exact = fixed_show(wa + wb, qa + qb, signed)
+
+                    cx.fault(span, s"the product of ${type_show(a)} and ${type_show(b)} has no format of " +
+                             s"its own — it is exactly ${if signed then "an" else "a"} <$n>$exact; give it a type")
+                    return Some(Unknown)
+                end if
+            end if
+
+            val lane = fixed_operator_type(cx, span, op, *la, *lb, named)
 
             if lane.is_none() then return None
             if lane.unwrap() == Unknown then return lane
@@ -669,13 +687,36 @@ end lane_of_width
 // it, as `val p: <2>Acc = x * y; p.sum()` is. Only a product or a quotient is read again, those being
 // the operations whose format comes from where they are written, and only a re-reading that succeeds
 // replaces the first.
-sum_receiver(cx: &Analyzer, receiver: Expr, tr: TExpr, member: string, args: Buf[Expr],
+//
+// **The receiver is read here, not by the caller**, because a product of lanes in two formats is
+// refused when read bare: that refusal is put back when the position's reading succeeds.
+sum_receiver(cx: &Analyzer, receiver: Expr, member: string, args: Buf[Expr],
              expected: Option[Type]) -> TExpr
+    val mark = cx.an.complaints()
+    val tr = type_expr_bare(cx, receiver)
+
     if member != "sum" || !args.is_empty() || expected.is_none() || !rescaled(receiver) then return tr
 
     val want = expected.unwrap()
 
     if !is_fixed(want) then return tr
+
+    if texpr_type(tr) == Unknown
+        val width = *receiver.kind match
+            Binary(_, l, _) -> repr(texpr_type(sandboxed_read(cx, l, None))) match
+                Vector(n, lane) -> if is_fixed(*lane) then n else 0
+                _ -> 0
+            _ -> 0
+
+        if width == 0 then return tr
+
+        val again = analyze_expected(cx, receiver, Some(Vector(width, want)))
+
+        if texpr_type(again) == Unknown || disagree(texpr_type(again), Vector(width, want)) then return tr
+
+        cx.an.restore_complaints(mark)
+        return again
+    end if
 
     repr(texpr_type(tr)) match
         Vector(n, lane) -> if is_fixed(*lane) then reread(cx, tr, receiver, Vector(n, want)) else tr

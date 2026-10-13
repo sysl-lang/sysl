@@ -747,6 +747,18 @@ first, and keeps the generic form.
 Each instruction does to each lane exactly what the generic form does, so a program's answers are the
 same bits on every machine; only the instructions differ.
 
+A product of lanes in two different formats follows the scalar rule: with no position to name its format
+(`val c = (x * y).sum()`), it is refused, saying the exact one:
+
+```sysl
+f(x: <2>q15, y: <2>q31) -> unit
+    val c = (x * y).sum()
+```
+
+```error
+the product of <2>q15 and <2>q31 has no format of its own — it is exactly an <2>i48q46; give it a type
+```
+
 Three things a scalar has and a register of lanes does not. **`/`** traps on a zero divisor, and a
 register traps as a whole rather than per lane, so it is refused as integer division is. **A shift**
 of a register is not defined. **`sum()` of saturating lanes** is refused because a fixed-point `+`
