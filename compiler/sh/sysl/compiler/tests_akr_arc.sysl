@@ -87,7 +87,7 @@ end akr_ir_for
 
 private akr_ir(text: string) -> string = akr_ir_for(host_target(), text)
 
-private akr_has(out: string, fragment: string) = assert(out.contains(fragment), s"missing:\n$fragment")
+private akr_has(out: string, fragment: string) = assert(out.contains(fragment), s"missing:\n$fragment\nin:\n$out")
 
 private akr_lacks(out: string, fragment: string) = assert(!out.contains(fragment), s"present:\n$fragment")
 
@@ -119,8 +119,9 @@ akr_a_wanted_reference_goes_on_the_heap()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
 
-    akr_has(out, "  %t5 = call ptr @malloc(i64 %t4)\n  store i64 1, ptr %t5\n")
-    akr_has(out, "  store ptr @arc.drop.plain, ptr %t6\n")
+    akr_has(out, "  %t5 = call ptr @malloc(i64 %t4)\n  %t6 = icmp ne ptr %t5, null\n")
+    akr_has(out, "alloc.bad2:\n  call void @llvm.trap()\n  unreachable\nalloc.ok1:\n  store i64 1, ptr %t5\n")
+    akr_has(out, "  store ptr @arc.drop.plain, ptr %t7\n")
 
 // The strong references hold one share of the weak count between them, so the storage lives exactly
 // until the object and every weak reference to it are both gone.
@@ -130,7 +131,7 @@ akr_the_weak_count_starts_at_one()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
 
-    akr_has(out, "  %t7 = getelementptr %arc.Point, ptr %t5, i32 0, i32 2\n  store i64 1, ptr %t7\n")
+    akr_has(out, "  %t8 = getelementptr %arc.Point, ptr %t5, i32 0, i32 2\n  store i64 1, ptr %t8\n")
 
 @test("the same construction with no expectation stays a value")
 akr_no_expectation_stays_a_value()
@@ -148,7 +149,7 @@ akr_a_local_holds_a_count_for_its_scope()
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\nprint(p.x)")
 
     akr_has(out, "  call void @arc.retain(ptr %t5)\n  store ptr %t5, ptr %p.addr\n")
-    akr_has(out, "  %t14 = load ptr, ptr %p.addr\n  call void @arc.release(ptr %t14)\n  ret i32 0\n")
+    akr_has(out, "  %t15 = load ptr, ptr %p.addr\n  call void @arc.release(ptr %t15)\n  ret i32 0\n")
 
 @test("assignment retains the new reference before releasing the old one")
 akr_assignment_retains_before_it_releases()
@@ -156,10 +157,10 @@ akr_assignment_retains_before_it_releases()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np = Point(3, 4)")
 
-    akr_has(out, "  %t17 = load ptr, ptr %p.addr\n" +
-                 "  call void @arc.retain(ptr %t13)\n" +
-                 "  store ptr %t13, ptr %p.addr\n" +
-                 "  call void @arc.release(ptr %t17)\n")
+    akr_has(out, "  %t19 = load ptr, ptr %p.addr\n" +
+                 "  call void @arc.retain(ptr %t14)\n" +
+                 "  store ptr %t14, ptr %p.addr\n" +
+                 "  call void @arc.release(ptr %t19)\n")
 
 // A by-value parameter is read through the count its caller holds for the length of the call, so
 // nothing is taken at entry; what comes back is the caller's to hold, so it arrives with a count.
@@ -249,9 +250,9 @@ akr_a_field_reaches_past_the_header()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np.y = 9")
 
-    akr_has(out, "  %t10 = getelementptr %arc.Point, ptr %t9, i32 0, i32 3\n" +
-                 "  %t11 = getelementptr %struct.Point, ptr %t10, i32 0, i32 1\n" +
-                 "  store i32 9, ptr %t11\n")
+    akr_has(out, "  %t11 = getelementptr %arc.Point, ptr %t10, i32 0, i32 3\n" +
+                 "  %t12 = getelementptr %struct.Point, ptr %t11, i32 0, i32 1\n" +
+                 "  store i32 9, ptr %t12\n")
 
 @test("a program that never allocates declares no allocator")
 akr_no_allocation_no_allocator()

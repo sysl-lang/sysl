@@ -121,6 +121,21 @@ private define_lines(out: string, name: string) -> Buf[string]
     found
 end define_lines
 
+// How many `@llvm.trap` calls are NOT the failed-allocation trap that every box allocation carries
+// (its block is labelled `alloc.bad`): a trap from a bounds check or a capacity check.
+private other_traps(out: string) -> int
+    var count = 0
+    var inside_bad = false
+
+    for item in lines_of(out)
+        if item.starts_with("alloc.bad") then inside_bad = true
+        else if item.ends_with(":") || item.contains("; preds") then inside_bad = false
+
+        if item.contains("@llvm.trap") && !inside_bad then count += 1
+
+    count
+end other_traps
+
 // Whether some IR still calls the function whose symbol holds `name`.
 private calls(out: string, name: string) -> bool
     val lines = lines_of(out)
@@ -508,7 +523,7 @@ ia_counted_push_is_absorbed()
             assert(!calls(body, "Buf.push.demo$Cell"), body)
             assert(!calls(body, "BufCore.push.demo$Cell"), body)
             assert(calls(body, "BufCore.grow_store.demo$Cell"), body)
-            assert(!body.contains("@llvm.trap"), body)
+            assert_eq(other_traps(body), 0)
 
 @test("and for a wider element, which the default budget refuses")
 ia_wide_push_is_absorbed()
