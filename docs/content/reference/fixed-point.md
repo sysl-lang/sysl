@@ -498,9 +498,23 @@ print(f"${x}%d")
 format '%d' expects an integer, but the value has type q15
 ```
 
-A format up to 128 bits wide renders this way; a wider one is refused under a float conversion. The
-hole lowers to `sysl.fmt.format_fixed`, and a program that may not allocate writes the same text with
-[`write_fixed`](/library/fmt/#writing-one-without-allocating).
+A format of any width renders this way, an `i256q100` as exactly as a `q31`:
+
+```sysl
+val w: i256q100 = i256q100::Min
+
+print(f"${w}%.3f")
+print(f"${i256q255::Max}%.80f")
+```
+
+```output
+-45671926166590716193865151022383844364247891968.000
+0.99999999999999999999999999999999999999999999999999999999999999999999999999998273
+```
+
+The hole lowers to `sysl.fmt.format_fixed` for a format of up to 128 bits and to
+`sysl.fmt.format_fixed_wide` above that, and a program that may not allocate writes the same text with
+[`write_fixed`](/library/fmt/#writing-one-without-allocating) or `write_fixed_wide`.
 
 ### A view of the bits
 

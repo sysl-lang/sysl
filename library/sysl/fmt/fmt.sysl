@@ -11,8 +11,9 @@ module sysl.fmt
 
 import sysl.text.from_utf8_unchecked
 import sysl.buf.byte_sink
-import sysl.{FloatField, FloatValue, f32_value, fixed_value, quad_value, real_value, shortest_f32, shortest_quad,
-             shortest_real, write_float_field, float_scratch_need, plain_real, plain_f32, plain_f16, plain_bf16, plain_quad}
+import sysl.{Integer, Big, FloatField, FloatValue, f32_value, fixed_value, quad_value, real_value, shortest_f32, shortest_quad,
+             shortest_real, write_float_field, float_scratch_need, wide_digits, float_request, write_float_laid,
+             scratch_need_of, bits_of, plain_real, plain_f32, plain_f16, plain_bf16, plain_quad}
 
 /** An integer rendered through a printf specifier, written here rather than handed to C's
  * `snprintf`, so a target with no C library formats `${n}%d` exactly as a hosted one does.
@@ -276,6 +277,101 @@ write_f128(x: f128, out: *Writer, spec: string, width: int, precision: int,
 write_fixed(raw: i128, bits: int, signed: bool, frac: int, out: *Writer, spec: string, width: int,
             precision: int, scratch: []u8) -> Result[unit, FormatError] =
     write_float(fixed_of(raw, bits, signed, frac), out, spec, width, precision, scratch)
+
+/** A fixed-point value of any width under a printf float conversion -- what `${x}%.4f` lowers to when
+ * `x` is wider than 128 bits, an `i256q100` say. `raw` is the integer the value is stored as
+ * (`x.bits`) at its own type, `frac` is the format's fraction, and the value is `raw * 2^-frac`. The
+ * digits are exact and rounded as `format_fixed`'s are, half to even at the position the conversion
+ * names; the arithmetic is the same, over working integers sized by the type, on the stack. `%a` is
+ * not offered, as a hole does not offer it, and answers an empty string.
+ */
+format_fixed_wide[T: Integer](raw: T, frac: int, spec: string, width: int, precision: int) -> string
+    var limbs: [sizeof(T) / 4 + 2]u32
+    var digits: [sizeof(T) * 8 + 16]u8
+    var sink = byte_sink()
+    val f = float_field(spec, width, precision)
+
+    if (f.conv | 0x20) != u8('a')
+        val (v, n, _) = wide_value(raw, frac, limbs[..])
+
+        if v.kind == Finite
+            val req = float_request(f)
+            var r: Big[sizeof(T) / 4 + 6] = Big([0; sizeof(T) / 4 + 6], 0)
+            var s: Big[sizeof(T) / 4 + 6] = Big([0; sizeof(T) / 4 + 6], 0)
+            val got = wide_digits(&r, &s, limbs[0..<n], -frac, req.0, req.1, digits[..])
+
+            write_float_laid(&sink, v, f, digits[..], Some(got))
+        else
+            write_float_laid(&sink, v, f, digits[..], None)
+        end if
+    end if
+
+    from_utf8_unchecked(sink.text())
+end format_fixed_wide
+
+/** `format_fixed_wide` written to `out`, allocating nothing, as `write_fixed` is for the narrow
+ * formats. `fixed_scratch_len(bits)` bytes of scratch are always enough, and a shorter one is refused
+ * with `Short` naming a length that would do, before anything is written.
+ */
+write_fixed_wide[T: Integer](raw: T, frac: int, out: *Writer, spec: string, width: int,
+                             precision: int, scratch: []u8) -> Result[unit, FormatError]
+    if !is_float_spec(spec) || (spec.bytes[spec.bytes.len - 1] | 0x20) == u8('a') then return Err(BadSpec)
+
+    var limbs: [sizeof(T) / 4 + 2]u32
+
+    val f = float_field(spec, width, precision)
+    val (v, n, mbits) = wide_value(raw, frac, limbs[..])
+    val need = scratch_need_of(v, mbits, f)
+
+
+    if scratch.len < need then return Err(Short(need))
+
+    if v.kind == Finite
+        val req = float_request(f)
+        var r: Big[sizeof(T) / 4 + 6] = Big([0; sizeof(T) / 4 + 6], 0)
+        var s: Big[sizeof(T) / 4 + 6] = Big([0; sizeof(T) / 4 + 6], 0)
+        val got = wide_digits(&r, &s, limbs[0..<n], -frac, req.0, req.1, scratch)
+
+        write_float_laid(out, v, f, scratch, Some(got))
+    else
+        write_float_laid(out, v, f, scratch, None)
+    end if
+
+    Ok(())
+end write_fixed_wide
+
+/** A scratch this long is enough for `write_fixed_wide` of a fixed-point value stored in `bits` bits,
+ * under any specifier: a value never has more significant digits than it has bits.
+ */
+fixed_scratch_len(bits: usize) -> usize = bits + 16
+
+// The magnitude of `raw` as 32-bit limbs, least significant first, and the value taken apart: how many
+// limbs, and how many bits the magnitude takes. The sign stays on until the last moment, as `Display`
+// for an integer keeps it, so the most negative value of a width needs no wider type to negate into.
+private wide_value[T: Integer](raw: T, frac: int, limbs: []u32) -> (FloatValue, usize, int)
+    val zero: T = 0
+    val two: T = 2
+    var base: T = 1
+
+    for _ in 0..<32
+        base = base * two
+
+    val neg = raw < zero
+    var rest = raw
+    var n: usize = 0
+
+    while rest != zero
+        val q = rest / base
+        val r = rest - q * base
+
+        limbs[n] = if neg then u32(zero - r) else u32(r)
+        n += 1
+        rest = q
+
+    if n == 0 then return (FloatValue(false, Zero, 0, 0), 0, 0)
+
+    (FloatValue(neg, Finite, 0, -frac), n, int((n - 1) * 32 + bits_of(limbs[n - 1])))
+end wide_value
 
 // A fixed-point value's raw integer, read at its own width and signedness, as the value it stands for.
 private fixed_of(raw: i128, bits: int, signed: bool, frac: int) -> FloatValue
