@@ -208,3 +208,28 @@ bpl_relocates_on_a_function()
 
     bpl_refused("@relocates\nf() = ()\n",
                 "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none")
+
+private plr_pool(extra: string) -> string =
+    "struct Pool\n    cells: [4]int\n\n" +
+    "    @relocates\n    grow(*self) = ()\n\n" +
+    "    index_place_helper(*self, i: usize) -> *int = &self.cells[i]\n\n" + extra
+
+@test("a method whose name merely contains 'index_place' is not a subscript, so a ref over it is not held")
+plr_a_lookalike_name_is_not_a_place()
+    if !bpl_ready() then return
+
+    val src = plr_pool("var p = Pool([1, 2, 3, 4])\n\nref r = *p.index_place_helper(1)\n\np.grow()\nr = 9\nprint(p.cells)\n")
+
+    assert_eq(bpl_ran(src), "[1, 9, 3, 4]\n")
+
+@test("a program's own 'IndexPlace' container still holds a ref to its element against a '*self' call")
+plr_user_container_relocates_refused()
+    if !bpl_ready() then return
+
+    val src = "import sysl.buf.{Buf, buf}\n\nstruct Pool\n    cells: Buf[int]\n\n" +
+              "    @relocates\n    grow(*self) = ()\n\n" +
+              "impl IndexPlace[usize, int] for Pool\n    index_place(*self, i: usize) -> *int = self.cells.index_place(i)\n\n" +
+              "var p = Pool(buf())\n\np.cells.push(1)\n\nref r = p[0]\n\np.grow()\nr = 9\n"
+
+    bpl_refused(src,
+                "'r' is a 'ref' standing on storage this call could release, since a '*self' method may write its receiver")

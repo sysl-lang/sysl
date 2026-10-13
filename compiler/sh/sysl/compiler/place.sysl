@@ -338,18 +338,19 @@ private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
     TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
     TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
     TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
-    TCall(_, _, _, _) -> placed_by(t) match
+    TCall(_, _, _, _) -> placed_by(cx, t) match
         Some(recv) -> key_step(place_key(cx, recv), "[]")
         None -> None
     _ -> None
 
 // The container a call addresses an element of, where the call is a subscript through
 // `IndexPlace` -- `b[i]` is `*b.index_place(i)`, so the step before the element is `b`.
-private placed_by(t: TExpr) -> Option[TExpr] = *t.kind match
-    // The lowered name carries the instantiation after the member's (`Buf.index_place.Item`).
-    // A `*self` receiver arrives as the address of the container, so the step is the container.
+private placed_by(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
+    // Whether the call is one a subscript made is a fact filed where the subscript was lowered, not
+    // something its name says. A `*self` receiver arrives as the address of the container, so the
+    // step is the container.
     TCall(name, args, _, _) ->
-        if args.is_empty() || !name.contains(".index_place") then return None
+        if args.is_empty() || !cx.an.tables.place_calls.has(name) then return None
 
         *args.at(0).kind match
             TAddrOf(inner, _) -> Some(inner)
@@ -385,11 +386,11 @@ private owning_step(t: Type) -> bool = t match
     _ -> false
 
 // The step a place was reached from, where it was reached from one.
-private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
+private step_before(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
     TField(recv, _, _) -> Some(recv)
     TIndex(recv, _, _) -> Some(recv)
     TDeref(operand, _) -> Some(operand)
-    TCall(_, _, _, _) -> placed_by(place)
+    TCall(_, _, _, _) -> placed_by(cx, place)
     _ -> None
 
 // The places a `ref` over `place` holds still: the **owning steps the path goes through**.
@@ -401,7 +402,7 @@ private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
 // `h.node = other` are one statement written two ways and neither is refused.
 private ref_hazards(cx: &Analyzer, place: TExpr) -> Buf[string]
     var out: Buf[string] = buf()
-    var at = step_before(place)
+    var at = step_before(cx, place)
 
     var through_call = false
 
@@ -418,8 +419,8 @@ private ref_hazards(cx: &Analyzer, place: TExpr) -> Buf[string]
             if key.is_some() then out.push(key.unwrap())
         end if
 
-        through_call = placed_by(step).is_some()
-        at = step_before(step)
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
 
     out
 end ref_hazards
