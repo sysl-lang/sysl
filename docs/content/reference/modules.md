@@ -1660,11 +1660,13 @@ print(k)
 
 **What a body may hold while it runs is narrower than what it may hold**: integers of every width,
 `f32` and `real`, fixed-point formats, `bool`, `char` and `unit`, constrained types of them with their
-checks run, and **fixed arrays** of any of these at any depth — built by a literal or a fill, read and
-written by element, walked by `for x in`, passed and returned by value. A struct, an enum value or a
-field stops the run with *"a 'P' is not evaluated while compiling yet — integers, floats,
-fixed-point, 'bool', 'char' and fixed arrays of them are"*; the program's own run-time call is
-unaffected.
+checks run, and **fixed arrays, structs and enums** of any of these at any depth — an array built by a
+literal or a fill, read and written by element, walked by `for x in`; a struct built by its
+constructor, read and written by field, its `invariant` run; an enum value built by its variant,
+payload-carrying ones included, taken apart by `match`; all passed and returned by value. A string,
+a pointer or a reference stops the run with *"a 'P' is not evaluated while compiling yet — integers,
+floats, fixed-point, 'bool', 'char', and fixed arrays, structs and enums of them are"*; the program's
+own run-time call is unaffected.
 
 **A table is the reason arrays are evaluated.** A module `val` whose initializer calls a `const`
 function returning an array is laid into the object file as the elements the call came to — a sine
@@ -1689,8 +1691,46 @@ print(SQUARES[3], SQUARES[7])
 9 49
 ```
 
-Making an array costs a step per element, so the same 16,000,000 steps bound how large a table may
-be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
+**A table of records is laid down the same way**: a struct as the constructor over the literals its
+fields came to, an enum value as its variant — one that carries fields with its payload written as
+the bytes a construction stores. A struct whose fields are private to its module may be built by a
+`const` function of that module, and the table it fills is read from anywhere:
+
+```sysl
+struct Note
+    pitch: u8
+    beats: u8
+
+enum Cue
+    Rest
+    Play(note: Note, loud: bool)
+
+const tune() -> [4]Cue
+    var t: [4]Cue = [Cue.Rest; 4]
+
+    for i in 0..<3
+        t[i] = Cue.Play(Note(u8(60 + i * 2), u8(i + 1)), i % 2 == 0)
+
+    t
+
+val TUNE: [4]Cue = tune()
+
+for cue in TUNE
+    cue match
+        Cue.Play(n, loud) -> print(n.pitch, n.beats, loud)
+        Cue.Rest -> print("rest")
+```
+
+```output
+60 1 true
+62 2 false
+64 3 true
+rest
+```
+
+A payload whose fields have no one fixed bit pattern — an `i128`, a bitfield struct — is not laid
+down; the value stays code, and a freestanding artifact's refusal says so. Making an array costs a
+step per element, so the same 16,000,000 steps bound how large a table may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
 call cannot be run — it reaches an `extern`, storage filled at run time, or more steps than the bound
 — the initializer stays code, filled before the program's statements; a freestanding artifact, which
 has nothing to fill it, refuses the storage and says what stopped the call: *"'T' did not finish
