@@ -67,6 +67,31 @@ an_else_under_a_nested_if()
     assert_eq(pf("val x = if a then\n            val y = if b then\n                        1\n                    else 2\n            y\n        else 3\n"),
               pf("val x = if a then\n            val y = if b then\n                        1\n            else 2\n            y\nelse 3\n"))
 
+@test("an 'else' lined up under its 'if' on a deeper line goes on that 'if'")
+an_else_deeper_under_its_if()
+    // After a `=`: the `if` is deeper than the statement's margin, and so is the line under it.
+    assert_eq(pf("val x = if c then 1\n        else 2\n"), pf("val x = if c then 1 else 2\n"))
+    assert_eq(pf("val x = if a then 1\n        elif b then 2\n        else 3\n"),
+              pf("val x = if a then 1 elif b then 2 else 3\n"))
+    // After an arm's arrow, which is where it was first refused.
+    assert_eq(pf("val g = o match\n    None -> if c then 1\n            else 2\n    _ -> 3\n"),
+              pf("val g = o match\n    None -> if c then 1 else 2\n    _ -> 3\n"))
+    assert_eq(pf("val g = o match\n    None -> if a then 1\n            elif b then 2\n            else 3\n    _ -> 4\n"),
+              pf("val g = o match\n    None -> if a then 1 elif b then 2 else 3\n    _ -> 4\n"))
+    // A block under the deeper `else` is the `else`'s own.
+    assert_eq(pf("val g = o match\n    None -> if c then 1\n            else\n                f()\n                2\n    _ -> 3\n"),
+              pf("val g = o match\n    None -> if c then 1 else\n        f()\n        2\n    _ -> 3\n"))
+
+@test("an 'else' on a deeper line under no 'if' in an arm is refused once, and the parse ends")
+an_else_deeper_under_no_if()
+    // The line is a block the arm never opened. Recovery steps over it whole, so its `Dedent` is not
+    // taken for the one closing the arms and nothing is left over for the file to spin on.
+    val src = "pick(o: Option[int], c: bool) -> int\n    val got = o match\n        Some(x) -> x\n        None -> if c then 1\n            else 2\n    got\n"
+
+    assert_eq(pf_err(src), "a pattern expected")
+    assert_eq(pf_at(src), "5:13")
+    assert_eq(parse(source_of("t.sysl", src)).report.len(), 1)
+
 @test("an 'else' at any other column no block opened is still ragged")
 an_else_at_another_column()
     assert_eq(bad("val x = if c then\n            1\n          else 2\n"),

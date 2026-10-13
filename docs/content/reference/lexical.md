@@ -969,6 +969,29 @@ sign(n: int) -> string
 a line indented 17 columns lines up with no open block: it sits between the block indented 19 and the one indented 4 — indent it to one of the two
 ```
 
+The branch lined up under its `if` may also sit **deeper** than the line it continues, which is where it
+lands when the `then` branch stays on the `if`'s own line. Such a line opens no block; it goes on the
+statement above, after a `=` or after an arm's `->` alike:
+
+```sysl
+digits(o: Option[int], wide: bool) -> int
+    val n = o match
+        Some(k) -> k
+        None -> if wide then 8
+                else 4
+
+    val m = if n > 4 then n * 2
+            else n
+
+    m
+
+print(digits(None, true), digits(None, false), digits(Some(3), false))
+```
+
+```output
+16 4 3
+```
+
 ### Brackets suspend the rule
 
 Inside `(`, `[` or `{`, layout stops applying until the bracket closes — so an argument list, an array
