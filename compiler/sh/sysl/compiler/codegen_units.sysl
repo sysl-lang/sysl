@@ -24,8 +24,13 @@ import sysl.text.{str_builder, StrBuilder, Search}
 // changes and the others do not. Everything local (`private`, `internal`) follows its users:
 //
 //   - a **small local function** -- the ARC runtime's blocks, a closure body, a helper -- is copied
-//     into every partition that calls it. It stays local in each, so each copy can still be inlined,
+//     into every partition that calls it, and so is a local one marked `@inline` of any length. It stays local in each, so each copy can still be inlined,
 //     which is the one thing a call across partitions cannot be.
+//   - a **small or `@inline` external function** stays in the partition its name hashes to, and every
+//     other partition that calls it gets an `available_externally` copy (`importable_define`): one
+//     definition at the link, and a body the caller's optimizer can still inline. A copy the program
+//     text already carries -- a precompiled package's function -- is placed the same way, and only
+//     where something calls it.
 //   - **anything else local** -- a global of any kind (a string, a vtable, a thread-local), or a
 //     large function -- lives in the first partition found to use it, and where a second partition
 //     uses it too it is given **hidden** linkage under a name no sysl or C symbol can spell
@@ -251,6 +256,55 @@ private ident_byte(c: u8) -> bool =
 private is_local_define(line: string) -> bool =
     line.starts_with("define private ") || line.starts_with("define internal ")
 
+// Whether item `i` is a copy of a body another object defines (`codegen.sysl`'s `importable`). It is
+// copied into every partition that calls it, as a small local function is, and kept by none that
+// does not.
+private is_copy(m: Module, i: usize) -> bool =
+    m.text[m.items.at(i).start..].starts_with("define available_externally ")
+
+// **Whether a function one partition defines is copied into another that calls it**, as an
+// `available_externally` definition its calls can inline -- the cut would otherwise be a wall no
+// inlining crosses. One marked `inlinehint` (`@inline`) is copied whatever its length; any other at
+// most `CopyLimit` long, as a small local is. Never one marked `noinline`, or `cold` without
+// `inlinehint` (`@inline @cold` asks to be absorbed), nor one placed in
+// a section, given a calling convention, or written with a linkage of its own (`weak`, `weak_odr`):
+// only the plain external definition the link resolves to one body.
+private importable_define(m: Module, i: usize) -> bool
+    val e = m.items.at(i)
+    val head = m.text[e.start..<line_end(m.text.bytes, e.start)]
+
+    var rest = head[7..]
+
+    if rest.starts_with("dso_local ") then rest = rest[10..]
+    if rest.starts_with("hidden ") then rest = rest[7..]
+
+    // What follows is the result, with its attributes (`zeroext i1`); a linkage or a calling
+    // convention in that place is a definition of some other kind.
+    val word = rest[0..<word_stop(rest.bytes, 0)]
+
+    if word == "private" || word == "internal" || word == "weak" || word == "weak_odr" ||
+            word == "linkonce" || word == "linkonce_odr" || word == "available_externally" ||
+            word == "external" || word == "extern_weak" || word == "common" || word == "appending" ||
+            word == "cc" || word.ends_with("cc")
+        return false
+
+    val hinted = head.contains(" inlinehint")
+
+    if head.contains(" noinline") || (head.contains(" cold") && !hinted) || head.contains(" section ")
+        return false
+
+    hinted || e.end - e.start <= CopyLimit
+end importable_define
+
+// Whether item `i` is a function marked `@inline` (`inlinehint`). A local one is copied into every
+// partition that calls it whatever its length, as a small one is, so that the mark means the same in
+// a program cut into units as in one module.
+private marked_inline(m: Module, i: usize) -> bool
+    val e = m.items.at(i)
+
+    m.text[e.start..<line_end(m.text.bytes, e.start)].contains(" inlinehint")
+end marked_inline
+
 private is_local_global(line: string) -> bool
     val after = global_rest(line)
 
@@ -362,10 +416,17 @@ split_module(text: string, n: int) -> Option[Buf[string]]
     // (partition, item) pairs still to be read for what they name.
     var work: Buf[(usize, usize)] = buf()
 
+    // `imported[p * count + e]`: p carries an `available_externally` copy of e, defined in another
+    // partition, for its calls to inline (`importable_define`).
+    var imported: Buf[bool] = buf()
+
+    for i in 0..<units * count
+        imported.push(false)
+
     for i in 0..<count
         val e = m.items.at(i)
 
-        if (e.piece == PieceDefine || e.piece == PieceGlobal) && !e.local
+        if (e.piece == PieceDefine || e.piece == PieceGlobal) && !e.local && !is_copy(m, i)
             val p = usize(name_hash(e.name) % u64(units))
 
             home.set(i, int(p))
@@ -390,11 +451,17 @@ split_module(text: string, n: int) -> Option[Buf[string]]
                 val r = m.refs.at(k)
                 val it = m.items.at(r)
 
-                if member.at(p * count + r) then continue
+                if member.at(p * count + r) || imported.at(p * count + r) then continue
 
-                if it.piece == PieceDeclare || !it.local
+                if it.piece == PieceDefine && is_copy(m, r)
+                    member.set(p * count + r, true)
+                    work.push((p, r))
+                elif it.piece == PieceDefine && !it.local && importable_define(m, r)
+                    imported.set(p * count + r, true)
+                    work.push((p, r))
+                elif it.piece == PieceDeclare || !it.local
                     needed.set(p * count + r, true)
-                elif it.piece == PieceDefine && it.end - it.start <= CopyLimit
+                elif it.piece == PieceDefine && (it.end - it.start <= CopyLimit || marked_inline(m, r))
                     member.set(p * count + r, true)
                     work.push((p, r))
                 elif home.at(r) < 0
@@ -412,6 +479,9 @@ split_module(text: string, n: int) -> Option[Buf[string]]
             val e = m.items.at(i)
 
             if e.piece != PieceDefine && e.piece != PieceGlobal then continue
+
+            // A copy nothing calls is nothing: its body is defined in another object.
+            if is_copy(m, i) then continue
 
             var anywhere = false
 
@@ -435,7 +505,7 @@ split_module(text: string, n: int) -> Option[Buf[string]]
     var out: Buf[string] = buf()
 
     for p in 0..<units
-        if placed.at(p) then out.push(render(m, p, count, &member, &needed, &promoted))
+        if placed.at(p) then out.push(render(m, p, count, &member, &needed, &imported, &promoted))
 
     Some(out)
 end split_module
@@ -452,7 +522,7 @@ end name_hash
 // One partition's text: every module-level line, its own definitions, and a declaration of
 // everything it names from elsewhere, in the order the whole text had them.
 private render(m: Module, p: usize, count: usize, member: *Buf[bool], needed: *Buf[bool],
-               promoted: *Buf[bool]) -> string
+               imported: *Buf[bool], promoted: *Buf[bool]) -> string
     var out = str_builder()
 
     for i in 0..<count
@@ -462,6 +532,16 @@ private render(m: Module, p: usize, count: usize, member: *Buf[bool], needed: *B
             out.push(m.text[e.start..<e.end])
         elif member.at(p * count + i)
             copy_renamed(m, i, promoted, &out)
+        elif imported.at(p * count + i)
+            // `define ` as the definition has it, then the copy's linkage.
+            var body = str_builder()
+
+            copy_renamed(m, i, promoted, &body)
+
+            val text = body.finish()
+
+            out.push("define available_externally ")
+            out.push(text[7..])
         elif needed.at(p * count + i)
             e.piece match
                 PieceDeclare -> out.push(m.text[e.start..<e.end])

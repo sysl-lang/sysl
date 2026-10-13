@@ -608,6 +608,10 @@ end typed_compilation
 // are the `--lib` roots' kept halves declared rather than defined: the text `emit-llvm` prints is the
 // whole program's, the roots' bodies included, since it is what the reference prints and what a diff
 // against it reads.
+// Whether a build at `level` is optimized, and so inlines: every level clang spells but `0`. An
+// `available_externally` copy at `-O0` is lowered and then dropped unread.
+imports_bodies(level: string) -> bool = level != "0"
+
 emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
                also_auto_imported: Buf[string] = buf(),
@@ -675,9 +679,12 @@ emit_llvm_text(path: string, named_target: Option[string],
                 Ok(Some(found)) -> linked = found
                 Ok(None) -> ()
 
+    // **A build that links and optimizes also carries a copy of each small or `@inline` function
+    // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
+    // a call within the program does. The text `emit-llvm` prints has none, and nor does `-O0`.
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
-                                    t, promotions)
+                                    t, promotions, linking && imports_bodies(level))
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -1894,7 +1901,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
                                                                            roots.precompiled) },
-                                    t, promotions)
+                                    t, promotions, imports_bodies(level))
 
     check_aligned_heap(done.an, kept)
 

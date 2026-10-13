@@ -1579,6 +1579,36 @@ print(report(21))
 42
 ```
 
+### What `@inline` guarantees across packages and codegen units
+
+A program is not always one module. A package — a dependency, or a `--lib` root — is compiled once
+into an archive of its own that every program using it links, and a large program is cut into
+codegen units compiled side by side. A call from one module into another is ordinarily a wall the
+optimizer cannot see through. **At every optimization level but `-O0`, an optimized build carries
+the body across that wall** for:
+
+- every function marked `@inline`, whatever its length, and
+- every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
+  multiply — whether marked or not.
+
+The calling module is given a copy of the body to inline (LLVM's `available_externally`) and never
+emits it, so the program still links the package's one definition, and a call the optimizer leaves
+out of line is the same call it always was. The copy is made from the package's source on every
+build, so an edit to the package is what the next build inlines; nothing is kept that could be stale.
+
+So the guarantee is **the same as within one file**: a call into a package, or into another unit,
+inlines exactly where the same call would inline if both functions sat side by side — the hint is
+still a hint, and the inliner still decides. What is never carried across:
+
+- a function marked `@noinline`, or `@cold` without `@inline` — the call stays a call;
+- an `async` function, an interrupt handler, one placed in a `@section`, or a variadic one;
+- a function that reaches the package's module storage, which is compiled by the program anyway
+  (the package keeps no copy of it), and so needs nothing carried;
+- a generic, which needs none of this: it is instantiated in the program that uses it, beside its
+  callers.
+
+`sysl emit-llvm` prints the program as one module and carries no copies.
+
 ### They mark a member too
 
 A method lowers to an ordinary function, and these three are about that function — so a generic
