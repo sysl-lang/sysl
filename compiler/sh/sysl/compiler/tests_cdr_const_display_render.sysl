@@ -1,0 +1,188 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A `const` function renders floats and values whose type supplies a `Display`**, and the text is
+// the program's own to the byte. A float goes through the library's renderers the compiler is linked
+// with -- the shortest round trip for `str`, the exact digits under a specifier. A `display` runs in
+// the evaluation, handed a writer the evaluation keeps: `write` appends to it, the library's
+// `display_*` routines and the `display` of every type the library renders run into it, and another
+// `const` `display` is handed the same writer. Each case is laid down while compiling and compared
+// with the same call made at run time.
+
+private val cdr_types: string = raw"""
+    struct Inner
+        n: int
+
+    impl Display for Inner
+        const display(self, out: *Writer, fmt: FormatSpec)
+            out.write("<".bytes)
+            self.n.display(out, fmt)
+            out.write(">".bytes)
+
+    struct P
+        x: int
+        b: bool
+        r: real
+        c: char
+        s: string
+        f: f32
+        u: u128
+        i: Inner
+
+    impl Display for P
+        const display(self, out: *Writer, fmt: FormatSpec)
+            self.x.display(out, fmt)
+            self.b.display(out, fmt)
+            self.r.display(out, fmt)
+            self.c.display(out, fmt)
+            self.s.display(out, fmt)
+            self.f.display(out, fmt)
+            self.u.display(out, fmt)
+            self.i.display(out, fmt)
+            display_pad("|".bytes, out, fmt)
+
+    """
+
+@test("a value renders through its own 'const' display while compiling, as it does at run time")
+cdr_a_display_renders_while_compiling()
+    if !enm_ready() then return
+
+    val prog = cdr_types + raw"""
+        const shown(p: P) -> string = f"[${p}] [${p}%6s] ${p.i}%-5s." + str(p.i)
+
+        static val A: string = shown(P(-3, true, 1.5, 'é', "s", 0.1, 340282366920938463463374607431768211455, Inner(7)))
+
+        var x = -3
+        print(A)
+        print(A == shown(P(x, true, 1.5, 'é', "s", 0.1, 340282366920938463463374607431768211455, Inner(7))))
+        """
+
+    assert_eq(enm_ran(prog), "[-3true1.5és0.1340282366920938463463374607431768211455<7>|] [    -3  true   " +
+              "1.5    é     s   0.1340282366920938463463374607431768211455<     7>     |] <7    >.<7>\ntrue\n")
+
+    // Laid down as the text, not filled when the program starts.
+    assert(enm_ir(prog).contains("<     7>     |] <7    >.<7>\\00\""), "A was not laid down")
+end cdr_a_display_renders_while_compiling
+
+@test("a float renders while compiling exactly as at run time: subnormals, -0, infinities and NaNs")
+cdr_floats_render_as_at_run_time()
+    if !enm_ready() then return
+
+    val prog = raw"""
+        const floats(x: real, y: f32) -> string =
+            f"${x} ${x}%.3f ${x}%e ${x}%g ${x}%+12.4E " + str(x) + " " + str(y) + f" ${y}%.9g ${y}%e"
+
+        const quad(q: f128) -> string = str(q) + f" ${q}%.30e ${q}%g"
+
+        static val F1: string = floats(5e-324, 1.0e-45)
+        static val F2: string = floats(-0.0, -0.0)
+        static val F3: string = floats(infinity, f32(-infinity))
+        static val F4: string = floats(-nan, f32(nan))
+        static val F5: string = floats(0.1, 3.4028235e38)
+        static val F6: string = floats(2.2250738585072014e-308, 1.17549435e-38)
+        static val Q1: string = quad(f128(0.1))
+        static val Q2: string = quad(f128(-0.0))
+
+        var zero = 0.0
+        print(F1 == floats(5e-324 + zero, f32(1.0e-45)), F2 == floats(-zero, f32(-zero)))
+        print(F3 == floats(1.0 / zero, f32(-1.0 / zero)), F4 == floats(-(zero / zero), f32(zero / zero)))
+        print(F5 == floats(0.1 + zero, 3.4028235e38), F6 == floats(2.2250738585072014e-308 + zero, 1.17549435e-38))
+        print(Q1 == quad(f128(0.1 + zero)), Q2 == quad(f128(-zero)))
+        print(F2)
+        print(F3)
+        print(F4)
+        print(Q2)
+        """
+
+    assert_eq(enm_ran(prog), "true true\ntrue true\ntrue true\ntrue true\n" +
+              "-0 -0.000 -0.000000e+00 -0  -0.0000E+00 -0 -0 -0 -0.000000e+00\n" +
+              "inf inf inf inf         +INF inf -inf -inf -inf\n" +
+              "NaN -nan -nan -nan         -NAN NaN NaN nan nan\n" +
+              "-0 -0.000000000000000000000000000000e+00 -0\n")
+
+    val ir = enm_ir(prog)
+
+    for laid in ["c\"-0 -0.000 -0.000000e+00 -0  -0.0000E+00 -0 -0 -0 -0.000000e+00\\00\"",
+                 "c\"inf inf inf inf         +INF inf -inf -inf -inf\\00\"",
+                 "c\"NaN -nan -nan -nan         -NAN NaN NaN nan nan\\00\"",
+                 "c\"-0 -0.000000000000000000000000000000e+00 -0\\00\"",
+                 "e-324 +4.9407E-324 "]
+        assert(ir.contains(laid), laid)
+end cdr_floats_render_as_at_run_time
+
+@test("a generic 'const' function renders whatever fills its 'Display' bound")
+cdr_a_generic_display()
+    if !enm_ready() then return
+
+    val prog = raw"""
+        struct Q
+            n: int
+
+        impl Display for Q
+            const display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.n), out, fmt)
+
+        const show[T: Display](x: T) -> string = s"(${x})"
+
+        static val G: string = show(Q(4)) + show(5) + show(2.5) + show("t")
+
+        print(G)
+        """
+
+    assert_eq(enm_ran(prog), "(4)(5)(2.5)(t)\n")
+    assert(enm_ir(prog).contains("c\"(4)(5)(2.5)(t)\\00\""), "G was not laid down")
+end cdr_a_generic_display
+
+@test("a display that is not 'const' is refused where the value is rendered")
+cdr_a_display_not_const_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct R
+            n: int
+
+        impl Display for R
+            display(self, out: *Writer, fmt: FormatSpec) = display_pad("r".bytes, out, fmt)
+
+        const f(r: R) -> string = str(r)
+
+        print(f(R(1)))
+        """).0
+
+    assert(said.contains("'f' is 'const', so it runs while compiling, and it calls 'R.display', which is not " +
+                         "— mark 'R.display' 'const' too, or compute this at run time"), said)
+end cdr_a_display_not_const_is_refused
+
+@test("a const display reaching a library call that is not a renderer is refused at the display")
+cdr_a_display_calling_the_library_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        import sysl.math.max
+
+        struct R
+            n: int
+
+        impl Display for R
+            const display(self, out: *Writer, fmt: FormatSpec) = display_int(long(max(self.n, 2)), out, fmt)
+
+        const f(r: R) -> string = str(r)
+
+        print(f(R(1)))
+        """).0
+
+    assert(said.contains("'R.display' is 'const', so it runs while compiling, and it calls 'sysl.math.max'"), said)
+end cdr_a_display_calling_the_library_is_refused
+
+@test("a float and a display rendered while compiling are laid down as text for a Cortex-M4")
+cdr_rendered_text_is_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding("struct Q\n    n: int\n\nimpl Display for Q\n    const display(self, out: *Writer, " +
+                               "fmt: FormatSpec) = display_int(long(self.n), out, fmt)\n\n" +
+                               "const label(x: real, q: Q) -> string = f\"${x}%.3f|${q}%4s|\" + str(x / 3.0)\n\n" +
+                               "val NAME: string = label(1.5, Q(42))" + ctb_main + "int(NAME.len)\n")
+
+    assert(out.contains("c\"1.500|  42|0.5\\00\""), out)
+end cdr_rendered_text_is_laid_down

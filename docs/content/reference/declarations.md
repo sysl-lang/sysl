@@ -1467,8 +1467,8 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
-| a box, a buffer, a value rendered through its type's own method | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`, `renders a value through the method its type supplies`) |
-| a float rendered as text | `… it calls 'sysl.fmt.format_real', which is not — the standard library marks nothing 'const' yet, so compute this at run time` |
+| a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
+| a value rendered through a `display` that is not `const` | `… it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time` |
 | a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
 | a pointer answered | `… its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at` |
 | a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
@@ -1554,13 +1554,50 @@ print(f())
 ```
 
 ```sysl
-const f(x: real) -> string = f"${x}%.2f"
+struct R
+    n: int
 
-print(f(1.5))
+impl Display for R
+    display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.n), out, fmt)
+
+const f(r: R) -> string = str(r)
+
+print(f(R(1)))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and it calls 'sysl.fmt.format_real', which is not — the standard library marks nothing 'const' yet, so compute this at run time
+'f' is 'const', so it runs while compiling, and it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time
+```
+
+**Text is rendered while compiling as the program renders it.** A float goes through the library's
+own renderers — the shortest round trip for `str`, the exact digits under a specifier — so `-0`, a
+subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` is `const`
+runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
+and the `display` of every type the library renders write into it, and a nested `display` is handed
+the same writer:
+
+```sysl
+struct Pt
+    x: int
+    y: real
+
+impl Display for Pt
+    const display(self, out: *Writer, fmt: FormatSpec)
+        out.write("(".bytes)
+        self.x.display(out, fmt)
+        out.write(", ".bytes)
+        self.y.display(out, fmt)
+        out.write(")".bytes)
+
+const label(p: Pt) -> string = f"$p ${p.y}%.3f ${p.y}%e ${p}%4s"
+
+static val L: string = label(Pt(-2, 0.1))
+
+print(L)
+```
+
+```output
+(-2, 0.1) 0.100 1.000000e-01 (  -2,  0.1)
 ```
 
 **A generic `const` function is checked at its definition** for everything that does not go through a

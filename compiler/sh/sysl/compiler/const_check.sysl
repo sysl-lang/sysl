@@ -165,7 +165,10 @@ end const_expr
 private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[string] = *e.kind match
     TCall(name, _, _, _) -> const_call_refusal(a, cx, name)
     TCallPtr(_, _, _, _) -> Some(s"it calls through a value — ${const_dispatch()}")
-    TVCall(_, _, _, _, _) -> Some(s"it dispatches through a trait object — ${const_dispatch()}")
+    // The one trait object a `const` function meets is the writer a rendering hands its `display`.
+    TVCall(receiver, _, _, _, _) ->
+        if writes_a_rendering(texpr_type(receiver)) then None
+        else Some(s"it dispatches through a trait object — ${const_dispatch()}")
     TErase(_, _, _) -> Some(s"it makes a trait object — ${const_dispatch()}")
     TFuncAddr(_, _, _) ->
         Some("it takes a function's address — which function a call through it reaches is " +
@@ -174,9 +177,11 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
     TBox(_, _) -> Some(s"it boxes a value, which allocates — ${const_heap()}")
     TBufLit(_, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
     TBufFill(_, _, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
-    // A value a type renders through its own method writes into a buffer the method is handed.
-    TRender(_, _, _, _) -> Some(s"it renders a value through the method its type supplies, which writes " +
-                                s"into a buffer — ${const_heap()}")
+    // A value a type renders through its own method runs that method, which is held to what any
+    // other call is; through a trait object, which method that is is not known yet.
+    TRender(_, method, _, slot) ->
+        if slot.is_some() then Some(s"it renders a value through a trait object — ${const_dispatch()}")
+        else const_call_refusal(a, cx, method)
 
     TCast(operand, ty) ->
         if names_an_address(ty) || names_an_address(texpr_type(operand)) then
@@ -253,7 +258,7 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
         return Some(s"it prints, which is outside the program — ${const_outside()}")
 
     // An `f"…"` specifier's renderers are run by the compiler itself (`const_eval.sysl`).
-    if const_renderer(shown) then return None
+    if const_renderer(shown) || writer_routine(shown) then return None
 
     if std_module(module_of(origin)) then
         return Some(s"it calls '$shown', which is not — the standard library marks nothing " +
@@ -359,6 +364,12 @@ private const_global_refusal(cx: &ConstSeen, symbol: string, writable: bool) -> 
 end const_global_refusal
 
 // Whether a type is a raw pointer or a C function pointer -- an address, under either spelling.
+// A `*Writer`: what a `display` is handed to write into.
+writes_a_rendering(t: Type) -> bool = t match
+    Ptr(inner) -> writes_a_rendering(*inner)
+    Trait(name, _, _) -> qualified_name(name) == "sysl.Writer"
+    _ -> false
+
 private names_an_address(t: Type) -> bool = t match
     Ptr(_) -> true
     CFn(_, _) -> true

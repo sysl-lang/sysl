@@ -1665,8 +1665,11 @@ literal or a fill, read and written by element, walked by `for x in`; a struct b
 constructor, read and written by field, its `invariant` run; an enum value built by its variant,
 payload-carrying ones included, taken apart by `match`; all passed and returned by value. A tuple is a
 struct of its own. **A string** is held as its text — built by `+`, interpolation, `str` and an
-`f"…"` specifier over an integer, a string or a fixed-point value (rendered by the library's own
-renderers, so the text is the program's to the byte), indexed by byte, sliced where characters start,
+`f"…"` specifier over an integer, a float, a string or a fixed-point value (rendered by the library's
+own renderers, so the text is the program's to the byte — a subnormal, `-0`, `inf` and `NaN`
+included), and over a value whose type's `display` is `const` (run with a writer the evaluation keeps;
+the library's `display_*` routines and the `display` of every type it renders write into it, and a
+nested `display` is handed the same one), indexed by byte, sliced where characters start,
 compared by bytes and matched. **A slice** is held as a view of an array or a string the run holds,
 read, walked by `for x in`, sub-sliced and written through; a call handed one is run afresh rather
 than remembered. A pointer or a reference stops the run with *"a 'P' is not evaluated while

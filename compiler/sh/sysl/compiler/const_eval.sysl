@@ -1,12 +1,13 @@
 module sh.sysl.compiler
 
 import sh.sysl.parsing.*
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, ByteSink, byte_sink}
 import sysl.container.{Map, map}
 import sysl.math.bigint.{BigInt, add, cmp, from_int, negate, sub, to_string,
                          not as big_not, shl as big_shl, shr as big_shr}
 import sysl.text.{Search, from_utf8_unchecked}
-import sysl.fmt.{format_int, format_str, format_fixed}
+import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, format_f128, format_real_plain,
+                 format_f32_plain, format_f128_plain}
 
 // The evaluator: a `const` function run while compiling.
 //
@@ -490,12 +491,14 @@ private struct EvRun
     loops: Buf[(Scope, Span)]
     kind: EvStopKind
     message: string
+    // The buffers the renderings in progress are gathered into, innermost last (`ConstWriter`).
+    writers: Buf[ByteSink]
 end EvRun
 
 // Runs one typed expression standing in a constant: `subject` is what a refusal names, `base` the
 // file it was written in.
 private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr) -> EvOutcome
-    val r: &EvRun = EvRun(a, subject, base, 0, buf(), buf(), EvRunning, "")
+    val r: &EvRun = EvRun(a, subject, base, 0, buf(), buf(), EvRunning, "", buf())
 
     // The expression itself is read in a frame of its own, which names no call: what it binds -- a
     // pattern in a `match` -- lands there.
@@ -645,7 +648,12 @@ private unheld(t: Type) -> Option[string] = t match
     Unknown -> None
     Str -> None
     Slice(elem, _) -> unheld(*elem)
-    _ -> Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, " +
+    // The writer a rendering hands its `display` (`ConstWriter`).
+    Ptr(_) -> if writes_a_rendering(t) then None else unheld_other(t)
+    _ -> unheld_other(t)
+
+private unheld_other(t: Type) -> Option[string] =
+    Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, " +
               "fixed-point, 'bool', 'char', strings, and fixed arrays, structs, enums and slices of them are")
 
 // The first field whose type the evaluation does not hold, as `unheld` says it.
@@ -671,6 +679,7 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstArray(xs) -> array_text(xs, element_type(t))
     ConstRecord(variant, fields) -> record_text(variant, fields, t)
     ConstView(xs, lo, n, _) -> array_text(viewed(xs, lo, n), element_type(t))
+    ConstWriter(_) -> "a writer"
 
 // The elements a slice sees, as a buffer of their own.
 private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
@@ -746,9 +755,11 @@ private copied_all(xs: Buf[Const]) -> Buf[Const]
 
     out
 
-// Whether a value is or holds a slice anywhere in it.
+// Whether a value is or holds a slice anywhere in it -- or a writer, which a call handed one writes
+// through, so that it is never remembered either.
 private holds_view(v: Const) -> bool = v match
     ConstView(_, _, _, _) -> true
+    ConstWriter(_) -> true
     ConstArray(xs) -> any_view(xs)
     ConstRecord(_, fields) -> any_view(fields)
     _ -> false
@@ -1032,6 +1043,8 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TSeq(exprs) -> seq(r, exprs)
         TStrLit(s) -> EvGave(ConstStr(s))
         TStr(arg) -> rendered(r, e.span, arg)
+        TRender(value, method, spec, slot) -> render(r, e.span, value, method, spec, slot)
+        TVCall(receiver, _, args, _, _) -> writer_call(r, e.span, receiver, args)
         TLen(receiver, _) -> length(r, receiver)
         TBytes(receiver) -> bytes_of(r, receiver)
         TSlice(base, lo, hi, inclusive, _) -> sliced(r, e.span, base, lo, hi, inclusive)
@@ -1441,23 +1454,183 @@ end text_of
 // The renderers an `f"…"` hole with a specifier lowers to. **The compiler runs the library's own
 // functions** -- the ones it was built with -- so the text is the program's, flag for flag: an integer
 // under `%d`, `%x` and the rest, a string under `%s`, and a fixed-point value under a float
-// conversion, which is a dyadic rational printed exactly. A float under one is not among them: its
-// rendering is a library call this list does not name, and is refused as one.
-const_renderer(shown: string) -> bool =
-    shown == "sysl.fmt.format_int" || shown == "sysl.fmt.format_str" || shown == "sysl.fmt.format_fixed"
+// conversion, which is a dyadic rational printed exactly. A float renders the same way, at its own
+// width: `str` and a plain hole through the shortest round-trip renderer, a specifier through the exact
+// one, so a subnormal, `-0`, an infinity and a NaN are spelled as the program spells them.
+const_renderer(shown: string) -> bool = shown match
+    "sysl.fmt.format_int" | "sysl.fmt.format_str" | "sysl.fmt.format_fixed" -> true
+    "sysl.fmt.format_real" | "sysl.fmt.format_f32" | "sysl.fmt.format_f128" -> true
+    "sysl.fmt.format_real_plain" | "sysl.fmt.format_f32_plain" | "sysl.fmt.format_f128_plain" -> true
+    _ -> false
 
 @noinline
 private library_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> Flow
-    val text = if shown == "sysl.fmt.format_int" then
-        format_int(wide_arg(vals, 0), small_arg(vals, 1), text_arg(vals, 2), small_arg(vals, 3), small_arg(vals, 4))
-    else if shown == "sysl.fmt.format_str" then
-        format_str(text_arg(vals, 0), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
-    else
-        format_fixed(wide_arg(vals, 0), small_arg(vals, 1), flag_arg(vals, 2), small_arg(vals, 3),
-                     text_arg(vals, 4), small_arg(vals, 5), small_arg(vals, 6))
+    val text = shown match
+        "sysl.fmt.format_int" ->
+            format_int(wide_arg(vals, 0), small_arg(vals, 1), text_arg(vals, 2), small_arg(vals, 3),
+                       small_arg(vals, 4))
+        "sysl.fmt.format_str" -> format_str(text_arg(vals, 0), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
+        "sysl.fmt.format_real" -> format_real(real_arg(vals, 0), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
+        "sysl.fmt.format_f32" -> format_f32(f32(real_arg(vals, 0)), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
+        "sysl.fmt.format_f128" -> format_f128(quad_arg(vals, 0), text_arg(vals, 1), small_arg(vals, 2), small_arg(vals, 3))
+        "sysl.fmt.format_real_plain" -> format_real_plain(real_arg(vals, 0))
+        "sysl.fmt.format_f32_plain" -> format_f32_plain(f32(real_arg(vals, 0)))
+        "sysl.fmt.format_f128_plain" -> format_f128_plain(quad_arg(vals, 0))
+        _ ->
+            format_fixed(wide_arg(vals, 0), small_arg(vals, 1), flag_arg(vals, 2), small_arg(vals, 3),
+                         text_arg(vals, 4), small_arg(vals, 5), small_arg(vals, 6))
 
     built(r, at, text)
 end library_render
+
+private real_arg(vals: Buf[Const], i: usize) -> real = vals.at(i) match
+    ConstFloat(f) -> f
+    _ -> 0.0
+
+// A binary128 argument from the two halves of its bits, which is how the evaluator holds one.
+private quad_arg(vals: Buf[Const], i: usize) -> f128 = vals.at(i) match
+    ConstQuad(hi, lo) -> f128.from_bits((u128(hi) << 64) | u128(lo))
+    _ -> f128.from_bits(0)
+
+// -- a value rendered through its `Display` --------------------------------------------------------
+
+// `str(v)`, and a hole, over a value whose type supplies its own rendering: the `display` it names
+// runs here with a writer of the evaluation's own, a growable buffer as the program's is, and what
+// lands in it becomes the string. Through a trait object the `display` is chosen at run time.
+@noinline
+private render(r: &EvRun, at: Span, value: TExpr, method: string, spec: TExpr, slot: Option[int]) -> Flow
+    if slot.is_some() then
+        return refuse_form(r, at, "a value rendered through a trait object is not evaluated while compiling")
+
+    val shown = eval_value(r, value) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val fmt = eval_value(r, spec) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val k = r.writers.len()
+
+    r.writers.push(byte_sink())
+
+    var vals: Buf[Const] = buf()
+
+    vals.push(shown)
+    vals.push(ConstWriter(int(k)))
+    vals.push(fmt)
+
+    val flow = run_call(r, at, method, vals)
+    val sink = r.writers.at(k)
+
+    r.writers.truncate(k)
+
+    flow match
+        EvStop -> EvStop
+        _ -> built(r, at, from_utf8_unchecked(sink.text()))
+end render
+
+// A call through the writer a rendering was handed: `write` appends the bytes, and `failed` is false,
+// since a buffer that grows has nothing to fail at. Any other trait object is not made while
+// compiling, so there is nothing else for a call through one to reach.
+@noinline
+private writer_call(r: &EvRun, at: Span, receiver: TExpr, args: Buf[TExpr]) -> Flow
+    val k = eval_value(r, receiver) match
+        Ok(ConstWriter(n)) -> usize(n)
+        Ok(_) -> return refuse_form(r, at, "a call through a trait object is not evaluated while compiling")
+        Err(f) -> return f
+
+    if args.len() == 0 then return EvGave(ConstBool(false))
+
+    val bytes = eval_value(r, args.at(0)) match
+        Ok(v) -> byte_list(v)
+        Err(f) -> return f
+
+    if bytes.is_none() then return refuse_form(r, at, "a write of something other than bytes")
+
+    var out = r.writers.at(k)
+
+    out.write(bytes.unwrap().view())
+    EvNone
+end writer_call
+
+// The library's routines a `display` writes through, and the `display` of each type the library
+// renders itself -- run by the compiler as the program runs them, into the evaluation's writer.
+writer_routine(shown: string) -> bool = shown match
+    "sysl.display_fill" | "sysl.display_pad" | "sysl.display_digits" | "sysl.display_str" -> true
+    "sysl.display_int" | "sysl.display_uint" | "sysl.display_bool" | "sysl.display_char" -> true
+    "sysl.display_real" | "sysl.display_f32" | "sysl.display_f128" -> true
+    "sysl.display_real_shortest" | "sysl.display_f32_shortest" | "sysl.display_f128_shortest" -> true
+    "bool.display" | "char.display" | "string.display" | "real.display" | "f32.display" | "f128.display" -> true
+    "bound.sysl.Integer.display" -> true
+    _ -> false
+
+@noinline
+private writer_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> Flow
+    val at_writer: usize = if shown == "sysl.display_fill" then 0 else 1
+
+    val k = vals.at(at_writer) match
+        ConstWriter(n) -> usize(n)
+        _ -> return refuse_form(r, at, "a rendering into a writer other than the one it was handed")
+
+    var out = r.writers.at(k)
+    val fmt = spec_of(vals)
+
+    shown match
+        "sysl.display_fill" -> display_fill(&out, u8(small_arg(vals, 1)), small_arg(vals, 2))
+        "sysl.display_pad" -> display_pad(byte_list(vals.at(0)).unwrap_or(buf()).view(), &out, fmt)
+        "sysl.display_digits" -> display_digits(byte_list(vals.at(0)).unwrap_or(buf()).view(), &out, fmt)
+        "sysl.display_str" | "string.display" -> display_str(text_arg(vals, 0), &out, fmt)
+        "sysl.display_int" -> display_int(long(wide_arg(vals, 0)), &out, fmt)
+        "sysl.display_uint" -> display_uint(ulong(wide_arg(vals, 0)), &out, fmt)
+        "sysl.display_bool" | "bool.display" -> display_bool(flag_arg(vals, 0), &out, fmt)
+        "sysl.display_char" | "char.display" -> display_char(char_arg(vals, 0), &out, fmt)
+        "sysl.display_real" | "real.display" -> display_real(real_arg(vals, 0), &out, fmt)
+        "sysl.display_f32" | "f32.display" -> display_f32(f32(real_arg(vals, 0)), &out, fmt)
+        "sysl.display_f128" | "f128.display" -> display_f128(quad_arg(vals, 0), &out, fmt)
+        "sysl.display_real_shortest" -> display_real_shortest(real_arg(vals, 0), &out, fmt)
+        "sysl.display_f32_shortest" -> display_f32_shortest(f32(real_arg(vals, 0)), &out, fmt)
+        "sysl.display_f128_shortest" -> display_f128_shortest(quad_arg(vals, 0), &out, fmt)
+        // Every integer renders as its decimal digits under `display_digits`, whatever its width.
+        _ ->
+            val digits = vals.at(0) match
+                ConstInt(n) -> to_string(n)
+                _ -> return refuse_form(r, at, s"'$shown' over this value is not evaluated while compiling")
+
+            display_digits(digits.bytes, &out, fmt)
+
+    EvNone
+end writer_render
+
+// The `FormatSpec` a rendering routine was handed, which is its last argument.
+private spec_of(vals: Buf[Const]) -> FormatSpec = vals.at(vals.len() - 1) match
+    ConstRecord(_, fields) -> FormatSpec(small_arg(fields, 0), small_arg(fields, 1), flag_arg(fields, 2))
+    _ -> FormatSpec(0, -1, false)
+
+private char_arg(vals: Buf[Const], i: usize) -> char = vals.at(i) match
+    ConstChar(c) -> c
+    ConstInt(n) -> char(u32(n.to_long().unwrap_or(0)))
+    _ -> char(0)
+
+// The bytes a string, a slice of bytes or an array of them holds.
+private byte_list(v: Const) -> Option[Buf[u8]]
+    var out: Buf[u8] = buf()
+
+    val (xs, lo, n) = v match
+        ConstStr(s) ->
+            for b in s.bytes do out.push(b)
+            return Some(out)
+        ConstView(found, from, count, _) -> (found, from, count)
+        ConstArray(found) -> (found, usize(0), found.len())
+        _ -> return None
+
+    for i in 0..<n
+        xs.at(lo + i) match
+            ConstInt(x) -> out.push(u8(x.to_long().unwrap_or(0)))
+            _ -> return None
+
+    Some(out)
+end byte_list
 
 private small_arg(vals: Buf[Const], i: usize) -> int = vals.at(i) match
     ConstInt(n) -> int(n.to_long().unwrap_or(0))
@@ -2060,6 +2233,10 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
 
     if const_renderer(shown) then return library_render(r, at, shown, vals)
 
+    val routine = qualified_name(r.a.tables.members.func_origin.get(name).unwrap_or(name))
+
+    if writer_routine(routine) then return writer_render(r, at, routine, vals)
+
     run_call(r, at, name, vals)
 end call
 
@@ -2323,6 +2500,8 @@ private key_part(v: Const) -> string = v match
 
         out + "]"
     ConstRecord(variant, fields) -> key_part(ConstInt(from_int(long(variant)))) + key_part(ConstArray(fields))
+    // Never part of a key either: a call handed a writer writes through it.
+    ConstWriter(_) -> "w"
 
 // A float's own pattern, a NaN's included, so that two arguments differing in a bit are two runs.
 private float_pattern_exact(f: real) -> u64 = f.bits()
