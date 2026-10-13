@@ -963,7 +963,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     if receiver.is_some() then
         ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver.unwrap(),
-                                            written),
+                                            written, m.marks.relocates),
                              if params.is_empty() then Unknown else params.at(0).1))
 
     if receiver.is_some() && m.marks.relocates then check_ref_call(cx, span, receiver.unwrap(), m.name)
@@ -1065,7 +1065,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
 
     var ts: Buf[TExpr] = buf()
 
-    ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written),
+    ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written,
+                                        m.marks.relocates),
                          if params.is_empty() then Unknown else params.at(0).1))
 
     // A `@relocates` member may move what a live `ref` stands on, whatever mode its receiver is in.
@@ -1216,7 +1217,7 @@ private as_read_only(tr: TExpr, want: Type) -> TExpr
 end as_read_only
 
 build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
-                       member: string) -> TExpr = mode match
+                       member: string, relocates: bool = false) -> TExpr = mode match
     // A by-value receiver is a **copy**, made by the caller, so calling one needs the layout exactly
     // as building the value does: without the refusal an opaque type's `self` methods would copy the
     // fields as they stood when the caller was compiled. `*self` and `&self` need no shape.
@@ -1244,8 +1245,9 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
 
             // A `*self` method is handed somewhere to write, so it is the one call that could move
             // storage a live `ref` is standing on -- asked here, where the receiver becomes a place
-            // the caller can be told about.
-            check_ref_call(cx, span, place)
+            // the caller can be told about. A `@relocates` member is asked by its caller instead,
+            // under its own name, so the refusal says which call moves the storage.
+            if !relocates then check_ref_call(cx, span, place)
             TExpr(span, TAddrOf(place, Ptr(texpr_type(place))))
     // **What is missing is the COUNT, not an address**: a `&self` method may keep what it is called
     // on, so it needs a box to keep a share of, and a value on the stack -- a local `var` as much as a

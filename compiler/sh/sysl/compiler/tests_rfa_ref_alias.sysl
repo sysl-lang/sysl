@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A live `ref` against a second name for the storage it stands on (`reference/memory.md § ref`):
+// while a `ref` stands inside storage a value of type `T` holds, writing storage held in a `T` by
+// any other name, or calling a body that may write one, is refused -- `val n = h.node` makes
+// `n.cell = …` the assignment `h.node.cell = …` written another way.
+
+private rfa_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rfa_ready
+
+private rfa_root(text: string) -> string
+    val root = make_temp_dir("sysl-ref-alias").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private rfa_ran(text: string) -> string
+    val root = rfa_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end rfa_ran
+
+// What analysing a program said, all of it.
+private rfa_said(text: string) -> string
+    val root = rfa_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private rfa_refused(text: string, part: string)
+    val out = rfa_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private rfa_types() -> string =
+    "struct Node\n    cell: []int\n    more: []int\n    count: int\n\n" +
+    "struct H\n    node: &Node\n\n"
+
+private rfa_alias_msg() -> string =
+    "'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may " +
+    "be the same object by another name"
+
+@test("a 'val' holding the same '&Node' cannot replace the view a live 'ref' stands in")
+rfa_val_alias_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "var h = H(Node([1, 2, 3], [4], 0))\n\nref e = h.node.cell[1]\n\n" +
+                "val n = h.node\n\nn.cell = [7; 8]\ne = 5\nprint(h.node.cell[0], e)\n",
+                rfa_alias_msg())
+
+@test("a '&Node' parameter is another name for the node a live 'ref' stands in")
+rfa_param_alias_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "poke(h: &H, n: &Node)\n    ref e = h.node.cell[0]\n\n" +
+                "    n.cell = [0; 2]\n    e = 1\n\n" +
+                "val h = H(Node([1, 2, 3], [4], 0))\n\npoke(h, h.node)\n",
+                rfa_alias_msg())
+
+@test("a call whose callee writes a 'Node' is refused while a 'ref' stands in one")
+rfa_writing_callee_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "alias(n: &Node) = n.cell = [0; 8]\n\n" +
+                "var h = H(Node([1, 2, 3], [4], 0))\n\nref e = h.node.cell[1]\n\nalias(h.node)\ne = 5\n",
+                "'e' is a 'ref' standing on storage held in a 'Node', and 'alias' may write a 'Node'")
+
+@test("the callee check reaches a callee's callees, inside a function as at the top of a file")
+rfa_transitive_callee_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "inner(n: &Node) = n.more = [0]\n\nouter(n: &Node) = inner(n)\n\n" +
+                "run(h: *H)\n    ref e = h.node.cell[1]\n\n    outer(h.node)\n    e = 5\n\n" +
+                "var h = H(Node([1, 2, 3], [4], 0))\n\nrun(&h)\n",
+                "and 'outer' may write a 'Node'")
+
+@test("a call through a closure names no body to ask, so it is refused while the 'ref' is live")
+rfa_closure_call_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "run(h: *H, f: &Fn(int) -> int)\n    ref e = h.node.cell[1]\n\n    e = f(2)\n\n" +
+                "var h = H(Node([1, 2, 3], [4], 0))\n\nrun(&h, x -> x + 1)\n",
+                "a call through a pointer or a trait names no body to ask")
+
+@test("a closure the program can see into is asked like a function, and one that only reads is cleared")
+rfa_seen_closure_accepted()
+    if !rfa_ready() then return
+
+    val src = rfa_types() + "var h = H(Node([1, 2, 3], [4], 0))\n\nval f = (n: &Node) -> n.count + 1\n\n" +
+              "ref e = h.node.cell[1]\n\nval k = f(h.node)\ne = k\nprint(h.node.cell)\n"
+
+    assert_eq(rfa_ran(src), "[1, 1, 3]\n")
+
+@test("a second 'Buf' handle on the same buffer cannot '@relocates' it under a live 'ref'")
+rfa_buf_handle_alias_refused()
+    if !rfa_ready() then return
+
+    rfa_refused("import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\n\nval b2 = b\n\n" +
+                "ref r = b[0]\n\nb2.push(2)\nr = 5\n",
+                "'r' is a 'ref' standing on an element whose storage 'push' could move or give up, " +
+                "since it is '@relocates'")
+
+@test("replacing a by-value value that holds an owning step of the 'ref''s path replaces the step")
+rfa_enclosing_value_refused()
+    if !rfa_ready() then return
+
+    rfa_refused(rfa_types() + "var h = H(Node([1, 2, 3], [4], 0))\n\nref e = h.node.cell[1]\n\n" +
+                "h = H(Node([4, 5], [6], 1))\ne = 5\n",
+                "'e' is a 'ref' standing on storage this assignment would release")
+
+@test("a program's own '@relocates' '*self' method is refused under its own name")
+rfa_user_relocates_named()
+    if !rfa_ready() then return
+
+    rfa_refused("struct Node\n    cell: []int\n\n    @relocates\n    grow(*self) = self.cell = [0; 9]\n\n" +
+                "struct H\n    node: &Node\n\nvar h = H(Node([1, 2, 3]))\n\nref e = h.node.cell[1]\n\n" +
+                "h.node.grow()\n",
+                "'e' is a 'ref' standing on an element whose storage 'grow' could move or give up")
+
+@test("the ref's own object's other fields, unrelated types and reading callees stay writable")
+rfa_disjoint_writes_accepted()
+    if !rfa_ready() then return
+
+    val src = rfa_types() + "look(n: &Node) -> int = n.count + 1\n\n" +
+              "var h = H(Node([1, 2, 3], [4], 0))\nvar other: []int = [9]\n\n" +
+              "ref e = h.node.cell[1]\n\nh.node.more = [5, 6]\nh.node.count = 2\nother = [10, 11]\n" +
+              "val k = look(h.node)\ne = 7\nprint(h.node.cell, h.node.more, other, k)\n"
+
+    assert_eq(rfa_ran(src), "[1, 7, 3] [5, 6] [10, 11] 3\n")
+
+@test("once the 'ref''s block has closed, a second name may write the node again")
+rfa_after_block_accepted()
+    if !rfa_ready() then return
+
+    val src = rfa_types() + "var h = H(Node([1, 2, 3], [4], 0))\n\nif true\n    ref e = h.node.cell[1]\n\n" +
+              "    e = 5\n    print(h.node.cell)\n\nval n = h.node\n\nn.cell = [7; 2]\nalias(n)\nprint(h.node.cell)\n\n" +
+              "alias(n: &Node) = n.more = [0]\n"
+
+    assert_eq(rfa_ran(src), "[1, 5, 3]\n[7, 7]\n")
+
+@test("a 'ref' whose path owns nothing is asked nothing about other names")
+rfa_no_owning_step_accepted()
+    if !rfa_ready() then return
+
+    val src = "struct P\n    x: int\n    y: []int\n\nbump(p: *P) = p.y = [3]\n\n" +
+              "var p = P(1, [2])\n\nref r = p.x\n\nbump(&p)\nr = 4\nprint(p.x, p.y)\n"
+
+    assert_eq(rfa_ran(src), "4 [3]\n")

@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.{point, Span}
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.{Search, from_utf8_unchecked}
 
 // The checks a whole program is held to once every body it reaches has been typed.
@@ -33,7 +34,200 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_test_scope(a, funcs)
     check_task_crossings(a, funcs)
     check_abandons(a, funcs, reached_externs(a), reached_vtables(a))
+    check_ref_calls(a, funcs, vals)
 end whole_program_checks
+
+// -- a call that may release what a live `ref` stands on ---------------------------------------
+
+// Refuses a call made while a `ref` is live (`place.sysl`'s `RefWatch`) whose callee may write a
+// value of a type the ref's storage is held in -- through another name for it, which the ref's own
+// checks cannot see.
+//
+// **The callee's body answers, read as `untouched_by` reads it**: a body that writes no object
+// that could share storage with such a value, gives back no count, and calls only bodies that do
+// the same. A call through a pointer or a trait's table names no body, so it is refused.
+//
+// **A callee that cannot get hold of such a value is cleared whatever its body does** -- the
+// printing helpers, which end in a foreign call, and a library's already compiled functions, which
+// have no body here at all. It can get hold of one only through what it is handed, through module
+// storage, or by making a pointer to one out of something else: so it is cleared where no argument
+// reaches a slot of the type behind a reference, pointer or view (an argument of the type itself is
+// the callee's own copy), no module storage reaches one, and nothing in the program casts a pointer
+// to the type.
+private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
+    if a.ref_watches.is_empty() then return
+
+    var globals: Buf[Type] = buf()
+
+    for item in vals
+        globals.push(item.ty)
+
+    val p = TProgram(buf(), buf(), buf(), buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
+                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false)
+    var u = untouched_summary(p, dropping_reached(a))
+    var known: Set[string] = set()
+    val sink: &ErasedSink = ErasedSink(buf())
+
+    for f in funcs
+        known.add(f.name)
+        walk_block_stmts(f.body, expr_walk(false, e -> note_erased(sink, e)))
+
+    val erased = sink.items
+
+    for f in funcs
+        var mine: Buf[RefWatch] = buf()
+
+        for w in a.ref_watches
+            if w.func == f.name then mine.push(w)
+
+        if mine.is_empty() then continue
+
+        val scope = func_home(a, f.name)
+        val at: *Untouched = &u
+
+        walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, known, globals, erased, scope,
+                                                                mine, e)))
+end check_ref_calls
+
+// Every value the program puts behind a trait, by the trait's name.
+private struct ErasedSink
+    items: Buf[(string, Type)]
+end ErasedSink
+
+private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
+    TErase(operand, _, ty) ->
+        val tr = repr(pointee(ty).unwrap_or(ty))
+
+        tr match
+            Trait(name, _, _) -> out.items.push((name, texpr_type(operand)))
+            _ -> ()
+    _ -> ()
+
+private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[Type],
+                 erased: Buf[(string, Type)], scope: Scope,
+                 mine: Buf[RefWatch], e: TExpr)
+    val callee = *e.kind match
+        TCall(name, args, ty, _) -> if ty == Never then None else Some((name, args))
+        TCallPtr(_, args, _, _) -> Some(("", args))
+        TVCall(_, _, args, _, _) -> Some(("", args))
+        _ -> None
+
+    if callee.is_none() then return
+
+    for item in a.ref_refusals
+        if item >= e.span.start && item < e.span.end then return
+
+    for w in mine
+        val live = e.span.start >= w.start && (w.end.is_none() || e.span.start < w.end.unwrap())
+
+        if !live then continue
+
+        val name = callee.unwrap().0
+        val args = callee.unwrap().1
+
+        for t in w.types
+            var cleared = false
+
+            if name != ""
+                cleared = unreachable_to(u, globals, erased, args, t) ||
+                          (known.has(name) && untouched_by(u, t).has(name))
+            end if
+
+            if !cleared
+                var what = "a call through a pointer or a trait names no body to ask"
+
+                if name != "" then what = s"'${qualified_name(name)}' may write a '${type_show(t)}'"
+
+                a.fault(scope, e.span, s"'${w.name}' is a 'ref' standing on storage held in a " +
+                        s"'${type_show(t)}', and $what — another name for the same object would " +
+                        "leave the 'ref' pointing at freed memory. Make the call before the 'ref', " +
+                        "or put the 'ref' in a block that closes first")
+                return
+            end if
+end ref_call
+
+// Whether a callee handed `args` has no way to get hold of a value of type `t` held anywhere else.
+private unreachable_to(u: *Untouched, globals: Buf[Type], erased: Buf[(string, Type)],
+                       args: Buf[TExpr], t: Type) -> bool
+    val want = underlying(t)
+
+    for item in u.laundered
+        var parts: Buf[Type] = buf()
+
+        by_value_parts(item, &parts)
+
+        for part in parts
+            if part == want then return false
+
+    for item in globals
+        var seen: Set[string] = set()
+
+        if type_reaches(item, want, true, erased, &seen) then return false
+
+    for item in args
+        var seen: Set[string] = set()
+
+        if type_reaches(texpr_type(item), want, false, erased, &seen) then return false
+
+    true
+end unreachable_to
+
+// Whether a value of type `from` reaches a slot of type `t` that is somebody else's: one behind a
+// reference, a pointer or a view, or held by value under one (`behind`). A generic's arguments count
+// as behind, since its storage may be a raw pointer. A trait object reaches what every value the
+// program erased to that trait reaches; a C function pointer and anything unresolved are taken to
+// reach everything.
+private type_reaches(from: Type, t: Type, behind: bool, erased: Buf[(string, Type)],
+                     seen: *Set[string]) -> bool
+    val u = underlying(from)
+
+    if behind && u == t then return true
+
+    val key = if behind then s"${mangle(u)}!" else mangle(u)
+
+    if seen.has(key) then return false
+
+    seen.add(key)
+
+    u match
+        Ptr(inner) -> type_reaches(*inner, t, true, erased, seen)
+        Ref(inner, _) -> type_reaches(*inner, t, true, erased, seen)
+        Weak(inner) -> type_reaches(*inner, t, true, erased, seen)
+        Slice(elem, _) -> type_reaches(*elem, t, true, erased, seen)
+        Volatile(inner) -> type_reaches(*inner, t, behind, erased, seen)
+        Array(_, elem) -> type_reaches(*elem, t, behind, erased, seen)
+        Vector(_, elem) -> type_reaches(*elem, t, behind, erased, seen)
+        Constrained(d) -> type_reaches(d.base, t, behind, erased, seen)
+        Struct(d) -> any_type_reaches(d.fields, d.targs, t, behind, erased, seen)
+        Results(d) -> any_type_reaches(d.fields, d.targs, t, behind, erased, seen)
+        Enum(d) ->
+            for item in d.variants
+                if any_type_reaches(item.fields, d.targs, t, behind, erased, seen) then return true
+
+            false
+        // A trait object reaches what the values the program put behind that trait reach.
+        Trait(name, _, _) ->
+            for item in erased
+                if item.0 == name && type_reaches(item.1, t, true, erased, seen) then return true
+
+            false
+        Abstract(_, _) -> true
+        CFn(_, _) -> true
+        Pack(_) -> true
+        Unknown -> true
+        _ -> false
+end type_reaches
+
+private any_type_reaches(fields: Buf[(string, Type)], targs: Buf[Type], t: Type, behind: bool,
+                         erased: Buf[(string, Type)], seen: *Set[string]) -> bool
+    for item in fields
+        if type_reaches(item.1, t, behind, erased, seen) then return true
+
+    for item in targs
+        if type_reaches(item, t, true, erased, seen) then return true
+
+    false
+end any_type_reaches
 
 // The file a typed body was written in, or an empty one where the body has no source of its own.
 func_home(a: &Analysis, name: string) -> Scope = a.tables.homes.get(name).unwrap_or(empty_scope())

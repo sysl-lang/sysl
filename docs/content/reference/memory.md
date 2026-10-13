@@ -1131,8 +1131,9 @@ t.swap()
 ```
 
 **While a ref is live, no step of its place that could come to name different storage may be
-assigned, and no mutating method may be called on a prefix of one.** The check is local, decided from
-types alone, and never asks where the ref is *used* — which is the question that would need lifetimes.
+assigned, and no mutating method may be called on a prefix of one.** The check is decided from types
+(and, for a call, from what the callee's body writes), and never asks where the ref is *used* —
+which is the question that would need lifetimes.
 
 Which steps are hazards falls out of the model rather than being a list, and **the discriminator is
 ownership, not indirection.** Only a step that *releases* something when it is overwritten can strand
@@ -1207,11 +1208,42 @@ first = 5
 **What this does not do is make a `*T` safe**, and it does not try. A ref's place may be rooted at a
 pointer, and whether *that* points anywhere is the raw tier's ordinary bargain.
 
-**The check is local, so it sees what the block writes through the ref's own path and nothing
-else.** A second name for the same object, or a callee handed it, can still move or free the storage
-— through a `&T` exactly as through a `Buf`. Here `n` is a second name for `h.node`, and `alias` a
-callee given it; both release the array `e` stands in, and both are accepted, so `e = 5` writes freed
-memory:
+**Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
+`h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
+
+**A second name for the same object is held to the rule as well.** A `&T` or a `Buf` may be held
+under many names, and whether two of them name one object is a run-time fact, so the question is
+asked of **types**: while a ref stands inside storage that a value of type `T` holds, writing storage
+held in any `T` other than along the ref's own path is refused. Here `n` is a second name for
+`h.node`:
+
+```sysl
+struct Node
+    cell: []int
+
+struct H
+    node: &Node
+
+var h = H(Node([1, 2, 3]))
+
+ref e = h.node.cell[0]
+
+val n = h.node
+
+n.cell = [7; 8]
+e = 5
+```
+
+```error
+'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may be the same object by another name
+```
+
+**A call is asked what its callee's body can write.** One that may write a value of such a type —
+directly, or through anything it calls — is refused while the ref is live; one that only reads, or
+writes only its own locals and types unrelated to the ref's storage, is not. A call through a closure
+or a trait object names no body to ask, so it is refused. A function with no body in the program — a
+library's already compiled, or a foreign one — was compiled without the program's types, so it is
+judged by its arguments: it is refused when one of them can reach such a value.
 
 ```sysl
 struct Node
@@ -1226,15 +1258,51 @@ var h = H(Node([1, 2, 3]))
 
 ref e = h.node.cell[0]
 
-val n = h.node
-
-n.cell = [7; 8]
 alias(h.node)
+e = 5
 ```
 
-What the rule buys is narrower than "a ref never dangles": no statement written through the ref's own
-path can release the storage it names. Keeping every other name for that storage still while the ref
-is live is the program's part, as it is for a view handed out by `Buf.view()`.
+```error
+'e' is a 'ref' standing on storage held in a 'Node', and 'alias' may write a 'Node'
+```
+
+A second handle on a `Buf` is the same case: `val b2 = b` makes `b2.push(…)` a `@relocates` call on
+the buffer a `ref r = b[0]` stands in, and it is refused with the `@relocates` message.
+
+What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
+reached along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated
+types, calls whose bodies only read, and anything at all once the ref's block has closed:
+
+```sysl
+struct Node
+    cell: []int
+    count: int
+
+struct H
+    node: &Node
+
+look(n: &Node) -> int = n.count + 1
+
+var h = H(Node([1, 2, 3], 0))
+
+if true
+    ref e = h.node.cell[1]
+
+    h.node.count = 2
+    e = look(h.node)
+
+val n = h.node
+
+n.cell = [7; 2]
+print(n.cell, h.node.count)
+```
+
+```output
+[7, 7] 2
+```
+
+**What this does not make safe is a `*T`**, as above: a ref rooted at a raw pointer, or storage
+reached through a reinterpreting cast, is the raw tier's ordinary bargain.
 
 ### A ref to a slot that holds a reference
 
