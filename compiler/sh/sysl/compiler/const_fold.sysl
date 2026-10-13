@@ -26,6 +26,13 @@ enum Const
     ConstFloat(value: real)
     // An `f128`, as its encoding's two words: a `real` holds 53 of its 113 bits.
     ConstQuad(hi: u64, lo: u64)
+    // A fixed array's elements, in order. Only a `const` function's evaluation makes one, and it is
+    // laid down as the array literal it comes to; nothing folds an expression to one.
+    ConstArray(elems: Buf[Const])
+    // A struct's fields in declaration order (`variant` -1), or an enum value: the position of its
+    // variant among the declaration's, and the fields that variant carries. Made, like an array, only
+    // by a `const` function's evaluation.
+    ConstRecord(variant: int, fields: Buf[Const])
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -226,6 +233,8 @@ private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) ->
         ConstQuad(hi, lo) -> b.unwrap() match
             ConstQuad(yh, yl) -> run_quad_binary(op, (hi, lo), (yh, yl)).ok()
             _ -> None
+        ConstArray(_) -> None
+        ConstRecord(_, _) -> None
 end const_binary
 
 // A comparison's verdict from the sign of the difference, where the operator is a comparison.
@@ -602,6 +611,8 @@ private const_text(v: Const) -> string = v match
     ConstStr(s) -> s"\"$s\""
     ConstFloat(f) -> real_text(f)
     ConstQuad(hi, lo) -> quad_text((hi, lo))
+    ConstArray(xs) -> s"an array of ${xs.len()} elements"
+    ConstRecord(v, _) -> if v < 0 then "a struct" else "an enum value"
 
 // A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
 // rather than as the `inf` and `nan` the C formatting underneath would print.
@@ -647,6 +658,8 @@ const_kind(v: Const) -> string = v match
     ConstStr(_) -> "a string"
     ConstFloat(_) -> "a float"
     ConstQuad(_, _) -> "a float"
+    ConstArray(_) -> "an array"
+    ConstRecord(v, _) -> if v < 0 then "a struct" else "an enum value"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
@@ -787,6 +800,8 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstStr(_) -> if ty == Str then Some(v) else None
     ConstChar(_) -> None
     ConstQuad(hi, lo) -> if is_quad(ty) && !quad_is_nan((hi, lo)) then Some(v) else None
+    ConstArray(_) -> None
+    ConstRecord(_, _) -> None
 
 // Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
 private scalar_value(n: BigInt) -> bool =
@@ -835,6 +850,8 @@ private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Con
             _ -> None
         ConstChar(_) -> None
         ConstQuad(_, _) -> None
+        ConstArray(_) -> None
+        ConstRecord(_, _) -> None
 end typed_binary
 
 // The integer operators, answered only where run time answers the same: never a division by zero,
@@ -913,6 +930,8 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
         ConstStr(s) -> if to == Str then Some(ConstStr(s)) else None
         ConstChar(_) -> None
         ConstQuad(_, _) -> None
+        ConstArray(_) -> None
+        ConstRecord(_, _) -> None
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n

@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A `const` function holds structs and enums by value**, as it holds fixed arrays: built, read
+// and written by field, matched, passed and returned, nested in arrays and holding them. A module
+// `val` over such a call is laid down as the constructor over literals it comes to, and an enum
+// variant that carries fields has its payload written as the bytes a construction stores -- so a
+// table of records is `.rodata` on a Cortex-M4 with nothing run before `main`.
+
+private val csr_item: string =
+    "struct Item\n    n: int\n    total: int\n    pair: [2]u8\n\n" +
+    "enum Shade\n    Dark\n    Light\n\n" +
+    "enum Step\n    Hold\n    Move(by: int, shade: Shade)\n\n" +
+    "const mk(n: int) -> Item = Item(n, 0, [0, 0])\n\n" +
+    "const shade_of(i: int) -> Shade = if i % 2 == 0 then Shade.Dark else Shade.Light\n\n" +
+    "const step(i: int) -> Step = if i == 0 then Step.Hold else Step.Move(i * 3, shade_of(i))\n\n" +
+    "const weight(s: Step) -> int = s match\n    Step.Hold -> 0\n    Step.Move(by, Shade.Dark) -> by\n" +
+    "    Step.Move(by, _) -> -by\n\n" +
+    "const items() -> [4]Item\n    var t: [4]Item = [mk(0); 4]\n\n" +
+    "    for i in 0..<4\n        var it = mk(i + 1)\n\n" +
+    "        it.total = weight(step(i)) + int(shade_of(i))\n        it.pair[1] = u8(i * 10)\n" +
+    "        t[i] = it\n\n" +
+    "    t[3].pair[0] = 7\n    t\n\n"
+
+private val csr_steps: string =
+    "struct Pt\n    x: i16\n    y: u8\n\n" +
+    "enum Jog\n    Hold\n    Move(by: int, at: Pt)\n    Jump(far: i64)\n\n" +
+    "const jog(n: int) -> Jog = Jog.Move(n, Pt(i16(-n), u8(n + 10)))\n\n"
+
+@test("a table of structs a 'const' function fills is laid down for a Cortex-M4")
+csr_a_struct_table_is_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(csr_item + "val made: Item = mk(4)\nval TABLE: [4]Item = items()\n" +
+                               "val S: Shade = shade_of(3)" + ctb_main + "TABLE[2].total + int(S) + made.n\n")
+
+    ctb_laid_down(out, "@TABLE = private constant [4 x %struct.Item] [%struct.Item { i32 1, i32 0, [2 x i8] " +
+                  "[i8 0, i8 0] }, %struct.Item { i32 2, i32 -2, [2 x i8] [i8 0, i8 10] }, %struct.Item " +
+                  "{ i32 3, i32 6, [2 x i8] [i8 0, i8 20] }, %struct.Item { i32 4, i32 -8, [2 x i8] [i8 7, i8 30] }]")
+    assert(out.contains("@made = private constant %struct.Item { i32 4, i32 0, [2 x i8] [i8 0, i8 0] }"), out)
+    assert(out.contains("@S = private constant i32 1"), out)
+end csr_a_struct_table_is_laid_down
+
+@test("an enum table whose variants carry fields is laid down, each payload as its bytes")
+csr_a_payload_table_is_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(csr_steps + "val TS: [4]Jog = [jog(1), Jog.Hold, jog(-7), Jog.Jump(-2)]" +
+                               ctb_main + "TS[0] match\n    Jog.Move(by, _) -> by\n    _ -> 0\n")
+
+    // Move(1, Pt(-1, 11)): `by` in the payload's first four bytes, the point in the next four.
+    ctb_laid_down(out, "@TS = private constant [4 x %enum.Jog] [%enum.Jog { i32 1, [1 x i64] " +
+                  "[i64 3377695425560577] }, %enum.Jog zeroinitializer, %enum.Jog { i32 1, [1 x i64] " +
+                  "[i64 844459289870329] }, %enum.Jog { i32 2, [1 x i64] [i64 -2] }]")
+end csr_a_payload_table_is_laid_down
+
+@test("the laid-down records are the values the same calls compute at run time")
+csr_the_values_are_the_run_time_values()
+    if !enm_ready() then return
+
+    val prog = csr_item + csr_steps +
+               "struct Pair[T]\n    a: T\n    b: T\n\n" +
+               "struct Span\n    lo: int\n    hi: int\n\n    invariant lo <= hi\n\n" +
+               "const pairs() -> [3]Pair[i16]\n    var out: [3]Pair[i16] = [Pair(i16(0), i16(0)); 3]\n\n" +
+               "    for i in 0..<3\n        out[i] = Pair(i16(i), i16(-i))\n\n    out\n\n" +
+               "const widen(s: Span) -> Span\n    var t = s\n    t.hi += 10\n    t\n\n" +
+               "const tally(xs: [4]Jog) -> int\n    var sum = 0\n\n" +
+               "    for x in xs\n        x match\n            Jog.Move(by, p) -> sum += by + int(p.y)\n" +
+               "            Jog.Jump(f) -> sum += int(f)\n            Jog.Hold -> ()\n\n    sum\n\n" +
+               "const light(s: Shade) -> bool = s == Shade.Light\n\n" +
+               "static val T: [4]Item = items()\n" +
+               "static val P: [3]Pair[i16] = pairs()\n" +
+               "static val W: Span = widen(Span(1, 3))\n" +
+               "static val J: [4]Jog = [jog(1), Jog.Hold, jog(-7), Jog.Jump(-2)]\n" +
+               "static val N: int = tally(J)\n" +
+               "static val L: bool = light(shade_of(5))\n\n" +
+               "val live = items()\nvar same = 0\n\n" +
+               "for i in 0..<4\n" +
+               "    if live[i].n == T[i].n && live[i].total == T[i].total && live[i].pair[1] == T[i].pair[1] " +
+               "then same += 1\n\n" +
+               "print(same, T[3].pair[0], P[2].a, P[2].b, W.lo, W.hi, N, tally(J), L)\n" +
+               "print(J[2] match\n    Jog.Move(by, p) -> by * 100 + int(p.x)\n    _ -> 0)\n"
+
+    assert_eq(enm_ran(prog), "4 7 2 -2 1 13 6 6 true\n-693\n")
+end csr_the_values_are_the_run_time_values
+
+@test("a struct made against its 'invariant' traps at the initializer")
+csr_an_invariant_traps()
+    if ctb_skip() then return
+
+    assert_eq(ctb_freestanding("struct Span\n    lo: int\n    hi: int\n\n    invariant lo <= hi\n\n" +
+                               "const span(n: int) -> Span = Span(0, n)\n\n" +
+                               "val B: Span = span(-1)" + ctb_main + "B.hi\n"),
+              "'B' traps while it is being compiled: the 'invariant' of 'Span' does not hold for " +
+              "Span(0, -1) (main.sysl:7:30) — inside 'span(-1)', called at main.sysl:9:15")
+end csr_an_invariant_traps
+
+@test("a payload with no fixed bit pattern stays code, and the refusal says so")
+csr_a_wide_payload_is_refused()
+    if ctb_skip() then return
+
+    val said = ctb_freestanding("enum Big\n    None\n    Wide(v: i128)\n\n" +
+                                "const big(n: int) -> Big = Big.Wide(i128(n))\n\n" +
+                                "val B: Big = big(3)" + ctb_main + "B match\n    Big.Wide(_) -> 1\n    _ -> 0\n")
+
+    assert(said.starts_with("'main_entry' is exported and reaches 'B', which is module storage"), said)
+    assert(said.ends_with(". 'B' came to a value holding an enum variant whose fields have no fixed bit " +
+                          "pattern, which is not laid down as constant data"), said)
+end csr_a_wide_payload_is_refused

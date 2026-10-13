@@ -1374,8 +1374,10 @@ print(area(Square(3)), plus(3), int(hyp(3.0, 4.0)))
 9 9 5
 ```
 
-What the compiler *evaluates* while compiling is narrower today than what a body may hold — scalars,
-not yet aggregates; [modules § const](/reference/modules/) says where the line is.
+What the compiler *evaluates* while compiling — scalars, fixed-point values, and fixed arrays,
+structs and enums of them, not yet tuples or strings — is set out in [modules §
+const](/reference/modules/), with how a table a `const` function fills in a loop becomes constant
+data.
 
 **A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere,
 and such a pointer can only point at a local of the evaluation that made the call:

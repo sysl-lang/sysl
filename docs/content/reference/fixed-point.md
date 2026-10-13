@@ -108,6 +108,68 @@ val RAMP: [4]q15 = [q15(step(0)), q15(step(1)), q15(step(2)), q15(step(3))]
 ramp_at(i: i32) -> i32 = i32(RAMP[i].bits)
 ```
 
+**A whole table a loop fills is constant data too.** A `const` function may build an array, write it
+element by element and return it, and a module `val` over the call is laid into `.rodata` — here a
+256-entry `q15` sine table for an oscillator on a Cortex-M4, with nothing run before `main`:
+
+```sysl build=c target=thumbv7em-freestanding
+module osc
+
+const pi: real = 3.141592653589793
+
+// sin(x) on [-pi, pi], by its series to x^15.
+const sine(x: real) -> real
+    var term = x
+    var sum = x
+
+    for k in 1..<8
+        term = -term * x * x / real((2 * k) * (2 * k + 1))
+        sum += term
+
+    sum
+
+const sine_table() -> [256]q15
+    var t: [256]q15 = [q15(0.0); 256]
+
+    for i in 0..<256
+        t[i] = q15(sine(2.0 * pi * real(i) / 256.0 - pi))
+
+    t
+
+val SINE: [256]q15 = sine_table()
+
+@export("sine_at")
+sine_at(phase: u8) -> i32 = i32(SINE[phase].bits)
+```
+
+**The table is the one the board would compute, bit for bit.** The evaluator runs only operations
+whose result IEEE 754 or this page specifies exactly — `+`, `-`, `*`, `/`, the square root, the
+conversions, and every fixed-point operator with the rounding and saturation above — so the series is
+written out rather than taken from the C library: a libm's `sin` differs in its last bit between
+libraries, and a `const` function that calls one is refused at its definition for that reason. The
+fixed-point operators are worked out over exact values and rounded once, which is what the lowering
+does at a width wide enough to hold them; the same call made at run time gives the same elements:
+
+```sysl
+const halves() -> [4]q15
+    var t: [4]q15 = [q15(0.0); 4]
+    val step: q15 = 0.25
+
+    for i in 0..<4
+        t[i] = step * i - q15(0.5)
+
+    t
+
+val H: [4]q15 = halves()
+val again = halves()
+
+print(H[0], H[3], H[1].bits == again[1].bits)
+```
+
+```output
+-0.5 0.25 true
+```
+
 ## The operators
 
 `+`, `-`, `*`, `/` and unary `-` over two values of **one** format answer the representable value
