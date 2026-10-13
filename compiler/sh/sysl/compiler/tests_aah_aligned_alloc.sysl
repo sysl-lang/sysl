@@ -185,6 +185,25 @@ aah_a_named_pair_still_works()
     assert_eq(aah_ran(p), "42\n")
     lbr_drop([p])
 
+@test("a box whose allocator answers null traps rather than being stored through")
+aah_a_failed_box_allocation_traps()
+    if !lbr_ready() then return
+
+    val refusing = "@export(\"own_alloc\")\nown_alloc(n: usize) -> *u8 = null\n\n" +
+        "@export(\"own_free\")\nown_free(p: *u8) = ()\n\n"
+    val p = aah_project(refusing +
+        "struct P\n    x: u64\n\nmain()\n    print(\"before\")\n    val b: &P = P(41)\n    print(b.x + 1)\n")
+    val ir = lbr_text(p, [])
+
+    assert(ir.contains("call ptr @own_alloc("), ir)
+    assert(ir.contains("icmp ne ptr"), ir)
+
+    val said = aah_ran(p)
+
+    assert(!said.starts_with("refused: "), said)
+    assert(!said.contains("42"), said)
+    lbr_drop([p])
+
 @test("a manifest-named pair with an over-aligned box and no aligned hook is refused")
 aah_a_named_pair_needs_the_hook()
     if !lbr_ready() then return

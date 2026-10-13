@@ -231,6 +231,13 @@ The one place a `&T` reads as null is storage the language did not lay out and t
 [below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value), with `is_null`, the raw
 tier's question for it, and `release`, the way such a field is emptied again.
 
+### A box whose allocation fails traps
+
+The heap can refuse. A box is made from whatever the program's allocator answers, and the answer is
+checked before anything is stored through it: a null traps, exactly as a failed array allocation does
+([arrays](arrays.md)). So a `&T` is never built over a null, which is what lets the section above say
+a reference is never null; the allocator-failure case is a trap, not a value the program must handle.
+
 ### What a heap object costs
 
 Every ARC object carries **three header words**: the strong count, a pointer to the function that
