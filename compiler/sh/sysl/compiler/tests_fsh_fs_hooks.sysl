@@ -35,13 +35,15 @@ private val fsh_manifest: string =
 private val fsh_runtime: string = raw"""
     @export("kstart")
     kstart() -> never
-        val n = run()
+        // Stored through a volatile pointer, so what `run` computes is used and cannot be folded away
+        // with every hook it reaches: the image is dead-stripped a function at a time.
+        var n = 0
+        val d: *volatile int = ptr_cast(&n)
+
+        d[0] = run()
 
         loop
             ()
-
-    @export("img_alloc")
-    img_alloc(n: usize) -> *u8 = null
 
     @export("img_free")
     img_free(p: *u8) = ()
@@ -171,8 +173,27 @@ private fsh_files(program: string, manifest: string) -> Buf[(string, string)]
     var files = lbr_two("main.sysl", program, "package.hocon", manifest)
 
     files.push(("link.ld", fsh_script))
+    files.push(("heap/heap.sysl", fsh_heap))
     files
 end fsh_files
+
+// The image's `alloc`: a bump arena, in a module of its own since a root file's `var` is its entry's
+// local. A box is stored through the moment it is allocated, so a pair answering null would make every
+// allocating path undefined, and the optimizer would rightly fold the program down to nothing.
+private val fsh_heap: string = raw"""
+    module heap
+
+    @align(16)
+    var arena: [65536]u8 = [0; 65536]
+    var used: usize = 0
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8
+        val at = used
+
+        used += (n + 15) / 16 * 16
+        &arena[at]
+    """
 
 // What `sysl build` answers for the image, and where it wrote it.
 private fsh_build(p: string) -> ((int, string), string)
@@ -487,12 +508,12 @@ fsh_floats_need_no_libc()
     for c in ["snprintf", "strtod", "strtof"]
         assert(!fsh_names(all, c), s"'$c' is in the image")
 
-    // What the program reached is in the image: the renderer both widths share and the two readers.
-    // (`format_f32` is a one-line wrapper over the shared `float_text` and is inlined into its caller,
-    // so it is not asked for by name.)
-    assert(all.contains("float_text"), all)
-    assert(all.contains("real_prefix"), all)
-    assert(all.contains("f32_prefix"), all)
+    // What the program reached is in the image: the renderer both widths share and the reader both
+    // widths share. The short functions above them -- `format_f32`, `fmt`'s `float_text`,
+    // `write_float_field`, `real_prefix` and `f32_prefix` -- are copied into their callers and
+    // inlined there, so none of them is asked for by name.
+    assert(all.contains("write_float_laid"), all)
+    assert(all.contains("sysl.text$scan"), all)
 
     lbr_drop([p, out])
 end fsh_floats_need_no_libc
