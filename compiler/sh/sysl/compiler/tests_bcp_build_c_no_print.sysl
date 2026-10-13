@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{split, Search}
+
+// A freestanding `build-c` archive is linked by somebody else's C build, often with a plain `ld.lld`
+// and no `--gc-sections`, so every symbol it leaves undefined is one that C build has to answer. A
+// program that never prints must leave `putchar` -- the byte sink a freestanding `print` writes
+// through -- out of it, and `exit` with it. The standard library's float writer once reached both
+// through an `unwrap`, whose panic prints, so an archive that only formatted a `real` into a buffer
+// asked its consumer for a `putchar`.
+
+private val bcp_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// Formats a `real` under `%g` into the caller's bytes and prints nothing.
+private bcp_program() -> string =
+    "import sysl.fmt.{float_scratch_len, write_real}\n\n" +
+    "struct Into\n    at: *u8\n    room: usize\n    used: usize\n\n" +
+    "impl Fallible for Into\n    override failed(*self) -> bool = false\n\n" +
+    "impl Writer for Into\n    write(*self, bytes: []const u8)\n        for b in bytes\n" +
+    "            if self.used < self.room\n                self.at[self.used] = b\n" +
+    "                self.used += 1\n\n" +
+    "@export(\"show_real\")\nshow_real(at: *u8, room: usize, x: real) -> usize\n" +
+    "    var sink = Into(at, room, 0)\n    var scratch: [float_scratch_len]u8\n\n" +
+    "    write_real(x, &sink, \"%g\", 0, -1, scratch[..]).unwrap_or(())\n    sink.used\n"
+
+// The C program the archive is linked into. It answers `memcpy`, which a compiler may call for any
+// copy and every C environment supplies, and nothing else.
+private val bcp_c_main: string =
+    "typedef unsigned long size_t;\n" +
+    "size_t show_real(char *at, size_t room, double x);\n" +
+    "void *memcpy(void *d, const void *s, size_t n) {\n" +
+    "    char *a = d; const char *b = s; while (n--) *a++ = *b++; return d;\n}\n" +
+    "int main(void) { char b[32]; return (int) show_real(b, sizeof b, 2.5); }\n"
+
+private bcp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// Builds the program's archive for aarch64-freestanding in a directory of its own, and answers the
+// directory, or why it could not.
+private bcp_archive() -> Result[string, string]
+    val root = make_temp_dir("sysl-bcp").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", bcp_program()).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+
+    if code != 0 then return Err(s"build-c failed:\n$text")
+
+    Ok(root)
+end bcp_archive
+
+// The names `llvm-nm -u` lists for the archive, one per entry.
+private bcp_undefined(archive: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    capture(bcp_nm, ["-u", archive]) match
+        Err(_) -> assert(false, "llvm-nm could not be run")
+        Ok(o) ->
+            val lines = split(o.text, "\n")
+
+            for i in 0..<lines.len
+                val line = lines[i].trim()
+
+                if line.starts_with("U ") then out.push(line[2..])
+
+    out
+end bcp_undefined
+
+@test("a freestanding archive of a program that never prints leaves no putchar or exit undefined")
+bcp_no_print_symbols()
+    if !bcp_ready() then skip("no clang or no standard library")
+    if !is_file(bcp_nm) then skip(s"there is no llvm-nm at $bcp_nm to read the archive")
+
+    val root = bcp_archive() match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(r) -> r
+
+    val undefined = bcp_undefined(s"$root/probe.a")
+    var listed = ""
+
+    for name in undefined
+        listed = listed + name + " "
+
+    for name in undefined
+        assert(name == "memcpy" || name == "memset" || name == "memmove", s"undefined: $listed")
+
+    remove_dir_all(root).unwrap_or(())
+end bcp_no_print_symbols
+
+@test("a freestanding archive links into a C main with a plain ld.lld and no --gc-sections")
+bcp_links_without_gc_sections()
+    if !bcp_ready() then skip("no clang or no standard library")
+
+    val lld = capture("ld.lld", ["--version"]) match
+        Ok(c) -> c.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so the archive cannot be linked")
+
+    val t = target_named("aarch64-freestanding").unwrap()
+
+    val cc = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(why) ->
+            skip(why)
+            return
+
+    val root = bcp_archive() match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(r) -> r
+
+    write_text(s"$root/cmain.c", bcp_c_main).unwrap()
+
+    val compiled = capture(cc, [s"--target=${t.triple}", "-ffreestanding", "-fno-builtin", "-c",
+                                s"$root/cmain.c", "-o", s"$root/cmain.o"], "", [], true) match
+        Err(_) ->
+            assert(false, "clang could not be run")
+            return
+        Ok(o) -> o
+
+    assert(compiled.status.ok(), compiled.err.unwrap_or(""))
+
+    val linked = capture("ld.lld", ["-e", "main", s"$root/cmain.o", s"$root/probe.a", "-o",
+                                    s"$root/image.elf"], "", [], true) match
+        Err(_) ->
+            assert(false, "ld.lld could not be run")
+            return
+        Ok(o) -> o
+
+    assert(linked.status.ok(), linked.err.unwrap_or(""))
+    remove_dir_all(root).unwrap_or(())
+end bcp_links_without_gc_sections
