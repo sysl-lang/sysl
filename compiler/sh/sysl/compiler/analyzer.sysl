@@ -316,6 +316,17 @@ struct Analyzer
     partials: Buf[(Span, string, Buf[Type])]
     merging: int
 
+    // The furthest a statement read so far reaches into the file. When a scope closes this is where
+    // its last statement ends, which is where a `ref` bound in it stops being live (`RefWatch`).
+    reach: usize
+
+    // The name the body being read is produced under -- a closure's and a nested function's own, and
+    // the entry file's check name -- which is how a live `ref` is found again among the typed bodies.
+    body: string
+
+    // The body a `RefWatch` filed now belongs to.
+    watch_key(self) -> string = if self.body != "" then self.body else self.func_name
+
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
         for item in self.captured
@@ -338,6 +349,16 @@ struct Analyzer
         val mark = self.marks.at(self.marks.len() - 1)
 
         self.marks.truncate(self.marks.len() - 1)
+
+        // A `ref` bound in the scope stops being live where the scope's last statement ends.
+        for i in 0..<self.an.ref_watches.len()
+            val w = self.an.ref_watches.at(i)
+
+            if w.func == self.watch_key() && w.end.is_none() && w.depth >= mark
+                self.an.ref_watches.set(i, RefWatch(w.func, w.name, w.types, w.start, Some(self.reach),
+                                                    w.depth))
+            end if
+
         self.locals.truncate(mark)
 
         if self.import_marks.is_empty() then return
@@ -518,7 +539,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
-             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0)
+             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "")
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

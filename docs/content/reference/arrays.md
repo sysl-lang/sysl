@@ -481,8 +481,8 @@ talks to hardware and to C, and the language supplies both rather than withholdi
 ### A type with no elements of its own is indexed through a trait
 
 Everything above is about the built-in subscript rather than about `[]` as a token. A user type — the
-library's [`Buf[T]`](/library/buf/), a lookup table, anything a program writes — implements `Index`
-and is read with the same syntax:
+library's [`Buf[T]`](/library/buf/), a lookup table, anything a program writes — implements
+`IndexPlace` or `Index` and is read with the same syntax:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -501,9 +501,10 @@ print(b[0], b.len())
 9 2
 ```
 
-Two differences follow from its being a call rather than a walk to an address. The index is whatever
-the implementation takes, and need not be an integer. And the element is **not a place**, so `b[i] =
-v` reaches a second trait's method and the compound forms are refused outright:
+**A type that implements `IndexPlace` has elements that are places**, as an array's are. Its one
+method answers the element's address, checked against the bounds, and `b[i]` means
+`*b.index_place(i)` — so `b[i].f` reads one field where it lives, `b[i] += 5` writes the element,
+and `ref e = b[i]` names it. `Buf` is one:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -513,23 +514,6 @@ var b: &Buf[int] = buf()
 b.push(1)
 
 b[0] += 5
-```
-
-```error
-would evaluate the receiver and the index twice — write it out as 'b[i] = b[i] + …'
-```
-
-**The form the diagnostic names is ordinary**, and writing it is what makes the two calls visible —
-one `index` on the right of the `=`, one `index_set` on the left:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-var b: &Buf[int] = buf()
-
-b.push(1)
-
-b[0] = b[0] + 5
 
 print(b[0])
 ```
@@ -537,6 +521,37 @@ print(b[0])
 ```output
 6
 ```
+
+A program's own container takes the same trait. It is declared `*self`, so a container whose elements
+are its own bytes answers an address in the container and not in a copy of it:
+
+```sysl
+struct Ring
+    cells: [4]int
+    head: usize
+
+impl IndexPlace[usize, int] for Ring
+    index_place(*self, i: usize) -> *int = &self.cells[(self.head + i) % 4]
+
+var r = Ring([1, 2, 3, 4], 2)
+
+r[0] *= 10
+
+ref last = r[1]
+
+last = 0
+
+print(r.cells)
+```
+
+```output
+[1, 2, 30, 0]
+```
+
+**A type that implements only `Index` is read by a call**, which yields a value rather than a place.
+The index is whatever the implementation takes, and need not be an integer; `b[i] = v` reaches a
+second trait's method, `IndexSet`, and the compound forms are refused, since expanding them would
+evaluate the receiver and the index twice ([core](/library/core/)).
 
 Note also that `b.len()` has parentheses where `a.len` does not: the built-in length is a property of
 a type the compiler knows, and `Buf`'s is an ordinary method. Nothing a program writes competes with

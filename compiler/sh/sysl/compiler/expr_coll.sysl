@@ -200,6 +200,17 @@ indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
 
     if texpr_type(t) == Unknown then return false
 
+    // A type indexed in place is written through the place, never through the trait's call. A raw
+    // pointer's subscript is the pointer's own, so a write through `*Buf` keeps reaching `IndexSet`.
+    val place_key = catalog_key(cx.an, "IndexPlace")
+    val through_ptr = texpr_type(t) match
+        Ptr(_) -> true
+        _ -> false
+
+    if !through_ptr && place_key.is_some() &&
+       indexes_through(cx.an, place_key.unwrap(), receiver_type(texpr_type(t)))
+        return false
+
     indexes_through(cx.an, key.unwrap(), receiver_type(texpr_type(t)))
 end indexes_written
 
@@ -243,6 +254,23 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         var args: Buf[Expr] = buf()
 
         args.push(index)
+
+        // **`IndexPlace` makes the subscript a place**: `b[i]` is `*b.index_place(i)`, so a field
+        // of the element is read where it lives, a write lands in it, and a `ref` can name it. It
+        // is asked first, so a type that also has `Index` for generic code is still indexed in place.
+        val place_key = catalog_key(cx.an, "IndexPlace")
+
+        if place_key.is_some() && indexes_through(cx.an, place_key.unwrap(), texpr_type(tr))
+            val call = call_member(cx, span, raw, "index_place", args, None)
+
+            *call.kind match
+                TCall(name, _, _, _) -> cx.an.tables.place_calls.put(name, true)
+                _ -> ()
+
+            return repr(texpr_type(call)) match
+                Ptr(inner) -> TExpr(span, TDeref(call, *inner))
+                _ -> call
+        end if
 
         val key = catalog_key(cx.an, "Index")
 

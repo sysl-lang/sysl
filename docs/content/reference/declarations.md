@@ -1822,6 +1822,46 @@ original could change during the call — through a `*T` aliasing it, say — or
 writes to its own `self`. So a `self` method on a struct of kilobytes costs no more stack than a
 `*self` one, and the choice between them is about what the method may do, never about size.
 
+**What "could change" means is decided by type, and conservatively.** A receiver of type `T` is
+handed over in place, with no copy and no count taken on what it holds, when nothing the method
+does before it returns — itself or anything it calls — writes storage that could be part of a `T`:
+
+- a write to the method's own locals never counts, nor one through a pointer, a reference or a
+  view to a type that neither holds a `T` nor is a part of one — an output buffer of `[4]u32`
+  beside a receiver that holds no `[4]u32`, a lock word of another struct;
+- a write through a pointer to a part of `T` counts (a `*u32` may point at a `u32` field), as does
+  one through a pointer type the program anywhere makes with `ptr_cast`, or reads at another type
+  with a reinterpreting view or `bytes`, since such a pointer may point anywhere;
+- so does a call into C, through a closure or a trait object, a write that replaces a counted
+  value, and making a value whose type has a destructor, since any of those can run code the
+  compiler cannot see;
+- and so does any argument worked out after the receiver that calls or writes something, since
+  the receiver is lent from the moment its address is taken.
+
+Everything else gets the snapshot, so the program sees exactly what a copy would. An argument
+after the receiver that writes it is the case a reader may not expect:
+
+```sysl
+struct Big
+    n: int
+    table: [1024]u32
+
+    look(self, k: int) -> int = self.n * 10 + k
+
+    later(*self) -> int = self.look(poke(self))
+
+poke(b: *Big) -> int
+    b.n = 5
+    0
+
+var b = Big(1, [0; 1024])
+print(b.later(), b.n)
+```
+
+```output
+10 5
+```
+
 Both halves of the promise, on a receiver of four kilobytes. `snap` is handed a pointer to the very
 value it was called on and writes through it, and its `self` does not move; `bumped` writes its own
 `self`, and the caller's value does not move:

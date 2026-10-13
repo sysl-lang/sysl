@@ -338,7 +338,39 @@ private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
     TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
     TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
     TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
+    TCall(_, _, _, _) -> placed_by(cx, t) match
+        Some(recv) -> key_step(place_key(cx, recv), "[]")
+        None -> None
     _ -> None
+
+// The container a call addresses an element of, where the call is a subscript through
+// `IndexPlace` -- `b[i]` is `*b.index_place(i)`, so the step before the element is `b`.
+private placed_by(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
+    // Whether the call is one a subscript made is a fact filed where the subscript was lowered, not
+    // something its name says. A `*self` receiver arrives as the address of the container, so the
+    // step is the container.
+    TCall(name, args, _, _) ->
+        if args.is_empty() || !cx.an.tables.place_calls.has(name) then return None
+
+        *args.at(0).kind match
+            TAddrOf(inner, _) -> Some(inner)
+            _ -> Some(args.at(0))
+    _ -> None
+
+// Whether a container's own value holds an address, so that overwriting it -- or a `@relocates`
+// member called on it -- can let go of the storage its elements live in. A `Buf` holds its storage
+// behind a `&`; a container whose elements are a fixed array inside it holds none and moves nothing.
+private holds_storage(t: Type) -> bool
+    if owning_step(t) then return true
+
+    repr(t) match
+        Struct(d) ->
+            for f in d.fields
+                if holds_storage(f.1) then return true
+
+            false
+        _ -> false
+end holds_storage
 
 private key_step(base: Option[string], step: string) -> Option[string] = base match
     Some(k) -> Some(s"$k/$step")
@@ -354,10 +386,11 @@ private owning_step(t: Type) -> bool = t match
     _ -> false
 
 // The step a place was reached from, where it was reached from one.
-private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
+private step_before(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
     TField(recv, _, _) -> Some(recv)
     TIndex(recv, _, _) -> Some(recv)
     TDeref(operand, _) -> Some(operand)
+    TCall(_, _, _, _) -> placed_by(cx, place)
     _ -> None
 
 // The places a `ref` over `place` holds still: the **owning steps the path goes through**.
@@ -369,18 +402,25 @@ private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
 // `h.node = other` are one statement written two ways and neither is refused.
 private ref_hazards(cx: &Analyzer, place: TExpr) -> Buf[string]
     var out: Buf[string] = buf()
-    var at = step_before(place)
+    var at = step_before(cx, place)
+
+    var through_call = false
 
     while at.is_some()
         val step = at.unwrap()
 
-        if owning_step(texpr_type(step))
+        // A container an element was addressed through by `index_place` is an owning step when its
+        // value holds the storage, which a `Buf`'s does.
+        val container = through_call && holds_storage(texpr_type(step))
+
+        if owning_step(texpr_type(step)) || container
             val key = place_key(cx, step)
 
             if key.is_some() then out.push(key.unwrap())
         end if
 
-        at = step_before(step)
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
 
     out
 end ref_hazards
@@ -388,40 +428,15 @@ end ref_hazards
 // Refuses an assignment that would move storage a live `ref` is standing on. **The message names
 // the `ref`**, because the line being refused is ordinary code and what makes it a mistake is a
 // binding somewhere above it. The nearest binding answers, and only one does.
+//
+// **Writing a value that holds such a step by value writes the step too**: `h = H(…)` replaces
+// `h.node` as surely as `h.node = …` does, so a target that encloses a hazard with nothing but
+// by-value steps between them is refused on the same terms.
+//
+// **A second name for the same object is the other way in**, and the second half asks it
+// (`aliased_holder`).
 private check_ref_guards(cx: &Analyzer, at: Span, target: TExpr)
     val key = place_key(cx, target)
-
-    if key.is_none() then return
-
-    var i = cx.locals.len()
-
-    while i > 0
-        i -= 1
-
-        val l = cx.locals.at(i)
-
-        if l.stands_for.is_some() && holds_string(ref_hazards(cx, l.stands_for.unwrap()), key.unwrap())
-            cx.fault(at, s"'${l.name}' is a 'ref' standing on storage this assignment would " +
-                     "release, so the name would be left pointing at freed memory. Write the " +
-                     "assignment before the 'ref', or put the 'ref' in a block that closes first")
-            return
-        end if
-end check_ref_guards
-
-// The same refusal for the other way the storage can move: a method that may write the place from
-// the inside.
-//
-// A `*self` receiver is the one place a callee is handed somewhere to write without an `&` in the
-// caller's own source, so it is the one call that has to be asked about. **It is refused whether or
-// not that method reassigns anything**: deciding otherwise means reading the body, and a module
-// compiles against its imports' signatures and never their bodies. The receiver reaches a hazard
-// when the hazard is the receiver or lies inside it -- `t.grow()` reaches `t.cell`.
-check_ref_call(cx: &Analyzer, at: Span, place: TExpr)
-    val key = place_key(cx, place)
-
-    if key.is_none() then return
-
-    val inside = s"${key.unwrap()}/"
     var i = cx.locals.len()
 
     while i > 0
@@ -431,16 +446,292 @@ check_ref_call(cx: &Analyzer, at: Span, place: TExpr)
 
         if l.stands_for.is_none() then continue
 
-        val hazards = ref_hazards(cx, l.stands_for.unwrap())
+        val place = l.stands_for.unwrap()
 
-        for item in hazards
-            if item == key.unwrap() || item.starts_with(inside)
-                cx.fault(at, s"'${l.name}' is a 'ref' standing on storage this call could " +
-                         "release, since a '*self' method may write its receiver — so the name " +
-                         "could be left pointing at freed memory. Make the call before the 'ref', " +
-                         "or put the 'ref' in a block that closes first")
-                return
-            end if
+        if key.is_some() && (holds_string(ref_hazards(cx, place), key.unwrap()) ||
+                             encloses_hazard(cx, place, key.unwrap()))
+            refuse_for_ref(cx, at, s"'${l.name}' is a 'ref' standing on storage this assignment " +
+                           "would release, so the name would be left pointing at freed memory. " +
+                           "Write the assignment before the 'ref', or put the 'ref' in a block " +
+                           "that closes first")
+            return
+        end if
+
+        val other = aliased_holder(cx, place, target)
+
+        if other.is_some()
+            refuse_for_ref(cx, at, s"'${l.name}' is a 'ref' standing on storage held in a " +
+                           s"'${type_show(other.unwrap())}', and this assignment writes one that " +
+                           "may be the same object by another name — so the name could be left " +
+                           "pointing at freed memory. Write the assignment before the 'ref', or " +
+                           "put the 'ref' in a block that closes first")
+            return
+        end if
+end check_ref_guards
+
+// A refusal on a live `ref`'s account, noted so that the whole-program question about a call on
+// the same line (`checks.sysl`'s `check_ref_calls`) does not ask it again.
+private refuse_for_ref(cx: &Analyzer, at: Span, message: string)
+    cx.fault(at, message)
+    cx.an.ref_refusals.push(at.start)
+
+// Whether writing the place spelled `key` overwrites, in place, an owning step a `ref` over `place`
+// goes through: a step of the path is `key`, and an owning step lies below it with no raw pointer
+// in between -- below a `*T` the storage is somewhere else, and replacing the pointer frees nothing.
+private encloses_hazard(cx: &Analyzer, place: TExpr, key: string) -> bool
+    var below = false
+    var at = step_before(cx, place)
+    var through_call = false
+
+    while at.is_some()
+        val step = at.unwrap()
+        val k = place_key(cx, step)
+
+        if below && k.is_some() && k.unwrap() == key then return true
+
+        val ty = texpr_type(step)
+
+        if owning_step(ty) || (through_call && holds_storage(ty)) then below = true
+
+        repr(ty) match
+            Ptr(_) -> below = false
+            _ -> ()
+
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
+
+    false
+end encloses_hazard
+
+// -- a second name for what a live `ref` stands on --------------------------------------------------
+//
+// The check above sees the ref's own path and nothing else, and a `&T` or a `Buf` may be held under
+// many names: `val n = h.node` makes `n.cell = …` the assignment `h.node.cell = …` written another
+// way. **The question is asked of types**, because whether two references name one object is a
+// run-time fact: while a `ref` stands inside storage a value of type `T` holds, writing storage
+// held in any `T` other than through the ref's own path is refused, and so is a call that may
+// write one (`check_ref_calls`, once every body is typed).
+
+// One `ref` whose place goes through storage another name could release, and the stretch of its
+// function it is live over: from the end of its statement to the end of the last statement of its
+// scope, or the end of the function where `end` is never filled.
+struct RefWatch
+    func: string
+    name: string
+    types: Buf[Type]
+    start: usize
+    end: Option[usize]
+    depth: usize
+end RefWatch
+
+// Files a `ref` just bound, where anything another name could reach holds the storage it stands in.
+watch_ref(cx: &Analyzer, span: Span, name: string, place: TExpr)
+    var types = ref_holders(cx, place)
+
+    // A call can also write a slot itself -- a global, or a local through a pointer to it -- so the
+    // type of every owning step goes in beside the types that hold one.
+    var at = step_before(cx, place)
+    var through_call = false
+
+    while at.is_some()
+        val step = at.unwrap()
+        val ty = texpr_type(step)
+
+        if owning_step(ty) || (through_call && holds_storage(ty)) then add_type(&types, underlying(ty))
+
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
+
+    if types.is_empty() then return
+
+    cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, cx.locals.len() - 1))
+end watch_ref
+
+// The types whose values hold the owning steps a `ref` over `place` goes through: for a field the
+// struct it is in, for an element the array or view it is in, and for a container an element was
+// placed through, the container itself -- a `Buf` copied is a second name for one buffer.
+private ref_holders(cx: &Analyzer, place: TExpr) -> Buf[Type]
+    var out: Buf[Type] = buf()
+    var at = step_before(cx, place)
+    var through_call = false
+
+    while at.is_some()
+        val step = at.unwrap()
+        val container = through_call && holds_storage(texpr_type(step))
+
+        if owning_step(texpr_type(step)) || container
+            if container then add_type(&out, underlying(texpr_type(step)))
+
+            val holder = step_holder(cx, step)
+
+            if holder.is_some() then add_type(&out, holder.unwrap())
+        end if
+
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
+
+    out
+end ref_holders
+
+// The type of the value a step's slot lies in, where it lies in one.
+private step_holder(cx: &Analyzer, step: TExpr) -> Option[Type] = *step.kind match
+    TField(recv, _, _) -> Some(object_type(texpr_type(recv)))
+    TIndex(recv, _, _) -> Some(underlying(texpr_type(recv)))
+    TCall(_, _, _, _) -> placed_by(cx, step) match
+        Some(recv) -> Some(object_type(texpr_type(recv)))
+        None -> None
+    _ -> None
+
+// What a receiver of this type is the storage of: the object a reference or pointer reaches, or the
+// value itself.
+private object_type(t: Type) -> Type = underlying(pointee(t).unwrap_or(t))
+
+private add_type(out: *Buf[Type], t: Type)
+    for item in *out
+        if item == t then return
+
+    out.push(t)
+end add_type
+
+// The holder type `target` may be writing storage inside of, by another name than the ref's: the
+// written value holds one by value, or one of the objects it lies in -- out to the first reference,
+// pointer or view, beyond which it is not held -- is one.
+private aliased_holder(cx: &Analyzer, place: TExpr, target: TExpr) -> Option[Type]
+    if !holds_storage(texpr_type(target)) || own_path(cx, place, target) then return None
+
+    val holders = ref_holders(cx, place)
+
+    if holders.is_empty() then return None
+
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(texpr_type(target), &parts)
+
+    for item in parts
+        if holders_have(holders, item) then return Some(item)
+
+    var at = step_before(cx, target)
+
+    while at.is_some()
+        val ty = texpr_type(at.unwrap())
+
+        if holders_have(holders, underlying(ty)) then return Some(underlying(ty))
+        if holders_have(holders, object_type(ty)) then return Some(object_type(ty))
+
+        if indirect_type(ty) then return None
+
+        at = step_before(cx, at.unwrap())
+
+    None
+end aliased_holder
+
+private holders_have(holders: Buf[Type], t: Type) -> bool
+    for item in holders
+        if item == t then return true
+
+    false
+end holders_have
+
+private indirect_type(t: Type) -> bool = repr(t) match
+    Ref(_, _) -> true
+    Ptr(_) -> true
+    Slice(_, _) -> true
+    Str -> true
+    _ -> false
+
+// Whether `target` is reached along the ref's own path and stays inside one object of it: it meets
+// the path at a step whose spelling the ref's place begins with, and nothing between that step and
+// the target -- other than the first step out of it, which the ref's path takes as well -- goes
+// through a reference, a pointer, a view or a container. What lies there is the check above's
+// business, decided by spelling.
+private own_path(cx: &Analyzer, place: TExpr, target: TExpr) -> bool
+    val r = place_key(cx, place)
+
+    if r.is_none() then return false
+
+    var y: Option[TExpr] = Some(target)
+    var crossed = false
+    var last = false
+
+    while y.is_some()
+        val s = y.unwrap()
+        val k = place_key(cx, s)
+
+        if k.is_some() && (k.unwrap() == r.unwrap() || r.unwrap().starts_with(s"${k.unwrap()}/"))
+            return !crossed
+
+        crossed = crossed || last
+        last = indirect_step(cx, s)
+        y = step_before(cx, s)
+
+    false
+end own_path
+
+// Whether a step reaches its storage through something rather than lying inside its predecessor.
+private indirect_step(cx: &Analyzer, s: TExpr) -> bool = *s.kind match
+    TDeref(_, _) -> true
+    TField(recv, _, _) -> indirect_type(texpr_type(recv))
+    TIndex(recv, _, _) -> indirect_type(texpr_type(recv))
+    TCall(_, _, _, _) -> placed_by(cx, s).is_some()
+    _ -> true
+
+// The same refusal for the other way the storage can move: a method that may write the place from
+// the inside.
+//
+// A `*self` receiver is the one place a callee is handed somewhere to write without an `&` in the
+// caller's own source, so it is the one call that has to be asked about. **It is refused whether or
+// not that method reassigns anything**: deciding otherwise means reading the body, and a module
+// compiles against its imports' signatures and never their bodies. The receiver reaches a hazard
+// when the hazard is the receiver or lies inside it -- `t.grow()` reaches `t.cell`.
+//
+// **A `@relocates` member is asked the same question whatever its receiver mode**: a `Buf`'s `push`
+// takes its handle by value and still moves the storage behind it, so `relocating` names the member
+// and the refusal says which call it is.
+//
+// A `@relocates` member called on **another name** for a container the ref stands in -- a second
+// `Buf` handle on the same buffer -- moves the same storage, so a receiver of a type the ref's
+// storage is held in is refused the same way off the ref's own path.
+check_ref_call(cx: &Analyzer, at: Span, place: TExpr, relocating: string = "")
+    val key = place_key(cx, place)
+    val inside = if key.is_some() then s"${key.unwrap()}/" else ""
+    var i = cx.locals.len()
+
+    while i > 0
+        i -= 1
+
+        val l = cx.locals.at(i)
+
+        if l.stands_for.is_none() then continue
+
+        val stands = l.stands_for.unwrap()
+        var hit = false
+
+        if key.is_some()
+            for item in ref_hazards(cx, stands)
+                if item == key.unwrap() || item.starts_with(inside) then hit = true
+
+        if !hit && relocating != "" && !own_path(cx, stands, place)
+            val holders = ref_holders(cx, stands)
+
+            hit = holders_have(holders, underlying(texpr_type(place))) ||
+                  holders_have(holders, object_type(texpr_type(place)))
+        end if
+
+        if hit && relocating != ""
+            refuse_for_ref(cx, at, s"'${l.name}' is a 'ref' standing on an element whose storage " +
+                           s"'$relocating' could move or give up, since it is '@relocates' — so " +
+                           "the name could be left pointing at freed memory. Make the call before " +
+                           "the 'ref', or put the 'ref' in a block that closes first")
+            return
+        end if
+
+        if hit
+            refuse_for_ref(cx, at, s"'${l.name}' is a 'ref' standing on storage this call could " +
+                           "release, since a '*self' method may write its receiver — so the name " +
+                           "could be left pointing at freed memory. Make the call before the " +
+                           "'ref', or put the 'ref' in a block that closes first")
+            return
+        end if
 end check_ref_call
 
 // How a diagnostic names an assignment target.

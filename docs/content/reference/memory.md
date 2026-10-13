@@ -1075,9 +1075,33 @@ demo()
 read and not written, exactly as the `val` may. Stating it twice would only create the chance to
 state it wrong.
 
-**A user type's subscript is not a place.** `b[i]` on a container goes through the `Index` trait,
-which is a call rather than a walk to an address, so there is nothing there for a name to mean. A ref
-reaches the built-in subscript, which is the one that indexes storage.
+**A user type's subscript is a place when the type implements `IndexPlace`**, whose method answers
+the element's address: `b[i]` is `*b.index_place(i)`, a dereference, so a ref names the element
+where it lives. `Buf` is one ([arrays](/reference/arrays/)). Through `Index` alone the subscript is a
+call answering a value, and there is nothing there for a name to mean.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Item
+    block: u64
+    data: Buf[u8]
+
+var items: Buf[Item] = buf()
+
+items.push(Item(1, buf()))
+
+ref t = items[0]
+
+t.block = 41
+t.block += 1
+
+print(items[0].block)
+```
+
+```output
+42
+```
 
 ### The one rule: what may move underneath it
 
@@ -1107,8 +1131,9 @@ t.swap()
 ```
 
 **While a ref is live, no step of its place that could come to name different storage may be
-assigned, and no mutating method may be called on a prefix of one.** The check is local, decided from
-types alone, and never asks where the ref is *used* — which is the question that would need lifetimes.
+assigned, and no mutating method may be called on a prefix of one.** The check is decided from types
+(and, for a call, from what the callee's body writes), and never asks where the ref is *used* —
+which is the question that would need lifetimes.
 
 Which steps are hazards falls out of the model rather than being a list, and **the discriminator is
 ownership, not indirection.** Only a step that *releases* something when it is overwritten can strand
@@ -1159,9 +1184,125 @@ Deciding otherwise would mean reading the callee's body, and a module compiles a
 signatures and never their bodies. The cost is one refusal in a program that could have written the
 ref one line later.
 
+**A container's storage moves under a `@relocates` member, whatever its receiver mode.** A `Buf`
+is a handle, so its `push` takes `self` and still reallocates what the handle points at. Each member
+that can move the storage or give an element up is marked, and the mark is what the check asks:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+ref first = b[0]
+
+b.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
+```
+
 **What this does not do is make a `*T` safe**, and it does not try. A ref's place may be rooted at a
-pointer, and whether *that* points anywhere is the raw tier's ordinary bargain. What the rule buys is
-that the storage a ref names cannot be released by the block that named it.
+pointer, and whether *that* points anywhere is the raw tier's ordinary bargain.
+
+**Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
+`h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
+
+**A second name for the same object is held to the rule as well.** A `&T` or a `Buf` may be held
+under many names, and whether two of them name one object is a run-time fact, so the question is
+asked of **types**: while a ref stands inside storage that a value of type `T` holds, writing storage
+held in any `T` other than along the ref's own path is refused. Here `n` is a second name for
+`h.node`:
+
+```sysl
+struct Node
+    cell: []int
+
+struct H
+    node: &Node
+
+var h = H(Node([1, 2, 3]))
+
+ref e = h.node.cell[0]
+
+val n = h.node
+
+n.cell = [7; 8]
+e = 5
+```
+
+```error
+'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may be the same object by another name
+```
+
+**A call is asked what its callee's body can write.** One that may write a value of such a type —
+directly, or through anything it calls — is refused while the ref is live; one that only reads, or
+writes only its own locals and types unrelated to the ref's storage, is not. A call through a closure
+or a trait object names no body to ask, so it is refused. A function with no body in the program — a
+library's already compiled, or a foreign one — was compiled without the program's types, so it is
+judged by its arguments: it is refused when one of them can reach such a value.
+
+```sysl
+struct Node
+    cell: []int
+
+struct H
+    node: &Node
+
+alias(n: &Node) = n.cell = [0; 8]
+
+var h = H(Node([1, 2, 3]))
+
+ref e = h.node.cell[0]
+
+alias(h.node)
+e = 5
+```
+
+```error
+'e' is a 'ref' standing on storage held in a 'Node', and 'alias' may write a 'Node'
+```
+
+A second handle on a `Buf` is the same case: `val b2 = b` makes `b2.push(…)` a `@relocates` call on
+the buffer a `ref r = b[0]` stands in, and it is refused with the `@relocates` message.
+
+What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
+reached along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated
+types, calls whose bodies only read, and anything at all once the ref's block has closed:
+
+```sysl
+struct Node
+    cell: []int
+    count: int
+
+struct H
+    node: &Node
+
+look(n: &Node) -> int = n.count + 1
+
+var h = H(Node([1, 2, 3], 0))
+
+if true
+    ref e = h.node.cell[1]
+
+    h.node.count = 2
+    e = look(h.node)
+
+val n = h.node
+
+n.cell = [7; 2]
+print(n.cell, h.node.count)
+```
+
+```output
+[7, 7] 2
+```
+
+**What this does not make safe is a `*T`**, as above: a ref rooted at a raw pointer, or storage
+reached through a reinterpreting cast, is the raw tier's ordinary bargain.
 
 ### A ref to a slot that holds a reference
 

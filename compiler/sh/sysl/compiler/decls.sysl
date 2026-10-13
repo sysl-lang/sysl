@@ -502,6 +502,11 @@ struct Tables
     // instantiation a call made of it (`nested.sysl`'s `NestedGeneric`).
     nested_generics: &Table[&NestedGeneric]
 
+    // The lowered name of every call a subscript made through `IndexPlace` -- the calls whose result
+    // is an element's address, so a `ref` over the subscript is held by the container. Filed where
+    // the subscript is lowered, so a function that merely has `index_place` in its name is not in it.
+    place_calls: &Table[bool]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -537,6 +542,7 @@ tables_for(t: Target) -> &Tables =
            table(),
            buf(),
            buf(),
+           table(),
            table())
 
 // One `override impl` still to be held to there being something for it to override: the type as a
@@ -774,6 +780,15 @@ struct Analysis
     // (`DeferredBound.after`).
     bound_after: Option[usize]
 
+    // Every `ref` read so far whose place goes through storage another name could release, with the
+    // stretch of its function it is live over (`place.sysl`'s `RefWatch`). A call in that stretch is
+    // asked about once every body has been typed, since the answer is what the callee's body writes.
+    ref_watches: Buf[RefWatch]
+
+    // Where a live `ref` already refused a statement, so the whole-program question about a call
+    // does not refuse the same line a second time in other words.
+    ref_refusals: Buf[usize]
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
     uses(*self, name: string) = note_reached(self.reached, self.journal, name)
@@ -969,7 +984,7 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
     Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, 0, 0, 0, buf(), buf(), buf(), buf(),
              set(), reached_none(), producing, reached_none(), reached_none(), 0, buf(), 0, None,
              false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation(), false,
-             None)
+             None, buf(), buf())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 
