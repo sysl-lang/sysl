@@ -219,9 +219,10 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // A variant that carries nothing is a tag and a payload region nothing will read -- except in a
     // simple enum, which is its underlying integer and nothing else, so its constant is the bare tag
     // at that width: the value the program wrote, not a `{ tag, region }` pair.
-    TEnumNew(en, variant, _) ->
-        if variant.carries then gap_at(e, "a constant enum variant that carries a payload")
-        else if variant.tag.is_zero() then VZero
+    // A variant that carries fields has its payload written as the region's units, its fields' bytes
+    // where a construction stores them (`payload_image.sysl`).
+    TEnumNew(en, variant, args) ->
+        if !variant.carries && variant.tag.is_zero() then VZero
         else
             val d = underlying(en) match
                 Enum(decl) -> decl
@@ -231,10 +232,25 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
             val area = payload_area(d, e.layout)
 
+            var payload = VZero
+
+            if variant.carries
+                val units = payload_units(e.layout, d, variant, args) match
+                    Some(found) -> found
+                    None -> return gap_at(e, "a constant enum variant whose payload has no byte image")
+
+                var cells: Buf[IrArg] = buf()
+
+                for u in units
+                    cells.push(ir_arg(area.0, VInt(u)))
+
+                payload = VArray(cells)
+            end if
+
             var fields: Buf[IrArg] = buf()
 
             fields.push(ir_arg(l_i32(), VInt(variant.tag)))
-            fields.push(ir_arg(LArr(area.1, area.0), VZero))
+            fields.push(ir_arg(LArr(area.1, area.0), payload))
             VAgg(gapped_values(fields, enum_gaps(e.layout, d)))
 
     _ -> gap_at(e, s"a constant ${texpr_kind_name(t)}")

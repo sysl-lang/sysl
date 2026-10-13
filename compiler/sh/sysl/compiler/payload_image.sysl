@@ -1,0 +1,168 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, pow, sub}
+
+// **A constant enum value whose variant carries fields is laid down as bytes.** Every variant of a
+// data enum shares one payload region, typed as a run of integer units as wide as the strictest
+// alignment any variant needs (`payload_area`), so one variant's constant cannot be written as that
+// variant's own aggregate the way a struct constant is: its fields are written into the region's
+// bytes at the offsets a construction stores them at, and the bytes are read back as the units.
+//
+// What can be written so is what has one fixed bit pattern: integers and fixed-point values up to
+// 64 bits, `char`, `bool`, `f32` and `f64`, and fixed arrays, plain structs and enums of them. Where
+// a payload holds anything else -- a pointer, a string, a bitfield struct -- the image is `None`,
+// and the analysis keeps the value as code.
+
+// The units of a carrying variant's payload region, in order, each at the region's unit width.
+payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[BigInt]]
+    val area = payload_area(d, l)
+    val unit = payload_unit(l, d)
+    val count = usize(area.1)
+
+    if unit > 8 then return None
+
+    var bytes: Buf[u8] = buf()
+
+    for _ in 0..<count * unit
+        bytes.push(0)
+
+    if !variant_bytes(l, v, args, bytes, 0) then return None
+
+    var out: Buf[BigInt] = buf()
+
+    for k in 0..<count
+        var word: long = 0
+
+        for j in 0..<unit
+            val b = bytes.at(k * unit + (if l.little_endian then unit - 1 - j else j))
+
+            word = (word << 8) | long(b)
+
+        // LLVM reads a constant at its type's width as a signed number.
+        val one: long = 1
+
+        if unit < 8 && word >= (one << (8 * unit - 1)) then word -= one << (8 * unit)
+
+        out.push(from_int(word))
+
+    Some(out)
+end payload_units
+
+// Whether every carrying enum value inside a constant has a payload image.
+payloads_laid(l: TargetLayout, t: TExpr) -> bool = *t.kind match
+    TArrayLit(items, _) -> all_payloads_laid(l, items)
+    TArrayFill(value, _) -> payloads_laid(l, value)
+    TStructNew(_, args) -> all_payloads_laid(l, args)
+    TEnumNew(en, v, args) ->
+        if !v.carries then true
+        else underlying(en) match
+            Enum(d) -> payload_units(l, d, v, args).is_some()
+            _ -> false
+    _ -> true
+
+private all_payloads_laid(l: TargetLayout, items: Buf[TExpr]) -> bool
+    for item in items
+        if !payloads_laid(l, item) then return false
+
+    true
+
+// The width of one unit of a payload region, in bytes.
+private payload_unit(l: TargetLayout, d: &EnumType) -> usize
+    val align = l.payload_align(d)
+
+    if align > 1 then align else 1
+
+// A variant's fields, written where a construction stores them: each stored one at its own alignment
+// after the one before it.
+private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Buf[u8], at: usize) -> bool
+    var off: usize = 0
+
+    for i in 0..<args.len()
+        val ft = v.fields.at(i).1
+
+        if !zero_sized(ft)
+            off = round_up(off, l.align(ft))
+
+            if !byte_image(l, args.at(i), ft, out, at + off) then return false
+
+            off += l.size(ft)
+        end if
+
+    true
+end variant_bytes
+
+// The bytes of one constant of type `ty`, written into `out` at `at`.
+private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], at: usize) -> bool = *t.kind match
+    TIntLit(n, _) ->
+        if l.size(ty) > 8 then return false
+
+        put_word(l, out, at, l.size(ty), low_word(n))
+    TBoolLit(b) -> put_word(l, out, at, 1, if b then 1 else 0)
+    TFloatLit(bits, fty) -> underlying(fty) match
+        Floating(32, false) -> put_word(l, out, at, 4, long(f32(real_of_bits(bits)).bits()))
+        Floating(64, false) -> put_word(l, out, at, 8, bits)
+        _ -> false
+    TStructNew(decl, args) -> struct_bytes(l, decl, args, out, at)
+    TArrayLit(items, aty) ->
+        val stride = l.size(element_of(aty))
+
+        for i in 0..<items.len()
+            if !byte_image(l, items.at(i), element_of(aty), out, at + i * stride) then return false
+
+        true
+    TArrayFill(value, aty) ->
+        val n = underlying(aty) match
+            Array(count, _) -> usize(count)
+            _ -> return false
+
+        for i in 0..<n
+            if !byte_image(l, value, element_of(aty), out, at + i * l.size(element_of(aty))) then return false
+
+        true
+    TEnumNew(en, v, args) -> underlying(en) match
+        Enum(d) ->
+            if d.simple then put_word(l, out, at, l.size(d.underlying), low_word(v.tag))
+            else
+                if !put_word(l, out, at, 4, low_word(v.tag)) then return false
+
+                !v.carries || variant_bytes(l, v, args, out, at + round_up(4, payload_unit(l, d)))
+        _ -> false
+    _ -> false
+
+// A plain struct's stored fields at the offsets the layout gives them. A bitfield struct packs its
+// fields into one container, and a `@byte_order` one reverses them, so neither is written here.
+private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: Buf[u8], at: usize) -> bool
+    if d.opaque || d.big_endian.is_some() || bitfield_ranges_of(Struct(d)).is_some() then return false
+
+    for i in 0..<args.len()
+        val field = d.fields.at(i)
+
+        if !zero_sized(field.1)
+            val off = l.field_offset(d, field.0) match
+                Some(o) -> o
+                None -> return false
+
+            if !byte_image(l, args.at(i), field.1, out, at + off) then return false
+        end if
+
+    true
+end struct_bytes
+
+private element_of(t: Type) -> Type = underlying(t) match
+    Array(_, elem) -> *elem
+    _ -> Unknown
+
+// `width` bytes of a word, in the target's order.
+private put_word(l: TargetLayout, out: Buf[u8], at: usize, width: usize, v: long) -> bool
+    var o = out
+
+    for i in 0..<width
+        o.set(if l.little_endian then at + i else at + width - 1 - i, u8((v >> (8 * i)) & 0xFF))
+
+    true
+
+// The low 64 bits of an integer, as a `long`: a `u64` above `long`'s range wraps to its pattern.
+private low_word(n: BigInt) -> long = n.to_long() match
+    Some(v) -> v
+    None -> sub(n, pow(from_int(2), 64)).to_long().unwrap_or(0)
