@@ -1226,7 +1226,7 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
                                 VGlobal(symbol_of(e, name)), args, ty, e.abandoning.has(name))
 
     var arg_vals: Buf[IrArg] = buf()
-    val staged = staged_args(e, args, &arg_vals, e.inert.has(name))
+    val staged = staged_args(e, args, &arg_vals, name)
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -1272,13 +1272,15 @@ end gen_va_intrinsic
 // call itself is written with. The two differ exactly where a parameter is zero-sized, which is an
 // argument evaluated and not passed -- so a check reading the parameters needs the first and the call
 // needs the second.
-staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg],
-            callee_inert: bool) -> Buf[(int, Val)]
+//
+// `callee` is the function being called, by name, or empty where none is known.
+staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf[(int, Val)]
     var staged: Buf[(int, Val)] = buf()
 
-    for a in args
+    for i in 0..<args.len()
+        val a = args.at(i)
         val aty = texpr_type(a)
-        val v = guaranteed_arg(e, a, callee_inert)
+        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "")
 
         if e.layout.indirect(aty)
             out.push(ir_arg(LPtr, v))
@@ -1295,7 +1297,7 @@ end staged_args
 // storage the caller holds, and a zero-sized one is evaluated and not passed.
 arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
     val ty = texpr_type(a)
-    val v = guaranteed_arg(e, a, false)
+    val v = guaranteed_arg(e, a, "")
 
     if e.layout.indirect(ty) then out.push(ir_arg(LPtr, v))
     else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
@@ -1321,6 +1323,34 @@ indirect_arg(e: *Emit, a: TExpr, still: bool) -> Val
     slot
 end indirect_arg
 
+// Whether a place of type `ty` may be handed to `callee` as it stands, with neither a snapshot nor a
+// count of this frame's: nothing the callee does before it returns can write the place or give back
+// the count it holds -- it releases nothing at all (`inert_callees`), or it reaches no storage a value
+// of this type could be in (`untouched_by`). An empty `callee` is a call nobody can see into.
+lends_in_place(e: *Emit, callee: string, ty: Type) -> bool
+    if callee == "" then return false
+
+    e.inert.has(callee) || untouched_by(&e.untouched, ty).has(callee)
+end lends_in_place
+
+// Whether the arguments after the `i`th can change nothing while they are worked out: no call, no
+// write. A place lent to the callee is lent from the moment its address is taken, so a later argument
+// that writes it -- `f(*p, bump(p))` -- would otherwise reach the callee instead of the snapshot.
+private quiet_after(args: Buf[TExpr], i: usize) -> bool
+    for j in i + 1..<args.len()
+        if !changes_nothing(args.at(j)) then return false
+
+    true
+end quiet_after
+
+// Whether working out this expression can change nothing: no call, no write.
+changes_nothing(a: TExpr) -> bool
+    val v: &Verdict = Verdict(true)
+
+    walk_texpr(a, expr_walk(true, x -> if !inert_leaf(x) then v.refuse()))
+    v.ok
+end changes_nothing
+
 // One argument evaluated, with the caller's side of the convention discharged (`borrowing.sysl`):
 // the callee reads it through a count somebody holds for the length of the call, and where that is
 // not already this frame -- a field, a global, a local whose address got out -- a count is taken
@@ -1328,13 +1358,13 @@ end indirect_arg
 // value is already a snapshot, so the count goes on it and comes back with the statement's other
 // temporaries; a large one never becomes a register, so the snapshot is a slot of this frame's,
 // written with counts taken and released where the scope holding it ends.
-private guaranteed_arg(e: *Emit, a: TExpr, callee_inert: bool) -> Val
+private guaranteed_arg(e: *Emit, a: TExpr, callee: string) -> Val
     val ty = texpr_type(a)
-    val still = callee_inert || held(e, a)
+    val big = e.layout.indirect(ty)
+    val still = held(e, a) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     val guarantee = contains_counted(ty) && !still
 
-    if e.layout.indirect(ty) then return indirect_arg(e, a, still)
-
+    if big then return indirect_arg(e, a, still)
 
     val v = gen_expr(e, a)
 

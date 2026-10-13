@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{Map, map, Set, set}
 
 // Who is holding a count for a by-value argument while the call it was passed to runs.
 //
@@ -202,7 +202,7 @@ private own_place(place: TExpr, locals: Set[string]) -> bool = *place.kind match
 // added later is unknown to it, and unknown has to mean "keep the retain" -- the other way round, a
 // new way of reaching arbitrary code would silently start dropping counts that were holding
 // something up.
-private inert_leaf(x: TExpr) -> bool = *x.kind match
+inert_leaf(x: TExpr) -> bool = *x.kind match
     TIntLit(_, _) -> true
     TFloatLit(_, _) -> true
     TQuadLit(_, _, _) -> true
@@ -259,6 +259,8 @@ private inert_leaf(x: TExpr) -> bool = *x.kind match
     // Building a value takes shares of what goes into it and gives none back, so none of these can
     // be the release the rule is looking for.
     TStructNew(_, _) -> true
+    TArrayLit(_, _) -> true
+    TArrayFill(_, _) -> true
     TEnumNew(_, _, _) -> true
     TEnumFromInt(_, _) -> true
     TEnumTry(_, _, _, _, _) -> true
@@ -267,6 +269,310 @@ private inert_leaf(x: TExpr) -> bool = *x.kind match
     TDowngrade(_, _) -> true
 
     _ -> false
+
+// -- the callee: a body that cannot reach a value of one type ---------------------------------------
+
+// What each body of the program can do to memory that is not its own, read once, and the functions
+// found unable to change a value of each type a caller has asked about (`untouched_by`).
+//
+// **A caller hands a place over with no snapshot where nothing the callee does before it returns can
+// write that place or give back a count it holds**: the by-value promise is about what the callee
+// can observe, and a place nobody writes cannot be told from a copy of it. `inert_callees` answers
+// that for every place at once, by refusing every write to memory the body does not own. This answers
+// it for the places of ONE type, which is what lets a method that only reads its receiver be handed a
+// large one in place even though it writes an output buffer, takes a lock word or fills a local `Buf`.
+//
+// **A write is judged by the object it lands in, by type.** Its place is traced back to what holds
+// it: one of the body's own locals (always allowed, as in `inert_callees`), a global, or whatever a
+// pointer, a reference or a view reaches. That object, of type R, can share storage with a value of
+// type T only where one holds the other by value -- R is T or a part of T (a `*u32` may point at a
+// field of a T, a `[]u32` at an array inside one), or T is a part of R. A pointer made by a cast and
+// either side of a reinterpreting view or `bytes` can point anywhere, so a write through one of those
+// types is never cleared (`laundered`).
+//
+// What keeps a body from qualifying for any type, exactly as in `inert_callees`: a call to anything
+// not itself cleared (a foreign function, a closure, a trait object), a node not on the `inert_leaf`
+// list, a contract, and a write that gives back a count -- plus making a value that holds a type with
+// a destructor, whose `drop` could run any code at all when the value is let go.
+struct Untouched
+    names: Buf[string]
+    calls: Buf[Buf[string]]
+    roots: Buf[Buf[Type]]
+    open: Buf[bool]
+    laundered: Buf[Type]
+    answers: Map[string, Set[string]]
+end Untouched
+
+// An empty summary, for an emitter that has not read a program yet.
+untouched_none() -> Untouched = Untouched(buf(), buf(), buf(), buf(), buf(), map())
+
+// Every body of `p` summarised for `untouched_by`. `dropping` is the program's types with a destructor.
+untouched_summary(p: TProgram, dropping: Buf[Type]) -> Untouched
+    var u = untouched_none()
+    val laundered = type_sink()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val calls: &CallSink = CallSink(buf())
+        val roots = type_sink()
+        val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
+                                  f.variant.is_none())
+        val locals = own_locals(f)
+
+        walk_block_stmts(f.body, TWalk(true, x -> touch_node(v, calls, roots, laundered, dropping, locals, x),
+                                       w -> touch_write(v, calls, roots, locals, w),
+                                       s -> if !touch_stmt(s) then v.refuse()))
+
+        u.names.push(f.name)
+        u.calls.push(calls.names)
+        u.roots.push(roots.types)
+        u.open.push(!v.ok)
+
+    u.laundered = laundered.types
+    u
+end untouched_summary
+
+// The functions that cannot write a value of type `t` held anywhere, nor give back a count one holds,
+// before they return: the greatest set closed under the rule, as `inert_callees` computes it.
+untouched_by(u: *Untouched, t: Type) -> Set[string]
+    val key = mangle(t)
+    val known = u.answers.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(t, &parts)
+
+    var alive: Buf[bool] = buf()
+    var out: Set[string] = set()
+
+    for i in 0..<u.names.len()
+        var ok = !u.open.at(i)
+
+        for root in u.roots.at(i)
+            if ok && overlaps(root, t, parts, u.laundered) then ok = false
+
+        alive.push(ok)
+
+        if ok then out.add(u.names.at(i))
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<u.names.len()
+            for item in u.calls.at(i)
+                if alive.at(i) && !out.has(item)
+                    alive.set(i, false)
+                    out.remove(u.names.at(i))
+                    moved = true
+
+    u.answers.put(key, out)
+    out
+end untouched_by
+
+// Whether an object of type `root` can share storage with a value of type `t`, whose by-value parts
+// are `parts`: one holds the other, or `root` is a type a pointer was made to by a cast.
+private overlaps(root: Type, t: Type, parts: Buf[Type], laundered: Buf[Type]) -> bool
+    val r = underlying(root)
+
+    if has_type(parts, r) || has_type(laundered, r) then return true
+
+    var inside: Buf[Type] = buf()
+
+    by_value_parts(r, &inside)
+    has_type(inside, underlying(t))
+end overlaps
+
+// Every type a value of `t` holds by value, itself included: its fields, elements and payloads, all the
+// way down, but not what a pointer, a reference or a view inside it reaches.
+private by_value_parts(t: Type, out: *Buf[Type])
+    val u = underlying(t)
+
+    if has_type(*out, u) then return
+
+    out.push(u)
+
+    u match
+        Array(_, elem) -> by_value_parts(*elem, out)
+        Vector(_, elem) -> by_value_parts(*elem, out)
+        Struct(d) ->
+            for item in d.fields
+                by_value_parts(item.1, out)
+        Results(d) ->
+            for item in d.fields
+                by_value_parts(item.1, out)
+        Enum(d) ->
+            for item in d.variants
+                for field in item.fields
+                    by_value_parts(field.1, out)
+        _ -> ()
+end by_value_parts
+
+private has_type(ts: Buf[Type], t: Type) -> bool
+    for item in ts
+        if item == t then return true
+
+    false
+end has_type
+
+// A list of types a walk adds to through the box it captured.
+private struct TypeSink
+    types: Buf[Type]
+
+    add(*self, t: Type)
+        if !has_type(self.types, t) then self.types.push(t)
+end TypeSink
+
+private type_sink() -> &TypeSink = TypeSink(buf())
+
+// The statements `untouched_summary` reads into: those `inert_stmt` admits, and writes, which are
+// judged by `touch_write`, and a deferred block, whose statements the walk reaches.
+private touch_stmt(s: TStmt) -> bool = s match
+    TWriteStmt(_) -> true
+    TMultiAssign(_) -> true
+    TDefer(_) -> true
+    _ -> inert_stmt(s)
+
+private touch_node(v: &Verdict, calls: &CallSink, roots: &TypeSink, laundered: &TypeSink,
+                   dropping: Buf[Type], locals: Set[string], x: TExpr)
+    note_laundered(laundered, x)
+
+    if makes_dropping(x, dropping) then v.refuse()
+
+    *x.kind match
+        TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
+
+        TStore(place, _, _) -> touch_place(v, roots, locals, place)
+        TIncDec(place, _, _, _, _) -> touch_place(v, roots, locals, place)
+        TUpdate(place, _, _, _, dispatch, _) ->
+            touch_place(v, roots, locals, place)
+
+            if dispatch.is_some() then calls.add(dispatch.unwrap().name)
+
+        TCompare(_, cmps) ->
+            for cmp in cmps
+                if cmp.dispatch.is_some() then calls.add(cmp.dispatch.unwrap().name)
+
+        _ -> if !inert_leaf(x) then v.refuse()
+end touch_node
+
+private touch_write(v: &Verdict, calls: &CallSink, roots: &TypeSink, locals: Set[string], w: TWrite)
+    touch_place(v, roots, locals, w.place)
+
+    if w.dispatch.is_some() then calls.add(w.dispatch.unwrap().name)
+end touch_write
+
+// One write: nothing to note where it lands in a local of the body's own; otherwise the object it
+// lands in, and a refusal where the place holds a count the write would give back or where the object
+// cannot be named.
+private touch_place(v: &Verdict, roots: &TypeSink, locals: Set[string], place: TExpr)
+    if own_place(place, locals) then return
+
+    if contains_counted(place_type(place)) then v.refuse()
+
+    write_root(place) match
+        Some(t) -> roots.add(t)
+        None -> v.refuse()
+end touch_place
+
+// The type of the object a place is part of: a local or a global, or what the pointer, reference or
+// view it goes through reaches. An array's element is part of the array; anything else indexed is
+// an element of storage somebody else owns.
+private write_root(place: TExpr) -> Option[Type] = *place.kind match
+    TLoad(_, ty) -> Some(ty)
+    TGlobal(_, declared, _) -> Some(declared)
+    TDeref(operand, ty) -> Some(pointee(texpr_type(operand)).unwrap_or(ty))
+    TField(r, _, _) -> write_root(r)
+    TIndex(r, _, ty) -> repr(texpr_type(r)) match
+        Array(_, _) -> write_root(r)
+        _ -> Some(element(texpr_type(r)).unwrap_or(ty))
+    _ -> None
+
+// The types a pointer was made to by something other than taking an address: a cast from another
+// pointer or from an integer, a view read at another element type, and the bytes of any value.
+private note_laundered(out: &TypeSink, x: TExpr) = *x.kind match
+    TCast(operand, ty) -> repr(ty) match
+        Ptr(inner) ->
+            val from = pointee(texpr_type(operand))
+
+            if from.is_none() || underlying(from.unwrap()) != underlying(*inner) then
+                out.add(underlying(*inner))
+        _ -> ()
+    TViewAs(arg, ty) ->
+        val a = view_elem(texpr_type(arg))
+        val b = view_elem(ty)
+
+        if a.is_some() then out.add(underlying(a.unwrap()))
+        if b.is_some() then out.add(underlying(b.unwrap()))
+    TBytes(_) -> out.add(byte_type())
+    _ -> ()
+
+// Whether this node makes a value that holds a type with a destructor -- one the body will let go,
+// so the destructor may run before it returns. Reading a value that is already somewhere makes
+// nothing.
+private makes_dropping(x: TExpr, dropping: Buf[Type]) -> bool
+    if dropping.is_empty() then return false
+
+    val reads = *x.kind match
+        TLoad(_, _) -> true
+        TGlobal(_, _, _) -> true
+        TField(_, _, _) -> true
+        TIndex(_, _, _) -> true
+        TDeref(_, _) -> true
+        _ -> false
+
+    if reads then return false
+
+    var seen: Set[string] = set()
+
+    holds_dropping(texpr_type(x), dropping, &seen)
+end makes_dropping
+
+// Whether a value of `t` holds, by value or through anything that keeps its object alive, a type
+// with a destructor. A generic's arguments count as held, since its storage may be a raw pointer.
+private holds_dropping(t: Type, dropping: Buf[Type], seen: *Set[string]) -> bool
+    if has_type(dropping, t) then return true
+
+    t match
+        Array(_, elem) -> holds_dropping(*elem, dropping, seen)
+        Ref(inner, _) -> holds_dropping(*inner, dropping, seen)
+        Slice(elem, _) -> holds_dropping(*elem, dropping, seen)
+        Constrained(d) -> holds_dropping(d.base, dropping, seen)
+        Volatile(inner) -> holds_dropping(*inner, dropping, seen)
+        Struct(d) ->
+            val k = mangle(t)
+
+            if seen.has(k) then return false
+
+            seen.add(k)
+
+            for item in d.fields
+                if holds_dropping(item.1, dropping, seen) then return true
+
+            for item in d.targs
+                if holds_dropping(item, dropping, seen) then return true
+
+            false
+        Enum(d) ->
+            val k = mangle(t)
+
+            if seen.has(k) then return false
+
+            seen.add(k)
+
+            for item in d.variants
+                for field in item.fields
+                    if holds_dropping(field.1, dropping, seen) then return true
+
+            for item in d.targs
+                if holds_dropping(item, dropping, seen) then return true
+
+            false
+        _ -> false
+end holds_dropping
 
 // -- the callee: which large parameters it reads where the caller put them ---------------------------
 

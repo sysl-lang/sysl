@@ -1,0 +1,339 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, split, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+
+// A large by-value receiver is handed over in place -- no snapshot, no count taken on what it holds --
+// wherever the callee cannot change it, judged by TYPE (`borrowing.sysl`'s `untouched_by`), not only
+// where the callee can write nothing at all (`inert_callees`). A method that writes an output buffer,
+// a lock word or a local of its own still reads a kilobyte receiver where its caller put it.
+//
+// Copy semantics stay what is observed: where a write the callee makes could land in the receiver --
+// through a pointer to a part of it, through a pointer made by a cast, or by an argument worked out
+// after the receiver -- the snapshot is still staged, and the programs below print what a copy would.
+
+private sba_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sba_ready
+
+private sba_ir(text: string) -> string
+    val root = make_temp_dir("sysl-sba").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sba_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private sba_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end sba_body
+
+// Whether a body stages a snapshot of a `Big`: a slot for one, the bytes copied in, its counts.
+private sba_staged(f: string) -> bool = f.contains("alloca %struct.Big") && f.contains("llvm.memcpy")
+
+private sba_prints(text: string, expected: string)
+    if !sba_ready() then return
+
+    val root = make_temp_dir("sysl-sba").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end sba_prints
+
+// The keel and musicbox shape: a `*self` method asking a `self` one that writes an output buffer, on
+// a receiver of four kilobytes holding a counted reference with a destructor and a `Buf`.
+private sba_writer() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Handle
+        id: int
+
+    impl Drop for Handle
+        drop(self) = print("drop", self.id)
+
+    struct Big
+        h: &Handle
+        data: Buf[u8]
+        table: [1024]u32
+
+        step(*self) -> u32
+            var o: [4]u32 = [0; 4]
+            self.more(&o)
+            o[0]
+
+        more(self, out: *[4]u32) = self.fill(out)
+
+        fill(self, out: *[4]u32)
+            out[0] = u32(self.h.id) + u32(self.data.len()) + self.table[0]
+
+    var b = Big(Handle(7), buf(), [0; 1024])
+    b.data.push(1)
+    print(b.step())
+    print(b.step())
+    print("end")
+    """
+
+@test("a self method that writes only an output buffer is handed the receiver in place")
+sba_a_writer_of_other_storage_is_handed_the_receiver()
+    if !sba_ready() then return
+
+    val step = sba_body(sba_ir(sba_writer()), "Big.step")
+
+    assert(!step.contains("llvm.memcpy"), step)
+    assert(!step.contains("alloca %struct.Big"), step)
+    assert(!step.contains("arc.copy_at"), step)
+    assert(!step.contains("arc.dispose_at"), step)
+end sba_a_writer_of_other_storage_is_handed_the_receiver
+
+@test("and its counts come out even: the destructor runs once, at the end")
+sba_the_counts_are_unchanged()
+    sba_prints(sba_writer(), "8\n8\nend\ndrop 7\n")
+
+// `peek` writes through a `*u32`, and a `u32` is a part of a `Big`: the pointer may be into the
+// receiver, so the snapshot is staged -- and here it is, so the copy is what is seen.
+private sba_aliased() -> string = raw"""
+    struct Big
+        n: u32
+        table: [1024]u32
+
+        peek(self, p: *u32) -> u32
+            val before = self.n
+            p[0] += 1
+            before * 100 + self.n
+
+        aliased(*self) -> u32 = self.peek(&self.n)
+
+    var b = Big(1, [0; 1024])
+    print(b.aliased(), b.n)
+    """
+
+@test("a callee that writes through a pointer to a part of the receiver still gets a snapshot")
+sba_a_write_to_a_part_keeps_the_snapshot()
+    if !sba_ready() then return
+
+    val f = sba_body(sba_ir(sba_aliased()), "Big.aliased")
+
+    assert(sba_staged(f), f)
+end sba_a_write_to_a_part_keeps_the_snapshot
+
+@test("and the snapshot is what it reads")
+sba_a_write_to_a_part_reads_the_copy()
+    sba_prints(sba_aliased(), "101 2\n")
+
+// `more` writes through a `*[4]u32`, which no `Big` holds -- but the program makes one by a cast from
+// the receiver's own table, so a `*[4]u32` may point anywhere and the snapshot is kept.
+private sba_cast() -> string = raw"""
+    struct Big
+        n: u32
+        table: [1024]u32
+
+        step(*self) -> u32 = self.more(ptr_cast(&self.table[0]))
+
+        more(self, out: *[4]u32) -> u32
+            val before = self.table[0]
+            out[0] = 9
+            before * 10 + self.table[0]
+
+    var b = Big(1, [0; 1024])
+    print(b.step(), b.table[0])
+    """
+
+@test("a pointer made by a cast may point into the receiver, so the snapshot is kept")
+sba_a_cast_pointer_keeps_the_snapshot()
+    if !sba_ready() then return
+
+    val f = sba_body(sba_ir(sba_cast()), "Big.step")
+
+    assert(sba_staged(f), f)
+end sba_a_cast_pointer_keeps_the_snapshot
+
+@test("and the callee reads the receiver as it was")
+sba_a_cast_pointer_reads_the_copy()
+    sba_prints(sba_cast(), "0 9\n")
+
+// `look` can write nothing, but `poke(self)` -- the argument after the receiver -- writes it before the
+// call is made. The receiver was lent from the moment its address was taken, so it is staged.
+private sba_later() -> string = raw"""
+    struct Big
+        n: u32
+        table: [1024]u32
+
+        look(self, k: u32) -> u32 = self.n * 10 + k
+
+        later(*self) -> u32 = self.look(poke(self))
+
+    poke(b: *Big) -> u32
+        b.n = 5
+        0
+
+    var b = Big(1, [0; 1024])
+    print(b.later(), b.n)
+    """
+
+@test("an argument after the receiver that writes it keeps the snapshot")
+sba_a_later_argument_keeps_the_snapshot()
+    if !sba_ready() then return
+
+    val f = sba_body(sba_ir(sba_later()), "Big.later")
+
+    assert(sba_staged(f), f)
+end sba_a_later_argument_keeps_the_snapshot
+
+@test("and the callee sees the receiver from before the argument ran")
+sba_a_later_argument_reads_the_copy()
+    sba_prints(sba_later(), "10 5\n")
+
+// A callee that writes its own `self` gets a copy of its own at entry, and the caller's value does not
+// move.
+private sba_writing_self() -> string = raw"""
+    struct Big
+        n: u32
+        table: [1024]u32
+
+        bumped(self) -> u32
+            self.n += 1
+            self.n
+
+        own(*self) -> u32 = self.bumped() * 10 + self.n
+
+    var b = Big(1, [0; 1024])
+    print(b.own(), b.n)
+    """
+
+@test("a self method that writes its receiver still has a copy of its own")
+sba_a_writing_self_keeps_its_copy()
+    if !sba_ready() then return
+
+    val f = sba_body(sba_ir(sba_writing_self()), "Big.bumped")
+
+    assert(f.contains("alloca %struct.Big"), f)
+end sba_a_writing_self_keeps_its_copy
+
+@test("and the caller's value does not move")
+sba_a_writing_self_leaves_the_caller()
+    sba_prints(sba_writing_self(), "21 1\n")
+
+// -- on the board -------------------------------------------------------------------------------------
+
+private sba_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end sba_objdump
+
+// The receiver of four kilobytes on a Cortex-M4, where the main stack is four: `step` hands it to an
+// out-of-line `more` that writes an output buffer.
+private sba_board() -> string = raw"""
+    struct Big
+        n: u32
+        table: [1024]u32
+
+        step(*self, out: *[4]u32) -> u32
+            self.n += 1
+            self.more(out)
+
+        @noinline
+        more(self, out: *[4]u32) -> u32
+            out[0] = self.table[3] + self.n
+            out[0]
+
+    var g: Big = Big(1, [0; 1024])
+
+    @export("probe_step")
+    probe_step(out: *[4]u32) -> u32 = g.step(out)
+    """
+
+@test("on thumbv7em the caller of a reading self method has no four-kilobyte frame")
+sba_no_frame_on_the_board()
+    val objdump = sba_objdump()
+
+    if objdump.is_none()
+        print("skipped: there is no llvm-objdump on this machine")
+        return
+
+    val root = make_temp_dir("sysl-sba").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", sba_board()).unwrap()
+
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "thumbv7em-freestanding", "-o", archive, root]
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    assert_eq(code, 0)
+
+    capture(objdump.unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) ->
+            var inside = false
+            var seen = false
+
+            for line in split(dis.text, "\n")
+                if line.contains("<Big.step>:") || line.contains("<probe_step>:")
+                    inside = true
+                    seen = true
+                elif inside && line.trim() == "" then inside = false
+                elif inside
+                    assert(!line.contains("sub.w") || !line.contains("sp"), line)
+                    assert(!line.contains("memcpy"), line)
+
+            assert(seen, dis.text)
+
+    remove_dir_all(root).unwrap_or(())
+end sba_no_frame_on_the_board
