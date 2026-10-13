@@ -670,25 +670,30 @@ thx_a_plain_reference_is_refused_at_the_call()
 
 // -- what is refused ---------------------------------------------------------------------------------
 
-// Both fields are private, so the positional constructor is out of reach -- which is what keeps a
-// lock from being built already held.
+// Its one field -- the `Guarded[SleepLock, T]` holding the lock and the value -- is private, so the
+// positional constructor is out of reach, which is what keeps a lock from being built already held.
 @test("building one by naming its fields, which would let it start held")
 thx_building_one_by_its_fields_is_refused()
     if thx_no_library() then return
 
-    val out = thx_err("var m = Mutex(SleepLock.new(), 5)\nprint(m.try_lock_raw().is_some())")
+    val out = thx_err("import sysl.sync.Guarded\n\nvar m: Mutex[int] = Mutex(Guarded.new(SleepLock.new(), 5))\n" +
+                      "print(m.try_lock_raw().is_some())")
 
     assert(out.contains("the constructor names every field of 'sysl.threads.Mutex' in order"), out)
-    assert(out.contains("'lock' is private"), out)
+    assert(out.contains("'inner' is private"), out)
     assert(out.contains("associated function"), out)
 
 @test("reading what it protects without taking it")
 thx_reading_the_value_without_the_lock()
     if thx_no_library() then return
 
-    val out = thx_err("var m = Mutex.new(5)\nprint(m.value)")
+    val out = thx_err("var m = Mutex.new(5)\nprint(m.inner)")
 
-    assert(out.contains("field 'value' of 'sysl.threads.Mutex' is private"), out)
+    assert(out.contains("field 'inner' of 'sysl.threads.Mutex' is private"), out)
+
+    // ...and the record inside keeps its own value private, so there is no way round through it.
+    assert(thx_err("import sysl.sync.{Guarded, SpinLock}\n\nvar g = Guarded.new(SpinLock(0), 5)\nprint(g.value)")
+           .contains("field 'value' of 'sysl.sync.Guarded' is private"))
 
 // `Mutex[T]` guards its `value` (`@guards(value)`), so sharing the lock does not share the `&Cell`
 // inside it: the `&sync` is formed, and what is held instead is what leaves through `with`.

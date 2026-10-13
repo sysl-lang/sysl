@@ -2284,9 +2284,11 @@ count: a store into a `[]string` puts a heap string there.
 ### A guarded value crosses with its lock
 
 A `Map` shared through a count that is not atomic may not be reached from another domain — **but a
-`Mutex[Map[...]]` may**, whatever it holds. `Mutex[T]` is declared `@guards(value)`: its own members
-are the only way to the `T`, and each takes the lock first, so sharing the lock does not share the
-value:
+`Mutex[Map[...]]` may**, whatever it holds. `Mutex[T]` is declared `@guards(inner)`, over a
+`Guarded[SleepLock, T]` that is itself `@guards(value)`: its own members are the only way to the `T`,
+and each takes the lock first, so sharing the lock does not share the value. A guarded field that is
+itself a guarding struct is looked through, so what leaves `Mutex.with` is held to the rule the `T`
+inside sets:
 
 ```sysl
 import sysl.container.{map, Map}
@@ -2419,10 +2421,28 @@ A slice or a `Buf` of guarded records is asked the same way: what is in the way 
 `Buf`'s own count, not the records, so one reached through a `*T` or held where it is constant data
 crosses, and one shared through its own ordinary count does not.
 
-**On a freestanding target the table is not module storage**: `Guarded.new` is a call the compiler
-does not run while compiling, and module storage a freestanding image reaches has to be constant data
-laid into the object file. A kernel keeps the table in memory it sets up at boot and reaches it
-through a `*[N]Guarded[...]`.
+**On a freestanding target the table is constant data**: `Guarded.new` is a `const` function, and
+an instance of a generic `const` function is run while compiling like any other, so a kernel writes
+the table as a module `var` and the image carries it laid out — every lock free, every record its
+initial value — with nothing run before `main`:
+
+```sysl
+import sysl.sync.{Guarded, SpinLock}
+
+struct Inode
+    refs: int
+    mode: u16
+
+var inodes: [64]Guarded[SpinLock, Inode] = [Guarded.new(SpinLock(0), Inode(0, 0)); 64]
+
+@export("iget")
+iget(i: int) -> int = inodes[i].with((n) ->
+    n.refs += 1
+    n.refs)
+```
+
+A record whose initializer is not constant — a `buf()` the heap fills, say — is still refused there,
+with the reason the call could not be run.
 
 ### `@crossing` — where the rule is asked
 

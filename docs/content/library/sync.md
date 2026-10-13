@@ -43,7 +43,7 @@ anything to schedule.
 | `Atomic[T]` | one word, and the nine operations that touch it indivisibly |
 | `SpinLock` | mutual exclusion held by spinning rather than by sleeping |
 | `Lock` | the trait every lock implements — `acquire`, `try_acquire`, `release` — whatever it waits by |
-| `Guarded[L, T]` | one record and its own lock, inline: a table of them is locked record by record ([memory](/reference/memory/#a-table-whose-every-record-has-its-own-lock)) |
+| `Guarded[L, T]` | one record and its own lock, inline: a table of them is locked record by record, and constant data even on a board ([memory](/reference/memory/#a-table-whose-every-record-has-its-own-lock)); `with`/`try_with` for a hold that is a block, `lock_raw`/`unlock_raw` for one that is not. `sysl.threads.Mutex[T]` is one over a `SleepLock` |
 | `spin_hint()` | the processor's own instruction for "this loop is waiting" |
 
 This is the `*T` tier of concurrency in the same sense `*T` is the unsafe tier of memory: nothing

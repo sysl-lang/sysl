@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **An instance of a generic `const` function is run while compiling**, so `Guarded.new(...)` -- a
+// member of the generic `Guarded[L, T]` -- fills a module table that a Cortex-M image carries as data,
+// with nothing run before `main`. And `sysl.threads.Mutex[T]` is a `Guarded[SleepLock, T]`
+// underneath: `@guards` looks through a guarded field that is itself a guarding struct, so what leaves
+// `Mutex.with` is still held to the rule the `T` sets, and `Guarded`'s raw hold is the one a
+// `Condvar.wait` lets go of and takes again.
+
+private val mgd_inode: string =
+    "import sysl.sync.{Guarded, SpinLock}\n\n" +
+    "struct Inode\n    refs: int\n    mode: u16\n\n"
+
+private val mgd_iget: string =
+    "\n\n@export(\"main\")\nmain_entry() -> int = inodes[3].with((n) ->\n    n.refs += 1\n    n.refs + int(n.mode))\n"
+
+// What a hosted program built from one file printed, or what refused it.
+private mgd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-mgd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end mgd_ran
+
+@test("a module table of 'Guarded.new' records is laid down as data for a Cortex-M4")
+mgd_a_guarded_table_is_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(mgd_inode +
+        "var inodes: [8]Guarded[SpinLock, Inode] = [Guarded.new(SpinLock(0), Inode(5, 420)); 8]" + mgd_iget)
+
+    ctb_laid_down(out, "@inodes = ")
+    assert(out.contains("i32 5, i16 420"), out)
+
+@test("records written one by one are laid down each at its own value")
+mgd_records_one_by_one()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(mgd_inode +
+        "var inodes: [4]Guarded[SpinLock, Inode] = [Guarded.new(SpinLock(0), Inode(1, 2)), " +
+        "Guarded.new(SpinLock(0), Inode(3, 4)), Guarded.new(SpinLock(0), Inode(5, 6)), " +
+        "Guarded.new(SpinLock(0), Inode(7, 8))]" + mgd_iget)
+
+    ctb_laid_down(out, "@inodes = ")
+    assert(out.contains("i32 1, i16 2"), out)
+    assert(out.contains("i32 7, i16 8"), out)
+
+@test("a generic 'const' function of the program's own, calling 'Guarded.new', is run too")
+mgd_a_generic_const_of_its_own()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(mgd_inode +
+        "const free_record[T](v: T) -> Guarded[SpinLock, T] = Guarded.new(SpinLock(0), v)\n\n" +
+        "var inodes: [2]Guarded[SpinLock, Inode] = [free_record(Inode(9, 1)); 2]" + mgd_iget)
+
+    ctb_laid_down(out, "@inodes = ")
+    assert(out.contains("i32 9, i16 1"), out)
+
+@test("a record the heap fills is still refused on a board, with the reason")
+mgd_a_heap_record_is_refused()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding("import sysl.buf.{Buf, buf}\nimport sysl.sync.{Guarded, SpinLock}\n\n" +
+        "struct Item\n    log: Buf[int]\n\n" +
+        "var items: [2]Guarded[SpinLock, Item] = [Guarded.new(SpinLock(0), Item(buf())); 2]" +
+        "\n\n@export(\"main\")\nmain_entry() -> int = items[1].with((r) -> int(r.log.len()))\n")
+
+    assert(out.contains("'main_entry' is exported and reaches 'items', which is module storage"), out)
+    assert(out.contains("'items' cannot be computed while compiling"), out)
+
+@test("'Guarded' takes and lets go of a hold that is not a block")
+mgd_raw_hold()
+    if ctb_skip() then return
+
+    val out = mgd_ran("import sysl.sync.{Guarded, SpinLock}\n\n" +
+        "var g = Guarded.new(SpinLock(0), 40)\n" +
+        "val p = g.lock_raw()\n*p += 2\n" +
+        "print(g.try_lock_raw().is_none())\n" +
+        "g.unlock_raw()\n" +
+        "val q = g.try_lock_raw()\nprint(*q.unwrap())\ng.unlock_raw()\n" +
+        "print(g.with((n) -> *n))\n")
+
+    assert_eq(out, "true\n42\n42\n")
+
+@test("'Mutex.with' answering a 'Buf' out of the value is still refused, naming 'Mutex.with'")
+mgd_mutex_still_holds_what_leaves()
+    if ctb_skip() then return
+
+    val out = mgd_ran("import sysl.buf.{Buf, buf}\nimport sysl.threads.Mutex\n\n" +
+        "var m: Mutex[Buf[int]] = Mutex.new(buf())\nval b = m.with((r) -> *r)\nprint(b.len())\n")
+
+    assert(out.contains("'sysl.threads.Mutex.with' answers a value out of the 'value' it guards"), out)
+    assert(!out.contains("'sysl.sync.Guarded.with'"), out)
+
+@test("a 'Mutex' over an 'int' hands an 'int' out, and a condvar wait lets go of it and takes it again")
+mgd_mutex_condvar_round_trip()
+    if ctb_skip() then return
+
+    val out = mgd_ran("import sysl.threads.*\n\n" +
+        "var m = Mutex.new(1)\nvar c = Condvar.new()\n" +
+        "print(*m.lock_raw())\nprint(c.wait_for(&m, 1000000))\n" +
+        "print(m.try_lock_raw().is_none())\nm.unlock_raw()\n" +
+        "print(m.with((n) -> *n + 1))\n")
+
+    assert_eq(out, "1\nfalse\ntrue\n2\n")

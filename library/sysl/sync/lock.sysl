@@ -44,9 +44,14 @@ impl Lock for SpinLock
  * cache[i].with((b) -> b.dirty = true)
  * ```
  *
- * It differs from `sysl.threads.Mutex[T]` in two ways: the lock is any `Lock`, so a board with no
- * scheduler can use one; and it offers no `lock_raw` -- a hold that cannot be written as a block is
- * the case `Mutex[T]` exists for.
+ * **`sysl.threads.Mutex[T]` is this with a `SleepLock`**: the lock is any `Lock`, so a board with no
+ * scheduler uses the same type a hosted program's mutex is built on. `new` is `const`, so a module
+ * table of them filled by `Guarded.new` calls is constant data even on a freestanding target.
+ *
+ * `lock_raw` and `unlock_raw` are the hold a block cannot express -- taken in one function and
+ * released in another, or let go and taken again around a `Condvar.wait`. Nothing ties the address
+ * they hand out to the hold, which is what the name says; where the hold fits a block, `with` is the
+ * one to write.
  */
 @guards(value)
 struct Guarded[L: Lock, T]
@@ -84,5 +89,21 @@ struct Guarded[L: Lock, T]
 
         defer self.lock.release()
         Some(body(&self.value))
+
+    /** Takes the lock, waiting however `L` waits, and answers the address of the record.
+     *
+     * The address is live until `unlock_raw`, and nothing ties it to the hold -- holding on to it past
+     * the release compiles.
+     */
+    lock_raw(*self) -> *T
+        self.lock.acquire()
+        &self.value
+
+    /** Takes the lock if it can without waiting, and answers the record's address where it did. */
+    try_lock_raw(*self) -> Option[*T] = if self.lock.try_acquire() then Some(&self.value) else None
+
+    /** Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through
+     * the address to whoever takes it next. */
+    unlock_raw(*self) = self.lock.release()
 
 end Guarded

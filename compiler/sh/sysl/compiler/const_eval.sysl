@@ -381,11 +381,25 @@ private trial_body(a: &Analysis, name: string) -> Option[TFunc]
     val covers = a.tables.body_covers.len()
     var typed: Option[TFunc] = None
     val f = a.tables.funcs.get(name)
+    val inst = a.tables.members.const_insts.get(name)
 
     if f.is_some()
         val d = f.unwrap()
 
         typed = Some(analyze_body(a, d.scope, d.span, with_call_bounds(d.decl), name))
+    else if inst.is_some()
+        // An instantiation of a generic `const` function, read at the terms it was made at. Its
+        // signature is filed again for the reading, since the trial that asked for it took it back.
+        val (job, sig) = inst.unwrap()
+        val filed = a.tables.members.func_insts.has(name)
+        val cx = analyzer_for(a, job.scope)
+
+        if !filed then a.tables.members.func_insts.put(name, sig)
+
+        cx.subst = job.subst
+        typed = Some(analyze_instance_in(a, cx, name, job.decl))
+
+        if !filed then a.tables.members.func_insts.remove(name)
     else
         val lowered = a.tables.members.lowered
 
@@ -1709,7 +1723,7 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
         return None
     end if
 
-    if r.a.tables.members.func_origin.has(name)
+    if r.a.tables.members.func_origin.has(name) && !r.a.tables.members.const_insts.has(name)
         refuse_form(r, at, s"'${qualified_name(name)}' is an instance of a generic 'const' function, and " +
                     "those are not evaluated while compiling yet")
         return None

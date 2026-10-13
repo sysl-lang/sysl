@@ -22,7 +22,7 @@ struct SleepLock
     private state: Atomic[u32]
 
     /** A free lock. */
-    new() -> SleepLock = SleepLock(Atomic(0))
+    const new() -> SleepLock = SleepLock(Atomic(0))
 
     /** Takes the lock, sleeping until it is free. */
     @blocks
@@ -88,17 +88,18 @@ impl Lock for SleepLock
  * `pthread_mutex_t`: a caller-allocated C struct's size is in a header and differs between libcs on
  * one platform, and the futex is what every system that has threads has underneath its own mutex. A
  * waiter sleeps; it neither spins nor yields.
+ *
+ * **Underneath it is a `sysl.sync.Guarded[SleepLock, T]`** -- the record-and-its-own-lock every lock
+ * shares -- so the two are one implementation and lay out alike. `Mutex[T]` is the name a hosted
+ * program reaches for, and the one that picks the lock for it.
  */
-@guards(value)
+@guards(inner)
 struct Mutex[T]
 
-    // The lock. Private for the reason the value is: everything the type promises is that the two
-    // are only ever reached together.
-    private lock: SleepLock
-
-    // What the lock protects. Private is the whole of what "owns" means here -- with it public,
-    // `m.value` would be an unsynchronized read of the thing the type exists to synchronize.
-    private value: T
+    // The lock and what it protects, together. Private is the whole of what "owns" means here --
+    // `Guarded` keeps its own fields private too, and `@guards(inner)` is what holds every way out of
+    // this struct to the rule the value inside it is held to.
+    private inner: Guarded[SleepLock, T]
 
     /** Builds a free lock around a value.
      *
@@ -106,7 +107,7 @@ struct Mutex[T]
      * Structs`), so a private field is what makes this the only way in from outside -- which is
      * what keeps the lock starting free.
      */
-    new(value: T) -> Mutex[T] = Mutex(SleepLock.new(), value)
+    const new(value: T) -> Mutex[T] = Mutex(Guarded.new(SleepLock.new(), value))
 
     /** Takes the lock, waiting until it is free, runs `body` with the address of what it protects,
      * releases the lock, and answers what `body` answered.
@@ -120,18 +121,20 @@ struct Mutex[T]
     @lends(body)
     @blocks
     with[R](*self, body: *T -> R) -> R
-        self.lock_raw()
+        val held = self.inner.lock_raw()
 
-        defer self.unlock_raw()
-        body(&self.value)
+        defer self.inner.unlock_raw()
+        body(held)
 
     /** The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. */
     @lends(body)
     try_with[R](*self, body: *T -> R) -> Option[R]
-        if !self.lock.try_lock() then return None
+        val held = self.inner.try_lock_raw()
 
-        defer self.unlock_raw()
-        Some(body(&self.value))
+        if held.is_none() then return None
+
+        defer self.inner.unlock_raw()
+        Some(body(held.unwrap()))
 
     /** Takes the lock, waiting until it is free, and answers the address of what it protects.
      *
@@ -140,12 +143,10 @@ struct Mutex[T]
      * in another; where the hold fits a block, `with` is the one to write.
      */
     @blocks
-    lock_raw(*self) -> *T
-        self.lock.lock()
-        &self.value
+    lock_raw(*self) -> *T = self.inner.lock_raw()
 
     /** Takes the lock if it is free, and answers what it protects where it did. Never waits. */
-    try_lock_raw(*self) -> Option[*T] = if self.lock.try_lock() then Some(&self.value) else None
+    try_lock_raw(*self) -> Option[*T] = self.inner.try_lock_raw()
 
     /** Releases the lock a `lock_raw` or `try_lock_raw` took.
      *
@@ -154,6 +155,6 @@ struct Mutex[T]
      * the data safe to touch, and it is why neither of these takes an `Ordering`: a lock's orderings
      * are fixed by what a lock means.
      */
-    unlock_raw(*self) = self.lock.unlock()
+    unlock_raw(*self) = self.inner.unlock_raw()
 
 end Mutex

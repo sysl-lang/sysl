@@ -78,8 +78,10 @@ private guarded_result(a: &Analysis, funcs: Buf[TFunc], index: Map[string, usize
 
     val d = guard.unwrap()
 
-    // A guarding struct's members call one another inside the guard, which is where they may.
-    if own.is_some() && own.unwrap().base == d.base then return
+    // A guarding struct's members call one another inside the guard, which is where they may -- and
+    // so do the members of a struct whose guarded field IS such a struct (`Mutex[T]` over a
+    // `Guarded[SleepLock, T]`), since what they answer is checked again at their own calls.
+    if own.is_some() && guards_within(own.unwrap(), d) then return
 
     val inside = guarded_unshareable(d)
 
@@ -97,6 +99,21 @@ private guarded_result(a: &Analysis, funcs: Buf[TFunc], index: Map[string, usize
 
     a.fault(scope, e.span, guarded_complaint(shown, inside.unwrap(), leaving.unwrap(), ty))
 end guarded_result
+
+// Whether `own` is the guarding struct `d`, or guards a field of type `d`.
+private guards_within(own: &StructType, d: &StructType) -> bool
+    if own.base == d.base then return true
+
+    for item in own.fields
+        if holds_string(own.guarded, item.0)
+            val inner = item.1 match
+                Struct(s) -> s.base == d.base
+                _ -> false
+
+            if inner then return true
+
+    false
+end guards_within
 
 // The body that makes what a call answers: the closure or named function handed to it.
 private answering_body(funcs: Buf[TFunc], index: Map[string, usize], args: Buf[TExpr]) -> Option[TFunc]

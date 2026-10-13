@@ -319,22 +319,24 @@ unchecked one.
 
 ## `Mutex[T]`
 
-`Mutex[T]` **owns what it protects**, which is the whole difference against `SpinLock`. Both of its
-fields are private, so there is no way to reach the value that does not go through the lock:
+`Mutex[T]` **owns what it protects**, which is the whole difference against `SpinLock`. Underneath
+it is a `sysl.sync.Guarded[SleepLock, T]` — the record-beside-its-lock every lock in the library
+shares (`library/sync.md`) — held in one private field, and `Guarded` keeps its own `value` private
+in turn, so there is no way to reach the value that does not go through the lock:
 
 ```sysl
 import sysl.threads.*
 
 var m = Mutex.new(7)
 
-print(m.value)
+print(m.inner)
 ```
 
 ```error
-field 'value' of 'sysl.threads.Mutex' is private to 'library/sysl/threads/mutex.sysl', the file that declares it
+field 'inner' of 'sysl.threads.Mutex' is private to 'library/sysl/threads/mutex.sysl', the file that declares it
 ```
 
-Private is the entirety of what "owns" means here. With `value` public, reading it would be an
+Private is the entirety of what "owns" means here. With the value public, reading it would be an
 unsynchronized read of the very thing the type exists to synchronize, and the type would be a
 spinlock with a suggestion attached.
 
@@ -342,15 +344,16 @@ The private field does a second job: it puts the **positional constructor** out 
 `Mutex.new` is the only way in and there is no way to build one that starts out held.
 
 ```sysl
+import sysl.sync.Guarded
 import sysl.threads.*
 
-var built = Mutex(SleepLock.new(), 5)
+var built: Mutex[int] = Mutex(Guarded.new(SleepLock.new(), 5))
 
 built.with((p) -> print(*p))
 ```
 
 ```error
-the constructor names every field of 'sysl.threads.Mutex' in order, and 'lock' is private to 'library/sysl/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
+the constructor names every field of 'sysl.threads.Mutex' in order, and 'inner' is private to 'library/sysl/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
 ```
 
 ### `with` lends the value for one call

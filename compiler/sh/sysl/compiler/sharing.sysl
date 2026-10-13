@@ -96,10 +96,19 @@ end unguarded
 
 // The part of a guarded field that may not be shared, or nothing where every guarded field of `d`
 // reaches only atomic counts -- in which case nothing a member hands out of it can carry one.
+//
+// **A guarded field that is itself a guarding struct is looked through**, to what IT guards: the walk
+// leaves that out, which is right for sharing the struct and wrong here -- `Mutex[T]` guards a
+// `Guarded[SleepLock, T]`, and what its members hand out comes from the `T`.
 guarded_unshareable(d: &StructType) -> Option[Unshareable]
     for item in d.fields
         if holds_string(d.guarded, item.0)
-            val found = share_walk(item.1, just_field(item.0), None, false)
+            val nested: Option[&StructType] = item.1 match
+                Struct(inner) -> if inner.guarded.is_empty() then None else Some(inner)
+                _ -> None
+
+            val found = if nested.is_some() then guarded_unshareable(nested.unwrap())
+            else share_walk(item.1, just_field(item.0), None, false)
 
             if found.is_some() then return found
 
