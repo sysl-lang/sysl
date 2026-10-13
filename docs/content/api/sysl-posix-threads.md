@@ -17,7 +17,7 @@ so a value made through either module is the other's.
 
 ## Index
 
-[`channel`](#channel) [`current`](#current) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`yield_now`](#yield_now) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Lock`](#lock) [`Mutex`](#mutex) [`Thread`](#thread)
+[`channel`](#channel) [`current`](#current) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`yield_now`](#yield_now) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`SleepLock`](#sleeplock) [`Thread`](#thread)
 
 ## Functions
 
@@ -75,16 +75,16 @@ type Channel[T] = th.Channel[T]
 type Condvar = th.Condvar
 ```
 
-### `Lock`
-
-```sysl
-type Lock = th.Lock
-```
-
 ### `Mutex`
 
 ```sysl
 type Mutex[T] = th.Mutex[T]
+```
+
+### `SleepLock`
+
+```sysl
+type SleepLock = th.SleepLock
 ```
 
 ### `Thread`

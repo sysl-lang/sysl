@@ -21,7 +21,7 @@ schedules threads on it.
 
 **Every thread is started, joined and named through the hooks** -- `sysl_thread_spawn`,
 `sysl_thread_join`, `sysl_thread_self` and `sysl_thread_yield` -- and **every wait sleeps on the
-futex pair**, `sysl_futex_wait` and `sysl_futex_wake`. `Lock`, `Mutex[T]`, `Condvar` and
+futex pair**, `sysl_futex_wait` and `sysl_futex_wake`. `SleepLock`, `Mutex[T]`, `Condvar` and
 `Channel[T]` are written once, here, over `sysl.sync.Atomic[u32]` and those two hooks; nothing in
 them is a C type.
 
@@ -43,7 +43,7 @@ compiler says so at the call (`reference/memory.md § @crossing`).
 
 ## Index
 
-[`DEFAULT_STACK`](#default_stack) [`channel`](#channel) [`current`](#current) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Lock`](#lock) [`Mutex`](#mutex) [`Thread`](#thread)
+[`DEFAULT_STACK`](#default_stack) [`channel`](#channel) [`current`](#current) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`SleepLock`](#sleeplock) [`Thread`](#thread) [Lock for SleepLock](#lock-for-sleeplock)
 
 ## Constants
 
@@ -176,7 +176,7 @@ processor straight back.
 
 ```sysl
 struct Channel[T]
-    private lock: Lock
+    private lock: SleepLock
     private has_room: Condvar
     private has_value: Condvar
     private ring: Ring[T]
@@ -260,40 +260,15 @@ m.unlock_raw()
 | `new` | `new() -> Condvar` | A condition variable nobody is waiting on. |
 | `wait` | `wait[T](*self, m: *Mutex[T])` | Releases `m`, which the caller holds, sleeps until notified, and takes `m` again before answering. |
 | `wait_for` | `wait_for[T](*self, m: *Mutex[T], ns: i64) -> bool` | `wait`, for at most `ns` nanoseconds: answers `false` where the time ran out first. |
-| `wait_raw` | `wait_raw(*self, l: *Lock)` | `wait` over a bare `Lock`, which the caller holds. |
+| `wait_raw` | `wait_raw(*self, l: *SleepLock)` | `wait` over a bare `SleepLock`, which the caller holds. |
 | `notify_one` | `notify_one(*self)` | Wakes one waiter, if there is one. |
 | `notify_all` | `notify_all(*self)` | Wakes every waiter. |
-
-### `Lock`
-
-```sysl
-struct Lock
-    private state: Atomic[u32]
-```
-
-A lock that sleeps, and guards nothing of its own: the classic three-state futex lock.
-
-**The word is zero when free, one when held, and two when held with a thread asleep on it**, so an
-uncontended `lock` and `unlock` are one atomic operation each and never reach the system, and only
-an `unlock` that may have a sleeper to wake calls `sysl_futex_wake`. A waiter sleeps in
-`sysl_futex_wait` rather than spinning or yielding, so a contended lock costs nothing while it waits.
-
-It is what `Mutex[T]` and `Channel[T]` are built on, and it is public for the hold neither of them
-expresses: a lock beside data the program names itself, as `SpinLock` is, for code that may sleep.
-
-| Member | Signature | Description |
-|---|---|---|
-| `new` | `new() -> Lock` | A free lock. |
-| `lock` | `lock(*self)` | Takes the lock, sleeping until it is free. |
-| `try_lock` | `try_lock(*self) -> bool` | Takes the lock if it is free, and answers whether it did. |
-| `unlock` | `unlock(*self)` | Releases the lock, waking one sleeper where there may be one. |
 
 ### `Mutex`
 
 ```sysl
 struct Mutex[T]
-    private lock: Lock
-    private value: T
+    private inner: Guarded[SleepLock, T]
 ```
 
 Mutual exclusion that **owns what it protects**, which is the difference `library/threads.md §
@@ -321,19 +296,49 @@ A guarded value crosses with its lock`): sharing the lock does not share the val
 through `with` or `try_with` is held to the `&sync` rule instead -- an `int` or a `.copy()` of a
 string, not the `Map` or a string still sharing the guarded one's count.
 
-**The lock is a `Lock`, written in sysl over an `Atomic[u32]` and the futex hooks**, not a
+**The lock is a `SleepLock`, written in sysl over an `Atomic[u32]` and the futex hooks**, not a
 `pthread_mutex_t`: a caller-allocated C struct's size is in a header and differs between libcs on
 one platform, and the futex is what every system that has threads has underneath its own mutex. A
 waiter sleeps; it neither spins nor yields.
 
+**Underneath it is a `sysl.sync.Guarded[SleepLock, T]`** -- the record-and-its-own-lock every lock
+shares -- so the two are one implementation and lay out alike. `Mutex[T]` is the name a hosted
+program reaches for, and the one that picks the lock for it.
+
 | Member | Signature | Description |
 |---|---|---|
-| `new` | `new(value: T) -> Mutex[T]` | Builds a free lock around a value. |
+| `new` | `const new(value: T) -> Mutex[T]` | Builds a free lock around a value. |
 | `with` | `with[R](*self, body: *T -> R) -> R` | Takes the lock, waiting until it is free, runs `body` with the address of what it protects, releases the lock, and answers what `body` answered. |
 | `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. |
 | `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting until it is free, and answers the address of what it protects. |
 | `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it is free, and answers what it protects where it did. |
 | `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took. |
+
+### `SleepLock`
+
+```sysl
+struct SleepLock
+    private state: Atomic[u32]
+```
+
+A lock that sleeps, and guards nothing of its own: the classic three-state futex lock.
+
+**The word is zero when free, one when held, and two when held with a thread asleep on it**, so an
+uncontended `lock` and `unlock` are one atomic operation each and never reach the system, and only
+an `unlock` that may have a sleeper to wake calls `sysl_futex_wake`. A waiter sleeps in
+`sysl_futex_wait` rather than spinning or yielding, so a contended lock costs nothing while it waits.
+
+It is what `Mutex[T]` and `Channel[T]` are built on, and it is public for the hold neither of them
+expresses: a lock beside data the program names itself, as `SpinLock` is, for code that may sleep.
+It implements `sysl.sync.Lock`, so `Guarded[SleepLock, T]` is a record with a sleeping lock of its
+own.
+
+| Member | Signature | Description |
+|---|---|---|
+| `new` | `const new() -> SleepLock` | A free lock. |
+| `lock` | `lock(*self)` | Takes the lock, sleeping until it is free. |
+| `try_lock` | `try_lock(*self) -> bool` | Takes the lock if it is free, and answers whether it did. |
+| `unlock` | `unlock(*self)` | Releases the lock, waking one sleeper where there may be one. |
 
 ### `Thread`
 
@@ -355,3 +360,11 @@ keeps its storage for the rest of the program.
 | Member | Signature | Description |
 |---|---|---|
 | `join` | `join(self) -> bool` | Waits for the thread to finish, and answers whether it was waited for. |
+
+## Implementations
+
+### Lock for SleepLock
+
+```sysl
+impl Lock for SleepLock
+```

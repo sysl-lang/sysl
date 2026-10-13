@@ -20,7 +20,7 @@ them exactly as much as a hosted one that shares it with a thread.
 
 ## Index
 
-[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Ordering`](#ordering) [`SpinLock`](#spinlock)
+[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Guarded`](#guarded) [`Ordering`](#ordering) [`SpinLock`](#spinlock) [`Lock`](#lock) [Lock for SpinLock](#lock-for-spinlock)
 
 ## Functions
 
@@ -88,6 +88,50 @@ the bargain the whole `*T` tier makes.
 | `or` | `or(*self, n: T, ord: Ordering = SeqCst) -> T` | Bitwise-ors into the word and answers what was there before, which is how a flag is set in a word other threads are setting their own flags in. |
 | `xor` | `xor(*self, n: T, ord: Ordering = SeqCst) -> T` | Bitwise-xors into the word and answers what was there before. |
 
+### `Guarded`
+
+```sysl
+struct Guarded[L: Lock, T]
+    private lock: L
+    private value: T
+```
+
+A record and its own lock, stored together, with **the record reachable only while the lock is
+held**.
+
+**This is the shape of a table whose every entry has a lock of its own** -- a buffer cache, an
+inode table, a page cache -- and it is a value, not a box: the lock is laid out inline beside the
+record, so `[64]Guarded[SpinLock, Inode]` is sixty-four locks and sixty-four inodes in one array,
+with no allocation and no count anywhere but inside the records themselves.
+
+**`@guards(value)` is what lets such a table cross into another domain** whatever its records
+hold (`reference/memory.md § A guarded value crosses with its lock`): both fields are private, so
+sharing the table shares the locks and not the records, and an array is shared element by
+element. What leaves through `with` or `try_with` is held to the `&sync` rule at the call -- an
+`int` or a `.copy()` of a string, not a `Buf` still sharing a count with the one inside.
+
+```
+cache[i].with((b) -> b.dirty = true)
+```
+
+**`sysl.threads.Mutex[T]` is this with a `SleepLock`**: the lock is any `Lock`, so a board with no
+scheduler uses the same type a hosted program's mutex is built on. `new` is `const`, so a module
+table of them filled by `Guarded.new` calls is constant data even on a freestanding target.
+
+`lock_raw` and `unlock_raw` are the hold a block cannot express -- taken in one function and
+released in another, or let go and taken again around a `Condvar.wait`. Nothing ties the address
+they hand out to the hold, which is what the name says; where the hold fits a block, `with` is the
+one to write.
+
+| Member | Signature | Description |
+|---|---|---|
+| `new` | `const new(lock: L, value: T) -> Guarded[L, T]` | A record behind a lock, which must be free. |
+| `with` | `with[R](*self, body: *T -> R) -> R` | Takes the lock, waiting however `L` waits, runs `body` with the address of the record in place, releases the lock on every way out, and answers what `body` answered. |
+| `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock can be taken without waiting: `Some` of what `body` answered, or `None`. |
+| `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting however `L` waits, and answers the address of the record. |
+| `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it can without waiting, and answers the record's address where it did. |
+| `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through the address to whoever takes it next. |
+
 ### `Ordering`
 
 ```sysl
@@ -154,3 +198,43 @@ pointers, where a type that owned its contents would have nothing coherent to ow
 | `with` | `with[R](*self, body: () -> R) -> R` | Takes the lock, runs `body`, releases the lock, and answers what `body` answered. |
 | `try_with` | `try_with[R](*self, body: () -> R) -> Option[R]` | The same, if the lock is free: `Some` of what `body` answered, or `None` without spinning. |
 | `unlock` | `unlock(*self)` | Releases the lock. |
+
+## Traits
+
+### `Lock`
+
+```sysl
+trait Lock
+    acquire(*self)
+    try_acquire(*self) -> bool
+    release(*self)
+```
+
+What every lock does, whatever it waits by: take the lock, try to take it, let it go.
+
+**A lock is told apart by how it waits, and nothing that holds one needs to know which.** A
+`SpinLock` spins, a `sysl.threads.SleepLock` sleeps on a futex, and a kernel's own lock may mask
+interrupts on the processor taking it -- and `Guarded[L, T]` is written once over all of them. The
+trait asks for nothing a board lacks, so a package can implement it for a lock it defines itself.
+
+**`acquire` returns with the lock held and everything the last holder wrote visible**, which is
+an `Acquire` ordering on whatever word the lock takes, and **`release` publishes everything the
+holder wrote** to whoever acquires next, which is a `Release` on it. That pairing is the whole of
+what makes data behind the lock safe to touch, and it is the implementation's to keep.
+
+`try_acquire` takes the lock only where it can without waiting, and answers whether it did. A lock
+that never waits -- one that masks interrupts on a single processor -- answers `true` every time.
+
+| Member | Signature | Description |
+|---|---|---|
+| `acquire` | `acquire(*self)` |  |
+| `try_acquire` | `try_acquire(*self) -> bool` |  |
+| `release` | `release(*self)` |  |
+
+## Implementations
+
+### Lock for SpinLock
+
+```sysl
+impl Lock for SpinLock
+```

@@ -14,7 +14,7 @@ rendering itself through `Display` is handed the `FormatSpec` the same count mak
 
 ## Index
 
-[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
+[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`fixed_scratch_len`](#fixed_scratch_len) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_fixed_wide`](#format_fixed_wide) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_fixed_wide`](#write_fixed_wide) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
 
 ## Constants
 
@@ -46,6 +46,15 @@ binary[T: Integer](v: T, width: int = 0) -> string
 
 An integer in base two, as `f"$v%b"` makes it: `width` zero-pads, and a negative value reads at
 its own width, so `binary(i8(-6))` is `"11111010"`.
+
+### `fixed_scratch_len`
+
+```sysl
+fixed_scratch_len(bits: usize) -> usize
+```
+
+A scratch this long is enough for `write_fixed_wide` of a fixed-point value stored in `bits` bits,
+under any specifier: a value never has more significant digits than it has bits.
 
 ### `format_bf16_plain`
 
@@ -138,6 +147,19 @@ even at the position the conversion names, never a `double`'s approximation of i
 `i64q60` keeps every one of its bits -- `${q31::Max}%.12f` is `0.999999999534`, and `%.20f` of an
 `i64q60` prints digits no `double` holds. `spec`, `width` and `precision` are read as `format_real`
 reads them, flag for flag.
+
+### `format_fixed_wide`
+
+```sysl
+format_fixed_wide[T: Integer](raw: T, frac: int, spec: string, width: int, precision: int) -> string
+```
+
+A fixed-point value of any width under a printf float conversion -- what `${x}%.4f` lowers to when
+`x` is wider than 128 bits, an `i256q100` say. `raw` is the integer the value is stored as
+(`x.bits`) at its own type, `frac` is the format's fraction, and the value is `raw * 2^-frac`. The
+digits are exact and rounded as `format_fixed`'s are, half to even at the position the conversion
+names; the arithmetic is the same, over working integers sized by the type, on the stack. `%a` is
+not offered, as a hole does not offer it, and answers an empty string.
 
 ### `format_int`
 
@@ -300,6 +322,16 @@ a `q31` exactly. `raw`, `bits`, `signed` and `frac` say what the value is (`i128
 format's width, whether it is an `iWqF`, and its `F`); the rest is `write_real`'s.
 `float_scratch_len` bytes of scratch are always enough: the longest exact value of a 128-bit format
 runs to under two hundred digits.
+
+### `write_fixed_wide`
+
+```sysl
+write_fixed_wide[T: Integer](raw: T, frac: int, out: *Writer, spec: string, width: int, precision: int, scratch: []u8) -> Result[unit, FormatError]
+```
+
+`format_fixed_wide` written to `out`, allocating nothing, as `write_fixed` is for the narrow
+formats. `fixed_scratch_len(bits)` bytes of scratch are always enough, and a shorter one is refused
+with `Short` naming a length that would do, before anything is written.
 
 ### `write_real`
 

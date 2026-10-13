@@ -15,7 +15,7 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 
 ## Index
 
-[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -176,6 +176,16 @@ impl[T] Index[usize, T] for Buf[T]
 
 Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
 means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
+
+### IndexPlace for Buf[T]
+
+```sysl
+impl[T] IndexPlace[usize, T] for Buf[T]
+```
+
+`b[i]` is the element where it lives: the address, checked against the count, so `b[i].f` reads
+one field without copying the element and `ref e = b[i]` names it. Good until a `@relocates`
+member moves the storage.
 
 ### IndexSet for Buf[T]
 
