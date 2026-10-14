@@ -1732,17 +1732,28 @@ stands in for expansion, in the one direction the catalog needs.
 
 | absent | why, and what to write instead |
 |---|---|
-| explicit type arguments **at a call** | `id[int](7)` collides with indexing; annotate what receives the result. At an **address** they are written — `&f[T]` |
 | `where` clauses | the inline `[T: A + B]` list is the settled baseline; an out-of-line form is a possible ergonomic addition |
 | type-level arithmetic (`[N + 1]T`) | a value parameter may stand as a length but not be computed with in a type; deciding that `N + 1` and `1 + N` are one type is a feature of its own |
 | pack expansion (`f(..a)`, `(..A, int)`) | a pack may be matched and walked, not spread into an argument list or appended to; `for const` is what stands in for it |
 | higher-kinded parameters (`F[_]`) | **excluded**, not deferred — it pushes inference toward undecidable, and abstraction over containers is served by traits and bounds |
 
-The first of those has one position where the annotation costs more than a word. A **nullary** generic
-has no argument to be inferred from, so `buf()` and `map()` are solved by what receives the result and
-nothing else — and `buf[u8]()` is the first thing a reader tries. That form is refused **by name**,
-naming the annotation that stands in for it, rather than by a general complaint about a callee that is
-not a name.
+Explicit type arguments at a call are **not** among them: they are written at the five heads
+[above](#writing-the-type-arguments). They matter most for a **nullary** generic, which has no
+argument to be inferred from — `buf()` and `map()` are otherwise solved by what receives the result
+and nothing else, and `buf[u8]()` says it at the call:
+
+```sysl
+import sysl.buf.buf
+
+var b = buf[u8]()
+
+b.push(3)
+print(b.len())
+```
+
+```output
+1
+```
 
 ---
 

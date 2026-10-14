@@ -2785,6 +2785,37 @@ c.with((v) -> keep(hp, v))
 and this one is passed to 'keep', which holds on to it
 ```
 
+**What a call answers is followed the same way.** A callee whose answer is made of the pointer — the
+pointer itself, or the address of something inside what it points at — hands the body the lent
+pointer back, and the body is held to it. A pointer the callee **read out of** the lent value is
+somebody else's address, and is the body's to keep:
+
+```sysl
+struct Node
+    v: int
+
+struct Queue
+    head: *Node
+
+    first(*self) -> *Node = self.head
+
+struct Guard
+    q: Queue
+
+    @lends(body)
+    with[R](*self, body: *Queue -> R) -> R = body(&self.q)
+
+var n = Node(7)
+var g = Guard(Queue(&n))
+val p = g.with((q) -> q.first())
+
+print(p.v)
+```
+
+```output
+7
+```
+
 An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed
 to one is refused as kept. Converting the pointer to an integer is not following it: `usize(p)` is
 an address as a number, which is the raw tier's to answer for.

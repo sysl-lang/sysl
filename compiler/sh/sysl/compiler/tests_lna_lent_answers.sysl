@@ -1,0 +1,113 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// What a call answers, under the lent rule: the caller follows the lent pointer into a call's answer
+// only where the callee's body makes the answer of it (`lends.sysl`'s `lent_answered`). A pointer the
+// callee read OUT of the lent value is somebody else's address. `reference/memory.md § A pointer lent
+// for one call` is the specification.
+
+private lna_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lna").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lna_outcome
+
+private lna_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lna_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lna_prints
+
+private lna_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lna_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lna_refused
+
+// A guard lending a queue whose head is a raw pointer to a node somewhere else.
+private lna_queue() -> string = raw"""
+    struct Node
+        v: int
+
+    struct Queue
+        head: *Node
+
+        first(*self) -> *Node = self.head
+
+    same(q: *Queue) -> *Queue = q
+    slot(q: *Queue) -> **Node = &q.head
+
+    struct Guard
+        q: Queue
+
+        @lends(body)
+        with[R](*self, body: *Queue -> R) -> R = body(&self.q)
+
+    var n = Node(7)
+    var g = Guard(Queue(&n))
+    """
+
+private lna_lent() -> string =
+    "'Guard.with' lends this body a pointer that is valid only until the call returns, and this one "
+
+@test("a pointer a method reads out of the lent value may be returned from the body")
+lna_read_out_returned()
+    lna_prints(lna_queue() + raw"""
+        val p = g.with((q) -> q.first())
+
+        print(p.v, p == &n)
+        """, "7 true\n")
+
+@test("and so may one read out two calls down, or by a function named there")
+lna_read_out_two_down()
+    lna_prints(lna_queue() + raw"""
+        head_of(q: *Queue) -> *Node = q.first()
+
+        val a = g.with((q) -> head_of(q))
+        val b = g.with(head_of)
+
+        print(a.v + b.v)
+        """, "14\n")
+
+@test("a callee answering the lent pointer itself is still followed, and refused")
+lna_answer_is_the_pointer()
+    lna_refused(lna_queue() + "val p = g.with((q) -> same(q))\n", lna_lent() + "is returned")
+
+@test("and so is one answering the address of the lent value's own storage")
+lna_answer_is_its_storage()
+    lna_refused(lna_queue() + "val p = g.with((q) -> slot(q))\n", lna_lent() + "is returned")
+
+@test("a callee that answers the pointer through a chain or a recursion is followed to the end")
+lna_answer_through_a_chain()
+    lna_refused(lna_queue() + raw"""
+        pass(q: *Queue, k: int) -> *Queue = if k == 0 then q else pass(q, k - 1)
+
+        val p = g.with((q) -> pass(q, 3))
+        """, lna_lent() + "is returned")

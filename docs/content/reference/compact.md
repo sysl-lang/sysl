@@ -238,7 +238,7 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 - **Comparison chains**: `0 <= i < n` is one expression, each operand evaluated once.
 - **`x is Pat`** and `x is not Pat` test against the full pattern grammar, alternatives included, and
   stand **in the condition of an `if` or a `while` and nowhere else** — chain them with `&&`, or use a
-  `match`.
+  `match`. Under that condition's `||` a test stands too, so long as it binds nothing.
 - **`?`** is postfix and tightest — except that **`await`** takes the postfix chain up to the first
   `?`, so `await f()?` is `(await f())?`: on `Ok(v)`/`Some(v)` it is `v`, otherwise it returns the
   failure from the enclosing function — which must return the same channel. It converts the error
@@ -634,6 +634,7 @@ do all along. One program and one `sysl build` settle it.
 | `this loop breaks with a int but has no 'else'` | add the `else` block that says what a normal finish is worth |
 | `a 'for' names one thing, and a pattern is what takes it apart` | `for (k, v) in …`, with the parentheses |
 | `'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else` | chain with `&&` inside the condition, or write a `match` |
+| `a pattern under '\|\|' cannot bind a name` | write `_` for the parts you do not name, chain with `&&`, or write a `match` |
 | `already implements 'sysl.Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |
 | `'require'/'ensure' clauses must come before any other statement` | move the whole contract block to the top of the body |
