@@ -483,6 +483,65 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     Impl(block, span, scope)
 end hoist_impl
 
+// **A block naming no trait adds members to a type, and it is the type's own module's to write.**
+// `impl[F: Float] Quaternion[F]` files its members exactly where the type's body files its own -- no
+// trait recorded, so they arrive wherever the type does -- which is also what makes a name the body
+// already used a duplicate, in either order. Its header binds the type's parameters as a trait
+// block's does, and a bound it adds is carried by each member it brings, so those members are asked
+// for only where the bound holds while the type's body is unchanged.
+//
+// **Another module may not**: a type's own members are part of what its declaration promises, and
+// a block elsewhere would make the type mean something different depending on what was linked.
+hoist_inherent(a: &Analysis, im: Impl)
+    val scope = im.scope
+    val span = im.span
+    val block = im.decl
+    val written = type_text(block.for_type)
+    val key = *block.for_type.kind match
+        NamedType(n, _) -> lookup_type_key(a, scope, n)
+        _ -> None
+    val nom = if key.is_some() then nominal_of(a, key.unwrap()) else None
+
+    if nom.is_none()
+        a.fault(scope, span, s"'$written' is not a struct or an enum, so an 'impl' naming no trait " +
+                s"has no members of its own to add to it — write 'impl Trait for $written' to " +
+                "implement a trait for it")
+        return
+    end if
+
+    val label = module_show(key.unwrap())
+
+    if module_of(key.unwrap()) != scope.module_name
+        a.fault(scope, span, s"'$label' ${declaring_whose(key.unwrap())}, and an 'impl' naming no " +
+                "trait adds members to a type only in a file of the module that declares it — " +
+                s"implement a trait for it here instead: 'impl Trait for $written'")
+        return
+    end if
+
+    if block.overrides
+        a.fault(scope, span, "'override' replaces a more general implementation of a trait, and " +
+                "this block names no trait — a type's own members have nothing to replace")
+        return
+    end if
+
+    if !block.assocs.is_empty()
+        a.fault(scope, block.assocs.at(0).span, "an associated type is what a block supplies for a " +
+                "trait, and this block names no trait")
+        return
+    end if
+
+    val asked = a.complaints()
+    val target = named_target(a, scope, span, block, block.for_type, key.unwrap(), nom.unwrap())
+
+    if a.complaints() > asked then return
+
+    val lowered = hoist_member_list(a, target.1, block.methods)
+
+    if !block.bounds.is_empty()
+        for fd in lowered
+            a.tables.members.block_bounds.put(fd.name, block.bounds)
+end hoist_inherent
+
 // Which associated type each `some` member settles, read off the **trait's** declaration of that
 // member. A member whose trait counterpart is not a projection has already been refused by
 // `opened_results`, so what reaches here is exactly the members that settle one.

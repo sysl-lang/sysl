@@ -570,6 +570,8 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
 
     var trait_name = ""
     var trait_args: Buf[TypeRef] = buf()
+    var for_type = named_type(p.here(), "")
+    val head_at = p.here()
 
     // `impl Fn(int) -> int for F` -- the callable trait, written as the type it stands for.
     if p.at_word("Fn") && p.kw_at(1, "(")
@@ -590,9 +592,17 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
         if p.at_kw("[") then trait_args = parse_type_args(p)
     end if
 
-    p.expect_kw("for")
-
-    val for_type = parse_type(p)
+    // **A block naming no trait adds the type's own members** -- `impl[F: Float] Quaternion[F]` --
+    // so what was read as the trait is the type, and the trait is left empty for the hoisting pass
+    // to tell the two kinds apart by.
+    if trait_name != "" &&!fn_is_call(trait_name) && !p.at_kw("for")
+        for_type = type_ref(head_at.to(p.just_taken()), NamedType(trait_name, trait_args))
+        trait_name = ""
+        trait_args = buf()
+    else
+        p.expect_kw("for")
+        for_type = parse_type(p)
+    end if
 
     tp = parse_where_on(p, tp)
 
