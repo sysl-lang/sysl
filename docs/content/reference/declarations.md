@@ -907,6 +907,62 @@ anything calls it — while a conversion written at `T` is checked at each call,
 A **closure's** parameter declares no default. A call reaches a closure through the `Fn` traits,
 which carry the types and not the names, so there would be nothing at the call to fill one from.
 
+A **trait member's** defaults and parameter names are part of the trait's signature, so they reach
+every call made through it: through a bound on a type parameter (a method, an associated function, a
+`where` clause, an associated type's bound) and through a trait object, exactly as on the type that
+implements it. The default is the trait's on every path, which is why an `impl` block's member
+declares none — a call through an object or a bound has no implementation to read one from — and an
+implementation that replaces the member keeps the trait's.
+
+```sysl
+trait Greet
+    greet(self, n: int = 3, m: int = 10) -> int = n + m
+
+struct A
+    x: int
+
+impl Greet for A
+
+via[G: Greet](g: G) -> int = g.greet()
+named[G: Greet](g: G) -> int = g.greet(m = 100)
+obj(g: &Greet) -> int = g.greet(n = 0)
+
+print(A(1).greet(), via(A(1)), named(A(1)), obj(A(1)))
+```
+
+```output
+13 13 103 10
+```
+
+```sysl
+trait Greet
+    greet(self, n: int = 3) -> int = n
+
+struct A
+    x: int
+
+impl Greet for A
+    override greet(self, n: int = 5) -> int = n * 10
+```
+
+```error
+a member of an 'impl' block declares no default
+```
+
+A parameter that has no default is still owed through a bound, and the refusal names the trait's
+member, since that is the signature the call was read against:
+
+```sysl
+trait Greet
+    greet(self, n: int, m: int = 1) -> int = n + m
+
+via[G: Greet](g: G) -> int = g.greet(m = 2)
+```
+
+```error
+method 'Greet.greet' was given no value for 'n', and that parameter declares no default
+```
+
 ### A parameter may collect the rest of the call
 
 **`xs: ...T` collects a call's trailing arguments into a `[]const T`**, so a function that takes a

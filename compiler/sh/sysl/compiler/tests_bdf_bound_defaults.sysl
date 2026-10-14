@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A trait member's defaulted parameters and its parameter names are part of the trait's signature, so
+// a call reached through a bound -- a value's method, an associated function, a `where` clause, an
+// associated type's bound -- binds what it wrote exactly as a call on the concrete type does, and so
+// does a call through a trait object (`reference/declarations.md § Default parameters and named
+// arguments`).
+
+private var bdf_library_cache: Buf[Program] = buf()
+private var bdf_library_read: bool = false
+
+private bdf_library() -> Buf[Program]
+    if bdf_library_read then return bdf_library_cache
+
+    bdf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bdf_library_cache = units
+
+    bdf_library_cache
+end bdf_library
+
+private bdf_ready() -> bool
+    if bdf_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bdf_ready
+
+// What a one-file program prints, built and run -- or what building it said.
+private bdf_ran(text: string) -> string
+    val root = make_temp_dir("sysl-bound-defaults").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bdf_ran
+
+private bdf_says(said: string, wanted: string)
+    assert(said.contains(wanted), said)
+
+@test("a default reaches a call through a bound as it reaches the concrete call")
+bdf_reported_shape()
+    if !bdf_ready() then return
+
+    assert_eq(bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int = 3) -> int = n
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet()
+
+        print(A(1).greet())
+        print(via(A(1)))
+        """), "3\n3\n")
+
+@test("defaults and named arguments bind on every path a trait member is called through")
+bdf_every_call_path()
+    if !bdf_ready() then return
+
+    assert_eq(bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int = 3, m: int = 10) -> int = n + m
+
+        trait Make
+            make(k: int = 7) -> Self
+
+        trait Holder
+            type Item: Greet
+            item(self) -> Self::Item
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        impl Make for A
+            make(k: int) -> A = A(k)
+
+        struct H
+            a: A
+
+        impl Holder for H
+            type Item = A
+            item(self) -> A = self.a
+
+        via[G: Greet](g: G) -> int = g.greet()
+        named[G: Greet](g: G) -> int = g.greet(m = 100)
+        made[G: Make]() -> G = G.make()
+        wh[G](g: G) -> int where G: Greet = g.greet(1)
+        assoc[H: Holder](h: H) -> int = h.item().greet(n = 5)
+        obj(g: &Greet) -> int = g.greet(m = 0)
+
+        print(A(1).greet())
+        print(via(A(1)))
+        print(named(A(1)))
+        print(made[A]().x)
+        print(wh(A(1)))
+        print(assoc(H(A(1))))
+        print(obj(A(1)))
+        """), "13\n13\n103\n7\n11\n15\n3\n")
+
+@test("a written argument still wins over the default through a bound, by position and by name")
+bdf_written_wins()
+    if !bdf_ready() then return
+
+    assert_eq(bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int = 3, m: int = 10) -> int = n * m
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        both[G: Greet](g: G) -> int = g.greet(2, 5)
+        swapped[G: Greet](g: G) -> int = g.greet(m = 4, n = 6)
+
+        print(both(A(1)), swapped(A(1)))
+        """), "10 24\n")
+
+@test("an implementation that replaces a defaulted member takes the trait's default on every path")
+bdf_override_takes_the_trait_default()
+    if !bdf_ready() then return
+
+    assert_eq(bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int = 3) -> int = n
+
+        struct A
+            x: int
+
+        impl Greet for A
+            override greet(self, n: int) -> int = n * 10
+
+        via[G: Greet](g: G) -> int = g.greet()
+        obj(g: &Greet) -> int = g.greet()
+
+        print(A(1).greet(), via(A(1)), obj(A(1)))
+        """), "30 30 30\n")
+
+@test("a parameter with no default left out through a bound is named, at the trait's member")
+bdf_missing_argument_through_a_bound()
+    if !bdf_ready() then return
+
+    val said = bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int, m: int = 1) -> int = n + m
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet(m = 2)
+
+        print(via(A(1)))
+        """)
+
+    bdf_says(said, "error: method 'Greet.greet' was given no value for 'n', and that parameter " +
+                   "declares no default\n --> ")
+    bdf_says(said, "main.sysl:9:32")
+
+@test("a missing argument through a bound is refused even where nothing instantiates the function")
+bdf_missing_argument_uninstantiated()
+    if !bdf_ready() then return
+
+    val said = bdf_ran(raw"""
+        trait Make
+            make(k: int) -> Self
+
+        made[G: Make]() -> G = G.make()
+
+        print(1)
+        """)
+
+    bdf_says(said, "error: associated function 'Make.make' takes 1 argument, but 0 arguments were given")
+
+@test("a name the trait's member does not declare is refused through a bound")
+bdf_unknown_name_through_a_bound()
+    if !bdf_ready() then return
+
+    val said = bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int = 3) -> int = n
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet(q = 2)
+
+        print(via(A(1)))
+        """)
+
+    bdf_says(said, "error: method 'Greet.greet' declares no parameter named 'q' — it takes 'n'")
+
+@test("too many arguments through a bound still say the count")
+bdf_too_many_through_a_bound()
+    if !bdf_ready() then return
+
+    val said = bdf_ran(raw"""
+        trait Greet
+            greet(self, n: int) -> int = n
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet(1, 2)
+
+        print(via(A(1)))
+        """)
+
+    bdf_says(said, "error: method 'Greet.greet' takes 1 argument, but 2 arguments were given")
