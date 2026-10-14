@@ -31,15 +31,23 @@ end codegen_module
 //
 // `imports` asks for the copies a build that optimizes wants of the precompiled functions it may
 // inline (`importable`); a module that will not be optimized, or whose text is printed, has none.
+//
+// `only`, where given, narrows the copies to the precompiled functions it names. A library's own
+// object half needs it: what it declares is partly another artifact's -- the standard module's
+// `real.zero` -- and partly its OWN functions deferred to the program (`library_build`), which read
+// storage or reach a body this half drops, and a copy of one of those is exactly the body the
+// deferral kept out of it.
 codegen_with_gaps(p: TProgram, t: Target, pr: Promotions,
-                  imports: bool = false) -> (IrModule, Buf[(string, string)])
+                  imports: bool = false,
+                  only: Option[Set[string]] = None) -> (IrModule, Buf[(string, string)])
     var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t, pr, imports)
+    codegen_into(&e, p, t, pr, imports, only)
 end codegen_with_gaps
 
 private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
-                     imports: bool = false) -> (IrModule, Buf[(string, string)])
+                     imports: bool = false,
+                     only: Option[Set[string]] = None) -> (IrModule, Buf[(string, string)])
     val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
@@ -100,7 +108,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
             gen_function(e, f) match
                 Some(built) -> funcs.push(built)
                 None -> gaps.push((f.name, gap_text(e)))
-        elif imports && importable(f)
+        elif imports && importable(f) && only.map((names) -> names.has(f.name)).unwrap_or(true)
             set_promoted(e, pr.for_func(f.name))
 
             e.main_thread_checks = e.off_main.has(f.name)

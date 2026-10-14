@@ -1622,6 +1622,12 @@ emits it, so the program still links the package's one definition, and a call th
 out of line is the same call it always was. The copy is made from the package's source on every
 build, so an edit to the package is what the next build inlines; nothing is kept that could be stale.
 
+**A package's own archive is a calling module too.** Its calls into the standard module, or into
+another package, carry the same copies — including a call a generic reaches through a bound. A
+package whose `is_nonzero[T: Zero + Eq](x: T) = x != T.zero()` is instantiated at `real` by the
+package's own code compiles `real.zero()` to the constant `0.0` in its archive, as it would in the
+program, rather than calling the standard module's `real.zero` out of line.
+
 So the guarantee is **the same as within one file**: a call into a package, or into another unit,
 inlines exactly where the same call would inline if both functions sat side by side — the hint is
 still a hint, and the inliner still decides. What is never carried across:
@@ -1630,7 +1636,7 @@ still a hint, and the inliner still decides. What is never carried across:
 - an `async` function, an interrupt handler, one placed in a `@section`, or a variadic one;
 - a function that reaches the package's module storage, which is compiled by the program anyway
   (the package keeps no copy of it), and so needs nothing carried;
-- a generic, which needs none of this: it is instantiated in the program that uses it, beside its
+- a generic, which needs none of this: it is instantiated in the module that uses it, beside its
   callers.
 
 `sysl emit-llvm` prints the program as one module and carries no copies.
