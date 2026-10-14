@@ -1676,9 +1676,32 @@ run()
 ```
 
 What a view is copied into is borrowed from the same receiver — a sub-slice, a struct or `Option`
-built around it, a closure that captures it, a name a pattern binds out of it — so each of those is
-held to the same places. A value that cannot hold a view (`v.len`, `v[0]`, a string rendered from
-it) is not borrowed from anything.
+built around it, a closure that captures it, a name a pattern binds out of it, a loop variable
+walking a view of views — so each of those is held to the same places. A value that cannot hold a
+view (`v.len`, `v[0]`, a string rendered from it, a byte a loop takes out of it) is not borrowed from
+anything:
+
+```sysl
+struct Table
+    rows: []const []const u8
+
+    @views(self)
+    all(&self) -> []const []const u8 = self.rows
+
+run()
+    var keep: []const u8 = []
+    val t: &Table = Table(["ab".bytes, "cde".bytes])
+
+    for row in t.all() do keep = row
+```
+
+```error
+'keep' is bound before 't', so it outlives it, and this stores in it a view borrowed from 't'
+```
+
+A trait member may carry the mark too, and then a call through a trait object (`&Viewer`) is held
+to it exactly as a call on the type is. The mark is only ever called on a value: `Column.bytes(c)`
+is refused, as every method reached through its type is.
 
 **Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
 `*self` call on it, and a call that may write an object of its type — which a member that frees the
