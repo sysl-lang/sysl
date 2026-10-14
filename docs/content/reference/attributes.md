@@ -99,7 +99,9 @@ Beside them a member takes the six about the function it lowers to — `@noinlin
 receiver's elements live in, so a live `ref` to one of them is refused the call
 ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
 the view a call answers is borrowed from its receiver, so the view may not outlive it
-([memory](/reference/memory/#a-view-borrowed-from-its-receiver)). Everything else is refused, and the line is what the annotation is **about** rather
+([memory](/reference/memory/#a-view-borrowed-from-its-receiver)), and `@consumes`, which says a call
+takes everything its receiver holds, so a local it was called on may not be read again until it is
+assigned (below). Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -1617,6 +1619,135 @@ calls itself nowhere the jump can replace
 
 It changes nothing about what is emitted. Write it where losing the jump silently would be a bug,
 and leave it off everywhere else.
+
+## `@consumes` — a call that takes everything its receiver holds
+
+Some members hand back what their receiver held and leave the receiver empty: `Buf.freeze()` moves a
+buffer's elements into the frozen buffer it answers ([memory](/reference/memory/#a-frozen-buffer-crosses)).
+A read of that receiver afterwards can only find nothing, so **`@consumes` above such a member makes
+the read a refusal**: once a local has been called on, it may not be read again on any path until it
+is assigned a new value.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    print(f.len(), b.len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held — 'freeze' is '@consumes', so 'b' has nothing in it on this path until it is assigned again
+```
+
+**Assigning it ends it**, and so does binding the name afresh — a `var` inside a loop body is a new
+local every turn:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    b = buf()
+    b.push(7)
+    print(f.len(), b.len(), b[0])
+
+    for i in 0..<2
+        var c: Buf[int] = buf()
+
+        c.push(i)
+        print(c.freeze()[0])
+
+run()
+```
+
+```output
+2 1 7
+0
+1
+```
+
+**The check follows every path the body can take.** A branch that consumed on one side leaves the
+local consumed after the two sides meet, and a loop is followed round, so a read on a later turn
+counts — here the second turn's `push`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    for i in 0..<3
+        b.push(i)
+
+        if i == 1 then print(b.freeze().len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
+A branch that consumed and then left — a `return`, a `break` past the read — never reaches it, and is
+not refused.
+
+**Only a local is followed.** A field, an element, or what a pointer or a second name reaches may be
+reached another way the body cannot see, so a call on one is accepted, and the member's own emptying
+at run time is what a later read finds:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Holder
+    b: Buf[int]
+
+val h: &Holder = Holder(buf())
+
+h.b.push(1)
+
+val f = h.b.freeze()
+
+print(f.len(), h.b.len())
+```
+
+```output
+1 0
+```
+
+**A call through a trait object is not followed either**: which body a slot dispatches to is settled
+at run time, so a trait member's `@consumes` says nothing about the object's own local. A method has
+no second spelling the check could miss — `Buf.freeze(b)` is refused as every instance method named
+through its type is.
+
+It marks a member that takes a receiver, in any mode, and takes no arguments. Above a free function,
+or a member that takes no `self`, it is refused:
+
+```sysl
+struct S
+    v: int
+
+    @consumes
+    make() -> S = S(1)
+```
+
+```error
+'@consumes' says a call to 'make' takes everything its receiver holds, and it has none — it takes no 'self'
+```
 
 ## `@noinline`, `@inline` and `@cold` — what the optimizer is told about a definition
 

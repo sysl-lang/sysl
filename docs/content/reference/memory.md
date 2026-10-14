@@ -2998,6 +2998,30 @@ assignment needs a variable, a field, an element, or a dereference — something
 `f.push(2)` is refused as a method `Frozen` does not have, and a store through `view()` is refused as
 a store through any `[]const T`.
 
+**Reading a local after `freeze` is refused**, since all it can find is the empty buffer: `freeze`
+is [`@consumes`](/reference/attributes/), so on every path after the call the local may not be read
+until it is assigned a new value. A field, or module storage like `b` above, is not followed, and
+reads as empty:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+pixels() -> usize
+    var b: Buf[u8] = buf()
+
+    b.push(1)
+
+    val f = b.freeze()
+
+    f.len() + b.len()
+
+print(pixels())
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
 **A frozen buffer shares exactly what its elements share.** Every thread reading one reads its
 elements, so the element type is held to the rule a `&sync` struct's fields are: a scalar, a `&sync
 U` (a `&sync` trait object among them), a raw pointer, another frozen buffer, and arrays and structs
