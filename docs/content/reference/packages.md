@@ -1551,9 +1551,10 @@ dev_dependencies {
 The difference is entirely in **who resolves them**:
 
 - `sysl test` on this project resolves them, exactly like an ordinary dependency;
-- `sysl build`, `sysl build-lib` and `sysl build-c` do not — every other build drops the source that
-  could name one before it analyzes anything, so fetching the package would compile something the
-  compilation cannot refer to;
+- `sysl build`, `sysl run`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` do not — every
+  build but `sysl test` drops the project's tests (each `@tests` file, and every `@test` function and
+  hook) after the parse and before it analyzes anything, so a test's import of one is never read and
+  fetching the package would compile something the compilation cannot refer to;
 - **anything that depends on this package does not resolve them at all**, at any command. They are
   not fetched, not built, and not on the link line.
 
