@@ -73,6 +73,11 @@ _start:
 
     bl   main
 
+    // `exit(status)` is the same door, with the status already in r0: the library calls it when a
+    // program panics, as it calls `putchar` to say why.
+    .thumb_func
+    .global exit
+exit:
     // SYS_EXIT_EXTENDED (0x20), not SYS_EXIT (0x18). On AArch32 the plain call takes the reason in
     // r1 and always reports zero, so a `main` returning 7 arrives as 0 and every assertion made
     // against the status is worthless. The extended call takes a pointer to {reason, code}, and

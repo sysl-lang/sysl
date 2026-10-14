@@ -103,11 +103,15 @@ private suppliers_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: 
     // definition. Where a reached body computes with `f128`, the whole runtime is kept -- the
     // linker takes the routines the code asks for and drops the rest -- and where none does it
     // is left out, so a build that may not touch a float register never meets one.
-    if !holds_quad_runtime(*extra) && reaches_quad(p, live)
-        for f in exports
-            if f.declared_in == QuadRuntimeModule && !holds_func(*extra, f.name)
-                extra.push(f)
-                more = true
+    if runtime_reached(p, live, exports, extra, QuadArithmetic) then more = true
+
+    // **A 32-bit machine's two runtimes are the same kind for the same reason**: a `long` divided
+    // lowers to `sdiv i64`, and Arm turns that into `__aeabi_ldivmod` and RISC-V into `__divdi3`; an
+    // `f64` operation on a machine with no double-precision unit becomes `__aeabi_dmul` or
+    // `__muldf3`. The modules exist only where their `#if` admits the processor, so on every other
+    // machine there is nothing here to keep.
+    if runtime_reached(p, live, exports, extra, DoubleArithmetic) then more = true
+    if runtime_reached(p, live, exports, extra, WideDivision) then more = true
 
     more
 end suppliers_reached
@@ -124,28 +128,68 @@ private exports_of(p: TProgram) -> Buf[TFunc]
 // The module whose `@export`s are the binary128 routines LLVM calls.
 const QuadRuntimeModule: string = "sysl.softfloat"
 
-private holds_quad_runtime(fs: Buf[TFunc]) -> bool
+// The module whose `@export`s are a 32-bit machine's binary64 routines: Arm's `__aeabi_d*` and the
+// `__adddf3` family, which a machine without a double-precision unit calls for every `f64` operation.
+const DoubleRuntimeModule: string = "sysl.softfloat.binary64"
+
+// The module whose `@export`s are a 32-bit machine's 64-bit division: `__aeabi_uldivmod` and its
+// relatives on Arm, `__udivdi3` and its relatives on RISC-V.
+const DivisionRuntimeModule: string = "sysl.softint"
+
+// The runtimes LLVM calls into on its own, each kept where a reached body computes what it answers.
+private enum Runtime
+    QuadArithmetic
+    DoubleArithmetic
+    WideDivision
+
+private runtime_home(r: Runtime) -> string = r match
+    QuadArithmetic -> QuadRuntimeModule
+    DoubleArithmetic -> DoubleRuntimeModule
+    WideDivision -> DivisionRuntimeModule
+
+// Keeps every `@export` of `r`'s module, where this build has the module at all and something the
+// walk reached computes what it answers; true where one was new. The linker takes the routines the
+// code asks for and drops the rest.
+private runtime_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: *Buf[TFunc],
+                        r: Runtime) -> bool
+    val home = runtime_home(r)
+
+    if !holds_runtime(exports, home) || holds_runtime(*extra, home) || !reaches_runtime(p, live, r)
+        return false
+
+    var more = false
+
+    for f in exports
+        if f.declared_in == home && !holds_func(*extra, f.name)
+            extra.push(f)
+            more = true
+
+    more
+end runtime_reached
+
+private holds_runtime(fs: Buf[TFunc], home: string) -> bool
     for item in fs
-        if item.declared_in == QuadRuntimeModule then return true
+        if item.declared_in == home then return true
 
     false
-end holds_quad_runtime
+end holds_runtime
 
-// Whether anything the walk reached holds an `f128`: a signature, a value a body computes, the
-// program's own statements or its storage. The runtime's own bodies are not asked.
-private reaches_quad(p: TProgram, live: &Live) -> bool
+// Whether anything the walk reached computes what `r` answers: a signature, a value a body computes,
+// the program's own statements or its storage. The runtime's own bodies are not asked.
+private reaches_runtime(p: TProgram, live: &Live, r: Runtime) -> bool
     var hits: Buf[Span] = buf()
     val sink = &hits
-    val walk = expr_walk(false, (e) -> note_quad(sink, e))
+    val walk = expr_walk(false, (e) -> note_runtime(sink, e, r))
+    val home = runtime_home(r)
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if live.call_set.has(f.name) && f.declared_in != QuadRuntimeModule
-            if is_quad(f.ret_ty) then return true
+        if live.call_set.has(f.name) && f.declared_in != home
+            if runtime_type(f.ret_ty, r) then return true
 
             for param in f.params
-                if is_quad(param.1) then return true
+                if runtime_type(param.1, r) then return true
 
             walk_stmts(f.body.stmts, walk)
 
@@ -156,13 +200,68 @@ private reaches_quad(p: TProgram, live: &Live) -> bool
     walk_stmts(p.main, walk)
 
     for i in 0..<p.vals.len()
-        if is_quad(p.vals.at(i).ty) then return true
+        val v = p.vals.at(i)
+
+        if runtime_type(v.ty, r) then return true
+
+        v.init match
+            Some(x) -> walk_texpr(x, walk)
+            None -> ()
 
     !hits.is_empty()
-end reaches_quad
+end reaches_runtime
 
-private note_quad(sink: *Buf[Span], e: TExpr)
-    if sink.is_empty() && is_quad(texpr_type(e)) then sink.push(e.span)
+// Whether holding a value of `t` is itself `r`'s concern: a binary128 or a binary64 value. A wide
+// integer is not -- only dividing one is.
+private runtime_type(t: Type, r: Runtime) -> bool = r match
+    QuadArithmetic -> is_quad(t)
+    DoubleArithmetic -> is_binary64(t)
+    WideDivision -> false
+
+private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime)
+    if sink.is_empty() && runtime_node(e, r) then sink.push(e.span)
+
+// Whether `e` is an operation `r` answers. A binary64 runtime also answers the conversions between
+// `f32` and a 64-bit integer, which a single-precision unit has no instruction for either; a
+// division runtime answers `/` and `%` on anything wider than 32 bits, a fixed-point value
+// included, since its quotient is formed in a register twice its width.
+private runtime_node(e: TExpr, r: Runtime) -> bool
+    if r == QuadArithmetic then return is_quad(texpr_type(e))
+
+    if r == DoubleArithmetic
+        if is_binary64(texpr_type(e)) then return true
+
+        return *e.kind match
+            TCast(operand, ty) -> converts_wide_single(texpr_type(operand), ty)
+            _ -> false
+
+    *e.kind match
+        TBinary(op, left, _, ty) -> divides(op) && (divides_wide(ty) || divides_wide(texpr_type(left)))
+        TUpdate(_, op, _, ty, _, _) -> divides(op) && divides_wide(ty)
+        _ -> false
+end runtime_node
+
+private converts_wide_single(from: Type, to: Type) -> bool =
+    (is_binary32(from) && is_wide_integer(to)) || (is_wide_integer(from) && is_binary32(to))
+
+private divides(op: string) -> bool = op == "/" || op == "%" || op == "/=" || op == "%="
+
+private divides_wide(t: Type) -> bool = underlying(t) match
+    Integer(bits, _, _) -> bits > 32
+    Fixed(_, _, _) -> true
+    _ -> false
+
+private is_wide_integer(t: Type) -> bool = underlying(t) match
+    Integer(bits, _, _) -> bits > 32
+    _ -> false
+
+private is_binary64(t: Type) -> bool = underlying(t) match
+    Floating(bits, _) -> bits == 64
+    _ -> false
+
+private is_binary32(t: Type) -> bool = underlying(t) match
+    Floating(bits, brain) -> bits == 32 && !brain
+    _ -> false
 
 private holds_func(fs: Buf[TFunc], name: string) -> bool
     for item in fs
@@ -791,7 +890,7 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Set[string]]
     // contributing instructions to the image contributes its roots too, or the image calls what it
     // does not define.
     for item in p.module_asm
-        add_module(&order, &reached, item.home)
+        if !is_runtime_module(item.home) then add_module(&order, &reached, item.home)
 
     var i: usize = 0
 
@@ -825,7 +924,23 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
     TProgram(p.structs, p.enums, p.vtables, externs, p.vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime)
+             p.warnings, p.module_deps, p.main_src, runtime_asm_kept(p.module_asm, funcs), p.c_runtime)
+
+// The top-of-file blocks a pruned program lays down. **A runtime's block goes with its routines**:
+// Arm's `__aeabi_uldivmod` answers in four registers, which no sysl signature can, so it is a block
+// of instructions wrapping an `@export` -- laid down where the division runtime was kept and left
+// out where it was not, as the routines are. Every other block is laid down whatever is reached.
+private runtime_asm_kept(blocks: Buf[TModuleAsm], funcs: Buf[TFunc]) -> Buf[TModuleAsm]
+    var out: Buf[TModuleAsm] = buf()
+
+    for block in blocks
+        if !is_runtime_module(block.home) || holds_runtime(funcs, block.home) then out.push(block)
+
+    out
+end runtime_asm_kept
+
+private is_runtime_module(home: string) -> bool =
+    home == QuadRuntimeModule || home == DoubleRuntimeModule || home == DivisionRuntimeModule
 
 // **The same program lowered AS a test build: the tests kept, and the program's own entry point put
 // aside.**

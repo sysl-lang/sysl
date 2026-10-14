@@ -1,0 +1,724 @@
+module sysl.softfloat.binary64
+
+import sysl.math.Bits
+
+// IEEE binary64 arithmetic in software: the routines LLVM calls for every `f64` operation on a
+// 32-bit machine with no double-precision unit -- every Cortex-M sysl targets, whose units are
+// single-precision or absent, and RISC-V with no `D` extension.
+//
+// **They are compiler-rt's names and compiler-rt's contracts**, Arm's run-time ABI names on Arm
+// (`__aeabi_dmul`, `__aeabi_dcmplt`, `__aeabi_d2lz`) and the generic ones on RISC-V (`__muldf3`,
+// `__ltdf2`, `__fixdfdi`), because the calls are LLVM's to make. A freestanding image has no runtime
+// library to find them in, so the standard module carries them, as `sysl.softfloat` carries the
+// binary128 routines, and an `f64` program links without asking anything of the machine. Every one
+// is exported WEAK, as every `@export` the library defines is: a libgcc or a program that defines the
+// symbol too wins, and two correct answers never collide.
+//
+// **A double travels as its encoding**, a `u64`, and a float as a `u32`. On Arm the run-time ABI
+// passes them in integer registers even where the program's own convention is hard-float, and on
+// RISC-V with no floating registers they are in integer registers anyway -- so a `u64` parameter is
+// exactly where the caller put the double, and nothing here ever holds a floating value, which a
+// build that may not touch a float register depends on.
+//
+// **Rounding is to nearest, ties to even, always**, and a NaN operand comes back quieted with its
+// payload, as compiler-rt answers. The arithmetic below has no `#if`, so the host checks it against
+// its own double unit; only the exports are per machine.
+
+// -- the encoding ------------------------------------------------------------------------------------
+
+private const FRACTION_BITS: int = 52
+private const BIAS: int = 1023
+private const MAX_EXPONENT: int = 0x7FF
+
+private const IMPLICIT: u64 = 0x0010_0000_0000_0000
+private const FRACTION_MASK: u64 = 0x000F_FFFF_FFFF_FFFF
+private const SIGN: u64 = 0x8000_0000_0000_0000
+private const ABS_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF
+private const INFINITY: u64 = 0x7FF0_0000_0000_0000
+private const QUIET: u64 = 0x0008_0000_0000_0000
+private const QUIET_NAN: u64 = 0x7FF8_0000_0000_0000
+private const LOW_32: u64 = 0xFFFF_FFFF
+private const ONE: u64 = 1
+private const ALL_ONES: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+// binary32, for the conversions: 23 bits of fraction under an 8-bit exponent.
+private const SINGLE_FRACTION: int = 23
+private const SINGLE_BIAS: int = 127
+private const SINGLE_TOP: int = 0xFF
+
+private exponent_of(r: u64) -> int = int((r >> FRACTION_BITS) & 0x7FF)
+
+private is_nan(abs: u64) -> bool = abs > INFINITY
+
+// Moves a subnormal's leading one up to the implicit bit, answering the exponent it then has.
+private normalize(sig: *u64) -> int
+    val shift = int((*sig).leading_zeros()) - int(IMPLICIT.leading_zeros())
+
+    *sig = *sig << shift
+    1 - shift
+
+// `x >> n`, with every bit shifted out folded into the lowest one: the sticky bit rounding reads.
+private shr_sticky(x: u64, n: int) -> u64
+    if n <= 0 then return x
+    if n >= 64 then return if x != 0 then 1 else 0
+
+    val lost = x << (64 - n)
+
+    (x >> n) | (if lost != 0 then 1 else 0)
+end shr_sticky
+
+// `x >> n` rounded to nearest, a tie to the even result.
+private shr_round(x: u64, n: int) -> u64
+    if n <= 0 then return x
+    if n > 64 then return 0
+
+    val q = if n == 64 then 0 else x >> n
+    val r = if n == 64 then x else x - (q << n)
+    val half = ONE << (n - 1)
+
+    if r > half || (r == half && q & 1 == 1) then q + 1 else q
+end shr_round
+
+// A result from its sign, its biased exponent and a significand with the implicit bit at 55 and
+// three bits below the last kept one -- the half bit, then two that say whether anything lies below
+// it. An exponent past the top is an infinity, one at or below zero a subnormal; a rounding that
+// carries out of the significand carries into the exponent, which is the encoding's own arithmetic.
+private round_pack(sign: u64, exponent: int, sig: u64) -> u64
+    if exponent >= MAX_EXPONENT then return INFINITY | sign
+
+    var e = exponent
+    var s = sig
+
+    if e <= 0
+        s = shr_sticky(s, 1 - e)
+        e = 0
+
+    val low = s & 7
+    var result = ((s >> 3) & FRACTION_MASK) | (u64(e) << FRACTION_BITS) | sign
+
+    if low > 4 then result += 1
+    if low == 4 then result += result & 1
+
+    result
+end round_pack
+
+// -- addition and subtraction ------------------------------------------------------------------------
+
+/** `a + b`, on encodings. */
+private[binary64] add(a_in: u64, b_in: u64) -> u64
+    var a = a_in
+    var b = b_in
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+
+    if is_nan(a_abs) then return a | QUIET
+    if is_nan(b_abs) then return b | QUIET
+
+    if a_abs == INFINITY
+        // The two infinities of opposite signs have no sum.
+        if (a ^ b) == SIGN then return QUIET_NAN
+
+        return a
+
+    if b_abs == INFINITY then return b
+
+    if a_abs == 0
+        // Two zeros sum to a negative zero only where both are negative.
+        if b_abs == 0 then return a & b
+
+        return b
+
+    if b_abs == 0 then return a
+
+    if b_abs > a_abs
+        val t = a
+        a = b
+        b = t
+
+    var a_exp = exponent_of(a)
+    var b_exp = exponent_of(b)
+    var a_sig = a & FRACTION_MASK
+    var b_sig = b & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    val sign = a & SIGN
+    val subtraction = (a ^ b) & SIGN != 0
+
+    a_sig = (a_sig | IMPLICIT) << 3
+    b_sig = shr_sticky((b_sig | IMPLICIT) << 3, a_exp - b_exp)
+
+    if subtraction
+        a_sig -= b_sig
+
+        // Exact cancellation is a positive zero, rounding to nearest.
+        if a_sig == 0 then return 0
+
+        if a_sig < IMPLICIT << 3
+            val shift = int(a_sig.leading_zeros()) - int((IMPLICIT << 3).leading_zeros())
+
+            a_sig = a_sig << shift
+            a_exp -= shift
+    else
+        a_sig += b_sig
+
+        if a_sig & (IMPLICIT << 4) != 0
+            a_sig = shr_sticky(a_sig, 1)
+            a_exp += 1
+
+    round_pack(sign, a_exp, a_sig)
+end add
+
+/** `a - b`: `a` plus `b` with its sign turned over. */
+private[binary64] sub(a: u64, b: u64) -> u64 = add(a, b ^ SIGN)
+
+// -- multiplication ----------------------------------------------------------------------------------
+
+// The 128-bit product of two 64-bit numbers, as its high and low halves, from four 32-bit products --
+// each one an instruction on a 32-bit machine, where a 64-bit multiply would be a call of its own.
+private wide_multiply(a: u64, b: u64) -> (u64, u64)
+    val a0 = a & LOW_32
+    val a1 = a >> 32
+    val b0 = b & LOW_32
+    val b1 = b >> 32
+
+    val p00 = a0 * b0
+    val p01 = a0 * b1
+    val p10 = a1 * b0
+    val p11 = a1 * b1
+
+    val mid = (p00 >> 32) + (p01 & LOW_32) + (p10 & LOW_32)
+
+    (p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32), (p00 & LOW_32) | (mid << 32))
+end wide_multiply
+
+/** `a * b`, on encodings. */
+private[binary64] mul(a: u64, b: u64) -> u64
+    val sign = (a ^ b) & SIGN
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+
+    if is_nan(a_abs) then return a | QUIET
+    if is_nan(b_abs) then return b | QUIET
+
+    // An infinity times anything but zero is an infinity; times zero it is not a number.
+    if a_abs == INFINITY then return if b_abs != 0 then INFINITY | sign else QUIET_NAN
+    if b_abs == INFINITY then return if a_abs != 0 then INFINITY | sign else QUIET_NAN
+
+    if a_abs == 0 || b_abs == 0 then return sign
+
+    var a_exp = exponent_of(a)
+    var b_exp = exponent_of(b)
+    var a_sig = a & FRACTION_MASK
+    var b_sig = b & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    // Both significands are in [2^52, 2^53), so their product is in [2^104, 2^106): the top of it at
+    // bit 105 or 104, which says whether the exponents' sum needs one more.
+    val (hi, lo) = wide_multiply(a_sig | IMPLICIT, b_sig | IMPLICIT)
+
+    var exponent = a_exp + b_exp - BIAS
+
+    // Bring the leading one to bit 55 of a single word, keeping everything below as a sticky bit.
+    val top_at_105 = hi & (ONE << 41) != 0
+    val drop = if top_at_105 then 50 else 49
+
+    if top_at_105 then exponent += 1
+
+    val kept = (hi << (64 - drop)) | (lo >> drop)
+    val below = lo << (64 - drop)
+
+    round_pack(sign, exponent, kept | (if below != 0 then 1 else 0))
+end mul
+
+// -- division ----------------------------------------------------------------------------------------
+
+/** `a / b`, on encodings. */
+private[binary64] div(a: u64, b: u64) -> u64
+    val sign = (a ^ b) & SIGN
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+
+    if is_nan(a_abs) then return a | QUIET
+    if is_nan(b_abs) then return b | QUIET
+
+    if a_abs == INFINITY then return if b_abs == INFINITY then QUIET_NAN else INFINITY | sign
+    if b_abs == INFINITY then return sign
+
+    if a_abs == 0 then return if b_abs == 0 then QUIET_NAN else sign
+    if b_abs == 0 then return INFINITY | sign
+
+    var a_exp = exponent_of(a)
+    var b_exp = exponent_of(b)
+    var a_sig = a & FRACTION_MASK
+    var b_sig = b & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    a_sig = a_sig | IMPLICIT
+    b_sig = b_sig | IMPLICIT
+
+    var exponent = a_exp - b_exp + BIAS
+
+    // A quotient of significands below one is brought into [1, 2) before the digits are taken.
+    if a_sig < b_sig
+        a_sig = a_sig << 1
+        exponent -= 1
+
+    // One quotient bit a step, most significant first: the integer bit, the 52 kept below it and the
+    // three rounding reads, 56 in all. The remainder left over is the sticky bit. Nothing here
+    // divides, so a 32-bit machine needs no division runtime for it.
+    var r = a_sig
+    var q: u64 = 0
+
+    for step in 0..<56
+        q = q << 1
+
+        if r >= b_sig
+            r -= b_sig
+            q = q | 1
+
+        r = r << 1
+
+    round_pack(sign, exponent, q | (if r != 0 then 1 else 0))
+end div
+
+// -- comparisons -------------------------------------------------------------------------------------
+
+/** `-1`, `0` or `1` as `a` is below, equal to or above `b`, or `unordered` where either is a NaN. A
+ * zero equals a zero whatever their signs. */
+private[binary64] compare(a: u64, b: u64, unordered: int) -> int
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+
+    if is_nan(a_abs) || is_nan(b_abs) then return unordered
+    if a_abs == 0 && b_abs == 0 then return 0
+
+    val a_neg = a & SIGN != 0
+    val b_neg = b & SIGN != 0
+
+    if a_neg != b_neg then return if a_neg then -1 else 1
+
+    val c = if a_abs < b_abs then -1 else if a_abs == b_abs then 0 else 1
+
+    if a_neg then -c else c
+end compare
+
+/** Whether either is a NaN. */
+private[binary64] unordered(a: u64, b: u64) -> bool = is_nan(a & ABS_MASK) || is_nan(b & ABS_MASK)
+
+// -- to and from binary32 ----------------------------------------------------------------------------
+
+// How many bits an all-ones exponent of `top` is.
+private exponent_width(top: int) -> int = 32 - int(u32(top).leading_zeros())
+
+/** A binary32 encoding widened, exactly. A NaN keeps its payload at the top of the wider fraction,
+ * quiet bit and all. */
+private[binary64] widen_single(x: u32) -> u64
+    val bits = u64(x)
+    val fraction = SINGLE_FRACTION
+    val sign = (bits >> (fraction + exponent_width(SINGLE_TOP))) & 1
+    val e = int((bits >> fraction) & u64(SINGLE_TOP))
+    val f = bits & ((ONE << fraction) - 1)
+    val signed = sign << 63
+
+    if e == SINGLE_TOP then return signed | INFINITY | (f << (FRACTION_BITS - fraction))
+
+    if e == 0
+        if f == 0 then return signed
+
+        // A subnormal: its leading one moved up to the implicit bit, the exponent going down with it.
+        val shift = int(f.leading_zeros()) - (63 - fraction)
+        val sig = f << shift
+
+        return signed | (u64(1 - SINGLE_BIAS - shift + BIAS) << FRACTION_BITS) |
+               ((sig & ((ONE << fraction) - 1)) << (FRACTION_BITS - fraction))
+
+    signed | (u64(e - SINGLE_BIAS + BIAS) << FRACTION_BITS) | (f << (FRACTION_BITS - fraction))
+end widen_single
+
+/** A binary64 encoding rounded to binary32, to nearest with ties to even: an overflow is an infinity,
+ * a value below the smallest subnormal's half a zero, and a NaN a quiet NaN keeping the top of its
+ * payload. */
+private[binary64] narrow_single(r: u64) -> u32
+    val fraction = SINGLE_FRACTION
+    val top = SINGLE_TOP
+    val sign = (r >> 63) << (fraction + exponent_width(top))
+    val abs = r & ABS_MASK
+    val infinity = u64(top) << fraction
+
+    if abs > INFINITY
+        return u32(sign | infinity | (ONE << (fraction - 1)) |
+                   ((abs & FRACTION_MASK) >> (FRACTION_BITS - fraction)))
+
+    if abs == INFINITY then return u32(sign | infinity)
+
+    // A binary64 subnormal is far below binary32's smallest value.
+    val e = exponent_of(abs)
+
+    if e == 0 then return u32(sign)
+
+    val exponent = e - BIAS + SINGLE_BIAS
+    val sig = (abs & FRACTION_MASK) | IMPLICIT
+
+    if exponent >= top then return u32(sign | infinity)
+
+    if exponent <= 0
+        // A subnormal result: the significand lands below the format's own implicit bit, and a carry
+        // out of the rounding is the smallest normal, encoded by the same arithmetic.
+        return u32(sign | shr_round(sig, FRACTION_BITS - fraction + 1 - exponent))
+
+    val rounded = shr_round(sig, FRACTION_BITS - fraction)
+    val packed = (u64(exponent - 1) << fraction) + rounded
+
+    if packed >= infinity then return u32(sign | infinity)
+
+    u32(sign | packed)
+end narrow_single
+
+// -- to and from the integers ------------------------------------------------------------------------
+
+// A magnitude and a sign as an encoding with `fraction` bits of fraction under `bias`, its sign at
+// `sign_at`: exact where the magnitude has no more significant bits than the format, rounded to
+// nearest where it has.
+private from_magnitude(m: u64, negative: bool, fraction: int, bias: int, sign_at: int) -> u64
+    // A zero integer is the positive zero, whatever its sign said.
+    if m == 0 then return 0
+
+    val width = 64 - int(m.leading_zeros())
+    val precision = fraction + 1
+    var exponent = width - 1
+    var sig = if width <= precision then m << (precision - width) else shr_round(m, width - precision)
+
+    // Rounding up from all ones carries into one more bit.
+    if sig >> precision != 0
+        sig = sig >> 1
+        exponent += 1
+
+    (if negative then ONE << sign_at else 0) | (u64(exponent + bias) << fraction) |
+    (sig & ((ONE << fraction) - 1))
+end from_magnitude
+
+// The magnitude of a signed value, the most negative one included.
+private magnitude(x: i64) -> u64 = if x >= 0 then u64(x) else u64(-(x + 1)) + 1
+
+/** A signed integer as binary64: exact up to 53 significant bits, rounded beyond. */
+private[binary64] from_signed(x: i64) -> u64 = from_magnitude(magnitude(x), x < 0, FRACTION_BITS, BIAS, 63)
+
+/** An unsigned integer as binary64. */
+private[binary64] from_unsigned(x: u64) -> u64 = from_magnitude(x, false, FRACTION_BITS, BIAS, 63)
+
+/** A signed integer as binary32, rounded once -- not through binary64, which would round twice. */
+private[binary64] single_from_signed(x: i64) -> u32 =
+    u32(from_magnitude(magnitude(x), x < 0, SINGLE_FRACTION, SINGLE_BIAS, 31))
+
+/** An unsigned integer as binary32, rounded once. */
+private[binary64] single_from_unsigned(x: u64) -> u32 =
+    u32(from_magnitude(x, false, SINGLE_FRACTION, SINGLE_BIAS, 31))
+
+// The integer part of `|x|` where it is below `2^width`, and `None` where it is not -- a NaN and an
+// infinity included. `Some(0)` is a magnitude below one.
+private truncated(r: u64, width: int) -> Option[u64]
+    val abs = r & ABS_MASK
+    val e = exponent_of(abs) - BIAS
+
+    if e < 0 then return Some(0)
+    if e >= width then return None
+
+    val sig = (abs & FRACTION_MASK) | IMPLICIT
+
+    Some(if e < FRACTION_BITS then sig >> (FRACTION_BITS - e) else sig << (e - FRACTION_BITS))
+end truncated
+
+/** Toward zero into a signed integer of `width` bits, its lowest and highest values standing for
+ * everything beyond them -- compiler-rt's answer for what C leaves undefined. */
+private[binary64] to_signed(r: u64, width: int) -> i64
+    val negative = r & SIGN != 0
+
+    truncated(r, width - 1) match
+        Some(m) -> if negative then -i64(m) else i64(m)
+        None ->
+            val top = i64((ONE << (width - 1)) - 1)
+            if negative then -top - 1 else top
+end to_signed
+
+/** Toward zero into an unsigned integer of `width` bits: a negative value is zero and a value past
+ * the top is all ones. */
+private[binary64] to_unsigned(r: u64, width: int) -> u64
+    if r & SIGN != 0 then return 0
+
+    truncated(r, width) match
+        Some(m) -> m
+        None -> if width == 64 then ALL_ONES else (ONE << width) - 1
+
+// -- the exports -------------------------------------------------------------------------------------
+//
+// Arm's run-time ABI answers a comparison as a truth value -- `__aeabi_dcmplt` is 1 where `a < b` and
+// 0 otherwise, a NaN included -- where the generic routines answer a three-way value whose sign the
+// caller tests, an unordered pair answering whichever way makes the test false.
+
+#if thumb
+
+/** `a + b`. */
+@export("__aeabi_dadd")
+aeabi_dadd(a: u64, b: u64) -> u64 = add(a, b)
+
+/** `a - b`. */
+@export("__aeabi_dsub")
+aeabi_dsub(a: u64, b: u64) -> u64 = sub(a, b)
+
+/** `a * b`. */
+@export("__aeabi_dmul")
+aeabi_dmul(a: u64, b: u64) -> u64 = mul(a, b)
+
+/** `a / b`. */
+@export("__aeabi_ddiv")
+aeabi_ddiv(a: u64, b: u64) -> u64 = div(a, b)
+
+/** 1 where `a == b`. */
+@export("__aeabi_dcmpeq")
+aeabi_dcmpeq(a: u64, b: u64) -> int = if compare(a, b, 1) == 0 then 1 else 0
+
+/** 1 where `a < b`. */
+@export("__aeabi_dcmplt")
+aeabi_dcmplt(a: u64, b: u64) -> int = if compare(a, b, 1) < 0 then 1 else 0
+
+/** 1 where `a <= b`. */
+@export("__aeabi_dcmple")
+aeabi_dcmple(a: u64, b: u64) -> int = if compare(a, b, 1) <= 0 then 1 else 0
+
+/** 1 where `a >= b`. */
+@export("__aeabi_dcmpge")
+aeabi_dcmpge(a: u64, b: u64) -> int = if compare(a, b, -1) >= 0 then 1 else 0
+
+/** 1 where `a > b`. */
+@export("__aeabi_dcmpgt")
+aeabi_dcmpgt(a: u64, b: u64) -> int = if compare(a, b, -1) > 0 then 1 else 0
+
+/** 1 where either is a NaN. */
+@export("__aeabi_dcmpun")
+aeabi_dcmpun(a: u64, b: u64) -> int = if unordered(a, b) then 1 else 0
+
+/** An `int` as a double, exactly. */
+@export("__aeabi_i2d")
+aeabi_i2d(x: int) -> u64 = from_signed(i64(x))
+
+/** A `uint` as a double, exactly. */
+@export("__aeabi_ui2d")
+aeabi_ui2d(x: uint) -> u64 = from_unsigned(u64(x))
+
+/** A `long` as a double, rounded. */
+@export("__aeabi_l2d")
+aeabi_l2d(x: long) -> u64 = from_signed(x)
+
+/** A `ulong` as a double, rounded. */
+@export("__aeabi_ul2d")
+aeabi_ul2d(x: ulong) -> u64 = from_unsigned(x)
+
+/** Toward zero, as an `int`. */
+@export("__aeabi_d2iz")
+aeabi_d2iz(x: u64) -> int = int(to_signed(x, 32))
+
+/** Toward zero, as a `uint`. */
+@export("__aeabi_d2uiz")
+aeabi_d2uiz(x: u64) -> uint = uint(to_unsigned(x, 32))
+
+/** Toward zero, as a `long`. */
+@export("__aeabi_d2lz")
+aeabi_d2lz(x: u64) -> long = to_signed(x, 64)
+
+/** Toward zero, as a `ulong`. */
+@export("__aeabi_d2ulz")
+aeabi_d2ulz(x: u64) -> ulong = to_unsigned(x, 64)
+
+/** An `f32` widened, exactly. */
+@export("__aeabi_f2d")
+aeabi_f2d(x: u32) -> u64 = widen_single(x)
+
+/** Rounded to an `f32`. */
+@export("__aeabi_d2f")
+aeabi_d2f(x: u64) -> u32 = narrow_single(x)
+
+/** An `f32` toward zero as a `long`, through the double it widens to exactly. */
+@export("__aeabi_f2lz")
+aeabi_f2lz(x: u32) -> long = to_signed(widen_single(x), 64)
+
+/** An `f32` toward zero as a `ulong`. */
+@export("__aeabi_f2ulz")
+aeabi_f2ulz(x: u32) -> ulong = to_unsigned(widen_single(x), 64)
+
+/** A `long` as an `f32`, rounded once. */
+@export("__aeabi_l2f")
+aeabi_l2f(x: long) -> u32 = single_from_signed(x)
+
+/** A `ulong` as an `f32`, rounded once. */
+@export("__aeabi_ul2f")
+aeabi_ul2f(x: ulong) -> u32 = single_from_unsigned(x)
+
+// The `f32` comparisons, which an `f32` converted to a 64-bit integer asks for on a machine with no
+// unit at all -- the conversion saturates, and the bounds are compared first. Widening is exact, so
+// comparing the widened doubles is comparing the floats.
+
+/** 1 where `a == b`. */
+@export("__aeabi_fcmpeq")
+aeabi_fcmpeq(a: u32, b: u32) -> int = aeabi_dcmpeq(widen_single(a), widen_single(b))
+
+/** 1 where `a < b`. */
+@export("__aeabi_fcmplt")
+aeabi_fcmplt(a: u32, b: u32) -> int = aeabi_dcmplt(widen_single(a), widen_single(b))
+
+/** 1 where `a <= b`. */
+@export("__aeabi_fcmple")
+aeabi_fcmple(a: u32, b: u32) -> int = aeabi_dcmple(widen_single(a), widen_single(b))
+
+/** 1 where `a >= b`. */
+@export("__aeabi_fcmpge")
+aeabi_fcmpge(a: u32, b: u32) -> int = aeabi_dcmpge(widen_single(a), widen_single(b))
+
+/** 1 where `a > b`. */
+@export("__aeabi_fcmpgt")
+aeabi_fcmpgt(a: u32, b: u32) -> int = aeabi_dcmpgt(widen_single(a), widen_single(b))
+
+/** 1 where either is a NaN. */
+@export("__aeabi_fcmpun")
+aeabi_fcmpun(a: u32, b: u32) -> int = aeabi_dcmpun(widen_single(a), widen_single(b))
+
+#elif riscv32
+
+/** `a + b`. */
+@export("__adddf3")
+adddf3(a: u64, b: u64) -> u64 = add(a, b)
+
+/** `a - b`. */
+@export("__subdf3")
+subdf3(a: u64, b: u64) -> u64 = sub(a, b)
+
+/** `a * b`. */
+@export("__muldf3")
+muldf3(a: u64, b: u64) -> u64 = mul(a, b)
+
+/** `a / b`. */
+@export("__divdf3")
+divdf3(a: u64, b: u64) -> u64 = div(a, b)
+
+/** Zero where `a == b`, and not zero otherwise or where either is a NaN. */
+@export("__eqdf2")
+eqdf2(a: u64, b: u64) -> int = compare(a, b, 1)
+
+/** Not zero where `a != b` or either is a NaN, and zero otherwise. */
+@export("__nedf2")
+nedf2(a: u64, b: u64) -> int = compare(a, b, 1)
+
+/** Below zero where `a < b`; zero or above otherwise, a NaN included. */
+@export("__ltdf2")
+ltdf2(a: u64, b: u64) -> int = compare(a, b, 1)
+
+/** Zero or below where `a <= b`; above zero otherwise, a NaN included. */
+@export("__ledf2")
+ledf2(a: u64, b: u64) -> int = compare(a, b, 1)
+
+/** Above zero where `a > b`; zero or below otherwise, a NaN included. */
+@export("__gtdf2")
+gtdf2(a: u64, b: u64) -> int = compare(a, b, -1)
+
+/** Zero or above where `a >= b`; below zero otherwise, a NaN included. */
+@export("__gedf2")
+gedf2(a: u64, b: u64) -> int = compare(a, b, -1)
+
+/** Not zero where either is a NaN. */
+@export("__unorddf2")
+unorddf2(a: u64, b: u64) -> int = if unordered(a, b) then 1 else 0
+
+/** An `int` as a double, exactly. */
+@export("__floatsidf")
+floatsidf(x: int) -> u64 = from_signed(i64(x))
+
+/** A `uint` as a double, exactly. */
+@export("__floatunsidf")
+floatunsidf(x: uint) -> u64 = from_unsigned(u64(x))
+
+/** A `long` as a double, rounded. */
+@export("__floatdidf")
+floatdidf(x: long) -> u64 = from_signed(x)
+
+/** A `ulong` as a double, rounded. */
+@export("__floatundidf")
+floatundidf(x: ulong) -> u64 = from_unsigned(x)
+
+/** Toward zero, as an `int`. */
+@export("__fixdfsi")
+fixdfsi(x: u64) -> int = int(to_signed(x, 32))
+
+/** Toward zero, as a `uint`. */
+@export("__fixunsdfsi")
+fixunsdfsi(x: u64) -> uint = uint(to_unsigned(x, 32))
+
+/** Toward zero, as a `long`. */
+@export("__fixdfdi")
+fixdfdi(x: u64) -> long = to_signed(x, 64)
+
+/** Toward zero, as a `ulong`. */
+@export("__fixunsdfdi")
+fixunsdfdi(x: u64) -> ulong = to_unsigned(x, 64)
+
+/** An `f32` widened, exactly. */
+@export("__extendsfdf2")
+extendsfdf2(x: u32) -> u64 = widen_single(x)
+
+/** Rounded to an `f32`. */
+@export("__truncdfsf2")
+truncdfsf2(x: u64) -> u32 = narrow_single(x)
+
+/** An `f32` toward zero as a `long`, through the double it widens to exactly. */
+@export("__fixsfdi")
+fixsfdi(x: u32) -> long = to_signed(widen_single(x), 64)
+
+/** An `f32` toward zero as a `ulong`. */
+@export("__fixunssfdi")
+fixunssfdi(x: u32) -> ulong = to_unsigned(widen_single(x), 64)
+
+/** A `long` as an `f32`, rounded once. */
+@export("__floatdisf")
+floatdisf(x: long) -> u32 = single_from_signed(x)
+
+/** A `ulong` as an `f32`, rounded once. */
+@export("__floatundisf")
+floatundisf(x: ulong) -> u32 = single_from_unsigned(x)
+
+// The `f32` comparisons, which an `f32` converted to a 64-bit integer asks for here -- the conversion
+// saturates, and the bounds are compared first. Widening is exact, so comparing the widened doubles is
+// comparing the floats.
+
+/** Zero where `a == b`, and not zero otherwise or where either is a NaN. */
+@export("__eqsf2")
+eqsf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), 1)
+
+/** Not zero where `a != b` or either is a NaN, and zero otherwise. */
+@export("__nesf2")
+nesf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), 1)
+
+/** Below zero where `a < b`; zero or above otherwise, a NaN included. */
+@export("__ltsf2")
+ltsf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), 1)
+
+/** Zero or below where `a <= b`; above zero otherwise, a NaN included. */
+@export("__lesf2")
+lesf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), 1)
+
+/** Above zero where `a > b`; zero or below otherwise, a NaN included. */
+@export("__gtsf2")
+gtsf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), -1)
+
+/** Zero or above where `a >= b`; below zero otherwise, a NaN included. */
+@export("__gesf2")
+gesf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), -1)
+
+/** Not zero where either is a NaN. */
+@export("__unordsf2")
+unordsf2(a: u32, b: u32) -> int = if unordered(widen_single(a), widen_single(b)) then 1 else 0
+
+#endif

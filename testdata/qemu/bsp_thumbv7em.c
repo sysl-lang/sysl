@@ -74,53 +74,8 @@ void *memset(void *dst, int c, size_t n) {
     return dst;
 }
 
-/* Sixty-four bit division, which no Cortex-M has an instruction for -- an M7 has a 32-bit divider
- * and stops there. `divmod64.h` has the arithmetic and says why the board owes it; the **interface**
- * is the peculiar part, and it is the ARM EABI's rather than this board's.
- *
- * `__aeabi_ldivmod` answers the quotient in r0:r1 *and* the remainder in r2:r3, which no C signature
- * can say. So each is a naked wrapper around an ordinary C helper that returns the quotient and
- * writes the remainder through a pointer, and the four lines of assembly are the marshalling: the
- * numerator and divisor are already in r0-r3 where the helper wants them, the fifth argument goes on
- * the stack because that is where the fifth argument goes, and the remainder is loaded back into
- * r2:r3 on the way out.
- *
- * Both wrappers push an even number of registers and subtract a multiple of eight, so the stack is
- * eight-byte aligned at the call, which AAPCS requires and which a fault would report as something
- * else entirely.
+/* Sixty-four bit division, which no Cortex-M has an instruction for, and binary64 arithmetic, which
+ * these single-precision units do not do, are not here: the program carries both. `sysl.softint`
+ * exports `__aeabi_uldivmod` and `__aeabi_ldivmod` wherever a reached body divides a `long`, and
+ * `sysl.softfloat.binary64` exports `__aeabi_dmul` and its family wherever one computes with an `f64`.
  */
-#include "divmod64.h"
-
-unsigned long long __sysl_uldivmod(unsigned long long n, unsigned long long d,
-                                   unsigned long long *rem) {
-    return sysl_udivmod64(n, d, rem);
-}
-
-long long __sysl_ldivmod(long long n, long long d, long long *rem) {
-    return sysl_divmod64(n, d, rem);
-}
-
-__attribute__((naked)) unsigned long long __aeabi_uldivmod(unsigned long long n,
-                                                           unsigned long long d) {
-    __asm__ volatile("push {r4, lr}\n"
-                     "sub  sp, sp, #16\n"
-                     "add  r4, sp, #8\n"
-                     "str  r4, [sp, #0]\n"
-                     "bl   __sysl_uldivmod\n"
-                     "ldr  r2, [sp, #8]\n"
-                     "ldr  r3, [sp, #12]\n"
-                     "add  sp, sp, #16\n"
-                     "pop  {r4, pc}\n");
-}
-
-__attribute__((naked)) long long __aeabi_ldivmod(long long n, long long d) {
-    __asm__ volatile("push {r4, lr}\n"
-                     "sub  sp, sp, #16\n"
-                     "add  r4, sp, #8\n"
-                     "str  r4, [sp, #0]\n"
-                     "bl   __sysl_ldivmod\n"
-                     "ldr  r2, [sp, #8]\n"
-                     "ldr  r3, [sp, #12]\n"
-                     "add  sp, sp, #16\n"
-                     "pop  {r4, pc}\n");
-}

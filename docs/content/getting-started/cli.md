@@ -739,9 +739,10 @@ offering only the first row meant the C had to be rebuilt to follow sysl. Pick t
 already uses; if you do not know, `softfp` is the pico-sdk default.
 
 **Both of those rows use the M33's own unit, which is single precision.** `f32` arithmetic is
-instructions and `f64` arithmetic is a call into the board's runtime — `__aeabi_dmul` and its family
-— because an `fpv5-sp-d16` has no double-precision instructions to select. That is the part rather
-than a setting, and it is worth knowing before a `f64` goes into an inner loop.
+instructions and `f64` arithmetic is a call — `__aeabi_dmul` and its family, which the program carries
+in `sysl.softfloat.binary64` — because an `fpv5-sp-d16` has no double-precision instructions to
+select. That is the part rather than a setting, and it is worth knowing before a `f64` goes into an
+inner loop.
 
 **`thumb-freestanding-soft` is the third, and it is for a board with no unit at all.** `softfp` is not
 `soft`: `-mfloat-abi=soft` means no FPU instructions whatever, while `softfp` uses the `fpv5-sp-d16`
@@ -851,12 +852,19 @@ unknown.
 
 **Freestanding does not mean self-contained.** A program built for a bare board still names C symbols
 its runtime has to define — `putchar` wherever anything prints, `free` wherever a reference count can
-reach zero, `memcpy` and `memset` for a structure assignment you never wrote — and on a 32-bit
-machine it names a 64-bit division helper as well, because a `long` is sixty-four bits everywhere and
-neither RP2350 core has the instruction. None of that is a sysl dependency the compiler could warn
-about: it is what any C compiler emits for the same code, and a real project never meets it because
-its SDK has linked `libgcc` or compiler-rt already. Meeting it looks like `undefined symbol:
-__aeabi_ldivmod` at the link, which is the one place anybody will come looking for this paragraph.
+reach zero, `memcpy` and `memset` for a structure assignment you never wrote. None of that is a sysl
+dependency the compiler could warn about: it is what any C compiler emits for the same code, and a
+real project never meets it because its SDK has linked a libc already.
+
+**What the program does carry is the arithmetic the machine has no instruction for.** A `long` is
+sixty-four bits everywhere, and no Cortex-M or 32-bit RISC-V core divides one, so dividing it — and
+rendering it, which divides by ten, and so any reachable `panic` — is a call to compiler-rt's
+`__aeabi_ldivmod` or `__divdi3`. An `f64` on a machine with no double-precision unit is a call per
+operation, `__aeabi_dmul` or `__muldf3`. The standard module defines those routines
+(`sysl.softint`, `sysl.softfloat.binary64`), weak, and a build for a 32-bit machine keeps them exactly
+where a reached body divides a 64-bit integer or computes with an `f64` — so an image links with
+`-nostdlib`, and a `libgcc` that defines them too simply wins. Armv6-M is the exception for now: its
+32-bit division, 64-bit shifts and multiply and `__aeabi_mem*` are still the board's to supply.
 
 ## Flags every subcommand takes
 

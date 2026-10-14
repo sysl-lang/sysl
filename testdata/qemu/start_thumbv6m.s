@@ -55,6 +55,11 @@ _start:
 
     bl   main
 
+    // `exit(status)` is the same door, with the status already in r0: the library calls it when a
+    // program panics, as it calls `putchar` to say why.
+    .thumb_func
+    .global exit
+exit:
     // SYS_EXIT_EXTENDED (0x20), for the reason `start_thumb.s` gives: on AArch32 the plain SYS_EXIT
     // always reports zero, so every assertion made against the status would be worthless.
     sub  sp, sp, #8
