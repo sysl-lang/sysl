@@ -19,7 +19,7 @@ import sysl.text.Search
 
 private dcp_ready() -> bool = std_root().is_ok() && clang_available()
 
-private dcp_tree(files: [](string, string)) -> string
+private dcp_tree(files: []const (string, string)) -> string
     var b: Buf[(string, string)] = buf()
 
     for i in 0..<files.len
@@ -35,6 +35,15 @@ private dcp_built(root: string) -> (int, string)
     remove_dir_all(root).unwrap_or(())
     got
 end dcp_built
+
+// What `sysl test` says about a tree, and its status: the one build that reads a `@tests` file, so
+// the one where a test's reach can be refused. Every other build drops the file before analysis.
+private dcp_tested(root: string) -> (int, string)
+    val got = lbr_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end dcp_tested
 
 // What the program of a tree prints, or what stopped it.
 private dcp_ran(root: string) -> string
@@ -210,10 +219,15 @@ private dcp_lifting_helper() -> string = "module sys\n@tests\n@requires(os)\n\nh
 dcp_a_test_may_reach_what_the_module_gave_up()
     if !dcp_ready() then return
 
-    assert_eq(dcp_ran(dcp_tree([("sys/a.sysl", dcp_gave_up_os()),
-                                ("sys/tests.sysl", "module sys\n@tests\n@requires(os)\n\n@test\n" +
-                                                   "reaches_the_machine() =\n    assert(pid() > 0)\n"),
-                                ("main.sysl", "print(1)\n")])), "1\n")
+    val files = [("sys/a.sysl", dcp_gave_up_os()),
+                 ("sys/tests.sysl", "module sys\n@tests\n@requires(os)\n\n@test\n" +
+                                    "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+                 ("main.sysl", "print(1)\n")]
+    val (code, out) = dcp_tested(dcp_tree(files))
+
+    // `sysl test` is the build that reads the test, so it is the one where the lifting is observed.
+    assert_eq(code, 0, out)
+    assert_eq(dcp_ran(dcp_tree(files)), "1\n")
 end dcp_a_test_may_reach_what_the_module_gave_up
 
 // The half that must not move with it: a shipping file of the same module is refused exactly as it
@@ -240,12 +254,28 @@ dcp_a_silent_test_file_is_held_to_the_module()
                          ("sys/tests.sysl", "module sys\n@tests\n\n@test\n" +
                                             "reaches_the_machine() =\n    assert(pid() > 0)\n"),
                          ("main.sysl", "print(1)\n")])
-    val (code, out) = dcp_built(root)
+    val (code, out) = dcp_tested(root)
 
     assert_eq(code, 1, out)
     assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'",
                     s"$root/sys/tests.sysl:6:12", "6 |     assert(pid() > 0)"), out)
 end dcp_a_silent_test_file_is_held_to_the_module
+
+// Every build but `sysl test` drops the `@tests` file before analysis, so what only a test reaches
+// refuses nothing there: the module's clause is a promise about what ships.
+@test("and 'sysl build', which drops the test file, refuses nothing the test alone reached")
+dcp_a_build_drops_the_test_that_reached()
+    if !dcp_ready() then return
+
+    val reach = "\n@test\nreaches_the_machine() =\n    assert(pid() > 0)\n"
+
+    for (shipped, tests) in [(dcp_gave_up_os(), "module sys\n@tests\n" + reach),
+                             (dcp_sys(), "module sys\n@tests\n@no_os\n" + reach)]
+        val (code, out) = dcp_built(dcp_tree([("sys/a.sysl", shipped), ("sys/tests.sysl", tests),
+                                              ("main.sysl", "print(1)\n")]))
+
+        assert_eq(code, 0, out)
+end dcp_a_build_drops_the_test_that_reached
 
 // `why` moves with `lacks`, or the diagnostic sends a reader to delete a line that is not there.
 @test("a test refused under its OWN narrowing is told which file declared it")
@@ -256,7 +286,7 @@ dcp_a_test_refused_under_its_own_narrowing()
                          ("sys/tests.sysl", "module sys\n@tests\n@no_os\n\n@test\n" +
                                             "reaches_the_machine() =\n    assert(pid() > 0)\n"),
                          ("main.sysl", "print(1)\n")])
-    val (code, out) = dcp_built(root)
+    val (code, out) = dcp_tested(root)
 
     assert_eq(code, 1, out)
     assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and the '@tests' file of 'sys' declared " +
@@ -269,10 +299,13 @@ end dcp_a_test_refused_under_its_own_narrowing
 dcp_a_test_in_an_ordinary_file()
     if !dcp_ready() then return
 
-    assert_eq(dcp_ran(dcp_tree([("sys/a.sysl", dcp_gave_up_os() + "\n@test\nbeside_what_it_tests() =\n" +
-                                               "    assert(pid() > 0)\n"),
-                                ("sys/tests.sysl", dcp_lifting_helper()),
-                                ("main.sysl", "print(1)\n")])), "1\n")
+    val files = [("sys/a.sysl", dcp_gave_up_os() + "\n@test\nbeside_what_it_tests() =\n    assert(pid() > 0)\n"),
+                 ("sys/tests.sysl", dcp_lifting_helper()),
+                 ("main.sysl", "print(1)\n")]
+    val (code, out) = dcp_tested(dcp_tree(files))
+
+    assert_eq(code, 0, out)
+    assert_eq(dcp_ran(dcp_tree(files)), "1\n")
 end dcp_a_test_in_an_ordinary_file
 
 // -- what the annotation may say ---------------------------------------------------------------------
