@@ -1097,9 +1097,13 @@ contract above; an executor is a package, written against the contract in ordina
 the run queue on this page is.
 
 - **[`kairos`](https://github.com/sysl-lang/kairos)** is an event loop written for a microcontroller
-  first — numbered sources an interrupt raises, timers on one clock. Its async face, wakers kept
-  where its sources fire them, is planned.
-- An executor over **[`libuv`](https://github.com/sysl-lang/libuv)**, for a host, is planned.
+  first — numbered sources an interrupt raises, timers on one clock. It is also an executor: tasks
+  spawned on the loop sleep on its timers and wait on its sources, with the wakers kept where the
+  timers and sources fire them. A board and a host use the same loop; only the driver value differs.
+- With its **`uv` feature** (`features = [uv]`), kairos runs the same loop over
+  **[`libuv`](https://github.com/sysl-lang/libuv)** for a host: sockets and whole-file reads and
+  writes are tasks awaited beside `sleep` and `timeout`. With the feature off nothing of libuv is
+  fetched or linked.
 
 ---
 

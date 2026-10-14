@@ -102,6 +102,28 @@ limited() {
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-build.XXXXXX")
 
+# **The candidate is the `sysl` any repository finds BY NAME.** A suite that spawns `sysl` itself
+# (cstd's does) would otherwise reach the installed release, and test the old compiler against the new
+# library. Each compiler gets a directory holding one executable called `sysl` that runs it, put in
+# front of `PATH` for that compiler's rows only. A wrapper rather than a symlink, so the compiler
+# never sees a different executable path than the one it was named by.
+pin_dir() {
+    mkdir -p "$work/pin-$1"
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$2" > "$work/pin-$1/sysl"
+    chmod +x "$work/pin-$1/sysl"
+}
+pin_dir ours "$ours_bin"
+pin_dir theirs "$theirs_bin"
+ours_path="$work/pin-ours:$PATH"
+theirs_path="$work/pin-theirs:$PATH"
+
+echo "sysl by name: $(PATH=$ours_path command -v sysl) runs $ours_bin"
+
+# `SYSL_CENSUS_PIN_ONLY=1` stops here, which is how the pin is tested without a twenty-minute run.
+if [ -n "$SYSL_CENSUS_PIN_ONLY" ]; then
+    exit 0
+fi
+
 # **`keel` is a kernel, and its image is built the way its boot test builds it** (`scripts/boot-test.sh`,
 # with no QEMU): each user program first, into `scratch/user/`, because the kernel embeds their images
 # with `.incbin` paths the assembler resolves against the repository's root -- then the kernel, from
@@ -315,7 +337,7 @@ for dir in "$org"/*/; do
     rows=$((rows + 1))
     ours_ok=0
 
-    ( cd "$here" && limited $via "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
+    ( cd "$here" && PATH=$ours_path limited $via "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
 
     if [ $ours_ok -eq 0 ]; then
         case $label in
@@ -357,7 +379,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && limited env $theirs_env $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && limited env PATH="$theirs_path" $theirs_env $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it
