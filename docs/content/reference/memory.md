@@ -1700,8 +1700,28 @@ run()
 ```
 
 A trait member may carry the mark too, and then a call through a trait object (`&Viewer`) is held
-to it exactly as a call on the type is. The mark is only ever called on a value: `Column.bytes(c)`
-is refused, as every method reached through its type is.
+to it exactly as a call on the type is. An implementation of a marked member inherits the mark, so
+it need not repeat it. The other way round is refused — a call through the object reads only the
+trait's member, so a mark the trait does not carry would hold nobody to anything:
+
+```sysl
+trait Viewer
+    look(&self) -> []const u8
+
+struct S
+    n: int
+
+impl Viewer for S
+    @views(self)
+    look(&self) -> []const u8 = []
+```
+
+```error
+'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares 'look' without it
+```
+
+A marked member is only ever called on a value: `Column.bytes(c)` is refused, as every method
+reached through its type is.
 
 **Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
 `*self` call on it, and a call that may write an object of its type — which a member that frees the

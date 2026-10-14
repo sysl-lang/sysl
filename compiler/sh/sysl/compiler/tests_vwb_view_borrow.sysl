@@ -366,3 +366,55 @@ vbh_static_form_refused()
     vwb_refused(vbh_object() + "leak() -> []const u8\n    val o = open(3)\n    Viewer.look(o)\n",
                 "'look' is a member of the trait 'Viewer' — call it on a value of a type that " +
                 "implements 'Viewer'")
+
+@test("an implementation marked '@views(self)' where its trait's member is not is refused, naming both")
+vbh_impl_mark_without_trait_refused()
+    if !vwb_ready() then return
+
+    vwb_refused("trait Viewer\n    look(&self) -> []const u8\n\nstruct S\n    n: int\n\n" +
+                "impl Viewer for S\n    @views(self)\n    look(&self) -> []const u8 = []\n",
+                "'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares " +
+                "'look' without it — a call through a '&Viewer' reads only the trait's member, so the " +
+                "view it answers would be held to nothing. Mark 'Viewer.look' '@views(self)' as well")
+
+@test("an implementation of a '@views(self)' trait member inherits the mark")
+vbh_impl_inherits_trait_mark()
+    if !vwb_ready() then return
+
+    val unmarked = vwb_owner() +
+                   "trait Viewer\n    @views(self)\n    look(&self) -> []const u8\n\n" +
+                   "impl Viewer for Owner\n    look(&self) -> []const u8 = self.view()\n\n"
+
+    // The body may hand back a view of `self`, as a marked member's may...
+    val out = vwb_ran(unmarked + "run()\n    val o = open(3)\n    val s = o.look()\n\n" +
+                      "    print(s.len, s[0])\n\nrun()\n")
+
+    assert_eq(out, "3 65\nfreed\n")
+
+    // ...and a call on the type, not only one through the object, is held to the borrow.
+    vwb_refused(unmarked + "leak() -> []const u8\n    val o = open(3)\n    o.look()\n\nprint(leak().len)\n",
+                "this returns a view borrowed from 'o', and nothing keeps 'o' alive once this " +
+                "function returns")
+
+    vwb_refused(unmarked + "print(open(3).look().len)\n",
+                "'look' answers a view borrowed from what it is called on, and that is the value " +
+                "'open' answers — a temporary")
+
+@test("a method called through a bounded type parameter is refused once, at the generic")
+vbh_bound_method_through_type_said_once()
+    if !vwb_ready() then return
+
+    val src = "trait Viewer\n    look(&self) -> []const u8\n\nstruct O\n    n: int\n\n" +
+              "impl Viewer for O\n    look(&self) -> []const u8 = []\n\n" +
+              "leak[T: Viewer](x: &T) -> []const u8 = T.look(x)\n\n"
+    val said = "'look' is an instance method of 'Viewer' — call it on a value of 'T', not the type"
+
+    // Never instantiated: the definition is the only place that can tell it.
+    vwb_refused(src, said)
+
+    // Instantiated: still told once, and nothing else is said about the call.
+    val out = vwb_said(src + "val o: &O = O(1)\nprint(leak(o).len)\n")
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+    assert(!out.contains("takes 0 arguments"), s"expected no arity complaint, got: $out")
+    assert(!out.contains("instance method of 'O'"), s"expected no second report at 'O', got: $out")
