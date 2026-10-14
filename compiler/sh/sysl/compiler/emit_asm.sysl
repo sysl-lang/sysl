@@ -107,11 +107,20 @@ end slot_of
 // purpose: assuming them costs optimization quality across a handful of instructions; not assuming
 // them costs a value kept in a register the block overwrote, which is a wrong answer with nothing to
 // point at.
+//
+// **Every output is early-clobber** (`=&`), for the same reason. A plain `=` lets LLVM give an output
+// the register an input arrives in, which is only right when every input has been read before the
+// first output is written -- an ordering inside instruction text the compiler cannot see. Written
+// first and read after, the input is gone. The one output that is not early-clobber is one pinned to
+// the very machine register an input is pinned to: the programmer asked for the two to share it.
 private asm_constraints(operands: Buf[TAsmOperand], clobbers: Buf[string]) -> string
     var parts: Buf[string] = buf()
 
     for item in operands
-        if asm_is_out(item.dir) then parts.push(s"=${asm_place(item)}")
+        if asm_is_out(item.dir) then
+            val early = if shares_input_register(operands, item) then "" else "&"
+
+            parts.push(s"=$early${asm_place(item)}")
 
     for item in operands
         if !asm_is_out(item.dir) then parts.push(asm_place(item))
@@ -131,6 +140,22 @@ private asm_constraints(operands: Buf[TAsmOperand], clobbers: Buf[string]) -> st
 
     b.finish()
 end asm_constraints
+
+// Whether an output names the same machine register as some input, which early-clobber would make
+// impossible to allocate.
+private shares_input_register(operands: Buf[TAsmOperand], o: TAsmOperand) -> bool = o.reg match
+    Some(r) -> input_pinned_to(operands, r)
+    None -> false
+
+private input_pinned_to(operands: Buf[TAsmOperand], register: string) -> bool
+    for item in operands
+        if !asm_is_out(item.dir) && pinned_to(item, register) then return true
+
+    false
+
+private pinned_to(o: TAsmOperand, register: string) -> bool = o.reg match
+    Some(r) -> r == register
+    None -> false
 
 // Where one operand has to live: a named machine register, or any general-purpose one.
 private asm_place(o: TAsmOperand) -> string = o.reg match

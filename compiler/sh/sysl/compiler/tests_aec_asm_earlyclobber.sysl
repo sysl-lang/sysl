@@ -1,0 +1,237 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An assembly output is early-clobber (`reference/inline-assembly.md` § "What the compiler owns").
+//
+// A plain `=r` output may be given the register an input arrives in, which is right only when the
+// instructions read every input before they write any output -- an order inside text the compiler
+// does not read. An arm that writes its output first and reads an input after then reads its own
+// output instead. So every output is `=&`, except one pinned to the same machine register as an
+// input, which the programmer asked to share.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private aec_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end aec_ready
+
+private aec_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-aec").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end aec_root
+
+// What a one-file program prints on this machine, or why it did not build.
+private aec_ran(text: string) -> string
+    val root = aec_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end aec_ran
+
+// The LLVM text a named machine lowers a one-file program to.
+private aec_ir(machine: string, text: string) -> string
+    val root = aec_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", Some(machine)) match
+        Err(why) -> failure_text(why)
+        Ok(made) ->
+            if made.report.is_empty() then made.text
+            else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end aec_ir
+
+private aec_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// The register a disassembled instruction names after `mnemonic` at operand `index` (0-based),
+// e.g. `mrs r1, BASEPRI` gives `r1` at 0.
+private aec_operand(code: string, mnemonic: string, index: int) -> string
+    val lines = split(code, "\n")
+
+    for i in 0..<lines.len
+        val cols = split(lines[i], "\t")
+
+        for j in 0..<cols.len
+            if cols[j].trim() == mnemonic && j + 1 < cols.len then
+                return split(cols[j + 1], ",")[index].trim()
+
+    assert(false, s"no '$mnemonic' in:\n$code")
+    ""
+end aec_operand
+
+private val aec_seven_plus: string = raw"""
+    seven_plus(level: int) -> int
+        var old: int = 0
+        asm
+            [aarch64]
+                "mov {old}, #7"
+                "add {old}, {old}, {level}"
+                in level : reg
+                out old : reg
+            [x86_64]
+                "movq $7, {old}"
+                "addq {level}, {old}"
+                in level : reg
+                out old : reg
+            [riscv64, riscv32]
+                "li {old}, 7"
+                "add {old}, {old}, {level}"
+                in level : reg
+                out old : reg
+            [thumb, craft, wasm32] unavailable "not this test's business"
+        old
+
+    print(seven_plus(1))
+    """
+
+// -- the tests ------------------------------------------------------------------------------------
+
+@test("an output written before an input is read does not land on the input's register")
+aec_output_written_first_keeps_the_input()
+    if !aec_ready() then return
+
+    assert_eq(aec_ran(aec_seven_plus), "8\n")
+
+@test("a lone output is early-clobber")
+aec_a_lone_output_is_early_clobber()
+    if !aec_ready() then return
+
+    aec_says(aec_ir("x86_64-macos", raw"""
+        seven() -> int
+            var v: int = 0
+            asm
+                [x86_64]
+                    "mov $7, {v}"
+                    out v : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(seven())
+        """), "\"=&r,~{memory},~{cc}\"()")
+
+@test("an output beside an input is early-clobber and the input is not")
+aec_an_output_beside_an_input()
+    if !aec_ready() then return
+
+    aec_says(aec_ir("aarch64-macos", aec_seven_plus), "\"mov $0, #7\\0Aadd $0, $0, $1\", \"=&r,r,~{memory},~{cc}\"")
+
+@test("every one of several outputs is early-clobber")
+aec_several_outputs_are_each_early_clobber()
+    if !aec_ready() then return
+
+    aec_says(aec_ir("riscv64-freestanding", raw"""
+        split(n: int) -> int
+            var lo: int = 0
+            var hi: int = 0
+            asm
+                [riscv64]
+                    "andi {lo}, {n}, 15"
+                    "srli {hi}, {n}, 4"
+                    in n : reg
+                    out lo : reg
+                    out hi : reg
+                [x86_64, aarch64, thumb, riscv32, craft, wasm32] unavailable "not this test's business"
+            lo + hi
+
+        @export("main")
+        boot() -> i32 = i32(split(33))
+        """), "\"=&r,=&r,r,~{memory},~{cc}\"")
+
+@test("an output pinned to a machine register is early-clobber too")
+aec_a_pinned_output_is_early_clobber()
+    if !aec_ready() then return
+
+    aec_says(aec_ir("x86_64-macos", raw"""
+        low(n: int) -> int
+            var v: int = 0
+            asm
+                [x86_64]
+                    "movl {n}, {v}"
+                    in n : reg
+                    out v : "eax"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(low(5))
+        """), "\"=&{eax},r,~{memory},~{cc}\"")
+
+@test("but not one pinned to the same machine register as an input, which it was asked to share")
+aec_a_shared_pinned_register_is_not_early_clobber()
+    if !aec_ready() then return
+
+    val src = raw"""
+        twice(n: int) -> int
+            var v: int = 0
+            asm
+                [x86_64]
+                    "addl %eax, %eax"
+                    in n : "eax"
+                    out v : "eax"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(twice(5))
+        """
+
+    aec_says(aec_ir("x86_64-macos", src), "\"={eax},{eax},~{memory},~{cc}\"")
+
+@test("on a Cortex-M4 the BASEPRI swap reads the old level and writes the new from two registers")
+aec_basepri_swap_on_m4()
+    val code = fx2_board_code(raw"""
+        @export("aec_raise")
+        raise(level: u32) -> u32
+            var old: u32 = 0
+            asm
+                [thumb]
+                    "mrs {old}, BASEPRI"
+                    "msr BASEPRI, {level}"
+                    in level : reg
+                    out old : reg
+                [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "a Cortex-M register"
+            old
+
+        @export("main")
+        boot() -> i32 = i32(raise(32))
+        """, "thumbv7em-freestanding", "aec_raise")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+    val old = aec_operand(f, "mrs", 0)
+    val level = aec_operand(f, "msr", 1)
+
+    assert(old != level, f)
+end aec_basepri_swap_on_m4
