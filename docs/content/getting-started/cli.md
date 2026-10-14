@@ -871,8 +871,13 @@ rendering it, which divides by ten, and so any reachable `panic` — is a call t
 operation, `__aeabi_dmul` or `__muldf3`. The standard module defines those routines
 (`sysl.softint`, `sysl.softfloat.binary64`), weak, and a build for a 32-bit machine keeps them exactly
 where a reached body divides a 64-bit integer or computes with an `f64` — so an image links with
-`-nostdlib`, and a `libgcc` that defines them too simply wins. Armv6-M is the exception for now: its
-32-bit division, 64-bit shifts and multiply and `__aeabi_mem*` are still the board's to supply.
+`-nostdlib`, and a `libgcc` that defines them too simply wins. An `f32` on a core with no unit at all
+— a Cortex-M0+ or M3, RISC-V with no `F` — is the same: `__aeabi_fmul` or `__mulsf3`, kept where a
+reached body computes with one. **Armv6-M lacks more**: 32-bit division, a 64-bit multiply and
+variable shift, a leading-zero count, and the run-time ABI's `__aeabi_memcpy` family are all calls
+there, which LLVM makes from code that spells none of them, so `sysl.softint` is kept in every
+Armv6-M build. What its board still supplies is `memcpy` and `memset`, as any freestanding target's
+does.
 
 ## Flags every subcommand takes
 

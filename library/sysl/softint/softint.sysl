@@ -18,8 +18,16 @@ module sysl.softint
 //
 // The arithmetic has no `#if`, so the host checks it against its own divider; only the exports are
 // per machine.
+//
+// **An Armv6-M core lacks more than a 64-bit divider**, and the second half of this module is what it
+// calls for besides: 32-bit division, a 64-bit shift by a variable count and a 64-bit multiply, a
+// leading-zero count, and the run-time ABI's own names for the block operations. LLVM makes those
+// calls from code that spells none of them -- a struct copied, a constant divided, a `long`
+// multiplied -- so on a core with no divider the module is kept in every build, and elsewhere only
+// where a reached body divides a `long`.
 
 private const ALL_ONES: u64 = 0xFFFF_FFFF_FFFF_FFFF
+private const LOW_32: u64 = 0xFFFF_FFFF
 
 /** The quotient and the remainder of `n / d`, the remainder below `d`. A zero divisor answers every
  * bit of the quotient set and `n` as the remainder -- which is what the long division falls into; a
@@ -65,6 +73,137 @@ private with_sign(m: u64, negative: bool) -> i64
     if m > 0x7FFF_FFFF_FFFF_FFFF then return -0x7FFF_FFFF_FFFF_FFFF - 1
 
     if negative then -i64(m) else i64(m)
+
+// -- what an Armv6-M core lacks --------------------------------------------------------------------
+//
+// **None of these may be written with the operation it implements**: on the core they run on, a
+// 32-bit `/`, a 64-bit `*`, a 64-bit shift by a variable count and `leading_zeros` are each a call
+// to the routine being written. Every step is a 32-bit shift, add, subtract, multiply keeping the
+// low word, or compare, or a 64-bit shift by a constant -- all instructions on the core.
+
+/** The quotient and the remainder of `n / d` on 32 bits, the same long division as `unsigned_divide`
+ * one word narrower, and the same answer for a zero divisor. */
+private[softint] unsigned_divide32(n_in: u32, d: u32) -> (u32, u32)
+    if d == 0 then return (0xFFFF_FFFF, n_in)
+
+    var n = n_in
+    var q: u32 = 0
+    var r: u32 = 0
+
+    for step in 0..<32
+        val carry = r >> 31
+
+        r = (r << 1) | (n >> 31)
+        n = n << 1
+        q = q << 1
+
+        if carry != 0 || r >= d
+            r -= d
+            q = q | 1
+
+    (q, r)
+end unsigned_divide32
+
+/** `n / d` and `n % d` on 32 bits toward zero, the remainder taking the sign of `n`; the most
+ * negative value divided by -1 wraps to itself, as a sysl division does. */
+private[softint] signed_divide32(n: i32, d: i32) -> (i32, i32)
+    val (q, r) = unsigned_divide32(magnitude32(n), magnitude32(d))
+
+    (with_sign32(q, (n < 0) != (d < 0)), with_sign32(r, n < 0))
+
+private magnitude32(x: i32) -> u32 = if x >= 0 then u32(x) else u32(-(x + 1)) + 1
+
+private with_sign32(m: u32, negative: bool) -> i32
+    if m > 0x7FFF_FFFF then return -0x7FFF_FFFF - 1
+
+    if negative then -i32(m) else i32(m)
+
+// The two halves of a 64-bit value, and the value two halves make.
+private low(v: u64) -> u32 = u32(v & LOW_32)
+private high(v: u64) -> u32 = u32(v >> 32)
+private joined(hi: u32, lo: u32) -> u64 = (u64(hi) << 32) | u64(lo)
+
+/** `v << n` for a count below 64, on the two halves. A 32-bit shift past its width answers zero,
+ * which is what makes a count of 0 and of 32 come out of the same two lines. */
+private[softint] shift_left(v: u64, n: int) -> u64
+    val lo = low(v)
+    val hi = high(v)
+
+    if n >= 32 then return joined(lo << (n - 32), 0)
+
+    joined((hi << n) | (lo >> (32 - n)), lo << n)
+
+/** `v >> n`, filling with zeros, for a count below 64. */
+private[softint] shift_right(v: u64, n: int) -> u64
+    val lo = low(v)
+    val hi = high(v)
+
+    if n >= 32 then return joined(0, hi >> (n - 32))
+
+    joined(hi >> n, (lo >> n) | (hi << (32 - n)))
+
+/** `v >> n`, filling with the sign, for a count below 64. */
+private[softint] shift_right_signed(v: i64, n: int) -> i64
+    val lo = low(u64(v))
+    val hi = i32(high(u64(v)))
+
+    if n >= 32 then return i64(joined(u32(hi >> 31), u32(hi >> (n - 32))))
+
+    i64(joined(u32(hi >> n), (lo >> n) | (u32(hi) << (32 - n))))
+
+/** The 64-bit product of two 32-bit values, from four products of 16-bit halves -- each of which fits
+ * in the word a 32-bit multiply keeps. */
+private wide_product32(a: u32, b: u32) -> u64
+    val al = a & 0xFFFF
+    val ah = a >> 16
+    val bl = b & 0xFFFF
+    val bh = b >> 16
+
+    val ll = al * bl
+    val lh = al * bh
+    val mid = lh + ah * bl
+    val carry: u32 = if mid < lh then 0x1_0000 else 0
+    val lo = ll + (mid << 16)
+    val hi = ah * bh + (mid >> 16) + carry + (if lo < ll then 1 else 0)
+
+    joined(hi, lo)
+end wide_product32
+
+/** The low 64 bits of `a * b`, which is the same for a signed product and an unsigned one. The two
+ * cross products land above bit 31, so only their low words count, and the product of the two high
+ * words lands above bit 63 entirely. */
+private[softint] multiply(a: u64, b: u64) -> u64
+    val cross = low(a) * high(b) + high(a) * low(b)
+
+    wide_product32(low(a), low(b)) + joined(cross, 0)
+
+/** How many zero bits lead `x`, 32 for zero: halved five times rather than counted a bit at a time. */
+private[softint] leading_zeros32(x: u32) -> int
+    if x == 0 then return 32
+
+    var v = x
+    var n = 0
+
+    if v & 0xFFFF_0000 == 0
+        n += 16
+        v = v << 16
+
+    if v & 0xFF00_0000 == 0
+        n += 8
+        v = v << 8
+
+    if v & 0xF000_0000 == 0
+        n += 4
+        v = v << 4
+
+    if v & 0xC000_0000 == 0
+        n += 2
+        v = v << 2
+
+    if v & 0x8000_0000 == 0 then n += 1
+
+    n
+end leading_zeros32
 
 #if thumb || riscv32
 
@@ -152,5 +291,170 @@ asm
         "pop {{r6, pc}}"
         ".size __aeabi_ldivmod, . - __aeabi_ldivmod"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's division"
+
+// -- the Armv6-M exports -----------------------------------------------------------------------------
+//
+// Every Cortex-M above Armv6-M has a 32-bit divider, a long multiply, `clz` and Thumb-2's two-word
+// shifts, so LLVM calls none of these there; they are here, weak, for the core that has none of them.
+
+/** `n / d` on 32 bits. */
+@export("__aeabi_uidiv")
+aeabi_uidiv(n: u32, d: u32) -> u32 = unsigned_divide32(n, d).0
+
+/** `n / d` on 32 bits, toward zero. */
+@export("__aeabi_idiv")
+aeabi_idiv(n: i32, d: i32) -> i32 = signed_divide32(n, d).0
+
+/** The quotient of `n / d` on 32 bits, its remainder written through `rem`. */
+@export("__udivmodsi4")
+udivmodsi4(n: u32, d: u32, rem: *u32) -> u32
+    val (q, r) = unsigned_divide32(n, d)
+
+    *rem = r
+    q
+
+/** The quotient of `n / d` on 32 bits toward zero, its remainder written through `rem`. */
+@export("__divmodsi4")
+divmodsi4(n: i32, d: i32, rem: *i32) -> i32
+    val (q, r) = signed_divide32(n, d)
+
+    *rem = r
+    q
+
+/** `v << n`. */
+@export("__aeabi_llsl")
+aeabi_llsl(v: u64, n: int) -> u64 = shift_left(v, n)
+
+/** `v >> n`, unsigned. */
+@export("__aeabi_llsr")
+aeabi_llsr(v: u64, n: int) -> u64 = shift_right(v, n)
+
+/** `v >> n`, signed. */
+@export("__aeabi_lasr")
+aeabi_lasr(v: i64, n: int) -> i64 = shift_right_signed(v, n)
+
+/** The low 64 bits of `a * b`. */
+@export("__aeabi_lmul")
+aeabi_lmul(a: u64, b: u64) -> u64 = multiply(a, b)
+
+/** How many zero bits lead `x`. */
+@export("__clzsi2")
+clzsi2(x: u32) -> int = leading_zeros32(x)
+
+// **The 32-bit `divmod` pair answers in r0 and r1**, the quotient and the remainder, which no sysl
+// signature can say -- the 64-bit pair's shape one word narrower: room for the remainder on the stack,
+// its address as the third argument, the call, and the remainder loaded into r1.
+@section(".text.__aeabi_uidivmod")
+asm
+    [thumb]
+        ".weak __aeabi_uidivmod"
+        ".type __aeabi_uidivmod, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_uidivmod:"
+        "push {{r4, lr}}"
+        "sub sp, #8"
+        "mov r2, sp"
+        "bl __udivmodsi4"
+        "ldr r1, [sp]"
+        "add sp, #8"
+        "pop {{r4, pc}}"
+        ".size __aeabi_uidivmod, . - __aeabi_uidivmod"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's division"
+
+@section(".text.__aeabi_idivmod")
+asm
+    [thumb]
+        ".weak __aeabi_idivmod"
+        ".type __aeabi_idivmod, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_idivmod:"
+        "push {{r4, lr}}"
+        "sub sp, #8"
+        "mov r2, sp"
+        "bl __divmodsi4"
+        "ldr r1, [sp]"
+        "add sp, #8"
+        "pop {{r4, pc}}"
+        ".size __aeabi_idivmod, . - __aeabi_idivmod"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's division"
+
+// **The run-time ABI's names for the block operations**, which LLVM calls in place of C's for a
+// struct copied or cleared. They are C's `memcpy` and `memset` under another contract -- and not a
+// spelling variant: `__aeabi_memset` takes its length before its byte, so the registers are swapped
+// on the way through. They are instructions rather than sysl, because a sysl body calling `memcpy`
+// could be lowered back into a call to `__aeabi_memcpy`, which is itself. The aligned forms are the
+// same routine: `memcpy` asks nothing of alignment.
+@section(".text.__aeabi_memcpy")
+asm
+    [thumb]
+        ".weak __aeabi_memcpy"
+        ".weak __aeabi_memcpy4"
+        ".weak __aeabi_memcpy8"
+        ".type __aeabi_memcpy, %function"
+        ".type __aeabi_memcpy4, %function"
+        ".type __aeabi_memcpy8, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_memcpy:"
+        ".thumb_func"
+        "__aeabi_memcpy4:"
+        ".thumb_func"
+        "__aeabi_memcpy8:"
+        "push {{r4, lr}}"
+        "bl memcpy"
+        "pop {{r4, pc}}"
+        ".size __aeabi_memcpy, . - __aeabi_memcpy"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's block copy"
+
+@section(".text.__aeabi_memset")
+asm
+    [thumb]
+        ".weak __aeabi_memset"
+        ".weak __aeabi_memset4"
+        ".weak __aeabi_memset8"
+        ".type __aeabi_memset, %function"
+        ".type __aeabi_memset4, %function"
+        ".type __aeabi_memset8, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_memset:"
+        ".thumb_func"
+        "__aeabi_memset4:"
+        ".thumb_func"
+        "__aeabi_memset8:"
+        "movs r3, r1"
+        "movs r1, r2"
+        "movs r2, r3"
+        "push {{r4, lr}}"
+        "bl memset"
+        "pop {{r4, pc}}"
+        ".size __aeabi_memset, . - __aeabi_memset"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's block fill"
+
+@section(".text.__aeabi_memclr")
+asm
+    [thumb]
+        ".weak __aeabi_memclr"
+        ".weak __aeabi_memclr4"
+        ".weak __aeabi_memclr8"
+        ".type __aeabi_memclr, %function"
+        ".type __aeabi_memclr4, %function"
+        ".type __aeabi_memclr8, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_memclr:"
+        ".thumb_func"
+        "__aeabi_memclr4:"
+        ".thumb_func"
+        "__aeabi_memclr8:"
+        "movs r2, r1"
+        "movs r1, #0"
+        "push {{r4, lr}}"
+        "bl memset"
+        "pop {{r4, pc}}"
+        ".size __aeabi_memclr, . - __aeabi_memclr"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's block fill"
 
 #endif

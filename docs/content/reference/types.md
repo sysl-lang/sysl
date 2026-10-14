@@ -354,6 +354,18 @@ and `__aeabi_dmul` itself:
 scale(x: real, n: long) -> real = x * real(n / 1000)
 ```
 
+**An `f32` on a core with no floating-point unit at all** — a Cortex-M0+ or M3, RISC-V with no `F` —
+is a call as well, `__aeabi_fmul` or `__mulsf3`, from the same module and under the same rule. It is
+the binary64 arithmetic between an exact widening and a narrowing, which rounds once in effect: 53
+bits is more than twice 24 plus two, so the double rounding is innocuous, and the result is bit for
+bit what a single-precision unit gives. This archive for a Cortex-M0+ computes with an `f32` and needs
+nothing from its board but `memcpy` and `memset`:
+
+```sysl build=c target=thumbv6m-freestanding
+@export("mix")
+mix(a: f32, b: f32, t: f32) -> f32 = a + (b - a) * t
+```
+
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
 it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
 program does not hold. A format
