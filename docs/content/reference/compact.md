@@ -639,6 +639,7 @@ do all along. One program and one `sysl build` settle it.
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |
 | `'require'/'ensure' clauses must come before any other statement` | move the whole contract block to the top of the body |
 | `a program starts in one place, and this 'main' is a second` | put the top-level statements inside `main` |
+| `a program starts in one place, and this function exported as 'main' is a second` | the export is the program's `main`: put the statements, or the declared `main`'s body, inside it |
 | `is exported and reaches … module storage an initializer fills` | the bare-metal `val` above: make it a local or a field |
 | `'private[…]' names one enclosing module by its simple name rather than by a path` | `private[b]` — the bracket takes a simple name |
 | `Undefined symbols … _stdout` | a macro, not a symbol; put a line of C beside the module |
