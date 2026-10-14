@@ -559,6 +559,104 @@ rfs_method_copy_into_storage_builds_c()
     remove_dir_all(root).unwrap_or(())
     assert_eq(said, "ok")
 
+// -- a function exported as `main` IS the program's entry (`exports_main`) -----------------------
+
+// Built and run on the host: the export is the platform's `main`, so there is no second one for the
+// link to refuse, and a computed `val` is filled before its body runs.
+@test("a program whose entry is an '@export(\"main\")' builds and runs on the host")
+exm_exported_main_runs() =
+    enf_prints("@export(\"main\")\nprobe() -> i32\n    print(\"from the export\")\n    0\n",
+               "from the export\n")
+
+@test("and its computed storage is filled before the export's body runs")
+exm_computed_vals_filled_first() =
+    enf_prints("seed() -> int = 41\n\nval base: int = seed() + 1\nval greeting: string = \"hi \" + str(base)\n\n" +
+               "@export(\"main\")\nprobe() -> i32\n    print(greeting)\n    i32(base - 42)\n",
+               "hi 42\n")
+
+@test("and what the export answers is the program's exit status")
+exm_the_export_answers_the_status()
+    if !enf_ready() then return
+
+    val out = enf_outcome([("", "main.sysl", "@export(\"main\")\nprobe() -> i32 = 3\n")])
+
+    assert(!out.1, out.0)
+    assert_eq(out.0, "")
+
+@test("so the text defines 'main' once, the export's thunk calling the prologue first")
+exm_one_main_in_the_text()
+    if !enf_ready() then return
+
+    val ir = enf_ir("val k: string = \"a\" + str(1)\n\n@export(\"main\")\nprobe() -> i32 = i32(k.len)\n")
+    var mains = 0
+
+    for line in lines_of(ir)
+        if line.starts_with("define ") && line.contains("@main(") then mains += 1
+
+    assert_eq(mains, 1, ir)
+    enf_has(ir, "call void @sysl.entry_prologue()")
+
+@test("and on a freestanding target the same")
+exm_one_main_on_thumb()
+    if !enf_ready() then return
+
+    val ir = rfs_ir_for(rfs_root_file("", "main"), "thumbv7em-freestanding")
+    var mains = 0
+
+    for line in lines_of(ir)
+        if line.starts_with("define ") && line.contains("@main(") then mains += 1
+
+    assert_eq(mains, 1, ir)
+    enf_has(ir, "call void @sysl.entry_prologue()")
+    enf_has_not(ir, "sysl_install_stack_guard")
+
+// The A2 root file, which before stopped at clang with two definitions of `main`, now runs.
+@test("so the bare-metal root file shape runs on the host, its storage the module's")
+exm_root_file_runs() =
+    enf_prints("private var kept: [2]u32 = [5, 0]\nprivate bump() -> u32 = kept[0]\n" +
+               "@export(\"main\")\nprobe() -> i32\n    print(bump())\n    0\n", "5\n")
+
+@test("as does a method copying into its storage")
+exm_method_copy_runs() =
+    enf_prints(rfs_method_copy("@export(\"main\")\nprobe() -> i32\n    var out: [8]u8 = [7; 8]\n" +
+                               "    var d = D(1)\n    d.into_storage(out[..])\n    print(storage[0])\n    0\n"),
+               "7\n")
+
+@test("while 'build-c' of the same root file for a board still makes the archive")
+exm_build_c_for_thumb()
+    if !enf_ready() then return
+
+    val root = enf_tree([("", "main.sysl", rfs_root_file("", "main"))])
+    val made = build_c_archive(root, Some("thumbv7em-freestanding"), None, DefaultOptimization,
+                               Some(s"$root/lib.a"), None, (m) -> ())
+    val said = made match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "ok")
+
+// -- and it is a beginning, so it is refused beside another ---------------------------------------
+
+@test("an export named 'main' beside statements is a second beginning")
+exm_beside_statements_refused() =
+    enf_refused("print(\"top\")\n\n@export(\"main\")\nprobe() -> i32 = 0\n",
+                "error: a program starts in one place, and this function exported as 'main' is a second — " +
+                "whichever of the two the program means, the other belongs inside it. The statements this " +
+                "program starts with are in @/main.sysl")
+
+@test("and one beside a declared 'main' is too")
+exm_beside_a_declared_main_refused() =
+    enf_refused_in([("", "main.sysl", "main()\n    print(\"declared\")\n"),
+                    ("", "entry.sysl", "@export(\"main\")\nprobe() -> i32 = 0\n")],
+                   "error: a program starts in one place, and this function exported as 'main' is a second " +
+                   "beside the declared 'main' — whichever of the two the program means, the other belongs " +
+                   "inside it. The declared 'main' is in @/main.sysl")
+
+@test("while an export under another name beside a 'main' is ordinary")
+exm_another_export_beside_main() =
+    enf_prints("@export(\"helper\")\nhelper() -> i32 = 2\n\nmain()\n    print(helper())\n", "2\n")
+
 // Every candidate of an overload set refused for the one reason no candidate causes -- an argument
 // naming a body's local from inside a method, which cannot see it -- so that reason is the message,
 // not the roster of declarations.

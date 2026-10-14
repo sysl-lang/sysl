@@ -1175,6 +1175,41 @@ main() -> int = 0
 'main' yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status is not something a signature can say
 ```
 
+**A function exported as `main` is the third way to write the beginning**, and the one a bare-metal
+root file uses: the [export](/reference/ffi/) *is* the platform's `main`, called by that symbol by the
+host's start-up code or by a board's reset handler, so the program gets no `main` of the compiler's own
+beside it. What that one would have done first is done on the way into the export instead — the
+program's computed `val`s are filled before its body runs — and what it answers is C's status, at C's
+signature:
+
+```sysl
+seed() -> int = 41
+
+val answer: int = seed() + 1
+
+@export("main")
+start() -> i32
+    print("the answer is", answer)
+    0
+```
+
+```output
+the answer is 42
+```
+
+It is a beginning like the other two, so it is refused beside statements, and beside a declared `main`:
+
+```sysl
+print("initialization")
+
+@export("main")
+start() -> i32 = 0
+```
+
+```error
+a program starts in one place, and this function exported as 'main' is a second — whichever of the two the program means, the other belongs inside it
+```
+
 **A program in which no file carries a statement is a complete program that does nothing.** The entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to, which
 is what it should compile to — a library is not an error.

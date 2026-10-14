@@ -130,13 +130,19 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // **Only this compilation's own functions get one**: a precompiled function's thunk was emitted
     // into the artifact that defined it, and a second copy here would be the duplicate symbol every
     // other cross-artifact declaration is careful to avoid.
+    //
+    // The one exported as `main` in a program is that program's entry, and its thunk runs the entry's
+    // prologue before anything else (`exports_main`).
     var thunks: Buf[IrFunc] = buf()
+    val export_entry = p.entry_point && exports_main(p)
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
         if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f)
-            gen_export_thunk(e, f, symbol_of(e, f.name)) match
+            val enters = export_entry && f.exported.unwrap() == "main"
+
+            gen_export_thunk(e, f, symbol_of(e, f.name), enters) match
                 Some(built) -> thunks.push(built)
                 None -> gaps.push((s"${f.name} thunk", gap_text(e)))
 
@@ -159,7 +165,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // one.
     var entry: Option[IrFunc] = None
 
-    if p.entry_point
+    // **A function exported as `main` is the entry**, so `@main` is not emitted; the prologue it would
+    // have run is, for the export's thunk to call first.
+    if export_entry
+        set_promoted(e, pr.for_func(""))
+
+        gen_entry_prologue(e, p) match
+            Some(f) -> funcs.push(f)
+            None -> gaps.push((entry_prologue_symbol(), gap_text(e)))
+    else if p.entry_point
         set_promoted(e, pr.for_func(""))
 
         val built = if p.tests.is_empty() then gen_main(e, p) else gen_test_main(e, p)
@@ -415,6 +429,21 @@ end allocates
 // it -- is a different closure's body under the same signature.
 private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
     !f.internal && holds_string(p.precompiled, f.name)
+
+// **Whether the program's entry is a function it exports as `main`** -- the way a bare-metal root
+// file names where it starts, and on the host a program written the same way. That export is the
+// platform's `main`, so the program gets no `@main` of the compiler's own beside it (a second
+// definition of the one symbol); its thunk runs the prologue `@main` would have run
+// (`gen_entry_prologue`). Only this compilation's own definition counts, since a precompiled one's
+// thunk is in the artifact that defined it, and a test build keeps its dispatcher.
+exports_main(p: TProgram) -> bool
+    if !p.tests.is_empty() then return false
+
+    for f in p.funcs
+        if !f.ghost && f.exported.unwrap_or("") == "main" && !declared_elsewhere(p, f) then return true
+
+    false
+end exports_main
 
 // The most instructions a precompiled function's lowered body may hold and still be copied into a
 // program that calls it without being marked `@inline`. Lowered text is unoptimized -- every local a
