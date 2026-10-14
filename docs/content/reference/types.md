@@ -339,6 +339,20 @@ bare-metal image has no runtime library at all. A program, an archive or a kerne
 in `f128` is linked with them, and one that does not carries none. They round to nearest, ties to
 even, always.
 
+**A `real` on a 32-bit board is the same arrangement one size down.** Every Cortex-M unit sysl targets
+is single-precision or absent, and 32-bit RISC-V here has none, so an `f64` operation there is a call
+too — `__aeabi_dmul` on Arm, `__muldf3` on RISC-V — and the standard module carries those in
+`sysl.softfloat.binary64`, with the same rounding and the same rule: an image that computes with a
+`real` carries them, and one that does not carries none. Results are bit for bit what a
+double-precision unit gives. The same holds for dividing a `long`, which no 32-bit core does in one
+instruction (`sysl.softint`). This archive for a Cortex-M4F defines `__aeabi_ldivmod`, `__aeabi_l2d`
+and `__aeabi_dmul` itself:
+
+```sysl build=c target=thumbv7em-freestanding
+@export("scale")
+scale(x: real, n: long) -> real = x * real(n / 1000)
+```
+
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
 it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
 program does not hold. A format

@@ -1,0 +1,72 @@
+module sysl.softint
+@tests
+
+import sysl.rand.{Rng, rng}
+
+// The 64-bit division routines' arithmetic, checked against the host's own divider: every sign
+// combination, divisors above 2^63 (where the partial remainder carries out of its word), and the
+// values at the ends. A board runs the same routines through the exports (`tests_qmu_qemu_run.sysl`).
+
+private const MAX: u64 = 0xFFFF_FFFF_FFFF_FFFF
+private const SMAX: i64 = 0x7FFF_FFFF_FFFF_FFFF
+private const SMIN: i64 = -0x7FFF_FFFF_FFFF_FFFF - 1
+
+private gives(n: u64, d: u64, q: u64, r: u64) -> bool
+    val got = unsigned_divide(n, d)
+
+    got.0 == q && got.1 == r
+
+private signed_gives(n: i64, d: i64, q: i64, r: i64) -> bool
+    val got = signed_divide(n, d)
+
+    got.0 == q && got.1 == r
+
+@test("unsigned quotients and remainders agree with the divider")
+random_unsigned_agree_with_hardware()
+    var g = rng(641, 7)
+
+    for step in 0..<20000
+        val n = g.next_u64() >> (g.next_u64() % 64)
+        val d = (g.next_u64() >> (g.next_u64() % 64)) | (if step % 5 == 0 then 0x8000_0000_0000_0000 else 1)
+
+        assert(gives(n, d, n / d, n % d), s"$n / $d")
+
+@test("signed quotients round toward zero and remainders take the dividend's sign")
+random_signed_agree_with_hardware()
+    var g = rng(642, 7)
+
+    for step in 0..<20000
+        val n = i64(g.next_u64() >> (1 + g.next_u64() % 63))
+        val d = i64(g.next_u64() >> (1 + g.next_u64() % 63)) | 1
+        val sn = if step % 2 == 0 then n else -n
+        val sd = if step % 3 == 0 then d else -d
+
+        assert(signed_gives(sn, sd, sn / sd, sn % sd), s"$sn / $sd")
+
+@test("the edges: zero, one, the largest values, every sign, and the most negative value")
+edges()
+    assert(gives(0, 7, 0, 0))
+    assert(gives(7, 1, 7, 0))
+    assert(gives(MAX, 1, MAX, 0))
+    assert(gives(MAX, MAX, 1, 0))
+    assert(gives(MAX - 1, MAX, 0, MAX - 1))
+    assert(gives(MAX, 0x8000_0000_0000_0001, 1, 0x7FFF_FFFF_FFFF_FFFE))
+    assert(gives(MAX, 10, 1844674407370955161, 5))
+
+    assert(signed_gives(7, 2, 3, 1))
+    assert(signed_gives(-7, 2, -3, -1))
+    assert(signed_gives(7, -2, -3, 1))
+    assert(signed_gives(-7, -2, 3, -1))
+    assert(signed_gives(0, -5, 0, 0))
+    assert(signed_gives(SMAX, 1, SMAX, 0))
+    assert(signed_gives(SMIN, 1, SMIN, 0))
+    assert(signed_gives(SMIN, SMIN, 1, 0))
+    assert(signed_gives(SMIN, SMAX, -1, -1))
+    assert(signed_gives(SMIN, 10, -922337203685477580, -8))
+
+    // The one quotient with no value: it wraps to the most negative value, as every divider does.
+    assert(signed_gives(SMIN, -1, SMIN, 0))
+
+@test("a zero divisor answers all ones and the dividend, which is what the long division falls into")
+zero_divisor()
+    assert(gives(42, 0, MAX, 42))
