@@ -385,16 +385,56 @@ cap_the_same_construction_in_a_file_that_ships()
     cap_check(said, cap_needs("a reference"))
     cap_check(said, "thing/a.sysl:4:15")
 
-@test("a test file that says nothing is held to its module's clause")
-cap_a_silent_tests_file_is_held_to_the_module()
+@test("a test file that says nothing may allocate, whatever its module declared")
+cap_ta_a_silent_tests_file_may_allocate()
     if !cap_ready() then return
 
-    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                "thing/tests.sysl", cap_thing("@tests\n\nboxed() -> &int = 1\n"),
+                                "print(thing.f())")), "1\n")
+
+@test("a test renders with str and an f-string in a module that gave the allocator up")
+cap_ta_a_test_renders_in_a_no_alloc_module()
+    if !cap_ready() then return
+
+    val tests = cap_thing("@tests\n\n@test\nrenders() =\n    assert_eq(str(double(21)), \"42\")\n" +
+                          "    assert_eq(f\"${double(2)}\", \"4\")\n")
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\ndouble(x: int) -> int = x * 2\n"),
+                                "thing/tests.sysl", tests, "print(thing.double(4))")), "8\n")
+
+@test("while the module's own file, which ships, still gets the exact error")
+cap_ta_the_shipping_file_is_still_refused()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nlabel(x: int) -> &int = x\n"),
                                  "thing/tests.sysl", cap_thing("@tests\n\nboxed() -> &int = 1\n"),
-                                 "print(thing.f())"))
+                                 "print(1)"))
 
     cap_check(said, cap_needs("a reference"))
-    cap_check(said, "thing/tests.sysl:4:19")
+    cap_check(said, "thing/a.sysl:4:25")
+    assert(!cap_says(said, "thing/tests.sysl"), said)
+
+@test("a test that calls an allocating function of the module is refused at that function")
+cap_ta_a_test_calling_an_allocating_function()
+    if !cap_ready() then return
+
+    val tests = cap_thing("@tests\n\n@test\ncalls() =\n    assert_eq(*made(), 1)\n")
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nmade() -> &int = 1\n"),
+                                 "thing/tests.sysl", tests, "print(1)"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:4:18")
+
+@test("a '@tests' file's own '@no_alloc' still binds it")
+cap_ta_a_tests_file_that_narrows_on_its_own_still_binds()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("f() -> int = 1\n"),
+                                 "thing/tests.sysl", cap_thing("@tests\n@no_alloc\n\nboxed() -> &int = 1\n"),
+                                 "print(thing.f())"))
+
+    cap_check(said, "this module's '@tests' file declared '@no_alloc'")
 
 @test("and one that narrows on its own is held to that, where its module narrowed nothing")
 cap_a_tests_file_that_narrows_on_its_own()
@@ -449,14 +489,11 @@ cap_a_test_function_answers_to_the_tests_clause()
                                 "thing/tests.sysl", cap_thing("@tests\n@requires(heap)\n\nhelper() -> int = 2\n"),
                                 "print(thing.f())")), "1\n")
 
-@test("and is refused with the module where no '@tests' file took the allocator back")
-cap_a_test_function_refused_with_the_module()
+@test("and so does one with no '@tests' file at all, a test being scaffolding wherever it is written")
+cap_a_test_function_with_no_tests_file()
     if !cap_ready() then return
 
-    val said = cap_err(cap_two("thing/a.sysl", cap_beside(), "print(thing.f())"))
-
-    cap_check(said, cap_needs("a reference"))
-    cap_check(said, "thing/a.sysl:8:19")
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_beside(), "print(thing.f())")), "1\n")
 
 // -- an allocator-free program reaches the modules that declared themselves so -------------------------
 
@@ -818,16 +855,13 @@ cap_the_same_body_in_a_tests_file_that_took_it_back()
                                 "thing/tests.sysl", cap_thing("@tests\n@requires(heap)\n\n" + cap_view_of_a_local()),
                                 "print(thing.g())")), "1\n")
 
-@test("while one whose '@tests' file said nothing is refused with its module")
+@test("and so is one whose '@tests' file said nothing")
 cap_the_same_body_in_a_silent_tests_file()
     if !cap_ready() then return
 
-    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\ng() -> int = 1\n"),
-                                 "thing/tests.sysl", cap_thing("@tests\n\n" + cap_view_of_a_local()),
-                                 "print(thing.g())"))
-
-    cap_check(said, cap_escapes())
-    cap_check(said, "thing/tests.sysl:6:6")
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\ng() -> int = 1\n"),
+                                "thing/tests.sysl", cap_thing("@tests\n\n" + cap_view_of_a_local()),
+                                "print(thing.g())")), "1\n")
 
 @test("and the same body in a module that kept its allocator is promoted with no diagnostic at all")
 cap_the_same_body_in_a_module_that_kept_its_allocator()

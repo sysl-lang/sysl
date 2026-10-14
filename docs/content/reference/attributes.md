@@ -1283,7 +1283,10 @@ the string a value renders as needs an allocator, and 'shown' declared '@no_allo
 blank lines do not end it, so a file whose first declaration is the promised function has the
 module's clause instead; an `import` or another declaration above the function is what makes it the
 function's. A function in a module that already declared `@no_alloc` is held to the module's clause,
-which says everything the annotation would.
+which says everything the annotation would. **The module's clause binds its own files and never its
+`@tests` files** ([a `@tests` file states its own
+capabilities](/reference/modules/#a-tests-file-states-its-own-capabilities)): a test may use `str`,
+f-strings and `Buf`, while the module's functions stay allocator-free when a test calls them.
 
 **A method may carry it** — it lowers to a function like any other and is held the same way.
 **A function declared inside another may not**: it is a closure by another spelling, and what it
