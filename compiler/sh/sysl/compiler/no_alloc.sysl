@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.Set
 import sysl.text.Search
 
 // A module that gave the allocator up, and what that costs it.
@@ -27,8 +28,16 @@ import sysl.text.Search
 // loophole**: its files are compiled into every program, so holding them to it would report the
 // allocating half of the standard module as a mistake in source the program's author cannot change.
 // What a program does with that half is still refused, at the call in the program's own body.
-private no_alloc_here(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> bool
-    if machine_has_no_heap(a) && !from_library(a, scope) then return true
+//
+// **A dependency's module answers to the machine only where the program reaches it** (`reach`, from
+// `checks.sysl`'s `program_reach`): a package is a set of modules, and one the program never names is
+// not asked, so a board build that imports only `sh.sysl.pool.deque` is not refused over the thread
+// pool beside it. One it does name is held like the program's own.
+private no_alloc_here(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
+                      scaffolding: bool) -> bool
+    // The file answers which module that is: a lifted closure's key names no module of its own.
+    if machine_has_no_heap(a) && !from_library(a, scope) && reached_module(reach, scope.module_name)
+        return true
 
     if scaffolding then return module_tests_narrowed(a, module_name, CapHeap)
 
@@ -117,6 +126,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     // no clause anywhere -- which is almost all of them -- should pay nothing at all for this pass.
     if !any then return
 
+    val reach = program_reach(a, funcs)
     var seeds: Buf[string] = buf()
     var made: Buf[(string, string)] = buf()
     val graph = with_abstract_callees(a, funcs)
@@ -165,7 +175,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // seam through the middle of one module's tests.
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        held_to(a, scope, module_name, scaffolding, f, made) match
+        held_to(a, reach, scope, module_name, scaffolding, f, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
@@ -184,7 +194,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
 
-        held_to(a, scope, module_name, scaffolding, f, made) match
+        held_to(a, reach, scope, module_name, scaffolding, f, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
@@ -202,7 +212,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val scope = val_home(a, v.symbol)
         val scaffolding = holds_string(a.tables.test_only, v.symbol)
 
-        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
+        if !no_alloc_here(a, reach, scope, module_name, scaffolding) then continue
 
         val why = because(a, module_name, scaffolding)
         val held = Promised(why, None, made, false)
@@ -236,9 +246,9 @@ struct Promised
 // The promise a body is held to, or nothing where it made none. **The module's comes first**: it
 // holds every body in the module, so a function there carrying `@no_alloc` as well says nothing the
 // module did not, and the refusal names the clause that would still hold were the annotation gone.
-private held_to(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool, f: TFunc,
-                made: Buf[(string, string)]) -> Option[Promised]
-    if no_alloc_here(a, scope, module_name, scaffolding) then
+private held_to(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
+                scaffolding: bool, f: TFunc, made: Buf[(string, string)]) -> Option[Promised]
+    if no_alloc_here(a, reach, scope, module_name, scaffolding) then
         return Some(Promised(because(a, module_name, scaffolding), None, made, false))
 
     if !f.marks.gives_up(NoAllocWord) then return None
