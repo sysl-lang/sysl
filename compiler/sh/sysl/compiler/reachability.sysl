@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
 
 // **What a program can arrive at**, and the declarations that go when nothing can.
 //
@@ -47,7 +48,25 @@ prune(p: TProgram, own: Buf[string]) -> TProgram
     for i in 0..<p.funcs.len()
         if live.call_set.has(p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
 
-    with_declarations(p, externs, funcs)
+    // A table goes with its bodies: one the walk did not count (`table_counts`) names bodies that
+    // are no longer emitted.
+    var index: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        index.add(p.funcs.at(i).name)
+
+    var vtables: Buf[TVtable] = buf()
+
+    for i in 0..<p.vtables.len()
+        val t = p.vtables.at(i)
+        var whole = true
+
+        for item in t.slots
+            if index.has(item.target) && !live.call_set.has(item.target) then whole = false
+
+        if whole then vtables.push(t)
+
+    with_declarations(p, externs, funcs) with { vtables = vtables }
 end prune
 
 // The whole walk, including the one root kind that cannot be decided before it has run.
@@ -61,6 +80,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val entries = entry_points(p, own)
     val index = func_index(p)
     val exports = exports_of(p)
+    val reached = reached_modules(p, own)
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
@@ -68,7 +88,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val scan = type_scan()
 
     while more
-        live = reached_from(p, index, roots_of(p, entries, extra))
+        live = reached_from(p, index, roots_of(p, entries, extra, reached))
 
         for entrie in entries
             add_call(live, entrie.name)
@@ -279,7 +299,16 @@ end holds_func
 
 // The trees a walk starts from: the program's own statements, the storage it lays down, the tables
 // it built, the entry point, and every function nothing in the program names.
-private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
+//
+// **A table counts only where the program reaches the module its slots were written in** (`reached`,
+// from `reached_modules`; nothing means every module counts). Every closure a dependency's module
+// lowered has a table, and that module may be one the program never names: `sh.sysl.pool`'s
+// closures, rooted, kept its scheduler -- and through it `sysl.threads`'s futex hooks -- in a board
+// build that imports only `sh.sysl.pool.deque`. A slot's module is the function's `declared_in`,
+// since a closure's key names none. A module a kept supplier (`extra`) was written in counts, and
+// the standard module's tables are left as they were.
+private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
+                 reached: Option[Set[string]]) -> &Live
     val out = no_reached()
 
     walk_stmts(p.main, expr_walk(false, e -> take_node(out, e)))
@@ -289,8 +318,26 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
             Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(out, e)))
             None -> ()
 
+    var homes: Map[string, string] = map()
+
+    if reached.is_some()
+        for i in 0..<p.funcs.len()
+            homes.put(p.funcs.at(i).name, p.funcs.at(i).declared_in)
+
+    var counted = reached
+
+    if counted.is_some()
+        var names = counted.unwrap()
+
+        for item in extra
+            names.add(item.declared_in)
+
+        counted = Some(names)
+
     for i in 0..<p.vtables.len()
         val t = p.vtables.at(i)
+
+        if !table_counts(t, homes, counted) then continue
 
         for item in t.slots
             add_call(out, item.target)
@@ -316,6 +363,23 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
 
     out
 end roots_of
+
+// Whether a table is a root: where every module counts, where one of its slots was written in a
+// module that does, or where one was written in the standard module or names no body here.
+private table_counts(t: TVtable, homes: Map[string, string], counted: Option[Set[string]]) -> bool
+    if counted.is_none() then return true
+
+    for item in t.slots
+        val home = homes.get(item.target)
+
+        if home.is_none() then return true
+
+        val m = home.unwrap()
+
+        if m == "sysl" || m.starts_with("sysl.") || counted.unwrap().has(m) then return true
+
+    false
+end table_counts
 
 // Everything a set of roots can arrive at, following each call into the body it lands in.
 //
@@ -985,7 +1049,7 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     var more = true
 
     while more
-        val root = roots_of(kept, entries, extra)
+        val root = roots_of(kept, entries, extra, None)
 
         for item in kept.tests
             add_call(root, item.func)

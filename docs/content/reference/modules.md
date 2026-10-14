@@ -855,6 +855,16 @@ a module of a path or git dependency is asked the same question as one into the 
 program on a `posix = false` target, or one that wrote `@no_posix`, is refused at the line that
 reaches a dependency's `@requires(posix)` module, naming that module by its package-qualified name.
 
+**What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
+target whose `package.hocon` says `heap = false`, or one with no thread-local storage, a fetched
+package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
+at the construct, in its own file — when the program names that module or names one that does. A
+package is a set of modules, and the program uses the ones it names: a board program that imports
+only a package's fixed-capacity queue builds, although the thread pool beside the queue in the same
+package boxes its tasks and keeps per-thread storage, and none of the pool's code — its closures'
+tables included — is in the image. The program's own modules and the standard module's are asked as
+before.
+
 ### A generic answers for what it wrote, not for what its caller chose
 
 A generic has no execution until a type is chosen, and whoever chose it is usually somebody else. So
