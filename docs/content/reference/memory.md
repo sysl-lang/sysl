@@ -1886,6 +1886,64 @@ tier is mostly for.
 `sizeof`, `alignof` and `offsetof`, which measure what is being carved, are on the
 [expressions](/reference/expressions/) page.
 
+## Slot storage: room that holds no value yet
+
+A growable container needs storage whose spare end holds **nothing** — not a fill value repeated into
+every slot, which for a counted element would keep whatever it names alive until the slot is
+overwritten. Three forms give the raw tier exactly that, and they are what
+[`sysl.buf.Buf`](/library/buf/) is written with:
+
+- **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**.
+  The element type comes from the position, the way `ptr_cast`'s does.
+- **`slot_place(xs, i, v)`** puts `v` in slot `i`. The first slot past the live ones is filled
+  without letting go of anything, and the live run grows by one; a live slot is an ordinary
+  assignment; a slot further on would leave a gap, so it **traps**.
+- **`slot_vacate(xs, n)`** lets go of every live slot from `n` on and shortens the live run to `n` —
+  but only where nothing else holds the storage. A view handed out earlier still reads those slots,
+  so while one exists the form does nothing, and the next vacate after the sharing ends catches up.
+
+```sysl
+struct Node
+    n: int
+
+var xs: []&Node = slot_storage(4)
+
+slot_place(xs, 0, Node(1))
+slot_place(xs, 1, Node(2))
+
+print(xs.len, xs[0].n + xs[1].n)
+
+slot_vacate(xs, 1)
+slot_place(xs, 1, Node(5))
+
+print(xs[0].n + xs[1].n)
+```
+
+```output
+4 3
+6
+```
+
+**The live run is the storage's own, not the slice's**: the buffer's box carries the count of live
+slots, and its destructor releases exactly those, so storage dropped with two of four slots placed
+releases two. The slice's `len` is still the whole room. **What the compiler cannot check is the one
+thing the caller owes**: nothing reads a slot past the live run, whose bytes are whatever the
+allocator left. That is the raw tier's bargain, as it is for `ptr_cast` — the forms are greppable, and
+`Buf` is what writes them so that a program does not have to.
+
+A form with no element type to make is refused at the call:
+
+```sysl
+var xs = slot_storage(4)
+```
+
+```error
+'slot_storage' makes storage for elements of some type, and nothing here says which
+```
+
+On storage that `slot_storage` did not make — an array, a frame, a view of a struct's field — the
+two writing forms are an ordinary assignment and nothing at all, since there is no live run to move.
+
 ## Device memory
 
 `ptr_cast` gets a driver to the register block. It does not get it a *correct* driver, and the missing

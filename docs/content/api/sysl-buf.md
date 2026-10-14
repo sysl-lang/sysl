@@ -15,7 +15,7 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 
 ## Index
 
-[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -24,6 +24,19 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 ```sysl
 buf[T]() -> Buf[T]
 ```
+
+### `buf_filled`
+
+```sysl
+buf_filled[T](n: usize, value: T) -> Buf[T]
+```
+
+A buffer of `n` elements, every one of them `value` -- what a RAM disk, a frame buffer or a table
+of counters starts as. The storage is sized to `n` once and each slot is filled in place, so it
+costs one allocation and `n` stores rather than the doublings of a `push` loop.
+
+**Every element is a copy of `value`**, the way any assignment copies: a plain value is repeated,
+and a counted one is shared -- `n` elements naming one object, holding `n` counts of it.
 
 ### `buf_with_capacity`
 

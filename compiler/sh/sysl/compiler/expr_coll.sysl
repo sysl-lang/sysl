@@ -19,6 +19,35 @@ private element_wanted(t: Type) -> Option[Type] = repr(t) match
     Vector(_, e) -> Some(*e)
     _ -> None
 
+// A string literal where a `[N]u8` is wanted: the literal's UTF-8 bytes, one element each, as the
+// array literal they spell. It is an array literal from here on, so it folds to constant data
+// wherever one of byte literals does. `None` when the position does not want a byte array, and the
+// literal stays a `string`.
+bytes_literal(cx: &Analyzer, span: Span, text: string, expected: Option[Type]) -> Option[TExpr]
+    if expected.is_none() then return None
+
+    val want = expected.unwrap()
+
+    repr(want) match
+        Array(n, elem) ->
+            if repr(*elem) != Integer(8, false, false) then return None
+
+            val bytes = text.bytes
+
+            if int(bytes.len) != n then
+                return Some(cx.err(span, s"this string literal is ${bytes.len} bytes and " +
+                                   s"${type_show(want)} holds $n — a string literal fills a byte " +
+                                   "array only when its UTF-8 length is exactly the array's"))
+
+            var ts: Buf[TExpr] = buf()
+
+            for b in bytes
+                ts.push(TExpr(span, TIntLit(from_int(long(b)), *elem)))
+
+            Some(TExpr(span, TArrayLit(ts, Array(n, *elem))))
+        _ -> None
+end bytes_literal
+
 array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type]) -> TExpr
     val elem_exp = expected.and_then(t -> element_wanted(t))
     var ts: Buf[TExpr] = buf()
