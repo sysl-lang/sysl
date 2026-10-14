@@ -461,7 +461,33 @@ with a UTF-8 `string` has to do. Conversion to `u32` is total and written `u32(c
 ## `unit` and `never`
 
 `unit` is the type with exactly one value — what a function that returns nothing returns. It is a real
-type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery.
+type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery. Its value is
+written `()`, and so is its [pattern](/reference/patterns/#the-pattern-forms).
+
+**It has the four memberships a tuple has, each with the one answer a single value allows**: `Eq`
+(every `()` equals every other), `Ord` (none is less than another), `Hash` (all hash alike) and
+`Display` (it prints as `()`). They are what let a `Result[unit, E]` or an `Option[unit]` compare,
+print and go through `assert_eq`, and they occupy no storage: a `unit` operand is passed as nothing.
+A program may implement its own traits for `unit` too.
+
+```sysl
+enum Fault
+    Low
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec) = display_str("Low", out, fmt)
+
+check(n: int) -> Result[unit, Fault] = if n > 0 then Ok(()) else Err(Low)
+
+print(check(1) == Ok(()), check(0) == Err(Low), () < ())
+print(check(1), check(0))
+assert_eq(check(0), Err(Low))
+```
+
+```output
+true true false
+Ok(()) Err(Low)
+```
 
 `never` is the type with **no** values, and it is what an expression that does not finish has. A call
 to `exit` has type `never`, as does a `return` or a `break` considered as an expression. Because there
@@ -683,7 +709,8 @@ lighter and says so. If yes, only the tuple will do.
 
 `Eq`, `Ord`, `Hash` and `Display` are provided structurally, at **every** arity, whenever every
 component has the row. Ordering is lexicographic, first component first, which is the only ordering a
-positional product has a claim to.
+positional product has a claim to. `unit`, the tuple with no parts, has the same four
+([`unit` and `never`](#unit-and-never)).
 
 ```sysl
 val pair = (1, "one")

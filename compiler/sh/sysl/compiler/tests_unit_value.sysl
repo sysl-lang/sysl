@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `unit`'s one value as a pattern and as an operand (`reference/types.md § unit and never`,
+// `reference/patterns.md § The pattern forms`): `()` matches it, which is what lets `Ok(())` be an
+// arm, and it compares, orders, hashes and prints, which is what lets a `Result[unit, E]` do the same.
+
+private var unv_library_cache: Buf[Program] = buf()
+private var unv_library_read: bool = false
+
+private unv_library() -> Buf[Program]
+    if unv_library_read then return unv_library_cache
+
+    unv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> unv_library_cache = units
+
+    unv_library_cache
+end unv_library
+
+private unv_ready() -> bool
+    if unv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end unv_ready
+
+private unv_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program prints, built and run.
+private unv_ran(text: string) -> string
+    val root = make_temp_dir("sysl-unit").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end unv_ran
+
+// The source is refused with exactly `message`, at `line:col` of the entry file.
+private unv_refused(text: string, message: string, at: string)
+    val root = make_temp_dir("sysl-unit").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val said = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(unv_says(said, s"error: $message\n --> "), s"expected '$message', got: $said")
+    assert(unv_says(said, s"/main.sysl:$at\n"), s"expected it at $at, got: $said")
+
+// ---- `()` is a pattern ----
+
+@test("Ok(()) is an arm, and with Err it covers the result")
+unv_ok_unit_is_an_arm()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        check(n: int) -> Result[unit, string] = if n > 0 then Ok(()) else Err("low")
+
+        for n in [1, 0]
+            check(n) match
+                Ok(()) -> print("ok")
+                Err(why) -> print(why)
+        """), "ok\nlow\n")
+
+@test("() matches unit directly, and on its own covers it")
+unv_unit_matched_directly()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        nothing() = ()
+
+        val u = nothing()
+        val word = u match
+            () -> "unit"
+
+        print(word)
+        """), "unit\n")
+
+@test("Some(()) and None cover an Option[unit]")
+unv_option_of_unit()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        val all: [2]Option[unit] = [Some(()), None]
+
+        for o in all
+            o match
+                Some(()) -> print("some")
+                None -> print("none")
+        """), "some\nnone\n")
+
+@test("Ok(()) alone leaves Err uncovered")
+unv_ok_unit_alone_is_not_exhaustive()
+    if !unv_ready() then return
+
+    unv_refused("val r: Result[unit, int] = Ok(())\nr match\n    Ok(()) -> print(\"ok\")\n",
+                "match on 'sysl.Result[unit, int]' is not exhaustive; missing Err (add an 'else' arm)",
+                "2:1")
+
+@test("() against a value that is not unit says what it matches")
+unv_unit_pattern_against_int()
+    if !unv_ready() then return
+
+    unv_refused("var p = 1\np match\n    () -> print(p)\n    _ -> print(0)\n",
+                "'()' matches unit, but the value is int", "3:5")
+
+// ---- unit compares, orders, hashes and prints ----
+
+@test("a Result[unit, E] compares with ==, and assert_eq takes it")
+unv_result_of_unit_compares()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        enum Fault
+            Low
+            High
+
+        impl Display for Fault
+            display(self, out: *Writer, fmt: FormatSpec) =
+                display_str(if self == Low then "Low" else "High", out, fmt)
+
+        check(n: int) -> Result[unit, Fault] = if n > 0 then Ok(()) else Err(Low)
+
+        print(check(1) == Ok(()), check(0) == Err(Low), check(0) == Err(High), check(1) != Ok(()))
+        assert_eq(check(0), Err(Low))
+        assert_eq(check(1), Ok(()))
+        print("held")
+        """), "true true false false\nheld\n")
+
+@test("an Option[unit] compares and prints")
+unv_option_of_unit_compares_and_prints()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        val s: Option[unit] = Some(())
+        val n: Option[unit] = None
+
+        print(s == Some(()), s == n, n == None)
+        print(s, n)
+        """), "true false true\nSome(()) None\n")
+
+@test("unit is equal to itself, never less, hashes alike, and prints in a field")
+unv_unit_members()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+
+        val r: Result[unit, string] = Ok(())
+
+        print(() == (), () != (), () < (), () <= (), same((), ()))
+        print(().hash() == ().hash())
+        print(f"[${()}%5s][${()}%-4s]", r)
+        """), "true false false true true\ntrue\n[   ()][()  ] Ok(())\n")
+
+@test("unit erases to a Display like any type that implements it")
+unv_unit_as_a_trait_object()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        var u = ()
+        val d: *Display = &u
+
+        print(d)
+        """), "()\n")
+
+@test("a program may implement its own trait for unit")
+unv_own_trait_for_unit()
+    if !unv_ready() then return
+
+    assert_eq(unv_ran(raw"""
+        trait Show
+            show(self) -> string
+
+        impl Show for unit
+            show(self) -> string = "nothing"
+
+        print(().show())
+        """), "nothing\n")
