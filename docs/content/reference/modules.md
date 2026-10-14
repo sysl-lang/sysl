@@ -1313,7 +1313,8 @@ Both moves the message names work, and neither is preferred: put the call after 
 **A file whose only running lines are `var`s is a body only when nothing else is the beginning.** A
 `var` could be read either way — a local of the statements a script runs, or storage its module
 owns — and the rest of the program chooses. With no `main` anywhere, a lone `var n = 1` is a script's
-first line, as it always was. With a `main`, the program has written where it starts, so there is no
+first line, as it always was. With a `main` — declared, or a function exported as `main`, which is
+how a bare-metal root file names its entry — the program has written where it starts, so there is no
 body for the `var` to be a local of, and it is the module's: exactly what a `val` beside the `main`
 is, and what a `var` in a file with a `module` line always is. A program shaped like most programs —
 a counter, the functions that bump it, and a `main` calling them — is therefore just that:
@@ -1443,10 +1444,28 @@ A [destructor](/reference/memory/) takes the same ruling and for the same reason
 storage never reaches a count of zero, so its `drop` does not run when the program ends.
 
 **`static` is meaningful only in the entry file**, since only that file has a body for a declaration
-to *not* belong to. In a file with a `module` header, or a headerless file carrying no statements,
-everything is the module's already and the modifier is refused rather than ignored. A function never
+to *not* belong to. In a file with a `module` header, or a headerless file that is not the program's
+beginning (the ruling that closes this section), everything is the module's already and the
+modifier is refused rather than ignored. A function never
 takes it either: settled by what it reads, the modifier would be redundant on one and impossible on
 the other.
+
+A bare-metal root file is the usual case: it runs no statement and names its entry with
+`@export("main")`, so its storage is the module's already — laid into `.bss`/`.data`, read by
+ordinary module functions and methods — and the modifier says nothing:
+
+```sysl
+private static var kept: [2]u32 = [0, 0]
+
+private bump() -> u32 = kept[0]
+
+@export("main")
+probe() -> i32 = i32(bump())
+```
+
+```error
+'static' says a declaration belongs to the module rather than to the body of the file the program starts in — and this file has no such body, so everything it declares is the module's already
+```
 
 **So everywhere else the same storage is written plain `var`**, and it is the same declaration —
 visibility, the shared value namespace, the initializer graph and the release rule all answer for it
@@ -1483,7 +1502,10 @@ in.
 and declaring storage runs nothing — a file holding a counter is no more the program's beginning than
 one holding a table. Where a file carries a statement that is not a binding, it is the entry file and
 every other file's top-level `var`s are their module's. Where nothing runs anywhere, a single
-**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did.
+**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did —
+unless the program names its beginning elsewhere, with a `main` or a function exported as `main`.
+**This is the one ruling**: the file it chooses is the only one where `static` means anything, and
+every other file's `var`s are the module's.
 
 That word is load-bearing: **a file naming a module is never the program's beginning**, and it is the
 sentence at the top of this section seen from the other side — a header means everything the file
