@@ -2455,6 +2455,9 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     var fitting: Buf[string] = buf()
     var fitted: Buf[Buf[Type]] = buf()
+    // The first thing each refused candidate said, so a refusal no candidate is the cause of -- an
+    // argument naming nothing this place can see -- is reported as itself rather than as a roster.
+    var first_said: Buf[Placed] = buf()
 
     for i in 0..<keys.len()
         // **A CANDIDATE THAT WAS NOT CHOSEN BUILT NOTHING.** Reading a call against a declaration
@@ -2472,6 +2475,8 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
         // The signature the fit arrived at is read before the instantiation it made is dropped:
         // the types outlive the trial, and for a generic candidate they are what the call solved.
         val sig = if said then buf() else fitted_signature(cx, keys.at(i), trial)
+
+        if said then first_said.push(cx.an.found.at(mark))
 
         cx.an.release(sandbox)
         rewind_instantiations(cx.an, queued, tables)
@@ -2515,9 +2520,35 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     if plausible.len() == 1 then return call_key(cx, span, written, plausible.at(0), args, expected, true)
 
+    // **Every candidate refused for one and the same reason, so the reason is not which one was
+    // meant** -- an argument that cannot be read at all, whatever it is passed to -- and that reason
+    // is the message. Read again with reporting on, it says exactly what each trial said.
+    if same_refusal(first_said, keys.len(), args)
+        return call_key(cx, span, written, keys.at(0), args, expected, true)
+
     cx.err(span, s"no '${qualified_callee(keys.at(0), written)}' takes these arguments — the " +
            s"declarations of that name are:\n${signature_list(cx, keys)}")
 end function_call
+
+// Whether every one of `count` candidates was refused, each first saying the same thing at the same
+// place **inside one of the arguments** -- a complaint at the call itself (a count no declaration
+// takes) is about which declaration was meant, and the roster answers that.
+private same_refusal(said: Buf[Placed], count: usize, args: Buf[Expr]) -> bool
+    if count < 2 || said.len() != count then return false
+
+    val first = said.at(0)
+
+    for item in said
+        if item.src.name != first.src.name || item.diag.message != first.diag.message ||
+                item.diag.span.start != first.diag.span.start then return false
+
+    val at = first.diag.span
+
+    for a in args
+        if a.span.start <= at.start && at.end <= a.span.end then return true
+
+    false
+end same_refusal
 
 // Which of the declarations a call fits is the one meant (`reference/declarations.md §
 // Overloading`): the three tie-breaks, in order, stopping as soon as one leaves a single answer.
@@ -3253,6 +3284,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
     if keys.is_empty() then return cx.err(span, out_of_reach(cx.an, base))
     if keys.len() == 1 then return extern_call(cx, span, written, keys.at(0), args)
 
+    var first_said: Buf[Placed] = buf()
+
     for i in 0..<keys.len()
         val mark = cx.an.complaints()
         val sandbox = cx.an.sandboxed()
@@ -3260,6 +3293,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
         val tables = cx.an.tables.members.vtables.len()
         val trial = extern_call(cx, span, written, keys.at(i), args)
         val said = cx.an.complaints() > mark
+
+        if said then first_said.push(cx.an.found.at(mark))
 
         cx.an.release(sandbox)
         rewind_instantiations(cx.an, queued, tables)
@@ -3276,6 +3311,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
             plausible.push(keys.at(i))
 
     if plausible.len() == 1 then return extern_call(cx, span, written, plausible.at(0), args)
+
+    if same_refusal(first_said, keys.len(), args) then return extern_call(cx, span, written, keys.at(0), args)
 
     var roster = ""
 

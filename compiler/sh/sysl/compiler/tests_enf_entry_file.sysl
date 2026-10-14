@@ -438,3 +438,137 @@ enf_a_library_beside_a_declared_main() =
 enf_a_headerless_lone_binding_is_a_local() =
     enf_refused_in([("", "a.sysl", "var n: int = 1"), ("", "b.sysl", "peek() -> int = n")],
                    "error: undefined name 'n'\n --> @/b.sysl:1:17")
+
+// -- a file whose entry is exported as `main` is not a body (`reference/modules.md`) --------------
+
+// The shape of a bare-metal root file: storage, a helper reading it, and an `@export("main")` the
+// reset code calls. The program's beginning is written there, so `kept` is the module's and `bump`
+// an ordinary module function.
+private rfs_root_file(modifier: string, entry: string) -> string =
+    s"private ${modifier}var kept: [2]u32 = [0, 0]\nprivate bump() -> u32 = kept[0]\n" +
+    s"@export(\"$entry\")\nprobe() -> i32 = i32(bump())\n"
+
+// The LLVM text `emit-llvm --target <target>` prints for one file, or what the compiler said instead.
+private rfs_ir_for(text: string, target: string) -> string
+    val root = enf_tree([("", "main.sysl", text)])
+
+    val out = emit_llvm_text(root + "/main.sysl", Some(target)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rfs_ir_for
+
+private val rfs_static_refused: string = "'static' says a declaration belongs to the module rather than to the " +
+    "body of the file the program starts in — and this file has no such body, so everything it " +
+    "declares is the module's already"
+
+@test("a bare-metal root file whose entry is an '@export' keeps its 'var' as module storage")
+rfs_root_file_storage_is_the_modules()
+    if !enf_ready() then return
+
+    val ir = rfs_ir_for(rfs_root_file("", "main"), "thumbv7em-freestanding")
+
+    enf_has(ir, "@kept = ")
+    enf_has(ir, "global [2 x i32]")
+    enf_has(ir, "define")
+    enf_has_not(ir, "declared inside a function body")
+
+@test("and on the host the same file is read the same way")
+rfs_root_file_reads_the_same_on_the_host()
+    if !enf_ready() then return
+
+    val ir = enf_ir(rfs_root_file("", "main"))
+
+    enf_has(ir, "@kept = ")
+    enf_has_not(ir, "declared inside a function body")
+
+@test("so 'static' there is refused, there being no body to opt out of")
+rfs_static_in_a_root_file_is_refused()
+    if !enf_ready() then return
+
+    enf_has(rfs_ir_for(rfs_root_file("static ", "main"), "thumbv7em-freestanding"),
+            rfs_static_refused)
+
+@test("and on the host too")
+rfs_static_in_a_root_file_is_refused_on_the_host()
+    if !enf_ready() then return
+
+    enf_has(enf_ir(rfs_root_file("static ", "main")), rfs_static_refused)
+
+@test("and its storage is held to what module storage is, a stated type first")
+rfs_untyped_storage_beside_an_exported_main()
+    if !enf_ready() then return
+
+    enf_has(enf_ir("var n = 1\n\n@export(\"main\")\nprobe() -> i32 = i32(n)\n"),
+            "'n' is module storage, and module storage states its type")
+
+// Exported under any other symbol, the file names no beginning, so its lone binding is a script's
+// body as before -- and the helper's refusal is on the helper's own line, not on the binding.
+@test("while an export under another symbol leaves it a body, refused on the helper's own line")
+rfs_another_export_leaves_a_body() =
+    enf_refused(rfs_root_file("", "probe"),
+                "'bump' is declared inside a function body, so nothing outside can name it and there " +
+                "is nothing for a visibility modifier to restrict\n --> @/main.sysl:2:")
+
+@test("and a script of bindings alone is still a body, its untyped 'var's locals")
+rfs_a_script_of_bindings_is_a_body() = enf_prints("var n = 1\nvar m = n + 1\n", "")
+
+// One statement makes the same file a body, so the helper is nested and `private` has nothing to
+// restrict -- reported on the helper's own line, not on the binding it reads.
+@test("while the same file running a statement is a body, refused on the helper's own line")
+rfs_a_running_root_file_is_a_body() =
+    enf_refused("var kept: [2]u32 = [0, 0]\nprivate bump() -> u32 = kept[0]\nprint(str(bump()))",
+                "'bump' is declared inside a function body, so nothing outside can name it and there " +
+                "is nothing for a visibility modifier to restrict\n --> @/main.sysl:2:")
+
+@test("and the hosted script shape is unchanged, its untyped 'var' a local")
+rfs_the_script_shape_is_unchanged() = enf_prints("var n = 1\nn += 1\nprint(str(n))", "2\n")
+
+// The same ruling seen from a method: a root file that runs nothing keeps a buffer as module storage,
+// so a method copies into a slice of it -- read as a body, the method could not see the buffer.
+private rfs_method_copy(tail: string) -> string =
+    "import sysl.slices.copy\n\nvar storage: [64]u8\n\nstruct D\n    n: int\n\n" +
+    "    into_storage(*self, data: []const u8)\n        copy(storage[0..<8], data)\n\n" + tail
+
+private val rfs_method_entry: string =
+    "@export(\"main\")\nprobe() -> i32\n    var out: [8]u8 = [7; 8]\n    var d = D(1)\n" +
+    "    d.into_storage(out[..])\n    i32(storage[0])\n"
+
+@test("a method copying into a root file's module storage is read by 'sysl build'")
+rfs_method_copy_into_storage_builds()
+    if !enf_ready() then return
+
+    val ir = enf_ir(rfs_method_copy(rfs_method_entry))
+
+    enf_has(ir, "@storage = ")
+    enf_has_not(ir, "takes these arguments")
+
+@test("and by 'build-c', laying the same storage down")
+rfs_method_copy_into_storage_builds_c()
+    if !enf_ready() then return
+
+    val root = enf_tree([("", "main.sysl", rfs_method_copy(rfs_method_entry))])
+    val made = build_c_archive(root, None, None, DefaultOptimization, Some(s"$root/lib.a"), None,
+                               (m) -> ())
+    val said = made match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "ok")
+
+// Every candidate of an overload set refused for the one reason no candidate causes -- an argument
+// naming a body's local from inside a method, which cannot see it -- so that reason is the message,
+// not the roster of declarations.
+@test("an overloaded call refused only for its argument says why, not which declarations exist")
+rfs_an_overload_refused_for_its_argument_says_why() =
+    enf_refused(rfs_method_copy("val src: [2]u8 = [1, 2]\nvar d = D(1)\nd.into_storage(src[..])\n" +
+                                "print(str(storage[0]))\n"),
+                "undefined name 'storage'")
+
+@test("while one refused for the call's own shape still lists them")
+rfs_an_overload_refused_for_its_shape_lists_them() =
+    enf_refused("import sysl.slices.copy\n\nvar a: [4]u8 = [0; 4]\ncopy(a[..], 3)\n",
+                "no 'sysl.slices.copy' takes these arguments")
