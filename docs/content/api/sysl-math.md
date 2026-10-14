@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t)
 
 ## Constants
 
@@ -182,6 +182,24 @@ first rather than being decided here. There is no check that the two are the rig
 bound is nearly always a constant or a length at the call site, and a contract (`16`) is the
 tool for saying so where it is not.
 
+### `div_floor`
+
+```sysl
+div_floor[T: Div + Rem + Eq + Ord + Sub](a: T, b: T) -> T
+```
+
+`a` divided by `b`, rounded toward negative infinity: `div_floor(-7, 2)` is `-4` where `-7 / 2`
+is `-3`.
+
+This is the division a calendar, a grid or a ring buffer wants: the quotient steps down by one
+for each whole `b` below zero instead of the cell at zero being twice as wide. It pairs with
+`mod_floor`, and `div_floor(a, b) * b + mod_floor(a, b)` is always `a`.
+
+**It is the operator's quotient, corrected by one when the operator rounded the wrong way** --
+a non-zero remainder whose sign differs from the divisor's. For unsigned types the operator
+already floors and nothing is corrected. **The operator's traps are this function's**: a zero
+divisor, and the one signed overflow `MIN / -1`, trap here exactly as `/` does.
+
 ### `divmod`
 
 ```sysl
@@ -280,6 +298,18 @@ Written as `if b < a` rather than `if a < b` so that a tie answers with `a`: for
 equality does not mean identity -- a record ordered on one field, a pair ordered on its first --
 which of two indistinguishable values comes back is something a caller can observe, and taking
 the first is the answer that makes a fold over a sequence stable.
+
+### `mod_floor`
+
+```sysl
+mod_floor[T: Rem + Add + Eq + Ord](a: T, b: T) -> T
+```
+
+`a` modulo `b`, taking the **divisor's** sign: `mod_floor(-7, 2)` is `1` where `-7 % 2` is `-1`.
+
+The result is zero or lies between zero and `b`, so `mod_floor(i, n)` is a valid index into `n`
+cells for any `i`. It is the remainder that goes with `div_floor`. A zero divisor traps, as `%`
+does.
 
 ### `nan`
 
