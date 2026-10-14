@@ -972,7 +972,7 @@ still refused — storage the body did not declare.
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and the methods
-over them. That it can be written at all is what the section on storage sized while running bought —
+over them — with the one fact below, which only the compiler can pass on to the optimizer. That it can be written at all is what the section on storage sized while running bought —
 a container does not need a [destructor](/reference/memory/) if its storage is a value that already
 has one, which the `[]T` field is.
 
@@ -992,6 +992,39 @@ var c = *p                  // a copy, because copying a struct is what that mea
 Go's confusion — two slices that agree until one of them grows — comes from having one representation
 and therefore one behaviour. Held by reference, a `Buf` behaves as a `&T` behaves; held by value it
 is a value. Neither is a rule about growable arrays.
+
+### Its elements are never its header
+
+A `Buf`'s **header** — the handle in its box, and the record behind it holding the storage view and the
+count — and its **elements** are two different allocations: the storage is made by the buffer for
+itself, and a box is never made out of a buffer's storage. So a write to an element cannot change the
+count or move the storage, and a write to the header cannot change an element. **The compiler tells
+the optimizer exactly that, and nothing more**: every access the buffer's own members make to its
+header is marked as one side, every access they make to an element as the other, and the optimizer
+may keep the header in registers across a loop that writes elements. A row operation over a matrix
+held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
+
+It is a fact about where things are, not a rule a program has to keep. Everything else stays as it
+was: a view handed out by `view()` or `elems`, a reinterpreting view over the elements, a `ptr_cast`
+of an element's address, and C given the data pointer all read and write the elements with no mark
+at all, which the optimizer must assume can touch anything. A member that grows the buffer writes
+the header, so an element read after it reads through the new storage:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: &Buf[int] = buf()
+
+b.push(1)
+
+for i in 0..<20 do b.push(b.at(usize(i)) + 1)
+
+print(b.len(), b.at(0), b.at(20), b.cap())
+```
+
+```output
+21 1 21 32
+```
 
 ## What is still refused
 

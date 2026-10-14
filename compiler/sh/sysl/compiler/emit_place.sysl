@@ -23,7 +23,50 @@ access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlai
 // store, free to be reordered or dropped, where the path it stands for gets `store volatile`.
 place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
     TLoad(name, ty) -> ref_access(e, name, ty)
-    _ -> access_of(place_ty(x))
+    _ -> access_of(place_ty(x)) match
+        AccPlain -> buf_side(x)
+        other -> other
+
+// Which side of a `Buf` a place is on, for the scopes a plain access carries (`ir_inst.sysl`,
+// `reference/arrays.md § Its elements are never its header`).
+//
+// **The header** is what is reached through a counted reference to a `Buf` or a `BufCore` -- a box,
+// which is an allocation of its own -- or through a `*BufCore`, and every field of a `BufCore`
+// wherever it sits: the type is private to `sysl.buf`, so a `BufCore` is only ever in a box or a
+// frame. A `Buf` reached any other way is NOT the header: a `Buf[Buf[T]]` keeps its handles among
+// its elements.
+//
+// **An element** is what `core.elems[i]` reaches for a `BufCore` `core`, and anything inside that
+// element. Indexing any other view, or reading through a pointer an element holds, is neither, and
+// keeps the plain access that says nothing.
+buf_side(x: TExpr) -> IrAccess = *x.kind match
+    TDeref(operand, _) -> if header_pointer(texpr_type(operand)) then AccBufHeader else AccPlain
+    TField(receiver, _, _) -> if is_buf_core(texpr_type(receiver)) then AccBufHeader else buf_side(receiver)
+    TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
+        Array(_, _) -> buf_side(receiver)
+        Slice(_, _) -> if is_core_elems(receiver) then AccBufElement else AccPlain
+        _ -> AccPlain
+    _ -> AccPlain
+
+private header_pointer(t: Type) -> bool = underlying(t) match
+    Ref(inner, _) -> is_buf_core(*inner) || struct_base_is(*inner, "Buf")
+    Ptr(inner) -> is_buf_core(*inner)
+    _ -> false
+
+private is_buf_core(t: Type) -> bool = struct_base_is(t, "BufCore")
+
+// Whether a type is the named struct of `sysl.buf`, at any element type.
+private struct_base_is(t: Type, name: string) -> bool = underlying(t) match
+    Struct(d) -> d.base == module_qualify("sysl.buf", name)
+    _ -> false
+
+// Whether a view is a `BufCore`'s own `elems` field.
+private is_core_elems(x: TExpr) -> bool = *x.kind match
+    TField(receiver, i, _) -> underlying(texpr_type(receiver)) match
+        Struct(d) -> d.base == module_qualify("sysl.buf", "BufCore") && i >= 0 &&
+            usize(i) < d.fields.len() && d.fields.at(usize(i)).0 == "elems"
+        _ -> false
+    _ -> false
 
 // How storage reached through a local's name is accessed: as the place a `ref` stands on was
 // declared, and as the local's own type says everywhere else.
@@ -417,8 +460,10 @@ end store_into
 
 // Whether an access says nothing beyond "read it" -- which is the only one an aggregate written at
 // its address may be, since the other two are per-instruction and there is no one instruction here.
+// A `Buf` access is a plain one with a scope beside it, and the scope is only ever a licence the
+// back end may decline, so the aggregate written at its address simply goes without.
 private is_plain(acc: IrAccess) -> bool = acc match
-    AccPlain -> true
+    AccPlain | AccBufHeader | AccBufElement -> true
     _ -> false
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------
