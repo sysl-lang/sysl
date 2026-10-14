@@ -332,8 +332,8 @@ print(stats.load(Acquire))
 
 ### What `T` may be
 
-**An integer of 8, 16, 32 or 64 bits, or a pointer** — what the machine has an instruction for.
-Nothing in the declaration says so, and there is no bound that could: sysl's integers are an
+**An integer of 8, 16, 32 or 64 bits, or a pointer** — what the machine has an instruction for,
+and on a 32-bit board that stops at 32 (below). Nothing in the declaration says so, and there is no bound that could: sysl's integers are an
 [open family](/reference/generics/), so `u12` is a type a program may name and no `impl` list could
 have covered it. What refuses the type is the **form inside**, where the instruction would have had
 to be chosen:
@@ -382,6 +382,26 @@ print(f.load())
 
 ```error
 'atomic_load' reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, or a pointer — and real is neither. An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)
+```
+
+**How wide is the build's, too.** Every 64-bit processor sysl targets, and 32-bit x86 and wasm, has a
+64-bit atomic. **A 32-bit Arm M-profile core does not** — Armv6-M, Armv7-M and Armv8-M stop at a
+32-bit `ldrex`/`strex`, and RV32's atomics are a word — so there an `Atomic[i64]` would be a call
+into `__atomic_fetch_add_8`, which no board's runtime defines. It is refused where the instruction
+would have been chosen, naming the target, and a `usize` or a pointer is the machine's own word and
+always fits:
+
+```sysl target=thumbv7em-freestanding
+import sysl.sync.*
+
+var ticks: Atomic[i64] = Atomic(0)
+
+@export("tick")
+tick() -> i64 = ticks.add(1, Relaxed)
+```
+
+```error
+'atomic_add' is one machine instruction, and 'thumbv7em-freestanding' has one for 32 bits at most — long is 64, so there is nothing to emit
 ```
 
 **The arithmetic members are refused on a pointer**, and for a third reason again: an address plus a
