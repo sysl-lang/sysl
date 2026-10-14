@@ -2592,6 +2592,98 @@ iget(i: int) -> int = inodes[i].with((n) ->
 A record whose initializer is not constant — a `buf()` the heap fills, say — is still refused there,
 with the reason the call could not be run.
 
+### A frozen buffer crosses
+
+A `Buf` and a view are shared through a count that is not atomic, so neither may sit in a `&sync`
+object — which leaves read-only heap data, decoded pixels or a list of shapes, behind a lock it does
+not need. **`buf.freeze()` takes a buffer's elements and answers a `&sync Frozen[T]`**: one atomic
+count on the whole buffer, and nothing that writes it. It goes wherever a `&sync` reference goes — a
+field of a `&sync` struct, a capture of a `&sync Fn`, the state handed to `spawn`:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+struct Texture
+    width: usize
+    pixels: &sync Frozen[u8]
+
+var b: Buf[u8] = buf()
+
+for i in 0..<6
+    b.push(u8(i * 40))
+
+val tex: &sync Texture = Texture(3, b.freeze())
+
+val job: &sync Fn() -> unit = () ->
+    var sum = 0
+
+    for p in tex.pixels
+        sum += int(p)
+
+    print(tex.pixels[4], tex.pixels.len(), sum)
+
+job()
+print(b.len())
+```
+
+```output
+160 6 600
+0
+```
+
+**The buffer is left empty**, through this name and every other name of it: the elements are copied
+once into storage sized to them, so nothing that still holds the buffer — or a view taken of it
+earlier — can reach the frozen storage. What a frozen buffer offers is `len`, `is_empty`, `f[i]`
+(checked, as a `Buf`'s is), `for x in f`, and `view()`, a `[]const T`. A view keeps the buffer alive
+through a small box of its own, counted the ordinary way, which holds one atomic share — so it is kept
+and handed on like any other view, and costs one allocation where `f[i]` and `for` cost none. Nothing
+writes one:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+val f = b.freeze()
+
+f[0] = 2
+```
+
+```error
+assignment needs a variable, a field, an element, or a dereference — something with an address
+```
+
+`f.push(2)` is refused as a method `Frozen` does not have, and a store through `view()` is refused as
+a store through any `[]const T`.
+
+**A frozen buffer shares exactly what its elements share.** Every thread reading one reads its
+elements, so the element type is held to the rule a `&sync` struct's fields are: a scalar, a `&sync
+U` (a `&sync` trait object among them), a raw pointer, another frozen buffer, and arrays and structs
+of those. Freezing a buffer of plain references is refused at the call, naming the element:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Cell
+    n: int
+
+var b: Buf[&Cell] = buf()
+
+b.push(Cell(1))
+
+val f = b.freeze()
+```
+
+```error
+'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+Held as a `Buf[&sync Cell]`, it freezes. A `Buf[string]` or a `Buf[Buf[u8]]` is refused the same way,
+for the count each element carries. **Freezing allocates** — the storage and the box — so a
+`@no_alloc` module may not call it, and a freestanding program freezes where it has a heap.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility

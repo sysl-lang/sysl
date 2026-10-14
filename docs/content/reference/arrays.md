@@ -993,6 +993,29 @@ Go's confusion — two slices that agree until one of them grows — comes from 
 and therefore one behaviour. Held by reference, a `Buf` behaves as a `&T` behaves; held by value it
 is a value. Neither is a rule about growable arrays.
 
+**A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
+Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
+never written — which every thread may read at once without a lock; `b` is left empty. What it may
+hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(3)
+b.push(4)
+
+val f = b.freeze()
+val v = f.view()
+
+print(f[1], f.len(), v, b.len())
+```
+
+```output
+4 2 [3, 4] 0
+```
+
 ## What is still refused
 
 **A `&sync` array cannot be sliced.**
