@@ -321,13 +321,17 @@ private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
         false
     _ -> false
 
-// Whether a typed tree calls a `const` function anywhere in it.
+// Whether a typed tree has anything in it the evaluator runs rather than the fold settles: a call to
+// a `const` function, or a read of a module `val`, whose value is what its own initializer comes to
+// where that is constant data. A read of a `val` whose initializer is code -- or one that comes back
+// to the storage being worked out -- stops the run, and the initializer stays code.
 private calls_const_fn(a: &Analysis, t: TExpr) -> bool
     var found: Buf[bool] = buf()
     val sink = &found
 
     walk_texpr(t, expr_walk(true, x -> *x.kind match
         TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        TGlobal(symbol, _, writable) -> if !writable && a.tables.vals.has(symbol) then sink.push(true)
         _ -> ()))
 
     !found.is_empty()
@@ -1834,7 +1838,13 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 
     val folded = const_fold(analyzer_for(r.a, d.unwrap().scope), d.unwrap().init.unwrap())
 
+    // **An initializer the untyped fold cannot settle is run**, as a whole value's is: `B + 1` over
+    // another `val B` reads `B` through here in turn, where the fold knows only a `const`'s name.
+    val ran = if folded.is_none() && !is_quad(base) then whole_value(r.a, d.unwrap(), shown, ty) else None
+
     ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+
+    if ran.is_some() then return EvGave(ran.unwrap())
 
     // **An `f128` is read from the literal it was written as**, since the untyped fold above reads a
     // float through a `double`.

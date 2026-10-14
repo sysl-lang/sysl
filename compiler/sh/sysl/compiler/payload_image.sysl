@@ -10,12 +10,25 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub}
 // bytes at the offsets a construction stores them at, and the bytes are read back as the units.
 //
 // What can be written so is what has one fixed bit pattern: integers and fixed-point values up to
-// 64 bits, `char`, `bool`, `f32` and `f64`, and fixed arrays, plain structs and enums of them. Where
-// a payload holds anything else -- a pointer, a string, a bitfield struct -- the image is `None`,
-// and the analysis keeps the value as code.
+// 64 bits, `char`, `bool`, `f32` and `f64`, and fixed arrays, plain structs and enums of them.
+//
+// **An address is the one thing in a payload that is not a bit pattern but is still constant data**:
+// the address of module storage (`analyze_body.sysl`'s `place_image`), `null`, and a trait object
+// made from such an address, which is the table's address and the object's. The linker fills an
+// address in, so it has to fill a whole unit: one is written where it starts a unit exactly as wide
+// as a pointer, and anywhere else -- a unit wider than a pointer, which a 64-bit field beside it on a
+// 32-bit target makes -- the image is `None`. So is a payload holding anything else -- a string, a
+// bitfield struct -- and the analysis keeps the value as code.
+
+// One unit of a payload region: its bits, or an address the linker fills in -- of module storage, or
+// of a trait's table.
+enum PayloadUnit
+    UnitBits(value: BigInt)
+    UnitAddr(place: TExpr)
+    UnitTable(symbol: string)
 
 // The units of a carrying variant's payload region, in order, each at the region's unit width.
-payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[BigInt]]
+payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[PayloadUnit]]
     val area = payload_area(d, l)
     val unit = payload_unit(l, d)
     val count = usize(area.1)
@@ -23,15 +36,26 @@ payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -
     if unit > 8 then return None
 
     var bytes: Buf[u8] = buf()
+    var refs: Buf[(usize, PayloadUnit)] = buf()
 
     for _ in 0..<count * unit
         bytes.push(0)
 
-    if !variant_bytes(l, v, args, bytes, 0) then return None
+    if !variant_bytes(l, v, args, bytes, refs, 0) then return None
 
-    var out: Buf[BigInt] = buf()
+    for item in refs
+        if unit != l.pointer_bytes() || item.0 % unit != 0 then return None
+
+    var out: Buf[PayloadUnit] = buf()
 
     for k in 0..<count
+        val linked = unit_ref(refs, k * unit)
+
+        if linked.is_some()
+            out.push(linked.unwrap())
+            continue
+        end if
+
         var word: long = 0
 
         for j in 0..<unit
@@ -44,10 +68,18 @@ payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -
 
         if unit < 8 && word >= (one << (8 * unit - 1)) then word -= one << (8 * unit)
 
-        out.push(from_int(word))
+        out.push(UnitBits(from_int(word)))
 
     Some(out)
 end payload_units
+
+// The address that fills the unit starting at `at`, where one does.
+private unit_ref(refs: Buf[(usize, PayloadUnit)], at: usize) -> Option[PayloadUnit]
+    for item in refs
+        if item.0 == at then return Some(item.1)
+
+    None
+end unit_ref
 
 // Whether every carrying enum value inside a constant has a payload image.
 payloads_laid(l: TargetLayout, t: TExpr) -> bool = *t.kind match
@@ -74,8 +106,9 @@ private payload_unit(l: TargetLayout, d: &EnumType) -> usize
     if align > 1 then align else 1
 
 // A variant's fields, written where a construction stores them: each stored one at its own alignment
-// after the one before it.
-private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Buf[u8], at: usize) -> bool
+// after the one before it. An address goes in `refs`, by the offset it starts at.
+private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Buf[u8],
+                      refs: Buf[(usize, PayloadUnit)], at: usize) -> bool
     var off: usize = 0
 
     for i in 0..<args.len()
@@ -84,7 +117,7 @@ private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Bu
         if !zero_sized(ft)
             off = round_up(off, l.align(ft))
 
-            if !byte_image(l, args.at(i), ft, out, at + off) then return false
+            if !byte_image(l, args.at(i), ft, out, refs, at + off) then return false
 
             off += l.size(ft)
         end if
@@ -93,7 +126,8 @@ private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Bu
 end variant_bytes
 
 // The bytes of one constant of type `ty`, written into `out` at `at`.
-private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], at: usize) -> bool = *t.kind match
+private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[(usize, PayloadUnit)],
+                   at: usize) -> bool = *t.kind match
     TIntLit(n, _) ->
         if l.size(ty) > 8 then return false
 
@@ -103,12 +137,12 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], at: usize)
         Floating(32, false) -> put_word(l, out, at, 4, long(f32(real_of_bits(bits)).bits()))
         Floating(64, false) -> put_word(l, out, at, 8, bits)
         _ -> false
-    TStructNew(decl, args) -> struct_bytes(l, decl, args, out, at)
+    TStructNew(decl, args) -> struct_bytes(l, decl, args, out, refs, at)
     TArrayLit(items, aty) ->
         val stride = l.size(element_of(aty))
 
         for i in 0..<items.len()
-            if !byte_image(l, items.at(i), element_of(aty), out, at + i * stride) then return false
+            if !byte_image(l, items.at(i), element_of(aty), out, refs, at + i * stride) then return false
 
         true
     TArrayFill(value, aty) ->
@@ -117,7 +151,8 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], at: usize)
             _ -> return false
 
         for i in 0..<n
-            if !byte_image(l, value, element_of(aty), out, at + i * l.size(element_of(aty))) then return false
+            if !byte_image(l, value, element_of(aty), out, refs, at + i * l.size(element_of(aty))) then
+                return false
 
         true
     TEnumNew(en, v, args) -> underlying(en) match
@@ -126,13 +161,29 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], at: usize)
             else
                 if !put_word(l, out, at, 4, low_word(v.tag)) then return false
 
-                !v.carries || variant_bytes(l, v, args, out, at + round_up(4, payload_unit(l, d)))
+                !v.carries || variant_bytes(l, v, args, out, refs, at + round_up(4, payload_unit(l, d)))
         _ -> false
+    // The address of module storage: a word the linker fills in, so its bytes stay zero here.
+    TAddrOf(place, _) ->
+        if l.size(ty) != l.pointer_bytes() then return false
+
+        refs.push((at, UnitAddr(place)))
+        true
+    // A trait object over such an address is two words, the table's first, as `gen_erase` builds it.
+    TErase(operand, vtable, _) -> *operand.kind match
+        TAddrOf(place, _) ->
+            refs.push((at, UnitTable(vtable)))
+            refs.push((at + l.pointer_bytes(), UnitAddr(place)))
+            true
+        _ -> false
+    // A null pointer, thin or fat, is all zero bits, which the region already is.
+    TNullLit(_) -> true
     _ -> false
 
 // A plain struct's stored fields at the offsets the layout gives them. A bitfield struct packs its
 // fields into one container, and a `@byte_order` one reverses them, so neither is written here.
-private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: Buf[u8], at: usize) -> bool
+private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: Buf[u8],
+                     refs: Buf[(usize, PayloadUnit)], at: usize) -> bool
     if d.opaque || d.big_endian.is_some() || bitfield_ranges_of(Struct(d)).is_some() then return false
 
     for i in 0..<args.len()
@@ -143,7 +194,7 @@ private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: Buf
                 Some(o) -> o
                 None -> return false
 
-            if !byte_image(l, args.at(i), field.1, out, at + off) then return false
+            if !byte_image(l, args.at(i), field.1, out, refs, at + off) then return false
         end if
 
     true
