@@ -1323,6 +1323,52 @@ print(f())
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
 ```
 
+**A generic keeps the promise twice: as it was written, and at every instance.** The body it was
+written as is held first, and what it makes whatever the type — the `str(n)` above — is refused
+once, naming the declaration, however many instances the program makes. A method of a generic
+struct and a method of a generic `impl` are held the same way:
+
+```sysl
+f() -> int = 1
+
+@no_alloc
+shown[T](x: T) -> usize = str(42).len
+
+print(shown(1), shown(true))
+```
+
+```error
+the string a value renders as needs an allocator, and 'shown' declared '@no_alloc'
+```
+
+What depends on the type is only there to see once a type is chosen: a call through a bound reaches
+a different implementation at each instance. Each instance is held to the promise as well, and the
+refusal names the instance that breaks it; the instances that keep it are not mentioned:
+
+```sysl
+trait Size
+    size(self) -> usize
+
+impl Size for int
+    size(self) -> usize = 8
+
+impl Size for bool
+    size(self) -> usize = str(self).len
+
+@no_alloc
+measured[T: Size](x: T) -> usize = x.size()
+
+print(measured(1), measured(true))
+```
+
+```error
+this reaches 'bool.size', which makes the string a value renders as, and 'measured' declared '@no_alloc' (instance 'measured.bool')
+```
+
+This is the function's own promise, not the module's: under a module's `@no_alloc` clause a generic
+still answers only for the body it was written as ([modules](/reference/modules/)), since the type an
+instance is made at is chosen by somebody else's code.
+
 ## `@no_block` and `@blocks` — a path that must never wait
 
 An interrupt handler may take a completion and wake a thread, and must never sleep: sleeping there
@@ -1428,6 +1474,31 @@ A call through a trait object reaches the implementation the body erased into it
 `try_with`, `try_lock_raw`, `try_send` and `try_receive` never wait and are not marked. A spin lock is not marked
 either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
 are made of.
+
+**A generic that promises is held as `@no_alloc` holds one**: the body it was written as, and then
+each instance, so a call through a bound that one type answers by waiting is refused at that
+instance:
+
+```sysl
+trait Poll
+    poll(self) -> int
+
+impl Poll for int
+    poll(self) -> int = 0
+
+impl Poll for bool
+    @blocks
+    poll(self) -> int = 1
+
+@no_block
+ready[T: Poll](x: T) -> int = x.poll()
+
+print(ready(1), ready(true))
+```
+
+```error
+this reaches 'bool.poll', which blocks, and 'ready' declared '@no_block' (instance 'ready.bool')
+```
 
 **The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
 module's clause, and a function there answers to it; a method may promise it; a function declared
