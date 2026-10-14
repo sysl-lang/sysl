@@ -104,7 +104,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     IntLit(digits, base, suffix) ->
         int_literal(cx, e.span, literal_value(digits, base), suffix, expected)
     FloatLit(text, suffix) -> float_literal(cx, e.span, text, suffix, expected)
-    CharLit(cp) -> TExpr(e.span, TIntLit(from_int(long(uint(cp))), Char))
+    CharLit(cp) -> char_literal(cx, e.span, cp, expected)
     // Where a `[N]u8` is wanted, the literal is its UTF-8 bytes.
     StrLit(v) -> bytes_literal(cx, e.span, v, expected) match
         Some(bytes) -> bytes
@@ -1670,6 +1670,11 @@ end sandboxed_read
 // was going to report it.
 reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type) -> TExpr
     if !disagree(texpr_type(t), want) then return t
+
+    // A character literal beside a byte is that byte or a mistake with its own name, so its reading
+    // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
+    // than that a `u8` cannot be compared with a `char`.
+    if is_char_literal(src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
 
     val mark = cx.an.complaints()
     val again = analyze_expected(cx, src, Some(want))
