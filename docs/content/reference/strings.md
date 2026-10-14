@@ -487,7 +487,49 @@ print(str(p))
 (1, 2)
 ```
 
-A reference, a pointer, a slice and an array remain errors, since none of them can carry an `impl`.
+**A reference renders as what it refers to.** A member call reaches through one `&` to find an
+`impl` — which is why no block may be written for `&T` itself — and `str`, `print`, an
+interpolation hole and a `format` hole reach through the same one level. A `&P`, a `&sync P` and a
+`&Buf[int]` render exactly as the `P` or the `Buf` would:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+impl Display for Point
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+
+var p: &Point = Point(1, 2)
+
+print(p)
+print(s"at $p")
+```
+
+```output
+(1, 2)
+at (1, 2)
+```
+
+So a reference whose referent has no `Display` is refused in the referent's words:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+var p: &Point = Point(1, 2)
+
+print(p)
+```
+
+```error
+cannot print a Point value — write an 'impl sysl.Display for Point' to say how it renders
+```
+
+A pointer is not reached through, since an address renders differently on every run, and a trait
+object keeps its reference, since the reference is what carries its table.
 
 ## Interpolation
 
