@@ -1260,6 +1260,14 @@ private numeric_expectation(expected: Option[Type]) -> Option[Type]
     if computes_numerically(expected.unwrap()) then expected else None
 end numeric_expectation
 
+// The expectation a prefix operator's operand inherits. `-` and `~` produce the type they are
+// given, so any expected type is the operand's too; anything else keeps the numeric one.
+private operand_expectation(op: string, expected: Option[Type]) -> Option[Type]
+    if op == "-" || op == "~" then return expected
+
+    numeric_expectation(expected)
+end operand_expectation
+
 // -- operators -----------------------------------------------------------------------------------
 
 private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
@@ -1298,8 +1306,10 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
     end if
     if op == "*" then return deref_expr(cx, e.span, operand)
 
-    val numeric = numeric_expectation(expected)
-    val t = type_expr(cx, operand, numeric)
+    // **`-` and `~` answer the operand's own type** -- a number's, or `Self` from `Neg` and `Not` --
+    // so the type the position wants is the type the operand has to be, and it is passed down whole:
+    // `-P.make()` at `P[int]` settles `make`'s `T` exactly as `P.make()` there does.
+    val t = type_expr(cx, operand, operand_expectation(op, expected))
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
