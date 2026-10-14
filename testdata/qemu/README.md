@@ -144,7 +144,9 @@ reports other programs going wrong, and `-d int` says it better for nothing.
 
 ## thumbv7em — `qemu-system-arm -M mps2-an500 …`
 
-A Cortex-M7, and the architecture the STM32 Nucleo boards use. Most of it is the AN505's board with
+A Cortex-M7, and the architecture the STM32 Nucleo boards use. The harness boots it twice: once as
+`thumbv7em-freestanding` (a single-precision unit, like the AN386's) and once as
+`thumbv7em-freestanding-dp`, whose `fpv5-d16` runs `f64` arithmetic in `vmul.f64` and friends. Most of it is the AN505's board with
 two addresses changed; what is worth knowing is what **stops** applying, because the temptation is to
 copy the sibling wholesale.
 

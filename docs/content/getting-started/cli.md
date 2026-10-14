@@ -669,6 +669,7 @@ thumbv6m-freestanding        thumbv6m-none-eabi
 thumbv7m-freestanding        thumbv7m-none-eabi
 thumbv7em-freestanding       thumbv7em-none-eabihf
 thumbv7em-freestanding-soft  thumbv7em-none-eabi
+thumbv7em-freestanding-dp    thumbv7em-none-eabihf
 riscv32-freestanding         riscv32-unknown-elf
 wasm32-freestanding          wasm32-unknown-unknown
 wasm32-wasi                  wasm32-wasip1
@@ -758,7 +759,14 @@ configured that way. Getting it wrong the other way is worse than a refusal — 
 and takes a fault at whatever arithmetic reached a VFP instruction first.
 
 `thumbv7em-freestanding` and `thumbv7em-freestanding-soft` are that same pair for Armv7E-M — an
-STM32 F4 or H7 with the FPU on, and one with it off.
+STM32 F4 with the FPU on, and one with it off.
+
+**`thumbv7em-freestanding-dp` is the Cortex-M7's double-precision unit.** The `thumbv7em-freestanding`
+row names an `fpv4-sp-d16`, which does single precision in hardware and calls a library routine
+(`__aeabi_dmul` and the rest) for every `f64` operation. A Cortex-M7 with the FPU configured double
+(an STM32 F7 or H7) has an `fpv5-d16`, so this row — the same triple, `-mfloat-abi=hard`, and
+`-mfpu=fpv5-d16` — lets an `f64` multiply select `vmul.f64`. Use it only on a part that has the double unit:
+on a single-precision-only M7 the first `f64` instruction takes a usage fault.
 
 **`thumbv6m-freestanding` and `thumbv7m-freestanding` are different architectures, not further
 conventions.** The first is the RP2040's Cortex-M0+ — Armv6-M, which came before Armv8-M rather than
@@ -1060,7 +1068,7 @@ sysl: error: 'run' executes what it builds, and 'x86_64-linux' is not this machi
 A name the registry does not have is answered with the names it does:
 
 ```
-sysl: error: unknown target 'arm-linux' — sysl knows aarch64-macos, x86_64-macos, aarch64-linux, x86_64-linux, riscv64-linux, x86_64-windows, aarch64-android, aarch64-freestanding, x86_64-freestanding, riscv64-freestanding, thumb-freestanding, thumb-freestanding-softfp, thumb-freestanding-soft, thumbv6m-freestanding, thumbv7m-freestanding, thumbv7em-freestanding, thumbv7em-freestanding-soft, riscv32-freestanding, wasm32-freestanding, wasm32-wasi, craft-freestanding, x86-linux
+sysl: error: unknown target 'arm-linux' — sysl knows aarch64-macos, x86_64-macos, aarch64-linux, x86_64-linux, riscv64-linux, x86_64-windows, aarch64-android, aarch64-freestanding, x86_64-freestanding, riscv64-freestanding, thumb-freestanding, thumb-freestanding-softfp, thumb-freestanding-soft, thumbv6m-freestanding, thumbv7m-freestanding, thumbv7em-freestanding, thumbv7em-freestanding-soft, thumbv7em-freestanding-dp, riscv32-freestanding, wasm32-freestanding, wasm32-wasi, craft-freestanding, x86-linux
 ```
 
 ### `-v`, `--verbose`
