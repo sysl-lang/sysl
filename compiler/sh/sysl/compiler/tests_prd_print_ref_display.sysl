@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A reference renders as what it refers to (`reference/strings.md § Any other type renders through
+// Display`). A member call reaches through one `&` to find an `impl`, which is why no block may be
+// written for `&T` itself, and every rendering form -- `print`, `str`, an interpolation hole, a
+// `format` hole -- reaches through the same one level. A pointer is still refused, and a reference
+// whose referent does not render is refused in the referent's words, naming the `impl` to write.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ir` lowers a program or answers its report,
+// `xvr_ran` builds, links and runs it.
+
+private prd_point() -> string = raw"""
+    struct P
+        x: int
+
+    impl Display for P
+        display(self, out: *Writer, fmt: FormatSpec) =
+            display_pad(("P" + str(self.x)).bytes, out, fmt)
+
+    """
+
+private prd_ran(body: string) -> string = xvr_ran([("main.sysl", prd_point() + body)])
+
+private prd_refused(text: string, said: string)
+    val e = xvr_ir([("main.sysl", text)])
+
+    assert(e.contains(said), s"expected '$said', got: $e")
+
+@test("print renders a counted reference as its referent")
+prd_print_renders_a_reference()
+    if xvr_no_library() then return
+
+    assert_eq(prd_ran("var p: &P = P(1)\nprint(p)\nprint(\"at\", p, 2)\n"), "P1\nat P1 2\n")
+
+@test("str and an interpolation hole render a reference as its referent")
+prd_str_and_interpolation()
+    if xvr_no_library() then return
+
+    assert_eq(prd_ran("var p: &P = P(7)\nprint(str(p))\nprint(s\"<${p}>\")\nprint(s\"$p\")\n"),
+              "P7\n<P7>\nP7\n")
+
+@test("a format hole reaches through the reference and keeps its specifier")
+prd_format_hole()
+    if xvr_no_library() then return
+
+    assert_eq(prd_ran("var p: &P = P(3)\nprint(f\"[${p}%5s] [${p}%-5s]\")\n"), "[   P3] [P3   ]\n")
+
+@test("a shared reference renders as its referent too")
+prd_sync_reference()
+    if xvr_no_library() then return
+
+    assert_eq(prd_ran("var p: &sync P = P(4)\nprint(p)\nprint(s\"${p}\")\n"), "P4\nP4\n")
+
+@test("a reference to a Buf renders as the Buf does")
+prd_buf_reference()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        print(b)
+        print(s"${b}")
+        """
+
+    assert_eq(xvr_ran([("main.sysl", text)]), "[1, 2]\n[1, 2]\n")
+
+@test("a reference to a scalar renders as the scalar")
+prd_scalar_reference()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", "var n: &int = 42\nprint(n)\nprint(s\"${n}!\")\n")]), "42\n42!\n")
+
+@test("a reference whose referent does not render is refused in the referent's words")
+prd_refuses_a_referent_without_display()
+    if xvr_no_library() then return
+
+    prd_refused("struct Q\n    x: int\nvar q: &Q = Q(1)\nprint(q)\n",
+                "cannot print a Q value — write an 'impl sysl.Display for Q' to say how it renders")
+    prd_refused("struct Q\n    x: int\nvar q: &Q = Q(1)\nprint(str(q))\n",
+                "cannot make a string of a Q value — write an 'impl sysl.Display for Q' to say how it " +
+                "renders")
+
+@test("a pointer is still not reached through")
+prd_pointer_still_refused()
+    if xvr_no_library() then return
+
+    prd_refused(prd_point() + "var p = P(1)\nprint(&p)\n",
+                "cannot print a *P value — it does not implement 'sysl.Display'")
