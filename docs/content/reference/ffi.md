@@ -785,8 +785,9 @@ A `const` has no storage at all and never arises.
 **An initializer is constant data when every scalar in it is a constant expression** — the same
 expressions a `const` may be written as ([modules § const](/reference/modules/)): a literal, a
 `const`, a conversion, a unary `-`, `!` or `~`, or an arithmetic, bitwise, shift, comparison or
-logical operator over those — **and the arrays, structs and variants carrying nothing that are built
-from them, at any depth.** A pointer written as `ptr_cast` of such an integer is one too. The compiler
+logical operator over those — **and the arrays, structs and enum variants that are built from them,
+at any depth.** A variant's fields are written into its payload where a construction stores them, so
+one carrying a string, or a bitfield struct, stays code. A pointer written as `ptr_cast` of such an integer is one too. The compiler
 works the value out and the object file carries it, so nothing runs to fill the storage:
 
 ```sysl build=c target=thumbv7em-freestanding
