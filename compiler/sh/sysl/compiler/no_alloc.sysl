@@ -179,16 +179,25 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     // place the two part company: a member of a structural type is hoisted under a bare
     // `tuple.display`, whose key names no module -- so reading the key puts the library's own tuple
     // renderer in the anonymous module, which is the program's.
+    val from = a.found.len()
+
     for f in a.tables.abstracts
         val scope = func_home(a, f.name)
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
 
-        held_to(a, scope, module_name, scaffolding, f, made) match
+        // Named by the key a call to it carries, `thing.free`, as a concrete function's refusal is.
+        var named = f
+
+        named.name = abstract_key(a, f)
+
+        held_to(a, scope, module_name, scaffolding, named, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
             None -> ()
+
+    check_instances(a, walk, funcs, from, NoAllocWord, made, false)
 
     // The module storage is code like any other: an initializer that makes heap storage makes it in
     // the module that wrote the declaration.
@@ -248,6 +257,54 @@ private held_to(a: &Analysis, scope: Scope, module_name: string, scaffolding: bo
     Some(Promised(s"'$name' declared '@no_alloc'", Some(f.name), made, false))
 end held_to
 
+// **A generic that made the promise for ITSELF keeps it at every instance** (`reference/attributes.md
+// § @no_alloc on a function`). The body it was written as is held first, and answers for everything
+// that does not depend on the type chosen; what does -- a call through a bound that one type's
+// implementation answers by allocating -- is only there to see in the instance, so each instance is
+// walked as well, its refusals naming the instance and the declaration that promised.
+//
+// **What the written body already answered for is not said again**: every span reported since `from`
+// in the declaration's file is skipped, so a `str(42)` in the body is one refusal, not one per type.
+// A module's clause is not followed here -- an instance of a generic answers to nobody's module
+// (`reference/modules.md § A generic answers for what it wrote`); only the declaration's own word is.
+check_instances(a: &Analysis, walk: &Reaches, funcs: Buf[TFunc], from: usize, word: string,
+                made: Buf[(string, string)], blocking: bool)
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+        val origin = a.tables.members.func_origin.get(f.name)
+
+        if origin.is_none() || !f.marks.gives_up(word) then continue
+
+        // Its home is the generic's: the file the body was written in, which every span in it is in.
+        val written = abstract_named(a, origin.unwrap())
+        val scope = func_home(a, if written.is_some() then written.unwrap().name else f.name)
+        val skip: &Skipped = Skipped(reported_since(a, from, scope.src.name))
+        val why = s"'${qualified_name(origin.unwrap())}' declared '@no_$word' (instance " +
+                  s"'${qualified_name(f.name)}')"
+        val held = Promised(why, Some(f.name), made, blocking)
+        val said: &Counted = Counted(0)
+
+        if !blocking then walk_block_stmts(f.body, expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+
+        walk_block_stmts(f.body, TWalk(false,
+                                       e -> if !skip.covers(e.span) then blame_one(a, walk, scope, e, held, said),
+                                       w -> if !skip.covers(w.place.span) then
+                                                blame_write(a, walk, scope, w, held, said),
+                                       st -> ()))
+end check_instances
+
+// The spans of the errors reported in one file since the `from`th.
+private reported_since(a: &Analysis, from: usize, file: string) -> Buf[(usize, usize)]
+    var out: Buf[(usize, usize)] = buf()
+
+    for i in from..<a.found.len()
+        val item = a.found.at(i)
+
+        if item.src.name == file then out.push((item.diag.span.start, item.diag.span.end))
+
+    out
+end reported_since
+
 // The program's functions, and beside them every generic body a generic's own body calls at its
 // stand-ins, filed under the name that call wrote.
 //
@@ -265,11 +322,7 @@ with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
     var keys: Buf[(string, usize)] = buf()
 
     for i in 0..<a.tables.abstracts.len()
-        val f = a.tables.abstracts.at(i)
-        val home = func_home(a, f.name).module_name
-        val key = if f.name.contains("$") then f.name else module_qualify(home, f.name)
-
-        keys.push((key + ".", i))
+        keys.push((abstract_key(a, a.tables.abstracts.at(i)) + ".", i))
 
     var named: Buf[string] = buf()
 
@@ -290,6 +343,19 @@ with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
 
     out
 end with_abstract_callees
+
+// The key a generic body is called by, and the one its instances name as their origin: it is filed
+// under its bare name in its own file (`free`), where every call to it says the module (`thing$free`).
+abstract_key(a: &Analysis, f: TFunc) -> string =
+    if f.name.contains("$") then f.name else module_qualify(func_home(a, f.name).module_name, f.name)
+
+// The generic body an instance was made from, by the key the instance names as its origin.
+private abstract_named(a: &Analysis, origin: string) -> Option[TFunc]
+    for f in a.tables.abstracts
+        if abstract_key(a, f) == origin then return Some(f)
+
+    None
+end abstract_named
 
 // The file a module's storage was declared in.
 val_home(a: &Analysis, symbol: string) -> Scope

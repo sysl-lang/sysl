@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@no_alloc` and `@no_block` written above ONE generic definition (`reference/attributes.md §
+// @no_alloc on a function`): the body it was written as is held to the promise, and so is every
+// instance of it, since a call through a bound reaches a different implementation for each type.
+// What the written body already answered for is said once, not once per instance.
+//
+// **In the header the word is the module's**, so each fixture puts a declaration above the promise.
+
+private var gnp_library_checked: bool = false
+private var gnp_library_there: bool = false
+
+private gnp_ready() -> bool
+    if !gnp_library_checked
+        gnp_library_checked = true
+        gnp_library_there = std_root().is_ok()
+
+    if !gnp_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end gnp_ready
+
+private gnp_check(said: string, part: string) = assert(said.index_of(part).is_some(), said)
+
+private gnp_count(said: string, part: string) -> int
+    var n = 0
+    var from: usize = 0
+
+    loop
+        val at = said[from..<said.bytes.len].index_of(part)
+
+        if at.is_none() then return n
+
+        n += 1
+        from += at.unwrap() + part.bytes.len
+end gnp_count
+
+// A project: `thing/a.sysl` holding the text given, under `module thing`, and a main calling into it.
+private gnp_write(thing: string, main: string) -> string
+    val root = make_temp_dir("sysl-generic-promise").unwrap()
+
+    make_dir_all(s"$root/thing").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/thing/a.sysl", s"module thing\n\nval k: int = 1\n\n$thing").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end gnp_write
+
+private gnp_err(thing: string, main: string) -> string
+    val root = gnp_write(thing, main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gnp_err
+
+private gnp_ran(thing: string, main: string) -> string
+    val root = gnp_write(thing, main)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gnp_ran
+
+private gnp_made() -> string = "— it may hold and release storage made elsewhere, and may make none of its own"
+
+// A trait one implementation answers by allocating and another does not.
+private const gnp_mk: string =
+    "trait Mk\n    mk(self) -> usize\n\nimpl Mk for int\n    mk(self) -> usize = 1\n\n" +
+    "impl Mk for bool\n    mk(self) -> usize = str(self).len\n\n"
+
+@test("a generic function's own allocation is refused once, naming the declaration, at any instances")
+gnp_generic_function()
+    if !gnp_ready() then return
+
+    val said = gnp_err("@no_alloc\nfree[T](x: T) -> usize = str(42).len\n",
+                       "print(thing.free(3), thing.free(true))\n")
+
+    gnp_check(said, "the string a value renders as needs an allocator, and 'thing.free' declared " +
+                    "'@no_alloc' " + gnp_made())
+    gnp_check(said, "thing/a.sysl:6:26")
+    assert_eq(gnp_count(said, "needs an allocator"), 1)
+    assert_eq(gnp_count(said, "error:"), 1)
+
+@test("a generic function nobody instantiates is still held to its promise")
+gnp_never_instantiated()
+    if !gnp_ready() then return
+
+    val said = gnp_err("@no_alloc\nfree[T](x: T) -> usize = str(42).len\n", "print(1)\n")
+
+    gnp_check(said, "and 'thing.free' declared '@no_alloc' " + gnp_made())
+
+@test("a method of a generic struct is held to its promise")
+gnp_generic_struct_method()
+    if !gnp_ready() then return
+
+    val said = gnp_err("struct Box[T]\n    v: T\n\n    @no_alloc\n    size(self) -> usize = str(7).len\n",
+                       "print(thing.Box(1).size())\n")
+
+    gnp_check(said, "the string a value renders as needs an allocator, and 'thing.Box.size' declared " +
+                    "'@no_alloc' " + gnp_made())
+    assert_eq(gnp_count(said, "error:"), 1)
+
+@test("a method of a generic trait impl is held to its promise")
+gnp_generic_impl_method()
+    if !gnp_ready() then return
+
+    val said = gnp_err("struct Box[T]\n    v: T\n\ntrait Sized\n    measure(self) -> usize\n\n" +
+                       "impl[T] Sized for Box[T]\n    @no_alloc\n    measure(self) -> usize = str(8).len\n",
+                       "print(thing.Box(true).measure())\n")
+
+    gnp_check(said, "the string a value renders as needs an allocator, and 'thing.Box.measure' " +
+                    "declared '@no_alloc' " + gnp_made())
+
+@test("an allocation only one instance makes is refused at that instance, naming it")
+gnp_one_instance()
+    if !gnp_ready() then return
+
+    val said = gnp_err(gnp_mk + "@no_alloc\ncount[T: Mk](x: T) -> usize = x.mk()\n",
+                       "print(thing.count(1), thing.count(true))\n")
+
+    gnp_check(said, "this reaches 'bool.mk', which makes the string a value renders as, and " +
+                    "'thing.count' declared '@no_alloc' (instance 'thing.count.bool') — an " +
+                    "allocator-free function may only call what is allocator-free itself")
+    assert_eq(gnp_count(said, "error:"), 1)
+    assert(!said.contains("count.int"), said)
+
+@test("the instance that keeps the promise compiles and runs")
+gnp_kept_instance_runs()
+    if !gnp_ready() then return
+
+    assert_eq(gnp_ran(gnp_mk + "@no_alloc\ncount[T: Mk](x: T) -> usize = x.mk()\n\n" +
+                      "struct P[T]\n    v: T\n\n    @no_alloc\n    get(self) -> T = self.v\n\n" +
+                      "@no_alloc\nsum[T: Add](a: T, b: T) -> T = a + b\n",
+                      "print(thing.count(1), thing.sum(1, 2), thing.sum(1.5, 2.0), thing.P(4).get())\n"),
+              "1 3 3.5 4\n")
+
+@test("a non-generic promise is held as before")
+gnp_non_generic_unchanged()
+    if !gnp_ready() then return
+
+    val said = gnp_err("@no_alloc\nnon(x: int) -> usize = str(x).len\n", "print(thing.non(3))\n")
+
+    gnp_check(said, "the string a value renders as needs an allocator, and 'thing.non' declared " +
+                    "'@no_alloc' " + gnp_made())
+    assert_eq(gnp_count(said, "error:"), 1)
+
+private const gnp_waits: string =
+    "@blocks\nwait_a_bit() -> int = 1\n\ntrait W\n    w(self) -> int\n\nimpl W for int\n" +
+    "    w(self) -> int = 0\n\nimpl W for bool\n    @blocks\n    w(self) -> int = 1\n\n"
+
+private gnp_block_tail() -> string = "a function that may not block may only call what never does"
+
+@test("'@no_block' on a generic function holds the body it was written as")
+gnp_no_block_generic()
+    if !gnp_ready() then return
+
+    val said = gnp_err(gnp_waits + "@no_block\nhold[T](x: T) -> int = wait_a_bit()\n",
+                       "print(thing.hold(1))\n")
+
+    gnp_check(said, "this reaches 'thing.wait_a_bit', which blocks, and 'thing.hold' declared " +
+                    "'@no_block' — " + gnp_block_tail())
+    assert_eq(gnp_count(said, "error:"), 1)
+
+@test("'@no_block' on a generic function holds each instance, naming the one that blocks")
+gnp_no_block_instance()
+    if !gnp_ready() then return
+
+    val said = gnp_err(gnp_waits + "@no_block\nvia[T: W](x: T) -> int = x.w()\n",
+                       "print(thing.via(1), thing.via(true))\n")
+
+    gnp_check(said, "this reaches 'bool.w', which blocks, and 'thing.via' declared '@no_block' " +
+                    "(instance 'thing.via.bool') — " + gnp_block_tail())
+    assert_eq(gnp_count(said, "error:"), 1)
+    assert_eq(gnp_ran(gnp_waits + "@no_block\nvia[T: W](x: T) -> int = x.w()\n",
+                      "print(thing.via(1))\n"), "0\n")
