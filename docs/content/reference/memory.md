@@ -1494,6 +1494,187 @@ immortality rule string literals use, generalized.
 A `string` is then exactly an **immutable, validated `[]u8`**, and the two share one representation
 and one implementation.
 
+### A view borrowed from its receiver
+
+A null owner is exactly right for static data and exactly wrong for memory **a C library owns**: an
+object wraps the library's handle, frees it in its destructor (below), and hands out a view
+of what the handle points at. Nothing in that view keeps the object alive, so the view can be read
+after the destructor has run. **`@views(self)` on the member says so, and the compiler holds every
+caller to it:**
+
+```sysl
+extern "malloc" c_malloc(n: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self)
+        print("freed")
+        c_free(self.p)
+
+open(n: usize) -> &Column
+    val p = c_malloc(n)
+
+    for i in 0..<n do p[i] = u8(65 + i)
+
+    Column(p, n)
+
+sum(xs: []const u8) -> int
+    var t = 0
+
+    for x in xs do t += int(x)
+
+    t
+
+run()
+    val c = open(3)
+    val v = c.bytes()
+
+    print(v.len, v[0], sum(v[1..<3]))
+
+run()
+```
+
+```output
+3 65 133
+freed
+```
+
+The view is an ordinary `[]const u8` — no extra word, no count, nothing at run time. What the mark
+adds is a fact the compiler keeps about the names in one body: **the view lives no longer than the
+name it was called through**, because that name holds the count that keeps the object alive. The
+check is lexical, the same one a `ref` gets (above), and it refuses four things.
+
+**A receiver that is not a name.** A temporary is freed at the end of its statement, so a view of it
+is refused at the call, naming it:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+open() -> &Column = Column(null, 0)
+
+print(open().bytes().len)
+```
+
+```error
+'bytes' answers a view borrowed from what it is called on, and that is the value 'open' answers — a temporary, freed at the end of this statement
+```
+
+**A view leaving the function that holds its receiver.** A `return`, or what the body comes to:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+first() -> []const u8
+    val c: &Column = Column(null, 0)
+
+    c.bytes()
+```
+
+```error
+this returns a view borrowed from 'c', and nothing keeps 'c' alive once this function returns
+```
+
+Only a member that is itself marked `@views(self)` hands one back, and only one borrowed from
+`self` — which is how a wrapper passes the borrow on to its own caller. A free function handed the
+receiver as a parameter does not: the caller has no way to know its result is tied to that argument.
+
+**A view stored where it outlives the receiver.** It may go into a local bound *after* the receiver,
+or into a struct value held by one, since those close first. A local bound before it, a field
+reached through a reference or a pointer, and module storage are refused:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+run()
+    var keep: []const u8 = []
+    val c: &Column = Column(null, 0)
+
+    keep = c.bytes()
+```
+
+```error
+'keep' is bound before 'c', so it outlives it, and this stores in it a view borrowed from 'c'
+```
+
+What a view is copied into is borrowed from the same receiver — a sub-slice, a struct or `Option`
+built around it, a closure that captures it, a name a pattern binds out of it — so each of those is
+held to the same places. A value that cannot hold a view (`v.len`, `v[0]`, a string rendered from
+it) is not borrowed from anything.
+
+**Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
+`*self` call on it, and a call that may write an object of its type — which a member that frees the
+memory does, and a call through a closure or a trait object might, naming no body to ask — are
+refused for as long as a local holding the view is in scope:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+run()
+    var c: &Column = Column(null, 0)
+    val v = c.bytes()
+
+    c = Column(null, 0)
+    print(v.len)
+```
+
+```error
+'v' is a view borrowed from 'c', and this assignment could free what it views
+```
+
+Put the view in a block that closes first, and the name is free again once it has.
+
+**This is the whole of it, and it is narrow on purpose.** The mark names only `self`, it marks only
+a member whose result is a view (`[]T`, `[]const T`, `string`), and nothing about the borrow is in a
+type: there are no lifetime parameters, and no borrow is tracked through a struct a member returns.
+A view of a `*T` region that no member marked stays the programmer's problem, as every `*T` is.
+
 ## Escape analysis
 
 The `owner` word answers "who keeps this alive" for every slice except one: a slice of a **local
@@ -1503,13 +1684,14 @@ fixed array**. That storage is a stack slot, valid until the frame returns and n
 |---|---|---|
 | a heap buffer | the buffer | yes — retained |
 | static data, a string literal | null (immortal) | yes — never freed |
-| a `*T` region | null | the programmer's problem, like every `*T` |
+| a `*T` region | null | the programmer's problem, like every `*T` — unless a `@views(self)` member hands it out, which ties it to the receiver (above) |
 | **a local fixed array** | **null** | **only while the frame lives** |
 
 The compiler finds the slices for which that matters, and **the programmer writes nothing**. There is
 no `@escaping`, no lifetime parameter, and no "this result views that argument" marker anywhere in a
 signature. Go is the precedent; Rust's lifetimes and Swift's `@escaping` are the alternative, and both
-charge the programmer for what a compiler can work out.
+charge the programmer for what a compiler can work out. (`@views(self)`, above, is about memory no
+frame owns — a C library's — which is exactly what the compiler cannot work out from a body.)
 
 ### What escapes
 

@@ -1,0 +1,442 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A view a member hands back of its own receiver, and the receiver it may not outlive.
+//
+// **A slice keeps its owner alive, except where it has none to keep**: a view of memory a C library
+// owns carries a null owner word, so nothing about the view stops the object that frees that memory
+// from being freed first (`reference/arrays.md § What a view keeps alive`). `@views(self)` on a
+// member says the view it answers is borrowed from what it is called on, and this file holds the
+// view to that: it may be used only while the receiver is certainly alive.
+//
+// **The receiver is alive while the name it was called through is in scope and unchanged**, because
+// that name holds a count of its own (or, for a parameter, its caller does). So the whole check is
+// lexical, the way a `ref`'s is (`place.sysl`'s `RefWatch`), and it reuses that machinery rather
+// than inventing a second:
+//
+// - the receiver has to BE a name: a temporary (`open().view()`) is freed at the end of its
+//   statement, so its view is refused at the call;
+// - a view, and everything made from it that can still hold it, goes only where it dies first: into
+//   a local bound after the receiver, never into a field reached through a reference, module
+//   storage, or a result -- except a `@views(self)` member's own result borrowed from `self`;
+// - while a local holding the view is in scope, the receiver's name is held still: assigning it, a
+//   `*self` call on it, and a call that may write the receiver's type are refused.
+//
+// **Nothing about this is in a type.** The view is an ordinary `[]T` at no run-time cost, and the
+// borrow is a fact the analyzer keeps about local names for as long as it reads one body.
+
+// One receiver a view is borrowed from: the place it was called on, the local at the bottom of that
+// place by its unique name (empty for module storage, which no scope closes on), and that local's
+// name as written, which is what a refusal says.
+struct ViewRoot
+    place: TExpr
+    unique: string
+    name: string
+end ViewRoot
+
+// The local name at the bottom of a receiver place, or nothing where the receiver is a temporary.
+private receiver_root(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
+    TLoad(_, _) -> Some(t)
+    TGlobal(_, _, _) -> Some(t)
+    TField(recv, _, _) -> receiver_root(cx, recv)
+    TIndex(recv, _, _) -> receiver_root(cx, recv)
+    TDeref(operand, _) -> receiver_root(cx, operand)
+    TConstView(arg) -> receiver_root(cx, arg)
+    TAddrOf(inner, _) -> receiver_root(cx, inner)
+    TCall(_, _, _, _) -> placed_by(cx, t) match
+        Some(recv) -> receiver_root(cx, recv)
+        None -> None
+    _ -> None
+
+// The local a unique name is bound to, with its position in the scope stack, while it is in scope.
+private local_at(cx: &Analyzer, unique: string) -> Option[(usize, Local)]
+    var i = cx.locals.len()
+
+    while i > 0
+        i -= 1
+
+        if cx.locals.at(i).unique == unique then return Some((i, cx.locals.at(i)))
+
+    None
+end local_at
+
+// A call to a `@views(self)` member, noted against its receiver. A receiver that is not a name is
+// a temporary, freed when the statement ends, so a view of it is refused here, naming it.
+note_view_call(cx: &Analyzer, span: Span, receiver: TExpr, member: string)
+    if texpr_type(receiver) == Unknown then return
+
+    val root = receiver_root(cx, receiver)
+
+    if root.is_none()
+        val what = *receiver.kind match
+            TCall(name, _, _, _) -> s"the value '${qualified_name(name)}' answers"
+            TCallPtr(_, _, _, _) -> "the value a call answers"
+            TVCall(_, _, _, _, _) -> "the value a call answers"
+            _ -> "the value it is called on"
+
+        cx.fault(span, s"'$member' answers a view borrowed from what it is called on, and that is " +
+                 s"$what — a temporary, freed at the end of this statement, so the view would be " +
+                 "left reading freed memory. Bind it with 'val' first, so it lives as long as the " +
+                 "view does")
+        return
+    end if
+
+    val unique = *root.unwrap().kind match
+        TLoad(name, _) -> name
+        _ -> ""
+
+    var name = unique
+
+    if unique != ""
+        val l = local_at(cx, unique)
+
+        if l.is_some() then name = l.unwrap().1.name
+    else
+        name = "module storage"
+
+    cx.view_calls.push((span, ViewRoot(receiver, unique, name)))
+end note_view_call
+
+// -- which receivers a value is borrowed from ------------------------------------------------------
+
+// Whether a value of this type can hold a view: a view or a string, or anything a view can be kept
+// in -- a struct, an enum, a fixed array, a closure (a closure is a struct of what it captured), a
+// reference to one of those, a trait object or a value whose type is not settled yet. A raw pointer
+// cannot: what it points at is the programmer's problem, like every `*T`.
+private holds_borrow(t: Type, depth: int) -> bool
+    if depth > 6 then return true
+
+    underlying(t) match
+        Slice(_, _) -> true
+        Str -> true
+        Ref(inner, _) -> holds_borrow(*inner, depth + 1)
+        Weak(inner) -> holds_borrow(*inner, depth + 1)
+        Array(_, elem) -> holds_borrow(*elem, depth + 1)
+        Struct(d) -> parts_hold_borrow(d.fields, d.targs, depth)
+        Results(d) -> parts_hold_borrow(d.fields, d.targs, depth)
+        Enum(d) ->
+            for item in d.variants
+                if parts_hold_borrow(item.fields, d.targs, depth) then return true
+
+            false
+        Trait(_, _, _) -> true
+        Abstract(_, _) -> true
+        _ -> false
+end holds_borrow
+
+private parts_hold_borrow(fields: Buf[(string, Type)], targs: Buf[Type], depth: int) -> bool
+    for item in fields
+        if holds_borrow(item.1, depth + 1) then return true
+
+    for item in targs
+        if holds_borrow(item, depth + 1) then return true
+
+    false
+end parts_hold_borrow
+
+// A string made fresh rather than shared: rendered, formatted, joined, or answered by a call. A
+// string is a counted object of its own unless it was made over bytes in place, so one of these
+// views nothing the operands viewed.
+private fresh_string(e: TExpr) -> bool
+    if texpr_type(e) != Str then return false
+
+    *e.kind match
+        TStr(_) -> true
+        TFormat(_, _, _) -> true
+        TRender(_, _, _, _) -> true
+        TBinary(_, _, _, _) -> true
+        TCall(_, _, _, _) -> true
+        TCallPtr(_, _, _, _) -> true
+        TVCall(_, _, _, _, _) -> true
+        _ -> false
+end fresh_string
+
+private struct RootSink
+    roots: Buf[ViewRoot]
+    pruned: Buf[Span]
+end RootSink
+
+// The receivers a value may hold a view borrowed from: every `@views(self)` call in it and every
+// local it reads that holds one, reached through nothing that cannot hold a view. **A node that
+// cannot hold one ends the walk below it** -- `v.len` is an integer, so a value made from it is not
+// borrowed from anything `v` was.
+//
+// The walk visits the outermost node first, so a node is skipped when it lies inside a span already
+// found to be one of those.
+view_roots(cx: &Analyzer, e: TExpr) -> Buf[ViewRoot]
+    var out: Buf[ViewRoot] = buf()
+
+    if cx.view_calls.is_empty() && cx.view_borrows.is_empty() then return out
+    if !holds_borrow(texpr_type(e), 0) then return out
+
+    val sink: &RootSink = RootSink(buf(), buf())
+
+    walk_texpr(e, expr_walk(false, x -> visit_root(cx, sink, x)))
+    sink.roots
+end view_roots
+
+private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
+    for s in sink.pruned
+        if x.span.start >= s.start && x.span.end <= s.end then return
+
+    for item in cx.view_calls
+        if item.0.start == x.span.start && item.0.end == x.span.end
+            add_root(sink, item.1)
+            return
+        end if
+
+    if !holds_borrow(texpr_type(x), 0) || fresh_string(x)
+        sink.pruned.push(x.span)
+        return
+    end if
+
+    *x.kind match
+        TLoad(name, _) ->
+            for item in cx.view_borrows
+                if item.0 == name then
+                    for r in item.1
+                        add_root(sink, r)
+        _ -> ()
+end visit_root
+
+private add_root(sink: &RootSink, r: ViewRoot)
+    for item in sink.roots
+        if item.unique == r.unique && item.place.span.start == r.place.span.start then return
+
+    sink.roots.push(r)
+end add_root
+
+// -- where a borrowed view may go ------------------------------------------------------------------
+
+// Whether every receiver is still in scope here. One that is not was bound in a block that has
+// closed, so what it held has been let go of and the view is reading freed memory -- `val v = if c
+// then (val o = open(); o.view()) else …` is this.
+private roots_in_scope(cx: &Analyzer, span: Span, what: string, roots: Buf[ViewRoot]) -> bool
+    for r in roots
+        if r.unique != "" && local_at(cx, r.unique).is_none()
+            cx.fault(span, s"$what a view borrowed from '${r.name}', which is let go of at the end " +
+                     "of the block that bound it — so the view would be left reading freed " +
+                     "memory. Use the view inside that block")
+            return false
+        end if
+
+    true
+end roots_in_scope
+
+// A local just bound to `value`: it holds the view `value` is borrowed from, so it is filed, and
+// the receiver is held still for as long as the local is in scope.
+note_view_binding(cx: &Analyzer, span: Span, name: string, unique: string, value: TExpr)
+    val roots = view_roots(cx, value)
+
+    if roots.is_empty() then return
+    if !roots_in_scope(cx, span, s"'$name' would hold", roots) then return
+
+    file_borrow(cx, span, unique, name, roots)
+end note_view_binding
+
+// The places a pattern takes its parts from, set while a pattern of a borrowed value is bound.
+pattern_view_roots(cx: &Analyzer, subject: TExpr) -> Buf[ViewRoot] = view_roots(cx, subject)
+
+// A name a pattern bound out of a borrowed value, with the type it was bound at.
+note_pattern_borrow(cx: &Analyzer, unique: string, name: string, ty: Type)
+    if cx.pattern_roots.is_empty() || !holds_borrow(ty, 0) then return
+
+    file_borrow(cx, cx.bind_site.unwrap_or(Span(0, 0)), unique, name, cx.pattern_roots)
+end note_pattern_borrow
+
+private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roots: Buf[ViewRoot])
+    var found = false
+
+    for i in 0..<cx.view_borrows.len()
+        val item = cx.view_borrows.at(i)
+
+        if item.0 == unique
+            var joined: Buf[ViewRoot] = buf()
+
+            for r in item.1
+                joined.push(r)
+
+            for r in roots
+                joined.push(r)
+
+            cx.view_borrows.set(i, (unique, joined))
+            found = true
+        end if
+
+    if !found then cx.view_borrows.push((unique, roots))
+
+    // The call half of the hold is the whole-program check a `ref` gets (`checks.sysl`'s
+    // `check_ref_calls`): a call that may write the receiver's object is refused while the local is
+    // in scope, since a member that frees what the view reads writes the object it frees it from.
+    val at = local_at(cx, unique)
+
+    if at.is_none() then return
+
+    for r in roots
+        var types: Buf[Type] = buf()
+
+        types.push(object_type(texpr_type(r.place)))
+        cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, at.unwrap().0,
+                                        r.name))
+end file_borrow
+
+// An assignment of `value` into `target`. **The target has to die before the receiver does**: a
+// local bound after it, or storage held by value inside one, and nothing reached through a
+// reference, a pointer or a view -- that storage may be held by something that outlives the frame.
+note_view_store(cx: &Analyzer, span: Span, target: TExpr, value: TExpr)
+    val roots = view_roots(cx, value)
+
+    if roots.is_empty() then return
+    if !roots_in_scope(cx, span, "this stores", roots) then return
+
+    val owner = by_value_local(target)
+
+    if owner.is_none()
+        cx.fault(span, s"this stores a view borrowed from '${roots.at(0).name}' somewhere reached " +
+                 "through a reference, a pointer or module storage, which may outlive it — so the " +
+                 "view could be read after what it views is freed. Keep the view in a local bound " +
+                 s"after '${roots.at(0).name}'")
+        return
+    end if
+
+    val l = local_at(cx, owner.unwrap())
+
+    if l.is_none() then return
+
+    for r in roots
+        if r.unique == "" then continue
+
+        val at = local_at(cx, r.unique)
+
+        if at.is_some() && at.unwrap().0 >= l.unwrap().0
+            cx.fault(span, s"'${l.unwrap().1.name}' is bound before '${r.name}', so it outlives it, " +
+                     s"and this stores in it a view borrowed from '${r.name}' — the view would be " +
+                     "read after what it views is freed. Bind the view's holder after " +
+                     s"'${r.name}'")
+            return
+        end if
+
+    file_borrow(cx, span, owner.unwrap(), l.unwrap().1.name, roots)
+end note_view_store
+
+// The local whose own storage a place is, reached through fields of struct values and elements of
+// fixed arrays only.
+private by_value_local(t: TExpr) -> Option[string] = *t.kind match
+    TLoad(name, _) -> Some(name)
+    TField(recv, _, _) -> if indirect(texpr_type(recv)) then None else by_value_local(recv)
+    TIndex(recv, _, _) -> if indirect(texpr_type(recv)) then None else by_value_local(recv)
+    _ -> None
+
+private indirect(t: Type) -> bool = underlying(t) match
+    Ref(_, _) -> true
+    Ptr(_) -> true
+    Weak(_) -> true
+    Slice(_, _) -> true
+    Str -> true
+    _ -> false
+
+// A value leaving the function -- a `return`, or what its body comes to. Only a `@views(self)`
+// member may hand back a view, and only one borrowed from `self`: anything else it is borrowed from
+// is a local the return lets go of, or a parameter whose caller does not know the result is tied to
+// it.
+note_view_return(cx: &Analyzer, span: Span, value: TExpr)
+    val roots = view_roots(cx, value)
+
+    for r in roots
+        if cx.views_self && r.unique == "self" then continue
+
+        if r.unique == ""
+            cx.fault(span, "this returns a view borrowed from module storage, which may be " +
+                     "reassigned while the caller still reads it. Return a copy")
+            return
+        end if
+
+        if r.unique == "self"
+            cx.fault(span, s"this returns a view borrowed from 'self', and only a member marked " +
+                     "'@views(self)' may — the mark is what tells the caller the view lives no " +
+                     "longer than what it was called on")
+            return
+        end if
+
+        cx.fault(span, s"this returns a view borrowed from '${r.name}', and nothing keeps " +
+                 s"'${r.name}' alive once this function returns — so the caller could read freed " +
+                 "memory. Return a copy, or return it from a member of its type marked " +
+                 "'@views(self)'")
+        return
+end note_view_return
+
+// -- what a live borrowed view holds still ---------------------------------------------------------
+
+// Refuses a write that could free what a view a live local holds is borrowed from: the receiver
+// itself, anything enclosing it, or anything inside it that holds storage. **Asked of spellings**,
+// as a `ref`'s own path is: two names for one object are the call check's business.
+check_view_guards(cx: &Analyzer, at: Span, target: TExpr) -> bool
+    if cx.view_borrows.is_empty() then return false
+
+    val key = place_key(cx, target)
+
+    if key.is_none() then return false
+
+    val k = key.unwrap()
+
+    for item in cx.view_borrows
+        val holder = local_at(cx, item.0)
+
+        if holder.is_none() then continue
+
+        for r in item.1
+            val rk = place_key(cx, r.place)
+
+            if rk.is_none() then continue
+
+            val p = rk.unwrap()
+            val related = k == p || p.starts_with(s"$k/") ||
+                          (k.starts_with(s"$p/") && holds_storage(texpr_type(target)))
+
+            if related
+                refuse_for_ref(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
+                               s"'${r.name}', and this assignment could free what it views — so " +
+                               "the view would be left reading freed memory. Write the " +
+                               "assignment before the view is taken, or put the view in a block " +
+                               "that closes first")
+                return true
+            end if
+
+    false
+end check_view_guards
+
+// The same for a `*self` call, or a `@relocates` one, on the receiver or on something holding it.
+check_view_call(cx: &Analyzer, at: Span, place: TExpr) -> bool
+    if cx.view_borrows.is_empty() then return false
+
+    val key = place_key(cx, place)
+
+    if key.is_none() then return false
+
+    val k = key.unwrap()
+
+    for item in cx.view_borrows
+        val holder = local_at(cx, item.0)
+
+        if holder.is_none() then continue
+
+        for r in item.1
+            val rk = place_key(cx, r.place)
+
+            if rk.is_none() then continue
+
+            val p = rk.unwrap()
+
+            if k == p || p.starts_with(s"$k/") || k.starts_with(s"$p/")
+                refuse_for_ref(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
+                               s"'${r.name}', and this call may write what it is called on — so " +
+                               "it could free what the view reads. Make the call before the view " +
+                               "is taken, or put the view in a block that closes first")
+                return true
+            end if
+
+    false
+end check_view_call

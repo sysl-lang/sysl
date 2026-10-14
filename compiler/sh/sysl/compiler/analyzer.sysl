@@ -324,6 +324,23 @@ struct Analyzer
     // the entry file's check name -- which is how a live `ref` is found again among the typed bodies.
     body: string
 
+    // Every call to a `@views(self)` method this body made, by the call's span, with the place it
+    // was called on -- what the view it answers is borrowed from (`view_borrow.sysl`).
+    view_calls: Buf[(Span, ViewRoot)]
+
+    // Every local of this body that holds a view borrowed from a receiver, by its unique name, with
+    // the places it is borrowed from. A unique name is unique within the function, so an entry
+    // outlives the scope that bound it, which is what lets a block's result be traced back to it.
+    view_borrows: Buf[(string, Buf[ViewRoot])]
+
+    // The places a pattern being bound right now takes its parts from, so that a name a pattern
+    // binds out of a borrowed view is borrowed too.
+    pattern_roots: Buf[ViewRoot]
+
+    // Whether the body is a `@views(self)` method's, the one body allowed to hand back a view
+    // borrowed from `self`.
+    views_self: bool
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -356,7 +373,7 @@ struct Analyzer
 
             if w.func == self.watch_key() && w.end.is_none() && w.depth >= mark
                 self.an.ref_watches.set(i, RefWatch(w.func, w.name, w.types, w.start, Some(self.reach),
-                                                    w.depth))
+                                                    w.depth, w.view_of))
             end if
 
         self.locals.truncate(mark)
@@ -539,7 +556,8 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
-             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "")
+             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
+             false)
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

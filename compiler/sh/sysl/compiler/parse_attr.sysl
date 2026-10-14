@@ -150,7 +150,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates' and '@views(self)' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -170,7 +170,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates"]
+                 "relocates", "views"]
         if word == w then return true
 
     false
@@ -266,6 +266,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
     // number the declaration has.
     if word == "relocates" then return no_inlining_args(p, Relocates, "a call either may move its receiver's storage or it may not")
+    if word == "views" then return Some(parse_views_attr(p))
     if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
@@ -357,6 +358,26 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     p.expect_kw(")")
     out
 end parse_named_list
+
+// `@views(self)`: what a member's returned view is borrowed from. **Only the receiver may be named**
+// -- a view borrowed from another parameter would need the caller to know which argument it was,
+// which is a lifetime in the signature, and the language has none.
+private parse_views_attr(p: *Parser) -> Attr
+    if p.accept_kw("(") && p.accept_kw("self") && p.accept_kw(")") then return Views(one_name("self"))
+
+    p.fault(p.here(), "'@views' says what a member's returned view is borrowed from, and that can " +
+            "only be the member's own receiver — '@views(self)'. A view of anything else is the " +
+            "caller's to keep alive")
+    skip_line(p)
+    Views(one_name("self"))
+end parse_views_attr
+
+private one_name(n: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(n)
+    out
+end one_name
 
 // The domains a function may say it is entered in. One today; the annotation is a name rather than a
 // bare word so that a second (a signal handler, a second core's own loop) is a row here and not a
@@ -659,6 +680,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             Relocates -> m.marks.relocates = true
+            Views(_) -> m.marks.views = true
             _ -> ()
 end apply_member_attrs
 
@@ -824,7 +846,8 @@ private may_carry(form: string, a: Attr) -> bool
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
-    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" && attr_word(a) != "relocates"
+    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" &&
+        attr_word(a) != "relocates" && attr_word(a) != "views"
 end may_carry
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
@@ -842,6 +865,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "relocates")
         return "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none"
+
+    if any_is(attrs, "views")
+        return "'@views(self)' says the view a call answers is borrowed from what it is called on, so it marks a method — and this declares none"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"

@@ -1038,6 +1038,38 @@ buffer instead, so a program that means to return one writes the ordinary `var b
 nothing. [Memory](/reference/memory/#escape-analysis) is where that is settled, along with what is
 still refused — storage the body did not declare.
 
+**The one view with nothing to keep alive and something that can die is a view of memory a C
+library owns**, made over a `*T` by an object that frees it in its destructor. Its owner word is
+null, so the view cannot hold the object; instead the member that hands it out is marked
+`@views(self)`, and the compiler refuses every use of the view that could come after the object it
+was called on is freed:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Rows
+    p: *u8
+    n: usize
+
+    @views(self)
+    view(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Rows
+    drop(self) = c_free(self.p)
+
+newest() -> []const u8
+    val r: &Rows = Rows(null, 0)
+
+    r.view()
+```
+
+```error
+this returns a view borrowed from 'r', and nothing keeps 'r' alive once this function returns
+```
+
+The view is still a plain `[]const u8` at no run-time cost. [Memory](/reference/memory/#a-view-borrowed-from-its-receiver)
+has the four places it is refused.
+
 ## Growing one
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the

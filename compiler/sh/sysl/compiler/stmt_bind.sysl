@@ -121,7 +121,11 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
         val part = part_at(taken, i)
         val written = value_written(taken, targets, values, i)
 
-        writes.push(one_write(cx, op, targets.at(i), place, part, written))
+        val w = one_write(cx, op, targets.at(i), place, part, written)
+
+        if op == "=" then note_view_store(cx, span, place, w.value)
+
+        writes.push(w)
 
     var out: Buf[TStmt] = buf()
 
@@ -257,6 +261,7 @@ multi_decl(cx: &Analyzer, span: Span, names: Buf[string], mutable: bool,
             val ty = texpr_type(tv)
             val u = if mutable then cx.bind(names.at(i), ty) else cx.bind_read_only(names.at(i), ty)
 
+            note_view_binding(cx, span, names.at(i), u, tv)
             out.push(TVarDecl(u, ty, tv, None))
         else
             out.push(TVarDecl(cx.bind(names.at(i), Unknown), Unknown, TExpr(span, TZero(Unknown)),
@@ -298,6 +303,8 @@ pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
     // of it. Reading the value expression again per part would run its side effects once each.
     val temp = cx.bind("$parts", held)
     var out: Buf[TStmt] = buf()
+
+    note_view_binding(cx, span, "$parts", temp, tv)
 
     out.push(TVarDecl(temp, held, tv, None))
     push_all(&out, bind_pattern(cx, span, pat, TExpr(value.span, TLoad(temp, held)), mutable))
@@ -412,6 +419,7 @@ private bind_name(cx: &Analyzer, n: string, subject: TExpr, mutable: bool) -> Bu
     val ty = texpr_type(subject)
     val u = if mutable then cx.bind(n, ty) else cx.bind_read_only(n, ty)
 
+    note_view_binding(cx, subject.span, n, u, subject)
     one(TVarDecl(u, ty, subject, None))
 end bind_name
 
