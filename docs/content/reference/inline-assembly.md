@@ -364,6 +364,44 @@ written on one line with `\n` between the instructions.
 **The constraint string**, which you never write, because a constraint that disagrees with the
 instruction text is not detectable by reading either one.
 
+**Every output gets a register of its own.** The compiler does not read the instructions, so it
+cannot know whether they finish reading the inputs before they write an output — and an output
+sharing an input's register is a wrong answer exactly when they do not. So no output is ever given
+the register an input arrives in (LLVM's *early-clobber*, `=&r`), and an arm may write its output
+first and read an input after:
+
+```sysl
+seven_plus(level: int) -> int
+    var old: int = 0
+    asm
+        [aarch64]
+            "mov {old}, #7"
+            "add {old}, {old}, {level}"
+            in level : reg
+            out old : reg
+        [x86_64]
+            "movq $7, {old}"
+            "addq {level}, {old}"
+            in level : reg
+            out old : reg
+        [riscv64, riscv32]
+            "li {old}, 7"
+            "add {old}, {old}, {level}"
+            in level : reg
+            out old : reg
+        [thumb, craft, wasm32] unavailable "not shown here"
+    old
+
+print(seven_plus(1))
+```
+
+```output
+8
+```
+
+The one exception is an output named to the same machine register as an input — `in n : "eax"`
+and `out v : "eax"` — which says the two share it, and they do.
+
 ## The words this construct spends
 
 None of them is reserved. `asm`, `unavailable`, `out`, `reg` and `clobbers` are contextual: each is
