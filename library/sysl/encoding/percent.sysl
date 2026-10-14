@@ -1,6 +1,6 @@
 module sysl.encoding
 
-import sysl.text.{Ascii, from_utf8_unchecked}
+import sysl.text.{Ascii, from_utf8, from_utf8_unchecked}
 import sysl.buf.byte_sink
 
 // Percent-encoding, the way a URL carries bytes its grammar would otherwise read as syntax.
@@ -119,3 +119,26 @@ percent_decode(text: []const u8, out: []u8, mode: Percent) -> Result[usize, Deco
 
     Ok(w)
 end percent_decode
+
+/** The text the percent-encoded `text` spells: `percent_decode`, then a UTF-8 check on the result.
+ *
+ * A query value or a path segment is text, so this is what most callers want. **The check is on the
+ * decoded bytes**, which is where an escape can make invalid text out of valid: `%C3%28` is a lead
+ * byte followed by `(`. That is `Utf8(at)` with `at` the offset in the decoded output; the escape
+ * errors are `percent_decode`'s. Allocates the result.
+ */
+percent_decode_string(text: []const u8, mode: Percent) -> Result[string, DecodeError]
+    var sink = byte_sink()
+    var w: *Writer = &sink
+    val zero: [1]u8 = [0]
+
+    for _ in 0..<percent_decoded_len(text)
+        w.write(zero)
+
+    val n = percent_decode(text, sink.text(), mode)?
+
+    // A malformed escape shortens nothing: the count above is exact for every well-formed input, and
+    // `percent_decode` has already refused every other.
+    from_utf8(sink.text()[0..<n]) match
+        Ok(s) -> Ok(s)
+        Err(e) -> Err(Utf8(e.offset))

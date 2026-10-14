@@ -459,3 +459,47 @@ percent_decode_short()
         _ -> false
 
     assert(short)
+
+@test("percent_decode_string answers text, multibyte included")
+percent_decode_string_text()
+    assert_eq(percent_decode_string("caf%C3%A9%20%E2%82%AC%F0%9F%98%80".bytes, Component).unwrap(), "café €😀")
+    assert_eq(percent_decode_string("".bytes, Component).unwrap(), "")
+    assert_eq(percent_decode_string("a+b".bytes, Component).unwrap(), "a+b")
+
+@test("percent_decode_string in Form mode turns a plus into a space")
+percent_decode_string_form()
+    assert_eq(percent_decode_string("a+b%2Bc%20d".bytes, Form).unwrap(), "a b+c d")
+
+@test("percent_decode_string refuses an escape that decodes to invalid UTF-8, naming the offset")
+percent_decode_string_invalid_utf8()
+    val lead_then_ascii = percent_decode_string("%C3%28".bytes, Component) match
+        Err(Utf8(at)) -> at == 0
+        _ -> false
+    val later = percent_decode_string("ok%FF".bytes, Component) match
+        Err(Utf8(at)) -> at == 2
+        _ -> false
+    val cut = percent_decode_string("%E2%82".bytes, Form) match
+        Err(Utf8(at)) -> at == 0
+        _ -> false
+
+    assert(lead_then_ascii)
+    assert(later)
+    assert(cut)
+
+    val shown = percent_decode_string("%C3%28".bytes, Component) match
+        Err(e) -> s"$e"
+        Ok(_) -> ""
+
+    assert_eq(shown, "the decoded bytes are not UTF-8 at byte 0")
+
+@test("percent_decode_string passes the escape errors through")
+percent_decode_string_escape_errors()
+    val trunc = percent_decode_string("ab%4".bytes, Component) match
+        Err(BadLength) -> true
+        _ -> false
+    val bad = percent_decode_string("%zz".bytes, Form) match
+        Err(BadByte(at)) -> at == 1
+        _ -> false
+
+    assert(trunc)
+    assert(bad)

@@ -92,7 +92,7 @@ forgiving about what cannot be ambiguous.
 
 ## What a refusal says
 
-`DecodeError` has four cases, separated by what a caller would **do** about each rather than by
+`DecodeError` has five cases, separated by what a caller would **do** about each rather than by
 taxonomy.
 
 | | |
@@ -101,6 +101,7 @@ taxonomy.
 | `BadLength` | not a whole number of encoded units |
 | `BadPadding(at)` | `=` somewhere it cannot be |
 | `Short(needed)` | the output slice is too small, and by how much |
+| `Utf8(at)` | decoded bytes that are not UTF-8 (`percent_decode_string` only), and where |
 
 `Short` carries the length that *would* have been enough, so a caller resizes once rather than
 discovering the requirement a byte at a time.
@@ -151,10 +152,11 @@ escapes `/`, `?`, `=` and `&`, so the piece is safe wherever it is later placed.
 Decoding writes into a slice the caller lends and refuses a malformed escape rather than passing it
 through: a `%` with fewer than two bytes after it is `BadLength`, and a `%` followed by a non-hex
 byte is `BadByte` at that byte. Either case of hex digit is accepted. Decoding does not check that
-the bytes are UTF-8.
+the bytes are UTF-8; `percent_decode_string` is the form for text, and refuses a result that is not
+UTF-8 with `Utf8(at)`, the offset in the decoded bytes (`%C3%28` is a lead byte followed by `(`).
 
 ```sysl
-import sysl.encoding.{percent_string, percent_decode, Component, Form, BadLength}
+import sysl.encoding.{percent_string, percent_decode, percent_decode_string, Component, Form, BadLength, Utf8}
 
 var out: []u8 = [0; 16]
 
@@ -170,6 +172,13 @@ val bad = percent_decode("100%".bytes, out, Component) match
     _ -> "something else"
 
 print(bad)
+print(percent_decode_string("caf%C3%A9+au+lait".bytes, Form).unwrap())
+
+val not_text = percent_decode_string("%C3%28".bytes, Component) match
+    Err(Utf8(at)) -> s"not UTF-8 at $at"
+    _ -> "something else"
+
+print(not_text)
 ```
 
 ```output
@@ -177,6 +186,8 @@ a%20b%2Fc%20%C3%A9
 a+b%2Bc
 5
 truncated escape
+café au lait
+not UTF-8 at 0
 ```
 
 ## Fixed-width integers, at either byte order
