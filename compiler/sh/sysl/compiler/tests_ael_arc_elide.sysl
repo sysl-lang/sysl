@@ -1,0 +1,542 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// A retain cancelled against the release of the same reference (`arc_elide.sysl`).
+//
+// Three kinds of claim. The pass itself, on blocks built by hand, so that each rule -- what may sit
+// between the pair, what makes two values the same reference, when a join's releases move -- is
+// pinned on its own. The emitted text of the shapes it was written for. And programs whose
+// destructors print, so that a count that went wrong shows up as a drop that ran early, late, twice
+// or never.
+
+// -- the pass, on blocks built by hand ------------------------------------------------------------------
+
+private ael_call(name: string, v: Val) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, v))
+    ir_call(None, LVoid, VGlobal(name), args)
+end ael_call
+
+private ael_load(d: string, slot: string) -> Inst = InLoad(VReg(d), LPtr, VReg(slot), AccPlain, None)
+
+private ael_store(v: string, slot: string) -> Inst = InStore(LPtr, VReg(v), VReg(slot), AccPlain, None)
+
+private ael_slot(d: string) -> Inst = InAlloca(VReg(d), LPtr, None)
+
+// The text of a function made of `blocks` once the pass has run over it.
+private ael_run(blocks: Buf[IrBlock]) -> string
+    var out = ""
+
+    for b in elide_arc_pairs(blocks)
+        out = s"$out${b.label}:\n"
+
+        for i in b.instrs
+            out = s"$out  ${inst_render(i)}\n"
+
+        b.terminator match
+            Some(t) -> out = s"$out  ${inst_render(t)}\n"
+            None -> ()
+
+    out
+end ael_run
+
+private ael_one(instrs: Buf[Inst]) -> string
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", instrs, Some(InRet(None, None))))
+    ael_run(blocks)
+end ael_one
+
+@test("a retain and the release of the same temporary with only stores between them both go")
+ael_adjacent_pair()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_slot("x.addr"))
+    is.push(ael_call("arc.retain_sync", VReg("t1")))
+    is.push(ael_store("t1", "x.addr"))
+    is.push(ael_call("arc.release_sync", VReg("t1")))
+    assert_eq(ael_one(is), "entry:\n  %x.addr = alloca ptr\n  store ptr %t1, ptr %x.addr\n  ret void\n")
+
+@test("an aggregate's copy is cancelled by its dispose, and a plain count's retain by its release")
+ael_every_family()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_call("arc.copy.Hit", VReg("a")))
+    is.push(ael_call("arc.dispose.Hit", VReg("a")))
+    is.push(ael_call("arc.retain", VReg("b")))
+    is.push(ael_call("arc.release", VReg("b")))
+    is.push(ael_call("arc.retain_maybe", VReg("c")))
+    is.push(ael_call("arc.release_maybe", VReg("c")))
+    is.push(ael_call("arc.weak_retain", VReg("d")))
+    is.push(ael_call("arc.weak_release", VReg("d")))
+    assert_eq(ael_one(is), "entry:\n  ret void\n")
+
+@test("a release of a different reference, or of the other kind of count, cancels nothing")
+ael_different_references_stay()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_call("arc.retain_sync", VReg("a")))
+    is.push(ael_call("arc.release_sync", VReg("b")))
+    is.push(ael_call("arc.copy.Hit", VReg("c")))
+    is.push(ael_call("arc.dispose.Ray", VReg("c")))
+    assert_eq(ael_one(is),
+              "entry:\n" +
+              "  call void @arc.retain_sync(ptr %a)\n" +
+              "  call void @arc.release_sync(ptr %b)\n" +
+              "  call void @arc.copy.Hit(ptr %c)\n" +
+              "  call void @arc.dispose.Ray(ptr %c)\n" +
+              "  ret void\n")
+
+@test("any other call between a retain and its release keeps both")
+ael_a_call_ends_the_window()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_call("arc.retain_sync", VReg("a")))
+    is.push(ael_call("user", VReg("a")))
+    is.push(ael_call("arc.release_sync", VReg("a")))
+    assert_eq(ael_one(is),
+              "entry:\n" +
+              "  call void @arc.retain_sync(ptr %a)\n" +
+              "  call void @user(ptr %a)\n" +
+              "  call void @arc.release_sync(ptr %a)\n" +
+              "  ret void\n")
+
+@test("two loads of one unescaped slot are one reference until the slot is stored to")
+ael_loads_of_a_slot()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_slot("v.addr"))
+    is.push(ael_load("t1", "v.addr"))
+    is.push(ael_call("arc.copy.Hit", VReg("t1")))
+    is.push(ael_load("t2", "v.addr"))
+    is.push(ael_call("arc.dispose.Hit", VReg("t2")))
+    is.push(ael_load("t3", "v.addr"))
+    is.push(ael_call("arc.copy.Hit", VReg("t3")))
+    is.push(ael_store("other", "v.addr"))
+    is.push(ael_load("t4", "v.addr"))
+    is.push(ael_call("arc.dispose.Hit", VReg("t4")))
+    assert_eq(ael_one(is),
+              "entry:\n" +
+              "  %v.addr = alloca ptr\n" +
+              "  %t1 = load ptr, ptr %v.addr\n" +
+              "  %t2 = load ptr, ptr %v.addr\n" +
+              "  %t3 = load ptr, ptr %v.addr\n" +
+              "  call void @arc.copy.Hit(ptr %t3)\n" +
+              "  store ptr %other, ptr %v.addr\n" +
+              "  %t4 = load ptr, ptr %v.addr\n" +
+              "  call void @arc.dispose.Hit(ptr %t4)\n" +
+              "  ret void\n")
+
+@test("a load of a slot is the value last stored to it")
+ael_store_forwards()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_slot("h.addr"))
+    is.push(ael_call("arc.copy.Hit", VReg("t1")))
+    is.push(ael_store("t1", "h.addr"))
+    is.push(ael_load("t2", "h.addr"))
+    is.push(ael_call("arc.dispose.Hit", VReg("t2")))
+    assert_eq(ael_one(is),
+              "entry:\n" +
+              "  %h.addr = alloca ptr\n" +
+              "  store ptr %t1, ptr %h.addr\n" +
+              "  %t2 = load ptr, ptr %h.addr\n" +
+              "  ret void\n")
+
+@test("a slot whose address escapes is never read as holding a known value")
+ael_escaped_slot()
+    var is: Buf[Inst] = buf()
+
+    is.push(ael_slot("v.addr"))
+    is.push(ael_call("keep", VReg("v.addr")))
+    is.push(ael_load("t1", "v.addr"))
+    is.push(ael_call("arc.copy.Hit", VReg("t1")))
+    is.push(ael_load("t2", "v.addr"))
+    is.push(ael_call("arc.dispose.Hit", VReg("t2")))
+    assert_eq(ael_one(is),
+              "entry:\n" +
+              "  %v.addr = alloca ptr\n" +
+              "  call void @keep(ptr %v.addr)\n" +
+              "  %t1 = load ptr, ptr %v.addr\n" +
+              "  call void @arc.copy.Hit(ptr %t1)\n" +
+              "  %t2 = load ptr, ptr %v.addr\n" +
+              "  call void @arc.dispose.Hit(ptr %t2)\n" +
+              "  ret void\n")
+
+@test("another release may sit between the pair, unless the window also writes outside the frame")
+ael_a_release_between()
+    var ok: Buf[Inst] = buf()
+
+    ok.push(ael_call("arc.retain_sync", VReg("a")))
+    ok.push(ael_call("arc.release_sync", VReg("b")))
+    ok.push(ael_call("arc.release_sync", VReg("a")))
+    assert_eq(ael_one(ok), "entry:\n  call void @arc.release_sync(ptr %b)\n  ret void\n")
+
+    // The release closing the window is of the slot the retain was stored into: the release inside
+    // it may be of the value it was copied out of (an iterator's `Option[&T]` and the `&T` taken out
+    // of it), so dropping the pair could free what the slot still points at.
+    var own: Buf[Inst] = buf()
+
+    own.push(ael_slot("c.addr"))
+    own.push(ael_call("arc.retain", VReg("t11")))
+    own.push(ael_store("t11", "c.addr"))
+    own.push(ael_call("arc.dispose.sysl$Option.ref.Cell", VReg("t5")))
+    own.push(ael_load("t18", "c.addr"))
+    own.push(ael_call("arc.release", VReg("t18")))
+    assert_eq(ael_one(own),
+              "entry:\n" +
+              "  %c.addr = alloca ptr\n" +
+              "  call void @arc.retain(ptr %t11)\n" +
+              "  store ptr %t11, ptr %c.addr\n" +
+              "  call void @arc.dispose.sysl$Option.ref.Cell(ptr %t5)\n" +
+              "  %t18 = load ptr, ptr %c.addr\n" +
+              "  call void @arc.release(ptr %t18)\n" +
+              "  ret void\n")
+
+    var kept: Buf[Inst] = buf()
+
+    kept.push(ael_call("arc.retain_sync", VReg("a")))
+    kept.push(ael_store("a", "heap"))
+    kept.push(ael_call("arc.release_sync", VReg("b")))
+    kept.push(ael_call("arc.release_sync", VReg("a")))
+    assert_eq(ael_one(kept),
+              "entry:\n" +
+              "  call void @arc.retain_sync(ptr %a)\n" +
+              "  store ptr %a, ptr %heap\n" +
+              "  call void @arc.release_sync(ptr %b)\n" +
+              "  call void @arc.release_sync(ptr %a)\n" +
+              "  ret void\n")
+
+@test("a join's releases move into the predecessors when one of them can cancel a retain")
+ael_join_hoist()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(ael_slot("x.addr"))
+    entry.push(ael_slot("y.addr"))
+    entry.push(ael_slot("r.addr"))
+
+    var a: Buf[Inst] = buf()
+
+    a.push(ael_load("t1", "x.addr"))
+    a.push(ael_call("arc.retain_sync", VReg("t1")))
+    a.push(ael_store("t1", "r.addr"))
+
+    var b: Buf[Inst] = buf()
+
+    b.push(ael_load("t2", "y.addr"))
+    b.push(ael_call("arc.retain_sync", VReg("t2")))
+    b.push(ael_store("t2", "r.addr"))
+
+    var j: Buf[Inst] = buf()
+
+    j.push(ael_load("t3", "r.addr"))
+    j.push(ael_load("t4", "y.addr"))
+    j.push(ael_call("arc.release_sync", VReg("t4")))
+    j.push(ael_load("t5", "x.addr"))
+    j.push(ael_call("arc.release_sync", VReg("t5")))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "a", "b"))))
+    blocks.push(IrBlock("a", a, Some(InBr("j"))))
+    blocks.push(IrBlock("b", b, Some(InBr("j"))))
+    blocks.push(IrBlock("j", j, Some(InRet(Some(LPtr), Some(VReg("t3"))))))
+    assert_eq(ael_run(blocks),
+              "entry:\n" +
+              "  %x.addr = alloca ptr\n" +
+              "  %y.addr = alloca ptr\n" +
+              "  %r.addr = alloca ptr\n" +
+              "  br i1 %c, label %a, label %b\n" +
+              "a:\n" +
+              "  %t1 = load ptr, ptr %x.addr\n" +
+              "  store ptr %t1, ptr %r.addr\n" +
+              "  %t4.j1 = load ptr, ptr %y.addr\n" +
+              "  call void @arc.release_sync(ptr %t4.j1)\n" +
+              "  %t5.j1 = load ptr, ptr %x.addr\n" +
+              "  br label %j\n" +
+              "b:\n" +
+              "  %t2 = load ptr, ptr %y.addr\n" +
+              "  store ptr %t2, ptr %r.addr\n" +
+              "  %t4.j2 = load ptr, ptr %y.addr\n" +
+              "  %t5.j2 = load ptr, ptr %x.addr\n" +
+              "  call void @arc.release_sync(ptr %t5.j2)\n" +
+              "  br label %j\n" +
+              "j:\n" +
+              "  %t3 = load ptr, ptr %r.addr\n" +
+              "  %t4 = load ptr, ptr %y.addr\n" +
+              "  %t5 = load ptr, ptr %x.addr\n" +
+              "  ret ptr %t3\n")
+
+@test("a join reached by a conditional branch keeps its releases")
+ael_no_hoist_past_a_conditional_edge()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(ael_slot("x.addr"))
+
+    var a: Buf[Inst] = buf()
+
+    a.push(ael_load("t1", "x.addr"))
+    a.push(ael_call("arc.retain_sync", VReg("t1")))
+
+    var j: Buf[Inst] = buf()
+
+    j.push(ael_load("t2", "x.addr"))
+    j.push(ael_call("arc.release_sync", VReg("t2")))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "a", "j"))))
+    blocks.push(IrBlock("a", a, Some(InBr("j"))))
+    blocks.push(IrBlock("j", j, Some(InRet(None, None))))
+    assert_eq(ael_run(blocks),
+              "entry:\n" +
+              "  %x.addr = alloca ptr\n" +
+              "  br i1 %c, label %a, label %j\n" +
+              "a:\n" +
+              "  %t1 = load ptr, ptr %x.addr\n" +
+              "  call void @arc.retain_sync(ptr %t1)\n" +
+              "  br label %j\n" +
+              "j:\n" +
+              "  %t2 = load ptr, ptr %x.addr\n" +
+              "  call void @arc.release_sync(ptr %t2)\n" +
+              "  ret void\n")
+
+// -- the emitted text ---------------------------------------------------------------------------------
+
+private var ael_library_cache: Buf[Program] = buf()
+private var ael_library_read: bool = false
+
+private ael_library() -> Buf[Program]
+    if ael_library_read then return ael_library_cache
+
+    ael_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ael_library_cache = units
+
+    ael_library_cache
+end ael_library
+
+// The text of `symbol` in a whole program read beside the standard library, which `Option` needs.
+private ael_lowered(text: string, symbol: string) -> string
+    if ael_library().is_empty() then return "skipped"
+
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+
+    for item in ael_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if item.0 == symbol then return item.1
+
+    s"no function '$symbol'"
+end ael_lowered
+
+private ael_hit_source() -> string = raw"""
+    struct Tag
+        v: real
+
+    struct Hit
+        t: real
+        tag: &sync Tag
+
+    probe(k: real, tag: &sync Tag) -> Option[Hit] = Some(Hit(k, tag))
+
+    pick(k: real, tag: &sync Tag) -> Option[Hit]
+        val x = probe(k, tag)
+        val y = probe(k * 0.5, tag)
+        if k > 1.0 then x else y
+
+    struct Holder
+        kept: Option[Hit]
+
+    stash(k: real, tag: &sync Tag, into: &Holder) -> real
+        val x = probe(k, tag)
+        into.kept = x
+        x.unwrap().t
+
+    print(pick(2.0, Tag(1.0)).unwrap().t)
+    print(stash(2.0, Tag(1.0), Holder(None)))
+    """
+
+@test("a call's result bound to a val, and a local returned through an if, take no count of their own")
+ael_pick_takes_no_count()
+    val ir = ael_lowered(ael_hit_source(), "pick")
+
+    if ir == "skipped" then return
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(count_of(ir, "@arc.copy."), 0)
+    // Each path gives back the one result it does not return, and nothing else.
+    assert_eq(count_of(ir, "@arc.dispose.sysl$Option.Hit"), 2)
+
+@test("a value stored where it outlives the frame keeps its own count")
+ael_escaping_value_keeps_its_count()
+    val ir = ael_lowered(ael_hit_source(), "stash")
+
+    if ir == "skipped" then return
+
+    assert(ir.starts_with("define"), ir)
+    // The copy `kept` takes is not cancelled against `x`'s release at the end: between them are a
+    // store to the heap and the release of what `kept` held, whose destructor could reach it.
+    assert_eq(count_of(ir, "@arc.copy.sysl$Option.Hit"), 1)
+    assert_eq(count_of(ir, "@arc.dispose.sysl$Option.Hit"), 2)
+
+@test("a result made in the function is handed back with the one count it was made with")
+ael_fresh_result()
+    assert_eq(emit_func_text("struct Node\n    v: int\n\nmake(n: int) -> &Node = Node(n)\n\nvar r: &Node = make(1)\n",
+                             "make").contains("@arc.retain("), false)
+
+private count_of(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// -- programs whose destructors say when they ran --------------------------------------------------------
+
+private ael_ran(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-ael").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            _ -> s"did not exit: ${o.text}"
+end ael_ran
+
+@test("a destructor still runs where the last reference goes, after every elided pair")
+ael_drops_where_they_did()
+    val got = ael_ran(raw"""
+        struct Tag
+            id: int
+
+        impl Drop for Tag
+            drop(self) = print("drop", self.id)
+
+        struct Hit
+            t: int
+            tag: &sync Tag
+
+        probe(t: int, tag: &sync Tag) -> Option[Hit] = Some(Hit(t, tag))
+
+        pick(near: bool) -> Option[Hit]
+            val x = probe(1, Tag(1))
+            val y = probe(2, Tag(2))
+            print("picking")
+            if near then x else y
+
+        nested(d: int) -> Option[Hit] = if d == 0 then probe(d, Tag(10)) else nested(d - 1)
+
+        val a = pick(true)
+        print("got", a.unwrap().t)
+        val b = pick(false)
+        print("got", b.unwrap().t)
+        print("deep", nested(3).unwrap().t)
+        print("end")
+        """)
+
+    if got == "skipped" then return
+
+    assert_eq(got,
+              "picking\ndrop 2\ngot 1\npicking\ndrop 1\ngot 2\ndeep 0\ndrop 10\nend\ndrop 2\ndrop 1\n")
+
+@test("a shared reference copied up a recursive search from several threads is counted exactly")
+ael_threads_count_exactly()
+    val got = ael_ran(raw"""
+        import sysl.threads.{Thread, spawn}
+
+        struct Tag
+            v: int
+
+        impl Drop for Tag
+            drop(self) = print("drop tag", self.v)
+
+        struct Hit
+            t: int
+            tag: &sync Tag
+
+        trait Shape
+            near(self, k: int) -> Option[Hit]
+
+        struct Leaf
+            s: int
+            tag: &sync Tag
+
+        impl Shape for Leaf
+            near(self, k: int) -> Option[Hit] = Some(Hit(self.s * k, self.tag))
+
+        struct Node
+            a: &sync Shape
+            b: &sync Shape
+
+        impl Shape for Node
+            near(self, k: int) -> Option[Hit]
+                val x = self.a.near(k)
+                val y = self.b.near(k + 1)
+                if x.unwrap().t < y.unwrap().t then x else y
+
+        tree(d: int, tag: &sync Tag) -> &sync Shape = if d == 0 then Leaf(1, tag) else Node(tree(d - 1, tag), tree(d - 1, tag))
+
+        struct Job
+            scene: &sync Shape
+            sum: int
+
+        work(j: *Job) -> unit
+            for i in 0..<2000
+                j.sum += j.scene.near(i).unwrap().t
+
+        run()
+            val scene = tree(6, Tag(7))
+            var jobs: [4]Job = [Job(scene, 0); 4]
+            var ts: []Option[Thread] = [None; 4]
+
+            for i in 0..<4
+                ts[i] = spawn(&work, &jobs[i])
+            for t in ts
+                t.unwrap().join()
+            for j in jobs
+                print(j.sum)
+
+        run()
+        print("end")
+        """)
+
+    if got == "skipped" then return
+
+    assert_eq(got, "1999000\n1999000\n1999000\n1999000\ndrop tag 7\nend\n")

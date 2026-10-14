@@ -1,0 +1,397 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
+
+// **A share taken and given back with nothing between them that could take away the count it held
+// is no share at all**, so the pair is dropped from the function before it is printed.
+//
+// The emitter counts locally: a value read into an owned place is retained there, and the temporary
+// or local it came from is released when its statement or scope ends. Where the source was itself
+// owned -- a call's result bound to a `val`, a local returned through the slot an `if` filled -- the
+// two land on the same reference: `copy(%v)`, a store, `dispose(%v)`. On a `&sync` reference each is
+// an atomic read-modify-write on the one count every thread shares, so a value copied up a recursive
+// search pays two contended atomics per level for a count that ends where it began.
+//
+// **The rule.** A retain of a reference is cancelled against a later release of the same reference in
+// the same basic block when nothing between them can take away the count the release gives back:
+//
+// - loads, stores, arithmetic, aggregate and address arithmetic, and other retains never can;
+// - another release can run a destructor, which is arbitrary code, but that code cannot reach a stack
+//   slot whose address never left this frame. So a release may sit between the pair unless the window
+//   also stores to memory that is not such a slot;
+// - any other call, inline assembly, an atomic, a fence or a volatile access ends the window.
+//
+// **Why it is sound.** Both halves act on one object, so its count after the window is the same with
+// the pair or without it. Inside the window the count is one lower than it was, and still at least
+// one: the count the release gives back is held by this frame -- by a temporary or a slot nothing
+// outside the frame can name -- and nothing in the window can give it back. No count reaches zero at a
+// different point, so no destructor moves. "The same reference" is a fact about values, not names:
+// two loads of one unescaped slot with no store to it between them read the same value, and the same
+// field of the same aggregate is the same field.
+//
+// **Across a join.** A block entered only by unconditional branches, which opens by releasing locals
+// (the end of a scope an `if` or `match` produced its value in), has those releases copied to the end
+// of every predecessor, in their order, when that lets at least one predecessor cancel a retain
+// against one. Each path then gives back exactly what it gave back before, earlier only by the slot
+// loads the join opened with.
+elide_arc_pairs(blocks: Buf[IrBlock]) -> Buf[IrBlock]
+    val clean = unescaped_slots(blocks)
+    var out: Buf[IrBlock] = buf()
+
+    for b in blocks
+        out.push(IrBlock(b.label, elide_in_block(b.instrs, clean), b.terminator))
+
+    for j in 1..<out.len()
+        hoist_join_releases(out, j, clean)
+
+    out
+end elide_arc_pairs
+
+// The stack slots whose address is used only as the address of a load or a store, so that nothing
+// outside the frame can read or write them.
+private unescaped_slots(blocks: Buf[IrBlock]) -> Set[string]
+    var slots: Set[string] = set()
+    var escaped: Set[string] = set()
+
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InAlloca(d, _, _) -> slots.add(v_render(d))
+                _ -> ()
+
+    for b in blocks
+        for inst in b.instrs
+            for v in escaping_operands(inst)
+                escaped.add(v_render(v))
+
+        b.terminator match
+            Some(t) ->
+                for v in escaping_operands(t)
+                    escaped.add(v_render(v))
+            None -> ()
+
+    var clean: Set[string] = set()
+
+    for s in slots
+        if !escaped.has(s) then clean.add(s)
+
+    clean
+end unescaped_slots
+
+// Every operand of `inst` an address could escape through: all of them, except the address a load
+// reads or a store writes.
+private escaping_operands(inst: Inst) -> Buf[Val]
+    var vs: Buf[Val] = buf()
+
+    inst match
+        InBin(_, _, _, a, b) ->
+            vs.push(a)
+            vs.push(b)
+        InNeg(_, _, v) -> vs.push(v)
+        InIntCmp(_, _, _, a, b) ->
+            vs.push(a)
+            vs.push(b)
+        InFloatCmp(_, _, _, a, b) ->
+            vs.push(a)
+            vs.push(b)
+        InCast(_, _, _, v, _) -> vs.push(v)
+        InAlloca(_, _, _) -> ()
+        InLoad(_, _, _, _, _) -> ()
+        InStore(_, v, _, _, _) -> vs.push(v)
+        InGep(_, _, p, idx) ->
+            vs.push(p)
+
+            for a in idx
+                vs.push(a.value)
+        InExtract(_, _, agg, _) -> vs.push(agg)
+        InInsert(_, _, agg, _, v, _) ->
+            vs.push(agg)
+            vs.push(v)
+        InSelect(_, c, _, a, b, _) ->
+            vs.push(c)
+            vs.push(a)
+            vs.push(b)
+        InInsertElement(_, _, vec, _, v, ix) ->
+            vs.push(vec)
+            vs.push(v)
+            vs.push(ix.value)
+        InExtractElement(_, _, vec, ix) ->
+            vs.push(vec)
+            vs.push(ix.value)
+        InShuffle(_, _, a, b, m) ->
+            vs.push(a)
+            vs.push(b)
+            vs.push(m.value)
+        InAsm(_, _, _, _, args) ->
+            for a in args
+                vs.push(a.value)
+        InCall(_, _, callee, args, _, _, _, _) ->
+            vs.push(callee)
+
+            for a in args
+                vs.push(a.value)
+        InVaArg(_, l, _) -> vs.push(l)
+        InAtomicRmw(_, _, p, _, v, _) ->
+            vs.push(p)
+            vs.push(v)
+        InCmpXchg(_, p, _, a, b, _) ->
+            vs.push(p)
+            vs.push(a)
+            vs.push(b)
+        InCondBr(c, _, _) -> vs.push(c)
+        InRet(_, Some(v)) -> vs.push(v)
+        InSwitch(_, v, _, _) -> vs.push(v)
+        _ -> ()
+
+    vs
+end escaping_operands
+
+// The release that gives back what `name` took, when `name` is a retain this pass knows.
+private release_for(name: string) -> Option[string]
+    if name == "arc.retain" then return Some("arc.release")
+    if name == "arc.retain_sync" then return Some("arc.release_sync")
+    if name == "arc.retain_maybe" then return Some("arc.release_maybe")
+    if name == "arc.weak_retain" then return Some("arc.weak_release")
+    if name.starts_with("arc.copy.") then return Some(s"arc.dispose.${name[9..<name.bytes.len]}")
+
+    None
+end release_for
+
+private is_release(name: string) -> bool =
+    name == "arc.release" || name == "arc.release_sync" || name == "arc.release_maybe" ||
+        name == "arc.weak_release" || name.starts_with("arc.dispose.")
+
+// The one-argument, no-result call to a named function `inst` is, if it is one.
+private arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
+    InCall(None, _, VGlobal(n), args, _, _, _, _) -> if args.len() == 1 then Some((n, args[0].value)) else None
+    _ -> None
+
+// A window still open: the retain's index, the release that closes it, the reference, and whether a
+// release and a store to memory outside the clean slots have happened since it opened.
+private struct Open
+    at: usize
+    release: string
+    key: string
+    released: bool
+    wrote_out: bool
+    // The clean slots the retained value was stored into since: `|a|b|`. The retain is the count
+    // those slots hold.
+    into: string
+
+private elide_in_block(instrs: Buf[Inst], clean: Set[string]) -> Buf[Inst]
+    var canon: Map[string, string] = map()
+    var epochs: Map[string, int] = map()
+    var stored: Map[string, string] = map()
+    var loaded_from: Map[string, string] = map()
+    var open: Buf[Open] = buf()
+    var dropped: Set[usize] = set()
+
+    for i in 0..<instrs.len()
+        val inst = instrs[i]
+
+        inst match
+            InLoad(d, ty, p, AccPlain, _) ->
+                val slot = v_render(p)
+
+                if clean.has(slot)
+                    val at = s"$slot #${epochs.get(slot).unwrap_or(0)}"
+
+                    loaded_from.put(v_render(d), slot)
+                    canon.put(v_render(d), stored.get(s"${l_render(ty)} $at").unwrap_or(s"load ${l_render(ty)} $at"))
+            InLoad(_, _, _, _, _) -> open.clear()
+            InExtract(d, _, agg, idx) ->
+                var key = s"field ${key_of(canon, agg)}"
+
+                for k in idx
+                    key = s"$key.$k"
+
+                canon.put(v_render(d), key)
+            InStore(ty, v, p, AccPlain, _) ->
+                val slot = v_render(p)
+
+                if clean.has(slot)
+                    val ep = epochs.get(slot).unwrap_or(0) + 1
+
+                    epochs.put(slot, ep)
+                    stored.put(s"${l_render(ty)} $slot #$ep", key_of(canon, v))
+
+                    for j in 0..<open.len()
+                        if open[j].key == key_of(canon, v) then open[j] = open[j] with { into = s"${open[j].into}$slot|" }
+                else
+                    for j in 0..<open.len()
+                        open[j] = open[j] with { wrote_out = true }
+            InStore(_, _, _, _, _) -> open.clear()
+            InCall(_, _, _, _, _, _, _, _) ->
+                arc_call_of(inst) match
+                    Some((name, v)) ->
+                        release_for(name) match
+                            Some(rel) -> open.push(Open(i, rel, key_of(canon, v), false, false, "|"))
+                            None ->
+                                if is_release(name)
+                                    val via = loaded_from.get(v_render(v)).unwrap_or("")
+
+                                    close_window(open, dropped, i, name, key_of(canon, v), via)
+                                else open.clear()
+                    None -> open.clear()
+            InAsm(_, _, _, _, _) -> open.clear()
+            InAtomicRmw(_, _, _, _, _, _) -> open.clear()
+            InCmpXchg(_, _, _, _, _, _) -> open.clear()
+            InFence(_) -> open.clear()
+            InVaArg(_, _, _) -> open.clear()
+            _ -> ()
+
+    if dropped.len() == 0 then return instrs
+
+    var kept: Buf[Inst] = buf()
+
+    for i in 0..<instrs.len()
+        if !dropped.has(i) then kept.push(instrs[i])
+
+    kept
+end elide_in_block
+
+// A release at `i`, of a value read from the clean slot `via` (or "" when it was not): it cancels the
+// latest open retain of the same reference whose window it may close, and is otherwise a release
+// inside every window still open.
+//
+// A window with a release inside it closes only on the release of the count the retain was taken
+// FROM, never on the release of the count it made: the slot the retain was stored into still holds a
+// count after the window, so through the window the count is at least that one plus the one the
+// closing release gives back, and dropping the pair leaves at least one. A release of the retained
+// value's own slot leaves no such floor -- the release inside the window may be of the very value it
+// was copied out of -- and neither does a window that wrote outside the frame, which the destructor
+// of the release inside it could reach.
+private close_window(open: Buf[Open], dropped: Set[usize], i: usize, name: string, key: string, via: string)
+    var j = open.len()
+
+    while j > 0
+        j -= 1
+
+        val o = open[j]
+        val own_slot = via != "" && o.into.contains(s"|$via|")
+
+        if o.release == name && o.key == key && !(o.released && (o.wrote_out || own_slot))
+            dropped.add(o.at)
+            dropped.add(i)
+            open.remove(j)
+            return
+
+    for k in 0..<open.len()
+        open[k] = open[k] with { released = true }
+end close_window
+
+private key_of(canon: Map[string, string], v: Val) -> string =
+    canon.get(v_render(v)).unwrap_or(v_render(v))
+
+// Copies the releases block `j` opens with to the end of each of its predecessors, where that lets a
+// predecessor cancel one (see `elide_arc_pairs`). The releases moved are those of a value loaded from
+// a clean slot, reached through nothing but clean-slot loads, field reads and other such releases.
+private hoist_join_releases(bs: Buf[IrBlock], j: usize, clean: Set[string])
+    val join = bs[j]
+    var preds: Buf[usize] = buf()
+
+    for k in 0..<bs.len()
+        bs[k].terminator match
+            Some(InBr(l)) ->
+                if l == join.label
+                    if k == j then return
+
+                    preds.push(k)
+            Some(InCondBr(_, a, b)) -> if a == join.label || b == join.label then return
+            Some(InSwitch(_, _, d, cases)) ->
+                if d == join.label then return
+
+                for c in cases
+                    if c.1 == join.label then return
+            _ -> ()
+
+    if preds.len() == 0 || preds.len() > 4 then return
+
+    var loads: Map[string, Inst] = map()
+    var fields: Set[string] = set()
+    var moved: Buf[(usize, Inst)] = buf()
+
+    for i in 0..<join.instrs.len()
+        val inst = join.instrs[i]
+        var go_on = false
+
+        inst match
+            InLoad(d, _, p, AccPlain, _) ->
+                if clean.has(v_render(p))
+                    loads.put(v_render(d), inst)
+                    go_on = true
+            InExtract(d, _, _, _) ->
+                fields.add(v_render(d))
+                go_on = true
+            InCall(_, _, _, _, _, _, _, _) ->
+                arc_call_of(inst) match
+                    Some((name, v)) ->
+                        if is_release(name) && !fields.has(v_render(v))
+                            moved.push((i, inst))
+                            go_on = true
+                    None -> ()
+            _ -> ()
+
+        if !go_on then break
+
+    if moved.len() == 0 then return
+
+    var trial: Buf[(usize, Buf[Inst])] = buf()
+    var gained = false
+
+    for k in preds
+        var instrs: Buf[Inst] = buf()
+
+        for x in bs[k].instrs
+            instrs.push(x)
+
+        for m in moved
+            val v = arc_call_of(m.1).unwrap().1
+
+            loads.get(v_render(v)) match
+                // A value the join loaded from a slot is loaded again at the end of the predecessor.
+                Some(load) ->
+                    val fresh = VReg(s"${reg_name(v)}.j$k")
+
+                    instrs.push(load match
+                        InLoad(_, ty, p, acc, al) -> InLoad(fresh, ty, p, acc, al)
+                        _ -> load)
+                    instrs.push(m.1 match
+                        InCall(dest, ret, callee, args, ra, ct, fast, tail) ->
+                            var a2: Buf[IrArg] = buf()
+
+                            a2.push(args[0] with { value = fresh })
+                            InCall(dest, ret, callee, a2, ra, ct, fast, tail)
+                        _ -> m.1)
+                // A value defined before the join dominates it, and so every predecessor too.
+                None -> instrs.push(m.1)
+
+        val after = elide_in_block(instrs, clean)
+
+        if after.len() < instrs.len() then gained = true
+
+        trial.push((k, after))
+
+    if !gained then return
+
+    for t in trial
+        bs[t.0] = IrBlock(bs[t.0].label, t.1, bs[t.0].terminator)
+
+    var rest: Buf[Inst] = buf()
+
+    for i in 0..<join.instrs.len()
+        var hoisted = false
+
+        for m in moved
+            if m.0 == i then hoisted = true
+
+        if !hoisted then rest.push(join.instrs[i])
+
+    bs[j] = IrBlock(join.label, rest, join.terminator)
+end hoist_join_releases
+
+private reg_name(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> "h"
