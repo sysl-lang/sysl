@@ -692,17 +692,41 @@ adds_two()
 
 ### What is dropped, and when
 
-`sysl run`, `sysl build` and `sysl emit-llvm` drop the tests — and drop them **after** analysis. So a
-`@test` that does not compile is an error in a build that would never have run it, and the module's
-capability rules reach its tests like they reach any other member — with the one difference that a
+**Every build but `sysl test` drops the tests after the parse and before analysis** — `sysl run`,
+`sysl build`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` alike, for a program's own files
+exactly as for a library's and a dependency's. What goes is every `@tests` file whole, and every
+`@test` function and hook wherever it was written. A **syntax** error in a test still stops the
+build, since every file is parsed first; everything after the parse — names, imports, types,
+capabilities — is asked of a test by `sysl test` alone, which is the one command that runs it.
+
+So a test's imports are never read by the program that ships. A `@tests` file may import a
+[dev dependency](/reference/packages/#dependencies-a-test-alone-needs), which only `sysl test` fetches,
+and the program still builds:
+
+```sysl
+main()
+    print("built")
+
+@test
+checks_nothing_yet()
+    val unused: NoSuchType = 0
+```
+
+```output
+built
+```
+
+The `@test` above names a type that does not exist, and `sysl build` says nothing about it: a broken
+test is reported by `sysl test`, the build that would run it. The module's capability rules reach its
+tests there like they reach any other member — with the one difference that a
 [`@tests` file states its own](/reference/modules/#a-tests-file-states-its-own-capabilities), since
-that file is what these builds are dropping.
+that file is what every other build drops.
 
-That ordering is what lets a test sit beside what it tests: a program's tests do not run when it
-runs, and they do not stop being checked.
+This is what lets a test sit beside what it tests: a program's tests do not run when it runs, and
+nothing they need is asked of it.
 
-A helper only a test calls leaves with it, because it becomes unreachable and pruning notices; a
-helper the program also calls stays, because the program still calls it.
+An ordinary helper only a test calls leaves too, because with the test gone it is unreachable and
+pruning notices; a helper the program also calls stays, because the program still calls it.
 
 What a test build keeps regardless is the three definitions **nothing in the program names**: an
 interrupt handler, an [`@export`](/reference/ffi/), and a `@section` definition (below). Each is
@@ -728,20 +752,22 @@ release calls is kept with it.
 That matters most to a package, whose only build is its own suite. A test build dropping an export
 would link, pass, and quietly go without the surface the package exists to provide.
 
-**`sysl build-lib` is the exception, and drops them *before* analysis.** An artifact is the one
-output that outlives the compilation that made it, and analysis is not a passive reading: a test
-naming `Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary
-library function afterwards, with nothing in it recording which declaration asked for it. Dropping
-the test from the analyzed program would therefore drop the test and keep everything it caused —
-shipping instantiations no caller of the library ever asked for, and making the artifact's contents
-a fact about its tests.
+**Why the drop comes *before* analysis.** Analysis is not a passive reading: a test naming
+`Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary library
+function afterwards, with nothing in it recording which declaration asked for it. Dropping the test
+from an analyzed program would drop the test and keep everything it caused — shipping, in an
+artifact, instantiations no caller of the library ever asked for. And a test's imports would be
+resolved against a build that never fetched what they name.
 
 **The line falls between parsing and analysis.** Every source is parsed before the drop, so a
-**syntax** error in a `@tests` file still stops a `build-lib`. What such a file no longer gets is
+**syntax** error in a test still stops a `build` or a `build-lib`. What a test no longer gets there is
 everything after the parse — name resolution, types, visibility, capabilities, the `@test`
-well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a library
-test that is well-formed text and wrong in every other way builds clean, and its real errors are
-reported by [`sysl test --std`](/getting-started/cli/), which is where a library's tests are run.
+well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a test that
+is well-formed text and wrong in every other way builds clean, and its real errors are reported by
+[`sysl test`](/getting-started/cli/) (`sysl test --std` for the standard library's), which is where
+tests are run. The refusals this page shows for tests are `sysl test`'s. That includes an ordinary
+function calling a `@test` or naming what a `@tests` file declares: `sysl test` says why, and any
+other build reports a name that is not there — since, in that build, it is not.
 
 That last one is worth naming because it is the case where "everything after the parse" is easy to
 apply to only half of a build. An `@export` in a `@tests` file names a symbol **this** build is about

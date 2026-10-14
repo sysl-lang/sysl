@@ -272,7 +272,12 @@ end adopt_owning_package
 // **Every command reads this one compilation, `emit-typed` included**, so a dependency has the name
 // in the typed tree that it has in the build: two commands answering about one program agree about
 // what it is.
-packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
+//
+// **`keep_tests` is true for `sysl test` alone.** Every other build takes the project's own scaffolding
+// -- each `@tests` file whole, and every `@test` function and hook -- out after the parse and before
+// anything is resolved, exactly as a library's and a dependency's are: a test's imports, its dev
+// dependencies and its errors belong to the one command that runs it.
+packaged_compilation_of(path: string, t: Target, keep_tests: bool = true) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     adopt_owning_package(root)
@@ -356,10 +361,10 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     var own: Buf[string] = buf()
 
-    // Then the program's own files, its `@tests` files among them. A test body is analyzed like
-    // every other -- it is code somebody wrote, held to the same rules -- and what a `@tests` file
-    // declares is *marked* rather than dropped, so that an ordinary body reaching one of those names
-    // is something to report about rather than a name that was never there.
+    // Then the program's own files. In a test build its `@tests` files are among them: a test body is
+    // analyzed like every other -- it is code somebody wrote, held to the same rules -- and what a
+    // `@tests` file declares is *marked* rather than dropped, so that an ordinary body reaching one
+    // of those names is something to report about rather than a name that was never there.
     //
     // **Every file is parsed before any refusal is made**, so a syntax error in one file does not hide
     // one in another: each file's first complaint is reported, in the order the files were found.
@@ -381,6 +386,11 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     val strayed = location_reports(mine, mine_units)
 
     if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
+
+    // Any other build drops the tests here, after the parse -- so a syntax error in one still stops
+    // it -- and before the first name is resolved, so a test's import of a dev dependency (which only
+    // `sysl test` fetches) or of anything else is never read.
+    if !keep_tests then mine_units = without_tests(mine_units)
 
     // **Before the analysis, because it is about what a CONSUMER would compile.** A dev dependency
     // is in scope for the whole of a test build, so an ordinary module importing one type-checks
@@ -616,9 +626,9 @@ emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
                also_auto_imported: Buf[string] = buf(),
                against: Option[Buf[string]] = None,
-               linking: bool = false) -> Result[Emitted, Failure]
+               linking: bool = false, keep_tests: bool = false) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
-    val program = packaged_compilation_of(path, t)?
+    val program = packaged_compilation_of(path, t, keep_tests)?
     val roots = if linking then roots_linked(program, path, level) else no_roots_linked()
     val done = analyze_bodies(program.units, program.target, also_auto_imported)
 
@@ -1462,7 +1472,7 @@ end LoweredForC
 // deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
 // carries a constructor of its own where the platform runs one.
 private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
-    val program = packaged_compilation_of(path, t)?
+    val program = packaged_compilation_of(path, t, false)?
 
     // **Told there is no entry point before a declaration is read, and that is not a detail.** A
     // file with no `module` header holding a `val` is a program's entry file, whose declarations are
@@ -1742,7 +1752,7 @@ build_library_of(path: string, named_target: Option[string],
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
     // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
     val probed = supplied_or_refused(path, t, false)?
-    val c = packaged_compilation_of(path, t)?
+    val c = packaged_compilation_of(path, t, false)?
 
     // **A library is reached by naming its module**, so a file of the tree that declares none sits in
     // the anonymous root module: no program could write a path to what it declares, and its keys would

@@ -1,0 +1,254 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **Every build but `sysl test` drops a program's own tests after the parse and before analysis**
+// (`reference/attributes.md § What is dropped, and when`, `reference/packages.md § Dependencies a
+// test alone needs`): each `@tests` file whole, and every `@test` function and hook. So a test's
+// imports -- a dev dependency, or a module nothing in the build provides -- are never read by
+// `build`, `run`, `build-c` or `emit-llvm`, and `sysl test` is still the build that checks them.
+
+private bdt_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project directory holding the given files, each written under its relative name.
+private bdt_project(files: Buf[(string, string)]) -> string
+    val dir = absolute_path(make_temp_dir("sysl-bdt").unwrap())
+
+    for item in files
+        val (name, text) = item
+
+        parent_of(s"$dir/$name") match
+            Some(up) -> make_dir_all(up).unwrap()
+            None -> ()
+
+        write_text(s"$dir/$name", text).unwrap()
+
+    dir
+end bdt_project
+
+// A command line, run in process, with the test flag and the search paths put back afterwards.
+private bdt_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    reset_feature_request()
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end bdt_cli
+
+private bdt_main() -> (string, string) = ("main.sysl", "main()\n    print(\"built\")\n")
+
+// The orbits shape: a `@tests` file importing a module no build of the program provides.
+private bdt_orbits() -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(bdt_main())
+    files.push(("tests.sysl", "@tests\n\nimport sh.sysl.nothing_here\n\n@test(\"t\")\nt()\n" +
+                              "    assert(true, \"x\")\n"))
+    files
+end bdt_orbits
+
+private bdt_missing() -> string = "no module is called 'sh.sysl.nothing_here'"
+
+@test("a '@tests' file importing a module nothing provides does not stop 'sysl build', and the program runs")
+bdt_build_drops_a_tests_files_import()
+    if !bdt_ready() then return
+
+    val root = bdt_project(bdt_orbits())
+    val exe = s"$root/built"
+    val built = bdt_cli(["sysl", "build", root, "-o", exe])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "built\n")
+
+@test("nor does it stop 'sysl emit-llvm', whose module holds no test")
+bdt_emit_llvm_drops_the_tests()
+    if !bdt_ready() then return
+
+    var files = bdt_orbits()
+
+    files.push(("more.sysl", "@test(\"beside the code\")\nbdt_beside_the_code()\n    assert(true, \"y\")\n"))
+
+    val root = bdt_project(files)
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> assert(false, why.message)
+        Ok(out) ->
+            assert(out.report.is_empty(), analysis_report(out.report))
+            assert(!out.text.contains("bdt_beside_the_code"), "a '@test' function was emitted")
+
+@test("'sysl test' still reads the '@tests' file, and refuses the import it cannot resolve")
+bdt_test_still_checks_the_tests()
+    if !bdt_ready() then return
+
+    val root = bdt_project(bdt_orbits())
+    val tested = bdt_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(tested.0 != 0, "a test whose import is missing passed")
+    assert(tested.1.contains(bdt_missing()), tested.1)
+
+@test("'sysl test' still runs a program's tests, and a failing one fails it")
+bdt_test_still_runs_the_tests()
+    if !bdt_ready() then return
+
+    var passing: Buf[(string, string)] = buf()
+
+    passing.push(bdt_main())
+    passing.push(("tests.sysl", "@tests\n\nfixture() -> int = 7\n\n@test(\"seven\")\nseven()\n" +
+                                "    assert(fixture() == 7, \"seven\")\n"))
+
+    val good = bdt_project(passing)
+    val passed = bdt_cli(["sysl", "test", good])
+
+    remove_dir_all(good).unwrap_or(())
+    assert_eq(passed.0, 0, passed.1)
+
+    var failing: Buf[(string, string)] = buf()
+
+    failing.push(bdt_main())
+    failing.push(("tests.sysl", "@tests\n\n@test(\"eight\")\neight()\n    assert(7 == 8, \"eight\")\n"))
+
+    val bad = bdt_project(failing)
+    val failed = bdt_cli(["sysl", "test", bad])
+
+    remove_dir_all(bad).unwrap_or(())
+    assert(failed.0 != 0, "a failing test passed")
+
+@test("a '@test' function naming a '@tests' fixture builds, and a broken one is 'sysl test''s to report")
+bdt_a_test_beside_the_code_naming_a_fixture()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("main.sysl", "main()\n    print(\"built\")\n\n@test(\"uses the fixture\")\n" +
+                             "uses_the_fixture()\n    assert(fixture() == 7, \"seven\")\n\n" +
+                             "@test(\"broken\")\nbroken()\n    val n: NoSuchType = 0\n"))
+    files.push(("tests.sysl", "@tests\n\nfixture() -> int = 7\n"))
+
+    val root = bdt_project(files)
+    val exe = s"$root/built"
+    val built = bdt_cli(["sysl", "build", root, "-o", exe])
+    val tested = bdt_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(built.0, 0, built.1)
+    assert(tested.0 != 0, "a test naming a type that does not exist passed")
+    assert(tested.1.contains("NoSuchType"), tested.1)
+
+// The scaffolding is not there to name, so `sysl build` says so plainly; `sysl test`, which reads it,
+// says why the name may not be used.
+@test("an ordinary statement naming a '@tests' helper is an undefined name to 'sysl build', and refused with the reason by 'sysl test'")
+bdt_an_ordinary_use_of_scaffolding()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("main.sysl", "print(quadruple(2))\n"))
+    files.push(("tests.sysl", "@tests\n\nquadruple(n: int) -> int = n * 4\n"))
+
+    val root = bdt_project(files)
+    val built = bdt_cli(["sysl", "build", root, "-o", s"$root/built"])
+    val tested = bdt_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(built.0 != 0, "a use of a helper no build keeps built")
+    assert(built.1.contains("error: undefined function 'quadruple'"), built.1)
+    assert(tested.0 != 0, "a use of a helper only tests may name passed")
+    assert(tested.1.contains("quadruple' is declared in a file that said '@tests'"), tested.1)
+
+@test("'sysl build-c' drops the tests too")
+bdt_build_c_drops_the_tests()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("lib.sysl", "@export(\"bdt_seven\")\nseven() -> i32 = 7\n"))
+    files.push(("tests.sysl", "@tests\n\nimport sh.sysl.nothing_here\n\n@test(\"seven\")\nis_seven()\n" +
+                              "    assert(seven() == 7, \"seven\")\n"))
+
+    val root = bdt_project(files)
+    val built = bdt_cli(["sysl", "build-c", root, "-o", s"$root/out.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(built.0, 0, built.1)
+
+@test("an ordinary file importing a module nothing provides is still refused by 'sysl build'")
+bdt_an_ordinary_import_is_still_refused()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("main.sysl", "import sh.sysl.nothing_here\n\nmain()\n    print(\"built\")\n"))
+
+    val root = bdt_project(files)
+    val built = bdt_cli(["sysl", "build", root, "-o", s"$root/built"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(built.0 != 0, "an ordinary import of nothing built")
+    assert(built.1.contains(bdt_missing()), built.1)
+
+@test("a syntax error in a '@tests' file still stops 'sysl build', since every file is parsed first")
+bdt_a_syntax_error_in_a_tests_file_still_stops_a_build()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(bdt_main())
+    files.push(("tests.sysl", "@tests\n\nf( -> int\n"))
+
+    val root = bdt_project(files)
+    val built = bdt_cli(["sysl", "build", root, "-o", s"$root/built"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(built.0 != 0, "a '@tests' file that does not parse built")
+
+// The package `github.com/e/extra` at 1.0.0, whose one module is `sh.sysl.extra`, published in the
+// project's `vendor/` as a fetch would have left it -- so nothing here reaches the network.
+private bdt_publish_extra(project: string)
+    val dir = s"$project/vendor/github.com/e/extra/@v1.0.0"
+
+    make_dir_all(s"$dir/sh/sysl/extra").unwrap()
+    write_text(s"$dir/package.hocon", "package { name = \"extra\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$dir/sh/sysl/extra/extra.sysl", "module sh.sysl.extra\n\nseven() -> int = 7\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end bdt_publish_extra
+
+@test("a program's dev dependency is imported by its tests under 'sysl test', and 'sysl build' never reads it")
+bdt_a_dev_dependency_in_a_programs_tests()
+    if !bdt_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("package.hocon", "package { name = \"app\", version = \"1.0.0\" }\n" +
+                                 "dev_dependencies { extra { git = \"github.com/e/extra\", version = \"1.0.0\" } }\n"))
+    files.push(bdt_main())
+    files.push(("tests.sysl", "@tests\n\nimport sh.sysl.extra\n\n@test(\"reaches\")\nreaches()\n" +
+                              "    assert(extra.seven() == 7, \"seven\")\n"))
+
+    val root = bdt_project(files)
+
+    bdt_publish_extra(root)
+
+    val tested = bdt_cli(["sysl", "test", root])
+    val built = bdt_cli(["sysl", "build", root, "-o", s"$root/built"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(tested.0, 0, tested.1)
+    assert_eq(built.0, 0, built.1)
+end bdt_a_dev_dependency_in_a_programs_tests
