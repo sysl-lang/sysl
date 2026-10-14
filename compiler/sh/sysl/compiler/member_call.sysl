@@ -203,6 +203,9 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     // subject settled the type's arguments and the arguments settle the member's.
     val generic = cx.an.tables.members.generic.get(member_key_of(found.0, picked))
 
+    if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
+        return Some(bad_expr(span))
+
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len()
         check_member_visible(cx, span, found.0, picked, decl, via)
 
@@ -809,6 +812,9 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     // arguments say.
     val generic = cx.an.tables.members.generic.get(member_key_of(found.0, chosen.unwrap()))
 
+    if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
+        return bad_expr(span)
+
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
         return call_generic_member(cx, span, Some(receiver), rty, found.0, decl, generic.unwrap(),
                                    found.1, args, expected, name, targs)
@@ -824,6 +830,25 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name,
                     via)
 end call_declared
+
+// **A member an `impl` naming no trait brought is there only where that block's bounds hold**, and
+// they are asked of the receiver's own arguments: nothing asked them where its type was made, since
+// the type's declaration does not carry them.
+private block_bounds_met(cx: &Analyzer, span: Span, fd: FuncDecl, owner_args: Buf[Type]) -> bool
+    val bounds = cx.an.tables.members.block_bounds.get(fd.name)
+
+    if bounds.is_none() then return true
+
+    var owner_params: Buf[string] = buf()
+
+    for i in 0..<owner_args.len()
+        if i < fd.tparams.len() then owner_params.push(fd.tparams.at(i))
+
+    val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
+
+    check_param_bounds(cx.an, home, span, fd.name, owner_params, bounds.unwrap(), owner_args, buf(),
+                       "type parameter", cx.scope)
+end block_bounds_met
 
 // `o.map(f)` -- a member declaring type parameters of its own, instantiated from the call.
 //

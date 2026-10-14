@@ -2172,6 +2172,116 @@ decides who may know the shape. See [modules](/reference/modules/).
 An opaque struct with no body at all is C's incomplete type, `struct sqlite3;` — nothing in sysl lays
 one out, and the declaration exists so that `*Session` is a type a `*u8` cannot be mistaken for.
 
+### Members in an `impl` block of their own
+
+**An `impl` naming no trait adds members to a struct or an enum**, written in any file of the module
+that declares the type. A type whose methods outgrow its declaration — a `Quaternion` with fifty
+operations, an enum with a parser and a printer — keeps its fields together and its members where
+they read best:
+
+```sysl
+// geom/quat.sysl
+module geom
+
+struct Quat[F]
+    w: F
+    x: F
+```
+
+```sysl
+// geom/ops.sysl
+module geom
+
+import sysl.math.Float
+
+impl[F: Float] Quat[F]
+    norm2(self) -> F = self.w * self.w + self.x * self.x
+
+    scaled(self, k: F) -> Quat[F] = Quat(self.w * k, self.x * k)
+```
+
+The block's members are the type's own exactly as the body's are: no trait to import, reached
+wherever the type is, and one namespace with the body — so a name the body already uses is a
+duplicate whichever was written first:
+
+```sysl
+struct P
+    n: int
+
+    show(self) -> int = self.n
+
+impl P
+    show(self) -> int = 2
+
+print(P(1).show())
+```
+
+```error
+type 'P' already has a member named 'show'
+```
+
+**The block's header binds the type's parameters**, under names of its own, as a trait's `impl`
+does. **A bound it adds is a condition on the members it brings**: they exist only where the
+receiver's arguments meet it, while the type and its body's members stay as they were. It is the
+inherent counterpart of [a conditional conformance](/reference/traits/#conditional-conformance):
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+    swapped(self) -> Pair[T] = Pair(self.hi, self.lo)
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(3, 7).larger())
+print(Pair(Tag(1), Tag(2)).swapped().lo.n)
+```
+
+```output
+7
+2
+```
+
+A `Pair[Tag]` is built and swapped; asking it for `larger` is refused at the call, naming the bound
+the block wrote:
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(Tag(1), Tag(2)).larger().n)
+```
+
+```error
+'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', but Tag does not
+```
+
+**Another module may not add members**: a type's own members are part of what its declaration
+promises, and what another module wants to add is a trait, which it may implement for the type:
+
+```sysl
+impl[T] Option[T]
+    or_zero(self) -> int = 0
+
+print(1)
+```
+
+```error
+'sysl.Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
+```
+
 ## Enums
 
 Two shapes under one keyword. A **simple** enum is a set of named discriminants over an underlying
