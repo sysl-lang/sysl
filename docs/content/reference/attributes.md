@@ -97,7 +97,9 @@ print(c.send(&n))
 Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
 `@no_alloc`, `@no_block` and `@blocks` — and `@relocates`, which says a call may move the storage its
 receiver's elements live in, so a live `ref` to one of them is refused the call
-([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)). Everything else is refused, and the line is what the annotation is **about** rather
+([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
+the view a call answers is borrowed from its receiver, so the view may not outlive it
+([memory](/reference/memory/#a-view-borrowed-from-its-receiver)). Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 

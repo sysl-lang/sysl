@@ -273,9 +273,14 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     cx.bind_site = Some(span)
 
+    val held = cx.pattern_roots
+
+    cx.pattern_roots = pattern_view_roots(cx, ts)
+
     for i in 0..<patterns.len()
         tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
 
+    cx.pattern_roots = held
     cx.bind_site = site
 
     // A pattern that matches every value of the type asks a question with one answer. Refused
@@ -324,7 +329,15 @@ end any_pattern_binds
 match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected: Option[Type],
            discarded: bool) -> TExpr
     val ts = type_expr_bare(cx, scrut)
+
+    // A name an arm binds out of a borrowed view is borrowed from the same receiver.
+    val held = cx.pattern_roots
+
+    cx.pattern_roots = pattern_view_roots(cx, ts)
+
     val tarms = analyze_arms(cx, texpr_type(ts), arms, expected, discarded)
+
+    cx.pattern_roots = held
 
     // A refusal of the whole `match` -- arms that disagree, a gap in its coverage -- anchors at its
     // SCRUTINEE, as the reference's does: `Colour.Red match` is refused under `Red`, a selection's
@@ -577,9 +590,15 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
     if tpats.len() > 1 && any_pattern_binds(tpats) then
         cx.fault(arm.span, "alternative patterns joined by '|' cannot bind a name")
 
+    // Only the arm's patterns bind out of the scrutinee; its body's own bindings are its own.
+    val roots = cx.pattern_roots
+
+    cx.pattern_roots = buf()
+
     val guard = arm.guard.map(g -> analyze_bool(cx, g, arm.span))
     val body = type_block_body(cx, arm.body, expected, discarded)
 
+    cx.pattern_roots = roots
     cx.leave()
     TArm(tpats, guard, body)
 end analyze_arm

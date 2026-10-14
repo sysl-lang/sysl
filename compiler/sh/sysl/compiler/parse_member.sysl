@@ -833,12 +833,38 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
             member.const_fn = marked_const
             apply_member_attrs(&member, attrs)
 
+            if member.marks.views then check_views_member(p, member)
+
             // **A property is read, not called**, so there is no call for a task to come out of.
             if async_at.is_some() then mark_async_member(p, &member, async_at.unwrap())
 
             out.push(member)
         None -> ()
 end parse_member_line
+
+// `@views(self)` is a statement about a view a member hands back of its own receiver, so the member
+// needs both: a receiver, and a written result that is a view -- `[]T`, `[]const T` or a `string`.
+// **Narrow on purpose**: a view inside a struct or an `Option` would need the borrow carried through
+// a type, and nothing here puts a borrow in a type.
+private check_views_member(p: *Parser, m: MethodDecl)
+    if m.recv_mode().is_none()
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "what it is called on, and it is called on nothing — it takes no 'self'")
+        return
+    end if
+
+    val is_view = m.ret_type match
+        Some(t) -> *t.kind match
+            ArrayType(length, _, _) -> length.is_none()
+            NamedType(n, args) -> n == "string" && args.is_empty()
+            _ -> false
+        None -> false
+
+    if !is_view then
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "its receiver, so it marks a member whose result is a view — '[]T', '[]const T' " +
+                "or 'string'")
+end check_views_member
 
 // An `async` member: a method's result becomes the task its call hands back. **A property is read,
 // not called**, so there is no call for a task to come out of, and it is refused at the word.
