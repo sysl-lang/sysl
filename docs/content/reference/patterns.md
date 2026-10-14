@@ -67,6 +67,7 @@ Two evaluation guarantees:
 | struct, positional | `Point(a, b)` | a struct, binding every field by position |
 | struct, named | `Point{x, y}`, `Point{x: a}` | a struct, binding fields by name; unlisted fields unconstrained |
 | tuple | `(a, b)`, `(a, _)` | a tuple, by position |
+| unit | `()` | `unit`'s one value — so it always matches one |
 | named | `c @ Circle(r)` | what the sub-pattern matches, binding the **whole** value too |
 
 **Literal patterns match any type with equality; range patterns need a contiguous order.** The two
@@ -90,6 +91,37 @@ yes no
 A range pattern is restricted to the numeric types and `char`, the types over which a contiguous
 interval is meaningful. `string` is deliberately excluded: `"a".."z"` has no useful meaning. A
 `string` is matched by literal or by binding.
+
+**`()` is `unit`'s pattern, the tuple with no parts.** `unit` has one value, so `()` matches whatever
+reaches it and covers the type on its own — which is what makes `Ok(())` an arm, and `Ok(())` with
+`Err(…)` a whole match:
+
+```sysl
+check(n: int) -> Result[unit, string] = if n > 0 then Ok(()) else Err("too low")
+
+for n in [1, 0]
+    check(n) match
+        Ok(()) -> print("ok")
+        Err(why) -> print(why)
+```
+
+```output
+ok
+too low
+```
+
+Against anything but `unit` it is refused for what it is:
+
+```sysl
+var p = 1
+p match
+    () -> print(p)
+    _ -> print(0)
+```
+
+```error
+'()' matches unit, but the value is int
+```
 
 ### The bare-name rule
 

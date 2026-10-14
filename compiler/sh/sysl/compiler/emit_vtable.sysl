@@ -123,22 +123,25 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
     // own count exactly where it was.
     val staged = adapter_snapshot(e, vt, slot, payload)
 
-    val recv = slot.recv match
+    // A zero-sized receiver taken by value -- `unit`'s -- has no parameter in the implementation's
+    // signature, so there is nothing to load and nothing to pass.
+    val recv: Option[IrArg] = slot.recv match
         // A large receiver is passed at its address like any other large argument.
         ByValue ->
-            if e.layout.indirect(vt.for_type) then ir_arg(LPtr, staged.unwrap_or(payload))
+            if zero_sized(vt.for_type) then None
+            else if e.layout.indirect(vt.for_type) then Some(ir_arg(LPtr, staged.unwrap_or(payload)))
             else
                 val v = fresh_reg(e)
 
                 emit(e, InLoad(v, lty(e, vt.for_type), payload, AccPlain, None))
-                ir_arg(lty(e, vt.for_type), v)
-        ByPtr -> ir_arg(LPtr, payload)
+                Some(ir_arg(lty(e, vt.for_type), v))
+        ByPtr -> Some(ir_arg(LPtr, payload))
 
         // A `&self` method on a raw object is refused where the object's type is formed, and on a
         // counted one the implementation is named directly, so no adapter is ever built for it.
         ByRef(_) ->
             gap_here(e, "an adapter for a '&self' method")
-            ir_arg(LPtr, payload)
+            Some(ir_arg(LPtr, payload))
 
     var call: Buf[IrArg] = buf()
 
@@ -146,7 +149,7 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
         Some(p) -> call.push(IrArg(LPtr, sret_param(), sret_forward_attrs(p.attrs)))
         None -> ()
 
-    call.push(recv)
+    if recv.is_some() then call.push(recv.unwrap())
 
     for i in 0..<slot.params.len()
         if !zero_sized(slot.params.at(i))
