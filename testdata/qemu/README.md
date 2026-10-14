@@ -37,8 +37,9 @@ on Arm, `__divdi3` and `__muldf3` on RISC-V — and the program carries them: `s
 an `f64`. This machine has **no cross builtins at all**, so before they were the program's they were
 C stand-ins here, and a real project linked without `libgcc` stopped at the linker; now a
 `-nostdlib` link of a panicking image resolves. What the Armv6-M core alone lacks — 32-bit division,
-64-bit shifts and multiply, `__clzsi2`, the `__aeabi_mem*` family — is `sysl.softint`'s too, kept in
-every build for that core, and the `f32` routines a core with no unit calls (`__aeabi_fadd`,
+64-bit shifts and multiply, `__clzsi2` — is `sysl.softint`'s too, kept in every build for that core;
+the `__aeabi_mem*` family every Thumb core calls for a large struct copy is `sysl.softint.aeabi`'s,
+laid down in every Thumb build over the board's `memcpy` and `memset`; and the `f32` routines a core with no unit calls (`__aeabi_fadd`,
 `__addsf3`, …) are `sysl.softfloat.binary64`'s. No board supplies any arithmetic.
 
 ## The startup zeroes `.bss`, and that is not optional

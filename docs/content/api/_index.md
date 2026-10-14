@@ -59,6 +59,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.softfloat`](sysl-softfloat/) |  |
 | [`sysl.softfloat.binary64`](sysl-softfloat-binary64/) |  |
 | [`sysl.softint`](sysl-softint/) |  |
+| [`sysl.softint.aeabi`](sysl-softint-aeabi/) |  |
 | [`sysl.sync`](sysl-sync/) | What two threads may touch at once: `Atomic[T]`, `SpinLock`, and the five memory orderings. |
 | [`sysl.sys`](sysl-sys/) | The platform seam: everything the library asks of what it is hosted on, and nothing else. |
 | [`sysl.term`](sysl-term/) | What a terminal understands: the escape sequences that colour text, emphasise it, and move the cursor about. |

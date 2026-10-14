@@ -90,8 +90,9 @@ void *memset(void *dst, int c, size_t n) {
 
 /* **What this core lacks is not here**, though it lacks more than any other board's: no divider at
  * all, no long multiply, no `clz` and no two-word shift, so a 32-bit division, a 64-bit multiply or
- * variable shift, a leading-zero count and the run-time ABI's `__aeabi_memcpy` family are each a call.
- * The program carries every one: `sysl.softint` exports them, weak, in every build for this core, and
- * `sysl.softfloat.binary64` the `f32` and `f64` routines a core with no floating-point unit calls.
+ * variable shift and a leading-zero count are each a call. The program carries every one:
+ * `sysl.softint` exports them, weak, in every build for this core, `sysl.softint.aeabi` the
+ * `__aeabi_memcpy` family every Thumb core calls, and `sysl.softfloat.binary64` the `f32` and `f64`
+ * routines a core with no floating-point unit calls.
  * That is why `memcpy` and `memset` above are all the block operations this file owes.
  */

@@ -874,10 +874,11 @@ where a reached body divides a 64-bit integer or computes with an `f64` — so a
 `-nostdlib`, and a `libgcc` that defines them too simply wins. An `f32` on a core with no unit at all
 — a Cortex-M0+ or M3, RISC-V with no `F` — is the same: `__aeabi_fmul` or `__mulsf3`, kept where a
 reached body computes with one. **Armv6-M lacks more**: 32-bit division, a 64-bit multiply and
-variable shift, a leading-zero count, and the run-time ABI's `__aeabi_memcpy` family are all calls
-there, which LLVM makes from code that spells none of them, so `sysl.softint` is kept in every
-Armv6-M build. What its board still supplies is `memcpy` and `memset`, as any freestanding target's
-does.
+variable shift and a leading-zero count are all calls there, which LLVM makes from code that spells
+none of them, so `sysl.softint` is kept in every Armv6-M build. **Every Thumb core** calls the
+run-time ABI's `__aeabi_memcpy4` and its relatives for a large struct copy, so `sysl.softint.aeabi`
+lays them down in every Thumb build, over C's `memcpy` and `memset` — which is all the board still
+supplies, as any freestanding target's does.
 
 ## Flags every subcommand takes
 
