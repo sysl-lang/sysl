@@ -1,0 +1,256 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// A literal in one branch adopts the type another branch settles, in the three places it did not:
+// beside a branch that does not finish, across an `elif` chain of tuples, and in a range standing
+// where a `Range[T]` is wanted. Two branches that each know their type still have to agree.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lar_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+private lar_skip_run() -> bool
+    if lar_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private lar_write(main: string) -> string
+    val root = make_temp_dir("sysl-lar").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+private lar_ran(main: string) -> string
+    val root = lar_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lar_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private lar_refused(main: string, message: string, at: string)
+    val root = lar_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+// A match whose `None` arm is `if c then <then> else <otherwise>`, inside a one-round loop so that
+// `continue` and `break` have somewhere to go.
+private lar_arm(then_side: string, otherwise: string) -> string =
+    "f(o: Option[usize], c: bool) -> usize\n" +
+    "    for _ in 0..<1\n" +
+    "        val at = o match\n" +
+    "            Some(i) -> i\n" +
+    s"            None -> if c then $then_side else $otherwise\n" +
+    "        return at\n" +
+    "    7\n\n" +
+    "print(f(None, true))\nprint(f(None, false))\nprint(f(Some(4), true))\n"
+
+private lar_sum() -> string = raw"""
+    total(r: Range[usize]) -> usize
+        var s: usize = 0
+
+        for i in r
+            s += i
+
+        s
+
+    """
+
+// -- a branch that does not finish ----------------------------------------------------------------
+
+@test("a literal beside a continue takes the type the other arm settles")
+lar_beside_a_continue()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_arm("0", "continue")), "0\n7\n4\n")
+
+@test("a literal beside a return, a break, or a panic takes it too")
+lar_beside_a_return_break_or_panic()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_arm("0", "return 9")), "0\n9\n4\n")
+    assert_eq(lar_ran(lar_arm("0", "break")), "0\n7\n4\n")
+    assert_eq(lar_ran(replace_all(lar_arm("2", "panic(\"no\")"), "print(f(None, false))\n", "")),
+              "2\n4\n")
+
+@test("a call of the program's own never-returning function stops the branch too")
+lar_beside_a_never_function()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran("stop() -> never = panic(\"stopped\")\n\n" +
+                      replace_all(lar_arm("3", "stop()"), "print(f(None, false))\n", "")), "3\n4\n")
+
+@test("the branch that stops may come first")
+lar_the_stopping_branch_first()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_arm("continue", "5")), "7\n5\n4\n")
+
+@test("a nested if of literals beside a continue takes the type as one")
+lar_nested_beside_a_continue()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_arm("(if o.is_none() then 1 else 2)", "continue")), "1\n7\n4\n")
+
+@test("an elif chain of a literal and a continue after a value that knows")
+lar_an_elif_chain_with_a_continue()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(raw"""
+        f(n: usize, a: bool, b: bool) -> usize
+            for _ in 0..<1
+                val w = if a then n elif b then 0 else continue
+                return w
+            7
+
+        print(f(5, true, false))
+        print(f(5, false, true))
+        print(f(5, false, false))
+        """), "5\n0\n7\n")
+
+@test("an arm that stops on both sides is still never, and the match is the other arm's")
+lar_both_sides_stop()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_arm("continue", "break")), "7\n7\n4\n")
+
+@test("the adopted literal must still fit the type it adopts")
+lar_the_literal_must_fit()
+    if lar_skip() then return
+
+    lar_refused(replace_all(lar_arm("300", "continue"), "usize", "u8"),
+                "the literal 300 does not fit byte", "5:31")
+
+@test("a branch that knows a different type beside a continue is still refused")
+lar_a_known_branch_beside_a_continue()
+    if lar_skip() then return
+
+    lar_refused(lar_arm("\"s\"", "continue"), "match arms have different types: usize and string",
+                "3:18")
+    val with_k = replace_all(replace_all(lar_arm("k", "continue"), "c: bool)", "c: bool, k: int)"),
+                             "))", ", 1))")
+
+    lar_refused(with_k, "match arms have different types: usize and int", "3:18")
+
+// -- an elif chain of tuples -----------------------------------------------------------------------
+
+@test("an elif chain of tuples meets at one type across all its branches")
+lar_a_tuple_chain()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(raw"""
+        pick(n: usize) -> usize
+            val (a, b) = if n % 3 == 0 then (n, 0) else if n % 2 == 0 then (0, n) else if n % 3 == 2 then (n, 1) else (n, 2)
+            a * 10 + b
+
+        print(pick(3))
+        print(pick(4))
+        print(pick(5))
+        print(pick(7))
+        """), "30\n4\n51\n72\n")
+
+@test("an elif chain of array literals meets at one element type")
+lar_an_array_chain()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(raw"""
+        pick(n: usize, a: bool, b: bool) -> usize
+            val xs = if a then [n, 0] elif b then [0, n] else [1, 1]
+            xs[0] * 10 + xs[1]
+
+        print(pick(5, true, false))
+        print(pick(5, false, true))
+        print(pick(5, false, false))
+        """), "50\n5\n11\n")
+
+@test("an elif chain of tuples in a match arm meets the other arm")
+lar_a_tuple_chain_in_an_arm()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(raw"""
+        pick(o: Option[usize], a: bool) -> usize
+            val (x, y) = o match
+                Some(n) -> if a then (n, 0) elif n > 2 then (0, n) else (1, 1)
+                None -> (0, 0)
+            x * 10 + y
+
+        print(pick(Some(5), true))
+        print(pick(Some(5), false))
+        print(pick(Some(1), false))
+        print(pick(None, true))
+        """), "50\n5\n11\n0\n")
+
+@test("a chain whose branches know different types for one part is refused")
+lar_a_tuple_chain_that_disagrees()
+    if lar_skip() then return
+
+    lar_refused("f(n: usize, a: bool, b: bool) -> usize\n" +
+                "    val (x, y) = if a then (n, 0) elif b then (0, \"s\") else (1, 1)\n    x\n",
+                "if branches have different types: (usize, string) and (usize, int)", "2:35")
+
+// -- a range where a Range[T] is wanted ------------------------------------------------------------
+
+@test("a range of literals at a Range[usize] parameter is a range of usize")
+lar_a_range_argument()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(lar_sum() + "print(total(0..<4))\nprint(total(1..3))\n"), "6\n6\n")
+
+@test("a range of literals takes a written Range type's element too")
+lar_a_range_val()
+    if lar_skip_run() then return
+
+    assert_eq(lar_ran(raw"""
+        val r: Range[u8] = 250..<253
+        var s = 0
+
+        for i in r
+            s += int(i)
+
+        print(s)
+        """), "753\n")
+
+@test("a range whose bounds know a different type is still refused")
+lar_a_range_of_ints()
+    if lar_skip() then return
+
+    lar_refused(lar_sum() + "f(a: int, b: int) -> usize = total(a..<b)\n",
+                "'r' of 'total' is sysl.Range[usize], but sysl.Range[int] was given", "9:36")
+    lar_refused(lar_sum() + "print(total(-1..<3))\n", "the literal -1 does not fit usize", "9:13")
