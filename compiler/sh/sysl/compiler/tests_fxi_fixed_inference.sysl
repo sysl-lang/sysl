@@ -1,0 +1,129 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A `new` type over a fixed-point format answers the format's attributes at itself
+// (`reference/fixed-point.md § Attributes, and the bits`), and an associated function of a generic
+// type is settled by what receives its result through an `unwrap()` or an `expect(…)` of the
+// `Option` or `Result` it answers (`reference/generics.md`).
+
+private fxi_says(text: string, part: string) -> bool = text.contains(part)
+
+// -- `::Bits` and the extremes of a `new` format --------------------------------------------------
+
+@test("a wrapping new format makes a value from its bits")
+fxi_a_wrapping_new_format_makes_a_value_from_its_bits()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Acc15 = new i64q43 wrapping\nval n: long = 8796093022208\n" +
+                      "val a = Acc15::Bits(n)\nvar w = a\nw += Acc15::Bits(-3 * n)\n" +
+                      "print(real(a), a.bits, real(w))\n"), "1 8796093022208 -2\n")
+
+@test("a plain new format answers Bits, Min, Max and Small at itself")
+fxi_a_plain_new_format_answers_every_attribute()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Gain = new q15\nval g: Gain = Gain::Bits(16384)\n" +
+                      "print(real(g), real(Gain::Min), real(Gain::Max), Gain::Small.bits, Gain::Max.bits)\n"),
+              "0.5 -1 0.999969482421875 1 32767\n")
+
+@test("Bits over a view reads the integers as the new type")
+fxi_bits_over_a_view_reads_the_integers_as_the_new_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Gain = new q15\nvar pcm: [2]i16 = [16384, -32768]\n" +
+                      "val g = Gain::Bits(pcm[..])\nprint(real(g[0]), real(g[1]))\n"), "0.5 -1\n")
+
+@test("Bits on a new format takes the integer it is stored as")
+fxi_bits_on_a_new_format_takes_its_storage()
+    if !enm_ready() then return
+
+    val said = enm_err("type Gain = new q15\nval n: int = 3\nprint(real(Gain::Bits(n)))\n")
+
+    assert(fxi_says(said, "'Gain::Bits' takes the short a Gain is stored as, or a view of them, not int"), said)
+
+@test("a new format with a range refuses Bits and names the checked spelling")
+fxi_a_ranged_new_format_refuses_bits()
+    if !enm_ready() then return
+
+    val said = enm_err("type Half = new q15 within 0.0..0.5\nval h = Half::Bits(16384)\nprint(real(h))\n")
+
+    assert(fxi_says(said, "'Half::Bits' would make a value nothing checks against 'Half' — write " +
+                          "'Half(q15::Bits(…))', which checks it"), said)
+
+    // The spelling it names is the one that checks.
+    assert_eq(enm_ran("type Half = new q15 within 0.0..0.5\nval h = Half(q15::Bits(16384))\n" +
+                      "print(real(h))\n"), "0.5\n")
+
+@test("an integer subtype keeps its own attributes")
+fxi_an_integer_subtype_keeps_its_own_attributes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Slot = new u8 within 0..<8\nprint(u8(Slot::First), u8(Slot::Last))\n"), "0 7\n")
+
+// -- the expected type through `unwrap()` and `expect(…)` -----------------------------------------
+
+private fxi_biquad() -> string =
+    "struct Biquad[S]\n    b0: S\n    of(c: real) -> Result[Self, string]\n" +
+    "        if c > 1.0 then return Err(\"too big\")\n        Ok(Biquad(S(c)))\n" +
+    "    maybe(c: real) -> Option[Self] = if c > 1.0 then None else Some(Biquad(S(c)))\n" +
+    "    held(x: S) -> Option[Self] = Some(Biquad(x))\n\n"
+
+@test("unwrap of a Result settles the type from the binding")
+fxi_unwrap_of_a_result_settles_the_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(fxi_biquad() + "var b: Biquad[q15] = Biquad.of(0.5).unwrap()\nprint(real(b.b0))\n"),
+              "0.5\n")
+
+@test("expect of a Result and unwrap of an Option do too")
+fxi_expect_and_option_settle_the_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(fxi_biquad() + "val d: Biquad[q31] = Biquad.of(0.25).expect(\"fits\")\n" +
+                      "val e: Biquad[q15] = Biquad.maybe(0.75).unwrap()\nprint(real(d.b0), real(e.b0))\n"),
+              "0.25 0.75\n")
+
+@test("an argument position and a return position are expectations too")
+fxi_argument_and_return_positions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(fxi_biquad() + "gain(b: Biquad[q15]) -> real = real(b.b0)\n" +
+                      "make() -> Biquad[q31] = Biquad.of(0.125).unwrap()\n" +
+                      "print(gain(Biquad.of(0.5).unwrap()), real(make().b0))\n"), "0.5 0.125\n")
+
+@test("an unwrapped Err still stops the program")
+fxi_an_unwrapped_err_still_stops()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(fxi_biquad() + "var b: Biquad[q15] = Biquad.of(2.0).unwrap()\nprint(real(b.b0))\n"),
+              "")
+
+@test("arguments that settle the type are read as before")
+fxi_arguments_that_settle_the_type_win()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(fxi_biquad() + "val b = Biquad.held(q15(0.5)).unwrap()\nprint(real(b.b0))\n"), "0.5\n")
+
+    val said = enm_err(fxi_biquad() + "val b: Biquad[q31] = Biquad.held(q15(0.5)).unwrap()\nprint(real(b.b0))\n")
+
+    assert(fxi_says(said, "declared Biquad[q31] but the value is Biquad[q15]"), said)
+
+@test("with nothing receiving the result the type is still asked for")
+fxi_nothing_receiving_the_result_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(fxi_biquad() + "val b = Biquad.of(0.5).unwrap()\nprint(real(b.b0))\n")
+
+    assert(fxi_says(said, "cannot infer the type argument 'S' of 'Biquad.of' here — annotate the expected type"),
+           said)
+
+@test("a member that is not unwrap or expect passes nothing back")
+fxi_another_member_passes_nothing_back()
+    if !enm_ready() then return
+
+    val said = enm_err(fxi_biquad() + "val ok: bool = Biquad.of(0.5).is_ok()\nprint(ok)\n")
+
+    assert(fxi_says(said, "cannot infer the type argument 'S' of 'Biquad.of' here — annotate the expected type"),
+           said)

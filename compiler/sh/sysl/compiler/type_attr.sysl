@@ -298,6 +298,21 @@ private constrained_attr(cx: &Analyzer, span: Span, d: &ConstrainedType, ty: Typ
     val what = s"$shown::$attr"
     val base = underlying(ty)
 
+    // **A `new` type over a fixed-point format is the format under a name of its own** -- `type Acc =
+    // new i64q61 wrapping` changes what the operators do and nothing about the storage -- so it
+    // answers the format's attributes, each at itself. One with a range or a predicate is the
+    // exception for `Bits`: a value made from raw bits is one nothing checked, so it is made at the
+    // base and wrapped, where the check is.
+    base match
+        Fixed(_, _, _) ->
+            if d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none() then
+                return fixed_attr(cx, span, shown, ty, attr, args)
+
+            if attr == "Bits" then
+                return cx.err(span, s"'$what' would make a value nothing checks against '$shown' — " +
+                              s"write '$shown(${type_show(base)}::Bits(…))', which checks it")
+        _ -> ()
+
     val bits = base match
         Integer(b, _, _) -> b
         _ -> 0

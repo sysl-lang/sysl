@@ -140,6 +140,30 @@ single solve; the annotation on the binding reaches it, and unlike the kernel ab
 one, since an associated function has a result. And a **bare arrow's own parameter**, which is the
 case below.
 
+The annotation reaches it through an `unwrap()` or an `expect(…)` as well, where the function answers
+an `Option` or a `Result` of what it makes: the binding says what the wrapper carries, and that is
+what settles the type. The call's own arguments are read first, so where they settle the type the
+binding is checked against it as usual:
+
+```sysl
+struct Gain[S]
+    k: S
+
+    of(x: real) -> Result[Self, string]
+        if x > 1.0 then return Err("too loud")
+        Ok(Gain(S(x)))
+end Gain
+
+val g: Gain[q15] = Gain.of(0.5).unwrap()
+val h: Gain[q31] = Gain.of(0.25).expect("in range")
+
+print(g.k, h.k)
+```
+
+```output
+0.5 0.25
+```
+
 ### A bare arrow is not in the list
 
 `f: T -> U` is sugar for a bounded type parameter — the callable's own type, which the compiler adds

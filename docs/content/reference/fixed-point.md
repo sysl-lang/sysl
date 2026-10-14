@@ -440,6 +440,35 @@ print(q15::Bits(16384), (0.5i32q31).bits)
 0.5 1073741824
 ```
 
+A [`new` type](/reference/types/) over a format is stored as its base is, so it answers the same four,
+each a value of itself — which is how an accumulator that wraps is filled from a raw integer:
+
+```sysl
+type Acc = new i64q43 wrapping
+
+val raw: i64 = 8796093022208
+val a = Acc::Bits(raw)
+
+print(real(a), a.bits, real(Acc::Max) > 1000000.0)
+```
+
+```output
+1 8796093022208 true
+```
+
+One declared with a range or a predicate refuses `Bits`, since a value made from raw bits is one
+nothing checked; it is made at the base and wrapped, which is where the check is:
+
+```sysl
+type Half = new q15 within 0.0..0.5
+
+val h = Half::Bits(16384)
+```
+
+```error
+'Half::Bits' would make a value nothing checks against 'Half' — write 'Half(q15::Bits(…))', which checks it
+```
+
 `print` and `str` write the **shortest decimal that reads back as the same value**, never in
 exponent form: `0.0000000005` says which place the one bit is in.
 
