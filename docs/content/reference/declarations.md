@@ -1244,6 +1244,107 @@ print(one(41), two(6, 7))
 42 13
 ```
 
+### Overloading a member
+
+**A type's own members overload by exactly the rules above.** A method or an associated function
+may be declared more than once in a type's body, and a call — `s.f(…)` or `S.make(…)` — means the
+one its arguments fit, with the same tie-breaks. The receiver is not part of what tells them apart:
+it is the same type in every one of them.
+
+```sysl
+struct S
+    n: int
+
+    f(self, x: int) -> int = x + self.n
+    f(self, x: string) -> int = int(x.len)
+    f(self, x: int, y: int) -> int = x * y
+    make(n: int) -> S = S(n)
+    make(s: string) -> S = S(int(s.len))
+
+val s = S.make("abcdefghij")
+print(s.f(1), s.f("abc"), s.f(3, 4), S.make(2).n)
+```
+
+```output
+11 3 12 2
+```
+
+**On a generic type the choice is made at the receiver's instantiation**, so a member taking `T`
+beside one taking `string` is two members on a `Box[int]` and the call picks by its arguments, in a
+generic body as well as outside one:
+
+```sysl
+struct Box[T]
+    v: T
+
+    put(self, x: T) -> string = "same"
+    put(self, x: string, y: int) -> string = "pair"
+
+g[T](b: Box[T], x: T) -> string = b.put(x)
+
+val b = Box(1)
+print(b.put(2), b.put("x", 3), g(b, 7))
+```
+
+```output
+same pair same
+```
+
+**A pair a call could not tell apart is refused at the second**, in the words a function pair gets,
+and its body is not read against the first's parameters:
+
+```sysl
+struct D
+    n: int
+
+    h(self, x: int) -> string = "s"
+    h(self, x: int, y: int = 0) -> int = 1
+```
+
+```error
+type 'D' already has a member named 'h' with parameters this one could not be told from — a call passing 1 argument would fit both
+```
+
+**A call that several fit equally, or that none fits, is refused at the call with the roster:**
+
+```sysl
+struct W
+    n: int
+
+    width(self, x: u8) -> string = "u8"
+    width(self, x: u16) -> string = "u16"
+
+print(W(0).width(1))
+```
+
+```error
+'W.width' is ambiguous here — 2 of its declarations take these arguments:
+    W.width(x: u8)
+    W.width(x: u16)
+```
+
+Three things do not overload, each because it is one name with one meaning rather than a set of
+calls:
+
+- **A [property](#a-property)** is read without parentheses, so there is no argument list to choose
+  by. A property and a method of one name are refused as before.
+- **A trait's member.** An implementation supplies each member of its trait by name, and a bound
+  reaches each by name, so a trait declares a name once:
+
+  ```sysl
+  trait Tr
+      f(self, x: int) -> string
+      f(self, x: string) -> string
+  ```
+
+  ```error
+  trait 'Tr' already declares a member named 'f' — an implementation supplies a trait's members by name, so a trait declares each name once
+  ```
+
+- **A type's own member and a trait's member of one name** still collide, whatever their
+  parameters: the trait's member is reachable only where the trait is in scope, and a name meaning
+  a different set of declarations in different files is exactly what that rule keeps out.
+
 ### Overloading an `extern`
 
 **Two `extern`s of one name are two functions exactly when they name two symbols.** A C library's
