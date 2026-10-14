@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_dir, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// A git dependency pinned at a commit, `rev = "<sha>"` in place of a `version`
+// (`reference/packages.md § Pinning a commit`): what the manifest accepts, what `sysl.sum` records, and
+// what resolution selects and fetches.
+//
+// **The repositories here are real ones, made on this machine**, and `github.com` is redirected to
+// them through git's own `url.<base>.insteadOf`, set in the environment every `git` this process
+// starts inherits. So the clone, the fetch by sha and the lengthening of a short sha are git's own,
+// and nothing reaches the network.
+
+private extern "setenv" pnr_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private pnr_set(name: string, value: string)
+    val k = cstring(name)
+    val v = cstring(value)
+
+    pnr_c_setenv(k.ptr, v.ptr, 1)
+
+// What a dependency entry reads as, or why it was refused.
+private pnr_read(entry: string) -> Result[Manifest, string] =
+    read_manifest(s"dependencies { $entry }")
+
+private pnr_sha() -> string = "0123456789abcdef0123456789abcdef01234567"
+
+// -- the manifest ---------------------------------------------------------------------------------
+
+@test("pnr: a rev is read as a pinned commit")
+pnr_rev_is_read()
+    val m = pnr_read(s"pin { git = \"github.com/e/pin\", rev = \"${pnr_sha()}\" }").unwrap()
+
+    assert_eq(dependency_version(m.dependencies.at(0)).unwrap().rev, pnr_sha())
+    assert(is_rev(dependency_version(m.dependencies.at(0)).unwrap()))
+
+    val short = pnr_read("pin { git = \"github.com/e/pin\", rev = \"0123456\", features = [x] }").unwrap()
+
+    assert_eq(dependency_version(short.dependencies.at(0)).unwrap().rev, "0123456")
+    assert_eq(short.dependencies.at(0).features.len(), usize(1))
+
+@test("pnr: a rev and a version together are refused")
+pnr_rev_and_version_refused()
+    assert_eq(pnr_read("pin { git = \"github.com/e/pin\", version = \"1.0.0\", rev = \"0123456\" }")
+                  .unwrap_err(),
+              "'dependencies.pin' names a 'version' and a 'rev' — a dependency is read at a " +
+              "release or at a pinned commit, and exactly one of the two says which")
+
+@test("pnr: a rev that is not a commit's sha is refused")
+pnr_bad_rev_text_refused()
+    val want = "'dependencies.pin.rev' is 'main', which is not a commit — a pin is a commit's sha, " +
+               "in lowercase hex, whole or shortened to at least seven digits"
+
+    assert_eq(pnr_read("pin { git = \"github.com/e/pin\", rev = \"main\" }").unwrap_err(), want)
+    assert(pnr_read("pin { git = \"github.com/e/pin\", rev = \"012345\" }").is_err())
+    assert(pnr_read("pin { git = \"github.com/e/pin\", rev = \"0123456ABC\" }").is_err())
+    assert(pnr_read(s"pin { git = \"github.com/e/pin\", rev = \"${pnr_sha()}0\" }").is_err())
+
+@test("pnr: a path and a rev together are refused")
+pnr_path_and_rev_refused()
+    assert_eq(pnr_read("pin { path = \"../pin\", rev = \"0123456\" }").unwrap_err(),
+              "'dependencies.pin' names a 'path' and a 'rev' — a path dependency is the directory " +
+              "as it is now, and there is no repository to pin a commit of")
+
+// -- sysl.sum ---------------------------------------------------------------------------------------
+
+@test("pnr: a pin is recorded by its whole sha, and the file reads back byte for byte")
+pnr_sum_line_is_stable()
+    val text = s"github.com/e/json v1.4.0 ${pnr_digest("a")}\n" +
+               s"github.com/e/pin ${pnr_sha()} ${pnr_digest("b")}\n"
+    val sums = sums_read(text).unwrap()
+
+    assert_eq(sum_of(sums, "github.com/e/pin", release_at_rev(pnr_sha())).unwrap(), pnr_digest("b"))
+    assert_eq(sums_render(sums), text)
+
+@test("pnr: a shortened sha is no line of the file")
+pnr_sum_short_sha_refused()
+    assert_eq(sums_read(s"github.com/e/pin 0123456 ${pnr_digest("b")}\n").unwrap_err(),
+              "sysl.sum:1: '0123456' is not a version tag or a commit's whole sha")
+
+@test("pnr: a shortened sha two recorded pins start is ambiguous, with the exact error")
+pnr_short_sha_ambiguous_in_sums()
+    val a = "abcdef0111111111111111111111111111111111"
+    val b = "abcdef0222222222222222222222222222222222"
+    val sums = sums_read(s"github.com/e/pin $a ${pnr_digest("a")}\n" +
+                         s"github.com/e/pin $b ${pnr_digest("b")}\n").unwrap()
+
+    assert_eq(full_rev("pin", "github.com/e/pin", "abcdef0", sums).unwrap_err(),
+              s"'pin' pins github.com/e/pin at 'abcdef0', which starts 2 commits ($a, $b) — " +
+              "write more of the sha")
+    assert_eq(full_rev("pin", "github.com/e/pin", "abcdef01", sums).unwrap(), a)
+    assert_eq(full_rev("pin", "github.com/e/pin", a, empty_sums()).unwrap(), a)
+
+private pnr_digest(c: string) -> string
+    var out = DigestPrefix
+
+    for i in 0..<64
+        out = out + c
+
+    out
+end pnr_digest
+
+// -- resolution, against a repository made here -----------------------------------------------------
+
+// One `git` command in `dir`, answering what it printed.
+private pnr_git(dir: string, args: []const string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("-C")
+    all.push(dir)
+    all.push("-c")
+    all.push("user.name=t")
+    all.push("-c")
+    all.push("user.email=t@t")
+
+    for a in args
+        all.push(a)
+
+    val o = capture("git", all.view(), "", [], true).unwrap()
+
+    assert(o.status.ok(), s"git ${args[0]} failed: ${o.err.unwrap_or("")}")
+    o.text.trim()
+end pnr_git
+
+// A repository at `<base>/e/pin.git` holding package `pin`, with one commit per marker; answers the
+// commits' shas, oldest first. `github.com/` is pointed at `<base>/` for every git started after.
+private pnr_repo(base: string, markers: []const string) -> Buf[string]
+    val dir = s"$base/e/pin.git"
+    var shas: Buf[string] = buf()
+
+    make_dir_all(s"$dir/pin").unwrap()
+    pnr_git(dir, ["init", "--quiet"])
+    pnr_git(dir, ["config", "uploadpack.allowAnySHA1InWant", "true"])
+    write_text(s"$dir/package.hocon", "package { name = \"pin\", version = \"0.1.0\" }\n").unwrap()
+
+    for m in markers
+        write_text(s"$dir/pin/pin.sysl", s"module pin\n\nmarker() -> string = \"$m\"\n").unwrap()
+        pnr_git(dir, ["add", "-A"])
+        pnr_git(dir, ["commit", "--quiet", "-m", m])
+        shas.push(pnr_git(dir, ["rev-parse", "HEAD"]))
+
+    pnr_set("GIT_CONFIG_COUNT", "1")
+    pnr_set("GIT_CONFIG_KEY_0", s"url.file://$base/.insteadOf")
+    pnr_set("GIT_CONFIG_VALUE_0", "https://github.com/")
+    shas
+end pnr_repo
+
+private pnr_project(deps: string) -> string
+    val root = make_temp_dir("sysl-pnr-project").unwrap()
+
+    write_text(join_path(root, ManifestName),
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n").unwrap()
+    root
+end pnr_project
+
+private pnr_resolve(root: string, sums: Sums, cache: string) -> Result[Graph, string] =
+    resolve_graph(root, manifest_of_package(root).unwrap(), sums, cache)
+
+private pnr_version_of(g: &Graph, canonical: string) -> string
+    for p in g.packages
+        if p.canonical == canonical then return release_shown(p.version.unwrap())
+
+    "<none>"
+end pnr_version_of
+
+@test("pnr: a short rev is lengthened, fetched at that commit, and recorded whole")
+pnr_short_rev_fetched_and_recorded()
+    val base = absolute_path(make_temp_dir("sysl-pnr-git").unwrap())
+    val shas = pnr_repo(base, ["first", "second"])
+    val first = shas.at(0)
+    val cache = make_temp_dir("sysl-pnr-cache").unwrap()
+    val root = pnr_project(s"pin { git = \"github.com/e/pin\", rev = \"${first[0..<9]}\" }")
+    val g = pnr_resolve(root, empty_sums(), cache).unwrap()
+
+    assert_eq(pnr_version_of(g, "github.com.e.pin"), first)
+    assert(is_dir(fetch_directory(cache, "github.com/e/pin", release_at_rev(first))))
+    assert(g.sums_changed)
+
+    val recorded = sums_render(g.sums)
+
+    assert(recorded.starts_with(s"github.com/e/pin $first "), recorded)
+
+    // The tree is the first commit's, not the branch's tip.
+    assert_eq(pnr_git(fetch_directory(cache, "github.com/e/pin", release_at_rev(first)),
+                      ["rev-parse", "HEAD"]), first)
+
+    // Again, against what was recorded: the same answer, and the file unchanged.
+    val again = pnr_resolve(root, g.sums, cache).unwrap()
+
+    assert_eq(pnr_version_of(again, "github.com.e.pin"), first)
+    assert(!again.sums_changed)
+    assert_eq(sums_render(again.sums), recorded)
+
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+
+@test("pnr: a short rev no commit starts is refused, with the exact error")
+pnr_missing_rev_refused()
+    val base = absolute_path(make_temp_dir("sysl-pnr-git").unwrap())
+
+    pnr_repo(base, ["only"])
+
+    val cache = make_temp_dir("sysl-pnr-cache").unwrap()
+    val root = pnr_project("pin { git = \"github.com/e/pin\", rev = \"0000000\" }")
+
+    assert_eq(pnr_resolve(root, empty_sums(), cache).unwrap_err(),
+              "'pin' pins github.com/e/pin at '0000000', and no commit of " +
+              "https://github.com/e/pin.git starts with it")
+
+    remove_dir_all(base).unwrap_or(())
+
+@test("pnr: a pin outranks a version claimed of the same coordinate")
+pnr_pin_outranks_a_version()
+    val base = absolute_path(make_temp_dir("sysl-pnr-git").unwrap())
+    val sha = pnr_repo(base, ["only"]).at(0)
+    val cache = make_temp_dir("sysl-pnr-cache").unwrap()
+    val b = fetch_directory(cache, "github.com/e/b", Release(1, 0, 0, ""))
+
+    make_dir_all(s"$b/b").unwrap()
+    write_text(join_path(b, ManifestName),
+               "package { name = \"b\", version = \"1.0.0\" }\n" +
+               "dependencies { pin { git = \"github.com/e/pin\", version = \"0.1.0\" } }\n").unwrap()
+    write_text(s"$b/b/b.sysl", "module b\n").unwrap()
+
+    val root = pnr_project(s"pin { git = \"github.com/e/pin\", rev = \"$sha\" }, " +
+                           "b { git = \"github.com/e/b\", version = \"1.0.0\" }")
+
+    assert_eq(pnr_version_of(pnr_resolve(root, empty_sums(), cache).unwrap(), "github.com.e.pin"),
+              sha)
+
+    remove_dir_all(base).unwrap_or(())
+
+@test("pnr: two pins of one coordinate at different commits are refused")
+pnr_two_pins_refused()
+    val base = absolute_path(make_temp_dir("sysl-pnr-git").unwrap())
+    val shas = pnr_repo(base, ["first", "second"])
+    val cache = make_temp_dir("sysl-pnr-cache").unwrap()
+    val b = fetch_directory(cache, "github.com/e/b", Release(1, 0, 0, ""))
+
+    make_dir_all(s"$b/b").unwrap()
+    write_text(join_path(b, ManifestName),
+               "package { name = \"b\", version = \"1.0.0\" }\n" +
+               s"dependencies { pin { git = \"github.com/e/pin\", rev = \"${shas.at(1)}\" } }\n")
+        .unwrap()
+    write_text(s"$b/b/b.sysl", "module b\n").unwrap()
+
+    val root = pnr_project(s"pin { git = \"github.com/e/pin\", rev = \"${shas.at(0)}\" }, " +
+                           "b { git = \"github.com/e/b\", version = \"1.0.0\" }")
+
+    assert_eq(pnr_resolve(root, empty_sums(), cache).unwrap_err(),
+              s"github.com/e/pin is pinned at two commits — app asks for ${shas.at(0)} and " +
+              s"github.com/e/b for ${shas.at(1)}, and one build holds one copy of a package")
+
+    remove_dir_all(base).unwrap_or(())

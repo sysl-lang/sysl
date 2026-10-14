@@ -1,0 +1,177 @@
+module sh.sysl.compiler
+@tests
+
+// A trait's member reached on a value with no import of the trait (`reference/traits.md § Reaching a
+// member through its trait`): what the file names answers first, and where it names none of the
+// traits, every impl the program can see does -- Scala 3's lexical scope ahead of its implicit scope.
+
+@test("ivs: a float's Float members with no import at all")
+ivs_float_members_need_no_import()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        val x = 2.25
+        val y = f32(6.25)
+
+        print(x.sqrt(), y.sqrt(), (-x).abs(), x.floor(), real.epsilon() < 1.0e-15)
+        """), "1.5 2.5 2.25 2 true\n")
+
+@test("ivs: a fixed-point value's Signed members with no import")
+ivs_fixed_members_need_no_import()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        val a: q15 = -0.5
+
+        print(a.abs(), a.signum() < q15(0))
+        """), "0.5 true\n")
+
+@test("ivs: a user trait from another module, used with no import")
+ivs_user_trait_from_another_module()
+    if !azb_ready() then return
+
+    azb_prints([("shape", "shape.sysl", raw"""
+                     module shape
+
+                     trait Area
+                         area(self) -> int
+
+                     struct Sq
+                         n: int
+
+                     impl Area for Sq
+                         area(self) -> int = self.n * self.n
+                     """),
+                ("", "main.sysl", raw"""
+                     import shape.Sq
+
+                     print(Sq(4).area())
+                     """)], "16\n")
+
+// Two traits from modules the file never imported, each giving `Box` a `size`.
+private ivs_two_traits() -> [](string, string, string) = [
+    ("weigh", "weigh.sysl", raw"""
+         module weigh
+
+         import boxes.Box
+
+         trait Weigh
+             size(self) -> int
+
+         impl Weigh for Box
+             size(self) -> int = 1
+         """),
+    ("measure", "measure.sysl", raw"""
+         module measure
+
+         import boxes.Box
+
+         trait Measure
+             size(self) -> int
+
+         impl Measure for Box
+             size(self) -> int = 2
+         """),
+    ("boxes", "boxes.sysl", raw"""
+         module boxes
+
+         struct Box
+             n: int
+         """),
+    ("", "main.sysl", raw"""
+         import boxes.Box
+
+         print(Box(0).size())
+         """)]
+
+@test("ivs: two traits nothing names give a member of one name: ambiguous, with the exact error")
+ivs_two_unnamed_traits_are_ambiguous()
+    if !azb_ready() then return
+
+    azb_refused(ivs_two_traits(),
+                ["'size' on boxes.Box comes from measure.Measure and weigh.Weigh, and this file names " +
+                 "none of them — nothing in the call says which was meant; import the one that " +
+                 "was meant"])
+
+@test("ivs: and importing one of them says which")
+ivs_an_import_settles_it()
+    if !azb_ready() then return
+
+    var files = ivs_two_traits()
+
+    files[3] = ("", "main.sysl", raw"""
+                    import boxes.Box
+                    import measure.Measure
+
+                    print(Box(0).size())
+                    """)
+    azb_prints(files, "2\n")
+
+@test("ivs: a std trait and a user trait sharing a name, both named, is the in-scope ambiguity")
+ivs_magnitude_and_a_user_trait_both_named()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        import sysl.math.Magnitude
+
+        trait Level
+            magnitude(self) -> Self
+
+        impl Level for f32
+            magnitude(self) -> f32 = self
+
+        print(f32(-2.0).magnitude())
+        """),
+        ["'magnitude' on f32 comes from sysl.math.Magnitude and Level, and each is in scope here — " +
+         "nothing in the call says which was meant"])
+
+@test("ivs: the user's own trait answers ahead of a std one the file never named")
+ivs_own_trait_ahead_of_an_unnamed_std_one()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Level
+            magnitude(self) -> Self
+
+        impl Level for f32
+            magnitude(self) -> f32 = self + f32(1.0)
+
+        print(f32(-2.0).magnitude())
+        """), "-1\n")
+
+@test("ivs: generic code still needs the bound")
+ivs_generic_code_still_needs_the_bound()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        half[T](x: T) -> T = x.sqrt()
+
+        print(half(4.0))
+        """), ["sqrt"])
+    azb_refused(azb_main(raw"""
+        z[T]() -> T = T.zero()
+
+        print(z[int]())
+        """), ["zero"])
+
+@test("ivs: a member of a trait private to its module stays out of reach")
+ivs_private_trait_stays_out_of_reach()
+    if !azb_ready() then return
+
+    azb_refused([("hid", "hid.sysl", raw"""
+                      module hid
+
+                      private[hid] trait Secret
+                          peek(self) -> int
+
+                      struct Thing
+                          n: int
+
+                      impl Secret for Thing
+                          peek(self) -> int = self.n
+                      """),
+                 ("", "main.sysl", raw"""
+                      import hid.Thing
+
+                      print(Thing(3).peek())
+                      """)], ["peek"])

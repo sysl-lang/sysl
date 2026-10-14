@@ -321,42 +321,60 @@ explicitly rather than by implicit structural match.
 
 ## Reaching a member through its trait
 
-A member declared by a trait is reached **where the trait is**, and the member's own name is not
-enough. That is the ordinary scope rule — a trait is a module member like any other — but it
-surprises, because what is written at the call is the *member's* name while what has to be in scope
-is the *trait's*:
+**A member an `impl` gave a type is reached on a value of that type with no import of the trait.**
+The impl travels with the type: wherever the program can see it — and a program sees every impl of
+the modules it is built from — `x.member()` finds it, as Scala 3 finds a given through its *implicit
+scope*. So a float has its `sqrt` and a slice its `map` in a file that imports nothing:
 
 ```sysl
-import sysl.seq.Sequence
-
 val a = [1, 2, 3]
 val xs: []const int = a[0..]
+val r = 2.25
 
-print(xs.map(x -> x * 2))
+print(xs.map(x -> x * 2), r.sqrt(), (-r).abs(), real.epsilon() < 1.0e-15)
 ```
 
 ```output
-[2, 4, 6]
+[2, 4, 6] 1.5 2.25 true
 ```
 
-Take the import away and the member is not there. The compiler says which trait it came from rather
-than leaving a reader to guess why a slice has a `map` in one file and not the one beside it:
+**What the file names answers first.** The lookup has two tiers: the traits the file can name — its
+own module's, the ones it imported, the ones a bound in force promised — and, only where none of
+those gives the type a member of that name, every trait whose impl the program can see. So a
+program's own trait answers ahead of a library trait of the same member name that the file never
+mentioned, and an import still settles which of two traits is meant:
 
 ```sysl
-val a = [1, 2, 3]
-val xs: []const int = a[0..]
+trait Level
+    magnitude(self) -> Self
 
-print(xs.map(x -> x * 2))
+impl Level for f32
+    magnitude(self) -> f32 = self + f32(1.0)
+
+print(f32(-2.0).magnitude())
 ```
 
-```error
-[]const int has 'map' from sysl.seq.Sequence, and that trait is not in scope here — import it to reach the member
+```output
+-1
 ```
 
-An `impl` does not change this. It settles which types are members; it does not put the member's
-name anywhere a file can see without naming the trait that declares it. So **moving a member out of
-a type and into a trait moves an import onto every caller** — including callers that never mention
-the trait — which is a cost worth weighing before making that move.
+`sysl.math.Magnitude` gives `f32` a `magnitude` too; this file names `Level` and not `Magnitude`, so
+`Level`'s is the one meant.
+
+**Where the file names none of several traits that each give the type the member, the call is
+ambiguous.** With a `Weigh` in one module and a `Measure` in another, each implemented for a `Box`
+of a third, a file importing only `Box` is refused at `Box(n).size()` with
+
+```text
+'size' on boxes.Box comes from measure.Measure and weigh.Weigh, and this file names none of them — nothing in the call says which was meant; import the one that was meant
+```
+
+and importing either trait is what says which. A trait private to the module that wrote it is
+reached by nobody outside that module, by either tier.
+
+**Generic code still needs the bound.** Inside `f[T](x: T)` the type is nobody's in particular, so no
+impl can be found for it: a `T` has the members its bounds promise and no others, and `x.sqrt()`
+there wants `T: Float` exactly as it did.
 
 ### Two traits may declare a member of one name
 

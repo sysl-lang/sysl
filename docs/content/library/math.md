@@ -555,8 +555,10 @@ So membership is the **compiler's**, by the same rule that makes an `int` an `Ad
 having written `impl Add for int`. What is in the source file is the part a declaration can say: the
 names, the signatures, and what each one means.
 
-**The trait still has to be in scope to be reached.** That is what a compiler-provided membership does
-*not* change — it settles which types have the member, not which files may name it:
+**A concrete value reaches the members with no import**, the way every impl's members are reached
+([Reaching a member through its trait](/reference/traits/#reaching-a-member-through-its-trait)): a
+`real` has its `sqrt` in a file that imports only `pi`. What still needs the trait is generic code,
+where a `T` has the members its bounds promise and no others:
 
 ```sysl
 import sysl.math.pi
@@ -566,12 +568,9 @@ var x = 2.0
 print(pi, x.sqrt())
 ```
 
-```error
-real has 'sqrt' from sysl.math.Float, and that trait is not in scope here — import it to reach the member
+```output
+3.141592653589793 1.4142135623730951
 ```
-
-Importing the module is not the same as importing the trait: `pi` is in scope on that line and
-`sqrt` is not.
 
 `Signed` covers the signed widths only; `Bits` covers both signednesses, because a bit pattern is a
 bit pattern:
@@ -707,14 +706,17 @@ every type.
 ```sysl
 import sysl.math.Bits
 
-var w: u32 = 7u32
+var w: u12 = 7
 
 print(w.swap_bytes())
 ```
 
 ```error
-type 'uint' has no method 'swap_bytes'
+type 'u12' has no method 'swap_bytes'
 ```
+
+A `u32` does have one — `ByteOrder`'s, reached with no import as every impl's members are — and a
+`u12` is a member of neither.
 
 Reversing the byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it.
 **Every member of `Bits` is total over every integer type**, because a `[T: Bits]` body is written

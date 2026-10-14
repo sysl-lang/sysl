@@ -99,6 +99,9 @@ end sums_render
 private sum_before(a: SumEntry, b: SumEntry) -> bool
     if a.coordinate != b.coordinate then return a.coordinate < b.coordinate
 
+    // Two pins are not ordered by selection, and the file still wants one order for them.
+    if is_rev(a.version) && is_rev(b.version) then return a.version.rev < b.version.rev
+
     release_before(a.version, b.version)
 end sum_before
 
@@ -126,11 +129,7 @@ sums_read(text: string) -> Result[Sums, string]
         if parts.len() != 3
             return Err(s"$at: a line is a coordinate, a version tag and a digest")
 
-        val tag = parts.at(1)
-
-        if !tag.starts_with("v") then return Err(s"$at: '$tag' is not a version tag")
-
-        val version = release_of(tag[1..<tag.bytes.len]) match
+        val version = release_of_tag(parts.at(1)) match
             Err(why) -> return Err(s"$at: $why")
             Ok(v) -> v
 
@@ -231,14 +230,35 @@ end sums_tidied
 private line_key(line: string) -> Option[(string, Release)]
     val parts = fields(line)
 
-    if parts.len() != 3 || !parts.at(1).starts_with("v") then return None
+    if parts.len() != 3 then return None
 
-    val tag = parts.at(1)
-
-    release_of(tag[1..<tag.bytes.len]) match
+    release_of_tag(parts.at(1)) match
         Ok(v) -> Some((parts.at(0), v))
         Err(_) -> None
 end line_key
+
+// A line's second field: a version tag, or the whole sha of a pinned commit -- which is how a pin is
+// recorded, since a shortened one could come to name a second commit later.
+private release_of_tag(tag: string) -> Result[Release, string]
+    if tag.bytes.len == 40 && is_commit_sha(tag) then return Ok(release_at_rev(tag))
+
+    if !tag.starts_with("v") then return Err(s"'$tag' is not a version tag or a commit's whole sha")
+
+    release_of(tag[1..<tag.bytes.len])
+end release_of_tag
+
+// The whole sha of the one recorded pin of `coordinate` that a shortened `rev` starts, where exactly
+// one does; the shas of all of them where several do.
+recorded_revs(sums: &Sums, coordinate: string, rev: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for entry in sums.entries
+        if entry.coordinate == coordinate && is_rev(entry.version) &&
+           entry.version.rev.starts_with(rev)
+            out.push(entry.version.rev)
+
+    out
+end recorded_revs
 
 private holds_key(keys: &Buf[(string, Release)], key: (string, Release)) -> bool
     for item in keys
@@ -273,6 +293,8 @@ end sorted_keys
 
 private key_before(a: (string, Release), b: (string, Release)) -> bool
     if a.0 != b.0 then return a.0 < b.0
+
+    if is_rev(a.1) && is_rev(b.1) then return a.1.rev < b.1.rev
 
     release_before(a.1, b.1)
 end key_before

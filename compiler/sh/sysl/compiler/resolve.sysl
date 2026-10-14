@@ -254,7 +254,7 @@ workspace_selection(ws: &Workspace, sums: Sums, cache: string) -> Result[Workspa
                 _ -> ()
 
         read_locals(paths, &state, cache)?
-        demanding(&state, mb.name, all)
+        demanding(&state, mb.name, all)?
 
     select_versions(&state, cache)?
 
@@ -309,7 +309,7 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     var state = new_resolve_state(sums, enabled, roots, floors, false)
 
     read_locals(config.dependencies, &state, cache)?
-    demanding(&state, root_asker(config), config.dependencies)
+    demanding(&state, root_asker(config), config.dependencies)?
 
     // **A `--lib` source root's `dependencies` join the one graph**, so selection sees every claim
     // at once and a package two roots name is one copy at one version. A root's modules are filed
@@ -325,7 +325,7 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
         val theirs = item.1.dependencies
 
         read_locals(theirs, &state, cache)?
-        demanding(&state, root_asker(config), theirs)
+        demanding(&state, root_asker(config), theirs)?
 
         for j in 0..<theirs.len()
             declared.push(theirs.at(j))
@@ -424,13 +424,22 @@ end dependency_floor_refusal
 // question: what is selected keeps a version with no memory of where it came from, and a version
 // that was passed over has its manifest dropped on purpose. So a claim recomputed from the finished
 // graph can only ever find the one that won, which is the half nobody needed to be told.
-private demanding(state: *ResolveState, asker: string, deps: &Buf[Dependency])
+private demanding(state: *ResolveState, asker: string,
+                  deps: &Buf[Dependency]) -> Result[unit, string]
     for item in deps
         // A coordinate a source root stands in for takes no part in selection at all.
         if stand_in_for(*state, item).is_some() then continue
 
         item.origin match
-            Git(coordinate, asked) ->
+            Git(coordinate, written) ->
+                // **A pin is selected as its whole sha**, so a shortened one and the whole one
+                // written elsewhere are one claim rather than two that disagree.
+                val asked =
+                    if is_rev(written)
+                        release_at_rev(full_rev(item.label, coordinate, written.rev, state.sums)?)
+                    else written
+
+                pinned_claim(*state, coordinate, asker, asked)?
                 state.claims.push(Claim(coordinate, asker, asked))
 
                 // **Inside a workspace a floor starts at the workspace's answer**, so a member's own
@@ -454,7 +463,25 @@ private demanding(state: *ResolveState, asker: string, deps: &Buf[Dependency])
 
                 state.selected = raised
             _ -> ()
+
+    Ok(())
 end demanding
+
+// **Two pins of one coordinate at different commits are refused**: a pin outranks every version,
+// but nothing orders two commits against each other, and taking either would build one claimant
+// against a tree it never asked for.
+private pinned_claim(state: &ResolveState, coordinate: string, asker: string,
+                     asked: Release) -> Result[unit, string]
+    if !is_rev(asked) then return Ok(())
+
+    for had in state.claims
+        if had.coordinate == coordinate && is_rev(had.version) && had.version != asked
+            return Err(s"$coordinate is pinned at two commits — ${had.asker} asks for " +
+                s"${had.version.rev} and $asker for ${asked.rev}, and one build holds one copy of " +
+                "a package")
+
+    Ok(())
+end pinned_claim
 
 // What a claim of `asked` on `coordinate` is selected at: the workspace's version where that is
 // higher, and the claim itself everywhere else.
@@ -525,7 +552,7 @@ private read_locals(deps: &Buf[Dependency], state: *ResolveState,
                         "written in")
 
         state.locals.push(ReadPackage(dependency_canonical(dep), "", None, got.root, theirs))
-        demanding(state, dep.label, theirs.dependencies)
+        demanding(state, dep.label, theirs.dependencies)?
 
         if member then read_locals(theirs.dependencies, state, cache)?
 
@@ -614,7 +641,7 @@ private select_versions(state: *ResolveState, cache: string) -> Result[unit, str
         with_fetch(state, dep, got)
         state.manifests.push(ReadPackage(canonical_prefix(coordinate), coordinate, Some(version),
                                          got.root, theirs))
-        demanding(state, coordinate, theirs.dependencies)
+        demanding(state, coordinate, theirs.dependencies)?
 end select_versions
 
 // The lowest coordinate whose selected version has no manifest read for it yet.

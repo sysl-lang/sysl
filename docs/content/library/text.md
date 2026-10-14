@@ -1187,8 +1187,9 @@ gets it.
 
 ## Reaching the module
 
-Everything above the free surface needs an `import`, and a trait needs to be *in scope* for its
-members to be reachable — which the compiler says in those words:
+Everything above the free surface needs an `import`. A trait's members do not: `Search` is
+implemented for `string`, so a string has its `trim` in a file that never names the trait
+([Reaching a member through its trait](/reference/traits/#reaching-a-member-through-its-trait)):
 
 ```sysl
 import sysl.text.split
@@ -1197,14 +1198,13 @@ print(split("a b", " ").len)
 print("  x  ".trim())
 ```
 
-```error
-string has 'trim' from sysl.text.Search, and that trait is not in scope here — import it to reach the member
+```output
+2
+x
 ```
 
-`import sysl.text.Search` is the fix, and it is worth reading as a feature rather than a hoop: a
-member arriving on `string` from three modules away, with nothing in the file saying so, is how a
-program becomes unreadable. The [import forms](/reference/modules/) are the same ones every module
-uses.
+`import sysl.text.Search` is still what a generic body bounded by it, or a file settling a name two
+traits share, writes. The [import forms](/reference/modules/) are the same ones every module uses.
 
 One conversion is easy to write backwards, since text and bytes are so nearly the same thing here:
 

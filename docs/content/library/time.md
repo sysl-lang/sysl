@@ -519,6 +519,27 @@ does not say.
 `Z` for a zero offset is a spelling rather than a special case: ISO 8601 writes it that way, and
 `parse_offset` reads it back as zero.
 
+A `Duration` renders the way a stopwatch reads, in the largest of seconds, milliseconds and
+microseconds it reaches, with the digits below written only as far as there are any — so a timing
+goes straight into a line of output. `duration_text` is the same renderer by name:
+
+```sysl
+import sysl.time.*
+
+print(seconds(1i64) + micros(234567i64), millis(12i64), micros(1500i64), micros(7i64))
+print(-seconds(3i64), micros(0i64), minutes(90i64), s"took ${millis(250i64)}")
+print(duration_text(millis(1001i64)))
+```
+
+```output
+1.234567s 12ms 1.5ms 7µs
+-3s 0s 5400s took 250ms
+1.001s
+```
+
+Seconds are the largest unit because a duration is a measurement rather than a reading of a clock:
+`5400s` is what a timer says, and `whole_hours` and `odd_minutes` build `1h30m` where that is wanted.
+
 ## Reading text back
 
 ```sysl
