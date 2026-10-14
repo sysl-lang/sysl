@@ -639,6 +639,9 @@ print(raw"a\nb".len, "a\nb".len, raw"a\nb")
 4 3 a\nb
 ```
 
+Where a `[N]u8` is expected, a literal of exactly `N` UTF-8 bytes is that array instead of a `string`
+— `val oem: [8]u8 = "MSWIN4.1"` ([arrays](/reference/arrays/#a-byte-array-from-a-string-literal)).
+
 ### Text blocks
 
 A literal that spans lines is written `"""` … `"""`. The content begins on the line **after** the

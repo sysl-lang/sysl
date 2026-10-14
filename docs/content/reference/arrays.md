@@ -275,6 +275,76 @@ That is the case a `const` could never have served: a constant is folded into it
 address, so there is nothing to index at `i`. A raw pointer may be held for the same reason a
 literal may — it counts nothing, so there is no release to write.
 
+### A byte array from a string literal
+
+On-disk formats are full of fixed-width text: an OEM name in eight bytes, a volume label in eleven, a
+magic number in four. **A string literal is accepted wherever a `[N]u8` is expected, when its UTF-8
+length is exactly `N`** — a binding's annotation, a field, an argument, an element of an outer array
+and a function's result:
+
+```sysl
+struct Boot
+    oem: [8]u8
+    label: [11]u8
+
+magic() -> [4]u8 = "FAT1"
+
+sum(b: [3]u8) -> int = int(b[0]) + int(b[1]) + int(b[2])
+
+val boot = Boot("MSWIN4.1", "NO NAME    ")
+val kinds: [2][3]u8 = ["FAT", "EXT"]
+
+print(boot.oem[0], boot.label[10], magic()[3], kinds[1][0], sum("abc"))
+```
+
+```output
+77 32 49 69 294
+```
+
+The literal is its bytes and nothing else: no NUL is added, and an escape counts as the bytes it
+encodes to, so a non-ASCII character takes its full UTF-8 width:
+
+```sysl
+val e: [2]u8 = "é"
+val nl: [2]u8 = "\n\0"
+
+print(e[0], e[1], nl[0], nl[1])
+```
+
+```output
+195 169 10 0
+```
+
+**It is an array literal of those bytes**, so a module `val` or `var` written this way is constant
+data: on a bare-metal target it is laid into `.rodata` or `.data` with nothing run before the first
+statement, exactly as `[77, 83, …]` would be.
+
+**The length has to match exactly, either way.** A shorter literal is not padded, because what the
+rest should hold — spaces, NULs — is the format's to say, not the language's:
+
+```sysl
+val oem: [8]u8 = "MSWIN"
+```
+
+```error
+this string literal is 5 bytes and [8]byte holds 8 — a string literal fills a byte array only when its UTF-8 length is exactly the array's
+```
+
+**Only `u8` (and a name for it) takes one.** A `[N]i8` or a `[N]char` is not a byte array the literal
+spells — a `char` is a scalar value, not a byte — so there the literal stays a `string`, and the
+position refuses it as it refuses any other mismatch:
+
+```sysl
+val a: [2]char = "ab"
+```
+
+```error
+cannot initialize 'a': declared [2]char but the value is string
+```
+
+A byte above `0x7F` that is not part of a UTF-8 character — a boot sector's `0xEB` jump — cannot be
+written in a string literal at all, since a string is valid UTF-8; that is an array literal's job.
+
 ### A file's bytes, embedded
 
 A table somebody else made is often a file — an image, a font, a program a kernel carries before it

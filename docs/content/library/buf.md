@@ -594,12 +594,54 @@ var c: Buf[int] = buf_with_capacity(8)
 function 'sysl.buf.buf_with_capacity' takes 2 arguments, but 1 argument was given
 ```
 
-None of those slots is ever read — `count` starts at zero, so every one of them is written before
-anything can see it. But they are **real values**, and that is the honest cost of a growable sequence
-in this language: there is no way to have storage that is merely reserved. A `Buf[&T]` grown to a
-capacity of 1024 while holding one element is holding 1024 references to whatever seeded the growth,
-and that object stays alive until the slots are overwritten. Capacity that is not yet values is a
-known gap, not a solved problem.
+**The fill is not stored anywhere.** The spare slots come from
+[`slot_storage`](/reference/memory/#slot-storage-room-that-holds-no-value-yet) and hold no value at
+all, so a `Buf[&T]` given a capacity of 1024 keeps nothing alive but the elements it was pushed.
+
+### A buffer filled to a length
+
+`buf_filled(n, value)` is a buffer that already holds `n` elements, every one of them `value` — what
+a RAM disk or a frame buffer starts as, and what `vec![0; n]` is in Rust:
+
+```sysl
+import sysl.buf.{Buf, buf_filled}
+
+val disk: Buf[u8] = buf_filled(4096, 0)
+
+print(disk.len(), disk[0], disk[4095])
+
+disk[512] = 0xEB
+
+print(disk[512], disk[513])
+```
+
+```output
+4096 0 0
+235 0
+```
+
+It is one allocation sized to `n` and `n` stores, not a `push` loop's doublings. **Every element is a
+copy of `value`, the way any assignment copies**, so there is no bound to write: a plain value is
+repeated, and a counted one is *shared* — the elements name one object and hold one count each:
+
+```sysl
+import sysl.buf.{Buf, buf_filled}
+
+struct Cell
+    n: int
+
+val cells: Buf[&Cell] = buf_filled(3, Cell(0))
+
+cells[0].n = 7
+
+print(cells[0].n, cells[1].n, cells[2].n)
+```
+
+```output
+7 7 7
+```
+
+A buffer of separate objects is a loop that makes one per element.
 
 ## It needs an allocator, and says so
 
