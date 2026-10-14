@@ -391,6 +391,64 @@ back:
 Storing a parameter is *not* one of them: an assignment takes a count for the value arriving, so
 `latest = h` above is where the new owner's share comes from, and the callee never held one.
 
+### A count that would be taken and given straight back is not taken
+
+Binding a call's result to a `val`, or returning a local through an `if` or a `match`, moves a value
+from one owner in the frame to another: the new owner takes a share and the old one gives its share
+back at the end of the statement or scope. On a `&sync T` each of those is an atomic operation on a
+count every thread shares, so a value copied up a recursive search would pay two contended atomics
+per level for a count that ends where it began. **The compiler drops such a pair.** A retain is
+cancelled against a later release of the same reference when nothing between them can give back the
+count that release would have given back:
+
+- loads and stores of the frame's own slots, arithmetic, and other retains never can;
+- the release of a different value may run a destructor, which is arbitrary code, but it cannot reach
+  a slot of this frame whose address never left it. So it may sit between the pair, unless the stretch
+  between them also writes to memory outside those slots;
+- any other call ends the stretch.
+
+Where the pair would be split by the arms of an `if` or a `match`, the releases at the end of the scope
+are given back at the end of each arm instead, so that the arm which returns a local takes no count
+for it. A count therefore never reaches zero at a different point, and **no destructor runs earlier,
+later or in a different order** than it would with every count taken. Nothing about it is visible
+except the time it saves: on a recursive search over a tree of `&sync` shapes it removes three of every
+four atomic operations.
+
+```sysl
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Hit
+    t: int
+    tag: &sync Tag
+
+probe(t: int, tag: &sync Tag) -> Option[Hit] = Some(Hit(t, tag))
+
+pick(near: bool) -> Option[Hit]
+    val x = probe(1, Tag(1))
+    val y = probe(2, Tag(2))
+    if near then x else y
+
+show(near: bool)
+    val h = pick(near)
+    print("got", h.unwrap().t)
+
+show(true)
+show(false)
+```
+
+```output
+drop 2
+got 1
+drop 1
+drop 1
+got 2
+drop 2
+```
+
 ## `weak T` — breaking cycles
 
 Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent
