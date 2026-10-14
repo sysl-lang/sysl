@@ -1481,7 +1481,7 @@ print(f())
 A function whose last act is a call to itself compiles to a branch back to its own entry rather than
 a second frame, so the recursion is bounded by the arithmetic and not by the stack. That happens
 whether or not anything is written — see
-[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the two
+[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the three
 things that end a tail position.
 
 `@tailrec` asserts the jump is there:

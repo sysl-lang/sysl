@@ -465,14 +465,51 @@ A tail call is a call, so the jump lands where a call would: **every `require` i
 the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
 its own precondition at depth four stops at depth four.
 
-Two things end a tail position instead of being optimized around:
+Three things end a tail position instead of being optimized around:
 
 - **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
   ordinary call, and before it is entered for a jump;
 - **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
-  returns.
+  returns;
+- **an argument that may point into the frame**. A jump reuses the frame: the locals are released on
+  the way to it, and the next round writes every slot again, so `&sub` handed down would be read
+  after `sub` was freed or written over. Where the body takes the address of its own storage
+  anywhere — `&` of a local, a parameter or a temporary, or a slice of a local array — a self-call
+  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call.
 
-Either one leaves the function compiled exactly as written.
+Any of them leaves the function compiled exactly as written:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct P
+    toks: Buf[string]
+    pos: usize
+
+decl(p: *P, base: string) -> string
+    if p.pos < p.toks.len() && p.toks[p.pos] == "*" then
+        p.pos += 1
+        return decl(p, base + "*")
+
+    if p.pos < p.toks.len() && p.toks[p.pos] == "("
+        var inner: Buf[string] = buf()
+        inner.push("*")
+        var sub = P(inner, 0)
+        return decl(&sub, base + "()")
+
+    base
+
+var toks: Buf[string] = buf()
+toks.push("(")
+var top = P(toks, 0)
+print(decl(&top, "void"))
+```
+
+```output
+void()*
+```
+
+The call that passes `&sub` keeps its frame, so `sub`'s buffer is alive while the callee reads it.
 
 It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
 calls, however they are written.
@@ -492,6 +529,29 @@ print(sum(5))
 
 ```error
 calls itself nowhere the jump can replace
+```
+
+A self-call in tail position that may hand down an address in the frame is refused with its own
+reason:
+
+```sysl
+struct S
+    n: int
+
+@tailrec
+walk(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    walk(&next, acc + s.n)
+
+var s = S(4)
+print(walk(&s, 0))
+```
+
+```error
+its tail call may pass an address in its own frame
 ```
 
 It changes nothing about what is emitted — write it on the functions where losing the jump silently
