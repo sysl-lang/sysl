@@ -155,6 +155,136 @@ bdb_an_m0_build_names_atomics_32()
                .contains("atomics-32"))
 end bdb_an_m0_build_names_atomics_32
 
+// =================================================================================================
+// Armv6-M changes nothing atomically, and IrqLock is its lock
+// =================================================================================================
+
+private bdb_rmw_tail() -> string =
+    "and 'thumbv6m-freestanding' has no instruction for one — use an 'IrqLock' where the code runs " +
+    "on one core, or a board's hardware lock (the RP2040's SIO spinlocks) through 'Guarded[L, T]'"
+
+@test("on an M0+ a read-modify-write, a compare-and-swap and a SpinLock are refused where the program reaches them")
+bdb_an_m0_refuses_every_read_modify_write()
+    if !bdb_ready() then return
+
+    val program = "import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\n" +
+                  "var g: Guarded[SpinLock, int] = Guarded.new(SpinLock(0), 0)\n" +
+                  "var n: Atomic[u32] = Atomic(0)\nvar w: u32 = 0\n\n" +
+                  "@export(\"a\")\na() = lock.lock()\n\n" +
+                  "@export(\"b\")\nb() -> u32 = n.add(1, Relaxed)\n\n" +
+                  "@export(\"c\")\nc() -> u32 = n.cas(0, 1, AcqRel)\n\n" +
+                  "@export(\"d\")\nd() -> u32 = atomic_swap(&w, 1, Acquire)\n\n" +
+                  "@export(\"e\")\ne() = g.with((v) -> *v = 1)\n"
+    val got = bdb_board(program, "thumbv6m-freestanding")
+    val said = got.1
+
+    assert(got.0 != Fine, said)
+    assert(said.contains(s"error: 'SpinLock' takes its flag with an atomic exchange, ${bdb_rmw_tail()}\n" +
+                         " --> @/main.sysl:9:12\n"), said)
+    assert(said.contains(s"error: this reaches 'sysl.sync.Atomic.add', which changes memory with an " +
+                         s"atomic read-modify-write, ${bdb_rmw_tail()}\n  --> @/main.sysl:12:16\n"), said)
+    assert(said.contains(s"error: this reaches 'sysl.sync.Atomic.cas', which changes memory with an " +
+                         s"atomic read-modify-write, ${bdb_rmw_tail()}\n  --> @/main.sysl:15:16\n"), said)
+    assert(said.contains("error: 'atomic_swap' is an atomic read-modify-write, and " +
+                         "'thumbv6m-freestanding' has no instruction for one: an Armv6-M core reads " +
+                         "and writes a word indivisibly but cannot change one — use an 'IrqLock'"), said)
+    assert(said.contains(s"error: 'SpinLock' takes its flag with an atomic exchange, ${bdb_rmw_tail()}\n" +
+                         "  --> @/main.sysl:21:9\n"), said)
+end bdb_an_m0_refuses_every_read_modify_write
+
+@test("the same SpinLock and add build on an M3, which has the exclusive pair")
+bdb_an_m3_keeps_its_read_modify_write()
+    if !bdb_ready() then return
+
+    val program = "import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\nvar n: Atomic[u32] = Atomic(0)\n\n" +
+                  "@export(\"a\")\na() -> u32\n    lock.lock()\n    val v = n.add(1, Relaxed)\n" +
+                  "    lock.unlock()\n    v\n"
+    val got = bdb_board(program, "thumbv7m-freestanding")
+
+    assert_eq(got.0, Fine, got.1)
+    assert(!got.2.contains("__atomic_") && !got.2.contains("__sync_"), got.2)
+end bdb_an_m3_keeps_its_read_modify_write
+
+private bdb_irq_program() -> string =
+    "import sysl.sync.*\n\nvar table: Guarded[IrqLock, int] = Guarded.new(IrqLock(0), 0)\n" +
+    "var n: Atomic[u32] = Atomic(0)\n\n" +
+    "@export(\"bump\")\nbump() -> int\n    n.store(n.load(Acquire) + 1, Release)\n" +
+    "    table.with((v) -> *v = *v + 1)\n    0\n"
+
+@test("Guarded[IrqLock, T] builds for an M0+, M3, M4 and M33 and calls no atomic routine")
+bdb_an_irq_lock_builds_on_every_cortex_m()
+    if !bdb_ready() then return
+
+    for target in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                   "thumb-freestanding"]
+        val got = bdb_board(bdb_irq_program(), target)
+
+        assert_eq(got.0, Fine, s"$target: ${got.1}")
+        assert(!got.2.contains("__atomic_") && !got.2.contains("__sync_"), s"$target: ${got.2}")
+end bdb_an_irq_lock_builds_on_every_cortex_m
+
+@test("IrqLock saves PRIMASK, masks with cpsid i, and puts PRIMASK back")
+bdb_an_irq_lock_is_mrs_cpsid_msr()
+    if !bdb_ready() then return
+
+    val root = bdb_root(bdb_irq_program(), "")
+
+    write_text(s"$root/package.hocon", "targets {\n  default = \"thumbv6m-freestanding\"\n" +
+               "  thumbv6m-freestanding { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = bdb_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding", "-o",
+                       s"$root/app.a"])
+    val tool = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    assert_eq(got.0, Fine, got.1)
+    assert(exists(tool), "this test reads a board's code and there is no arm-none-eabi-objdump")
+
+    val dis = capture(tool, ["-d", s"$root/app.a"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+
+    val taken = dis.index_of("mrs")
+    val masked = dis.index_of("cpsid")
+    val restored = dis.index_of("msr")
+
+    assert(taken.is_some() && masked.is_some() && restored.is_some(), dis)
+    assert(dis.contains("PRIMASK") || dis.contains("primask"), dis)
+    assert(taken.unwrap() < masked.unwrap() && masked.unwrap() < restored.unwrap(), dis)
+end bdb_an_irq_lock_is_mrs_cpsid_msr
+
+@test("IrqLock reached on a host is refused, naming the cores it is for")
+bdb_an_irq_lock_is_refused_off_cortex_m()
+    if !bdb_ready() then return
+
+    val root = bdb_root("import sysl.sync.*\n\nvar l: IrqLock = IrqLock(0)\n\nl.lock()\nl.unlock()\n", "")
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    val host = host_target().name
+
+    assert(said.contains(s"error: 'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and " +
+                         s"'$host' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; " +
+                         "elsewhere use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are " +
+                         "threads\n --> @/main.sysl:5:3\n"), said)
+end bdb_an_irq_lock_is_refused_off_cortex_m
+
+@test("the read-modify-write width of each target: none on Armv6-M, the atomic width elsewhere")
+bdb_the_rmw_width_of_each_target()
+    for (name, bits, primask) in [("thumbv6m-freestanding", 0, true), ("thumbv7m-freestanding", 32, true),
+                                  ("thumb-freestanding", 32, true), ("riscv32-freestanding", 32, false),
+                                  ("aarch64-freestanding", 64, false)]
+        val t = target_named(name).unwrap()
+
+        assert_eq(t.atomic_rmw_bits(), bits, name)
+        assert_eq(t.has_primask(), primask, name)
+end bdb_the_rmw_width_of_each_target
+
 @test("a 64-bit atomic on a 64-bit board is accepted")
 bdb_a_64_bit_board_keeps_its_64_bit_atomics()
     if !bdb_ready() then return

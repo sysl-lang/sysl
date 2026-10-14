@@ -1,0 +1,62 @@
+module sysl.sync
+@no_alloc
+
+/** Mutual exclusion on one Cortex-M core, held by masking interrupts rather than by spinning.
+ *
+ * **This is the lock an Armv6-M core has.** It has no exclusive pair, so it cannot take a
+ * `SpinLock`'s flag; what it can do is stop being interrupted. `lock` saves PRIMASK and runs
+ * `cpsid i`, `unlock` puts PRIMASK back as it was, so holds nest: an inner hold taken with interrupts
+ * already masked leaves them masked when it lets go. Nothing waits, so `try_lock` always succeeds.
+ *
+ * **It excludes interrupt handlers, not other cores.** Code on a second core runs straight through
+ * it, so it is right only where everything that touches the data runs on the core taking the lock --
+ * the main loop and that core's handlers. A dual-core part (an RP2040) needs its hardware lock,
+ * through `Guarded[L, T]`.
+ *
+ * It exists on every Cortex-M target sysl builds for (Armv6-M, Armv7-M, Armv8-M); a program reaching
+ * it for any other machine is refused.
+ */
+struct IrqLock
+
+    // PRIMASK as `lock` found it: one where interrupts were already masked.
+    saved: u32
+
+    /** Masks interrupts, remembering whether they already were. */
+    lock(*self)
+        var was: u32 = 0
+
+        // Only a Cortex-M core has PRIMASK. The other arms are never built into a program: a
+        // program reaching an `IrqLock` for those machines is refused (`atomic_reach.sysl`).
+        asm
+            [thumb]
+                "mrs {was}, primask"
+                "cpsid i"
+                out was : reg
+            [x86_64, x86, aarch64, riscv64, riscv32, craft, wasm32]
+
+        self.saved = was
+    end lock
+
+    /** Takes the lock, which never has to wait, and answers `true`. */
+    try_lock(*self) -> bool
+        self.lock()
+        true
+
+    /** Takes the lock, runs `body`, releases it, and answers what `body` answered. */
+    with[R](*self, body: () -> R) -> R
+        self.lock()
+
+        defer self.unlock()
+        body()
+
+    /** Puts PRIMASK back as `lock` found it. */
+    unlock(*self)
+        val was = self.saved
+
+        asm
+            [thumb]
+                "msr primask, {was}"
+                in was : reg
+            [x86_64, x86, aarch64, riscv64, riscv32, craft, wasm32]
+
+end IrqLock
