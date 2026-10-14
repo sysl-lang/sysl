@@ -758,3 +758,258 @@ private render_call(at: Span, helper: string, sink: Expr) -> Stmt
     args.push(ident(at, "parts"))
     stmt(at, ExprStmt(call_of(at, ident(at, helper), args)))
 end render_call
+
+// -- Debug, which every type has --------------------------------------------------------------------
+//
+// **Every struct and enum gets a `Debug` its compilation did not write**, so every value can be shown:
+// `Point(x: 1, y: 2)`, `Shape.Circle(r: 3.0)`, `Color.Red`. It is the same move a `derives` clause
+// makes -- the block a reader could have written, hoisted and analyzed by the ordinary machinery --
+// made for every type rather than on request. A block the program wrote itself is the override, and
+// the type then gets none from here.
+//
+// **Every name the blocks reach is written by its path** (`sysl.Writer`, `sysl.debug_enter`), so a
+// program with a `Writer` or a `Debug` of its own still gets the library's.
+
+// The units with every struct and enum's supplied `Debug` written in after it, where the library
+// declares the trait at all -- a compilation given no standard module gets nothing.
+debug_units(units: Buf[Program]) -> Buf[Program]
+    if !declares_debug(units) then return units
+
+    val written = written_debug(units)
+    var out: Buf[Program] = buf()
+
+    for unit in units
+        val home = module_of_unit(unit)
+        var body: Buf[Stmt] = buf()
+        var grew = false
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            body.push(s)
+
+            val name = declared_name(s)
+
+            if name.bytes.len > 0 && !holds_string(written, s"$home.$name")
+                for item in debug_blocks(s)
+                    body.push(item)
+
+                grew = true
+
+        if !grew then out.push(unit)
+        else out.push(Program(body, unit.module_name, unit.capabilities, unit.links, unit.src,
+                              unit.test_only, unit.includes, unit.docs, unit.pkg))
+
+    out
+end debug_units
+
+private declares_debug(units: Buf[Program]) -> bool
+    for unit in units
+        if module_of_unit(unit) == AutoImportedModule
+            for s in unit.body
+                *s.kind match
+                    TraitDecl(d) -> if d.name == "Debug" then return true
+                    _ -> ()
+
+    false
+end declares_debug
+
+// The types an `impl Debug` was written for, each as `module.Name`: a block for a type lives in the
+// type's own module, so the module the block is in is the type's.
+private written_debug(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for unit in units
+        val home = module_of_unit(unit)
+
+        for s in unit.body
+            *s.kind match
+                ImplDecl(d) ->
+                    if last_dotted(d.trait_name) == "Debug"
+                        *d.for_type.kind match
+                            NamedType(n, _) -> out.push(s"$home.${last_dotted(n)}")
+                            _ -> ()
+                _ -> ()
+
+    out
+end written_debug
+
+// What a supplied `debug` writes through: the library's, by path.
+private lib(at: Span, name: string) -> Expr = field_of(at, ident(at, "sysl"), name)
+
+private lib_type(at: Span, name: string) -> TypeRef = TypeRef(at, NamedType(s"sysl.$name", buf()))
+
+private lib_writer(at: Span) -> Param = param_of(at, "out", TypeRef(at, PtrType(lib_type(at, "Writer"))))
+
+private lib_spec(at: Span, name: string) -> Param = param_of(at, name, lib_type(at, "FormatSpec"))
+
+// The block, and the function it renders through where the shape has parts.
+private debug_blocks(s: Stmt) -> Buf[Stmt]
+    val at = s.span
+    val name = declared_name(s)
+    val tparams = declared_tparams(s)
+    val tvalues = declared_tvalues(s)
+    var out: Buf[Stmt] = buf()
+
+    // Every type parameter gains `Debug` as a bound, exactly as a `derives` clause's trait does: a
+    // `Box[T]` shows its `T` through the `T`'s own `Debug`.
+    var bounds: Buf[NamedBounds] = buf()
+
+    for item in declared_bounds(s)
+        bounds.push(item)
+
+    for tparam in tparams
+        if !has_binding(tvalues, tparam)
+            var bs: Buf[BoundRef] = buf()
+
+            bs.push(BoundRef(at, "sysl.Debug", buf()))
+            bounds.push(NamedBounds(tparam, bs))
+
+    var targs: Buf[TypeRef] = buf()
+
+    for tparam in tparams
+        targs.push(TypeRef(at, NamedType(tparam, buf())))
+
+    val subject = TypeRef(at, NamedType(name, targs))
+    var method = debug_literal_method(at, name, s)
+
+    if has_parts(s) then method = debug_parts_method(at, name, s)
+
+    var methods: Buf[MethodDecl] = buf()
+
+    methods.push(method)
+    out.push(stmt(at, ImplDecl(ImplDecl("sysl.Debug", subject, methods, tparams, bounds, buf(), buf(),
+                                        false, tvalues, buf(), buf()))))
+    out
+end debug_blocks
+
+// A shape with no parts: the struct's name, or the enum's and the variant's, as one literal.
+private debug_literal_method(at: Span, name: string, s: Stmt) -> MethodDecl
+    var text = expr(at, StrLit(name))
+
+    if is_sum(s)
+        var arms: Buf[MatchArm] = buf()
+
+        for item in variants_of(s)
+            arms.push(arm_of(at, any_of(at, item),
+                             one_stmt_of(stmt(at, ExprStmt(expr(at, StrLit(s"$name.${item.name}")))))))
+
+        // An enum with no variants has no value to show, and a match with no arms has no type.
+        if !arms.is_empty() then text = expr(at, MatchExpr(ident(at, "self"), arms))
+    end if
+
+    var args: Buf[Expr] = buf()
+
+    args.push(field_of(at, text, "bytes"))
+    args.push(ident(at, "out"))
+    args.push(ident(at, "fmt"))
+
+    var params: Buf[Param] = buf()
+
+    params.push(lib_writer(at))
+    params.push(lib_spec(at, "fmt"))
+    method_of(at, "debug", params, None,
+              one_stmt_of(stmt(at, ExprStmt(call_of(at, lib(at, "display_pad"), args)))))
+end debug_literal_method
+
+// `Point(x: 1, y: 2)`, or for an enum `Shape.Circle(r: 3.0)` and a bare `Shape.Empty`, each field
+// shown through the compiler's `debug part` form -- the field's own `Debug`, a pointer's address, a
+// callable's `<fn>`.
+//
+// **A rendering that nests too deep writes `…` and stops**, which is what keeps a structure that
+// refers back to itself through a `&T` from rendering for ever: the library counts the depth, and
+// every call is paired with a leave whatever the count said.
+//
+// **A width is the library's to honour** (`sysl.debug_padded`): it measures the rendering by running
+// this same member into a counting sink with no width, and pads once around it. So the block is one
+// member and nothing beside it -- a function beside it would be one more name a `@tests` file's type
+// could not lend its block.
+private debug_parts_method(at: Span, name: string, s: Stmt) -> MethodDecl
+    var shown: Buf[Stmt] = buf()
+
+    if !is_sum(s)
+        var parts: Buf[(string, Expr)] = buf()
+
+        *s.kind match
+            StructDecl(d) ->
+                for item in d.fields
+                    parts.push((item.name, self_field(at, item.name)))
+            _ -> ()
+
+        shown = debug_writes(at, name, parts)
+    else
+        var arms: Buf[MatchArm] = buf()
+
+        for v in variants_of(s)
+            var parts: Buf[(string, Expr)] = buf()
+
+            for j in 0..<v.fields.len()
+                parts.push((v.fields.at(j).name, ident(at, binder("l", j))))
+
+            arms.push(arm_of(at, variant_pattern(at, v, "l"), debug_writes(at, s"$name.${v.name}", parts)))
+
+        shown.push(stmt(at, ExprStmt(expr(at, MatchExpr(ident(at, "self"), arms)))))
+
+    var cut: Buf[Stmt] = buf()
+
+    cut.push(write_text(at, "…"))
+
+    var padded: Buf[Expr] = buf()
+
+    padded.push(ident(at, "self"))
+    padded.push(ident(at, "out"))
+    padded.push(ident(at, "fmt"))
+
+    var measured: Buf[Stmt] = buf()
+
+    measured.push(stmt(at, ExprStmt(call_of(at, lib(at, "debug_padded"), padded))))
+    measured.push(stmt(at, Return(None)))
+
+    var spec_args: Buf[Expr] = buf()
+
+    spec_args.push(int_of(at, "0"))
+    spec_args.push(expr(at, Unary("-", int_of(at, "1"))))
+    spec_args.push(expr(at, BoolLit(false)))
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(compare(at, ">", field_of(at, ident(at, "fmt"), "width"),
+                                                         int_of(at, "0")),
+                                                measured, None, false)))))
+    body.push(stmt(at, ValDecl("parts", None, call_of(at, lib(at, "FormatSpec"), spec_args), Public,
+                               None, None, OneCopy, None)))
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(call_of(at, lib(at, "debug_enter"), no_args()), shown,
+                                                Some(cut), false)))))
+    body.push(stmt(at, ExprStmt(call_of(at, lib(at, "debug_leave"), no_args()))))
+
+    var params: Buf[Param] = buf()
+
+    params.push(lib_writer(at))
+    params.push(lib_spec(at, "fmt"))
+    method_of(at, "debug", params, None, body)
+end debug_parts_method
+
+// `Name(`, each `field: part` with `, ` between, `)`; a variant with no fields is its name alone.
+private debug_writes(at: Span, name: string, parts: Buf[(string, Expr)]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    if parts.is_empty()
+        out.push(write_text(at, name))
+        return out
+    end if
+
+    for i in 0..<parts.len()
+        val lead = if i == 0 then s"$name(" else ", "
+
+        out.push(write_text(at, s"$lead${parts.at(i).0}: "))
+
+        var args: Buf[Expr] = buf()
+
+        args.push(parts.at(i).1)
+        args.push(ident(at, "out"))
+        args.push(ident(at, "parts"))
+        out.push(stmt(at, ExprStmt(call_of(at, ident(at, DebugPart), args))))
+
+    out.push(write_text(at, ")"))
+    out
+end debug_writes

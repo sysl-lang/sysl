@@ -573,12 +573,28 @@ end trait_members
 // there is nothing for a slot to point at. That is a fact about the member and not about the trait:
 // a `filter` that cannot be dispatched sits perfectly well beside a `map` that can, so the object
 // still forms and what is refused is the call.
+//
+// **Every table carries `Debug` after its own slots**, whether or not the trait requires it, because
+// every type has one: an object is shown through its concrete value's `Debug` exactly as a value is.
+// It goes last so that adding it moves no slot a trait's own members already had. A callable's table
+// carries none -- a callable is shown as `<fn>`, and the value behind it is a closure's capture
+// record, which has no `Debug` to point at.
 slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, MethodDecl)]
     var out: Buf[(Bound, MethodDecl)] = buf()
     val all = trait_members(a, b, self_bind)
+    val dbg = library_key("Debug")
+    var shown = b.name == dbg || fn_is_call(b.name)
 
     for item in all
         if item.1.tparams.is_empty() then out.push(item)
+        if item.0.name == dbg then shown = true
+
+    if !shown
+        trait_decl_at(a, dbg) match
+            Some(d) ->
+                for m in d.methods
+                    out.push((Bound(dbg, buf()), m))
+            None -> ()
 
     out
 end slotted_members
@@ -611,7 +627,26 @@ satisfies(a: &Analysis, tr: Bound, t: Type) -> bool = t match
     // the membership answerable before instantiation -- a tuple implements `Display` when every part
     // does, so a call is refused where it is written rather than inside a body already committed to.
     Pack(elems) -> every_satisfies(a, tr, elems)
-    _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t)
+    _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t) ||
+         debug_through(a, tr, t)
+
+// **A reference or a pointer is `Debug` where what it reaches is**, because a member call sees
+// through one level of `&` or `*` to find its receiver (`reference/traits.md § Any type may carry an
+// impl`), so `x.debug(…)` on one reaches the referent's -- which is what lets an `Option[&Node]` or a
+// `Buf[*P]` meet `T: Debug`. An object reaches the `Debug` every table carries, and a callable's
+// `debug` is answered by the compiler as `<fn>` (`callable_debug`).
+private debug_through(a: &Analysis, tr: Bound, t: Type) -> bool
+    if tr.name != library_key("Debug") then return false
+
+    val inner = t match
+        Ref(i, _) -> *i
+        Ptr(i) -> *i
+        _ -> return false
+
+    if is_trait(inner) then return true
+
+    satisfies(a, tr, inner)
+end debug_through
 
 private bound_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> bool
     for item in bounds

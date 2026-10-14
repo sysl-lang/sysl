@@ -1232,6 +1232,116 @@ one that is hidden. The clause is part of the declaration, so the block it write
 that declares the type: a **private field is walked**, because the block is written where the type
 is.
 
+## Every type has a `Debug`
+
+`Debug` is the library's other rendering trait, shaped exactly as `Display` is — a sink and the field
+the whole value occupies — and it is the one exception to [conformance being explicit](#conformance-is-explicit-always):
+**every type has one, and none has to be written.** The compiler supplies a `Debug` for every struct
+and enum that does not write its own, the way a `derives` clause would but without being asked:
+the name, then each field by name, each shown through **its own** `Debug`, so a string inside a
+structure is quoted and escaped. An enum's variant is shown under the enum's name.
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+enum Color
+    Red
+    Green
+
+struct Label
+    text: string
+    at: Point
+    color: Color
+
+print(Label("a \"b\"", Point(1, 2), Red))
+```
+
+```output
+Label(text: "a \"b\"", at: Point(x: 1, y: 2), color: Color.Red)
+```
+
+The library writes the rest: the scalars (a `char` in single quotes, a `string` in double), tuples,
+arrays, slices, `Buf`, `Option` and `Result`, each shown as its `Display` shows it but with the parts
+through their `Debug`. So `print` of a value with neither block written still prints —
+**`print`, `str` and an interpolation hole reach `Display` where a value has one and `Debug` where it
+does not**, and `f"${x}%?"` and `debug(x)` always reach `Debug`
+([strings](/reference/strings/#format-specifiers)). `assert_eq` reports both sides through it, so
+`got "1", want 1` cannot read as equal.
+
+**An `impl Debug` of your own replaces the supplied one** — to hide a field, or to abbreviate a large
+buffer — and a structure holding the type shows it through that block too:
+
+```sysl
+struct Secret
+    key: string
+
+impl Debug for Secret
+    debug(self, out: *Writer, fmt: FormatSpec) = display_pad("Secret(***)".bytes, out, fmt)
+
+struct Login
+    user: string
+    secret: Secret
+
+print(Login("ed", Secret("hunter2")))
+```
+
+```output
+Login(user: "ed", secret: Secret(***))
+```
+
+A generic type's supplied block is conditional, as a derived one is, and every type meets the
+condition, so a `T: Debug` bound costs a caller nothing:
+
+```sysl
+show[T: Debug](x: T) = print(f"${x}%?")
+
+struct Box[T]
+    v: T
+
+show(Box("in"))
+show(3)
+```
+
+```output
+Box(v: "in")
+3
+```
+
+### What is shown by rule
+
+A few values have no block that could be written for them, and are shown by the compiler's own rule:
+
+- **a raw pointer `*T` shows its address**, in lower-case hex with no padding, the null one as `0x0`.
+  It is not followed: what it points at may be gone. *This is a split, and it is deliberate*: a
+  member call sees through one `*` (above), so in generic code a `T: Debug` instantiated at `*P`
+  reaches `P`'s `Debug` — the bound is met by what the pointer points at — while `print(p)`,
+  `f"${p}%?"` and a field of type `*P` show the address;
+- **a reference `&T` is followed** — it is a value — and shows as its referent;
+- **a callable shows as `<fn>`**, and a `weak T` as `weak(…)`, without following it;
+- **a trait object shows its concrete value**: every object's table carries a `Debug` slot after
+  its own members, whether or not the trait requires `Debug`, so `print` of a `*Shape` reaches the
+  `Debug` of the `Rect` behind it. A callable's table carries none, being `<fn>`.
+
+**A rendering that nests deeper than thirty-two levels writes `…` and stops.** Following references
+is what makes a list or a tree show as one, and it is also what would make a structure that refers
+back to itself render for ever; the limit is what makes every value safe to show.
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+val list: &Node = Node(1, Some(Node(2, None)))
+
+print(list)
+```
+
+```output
+Node(v: 1, next: Some(Node(v: 2, next: None)))
+```
+
 ## A trait may take type parameters
 
 A trait declares parameters in the same bracketed list every other generic declaration writes, and an

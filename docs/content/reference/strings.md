@@ -448,26 +448,34 @@ library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling a
 whose digits are the ones `print` writes, so `str(x)` and `print(x)` can never disagree and a board
 with no C library renders one the same way.
 
-**Any other type renders through `Display`.** A struct or an enum carrying an `impl` writes itself
-into a growable buffer, and the bytes that land there become the string — so `str` of a user type is
-an ordinary call, and `str` of one *without* an implementation names the `impl` to write:
+**Every other value renders too: through `Display` where it has one, and through `Debug` where it
+does not.** Every type has a [`Debug`](/reference/traits/#every-type-has-a-debug) — the compiler
+supplies one for each struct and enum that does not write its own — so nothing is refused for having
+no string form. A struct shows its name and its fields, an enum the variant under the enum's name:
 
 ```sysl
 struct Point
     x: int
     y: int
 
+enum Shape
+    Circle(r: int)
+    Dot
+
 var p = Point(1, 2)
 
 print(str(p))
+print(p, Circle(3), Dot)
 ```
 
-```error
-write an 'impl sysl.Display for Point' to say how it renders
+```output
+Point(x: 1, y: 2)
+Point(x: 1, y: 2) Shape.Circle(r: 3) Shape.Dot
 ```
 
-Written, the same `str` is an ordinary call — the [member](/library/core/#writing-display-for-your-own-type)
-takes the writer the string is being gathered into and the specifier the call site asked for:
+**`Display` is the override, not the requirement.** Written, it is what `str`, `print` and a hole
+reach — the [member](/library/core/#writing-display-for-your-own-type) takes the writer the string is
+being gathered into and the specifier the call site asked for:
 
 ```sysl
 struct Point
@@ -512,7 +520,7 @@ print(s"at $p")
 at (1, 2)
 ```
 
-So a reference whose referent has no `Display` is refused in the referent's words:
+So a reference whose referent has no `Display` prints the referent's `Debug`:
 
 ```sysl
 struct Point
@@ -524,12 +532,36 @@ var p: &Point = Point(1, 2)
 print(p)
 ```
 
-```error
-cannot print a Point value — write an 'impl sysl.Display for Point' to say how it renders
+```output
+Point(x: 1, y: 2)
 ```
 
-A pointer is not reached through, since an address renders differently on every run, and a trait
-object keeps its reference, since the reference is what carries its table.
+**A raw pointer is not reached through** — what it points at may be gone — so it prints its address
+in lower-case hex, the null one as `0x0`. A trait object keeps its reference, since the reference is
+what carries its table, and prints its concrete value: through `Display` where the trait requires
+it, and otherwise through the `Debug` every table carries. A callable prints as `<fn>`.
+
+```sysl
+trait Area
+    area(self) -> int
+
+struct Square
+    side: int
+
+impl Area for Square
+    area(self) -> int = self.side * self.side
+
+val z: *int = ptr_cast(usize(0))
+val p: *int = ptr_cast(usize(0x1000))
+val a: *Area = &Square(3)
+val f: &Fn(int) -> int = (x: int) -> x + 1
+
+print(z, p, a, f)
+```
+
+```output
+0x0 0x1000 Square(side: 3) <fn>
+```
 
 ## Interpolation
 
@@ -546,8 +578,8 @@ print(s"n is $n, ${n * 2} doubled, $$5")
 n is 7, 14 doubled, $5
 ```
 
-Each spliced value is rendered by `str`, so the same rules apply: a primitive renders, and a type
-with no string form is an error at the splice. The whole thing desugars to the machinery already
+Each spliced value is rendered by `str`, so the same rules apply: a primitive renders, a type with a
+`Display` renders through it, and every other value through its `Debug`. The whole thing desugars to the machinery already
 built — `s"a${e}b"` is exactly `"a" + str(e) + "b"` — so an interpolation is not a new kind of value,
 just a concise way to write a concatenation. A hole holds a full expression, which may itself
 interpolate, and an empty literal segment beside a hole is dropped, since it is the identity under
@@ -589,8 +621,9 @@ print(f"${n}%s")
 format '%s' expects a string, but the value has type int
 ```
 
-`%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float or a
-[fixed-point](/reference/fixed-point/#under-a-format-specifier) value, and `%s` a string. An unsigned
+`%?` takes any value (below), `%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float or a
+[fixed-point](/reference/fixed-point/#under-a-format-specifier) value, and `%s` a string or any value that is not a scalar, which renders as `str` would render it.
+An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
 `ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. Under `%s` a
 width and a precision count **bytes**, as C's do, and an interior NUL ends the field there, as it
@@ -664,6 +697,33 @@ print(f"${x}%.${x}f")
 ```error
 a width or precision written as a hole is a count, so it has to be an integer — but this one has type real
 ```
+
+**`%?` shows any value through its [`Debug`](/reference/traits/#every-type-has-a-debug)**, even one
+with a `Display` — the structure rather than the presentation, with a string inside it quoted and
+escaped. A width pads the whole rendering. `debug(x)` is the same thing as a string, with no width:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+impl Display for Point
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+
+val p = Point(1, 2)
+
+print(f"${p} [${p}%20?] ${"hi"}%?")
+print(debug(p), debug('c'), debug(Some("x")))
+```
+
+```output
+(1, 2) [   Point(x: 1, y: 2)] "hi"
+Point(x: 1, y: 2) 'c' Some("x")
+```
+
+`debug` yields to a function or a local of that name, as `embed` does, since it is an ordinary
+enough word to be somebody's own.
 
 `s`, `raw` and `f` are only prefixes when written directly against the opening quote. Used as
 ordinary names they are unaffected, so `s + raw` and `f + 1` are ordinary expressions.

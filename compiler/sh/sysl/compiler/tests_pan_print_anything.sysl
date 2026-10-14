@@ -1,0 +1,216 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Every value prints (`reference/traits.md § Every type has a Debug`). A value with a `Display` prints
+// through it; every other value prints through its `Debug`, which the compiler supplies for every
+// struct and enum that does not write its own -- `Point(x: 1, y: 2)`, `Shape.Circle(r: 3)`,
+// `Color.Red` -- with each field shown through the field's own `Debug`, so a string inside one is
+// quoted. `f"${x}%?"` and `debug(x)` always reach `Debug`. A raw pointer shows its address, a callable
+// `<fn>`, an object its concrete value's `Debug` through the slot every table carries, and a
+// rendering that nests deeper than the library's limit writes `…` rather than running for ever.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds, links and runs a program, and
+// `xvr_ir` answers a program's report.
+
+private pan_types() -> string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    enum Shape
+        Circle(r: int)
+        Rect(w: int, h: int)
+        Dot
+
+    enum Color
+        Red
+        Green
+
+    struct Empty
+    end Empty
+
+    struct Name
+        s: string
+
+    struct P
+        x: int
+
+    impl Display for P
+        display(self, out: *Writer, fmt: FormatSpec) =
+            display_pad(("P" + str(self.x)).bytes, out, fmt)
+
+    """
+
+private pan_ran(body: string) -> string = xvr_ran([("main.sysl", pan_types() + body)])
+
+private pan_refused(text: string, said: string)
+    val e = xvr_ir([("main.sysl", text)])
+
+    assert(e.contains(said), s"expected '$said', got: $e")
+
+@test("a struct with no Display prints its name and its fields")
+pan_struct()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("print(Point(1, 2))\nprint(Empty())\n"), "Point(x: 1, y: 2)\nEmpty\n")
+
+@test("an enum prints its variant under the enum's name, with the variant's fields")
+pan_enum()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("print(Circle(3), Rect(1, 2), Dot)\nprint(Red, Green)\n"),
+              "Shape.Circle(r: 3) Shape.Rect(w: 1, h: 2) Shape.Dot\nColor.Red Color.Green\n")
+
+@test("str, an interpolation hole and a %s hole reach the supplied Debug too")
+pan_str_and_holes()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("val p = Point(3, 4)\nprint(str(p))\nprint(s\"<$p>\")\nprint(f\"[${p}%20s]\")\n"),
+              "Point(x: 3, y: 4)\n<Point(x: 3, y: 4)>\n[   Point(x: 3, y: 4)]\n")
+
+@test("a string inside a structure is quoted and escaped, and a top-level one prints raw")
+pan_nested_string()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("val n = Name(\"a\\\"b\\n\\\\\")\nprint(n)\nprint(n.s)\n"),
+              "Name(s: \"a\\\"b\\n\\\\\")\na\"b\n\\\n")
+
+@test("%? and debug(x) always show Debug, even over a type with a Display")
+pan_debug_over_display()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("val p = P(7)\nprint(p)\nprint(f\"${p}%?\")\nprint(debug(p))\n" +
+                      "print(debug(\"hi\"), debug('c'), debug(1.5), debug(true))\n"),
+              "P7\nP(x: 7)\nP(x: 7)\n\"hi\" 'c' 1.5 true\n")
+
+@test("a %? hole takes a width and pads the whole rendering")
+pan_debug_width()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("print(f\"[${Point(1, 2)}%20?][${Point(1, 2)}%-19?][${Dot}%10?]\")\n"),
+              "[   Point(x: 1, y: 2)][Point(x: 1, y: 2)  ][ Shape.Dot]\n")
+
+@test("tuples, arrays, Bufs, options and results show their parts through Debug")
+pan_library_shapes()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("import sysl.buf.{Buf, buf}\n" +
+                      "var b: Buf[Point] = buf()\nb.push(Point(1, 2))\n" +
+                      "val o: Option[Point] = Some(Point(5, 6))\nval r: Result[int, string] = Err(\"x\")\n" +
+                      "print([Point(1, 2), Point(3, 4)])\nprint(b)\nprint(o)\nprint(r)\n" +
+                      "print(f\"${r}%?\")\nprint(f\"${(1, \"a\")}%?\")\nprint((1, \"a\"))\n"),
+              "[Point(x: 1, y: 2), Point(x: 3, y: 4)]\n[Point(x: 1, y: 2)]\nSome(Point(x: 5, y: 6))\n" +
+              "Err(x)\nErr(\"x\")\n(1, \"a\")\n(1, a)\n")
+
+@test("a field that has a Display is still shown through its Debug")
+pan_nested_field_debug()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran("struct W\n    p: P\n    c: Color\n\nprint(W(P(1), Red))\n"),
+              "W(p: P(x: 1), c: Color.Red)\n")
+
+@test("an impl Debug of the program's own replaces the supplied one, at the top and nested")
+pan_override()
+    if xvr_no_library() then return
+
+    val text = "struct Secret\n    key: string\n\n" +
+               "impl Debug for Secret\n" +
+               "    debug(self, out: *Writer, fmt: FormatSpec) = display_pad(\"Secret(***)\".bytes, out, fmt)\n\n" +
+               "struct Login\n    user: string\n    secret: Secret\n\n" +
+               "print(Secret(\"k\"))\nprint(Login(\"ed\", Secret(\"k\")))\n"
+
+    assert_eq(pan_ran(text), "Secret(***)\nLogin(user: \"ed\", secret: Secret(***))\n")
+
+@test("a generic parameter bounded by Debug alone prints and shows through it")
+pan_generic_debug()
+    if xvr_no_library() then return
+
+    val text = "show[T: Debug](x: T)\n    print(x)\n    print(f\"${x}%?\")\n\n" +
+               "struct Box[T]\n    v: T\n\n" +
+               "show(Point(1, 2))\nshow(\"s\")\nprint(Box(Point(0, 0)))\nprint(Box(\"in\"))\n"
+
+    assert_eq(pan_ran(text), "Point(x: 1, y: 2)\nPoint(x: 1, y: 2)\ns\n\"s\"\n" +
+                             "Box(v: Point(x: 0, y: 0))\nBox(v: \"in\")\n")
+
+@test("a trait object prints its concrete value's Debug through the slot every table carries")
+pan_trait_object()
+    if xvr_no_library() then return
+
+    val text = "trait Area\n    area(self) -> int\n\n" +
+               "impl Area for Point\n    area(self) -> int = self.x * self.y\n\n" +
+               "impl Area for P\n    area(self) -> int = self.x\n\n" +
+               "val a: *Area = &Point(2, 3)\nval b: *Area = &P(4)\n" +
+               "print(a, a.area())\nprint(b)\nprint(f\"${b}%?\")\n"
+
+    assert_eq(pan_ran(text), "Point(x: 2, y: 3) 6\nP(x: 4)\nP(x: 4)\n")
+
+@test("a raw pointer shows its address in lower-case hex, the null one as 0x0")
+pan_pointer()
+    if xvr_no_library() then return
+
+    val text = "struct Holder\n    at: *int\n\n" +
+               "val z: *int = ptr_cast(usize(0))\nval p: *int = ptr_cast(usize(0xbeef0))\n" +
+               "print(z, p)\nprint(Holder(p))\nprint(f\"[${p}%9?]\")\n"
+
+    assert_eq(pan_ran(text), "0x0 0xbeef0\nHolder(at: 0xbeef0)\n[  0xbeef0]\n")
+
+@test("a callable shows as <fn>")
+pan_callable()
+    if xvr_no_library() then return
+
+    val text = "struct Task\n    run: &Fn(int) -> int\n\n" +
+               "val f: &Fn(int) -> int = (x: int) -> x + 1\n" +
+               "print(f)\nprint(Task(f))\nprint(debug(f))\n"
+
+    assert_eq(pan_ran(text), "<fn>\nTask(run: <fn>)\n<fn>\n")
+
+@test("a reference field is followed, and a chain deeper than the limit stops with an ellipsis")
+pan_depth_limit()
+    if xvr_no_library() then return
+
+    val text = "struct Node\n    v: int\n    next: Option[&Node]\n\n" +
+               "var head: Option[&Node] = None\n" +
+               "for i in 0..<40\n    head = Some(Node(i, head))\n\n" +
+               "val two: &Node = Node(1, Some(Node(2, None)))\n" +
+               "print(two)\nprint(head)\n"
+    val out = pan_ran(text)
+    val lines = lines_of(out)
+
+    assert_eq(lines.at(0), "Node(v: 1, next: Some(Node(v: 2, next: None)))")
+    assert(lines.at(1).starts_with("Some(Node(v: 39, next: Some(Node(v: 38, "), out)
+    assert(lines.at(1).contains("…"), out)
+    assert_eq(xvr_count(lines.at(1), "Node("), 32)
+
+@test("a cycle through a weak reference shows the reference without following it")
+pan_weak()
+    if xvr_no_library() then return
+
+    val text = "struct Node\n    label: string\n    parent: weak Node\n\n" +
+               "var root: &Node = Node(\"root\", None)\nvar kid: &Node = Node(\"kid\", root)\n" +
+               "print(kid)\n"
+
+    assert_eq(pan_ran(text), "Node(label: \"kid\", parent: weak(…))\n")
+
+@test("a type parameter with neither bound is still refused, naming the bound to write")
+pan_unbounded_parameter()
+    if xvr_no_library() then return
+
+    pan_refused("f[T](x: T)\n    print(x)\n\nf(1)\n", "'print' needs 'T: ")
+    pan_refused("g[T](x: T)\n    print(f\"${x}%?\")\n\ng(1)\n", "'debug' needs 'T: ")
+
+@test("debug takes exactly one value, and yields to a function of the name")
+pan_debug_form()
+    if xvr_no_library() then return
+
+    pan_refused("print(debug(1, 2))\n", "debug takes exactly one value")
+    assert_eq(xvr_ran([("main.sysl", "debug(x: int) -> int = x * 2\n\nprint(debug(21))\n")]), "42\n")
+
+@test("printing a struct through its supplied Debug allocates nothing")
+pan_no_alloc()
+    if xvr_no_library() then return
+
+    val text = "@no_alloc\nshow_point()\n    print(Point(1, 2), Red, Name(\"n\"))\n\nshow_point()\n"
+
+    assert_eq(pan_ran(text), "Point(x: 1, y: 2) Color.Red Name(s: \"n\")\n")
