@@ -30,6 +30,7 @@ the path is standing on.
 | `sysl vendor <path>` | put what the project depends on into `vendor/` |
 | `sysl tidy [<path>]` | drop the `sysl.sum` lines for versions the project no longer resolves |
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
+| `sysl import-c <header.h>` | write the sysl declarations for a C header — the raw layer of a binding |
 | `sysl targets` | list the machines sysl can build for |
 | `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
 
@@ -39,7 +40,7 @@ A word that is not one of these is refused on stderr, naming the commands there 
 Every command is sysl's own — nothing is looked for on the `PATH`:
 
 ```text
-sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets
+sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, import-c, targets
 ```
 
 **What a command was run for goes to stdout, and everything it says about the run goes to stderr** —
@@ -645,6 +646,47 @@ narrative therefore produces bare signatures here, and that is the honest answer
 hands the pages to the **`juicer`** command, found on your `PATH`, to build the HTML: generating a
 site means a templating engine, an asset pipeline and a web server, and a systems compiler has no
 business carrying any of that. Without a `juicer` it says so and where one comes from.
+
+### `import-c`
+
+```bash
+sysl import-c /opt/homebrew/include/tree_sitter/api.h --prefix ts_ --include-as tree_sitter/api.h
+sysl import-c -I vendor/include vendor/include/fx.h --prefix fx_ --module sh.sysl.fx.c -o sh/sysl/fx/c/c.sysl
+```
+
+`import-c [-I <dir>] [-D <macro>] [--prefix <p>] [--module <name>] [--link-lib <lib>] [--include-as <path>]
+[--target <name>] [-o <path>] <header.h>`. The raw layer of a binding, read out of the header rather
+than transcribed from it: an `opaque struct` for each handle, a `struct` for each record with a
+complete definition, an `extern` for each function and variable, a `type` alias for each callback
+and scalar typedef, and every number in a `c const` block — each enum a `c type` with its
+enumerators at it, each `#define` of a number by name. **The pleasant layer above it is still
+written by hand**: who owns what, which pointer may be null, and what a callback's trampoline looks
+like are decisions the header does not record.
+
+**clang is the front end.** The header is compiled twice — once with `-E -dD` for its own
+`#define`s, once with `-ast-dump=json` for its declarations — for the target `--target` names (the
+host by default) and with every `-I`, `--include-path` and `-D` on the command line, which are the
+flags a `c const` is measured with. A header clang cannot compile is refused in clang's own words.
+
+**What it writes checks itself on every build.** A record that is laid out carries an `@assert` for
+its size and for each field's offset, against `c const`s holding clang's `sizeof` and
+`__builtin_offsetof` for the target being built — so a layout that differs on another machine stops
+the build at that record, naming it, instead of reading the wrong bytes. C's `long` is a `c type`
+(`CLong`) for the same reason: it is four bytes on one machine and eight on the next.
+
+`--prefix` is taken off every name, ignoring case: with `ts_`, `ts_parser_new` is `parser_new`,
+`TSNode` is `Node` and `TSQuantifierZero` is `QUANTIFIER_ZERO`. A type is UpperCamel with any `_t`
+dropped; a constant is SCREAMING_SNAKE; a reserved word is written between backticks.
+`--include-as` is how the module's `@include` names the header, which by default is its path under
+the first `-I` holding it, or its file name. `--module` and `--link-lib` put a `module` line and an
+`@link` at the top.
+
+**What cannot be generated is said, not guessed** — on stderr as `sysl: note: not generated: …`, and
+again in a comment at the foot of the module. A union, a record with a bitfield or an anonymous
+member, and one with a flexible array member stay `opaque`, with `SIZEOF_`/`ALIGNOF_` constants so a
+caller can still allocate one. A `static inline` function, a function-like macro, a string macro and
+a record from another header passed by value are refused by name. The command still succeeds: a
+header with one unbindable macro is worth the rest.
 
 ### `targets`
 

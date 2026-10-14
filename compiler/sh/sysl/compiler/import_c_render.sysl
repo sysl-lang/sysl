@@ -1,0 +1,760 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, str_builder, to_lower, to_upper}
+
+// **What `sysl import-c` writes for what it read** (`import_c.sysl` reads it): the names, the type
+// mapping, which records can be laid out, and the module's text.
+//
+// **The mapping is the house's, written once.** A `const char *` and a `void *` are `*u8`; a
+// typedef'd record is a `struct` named for the typedef with the prefix and `_t` taken off; a handle
+// is an `opaque struct`; a callback typedef is a `type` alias of a `*extern(...)`; an enum is a
+// `c type`, so its width is the target's; C's `long` is a `c type` too, being four bytes on one
+// machine and eight on the next. Explicit widths everywhere else, as the reference asks of foreign
+// code.
+
+// Where a type sits, which decides what C means by it: an array is storage in a field and a pointer
+// in a parameter, `void` is only a result, and a record behind a pointer needs no layout.
+private const IcAtField: int = 0
+private const IcAtParam: int = 1
+private const IcAtResult: int = 2
+private const IcAtPointee: int = 3
+
+// ## Names
+
+private ic_upper_byte(c: u8) -> bool = c >= u8('A') && c <= u8('Z')
+
+private ic_lower_or_digit(c: u8) -> bool = (c >= u8('a') && c <= u8('z')) || (c >= u8('0') && c <= u8('9'))
+
+// `name` with the prefix taken off, matched without regard to case: `ts_` takes `ts_parser_new` to
+// `parser_new` and `TSNode` to `Node`. Written without its underscore the prefix only matches where a
+// capital or an underscore follows, so `ts_` does not take `tsunami` to `unami`.
+private ic_strip(name: string, prefix: string) -> string
+    if prefix == "" then return name
+
+    val lower = to_lower(name)
+    val p = to_lower(prefix)
+    var out = name
+
+    if lower.starts_with(p) && name.len > p.len
+        out = name[p.len..<name.len]
+    else
+        val bare = if p.ends_with("_") then p[0..<p.len - 1] else p
+
+        if bare != "" && lower.starts_with(bare) && name.len > bare.len
+            val next = name.bytes[bare.len]
+
+            if next == u8('_') || ic_upper_byte(next) then out = name[bare.len..<name.len]
+        end if
+
+    while out.starts_with("_") && out.len > 1 do out = out[1..<out.len]
+
+    if out.bytes[0] >= u8('0') && out.bytes[0] <= u8('9') then name else out
+end ic_strip
+
+// A type's sysl name: prefix and `_t` off, then each underscore-separated piece capitalised --
+// `uv_tcp_t` to `Tcp`, `fx_point` to `Point`, `TSQueryCursor` to `QueryCursor`.
+ic_type_name(name: string, prefix: string) -> string
+    var s = ic_strip(name, prefix)
+
+    if s.ends_with("_t") && s.len > 2 then s = s[0..<s.len - 2]
+
+    var out = str_builder()
+
+    for piece in ic_pieces(s)
+        out.push(to_upper(piece[0..<1]))
+        out.push(piece[1..<piece.len])
+
+    val made = out.finish()
+
+    if made == "" then name else made
+end ic_type_name
+
+private ic_pieces(s: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for k in 0..<s.len + 1
+        if k == s.len || s.bytes[k] == u8('_')
+            if k > start then out.push(s[start..<k])
+
+            start = k + 1
+        end if
+
+    out
+
+// A constant's sysl name: prefix off, then SCREAMING_SNAKE -- `TSQuantifierZero` to
+// `QUANTIFIER_ZERO`, `FX_MODE_ON` to `MODE_ON`.
+ic_const_name(name: string, prefix: string) -> string = ic_screaming(ic_strip(name, prefix))
+
+ic_screaming(s: string) -> string
+    var out = str_builder()
+    val b = s.bytes
+
+    for k in 0..<b.len
+        val c = b[k]
+
+        if k > 0 && ic_upper_byte(c)
+            val after_lower = ic_lower_or_digit(b[k - 1])
+            val word_start = ic_upper_byte(b[k - 1]) && k + 1 < b.len && b[k + 1] >= u8('a') && b[k + 1] <= u8('z')
+
+            if after_lower || word_start then out.push("_")
+        end if
+
+        out.push(s[k..<k + 1])
+
+    to_upper(out.finish())
+end ic_screaming
+
+// A function's or a variable's sysl name: the prefix off and nothing else.
+ic_value_name(name: string, prefix: string) -> string = ic_strip(name, prefix)
+
+// A name as sysl must write it: a reserved word between backticks.
+ic_ident(name: string) -> string = if is_reserved(name) then s"`$name`" else name
+
+private ic_unique(used: *Buf[string], name: string) -> string
+    var out = name
+    var n = 2
+
+    loop
+        var taken = false
+
+        for k in 0..<used.len()
+            if used.at(k) == out then taken = true
+
+        if !taken then break
+
+        out = s"${name}_$n"
+        n += 1
+
+    used.push(out)
+    out
+end ic_unique
+
+// ## Types
+
+private ic_builtin(spec: string) -> Option[string] = spec match
+    "char" -> Some("u8")
+    "signed char" -> Some("i8")
+    "unsigned char" -> Some("u8")
+    "short" -> Some("i16")
+    "short int" -> Some("i16")
+    "signed short" -> Some("i16")
+    "unsigned short" -> Some("u16")
+    "unsigned short int" -> Some("u16")
+    "int" -> Some("i32")
+    "signed" -> Some("i32")
+    "signed int" -> Some("i32")
+    "unsigned" -> Some("u32")
+    "unsigned int" -> Some("u32")
+    "long" -> Some("CLong")
+    "long int" -> Some("CLong")
+    "signed long" -> Some("CLong")
+    "unsigned long" -> Some("CULong")
+    "unsigned long int" -> Some("CULong")
+    "long long" -> Some("i64")
+    "long long int" -> Some("i64")
+    "unsigned long long" -> Some("u64")
+    "unsigned long long int" -> Some("u64")
+    "__int128" -> Some("i128")
+    "unsigned __int128" -> Some("u128")
+    "float" -> Some("f32")
+    "double" -> Some("f64")
+    "_Bool" -> Some("bool")
+    "bool" -> Some("bool")
+    "int8_t" -> Some("i8")
+    "int16_t" -> Some("i16")
+    "int32_t" -> Some("i32")
+    "int64_t" -> Some("i64")
+    "uint8_t" -> Some("u8")
+    "uint16_t" -> Some("u16")
+    "uint32_t" -> Some("u32")
+    "uint64_t" -> Some("u64")
+    "size_t" -> Some("usize")
+    "uintptr_t" -> Some("usize")
+    "ssize_t" -> Some("isize")
+    "ptrdiff_t" -> Some("isize")
+    "intptr_t" -> Some("isize")
+    _ -> None
+
+private ic_numeric(sysl: string) -> bool = sysl match
+    "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128" -> true
+    "usize" | "isize" | "f32" | "f64" | "CLong" | "CULong" -> true
+    _ -> false
+
+private ic_find_record(m: *IcModel, tag: string, id: string) -> Option[usize]
+    for k in 0..<m.records.len()
+        val r = m.records.at(k)
+
+        // clang spells a tag the typedef names as that typedef: `typedef struct {...} T` is `struct T`.
+        if (tag != "" && (r.tag == tag || (r.tag == "" && r.named == tag))) || (id != "" && r.id == id)
+            return Some(k)
+
+    None
+
+private ic_find_enum(m: *IcModel, tag: string, id: string) -> Option[usize]
+    for k in 0..<m.enums.len()
+        val e = m.enums.at(k)
+
+        if (tag != "" && (e.tag == tag || (e.tag == "" && e.named == tag))) || (id != "" && e.id == id)
+            return Some(k)
+
+    None
+
+// The typedef called `name`, the header's own first.
+private ic_find_typedef(m: *IcModel, name: string) -> Option[usize]
+    var found: Option[usize] = None
+
+    for k in 0..<m.typedefs.len()
+        val t = m.typedefs.at(k)
+
+        if t.name == name
+            if t.main then return Some(k)
+
+            if found.is_none() then found = Some(k)
+        end if
+
+    found
+
+// A record from another header, named once and declared `opaque` where it is only pointed at.
+private ic_foreign(m: *IcModel, c_name: string) -> string
+    for f in m.foreign
+        if f.1 == c_name then return f.0
+
+    val name = ic_unique(&m.used, ic_type_name(c_name, ""))
+
+    m.foreign.push((name, c_name))
+    name
+
+private ic_tagged(spec: string) -> (string, string) =
+    if spec.starts_with("struct ") then ("struct", spec[7..<spec.len])
+    else if spec.starts_with("union ") then ("union", spec[6..<spec.len])
+    else if spec.starts_with("enum ") then ("enum", spec[5..<spec.len])
+    else ("", spec)
+
+// The function type a pointer's target is, through typedefs: `fx_cb` is not one, `fx_fn` in
+// `typedef void fx_fn(int)` is.
+private ic_func_of(t: IcType, m: *IcModel, depth: int) -> Option[IcType]
+    if t.kind == IcFunc then return Some(t)
+
+    if t.kind != IcNamed || depth > 32 then return None
+
+    ic_find_typedef(m, t.name) match
+        Some(k) -> ic_func_of(ic_parse(m.typedefs.at(k).qual), m, depth + 1)
+        None -> None
+
+private ic_record_ref(spec: string, kind: string, tag: string, pos: int, m: *IcModel) -> Result[string, string]
+    if tag.starts_with("(") || tag.contains("::(")
+        return Err("an anonymous struct or union, which has no name to give it")
+
+    ic_find_record(m, tag, "") match
+        Some(k) ->
+            val r = m.records.at(k)
+
+            if r.main && r.sysl != ""
+                if pos == IcAtPointee || (r.complete && r.why == "" && !r.is_union) then return Ok(r.sysl)
+
+                return Err(s"'$spec' by value, whose layout is not generated here")
+            end if
+        None -> ()
+
+    if pos == IcAtPointee then return Ok(ic_foreign(m, tag))
+
+    Err(s"'$spec' by value, and it is declared by another header")
+end ic_record_ref
+
+private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[string, string]
+    if spec == "void"
+        return if pos == IcAtResult then Ok("") else Err("'void' where a value has to be")
+
+    ic_builtin(spec) match
+        Some(s) ->
+            if s == "CLong" then m.clong = true
+            if s == "CULong" then m.culong = true
+
+            return Ok(s)
+        None -> ()
+
+    if spec == "long double"
+        return Err("'long double', whose format is the machine's -- see `c type`")
+
+    val (kind, tag) = ic_tagged(spec)
+
+    if kind == "struct" || kind == "union" then return ic_record_ref(spec, kind, tag, pos, m)
+
+    if kind == "enum"
+        ic_find_enum(m, tag, "") match
+            Some(k) ->
+                val e = m.enums.at(k)
+
+                if e.main && e.sysl != "" then return Ok(e.sysl)
+            None -> ()
+
+        return Err(s"'$spec', an enum declared by another header")
+    end if
+
+    ic_find_typedef(m, spec) match
+        Some(k) ->
+            val t = m.typedefs.at(k)
+
+            if t.main && t.sysl != "" then return Ok(t.sysl)
+
+            if depth > 32 then return Err(s"'$spec', a typedef chain too long to follow")
+
+            val under = ic_parse(t.qual)
+
+            // A record another header declares is named for the typedef a program writes, and is
+            // only ever pointed at.
+            if !t.main && under.kind == IcNamed
+                val (k2, _) = ic_tagged(under.name)
+
+                if k2 == "struct" || k2 == "union"
+                    if pos == IcAtPointee then return Ok(ic_foreign(m, spec))
+
+                    return Err(s"'$spec' by value, and it is declared by another header")
+                end if
+            end if
+
+            ic_map(under, pos, m, depth + 1)
+        None -> Err(s"'$spec', which no header read here declares")
+end ic_map_named
+
+// **A C type as sysl writes it**, or why it cannot be.
+ic_map(t: IcType, pos: int, m: *IcModel, depth: int) -> Result[string, string]
+    t.kind match
+        IcBad -> Err(t.name)
+        IcNamed -> ic_map_named(t.name, pos, m, depth)
+        IcPtr ->
+            val p = t.parts.at(0)
+
+            if p.kind == IcNamed
+                if p.name == "void" || p.name == "char" || p.name == "unsigned char" then return Ok("*u8")
+                if p.name == "signed char" then return Ok("*i8")
+            end if
+
+            ic_func_of(p, m, depth) match
+                Some(f) -> return ic_fnptr(f, m, depth)
+                None -> ()
+
+            Ok("*" + ic_map(p, IcAtPointee, m, depth)?)
+        IcArr ->
+            if pos == IcAtParam then return Ok("*" + ic_map(t.parts.at(0), IcAtPointee, m, depth)?)
+
+            if pos != IcAtField then return Err("an array where C has none")
+
+            if t.count < 0 then return Err("a flexible array member, whose length is the allocation's")
+
+            Ok(s"[${t.count}]${ic_map(t.parts.at(0), IcAtField, m, depth)?}")
+        IcFunc ->
+            if pos == IcAtParam then ic_fnptr(t, m, depth) else Err("a function where a value has to be")
+end ic_map
+
+private ic_fnptr(f: IcType, m: *IcModel, depth: int) -> Result[string, string]
+    if f.variadic then return Err("a pointer to a variadic function")
+
+    var ps: Buf[string] = buf()
+
+    for k in 1..<f.parts.len()
+        ps.push(ic_map(f.parts.at(k), IcAtParam, m, depth)?)
+
+    val r = ic_map(f.parts.at(0), IcAtResult, m, depth)?
+
+    Ok(s"*extern(${join(ps.view(), ", ")}) -> ${if r == "" then "unit" else r}")
+
+// ## Layout
+
+// The C spelling of a record, as `sizeof` and `__builtin_offsetof` are handed it.
+private ic_c_record(r: IcRecord) -> string =
+    if r.named != "" then r.named else s"${if r.is_union then "union" else "struct"} ${r.tag}"
+
+// Why a record's layout is withheld before its fields' types are looked at, or nothing.
+private ic_first_why(r: IcRecord) -> string
+    if r.is_union then return "is a C union, which sysl has no spelling for"
+    if r.why != "" then return r.why
+    if r.fields.is_empty() then return "has no fields"
+
+    for f in r.fields
+        if f.name == "" then return "has an anonymous member"
+        if f.bitfield then return s"has a bitfield ('${f.name}'), whose layout C leaves to the implementation"
+
+    ""
+
+// **Which records are laid out.** A field holding a record by value needs that record laid out too,
+// so withholding one can withhold another: this runs until nothing changes.
+private ic_settle_layouts(m: *IcModel)
+    for k in 0..<m.records.len()
+        var r = m.records.at(k)
+
+        if r.main && r.complete then r.why = ic_first_why(r)
+
+        m.records.set(k, r)
+
+    var changed = true
+
+    while changed
+        changed = false
+
+        for k in 0..<m.records.len()
+            var r = m.records.at(k)
+
+            if !r.main || !r.complete || r.why != "" || r.sysl == "" then continue
+
+            for f in r.fields
+                ic_map(ic_parse(f.qual), IcAtField, m, 0) match
+                    Ok(_) -> ()
+                    Err(why) ->
+                        r.why = s"has a field ('${f.name}') that is $why"
+                        break
+
+            if r.why != ""
+                m.records.set(k, r)
+                changed = true
+            end if
+end ic_settle_layouts
+
+// ## The module
+
+// The names the header's declarations take, decided before anything is mapped so that a use can
+// come before its declaration.
+private ic_name_everything(m: *IcModel)
+    // A typedef names the record or enum it is written over, the first one doing so.
+    for k in 0..<m.typedefs.len()
+        val t = m.typedefs.at(k)
+
+        if !t.main then continue
+
+        val q = ic_parse(t.qual)
+
+        if q.kind != IcNamed then continue
+
+        val (kind, tag) = ic_tagged(q.name)
+        val anon = tag.starts_with("(") || tag.contains("::(")
+        val tag_key = if anon then "" else tag
+        val id_key = t.owned
+
+        if kind == "struct" || kind == "union"
+            ic_find_record(m, tag_key, id_key) match
+                Some(i) ->
+                    var r = m.records.at(i)
+
+                    if r.named == "" then r.named = t.name
+                    if anon then r.main = true
+
+                    m.records.set(i, r)
+                None -> ()
+        else if kind == "enum"
+            ic_find_enum(m, tag_key, id_key) match
+                Some(i) ->
+                    var e = m.enums.at(i)
+
+                    if e.named == "" then e.named = t.name
+                    if anon then e.main = true
+
+                    m.enums.set(i, e)
+                None -> ()
+
+    for k in 0..<m.records.len()
+        var r = m.records.at(k)
+        val base = if r.named != "" then r.named else r.tag
+
+        if r.main && base != "" && !base.starts_with("(")
+            r.sysl = ic_unique(&m.used, ic_type_name(base, m.prefix))
+            m.records.set(k, r)
+        end if
+
+    for k in 0..<m.enums.len()
+        var e = m.enums.at(k)
+        val base = if e.named != "" then e.named else e.tag
+
+        if e.main && base != ""
+            e.sysl = ic_unique(&m.used, ic_type_name(base, m.prefix))
+            m.enums.set(k, e)
+        end if
+
+    // A typedef the record or enum already answers to is not written twice; one over a function type
+    // is written where it is used, there being no sysl type for a function that is not a pointer.
+    for k in 0..<m.typedefs.len()
+        var t = m.typedefs.at(k)
+
+        if !t.main then continue
+
+        val q = ic_parse(t.qual)
+        val wanted = ic_type_name(t.name, m.prefix)
+        var answered = false
+
+        if q.kind == IcNamed
+            val (kind, tag) = ic_tagged(q.name)
+            val anon = tag.starts_with("(") || tag.contains("::(")
+
+            if kind == "struct" || kind == "union"
+                ic_find_record(m, if anon then "" else tag, t.owned) match
+                    Some(i) ->
+                        if m.records.at(i).sysl == wanted then answered = true
+                    None -> ()
+            else if kind == "enum"
+                ic_find_enum(m, if anon then "" else tag, t.owned) match
+                    Some(i) ->
+                        if m.enums.at(i).sysl == wanted then answered = true
+                    None -> ()
+        end if
+
+        if answered
+            t.sysl = wanted
+        else if q.kind != IcFunc
+            t.sysl = ic_unique(&m.used, wanted)
+        end if
+
+        m.typedefs.set(k, t)
+end ic_name_everything
+
+// **The module's text**, every declaration that could not be generated pushed onto `refused`.
+ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], bad_lines: Buf[long],
+          refused: *Buf[string]) -> string
+    ic_name_everything(m)
+    ic_settle_layouts(m)
+
+    var records = str_builder()
+    var consts = str_builder()
+    var layout = str_builder()
+    var asserts = str_builder()
+
+    for r in m.records
+        if !r.main || r.sysl == "" then continue
+
+        val c = ic_c_record(r)
+        val upper = ic_screaming(r.sysl)
+
+        if !r.complete
+            records.push(s"opaque struct ${r.sysl}\n\n")
+        else if r.why != ""
+            records.push(s"// `$c` ${r.why}.\n")
+            records.push(s"// Opaque here: its storage is SIZEOF_$upper bytes, aligned to ALIGNOF_$upper.\n")
+            records.push(s"opaque struct ${r.sysl}\n\n")
+            layout.push(s"    SIZEOF_$upper: usize = \"sizeof($c)\"\n")
+            layout.push(s"    ALIGNOF_$upper: usize = \"_Alignof($c)\"\n")
+            refused.push(s"$c ${r.why} -- an opaque struct here, sized by SIZEOF_$upper and aligned by ALIGNOF_$upper")
+        else
+            if r.packed then records.push("@packed\n")
+
+            records.push(s"struct ${r.sysl}\n")
+            layout.push(s"    SIZEOF_$upper: usize = \"sizeof($c)\"\n")
+            asserts.push(s"@assert(sizeof(${r.sysl}) == SIZEOF_$upper, \"${r.sysl} must match $c\")\n")
+
+            for f in r.fields
+                val ty = ic_map(ic_parse(f.qual), IcAtField, m, 0).unwrap_or("?")
+                val field_const = s"OFFSETOF_${upper}_${to_upper(f.name)}"
+
+                records.push(s"    ${ic_ident(f.name)}: $ty\n")
+                layout.push(s"    $field_const: usize = \"__builtin_offsetof($c, ${f.name})\"\n")
+                asserts.push(s"@assert(offsetof(${r.sysl}, ${ic_ident(f.name)}) == $field_const, \"$c.${f.name} moved\")\n")
+
+            records.push("\n")
+
+    // The aliases: a callback's signature, and a typedef over a scalar or a pointer.
+    var aliases = str_builder()
+
+    for t in m.typedefs
+        if !t.main || t.sysl == "" then continue
+
+        val q = ic_parse(t.qual)
+
+        if q.kind == IcNamed
+            val (kind, _) = ic_tagged(q.name)
+
+            if kind != "" && t.sysl == ic_type_name(t.name, m.prefix)
+                // Answered by the record or enum itself, unless that took another typedef's name.
+                var answered = false
+
+                for r in m.records
+                    if r.sysl == t.sysl then answered = true
+
+                for e in m.enums
+                    if e.sysl == t.sysl then answered = true
+
+                if answered then continue
+            end if
+        end if
+
+        ic_map(q, IcAtField, m, 0) match
+            Ok(ty) -> aliases.push(s"type ${t.sysl} = $ty\n")
+            Err(why) -> refused.push(s"${t.name}: the typedef is $why")
+
+    // The entry points.
+    var externs = str_builder()
+
+    for f in m.funcs
+        if f.storage == "static"
+            val what = if f.inline then "a 'static inline' function" else "a 'static' function"
+
+            refused.push(s"${f.name}: $what has no symbol to link against -- a '.c' shim beside the module reaches it")
+            continue
+        end if
+
+        val q = ic_parse(f.qual)
+
+        if q.kind != IcFunc
+            refused.push(s"${f.name}: its type '${f.qual}' is not one this reader follows")
+            continue
+        end if
+
+        ic_extern(f, q, m) match
+            Ok(line) -> externs.push(line + "\n")
+            Err(why) -> refused.push(s"${f.name}: $why")
+
+    for v in m.vars
+        ic_map(ic_parse(v.1), IcAtField, m, 0) match
+            Ok(ty) ->
+                val name = ic_ident(ic_value_name(v.0, m.prefix))
+                val linked = if name == v.0 then "" else s"\"${v.0}\" "
+
+                externs.push(s"extern $linked$name: $ty\n")
+            Err(why) -> refused.push(s"${v.0}: the variable is $why")
+
+    // The numbers: each enum's constants at its own `c type`, then the macros.
+    var used_consts: Buf[string] = buf()
+    var ctypes = str_builder()
+
+    for e in m.enums
+        if !e.main then continue
+
+        val ty = if e.sysl != "" then e.sysl else "i32"
+
+        if e.sysl != ""
+            val c = if e.named != "" then e.named else s"enum ${e.tag}"
+
+            ctypes.push(s"    ${e.sysl} = \"$c\"\n")
+        end if
+
+        for c in e.consts
+            val name = ic_unique(&used_consts, ic_const_name(c, m.prefix))
+
+            consts.push(s"    $name: $ty = \"$c\"\n")
+
+    var macro_lines = str_builder()
+
+    for k in 0..<macros.len()
+        val name = macros.at(k)
+        var bad = false
+
+        for line in bad_lines
+            if line == long(k) + 2 then bad = true
+
+        if bad
+            refused.push(s"$name: not a constant expression C can evaluate")
+            continue
+        end if
+
+        var qual = ""
+
+        for mt in m.macro_types
+            if mt.0 == int(k) then qual = mt.1
+
+        val t = ic_parse(qual)
+
+        if t.kind == IcPtr && t.parts.at(0).kind == IcNamed && t.parts.at(0).name == "char"
+            refused.push(s"$name: a string, and a 'c const' measures numbers only")
+            continue
+        end if
+
+        val ty = if t.kind == IcNamed then ic_map(t, IcAtField, m, 0).unwrap_or("") else ""
+
+        if !ic_numeric(ty)
+            refused.push(s"$name: a '${ic_show(t)}', not a number")
+            continue
+        end if
+
+        val cname = ic_unique(&used_consts, ic_const_name(name, m.prefix))
+
+        macro_lines.push(s"    $cname: $ty = \"$name\"\n")
+
+    // Only now, since a macro's type may be the first to need one.
+    if m.clong then ctypes.push("    CLong = \"long\"\n")
+    if m.culong then ctypes.push("    CULong = \"unsigned long\"\n")
+
+    // Assembled in the order a reader wants: what it includes, the types, the numbers, the checks
+    // and the calls.
+    var out = str_builder()
+
+    out.push(s"// Generated by `sysl import-c` from $spelled: the raw layer of a binding, one declaration per\n")
+    out.push("// C declaration. Regenerate it rather than editing it -- what a program calls belongs in a\n")
+    out.push("// module above this one.\n\n")
+
+    if opts.module_name != "" then out.push(s"module ${opts.module_name}\n\n")
+    if opts.link != "" then out.push(s"@link(\"${opts.link}\")\n\n")
+
+    out.push(s"@include(\"$spelled\")\n\n")
+
+    if !m.foreign.is_empty()
+        out.push("// Declared by another header, and only ever pointed at here.\n")
+
+        for f in m.foreign
+            out.push(s"opaque struct ${f.0}\n")
+
+        out.push("\n")
+    end if
+
+    out.push(records.finish())
+
+    val alias_text = aliases.finish()
+
+    if alias_text != "" then out.push(alias_text + "\n")
+
+    val ctype_text = ctypes.finish()
+
+    if ctype_text != "" then out.push(s"c type\n$ctype_text\n")
+
+    val parts = [consts.finish(), macro_lines.finish(), layout.finish()]
+    var first = true
+
+    for p in parts
+        if p == "" then continue
+
+        out.push(if first then "c const\n" else "\n")
+        out.push(p)
+        first = false
+
+    if !first then out.push("\n")
+
+    val assert_text = asserts.finish()
+
+    if assert_text != "" then out.push(assert_text + "\n")
+
+    out.push(externs.finish())
+    out.finish()
+end ic_render
+
+private ic_extern(f: IcFunc, q: IcType, m: *IcModel) -> Result[string, string]
+    var ps: Buf[string] = buf()
+
+    for k in 1..<q.parts.len()
+        val i = k - 1
+        val pname = if i < f.params.len() && f.params.at(i) != "" then f.params.at(i) else s"p$i"
+        val ty = ic_map(q.parts.at(k), IcAtParam, m, 0)?
+
+        ps.push(s"${ic_ident(pname)}: $ty")
+
+    if q.variadic then ps.push("...")
+
+    val r = ic_map(q.parts.at(0), IcAtResult, m, 0)?
+    val name = ic_ident(ic_value_name(f.name, m.prefix))
+    val linked = if name == f.name then "" else s"\"${f.name}\" "
+    val result = if r == "" then "" else s" -> $r"
+
+    Ok(s"extern $linked$name(${join(ps.view(), ", ")})$result")
+
+// The text, with what was not generated said at its foot.
+ic_finish(text: string, refused: Buf[string]) -> string
+    if refused.is_empty() then return text
+
+    var out = str_builder()
+
+    out.push(text)
+
+    if !text.ends_with("\n\n") then out.push("\n")
+
+    out.push("// Not generated:\n//\n")
+
+    for item in refused
+        out.push(s"// - $item\n")
+
+    out.finish()

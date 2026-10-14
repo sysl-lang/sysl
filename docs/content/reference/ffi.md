@@ -2894,7 +2894,7 @@ it was.
 | absent | instead |
 |---|---|
 | an `fn(int) -> int` type for sysl's own callables | the `Fn` trait; `*extern` exists only where the representation is somebody else's to choose |
-| a header parser or a binding generator | an `extern` per declaration, and a `.c` shim for what a header hides |
+| a header parser in the language | [`sysl import-c`](/getting-started/cli/#import-c) asks clang for a header's declarations and writes the `extern`s, records and `c const`s; a `.c` shim for what a header hides |
 | a calling convention on an export | open — `@export` implies C's, and `interrupt` already built the shape a second one would take |
 | a capability gate on an extern | open — an extern reaching libc plausibly needs `os`, and does not yet say so |
 
