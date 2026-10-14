@@ -791,6 +791,46 @@ temps_here(e: *Emit) -> Buf[(Val, Type)]
     out
 end temps_here
 
+// **A temporary handed to an async function moves into the task's frame.** The frame keeps a count of
+// every parameter of its own, taken before the call returns, so the count this frame took for the
+// argument is given back as soon as the call returns rather than with the statement's other
+// temporaries -- and a task the callee lets go of is cancelled there, not after the statement that
+// made the call has run to its end. `mark` is the height of the temporaries before the arguments were
+// worked out; only the ones the call was handed are let go, and everything else in the range stays.
+move_into_task(e: *Emit, mark: usize, args: Buf[IrArg])
+    var moved: Buf[(Val, Type)] = buf()
+    var kept: Buf[(Val, Type)] = buf()
+
+    for i in mark..<e.temps.len()
+        val t = e.temps.at(i)
+
+        if handed(args, t.0) then moved.push(t) else kept.push(t)
+
+    if moved.is_empty() then return
+
+    release_values(e, moved)
+    e.temps.truncate(mark)
+
+    for t in kept
+        e.temps.push(t)
+end move_into_task
+
+// Whether a register is one of a call's arguments.
+private handed(args: Buf[IrArg], v: Val) -> bool
+    val name = reg_name(v)
+
+    if name == "" then return false
+
+    for a in args
+        if reg_name(a.value) == name then return true
+
+    false
+end handed
+
+private reg_name(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""
+
 // Every value in a list let go of, last taken first -- by value, or at its address where it was
 // registered as a slot (`own_temp_at`).
 release_values(e: *Emit, vs: Buf[(Val, Type)])

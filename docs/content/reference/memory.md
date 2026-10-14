@@ -341,6 +341,48 @@ What the caller has to look at is one question with three answers:
   handed out — keeps its count in memory the call itself may write. That one costs a retain before
   the call and a release after it, and it is the only shape that does.
 
+**A call to an [async function](/reference/async/) is the one place the first answer changes.** Its
+task keeps a count of every parameter of its own, since its body runs after the call has returned, so
+a temporary handed to it **moves into the task**: the caller gives its count back as soon as the call
+returns instead of holding it to the end of the statement. What the task was handed goes when the
+task lets go of it — at its `return` — and not when the statement that made the call has run to its
+end. A local or a parameter handed to an async call is still the caller's, and keeps its count where
+it always does; a plain call keeps its temporaries to the end of the statement, as above.
+
+```sysl
+struct Noisy
+    id: int
+
+impl Drop for Noisy
+    drop(self)
+        print(s"dropped ${self.id}")
+
+async keep(n: &Noisy) -> int = n.id
+
+plain(n: &Noisy) -> int = n.id
+
+async run()
+    print(s"async ${await keep(Noisy(1))}")
+    print(s"plain ${plain(Noisy(2))}")
+
+    val named: &Noisy = Noisy(3)
+
+    print(s"named ${await keep(named)}")
+    print("end of run")
+
+block_on(run())
+```
+
+```output
+dropped 1
+async 1
+plain 2
+dropped 2
+named 3
+end of run
+dropped 3
+```
+
 The third case is not a technicality. `remember` below is handed a field of module storage and then
 assigns to that very field, so the count the argument was resting on is given back **while the callee
 is still running** — and the read on the next line would be a read of freed storage if nobody else
