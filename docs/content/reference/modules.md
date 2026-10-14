@@ -762,15 +762,21 @@ allocation-free primitive means rendering what it produced and building inputs o
 and both allocate — so a module could have the promise or have tests, and not both.
 
 **What a `@tests` file writes is an override of its module's, per capability, not a set of its own.**
-A file that writes no clause is held to the module's, which is what every one of them meant before
-there was another answer:
+**The allocator is the exception: `@no_alloc` binds the module's own files and never its tests.**
+Tests are hosted code that checks the module, so a `@tests` file that writes no clause may render a
+value with `str`, build an f-string or fill a `Buf` with no `@requires(heap)` above it, and so may a
+`@test` written beside what it tests. The module's functions stay checked as allocator-free
+wherever they are called from, a test included: a test that calls a function of the module which
+allocates is refused at that function, in the module's own file, with the module's own message.
+Every other capability (`@no_os`, `@no_block`) is still inherited by a `@tests` file that writes no
+clause:
 
 ```text
-error: a reference needs an allocator, and this module declared '@no_alloc' — it may hold and
-release storage made elsewhere, and may make none of its own
+error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
 ```
 
-A file that writes one hears about its own instead, since that is the line to go and read:
+A `@tests` file may still hold itself to the allocator with a `@no_alloc` of its own, and then hears
+about its own line, since that is the line to go and read:
 
 ```text
 error: a reference needs an allocator, and this module's '@tests' file declared '@no_alloc' — it may
