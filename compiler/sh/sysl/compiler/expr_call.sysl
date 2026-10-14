@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, cmp, from_int, to_string as big_text}
+import sysl.math.bigint.{BigInt, cmp, from_int, negate, to_string as big_text}
 
 // What a pair of parentheses means, which is six different things told apart by what stands in
 // front of them: a conversion, a variant, a struct's constructor, a simple enum read out of an
@@ -944,12 +944,46 @@ private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = type_expr(cx, args.at(0), literal_target(args.at(0), to))
 
     if texpr_type(t) == Unknown then return t
 
     convert_to(cx, span, t, to, None)
 end convert_call
+
+// The type an integer literal written as a conversion's argument is read at: **the target's**,
+// wherever the value fits it, so `i128(9223372036854775807)` is the `i128` it says and never an
+// `int` too narrow to hold it first. A value that fits `int` and not the target keeps the conversion
+// it always had, from `int` -- `u8(300)` is `44` and `u64(-1)` is the largest `u64` -- and one that
+// fits neither is refused at the target, which is the type the line names.
+private literal_target(arg: Expr, to: Type) -> Option[Type]
+    val value = integer_literal_value(arg)
+
+    if value.is_none() then return None
+
+    val v = value.unwrap()
+
+    to match
+        Integer(bits, signed, _) ->
+            if fits(v, bits, signed) || !fits_int(v) then Some(to) else None
+        _ -> None
+end literal_target
+
+private fits_int(v: BigInt) -> bool = int_type() match
+    Integer(bits, signed, _) -> fits(v, bits, signed)
+    _ -> true
+
+// The value of an unsuffixed integer literal, with the minus in front of it where one is written --
+// the minus and the literal are one unit for the range check, as they are anywhere else.
+private integer_literal_value(arg: Expr) -> Option[BigInt] = *arg.kind match
+    IntLit(digits, base, suffix) -> if suffix == "" then Some(literal_value(digits, base)) else None
+    Unary(op, operand) -> if op == "-" then negated_literal(operand) else None
+    _ -> None
+
+private negated_literal(operand: Expr) -> Option[BigInt] = *operand.kind match
+    IntLit(digits, base, suffix) ->
+        if suffix == "" then Some(negate(literal_value(digits, base))) else None
+    _ -> None
 
 // The conversion itself, which a subtype's cast also reaches.
 //

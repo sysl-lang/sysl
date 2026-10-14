@@ -78,7 +78,8 @@ the literal 300 does not fit byte
 ```
 
 A literal with no type from its context is an `int`, and one too large for `int` is refused rather
-than widened — give it a type, with a suffix or on the declaration:
+than widened — give it a type, with a suffix, on the declaration, or with a
+[conversion](/reference/expressions/#conversions-are-calls), whose argument is read at its target:
 
 ```sysl
 val big = 4294967295

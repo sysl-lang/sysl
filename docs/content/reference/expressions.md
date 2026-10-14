@@ -842,8 +842,53 @@ true true
 **Every position that already pushes an expected type down supplies one**, which is why the list is
 long and needs no rule of its own: an argument, an argument written by name, a parameter's default, an
 annotated binding and the assignment after it, a return and an expression body, a struct's field, an
-element of an array or a slice, a part of a tuple, a variant's payload, and each branch of an `if` or
-a `match` used as a value.
+element of an array or a slice, a part of a tuple, a variant's payload, each branch of an `if` or
+a `match` used as a value, and the operand of a prefix `-` or `~`.
+
+**`-` and `~` hand the operand the whole expected type**, because each answers the type it is given:
+a number's own, or `Self` from `Neg` and `Not`. So whatever settles `P.make()` at a `P[int]` settles
+`-P.make()` there too, and an operator over an operator passes it on. `!` takes and answers a `bool`,
+so its operand is expected to be one whatever the position says.
+
+```sysl
+struct P[T]
+    v: T
+
+    make() -> P[T] = P(T(1))
+
+impl[T: Neg] Neg for P[T]
+    neg(self) -> P[T] = P(-self.v)
+
+val a: P[int] = -P.make()
+val b: P[real] = -(-P.make())
+
+print(a.v, b.v)
+```
+
+```output
+-1 1
+```
+
+The operator lends the operand a type, never an operation: with nothing expected the call is refused
+in its own words, as `P.make()` alone would be, and a type without a `Neg` is refused at the minus.
+
+```sysl
+struct P[T]
+    v: T
+
+    make() -> P[T] = P(T(1))
+
+impl[T: Neg] Neg for P[T]
+    neg(self) -> P[T] = P(-self.v)
+
+val a = -P.make()
+
+print(a.v)
+```
+
+```error
+cannot infer the type argument 'T' of 'P.make' here
+```
 
 **An operand takes it from the operand beside it, and neither side is privileged** — `c == .Green`
 and `.Green == c` are the same question. At a *generic* parameter it is held back to the second pass
@@ -967,6 +1012,29 @@ print(int(2.9), int(-2.9))
 2147483647 -2147483648 0
 255 0 0 255
 2 -2
+```
+
+**An integer literal written as the argument is read at the target wherever it fits there**, so a
+value too wide for `int` needs no suffix to reach a wider type. One that fits `int` and not the
+target is converted from `int`, by the table's own row, and one that fits neither is refused at the
+type the line names:
+
+```sysl
+print(i128(9223372036854775807), u64(18446744073709551615), i64(-2147483649))
+print(u8(300), u64(-1))
+```
+
+```output
+9223372036854775807 18446744073709551615 -2147483649
+44 18446744073709551615
+```
+
+```sysl
+print(i64(9223372036854775808))
+```
+
+```error
+the literal 9223372036854775808 does not fit long
 ```
 
 Everything else is rejected. There is **no conversion to or from `bool`** — `int(true)` is an error
