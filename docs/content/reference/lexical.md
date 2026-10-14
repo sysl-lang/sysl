@@ -844,6 +844,9 @@ print(b)
 the character U+00E9 is not ASCII, so it is more than one byte in UTF-8 and cannot be a u8 — write a string for its bytes, or u8(0x..) for one byte
 ```
 
+The same holds one level up for a string literal: **where a `[N]u8` is wanted**, it is its UTF-8
+bytes — see [a byte array from a string literal](/reference/arrays/#a-byte-array-from-a-string-literal).
+
 Only `u8` is a byte. Every other integer type — `i8` included — is a number, and a character
 literal is not one:
 
