@@ -706,14 +706,17 @@ every type.
 ```sysl
 import sysl.math.Bits
 
-var w: u32 = 7u32
+var w: u12 = 7
 
 print(w.swap_bytes())
 ```
 
 ```error
-type 'uint' has no method 'swap_bytes'
+type 'u12' has no method 'swap_bytes'
 ```
+
+A `u32` does have one — `ByteOrder`'s, reached with no import as every impl's members are — and a
+`u12` is a member of neither.
 
 Reversing the byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it.
 **Every member of `Bits` is total over every integer type**, because a `[T: Bits]` body is written

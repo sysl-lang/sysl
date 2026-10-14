@@ -378,7 +378,7 @@ write_text("/tmp/sysl-fs-doc-3.txt", "abcdef").unwrap()
 var f = open("/tmp/sysl-fs-doc-3.txt").unwrap()
 var window: [4]u8
 
-print(f.read(window).unwrap())
+print(f.read(window).len)
 remove_file("/tmp/sysl-fs-doc-3.txt").unwrap()
 ```
 
