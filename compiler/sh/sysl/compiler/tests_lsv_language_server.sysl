@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.io.{bytes_reader, bytes_writer, Reader}
+import sysl.text.{from_utf8_lossy, Search}
+import sysl.time.{monotonic, whole_millis}
+
+// `sysl lsp`: the JSON it reads and writes, the framing, and scripted exchanges with the server,
+// each response compared whole.
+
+// ---- JSON ----
+
+@test("lsv: a JSON value is read and written back compactly, its escapes and non-ASCII kept")
+lsv_json_round_trip()
+    val text = "{ \"a\" : [1, -2.5e3, true, false, null], \"b\": \"q\\\"b\\\\n\\n\\u00e9\\ud83d\\ude00/\\/\" }"
+
+    assert_eq(json_text(read_json(text).unwrap()),
+              "{\"a\":[1,-2.5e3,true,false,null],\"b\":\"q\\\"b\\\\n\\né😀//\"}")
+
+@test("lsv: a control character is written as a \\u escape")
+lsv_json_control_character()
+    assert_eq(json_quote("a\u{1}b\tc"), "\"a\\u0001b\\tc\"")
+
+@test("lsv: JSON that is not well formed is refused, saying where")
+lsv_json_refusals()
+    val cases = [
+        ("{\"a\" 1}", "':' expected at offset 5"),
+        ("[1,]", "a value was expected at offset 3"),
+        ("01", "a malformed number at offset 0"),
+        ("1.", "a malformed number at offset 0"),
+        ("\"\\ud800\"", "a lone high surrogate at offset 1"),
+        ("\"\\udc00\"", "a lone low surrogate at offset 1"),
+        ("\"\\x\"", "'\\x' is not a JSON escape, at offset 1"),
+        ("\"open", "a string was opened and never closed"),
+        ("[1", "a '[' was opened and never closed"),
+        ("{\"a\":1", "a '{' was opened and never closed"),
+        ("1 2", "unexpected text after the value at offset 2"),
+        ("nul", "a value was expected at offset 0")
+    ]
+
+    for c in cases
+        read_json(c.0) match
+            Ok(_) -> assert(false, s"accepted: ${c.0}")
+            Err(e) -> assert_eq(e, c.1)
+end lsv_json_refusals
+
+@test("lsv: members are read by path, a number as an integer")
+lsv_json_paths()
+    val j = read_json("{\"p\":{\"line\":12,\"uri\":\"x\"},\"n\":\"7\"}").unwrap()
+
+    assert_eq(json_int_at(j, ["p", "line"]).unwrap_or(-1), 12)
+    assert_eq(json_text_at(j, ["p", "uri"]).unwrap_or(""), "x")
+    assert(json_int_at(j, ["n"]).is_none())
+    assert(json_at(j, ["p", "nope"]).is_none())
+
+// ---- framing ----
+
+@test("lsv: messages are read off a stream by Content-Length, a header name in any case")
+lsv_framing_reads_messages()
+    val wire = lsp_frame("{\"a\":1}") + "content-length: 2\r\nContent-Type: x\r\n\r\n[]"
+    var r = bytes_reader(wire.bytes)
+    var pending: Buf[u8] = buf()
+
+    assert_eq(lsv_read(&r, &pending), "{\"a\":1}")
+    assert_eq(lsv_read(&r, &pending), "[]")
+    assert_eq(lsv_read(&r, &pending), "<end>")
+end lsv_framing_reads_messages
+
+// What `lsp_read` answered, as one string to compare.
+private lsv_read(r: *Reader, pending: *Buf[u8]) -> string = lsp_read(r, pending) match
+    Ok(Some(body)) -> body
+    Ok(None) -> "<end>"
+    Err(why) -> s"<error: $why>"
+
+@test("lsv: a message cut short, or one with no length, is refused")
+lsv_framing_refusals()
+    var pending: Buf[u8] = buf()
+    var short = bytes_reader("Content-Length: 10\r\n\r\n{}".bytes)
+
+    assert_eq(lsv_read(&short, &pending), "<error: the input ended inside a message>")
+
+    pending = buf()
+
+    var no_length = bytes_reader("X: 1\r\n\r\n{}".bytes)
+
+    assert_eq(lsv_read(&no_length, &pending), "<error: a message with no Content-Length header>")
+
+    pending = buf()
+
+    var cut = bytes_reader("Content-Len".bytes)
+
+    assert_eq(lsv_read(&cut, &pending), "<error: the input ended inside a message's header>")
+end lsv_framing_refusals
+
+// ---- positions ----
+
+@test("lsv: a position counts UTF-16 code units, both ways")
+lsv_positions_are_utf16()
+    // `é` is two bytes and one unit; `😀` is four bytes and two units.
+    val text = "ab\né😀z\n"
+    val src = source_of("t.sysl", text)
+    val z = text.bytes.len - 2
+
+    assert_eq(json_text(lsp_position(src, z)), "{\"line\":1,\"character\":3}")
+    assert_eq(lsp_offset(src, 1, 3), z)
+    assert_eq(lsp_offset(src, 1, 99), text.bytes.len - 1)
+    assert_eq(lsp_offset(src, 9, 0), text.bytes.len)
+end lsv_positions_are_utf16
+
+@test("lsv: a file URI is decoded to a path and a path encoded to one")
+lsv_uris()
+    assert_eq(lsp_uri_file("file:///a/b%20c/%C3%A9.sysl"), "/a/b c/é.sysl")
+    assert_eq(lsp_file_uri("/a/b c/é.sysl"), "file:///a/b%20c/%C3%A9.sysl")
+    assert_eq(lsp_uri_file("untitled:1"), "untitled:1")
+
+// ---- what an editor holds ----
+
+@test("lsv: a file an editor holds is read as it holds it, alone and in a tree, until let go")
+lsv_editor_text_replaces_the_disk()
+    val root = make_temp_dir("sysl-lsv").unwrap()
+
+    write_text(s"$root/a.sysl", "main() = ()\n").unwrap()
+    hold_editor_text(s"$root/a.sysl", "main() = print(1)\n")
+    hold_editor_text(s"$root/unsaved.sysl", "f() = ()\n")
+
+    assert_eq(lsv_texts(collect(s"$root/a.sysl", None).unwrap()), "a.sysl=main() = print(1)\n")
+    assert_eq(lsv_texts(collect(s"$root/unsaved.sysl", None).unwrap()), "unsaved.sysl=f() = ()\n")
+    assert_eq(lsv_texts(collect(root, None).unwrap()), "a.sysl=main() = print(1)\n")
+
+    release_editor_text(s"$root/a.sysl")
+    release_editor_text(s"$root/unsaved.sysl")
+
+    assert_eq(lsv_texts(collect(root, None).unwrap()), "a.sysl=main() = ()\n")
+    assert(editor_text(s"$root/a.sysl").is_none())
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_editor_text_replaces_the_disk
+
+// Each file found, as its name and what it said.
+private lsv_texts(found: Buf[Found]) -> string
+    var out = ""
+
+    for f in found
+        out = out + basename(f.src.name) + "=" + from_utf8_lossy(f.src.bytes)
+
+    out
+end lsv_texts
+
+// ---- the protocol ----
+
+private lsv_request(id: int, method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+private lsv_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private lsv_at(uri: string, line: int, character: int) -> string =
+    s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":$line,\"character\":$character}}"
+
+private lsv_open(uri: string, text: string) -> string =
+    lsv_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"sysl\",\"version\":1,\"text\":${json_quote(text)}}}")
+
+// A server past `initialize`.
+private lsv_ready() -> LspServer
+    var server = lsp_server()
+
+    lsp_answer(&server, lsv_request(1, "initialize", "{\"capabilities\":{}}"))
+    lsp_answer(&server, lsv_notify("initialized", "{}"))
+    server
+end lsv_ready
+
+// The one message an exchange answered with.
+private lsv_one(server: *LspServer, body: string) -> string
+    val out = lsp_answer(server, body)
+
+    assert_eq(out.len(), 1)
+    out.at(0)
+end lsv_one
+
+@test("lsv: initialize answers the capabilities")
+lsv_initialize()
+    var server = lsp_server()
+
+    assert_eq(lsv_one(&server, lsv_request(1, "initialize", "{\"capabilities\":{}}")),
+              "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
+              "\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}," +
+              s"\"serverInfo\":{\"name\":\"sysl\",\"version\":\"${Version}\"}}}")
+    assert_eq(lsp_answer(&server, lsv_notify("initialized", "{}")).len(), 0)
+end lsv_initialize
+
+@test("lsv: a message that is not JSON is answered with a parse error and a null id")
+lsv_malformed_message()
+    var server = lsv_ready()
+
+    assert_eq(lsv_one(&server, "{oops"),
+              "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700," +
+              "\"message\":\"the message is not JSON: a quoted key expected at offset 1\"}}")
+    assert_eq(lsv_one(&server, "{\"jsonrpc\":\"2.0\",\"id\":4}"),
+              "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600,\"message\":\"a request names a method\"}}")
+end lsv_malformed_message
+
+@test("lsv: the lifecycle -- before initialize, an unknown method, after shutdown, and exit")
+lsv_lifecycle()
+    var server = lsp_server()
+
+    assert_eq(lsv_one(&server, lsv_request(0, "textDocument/hover", "{}")),
+              "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32002," +
+              "\"message\":\"'textDocument/hover' before 'initialize'\"}}")
+
+    lsp_answer(&server, lsv_request(1, "initialize", "{}"))
+
+    assert_eq(lsv_one(&server, lsv_request(2, "no/such", "{}")),
+              "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601," +
+              "\"message\":\"'no/such' is not a method sysl lsp answers\"}}")
+    assert_eq(lsp_answer(&server, lsv_notify("no/such", "{}")).len(), 0)
+    assert_eq(lsv_one(&server, lsv_request(3, "shutdown", "null")), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+    assert_eq(lsv_one(&server, lsv_request(4, "textDocument/hover", "{}")),
+              "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600," +
+              "\"message\":\"'textDocument/hover' after 'shutdown'\"}}")
+    assert(server.exit_code.is_none())
+
+    lsp_answer(&server, lsv_notify("exit", "{}"))
+    assert_eq(server.exit_code.unwrap_or(-1), 0)
+
+    var abrupt = lsv_ready()
+
+    lsp_answer(&abrupt, lsv_notify("exit", "{}"))
+    assert_eq(abrupt.exit_code.unwrap_or(-1), 1)
+end lsv_lifecycle
+
+// The program the analysis exchanges read. Line 4 holds a non-BMP character before its mistake, so a
+// column counted in bytes (21) or characters (18) would not be the 19 UTF-16 units the protocol wants.
+private lsv_program() -> string = "val limit: int = 10\nf(n: int) -> int = n + limit\nmain()\n    val x = f(2)\n" +
+    "    print(x, \"😀\", nope)\n"
+
+private lsv_publish(uri: string, diagnostics: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[$diagnostics]}}"
+
+private lsv_range(l0: int, c0: int, l1: int, c1: int) -> string =
+    s"{\"start\":{\"line\":$l0,\"character\":$c0},\"end\":{\"line\":$l1,\"character\":$c1}}"
+
+@test("lsv: opening a file publishes the analyzer's diagnostics, ranged in UTF-16")
+lsv_diagnostics_on_open()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsv_ready()
+
+    assert_eq(lsv_one(&server, lsv_open(uri, lsv_program())),
+              lsv_publish(uri, s"{\"range\":${lsv_range(4, 19, 4, 23)},\"severity\":1,\"source\":\"sysl\"," +
+                               "\"message\":\"undefined name 'nope'\"}"))
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_diagnostics_on_open
+
+@test("lsv: a syntax error is published where it is, and a fix clears it")
+lsv_diagnostics_follow_changes()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsv_ready()
+
+    assert_eq(lsv_one(&server, lsv_open(uri, "main()\n    val = 3\n")),
+              lsv_publish(uri, s"{\"range\":${lsv_range(1, 8, 1, 9)},\"severity\":1,\"source\":\"sysl\"," +
+                               "\"message\":\"identifier expected\"}"))
+
+    val change = s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":2},\"contentChanges\":[{\"text\":\"main()\\n    print(1)\\n\"}]}"
+
+    assert_eq(lsv_one(&server, lsv_notify("textDocument/didChange", change)), lsv_publish(uri, ""))
+    assert_eq(lsv_one(&server, lsv_notify("textDocument/didClose", s"{\"textDocument\":{\"uri\":\"$uri\"}}")),
+              lsv_publish(uri, ""))
+    assert(editor_text(s"$root/t.sysl").is_none())
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_diagnostics_follow_changes
+
+@test("lsv: hover shows a local's type, a function's signature and module storage's type")
+lsv_hover()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsv_ready()
+
+    lsp_answer(&server, lsv_open(uri, lsv_program()))
+
+    val cases = [
+        (4, 10, "x: int", lsv_range(4, 10, 4, 11)),
+        (3, 12, "f(n: int) -> int", lsv_range(3, 12, 3, 13)),
+        (1, 26, "limit: int", lsv_range(1, 23, 1, 28)),
+        (1, 28, "limit: int", lsv_range(1, 23, 1, 28))
+    ]
+
+    for c in cases
+        assert_eq(lsv_one(&server, lsv_request(2, "textDocument/hover", lsv_at(uri, c.0, c.1))),
+                  s"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"contents\":{\"kind\":\"markdown\"," +
+                  s"\"value\":\"```sysl\\n${c.2}\\n```\"},\"range\":${c.3}}}")
+
+    assert_eq(lsv_one(&server, lsv_request(3, "textDocument/hover", lsv_at(uri, 2, 0))),
+              "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+    assert_eq(lsv_one(&server, lsv_request(4, "textDocument/hover", lsv_at("file:///not/open.sysl", 0, 0))),
+              "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}")
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_hover
+
+@test("lsv: definition reaches a local's binding and a module-level function and val")
+lsv_definition()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsv_ready()
+
+    lsp_answer(&server, lsv_open(uri, lsv_program()))
+
+    val cases = [
+        (4, 10, lsv_range(3, 8, 3, 9)),
+        (3, 12, lsv_range(1, 0, 1, 1)),
+        (1, 24, lsv_range(0, 4, 0, 9)),
+        (1, 19, lsv_range(1, 2, 1, 3))
+    ]
+
+    for c in cases
+        assert_eq(lsv_one(&server, lsv_request(5, "textDocument/definition", lsv_at(uri, c.0, c.1))),
+                  s"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"uri\":\"$uri\",\"range\":${c.2}}}")
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_definition
+
+@test("lsv: a definition in another file is answered with that file's URI")
+lsv_definition_in_the_library()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsv_ready()
+
+    lsp_answer(&server, lsv_open(uri, "import sysl.text.to_lower\n\nmain()\n    print(to_lower(\"A\"))\n"))
+
+    val got = lsv_one(&server, lsv_request(6, "textDocument/definition", lsv_at(uri, 3, 12)))
+
+    // A library file is named `library/sysl/…` by the compilation; the answer is where it is on disk.
+    assert(got.contains(s"\"uri\":\"file:///"), got)
+    assert(got.ends_with("/sysl/text/edit.sysl\",\"range\":" + lsv_range(193, 0, 193, 8) + "}}"), got)
+    assert(!got.contains(uri), got)
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_definition_in_the_library
+
+@test("lsv: the server runs a scripted session over a stream and ends with exit's status")
+lsv_serve_a_session()
+    val input = lsp_frame(lsv_request(1, "initialize", "{}")) + lsp_frame(lsv_notify("initialized", "{}")) +
+        lsp_frame(lsv_request(2, "shutdown", "null")) + lsp_frame(lsv_notify("exit", "{}"))
+    var r = bytes_reader(input.bytes)
+    var w = bytes_writer()
+    var noted: Buf[string] = buf()
+
+    assert_eq(lsp_serve(&r, &w, line -> noted.push(line)), 0)
+
+    val out = from_utf8_lossy(w.bytes.view())
+
+    assert(out.starts_with("Content-Length: "), out)
+    assert(out.ends_with(lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}")), out)
+    assert_eq(noted.len(), 0)
+
+    var broken = bytes_reader("Content-Length: x\r\n\r\n{}".bytes)
+    var nowhere = bytes_writer()
+
+    assert_eq(lsp_serve(&broken, &nowhere, line -> noted.push(line)), 1)
+    assert_eq(noted.at(0), "sysl: error: lsp: 'Content-Length: x' is not a length")
+end lsv_serve_a_session
+
+@test("lsv: lsp takes --stdio and refuses any other option")
+lsv_command_line()
+    val (lines, code) = said(["sysl", "lsp", "--tcp"])
+
+    assert_eq(code, Misused)
+    assert_eq(lines.at(0), "Error: Unknown option --tcp\nusage: sysl lsp [--stdio]")
+
+// The cost the design is built on: analyzing a thousand-line file again, whole, after a change. The
+// number is printed for the record; the bound is loose enough for a loaded machine.
+@test("lsv: re-analysis of a thousand-line file is measured")
+lsv_reanalysis_latency()
+    if std_root().is_err() then return
+
+    var text = ""
+
+    for i in 1..125
+        text = text + s"f$i(n: int) -> int\n    var acc = n\n\n    for k in 0..<n\n        acc += k * $i\n\n" +
+            s"    if acc > 100 then acc - 1 else acc + 1\n\n"
+
+    text = text + "main()\n    print(f1(3))\n"
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/big.sysl")
+    var server = lsv_ready()
+
+    lsp_answer(&server, lsv_open(uri, text))
+
+    val started = monotonic()
+    val change = s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":2},\"contentChanges\":[{\"text\":${json_quote(text + "\n")}}]}"
+
+    assert_eq(lsv_one(&server, lsv_notify("textDocument/didChange", change)), lsv_publish(uri, ""))
+
+    val took = whole_millis(monotonic() - started)
+
+    eprints(s"lsv: re-analysis of ${text.bytes.len} bytes, 1002 lines: $took ms\n")
+    assert(took < 10000, s"$took ms")
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_reanalysis_latency

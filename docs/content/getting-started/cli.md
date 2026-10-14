@@ -32,6 +32,7 @@ the path is standing on.
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
 | `sysl targets` | list the machines sysl can build for |
 | `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
+| `sysl lsp` | serve the Language Server Protocol to an editor, on standard input and output |
 
 A subcommand is required; sysl with none says so on stderr, with its usage, and exits 2.
 
@@ -39,7 +40,7 @@ A word that is not one of these is refused on stderr, naming the commands there 
 Every command is sysl's own — nothing is looked for on the `PATH`:
 
 ```text
-sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets
+sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets, lsp
 ```
 
 **What a command was run for goes to stdout, and everything it says about the run goes to stderr** —
@@ -857,6 +858,27 @@ neither RP2350 core has the instruction. None of that is a sysl dependency the c
 about: it is what any C compiler emits for the same code, and a real project never meets it because
 its SDK has linked `libgcc` or compiler-rt already. Meeting it looks like `undefined symbol:
 __aeabi_ldivmod` at the link, which is the one place anybody will come looking for this paragraph.
+
+### `lsp`
+
+`sysl lsp` is a [Language Server Protocol](https://microsoft.github.io/language-server-protocol/)
+server on standard input and output, for an editor to start and talk to. It takes `--stdio`, which is
+what an editor's client library passes, and no other option. Standard output belongs to the protocol;
+anything the server has to say about itself goes to standard error.
+
+Every answer comes from the same analysis `sysl build` makes, run again, whole, on each change to an
+open file — its text as the editor holds it, saved or not:
+
+| request | answer |
+|---|---|
+| `textDocument/didOpen`, `didChange` (full text) | `textDocument/publishDiagnostics`: the file's syntax error, or every diagnostic the analysis reports about it, ranged in UTF-16 columns as the protocol counts them |
+| `textDocument/hover` | the type of a local or a module `val`/`var`, or a function's signature |
+| `textDocument/definition` | where that name is declared — in the file, another file of the package, or the standard library |
+
+A file is analyzed with the package whose `package.hocon` is nearest above it, or alone where there
+is none. A message that is not JSON is answered with the JSON-RPC parse error (`-32700`); a request
+the server does not answer, with `-32601`. The server ends at `exit`, with status 0 after `shutdown`
+and 1 without; input that ends or cannot be framed ends it with status 1.
 
 ## Flags every subcommand takes
 
