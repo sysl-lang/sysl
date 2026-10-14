@@ -412,6 +412,26 @@ print(max(1, 2))
 'max' is already imported
 ```
 
+**An import may not take a name a module path begins with**, since `fs.read` would then mean one thing
+in a file that imported it and another in the file beside it. The name can always be bound to
+something else with `as`:
+
+```sysl
+import sysl.unicode.{fold as sysl}
+
+print(sysl("A"))
+```
+
+```error
+'sysl' is a module, so importing something else under that name would hide it — import it as another name with 'as'
+```
+
+**The names that check counts are the ones the importing file could have written.** A program's own
+modules are the program's: a program with a module called `fold` or `buf` cannot write
+`import sysl.unicode.{fold}` itself, but the library's own files, which import exactly that, are not
+held to the program's module names, and the reverse is equally true — the library's internal imports
+bind nothing in the program.
+
 **The standard module counts as one of those wildcards.** `sysl` is auto-imported into every file, so
 a written `import a.*` where `a` declares an `Option` of its own is the two-wildcard case, and an
 unqualified `Option` in that file is a compile error naming both — it does not shadow the library's.
