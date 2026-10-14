@@ -1,0 +1,87 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **Two traits may declare a member of one name** (`reference/traits.md`), and a type implementing
+// both files the second block's members under a suffix. That suffix covers EVERY member of the
+// block, not only the shared one -- so an associated function the second trait declares alone is
+// filed only suffixed, and a call through the type's name has to find it there rather than report
+// it missing.
+
+// `Level` shares `magnitude` with the library's `sysl.math.Magnitude`, which f32 already implements.
+private tns_level() -> string =
+    "trait Level\n    magnitude(self) -> Self\n    half() -> Self\n" +
+    "impl Level for f32\n    magnitude(self) -> f32 = self * 2.0\n    half() -> f32 = 0.5\n"
+
+// Two user traits sharing `half`, the second with a member of its own.
+private tns_pair() -> string =
+    "trait W\n    half() -> Self\ntrait M\n    half() -> Self\n    unit() -> Self\n" +
+    "impl W for f32\n    half() -> f32 = 0.5\nimpl M for f32\n    half() -> f32 = 0.25\n" +
+    "    unit() -> f32 = 1.0\n"
+
+@test("an impl whose trait shares a member name with a std trait keeps its associated functions")
+tns_shared_with_std()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tns_level() + "h[S: Level]() -> S = S.half()\nprint(h[f32]())\n"), "0.5\n")
+    assert_eq(enm_ran(tns_level() + "print(f32.half())\n"), "0.5\n")
+
+@test("both traits' members are reached through their own bounds")
+tns_both_through_bounds()
+    if !enm_ready() then return
+
+    val text = "import sysl.math.Magnitude\n" + tns_level() +
+               "lv[S: Level](x: S) -> S = x.magnitude()\n" +
+               "mg[S: Magnitude](x: S) -> S = x.magnitude()\n" +
+               "print(lv(f32(-3)), mg(f32(-3)))\n"
+
+    assert_eq(enm_ran(text), "-6 3\n")
+
+@test("a call on the value with both traits in scope is ambiguous, not missing")
+tns_ambiguous_with_std()
+    if !enm_ready() then return
+
+    val said = enm_err("import sysl.math.Magnitude\n" + tns_level() + "print(f32(-3).magnitude())\n")
+
+    assert(said.contains("'magnitude' on f32 comes from sysl.math.Magnitude and Level, and each " +
+                         "is in scope here — nothing in the call says which was meant"), said)
+    assert(!said.contains("has no"), said)
+
+@test("two user traits sharing a name: each through its bound, and the second's own member")
+tns_user_pair()
+    if !enm_ready() then return
+
+    val text = tns_pair() + "w[S: W]() -> S = S.half()\nm[S: M]() -> S = S.half()\n" +
+               "o[S: M]() -> S = S.unit()\nprint(w[f32](), m[f32](), o[f32](), f32.unit())\n"
+
+    assert_eq(enm_ran(text), "0.5 0.25 1 1\n")
+
+@test("an associated function both user traits declare, called through the type, is ambiguous")
+tns_user_pair_ambiguous()
+    if !enm_ready() then return
+
+    val said = enm_err(tns_pair() + "print(f32.half())\n")
+
+    assert(said.contains("'half' on f32 comes from W and M, and each is in scope here — nothing " +
+                         "in the call says which was meant"), said)
+    assert(!said.contains("has no associated function"), said)
+
+@test("on a struct, the second trait's associated function is reached through the type")
+tns_struct()
+    if !enm_ready() then return
+
+    val text = "trait W\n    size(self) -> int\ntrait M\n    size(self) -> int\n    make() -> Self\n" +
+               "struct B\n    x: int\nimpl W for B\n    size(self) -> int = 1\n" +
+               "impl M for B\n    size(self) -> int = 2\n    make() -> B = B(3)\n" +
+               "print(B.make().x)\n"
+
+    assert_eq(enm_ran(text), "3\n")
+
+@test("a name neither trait declares is still told it is missing")
+tns_still_missing()
+    if !enm_ready() then return
+
+    val said = enm_err(tns_pair() + "print(f32.nope())\n")
+
+    assert(said.contains("f32 has no associated function 'nope'"), said)

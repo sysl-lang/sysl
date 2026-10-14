@@ -417,6 +417,33 @@ print(Box().size())
 Note what the refusal turns on: *each is in scope here*. A file importing one of the two has no
 ambiguity to resolve, which is the ordinary case and the reason this is rarely met.
 
+**Sharing one name costs the trait nothing else.** Its other members stay the type's, and a bound
+reaches every one of them, an associated function through the type's name included. Here `Level`
+shares `magnitude` with the library's `sysl.math.Magnitude`, which `f32` already implements:
+
+```sysl
+trait Level
+    magnitude(self) -> Self
+    half() -> Self
+
+impl Level for f32
+    magnitude(self) -> f32 = self * 2.0
+    half() -> f32 = 0.5
+
+h[S: Level]() -> S = S.half()
+twice[S: Level](x: S) -> S = x.magnitude()
+
+print(h[f32](), f32.half(), twice(f32(-3)))
+```
+
+```output
+0.5 0.5 -6
+```
+
+The same rule holds through the type's name as on a value: an associated function both traits
+declare, called as `f32.half()` with both in scope, is refused with the message above, and a bound
+naming one of the two settles it.
+
 **Where it cannot be arranged away is a member taking no arguments on a type that is genuinely
 both**, and that is why a question two traits both want is a **required** trait rather than a member
 each declares. `Writer` and `Reader` both need to answer whether a stream has gone wrong, and an open
