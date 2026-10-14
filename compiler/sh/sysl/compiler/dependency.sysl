@@ -240,8 +240,8 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version', " +
-                "'workspace'")
+                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'rev', " +
+                "'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
     val origin = read_origin(sub, where)?
@@ -258,7 +258,7 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
 end read_dependency
 
 private known_dependency_key(key: string) -> bool =
-    key == "git" || key == "version" || key == "path" || key == "mount" || key == "optional" ||
+    key == "git" || key == "version" || key == "rev" || key == "path" || key == "mount" || key == "optional" ||
     key == "features" || key == "default_features" || key == "workspace"
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
@@ -321,7 +321,7 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
             return Err(s"'$where.workspace' is only ever 'true' — leave it out and name a 'git' " +
                 "coordinate or a 'path' instead")
 
-        if has_git || has_path || conf_at(sub, "version").is_some()
+        if has_git || has_path || conf_at(sub, "version").is_some() || conf_at(sub, "rev").is_some()
             return Err(s"'$where' names 'workspace = true' and a 'git', 'path' or 'version' as well " +
                 "— a workspace member is the directory the workspace lists, at no version, so it " +
                 "is named by the workspace alone")
@@ -343,6 +343,10 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
             return Err(s"'$where' names a 'path' and a 'version' — a path dependency is the " +
                 "directory as it is now, and there is nothing to resolve a version against")
 
+        if conf_at(sub, "rev").is_some()
+            return Err(s"'$where' names a 'path' and a 'rev' — a path dependency is the " +
+                "directory as it is now, and there is no repository to pin a commit of")
+
         val dir = conf_text(sub, "path")
 
         if dir.is_empty() then return Err(s"'$where.path' is empty")
@@ -350,10 +354,29 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
         return Ok(Local(dir))
 
     val coordinate = conf_text(sub, "git")
+    val has_rev = conf_at(sub, "rev").is_some()
+
+    if has_rev && conf_at(sub, "version").is_some()
+        return Err(s"'$where' names a 'version' and a 'rev' — a dependency is read at a release or " +
+            "at a pinned commit, and exactly one of the two says which")
+
+    // **A pin is a commit and nothing else**: the sha, whole or shortened, because a branch name
+    // moves and a tag already has `version`. It is lowercase hex since that is what git prints and
+    // what `sysl.sum` records, so one commit is never two spellings.
+    if has_rev
+        val sha = conf_text(sub, "rev")
+
+        if !is_commit_sha(sha)
+            return Err(s"'$where.rev' is '$sha', which is not a commit — a pin is a commit's sha, " +
+                "in lowercase hex, whole or shortened to at least seven digits")
+
+        check_coordinate(coordinate, where)?
+        return Ok(Git(coordinate, release_at_rev(sha)))
+    end if
 
     if conf_at(sub, "version").is_none()
-        return Err(s"'$where' names a 'git' coordinate and no 'version' — a coordinate says which " +
-            "repository and a version says which of it")
+        return Err(s"'$where' names a 'git' coordinate and neither a 'version' nor a 'rev' — a " +
+            "coordinate says which repository, and a version or a pinned commit says which of it")
 
     val version = release_of(conf_text(sub, "version")) match
         Err(why) -> return Err(s"'$where.version': $why")
@@ -363,6 +386,17 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
     check_major(coordinate, version, where)?
     Ok(Git(coordinate, version))
 end read_origin
+
+// Whether text is a commit's sha as a pin writes one: lowercase hex, from git's usual seven-digit
+// abbreviation up to the whole forty.
+is_commit_sha(text: string) -> bool
+    if text.bytes.len < 7 || text.bytes.len > 40 then return false
+
+    for c in text.bytes
+        if !((c >= u8('0') && c <= u8('9')) || (c >= u8('a') && c <= u8('f'))) then return false
+
+    true
+end is_commit_sha
 
 // What a coordinate is: a host and a path under it, as `git` would be given, and **not a URL**.
 //

@@ -366,19 +366,24 @@ reason.
 members of one name on one type and a call could not say which it meant — on a file, which is both.
 One shared latch leaves a single answer that each of them reaches.
 
-Reaching a trait member still needs the trait in scope:
+Reaching a trait member on a `File` needs no import of the trait, since `impl Reader for File` is
+one the program can see ([Reaching a member through its
+trait](/reference/traits/#reaching-a-member-through-its-trait)):
 
 ```sysl
-import sysl.fs.open
+import sysl.fs.{open, write_text, remove_file}
+
+write_text("/tmp/sysl-fs-doc-3.txt", "abcdef").unwrap()
 
 var f = open("/tmp/sysl-fs-doc-3.txt").unwrap()
 var window: [4]u8
 
-f.read(window)
+print(f.read(window).unwrap())
+remove_file("/tmp/sysl-fs-doc-3.txt").unwrap()
 ```
 
-```error
-sysl.fs.File has 'read' from sysl.io.Reader, and that trait is not in scope here — import it to reach the member
+```output
+4
 ```
 
 ### Position and size

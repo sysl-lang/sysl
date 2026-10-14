@@ -1338,7 +1338,7 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
     val subject = type_show(rty)
 
     if alts.is_none()
-        if member_reachable(cx, base, mname, via) then return Some(mname)
+        if member_reachable(cx, base, mname, via, implicit = true) then return Some(mname)
 
         var one: Buf[string] = buf()
 
@@ -1369,6 +1369,16 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
 
     for item in all
         if member_reachable(cx, base, item, via) then cands.push(item)
+
+    // **What the file names answers first; the impls the program can see answer only where it named
+    // none of them** -- Scala 3's lexical scope ahead of its implicit scope. So an import still
+    // settles which of two traits is meant, and a call naming neither reaches whichever one an impl
+    // gave the type, or is ambiguous between several.
+    val implicit = cands.is_empty()
+
+    if implicit
+        for item in all
+            if member_reachable(cx, base, item, via, implicit = true) then cands.push(item)
 
     if cands.is_empty()
         if provided then return Some(mname)
@@ -1454,6 +1464,13 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
                 if traits.at(j) == module_show(tr.unwrap()) then seen = true
 
             if !seen then traits.push(module_show(tr.unwrap()))
+
+    if traits.len() > 1 && implicit
+        cx.fault(span, s"'$mname' on $subject comes from ${conjoin(traits)}, and this file names " +
+                 "none of them — nothing in the call says which was meant; import the one that " +
+                 "was meant")
+        return None
+    end if
 
     if traits.len() > 1
         cx.fault(span, s"'$mname' on $subject comes from ${conjoin(traits)}, and each is in scope " +
@@ -1615,7 +1632,7 @@ end member_func_name_quiet
 // where the trait can be named, which is what keeps the first library to implement a wide trait for
 // a built-in from claiming those names from everybody.
 private member_reachable(cx: &Analyzer, base: string, filed: string,
-                         via: Buf[string] = no_bound_traits()) -> bool
+                         via: Buf[string] = no_bound_traits(), implicit: bool = false) -> bool
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
 
     // A member that arrives with its type is reachable wherever the type is.
@@ -1628,9 +1645,14 @@ private member_reachable(cx: &Analyzer, base: string, filed: string,
 
     // **A member an `impl` brought is reached where its trait can be NAMED, not merely where the
     // trait is visible.** The two are different questions and only the first is what an import
-    // changes: `sysl.text.Search` is public everywhere, so a visibility test answers yes in a file
-    // that never imported it and `"  x  ".trim()` compiles where the reference refuses it.
-    names_trait(cx, from.unwrap())
+    // changes: a file naming `sysl.text.Search` reaches its `trim` ahead of any other trait's.
+    if names_trait(cx, from.unwrap()) then return true
+
+    // **The second reach is the impl's own visibility** (`reference/traits.md § Reaching a member
+    // through its trait`): a member an `impl` the program can see gave a type is reached on a value
+    // of that type with no import at all, once nothing the file names has answered. A trait private
+    // to the module that wrote it stays out of reach, since nothing outside could name it either.
+    implicit && reachable_key(cx.an, from.unwrap(), cx.scope)
 end member_reachable
 
 // Whether the file the expression is written in can name a trait: its own module's, one it imported,
@@ -1736,7 +1758,7 @@ end method_written
 // Whether a member the reader named is one their file may reach.
 private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl,
                              via: Buf[string] = no_bound_traits())
-    if !member_reachable(cx, base, filed, via)
+    if !member_reachable(cx, base, filed, via, implicit = true)
         val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed)).unwrap_or("")
 
         cx.fault(span, s"'${source_member_name(filed)}' is a member '${qualified_name(from)}' gave " +
@@ -2096,10 +2118,10 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
 
     val tr_name = found.unwrap()
 
-    // **A provided membership says which types have the member, never which files may write it**:
-    // the trait has to be nameable here, as a library `impl`'s member has to be. Answering nothing
-    // leaves the call to the ordinary "has no method" refusal.
-    if !names_trait(cx, tr_name) then return None
+    // **A provided membership is reached as a library `impl`'s member is**: the trait named here, or
+    // failing that visible here, since the compiler's membership is an impl every program can see.
+    // Answering nothing leaves the call to the ordinary "has no method" refusal.
+    if !names_trait(cx, tr_name) && !reachable_key(cx.an, tr_name, cx.scope) then return None
 
     val d = trait_decl_at(cx.an, tr_name)
 
