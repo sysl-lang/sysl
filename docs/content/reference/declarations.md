@@ -475,7 +475,9 @@ Three things end a tail position instead of being optimized around:
   the way to it, and the next round writes every slot again, so `&sub` handed down would be read
   after `sub` was freed or written over. Where the body takes the address of its own storage
   anywhere — `&` of a local, a parameter or a temporary, or a slice of a local array — a self-call
-  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call.
+  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call. A
+  parameter passed on as it arrived — never written, its address never taken — is the caller's, and
+  does not count.
 
 Any of them leaves the function compiled exactly as written:
 
@@ -665,6 +667,60 @@ print(f(x))
 
 ```error
 counted value
+```
+
+**No argument may point into the frame being replaced.** The callee runs in the replaced frame's
+place, so `&` of a local, a parameter or a temporary — or a slice of a local array — would hand it
+storage that no longer exists. The test is the one a self tail call is held to: where the body takes
+the address of its own storage anywhere, an argument that can hold an address (a pointer, a slice,
+or a value made of one) is refused, unless it is one of the function's own parameters passed on as
+it arrived, which points at its caller's storage:
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    become g(&next, acc + s.n)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```error
+an argument may point into this frame
+```
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    var probe = S(0)
+    val seen = &probe
+
+    if s.n == 0 then return acc + seen.n
+
+    s.n -= 1
+
+    become g(s, acc + 1)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```output
+4
 ```
 
 The rest are the tail call's own, for the reasons `Tail calls` gives: an `ensures` is checked when a

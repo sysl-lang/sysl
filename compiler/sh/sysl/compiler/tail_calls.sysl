@@ -206,15 +206,57 @@ private is_self_call(f: TFunc, name: string, args: Buf[TExpr], ty: Type) -> bool
 // The question is answered from the whole body rather than from the argument's spelling, because an
 // address can be taken in one place and passed in another (`val q = &sub` and later `decl(q, …)`): a
 // body that never takes the address of its own storage cannot hand any out, and one that does keeps
-// every self-call whose arguments could carry an address.
-private may_reach_frame(f: TFunc, args: Buf[TExpr]) -> bool
+// every self-call whose arguments could carry an address. A `become` asks the same question
+// (`emit_checks.sysl`), and refuses where the answer is yes.
+may_reach_frame(f: TFunc, args: Buf[TExpr]) -> bool
     var carried = false
 
     for item in args
-        if may_hold_address(texpr_type(item)) then carried = true
+        if may_hold_address(texpr_type(item)) && !passed_through(f, item) then carried = true
 
     carried && takes_frame_address(f)
 end may_reach_frame
+
+// Whether an argument is one of the function's own parameters, read as it arrived: never written
+// and never had its address taken, so what it holds came from the caller and points at nothing in
+// this frame. A name in the typed tree is unique within its function, so a shadowing binding of the
+// same spelling is a different name here.
+private passed_through(f: TFunc, e: TExpr) -> bool = *e.kind match
+    TLoad(name, _) -> is_param(f, name) && !param_disturbed(f, name)
+    _ -> false
+
+private is_param(f: TFunc, name: string) -> bool
+    for item in f.params
+        if item.0 == name then return true
+
+    false
+
+private param_disturbed(f: TFunc, name: string) -> bool
+    val found: &FrameAddress = FrameAddress(false)
+
+    walk_block_stmts(f.body, TWalk(false, e -> note_disturbed(found, name, e),
+                                   w -> if root_name(w.place) == Some(name) then found.taken = true,
+                                   s -> ()))
+    found.taken
+end param_disturbed
+
+private note_disturbed(found: &FrameAddress, name: string, e: TExpr)
+    val place = *e.kind match
+        TAddrOf(p, _) -> Some(p)
+        TStore(p, _, _) -> Some(p)
+        TUpdate(p, _, _, _, _, _) -> Some(p)
+        TIncDec(p, _, _, _, _) -> Some(p)
+        _ -> None
+
+    if place.is_some() && root_name(place.unwrap()) == Some(name) then found.taken = true
+
+// The local or parameter a place is part of, short of a dereference.
+private root_name(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> root_name(r)
+    TIndex(r, _, _) -> root_name(r)
+    TSlice(b, _, _, _, _) -> root_name(b)
+    _ -> None
 
 // Whether a value of this type could hold an address: a pointer, a view, or something made of one.
 // A reference, a weak reference and a string are counted heap objects, so they hold none that a
@@ -262,6 +304,7 @@ private struct FrameAddress
 private note_frame_address(found: &FrameAddress, e: TExpr)
     *e.kind match
         TAddrOf(place, _) -> if frame_rooted(place) then found.taken = true
+        TTempAddr(_, _) -> found.taken = true
         TSlice(base, _, _, _, _) ->
             nameless(underlying(texpr_type(base))) match
                 Array(_, _) -> if frame_rooted(base) then found.taken = true

@@ -243,3 +243,78 @@ tfa_tailrec_refused()
                          "round reads it\n --> "), said)
     assert(said.contains("/main.sysl:4:1\n"), said)
 end tfa_tailrec_refused
+
+@test("a self-call passing a parameter straight on jumps, even where the body takes an address")
+tfa_parameter_through_a_framed_body_jumps()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct C
+            left: int
+
+        drain(c: *C, acc: int) -> int
+            var probe = C(0)
+            val seen = &probe
+            if c.left == 0 then return acc + seen.left
+            c.left -= 1
+            drain(c, acc + 1)
+
+        var c = C(1000000)
+        print(drain(&c, 0))
+        """
+
+    assert_eq(tfa_ran(text), "1000000\n")
+    assert(tfa_define(tfa_ir(text), "drain").contains("br label %tailrec1"))
+end tfa_parameter_through_a_framed_body_jumps
+
+// -- become -----------------------------------------------------------------------------------------
+
+private tfa_become(arg: string) -> string = tfa_become_after("s.n -= 1", arg)
+
+// The `become` program, with `write` as the statement before the jump.
+private tfa_become_after(write: string, arg: string) -> string = s"""
+    struct S
+        n: int
+
+    f(s: *S, acc: int) -> int
+        var probe = S(0)
+        val seen = &probe
+        if s.n == 0 then return acc + seen.n
+        var next = S(s.n - 1)
+        $write
+        become g($arg, acc + 1)
+
+    g(s: *S, acc: int) -> int = f(s, acc)
+
+    var s = S(4)
+    print(f(&s, 0))
+    """
+
+@test("a 'become' handing on the address of a local is refused")
+tfa_become_local_refused()
+    if xvr_no_library() then return
+
+    val said = tfa_ir(tfa_become("&next"))
+
+    assert(said.contains("error: 'become' replaces this frame with the call's, and an argument " +
+                         "may point into this frame — its storage is given up before the callee " +
+                         "runs, so the callee would read storage that is no longer there. Pass a " +
+                         "pointer this function was handed, or keep it a 'return'\n  --> main.sysl:10:12\n"), said)
+end tfa_become_local_refused
+
+@test("a 'become' handing on a parameter that was pointed at a local is refused")
+tfa_become_reassigned_parameter_refused()
+    if xvr_no_library() then return
+
+    val said = tfa_ir(tfa_become_after("s = &next", "s"))
+
+    assert(said.contains("an argument may point into this frame"), said)
+end tfa_become_reassigned_parameter_refused
+
+@test("a 'become' handing on a parameter as it arrived is allowed")
+tfa_become_parameter_through()
+    if xvr_no_library() then return
+
+    assert_eq(tfa_ran(tfa_become("s")), "4\n")
+    assert(tfa_define(tfa_ir(tfa_become("s")), "f").contains("musttail call"))
+end tfa_become_parameter_through
