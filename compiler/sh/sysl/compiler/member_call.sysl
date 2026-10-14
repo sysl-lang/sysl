@@ -1162,8 +1162,12 @@ private recheck_after(cx: &Analyzer, span: Span, recv_arg: TExpr, call: TExpr) -
 
 // Which written argument fills which of a member's parameters. The receiver is not among them, so
 // this is the free function's rule read one slot in.
+//
+// `kept` is for a call read through a **bound**, at a generic's own definition: what is wrong with it
+// is wrong at every instantiation, and the walk that reads it is a trial whose ordinary complaints are
+// thrown away, so the refusal is recorded as one the trial keeps.
 bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
-                         written_args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
+                 written_args: Buf[Expr], kept: bool = false) -> Option[Buf[Option[Expr]]]
     val args = pack_rest(cx, shown, m.params, written_args, true)
     var slots: Buf[Option[Expr]] = buf()
 
@@ -1185,8 +1189,8 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
                     if m.params.at(j).name == name then idx = int(j)
 
                 if idx < 0
-                    cx.fault(a.span, s"$shown declares no parameter named '$name' — it takes " +
-                             s"${name_list(m.params)}")
+                    member_args_fault(cx, a.span, kept, s"$shown declares no parameter named " +
+                                      s"'$name' — it takes ${name_list(m.params)}")
                     return None
 
                 slots.set(usize(idx), Some(value))
@@ -1202,12 +1206,17 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
         if slots.at(i).is_none() && m.params.at(i).default.is_none() then missing += 1
 
     if missing > 0 || (extra > 0 && !m.variadic)
-        cx.fault(span, arity_refusal(shown, m.params, args, slots, named_seen, extra, m.variadic))
+        member_args_fault(cx, span, kept, arity_refusal(shown, m.params, args, slots, named_seen, extra,
+                                                        m.variadic))
         return None
     end if
 
     Some(slots)
 end bind_member_args
+
+private member_args_fault(cx: &Analyzer, span: Span, kept: bool, message: string)
+    if kept then cx.an.bound_fault(cx.scope, span, message)
+    else cx.fault(span, message)
 
 // **The tail of a variadic member**: every positional argument past the ones its parameters took,
 // each read at whatever type it has and passed as C's promotions leave it -- the free function's
