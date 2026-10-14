@@ -988,7 +988,7 @@ impl Drop for Rows
     drop(self) = c_free(self.p)
 
 newest() -> []const u8
-    val r = Rows(null, 0)
+    val r: &Rows = Rows(null, 0)
 
     r.view()
 ```

@@ -1592,7 +1592,7 @@ impl Drop for Column
     drop(self) = c_free(self.p)
 
 first() -> []const u8
-    val c = Column(null, 0)
+    val c: &Column = Column(null, 0)
 
     c.bytes()
 ```
@@ -1624,7 +1624,7 @@ impl Drop for Column
 
 run()
     var keep: []const u8 = []
-    val c = Column(null, 0)
+    val c: &Column = Column(null, 0)
 
     keep = c.bytes()
 ```
@@ -1639,8 +1639,9 @@ held to the same places. A value that cannot hold a view (`v.len`, `v[0]`, a str
 it) is not borrowed from anything.
 
 **Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
-`*self` call on it, and a call that may write an object of its type are refused for as long as a
-local holding the view is in scope:
+`*self` call on it, and a call that may write an object of its type — which a member that frees the
+memory does, and a call through a closure or a trait object might, naming no body to ask — are
+refused for as long as a local holding the view is in scope:
 
 ```sysl
 extern "free" c_free(p: *u8)
@@ -1656,7 +1657,7 @@ impl Drop for Column
     drop(self) = c_free(self.p)
 
 run()
-    var c = Column(null, 0)
+    var c: &Column = Column(null, 0)
     val v = c.bytes()
 
     c = Column(null, 0)
