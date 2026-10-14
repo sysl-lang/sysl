@@ -1729,6 +1729,11 @@ print(f.len(), h.b.len())
 1 0
 ```
 
+**A call through a trait object is not followed either**: which body a slot dispatches to is settled
+at run time, so a trait member's `@consumes` says nothing about the object's own local. A method has
+no second spelling the check could miss — `Buf.freeze(b)` is refused as every instance method named
+through its type is.
+
 It marks a member that takes a receiver, in any mode, and takes no arguments. Above a free function,
 or a member that takes no `self`, it is refused:
 
