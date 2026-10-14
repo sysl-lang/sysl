@@ -202,9 +202,41 @@ The [boxed spelling](/reference/types/) is what an address needs: `&Fn(T) -> U` 
 so a function declared with one is an ordinary generic and its address is written as any other.
 
 
-There is also a **hole shared with the address form**: the brackets read the *expression* grammar, so
-a type the two grammars do not spell alike has no form there. `[]int`, `weak T`, `volatile T`,
-`<4>f32` and a callable are refused by the parser. The annotation reaches every one of them.
+**Every type an annotation can spell can be written in the list.** The parser reads each item as an
+expression first, so a subscript, `T`, `*T`, `&T`, `Box[T]` and `(A, B)` are what they always were;
+where that reading does not end the item at the `,` or `]`, it reads the item again as a type from the
+same place. That is what admits `&sync T`, `[]T`, `[]const T`, `[N]T`, a nested application and a boxed
+callable:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Shared
+    n: int
+
+val shared = buf[&sync Shared]()
+val views = buf[[]const u8]()
+val rows = buf[[3]int]()
+val nested = buf[Buf[&sync Shared]]()
+
+print(shared.len(), views.len(), rows.len(), nested.len())
+```
+
+```output
+0 0 0 0
+```
+
+A type that is refused in an annotation is refused here with the same message, so a bare callable
+`int -> int` is told to be written `&Fn(int) -> int`. In a subscript, such a type is told it is not a
+value:
+
+```sysl
+first(xs: []const int) -> int = xs[&sync Missing]
+```
+
+```error
+this is a type, and a value is wanted here
+```
 
 **The address form came first**: `&f[T]` names one instantiation of a generic function, and the case
 that earned it is a C callback whose signature mentions the type parameter nowhere. See

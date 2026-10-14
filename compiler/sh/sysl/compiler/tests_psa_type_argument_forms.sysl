@@ -1,0 +1,135 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A type argument written in brackets after a generic function or type takes every form a type
+// annotation takes. Brackets also hold a subscript, so an item is read as an expression first and as a
+// type only where that reading fails; these tests pin both halves, and that no subscript moved.
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` for a program linked and run, `xvr_ir` for
+// the analysis's report.
+
+private psa_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private psa_ran(text: string) -> string = xvr_ran(psa_main(text))
+
+private psa_ir(text: string) -> string = xvr_ir(psa_main(text))
+
+// A call of `buf` or `make` with this explicit argument, whose buffer is empty.
+private psa_len(arg: string) -> string
+    psa_ran(s"""
+        import sysl.buf.{Buf, buf}
+
+        struct C
+            n: int
+
+        make[T]() -> Buf[T] = buf()
+
+        main()
+            val b = buf[$arg]()
+            val m = make[$arg]()
+            print(b.len(), m.len())
+        """)
+end psa_len
+
+@test("a reference to a shareable object is a type argument of a call")
+psa_sync_reference()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("&sync C"), "0 0\n")
+
+@test("a plain reference and a pointer still parse as they did")
+psa_reference_and_pointer()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("&C"), "0 0\n")
+    assert_eq(psa_len("*C"), "0 0\n")
+
+@test("a pointer to a shareable reference")
+psa_pointer_to_sync_reference()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("*&sync C"), "0 0\n")
+
+@test("a slice, a read-only slice and an array")
+psa_slices_and_arrays()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("[]int"), "0 0\n")
+    assert_eq(psa_len("[]const u8"), "0 0\n")
+    assert_eq(psa_len("[3]int"), "0 0\n")
+
+@test("a tuple holding a form only the type grammar reads")
+psa_tuple_of_sync()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("(int, &sync C)"), "0 0\n")
+
+@test("a generic type applied to a form only the type grammar reads")
+psa_applied_generic()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("Buf[&sync C]"), "0 0\n")
+    assert_eq(psa_len("&Buf[&sync C]"), "0 0\n")
+    assert_eq(psa_len("Buf[[]int]"), "0 0\n")
+
+@test("a boxed callable")
+psa_boxed_callable()
+    if xvr_no_library() then return
+
+    assert_eq(psa_len("&Fn(int) -> int"), "0 0\n")
+
+@test("a type argument inside a generic body names the function's own parameter")
+psa_inside_a_generic_body()
+    if xvr_no_library() then return
+
+    assert_eq(psa_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        make[T]() -> Buf[T] = buf()
+
+        wrap[T]() -> Buf[[]T] = make[[]T]()
+
+        main()
+            print(wrap[int]().len())
+        """), "0\n")
+
+@test("a bare callable type is refused exactly as in an annotation")
+psa_callable_refused_like_an_annotation()
+    if xvr_no_library() then return
+
+    val said = psa_ir("import sysl.buf.{Buf, buf}\n\nmain()\n    val g = buf[int -> int]()\n")
+
+    assert(said.contains("'int -> int' is a callable a function is passed and does not keep"), said)
+
+@test("an unknown name inside such a form is told as an unknown type")
+psa_unknown_name_inside()
+    if xvr_no_library() then return
+
+    val said = psa_ir("import sysl.buf.{Buf, buf}\n\nmain()\n    val b = buf[&sync Nope]()\n    b.len()\n")
+
+    assert(said.contains("error: unknown type 'Nope'\n --> main.sysl:4:23\n"), said)
+
+@test("such a type in a subscript is told it is not a value")
+psa_in_a_subscript()
+    if xvr_no_library() then return
+
+    val said = psa_ir("main()\n    val xs = [1, 2, 3]\n    val a = xs[&sync Nope]\n    a\n")
+
+    assert(said.contains("error: this is a type, and a value is wanted here"), said)
+
+@test("subscripts parse as they did, including an array literal inside one")
+psa_subscripts_unchanged()
+    assert_eq(pe("a[i]"), "(index a i)")
+    assert_eq(pe("a[i + 1]"), "(index a (+ i 1))")
+    assert_eq(pe("a[[1][0]]"), "(index a (index (array 1) 0))")
+    assert_eq(pe("f[A, B]"), "(typeargs f A B)")
+
+@test("a subscript missing its bracket is still told so")
+psa_missing_bracket_unchanged()
+    assert_eq(pe_err("xs[1 2]"), "']' expected")
+
+@test("the form only the type grammar reads is a typed node in the tree")
+psa_parse_shape()
+    assert_eq(pe("buf[&sync C]()"), "(call (index buf (type (ref-sync C))))")
+    assert(pe("buf[[]int]()").starts_with("(call (index buf (type "), pe("buf[[]int]()"))
