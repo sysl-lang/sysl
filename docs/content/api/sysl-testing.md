@@ -13,9 +13,15 @@ told the two collide. A test that wants this one imports it — `import sysl.tes
 
 ## Index
 
-[`skip`](#skip)
+[`compiler`](#compiler) [`skip`](#skip)
 
 ## Functions
+
+### `compiler`
+
+```sysl
+compiler() -> string
+```
 
 ### `skip`
 
