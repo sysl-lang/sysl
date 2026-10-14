@@ -470,6 +470,8 @@ from_library(a: &Analysis, scope: Scope) -> bool =
 private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
     var guard: usize = 0
 
+    queue_generic_drops(a)
+
     while !a.tables.members.pending.is_empty() && guard < 4096
         val work = a.tables.members.pending
 
@@ -495,8 +497,44 @@ private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
 
             if holds_string(a.tables.members.bad_generics, job.decl.name) then a.restore_complaints(mark)
 
+        // Typing a body may have made a type real whose destructor is generic.
+        queue_generic_drops(a)
         guard += 1
 end drain_pending
+
+// **A generic type's destructor is a member no body calls**: what reaches it is the hook a box of the
+// type runs when its count reaches zero, which emission builds from the instantiated types. So every
+// instantiated type whose family implements `Drop` generically has its `drop` made real here, beside
+// the instantiations the bodies asked for -- once, the instantiation being filed by name.
+private queue_generic_drops(a: &Analysis)
+    val drops = drops_declared(a)
+
+    if drops.is_empty() then return
+
+    var types = reached_structs(a)
+
+    for item in reached_enums(a)
+        types.push(item)
+
+    for t in types
+        if !holds_string(drops, owner_key(t)) then continue
+
+        val found = member_key(a, t, "drop")
+        val generic = a.tables.members.generic.get(member_key_of(found.0, "drop"))
+
+        if generic.is_none() then continue
+
+        val home = a.tables.members.generic_scope.get(generic.unwrap().name)
+
+        if home.is_none() then continue
+
+        val name = member_func_name(analyzer_for(a, home.unwrap()), span_zero(), t, "drop")
+
+        if name == "" then continue
+
+        a.tables.members.generic_drops.put(mangle(t), name)
+        a.uses(name)
+end queue_generic_drops
 
 // Whether a declaration's symbol is one only its own file can name.
 file_local(v: Visibility) -> bool = v match

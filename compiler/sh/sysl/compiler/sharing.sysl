@@ -60,7 +60,14 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // **A guarded field is not shared by sharing its struct**: `@guards(value)` promises that the
     // struct's own members are the only way to it, and those hold whatever leaves through them to
     // this same rule at the call (`guarded_results`), so the walk leaves it out.
-    Struct(d) -> share_walk_fields(unguarded(d), path, "", t, laid)
+    //
+    // **A frozen buffer shares exactly what its elements share.** Its storage is owned through a
+    // count that is not atomic, and the library keeps that count out of every reader's reach: only
+    // the destructor of the one atomically counted box touches it, once. So the walk asks the
+    // element type in place of the fields, and nothing about the storage.
+    Struct(d) ->
+        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs.at(0), path, Some(t), laid)
+        else share_walk_fields(unguarded(d), path, "", t, laid)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
     Enum(d) -> share_walk_variants(d.variants, path, t, laid)
@@ -70,6 +77,28 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // question has an answer. A trait object is the same case one step further -- the type it forgot
     // is known where a value is erased into one, and that is where it is asked.
     _ -> None
+
+// The library's frozen buffer (`library/sysl/buf/frozen.sysl`), whose elements are what it shares.
+frozen_base() -> string = module_qualify("sysl.buf", "Frozen")
+
+private is_frozen(t: Type) -> bool = t match
+    Struct(d) -> d.base == frozen_base()
+    _ -> false
+
+// Holds what a call answers to the `&sync` rule where it answers a frozen buffer, at the call: the
+// library's signature names `&sync Frozen[T]`, and only the call knows which `T` it was made at.
+check_shared_result(cx: &Analyzer, span: Span, ret: Type)
+    val inner = ret match
+        Ref(t, sync) -> if sync && is_frozen(*t) then Some(*t) else None
+        _ -> None
+
+    // A call inside the library is one step of a call the program made, which is where it is asked.
+    if inner.is_none() || from_library(cx.an, cx.scope) then return
+
+    val why = share_complaint(inner.unwrap(), cx.an, cx.scope)
+
+    if why.is_some() then cx.fault(span, why.unwrap())
+end check_shared_result
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
                           prefix: string, holder: Type, laid: bool) -> Option[Unshareable]
@@ -222,6 +251,11 @@ sealed_rest() -> string =
 // fields are in, and once they are if not.
 check_shared(a: &Analysis, scope: Scope, span: Span, inner: Type)
     if a.shares_asked_at_trait then return
+
+    // **A frozen buffer the library's own signature names is asked at the CALL instead**
+    // (`check_shared_result`): `freeze` written at one element type is the program's choice, and a
+    // refusal pointing into the library would name a line the reader never wrote.
+    if is_frozen(inner) && from_library(a, scope) then return
 
     if !a.types_hoisted
         a.shared_checks.push((inner, scope, span))

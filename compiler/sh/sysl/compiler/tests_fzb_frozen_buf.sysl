@@ -1,0 +1,394 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `Buf.freeze()` and `&sync Frozen[T]` -- read-only heap data every thread reads at once
+// (`reference/memory.md § A frozen buffer crosses`). The sharing rule asks a frozen buffer's ELEMENT
+// type where a `&sync` struct's fields would be asked, and asks it at the call that froze it; and a
+// generic type's destructor is made real for every type of its family the program makes, which a
+// frozen buffer's storage depends on and which no generic type had before.
+
+private fzb_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+// What a program built from these files does: what it printed, and whether it built, ran and exited
+// zero. A refused build answers the driver's whole report.
+private fzb_outcome(files: []const (string, string)) -> (string, bool)
+    val root = make_temp_dir("sysl-fzb").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end fzb_outcome
+
+private fzb_importing() -> string = "import sysl.buf.{Buf, buf, Frozen}\n\n"
+
+private fzb_ran(text: string) -> string
+    val out = fzb_outcome([("main.sysl", fzb_importing() + text)])
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+end fzb_ran
+
+private fzb_err(text: string) -> string
+    val out = fzb_outcome([("main.sysl", fzb_importing() + text)])
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+end fzb_err
+
+// -- what it is --------------------------------------------------------------------------------------
+
+@test("a frozen buffer is indexed, measured, walked and viewed, and the buffer is left empty")
+fzb_reads_and_empties()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        var b: Buf[int] = buf()
+
+        for i in 0..<5
+            b.push(i * 10)
+
+        val alias = b
+        val f = b.freeze()
+        var sum = 0
+
+        for x in f
+            sum += x
+
+        val v = f.view()
+
+        print(f[2], f.len(), f.is_empty(), sum, v, v.len)
+        print(b.len(), alias.len())
+        b.push(7)
+        print(b.len(), f.len())
+        """), "20 5 false 100 [0, 10, 20, 30, 40] 5\n0 0\n1 5\n")
+
+@test("an empty buffer freezes to an empty frozen buffer, whose view is empty")
+fzb_empty()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        var b: Buf[u8] = buf()
+        val f = b.freeze()
+        var n = 0
+
+        for x in f
+            n += 1
+
+        print(f.len(), f.is_empty(), n, f.view().len)
+        """), "0 true 0 0\n")
+
+@test("an index past the end panics, naming the frozen buffer")
+fzb_past_end()
+    if !fzb_ready() then return
+
+    val out = fzb_outcome([("main.sysl", fzb_importing() +
+                            "var b: Buf[int] = buf()\nb.push(5)\nval f = b.freeze()\nprint(f[3])\n")])
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("panic: index 3 past the 1 elements of a frozen buffer"), out.0)
+
+// A view earlier than the freeze keeps the old storage, which the frozen buffer shares nothing with.
+@test("a view taken before the freeze still reads what it read, and the frozen storage is its own")
+fzb_earlier_view()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        var b: Buf[int] = buf()
+
+        b.push(1)
+        b.push(2)
+
+        val before = b.view()
+        val f = b.freeze()
+
+        before[0] = 9
+        print(before, f[0], f[1])
+        """), "[9, 2] 1 2\n")
+
+// -- lifetimes ---------------------------------------------------------------------------------------
+
+// Each element's destructor runs once, when the last share of the frozen buffer goes -- and a view
+// outlives every name of the frozen buffer through the box it holds.
+@test("counted elements are let go of once, when the last share -- a view's among them -- goes")
+fzb_elements_dropped_once()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        struct Cell
+            n: int
+
+        impl Drop for Cell
+            drop(self) = print("drop", self.n)
+
+        view_of() -> []const &sync Cell
+            var b: Buf[&sync Cell] = buf()
+
+            for i in 1..3
+                val c: &sync Cell = Cell(i)
+                b.push(c)
+
+            val f = b.freeze()
+
+            f.view()
+
+        run()
+            val v = view_of()
+
+            print("held", v.len, v[2].n)
+
+        run()
+        print("after")
+        """), "held 3 3\ndrop 3\ndrop 2\ndrop 1\nafter\n")
+
+@test("a frozen buffer with no view goes with its last name")
+fzb_dropped_with_last_name()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        struct Cell
+            n: int
+
+        impl Drop for Cell
+            drop(self) = print("drop", self.n)
+
+        make()
+            var b: Buf[&sync Cell] = buf()
+            val c: &sync Cell = Cell(7)
+
+            b.push(c)
+
+            val f = b.freeze()
+
+            print("in", f[0].n)
+
+        make()
+        print("after")
+        """), "in 7\ndrop 7\nafter\n")
+
+// -- crossing ---------------------------------------------------------------------------------------
+
+// The raytrace shape: a `&sync` struct holding frozen pixels and a frozen list of `&sync` trait
+// objects, read by eight threads at once, each also taking a view.
+@test("a '&sync' struct holding frozen buffers is read from eight threads")
+fzb_eight_threads()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        import sysl.threads.{spawn, Thread}
+
+        trait Shape
+            area(self) -> int
+
+        struct Square
+            side: int
+
+        impl Shape for Square
+            area(self) -> int = self.side * self.side
+
+        struct Texture
+            width: usize
+            pixels: &sync Frozen[u8]
+
+        struct Scene
+            texture: &sync Texture
+            shapes: &sync Frozen[&sync Shape]
+
+        struct Work
+            scene: &sync Scene
+            from: usize
+            sum: int
+            areas: int
+
+        work(w: *Work)
+            val px = w.scene.texture.pixels
+            var s = 0
+
+            for i in w.from..<w.from + 25000
+                s += int(px[i % px.len()])
+
+            for sh in w.scene.shapes
+                w.areas += sh.area()
+
+            val v = px.view()
+
+            w.sum = s + int(v[299])
+
+        var px: Buf[u8] = buf()
+
+        for i in 0..<300
+            px.push(u8(i % 251))
+
+        var shapes: Buf[&sync Shape] = buf()
+
+        for i in 1..4
+            val sq: &sync Square = Square(i)
+            shapes.push(sq)
+
+        val scene: &sync Scene = Scene(Texture(300, px.freeze()), shapes.freeze())
+        var jobs: [8]Work = [Work(scene, 0, 0, 0); 8]
+
+        for i in 0..<8
+            jobs[i].from = usize(i) * 25000
+
+        var started: Buf[Thread] = buf()
+
+        for i in 0..<8
+            started.push(spawn(&work, &jobs[i]).unwrap())
+
+        for t in started
+            t.join()
+
+        var total = 0
+        var areas = 0
+
+        for j in jobs
+            total += j.sum
+            areas += j.areas
+
+        print(total, areas)
+        """), "21699250 240\n")
+
+@test("a '&sync Fn' may capture a frozen buffer")
+fzb_captured()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        var b: Buf[int] = buf()
+
+        b.push(5)
+
+        val f = b.freeze()
+        val job: &sync Fn() -> unit = () -> print(f[0], f.len())
+
+        job()
+        """), "5 1\n")
+
+// -- what is refused ---------------------------------------------------------------------------------
+
+@test("freezing plain references is refused at the call, naming the element")
+fzb_plain_reference_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_err(raw"""
+        struct Cell
+            n: int
+
+        var b: Buf[&Cell] = buf()
+
+        b.push(Cell(1))
+
+        val f = b.freeze()
+        """)
+
+    assert(out.contains("'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once, " +
+                        "so every count inside it has to be atomic — but it holds a '&Cell', whose " +
+                        "count is not. Hold it as a '&sync Cell' ('06')"), out)
+    assert(out.contains("main.sysl:10:11"), out)
+    assert(!out.contains("buf.sysl"), out)
+
+@test("freezing strings or buffers is refused for the count each carries")
+fzb_strings_and_bufs_refused()
+    if !fzb_ready() then return
+
+    val strings = fzb_err("var b: Buf[string] = buf()\nval f = b.freeze()\n")
+
+    assert(strings.contains("but it holds a 'string', which owns its bytes through a count that is not atomic"),
+           strings)
+
+    val bufs = fzb_err("var b: Buf[Buf[u8]] = buf()\nval f = b.freeze()\n")
+
+    assert(bufs.contains("but it holds a 'sysl.buf.Buf[byte]', which is shared through a count that " +
+                         "is not atomic, and no spelling of it can cross into a '&sync' ('06')"), bufs)
+
+@test("a field written as a frozen buffer of plain references is refused where it is written")
+fzb_field_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_err("struct Cell\n    n: int\n\nstruct Holder\n    f: &sync Frozen[&Cell]\n")
+
+    assert(out.contains("'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once"), out)
+    assert(out.contains("main.sysl:7:8"), out)
+
+@test("nothing writes a frozen buffer: no subscript store, no push, no store through its view")
+fzb_writes_refused()
+    if !fzb_ready() then return
+
+    val head = "var b: Buf[int] = buf()\nb.push(1)\nval f = b.freeze()\n"
+
+    assert(fzb_err(head + "f[0] = 2\n").contains("assignment needs a variable, a field, an element, " +
+                                                 "or a dereference — something with an address"))
+    assert(fzb_err(head + "f.push(2)\n").contains("type 'sysl.buf.Frozen' has no method 'push'"))
+    assert(fzb_err(head + "val v = f.view()\nv[0] = 2\n").contains("this element belongs to a " +
+                                                                  "'[]const int', which views elements it may not write"))
+
+@test("an allocator-free module may not freeze, the freeze making storage")
+fzb_no_alloc_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_outcome([("main.sysl", "@no_alloc\n\nimport sysl.buf.{Buf, Frozen}\n\n" +
+                            "freeze_it(b: Buf[int]) -> &sync Frozen[int] = b.freeze()\n\nprint(1)\n")])
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("this reaches 'sysl.buf.Buf.freeze.int', which makes heap storage through " +
+                          "'sysl.buf.freeze_buf.int', and this module declared '@no_alloc'"), out.0)
+
+// -- a generic type's destructor ----------------------------------------------------------------------
+
+// Before, the release hook of a `&G[int]` called `G.int.drop`, which nothing made real, and the build
+// failed in clang on an undefined symbol.
+@test("a generic type's destructor runs, through '&T' and '&sync T', at each instantiation")
+fzb_generic_drop()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_ran(raw"""
+        struct G[T]
+            v: T
+
+        impl[T: Display] Drop for G[T]
+            drop(self) = print("gone", self.v)
+
+        plain() -> &G[string] = G("s")
+        shared() -> &sync G[int] = G(3)
+
+        do_it()
+            val a = plain()
+            val b = shared()
+
+            print(a.v, b.v)
+
+        do_it()
+        print("after")
+        """), "s 3\ngone 3\ngone s\nafter\n")
