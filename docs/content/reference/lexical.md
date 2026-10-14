@@ -836,6 +836,8 @@ one byte by number:
 
 ```sysl
 val b: u8 = 'é'
+
+print(b)
 ```
 
 ```error
@@ -847,6 +849,8 @@ literal is not one:
 
 ```sysl
 val x: i8 = 'a'
+
+print(x)
 ```
 
 ```error
@@ -859,6 +863,8 @@ variable may be any code point, so it still needs the conversion, which keeps it
 ```sysl
 val c = 'a'
 val b: u8 = c
+
+print(b)
 ```
 
 ```error
