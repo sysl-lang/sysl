@@ -455,7 +455,7 @@ generic_subject_of(cx: &Analyzer, span: Span, k: string, name: string, args: Buf
         None -> ()
 
     val said = cx.an.complaints()
-    val solved = solved_subject(cx, span, key.unwrap(), name, args, expected)
+    val solved = solved_subject(cx, span, key.unwrap(), name, args, expected, None)
 
     if solved.is_some() then return solved
 
@@ -483,6 +483,81 @@ generic_subject_of(cx: &Analyzer, span: Span, k: string, name: string, args: Buf
 
     Some(Unknown)
 end generic_subject_of
+
+// `Biquad.of(c).unwrap()` where a `Biquad[q15]` is wanted: the associated function of a generic type
+// whose result is an `Option` or a `Result` of what it makes, unwrapped where the position says what
+// that is. **The expectation reaches the type through the value the wrapper carries**, as it reaches
+// `Biquad.of(c)` written alone through its whole result -- so the annotation the refusal asks for is
+// one a reader can write whether or not the result is unwrapped on the same line.
+//
+// Kept to `unwrap()` and `expect(msg)`, the two members that hand back exactly what the wrapper
+// carries, and taken only where the call's own arguments settle nothing: a type they settle is read
+// as it would be anyway, and a disagreement with the position is reported as one. `None` everywhere
+// else, which leaves the receiver to its ordinary reading.
+unwrapped_associated(cx: &Analyzer, receiver: Expr, member: string, margs: Buf[Expr],
+                     expected: Option[Type]) -> Option[TExpr]
+    if expected.is_none() then return None
+    if member == "unwrap" && !margs.is_empty() then return None
+    if member == "expect" && margs.len() != 1 then return None
+    if member != "unwrap" && member != "expect" then return None
+
+    val (callee, cargs) = *receiver.kind match
+        Call(c, a) -> (c, a)
+        _ -> return None
+
+    val (head, fname) = *callee.kind match
+        Field(h, n, _) -> (h, n)
+        _ -> return None
+
+    val written = *head.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val written_key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if written_key.is_none() then return None
+
+    val key = renamed_generic(cx, written_key.unwrap())
+
+    if concrete_instance(cx.an, key).is_some() then return None
+
+    val owner = cx.an.tables.types.get(key)
+    val m = member_at(cx.an, key, fname)
+
+    if owner.is_none() || m.is_none() || !m.unwrap().is_associated() || m.unwrap().ret_type.is_none() then
+        return None
+
+    val carried = *m.unwrap().ret_type.unwrap().kind match
+        NamedType(n, targs) ->
+            val wrapper = lookup_type_key(cx.an, owner.unwrap().scope, n)
+
+            if targs.is_empty() || wrapper.is_none() then None
+            else if wrapper.unwrap() == library_key("Option") || wrapper.unwrap() == library_key("Result")
+                Some(targs.at(0))
+            else None
+        _ -> None
+
+    if carried.is_none() then return None
+
+    // The arguments alone, read as the ordinary path would read them: where they settle the type,
+    // that reading is the one the program gets.
+    val said = cx.an.complaints()
+    val alone = solved_subject(cx, receiver.span, key, fname, cargs, None, None)
+
+    cx.an.restore_complaints(said)
+
+    if alone.is_some() then return None
+
+    val solved = solved_subject(cx, receiver.span, key, fname, cargs, expected, carried)
+
+    cx.an.restore_complaints(said)
+
+    if solved.is_none() then return None
+
+    associated_on(cx, receiver.span, solved.unwrap(), fname, cargs, None, buf())
+end unwrapped_associated
 
 // Whether a receiverless member's written result names every parameter of the type that declares
 // it -- `Self` counting as all of them -- so that the type an expectation names is the type the call
@@ -594,8 +669,11 @@ end subject_bounds_met
 // **Each argument is read in a sandbox and the reading thrown away**, which is what keeps a closure
 // among them from being lowered twice: the arguments are read again below at the parameters this
 // solve arrived at, and the second reading is the one the program gets.
+//
+// `ret` stands in for the member's written result where the expectation is of something else than
+// the result itself -- the value an `Option` or a `Result` carries, for `unwrapped_associated`.
 private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, args: Buf[Expr],
-                       expected: Option[Type]) -> Option[Type]
+                       expected: Option[Type], ret: Option[TypeRef]) -> Option[Type]
     val decl = cx.an.tables.types.get(key)
 
     if decl.is_none() then return None
@@ -650,8 +728,11 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
 
     // **The call is what the refusal names, not the type** -- `M.one`, since a reader told the
     // argument of `M` could not be inferred has nowhere to write one, `M` not being what they wrote.
+    val result = if ret.is_some() then Some(self_spelled(ret.unwrap(), written_name, tparams))
+    else member.ret_type
+
     val targs = solve(cx.an, owner.scope, cx.scope, span, s"${module_show(key)}.$name", tparams, param_refs,
-                      arg_tys, member.ret_type, expected, soft, shape.unwrap().1, buf())
+                      arg_tys, result, expected, soft, shape.unwrap().1, buf())
 
     if targs.len() != tparams.len() then return None
 
