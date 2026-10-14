@@ -266,13 +266,21 @@ call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bo
 
     // A **static** property belongs to the type, so `T.count` is the read and there is no value to
     // reach it on. It arrives here because a read with no parentheses is analyzed as the call it is.
-    if m.is_property && !m.is_static then
+    //
+    // **A member needing a value is the one mistake**, so nothing is read past it: its arguments
+    // weighed against a receiverless shape it does not have would be a second complaint about the
+    // same call, and an instantiation does not tell it again (`associated_on`).
+    if m.is_property && !m.is_static
         cx.an.bound_fault(cx.scope, span, s"'$name' is a property of '${tr.show()}' — read it on a " +
                           s"value, as 'value.$name'")
+        return bad_expr(span)
+    end if
 
-    else if m.recv_mode().is_some() then
-        cx.an.bound_fault(cx.scope, span, s"'$name' is a method of '${tr.show()}' — call it on a " +
-                          s"value of '${type_show(subject)}', not on the type itself")
+    if m.recv_mode().is_some()
+        cx.an.bound_fault(cx.scope, span, s"'$name' is an instance method of '${tr.show()}' — call " +
+                          s"it on a value of '${type_show(subject)}', not the type")
+        return bad_expr(span)
+    end if
 
     val scope = trait_scope_of(cx.an, tr.name)
     // **A member's own type parameters stand in for themselves, carrying what it asked of them.**
