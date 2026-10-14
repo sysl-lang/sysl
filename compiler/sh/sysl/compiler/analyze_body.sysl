@@ -2093,7 +2093,32 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
     TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
     TAddrOf(place, ty) -> place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
+    TErase(operand, vtable, ty) -> erase_image(cx, name, t, operand, vtable, ty)
+    TEnumNew(en, variant, args) ->
+        if !variant.carries then return leaf_image(cx, name, t)
+
+        val parts = static_images(cx, name, args)
+
+        if parts.is_none() then return None
+
+        val whole = TExpr(t.span, TEnumNew(en, variant, parts.unwrap()))
+
+        if payloads_laid(cx.an.tables.layout, whole) then Some(whole) else None
     _ -> leaf_image(cx, name, t)
+
+// **A trait object over the address of module storage is constant data**: it is two addresses, the
+// object's and its type's table for the trait, and the linker fills in both. Anything else erased --
+// a value that is not such an address -- stays code.
+private erase_image(cx: &Analyzer, name: string, t: TExpr, operand: TExpr, vtable: string,
+                    ty: Type) -> Option[TExpr]
+    val inner = static_image(cx, name, operand)
+
+    if inner.is_none() then return None
+
+    *inner.unwrap().kind match
+        TAddrOf(_, _) -> Some(TExpr(t.span, TErase(inner.unwrap(), vtable, ty)))
+        _ -> None
+end erase_image
 
 // A scalar that is not an aggregate, a conversion or an address: a literal as it stands, an
 // expression the typed fold settles, or a `const` call the evaluator runs.

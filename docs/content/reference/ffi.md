@@ -835,6 +835,62 @@ which is a load before it is an address — an [`embed`](/reference/arrays/#a-fi
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 
+**Three more things are constant data, all at any depth:**
+
+- **A read of a module `val` whose own initializer is constant data** is that value, as a `const`'s
+  name is — whatever order the two are declared in. `[ZERO; 4]` over `val ZERO: P = P(0)` is laid
+  down exactly as `[P(0); 4]` is.
+- **A trait object over the address of module storage** is two addresses, the object's and its type's
+  table for the trait, and the linker fills in both.
+- **A variant carrying such an address** — `Some(&target)`, or a trait object — has the address
+  written into its payload, a relocation like any other. The linker fills a whole word, so an address
+  is laid down where it starts a payload unit as wide as a pointer; a payload whose units are wider
+  (an `Option` of a struct holding a `u64` beside the pointer, on a 32-bit target) stays code.
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+trait Ring
+    ring(self) -> u32
+
+struct Bell
+    n: u32
+
+impl Ring for Bell
+    ring(self) -> u32 = self.n
+
+struct P
+    v: u32
+
+val ZERO: P = P(0)
+
+var table: [4]P = [ZERO; 4]
+var bell: Bell = Bell(7)
+var target: u32 = 5
+var current: *Ring = &bell
+var chosen: Option[*u32] = Some(&target)
+
+@export
+total() -> u32 = table[1].v + current.ring() + *chosen.unwrap()
+```
+
+A `val` that reads another reading it back is no constant at all, and is refused where the cycle
+closes, as computed storage is:
+
+```sysl
+struct P
+    v: u32
+
+static val A: P = B
+static val B: P = A
+
+print(A.v)
+```
+
+```error
+'A' cannot be initialized: its value needs 'B', whose value needs 'A' — computed module storage runs once before anything else does, so what it needs has to be settled first
+```
+
 **A call is constant data only when it calls a
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant
 arguments, which the compiler runs while compiling. Any other call is module storage whatever it is

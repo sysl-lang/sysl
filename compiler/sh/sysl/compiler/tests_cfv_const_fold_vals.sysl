@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **Three more kinds of constant data**, each laid into the object file of a bare machine that has no
+// loader to fill storage: a read of a module `val` whose own initializer is constant data, which is
+// that value; a trait object over the address of module storage, which is two relocations; and a
+// data enum variant carrying such an address, whose payload unit the linker fills in. A `val` that
+// comes back to itself is the cycle it always was, and storage reading a `val` that is code is still
+// code.
+
+private cfv_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end cfv_library_for
+
+private cfv_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end cfv_first_of
+
+private cfv_target() -> Target = target_named("thumbv7em-freestanding").unwrap()
+
+private cfv_skip() -> bool
+    if cfv_library_for(cfv_target()).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end cfv_skip
+
+// A `thumbv7em-freestanding` archive, as `build-c` makes one: the first thing the compilation had to
+// say, or the LLVM text it lowered to.
+private cfv_built(text: string) -> string
+    val t = cfv_target()
+    var units = cfv_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = cfv_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = cfv_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end cfv_built
+
+// The storage is the constant the object file carries, and nothing runs before the program to fill it.
+private cfv_laid_down(out: string, global: string)
+    assert(out.contains(global), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end cfv_laid_down
+
+private cfv_refused(out: string, name: string)
+    assert(out.contains(s"and reaches '$name'") || out.contains(s", '$name'"), out)
+    assert(out.contains("which is module storage an initializer fills"), out)
+end cfv_refused
+
+private val cfv_p: string = "struct P\n    v: u32\n\n"
+private val cfv_ring: string = "trait Ring\n    ring(self) -> u32\n\nstruct Bell\n    n: u32\n\n" +
+                               "impl Ring for Bell\n    ring(self) -> u32 = self.n\n\n"
+private val cfv_main: string = "\n\n@export(\"main\")\nmain_entry() -> int = "
+
+@test("a 'val' read by storage's initializer is the constant its own initializer comes to")
+cfv_a_val_is_its_value()
+    if cfv_skip() then return
+
+    val out = cfv_built(cfv_p + "val ZERO: P = P(0)\nval ONE: P = P(1)\n\nvar table: [4]P = [ZERO; 4]\n" +
+                        "var other: [2]P = [ONE, ZERO]" + cfv_main + "int(table[1].v + other[0].v)\n")
+
+    cfv_laid_down(out, "@table = private global [4 x %struct.P] zeroinitializer\n")
+    cfv_laid_down(out, "@other = private global [2 x %struct.P] [%struct.P { i32 1 }, %struct.P { i32 0 }]\n")
+end cfv_a_val_is_its_value
+
+@test("a 'val' over a 'val' declared after it is folded through both")
+cfv_a_chain_declared_out_of_order()
+    if cfv_skip() then return
+
+    cfv_laid_down(cfv_built("var t: [2]u32 = [A, B]\nval A: u32 = B + 1\nval B: u32 = 41" + cfv_main +
+                            "int(t[0])\n"),
+                  "@t = private global [2 x i32] [i32 42, i32 41]\n")
+end cfv_a_chain_declared_out_of_order
+
+@test("storage reading a 'val' whose initializer is code is still code")
+cfv_a_val_that_is_code_stays_code()
+    if cfv_skip() then return
+
+    cfv_refused(cfv_built("counter() -> u32 = 7\n\nval start: u32 = counter()\n\nvar t: [2]u32 = [start; 2]" +
+                          cfv_main + "int(t[0])\n"),
+                "t")
+end cfv_a_val_that_is_code_stays_code
+
+@test("two 'val's that read each other are the cycle they always were")
+cfv_a_val_cycle()
+    if cfv_skip() then return
+
+    assert_eq(cfv_built(cfv_p + "val A: P = B\nval B: P = A" + cfv_main + "int(A.v)\n"),
+              "'A' cannot be initialized: its value needs 'B', whose value needs 'A' — computed module " +
+              "storage runs once before anything else does, so what it needs has to be settled first")
+end cfv_a_val_cycle
+
+@test("a trait object over the address of module storage is the table's address and the object's")
+cfv_a_trait_object()
+    if cfv_skip() then return
+
+    cfv_laid_down(cfv_built(cfv_ring + "var bell: Bell = Bell(7)\nvar t: *Ring = &bell" + cfv_main +
+                            "int(t.ring())\n"),
+                  "@t = private global { ptr, ptr } { ptr @vt.Ring.Bell, ptr @bell }\n")
+end cfv_a_trait_object
+
+@test("a variant carrying the address of module storage has the address as its payload unit")
+cfv_a_variant_carrying_an_address()
+    if cfv_skip() then return
+
+    cfv_laid_down(cfv_built("var target: u32 = 5\nvar s: Option[*u32] = Some(&target)\n" +
+                            "var n: Option[*u32] = None" + cfv_main + "int(*s.unwrap())\n"),
+                  "@s = private global %enum.sysl$Option.ptr.uint { i32 0, [1 x i32] " +
+                  "[i32 ptrtoint (ptr @target to i32)] }\n")
+end cfv_a_variant_carrying_an_address
+
+@test("a variant carrying a trait object has both addresses as its payload units")
+cfv_a_variant_carrying_a_trait_object()
+    if cfv_skip() then return
+
+    cfv_laid_down(cfv_built(cfv_ring + "var bell: Bell = Bell(7)\nvar f: Option[*Ring] = Some(&bell)" +
+                            cfv_main + "int(f.unwrap().ring())\n"),
+                  "@f = private global %enum.sysl$Option.ptr.Ring { i32 0, [2 x i32] " +
+                  "[i32 ptrtoint (ptr @vt.Ring.Bell to i32), i32 ptrtoint (ptr @bell to i32)] }\n")
+end cfv_a_variant_carrying_a_trait_object
+
+@test("an address in a payload unit wider than a pointer is not constant data")
+cfv_an_address_in_a_wide_unit_stays_code()
+    if cfv_skip() then return
+
+    cfv_refused(cfv_built("struct W\n    a: u64\n    p: *u32\n\nvar target: u32 = 5\n" +
+                          "var m: Option[W] = Some(W(1, &target))" + cfv_main + "int(*m.unwrap().p)\n"),
+                "m")
+end cfv_an_address_in_a_wide_unit_stays_code
+
+@test("the laid-down values are the ones the same initializers computed at run time")
+cfv_the_hosted_values_are_unchanged()
+    if !enm_ready() then return
+
+    val prog = cfv_ring + cfv_p +
+               "static val ZERO: P = P(4)\nstatic val TWO: [2]P = [ZERO, P(9)]\n" +
+               "static var table: [3]P = [ZERO; 3]\nstatic var bell: Bell = Bell(7)\n" +
+               "static var t: *Ring = &bell\nstatic var target: u32 = 5\n" +
+               "static var s: Option[*u32] = Some(&target)\nstatic val o: Option[int] = Some(3)\n" +
+               "static var n: Option[*u32] = None\nstatic var f: Option[*Ring] = Some(&bell)\n\n" +
+               "print(t.ring())\nprint(*s.unwrap())\nprint(o.unwrap())\nprint(n.is_none())\n" +
+               "print(table[2].v + TWO[1].v)\nbell = Bell(8)\nprint(t.ring(), f.unwrap().ring())\n" +
+               "target = 6\nprint(*s.unwrap())\n"
+
+    assert_eq(enm_ran(prog), "7\n5\n3\ntrue\n13\n8 8\n6\n")
+end cfv_the_hosted_values_are_unchanged
