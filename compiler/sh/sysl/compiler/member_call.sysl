@@ -28,7 +28,14 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
         Trait(_, _, _) -> read_erased(cx, span, receiver, rty, name)
         _ ->
             val found = member_key(cx.an, rty, name)
-            val chosen = chosen_member(cx, rty, found.0, name, span, buf(), via)
+            // A name a type's own body overloads is a set of methods and never a property, so the
+            // first of them answers the read with what a method read without a call is told.
+            val first = member_at(cx.an, found.0, name)
+            val overloaded = first.is_some() && !first.unwrap().is_property &&
+                             cx.an.tables.members.from_trait.get(member_key_of(found.0, name)).is_none() &&
+                             cx.an.tables.members.alts.has(member_key_of(found.0, name))
+            val chosen = if overloaded then Some(name) else
+                chosen_member(cx, rty, found.0, name, span, buf(), via)
 
             if chosen.is_none() then return bad_expr(span)
 
@@ -1389,8 +1396,16 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
 
         if texpr_type(t) == Unknown then arg_tys.push(None) else arg_tys.push(Some(texpr_type(t)))
 
-    val from = s"'$mname' comes from ${quantity(cands.len(), "implementation")} of one trait on " +
-               subject
+    // **A type's own overloads are an overload set**, and are refused in the words a function's are;
+    // the members of several implementations of one trait are the other case.
+    var overloads = true
+
+    for cand in cands
+        if cx.an.tables.members.from_trait.get(member_key_of(base, cand)).is_some() then
+            overloads = false
+
+    val from = if overloads then s"'$mname' on $subject has ${quantity(cands.len(), "declaration")}" else
+        s"'$mname' comes from ${quantity(cands.len(), "implementation")} of one trait on $subject"
 
     // Which candidate a call means is read off the arguments it wrote, **in the order it wrote
     // them** -- so a name, which is exactly a refusal to say what an argument's position is, has
@@ -1433,6 +1448,39 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
 
     if fits.len() == 1 then return Some(fits.at(0))
 
+    if overloads && !provided
+        if fits.len() > 1
+            val chosen = narrowed_at(declared, generic, fitted, args, arg_tys)
+            var tied: Buf[string] = buf()
+
+            for i in chosen
+                tied.push(fits.at(i))
+
+            if tied.is_empty() then tied = fits
+
+            cx.fault(span, s"'$subject.$mname' is ambiguous here — ${tied.len()} of its " +
+                     s"declarations take these arguments:\n${member_signatures(cx, base, subject, mname, tied)}" +
+                     "\nAnnotate an argument, or name the type a literal is meant at")
+            return None
+        end if
+
+        // Nothing fits. Where exactly one declaration could take this many arguments, the call was
+        // written meaning that one and got an argument wrong, so its own complaint is the message.
+        var plausible: Buf[string] = buf()
+
+        for cand in cands
+            val d = member_at(cx.an, base, cand).unwrap()
+
+            if args.len() <= d.params.len() || (d.variadic && args.len() >= d.params.len()) then
+                plausible.push(cand)
+
+        if plausible.len() == 1 then return Some(plausible.at(0))
+
+        cx.fault(span, s"no '$subject.$mname' takes these arguments — the declarations of that " +
+                 s"name are:\n${member_signatures(cx, base, subject, mname, cands)}")
+        return None
+    end if
+
     // No written block takes these arguments and the compiler has a member of this name: that is the
     // ordinary call the instruction answers.
     if fits.is_empty() && provided then return Some(mname)
@@ -1470,6 +1518,28 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
     cx.fault(span, s"$from, and the arguments do not say which was meant")
     None
 end chosen_member
+
+// The roster an overload refusal carries, one declaration a line, each as it was written.
+private member_signatures(cx: &Analyzer, base: string, subject: string, mname: string,
+                          names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        val d = member_at(cx.an, base, names.at(i)).unwrap()
+
+        if i > 0 then b.push("\n")
+
+        b.push(s"    $subject.$mname(")
+
+        for j in 0..<d.params.len()
+            if j > 0 then b.push(", ")
+
+            b.push(s"${d.params.at(j).name}: ${type_text(d.params.at(j).typ)}")
+
+        b.push(")")
+
+    b.finish()
+end member_signatures
 
 // The argument types a refusal quotes back, with an argument that could not be read left as a
 // question mark rather than as a guess.
