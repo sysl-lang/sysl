@@ -1,0 +1,273 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A default written in a generic trait names the trait's own type parameters, which are part of the
+// signature (`reference/declarations.md § Default parameters and named arguments`): an `impl` that
+// fixes them reads the default at what it fixed, on every path a call reaches the member through --
+// the type, a bound, a trait object -- and the trait itself holds the default to its bounds.
+
+private var gtd_library_cache: Buf[Program] = buf()
+private var gtd_library_read: bool = false
+
+private gtd_library() -> Buf[Program]
+    if gtd_library_read then return gtd_library_cache
+
+    gtd_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> gtd_library_cache = units
+
+    gtd_library_cache
+end gtd_library
+
+private gtd_ready() -> bool
+    if gtd_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end gtd_ready
+
+// What a one-file program prints, built and run -- or what building it said.
+private gtd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-generic-trait-defaults").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gtd_ran
+
+// How many times `what` occurs in `text`.
+private gtd_count(text: string, what: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        val at = rest.index_of(what)
+
+        if at.is_none() then return n
+
+        n += 1
+        rest = rest[at.unwrap() + what.bytes.len..<rest.bytes.len]
+end gtd_count
+
+private val gtd_pad: string = raw"""
+    trait Pad[T: Zero + Add]
+        pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+    struct A
+        x: int
+
+    impl Pad[f64] for A
+
+    """
+
+@test("a trait's default naming its type parameter is read at what the impl fixed, on a concrete call")
+gtd_concrete()
+    if !gtd_ready() then return
+
+    assert_eq(gtd_ran(gtd_pad + raw"""
+        print(A(1).pad(1.5))
+        print(A(1).pad(1.5, 2.0))
+        print(A(1).pad(1.5, by = 0.25))
+        """), "1.5\n3.5\n1.75\n")
+
+@test("the same default reaches a call through a bound and through a trait object")
+gtd_bound_and_object()
+    if !gtd_ready() then return
+
+    assert_eq(gtd_ran(gtd_pad + raw"""
+        via[P: Pad[f64]](p: P) -> f64 = p.pad(2.5)
+        obj(p: &Pad[f64]) -> f64 = p.pad(4.5)
+        obj_given(p: &Pad[f64]) -> f64 = p.pad(4.5, 1.0)
+
+        print(via(A(1)))
+        print(obj(A(1)))
+        print(obj_given(A(1)))
+        """), "2.5\n4.5\n5.5\n")
+
+@test("two impls of one generic trait read the default each at its own argument")
+gtd_two_impls()
+    if !gtd_ready() then return
+
+    assert_eq(gtd_ran(raw"""
+        import sysl.math.Float
+
+        trait Pad[T: Zero + Add]
+            pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+        trait Tune[F: Float]
+            tune(self, f: F, a4: F = F(440.0)) -> F = f + a4
+
+        struct A
+            x: int
+
+        struct B
+            x: int
+
+        impl Pad[f64] for A
+        impl Pad[int] for B
+        impl Tune[f32] for A
+
+        val p: f64 = A(1).pad(1.5)
+        val q: int = B(1).pad(7)
+        val r: f32 = A(1).tune(0.5)
+
+        print(p, q, r)
+        """), "1.5 7 440.5\n")
+
+@test("a generic impl of a generic trait reads the inherited default and result at the instantiation")
+gtd_generic_impl()
+    if !gtd_ready() then return
+
+    assert_eq(gtd_ran(raw"""
+        trait Pad[T: Zero + Add]
+            pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+        trait Get[T]
+            get(self, x: T) -> T = x
+
+        struct W[U]
+            u: U
+
+        impl[U: Zero + Add] Pad[U] for W[U]
+        impl[U] Get[U] for W[U]
+
+        val r: int = W(3).pad(4)
+
+        print(r)
+        print(W(1.25).pad(1.0, by = 2.0))
+        print(W(1.25).get(1.0))
+        print(W(1).get(9))
+        """), "4\n3\n1\n9\n")
+
+@test("a trait's default is held to the trait's own bounds, though every impl's type would satisfy it")
+gtd_default_held_to_bounds()
+    if !gtd_ready() then return
+
+    val said = gtd_ran(raw"""
+        trait Pad[T]
+            pad(self, x: T, by: T = T.zero()) -> T = x
+
+        struct A
+            x: int
+
+        impl Pad[f64] for A
+
+        print(A(1).pad(1.5))
+        """)
+
+    assert(said.contains("error: 'zero' needs 'T: sysl.Zero'\n --> "), said)
+    assert(said.contains("main.sysl:2:31"), said)
+
+@test("a trait's default is held to its bounds where nothing implements the trait")
+gtd_default_held_unimplemented()
+    if !gtd_ready() then return
+
+    val said = gtd_ran(raw"""
+        trait Pad[T]
+            pad(self, x: T, by: T = T.zero()) -> T = x
+
+        print(1)
+        """)
+
+    assert(said.contains("error: 'zero' needs 'T: sysl.Zero'"), said)
+
+@test("a missing argument through a bound in an instantiated generic is refused once, naming the trait")
+gtd_bound_refusal_once()
+    if !gtd_ready() then return
+
+    val said = gtd_ran(raw"""
+        trait Greet
+            greet(self, n: int, m: int = 1) -> int = n + m
+
+        struct A
+            x: int
+
+        struct B
+            x: int
+
+        impl Greet for A
+        impl Greet for B
+
+        via[G: Greet](g: G) -> int = g.greet(m = 2)
+
+        print(via(A(1)), via(B(1)))
+        """)
+
+    assert(said.contains("error: method 'Greet.greet' was given no value for 'n', and that " +
+                         "parameter declares no default"), said)
+    assert_eq(gtd_count(said, "error:"), 1)
+
+@test("an unknown argument name through a bound in an instantiated generic is refused once")
+gtd_bound_name_once()
+    if !gtd_ready() then return
+
+    val said = gtd_ran(raw"""
+        trait Greet
+            greet(self, n: int, m: int = 1) -> int = n + m
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet(k = 2)
+
+        print(via(A(1)))
+        """)
+
+    assert(said.contains("error: method 'Greet.greet' declares no parameter named 'k' — it takes " +
+                         "'n' and 'm'"), said)
+    assert_eq(gtd_count(said, "error:"), 1)
+
+@test("a concrete call's refusal still names the type it was made on")
+gtd_concrete_refusal_names_type()
+    if !gtd_ready() then return
+
+    val said = gtd_ran(raw"""
+        trait Greet
+            greet(self, n: int, m: int = 1) -> int = n + m
+
+        struct A
+            x: int
+
+        impl Greet for A
+
+        via[G: Greet](g: G) -> int = g.greet(m = 2)
+
+        print(A(1).greet(m = 3))
+        """)
+
+    assert(said.contains("error: method 'A.greet' was given no value for 'n'"), said)
+    assert(said.contains("error: method 'Greet.greet' was given no value for 'n'"), said)
+    assert_eq(gtd_count(said, "error:"), 2)

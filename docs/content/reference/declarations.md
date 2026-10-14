@@ -934,6 +934,46 @@ print(A(1).greet(), via(A(1)), named(A(1)), obj(A(1)))
 13 13 103 10
 ```
 
+A trait's default may name **the trait's own type parameters**, and it is read at what the `impl`
+fixed them to — `f64` below, on every one of those paths. Where the `impl` is generic itself, at what
+each instantiation gives its parameter. The default is still held to the trait's bounds where it is
+written: `T.zero()` in a `trait Pad[T]` with no `Zero` among `T`'s bounds is refused, though every
+type that implements it might have a `zero`.
+
+```sysl
+trait Pad[T: Zero + Add]
+    pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+struct A
+    x: int
+
+struct W[U]
+    u: U
+
+impl Pad[f64] for A
+impl[U: Zero + Add] Pad[U] for W[U]
+
+via[P: Pad[f64]](p: P) -> f64 = p.pad(2.5)
+obj(p: &Pad[f64]) -> f64 = p.pad(4.5)
+
+val n: int = W(3).pad(4)
+
+print(A(1).pad(1.5), via(A(1)), obj(A(1)), n)
+```
+
+```output
+1.5 2.5 4.5 4
+```
+
+```sysl
+trait Pad[T]
+    pad(self, x: T, by: T = T.zero()) -> T = x
+```
+
+```error
+'zero' needs 'T: sysl.Zero'
+```
+
 ```sysl
 trait Greet
     greet(self, n: int = 3) -> int = n
