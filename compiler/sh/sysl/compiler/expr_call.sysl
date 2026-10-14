@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, cmp, from_int, to_string as big_text}
+import sysl.math.bigint.{BigInt, cmp, from_int, negate, to_string as big_text}
 
 // What a pair of parentheses means, which is six different things told apart by what stands in
 // front of them: a conversion, a variant, a struct's constructor, a simple enum read out of an
@@ -285,7 +285,9 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                     return cx.err(named_at, s"undefined function '${module_qualify(owner.unwrap(), member)}'")
             end if
 
-            val tr = sum_receiver(cx, receiver, member, args, expected)
+            val tr = unwrapped_associated(cx, receiver, member, args, expected) match
+                Some(read) -> read
+                None -> sum_receiver(cx, receiver, member, args, expected)
 
             if texpr_type(tr) == Unknown then return tr
 
@@ -716,7 +718,7 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     if name == "str" then
         if args.len() != 1 then return Some(cx.err(span, "str takes exactly one value"))
 
-        val v = type_expr_bare(cx, args.at(0))
+        val v = through_ref(cx, type_expr_bare(cx, args.at(0)))
 
         // A float is written as Rust's `{}` writes it, at its own width: the fewest digits that read
         // back as a value of that type, set out positionally (`sysl.fmt.format_real_plain`).
@@ -944,12 +946,46 @@ private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = type_expr(cx, args.at(0), literal_target(args.at(0), to))
 
     if texpr_type(t) == Unknown then return t
 
     convert_to(cx, span, t, to, None)
 end convert_call
+
+// The type an integer literal written as a conversion's argument is read at: **the target's**,
+// wherever the value fits it, so `i128(9223372036854775807)` is the `i128` it says and never an
+// `int` too narrow to hold it first. A value that fits `int` and not the target keeps the conversion
+// it always had, from `int` -- `u8(300)` is `44` and `u64(-1)` is the largest `u64` -- and one that
+// fits neither is refused at the target, which is the type the line names.
+private literal_target(arg: Expr, to: Type) -> Option[Type]
+    val value = integer_literal_value(arg)
+
+    if value.is_none() then return None
+
+    val v = value.unwrap()
+
+    to match
+        Integer(bits, signed, _) ->
+            if fits(v, bits, signed) || !fits_int(v) then Some(to) else None
+        _ -> None
+end literal_target
+
+private fits_int(v: BigInt) -> bool = int_type() match
+    Integer(bits, signed, _) -> fits(v, bits, signed)
+    _ -> true
+
+// The value of an unsuffixed integer literal, with the minus in front of it where one is written --
+// the minus and the literal are one unit for the range check, as they are anywhere else.
+private integer_literal_value(arg: Expr) -> Option[BigInt] = *arg.kind match
+    IntLit(digits, base, suffix) -> if suffix == "" then Some(literal_value(digits, base)) else None
+    Unary(op, operand) -> if op == "-" then negated_literal(operand) else None
+    _ -> None
+
+private negated_literal(operand: Expr) -> Option[BigInt] = *operand.kind match
+    IntLit(digits, base, suffix) ->
+        if suffix == "" then Some(negate(literal_value(digits, base))) else None
+    _ -> None
 
 // The conversion itself, which a subtype's cast also reaches.
 //
@@ -1509,7 +1545,7 @@ private written_floating(t: Type) -> bool = t match
     _ -> false
 
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written: Buf[Expr]) -> TExpr
-    val v = type_expr_bare(cx, arg)
+    val v = through_ref(cx, type_expr_bare(cx, arg))
     val ty = texpr_type(v)
     var counts: Buf[TExpr] = buf()
 
@@ -2195,7 +2231,7 @@ private function_in_scope(cx: &Analyzer, written: string) -> bool
     false
 end function_in_scope
 
-private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
+function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     // A module bound to a name is written before a dot, so `unicode.is_alpha` is the module's key
     // and the name after it. It is asked first, since the alias is what the file said the word
     // means.
@@ -2455,6 +2491,9 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     var fitting: Buf[string] = buf()
     var fitted: Buf[Buf[Type]] = buf()
+    // The first thing each refused candidate said, so a refusal no candidate is the cause of -- an
+    // argument naming nothing this place can see -- is reported as itself rather than as a roster.
+    var first_said: Buf[Placed] = buf()
 
     for i in 0..<keys.len()
         // **A CANDIDATE THAT WAS NOT CHOSEN BUILT NOTHING.** Reading a call against a declaration
@@ -2472,6 +2511,8 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
         // The signature the fit arrived at is read before the instantiation it made is dropped:
         // the types outlive the trial, and for a generic candidate they are what the call solved.
         val sig = if said then buf() else fitted_signature(cx, keys.at(i), trial)
+
+        if said then first_said.push(cx.an.found.at(mark))
 
         cx.an.release(sandbox)
         rewind_instantiations(cx.an, queued, tables)
@@ -2515,9 +2556,35 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     if plausible.len() == 1 then return call_key(cx, span, written, plausible.at(0), args, expected, true)
 
+    // **Every candidate refused for one and the same reason, so the reason is not which one was
+    // meant** -- an argument that cannot be read at all, whatever it is passed to -- and that reason
+    // is the message. Read again with reporting on, it says exactly what each trial said.
+    if same_refusal(first_said, keys.len(), args)
+        return call_key(cx, span, written, keys.at(0), args, expected, true)
+
     cx.err(span, s"no '${qualified_callee(keys.at(0), written)}' takes these arguments — the " +
            s"declarations of that name are:\n${signature_list(cx, keys)}")
 end function_call
+
+// Whether every one of `count` candidates was refused, each first saying the same thing at the same
+// place **inside one of the arguments** -- a complaint at the call itself (a count no declaration
+// takes) is about which declaration was meant, and the roster answers that.
+private same_refusal(said: Buf[Placed], count: usize, args: Buf[Expr]) -> bool
+    if count < 2 || said.len() != count then return false
+
+    val first = said.at(0)
+
+    for item in said
+        if item.src.name != first.src.name || item.diag.message != first.diag.message ||
+                item.diag.span.start != first.diag.span.start then return false
+
+    val at = first.diag.span
+
+    for a in args
+        if a.span.start <= at.start && at.end <= a.span.end then return true
+
+    false
+end same_refusal
 
 // Which of the declarations a call fits is the one meant (`reference/declarations.md §
 // Overloading`): the three tie-breaks, in order, stopping as soon as one leaves a single answer.
@@ -2937,6 +3004,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type, f.decl.needs)
 
+    check_shared_result(cx, span, ret)
     cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end call_key
@@ -2950,9 +3018,13 @@ end call_key
 // so an argument that could not be read at all is told rather than the parameter it went to, and
 // the checks stop at the first that disagrees -- the reference gives up on the whole statement
 // there, so a second bad argument, and a result the call never had, are consequences.
-refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
+refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                  slots: Buf[Option[Expr]], ts: Buf[TExpr], wants: Buf[Type],
                  before: usize, report: bool = true) -> Option[TExpr]
+    // Every caller quotes the declaration it reached, which for an overload or a second
+    // implementation is the slot it was filed under and not the name anybody wrote.
+    val shown = unslotted_quote(quoted)
+
     // Only where reading them said something: an `Unknown` nothing reported is not a mistake
     // already told, and must not quietly become one the build never mentions.
     if cx.an.complaints() > before
@@ -3253,6 +3325,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
     if keys.is_empty() then return cx.err(span, out_of_reach(cx.an, base))
     if keys.len() == 1 then return extern_call(cx, span, written, keys.at(0), args)
 
+    var first_said: Buf[Placed] = buf()
+
     for i in 0..<keys.len()
         val mark = cx.an.complaints()
         val sandbox = cx.an.sandboxed()
@@ -3260,6 +3334,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
         val tables = cx.an.tables.members.vtables.len()
         val trial = extern_call(cx, span, written, keys.at(i), args)
         val said = cx.an.complaints() > mark
+
+        if said then first_said.push(cx.an.found.at(mark))
 
         cx.an.release(sandbox)
         rewind_instantiations(cx.an, queued, tables)
@@ -3276,6 +3352,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
             plausible.push(keys.at(i))
 
     if plausible.len() == 1 then return extern_call(cx, span, written, plausible.at(0), args)
+
+    if same_refusal(first_said, keys.len(), args) then return extern_call(cx, span, written, keys.at(0), args)
 
     var roster = ""
 

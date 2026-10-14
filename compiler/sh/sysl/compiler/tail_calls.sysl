@@ -23,17 +23,32 @@ import sysl.buf.{Buf, buf}
 // are shared: what is wanted is *this* call and not another written alike. A span is what this tree
 // has that says which occurrence a node is, and two calls to one function at one span are one call.
 tail_calls_of(f: TFunc) -> Buf[Span]
+    var out: Buf[Span] = buf()
+
+    for item in self_calls_in_tail(f)
+        if !may_reach_frame(f, item.args) then out.push(item.span)
+
+    out
+end tail_calls_of
+
+// A self-call in tail position and the arguments it passes, before the arguments are asked whether
+// they may point into the frame the jump would reuse.
+private struct TailSite
+    span: Span
+    args: Buf[TExpr]
+
+private self_calls_in_tail(f: TFunc) -> Buf[TailSite]
     if tailrec_disqualified(f).is_some() then return buf()
 
     // A call of an async function makes a task rather than running the body, so nothing in one is a
     // jump back to its own top.
     if f.marks.is_async() then return buf()
 
-    var out: Buf[Span] = buf()
+    var out: Buf[TailSite] = buf()
 
     tail_block(f, f.body, false, &out)
     out
-end tail_calls_of
+end self_calls_in_tail
 
 // Whether the call at this span is one the walk named.
 is_tail_call(found: Buf[Span], at: Span) -> bool
@@ -77,7 +92,7 @@ end tailrec_disqualified
 // true at the first one this block registers. A deferred statement runs on the way *out* of the
 // scope, which for an ordinary call is after the callee has returned and for a jump would be before
 // it is even entered.
-private tail_block(f: TFunc, b: TBlock, deferred: bool, out: *Buf[Span])
+private tail_block(f: TFunc, b: TBlock, deferred: bool, out: *Buf[TailSite])
     val after = tail_stmts(f, b.stmts, deferred, out)
 
     b.result match
@@ -87,7 +102,7 @@ end tail_block
 
 // Walks a statement list in order, answering whether a `defer` was registered along the way — which
 // the caller needs, because the block's trailing expression sits after all of them.
-private tail_stmts(f: TFunc, ss: Buf[TStmt], deferred: bool, out: *Buf[Span]) -> bool
+private tail_stmts(f: TFunc, ss: Buf[TStmt], deferred: bool, out: *Buf[TailSite]) -> bool
     var d = deferred
 
     for item in ss
@@ -112,10 +127,10 @@ end tail_stmts
 
 // What an expression in tail position contributes: itself, where it is a self-call the jump can
 // replace, and whatever its arms hold where it is a form that has arms.
-private tail_expr(f: TFunc, e: TExpr, deferred: bool, out: *Buf[Span])
+private tail_expr(f: TFunc, e: TExpr, deferred: bool, out: *Buf[TailSite])
     *e.kind match
         TCall(name, args, ty, _) ->
-            if !deferred && is_self_call(f, name, args, ty) then out.push(e.span)
+            if !deferred && is_self_call(f, name, args, ty) then out.push(TailSite(e.span, args))
 
         // Both arms end the function, so both are tail positions — and they are independent, so a
         // function may jump back from one and return from the other.
@@ -133,7 +148,7 @@ end tail_expr
 
 // The `return`s inside an expression whose own value is **not** in tail position. Only the forms
 // that carry statements are followed: a `return` is a statement, so it can be nowhere else.
-private nested_returns(f: TFunc, e: TExpr, deferred: bool, out: *Buf[Span])
+private nested_returns(f: TFunc, e: TExpr, deferred: bool, out: *Buf[TailSite])
     *e.kind match
         TIf(_, t, els, _) ->
             tail_stmts(f, t.stmts, deferred, out)
@@ -163,7 +178,7 @@ private nested_returns(f: TFunc, e: TExpr, deferred: bool, out: *Buf[Span])
 end nested_returns
 
 private loop_returns(f: TFunc, body: Buf[TStmt], els: Option[TBlock], deferred: bool,
-                     out: *Buf[Span])
+                     out: *Buf[TailSite])
     tail_stmts(f, body, deferred, out)
 
     els match
@@ -179,6 +194,136 @@ end loop_returns
 // whose result is wrapped reaches here as the wrapper's operand and not as the tail expression.
 private is_self_call(f: TFunc, name: string, args: Buf[TExpr], ty: Type) -> bool =
     name == f.name && type_eq(ty, f.ret_ty) && args.len() == f.params.len()
+
+// Whether an argument of this self-call may point into the caller's own frame.
+//
+// A jump keeps the frame: the locals are released on the way to it, exactly as a `return` would
+// release them, and every slot is the one the next round writes. So an argument holding the address
+// of a local, a parameter or a temporary would be read after its storage was disposed of and then
+// overwritten — `decl(&sub, …)` hands the next round a `P` whose buffer is already freed. A real call
+// keeps the storage alive until the callee is done with it, so such a call stays a call.
+//
+// The question is answered from the whole body rather than from the argument's spelling, because an
+// address can be taken in one place and passed in another (`val q = &sub` and later `decl(q, …)`): a
+// body that never takes the address of its own storage cannot hand any out, and one that does keeps
+// every self-call whose arguments could carry an address. A `become` asks the same question
+// (`emit_checks.sysl`), and refuses where the answer is yes.
+may_reach_frame(f: TFunc, args: Buf[TExpr]) -> bool
+    var carried = false
+
+    for item in args
+        if may_hold_address(texpr_type(item)) && !passed_through(f, item) then carried = true
+
+    carried && takes_frame_address(f)
+end may_reach_frame
+
+// Whether an argument is one of the function's own parameters, read as it arrived: never written
+// and never had its address taken, so what it holds came from the caller and points at nothing in
+// this frame. A name in the typed tree is unique within its function, so a shadowing binding of the
+// same spelling is a different name here.
+private passed_through(f: TFunc, e: TExpr) -> bool = *e.kind match
+    TLoad(name, _) -> is_param(f, name) && !param_disturbed(f, name)
+    _ -> false
+
+private is_param(f: TFunc, name: string) -> bool
+    for item in f.params
+        if item.0 == name then return true
+
+    false
+
+private param_disturbed(f: TFunc, name: string) -> bool
+    val found: &FrameAddress = FrameAddress(false)
+
+    walk_block_stmts(f.body, TWalk(false, e -> note_disturbed(found, name, e),
+                                   w -> if root_name(w.place) == Some(name) then found.taken = true,
+                                   s -> ()))
+    found.taken
+end param_disturbed
+
+private note_disturbed(found: &FrameAddress, name: string, e: TExpr)
+    val place = *e.kind match
+        TAddrOf(p, _) -> Some(p)
+        TStore(p, _, _) -> Some(p)
+        TUpdate(p, _, _, _, _, _) -> Some(p)
+        TIncDec(p, _, _, _, _) -> Some(p)
+        _ -> None
+
+    if place.is_some() && root_name(place.unwrap()) == Some(name) then found.taken = true
+
+// The local or parameter a place is part of, short of a dereference.
+private root_name(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> root_name(r)
+    TIndex(r, _, _) -> root_name(r)
+    TSlice(b, _, _, _, _) -> root_name(b)
+    _ -> None
+
+// Whether a value of this type could hold an address: a pointer, a view, or something made of one.
+// A reference, a weak reference and a string are counted heap objects, so they hold none that a
+// frame owns.
+private may_hold_address(t: Type) -> bool = nameless(underlying(t)) match
+    Ptr(_) -> true
+    Slice(_, _) -> true
+    Array(_, elem) -> may_hold_address(*elem)
+    Pack(elems) -> any_holds_address(elems)
+    Struct(d) -> field_holds_address(d.fields)
+    Enum(d) -> variant_holds_address(d.variants)
+    _ -> false
+
+private any_holds_address(ts: Buf[Type]) -> bool
+    for item in ts
+        if may_hold_address(item) then return true
+
+    false
+
+private field_holds_address(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if may_hold_address(item.1) then return true
+
+    false
+
+private variant_holds_address(vs: Buf[EnumVariant]) -> bool
+    for item in vs
+        if field_holds_address(item.fields) then return true
+
+    false
+
+// Whether the body anywhere takes the address of storage in its own frame: `&` of a place, or a
+// slice of an array, rooted in a local, a parameter or a temporary. A place reached through a
+// dereference, a global, or the element of a slice is storage somebody else owns.
+private takes_frame_address(f: TFunc) -> bool
+    val found: &FrameAddress = FrameAddress(false)
+
+    walk_block_stmts(f.body, expr_walk(false, e -> note_frame_address(found, e)))
+    found.taken
+end takes_frame_address
+
+private struct FrameAddress
+    taken: bool
+
+private note_frame_address(found: &FrameAddress, e: TExpr)
+    *e.kind match
+        TAddrOf(place, _) -> if frame_rooted(place) then found.taken = true
+        TTempAddr(_, _) -> found.taken = true
+        TSlice(base, _, _, _, _) ->
+            nameless(underlying(texpr_type(base))) match
+                Array(_, _) -> if frame_rooted(base) then found.taken = true
+                _ -> ()
+        _ -> ()
+
+// Whether a place lives in the frame. Anything that is not a recognised path into other storage is
+// answered yes: a temporary is frame storage too, and missing a jump costs nothing.
+private frame_rooted(place: TExpr) -> bool = *place.kind match
+    TGlobal(_, _, _) -> false
+    TDeref(_, _) -> false
+    TField(r, _, _) -> frame_rooted(r)
+    TIndex(r, _, _) -> nameless(underlying(texpr_type(r))) match
+        Array(_, _) -> frame_rooted(r)
+        _ -> false
+    TSlice(b, _, _, _, _) -> nameless(underlying(texpr_type(b))) match
+        Array(_, _) -> frame_rooted(b)
+        _ -> false
+    _ -> true
 
 // -- what `@tailrec` earns ----------------------------------------------------------------------------
 
@@ -197,7 +342,15 @@ check_tail_calls(a: &Analysis, funcs: Buf[TFunc])
                     a.fault(func_home(a, f.name), f.span,
                             s"'${qualified_name(f.name)}' is marked '@tailrec' but $why")
                 None ->
-                    if tail_calls_of(f).is_empty()
+                    if !tail_calls_of(f).is_empty() then continue
+
+                    if !self_calls_in_tail(f).is_empty()
+                        a.fault(func_home(a, f.name), f.span,
+                                s"'${qualified_name(f.name)}' is marked '@tailrec' but its tail " +
+                                "call may pass an address in its own frame — a jump reuses the " +
+                                "frame, so what the argument points at would be released and " +
+                                "written over before the next round reads it")
+                    else
                         a.fault(func_home(a, f.name), f.span,
                                 s"'${qualified_name(f.name)}' is marked '@tailrec' but calls itself " +
                                 "nowhere the jump can replace — a tail call is the last thing the " +

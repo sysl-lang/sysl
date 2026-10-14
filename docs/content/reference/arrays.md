@@ -275,6 +275,76 @@ That is the case a `const` could never have served: a constant is folded into it
 address, so there is nothing to index at `i`. A raw pointer may be held for the same reason a
 literal may — it counts nothing, so there is no release to write.
 
+### A byte array from a string literal
+
+On-disk formats are full of fixed-width text: an OEM name in eight bytes, a volume label in eleven, a
+magic number in four. **A string literal is accepted wherever a `[N]u8` is expected, when its UTF-8
+length is exactly `N`** — a binding's annotation, a field, an argument, an element of an outer array
+and a function's result:
+
+```sysl
+struct Boot
+    oem: [8]u8
+    label: [11]u8
+
+magic() -> [4]u8 = "FAT1"
+
+sum(b: [3]u8) -> int = int(b[0]) + int(b[1]) + int(b[2])
+
+val boot = Boot("MSWIN4.1", "NO NAME    ")
+val kinds: [2][3]u8 = ["FAT", "EXT"]
+
+print(boot.oem[0], boot.label[10], magic()[3], kinds[1][0], sum("abc"))
+```
+
+```output
+77 32 49 69 294
+```
+
+The literal is its bytes and nothing else: no NUL is added, and an escape counts as the bytes it
+encodes to, so a non-ASCII character takes its full UTF-8 width:
+
+```sysl
+val e: [2]u8 = "é"
+val nl: [2]u8 = "\n\0"
+
+print(e[0], e[1], nl[0], nl[1])
+```
+
+```output
+195 169 10 0
+```
+
+**It is an array literal of those bytes**, so a module `val` or `var` written this way is constant
+data: on a bare-metal target it is laid into `.rodata` or `.data` with nothing run before the first
+statement, exactly as `[77, 83, …]` would be.
+
+**The length has to match exactly, either way.** A shorter literal is not padded, because what the
+rest should hold — spaces, NULs — is the format's to say, not the language's:
+
+```sysl
+val oem: [8]u8 = "MSWIN"
+```
+
+```error
+this string literal is 5 bytes and [8]byte holds 8 — a string literal fills a byte array only when its UTF-8 length is exactly the array's
+```
+
+**Only `u8` (and a name for it) takes one.** A `[N]i8` or a `[N]char` is not a byte array the literal
+spells — a `char` is a scalar value, not a byte — so there the literal stays a `string`, and the
+position refuses it as it refuses any other mismatch:
+
+```sysl
+val a: [2]char = "ab"
+```
+
+```error
+cannot initialize 'a': declared [2]char but the value is string
+```
+
+A byte above `0x7F` that is not part of a UTF-8 character — a boot sector's `0xEB` jump — cannot be
+written in a string literal at all, since a string is valid UTF-8; that is an array literal's job.
+
 ### A file's bytes, embedded
 
 A table somebody else made is often a file — an image, a font, a program a kernel carries before it
@@ -968,11 +1038,43 @@ buffer instead, so a program that means to return one writes the ordinary `var b
 nothing. [Memory](/reference/memory/#escape-analysis) is where that is settled, along with what is
 still refused — storage the body did not declare.
 
+**The one view with nothing to keep alive and something that can die is a view of memory a C
+library owns**, made over a `*T` by an object that frees it in its destructor. Its owner word is
+null, so the view cannot hold the object; instead the member that hands it out is marked
+`@views(self)`, and the compiler refuses every use of the view that could come after the object it
+was called on is freed:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Rows
+    p: *u8
+    n: usize
+
+    @views(self)
+    view(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Rows
+    drop(self) = c_free(self.p)
+
+newest() -> []const u8
+    val r: &Rows = Rows(null, 0)
+
+    r.view()
+```
+
+```error
+this returns a view borrowed from 'r', and nothing keeps 'r' alive once this function returns
+```
+
+The view is still a plain `[]const u8` at no run-time cost. [Memory](/reference/memory/#a-view-borrowed-from-its-receiver)
+has the four places it is refused.
+
 ## Growing one
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and the methods
-over them. That it can be written at all is what the section on storage sized while running bought —
+over them — with the one fact below, which only the compiler can pass on to the optimizer. That it can be written at all is what the section on storage sized while running bought —
 a container does not need a [destructor](/reference/memory/) if its storage is a value that already
 has one, which the `[]T` field is.
 
@@ -992,6 +1094,62 @@ var c = *p                  // a copy, because copying a struct is what that mea
 Go's confusion — two slices that agree until one of them grows — comes from having one representation
 and therefore one behaviour. Held by reference, a `Buf` behaves as a `&T` behaves; held by value it
 is a value. Neither is a rule about growable arrays.
+
+**A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
+Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
+never written — which every thread may read at once without a lock; `b` is left empty. What it may
+hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(3)
+b.push(4)
+
+val f = b.freeze()
+val v = f.view()
+
+print(f[1], f.len(), v, b.len())
+```
+
+```output
+4 2 [3, 4] 0
+```
+
+### Its elements are never its header
+
+A `Buf`'s **header** — the handle in its box, and the record behind it holding the storage view and the
+count — and its **elements** are two different allocations: the storage is made by the buffer for
+itself, and a box is never made out of a buffer's storage. So a write to an element cannot change the
+count or move the storage, and a write to the header cannot change an element. **The compiler tells
+the optimizer exactly that, and nothing more**: every access the buffer's own members make to its
+header is marked as one side, every access they make to an element as the other, and the optimizer
+may keep the header in registers across a loop that writes elements. A row operation over a matrix
+held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
+
+It is a fact about where things are, not a rule a program has to keep. Everything else stays as it
+was: a view handed out by `view()` or `elems`, a reinterpreting view over the elements, a `ptr_cast`
+of an element's address, and C given the data pointer all read and write the elements with no mark
+at all, which the optimizer must assume can touch anything. A member that grows the buffer writes
+the header, so an element read after it reads through the new storage:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: &Buf[int] = buf()
+
+b.push(1)
+
+for i in 0..<20 do b.push(b.at(usize(i)) + 1)
+
+print(b.len(), b.at(0), b.at(20), b.cap())
+```
+
+```output
+21 1 21 32
+```
 
 ## What is still refused
 

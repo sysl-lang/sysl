@@ -1,9 +1,9 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{cache_dir, is_dir, is_file, make_dir_all, pending_name, publish_dir, read_text, remove_dir_all, write_text, write_text_atomic}
+import sysl.fs.{cache_dir, is_dir, is_file, make_dir_all, make_temp_dir, pending_name, publish_dir, read_text, remove_dir_all, write_text, write_text_atomic}
 import sysl.process.capture
-import sysl.text.Search
+import sysl.text.{join, split, Search}
 
 // Getting a package's source onto this machine.
 //
@@ -135,18 +135,15 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
     // `--depth 1` at the tag: a package is read at one version and its history is not part of what
     // is compiled, so fetching the rest of it is bytes nobody asks for. It also keeps the clone out
     // of the tree hash's way, since `.git` is excluded from that either way.
-    val answer = capture("git", ["clone", "--quiet", "--depth", "1", "--branch", tag, url, partial],
-                         "", [], true) match
-        Err(_) ->
-            remove_dir_all(partial).unwrap_or(())
-            return Err(s"cannot fetch $coordinate $tag: git is not on this machine")
-        Ok(got) -> got
+    //
+    // A pinned commit is fetched by its sha the same way, one commit deep: `clone --branch` takes
+    // only a ref, so the repository is begun empty and the one commit asked for by name.
+    val fetched = fetch_tree(coordinate, version, url, partial)
 
-    if !answer.status.ok()
-        val said = answer.err.unwrap_or("").trim()
-
+    if fetched.is_err()
         remove_dir_all(partial).unwrap_or(())
-        return Err(s"cannot fetch $coordinate $tag from $url:\n$said")
+        return Err(fetched.unwrap_err())
+    end if
 
     val hash = tree_hash(partial) match
         Err(why) ->
@@ -171,6 +168,87 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
 
     Ok(hash)
 end clone_at_tag
+
+// The whole sha a pin names, which is what selection, the cache and `sysl.sum` all carry.
+//
+// A whole one is its own answer. A shortened one is lengthened from `sysl.sum` where a recorded pin
+// of the coordinate starts with it -- so only the first build asks the network -- and otherwise
+// against the repository's own commits. **Several commits starting with it is refused rather than
+// one picked**, since which was meant is exactly what the shortening threw away.
+full_rev(label: string, coordinate: string, rev: string, sums: &Sums) -> Result[string, string]
+    if rev.bytes.len == 40 then return Ok(rev)
+
+    var found = recorded_revs(sums, coordinate, rev)
+    val url = clone_url(coordinate)
+
+    if found.is_empty()
+        val scratch = make_temp_dir("sysl-rev") match
+            Err(_) -> return Err(s"cannot look up '$rev' in $coordinate: no temporary directory")
+            Ok(d) -> d
+
+        val listed = commits_of(coordinate, rev, url, s"$scratch/repo")
+
+        remove_dir_all(scratch).unwrap_or(())
+
+        for sha in listed?
+            if sha.starts_with(rev) then found.push(sha)
+    end if
+
+    if found.len() == 1 then return Ok(found.at(0))
+
+    if found.is_empty()
+        return Err(s"'$label' pins $coordinate at '$rev', and no commit of $url starts with it")
+
+    Err(s"'$label' pins $coordinate at '$rev', which starts ${found.len()} commits " +
+        s"(${join(found.view(), ", ")}) — write more of the sha")
+end full_rev
+
+// Every commit a repository's refs reach, read from a clone with no checkout.
+private commits_of(coordinate: string, rev: string, url: string,
+                   into: string) -> Result[Buf[string], string]
+    git_step(["clone", "--quiet", "--bare", url, into], coordinate, rev, url)?
+
+    val answer = capture("git", ["-C", into, "rev-list", "--all"], "", [], true) match
+        Err(_) -> return Err(s"cannot fetch $coordinate $rev: git is not on this machine")
+        Ok(got) -> got
+
+    if !answer.status.ok()
+        return Err(s"cannot list the commits of $url:\n${answer.err.unwrap_or("").trim()}")
+
+    var out: Buf[string] = buf()
+
+    for line in split(answer.text, "\n")
+        if !line.trim().is_empty() then out.push(line.trim())
+
+    Ok(out)
+end commits_of
+
+// The tree at a tag or a pinned commit, into `partial`.
+private fetch_tree(coordinate: string, version: Release, url: string,
+                   partial: string) -> Result[unit, string]
+    val tag = release_tag(version)
+
+    if !is_rev(version)
+        return git_step(["clone", "--quiet", "--depth", "1", "--branch", tag, url, partial],
+                        coordinate, tag, url)
+
+    git_step(["init", "--quiet", partial], coordinate, tag, url)?
+    git_step(["-C", partial, "fetch", "--quiet", "--depth", "1", url, version.rev], coordinate, tag,
+             url)?
+    git_step(["-C", partial, "checkout", "--quiet", "--detach", "FETCH_HEAD"], coordinate, tag, url)
+end fetch_tree
+
+// One `git` command of a fetch, or what it said on the way out.
+private git_step(args: []const string, coordinate: string, tag: string,
+                 url: string) -> Result[unit, string]
+    val answer = capture("git", args, "", [], true) match
+        Err(_) -> return Err(s"cannot fetch $coordinate $tag: git is not on this machine")
+        Ok(got) -> got
+
+    if answer.status.ok() then return Ok(())
+
+    Err(s"cannot fetch $coordinate $tag from $url:\n${answer.err.unwrap_or("").trim()}")
+end git_step
 
 // The one diagnostic that says the fetch was not the package that was promised.
 //

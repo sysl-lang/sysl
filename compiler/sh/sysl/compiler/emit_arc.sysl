@@ -791,6 +791,58 @@ temps_here(e: *Emit) -> Buf[(Val, Type)]
     out
 end temps_here
 
+// **A temporary handed to an async function moves into the task's frame.** The frame keeps a count of
+// every parameter of its own, taken before the call returns, so the count this frame took for the
+// argument is given back as soon as the call returns rather than with the statement's other
+// temporaries -- and a task the callee lets go of is cancelled there, not after the statement that
+// made the call has run to its end. `mark` and `worked_out` are the height of the temporaries before
+// and after the arguments were worked out.
+//
+// **Every temporary the arguments made goes, not only the arguments themselves**: a struct built in
+// an argument holds its fields' counts in the temporaries they came from, and a temporary read
+// only on the way to an argument is read by nothing after the call. The frame holds a count of
+// everything a parameter reaches through a counted reference, so nothing it reads is let go. The
+// exception is a raw pointer, which holds no count: where an argument can hold one, only the
+// arguments themselves are given back, since the pointer may point into one of the others.
+move_into_task(e: *Emit, mark: usize, worked_out: usize, exprs: Buf[TExpr], args: Buf[IrArg])
+    var whole = true
+
+    for x in exprs
+        if holds_pointer(texpr_type(x)) then whole = false
+
+    var moved: Buf[(Val, Type)] = buf()
+    var kept: Buf[(Val, Type)] = buf()
+
+    for i in mark..<e.temps.len()
+        val t = e.temps.at(i)
+
+        if i < worked_out && (whole || handed(args, t.0)) then moved.push(t) else kept.push(t)
+
+    if moved.is_empty() then return
+
+    release_values(e, moved)
+    e.temps.truncate(mark)
+
+    for t in kept
+        e.temps.push(t)
+end move_into_task
+
+// Whether a register is one of a call's arguments.
+private handed(args: Buf[IrArg], v: Val) -> bool
+    val name = reg_name(v)
+
+    if name == "" then return false
+
+    for a in args
+        if reg_name(a.value) == name then return true
+
+    false
+end handed
+
+private reg_name(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""
+
 // Every value in a list let go of, last taken first -- by value, or at its address where it was
 // registered as a slot (`own_temp_at`).
 release_values(e: *Emit, vs: Buf[(Val, Type)])

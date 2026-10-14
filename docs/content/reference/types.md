@@ -78,7 +78,8 @@ the literal 300 does not fit byte
 ```
 
 A literal with no type from its context is an `int`, and one too large for `int` is refused rather
-than widened — give it a type, with a suffix or on the declaration:
+than widened — give it a type, with a suffix, on the declaration, or with a
+[conversion](/reference/expressions/#conversions-are-calls), whose argument is read at its target:
 
 ```sysl
 val big = 4294967295
@@ -339,6 +340,20 @@ bare-metal image has no runtime library at all. A program, an archive or a kerne
 in `f128` is linked with them, and one that does not carries none. They round to nearest, ties to
 even, always.
 
+**A `real` on a 32-bit board is the same arrangement one size down.** Every Cortex-M unit sysl targets
+is single-precision or absent, and 32-bit RISC-V here has none, so an `f64` operation there is a call
+too — `__aeabi_dmul` on Arm, `__muldf3` on RISC-V — and the standard module carries those in
+`sysl.softfloat.binary64`, with the same rounding and the same rule: an image that computes with a
+`real` carries them, and one that does not carries none. Results are bit for bit what a
+double-precision unit gives. The same holds for dividing a `long`, which no 32-bit core does in one
+instruction (`sysl.softint`). This archive for a Cortex-M4F defines `__aeabi_ldivmod`, `__aeabi_l2d`
+and `__aeabi_dmul` itself:
+
+```sysl build=c target=thumbv7em-freestanding
+@export("scale")
+scale(x: real, n: long) -> real = x * real(n / 1000)
+```
+
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
 it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
 program does not hold. A format
@@ -446,7 +461,33 @@ with a UTF-8 `string` has to do. Conversion to `u32` is total and written `u32(c
 ## `unit` and `never`
 
 `unit` is the type with exactly one value — what a function that returns nothing returns. It is a real
-type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery.
+type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery. Its value is
+written `()`, and so is its [pattern](/reference/patterns/#the-pattern-forms).
+
+**It has the four memberships a tuple has, each with the one answer a single value allows**: `Eq`
+(every `()` equals every other), `Ord` (none is less than another), `Hash` (all hash alike) and
+`Display` (it prints as `()`). They are what let a `Result[unit, E]` or an `Option[unit]` compare,
+print and go through `assert_eq`, and they occupy no storage: a `unit` operand is passed as nothing.
+A program may implement its own traits for `unit` too.
+
+```sysl
+enum Fault
+    Low
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec) = display_str("Low", out, fmt)
+
+check(n: int) -> Result[unit, Fault] = if n > 0 then Ok(()) else Err(Low)
+
+print(check(1) == Ok(()), check(0) == Err(Low), () < ())
+print(check(1), check(0))
+assert_eq(check(0), Err(Low))
+```
+
+```output
+true true false
+Ok(()) Err(Low)
+```
 
 `never` is the type with **no** values, and it is what an expression that does not finish has. A call
 to `exit` has type `never`, as does a `return` or a `break` considered as an expression. Because there
@@ -668,7 +709,8 @@ lighter and says so. If yes, only the tuple will do.
 
 `Eq`, `Ord`, `Hash` and `Display` are provided structurally, at **every** arity, whenever every
 component has the row. Ordering is lexicographic, first component first, which is the only ordering a
-positional product has a claim to.
+positional product has a claim to. `unit`, the tuple with no parts, has the same four
+([`unit` and `never`](#unit-and-never)).
 
 ```sysl
 val pair = (1, "one")

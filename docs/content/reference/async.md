@@ -843,6 +843,39 @@ done
 code that does not run. Transfer 2 never reached its first statement, so it made no buffer to give
 back.
 
+**A task handed to an async function as a temporary belongs to the task it was handed to.** A
+temporary argument of an async call [moves into the callee's frame](/reference/memory/), so when
+the callee returns without finishing what it was given, that task is dropped — and cancelled — right
+there, before the caller does anything with the answer:
+
+```sysl
+async parked()
+    defer print("parked task cancelled")
+    await park((w) -> ())
+
+async give_up(t: Task[unit]) -> Option[int]
+    step(t, () -> ())
+    None
+
+async caller()
+    (await give_up(parked())) match
+        None -> print("gave up")
+        Some(n) -> print(s"got $n")
+    print("after")
+
+block_on(caller())
+```
+
+```output
+parked task cancelled
+gave up
+after
+```
+
+A timeout written this way — `(await timeout(d, conn.read())) match …` — lets go of the abandoned read
+the moment the timeout drops it. A task held in a named local is the caller's as well as the callee's,
+and lives until the local's block ends.
+
 ## A task crossing a concurrency domain
 
 **A task may be handed to another thread — or anywhere a [`@crossing`](/library/threads/) parameter
@@ -1097,9 +1130,13 @@ contract above; an executor is a package, written against the contract in ordina
 the run queue on this page is.
 
 - **[`kairos`](https://github.com/sysl-lang/kairos)** is an event loop written for a microcontroller
-  first — numbered sources an interrupt raises, timers on one clock. Its async face, wakers kept
-  where its sources fire them, is planned.
-- An executor over **[`libuv`](https://github.com/sysl-lang/libuv)**, for a host, is planned.
+  first — numbered sources an interrupt raises, timers on one clock. It is also an executor: tasks
+  spawned on the loop sleep on its timers and wait on its sources, with the wakers kept where the
+  timers and sources fire them. A board and a host use the same loop; only the driver value differs.
+- With its **`uv` feature** (`features = [uv]`), kairos runs the same loop over
+  **[`libuv`](https://github.com/sysl-lang/libuv)** for a host: sockets and whole-file reads and
+  writes are tasks awaited beside `sleep` and `timeout`. With the feature off nothing of libuv is
+  fetched or linked.
 
 ---
 

@@ -260,7 +260,28 @@ print(step(0), step(1), step(8))
 ```
 
 An arm or a branch that does not finish settles nothing, which is the same standing-aside `never`
-already does when the type of the whole form is worked out.
+already does when the type of the whole form is worked out. It does not stop its sibling taking a
+type either: `if c then 0 else continue` is a `0` of whatever the position wants, exactly as it
+would be with a `1` in place of the `continue`. A branch ending in `return`, `break`, `continue` or a
+call of a function declared `-> never` (`panic`, or one of the program's own) stands aside like this.
+
+```sysl
+first_even(xs: []usize) -> usize
+    for x in xs
+        val w = (x % 2) match
+            0 -> x
+            _ -> if x > 100 then 0 else continue
+
+        return w
+
+    1
+
+print(first_even([3, 5, 8]), first_even([7, 101]), first_even([1]))
+```
+
+```output
+8 0 1
+```
 
 **Two branches that each know what they are still have to agree.** That is the half the rule
 protects: neither is silently decided by the other, because both arrived with an opinion.
@@ -304,6 +325,22 @@ print(ends(true), ends(false), joined(1, 5), joined(7, 5))
 
 ```output
 7 0 2 5
+```
+
+The branches of an `elif` chain are siblings, so they meet at one type all together rather than two
+at a time — the four branches below are four pairs of `usize`:
+
+```sysl
+split(n: usize) -> usize
+    val (a, b) = if n % 3 == 0 then (n, 0) elif n % 2 == 0 then (0, n) elif n % 3 == 2 then (n, 1) else (n, 2)
+
+    a * 10 + b
+
+print(split(3), split(4), split(5), split(7))
+```
+
+```output
+30 4 51 72
 ```
 
 A part that cannot be what the sibling says keeps its own type, and the branches are refused as

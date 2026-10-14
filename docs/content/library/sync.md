@@ -42,6 +42,7 @@ anything to schedule.
 | `Ordering` | the five C11 orderings — `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |
 | `Atomic[T]` | one word, and the nine operations that touch it indivisibly |
 | `SpinLock` | mutual exclusion held by spinning rather than by sleeping |
+| `IrqLock` | mutual exclusion on one Cortex-M core, held by masking interrupts — the lock an Armv6-M core has |
 | `Lock` | the trait every lock implements — `acquire`, `try_acquire`, `release` — whatever it waits by |
 | `Guarded[L, T]` | one record and its own lock, inline: a table of them is locked record by record, and constant data even on a board ([memory](/reference/memory/#a-table-whose-every-record-has-its-own-lock)); `with`/`try_with` for a hold that is a block, `lock_raw`/`unlock_raw` for one that is not. `sysl.threads.Mutex[T]` is one over a `SleepLock` |
 | `spin_hint()` | the processor's own instruction for "this loop is waiting" |
@@ -332,8 +333,8 @@ print(stats.load(Acquire))
 
 ### What `T` may be
 
-**An integer of 8, 16, 32 or 64 bits, or a pointer** — what the machine has an instruction for.
-Nothing in the declaration says so, and there is no bound that could: sysl's integers are an
+**An integer of 8, 16, 32 or 64 bits, or a pointer** — what the machine has an instruction for,
+and on a 32-bit board that stops at 32 (below). Nothing in the declaration says so, and there is no bound that could: sysl's integers are an
 [open family](/reference/generics/), so `u12` is a type a program may name and no `impl` list could
 have covered it. What refuses the type is the **form inside**, where the instruction would have had
 to be chosen:
@@ -382,6 +383,27 @@ print(f.load())
 
 ```error
 'atomic_load' reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, or a pointer — and real is neither. An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)
+```
+
+**How wide is the build's, too.** Every 64-bit processor sysl targets, and 32-bit x86 and wasm, has a
+64-bit atomic. **A 32-bit Arm M-profile core does not** — Armv7-M and Armv8-M stop at a 32-bit
+`ldrex`/`strex`, Armv6-M has no exclusive pair at all ([below](#armv6-m-changes-nothing-atomically)),
+and RV32's atomics are a word — so there an `Atomic[i64]` would be a call
+into `__atomic_fetch_add_8`, which no board's runtime defines. It is refused where the instruction
+would have been chosen, naming the target, and a `usize` or a pointer is the machine's own word and
+always fits:
+
+```sysl target=thumbv7em-freestanding
+import sysl.sync.*
+
+var ticks: Atomic[i64] = Atomic(0)
+
+@export("tick")
+tick() -> i64 = ticks.add(1, Relaxed)
+```
+
+```error
+'atomic_add' is one machine instruction, and 'thumbv7em-freestanding' has one for 32 bits at most — long is 64, so there is nothing to emit
 ```
 
 **The arithmetic members are refused on a pointer**, and for a third reason again: an address plus a
@@ -570,6 +592,82 @@ the exchange itself fight each other for the line — and worse, they fight the 
 the release, which is the one thread whose progress everybody is waiting on. A relaxed load spins in
 a shared line and costs nobody anything, and [`spin_hint()`](#spin-hint) on each round tells the
 processor that is what it is doing.
+
+## Armv6-M changes nothing atomically
+
+**An Armv6-M core — a Cortex-M0 or M0+ — reads and writes a word indivisibly, and that is all.** It
+has no `ldrex`/`strex`, so `load` and `store` of up to 32 bits are a plain `ldr` and `str` with the
+barriers their ordering needs, and every read-modify-write — `swap`, `cas`, `add` and the rest — would
+be a call into `__sync_*_4`, which no board's runtime defines. A program that reaches one is refused
+at its own call, a `SpinLock` included, since its flag is taken with an exchange:
+
+```sysl target=thumbv6m-freestanding
+import sysl.sync.*
+
+var ticks: Atomic[u32] = Atomic(0)
+
+@export("tick")
+tick() -> u32 = ticks.add(1, Relaxed)
+```
+
+```error
+this reaches 'sysl.sync.Atomic.add', which changes memory with an atomic read-modify-write, and 'thumbv6m-freestanding' has no instruction for one — use an 'IrqLock' where the code runs on one core, or a board's hardware lock (the RP2040's SIO spinlocks) through 'Guarded[L, T]'
+```
+
+```sysl target=thumbv6m-freestanding
+import sysl.sync.*
+
+var guard: SpinLock = SpinLock(0)
+
+@export("enter")
+enter() = guard.lock()
+```
+
+```error
+'SpinLock' takes its flag with an atomic exchange, and 'thumbv6m-freestanding' has no instruction for one
+```
+
+The refusal is of what the program *reaches*, not of what the standard module holds: the module is
+built whole for every target, and its `SpinLock` is there on an M0+ for a program that never takes
+it.
+
+## `IrqLock`
+
+**Mutual exclusion on one Cortex-M core, held by masking interrupts.** `lock` saves PRIMASK and runs
+`cpsid i`; `unlock` puts PRIMASK back as `lock` found it, so holds nest — an inner hold taken with
+interrupts already masked leaves them masked when it lets go. Nothing waits, so `try_lock` always
+answers `true`. It implements `Lock`, so the table of records that would be `Guarded[SpinLock, T]`
+elsewhere is `Guarded[IrqLock, T]` on an M0+:
+
+```sysl build=c target=thumbv6m-freestanding
+import sysl.sync.*
+
+var counts: Guarded[IrqLock, int] = Guarded.new(IrqLock(0), 0)
+
+@export("on_tick")
+on_tick() = counts.with((n) -> *n = *n + 1)
+```
+
+**It excludes interrupt handlers, not other cores.** A second core runs straight through it, so it is
+right only where everything that touches the data runs on the core taking the lock — the main loop
+and that core's handlers. A dual-core part such as the RP2040 needs its hardware lock, which its own
+package provides as a `Lock` for `Guarded[L, T]`.
+
+It exists on every Cortex-M target — Armv6-M, Armv7-M and Armv8-M — and a program reaching it for any
+other machine is refused:
+
+```sysl target=aarch64-macos
+import sysl.sync.*
+
+var l: IrqLock = IrqLock(0)
+
+l.lock()
+l.unlock()
+```
+
+```error
+'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and 'aarch64-macos' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; elsewhere use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are threads
+```
 
 ## `spin_hint`
 

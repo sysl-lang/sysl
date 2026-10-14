@@ -1,0 +1,317 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **The arithmetic a 32-bit machine calls out for is the program's own**: 64-bit division
+// (`sysl.softint`) and binary64 on a machine with no double-precision unit (`sysl.softfloat.binary64`).
+// These programs run on the QEMU boards (`tests_qmu_support.sysl`), whose support files define none
+// of those routines -- so an image that links at all proves the program carried them, and the values
+// it prints are checked against the host's own divider and double unit.
+
+// Cells the optimizer cannot see through, appended to the board module: a value written into one and
+// read back is unknown at compile time, so the arithmetic on it is done on the machine.
+private val SrtCells: string = raw"""
+
+    struct Cell
+        v: volatile u64
+
+    struct LongCell
+        v: volatile long
+
+    var cell: Cell = Cell(0)
+    var long_cell: LongCell = LongCell(0)
+
+    /** The double `bits` encodes, as nothing could fold. */
+    hidden(bits: u64) -> real
+        cell.v = bits
+        real.from_bits(cell.v)
+
+    /** `x`, as nothing could fold. */
+    hidden_long(x: long) -> long
+        long_cell.v = x
+        long_cell.v
+
+    /** `x`, as nothing could fold. */
+    hidden_ulong(x: u64) -> u64
+        cell.v = x
+        cell.v
+
+    /** A double's encoding and a space, or `nan`: a NaN's payload is not what is being checked. */
+    show(w: *Writer, x: real)
+        if x != x then w.write("nan".bytes) else x.bits().display(w, FormatSpec(0, -1, false))
+        w.write(" ".bytes)
+
+    show_long(w: *Writer, x: long)
+        x.display(w, FormatSpec(0, -1, false))
+        w.write(" ".bytes)
+
+    show_ulong(w: *Writer, x: u64)
+        x.display(w, FormatSpec(0, -1, false))
+        w.write(" ".bytes)
+
+    show_flag(w: *Writer, x: bool) = w.write((if x then "1 " else "0 ").bytes)
+    """
+
+private srt_program(b: QemuBoard, body: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", "import board.*\n\nval w = console()\n\n" + body))
+    files.push(("board/board.sysl", qemu_board_module(b, SrtCells)))
+    files
+end srt_program
+
+// Runs `body` on every board `only` admits; a complaint per board that did not exit cleanly having
+// printed exactly `want`.
+private srt_sweep(only: &Fn(QemuBoard) -> bool, body: string, want: string)
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        if !only(b) then continue
+
+        ran += 1
+
+        qemu_boot(b, srt_program(b, body)) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains(want) then
+                    bad.push(s"${b.name} wanted '$want': ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end srt_sweep
+
+private srt_every(b: QemuBoard) -> bool = true
+
+// -- 64-bit division ---------------------------------------------------------------------------------
+
+// The finding this closes: a reachable `panic` renders its line number through `digits_ulong`, which
+// divides a `ulong`, so an image that merely COULD panic needed `__aeabi_uldivmod` and failed to link.
+// Nothing in the program divides; the division the runtime answers is the library's own.
+@test("a program that can panic links and runs where no board supplies a division")
+srt_panicking_image_links_and_runs()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        ran += 1
+
+        qemu_boot(b, srt_program(b, raw"""
+            cell.v = 3
+            w.write("before ".bytes)
+
+            if cell.v == 3 then panic("boom")
+
+            w.write("after".bytes)
+            """)) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if r.status.ok() || !r.out.contains("before") || !r.out.contains("boom") ||
+                   r.out.contains("after")
+                    bad.push(s"${b.name} wanted a failed run saying 'boom': ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end srt_panicking_image_links_and_runs
+
+// The quotients and remainders of the edge cases -- zero, one, the largest values, every sign
+// combination, a divisor above 2^63 -- as the host's own divider answers them.
+@test("divides longs and ulongs, quotient and remainder, as the host's divider does")
+srt_divides_as_the_host()
+    val signed: []const (long, long) = [(0, 7), (7, 1), (-7, 2), (7, -2), (-7, -2),
+                                        (9223372036854775807, 1), (-9223372036854775807, 10),
+                                        (-9223372036854775807, 9223372036854775807),
+                                        (1234567890123456789, -987654321)]
+    val unsigned: []const (u64, u64) = [(0, 3), (18446744073709551615, 1),
+                                        (18446744073709551615, 18446744073709551615),
+                                        (18446744073709551615, 9223372036854775809),
+                                        (18446744073709551615, 10), (12345, 67890)]
+    var body = ""
+    var want = ""
+
+    for p in signed
+        body = body + s"show_long(w, hidden_long(${p.0}) / hidden_long(${p.1}))\n" +
+               s"show_long(w, hidden_long(${p.0}) % hidden_long(${p.1}))\n"
+        want = want + s"${p.0 / p.1} ${p.0 % p.1} "
+
+    for p in unsigned
+        body = body + s"show_ulong(w, hidden_ulong(${p.0}) / hidden_ulong(${p.1}))\n" +
+               s"show_ulong(w, hidden_ulong(${p.0}) % hidden_ulong(${p.1}))\n"
+        want = want + s"${p.0 / p.1} ${p.0 % p.1} "
+
+    srt_sweep(srt_every, body, want)
+end srt_divides_as_the_host
+
+// -- binary64 ----------------------------------------------------------------------------------------
+
+// The operands, as encodings: ordinary values, values whose results round, the largest finite value, a
+// subnormal, both zeros, an infinity, a NaN, and a large negative.
+private val SrtOperands: []const u64 = [
+    0x3FF0_0000_0000_0000, 0x4008_0000_0000_0000, 0x3FB9_9999_9999_999A, 0x3FC9_9999_9999_999A,
+    0x7FEF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0003, 0x8000_0000_0000_0000, 0x0000_0000_0000_0000,
+    0x7FF0_0000_0000_0000, 0x7FF8_0000_0000_0000, 0xC2E1_2345_6789_ABCD, 0x3FE0_0000_0000_0000,
+    0x3CA0_0000_0000_0000, 0x0010_0000_0000_0000]
+
+private srt_shown(x: real) -> string = if x != x then "nan " else s"${x.bits()} "
+
+private srt_flag(x: bool) -> string = if x then "1 " else "0 "
+
+// The boards whose machine has no double-precision unit, which is every one of them; the Armv6-M
+// board is left out because its support file is what supplies a 64-bit multiply and shift there, and
+// that is a different test's subject.
+private srt_binary64_board(b: QemuBoard) -> bool = b.name != "microbit"
+
+@test("multiplies, divides, adds, compares and narrows doubles exactly as the host's double unit")
+srt_binary64_agrees_with_the_host()
+    var body = ""
+    var want = ""
+
+    for i in 0..<SrtOperands.len
+        // 12 pairs 1.0 with 2^-53, half way to the next double: a tie, rounded to even.
+        val steps: []const usize = [0, 3, 7, 12]
+
+        for j in steps
+            val ab = SrtOperands[i]
+            val bb = SrtOperands[(i + j) % SrtOperands.len]
+            val a = real.from_bits(ab)
+            val b = real.from_bits(bb)
+            val pa = s"hidden($ab)"
+            val pb = s"hidden($bb)"
+
+            body = body + s"show(w, $pa * $pb)\nshow(w, $pa / $pb)\nshow(w, $pa + $pb)\n" +
+                   s"show(w, $pa - $pb)\nshow_flag(w, $pa < $pb)\nshow_flag(w, $pa <= $pb)\n" +
+                   s"show_flag(w, $pa == $pb)\nshow_flag(w, $pa >= $pb)\nshow_flag(w, $pa > $pb)\n"
+            want = want + srt_shown(a * b) + srt_shown(a / b) + srt_shown(a + b) + srt_shown(a - b) +
+                   srt_flag(a < b) + srt_flag(a <= b) + srt_flag(a == b) + srt_flag(a >= b) +
+                   srt_flag(a > b)
+
+        // Narrowed to f32 and widened back: a rounding, then an exact widening.
+        body = body + s"show(w, real(f32(hidden(${SrtOperands[i]}))))\n"
+        want = want + srt_shown(real(f32(real.from_bits(SrtOperands[i]))))
+
+    srt_sweep(srt_binary64_board, body, want)
+end srt_binary64_agrees_with_the_host
+
+// Each conversion between a double and an integer, and between an `f32` and a 64-bit integer -- which
+// a single-precision unit has no instruction for either -- with values that round.
+@test("converts between doubles, f32 and the integers exactly as the host's double unit")
+srt_conversions_agree_with_the_host()
+    val longs: []const long = [0, -1, 9007199254740993, -1234567890123456789, 9223372036854775807,
+                               16777217, -2147483647]
+    val doubles: []const u64 = [0x3FF8_0000_0000_0000, 0xC1DF_FFFF_FFC0_0000, 0x41EF_FFFF_FFE0_0000,
+                                0x43D2_3456_789A_BCDE, 0xBFEF_FFFF_FFFF_FFFF, 0xC3C1_2345_6789_ABCD]
+    var body = ""
+    var want = ""
+
+    for n in longs
+        body = body + s"show(w, real(hidden_long($n)))\n" +
+               s"show_ulong(w, u64(f32(hidden_long($n)).bits()))\n"
+        want = want + srt_shown(real(n)) + s"${u64(f32(n).bits())} "
+
+        if n >= -2147483647 && n <= 2147483647
+            body = body + s"show(w, real(int(hidden_long($n))))\n"
+            want = want + srt_shown(real(int(n)))
+
+        if n >= 0
+            body = body + s"show(w, real(u64(hidden_long($n))))\n" +
+                   s"show_ulong(w, u64(f32(u64(hidden_long($n))).bits()))\n"
+            want = want + srt_shown(real(u64(n))) + s"${u64(f32(u64(n)).bits())} "
+
+    for bits in doubles
+        val x = real.from_bits(bits)
+
+        body = body + s"show_long(w, long(hidden($bits)))\n" +
+               s"show_long(w, long(f32(hidden($bits))))\n"
+        want = want + s"${long(x)} ${long(f32(x))} "
+
+        if x > -2147483648.0 && x < 2147483648.0
+            body = body + s"show_long(w, long(int(hidden($bits))))\n"
+            want = want + s"${long(int(x))} "
+
+        if x >= 0.0 && x < 4294967296.0
+            body = body + s"show_long(w, long(uint(hidden($bits))))\n" +
+                   s"show_ulong(w, u64(hidden($bits)))\n"
+            want = want + s"${long(uint(x))} ${u64(x)} "
+
+    srt_sweep(srt_binary64_board, body, want)
+end srt_conversions_agree_with_the_host
+
+// -- what is left out --------------------------------------------------------------------------------
+
+// **A runtime is kept where something divides or computes with a double, and only there**: an image
+// that does neither carries no routine, which an emitted module says by not defining one.
+@test("a program that neither divides a long nor computes with a double carries neither runtime")
+srt_neither_runtime_where_neither_is_reached()
+    val plain = srt_emitted("thumbv7em-freestanding", raw"""
+        @export("main")
+        probe(x: int) -> int = x * 3 + x
+        """)
+
+    assert(!plain.contains("__aeabi_uldivmod") && !plain.contains("__aeabi_dmul") &&
+           !plain.contains("__udivmoddi4"), plain)
+
+    val divides = srt_emitted("thumbv7em-freestanding", raw"""
+        @export("main")
+        probe(x: long) -> long = x / 3
+        """)
+
+    assert(divides.contains("__aeabi_ldivmod:") && divides.contains("@__divmoddi4") &&
+           !divides.contains("__aeabi_dmul"), divides)
+
+    val doubles = srt_emitted("riscv32-freestanding", raw"""
+        @export("main")
+        probe(x: real) -> real = x * 3.0
+        """)
+
+    assert(doubles.contains("@__muldf3") && !doubles.contains("@__udivdi3"), doubles)
+
+    val hosted = srt_emitted("x86_64-linux", raw"""
+        @export("main")
+        probe(x: long, y: real) -> real = real(x / 3) * y
+        """)
+
+    assert(!hosted.contains("__divdi3") && !hosted.contains("__muldf3"), hosted)
+end srt_neither_runtime_where_neither_is_reached
+
+@test("a double-precision unit computes with doubles itself, and keeps the runtime only for a long conversion")
+srt_double_unit_keeps_the_runtime_only_for_conversions()
+    val multiplies = srt_emitted("thumbv7em-freestanding-dp", raw"""
+        @export("main")
+        probe(x: real) -> real = x * 3.0
+        """)
+
+    assert(multiplies.contains("fmul double") && !multiplies.contains("__aeabi_dmul"), multiplies)
+
+    val converts = srt_emitted("thumbv7em-freestanding-dp", raw"""
+        @export("main")
+        probe(x: real) -> long = long(x * 3.0)
+        """)
+
+    assert(converts.contains("__aeabi_d2lz"), converts)
+
+    val single = srt_emitted("thumbv7em-freestanding", raw"""
+        @export("main")
+        probe(x: real) -> real = x * 3.0
+        """)
+
+    assert(single.contains("__aeabi_dmul"), single)
+end srt_double_unit_keeps_the_runtime_only_for_conversions
+
+// The LLVM text a one-file program emits for `target`.
+private srt_emitted(target: string, src: string) -> string
+    val dir = make_temp_dir("sysl-srt").unwrap()
+
+    write_text(s"$dir/main.sysl", src).unwrap()
+
+    val text = emit_llvm_text(dir, Some(target), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(dir).unwrap_or(())
+    text
+end srt_emitted

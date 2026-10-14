@@ -323,13 +323,20 @@ struct Buf[T]
 
     is_empty(self) -> bool = self.len() == 0
 
-    at(self, i: usize) -> T
-        if is_null(self.core) then past_end(i, 0)
-        self.core.at(i)
+    at(self, i: usize) -> T = self.reading().at(i)
 
-    set(self, i: usize, v: T)
-        if is_null(self.core) then past_end(i, 0)
-        self.core.set(i, v)
+    set(self, i: usize, v: T) = self.reading().set(i, v)
+
+    /** The core an index reads through: this handle's own, or the empty one a handle naming nothing
+     * reads as -- whose count of zero refuses every index with the same report a buffer's own would.
+     *
+     * **It is a choice of address, not a branch around the read**, and that is what lets a loop of
+     * reads keep the storage and the count in registers. Behind an `if` the core's fields are read
+     * only on the arm where the handle names something, and a read the optimizer cannot prove happens
+     * on every turn is one it may not hoist; chosen this way, every turn reads the same address, and
+     * the panic that reports an index stays inside the loop where the index is.
+     */
+    private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
 
     // Every member that can move the storage or give an element up is `@relocates`, so a live `ref`
     // to an element is refused the call.
@@ -373,6 +380,15 @@ struct Buf[T]
 
         out.extend(self.view())
         out
+
+    /** The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer --
+     * through this name and every other -- left empty (`Frozen`). The elements are copied once into
+     * storage sized to them. A local this is called on may not be read again until it is assigned
+     * a new value (`@consumes`).
+     */
+    @relocates
+    @consumes
+    freeze(self) -> &sync Frozen[T] = freeze_buf(self)
 
     /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
      * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
@@ -430,6 +446,12 @@ private[sysl] enum Unassigned
 // accessor: the whole member is then too big for a caller to absorb, so every read is a call and a
 // frame. Behind a name that does not return, what is left where the check was is a compare and a
 // branch, and the accessor is small enough to disappear into its caller.
+/** An empty core at every element type: storage `[]` and a count of zero are all-zero words, four of
+ * them -- the view's three and the count -- whatever `T` is. A `var` only because an address is taken
+ * of it: it is never written, since a count of zero refuses every index before anything is.
+ */
+private[buf] var NoCore: [4]usize = [0, 0, 0, 0]
+
 private past_end(i: usize, n: usize) -> never
     print("panic: index", i, "past the", n, "elements of a Buf")
     exit(1)
@@ -469,9 +491,7 @@ impl[T] IndexSet[usize, T] for Buf[T]
  * member moves the storage.
  */
 impl[T] IndexPlace[usize, T] for Buf[T]
-    index_place(self, i: usize) -> *T
-        if is_null(self.core) then past_end(i, 0)
-        self.core.place(i)
+    index_place(self, i: usize) -> *T = self.reading().place(i)
 
 /** `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
  * slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
@@ -492,6 +512,22 @@ buf[T]() -> Buf[T] = Buf(BufCore([], 0))
  * callers write it, and because it is what lets a call say the element type without brackets.
  */
 buf_with_capacity[T](n: usize, fill: T) -> Buf[T] = Buf(BufCore(slot_storage(n), 0))
+
+/** A buffer of `n` elements, every one of them `value` -- what a RAM disk, a frame buffer or a table
+ * of counters starts as. The storage is sized to `n` once and each slot is filled in place, so it
+ * costs one allocation and `n` stores rather than the doublings of a `push` loop.
+ *
+ * **Every element is a copy of `value`**, the way any assignment copies: a plain value is repeated,
+ * and a counted one is shared -- `n` elements naming one object, holding `n` counts of it.
+ */
+buf_filled[T](n: usize, value: T) -> Buf[T]
+    var out: Buf[T] = Buf(BufCore(slot_storage(n), 0))
+
+    for _ in 0..<n
+        out.push(value)
+
+    out
+end buf_filled
 
 /** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
  * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier

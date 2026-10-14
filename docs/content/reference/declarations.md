@@ -465,14 +465,53 @@ A tail call is a call, so the jump lands where a call would: **every `require` i
 the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
 its own precondition at depth four stops at depth four.
 
-Two things end a tail position instead of being optimized around:
+Three things end a tail position instead of being optimized around:
 
 - **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
   ordinary call, and before it is entered for a jump;
 - **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
-  returns.
+  returns;
+- **an argument that may point into the frame**. A jump reuses the frame: the locals are released on
+  the way to it, and the next round writes every slot again, so `&sub` handed down would be read
+  after `sub` was freed or written over. Where the body takes the address of its own storage
+  anywhere — `&` of a local, a parameter or a temporary, or a slice of a local array — a self-call
+  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call. A
+  parameter passed on as it arrived — never written, its address never taken — is the caller's, and
+  does not count.
 
-Either one leaves the function compiled exactly as written.
+Any of them leaves the function compiled exactly as written:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct P
+    toks: Buf[string]
+    pos: usize
+
+decl(p: *P, base: string) -> string
+    if p.pos < p.toks.len() && p.toks[p.pos] == "*" then
+        p.pos += 1
+        return decl(p, base + "*")
+
+    if p.pos < p.toks.len() && p.toks[p.pos] == "("
+        var inner: Buf[string] = buf()
+        inner.push("*")
+        var sub = P(inner, 0)
+        return decl(&sub, base + "()")
+
+    base
+
+var toks: Buf[string] = buf()
+toks.push("(")
+var top = P(toks, 0)
+print(decl(&top, "void"))
+```
+
+```output
+void()*
+```
+
+The call that passes `&sub` keeps its frame, so `sub`'s buffer is alive while the callee reads it.
 
 It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
 calls, however they are written.
@@ -492,6 +531,29 @@ print(sum(5))
 
 ```error
 calls itself nowhere the jump can replace
+```
+
+A self-call in tail position that may hand down an address in the frame is refused with its own
+reason:
+
+```sysl
+struct S
+    n: int
+
+@tailrec
+walk(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    walk(&next, acc + s.n)
+
+var s = S(4)
+print(walk(&s, 0))
+```
+
+```error
+its tail call may pass an address in its own frame
 ```
 
 It changes nothing about what is emitted — write it on the functions where losing the jump silently
@@ -605,6 +667,60 @@ print(f(x))
 
 ```error
 counted value
+```
+
+**No argument may point into the frame being replaced.** The callee runs in the replaced frame's
+place, so `&` of a local, a parameter or a temporary — or a slice of a local array — would hand it
+storage that no longer exists. The test is the one a self tail call is held to: where the body takes
+the address of its own storage anywhere, an argument that can hold an address (a pointer, a slice,
+or a value made of one) is refused, unless it is one of the function's own parameters passed on as
+it arrived, which points at its caller's storage:
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    become g(&next, acc + s.n)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```error
+an argument may point into this frame
+```
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    var probe = S(0)
+    val seen = &probe
+
+    if s.n == 0 then return acc + seen.n
+
+    s.n -= 1
+
+    become g(s, acc + 1)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```output
+4
 ```
 
 The rest are the tail call's own, for the reasons `Tail calls` gives: an `ensures` is checked when a
@@ -906,6 +1022,102 @@ anything calls it — while a conversion written at `T` is checked at each call,
 
 A **closure's** parameter declares no default. A call reaches a closure through the `Fn` traits,
 which carry the types and not the names, so there would be nothing at the call to fill one from.
+
+A **trait member's** defaults and parameter names are part of the trait's signature, so they reach
+every call made through it: through a bound on a type parameter (a method, an associated function, a
+`where` clause, an associated type's bound) and through a trait object, exactly as on the type that
+implements it. The default is the trait's on every path, which is why an `impl` block's member
+declares none — a call through an object or a bound has no implementation to read one from — and an
+implementation that replaces the member keeps the trait's.
+
+```sysl
+trait Greet
+    greet(self, n: int = 3, m: int = 10) -> int = n + m
+
+struct A
+    x: int
+
+impl Greet for A
+
+via[G: Greet](g: G) -> int = g.greet()
+named[G: Greet](g: G) -> int = g.greet(m = 100)
+obj(g: &Greet) -> int = g.greet(n = 0)
+
+print(A(1).greet(), via(A(1)), named(A(1)), obj(A(1)))
+```
+
+```output
+13 13 103 10
+```
+
+A trait's default may name **the trait's own type parameters**, and it is read at what the `impl`
+fixed them to — `f64` below, on every one of those paths. Where the `impl` is generic itself, at what
+each instantiation gives its parameter. The default is still held to the trait's bounds where it is
+written: `T.zero()` in a `trait Pad[T]` with no `Zero` among `T`'s bounds is refused, though every
+type that implements it might have a `zero`.
+
+```sysl
+trait Pad[T: Zero + Add]
+    pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+struct A
+    x: int
+
+struct W[U]
+    u: U
+
+impl Pad[f64] for A
+impl[U: Zero + Add] Pad[U] for W[U]
+
+via[P: Pad[f64]](p: P) -> f64 = p.pad(2.5)
+obj(p: &Pad[f64]) -> f64 = p.pad(4.5)
+
+val n: int = W(3).pad(4)
+
+print(A(1).pad(1.5), via(A(1)), obj(A(1)), n)
+```
+
+```output
+1.5 2.5 4.5 4
+```
+
+```sysl
+trait Pad[T]
+    pad(self, x: T, by: T = T.zero()) -> T = x
+```
+
+```error
+'zero' needs 'T: sysl.Zero'
+```
+
+```sysl
+trait Greet
+    greet(self, n: int = 3) -> int = n
+
+struct A
+    x: int
+
+impl Greet for A
+    override greet(self, n: int = 5) -> int = n * 10
+```
+
+```error
+a member of an 'impl' block declares no default
+```
+
+A parameter that has no default is still owed through a bound, and the refusal names the trait's
+member, since that is the signature the call was read against:
+
+```sysl
+trait Greet
+    greet(self, n: int, m: int = 1) -> int = n + m
+
+via[G: Greet](g: G) -> int = g.greet(m = 2)
+```
+
+```error
+method 'Greet.greet' was given no value for 'n', and that parameter declares no default
+```
 
 ### A parameter may collect the rest of the call
 
@@ -1243,6 +1455,107 @@ print(one(41), two(6, 7))
 ```output
 42 13
 ```
+
+### Overloading a member
+
+**A type's own members overload by exactly the rules above.** A method or an associated function
+may be declared more than once in a type's body, and a call — `s.f(…)` or `S.make(…)` — means the
+one its arguments fit, with the same tie-breaks. The receiver is not part of what tells them apart:
+it is the same type in every one of them.
+
+```sysl
+struct S
+    n: int
+
+    f(self, x: int) -> int = x + self.n
+    f(self, x: string) -> int = int(x.len)
+    f(self, x: int, y: int) -> int = x * y
+    make(n: int) -> S = S(n)
+    make(s: string) -> S = S(int(s.len))
+
+val s = S.make("abcdefghij")
+print(s.f(1), s.f("abc"), s.f(3, 4), S.make(2).n)
+```
+
+```output
+11 3 12 2
+```
+
+**On a generic type the choice is made at the receiver's instantiation**, so a member taking `T`
+beside one taking `string` is two members on a `Box[int]` and the call picks by its arguments, in a
+generic body as well as outside one:
+
+```sysl
+struct Box[T]
+    v: T
+
+    put(self, x: T) -> string = "same"
+    put(self, x: string, y: int) -> string = "pair"
+
+g[T](b: Box[T], x: T) -> string = b.put(x)
+
+val b = Box(1)
+print(b.put(2), b.put("x", 3), g(b, 7))
+```
+
+```output
+same pair same
+```
+
+**A pair a call could not tell apart is refused at the second**, in the words a function pair gets,
+and its body is not read against the first's parameters:
+
+```sysl
+struct D
+    n: int
+
+    h(self, x: int) -> string = "s"
+    h(self, x: int, y: int = 0) -> int = 1
+```
+
+```error
+type 'D' already has a member named 'h' with parameters this one could not be told from — a call passing 1 argument would fit both
+```
+
+**A call that several fit equally, or that none fits, is refused at the call with the roster:**
+
+```sysl
+struct W
+    n: int
+
+    width(self, x: u8) -> string = "u8"
+    width(self, x: u16) -> string = "u16"
+
+print(W(0).width(1))
+```
+
+```error
+'W.width' is ambiguous here — 2 of its declarations take these arguments:
+    W.width(x: u8)
+    W.width(x: u16)
+```
+
+Three things do not overload, each because it is one name with one meaning rather than a set of
+calls:
+
+- **A [property](#a-property)** is read without parentheses, so there is no argument list to choose
+  by. A property and a method of one name are refused as before.
+- **A trait's member.** An implementation supplies each member of its trait by name, and a bound
+  reaches each by name, so a trait declares a name once:
+
+  ```sysl
+  trait Tr
+      f(self, x: int) -> string
+      f(self, x: string) -> string
+  ```
+
+  ```error
+  trait 'Tr' already declares a member named 'f' — an implementation supplies a trait's members by name, so a trait declares each name once
+  ```
+
+- **A type's own member and a trait's member of one name** still collide, whatever their
+  parameters: the trait's member is reachable only where the trait is in scope, and a name meaning
+  a different set of declarations in different files is exactly what that rule keeps out.
 
 ### Overloading an `extern`
 
@@ -2171,6 +2484,116 @@ decides who may know the shape. See [modules](/reference/modules/).
 
 An opaque struct with no body at all is C's incomplete type, `struct sqlite3;` — nothing in sysl lays
 one out, and the declaration exists so that `*Session` is a type a `*u8` cannot be mistaken for.
+
+### Members in an `impl` block of their own
+
+**An `impl` naming no trait adds members to a struct or an enum**, written in any file of the module
+that declares the type. A type whose methods outgrow its declaration — a `Quaternion` with fifty
+operations, an enum with a parser and a printer — keeps its fields together and its members where
+they read best:
+
+```sysl
+// geom/quat.sysl
+module geom
+
+struct Quat[F]
+    w: F
+    x: F
+```
+
+```sysl
+// geom/ops.sysl
+module geom
+
+import sysl.math.Float
+
+impl[F: Float] Quat[F]
+    norm2(self) -> F = self.w * self.w + self.x * self.x
+
+    scaled(self, k: F) -> Quat[F] = Quat(self.w * k, self.x * k)
+```
+
+The block's members are the type's own exactly as the body's are: no trait to import, reached
+wherever the type is, and one namespace with the body — so a name the body already uses is a
+duplicate whichever was written first:
+
+```sysl
+struct P
+    n: int
+
+    show(self) -> int = self.n
+
+impl P
+    show(self) -> int = 2
+
+print(P(1).show())
+```
+
+```error
+type 'P' already has a member named 'show'
+```
+
+**The block's header binds the type's parameters**, under names of its own, as a trait's `impl`
+does. **A bound it adds is a condition on the members it brings**: they exist only where the
+receiver's arguments meet it, while the type and its body's members stay as they were. It is the
+inherent counterpart of [a conditional conformance](/reference/traits/#conditional-conformance):
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+    swapped(self) -> Pair[T] = Pair(self.hi, self.lo)
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(3, 7).larger())
+print(Pair(Tag(1), Tag(2)).swapped().lo.n)
+```
+
+```output
+7
+2
+```
+
+A `Pair[Tag]` is built and swapped; asking it for `larger` is refused at the call, naming the bound
+the block wrote:
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(Tag(1), Tag(2)).larger().n)
+```
+
+```error
+'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', but Tag does not
+```
+
+**Another module may not add members**: a type's own members are part of what its declaration
+promises, and what another module wants to add is a trait, which it may implement for the type:
+
+```sysl
+impl[T] Option[T]
+    or_zero(self) -> int = 0
+
+print(1)
+```
+
+```error
+'sysl.Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
+```
 
 ## Enums
 

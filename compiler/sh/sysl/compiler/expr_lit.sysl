@@ -81,6 +81,31 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
     TExpr(span, TIntLit(value, ty))
 end int_literal
 
+// A character literal is a `char`, except where its position wants a `u8`: there an ASCII one is
+// that byte, read exactly as an integer literal would be, so `b[i] == ';'` and `out.push('\n')`
+// need no conversion.
+//
+// **Only `u8`, and only below 128.** A `u8` is a byte of UTF-8 text, and a code point from 128 up is
+// more than one byte of it, so such a literal is refused rather than truncated. No other integer
+// type takes one: a character is not a number to a signed or wider type.
+char_literal(cx: &Analyzer, span: Span, cp: char, expected: Option[Type]) -> TExpr
+    if !wants_byte(expected) then return TExpr(span, TIntLit(from_int(long(uint(cp))), Char))
+
+    val code = u32(cp)
+
+    if code >= 128 then
+        return cx.err(span, s"the character U+${hex_upper(u64(code), 4)} is not ASCII, so it is " +
+                      "more than one byte in UTF-8 and cannot be a u8 — write a string for its " +
+                      "bytes, or u8(0x..) for one byte")
+
+    TExpr(span, TIntLit(from_int(long(code)), Integer(8, false, false)))
+end char_literal
+
+// Whether a position wants a byte -- seen through a vector, as an integer literal's is.
+wants_byte(expected: Option[Type]) -> bool = expected match
+    Some(t) -> scalar_wanted(t) == Integer(8, false, false)
+    None -> false
+
 private suffixed_int(cx: &Analyzer, span: Span, suffix: string) -> Type
     val named = scalar_type_named(cx, span, suffix)
 
@@ -232,7 +257,17 @@ constructed(t: TExpr) -> bool = *t.kind match
 // spelling says that one of them chose its width. `constructed` reads the analyzed node, and is
 // what separates `Some(3)` from `f(3)`: the two parse identically, and a function's result has
 // nothing to do with the literals handed to it.
-adaptable(e: Expr, t: TExpr) -> bool = is_literal(e) || literal_shaped(e) && constructed(t)
+//
+// **A character literal is adaptable too, though it is not a bare literal**: it has a type of its
+// own, `char`, and keeps it wherever nothing else is said, but beside a `u8` it is that byte -- so
+// `';' == b[i]` takes the byte's type rather than imposing its own.
+adaptable(e: Expr, t: TExpr) -> bool =
+    is_literal(e) || is_char_literal(e) || literal_shaped(e) && constructed(t)
+
+// Whether an expression is a character literal, as written.
+is_char_literal(e: Expr) -> bool = *e.kind match
+    CharLit(_) -> true
+    _ -> false
 
 // The type an adaptable literal falls back to, worked out from how it is written rather than by
 // analyzing it.

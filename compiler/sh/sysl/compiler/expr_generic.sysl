@@ -155,6 +155,8 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
     IntLit(_, _, _) -> const_arg_at(cx, e)
     Index(head, one, _) -> applied_type_arg(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_arg(cx, anchor_of(e), head, inner, at_address)
+    // A type only the type grammar could read is already written as one.
+    TypeArg(written) -> resolve_type(cx.an, cx.scope, written, cx.subst)
     // The three the two grammars share a spelling for. `*T` and `&T` are a unary operator in an
     // expression and a qualifier in a type; a tuple is parentheses either way. Everything else has
     // no spelling here at all, which the refusal below is what says.
@@ -207,6 +209,7 @@ private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = 
     // An applied generic behind a pointer or a reference -- `&Box[i32]` -- nests the same way.
     Index(head, one, _) -> applied_type_ref(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_ref(cx, anchor_of(e), head, inner, at_address)
+    TypeArg(written) -> written
     _ ->
         not_a_type_arg(cx, e, at_address)
         named_type(e.span, "")
@@ -273,6 +276,7 @@ private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
             Unary(op, _) if op == "*" || op == "&" -> refs.push(written_type_ref(cx, arg, at_address))
             Index(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArgs(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
+            TypeArg(_) -> refs.push(written_type_ref(cx, arg, at_address))
             _ -> refs.push(type_ref(arg.span, ValueArgType(arg)))
 
 
@@ -425,6 +429,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
             ts.push(variadic_extra(cx, args.at(i), false))
 
     check_crossings(cx, decl.crossing, written, written_params, ts)
+    check_shared_result(cx, span, sig.unwrap().ret)
     cx.an.uses(name)
 
     if nested.is_none() then return TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
@@ -875,6 +880,7 @@ private expr_mentions(e: Expr, names: Buf[string]) -> bool = *e.kind match
     Ident(n) -> holds_string(names, n)
     LayoutOf(_, tr) -> ref_mentions(tr, names)
     OffsetOf(tr, _) -> ref_mentions(tr, names)
+    TypeArg(tr) -> ref_mentions(tr, names)
     Unary(_, operand) -> expr_mentions(operand, names)
     Binary(_, l, r) -> expr_mentions(l, names) || expr_mentions(r, names)
     Compare(operands, _) ->

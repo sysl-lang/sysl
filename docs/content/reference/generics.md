@@ -140,6 +140,30 @@ single solve; the annotation on the binding reaches it, and unlike the kernel ab
 one, since an associated function has a result. And a **bare arrow's own parameter**, which is the
 case below.
 
+The annotation reaches it through an `unwrap()` or an `expect(…)` as well, where the function answers
+an `Option` or a `Result` of what it makes: the binding says what the wrapper carries, and that is
+what settles the type. The call's own arguments are read first, so where they settle the type the
+binding is checked against it as usual:
+
+```sysl
+struct Gain[S]
+    k: S
+
+    of(x: real) -> Result[Self, string]
+        if x > 1.0 then return Err("too loud")
+        Ok(Gain(S(x)))
+end Gain
+
+val g: Gain[q15] = Gain.of(0.5).unwrap()
+val h: Gain[q31] = Gain.of(0.25).expect("in range")
+
+print(g.k, h.k)
+```
+
+```output
+0.5 0.25
+```
+
 ### A bare arrow is not in the list
 
 `f: T -> U` is sugar for a bounded type parameter — the callable's own type, which the compiler adds
@@ -202,9 +226,41 @@ The [boxed spelling](/reference/types/) is what an address needs: `&Fn(T) -> U` 
 so a function declared with one is an ordinary generic and its address is written as any other.
 
 
-There is also a **hole shared with the address form**: the brackets read the *expression* grammar, so
-a type the two grammars do not spell alike has no form there. `[]int`, `weak T`, `volatile T`,
-`<4>f32` and a callable are refused by the parser. The annotation reaches every one of them.
+**Every type an annotation can spell can be written in the list.** The parser reads each item as an
+expression first, so a subscript, `T`, `*T`, `&T`, `Box[T]` and `(A, B)` are what they always were;
+where that reading does not end the item at the `,` or `]`, it reads the item again as a type from the
+same place. That is what admits `&sync T`, `[]T`, `[]const T`, `[N]T`, a nested application and a boxed
+callable:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Shared
+    n: int
+
+val shared = buf[&sync Shared]()
+val views = buf[[]const u8]()
+val rows = buf[[3]int]()
+val nested = buf[Buf[&sync Shared]]()
+
+print(shared.len(), views.len(), rows.len(), nested.len())
+```
+
+```output
+0 0 0 0
+```
+
+A type that is refused in an annotation is refused here with the same message, so a bare callable
+`int -> int` is told to be written `&Fn(int) -> int`. In a subscript, such a type is told it is not a
+value:
+
+```sysl
+first(xs: []const int) -> int = xs[&sync Missing]
+```
+
+```error
+this is a type, and a value is wanted here
+```
 
 **The address form came first**: `&f[T]` names one instantiation of a generic function, and the case
 that earned it is a C callback whose signature mentions the type parameter nowhere. See
@@ -1732,17 +1788,28 @@ stands in for expansion, in the one direction the catalog needs.
 
 | absent | why, and what to write instead |
 |---|---|
-| explicit type arguments **at a call** | `id[int](7)` collides with indexing; annotate what receives the result. At an **address** they are written — `&f[T]` |
 | `where` clauses | the inline `[T: A + B]` list is the settled baseline; an out-of-line form is a possible ergonomic addition |
 | type-level arithmetic (`[N + 1]T`) | a value parameter may stand as a length but not be computed with in a type; deciding that `N + 1` and `1 + N` are one type is a feature of its own |
 | pack expansion (`f(..a)`, `(..A, int)`) | a pack may be matched and walked, not spread into an argument list or appended to; `for const` is what stands in for it |
 | higher-kinded parameters (`F[_]`) | **excluded**, not deferred — it pushes inference toward undecidable, and abstraction over containers is served by traits and bounds |
 
-The first of those has one position where the annotation costs more than a word. A **nullary** generic
-has no argument to be inferred from, so `buf()` and `map()` are solved by what receives the result and
-nothing else — and `buf[u8]()` is the first thing a reader tries. That form is refused **by name**,
-naming the annotation that stands in for it, rather than by a general complaint about a callee that is
-not a name.
+Explicit type arguments at a call are **not** among them: they are written at the five heads
+[above](#writing-the-type-arguments). They matter most for a **nullary** generic, which has no
+argument to be inferred from — `buf()` and `map()` are otherwise solved by what receives the result
+and nothing else, and `buf[u8]()` says it at the call:
+
+```sysl
+import sysl.buf.buf
+
+var b = buf[u8]()
+
+b.push(3)
+print(b.len())
+```
+
+```output
+1
+```
 
 ---
 

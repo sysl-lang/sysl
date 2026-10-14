@@ -104,8 +104,11 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     IntLit(digits, base, suffix) ->
         int_literal(cx, e.span, literal_value(digits, base), suffix, expected)
     FloatLit(text, suffix) -> float_literal(cx, e.span, text, suffix, expected)
-    CharLit(cp) -> TExpr(e.span, TIntLit(from_int(long(uint(cp))), Char))
-    StrLit(v) -> TExpr(e.span, TStrLit(v))
+    CharLit(cp) -> char_literal(cx, e.span, cp, expected)
+    // Where a `[N]u8` is wanted, the literal is its UTF-8 bytes.
+    StrLit(v) -> bytes_literal(cx, e.span, v, expected) match
+        Some(bytes) -> bytes
+        None -> TExpr(e.span, TStrLit(v))
 
     // A C callee finds the end by the terminator, so an interior NUL would hide everything written
     // after it. Refused outright rather than silently truncated.
@@ -139,9 +142,8 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // A list in brackets reaches here only where it is neither a call's nor an address's.
     TypeArgs(_, args, _) ->
         cx.err(anchor_of(e), s"a subscript takes one index, and ${args.len()} were written — a list of " +
-               "types in brackets is a type-argument list, and the only place one is written is " +
-               "at an address, as '&f[A, B]'. Everywhere else a generic's arguments are inferred, " +
-               "from the arguments at a call or from the type the result is read into")
+               "types in brackets is a type-argument list, and one is written after a generic's " +
+               "name — at a call, as 'f[A, B](x)', or at an address, as '&f[A, B]'")
 
     Field(receiver, name, name_at) -> field_expr(cx, name_at, receiver, name, expected)
 
@@ -149,6 +151,10 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 
     TryExpr(inner) -> try_expr(cx, e.span, inner, expected)
     AwaitExpr(inner) -> await_expr(cx, e.span, inner)
+
+    TypeArg(_) ->
+        cx.err(anchor_of(e), "this is a type, and a value is wanted here — a type between brackets is a " +
+               "type argument, written after a generic function or type: 'buf[&sync C]()'")
 
     LayoutOf(op, t) -> layout_of(cx, e.span, op, t, expected)
     OffsetOf(t, field) -> offset_of(cx, e.span, t, field, expected)
@@ -226,7 +232,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     TypeAttr(subject, attr, _, _) -> type_attr_expr(cx, anchor_of(e), subject, attr)
 
     // `lo..hi` and `lo..<hi` standing where a value is wanted, which is `sysl.Range[T]`.
-    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive)
+    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive, expected)
 
     Bad -> bad_expr(e.span)
 
@@ -242,8 +248,12 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 // **An open end stays a form.** `..`, `lo..` and `..hi` mean something in an index and nothing on
 // their own -- what an absent bound *is* depends on what is being indexed -- so they keep the
 // refusal, which names the one place they are legal rather than all four.
+//
+// **A range standing where a `Range[T]` is wanted reads its bounds at `T`**, exactly as an operator's
+// operands read the type their position wants: `total(0..<4)` at a `Range[usize]` parameter is a
+// range of `usize`, not an `int` one refused for a difference the reader never wrote.
 private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr],
-                    inclusive: bool) -> TExpr
+                    inclusive: bool, expected: Option[Type]) -> TExpr
     if lo.is_none() || hi.is_none() then
         return cx.err(span, "a range with an open end is only allowed in a slice index — as a " +
                       "value it would have to say what the missing bound is, and only the thing " +
@@ -256,7 +266,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
 
     // The same two questions the `for` header asks of its bounds, in the same order and the same
     // words: a range value and a counted loop must not come to disagree about what a range is.
-    val ts = analyze_operands(cx, ends, None)
+    val ts = analyze_operands(cx, ends, range_element(expected))
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -287,6 +297,15 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
             TExpr(span, TStructNew(d, fields))
         _ -> bad_expr(span)
 end range_value
+
+// The `T` of an expected `sysl.Range[T]`, where that is what the position wants.
+private range_element(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    underlying(expected.unwrap()) match
+        Struct(d) if d.base == library_key("Range") && d.targs.len() == 1 -> Some(d.targs.at(0))
+        _ -> None
+end range_element
 
 // `a, b` where a function's result list is what is being produced. It builds the aggregate the
 // caller takes apart -- the same one a tuple builds, since a result list is a tuple's layout
@@ -1260,6 +1279,14 @@ private numeric_expectation(expected: Option[Type]) -> Option[Type]
     if computes_numerically(expected.unwrap()) then expected else None
 end numeric_expectation
 
+// The expectation a prefix operator's operand inherits. `-` and `~` produce the type they are
+// given, so any expected type is the operand's too; anything else keeps the numeric one.
+private operand_expectation(op: string, expected: Option[Type]) -> Option[Type]
+    if op == "-" || op == "~" then return expected
+
+    numeric_expectation(expected)
+end operand_expectation
+
 // -- operators -----------------------------------------------------------------------------------
 
 private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
@@ -1298,8 +1325,10 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
     end if
     if op == "*" then return deref_expr(cx, e.span, operand)
 
-    val numeric = numeric_expectation(expected)
-    val t = type_expr(cx, operand, numeric)
+    // **`-` and `~` answer the operand's own type** -- a number's, or `Self` from `Neg` and `Not` --
+    // so the type the position wants is the type the operand has to be, and it is passed down whole:
+    // `-P.make()` at `P[int]` settles `make`'s `T` exactly as `P.make()` there does.
+    val t = type_expr(cx, operand, operand_expectation(op, expected))
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
@@ -1657,6 +1686,11 @@ end sandboxed_read
 // was going to report it.
 reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type) -> TExpr
     if !disagree(texpr_type(t), want) then return t
+
+    // A character literal beside a byte is that byte or a mistake with its own name, so its reading
+    // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
+    // than that a `u8` cannot be compared with a `char`.
+    if is_char_literal(src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
 
     val mark = cx.an.complaints()
     val again = analyze_expected(cx, src, Some(want))

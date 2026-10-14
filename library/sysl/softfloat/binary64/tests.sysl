@@ -1,0 +1,144 @@
+module sysl.softfloat.binary64
+@tests
+
+import sysl.rand.{Rng, rng}
+
+// The binary64 routines' arithmetic, called on encodings.
+//
+// **The oracle is the host's own double unit**, which had nothing to do with this file: thousands of
+// random pairs over the whole encoding -- every exponent, both signs, subnormals, infinities, NaNs --
+// must come back bit for bit what the hardware answers, a NaN matching a NaN. A board runs the same
+// routines through the exports (`tests_qmu_qemu_run.sysl`); this is where every case is affordable.
+
+private same(a: u64, b: real) -> bool = a == b.bits() || (real.from_bits(a) != real.from_bits(a) && b != b)
+
+private any_double(g: *Rng) -> real = real.from_bits(g.next_u64())
+
+@test("+ - * / of random doubles agree with the double unit")
+random_pairs_agree_with_hardware()
+    var g = rng(64, 7)
+
+    for step in 0..<20000
+        val a = any_double(&g)
+        val b = any_double(&g)
+
+        assert(same(add(a.bits(), b.bits()), a + b), s"$a + $b")
+        assert(same(sub(a.bits(), b.bits()), a - b), s"$a - $b")
+        assert(same(mul(a.bits(), b.bits()), a * b), s"$a * $b")
+        assert(same(div(a.bits(), b.bits()), a / b), s"$a / $b")
+
+@test("and so do pairs close in magnitude, where subtraction cancels and rounding ties")
+random_near_pairs_agree_with_hardware()
+    var g = rng(65, 7)
+
+    for step in 0..<20000
+        val a = any_double(&g)
+        val b = real.from_bits(a.bits() ^ (g.next_u64() & 0xFFFF))
+
+        assert(same(sub(a.bits(), b.bits()), a - b), s"$a - $b")
+        assert(same(add(a.bits(), b.bits()), a + b), s"$a + $b")
+        assert(same(div(a.bits(), b.bits()), a / b), s"$a / $b")
+        assert(same(mul(a.bits(), b.bits()), a * b), s"$a * $b")
+
+@test("small operands, whose products and quotients land among the subnormals")
+random_subnormal_results_agree_with_hardware()
+    var g = rng(66, 7)
+
+    for step in 0..<20000
+        // Exponents near the bottom of the range, so results underflow into the subnormals.
+        val a = real.from_bits(g.next_u64() & 0x81FF_FFFF_FFFF_FFFF)
+        val b = real.from_bits((g.next_u64() & 0x803F_FFFF_FFFF_FFFF) | 0x3C00_0000_0000_0000)
+
+        assert(same(mul(a.bits(), b.bits()), a * b), s"$a * $b")
+        assert(same(div(a.bits(), b.bits()), a / b), s"$a / $b")
+        assert(same(add(a.bits(), b.bits()), a + b), s"$a + $b")
+
+@test("comparisons agree with the double unit, NaN and the two zeros included")
+random_comparisons_agree_with_hardware()
+    var g = rng(67, 7)
+
+    for step in 0..<20000
+        val a = if step % 7 == 0 then 0.0 else any_double(&g)
+        val b = if step % 11 == 0 then -0.0 else if step % 13 == 0 then a else any_double(&g)
+
+        assert((compare(a.bits(), b.bits(), 1) < 0) == (a < b), s"$a < $b")
+        assert((compare(a.bits(), b.bits(), 1) <= 0) == (a <= b), s"$a <= $b")
+        assert((compare(a.bits(), b.bits(), -1) > 0) == (a > b), s"$a > $b")
+        assert((compare(a.bits(), b.bits(), -1) >= 0) == (a >= b), s"$a >= $b")
+        assert((compare(a.bits(), b.bits(), 1) == 0) == (a == b), s"$a == $b")
+        assert(unordered(a.bits(), b.bits()) == (a != a || b != b), s"$a unordered $b")
+
+@test("to and from the integers agree with the double unit")
+random_integers_agree_with_hardware()
+    var g = rng(68, 7)
+
+    for step in 0..<20000
+        val n = i64(g.next_u64() >> (1 + g.next_u64() % 63))
+        val m = if step % 2 == 0 then n else -n
+        val u = g.next_u64() >> (g.next_u64() % 64)
+
+        assert(from_signed(m) == real(m).bits(), s"long $m")
+        assert(from_unsigned(u) == real(u).bits(), s"ulong $u")
+        assert(single_from_signed(m) == f32(m).bits(), s"long $m as f32")
+        assert(single_from_unsigned(u) == f32(u).bits(), s"ulong $u as f32")
+
+        val x = any_double(&g)
+
+        if x == x && x > -9.0e18 && x < 9.0e18 then assert(to_signed(x.bits(), 64) == long(x), s"$x")
+        if x == x && x > -2.0e9 && x < 2.0e9 then assert(to_signed(x.bits(), 32) == i64(int(x)), s"$x")
+        if x == x && x >= 0.0 && x < 1.8e19 then assert(to_unsigned(x.bits(), 64) == ulong(x), s"$x")
+        if x == x && x >= 0.0 && x < 4.0e9 then assert(to_unsigned(x.bits(), 32) == u64(uint(x)), s"$x")
+
+@test("to and from f32 agree with the double unit")
+random_singles_agree_with_hardware()
+    var g = rng(69, 7)
+
+    for step in 0..<20000
+        val f = f32.from_bits(u32(g.next_u64() >> 32))
+        val wide = widen_single(f.bits())
+
+        assert(same(wide, real(f)), s"f32 ${f.bits()} widened")
+
+        val x = any_double(&g)
+        val narrow = narrow_single(x.bits())
+
+        assert(narrow == f32(x).bits() || (x != x && f32.from_bits(narrow) != f32.from_bits(narrow)),
+               s"$x narrowed")
+
+@test("the edges: zeros, infinities, NaNs, the ends of the range, and a tie rounded to even")
+edges()
+    val inf: u64 = 0x7FF0_0000_0000_0000
+    val nan: u64 = 0x7FF8_0000_0000_0000
+    val one = 1.0.bits()
+
+    // Infinity minus itself and zero times infinity have no value; a NaN operand comes back quiet with
+    // its payload.
+    assert(sub(inf, inf) == nan)
+    assert(mul(inf, 0) == nan)
+    assert(div(0, 0) == nan)
+    assert(add(0x7FF0_0000_0000_0001, one) == 0x7FF8_0000_0000_0001)
+
+    // The two zeros: a sum is negative only where both are, and a difference that cancels is positive.
+    assert(add((-0.0).bits(), (-0.0).bits()) == (-0.0).bits())
+    assert(add((-0.0).bits(), 0) == 0)
+    assert(sub(one, one) == 0)
+
+    // Past the largest finite value is an infinity; the least subnormal halved is a tie to zero.
+    assert(mul(0x7FEF_FFFF_FFFF_FFFF, 2.0.bits()) == inf)
+    assert(mul(1, 0.5.bits()) == 0)
+    assert(mul(3, 0.5.bits()) == 2)
+
+    // 1 + 2^-53 is exactly half way to the next double, and rounds to the even neighbour: 1.
+    assert(add(one, 0x3CA0_0000_0000_0000) == one)
+    assert(add(0x3FF0_0000_0000_0001, 0x3CA0_0000_0000_0000) == 0x3FF0_0000_0000_0002)
+
+    assert(add(0.1.bits(), 0.2.bits()) == 0x3FD3_3333_3333_3334)
+
+    // Beyond the integer types: the ends, a NaN, and a negative value into an unsigned one.
+    assert(to_signed(inf, 64) == 0x7FFF_FFFF_FFFF_FFFF)
+    assert(to_signed((-1.0e300).bits(), 32) == -2147483648)
+    assert(to_unsigned((-1.0).bits(), 64) == 0)
+    assert(to_unsigned(1.0e300.bits(), 32) == 0xFFFF_FFFF)
+    assert(from_signed(-0x7FFF_FFFF_FFFF_FFFF - 1) == 0xC3E0_0000_0000_0000)
+    assert(from_unsigned(0xFFFF_FFFF_FFFF_FFFF) == 0x43F0_0000_0000_0000)
+    assert(from_signed(0) == 0)

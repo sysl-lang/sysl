@@ -97,7 +97,11 @@ print(c.send(&n))
 Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
 `@no_alloc`, `@no_block` and `@blocks` — and `@relocates`, which says a call may move the storage its
 receiver's elements live in, so a live `ref` to one of them is refused the call
-([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)). Everything else is refused, and the line is what the annotation is **about** rather
+([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
+the view a call answers is borrowed from its receiver, so the view may not outlive it
+([memory](/reference/memory/#a-view-borrowed-from-its-receiver)), and `@consumes`, which says a call
+takes everything its receiver holds, so a local it was called on may not be read again until it is
+assigned (below). Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -651,7 +655,7 @@ import sysl.testing.compiler
 @test
 asks_the_running_compiler_its_version()
     val answer = capture(compiler(), ["--version"]).unwrap()
-    assert(answer.status.is_ok(), "the compiler answers --version")
+    assert(answer.status.ok(), "the compiler answers --version")
 ```
 
 - **`skip` is imported, not ambient.** It lives in `sysl.testing` rather than the root module, so a
@@ -692,17 +696,41 @@ adds_two()
 
 ### What is dropped, and when
 
-`sysl run`, `sysl build` and `sysl emit-llvm` drop the tests — and drop them **after** analysis. So a
-`@test` that does not compile is an error in a build that would never have run it, and the module's
-capability rules reach its tests like they reach any other member — with the one difference that a
+**Every build but `sysl test` drops the tests after the parse and before analysis** — `sysl run`,
+`sysl build`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` alike, for a program's own files
+exactly as for a library's and a dependency's. What goes is every `@tests` file whole, and every
+`@test` function and hook wherever it was written. A **syntax** error in a test still stops the
+build, since every file is parsed first; everything after the parse — names, imports, types,
+capabilities — is asked of a test by `sysl test` alone, which is the one command that runs it.
+
+So a test's imports are never read by the program that ships. A `@tests` file may import a
+[dev dependency](/reference/packages/#dependencies-a-test-alone-needs), which only `sysl test` fetches,
+and the program still builds:
+
+```sysl
+main()
+    print("built")
+
+@test
+checks_nothing_yet()
+    val unused: NoSuchType = 0
+```
+
+```output
+built
+```
+
+The `@test` above names a type that does not exist, and `sysl build` says nothing about it: a broken
+test is reported by `sysl test`, the build that would run it. The module's capability rules reach its
+tests there like they reach any other member — with the one difference that a
 [`@tests` file states its own](/reference/modules/#a-tests-file-states-its-own-capabilities), since
-that file is what these builds are dropping.
+that file is what every other build drops.
 
-That ordering is what lets a test sit beside what it tests: a program's tests do not run when it
-runs, and they do not stop being checked.
+This is what lets a test sit beside what it tests: a program's tests do not run when it runs, and
+nothing they need is asked of it.
 
-A helper only a test calls leaves with it, because it becomes unreachable and pruning notices; a
-helper the program also calls stays, because the program still calls it.
+An ordinary helper only a test calls leaves too, because with the test gone it is unreachable and
+pruning notices; a helper the program also calls stays, because the program still calls it.
 
 What a test build keeps regardless is the three definitions **nothing in the program names**: an
 interrupt handler, an [`@export`](/reference/ffi/), and a `@section` definition (below). Each is
@@ -728,20 +756,22 @@ release calls is kept with it.
 That matters most to a package, whose only build is its own suite. A test build dropping an export
 would link, pass, and quietly go without the surface the package exists to provide.
 
-**`sysl build-lib` is the exception, and drops them *before* analysis.** An artifact is the one
-output that outlives the compilation that made it, and analysis is not a passive reading: a test
-naming `Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary
-library function afterwards, with nothing in it recording which declaration asked for it. Dropping
-the test from the analyzed program would therefore drop the test and keep everything it caused —
-shipping instantiations no caller of the library ever asked for, and making the artifact's contents
-a fact about its tests.
+**Why the drop comes *before* analysis.** Analysis is not a passive reading: a test naming
+`Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary library
+function afterwards, with nothing in it recording which declaration asked for it. Dropping the test
+from an analyzed program would drop the test and keep everything it caused — shipping, in an
+artifact, instantiations no caller of the library ever asked for. And a test's imports would be
+resolved against a build that never fetched what they name.
 
 **The line falls between parsing and analysis.** Every source is parsed before the drop, so a
-**syntax** error in a `@tests` file still stops a `build-lib`. What such a file no longer gets is
+**syntax** error in a test still stops a `build` or a `build-lib`. What a test no longer gets there is
 everything after the parse — name resolution, types, visibility, capabilities, the `@test`
-well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a library
-test that is well-formed text and wrong in every other way builds clean, and its real errors are
-reported by [`sysl test --std`](/getting-started/cli/), which is where a library's tests are run.
+well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a test that
+is well-formed text and wrong in every other way builds clean, and its real errors are reported by
+[`sysl test`](/getting-started/cli/) (`sysl test --std` for the standard library's), which is where
+tests are run. The refusals this page shows for tests are `sysl test`'s. That includes an ordinary
+function calling a `@test` or naming what a `@tests` file declares: `sysl test` says why, and any
+other build reports a name that is not there — since, in that build, it is not.
 
 That last one is worth naming because it is the case where "everything after the parse" is easy to
 apply to only half of a build. An `@export` in a `@tests` file names a symbol **this** build is about
@@ -1283,7 +1313,10 @@ the string a value renders as needs an allocator, and 'shown' declared '@no_allo
 blank lines do not end it, so a file whose first declaration is the promised function has the
 module's clause instead; an `import` or another declaration above the function is what makes it the
 function's. A function in a module that already declared `@no_alloc` is held to the module's clause,
-which says everything the annotation would.
+which says everything the annotation would. **The module's clause binds its own files and never its
+`@tests` files** ([a `@tests` file states its own
+capabilities](/reference/modules/#a-tests-file-states-its-own-capabilities)): a test may use `str`,
+f-strings and `Buf`, while the module's functions stay allocator-free when a test calls them.
 
 **A method may carry it** — it lowers to a function like any other and is held the same way.
 **A function declared inside another may not**: it is a closure by another spelling, and what it
@@ -1319,6 +1352,52 @@ print(f())
 ```error
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
 ```
+
+**A generic keeps the promise twice: as it was written, and at every instance.** The body it was
+written as is held first, and what it makes whatever the type — the `str(n)` above — is refused
+once, naming the declaration, however many instances the program makes. A method of a generic
+struct and a method of a generic `impl` are held the same way:
+
+```sysl
+f() -> int = 1
+
+@no_alloc
+shown[T](x: T) -> usize = str(42).len
+
+print(shown(1), shown(true))
+```
+
+```error
+the string a value renders as needs an allocator, and 'shown' declared '@no_alloc'
+```
+
+What depends on the type is only there to see once a type is chosen: a call through a bound reaches
+a different implementation at each instance. Each instance is held to the promise as well, and the
+refusal names the instance that breaks it; the instances that keep it are not mentioned:
+
+```sysl
+trait Size
+    size(self) -> usize
+
+impl Size for int
+    size(self) -> usize = 8
+
+impl Size for bool
+    size(self) -> usize = str(self).len
+
+@no_alloc
+measured[T: Size](x: T) -> usize = x.size()
+
+print(measured(1), measured(true))
+```
+
+```error
+this reaches 'bool.size', which makes the string a value renders as, and 'measured' declared '@no_alloc' (instance 'measured.bool')
+```
+
+This is the function's own promise, not the module's: under a module's `@no_alloc` clause a generic
+still answers only for the body it was written as ([modules](/reference/modules/)), since the type an
+instance is made at is chosen by somebody else's code.
 
 ## `@no_block` and `@blocks` — a path that must never wait
 
@@ -1426,6 +1505,31 @@ A call through a trait object reaches the implementation the body erased into it
 either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
 are made of.
 
+**A generic that promises is held as `@no_alloc` holds one**: the body it was written as, and then
+each instance, so a call through a bound that one type answers by waiting is refused at that
+instance:
+
+```sysl
+trait Poll
+    poll(self) -> int
+
+impl Poll for int
+    poll(self) -> int = 0
+
+impl Poll for bool
+    @blocks
+    poll(self) -> int = 1
+
+@no_block
+ready[T: Poll](x: T) -> int = x.poll()
+
+print(ready(1), ready(true))
+```
+
+```error
+this reaches 'bool.poll', which blocks, and 'ready' declared '@no_block' (instance 'ready.bool')
+```
+
 **The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
 module's clause, and a function there answers to it; a method may promise it; a function declared
 inside another may not, being a closure. `@blocks` takes no arguments and marks a function, a method
@@ -1481,7 +1585,7 @@ print(f())
 A function whose last act is a call to itself compiles to a branch back to its own entry rather than
 a second frame, so the recursion is bounded by the arithmetic and not by the stack. That happens
 whether or not anything is written — see
-[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the two
+[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the three
 things that end a tail position.
 
 `@tailrec` asserts the jump is there:
@@ -1515,6 +1619,135 @@ calls itself nowhere the jump can replace
 
 It changes nothing about what is emitted. Write it where losing the jump silently would be a bug,
 and leave it off everywhere else.
+
+## `@consumes` — a call that takes everything its receiver holds
+
+Some members hand back what their receiver held and leave the receiver empty: `Buf.freeze()` moves a
+buffer's elements into the frozen buffer it answers ([memory](/reference/memory/#a-frozen-buffer-crosses)).
+A read of that receiver afterwards can only find nothing, so **`@consumes` above such a member makes
+the read a refusal**: once a local has been called on, it may not be read again on any path until it
+is assigned a new value.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    print(f.len(), b.len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held — 'freeze' is '@consumes', so 'b' has nothing in it on this path until it is assigned again
+```
+
+**Assigning it ends it**, and so does binding the name afresh — a `var` inside a loop body is a new
+local every turn:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    b = buf()
+    b.push(7)
+    print(f.len(), b.len(), b[0])
+
+    for i in 0..<2
+        var c: Buf[int] = buf()
+
+        c.push(i)
+        print(c.freeze()[0])
+
+run()
+```
+
+```output
+2 1 7
+0
+1
+```
+
+**The check follows every path the body can take.** A branch that consumed on one side leaves the
+local consumed after the two sides meet, and a loop is followed round, so a read on a later turn
+counts — here the second turn's `push`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    for i in 0..<3
+        b.push(i)
+
+        if i == 1 then print(b.freeze().len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
+A branch that consumed and then left — a `return`, a `break` past the read — never reaches it, and is
+not refused.
+
+**Only a local is followed.** A field, an element, or what a pointer or a second name reaches may be
+reached another way the body cannot see, so a call on one is accepted, and the member's own emptying
+at run time is what a later read finds:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Holder
+    b: Buf[int]
+
+val h: &Holder = Holder(buf())
+
+h.b.push(1)
+
+val f = h.b.freeze()
+
+print(f.len(), h.b.len())
+```
+
+```output
+1 0
+```
+
+**A call through a trait object is not followed either**: which body a slot dispatches to is settled
+at run time, so a trait member's `@consumes` says nothing about the object's own local. A method has
+no second spelling the check could miss — `Buf.freeze(b)` is refused as every instance method named
+through its type is.
+
+It marks a member that takes a receiver, in any mode, and takes no arguments. Above a free function,
+or a member that takes no `self`, it is refused:
+
+```sysl
+struct S
+    v: int
+
+    @consumes
+    make() -> S = S(1)
+```
+
+```error
+'@consumes' says a call to 'make' takes everything its receiver holds, and it has none — it takes no 'self'
+```
 
 ## `@noinline`, `@inline` and `@cold` — what the optimizer is told about a definition
 
@@ -1622,6 +1855,12 @@ emits it, so the program still links the package's one definition, and a call th
 out of line is the same call it always was. The copy is made from the package's source on every
 build, so an edit to the package is what the next build inlines; nothing is kept that could be stale.
 
+**A package's own archive is a calling module too.** Its calls into the standard module, or into
+another package, carry the same copies — including a call a generic reaches through a bound. A
+package whose `is_nonzero[T: Zero + Eq](x: T) = x != T.zero()` is instantiated at `real` by the
+package's own code compiles `real.zero()` to the constant `0.0` in its archive, as it would in the
+program, rather than calling the standard module's `real.zero` out of line.
+
 So the guarantee is **the same as within one file**: a call into a package, or into another unit,
 inlines exactly where the same call would inline if both functions sat side by side — the hint is
 still a hint, and the inliner still decides. What is never carried across:
@@ -1630,7 +1869,7 @@ still a hint, and the inliner still decides. What is never carried across:
 - an `async` function, an interrupt handler, one placed in a `@section`, or a variadic one;
 - a function that reaches the package's module storage, which is compiled by the program anyway
   (the package keeps no copy of it), and so needs nothing carried;
-- a generic, which needs none of this: it is instantiated in the program that uses it, beside its
+- a generic, which needs none of this: it is instantiated in the module that uses it, beside its
   callers.
 
 `sysl emit-llvm` prints the program as one module and carries no copies.

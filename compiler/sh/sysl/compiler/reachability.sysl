@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
 
 // **What a program can arrive at**, and the declarations that go when nothing can.
 //
@@ -47,7 +48,25 @@ prune(p: TProgram, own: Buf[string]) -> TProgram
     for i in 0..<p.funcs.len()
         if live.call_set.has(p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
 
-    with_declarations(p, externs, funcs)
+    // A table goes with its bodies: one the walk did not count (`table_counts`) names bodies that
+    // are no longer emitted.
+    var index: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        index.add(p.funcs.at(i).name)
+
+    var vtables: Buf[TVtable] = buf()
+
+    for i in 0..<p.vtables.len()
+        val t = p.vtables.at(i)
+        var whole = true
+
+        for item in t.slots
+            if index.has(item.target) && !live.call_set.has(item.target) then whole = false
+
+        if whole then vtables.push(t)
+
+    with_declarations(p, externs, funcs) with { vtables = vtables }
 end prune
 
 // The whole walk, including the one root kind that cannot be decided before it has run.
@@ -61,6 +80,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val entries = entry_points(p, own)
     val index = func_index(p)
     val exports = exports_of(p)
+    val reached = reached_modules(p, own)
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
@@ -68,7 +88,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val scan = type_scan()
 
     while more
-        live = reached_from(p, index, roots_of(p, entries, extra))
+        live = reached_from(p, index, roots_of(p, entries, extra, reached))
 
         for entrie in entries
             add_call(live, entrie.name)
@@ -103,11 +123,15 @@ private suppliers_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: 
     // definition. Where a reached body computes with `f128`, the whole runtime is kept -- the
     // linker takes the routines the code asks for and drops the rest -- and where none does it
     // is left out, so a build that may not touch a float register never meets one.
-    if !holds_quad_runtime(*extra) && reaches_quad(p, live)
-        for f in exports
-            if f.declared_in == QuadRuntimeModule && !holds_func(*extra, f.name)
-                extra.push(f)
-                more = true
+    if runtime_reached(p, live, exports, extra, QuadArithmetic) then more = true
+
+    // **A 32-bit machine's two runtimes are the same kind for the same reason**: a `long` divided
+    // lowers to `sdiv i64`, and Arm turns that into `__aeabi_ldivmod` and RISC-V into `__divdi3`; an
+    // `f64` operation on a machine with no double-precision unit becomes `__aeabi_dmul` or
+    // `__muldf3`. The modules exist only where their `#if` admits the processor, so on every other
+    // machine there is nothing here to keep.
+    if runtime_reached(p, live, exports, extra, DoubleArithmetic) then more = true
+    if runtime_reached(p, live, exports, extra, WideDivision) then more = true
 
     more
 end suppliers_reached
@@ -124,28 +148,69 @@ private exports_of(p: TProgram) -> Buf[TFunc]
 // The module whose `@export`s are the binary128 routines LLVM calls.
 const QuadRuntimeModule: string = "sysl.softfloat"
 
-private holds_quad_runtime(fs: Buf[TFunc]) -> bool
+// The module whose `@export`s are a 32-bit machine's binary64 routines: Arm's `__aeabi_d*` and the
+// `__adddf3` family, which a machine without a double-precision unit calls for every `f64` operation.
+const DoubleRuntimeModule: string = "sysl.softfloat.binary64"
+
+// The module whose `@export`s are a 32-bit machine's 64-bit division: `__aeabi_uldivmod` and its
+// relatives on Arm, `__udivdi3` and its relatives on RISC-V.
+const DivisionRuntimeModule: string = "sysl.softint"
+
+// The runtimes LLVM calls into on its own, each kept where a reached body computes what it answers.
+private enum Runtime
+    QuadArithmetic
+    DoubleArithmetic
+    WideDivision
+
+private runtime_home(r: Runtime) -> string = r match
+    QuadArithmetic -> QuadRuntimeModule
+    DoubleArithmetic -> DoubleRuntimeModule
+    WideDivision -> DivisionRuntimeModule
+
+// Keeps every `@export` of `r`'s module, where this build has the module at all and something the
+// walk reached computes what it answers; true where one was new. The linker takes the routines the
+// code asks for and drops the rest.
+private runtime_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: *Buf[TFunc],
+                        r: Runtime) -> bool
+    val home = runtime_home(r)
+
+    if !holds_runtime(exports, home) || holds_runtime(*extra, home) || !reaches_runtime(p, live, r)
+        return false
+
+    var more = false
+
+    for f in exports
+        if f.declared_in == home && !holds_func(*extra, f.name)
+            extra.push(f)
+            more = true
+
+    more
+end runtime_reached
+
+private holds_runtime(fs: Buf[TFunc], home: string) -> bool
     for item in fs
-        if item.declared_in == QuadRuntimeModule then return true
+        if item.declared_in == home then return true
 
     false
-end holds_quad_runtime
+end holds_runtime
 
-// Whether anything the walk reached holds an `f128`: a signature, a value a body computes, the
-// program's own statements or its storage. The runtime's own bodies are not asked.
-private reaches_quad(p: TProgram, live: &Live) -> bool
+// Whether anything the walk reached computes what `r` answers: a signature, a value a body computes,
+// the program's own statements or its storage. The runtime's own bodies are not asked.
+private reaches_runtime(p: TProgram, live: &Live, r: Runtime) -> bool
     var hits: Buf[Span] = buf()
     val sink = &hits
-    val walk = expr_walk(false, (e) -> note_quad(sink, e))
+    val unit = p.double_unit
+    val walk = expr_walk(false, (e) -> note_runtime(sink, e, r, unit))
+    val home = runtime_home(r)
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if live.call_set.has(f.name) && f.declared_in != QuadRuntimeModule
-            if is_quad(f.ret_ty) then return true
+        if live.call_set.has(f.name) && f.declared_in != home
+            if runtime_type(f.ret_ty, r, unit) then return true
 
             for param in f.params
-                if is_quad(param.1) then return true
+                if runtime_type(param.1, r, unit) then return true
 
             walk_stmts(f.body.stmts, walk)
 
@@ -156,13 +221,74 @@ private reaches_quad(p: TProgram, live: &Live) -> bool
     walk_stmts(p.main, walk)
 
     for i in 0..<p.vals.len()
-        if is_quad(p.vals.at(i).ty) then return true
+        val v = p.vals.at(i)
+
+        if runtime_type(v.ty, r, unit) then return true
+
+        v.init match
+            Some(x) -> walk_texpr(x, walk)
+            None -> ()
 
     !hits.is_empty()
-end reaches_quad
+end reaches_runtime
 
-private note_quad(sink: *Buf[Span], e: TExpr)
-    if sink.is_empty() && is_quad(texpr_type(e)) then sink.push(e.span)
+// Whether holding a value of `t` is itself `r`'s concern: a binary128 value, or a binary64 one on a
+// machine with no double-precision `unit`. A wide integer is not -- only dividing one is.
+private runtime_type(t: Type, r: Runtime, unit: bool) -> bool = r match
+    QuadArithmetic -> is_quad(t)
+    DoubleArithmetic -> !unit && is_binary64(t)
+    WideDivision -> false
+
+private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: bool)
+    if sink.is_empty() && runtime_node(e, r, unit) then sink.push(e.span)
+
+// Whether `e` is an operation `r` answers. A binary64 runtime also answers the conversions between
+// `f32` and a 64-bit integer, which a single-precision unit has no instruction for either. On a
+// machine with a double-precision `unit` an `f64` operation is an instruction, so only the
+// conversions between a 64-bit integer and either float width -- which that unit has no
+// instruction for -- still need it. A division runtime answers `/` and `%` on anything wider than
+// 32 bits, a fixed-point value included, since its quotient is formed in a register twice its width.
+private runtime_node(e: TExpr, r: Runtime, unit: bool) -> bool
+    if r == QuadArithmetic then return is_quad(texpr_type(e))
+
+    if r == DoubleArithmetic
+        if !unit && is_binary64(texpr_type(e)) then return true
+
+        return *e.kind match
+            TCast(operand, ty) -> converts_wide_single(texpr_type(operand), ty) ||
+                                  (unit && converts_wide_double(texpr_type(operand), ty))
+            _ -> false
+
+    *e.kind match
+        TBinary(op, left, _, ty) -> divides(op) && (divides_wide(ty) || divides_wide(texpr_type(left)))
+        TUpdate(_, op, _, ty, _, _) -> divides(op) && divides_wide(ty)
+        _ -> false
+end runtime_node
+
+private converts_wide_single(from: Type, to: Type) -> bool =
+    (is_binary32(from) && is_wide_integer(to)) || (is_wide_integer(from) && is_binary32(to))
+
+private converts_wide_double(from: Type, to: Type) -> bool =
+    (is_binary64(from) && is_wide_integer(to)) || (is_wide_integer(from) && is_binary64(to))
+
+private divides(op: string) -> bool = op == "/" || op == "%" || op == "/=" || op == "%="
+
+private divides_wide(t: Type) -> bool = underlying(t) match
+    Integer(bits, _, _) -> bits > 32
+    Fixed(_, _, _) -> true
+    _ -> false
+
+private is_wide_integer(t: Type) -> bool = underlying(t) match
+    Integer(bits, _, _) -> bits > 32
+    _ -> false
+
+private is_binary64(t: Type) -> bool = underlying(t) match
+    Floating(bits, _) -> bits == 64
+    _ -> false
+
+private is_binary32(t: Type) -> bool = underlying(t) match
+    Floating(bits, brain) -> bits == 32 && !brain
+    _ -> false
 
 private holds_func(fs: Buf[TFunc], name: string) -> bool
     for item in fs
@@ -173,7 +299,16 @@ end holds_func
 
 // The trees a walk starts from: the program's own statements, the storage it lays down, the tables
 // it built, the entry point, and every function nothing in the program names.
-private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
+//
+// **A table counts only where the program reaches the module its slots were written in** (`reached`,
+// from `reached_modules`; nothing means every module counts). Every closure a dependency's module
+// lowered has a table, and that module may be one the program never names: `sh.sysl.pool`'s
+// closures, rooted, kept its scheduler -- and through it `sysl.threads`'s futex hooks -- in a board
+// build that imports only `sh.sysl.pool.deque`. A slot's module is the function's `declared_in`,
+// since a closure's key names none. A module a kept supplier (`extra`) was written in counts, and
+// the standard module's tables are left as they were.
+private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
+                 reached: Option[Set[string]]) -> &Live
     val out = no_reached()
 
     walk_stmts(p.main, expr_walk(false, e -> take_node(out, e)))
@@ -183,8 +318,26 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
             Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(out, e)))
             None -> ()
 
+    var homes: Map[string, string] = map()
+
+    if reached.is_some()
+        for i in 0..<p.funcs.len()
+            homes.put(p.funcs.at(i).name, p.funcs.at(i).declared_in)
+
+    var counted = reached
+
+    if counted.is_some()
+        var names = counted.unwrap()
+
+        for item in extra
+            names.add(item.declared_in)
+
+        counted = Some(names)
+
     for i in 0..<p.vtables.len()
         val t = p.vtables.at(i)
+
+        if !table_counts(t, homes, counted) then continue
 
         for item in t.slots
             add_call(out, item.target)
@@ -210,6 +363,23 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
 
     out
 end roots_of
+
+// Whether a table is a root: where every module counts, where one of its slots was written in a
+// module that does, or where one was written in the standard module or names no body here.
+private table_counts(t: TVtable, homes: Map[string, string], counted: Option[Set[string]]) -> bool
+    if counted.is_none() then return true
+
+    for item in t.slots
+        val home = homes.get(item.target)
+
+        if home.is_none() then return true
+
+        val m = home.unwrap()
+
+        if m == "sysl" || m.starts_with("sysl.") || counted.unwrap().has(m) then return true
+
+    false
+end table_counts
 
 // Everything a set of roots can arrive at, following each call into the body it lands in.
 //
@@ -326,7 +496,8 @@ end domain_refs
 // so there is no program yet, only the bodies typed so far and the tables built for them.
 vals_read_by(init: TExpr, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> Buf[string]
     val p = TProgram(buf(), buf(), vtables, buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
-                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false)
+                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
+                     false)
     val root = no_reached()
 
     walk_texpr(init, expr_walk(false, e -> take_node_of(p, root, e)))
@@ -791,7 +962,7 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Set[string]]
     // contributing instructions to the image contributes its roots too, or the image calls what it
     // does not define.
     for item in p.module_asm
-        add_module(&order, &reached, item.home)
+        if !is_runtime_module(item.home) then add_module(&order, &reached, item.home)
 
     var i: usize = 0
 
@@ -825,7 +996,24 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
     TProgram(p.structs, p.enums, p.vtables, externs, p.vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime)
+             p.warnings, p.module_deps, p.main_src, runtime_asm_kept(p.module_asm, funcs), p.c_runtime,
+             p.double_unit)
+
+// The top-of-file blocks a pruned program lays down. **A runtime's block goes with its routines**:
+// Arm's `__aeabi_uldivmod` answers in four registers, which no sysl signature can, so it is a block
+// of instructions wrapping an `@export` -- laid down where the division runtime was kept and left
+// out where it was not, as the routines are. Every other block is laid down whatever is reached.
+private runtime_asm_kept(blocks: Buf[TModuleAsm], funcs: Buf[TFunc]) -> Buf[TModuleAsm]
+    var out: Buf[TModuleAsm] = buf()
+
+    for block in blocks
+        if !is_runtime_module(block.home) || holds_runtime(funcs, block.home) then out.push(block)
+
+    out
+end runtime_asm_kept
+
+private is_runtime_module(home: string) -> bool =
+    home == QuadRuntimeModule || home == DoubleRuntimeModule || home == DivisionRuntimeModule
 
 // **The same program lowered AS a test build: the tests kept, and the program's own entry point put
 // aside.**
@@ -861,7 +1049,7 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     var more = true
 
     while more
-        val root = roots_of(kept, entries, extra)
+        val root = roots_of(kept, entries, extra, None)
 
         for item in kept.tests
             add_call(root, item.func)
@@ -901,7 +1089,7 @@ private without_program_entry(p: TProgram) -> TProgram =
     TProgram(p.structs, p.enums, p.vtables, p.externs, p.vals, p.funcs, buf(), None, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime)
+             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit)
 
 // **The scaffolding a module's tests are written against, taken out of the build that runs none.**
 //
@@ -1049,7 +1237,7 @@ private without_scaffolding(p: TProgram, gone: Set[string]) -> TProgram
     TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, tests, hooks, p.extern_vars, only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime)
+             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit)
 end without_scaffolding
 
 private fills_a_slot(gone: Set[string], t: TVtable) -> bool

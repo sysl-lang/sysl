@@ -823,10 +823,12 @@ dispatch_value(e: *Emit, d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val,
     val right = if d.swap then av else bv
     val right_ty = if d.swap then aty else bty
 
+    // A zero-sized operand -- `unit`'s `==` -- has no parameter in the callee's signature, so it
+    // has no argument here either, exactly as at an ordinary call.
     var args: Buf[IrArg] = buf()
 
-    args.push(operand_arg(e, left_ty, left))
-    args.push(operand_arg(e, right_ty, right))
+    if !zero_sized(left_ty) then args.push(operand_arg(e, left_ty, left))
+    if !zero_sized(right_ty) then args.push(operand_arg(e, right_ty, right))
 
     val res = gen_sysl_call(e, VGlobal(symbol_of(e, d.name)), args, result_ty)
 
@@ -1226,7 +1228,9 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
                                 VGlobal(symbol_of(e, name)), args, ty, e.abandoning.has(name))
 
     var arg_vals: Buf[IrArg] = buf()
+    val mark = e.temps.len()
     val staged = staged_args(e, args, &arg_vals, name)
+    val worked_out = e.temps.len()
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -1245,6 +1249,8 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
         gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty, variadic_type_of(e, name))
     else
         gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
+
+    if e.asyncs.has(name) then move_into_task(e, mark, worked_out, args, arg_vals)
 
     // What the callee promised, said again where the caller's own code can be folded against it
     // (`contract_assume.sysl`). It goes after the call because a postcondition is about the state the

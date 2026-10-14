@@ -883,3 +883,77 @@ zeroed_push_panics()
     val p: *Buf[int] = ptr_cast(&raw[0])
 
     p.push(1)
+
+// An index into a handle naming nothing reads through the shared empty core, whose count of zero
+// refuses it -- `at`, `set` and `b[i]` alike, with nothing written anywhere.
+@test(should_trap)
+zeroed_at_traps()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.at(0)
+
+@test(should_trap)
+zeroed_set_traps()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.set(0, 7)
+
+@test(should_trap)
+zeroed_index_traps()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    (*p)[0] = 7
+
+@test("a released buffer reads as empty, and the empty core it reads through stays all zero")
+released_index_refused_live_index_kept()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+
+    a.push(5)
+    b.push(6)
+    b.release()
+    a[0] = 9
+    assert_eq(a.at(0), 9)
+    assert_eq(a[0], 9)
+    assert_eq(b.len(), 0)
+    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+
+@test("freezing takes the elements, in order, and leaves every name of the buffer empty")
+freeze_takes_the_elements()
+    var b: Buf[int] = buf()
+    val other = b
+
+    for i in 0..<4
+        b.push(i + 1)
+
+    val f = b.freeze()
+    var seen: Buf[int] = buf()
+
+    for x in f
+        seen.push(x)
+
+    assert_eq(f.len(), 4)
+    assert_eq(f[3], 4)
+    assert_eq(seen.view(), [1, 2, 3, 4])
+    assert_eq(f.view(), [1, 2, 3, 4])
+    // `b` itself may not be read again ('freeze' is '@consumes'); a second name of it may, and
+    // finds it empty.
+    assert_eq(other.len(), 0)
+
+@test("a frozen buffer's view outlives every name of the buffer it views")
+frozen_view_outlives()
+    val v = freeze_view_of_sync()
+
+    assert_eq(v.len, 2)
+    assert_eq(v[1], 20)
+
+private freeze_view_of_sync() -> []const int
+    var b: Buf[int] = buf()
+
+    b.push(10)
+    b.push(20)
+
+    b.freeze().view()

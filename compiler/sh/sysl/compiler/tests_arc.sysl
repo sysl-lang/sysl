@@ -97,7 +97,10 @@ end lowered_whole
 
 // A parameter is read through the caller's count unless the body rebinds its slot, so `n` -- the
 // one assigned to -- is the parameter the frame owns, and `m` beside it is borrowed.
-@test("a counted parameter is retained at entry and released at every return")
+// Its entry retain and the release the rebinding makes are one pair with nothing between them that
+// could give a count back, and so are the share `m` is stored with and the release at the return:
+// every one of the four is dropped (`arc_elide.sysl`), which leaves `n` reading through `m`'s count.
+@test("a counted parameter the body rebinds takes no count it would give straight back")
 a_counted_parameter_is_owned_by_the_frame()
     assert_eq(lowered_arc("struct Node\n" +
                            "    v: int\n" +
@@ -117,19 +120,15 @@ a_counted_parameter_is_owned_by_the_frame()
               "  %n.addr = alloca ptr\n" +
               "  %m.addr = alloca ptr\n" +
               "  store ptr %n.param, ptr %n.addr\n" +
-              "  call void @arc.retain(ptr %n.param)\n" +
               "  store ptr %m.param, ptr %m.addr\n" +
               "  %t1 = load ptr, ptr %m.addr\n" +
               "  %t2 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.retain(ptr %t1)\n" +
               "  store ptr %t1, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t2)\n" +
               "  %t3 = load ptr, ptr %n.addr\n" +
               "  %t4 = getelementptr %arc.Node, ptr %t3, i32 0, i32 3\n" +
               "  %t5 = load %struct.Node, ptr %t4\n" +
               "  %t6 = extractvalue %struct.Node %t5, 0\n" +
               "  %t7 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t7)\n" +
               "  ret i32 %t6\n" +
               "}\n")
 end a_counted_parameter_is_owned_by_the_frame
@@ -166,8 +165,6 @@ a_result_carries_its_own_count()
               "  store i64 1, ptr %t8\n" +
               "  %t9 = getelementptr %arc.Node, ptr %t5, i32 0, i32 3\n" +
               "  store %struct.Node %t2, ptr %t9\n" +
-              "  call void @arc.retain(ptr %t5)\n" +
-              "  call void @arc.release(ptr %t5)\n" +
               "  ret ptr %t5\n" +
               "}\n")
 end a_result_carries_its_own_count
@@ -343,10 +340,8 @@ a_sized_buffer_is_checked_before_it_is_asked_for()
               "  %t26 = insertvalue { ptr, ptr, i64 } %t25, ptr %t19, 1\n" +
               "  %t27 = insertvalue { ptr, ptr, i64 } %t26, i64 %t1, 2\n" +
               "  %t28 = extractvalue { ptr, ptr, i64 } %t27, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t28)\n" +
               "  store { ptr, ptr, i64 } %t27, ptr %xs.addr\n" +
               "  %t29 = extractvalue { ptr, ptr, i64 } %t27, 0\n" +
-              "  call void @arc.release_maybe(ptr %t29)\n" +
               "  %t30 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
               "  %t31 = extractvalue { ptr, ptr, i64 } %t30, 2\n" +
               "  %t32 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
@@ -522,7 +517,7 @@ inline_assembly_is_operands_in_and_operands_out()
               "  store i32 %n.param, ptr %n.addr\n" +
               "  store i32 0, ptr %v.addr\n" +
               "  %t1 = load i32, ptr %n.addr\n" +
-              "  %t2 = call i32 asm sideeffect \"mov $0, $1\", \"=r,r,~{memory},~{cc}\"(i32 %t1)\n" +
+              "  %t2 = call i32 asm sideeffect \"mov $0, $1\", \"=&r,r,~{memory},~{cc}\"(i32 %t1)\n" +
               "  store i32 %t2, ptr %v.addr\n" +
               "  %t3 = load i32, ptr %v.addr\n" +
               "  ret i32 %t3\n" +

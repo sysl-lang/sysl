@@ -21,10 +21,12 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_drop_returns(a)
     check_ghost(a, funcs)
     check_module_graph(a)
+    check_target_refusals(a, funcs)
     check_gated_modules(a, funcs, vals, reached_vtables(a))
     check_no_alloc(a, funcs, vals, reached_vtables(a))
     check_no_block(a, funcs, vals, reached_vtables(a))
     check_decl_capabilities(a, funcs, vals, reached_vtables(a))
+    check_atomic_reach(a, funcs, reached_vtables(a))
     check_purity(a, funcs, reached_externs(a))
     check_const_fns(a, funcs, vals, reached_externs(a))
     check_frames(a, funcs, reached_externs(a))
@@ -63,7 +65,8 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         globals.push(item.ty)
 
     val p = TProgram(buf(), buf(), buf(), buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
-                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false)
+                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
+                     false)
     var u = untouched_summary(p, dropping_reached(a))
     var known: Set[string] = set()
     val sink: &ErasedSink = ErasedSink(buf())
@@ -137,6 +140,14 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
                 var what = "a call through a pointer or a trait names no body to ask"
 
                 if name != "" then what = s"'${qualified_name(name)}' may write a '${type_show(t)}'"
+
+                if w.view_of != ""
+                    a.fault(scope, e.span, s"'${w.name}' is a view borrowed from '${w.view_of}', " +
+                            s"held in a '${type_show(t)}', and $what — which could free what " +
+                            "the view reads. Make the call before the view is taken, or put the " +
+                            "view in a block that closes first")
+                    return
+                end if
 
                 a.fault(scope, e.span, s"'${w.name}' is a 'ref' standing on storage held in a " +
                         s"'${type_show(t)}', and $what — another name for the same object would " +
@@ -231,6 +242,79 @@ end any_type_reaches
 
 // The file a typed body was written in, or an empty one where the body has no source of its own.
 func_home(a: &Analysis, name: string) -> Scope = a.tables.homes.get(name).unwrap_or(empty_scope())
+
+// -- the modules a program reaches ------------------------------------------------------------
+
+// The modules the program's own reach, or nothing where every module counts -- a compilation with no
+// program of its own, such as a build of a library.
+//
+// **A dependency is a set of modules, and a program uses the ones it names**
+// (`reference/modules.md § The target's half needs no clause at all`). So the target's half of a promise --
+// a machine with no heap, no thread-local storage -- is asked of a fetched package's or a `--lib`
+// root's module only where the program reaches it: one that never names `sh.sysl.pool` builds for a
+// board although `sh.sysl.pool.deque`, which it does name, sits beside a module that boxes and keeps
+// per-thread storage. The referring is asked of the graph name resolution built, which records an
+// `import` as readily as a call, so a module is reached through whatever a reached module wrote.
+//
+// **Two modules are reached that nothing names**: one whose top-of-file `asm` is laid down, and one
+// holding an `@export` that answers an `extern` the program calls -- the image carries both whether
+// or not an import leads there, as `reachability.sysl`'s roots do.
+program_reach(a: &Analysis, funcs: Buf[TFunc]) -> Option[Set[string]]
+    var order: Buf[string] = buf()
+    var reached: Set[string] = set()
+
+    // The program's own modules are every one nobody handed over (`Tables.supplied_modules`).
+    for item in a.tables.modules
+        if !holds_string(a.tables.supplied_modules, item) && reached.add(item) then order.push(item)
+
+    if order.is_empty() then return None
+
+    if reached.add(ModuleRoot) then order.push(ModuleRoot)
+
+    for item in a.tables.module_asm
+        if reached.add(item.home) then order.push(item.home)
+
+    val externs = reached_externs(a)
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.exported.is_none() then continue
+
+        for x in externs
+            if f.exported == Some(x.symbol) && reached.add(module_of(f.name)) then
+                order.push(module_of(f.name))
+
+    var i: usize = 0
+
+    while i < order.len()
+        val from = order.at(i)
+
+        i += 1
+
+        for module_dep in a.tables.module_deps
+            if module_dep.0 == from
+                for to in module_dep.1
+                    if reached.add(to) then order.push(to)
+
+    Some(reached)
+end program_reach
+
+// Whether a module is one the program reaches, where `reach` came from `program_reach`.
+reached_module(reach: Option[Set[string]], module_name: string) -> bool = reach match
+    Some(names) -> names.has(module_name)
+    None -> true
+
+// The refusals a declaration earned from the machine alone, kept until the program's reach is known
+// (`Analysis.target_refusals`) and made now for the modules it reaches.
+private check_target_refusals(a: &Analysis, funcs: Buf[TFunc])
+    if a.target_refusals.is_empty() then return
+
+    val reach = program_reach(a, funcs)
+
+    for item in a.target_refusals
+        if reached_module(reach, item.0.module_name) then a.fault(item.0, item.1, item.2)
+end check_target_refusals
 
 // -- doc comments ----------------------------------------------------------------------------
 

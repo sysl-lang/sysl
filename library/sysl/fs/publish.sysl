@@ -30,12 +30,13 @@ import sysl.slices.as_mut_ptr
 // the second. It is not a process id, which not every platform has to give.
 
 /** The token that sets this process's pending names apart from every other process's, zero until the
- * first name is asked for.
+ * first name is asked for. **It is a machine word**, because a word is what every processor has an
+ * atomic for: 64 bits on a 64-bit host, and the 32 a Cortex-M running a filesystem has.
  */
-private var publish_token: Atomic[u64] = Atomic(0)
+private var publish_token: Atomic[usize] = Atomic(0)
 
 /** How many pending names this process has handed out. */
-private var publish_minted: Atomic[u64] = Atomic(0)
+private var publish_minted: Atomic[usize] = Atomic(0)
 
 /** A name beside `target` that no other call -- in this process or in any other -- will answer.
  *
@@ -104,12 +105,12 @@ write_text_atomic(path: string, text: string) -> Result[unit, IoError] = write_b
  * first, so every name the process ever hands out carries the same token. It is never zero, zero
  * being what says nothing has been drawn yet.
  */
-private pending_token() -> u64
+private pending_token() -> usize
     val held = publish_token.load()
 
     if held != 0 then return held
 
-    val fresh = drawn_token() | 1
+    val fresh = usize(drawn_token()) | 1
     val before = publish_token.cas(0, fresh)
 
     if before == 0 then fresh else before

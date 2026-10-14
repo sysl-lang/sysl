@@ -257,7 +257,21 @@ private entry_binding(s: Stmt) -> bool = *s.kind match
 // implementation could only take it or replace it whole, and a trait is the wrong place to write a
 // constant every type shares.
 private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
-    for m in d.methods
+    for i in 0..<d.methods.len()
+        val m = d.methods.at(i)
+
+        // **A trait's members are one per name.** An implementation supplies each by its name and a
+        // bound reaches each by its name, so a second declaration of one would replace the first
+        // without a word -- a type's own body may overload, a trait's may not.
+        for j in 0..<i
+            if d.methods.at(j).name == m.name
+                a.fault(scope, m.span, s"trait '${d.name}' already declares a member named " +
+                        s"'${source_member_name(m.name)}' — an implementation supplies a trait's " +
+                        "members by name, so a trait declares each name once; give this one a " +
+                        "name of its own")
+                break
+            end if
+
         if m.recv_mode().is_none() && m.is_static && !m.body.is_empty()
             a.fault(scope, m.span,
                     s"'${d.name}.${m.name}' is a property of the type, so a default body would " +
@@ -1326,7 +1340,7 @@ overlapping(d: FuncDecl, other: FuncDecl) -> bool =
     overlapping_lists(d.params, d.variadic, other.params, other.variadic)
 
 // The same question asked of two parameter lists, which is all an `extern` has to be asked about.
-private overlapping_lists(ps: Buf[Param], variadic: bool, others: Buf[Param],
+overlapping_lists(ps: Buf[Param], variadic: bool, others: Buf[Param],
                           other_variadic: bool) -> bool
     val lo = max_usize2(required(ps), required(others))
     val hi = min_usize2(accepted(ps, variadic), accepted(others, other_variadic))
@@ -1373,15 +1387,20 @@ private written_result(ret: Option[TypeRef]) -> string = ret match
 private indistinguishable(plain: string, d: FuncDecl, other: FuncDecl) -> string =
     indistinguishable_lists(plain, d.params, other.params)
 
-private indistinguishable_lists(plain: string, ps: Buf[Param], others: Buf[Param]) -> string
+private indistinguishable_lists(plain: string, ps: Buf[Param], others: Buf[Param]) -> string =
+    s"'${qualified_name(plain)}' is already declared with parameters this one could not be told from — " +
+    indistinguishable_tail(ps, others)
+
+// Why two parameter lists `overlapping_lists` found meeting cannot be two declarations, said the same
+// way of a function and of a member.
+indistinguishable_tail(ps: Buf[Param], others: Buf[Param]) -> string
     val n = min_usize2(max_usize2(required(ps), required(others)),
                        min_usize2(ps.len(), others.len()))
 
-    s"'${qualified_name(plain)}' is already declared with parameters this one could not be told from — " +
     s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
     "declaration a call means is decided by its arguments and never by what it returns. Two " +
     "declarations of one name have to differ in a way a call site can show"
-end indistinguishable_lists
+end indistinguishable_tail
 
 // Files every type a `@tests` file declares under that file's name: a struct, an enum, a trait and
 // a `new` type. A transparent alias is left out, since it is another spelling of a type declared

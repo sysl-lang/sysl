@@ -87,10 +87,11 @@ struct Lending
     funcs: Buf[TFunc]
     index: Map[string, usize]
 
-    // A callee's answer, by `<name>|<position>`, once it is known.
+    // A callee's answer, by `<name>|<position>`, once it is known -- whether it keeps the argument
+    // there, and under `=<name>|<position>` whether what it answers can be made of it.
     kept: Map[string, bool]
 
-    // The answers being worked out. Asked again from inside its own walk, a callee is assumed to keep
+    // The answers being worked out, by the same keys. Asked again from inside its own walk, a callee is assumed to keep
     // nothing -- recursion adds no way out that the walk in progress will not find for itself.
     busy: Buf[string]
 
@@ -180,8 +181,9 @@ private lent_argument(a: &Analysis, cx: &Lending, scope: Scope, shown: string, l
 
     val an = a
     val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
+    val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
 
-    lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, shown, false, keeps)
+    lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, shown, false, keeps, answers)
 end lent_argument
 
 // Whether a callee lets the argument at a position outlive the call. A function with no body here --
@@ -207,9 +209,39 @@ private lent_keeps(a: &Analysis, cx: &Lending, name: string, i: usize) -> bool
 
     val an = a
     val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
-    val out = lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, "", true, keeps)
+    val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
+    val out = lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, "", true, keeps, answers)
 
     cx.busy.truncate(cx.busy.len() - 1)
     cx.kept.put(key, out)
     out
 end lent_keeps
+
+// Whether what a callee answers can be made of the argument at a position, so the caller follows the
+// pointer into the answer. Without a body here, it may be. Asked again from inside its own walk, a
+// callee answers nothing it was handed -- a recursive call's answer is some other return's, which the
+// walk in progress reads for itself.
+private lent_answered(a: &Analysis, cx: &Lending, name: string, i: usize) -> bool
+    val key = s"=$name|$i"
+
+    cx.kept.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    if holds_string(cx.busy, key) then return false
+
+    val f = cx.find(name)
+
+    if f.is_none() || i >= f.unwrap().params.len() then return true
+
+    cx.busy.push(key)
+
+    val an = a
+    val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
+    val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
+    val out = lent_answers(f.unwrap().params.at(i).0, f.unwrap().body, keeps, answers)
+
+    cx.busy.truncate(cx.busy.len() - 1)
+    cx.kept.put(key, out)
+    out
+end lent_answered

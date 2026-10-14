@@ -213,6 +213,15 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // written as a constant `getelementptr` over the global (`analyze_body.sysl`'s `place_image`).
     TAddrOf(place, _) -> constant_address(e, place)
 
+    // A trait object over such an address: the table's address and the object's, the two words
+    // `gen_erase` builds -- both relocations, so nothing runs to pair them.
+    TErase(operand, vtable, _) ->
+        var words: Buf[IrArg] = buf()
+
+        words.push(ir_arg(LPtr, VGlobal(vtable)))
+        words.push(ir_arg(LPtr, constant_value(e, operand)))
+        VAgg(words)
+
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
 
@@ -242,7 +251,12 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
                 var cells: Buf[IrArg] = buf()
 
                 for u in units
-                    cells.push(ir_arg(area.0, VInt(u)))
+                    val cell = u match
+                        UnitBits(n) -> VInt(n)
+                        UnitAddr(place) -> VPtrToInt(area.0, constant_address(e, place))
+                        UnitTable(symbol) -> VPtrToInt(area.0, VGlobal(symbol))
+
+                    cells.push(ir_arg(area.0, cell))
 
                 payload = VArray(cells)
             end if

@@ -14,20 +14,38 @@ import sysl.text.{split, Search}
 // It is a value rather than the text it was written as, because the resolver compares versions far
 // more often than it prints them and a comparison over text is the thing that reads `0.10.0` as
 // older than `0.9.0`.
+//
+// **`rev` is a pinned commit** (`rev = "<sha>"` in place of a `version`), and the three numbers are
+// zero beside one. Inside resolution it is always the whole forty-digit sha: a shortened one is
+// lengthened before selection sees it (`full_rev`), so two spellings of one commit are one value.
 struct Release derives Eq
     major: usize
     minor: usize
     patch: usize
+    rev: string
 end Release
 
-// The git tag this version is published under, which is semver's own convention and Go's.
-release_tag(v: Release) -> string = s"v${release_shown(v)}"
+// A pinned commit, as selection, the cache and `sysl.sum` carry it.
+release_at_rev(sha: string) -> Release = Release(0, 0, 0, sha)
+
+is_rev(v: Release) -> bool = !v.rev.is_empty()
+
+// The git tag this version is published under, which is semver's own convention and Go's. A pin has
+// no tag, and its sha is what names it in every place a tag would.
+release_tag(v: Release) -> string = if is_rev(v) then v.rev else s"v${release_shown(v)}"
 
 // The version as a manifest writes it, which is the tag without its `v`.
-release_shown(v: Release) -> string = s"${v.major}.${v.minor}.${v.patch}"
+release_shown(v: Release) -> string =
+    if is_rev(v) then v.rev else s"${v.major}.${v.minor}.${v.patch}"
 
 // Whether one release came before another, compared a number at a time.
+//
+// **A pinned commit comes after every version**: a pin is a decision about exactly which tree, and a
+// floor cannot be raised past it, so where one is claimed it is what is selected. Two different pins
+// are not ordered at all -- `pinned_claim` refuses them before this is asked.
 release_before(a: Release, b: Release) -> bool
+    if is_rev(a) || is_rev(b) then return !is_rev(a) && is_rev(b)
+
     if a.major != b.major then return a.major < b.major
     if a.minor != b.minor then return a.minor < b.minor
 
@@ -46,7 +64,7 @@ release_of(text: string) -> Result[Release, string]
 
     if major.is_none() || minor.is_none() || patch.is_none() then return Err(not_a_version(text))
 
-    Ok(Release(major.unwrap(), minor.unwrap(), patch.unwrap()))
+    Ok(Release(major.unwrap(), minor.unwrap(), patch.unwrap(), ""))
 end release_of
 
 // **The compiler's own version, which is the one version in the system that may carry a suffix.**

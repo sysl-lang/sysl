@@ -153,8 +153,15 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
 
     // The block is written back with its setters paired for the reason a declaration is: what a
     // later pass reads is the table, not the copy this walk made.
+    // A block naming no trait adds the type's own members, so it joins the type's body before any
+    // trait's block does: a trait member colliding with one is then told so whichever was written
+    // first, exactly as it is against a member of the body.
     for i in 0..<a.tables.impls.len()
-        a.tables.impls.set(i, hoist_impl(a, a.tables.impls.at(i)))
+        if a.tables.impls.at(i).decl.trait_name == "" then hoist_inherent(a, a.tables.impls.at(i))
+
+    for i in 0..<a.tables.impls.len()
+        if a.tables.impls.at(i).decl.trait_name != "" then
+            a.tables.impls.set(i, hoist_impl(a, a.tables.impls.at(i)))
 
     // Every block is in, so a bound is answerable: a type's bounds are checked wherever it is
     // applied, and the earliest applications are resolved while the file is still being hoisted.
@@ -368,7 +375,11 @@ end concrete_instance
 //
 // The declarations come back so that a caller with something further to do with them needs no second
 // walk to find them.
-hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> Buf[FuncDecl]
+//
+// `in_impl` says the members are a trait's, supplied by an `impl` block -- a call trait's among them,
+// which `from_trait` leaves empty -- and those never overload: the trait names each member once.
+hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
+                  in_impl: bool = false) -> Buf[FuncDecl]
     var lowered: Buf[FuncDecl] = buf()
     // An `impl` block need not restate the property it is writing: the trait declared it, and a block
     // supplying only the setter is supplying exactly what the trait left open.
@@ -380,7 +391,8 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
         // sugar wherever a function does -- so `map(self, f: A -> B)` asks for a callable it can
         // call directly rather than for one in a counted box.
         val m = with_member_call_bounds(item)
-        val filed = m.name + home.alt
+        var filed = m.name + home.alt
+        var at = home
 
         // A member's parameters and its type's are two lists that end up in one signature, so a name
         // used by both would leave the lowered function with two parameters of that name and nothing
@@ -409,16 +421,31 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
                 // parameters would be what the first body is read against.
                 continue
             else
-                a.fault(home.scope, m.span, s"type '${home.label}' already has a member named " +
-                        s"'$written'")
+                // **A member overloads exactly as a function does** (`reference/declarations.md §
+                // Overloading`): a second declaration of one name is a second member wherever a
+                // call can tell the two apart by its arguments, and is filed under a name of its
+                // own that the written name reaches, as a second implementation's members are.
+                val clash = member_clash(a, home, m, filed, in_impl)
+
+                if clash == ""
+                    val slot = overload_slot(a, home.key, filed)
+
+                    at.alt = home.alt + slot
+                    filed = filed + slot
+                else
+                    a.fault(home.scope, m.span, clash)
+                    // Left out, not filed over the first, so the first body is never read against
+                    // the second's parameters.
+                    continue
+                end if
 
         if holds_string(home.taken, m.name) then
             a.fault(home.scope, m.span, s"type '${home.label}' has both a ${home.noun} and a member " +
                     s"named '$written'")
 
         check_bound_names(a, home.scope, s"${home.label}.${m.name}", m.bounds)
-        check_namespace_share(a, home, m, written)
-        check_hides_builtin(a, home, m)
+        check_namespace_share(a, at, m, written)
+        check_hides_builtin(a, at, m)
 
         a.tables.members.decls.put(member_key_of(home.key, filed), m)
 
@@ -432,7 +459,7 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
         // something was actually **filed** under it.
         if filed != m.name then record_alt(a, home.key, m.name, filed)
 
-        val fd = synthesize(a, home, m)
+        val fd = synthesize(a, at, m)
 
         if fd.const_fn then a.tables.const_fns.put(fd.name, true)
 
@@ -872,6 +899,53 @@ receiver_param(m: MethodDecl, self_ref: TypeRef) -> Option[Param]
 
     Some(Param(m.span, "self", typ, Public, None, false, false))
 end receiver_param
+
+// Why a member may not be filed beside one of the same name, or nothing where it may. Two functions
+// of one name are two members by the rule two free functions follow: each takes a range of argument
+// counts, and two collide where those ranges meet and the parameters up to there are written alike.
+// A property or a setter is one value of its type rather than a set of calls, so it shares its name
+// with nothing; nor does a member of a trait's block, whose names are the trait's to give.
+private member_clash(a: &Analysis, home: MemberHome, m: MethodDecl, filed: string,
+                     in_impl: bool) -> string
+    val plain = s"type '${home.label}' already has a member named '${m.name}'"
+
+    if m.is_property || in_impl || home.from_trait.is_some() then return plain
+
+    var names: Buf[string] = buf()
+
+    names.push(filed)
+
+    val held = a.tables.members.alts.get(member_key_of(home.key, filed))
+
+    if held.is_some() then names = held.unwrap()
+
+    for name in names
+        val other = member_at(a, home.key, name)
+
+        if other.is_some()
+            val o = other.unwrap()
+
+            if o.is_property then return plain
+
+            if overlapping_lists(m.params, m.variadic, o.params, o.variadic)
+                return s"$plain with parameters this one could not be told from — " +
+                       indistinguishable_tail(m.params, o.params)
+        end if
+
+    ""
+end member_clash
+
+// The suffix the next overload of a member is filed under: `.2` and up, the first free one. A second
+// implementation of a trait files its members the same way, and the two never meet on one name,
+// since a type's own member and a trait's of that name are refused together.
+private overload_slot(a: &Analysis, key: string, filed: string) -> string
+    var n = 2
+
+    while has_member_at(a, key, s"$filed.$n")
+        n += 1
+
+    s".$n"
+end overload_slot
 
 private record_alt(a: &Analysis, key: string, written: string, filed: string)
     val held = a.tables.members.alts.get(member_key_of(key, written))

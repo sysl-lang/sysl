@@ -49,7 +49,11 @@ private bind_once(cx: &Analyzer, span: Span, name: string, ty: Type) -> string
             return cx.bind_pattern(name, ty)
 
     cx.bound_in_pattern.push(name)
-    cx.bind_pattern(name, ty)
+
+    val unique = cx.bind_pattern(name, ty)
+
+    note_pattern_borrow(cx, unique, name, ty)
+    unique
 end bind_once
 
 private pattern_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern = *p.kind match
@@ -287,7 +291,21 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
 // A tuple pattern is the positional struct pattern with the name off, which is why it ends as the
 // same node: a tuple's parts are its fields, and matching every one of them is what the positional
 // form already means.
+//
+// **`()` is unit's pattern**, the tuple with no parts: unit has one value, so the pattern matches
+// whatever reaches it and ends as a wildcard -- which is what lets `Ok(())` be an arm and what makes
+// it cover the variant on its own.
 private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -> TPattern
+    if args.len() == 0 then
+        underlying(ty) match
+            Unit -> return TWildPattern(ty)
+            Unknown -> ()
+            other ->
+                cx.fault(span, s"'()' matches unit, but the value is " +
+                         s"${type_show(other)}${held_behind(other)}")
+
+                return TWildPattern(ty)
+
     underlying(ty) match
         Struct(d) ->
             if !is_tuple(d)

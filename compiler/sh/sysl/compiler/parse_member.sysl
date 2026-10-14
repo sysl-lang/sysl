@@ -570,6 +570,8 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
 
     var trait_name = ""
     var trait_args: Buf[TypeRef] = buf()
+    var for_type = named_type(p.here(), "")
+    val head_at = p.here()
 
     // `impl Fn(int) -> int for F` -- the callable trait, written as the type it stands for.
     if p.at_word("Fn") && p.kw_at(1, "(")
@@ -590,9 +592,17 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
         if p.at_kw("[") then trait_args = parse_type_args(p)
     end if
 
-    p.expect_kw("for")
-
-    val for_type = parse_type(p)
+    // **A block naming no trait adds the type's own members** -- `impl[F: Float] Quaternion[F]` --
+    // so what was read as the trait is the type, and the trait is left empty for the hoisting pass
+    // to tell the two kinds apart by.
+    if trait_name != "" &&!fn_is_call(trait_name) && !p.at_kw("for")
+        for_type = type_ref(head_at.to(p.just_taken()), NamedType(trait_name, trait_args))
+        trait_name = ""
+        trait_args = buf()
+    else
+        p.expect_kw("for")
+        for_type = parse_type(p)
+    end if
 
     tp = parse_where_on(p, tp)
 
@@ -833,12 +843,43 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
             member.const_fn = marked_const
             apply_member_attrs(&member, attrs)
 
+            if member.marks.views then check_views_member(p, member)
+
+            // What a call takes is what its receiver held, so a member called on nothing takes nothing.
+            if member.marks.consumes && member.recv_mode().is_none() then
+                p.fault(member.named_at, s"'@consumes' says a call to '${member.name}' takes " +
+                        "everything its receiver holds, and it has none — it takes no 'self'")
+
             // **A property is read, not called**, so there is no call for a task to come out of.
             if async_at.is_some() then mark_async_member(p, &member, async_at.unwrap())
 
             out.push(member)
         None -> ()
 end parse_member_line
+
+// `@views(self)` is a statement about a view a member hands back of its own receiver, so the member
+// needs both: a receiver, and a written result that is a view -- `[]T`, `[]const T` or a `string`.
+// **Narrow on purpose**: a view inside a struct or an `Option` would need the borrow carried through
+// a type, and nothing here puts a borrow in a type.
+private check_views_member(p: *Parser, m: MethodDecl)
+    if m.recv_mode().is_none()
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "what it is called on, and it is called on nothing — it takes no 'self'")
+        return
+    end if
+
+    val is_view = m.ret_type match
+        Some(t) -> *t.kind match
+            ArrayType(length, _, _) -> length.is_none()
+            NamedType(n, args) -> n == "string" && args.is_empty()
+            _ -> false
+        None -> false
+
+    if !is_view then
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "its receiver, so it marks a member whose result is a view — '[]T', '[]const T' " +
+                "or 'string'")
+end check_views_member
 
 // An `async` member: a method's result becomes the task its call hands back. **A property is read,
 // not called**, so there is no call for a task to come out of, and it is refused at the word.

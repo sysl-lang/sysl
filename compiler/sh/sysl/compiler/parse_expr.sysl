@@ -773,7 +773,7 @@ end parse_trailing_block
 // bracket (`anchor.sysl`'s `anchor_of`), the receiver having a span of its own.
 private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
     val from = left_start(lhs, p)
-    val first = parse_expr(p)
+    val first = parse_index_item(p)
 
     if !p.at_kw(",")
         p.expect_kw("]")
@@ -788,11 +788,44 @@ private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
         if !p.accept_kw(",") then break
         if p.at_kw("]") then break
 
-        args.push(parse_expr(p))
+        args.push(parse_index_item(p))
 
     p.expect_kw("]")
     expr(from.to(p.just_taken()), TypeArgs(lhs, args, at))
 end led_index
+
+// One item inside brackets: an expression, or -- where no expression reads there -- a type.
+//
+// **The expression reading wins wherever it ends the item cleanly** (at the `]` or `,` with nothing
+// reported), so a subscript, a value argument and every type with an expression spelling (`T`, `*T`,
+// `&T`, `Box[T]`, `(A, B)`) parse as they always did. What it cannot read -- `&sync C`, `[]u8`,
+// `Fn(int) -> int` -- is re-read by the type grammar from the same place. A parenthesised list
+// before an arrow reads as a closure, which no subscript ever holds, so that is tried as a type too.
+private parse_index_item(p: *Parser) -> Expr
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+    val e = parse_expr(p)
+    val ends = p.errors_at() == errors_at && (p.at_kw("]") || p.at_kw(","))
+
+    var closure = false
+
+    *e.kind match
+        Lambda(_, _, _) -> closure = true
+        _ -> ()
+
+    if ends && !closure then return e
+
+    p.rewind(tokens_at, errors_at)
+
+    val start = p.here()
+    val t = parse_type(p)
+
+    if p.errors_at() == errors_at && (p.at_kw("]") || p.at_kw(","))
+        return expr(start.to(p.just_taken()), TypeArg(t))
+
+    p.rewind(tokens_at, errors_at)
+    parse_expr(p)
+end parse_index_item
 
 // `a.b`, and `a.0` -- a tuple's parts are selected by number and are fields like any other.
 //

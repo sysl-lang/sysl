@@ -1494,6 +1494,44 @@ on, and every claim that was made on it, including the ones that lost. That is t
 losing claim survives: selection keeps the maximum and forgets the rest, so once a build is over
 there is nothing left to reconstruct it from.
 
+### Pinning a commit
+
+A git dependency may name **a commit** in place of a version — a fix not yet released, or a package
+that has never been tagged:
+
+```hocon
+dependencies {
+  orbits { git = "github.com/edadma/orbits", rev = "3f9c2e1" }
+}
+```
+
+`rev` is the commit's sha in lowercase hex, whole or shortened to at least seven digits; a branch name
+is refused, since a branch moves and a pin is a promise about one tree. **Exactly one of `version`
+and `rev` is written** — both together are refused, and so is a `rev` beside a `path`. `features`,
+`default_features`, `optional` and `mount` read exactly as they do beside a version.
+
+**What is recorded is the whole sha.** A shortened `rev` is lengthened against the repository's
+commits the first time it is resolved, and `sysl.sum` gets a line naming the whole sha where a
+version line names its tag, so later builds lengthen it from the file without asking the network:
+
+```text
+github.com/edadma/orbits 3f9c2e1a7d04b6c58e1f0a9b2c3d4e5f60718293 h1:…
+```
+
+The package is fetched at that commit and cached under it, beside the tagged versions of the same
+coordinate. A short sha that two commits start with is refused with both shas listed — the
+shortening is what lost which one was meant — and one no commit starts with is refused by name:
+
+```text
+'orbits' pins github.com/edadma/orbits at '3f9c2e1', and no commit of https://github.com/edadma/orbits.git starts with it
+```
+
+**A pin outranks every version.** Selection takes the highest minimum, and a commit cannot be ordered
+against a tag without the repository's history, so where any manifest in the graph pins a coordinate
+the pinned commit is what every claimant gets — the decision a pin exists to make. **Two pins of one
+coordinate at different commits are refused**, naming both claimants, since nothing orders two
+commits and the build holds one copy of a package.
+
 ### Dependencies a test alone needs
 
 A package's own suite often reaches for something no consumer of it should have to install — a second
@@ -1513,9 +1551,10 @@ dev_dependencies {
 The difference is entirely in **who resolves them**:
 
 - `sysl test` on this project resolves them, exactly like an ordinary dependency;
-- `sysl build`, `sysl build-lib` and `sysl build-c` do not — every other build drops the source that
-  could name one before it analyzes anything, so fetching the package would compile something the
-  compilation cannot refer to;
+- `sysl build`, `sysl run`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` do not — every
+  build but `sysl test` drops the project's tests (each `@tests` file, and every `@test` function and
+  hook) after the parse and before it analyzes anything, so a test's import of one is never read and
+  fetching the package would compile something the compilation cannot refer to;
 - **anything that depends on this package does not resolve them at all**, at any command. They are
   not fetched, not built, and not on the link line.
 

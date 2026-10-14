@@ -91,7 +91,8 @@ void *memset(void *dst, int c, size_t n) {
 /* **The second difference, and the one that is about the architecture rather than the board: this
  * core has no divider at all.**
  *
- * The M33 has `sdiv` and `udiv`, so `bsp_thumb.c` owes only the sixty-four bit helpers. Armv6-M has
+ * The M33 has `sdiv` and `udiv`, so `bsp_thumb.c` owes no division at all (the sixty-four bit pair
+ * is the program's own, from `sysl.softint`). Armv6-M has
  * neither, so *thirty-two* bit division is a call as well, and a program that divides an `int` — or
  * renders one, since printing divides by ten — fails to link without these four.
  *
@@ -172,9 +173,8 @@ __attribute__((naked)) int __aeabi_idivmod(int n, int d) {
 /* **Sixty-four bit shifts, which this core has no instruction for either.**
  *
  * The M33 does them inline as a pair of Thumb-2 sequences, so `bsp_thumb.c` never hears about them.
- * Armv6-M cannot, so `divmod64.h` — which shifts a `long long` on every iteration of its long
- * division — turns into calls to `__aeabi_llsr` and `__aeabi_llsl`, and the link fails naming those
- * two and nothing else.
+ * Armv6-M cannot, so any C or sysl that shifts a `long` by a variable count turns into calls to
+ * `__aeabi_llsr` and `__aeabi_llsl`, and the link fails naming those two and nothing else.
  *
  * **They must not be written with the operator they implement.** `return v >> n` on a `long long`
  * compiles to a call to `__aeabi_llsr`, which is this function: it would assemble, link, and recurse
@@ -212,8 +212,8 @@ unsigned long long __aeabi_llsl(unsigned long long v, int n) {
     return ((unsigned long long)hi << 32) | lo;
 }
 
-/* The arithmetic one, for a shift of a *signed* `long long`. Nothing here reaches it today —
- * `divmod64.h` shifts unsigned — but it is four lines beside its siblings and a link error away
+/* The arithmetic one, for a shift of a *signed* `long long`. Nothing here reaches it today, but it
+ * is four lines beside its siblings and a link error away
  * otherwise, and the sign-extension is the part somebody would get wrong in a hurry.
  */
 long long __aeabi_lasr(long long v, int n) {
@@ -283,41 +283,7 @@ void __aeabi_memclr(void *dst, size_t n)  { memset(dst, 0, n); }
 void __aeabi_memclr4(void *dst, size_t n) { memset(dst, 0, n); }
 void __aeabi_memclr8(void *dst, size_t n) { memset(dst, 0, n); }
 
-/* And the sixty-four bit division pair, identical to the M33's because the EABI is the same — only
- * the core underneath it changed. `divmod64.h` has the arithmetic and says why the board owes it.
+/* The sixty-four bit division pair is not here: the program carries it. `sysl.softint` exports
+ * `__aeabi_uldivmod` and `__aeabi_ldivmod` wherever a reached body divides a `long`, written with no
+ * variable 64-bit shift and no division, so on this core too it needs nothing above.
  */
-#include "divmod64.h"
-
-unsigned long long __sysl_uldivmod(unsigned long long n, unsigned long long d,
-                                   unsigned long long *rem) {
-    return sysl_udivmod64(n, d, rem);
-}
-
-long long __sysl_ldivmod(long long n, long long d, long long *rem) {
-    return sysl_divmod64(n, d, rem);
-}
-
-__attribute__((naked)) unsigned long long __aeabi_uldivmod(unsigned long long n,
-                                                           unsigned long long d) {
-    __asm__ volatile("push {r4, lr}\n"
-                     "sub  sp, sp, #16\n"
-                     "add  r4, sp, #8\n"
-                     "str  r4, [sp, #0]\n"
-                     "bl   __sysl_uldivmod\n"
-                     "ldr  r2, [sp, #8]\n"
-                     "ldr  r3, [sp, #12]\n"
-                     "add  sp, sp, #16\n"
-                     "pop  {r4, pc}\n");
-}
-
-__attribute__((naked)) long long __aeabi_ldivmod(long long n, long long d) {
-    __asm__ volatile("push {r4, lr}\n"
-                     "sub  sp, sp, #16\n"
-                     "add  r4, sp, #8\n"
-                     "str  r4, [sp, #0]\n"
-                     "bl   __sysl_ldivmod\n"
-                     "ldr  r2, [sp, #8]\n"
-                     "ldr  r3, [sp, #12]\n"
-                     "add  sp, sp, #16\n"
-                     "pop  {r4, pc}\n");
-}

@@ -1,0 +1,147 @@
+module sysl.encoding.json
+
+import sysl.buf.byte_sink
+import sysl.math.Float
+import sysl.text.from_utf8_unchecked
+
+// Writing. **The compact form is the `Display`**, so `str(j)`, `print(j)` and `s"$j"` all produce
+// JSON with no space anywhere -- what a wire wants, and what round-trips: `parse(str(j))` reads back
+// what `j` held, for every value but a non-finite `Real`. `pretty` is for a person.
+
+/** The value as JSON, compactly. Rendering goes straight into the sink, so `print(j)` writes a large
+ * document with nothing assembled in the middle.
+ */
+impl Display for Json
+    display(self, out: *Writer, fmt: FormatSpec) = laid_out(self, out, 0, 0, false)
+
+/** The value as JSON a person reads: one element or member to a line, indented by `step` spaces per
+ * level, with a space after every colon. An empty array or object stays `[]` or `{}`.
+ */
+pretty(j: Json, step: usize) -> string
+    var sink = byte_sink()
+
+    write_pretty(j, step, &sink)
+    from_utf8_unchecked(sink.text())
+
+/** `pretty`'s rendering, written into a sink rather than gathered into a string. */
+write_pretty(j: Json, step: usize, out: *Writer) = laid_out(j, out, step, 0, true)
+
+/** A string as a JSON string literal, quotes and escapes included -- for a program that assembles
+ * JSON by hand. The quote, the backslash and every byte below a space are escaped; everything else
+ * stands for itself, since JSON text is UTF-8.
+ */
+quoted(s: string) -> string
+    var sink = byte_sink()
+
+    quote(s, &sink)
+    from_utf8_unchecked(sink.text())
+
+private laid_out(j: Json, out: *Writer, step: usize, depth: usize, nl: bool)
+    j match
+        Null -> out.write("null".bytes)
+        Bool(b) -> out.write(if b then "true".bytes else "false".bytes)
+        Int(n) -> n.display(out, FormatSpec(0, -1, false))
+        // The digits go out as they came in, unquoted: a number too large for a `long` is a number.
+        Big(d) -> out.write(d.bytes)
+        Real(x) -> real_text(x, out)
+        Str(s) -> quote(s, out)
+        Arr(items) ->
+            if items.is_empty()
+                out.write("[]".bytes)
+                return
+
+            out.write("[".bytes)
+
+            for i in 0..<items.len()
+                if i > 0 then out.write(",".bytes)
+
+                line(out, step, depth + 1, nl)
+                laid_out(items.at(i), out, step, depth + 1, nl)
+
+            line(out, step, depth, nl)
+            out.write("]".bytes)
+        Obj(members) ->
+            if members.is_empty()
+                out.write("{}".bytes)
+                return
+
+            out.write("{".bytes)
+
+            for i in 0..<members.len()
+                if i > 0 then out.write(",".bytes)
+
+                val m = members.at(i)
+
+                line(out, step, depth + 1, nl)
+                quote(m.key, out)
+                out.write(if nl then ": ".bytes else ":".bytes)
+                laid_out(m.value, out, step, depth + 1, nl)
+
+            line(out, step, depth, nl)
+            out.write("}".bytes)
+end laid_out
+
+// A new line indented to `depth`, in the pretty form; nothing in the compact one.
+private line(out: *Writer, step: usize, depth: usize, nl: bool)
+    if !nl then return
+
+    out.write("\n".bytes)
+
+    for _ in 0..<step * depth do out.write(" ".bytes)
+
+// A float as the shortest text that reads back as the same value, with a `.0` where that text has
+// neither a point nor an exponent -- so that `Real(1.0)` does not read back as `Int(1)`. JSON has no
+// spelling for a NaN or an infinity; they are written `null`, as JavaScript's `JSON.stringify` does,
+// so that rendering can never fail.
+private real_text(x: real, out: *Writer)
+    if !x.is_finite()
+        out.write("null".bytes)
+        return
+
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+
+    val t = sink.text()
+
+    out.write(t)
+
+    for i in 0..<t.len
+        if t[i] == u8('.') || t[i] == u8('e') || t[i] == u8('E') then return
+
+    out.write(".0".bytes)
+end real_text
+
+private quote(s: string, out: *Writer)
+    out.write("\"".bytes)
+
+    val bs = s.bytes
+    var start: usize = 0
+
+    for i in 0..<bs.len
+        val b = bs[i]
+
+        if b >= 32 && b != u8('"') && b != u8('\\') then continue
+
+        out.write(bs[start..<i])
+        start = i + 1
+
+        if b == u8('"') then out.write("\\\"".bytes)
+        elif b == u8('\\') then out.write("\\\\".bytes)
+        elif b == u8('\b') then out.write("\\b".bytes)
+        elif b == u8('\f') then out.write("\\f".bytes)
+        elif b == u8('\n') then out.write("\\n".bytes)
+        elif b == u8('\r') then out.write("\\r".bytes)
+        elif b == u8('\t') then out.write("\\t".bytes)
+        else
+            val hex = "0123456789abcdef".bytes
+            val hi = usize(b >> 4)
+            val lo = usize(b & 15)
+
+            out.write("\\u00".bytes)
+            out.write(hex[hi..<hi + 1])
+            out.write(hex[lo..<lo + 1])
+
+    out.write(bs[start..])
+    out.write("\"".bytes)
+end quote

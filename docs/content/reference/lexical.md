@@ -796,6 +796,84 @@ unknown escape sequence '\e'
 the fixed-width form is what forces surrogate pairs into source text, and sysl's `char` is a scalar
 value rather than a UTF-16 code unit, so there is nothing to pair.
 
+### Byte literals
+
+A character literal is a `char` — except **where a `u8` is wanted**, where an ASCII one (a code
+point below 128) is that byte. It takes its type from its position exactly as an integer literal
+does: a binding's annotation, an argument, a return, an array element, a pattern or a range in a
+pattern against a `u8`, and an operand of an operator whose other operand is a `u8`, on either
+side. Byte-oriented code reads the way it means, with no `u8(...)` around each character.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+digit(b: u8) -> int = b match
+    '0'..'9' -> int(b - '0')
+    _ -> -1
+
+val sep: u8 = ','
+var out: Buf[u8] = buf()
+var fields = 1
+
+for b in "a,b;c".bytes
+    if b == sep || ';' == b then fields += 1
+
+out.push('o')
+out.push('\n')
+print(sep, fields, digit('7'), digit('x'), out.len(), out.at(1))
+```
+
+```output
+44 3 7 -1 2 10
+```
+
+Escapes are the bytes they encode — `'\n'` is 10, `'\0'` is 0, `'\u{7f}'` is 127. Where no `u8` is
+wanted, nothing changes: `val c = 'a'` is a `char`, and so is each side of `'a' == 'b'`.
+
+A code point from 128 up is **more than one byte** of UTF-8, so it is not a byte, and is refused
+rather than cut down to one. A string is the way to write its bytes, and `u8(0x..)` the way to write
+one byte by number:
+
+```sysl
+val b: u8 = 'é'
+
+print(b)
+```
+
+```error
+the character U+00E9 is not ASCII, so it is more than one byte in UTF-8 and cannot be a u8 — write a string for its bytes, or u8(0x..) for one byte
+```
+
+The same holds one level up for a string literal: **where a `[N]u8` is wanted**, it is its UTF-8
+bytes — see [a byte array from a string literal](/reference/arrays/#a-byte-array-from-a-string-literal).
+
+Only `u8` is a byte. Every other integer type — `i8` included — is a number, and a character
+literal is not one:
+
+```sysl
+val x: i8 = 'a'
+
+print(x)
+```
+
+```error
+cannot initialize 'x': declared i8 but the value is char
+```
+
+The rule is about the **literal**, whose value is known as it is written. A `char` held in a
+variable may be any code point, so it still needs the conversion, which keeps its low eight bits:
+
+```sysl
+val c = 'a'
+val b: u8 = c
+
+print(b)
+```
+
+```error
+cannot initialize 'b': declared byte but the value is char
+```
+
 ### Strings
 
 A plain string is double-quoted and decodes the same escapes a `char` does.

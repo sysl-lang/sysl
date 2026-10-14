@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.fs.{make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file}
 import sysl.text.{from_utf8_unchecked, Search}
 
@@ -304,7 +305,8 @@ private write_artifact(units: Buf[Program], own: Buf[string], root: string, out:
                        ar: Option[string] = None) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    write_half(library_half(units, own, t, who)?, root, out, fingerprint, t, probed, level, ar)
+    write_half(library_half(units, own, t, who, None, level)?, root, out, fingerprint, t, probed,
+               level, ar)
 end write_artifact
 
 // The artifact written from a library that analyzed.
@@ -312,7 +314,7 @@ private write_built(built: LibraryBuild, root: string, out: string, fingerprint:
                     who: string, probed: PkgAnswer, level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    write_half(half_of(built, t, who)?, root, out, fingerprint, t, probed, level)
+    write_half(half_of(built, t, who, level)?, root, out, fingerprint, t, probed, level)
 end write_built
 
 // A source root's kept half (`root_artifact.sysl`): the root's object half and the metadata naming
@@ -326,7 +328,7 @@ write_root_artifact(built: LibraryBuild, out: string, key: string, t: Target,
                     level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    val half = half_of(built, t, "the source root")?
+    val half = half_of(built, t, "the source root", level)?
     val clang = find_clang(t, named_cc())?
     val archiver = find_ar(None)?
     val staging = make_temp_dir("sysl-root-") match
@@ -419,25 +421,46 @@ end std_library_half
 
 // A package root's object half for a machine, as text: what `build-lib <root>` assembles and throws
 // away, read before clang is asked anything -- which functions it defines, which it only declares,
-// and which it advertises to a program linking it.
-root_library_half(units: Buf[Program], own: Buf[string], t: Target) -> Result[LibraryHalf, string] =
-    library_half(units, own, t, "the library", Some(project_files(units)))
+// and which it advertises to a program linking it. `level` is the optimization the half is compiled
+// at, which decides whether it carries copies of what it declares (`half_of`).
+root_library_half(units: Buf[Program], own: Buf[string], t: Target,
+                  level: string = "0") -> Result[LibraryHalf, string] =
+    library_half(units, own, t, "the library", Some(project_files(units)), level)
 
 private library_half(units: Buf[Program], own: Buf[string], t: Target, who: string,
-                     producing: Option[Buf[string]] = None) -> Result[LibraryHalf, string]
+                     producing: Option[Buf[string]] = None,
+                     level: string = "0") -> Result[LibraryHalf, string]
     val built = library_build(units, own, t, producing)
 
     if !built.report.is_empty()
         return Err(s"$who does not analyze: ${first_message(built.report)}")
 
-    half_of(built, t, who)
+    half_of(built, t, who, level)
 end library_half
 
-// The object half of a library that analyzed.
-private half_of(built: LibraryBuild, t: Target, who: string) -> Result[LibraryHalf, string]
-    val first = codegen_with_gaps(built.program, t, built.promotions)
+// The object half of a library that analyzed, compiled at `level`.
+//
+// **A half compiled to be optimized carries a copy of each small or `@inline` function it declares**
+// (`codegen.sysl`'s `importable`), exactly as a program does: a package's own code calling
+// `real.zero()` -- directly, or through a bound in a generic the package instantiates -- reaches the
+// standard module's precompiled half, and with only a declaration that call stays out of line in
+// every program that links the package, however trivial the body. The copies are
+// `available_externally`, so the half still defines only what it advertises.
+//
+// **Only another artifact's functions are copied** (`built.foreign`). The half also declares its own
+// deferred functions, and those are left to the program precisely because their bodies cannot be
+// compiled here.
+private half_of(built: LibraryBuild, t: Target, who: string,
+                level: string) -> Result[LibraryHalf, string]
+    val imports = imports_bodies(level)
+    var foreign: Set[string] = set()
+
+    for name in built.foreign
+        foreign.add(name)
+
+    val first = codegen_with_gaps(built.program, t, built.promotions, imports, Some(foreign))
     val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
-                                    built.promotions)
+                                    built.promotions, imports, Some(foreign))
     val defined = advertised(built.determined, lowered.0)
     val text = ir_print_module(lowered.0)
 

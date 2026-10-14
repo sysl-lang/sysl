@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// An ASCII character literal where a `u8` is wanted is that byte, read the way an integer literal
+// is read at its position; everywhere else it stays a `char`. The helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+private val CubNotAscii: string =" is not ASCII, so it is more than one byte in UTF-8 and cannot be a u8 " +
+                          "— write a string for its bytes, or u8(0x..) for one byte"
+
+// ---- every position that wants a byte
+
+@test("a char literal is a byte at a binding, an argument, a return and an array element")
+cub_each_position()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        f(b: u8) -> int = int(b)
+        g() -> u8 = 'z'
+        val sep: u8 = ','
+        val a: [3]u8 = ['a', 'b', 'c']
+        print(sep, f('A'), g(), a[2])
+        """), "44 65 122 99\n")
+
+@test("a char literal beside a byte compares as that byte, whichever side it is on")
+cub_compare_either_side()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var n = 0
+        var m = 0
+        for x in "a;b;c".bytes
+            if x == ';' then n += 1
+            if ';' == x then m += 1
+        val d: u8 = '7'
+        print(n, m, d - '0', d > '0')
+        """), "2 2 7 true\n")
+
+@test("a char literal is pushed onto a byte buffer and wrapped in an option of a byte")
+cub_push_and_generic()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var out: Buf[u8] = buf()
+        out.push('h')
+        out.push('\n')
+        val o: Option[u8] = Some('a')
+        print(out.len(), out.at(1), o.unwrap())
+        """), "2 10 97\n")
+
+@test("a byte scrutinee matches char literals and char ranges")
+cub_match_arms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        kind(b: u8) -> string = b match
+            'a'..'z' -> "lower"
+            '0'..'9' -> "digit"
+            '\n' -> "newline"
+            _ -> "other"
+        print(kind('q'), kind('5'), kind('\n'), kind('!'), kind(200))
+        """), "lower digit newline other other\n")
+
+@test("an escape is the byte it encodes, up to U+007F")
+cub_escapes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val z: u8 = '\0'
+        val nl: u8 = '\n'
+        val del: u8 = '\u{7f}'
+        print(z, nl, del)
+        """), "0 10 127\n")
+
+// ---- where nothing changes
+
+@test("with no byte wanted a char literal is still a char, and u8 of one still converts")
+cub_char_elsewhere()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val c = 'a'
+        print(c, int('a'), 'a' == 'b', u8('é'))
+        """), "a 97 false 233\n")
+
+// ---- the refusals
+
+@test("a non-ASCII char literal where a byte is wanted names its code point")
+cub_non_ascii_binding()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err("val x: u8 = 'é'\nprint(x)\n"), "the character U+00E9" + CubNotAscii))
+
+@test("a non-ASCII char literal compared with a byte names its code point, not the type pair")
+cub_non_ascii_compare()
+    if !enm_ready() then return
+
+    val out = enm_err("val b: u8 = 1\nprint(b == 'é')\n")
+
+    assert(enm_says(out, "the character U+00E9" + CubNotAscii))
+    assert(!enm_says(out, "cannot compare"))
+
+@test("U+0080 is the first character refused, in a pattern as anywhere")
+cub_non_ascii_pattern()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err(raw"""
+        kind(b: u8) -> int = b match
+            '\u{80}' -> 1
+            _ -> 0
+        print(kind(1))
+        """), "the character U+0080" + CubNotAscii))
+
+@test("an i8 does not take a char literal")
+cub_i8_refused()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err("val x: i8 = 'a'\nprint(x)\n"),
+                    "cannot initialize 'x': declared i8 but the value is char"))
+
+@test("a char value that is not a literal still needs u8(...)")
+cub_char_variable_refused()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err("val c = 'a'\nval b: u8 = c\nprint(b)\n"),
+                    "cannot initialize 'b': declared byte but the value is char"))
+
+// ---- the machine sees an integer constant
+
+// The same function written with char literals and with the integers they denote lowers to the same
+// IR on a bare-metal target, so the literal costs nothing and changes nothing.
+@test("on thumbv7em a char literal at u8 lowers exactly as the integer it denotes")
+cub_bare_metal_same_ir()
+    if !enm_ready() then return
+
+    val chars = raw"""
+        @export("main")
+        probe(b: u8) -> i32
+            if b == ';' then return 1
+            val sep: u8 = ','
+            if b == sep then return 2
+            b match
+                'a'..'z' -> 3
+                '\n' -> 4
+                _ -> 0
+        """
+    val ints = raw"""
+        @export("main")
+        probe(b: u8) -> i32
+            if b == 59 then return 1
+            val sep: u8 = 44
+            if b == sep then return 2
+            b match
+                97..122 -> 3
+                10 -> 4
+                _ -> 0
+        """
+    val root = make_temp_dir("sysl-cub").unwrap()
+    val a = cub_thumb_ir(root, chars)
+    val b = cub_thumb_ir(root, ints)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(enm_says(a, "define"))
+    assert_eq(a, b)
+
+// The IR of `text` built alone for thumbv7em-freestanding from `root`, so that two texts written at
+// the same path can differ only in what was written.
+private cub_thumb_ir(root: string, text: string) -> string
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    emit_llvm_text(src, Some("thumbv7em-freestanding")) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)

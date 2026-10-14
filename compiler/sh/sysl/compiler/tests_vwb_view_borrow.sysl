@@ -1,0 +1,420 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A member's returned view borrowed from its receiver (`reference/memory.md § A view borrowed from
+// its receiver`): `@views(self)` on a member ties the view it answers to what it was called on, and
+// the view is refused anywhere it could be read after that receiver is freed -- a temporary
+// receiver, a return, a holder that outlives the receiver, a write to the receiver while the view
+// is in scope.
+
+private vwb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vwb_ready
+
+private vwb_root(text: string) -> string
+    val root = make_temp_dir("sysl-view-borrow").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private vwb_ran(text: string) -> string
+    val root = vwb_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end vwb_ran
+
+// What analysing a program said, all of it.
+private vwb_said(text: string) -> string
+    val root = vwb_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private vwb_refused(text: string, part: string)
+    val out = vwb_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private vwb_clean(text: string)
+    val out = vwb_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+
+// The duckdb shape reduced: an object that owns C memory, frees it when its last count goes, and
+// hands out a view of it.
+private vwb_owner() -> string =
+    "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n\n" +
+    "struct Owner\n    p: *u8\n    n: usize\n\n" +
+    "    @views(self)\n    view(&self) -> []const u8 = self.p[0..<self.n]\n\n" +
+    "impl Drop for Owner\n    drop(self)\n        print(\"freed\")\n        c_free(self.p)\n\n" +
+    "open(n: usize) -> &Owner\n    val p = c_malloc(n)\n\n    for i in 0..<n do p[i] = u8(65 + i)\n\n" +
+    "    Owner(p, n)\n\n" +
+    "total(xs: []const u8) -> int\n    var t = 0\n\n    for x in xs do t += int(x)\n\n    t\n\n"
+
+@test("a view used while its receiver lives, and handed to a callee, reads the receiver's memory")
+vwb_use_while_alive()
+    if !vwb_ready() then return
+
+    val out = vwb_ran(vwb_owner() +
+                      "run()\n    val o = open(3)\n    val v = o.view()\n    val w = v[1..<3]\n\n" +
+                      "    print(v.len, v[0], w[0], total(v), total(o.view()))\n\nrun()\nprint(\"after\")\n")
+
+    assert_eq(out, "3 65 66 198 198\nfreed\nafter\n")
+
+@test("returning a view from the function that owns its receiver is refused")
+vwb_return_from_owner_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "leak() -> []const u8\n    val o = open(3)\n    o.view()\n\nprint(leak().len)\n",
+                "this returns a view borrowed from 'o', and nothing keeps 'o' alive once this " +
+                "function returns")
+
+    vwb_refused(vwb_owner() + "leak() -> []const u8\n    val o = open(3)\n    val v = o.view()\n\n" +
+                "    return v[0..<1]\n\nprint(leak().len)\n",
+                "this returns a view borrowed from 'o'")
+
+@test("a view borrowed from a parameter is not handed back by a free function")
+vwb_return_from_param_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "first(o: &Owner) -> []const u8 = o.view()\n\nval o = open(2)\nprint(first(o).len)\n",
+                "this returns a view borrowed from 'o'")
+
+@test("a chain over a temporary is refused at the call, naming the temporary")
+vwb_temporary_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "print(open(3).view().len)\n",
+                "'view' answers a view borrowed from what it is called on, and that is the value " +
+                "'open' answers — a temporary, freed at the end of this statement")
+
+@test("assigning the receiver while a view of it is in scope is refused")
+vwb_reassign_receiver_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "run()\n    var o = open(3)\n    val v = o.view()\n\n    o = open(4)\n" +
+                "    print(v[0])\n\nrun()\n",
+                "'v' is a view borrowed from 'o', and this assignment could free what it views")
+
+@test("the receiver may be assigned once the block holding the view has closed")
+vwb_reassign_after_block()
+    if !vwb_ready() then return
+
+    val out = vwb_ran(vwb_owner() +
+                      "run()\n    var o = open(3)\n\n    if true\n        val v = o.view()\n\n" +
+                      "        print(v[2])\n\n    o = open(1)\n    print(o.view()[0])\n\nrun()\n")
+
+    assert_eq(out, "67\nfreed\n65\nfreed\n")
+
+@test("a view stored in a holder bound before its receiver is refused")
+vwb_store_in_older_holder_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "struct Keep\n    v: []const u8\n\n" +
+                "run()\n    var k = Keep([])\n\n    if true\n        val o = open(3)\n\n" +
+                "        k.v = o.view()\n\n    print(k.v.len)\n\nrun()\n",
+                "'k' is bound before 'o', so it outlives it, and this stores in it a view borrowed " +
+                "from 'o'")
+
+    vwb_refused(vwb_owner() + "run()\n    var keep: []const u8 = []\n    val o = open(3)\n\n" +
+                "    keep = o.view()\n    print(keep.len)\n\nrun()\n",
+                "'keep' is bound before 'o', so it outlives it")
+
+@test("a view stored through a reference is refused, and one kept in a later local is not")
+vwb_store_through_reference_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "struct Keep\n    v: []const u8\n\n" +
+                "run(k: &Keep)\n    val o = open(3)\n\n    k.v = o.view()\n\nrun(Keep([]))\n",
+                "this stores a view borrowed from 'o' somewhere reached through a reference, a " +
+                "pointer or module storage")
+
+    val out = vwb_ran(vwb_owner() + "struct Keep\n    v: []const u8\n\n" +
+                      "run()\n    val o = open(3)\n    var k = Keep([])\n\n    k.v = o.view()\n" +
+                      "    print(k.v[1])\n\nrun()\n")
+
+    assert_eq(out, "66\nfreed\n")
+
+@test("a view bound out of a borrowed value by a pattern is borrowed too")
+vwb_pattern_borrow_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "run()\n    var keep: []const u8 = []\n    val o = open(3)\n\n" +
+                "    Some(o.view()) match\n        Some(s) -> keep = s\n        None -> ()\n\n" +
+                "    print(keep.len)\n\nrun()\n",
+                "'keep' is bound before 'o', so it outlives it")
+
+@test("a '@views(self)' member may hand back a view borrowed from 'self', and no other member may")
+vwb_member_returns_self_view()
+    if !vwb_ready() then return
+
+    val wrapper = "struct Pair\n    o: &Owner\n\n    @views(self)\n    head(&self) -> []const u8 = " +
+                  "self.o.view()[0..<1]\n\n"
+
+    val out = vwb_ran(vwb_owner() + wrapper + "run()\n    val p: &Pair = Pair(open(3))\n    val h = p.head()\n" +
+                      "    print(h.len, h[0])\n\nrun()\n")
+
+    assert_eq(out, "1 65\nfreed\n")
+
+    vwb_refused(vwb_owner() + "struct Pair\n    o: &Owner\n\n    head(&self) -> []const u8 = " +
+                "self.o.view()\n\nprint(Pair(open(1)).head().len)\n",
+                "this returns a view borrowed from 'self', and only a member marked '@views(self)' may")
+
+@test("a member without '@views(self)' is not held to it")
+vwb_unmarked_unchanged()
+    if !vwb_ready() then return
+
+    vwb_clean("struct Owner\n    p: *u8\n    n: usize\n\n    view(&self) -> []const u8 = " +
+              "self.p[0..<self.n]\n\nleak(p: *u8) -> []const u8\n    val o: &Owner = Owner(p, 1)\n    o.view()\n")
+
+@test("'@views' names only 'self', on a member with a receiver whose result is a view")
+vwb_annotation_refused()
+    if !vwb_ready() then return
+
+    vwb_refused("struct S\n    n: int\n\n    @views(n)\n    f(&self) -> []const u8 = []\n",
+                "'@views' says what a member's returned view is borrowed from, and that can only " +
+                "be the member's own receiver — '@views(self)'")
+
+    vwb_refused("struct S\n    n: int\n\n    @views(self)\n    f(&self) -> int = 1\n",
+                "'@views(self)' says the view 'f' answers is borrowed from its receiver, so it " +
+                "marks a member whose result is a view")
+
+    vwb_refused("struct S\n    n: int\n\n    @views(self)\n    make() -> []const u8 = []\n",
+                "'@views(self)' says the view 'make' answers is borrowed from what it is called on, " +
+                "and it is called on nothing")
+
+    vwb_refused("@views(self)\nf() -> []const u8 = []\n",
+                "'@views(self)' says the view a call answers is borrowed from what it is called on, " +
+                "so it marks a method — and this declares none")
+
+@test("a member that frees the receiver's memory is refused while a view of it is in scope")
+vwb_freeing_call_refused()
+    if !vwb_ready() then return
+
+    val closer = "struct Shut\n    p: *u8\n    n: usize\n\n    @views(self)\n    view(&self) -> " +
+                 "[]const u8 = self.p[0..<self.n]\n\n    close(&self) = c_free(self.p)\n\n" +
+                 "extern \"free\" c_free(p: *u8)\n\n"
+
+    vwb_refused(closer + "run(s: &Shut)\n    val v = s.view()\n\n    s.close()\n    print(v.len)\n",
+                "'v' is a view borrowed from 's', held in a 'Shut', and 'Shut.close' may write a 'Shut'")
+
+    val out = vwb_ran(closer + "run(s: &Shut)\n    if true\n        val v = s.view()\n\n" +
+                      "        print(v.len)\n\n    s.close()\n\nval p: *u8 = null\nrun(Shut(p, 0))\n")
+
+    assert_eq(out, "0\n")
+
+@test("a closure that captures a borrowed view is borrowed too, and may not leave the function")
+vwb_closure_capture_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "later() -> &Fn() -> usize\n    val o = open(3)\n    val v = o.view()\n\n" +
+                "    () -> v.len\n",
+                "this returns a view borrowed from 'o'")
+
+    // A call through a closure names no body to ask whether it frees the receiver, so it is
+    // refused while the view is in scope, as it is while a `ref` is live.
+    vwb_refused(vwb_owner() + "run()\n    val o = open(3)\n    val v = o.view()\n" +
+                "    val n: &Fn() -> usize = () -> v.len\n\n    print(n())\n\nrun()\n",
+                "'v' is a view borrowed from 'o', held in a 'Owner', and a call through a pointer " +
+                "or a trait names no body to ask")
+
+// -- the same rules through a loop variable and through a trait object ----------------------------
+
+// An owner whose `@views(self)` member answers a view of views: each element is itself a view of
+// the same storage, so a loop variable walking it is borrowed from the owner too.
+private vbh_rows() -> string =
+    "extern \"free\" c_free(p: *u8)\n\n" +
+    "struct Rows\n    p: *u8\n    rows: []const []const u8\n\n" +
+    "    @views(self)\n    all(&self) -> []const []const u8 = self.rows\n\n" +
+    "    close(&self) = c_free(self.p)\n\n" +
+    "impl Drop for Rows\n    drop(self)\n        print(\"freed\")\n        c_free(self.p)\n\n" +
+    "open() -> &Rows = Rows(null, [\"ab\".bytes, \"cde\".bytes])\n\n"
+
+// A trait whose member is marked, called through a `&Viewer` object.
+private vbh_object() -> string =
+    vwb_owner() +
+    "trait Viewer\n    @views(self)\n    look(&self) -> []const u8\n\n" +
+    "impl Viewer for Owner\n    @views(self)\n    look(&self) -> []const u8 = self.view()\n\n"
+
+@test("a loop variable walking a borrowed view of views reads the receiver while it lives")
+vbh_loop_use_while_alive()
+    if !vwb_ready() then return
+
+    val out = vwb_ran(vbh_rows() +
+                      "run()\n    val r = open()\n    val all = r.all()\n    var n: usize = 0\n\n" +
+                      "    for s in all do n += s.len\n    for s in r.all()\n        val t = s[0..<1]\n\n" +
+                      "        print(t[0])\n\n    print(n)\n\nrun()\nprint(\"after\")\n")
+
+    assert_eq(out, "97\n99\n5\nfreed\nafter\n")
+
+@test("a loop variable from a borrowed view of views is refused wherever the view itself is")
+vbh_loop_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vbh_rows() + "run()\n    var keep: []const u8 = []\n    val r = open()\n\n" +
+                "    for s in r.all() do keep = s\n\n    print(keep.len)\n\nrun()\n",
+                "'keep' is bound before 'r', so it outlives it, and this stores in it a view borrowed " +
+                "from 'r'")
+
+    vwb_refused(vbh_rows() + "run()\n    var keep: []const u8 = []\n    val r = open()\n" +
+                "    val all = r.all()\n\n    for s in all do keep = s\n\n    print(keep.len)\n\nrun()\n",
+                "'keep' is bound before 'r', so it outlives it")
+
+    vwb_refused(vbh_rows() + "first() -> []const u8\n    val r = open()\n\n" +
+                "    for s in r.all() do return s\n\n    []\n\nprint(first().len)\n",
+                "this returns a view borrowed from 'r', and nothing keeps 'r' alive once this " +
+                "function returns")
+
+    vwb_refused(vbh_rows() + "struct Keep\n    v: []const u8\n\n" +
+                "run(k: &Keep)\n    val r = open()\n\n    for s in r.all() do k.v = s\n\nrun(Keep([]))\n",
+                "this stores a view borrowed from 'r' somewhere reached through a reference, a " +
+                "pointer or module storage")
+
+    vwb_refused(vbh_rows() + "run()\n    var r = open()\n\n    for s in r.all()\n        r = open()\n" +
+                "        print(s.len)\n\nrun()\n",
+                "'s' is a view borrowed from 'r', and this assignment could free what it views")
+
+    vwb_refused(vbh_rows() + "run(r: &Rows)\n    for s in r.all()\n        r.close()\n" +
+                "        print(s.len)\n",
+                "'s' is a view borrowed from 'r', held in a 'Rows', and 'Rows.close' may write a 'Rows'")
+
+    vwb_refused(vbh_rows() + "run()\n    for s in open().all() do print(s.len)\n\nrun()\n",
+                "'all' answers a view borrowed from what it is called on, and that is the value " +
+                "'open' answers — a temporary, freed at the end of this statement")
+
+@test("a loop variable that cannot hold a view borrows nothing")
+vbh_loop_scalar_free()
+    if !vwb_ready() then return
+
+    val out = vwb_ran(vwb_owner() + "run()\n    var last = 0u8\n    val o = open(3)\n\n" +
+                      "    for b in o.view() do last = b\n\n    print(last)\n\nrun()\n")
+
+    assert_eq(out, "67\nfreed\n")
+
+@test("a '@views(self)' trait member called through a trait object is held to the same rules")
+vbh_object_refused()
+    if !vwb_ready() then return
+
+    val out = vwb_ran(vbh_object() + "run()\n    val v: &Viewer = open(3)\n    val s = v.look()\n\n" +
+                      "    print(s.len, s[2])\n\nrun()\n")
+
+    assert_eq(out, "3 67\nfreed\n")
+
+    vwb_refused(vbh_object() + "leak() -> []const u8\n    val v: &Viewer = open(3)\n    val s = v.look()\n\n" +
+                "    s\n\nprint(leak().len)\n",
+                "this returns a view borrowed from 'v', and nothing keeps 'v' alive once this " +
+                "function returns")
+
+    vwb_refused(vbh_object() + "make() -> &Viewer = open(3)\n\nprint(make().look().len)\n",
+                "'look' answers a view borrowed from what it is called on, and that is the value " +
+                "'make' answers — a temporary")
+
+    vwb_refused(vbh_object() + "run()\n    var keep: []const u8 = []\n    val v: &Viewer = open(3)\n\n" +
+                "    keep = v.look()\n    print(keep.len)\n\nrun()\n",
+                "'keep' is bound before 'v', so it outlives it")
+
+    vwb_refused(vbh_object() + "run()\n    var v: &Viewer = open(3)\n    val s = v.look()\n\n" +
+                "    v = open(1)\n    print(s.len)\n\nrun()\n",
+                "'s' is a view borrowed from 'v', and this assignment could free what it views")
+
+@test("an unmarked trait member called through a trait object is not held to '@views(self)'")
+vbh_object_unmarked_unchanged()
+    if !vwb_ready() then return
+
+    vwb_clean("trait Viewer\n    look(&self) -> []const u8\n\nstruct S\n    n: int\n\n" +
+              "impl Viewer for S\n    look(&self) -> []const u8 = []\n\n" +
+              "leak() -> []const u8\n    val v: &Viewer = S(1)\n    v.look()\n")
+
+@test("a '@views(self)' member is not reached through its type, so it has no unchecked static form")
+vbh_static_form_refused()
+    if !vwb_ready() then return
+
+    vwb_refused(vwb_owner() + "leak() -> []const u8\n    val o = open(3)\n    Owner.view(o)\n",
+                "'view' is an instance method of 'Owner' — call it on a value, not the type")
+
+    vwb_refused(vbh_object() + "leak() -> []const u8\n    val o = open(3)\n    Viewer.look(o)\n",
+                "'look' is a member of the trait 'Viewer' — call it on a value of a type that " +
+                "implements 'Viewer'")
+
+@test("an implementation marked '@views(self)' where its trait's member is not is refused, naming both")
+vbh_impl_mark_without_trait_refused()
+    if !vwb_ready() then return
+
+    vwb_refused("trait Viewer\n    look(&self) -> []const u8\n\nstruct S\n    n: int\n\n" +
+                "impl Viewer for S\n    @views(self)\n    look(&self) -> []const u8 = []\n",
+                "'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares " +
+                "'look' without it — a call through a '&Viewer' reads only the trait's member, so the " +
+                "view it answers would be held to nothing. Mark 'Viewer.look' '@views(self)' as well")
+
+@test("an implementation of a '@views(self)' trait member inherits the mark")
+vbh_impl_inherits_trait_mark()
+    if !vwb_ready() then return
+
+    val unmarked = vwb_owner() +
+                   "trait Viewer\n    @views(self)\n    look(&self) -> []const u8\n\n" +
+                   "impl Viewer for Owner\n    look(&self) -> []const u8 = self.view()\n\n"
+
+    // The body may hand back a view of `self`, as a marked member's may...
+    val out = vwb_ran(unmarked + "run()\n    val o = open(3)\n    val s = o.look()\n\n" +
+                      "    print(s.len, s[0])\n\nrun()\n")
+
+    assert_eq(out, "3 65\nfreed\n")
+
+    // ...and a call on the type, not only one through the object, is held to the borrow.
+    vwb_refused(unmarked + "leak() -> []const u8\n    val o = open(3)\n    o.look()\n\nprint(leak().len)\n",
+                "this returns a view borrowed from 'o', and nothing keeps 'o' alive once this " +
+                "function returns")
+
+    vwb_refused(unmarked + "print(open(3).look().len)\n",
+                "'look' answers a view borrowed from what it is called on, and that is the value " +
+                "'open' answers — a temporary")
+
+@test("a method called through a bounded type parameter is refused once, at the generic")
+vbh_bound_method_through_type_said_once()
+    if !vwb_ready() then return
+
+    val src = "trait Viewer\n    look(&self) -> []const u8\n\nstruct O\n    n: int\n\n" +
+              "impl Viewer for O\n    look(&self) -> []const u8 = []\n\n" +
+              "leak[T: Viewer](x: &T) -> []const u8 = T.look(x)\n\n"
+    val said = "'look' is an instance method of 'Viewer' — call it on a value of 'T', not the type"
+
+    // Never instantiated: the definition is the only place that can tell it.
+    vwb_refused(src, said)
+
+    // Instantiated: still told once, and nothing else is said about the call.
+    val out = vwb_said(src + "val o: &O = O(1)\nprint(leak(o).len)\n")
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+    assert(!out.contains("takes 0 arguments"), s"expected no arity complaint, got: $out")
+    assert(!out.contains("instance method of 'O'"), s"expected no second report at 'O', got: $out")

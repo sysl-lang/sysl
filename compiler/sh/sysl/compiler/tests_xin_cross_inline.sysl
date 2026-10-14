@@ -293,3 +293,122 @@ xin_units_inline_and_link()
     assert(ran.status == Status.Exited(115), "the program returned c0(3)")
     remove_dir_all(dir).unwrap_or(())
 end xin_units_inline_and_link
+
+// -- a trait member of the standard module, reached through a bound ----------------------------------
+//
+// `T.zero()` in a generic body instantiated at `real` calls `real.zero`, which the standard module's
+// precompiled half defines. A program carries a copy of it as of any small function it declares; a
+// package root's own half has to as well, or every call the package makes into the standard module
+// stays out of line in every program that links it.
+
+// Generic functions bounded by the standard module's traits, and `@noinline` concrete instances of
+// them, so that the root's own half is what holds each call.
+private tbi_geom() -> string = lbr_tree(lbr_one("geom/geom.sysl",
+    "module geom\n\nimport sysl.math.{Float, Magnitude}\n\n" +
+    "is_nonzero[T: Zero + Eq](x: T) -> bool = x != T.zero()\n" +
+    "unit[T: One + Add](x: T) -> T = x + T.one()\n" +
+    "top[F: Float](x: F) -> bool = x < F.max_value() && x > F.epsilon()\n" +
+    "root[F: Float](x: F) -> F = x.sqrt()\n" +
+    "mag[M: Magnitude](x: M) -> M = x.magnitude()\n\n" +
+    "@noinline\nnz_real(x: real) -> bool = is_nonzero(x)\n" +
+    "@noinline\nnz_f32(x: f32) -> bool = is_nonzero(x)\n" +
+    "@noinline\nnz_f16(x: f16) -> bool = is_nonzero(x)\n" +
+    "@noinline\nnz_q15(x: q15) -> bool = is_nonzero(x)\n" +
+    "@noinline\nunit_real(x: real) -> real = unit(x)\n" +
+    "@noinline\ntop_f32(x: f32) -> bool = top(x)\n" +
+    "@noinline\nroot_real(x: real) -> real = root(x)\n" +
+    "@noinline\nmag_f32(x: f32) -> f32 = mag(x)\n"))
+
+private tbi_app() -> string =
+    lbr_program("print(geom.nz_real(0.5))\nprint(geom.nz_f32(0.0))\nprint(geom.nz_f16(1.0))\n" +
+                "print(geom.nz_q15(q15(-0.5)))\nprint(geom.unit_real(1.5))\nprint(geom.top_f32(2.0))\n" +
+                "print(geom.root_real(16.0))\nprint(geom.mag_f32(-3.0))\n")
+
+// The standard module's members the root reaches, as the IR names them.
+private tbi_members() -> [8]string =
+    ["@real.zero(", "@f32.zero(", "@f16.zero(", "@real.one(", "@f32.max_value(", "@f32.epsilon(",
+     "@real.sqrt(", "@f32.magnitude("]
+
+// The object half `build-lib` would assemble for `root` at `level`.
+private tbi_half(root: string, level: string) -> string
+    lbr_hand([])
+
+    val t = host_target()
+    val text = packaged_compilation_of(root, t) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(c) ->
+            root_library_half(c.units, c.own, t, level) match
+                Err(why) -> s"refused: $why"
+                Ok(h) -> h.text
+
+    reset_search_paths()
+    text
+end tbi_half
+
+@test("an optimized root half carries a copy of each standard trait member it reaches through a bound, and -O0 only declares them")
+tbi_root_half_copies_bound_members()
+    if !lbr_ready() then return
+
+    val geom = tbi_geom()
+    val o2 = tbi_half(geom, "2")
+    val o1 = tbi_half(geom, "1")
+    val o0 = tbi_half(geom, "0")
+
+    for member in tbi_members()
+        assert_eq(xin_lines(o2, "define available_externally ", member), 1)
+        assert_eq(xin_lines(o2, "declare ", member), 0)
+        assert_eq(xin_lines(o1, "define available_externally ", member), 1)
+        assert_eq(xin_lines(o0, "define available_externally ", member), 0)
+        assert_eq(xin_lines(o0, "declare ", member), 1)
+
+    // The copies are not the half's own: it still defines only its own functions, and the call to a
+    // copied member goes away once clang has optimized the half.
+    assert_eq(xin_lines(o2, "define ", "@real.zero("), 1)
+
+    val out = xin_optimized(o2)
+
+    for member in tbi_members()
+        assert(!xin_calls(out, member), s"the root's call to $member was inlined")
+
+    assert(xin_calls(xin_optimized(o0), "@real.zero("), "at -O0 the call stays")
+    lbr_drop([geom])
+end tbi_root_half_copies_bound_members
+
+@test("a program linking a root at -O2 has no standard trait member left out of line, and prints the same")
+tbi_root_bound_members_inline_in_the_binary()
+    if !lbr_ready() then return
+
+    val cache = xin_begin()
+    val geom = tbi_geom()
+    val app = tbi_app()
+    val exe = s"$cache/tbi-app"
+
+    assert_eq(xin_run(app, [geom], exe), "true\nfalse\ntrue\ntrue\n2.5\ntrue\n4\n3\n")
+
+    val symbols = capture("nm", [exe], "", [], true).unwrap().text
+
+    assert(symbols.contains("geom$nz_real"), "the '@noinline' root function is in the binary")
+
+    for member in ["real.zero", "f32.zero", "f16.zero", "real.one", "f32.max_value", "f32.epsilon",
+                   "real.sqrt", "f32.magnitude"]
+        assert(!symbols.contains(s"_$member\n"), s"$member was inlined, so nothing links its body")
+
+    xin_end(cache, [geom, app])
+end tbi_root_bound_members_inline_in_the_binary
+
+@test("a program's own bound call into the standard module carries the member's copy at -O2 and declares it at -O0")
+tbi_program_bound_member()
+    if !lbr_ready() then return
+
+    val cache = xin_begin()
+    val app = lbr_program("is_nonzero[T: Zero + Eq](x: T) -> bool = x != T.zero()\n\n" +
+                          "@noinline\nnz(x: real) -> bool = is_nonzero(x)\n\nprint(nz(0.5))\n")
+    val o2 = xin_text(app, [], "2")
+    val o0 = xin_text(app, [], "0")
+
+    assert_eq(xin_lines(o2, "define available_externally ", "@real.zero("), 1)
+    assert(!xin_calls(xin_optimized(o2), "@real.zero("), "the copy was inlined")
+    assert_eq(xin_lines(o0, "define available_externally ", ""), 0)
+    assert_eq(xin_lines(o0, "declare ", "@real.zero("), 1)
+    xin_end(cache, [app])
+end tbi_program_bound_member

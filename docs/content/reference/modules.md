@@ -412,6 +412,26 @@ print(max(1, 2))
 'max' is already imported
 ```
 
+**An import may not take a name a module path begins with**, since `fs.read` would then mean one thing
+in a file that imported it and another in the file beside it. The name can always be bound to
+something else with `as`:
+
+```sysl
+import sysl.unicode.{fold as sysl}
+
+print(sysl("A"))
+```
+
+```error
+'sysl' is a module, so importing something else under that name would hide it — import it as another name with 'as'
+```
+
+**The names that check counts are the ones the importing file could have written.** A program's own
+modules are the program's: a program with a module called `fold` or `buf` cannot write
+`import sysl.unicode.{fold}` itself, but the library's own files, which import exactly that, are not
+held to the program's module names, and the reverse is equally true — the library's internal imports
+bind nothing in the program.
+
 **The standard module counts as one of those wildcards.** `sysl` is auto-imported into every file, so
 a written `import a.*` where `a` declares an `Option` of its own is the two-wildcard case, and an
 unqualified `Option` in that file is a compile error naming both — it does not shadow the library's.
@@ -762,15 +782,21 @@ allocation-free primitive means rendering what it produced and building inputs o
 and both allocate — so a module could have the promise or have tests, and not both.
 
 **What a `@tests` file writes is an override of its module's, per capability, not a set of its own.**
-A file that writes no clause is held to the module's, which is what every one of them meant before
-there was another answer:
+**The allocator is the exception: `@no_alloc` binds the module's own files and never its tests.**
+Tests are hosted code that checks the module, so a `@tests` file that writes no clause may render a
+value with `str`, build an f-string or fill a `Buf` with no `@requires(heap)` above it, and so may a
+`@test` written beside what it tests. The module's functions stay checked as allocator-free
+wherever they are called from, a test included: a test that calls a function of the module which
+allocates is refused at that function, in the module's own file, with the module's own message.
+Every other capability (`@no_os`, `@no_block`) is still inherited by a `@tests` file that writes no
+clause:
 
 ```text
-error: a reference needs an allocator, and this module declared '@no_alloc' — it may hold and
-release storage made elsewhere, and may make none of its own
+error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
 ```
 
-A file that writes one hears about its own instead, since that is the line to go and read:
+A `@tests` file may still hold itself to the allocator with a `@no_alloc` of its own, and then hears
+about its own line, since that is the line to go and read:
 
 ```text
 error: a reference needs an allocator, and this module's '@tests' file declared '@no_alloc' — it may
@@ -828,6 +854,16 @@ module hears nothing.
 a module of a path or git dependency is asked the same question as one into the standard module: a
 program on a `posix = false` target, or one that wrote `@no_posix`, is refused at the line that
 reaches a dependency's `@requires(posix)` module, naming that module by its package-qualified name.
+
+**What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
+target whose `package.hocon` says `heap = false`, or one with no thread-local storage, a fetched
+package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
+at the construct, in its own file — when the program names that module or names one that does. A
+package is a set of modules, and the program uses the ones it names: a board program that imports
+only a package's fixed-capacity queue builds, although the thread pool beside the queue in the same
+package boxes its tasks and keeps per-thread storage, and none of the pool's code — its closures'
+tables included — is in the image. The program's own modules and the standard module's are asked as
+before.
 
 ### A generic answers for what it wrote, not for what its caller chose
 
@@ -1149,6 +1185,41 @@ main() -> int = 0
 'main' yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status is not something a signature can say
 ```
 
+**A function exported as `main` is the third way to write the beginning**, and the one a bare-metal
+root file uses: the [export](/reference/ffi/) *is* the platform's `main`, called by that symbol by the
+host's start-up code or by a board's reset handler, so the program gets no `main` of the compiler's own
+beside it. What that one would have done first is done on the way into the export instead — the
+program's computed `val`s are filled before its body runs — and what it answers is C's status, at C's
+signature:
+
+```sysl
+seed() -> int = 41
+
+val answer: int = seed() + 1
+
+@export("main")
+start() -> i32
+    print("the answer is", answer)
+    0
+```
+
+```output
+the answer is 42
+```
+
+It is a beginning like the other two, so it is refused beside statements, and beside a declared `main`:
+
+```sysl
+print("initialization")
+
+@export("main")
+start() -> i32 = 0
+```
+
+```error
+a program starts in one place, and this function exported as 'main' is a second — whichever of the two the program means, the other belongs inside it
+```
+
 **A program in which no file carries a statement is a complete program that does nothing.** The entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to, which
 is what it should compile to — a library is not an error.
@@ -1287,7 +1358,8 @@ Both moves the message names work, and neither is preferred: put the call after 
 **A file whose only running lines are `var`s is a body only when nothing else is the beginning.** A
 `var` could be read either way — a local of the statements a script runs, or storage its module
 owns — and the rest of the program chooses. With no `main` anywhere, a lone `var n = 1` is a script's
-first line, as it always was. With a `main`, the program has written where it starts, so there is no
+first line, as it always was. With a `main` — declared, or a function exported as `main`, which is
+how a bare-metal root file names its entry — the program has written where it starts, so there is no
 body for the `var` to be a local of, and it is the module's: exactly what a `val` beside the `main`
 is, and what a `var` in a file with a `module` line always is. A program shaped like most programs —
 a counter, the functions that bump it, and a `main` calling them — is therefore just that:
@@ -1417,10 +1489,28 @@ A [destructor](/reference/memory/) takes the same ruling and for the same reason
 storage never reaches a count of zero, so its `drop` does not run when the program ends.
 
 **`static` is meaningful only in the entry file**, since only that file has a body for a declaration
-to *not* belong to. In a file with a `module` header, or a headerless file carrying no statements,
-everything is the module's already and the modifier is refused rather than ignored. A function never
+to *not* belong to. In a file with a `module` header, or a headerless file that is not the program's
+beginning (the ruling that closes this section), everything is the module's already and the
+modifier is refused rather than ignored. A function never
 takes it either: settled by what it reads, the modifier would be redundant on one and impossible on
 the other.
+
+A bare-metal root file is the usual case: it runs no statement and names its entry with
+`@export("main")`, so its storage is the module's already — laid into `.bss`/`.data`, read by
+ordinary module functions and methods — and the modifier says nothing:
+
+```sysl
+private static var kept: [2]u32 = [0, 0]
+
+private bump() -> u32 = kept[0]
+
+@export("main")
+probe() -> i32 = i32(bump())
+```
+
+```error
+'static' says a declaration belongs to the module rather than to the body of the file the program starts in — and this file has no such body, so everything it declares is the module's already
+```
 
 **So everywhere else the same storage is written plain `var`**, and it is the same declaration —
 visibility, the shared value namespace, the initializer graph and the release rule all answer for it
@@ -1457,7 +1547,10 @@ in.
 and declaring storage runs nothing — a file holding a counter is no more the program's beginning than
 one holding a table. Where a file carries a statement that is not a binding, it is the entry file and
 every other file's top-level `var`s are their module's. Where nothing runs anywhere, a single
-**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did.
+**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did —
+unless the program names its beginning elsewhere, with a `main` or a function exported as `main`.
+**This is the one ruling**: the file it chooses is the only one where `static` means anything, and
+every other file's `var`s are the module's.
 
 That word is load-bearing: **a file naming a module is never the program's beginning**, and it is the
 sentence at the top of this section seen from the other side — a header means everything the file

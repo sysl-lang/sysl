@@ -1,0 +1,286 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// An `impl` block naming no trait (`reference/declarations.md § Members in an impl block of their
+// own`): it adds members of the type's own, in any file of the module that declares the type, and a
+// bound its header adds is a condition on the members it brings.
+
+// -- a program of several files ------------------------------------------------------------------
+
+private var iim_library_cache: Buf[Program] = buf()
+private var iim_library_read: bool = false
+
+private iim_library() -> Buf[Program]
+    if iim_library_read then return iim_library_cache
+
+    iim_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> iim_library_cache = units
+
+    iim_library_cache
+end iim_library
+
+private iim_no_library() -> bool
+    if iim_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end iim_no_library
+
+// The whole report a program of several files is refused with, as a reader sees it.
+private iim_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+
+    for item in iim_library()
+        units.push(item)
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end iim_err
+
+private iim_one_err(text: string) -> string = iim_err([("main.sysl", text)])
+
+// What a program of several files prints. The tree goes on disk, since a module is a directory.
+private iim_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-iim").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end iim_ran
+
+private iim_one_ran(text: string) -> string = iim_ran([("main.sysl", text)])
+
+private iim_quat() -> string =
+    "module geom\nstruct Quat[F]\n    w: F\n    x: F\n\n    first(self) -> F = self.w\n"
+
+private iim_ops() -> string =
+    "module geom\nimport sysl.math.Float\nimpl[F: Float] Quat[F]\n" +
+    "    norm2(self) -> F = self.w * self.w + self.x * self.x\n" +
+    "    scaled(self, k: F) -> Quat[F] = Quat(self.w * k, self.x * k)\n"
+
+private iim_pair() -> string =
+    "struct Pair[T]\n    lo: T\n    hi: T\n\n    swapped(self) -> Pair[T] = Pair(self.hi, self.lo)\n" +
+    "impl[T: Ord] Pair[T]\n    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo\n" +
+    "    twin(a: T) -> Pair[T] = Pair(a, a)\n" +
+    "struct Tag\n    n: int\n"
+
+// -- the parse --------------------------------------------------------------------------------------
+
+@test("a block naming no trait parses with the type as its subject and no trait")
+iim_parses_with_no_trait()
+    val parsed = parse(source_of("main.sysl", "impl[F] Quat[F]\n    first(self) -> int = 1\n"))
+
+    assert(parsed.ok())
+
+    *parsed.program.body.at(0).kind match
+        ImplDecl(d) ->
+            assert_eq(d.trait_name, "")
+            assert_eq(type_text(d.for_type), "Quat[F]")
+            assert_eq(d.methods.len(), 1)
+            assert_eq(doc_impl_head(d), "impl[F] Quat[F]")
+        _ -> assert(false, "not an impl")
+
+@test("and a block naming a trait still parses as one")
+iim_a_trait_block_is_unchanged()
+    val parsed = parse(source_of("main.sysl", "impl[T] Show for Box[T]\n    show(self) -> int = 1\n"))
+
+    assert(parsed.ok())
+
+    *parsed.program.body.at(0).kind match
+        ImplDecl(d) ->
+            assert_eq(d.trait_name, "Show")
+            assert_eq(type_text(d.for_type), "Box[T]")
+        _ -> assert(false, "not an impl")
+
+// -- the happy path ---------------------------------------------------------------------------------
+
+@test("members in another file of the type's module are the type's own")
+iim_members_across_two_files()
+    assert_eq(iim_ran([("main.sysl", "import geom.Quat\nval q = Quat(1.0, 2.0)\n" +
+                                     "print(q.first(), q.norm2(), q.scaled(2.0).x)\n"),
+                       ("geom/quat.sysl", iim_quat()),
+                       ("geom/ops.sysl", iim_ops())]), "1 5 4\n")
+
+@test("in the type's own file too, and on an enum")
+iim_same_file_and_an_enum()
+    assert_eq(iim_one_ran("enum Dir\n    Up\n    Down\nimpl Dir\n" +
+                          "    flipped(self) -> Dir = self match\n        Up -> Down\n        Down -> Up\n" +
+                          "    code(self) -> int = self match\n        Up -> 1\n        Down -> 0\n" +
+                          "struct P\n    n: int\nimpl P\n    twice(self) -> int = self.n * 2\n" +
+                          "    bump(*self)\n        self.n += 1\n" +
+                          "var p = P(3)\np.bump()\nprint(Dir.Up.flipped().code(), p.twice())\n"), "0 8\n")
+
+@test("a bounded block's members exist where the bound holds, and the body's stay for every type")
+iim_bounded_block_where_the_bound_holds()
+    assert_eq(iim_one_ran(iim_pair() + "print(Pair(3, 7).larger(), Pair.twin(4).hi)\n" +
+                          "print(Pair(Tag(1), Tag(2)).swapped().lo.n)\n"), "7 4\n2\n")
+
+@test("a generic function bounded as the block asks may call the member")
+iim_bounded_caller_may_call()
+    assert_eq(iim_one_ran(iim_pair() + "large[U: Ord](p: Pair[U]) -> U = p.larger()\n" +
+                          "print(large(Pair(9, 2)))\n"), "9\n")
+
+// -- the refusals -----------------------------------------------------------------------------------
+
+@test("a bounded block's member is refused at a call whose receiver misses the bound")
+iim_unmet_bound_refused_at_the_call()
+    if iim_no_library() then return
+
+    val out = iim_one_err(iim_pair() + "print(Pair(Tag(1), Tag(2)).larger().n)\n")
+
+    assert(out.contains("'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', " +
+                        "but Tag does not"), out)
+
+@test("and so is its associated function")
+iim_unmet_bound_refused_at_an_associated_function()
+    if iim_no_library() then return
+
+    val out = iim_one_err(iim_pair() + "print(Pair.twin(Tag(1)).lo.n)\n")
+
+    assert(out.contains("'Pair.twin' requires its type parameter 'T' to implement 'sysl.Ord', " +
+                        "but Tag does not"), out)
+
+@test("and in a generic function whose parameter is not bounded by it")
+iim_unmet_bound_refused_in_a_generic_body()
+    if iim_no_library() then return
+
+    val out = iim_one_err(iim_pair() + "large[U](p: Pair[U]) -> U = p.larger()\nprint(1)\n")
+
+    assert(out.contains("'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', " +
+                        "but 'U' is not bounded by it"), out)
+
+@test("another module may not add members")
+iim_another_module_refused()
+    if iim_no_library() then return
+
+    val out = iim_err([("main.sysl", "import geom.Quat\nimport other\nprint(1)\n"),
+                       ("geom/quat.sysl", iim_quat()),
+                       ("other/x.sysl", "module other\nimport geom.Quat\nimpl[F] Quat[F]\n" +
+                                        "    second(self) -> F = self.x\n")])
+
+    assert(out.contains("'geom.Quat' is declared in module 'geom', and an 'impl' naming no trait " +
+                        "adds members to a type only in a file of the module that declares it — " +
+                        "implement a trait for it here instead: 'impl Trait for Quat[F]'"), out)
+
+@test("nor may a program add them to the library's")
+iim_the_library_refused()
+    if iim_no_library() then return
+
+    val out = iim_one_err("impl[T] Option[T]\n    or_zero(self) -> int = 0\nprint(1)\n")
+
+    assert(out.contains("'sysl.Option' is the library's, and an 'impl' naming no trait adds " +
+                        "members to a type only in a file of the module that declares it"), out)
+
+@test("a name the body uses is a duplicate in the block")
+iim_duplicate_of_the_body()
+    if iim_no_library() then return
+
+    val out = iim_one_err("struct P\n    n: int\n\n    show(self) -> int = self.n\n" +
+                          "impl P\n    show(self) -> int = 2\nprint(P(1).show())\n")
+
+    assert(out.contains("type 'P' already has a member named 'show'"), out)
+
+@test("and across two files, and two blocks")
+iim_duplicate_across_files_and_blocks()
+    if iim_no_library() then return
+
+    val out = iim_err([("main.sysl", "print(1)\n"),
+                       ("geom/quat.sysl", iim_quat()),
+                       ("geom/a.sysl", "module geom\nimpl[F] Quat[F]\n    first(self) -> int = 1\n"),
+                       ("geom/b.sysl", "module geom\nimpl[G] Quat[G]\n    other(self) -> int = 1\n" +
+                                       "impl[G] Quat[G]\n    other(self) -> int = 2\n")])
+
+    assert(out.contains("type 'geom.Quat' already has a member named 'first'"), out)
+    assert(out.contains("type 'geom.Quat' already has a member named 'other'"), out)
+
+@test("a trait member colliding with one is refused whichever was written first")
+iim_trait_member_collides()
+    if iim_no_library() then return
+
+    val out = iim_one_err("trait Show\n    show(self) -> int\nstruct P\n    n: int\n" +
+                          "impl Show for P\n    show(self) -> int = 1\n" +
+                          "impl P\n    show(self) -> int = 2\nprint(1)\n")
+
+    assert(out.contains("type 'P' already has a member named 'show'"), out)
+    assert(out.contains("main.sysl:6:5"), out)
+
+@test("a field's name is taken")
+iim_field_name_taken()
+    if iim_no_library() then return
+
+    val out = iim_one_err("struct P\n    n: int\nimpl P\n    n(self) -> int = 2\nprint(1)\n")
+
+    assert(out.contains("type 'P' has both a field and a member named 'n'"), out)
+
+@test("a type that is not a struct or an enum has no members of its own to add")
+iim_not_a_nominal_type()
+    if iim_no_library() then return
+
+    val out = iim_one_err("impl int\n    twice(self) -> int = self * 2\nprint(1)\n")
+
+    assert(out.contains("'int' is not a struct or an enum, so an 'impl' naming no trait has no " +
+                        "members of its own to add to it — write 'impl Trait for int' to implement " +
+                        "a trait for it"), out)
+
+@test("an associated type and 'override' are a trait block's")
+iim_assoc_and_override_refused()
+    if iim_no_library() then return
+
+    val out = iim_one_err("struct P\n    n: int\nimpl P\n    type Item = int\n" +
+                          "    get(self) -> int = self.n\noverride impl P\n    two(self) -> int = 2\n" +
+                          "print(1)\n")
+
+    assert(out.contains("an associated type is what a block supplies for a trait, and this block " +
+                        "names no trait"), out)
+    assert(out.contains("'override' replaces a more general implementation of a trait, and this " +
+                        "block names no trait — a type's own members have nothing to replace"), out)
+
+@test("a member's body is checked against the block's bounds, not the type's")
+iim_body_checked_against_block_bounds()
+    if iim_no_library() then return
+
+    val out = iim_one_err("struct Pair[T]\n    lo: T\n    hi: T\nimpl[T] Pair[T]\n" +
+                          "    larger(self) -> bool = self.lo < self.hi\nprint(1)\n")
+
+    assert(out.contains("'<' needs 'T: sysl.Ord'"), out)

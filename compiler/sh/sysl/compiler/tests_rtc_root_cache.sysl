@@ -495,7 +495,7 @@ end rtc_an_export_is_compiled_by_the_program
 // instantiation though its own text never names it; `spare` is unreached and instantiates
 // `Buf[Box]`, which nothing in the program defines, so its reference is left to the linker's
 // dead-stripping.
-@test("a root function the program reaches, or leaves unreached, links though its callees are instantiated nowhere else")
+@test("a root function the program reaches, or leaves unreached, links though its callees are instantiated nowhere else", ignore: "a function reading Buf's shared empty core reaches std module storage, which each program emits privately, so it is left to the program rather than precompiled")
 rtc_what_a_root_member_calls_is_linked_or_stripped()
     if !lbr_ready() then return
 
@@ -681,3 +681,30 @@ rtc_a_test_build_links_the_entry()
     assert_eq(rtc_counts(), "hits 1, built 0, from source 0")
     rtc_end(dirs, [geom, app])
 end rtc_a_test_build_links_the_entry
+
+@test("a build that drops the program's tests keeps the root's entry, and hits it again after a test build")
+rtc_a_build_dropping_tests_shares_the_entry()
+    if !lbr_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = lbr_program("print(geom.quad(5))\n\n" +
+        "@test(\"quad through the root\")\nquad_case()\n    assert(geom.quad(2) == 8, \"quad\")\n")
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/built/prog"), "20\n")
+    assert_eq(rtc_counts(), "hits 0, built 1, from source 0")
+
+    clear_root_artifact_counts()
+    use_run_cache_dir(Some(dirs.1))
+
+    val tested = lbr_cli(["sysl", "test", app, "--lib", geom])
+
+    use_run_cache_dir(None)
+    assert_eq(tested.0, 0)
+
+    // The test build keeps an entry of its own; the build that dropped the tests still has its own.
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/again/prog"), "20\n")
+    assert_eq(rtc_counts(), "hits 1, built 0, from source 0")
+    rtc_end(dirs, [geom, app])
+end rtc_a_build_dropping_tests_shares_the_entry

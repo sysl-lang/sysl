@@ -338,7 +338,7 @@ tfx_an_ordinary_closure_may_not()
     val root = tfx_tree([("main.sysl", "import m.*\nprint(twice_over(21))"),
                          ("m/m.sysl", tfx_consumer() + "\n\ntwice_over(n: int) -> int = apply(v -> quadruple(v), n)"),
                          ("m/tests.sysl", tfx_scaffolding())])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, tfx_refusal("m.quadruple"), s"$root/m/m.sysl:7:40",
@@ -363,6 +363,9 @@ tfx_a_test_closure_is_dropped_with_the_test()
         if item.starts_with("define") then assert(!item.contains("closure"), item)
 
 // -- anything else that names one is told so where it wrote the name ---------------------------------
+//
+// By `sysl test`, the one build that reads the scaffolding; any other build drops it before analysis,
+// so there the name is simply not declared (`tests_bdt_build_drops_tests.sysl`).
 
 @test("a function of an ordinary file")
 tfx_a_function_of_an_ordinary_file()
@@ -371,7 +374,7 @@ tfx_a_function_of_an_ordinary_file()
     val root = tfx_tree([("main.sysl", "import m.*\nprint(twice_over(21))"),
                          ("m/m.sysl", tfx_double() + "\n\ntwice_over(n: int) -> int = quadruple(n)"),
                          ("m/tests.sysl", tfx_scaffolding())])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, tfx_refusal("m.quadruple"), s"$root/m/m.sysl:5:29",
@@ -383,7 +386,7 @@ tfx_the_programs_own_statements()
 
     val root = tfx_tree([("main.sysl", "import m.*\nprint(quadruple(21))"), ("m/m.sysl", tfx_double()),
                          ("m/tests.sysl", tfx_scaffolding())])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, tfx_refusal("m.quadruple"), s"$root/main.sysl:2:7", "2 | print(quadruple(21))"), out)
@@ -394,7 +397,7 @@ tfx_a_read_of_storage()
 
     val root = tfx_tree([("main.sysl", "import m.*\nprint(fixture)"), ("m/m.sysl", tfx_double()),
                          ("m/tests.sysl", "module m\n@tests\n\nval fixture: int = 7")])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, tfx_refusal("m.fixture"), s"$root/main.sysl:2:7", "2 | print(fixture)"), out)
@@ -405,7 +408,7 @@ tfx_taking_a_helpers_address()
 
     val root = tfx_tree([("main.sysl", "import m.*\nval f: *extern(int) -> int = &quadruple\nprint(f(21))"),
                          ("m/m.sysl", tfx_double()), ("m/tests.sysl", tfx_scaffolding())])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, tfx_refusal("m.quadruple"), s"$root/main.sysl:2:30",
@@ -486,7 +489,7 @@ tfx_a_test_file_naming_a_private_helper()
     val root = tfx_tree([("main.sysl", tfx_use()),
                          ("m/a.sysl", "module m\n\nprivate helper(n: int) -> int = n\n\nuse(n: int) -> int = helper(n)"),
                          ("m/b.sysl", "module m\n@tests\n\n@test\nreaches_across() =\n    assert(helper(1) == 1)\n")])
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     assert_eq(code, 1, out)
     assert(tfx_says(out, s"'m.helper' is private to '$root/m/a.sysl', the file that declares it",
@@ -505,9 +508,9 @@ private tfx_scale() -> string =
     "module m\n\ntrait Scale\n    scale(self, k: int) -> int\n\n    twice(self) -> int = self.scale(2)\n\n" +
     "struct P\n    n: int\n\nscaled(s: &Scale, k: int) -> int = s.scale(k)\n"
 
-// The refusal, its reason, where it points and the line it quotes.
+// The refusal `sysl test` makes, its reason, where it points and the line it quotes.
 private tfx_impl_refused(root: string, reason: string, line: int, text: string) -> bool
-    val (code, out) = tfx_cli("build", root)
+    val (code, out) = tfx_cli("test", root)
 
     code == 1 && tfx_says(out, s"an 'impl' block in a file that said '@tests' has to be for a type " +
                           s"that file declares, and $reason — a test build would keep this block and " +

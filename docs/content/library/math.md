@@ -555,8 +555,10 @@ So membership is the **compiler's**, by the same rule that makes an `int` an `Ad
 having written `impl Add for int`. What is in the source file is the part a declaration can say: the
 names, the signatures, and what each one means.
 
-**The trait still has to be in scope to be reached.** That is what a compiler-provided membership does
-*not* change — it settles which types have the member, not which files may name it:
+**A concrete value reaches the members with no import**, the way every impl's members are reached
+([Reaching a member through its trait](/reference/traits/#reaching-a-member-through-its-trait)): a
+`real` has its `sqrt` in a file that imports only `pi`. What still needs the trait is generic code,
+where a `T` has the members its bounds promise and no others:
 
 ```sysl
 import sysl.math.pi
@@ -566,12 +568,9 @@ var x = 2.0
 print(pi, x.sqrt())
 ```
 
-```error
-real has 'sqrt' from sysl.math.Float, and that trait is not in scope here — import it to reach the member
+```output
+3.141592653589793 1.4142135623730951
 ```
-
-Importing the module is not the same as importing the trait: `pi` is in scope on that line and
-`sqrt` is not.
 
 `Signed` covers the signed widths only; `Bits` covers both signednesses, because a bit pattern is a
 bit pattern:
@@ -707,14 +706,17 @@ every type.
 ```sysl
 import sysl.math.Bits
 
-var w: u32 = 7u32
+var w: u12 = 7
 
 print(w.swap_bytes())
 ```
 
 ```error
-type 'uint' has no method 'swap_bytes'
+type 'u12' has no method 'swap_bytes'
 ```
+
+A `u32` does have one — `ByteOrder`'s, reached with no import as every impl's members are — and a
+`u12` is a member of neither.
 
 Reversing the byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it.
 **Every member of `Bits` is total over every integer type**, because a `[T: Bits]` body is written
@@ -941,11 +943,12 @@ print(7.extent(), 200u8.extent())
 
 ## The arithmetic above the operators
 
-Six free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
+Eight free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
 
 ```
 pow(base, exponent)          gcd(a, b)                lcm(a, b)
 divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Option[T]
+div_floor(a, b)              mod_floor(a, b)
 ```
 
 ```sysl
@@ -982,6 +985,8 @@ What each one actually needs is written in its own bound instead:
 | `gcd` | `Rem + Eq + Ord + Sub` |
 | `lcm` | `Rem + Eq + Ord + Sub + Div + Mul` |
 | `divmod` | `Div + Rem` |
+| `div_floor` | `Div + Rem + Eq + Ord + Sub` |
+| `mod_floor` | `Rem + Add + Eq + Ord` |
 | `is_power_of_two` | `Bits + Ord` |
 | `next_power_of_two` | `Bits + Ord + Shl + Sub` |
 
@@ -1228,6 +1233,42 @@ print(q, r)
 ```error
 a module-level 'val' states its type, and a binding that names several things has nowhere to write one — declare 'q' and 'r' separately
 ```
+
+### `div_floor` and `mod_floor`
+
+```sysl
+@no_alloc
+@no_os
+
+import sysl.math.{div_floor, mod_floor}
+
+show()
+    print(-7 / 2, -7 % 2)
+    print(div_floor(-7, 2), mod_floor(-7, 2))
+    print(div_floor(7, -2), mod_floor(7, -2))
+
+    val day = mod_floor(-1, 7)
+
+    print(day)
+
+show()
+```
+
+```output
+-3 -1
+-4 1
+-4 -1
+6
+```
+
+The operators truncate toward zero; these round toward **negative infinity**, and the remainder
+takes the **divisor's** sign. That is the division a calendar, a grid or a ring buffer wants:
+`mod_floor(i, n)` is a valid index into `n` cells for any `i`, and
+`div_floor(a, b) * b + mod_floor(a, b)` is always `a`. They work at every integer width; for
+unsigned types they are the operators. They trap where the operators do: a zero divisor, and the
+one signed overflow `MIN / -1`.
+
+(`sysl.math.bigint` has its own `div_floor` and `mod_floor` over `BigInt`.)
 
 ### `is_power_of_two` and `next_power_of_two`
 

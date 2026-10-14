@@ -183,7 +183,7 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
              no_alloc_modules(done.units, false), no_alloc_modules(done.units, true), main_module,
              declared_tests(done, analyzed, hooks), hooks, reached_extern_vars(a),
              a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps,
-             entry_source(done), a.tables.module_asm, false)
+             entry_source(done), a.tables.module_asm, false, a.tables.target.double_unit())
 end program_of
 
 // The file the program starts in, which `entry_body` typed the statements of.
@@ -250,7 +250,9 @@ private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, str
 
     if !holds_string(drops, owner) then return
 
-    val filed = a.tables.members.funcs.get(member_key_of(owner, "drop"))
+    // A generic family's destructor is filed per instantiated type (`queue_generic_drops`).
+    val made = a.tables.members.generic_drops.get(mangle(t))
+    val filed = if made.is_some() then made else a.tables.members.funcs.get(member_key_of(owner, "drop"))
 
     out.push((mangle(t), filed.unwrap_or(s"${member_symbol(t)}.drop")))
 end push_destructor
@@ -564,7 +566,9 @@ private module_clauses(units: Buf[Program], module_name: string,
                 mine = unit.capabilities
                 found_mine = true
 
-    if for_tests && found_theirs then theirs else mine
+    // **The tests' list is the `@tests` file's own clauses and never the module's**: `@no_alloc`
+    // binds the files that ship, and tests are hosted code that may allocate.
+    if for_tests then (if found_theirs then theirs else buf()) else mine
 end module_clauses
 
 // Whether a module's clauses give up the allocator. `no alloc` is the word a module writes for it.

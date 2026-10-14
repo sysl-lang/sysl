@@ -167,10 +167,18 @@ ord_on_failure(o: IrOrdering) -> IrOrdering = o match
     _ -> o
 
 // What kind of access a load or a store is.
+//
+// **The two `AccBuf` kinds are plain accesses that say which side of a `Buf` they touch**: its header
+// (the `Buf` handle in its box, and the `BufCore` holding the storage view and the count) or one of
+// its elements. A buffer's elements live in an allocation of their own, never inside a header, so
+// each kind is told the other is not what it touches (`reference/arrays.md § Its elements are never
+// its header`), and the optimizer can keep the header in registers across a loop that writes elements.
 enum IrAccess
     AccPlain
     AccVolatile
     AccAtomic(ordering: IrOrdering)
+    AccBufHeader
+    AccBufElement
 end IrAccess
 
 // The relaxations the back end is allowed on a floating-point operation.
@@ -267,10 +275,10 @@ inst_render(i: Inst) -> string = i match
     InAlloca(d, ty, align) -> s"${v_render(d)} = alloca ${l_render(ty)}${align_text(align)}"
     InLoad(d, ty, p, acc, align) ->
         s"${v_render(d)} = load${access_text(acc)} ${l_render(ty)}, ptr ${v_render(p)}" +
-            s"${order_text(acc)}${align_text(align)}"
+            s"${order_text(acc)}${align_text(align)}${scope_text(acc)}"
     InStore(ty, v, p, acc, align) ->
         s"store${access_text(acc)} ${l_render(ty)} ${v_render(v)}, ptr ${v_render(p)}" +
-            s"${order_text(acc)}${align_text(align)}"
+            s"${order_text(acc)}${align_text(align)}${scope_text(acc)}"
     InGep(d, ty, p, idx) ->
         s"${v_render(d)} = getelementptr ${l_render(ty)}, ptr ${v_render(p)}, ${arg_list(idx)}"
     InExtract(d, ty, agg, idx) ->
@@ -378,9 +386,20 @@ private switch_arms(ty: LType, cases: Buf[(BigInt, string)]) -> string
 end switch_arms
 
 private access_text(a: IrAccess) -> string = a match
-    AccPlain -> ""
     AccVolatile -> " volatile"
     AccAtomic(_) -> " atomic"
+    _ -> ""
+
+// The scope a `Buf` access is in and the one it is said not to touch. The scopes are named by strings
+// rather than by numbered nodes, so they are one scope in every module that names them -- a std
+// artifact's copy of a member and the program that inlines it agree on what they mean -- and the text
+// needs no metadata table at the end of the module.
+private scope_text(a: IrAccess) -> string = a match
+    AccBufHeader -> s", !alias.scope ${buf_scope("header")}, !noalias ${buf_scope("elements")}"
+    AccBufElement -> s", !alias.scope ${buf_scope("elements")}, !noalias ${buf_scope("header")}"
+    _ -> ""
+
+private buf_scope(side: string) -> string = s"!{!{!\"sysl.buf.$side\", !{!\"sysl.buf\"}}}"
 
 private order_text(a: IrAccess) -> string = a match
     AccAtomic(o) -> s" ${ord_render(o)}"
