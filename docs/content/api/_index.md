@@ -20,6 +20,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |
 | [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
+| [`sysl.encoding.json`](sysl-encoding-json/) | JSON, read and written: a document parsed into a value tree that owns itself, and a value tree written back out compactly or for a person to read. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
 | [`sysl.env.sys`](sysl-env-sys/) |  |
