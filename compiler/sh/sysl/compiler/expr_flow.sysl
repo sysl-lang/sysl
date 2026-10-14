@@ -136,19 +136,33 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 end if_expr
 
 // The type two leaning branches meet at, where both end in a tuple or an array literal and they
-// come to one -- `(n, 0)` against `(0, m)`.
+// come to one -- `(n, 0)` against `(0, m)`. An `elif` chain's branches are siblings, so
+// `(n, 0)`, `(0, n)` and `(n, 1)` meet at one type all together rather than two at a time.
 private shared_branch_type(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                            else_body: Buf[Stmt], discarded: bool) -> Option[Type]
     if !shaped_value(then_body) || !shaped_value(else_body) then return None
 
-    common_offer(2, (i, want) -> trial(cx, () -> branch_reading(cx, span, cond, then_body, else_body,
-                                                                i, want, discarded)))
+    common_offer(chain_branches(else_body),
+                 (i, want) -> trial(cx, () -> branch_reading(cx, span, cond, then_body, else_body,
+                                                             i, want, discarded)))
 end shared_branch_type
 
-// The *then* branch, read in the condition's scope, for `i` 0, and the `else` for anything else.
+// Branch `i` of an `if` chain: the *then* branch, read in the condition's scope, for `i` 0, an
+// `elif`'s branches after it, and the last `else`.
 private branch_reading(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                        else_body: Buf[Stmt], i: usize, want: Option[Type], discarded: bool) -> TBlock
     if i == 0 then return then_side(cx, span, cond, then_body, want, discarded).1
+
+    val inner = elif_of(else_body)
+
+    if inner.is_some()
+        val at = inner.unwrap()
+
+        *at.kind match
+            IfExpr(c, t, e, _) -> return branch_reading(cx, at.span, c, t, e.unwrap(), i - 1, want,
+                                                        discarded)
+            _ -> ()
+    end if
 
     type_value_block(cx, else_body, want, discarded)
 
@@ -1364,13 +1378,40 @@ private block_value(stmts: Buf[Stmt]) -> Option[Expr]
 end block_value
 
 // Whether a value block ends in a tuple or an array literal, the two constructions whose parts a
-// sibling's type is read against one by one.
+// sibling's type is read against one by one -- or in an `if` every one of whose branches does.
 private shaped_value(stmts: Buf[Stmt]) -> bool = block_value(stmts) match
     Some(e) -> *e.kind match
         Tuple(_) -> true
         ArrayLit(_) -> true
+        IfExpr(_, then_body, else_body, _) ->
+            else_body.is_some() && shaped_value(then_body) && shaped_value(else_body.unwrap())
         _ -> false
     None -> false
+
+// The `elif` an `else` branch is, where it is nothing else: the parser nests one into the branch
+// before it as the whole of that branch.
+private elif_of(stmts: Buf[Stmt]) -> Option[Expr]
+    if stmts.len() != 1 then return None
+
+    val e = block_value(stmts)
+
+    if e.is_none() then return None
+
+    *e.unwrap().kind match
+        IfExpr(_, _, else_body, _) -> if else_body.is_some() then e else None
+        _ -> None
+end elif_of
+
+// How many branches an `if` chain has, counting each `elif` as a sibling of the `if` it follows.
+private chain_branches(else_body: Buf[Stmt]) -> usize
+    val inner = elif_of(else_body)
+
+    if inner.is_none() then return 2
+
+    *inner.unwrap().kind match
+        IfExpr(_, _, e, _) -> 1 + chain_branches(e.unwrap())
+        _ -> 2
+end chain_branches
 
 // The one type every one of `n` branches can be read at, where there is one: the first is read on
 // its own, and each is then offered the type the last reading came to, until a whole round reads
@@ -1448,6 +1489,7 @@ private leans(cx: &Analyzer, e: Expr) -> bool
         ArrayFill(v, _) -> leans(cx, v)
         Call(_, args) -> any_leans(cx, args)
         NamedArg(_, v) -> leans(cx, v)
+        IfExpr(_, _, _, _) -> every_branch_leans(cx, e)
         _ -> false
 end leans
 
@@ -1462,10 +1504,78 @@ end any_leans
 // `elif` chain is, the parser nesting each `elif` into the branch before it: in
 // `if a then n elif b then 1 else 2` the three arms are siblings, and the two literal ones take the
 // type the first one knows, exactly as three arms of a `match` would.
+//
+// **A branch that does not finish is no evidence either way**, so it does not stop its sibling
+// guessing: `if c then 0 else continue` is a `0` of whatever its position says, exactly as the `if`
+// with a `1` in place of the `continue` is. One branch still has to be a guess -- an `if` that never
+// finishes on either side is `never`, which is a type of its own.
 private every_branch_guesses(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     IfExpr(_, then_body, else_body, _) ->
-        else_body.is_some() && guessing(cx, then_body) && guessing(cx, else_body.unwrap())
+        if else_body.is_none() then return false
+
+        val eb = else_body.unwrap()
+
+        guessing(cx, then_body) && (guessing(cx, eb) || stops(cx, eb)) ||
+            guessing(cx, eb) && stops(cx, then_body)
     _ -> false
+
+// Whether a block ends by leaving: in a `return`, a `break` or a `continue`, or in a call of a
+// function declared `-> never` -- `panic(…)`, or one of the program's own.
+//
+// **The test is on the spelling, as `guessing`'s is**, because it is asked before the block around
+// the branch has been read: a reading of the branch here would look its names up before the lines
+// that declare them.
+private stops(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
+    if stmts.is_empty() then return false
+
+    *stmts.at(stmts.len() - 1).kind match
+        Return(_) -> true
+        Break(_, _) -> true
+        Continue(_) -> true
+        ExprStmt(e) -> *e.kind match
+            Call(callee, _) -> *callee.kind match
+                Ident(name) -> declared_never(cx, name)
+                _ -> false
+            _ -> false
+        _ -> false
+end stops
+
+// Whether every function a name reaches is declared to return `never`.
+private declared_never(cx: &Analyzer, name: string) -> bool
+    val keys = function_keys_of(cx, name)
+
+    if keys.is_empty() then return false
+
+    for key in keys
+        val f = cx.an.tables.funcs.get(key)
+
+        if f.is_none() then return false
+
+        val ret = f.unwrap().decl.ret_type
+
+        if ret.is_none() then return false
+
+        val spelled_never = *ret.unwrap().kind match
+            NamedType(written, args) -> written == "never" && args.is_empty()
+            _ -> false
+
+        if !spelled_never then return false
+    end for
+
+    true
+end declared_never
+
+// Whether an `if` is a chain of branches each of which knows its type only in part or not at all --
+// `if a then (n, 0) elif b then (0, n) else (n, 1)` -- which, like its branches, is read against
+// the type its siblings settle.
+private every_branch_leans(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    IfExpr(_, then_body, else_body, _) ->
+        else_body.is_some() && branch_leans(cx, then_body) && branch_leans(cx, else_body.unwrap())
+    _ -> false
+
+private branch_leans(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> leans(cx, e)
+    None -> false
 
 // What a branch or an arm **settles** for whichever of its siblings is guessing, or nothing where
 // it settles nothing.

@@ -347,7 +347,9 @@ anything with a cursor rather than a second kind of loop. The cursor moves, but 
 **Its bounds are read by the same two rules a `for` header's are** — they must agree, and they must
 be integers — so the value and the loop cannot come to disagree about what a range is. Note that a
 bound written as a literal takes its type from the other end, so `0..<3u8` is a `u8` range rather
-than a disagreement; it takes two names to write one.
+than a disagreement; it takes two names to write one. A range of literals standing where a
+`Range[T]` is wanted takes `T` the same way, so `total(0..<4)` passes a `Range[usize]` to a
+`total(r: Range[usize])`, and `val r: Range[u8] = 0..<3` is a `u8` range.
 
 ```sysl
 f(a: int, b: u8) -> int
@@ -359,6 +361,24 @@ print(f(0, 3))
 
 ```error
 a range needs matching bounds
+```
+
+A range of literals where a `Range[usize]` is wanted:
+
+```sysl
+total(r: Range[usize]) -> usize
+    var acc: usize = 0
+
+    for i in r
+        acc += i
+
+    acc
+
+print(total(0..<4), total(1..3))
+```
+
+```output
+6 6
 ```
 
 **An open end has no value reading.** `..`, `lo..` and `..hi` mean something only in a slice index,

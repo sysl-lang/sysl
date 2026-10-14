@@ -226,7 +226,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     TypeAttr(subject, attr, _, _) -> type_attr_expr(cx, anchor_of(e), subject, attr)
 
     // `lo..hi` and `lo..<hi` standing where a value is wanted, which is `sysl.Range[T]`.
-    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive)
+    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive, expected)
 
     Bad -> bad_expr(e.span)
 
@@ -242,8 +242,12 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 // **An open end stays a form.** `..`, `lo..` and `..hi` mean something in an index and nothing on
 // their own -- what an absent bound *is* depends on what is being indexed -- so they keep the
 // refusal, which names the one place they are legal rather than all four.
+//
+// **A range standing where a `Range[T]` is wanted reads its bounds at `T`**, exactly as an operator's
+// operands read the type their position wants: `total(0..<4)` at a `Range[usize]` parameter is a
+// range of `usize`, not an `int` one refused for a difference the reader never wrote.
 private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr],
-                    inclusive: bool) -> TExpr
+                    inclusive: bool, expected: Option[Type]) -> TExpr
     if lo.is_none() || hi.is_none() then
         return cx.err(span, "a range with an open end is only allowed in a slice index — as a " +
                       "value it would have to say what the missing bound is, and only the thing " +
@@ -256,7 +260,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
 
     // The same two questions the `for` header asks of its bounds, in the same order and the same
     // words: a range value and a counted loop must not come to disagree about what a range is.
-    val ts = analyze_operands(cx, ends, None)
+    val ts = analyze_operands(cx, ends, range_element(expected))
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -287,6 +291,15 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
             TExpr(span, TStructNew(d, fields))
         _ -> bad_expr(span)
 end range_value
+
+// The `T` of an expected `sysl.Range[T]`, where that is what the position wants.
+private range_element(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    underlying(expected.unwrap()) match
+        Struct(d) if d.base == library_key("Range") && d.targs.len() == 1 -> Some(d.targs.at(0))
+        _ -> None
+end range_element
 
 // `a, b` where a function's result list is what is being produced. It builds the aggregate the
 // caller takes apart -- the same one a tuple builds, since a result list is a tuple's layout
