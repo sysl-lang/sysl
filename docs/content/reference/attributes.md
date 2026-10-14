@@ -653,7 +653,7 @@ import sysl.testing.compiler
 @test
 asks_the_running_compiler_its_version()
     val answer = capture(compiler(), ["--version"]).unwrap()
-    assert(answer.status.is_ok(), "the compiler answers --version")
+    assert(answer.status.ok(), "the compiler answers --version")
 ```
 
 - **`skip` is imported, not ambient.** It lives in `sysl.testing` rather than the root module, so a

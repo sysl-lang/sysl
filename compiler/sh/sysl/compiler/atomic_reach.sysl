@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a program may reach of the atomic tier on the machine it is built for.
+//
+// **Two refusals that cannot be made where the code is typed**, because the standard module is typed
+// for every target and holds code a particular machine has no instruction for: `SpinLock` takes its
+// flag with an exchange an Armv6-M core cannot make, and `IrqLock` masks interrupts through a
+// Cortex-M register no other processor has. The library is built whole wherever it is built; what a
+// *program* calls is what is refused, at the smallest piece of the program that still arrives there,
+// with the walk `reaches.sysl` gives `@needs` and `@no_block`.
+//
+// **A read-modify-write is refused where the processor has no instruction for one.** An Armv6-M core
+// reads and writes a word indivisibly (`+atomics-32`, `codegen_features.sysl`) but has no exclusive
+// pair, so an exchange, an add or a compare-and-swap there would be a call into `__sync_*_4`, which no
+// board's runtime defines. A load and a store are left alone.
+
+// Says where to go instead, wherever a read-modify-write is refused.
+private rmw_alternatives() -> string =
+    "use an 'IrqLock' where the code runs on one core, or a board's hardware lock (the RP2040's SIO " +
+    "spinlocks) through 'Guarded[L, T]'"
+
+// Whether a typed form changes memory atomically, rather than only reading or writing it.
+private is_rmw(e: TExpr) -> bool = *e.kind match
+    TAtomic(op, _, _, _, _, _) -> op != "atomic_load" && op != "atomic_store"
+    _ -> false
+
+private rmw_name(e: TExpr) -> string = *e.kind match
+    TAtomic(op, _, _, _, _, _) -> op
+    _ -> ""
+
+// Whether a function is the standard module's own. Its bodies are typed for every machine, so what
+// it reaches is charged to the program that calls into it.
+private standard_body(name: string) -> bool
+    val m = module_of(name)
+
+    m == "sysl" || m.starts_with("sysl.")
+end standard_body
+
+// Asked of a key as a diagnostic spells it, which is the one form that names the owner plainly.
+private is_irq_lock(key: string) -> bool = qualified_name(key).starts_with("sysl.sync.IrqLock.")
+
+private is_spin_lock(key: string) -> bool = qualified_name(key).starts_with("sysl.sync.SpinLock.")
+
+// A function as the reader wrote it: an instantiation by the generic it was made from, so a call of
+// `Atomic[u32].add` is told about `sysl.sync.Atomic.add`.
+private shown(a: &Analysis, key: string) -> string =
+    qualified_name(a.tables.members.func_origin.get(key).unwrap_or(key))
+
+// Every body holding a read-modify-write form.
+private rmw_seeds(graph: Buf[TFunc]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<graph.len()
+        val f = graph.at(i)
+        val found: &Counted = Counted(0)
+
+        walk_block_stmts(f.body, TWalk(false, e -> if is_rmw(e) then found.n = found.n + 1,
+                                       w -> (), st -> ()))
+
+        if found.n > 0 && !holds_string(out, f.name) then out.push(f.name)
+
+    out
+end rmw_seeds
+
+private irq_seeds(graph: Buf[TFunc]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<graph.len()
+        if is_irq_lock(graph.at(i).name) then out.push(graph.at(i).name)
+
+    out
+end irq_seeds
+
+// Refuses what the program reaches of the atomic tier that the target cannot do.
+check_atomic_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    val t = a.tables.target
+    val no_rmw = t.atomic_rmw_bits() == 0
+    val no_primask = !t.has_primask()
+
+    if !no_rmw && !no_primask then return
+
+    val graph = with_abstract_callees(a, funcs)
+    val rmw_walk = reaches_over(graph, vtables, if no_rmw then rmw_seeds(graph) else buf())
+    val irq_walk = reaches_over(graph, vtables, if no_primask then irq_seeds(graph) else buf())
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        // An instantiation is reported at the call that chose its types, and the library's own
+        // bodies at the program's call into them.
+        if a.tables.members.func_origin.has(f.name) then continue
+        if standard_body(f.name) then continue
+
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, TWalk(false, e -> blame_atomic(a, t, scope, rmw_walk, irq_walk,
+                                                                no_rmw, e),
+                                       w -> (), st -> ()))
+end check_atomic_reach
+
+private blame_atomic(a: &Analysis, t: Target, scope: Scope, rmw_walk: &Reaches, irq_walk: &Reaches,
+                     no_rmw: bool, e: TExpr)
+    if no_rmw && is_rmw(e)
+        a.fault(scope, e.span, s"'${rmw_name(e)}' is an atomic read-modify-write, and " +
+                s"'${t.name}' has no instruction for one: an Armv6-M core reads and writes a word " +
+                s"indivisibly but cannot change one — ${rmw_alternatives()}")
+        return
+    end if
+
+    val irq = named_reach(irq_walk, own_refs(e))
+
+    if irq.is_some() && !reaches_a_seed(irq_walk, strict_refs(e))
+        a.fault(scope, e.span, s"'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and " +
+                s"'${t.name}' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; elsewhere " +
+                "use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are threads")
+        return
+    end if
+
+    val rmw = named_reach(rmw_walk, own_refs(e))
+
+    if rmw.is_none() || reaches_a_seed(rmw_walk, strict_refs(e)) then return
+
+    val (who, seed) = rmw.unwrap()
+
+    if is_spin_lock(who) || is_spin_lock(seed)
+        a.fault(scope, e.span, s"'SpinLock' takes its flag with an atomic exchange, and " +
+                s"'${t.name}' has no instruction for one — ${rmw_alternatives()}")
+        return
+    end if
+
+    val through = if who == seed then "" else s" through '${shown(a, seed)}'"
+
+    a.fault(scope, e.span, s"this reaches '${shown(a, who)}'$through, which changes memory " +
+            s"with an atomic read-modify-write, and '${t.name}' has no instruction for one — " +
+            rmw_alternatives())
+end blame_atomic
