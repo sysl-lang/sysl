@@ -132,6 +132,53 @@ It is a type of its own rather than [`sysl.text`](/library/text/)'s `ParseError`
 reading a *number* out of text: two of that type's four cases could never occur here, and a caller
 matching on it would be told cases exist that cannot.
 
+## Percent-encoding
+
+`percent_encode` / `percent_string` and `percent_decode` carry bytes through a URL. The unreserved
+set of RFC 3986 (`A-Z a-z 0-9 - . _ ~`) is written as itself and every other byte as upper-case
+`%XX`, so a multibyte character becomes one escape per byte. The `Percent` argument picks the
+dialect, which differs in exactly the space:
+
+| | space encodes as | `+` decodes as |
+|---|---|---|
+| `Component` | `%20` | `+` |
+| `Form` | `+` | space |
+
+`Component` is the right encoding for one **path segment** and for one **query key or value**: it
+escapes `/`, `?`, `=` and `&`, so the piece is safe wherever it is later placed. `Form` is
+`application/x-www-form-urlencoded`.
+
+Decoding writes into a slice the caller lends and refuses a malformed escape rather than passing it
+through: a `%` with fewer than two bytes after it is `BadLength`, and a `%` followed by a non-hex
+byte is `BadByte` at that byte. Either case of hex digit is accepted. Decoding does not check that
+the bytes are UTF-8.
+
+```sysl
+import sysl.encoding.{percent_string, percent_decode, Component, Form, BadLength}
+
+var out: []u8 = [0; 16]
+
+print(percent_string("a b/c é".bytes, Component))
+print(percent_string("a b+c".bytes, Form))
+
+val n = percent_decode("a%20b%C3%A9".bytes, out, Component).unwrap()
+
+print(n)
+
+val bad = percent_decode("100%".bytes, out, Component) match
+    Err(BadLength) -> "truncated escape"
+    _ -> "something else"
+
+print(bad)
+```
+
+```output
+a%20b%2Fc%20%C3%A9
+a+b%2Bc
+5
+truncated escape
+```
+
 ## Fixed-width integers, at either byte order
 
 ```sysl

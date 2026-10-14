@@ -1,0 +1,121 @@
+module sysl.encoding
+
+import sysl.text.{Ascii, from_utf8_unchecked}
+import sysl.buf.byte_sink
+
+// Percent-encoding, the way a URL carries bytes its grammar would otherwise read as syntax.
+//
+// **Shaped like `hex` and `base64`**: encoding writes to a `Writer`, decoding writes into a slice the
+// caller lends, and the `_string` convenience is the only thing that allocates.
+
+/** Which dialect of percent-encoding. The two differ in exactly one byte, the space. */
+enum Percent
+    /** RFC 3986: the **unreserved** set (`A-Z a-z 0-9 - . _ ~`) is written as itself and every other
+     * byte as `%XX`, so a space is `%20`. This is the right encoding for **one path segment** (a `/`
+     * inside a segment is data, so it is escaped) and for **one query key or value** (so is `&` and
+     * `=`). It deliberately escapes more than a URL strictly needs: a component encoded this way is
+     * safe wherever it is later placed. Decoding leaves a `+` alone.
+     */
+    Component
+
+    /** `application/x-www-form-urlencoded`: the same, except that a space is written `+` (and a `+`
+     * in the input is therefore `%2B`), and decoding turns a `+` back into a space.
+     */
+    Form
+
+private const HEX_UPPER: string = "0123456789ABCDEF"
+
+private is_unreserved(b: u8) -> bool
+    val alnum = (b >= u8('A') && b <= u8('Z')) || (b >= u8('a') && b <= u8('z')) || (b >= u8('0') && b <= u8('9'))
+
+    alnum || b == u8('-') || b == u8('.') || b == u8('_') || b == u8('~')
+
+private hex_digit_at(text: []const u8, at: usize) -> Result[int, DecodeError] =
+    text[at].digit_value(16) match
+        Some(v) -> Ok(v)
+        None -> Err(BadByte(at))
+
+/** Each byte of `bytes` as itself where unreserved and as `%XX` (upper-case hex, as RFC 3986
+ * recommends) otherwise. Works on bytes, so UTF-8 text is escaped one byte of each multibyte
+ * character at a time.
+ */
+percent_encode(bytes: []const u8, out: *Writer, mode: Percent)
+    val digits = HEX_UPPER.bytes
+    var triple: [3]u8
+    var one: [1]u8
+
+    for i in 0..<bytes.len
+        val b = bytes[i]
+
+        if is_unreserved(b) then
+            one[0] = b
+            out.write(one)
+        else if b == u8(' ') && mode == Form then
+            one[0] = u8('+')
+            out.write(one)
+        else
+            triple[0] = u8('%')
+            triple[1] = digits[usize(b >> 4)]
+            triple[2] = digits[usize(b & 0xf)]
+            out.write(triple)
+
+/** The same, gathered into a string. Every byte emitted is ASCII, so the result is valid UTF-8. */
+percent_string(bytes: []const u8, mode: Percent) -> string
+    var sink = byte_sink()
+    var w: *Writer = &sink
+
+    percent_encode(bytes, w, mode)
+
+    from_utf8_unchecked(sink.text())
+
+/** How many bytes `percent_decode` will write for a well-formed `text`: every `%XX` is one byte and
+ * every other byte is itself. A truncated escape is not counted as anything; `percent_decode`
+ * refuses it.
+ */
+percent_decoded_len(text: []const u8) -> usize
+    var n: usize = 0
+    var i: usize = 0
+
+    while i < text.len do
+        if text[i] == u8('%') then i += 3 else i += 1
+
+        n += 1
+
+    n
+
+/** The bytes the text spells, written into `out`, and how many there were.
+ *
+ * **A malformed escape is refused, never passed through**: a `%` with fewer than two bytes after it
+ * is `BadLength`, and a `%` followed by a byte that is not a hex digit is `BadByte` at that byte's
+ * offset. Either case of hex digit is accepted. Any other byte is copied as it stands, so decoding
+ * does not check that the output is UTF-8 -- what the bytes mean is the caller's.
+ */
+percent_decode(text: []const u8, out: []u8, mode: Percent) -> Result[usize, DecodeError]
+    val need = percent_decoded_len(text)
+
+    var i: usize = 0
+    var w: usize = 0
+
+    while i < text.len do
+        val c = text[i]
+
+        if c == u8('%') then
+            if i + 2 >= text.len then return Err(BadLength)
+
+            val hi = hex_digit_at(text, i + 1)?
+            val lo = hex_digit_at(text, i + 2)?
+
+            if w >= out.len then return Err(Short(need))
+
+            out[w] = u8(hi * 16 + lo)
+            i += 3
+        else
+            if w >= out.len then return Err(Short(need))
+
+            out[w] = if c == u8('+') && mode == Form then u8(' ') else c
+            i += 1
+
+        w += 1
+
+    Ok(w)
+end percent_decode

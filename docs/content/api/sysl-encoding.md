@@ -17,7 +17,7 @@ a field of anything. What the bytes *mean* belongs to whatever asked for them.
 
 ## Index
 
-[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Uuid`](#uuid) [`Plain`](#plain) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
+[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`percent_decode`](#percent_decode) [`percent_decoded_len`](#percent_decoded_len) [`percent_encode`](#percent_encode) [`percent_string`](#percent_string) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Percent`](#percent) [`Uuid`](#uuid) [`Plain`](#plain) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
 
 ## Values
 
@@ -179,6 +179,47 @@ A hyphen in the wrong place is refused as firmly as a bad digit: the positions a
 form from the others, so a text with them elsewhere is a different format rather than a sloppy
 spelling of this one.
 
+### `percent_decode`
+
+```sysl
+percent_decode(text: []const u8, out: []u8, mode: Percent) -> Result[usize, DecodeError]
+```
+
+The bytes the text spells, written into `out`, and how many there were.
+
+**A malformed escape is refused, never passed through**: a `%` with fewer than two bytes after it
+is `BadLength`, and a `%` followed by a byte that is not a hex digit is `BadByte` at that byte's
+offset. Either case of hex digit is accepted. Any other byte is copied as it stands, so decoding
+does not check that the output is UTF-8 -- what the bytes mean is the caller's.
+
+### `percent_decoded_len`
+
+```sysl
+percent_decoded_len(text: []const u8) -> usize
+```
+
+How many bytes `percent_decode` will write for a well-formed `text`: every `%XX` is one byte and
+every other byte is itself. A truncated escape is not counted as anything; `percent_decode`
+refuses it.
+
+### `percent_encode`
+
+```sysl
+percent_encode(bytes: []const u8, out: *Writer, mode: Percent)
+```
+
+Each byte of `bytes` as itself where unreserved and as `%XX` (upper-case hex, as RFC 3986
+recommends) otherwise. Works on bytes, so UTF-8 text is escaped one byte of each multibyte
+character at a time.
+
+### `percent_string`
+
+```sysl
+percent_string(bytes: []const u8, mode: Percent) -> string
+```
+
+The same, gathered into a string. Every byte emitted is ASCII, so the result is valid UTF-8.
+
 ### `put_u16_be`
 
 ```sysl
@@ -333,6 +374,16 @@ the variants are separated by what a caller would **do** about each and not by t
 -- a message naming where is worth writing and cannot be reconstructed afterwards. `Short` carries
 the length that *would* have been enough, so a caller can resize and retry in one step rather than
 discovering the requirement one byte at a time.
+
+### `Percent`
+
+```sysl
+enum Percent
+    Component
+    Form
+```
+
+Which dialect of percent-encoding. The two differ in exactly one byte, the space.
 
 ### `Uuid`
 

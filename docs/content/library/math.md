@@ -941,11 +941,12 @@ print(7.extent(), 200u8.extent())
 
 ## The arithmetic above the operators
 
-Six free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
+Eight free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
 
 ```
 pow(base, exponent)          gcd(a, b)                lcm(a, b)
 divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Option[T]
+div_floor(a, b)              mod_floor(a, b)
 ```
 
 ```sysl
@@ -982,6 +983,8 @@ What each one actually needs is written in its own bound instead:
 | `gcd` | `Rem + Eq + Ord + Sub` |
 | `lcm` | `Rem + Eq + Ord + Sub + Div + Mul` |
 | `divmod` | `Div + Rem` |
+| `div_floor` | `Div + Rem + Eq + Ord + Sub` |
+| `mod_floor` | `Rem + Add + Eq + Ord` |
 | `is_power_of_two` | `Bits + Ord` |
 | `next_power_of_two` | `Bits + Ord + Shl + Sub` |
 
@@ -1228,6 +1231,42 @@ print(q, r)
 ```error
 a module-level 'val' states its type, and a binding that names several things has nowhere to write one — declare 'q' and 'r' separately
 ```
+
+### `div_floor` and `mod_floor`
+
+```sysl
+@no_alloc
+@no_os
+
+import sysl.math.{div_floor, mod_floor}
+
+show()
+    print(-7 / 2, -7 % 2)
+    print(div_floor(-7, 2), mod_floor(-7, 2))
+    print(div_floor(7, -2), mod_floor(7, -2))
+
+    val day = mod_floor(-1, 7)
+
+    print(day)
+
+show()
+```
+
+```output
+-3 -1
+-4 1
+-4 -1
+6
+```
+
+The operators truncate toward zero; these round toward **negative infinity**, and the remainder
+takes the **divisor's** sign. That is the division a calendar, a grid or a ring buffer wants:
+`mod_floor(i, n)` is a valid index into `n` cells for any `i`, and
+`div_floor(a, b) * b + mod_floor(a, b)` is always `a`. They work at every integer width; for
+unsigned types they are the operators. They trap where the operators do: a zero divisor, and the
+one signed overflow `MIN / -1`.
+
+(`sysl.math.bigint` has its own `div_floor` and `mod_floor` over `BigInt`.)
 
 ### `is_power_of_two` and `next_power_of_two`
 
