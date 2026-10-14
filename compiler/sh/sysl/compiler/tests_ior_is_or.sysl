@@ -1,0 +1,134 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// An `is` under a condition's `||`, which binds nothing and so is the `bool` it answers
+// (`expr_flow.sysl`'s `disjunction`; `reference/expressions.md § is`).
+
+private ior_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-ior").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end ior_outcome
+
+private ior_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = ior_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end ior_prints
+
+private ior_binds() -> string =
+    "a pattern under '||' cannot bind a name — the branch runs when either side held, so there " +
+    "would be nothing for the name to hold when the other one did. Write '_' for the parts you are " +
+    "not naming, chain it with '&&', or write 'match'"
+
+@test("an 'is not' that binds nothing stands under '||', and either side makes it true")
+ior_is_not_under_or()
+    ior_prints(raw"""
+        enum Push
+            NoRoom
+            Pushed(at: int)
+
+        full(e: Push, room: int, limit: int) -> bool
+            if e is not NoRoom || room == limit then return true
+
+            false
+
+        print(full(NoRoom, 3, 3), full(Pushed(1), 0, 3), full(NoRoom, 0, 3))
+        """, "true true false\n")
+
+@test("an 'is' on either side, with alternatives, and an '&&' term inside the '||'")
+ior_is_on_either_side()
+    ior_prints(raw"""
+        enum Tok
+            Num(v: int)
+            Plus
+            Minus
+            End
+
+        kind(t: Tok, n: int) -> string
+            if t is Plus | Minus || n > 9 && t is Num(_) then "op-or-big" else "other"
+
+        print(kind(Plus, 0), kind(Minus, 0), kind(Num(1), 10), kind(Num(1), 1), kind(End, 99))
+        """, "op-or-big op-or-big op-or-big other other\n")
+
+@test("the right side is not evaluated when the left one held, and a while reads it too")
+ior_short_circuits()
+    ior_prints(raw"""
+        var asked = 0
+
+        probe(o: Option[int]) -> Option[int]
+            asked += 1
+            o
+
+        val a: Option[int] = Some(1)
+
+        if a is Some(_) || probe(None) is Some(_) then print("yes")
+
+        var o: Option[int] = None
+        var n = 0
+
+        while o is None || n < 3
+            n += 1
+            if n == 5 then o = Some(n)
+
+        print(asked, n)
+        """, "yes\n0 5\n")
+
+@test("a pattern under '||' that binds a name is refused, and that is the whole report")
+ior_binding_refused()
+    if xvr_no_library() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if false || o is Some(n) then print(n)
+        """), s"2:13 ${ior_binds()}\n")
+
+@test("an 'is not' that binds is refused once, by the rule 'is not' already has")
+ior_negated_binding_refused_once()
+    if xvr_no_library() then return
+
+    val said = isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if o is not Some(n) || false then print(0)
+        """)
+
+    assert(said.index_of("a pattern under 'is not' cannot bind a name").is_some(), said)
+    assert(said.index_of("under '||'").is_none(), said)
+
+@test("an 'is' inside an operand that is not a connective is still refused")
+ior_inside_a_call_refused()
+    if xvr_no_library() then return
+
+    val said = isc_diags(raw"""
+        id(b: bool) -> bool = b
+
+        var o: Option[int] = Some(1)
+        if id(o is Some(_)) || false then print(0)
+        """)
+
+    assert(said.index_of("'is' tests a pattern in the condition of an 'if' or a 'while'").is_some(),
+           said)

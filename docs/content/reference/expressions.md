@@ -401,7 +401,42 @@ rectangular
 ```
 
 Its level — between `&&` and the comparisons — is what makes `a is P && b > 0` a chain of two terms
-rather than an `is` against a conjunction. Both `is` and `not` are **soft** words: neither is
+rather than an `is` against a conjunction.
+
+**Under `||` a test stands so long as it binds nothing.** A name bound by `is` is live from its own
+`is` rightward and through the branch, and under `||` the branch runs when either side held — so a
+name bound on one side would hold nothing when the other side was the one that did. A test that binds
+nothing has no such question to answer:
+
+```sysl
+enum Push
+    NoRoom
+    Pushed(at: int)
+
+full(e: Push, room: int, limit: int) -> bool
+    if e is not NoRoom || room == limit then return true
+
+    false
+
+print(full(NoRoom, 3, 3), full(Pushed(1), 0, 3), full(NoRoom, 0, 3))
+```
+
+```output
+true true false
+```
+
+```sysl
+var o: Option[int] = Some(1)
+
+if o is Some(n) || false
+    print(n)
+```
+
+```error
+a pattern under '||' cannot bind a name
+```
+
+Both `is` and `not` are **soft** words: neither is
 reserved, so both remain usable as ordinary names, and this is the only place either reads as a
 keyword.
 

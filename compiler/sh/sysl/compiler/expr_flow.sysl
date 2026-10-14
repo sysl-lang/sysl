@@ -256,7 +256,54 @@ private conjuncts(out: *Buf[Expr], e: Expr)
 
 private cond_term(cx: &Analyzer, e: Expr, at: Span) -> TCondTerm = *e.kind match
     IsPattern(subject, patterns, negated) -> cond_is(cx, e.span, subject, patterns, negated)
+    Binary(op, _, _) if op == "||" -> TCondTest(disjunction(cx, e, at))
     _ -> TCondTest(analyze_bool(cx, e, at))
+
+// A `||` term of a condition, in which an `is` may stand as a plain test when it binds nothing.
+//
+// What a binding reaches is "from its own `is` rightward, and through the branch", and under `||` the
+// branch runs when either side held -- so a name bound on one side would hold nothing when the other
+// side was the one that did. A test that binds nothing has no such question to answer, and is the
+// `bool` a `match` with one arm for the pattern would have produced. The connectives are followed down
+// so `a is A || b is B && n > 0` reads as written; anything else is an ordinary `bool` operand, where
+// an `is` is refused as it is in every other position.
+private disjunction(cx: &Analyzer, e: Expr, at: Span) -> TExpr = *e.kind match
+    Binary(op, l, r) if op == "||" || op == "&&" ->
+        TExpr(e.span, TLogical(op, disjunction(cx, l, e.span), disjunction(cx, r, e.span)))
+    IsPattern(subject, patterns, negated) -> pattern_test(cx, e.span, subject, patterns, negated)
+    _ -> analyze_bool(cx, e, at)
+
+// `x is P` as the `bool` it answers: a `match` whose one arm is the pattern and whose other is `_`.
+private pattern_test(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern],
+                     negated: bool) -> TExpr
+    cond_is(cx, span, subject, patterns, negated) match
+        TCondIs(ts, tpats, _) -> pattern_match(cx, span, ts, tpats, negated)
+        _ -> bad_expr(span)
+
+private pattern_match(cx: &Analyzer, span: Span, ts: TExpr, tpats: Buf[TPattern],
+                      negated: bool) -> TExpr
+    // `is not` and `|` refuse a binder of their own, in `cond_is`; this is the one left.
+    if !negated && tpats.len() == 1 && any_pattern_binds(tpats) then
+        return cx.err(span, "a pattern under '||' cannot bind a name — the branch runs when either " +
+                      "side held, so there would be nothing for the name to hold when the other one " +
+                      "did. Write '_' for the parts you are not naming, chain it with '&&', or write " +
+                      "'match'")
+
+    if texpr_type(ts) == Unknown then return bad_expr(span)
+
+    val hit = TBlock(buf(), Some(TExpr(span, TBoolLit(!negated))), Bool)
+    val miss = TBlock(buf(), Some(TExpr(span, TBoolLit(negated))), Bool)
+    var rest: Buf[TPattern] = buf()
+
+    rest.push(TWildPattern(texpr_type(ts)))
+
+    var arms: Buf[TArm] = buf()
+
+    arms.push(TArm(tpats, None, hit))
+    arms.push(TArm(rest, None, miss))
+
+    TExpr(span, TMatch(ts, arms, Bool))
+end pattern_match
 
 private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern],
                 negated: bool) -> TCondTerm
