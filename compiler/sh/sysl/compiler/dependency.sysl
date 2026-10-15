@@ -46,11 +46,16 @@ struct Dependency
     // too. Accepted as written here and resolved against that package's own manifest elsewhere.
     features: Buf[string]
     default_features: bool
+
+    // Directories of the CONSUMER's, relative to the manifest that wrote this entry, searched ahead of
+    // the package's own include roots by every C file of the package (`c_libraries.sysl`) -- which is
+    // how a consumer supplies the configuration header a vendored library is written to take.
+    c_include: Buf[string]
 end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
 plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
-    Dependency(label, origin, mount, false, buf(), true)
+    Dependency(label, origin, mount, false, buf(), true, buf())
 
 // The identity everything mangles, caches and resolves by -- the coordinate, with the separators a
 // module name is allowed to hold.
@@ -110,7 +115,7 @@ resolved_against(dep: &Dependency, declaring_dir: string) -> Dependency
             val joined = if dir.starts_with("/") then dir else join_path(declaring_dir, dir)
 
             Dependency(dep.label, Local(absolute_path(joined)), dep.mount, dep.optional,
-                       dep.features, dep.default_features)
+                       dep.features, dep.default_features, dep.c_include)
 end resolved_against
 
 // Every dependency of a list read against the directory holding the manifest that wrote it.
@@ -240,7 +245,7 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'rev', " +
+                "'c_include', 'default_features', 'features', 'git', 'mount', 'optional', 'path', 'rev', " +
                 "'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
@@ -254,12 +259,23 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
             None -> return Err(not_a_feature_list(s"$where.features"))
             Some(names) -> names
 
-    Ok(Dependency(label, origin, mount, optional, features, defaults))
+    var c_include: Buf[string] = buf()
+
+    conf_at(sub, "c_include") match
+        None -> ()
+        Some(v) -> conf_list(v) match
+            None -> return Err(s"'$where.c_include' must be a list of directories, relative to this " +
+                               "manifest")
+            Some(dirs) ->
+                for dir in dirs
+                    c_include.push(inside_package(s"$where.c_include", "", dir)?)
+
+    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include))
 end read_dependency
 
 private known_dependency_key(key: string) -> bool =
     key == "git" || key == "version" || key == "rev" || key == "path" || key == "mount" || key == "optional" ||
-    key == "features" || key == "default_features" || key == "workspace"
+    key == "features" || key == "default_features" || key == "workspace" || key == "c_include"
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.

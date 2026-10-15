@@ -1336,25 +1336,20 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         val is_std = root == std_tree
         var built: Buf[string] = buf()
 
-        val found = c_sources(root, Some(t.os)) match
-            Err(e) -> return Err(Refusal(e.message))
-            Ok(cs) -> cs
+        val units = tree_c_units(root, t) match
+            Err(e) ->
+                if !e.of_manifest then return Err(Refusal(e.why))
 
-        val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
-
-        carried_defines(declared, found) match
-            Err(why) ->
                 return Err(Refusal(defines_refusal(
-                    if is_directory(path) then path else parent_of(path).unwrap_or("."), root, why)))
-            Ok(_) -> ()
+                    if is_directory(path) then path else parent_of(path).unwrap_or("."), root, e.why)))
+            Ok(us) -> us
 
-        for j in 0..<found.len()
-            val obj = s"$staging/${native_member(root, found.at(j))}"
+        for unit in units
+            val obj = s"$staging/${native_member(root, unit.src)}"
 
             make_dir_all(parent_of(obj).unwrap_or("."))
 
-            compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j))) match
+            compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes) match
                 Err(why) -> return Err(Refusal(why))
                 Ok(_) -> ()
 
@@ -2057,25 +2052,18 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
     var n = 0
 
     for item in trees
-        val found = c_sources(item, Some(t.os)) match
-            Err(e) -> return Err(Refusal(e.message))
-            Ok(cs) -> cs
-
-        val declared: &Manifest = manifest_at(item).unwrap_or(empty_manifest())
-
-        carried_defines(declared, found) match
-            Err(why) ->
+        val units = tree_c_units(item, t) match
+            Err(e) ->
                 discard_objects(objects)
-                return Err(Refusal(defines_refusal(root, item, why)))
-            Ok(_) -> ()
+                return Err(Refusal(if e.of_manifest then defines_refusal(root, item, e.why) else e.why))
+            Ok(us) -> us
 
-        for j in 0..<found.len()
+        for unit in units
             val obj = s"$exe.$n.o"
 
             n += 1
 
-            compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j))) match
+            compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes) match
                 Err(why) ->
                     discard_objects(objects)
                     return Err(Refusal(why))

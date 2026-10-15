@@ -2353,7 +2353,8 @@ guess between *do not define this* and `-DNAME=0` — and those differ under `#i
 meant can be said exactly: leave the line out, or write `0`.
 
 This is not a general flags channel. It reaches the C a package carries and nothing else: no include
-paths, no warning flags, nothing for an installed library's headers. `--define` remains what a
+paths (a vendored library's are [the `c` block's](#a-vendored-c-library-left-as-upstream-shipped-it)),
+no warning flags, nothing for an installed library's headers. `--define` remains what a
 *build* says and applies to every C compilation in it; a `defines` block is what a *package* says
 and applies to the file it names. Where both name the same macro the package wins, since the whole
 point is that its configuration is not the consumer's to change by accident.
@@ -2447,3 +2448,161 @@ Any definition made before including that header — from a `defines` block, fro
 anything — is overridden there, with a `macro redefined` warning and no other effect. A vendored
 copy has to guard the line. That is one line of difference from upstream rather than a wrapper
 header, but it is not nothing, and no mechanism here can remove it.
+
+## A vendored C library, left as upstream shipped it
+
+The C a module carries is found by the walk: a `.c` beside the sysl that declares its `extern`s
+([ffi](/reference/ffi/)). An upstream library is not laid out that way. TinyUSB, lwIP, mbedTLS and
+littlefs each keep their C in directories holding no sysl, reach their headers through an include
+root (`#include "common/tusb_common.h"`), take a configuration header from wherever the integrator
+put it, and ship far more C than one build compiles — TinyUSB carries a device driver for each of
+some fifty chips. A `c` block says all of that in the manifest, so the tree itself stays **byte for
+byte what upstream released**, and an upgrade is a copy of the new release over the old:
+
+```hocon
+c {
+  tinyusb {
+    root    = "c/tinyusb/src"
+    include = [".", "../../config"]
+    sources = ["tusb.c", "common/tusb_fifo.c", "device/{usbd,usbd_control}.c",
+               "class/cdc/cdc_device.c"]
+    defines { CFG_TUSB_CONFIG_FILE = "\"tusb_config.h\"" }
+  }
+}
+```
+
+Each key is one library, named for refusals to call it by:
+
+| key | what it says |
+|---|---|
+| `root` | where the library's tree is, relative to the package root; the package root if left out |
+| `include` | the directories its files are compiled with `-I` on, relative to `root`, searched in the order written |
+| `sources` | the files it compiles, relative to `root`: named outright, or by a pattern |
+| `exclude` | files taken back out of what the patterns match, by path or by pattern |
+| `defines` | the macros every one of them is compiled with, as a `defines` block's are |
+| `export` | include roots it publishes to the C of the packages that depend on this one |
+| `libc` | `true` where those roots are the C standard library's headers |
+
+**The list is the whole of what is compiled under the root.** The walk compiles none of the C there,
+even in a directory that holds sysl, so a driver nobody listed stays out however the tree is laid
+out, and a directory of C no list reaches is not a stray to warn about. A library that lists no
+`sources` claims no C: it is a header library, there to be read or published.
+
+**A pattern is allowed here, where a `defines` key may not use one.** A vendored tree is upstream's
+and changes only when somebody re-vendors it, and the diff of that commit shows every file the new
+release added — so `src/**/*.c` decides nothing behind anybody's back, while spelling out BearSSL's
+277 files would be a list nobody reads. `*` and `?` match within one name, `**` is a whole segment
+standing for any number of directories, and braces work as everywhere else. `exclude` takes files
+back out:
+
+```hocon
+c {
+  bearssl {
+    root    = "c/bearssl"
+    include = ["src", "inc"]
+    sources = ["src/**/*.c"]
+    defines { BR_USE_URANDOM = 0, BR_USE_GETENTROPY = 0 }
+  }
+}
+```
+
+The rest of the rules are the `defines` block's, for the same reasons:
+
+- **No character class**, and `**` only as a whole segment. A pattern **matching no file** stops the
+  build, and so does an `exclude` entry **taking out no file** a pattern matched: each is a path that
+  is merely wrong, and either would otherwise build — short of what it meant, or compiling the file
+  it meant to leave out. An `exclude` beside no pattern is refused when the manifest is read; leave
+  the file out of the list instead.
+- **Every path is relative and stays inside the package.** `..` may climb while it stays there —
+  `"../../config"` is the package's own configuration directory beside the vendored tree — and one
+  that climbs out is refused when the manifest is read.
+- **A named file the tree does not hold stops the build**, as does an include or export root that is
+  not a directory. The list is everything the library compiles, so a missing file is a typo or an
+  upgrade that renamed it, never a file to leave out.
+- **An unknown key in a library is refused**, where one at the top of the file is only warned about:
+  a misspelt `source` would compile nothing, and the first anybody heard of it would be a link that
+  cannot find the library's symbols.
+- A file is compiled once, so one listed twice, or by two libraries, is refused; and a library
+  declaring none of `sources`, `include` and `export` is a block to delete.
+
+```
+package.hocon: 'c.tinyusb.sources' names 'c/tinyusb/src/device/usbx.c', which this package does
+not hold — a library compiles exactly the files it lists, so a missing one is a mistake rather than
+a file to leave out
+```
+
+### What the package's own C reads
+
+A library's own files read its `include` roots and are compiled with its `defines`, plus any key of
+a top-level `defines` block naming one of them. **The package's other C reads every library's roots
+under every library's macros**: the shim beside the sysl, and the translation unit a
+[`c const`](/reference/ffi/) block is measured from. A shim including `tusb.h` has to see the
+configuration the objects beside it were built with, and a probe measuring a configured struct has
+to measure the one the package compiled — the reason a `c const` block inherits from the `defines`
+beside it, carried one step further.
+
+A package's include roots come before any `--include-path`: a configuration header is the package's,
+and one of the same name elsewhere on the machine is not the one the library was written against.
+
+### Publishing headers to the packages that depend on this one
+
+`export` names include roots a package hands on. **Every package that depends on it, directly or
+through another, compiles its C with them** — imports are transitive, and so are the headers behind
+them — and nothing else does. A package that only publishes headers says so and nothing more:
+
+```hocon
+c {
+  headers { export = ["include"] }
+}
+```
+
+### A consumer's own configuration header
+
+A vendored library is usually written to take its configuration from its integrator: lwIP includes
+`lwipopts.h` and `arch/cc.h`, TinyUSB `tusb_config.h`. The package ships a default, in a directory
+its `include` names, and a consumer that wants another says where its own are, on the dependency:
+
+```hocon
+dependencies {
+  lwip { git = "github.com/you/lwip", version = "0.1.0", c_include = ["config"] }
+}
+```
+
+`c_include` names directories **of the consumer's**, relative to its manifest and staying inside
+its project, and they are searched **before the package's own roots** — so the consumer's
+`lwipopts.h` stands in for the default and a header it does not supply (`arch/cc.h`) still comes
+from the package. They reach every C file of the package: its library's files, its shims, and its
+`c const` probes, so a pool size the package measures is the one its objects were compiled with.
+They travel with the package's exported roots too, so the consumer's own C including `lwip/tcp.h`
+reads the same `lwipopts.h`.
+
+A package is compiled once, so **two consumers each configuring it is refused**, naming both entries.
+A `c_include` directory that is not there stops the build.
+
+### A package that supplies the C standard library's headers
+
+A vendored library that includes `<string.h>` has nothing to compile against on a machine with no
+libc, and that is what a package written to be one is for. `libc = true` marks its exported roots as
+the standard library's:
+
+```hocon
+c {
+  libc { export = ["include"], libc = true }
+}
+```
+
+**Where the target has no libc**, the C of every dependent is compiled with the machine's own search
+for those headers taken away (`-nostdlibinc`) and these in its place (`-isystem`). clang's own
+freestanding headers — `stddef.h`, `stdint.h`, `stdbool.h`, `limits.h` — are kept, being the
+compiler's rather than a libc's. **Where the target has a libc the roots are not used at all**: the
+program links that libc, and its headers are the ones that describe it.
+
+Two packages in one build supplying them is refused — a file is compiled against one `string.h`, and
+there is no telling which was meant.
+
+### The run cache sees all of it
+
+What a library is compiled with is a change to the program, and so is a header in a vendored tree:
+`sysl run` and `sysl test` replay no binary built under a different `c` or `defines` block or
+`c_include`, against a file a pattern has since started or stopped matching, or against a header
+under a library's `include` or `export` roots, or a consumer's `c_include`, that has since changed.

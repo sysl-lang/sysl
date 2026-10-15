@@ -1,0 +1,887 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_file, read_text}
+import sysl.text.{join, split, Search}
+
+// A vendored C library: an upstream tree a package carries **byte for byte**, with the package's
+// manifest saying everything the tree's own build system would have said.
+//
+// ```hocon
+// c {
+//   tinyusb {
+//     root    = "c/tinyusb/src"
+//     include = [".", "../../config"]
+//     sources = ["tusb.c", "common/tusb_fifo.c", "device/{usbd,usbd_control}.c"]
+//     defines { CFG_TUSB_CONFIG_FILE = "\"tusb_config.h\"" }
+//   }
+// }
+// ```
+//
+// **Why the walk cannot do this.** The walk compiles the C in a directory holding sysl, which is what
+// a binding's shim is; an upstream tree holds no sysl, keeps its headers in directories its files
+// reach through an include root, and ships far more C than any one build compiles (TinyUSB carries a
+// device driver for each of fifty chips). So a library is its own list: **the C under a library's
+// root is compiled exactly as `sources` says and the walk compiles none of it.** Nothing is added to
+// the tree, so an upgrade is a copy of the new release over the old.
+//
+// **Every path is relative and stays inside the package**, as a `defines` key does: the package is
+// the same tree wherever it was fetched to, and a library that reached outside it would compile
+// whatever the machine it landed on happened to hold there.
+struct CLibrary
+    // The name the block gave it, which is what a refusal calls it.
+    name: string
+
+    // Where its tree is, relative to the package root and `/`-separated; `""` is the root itself.
+    root: string
+
+    // The directories its sources are compiled with `-I` on, in the order written, each relative
+    // to the package root.
+    include: Buf[string]
+
+    // The files compiled, relative to the package root, braces expanded.
+    sources: Buf[string]
+
+    // The patterns that name more of them (`src/**/*.c`), relative to the package root, braces
+    // expanded; and the patterns or paths taken back out of what those match. Matched against the
+    // tree when it is built, since reading the manifest has no tree to read.
+    patterns: Buf[string]
+    exclude: Buf[string]
+
+    // What every one of them is compiled with, as clang spells it after the `-D`.
+    macros: Buf[string]
+
+    // The include roots it publishes to the C of every package that depends on this one.
+    exports: Buf[string]
+
+    // Whether those roots are the C standard library's headers, for a machine that has none.
+    libc: bool
+end CLibrary
+
+// The `c` block. Each key is one library, and each library says at least one of what it compiles,
+// what it reads or what it publishes.
+read_c_libraries(root: &Conf) -> Result[Buf[CLibrary], string]
+    var out: Buf[CLibrary] = buf()
+
+    val block = conf_at(root, "c") match
+        None -> return Ok(out)
+        Some(found) -> found
+
+    if !conf_is_block(block)
+        return Err("'c' is not a block of libraries — each key names one vendored C library and " +
+                   "what follows it says how that library is compiled")
+
+    val names = conf_keys(block)
+
+    for name in names
+        val lib = read_c_library(name, conf_at(block, name).unwrap())?
+
+        // **One file, one library.** Compiled twice it is two definitions of every symbol in it,
+        // and a file both libraries claim has no answer to which configuration it gets.
+        for item in lib.sources
+            for other in out
+                if holds(other.sources, item)
+                    return Err(s"'c.$name.sources' and 'c.${other.name}.sources' both name " +
+                               s"'$item' — a file is compiled once, so one library lists it")
+
+        out.push(lib)
+
+    Ok(out)
+end read_c_libraries
+
+private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
+    if !conf_is_block(sub)
+        return Err(s"'c.$name' is not a block — a library says its 'root', 'include', " +
+                   "'sources', 'defines' and 'export' in one")
+
+    val keys = conf_keys(sub)
+
+    // **An unknown key is refused here, not warned about** as one at the top of the file is: a
+    // misspelt `source` would otherwise compile nothing, and the first anybody heard of it would
+    // be a link that cannot find the library's symbols.
+    for key in keys
+        if !(key == "root" || key == "include" || key == "sources" || key == "exclude" ||
+             key == "defines" || key == "export" || key == "libc")
+            return Err(s"'c.$name.$key' is not something a C library declares — a library says " +
+                       "its 'root', 'include', 'sources', 'exclude', 'defines', 'export' and 'libc'")
+
+    val root = conf_at(sub, "root") match
+        None -> ""
+        Some(v) -> *v match
+            Text(s) -> inside_package(s"c.$name.root", "", s)?
+            Word(s) -> inside_package(s"c.$name.root", "", s)?
+            _ -> return Err(s"'c.$name.root' must be a path — the directory the library's tree " +
+                            "is in, relative to the package root")
+
+    val include = path_list(sub, name, "include", root)?
+    val exports = path_list(sub, name, "export", root)?
+    var sources: Buf[string] = buf()
+    var patterns: Buf[string] = buf()
+
+    val listed = conf_at(sub, "sources") match
+        None -> buf()
+        Some(v) -> conf_list(v) match
+            None -> return Err(s"'c.$name.sources' must be a list of paths — the C files the " +
+                               "library compiles, relative to its root")
+            Some(items) -> items
+
+    // **A vendored library may name its files with a pattern, where a `defines` key may not.** The
+    // tree is upstream's and changes only when somebody re-vendors it, and that commit's diff shows
+    // every file the new release added -- so a `src/**/*.c` decides nothing behind anybody's back,
+    // and spelling out BearSSL's 278 files would be a list nobody reads.
+    for item in listed
+        val expanded = expand_alternatives(item, s"'c.$name.sources' entry '", "'")?
+
+        for one in expanded
+            if !one.ends_with(".c")
+                return Err(s"'c.$name.sources' entry '$one' does not name a '.c' file — a header " +
+                           "is reached through 'include', and only a translation unit is compiled")
+
+            pattern_shape(s"c.$name.sources", one)?
+
+            val file = inside_package(s"c.$name.sources", root, one)?
+
+            if is_pattern(one)
+                patterns.push(file)
+                continue
+
+            if holds(sources, file)
+                return Err(s"'c.$name.sources' names '$one' twice — a file is compiled once")
+
+            sources.push(file)
+
+    var exclude: Buf[string] = buf()
+
+    val excluded = conf_at(sub, "exclude") match
+        None -> buf()
+        Some(v) -> conf_list(v) match
+            None -> return Err(s"'c.$name.exclude' must be a list of paths or patterns, relative " +
+                               "to the library's root")
+            Some(items) -> items
+
+    for item in excluded
+        val expanded = expand_alternatives(item, s"'c.$name.exclude' entry '", "'")?
+
+        for one in expanded
+            pattern_shape(s"c.$name.exclude", one)?
+            exclude.push(inside_package(s"c.$name.exclude", root, one)?)
+
+    if !exclude.is_empty() && patterns.is_empty()
+        return Err(s"'c.$name.exclude' takes files out of what a pattern in 'sources' matches, and " +
+                   "this library's sources are all named outright — leave the file out of the list")
+
+    var macros: Buf[string] = buf()
+
+    conf_at(sub, "defines") match
+        None -> ()
+        Some(v) ->
+            if !conf_is_block(v)
+                return Err(s"'c.$name.defines' is not a block of macros — each line is one " +
+                           "macro the library's files are compiled with")
+
+            // Sorted, as a `defines` block's are, so the command line is what the block says
+            // rather than the order it was written in.
+            val ordered = sort_names(conf_keys(v))
+
+            for j in 0..<ordered.len()
+                macros.push(macro_of(s"c.$name.defines", ordered.at(j), conf_at(v, ordered.at(j)).unwrap())?)
+
+    val libc = conf_at(sub, "libc") match
+        None -> false
+        Some(v) -> *v match
+            Flag(b) -> b
+            _ -> return Err(s"'c.$name.libc' must be true or false — whether the roots it " +
+                            "exports are the C standard library's headers")
+
+    if libc && exports.is_empty()
+        return Err(s"'c.$name.libc' is true and the library exports nothing — 'libc' says the " +
+                   "roots in 'export' are the C standard library's headers, so it needs some")
+
+    if sources.is_empty() && patterns.is_empty() && include.is_empty() && exports.is_empty()
+        return Err(s"'c.$name' declares nothing — a library compiles 'sources', reads 'include' " +
+                   "or publishes 'export', and one doing none of them is a block to delete")
+
+    Ok(CLibrary(name, root, include, sources, patterns, exclude, macros, exports, libc))
+end read_c_library
+
+// Whether a path is a pattern rather than a file.
+private is_pattern(path: string) -> bool = path.index_of("*").is_some() || path.index_of("?").is_some()
+
+// A pattern is `*` and `?` within a segment and `**` as a whole segment, which is what a shell's
+// globstar matches; a character class is refused rather than read as a file named with a bracket.
+private pattern_shape(key: string, item: string) -> Result[unit, string]
+    if item.index_of("[").is_some()
+        return Err(s"'$key' entry '$item' has a character class — a pattern is '*', '?' and '**', " +
+                   "and braces ('{a,b}') say alternatives")
+
+    val segments = split(item, "/")
+
+    for i in 0..<segments.len
+        val part = segments[i]
+
+        if part.index_of("**").is_some() && part != "**"
+            return Err(s"'$key' entry '$item' puts '**' inside a name — '**' is a whole segment " +
+                       "('src/**/*.c'), standing for any number of directories")
+
+    Ok(())
+end pattern_shape
+
+// One of the lists of directories, each joined to the library's root.
+private path_list(sub: &Conf, name: string, key: string, root: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+
+    val items = conf_at(sub, key) match
+        None -> return Ok(out)
+        Some(v) -> conf_list(v) match
+            None -> return Err(s"'c.$name.$key' must be a list of directories, relative to the " +
+                               "library's root")
+            Some(found) -> found
+
+    for item in items
+        out.push(inside_package(s"c.$name.$key", root, item)?)
+
+    Ok(out)
+end path_list
+
+// `item` joined to `base`, both relative to the package root, with `.` and `..` worked out -- or the
+// refusal where the result is not inside the package. `""` is the package root itself.
+//
+// **`..` is allowed while it stays inside**, which is what lets an include list reach a sibling of
+// the library's tree (`../../config`, where the package keeps the configuration header it supplies).
+inside_package(key: string, base: string, item: string) -> Result[string, string]
+    if item.starts_with("/")
+        return Err(s"'$key' names '$item', an absolute path — a path is relative, since the " +
+                   "package is the same tree wherever it was fetched to")
+
+    var parts: Buf[string] = buf()
+    val whole = if base == "" then item else s"$base/$item"
+    val segments = split(whole, "/")
+
+    for i in 0..<segments.len
+        val part = segments[i]
+
+        if part == "" || part == "." then ()
+        else if part == ".."
+            if parts.is_empty()
+                return Err(s"'$key' names '$item', which climbs out of the package — a package " +
+                           "compiles and publishes the C it carries and nothing else")
+
+            parts.truncate(parts.len() - 1)
+        else parts.push(part)
+
+    Ok(join(parts.view(), "/"))
+end inside_package
+
+// A package-relative path as the machine spells it under the tree at `tree`.
+private under(tree: string, rel: string) -> string =
+    if rel == "" then absolute_path(tree) else absolute_path(join_path(tree, rel))
+
+// Whether `file`, an absolute path, is under the root of a library of this package that compiles a
+// list -- which makes it the list's to compile and not the walk's.
+claimed_by_library(tree: string, m: &Manifest, file: string) -> bool
+    for lib in m.c_libraries
+        if !lib.sources.is_empty() || !lib.patterns.is_empty()
+            val dir = under(tree, lib.root)
+
+            if file == dir || file.starts_with(dir + "/") || dir == "/" then return true
+
+    false
+end claimed_by_library
+
+// A library's files, relative to the package root: the ones named outright, then what each pattern
+// matches less what `exclude` takes out, each once and in a stable order.
+//
+// **A pattern matching nothing is refused, and so is an exclusion taking nothing out**: either is a
+// path that is merely wrong, and both would otherwise build -- one a library short of the files it
+// meant, the other compiling the file it meant to leave out.
+library_files(tree: string, lib: &CLibrary) -> Result[Buf[string], string]
+    var out = lib.sources.copy()
+
+    if lib.patterns.is_empty() then return Ok(out)
+
+    var matched: Buf[string] = buf()
+
+    for pattern in lib.patterns
+        val found = files_matching(tree, pattern)
+
+        if found.is_empty()
+            return Err(s"'c.${lib.name}.sources' pattern '$pattern' matches no file in this " +
+                       "package — a pattern is there to name files, so one naming none is a mistake")
+
+        for item in found
+            if !holds(matched, item) then matched.push(item)
+
+    var used: Buf[bool] = buf()
+
+    for k in 0..<lib.exclude.len()
+        used.push(false)
+
+    for item in matched
+        var dropped = false
+
+        for k in 0..<lib.exclude.len()
+            if glob_match(split_path(lib.exclude.at(k)), split_path(item))
+                dropped = true
+                used.set(k, true)
+
+        if !dropped && !holds(out, item) then out.push(item)
+
+    for k in 0..<lib.exclude.len()
+        if !used.at(k)
+            return Err(s"'c.${lib.name}.exclude' entry '${lib.exclude.at(k)}' takes out no file " +
+                       "the patterns in 'sources' match — an exclusion that excludes nothing is a " +
+                       "path that is wrong, and the file it meant is being compiled")
+
+    Ok(out)
+end library_files
+
+// Every file under the tree, relative to the package root, that a pattern matches -- sorted, so a
+// library is compiled in the same order on every machine. The walk starts below the pattern's
+// literal head (`src/` for `src/**/*.c`), which is all of the tree it can match.
+private files_matching(tree: string, pattern: string) -> Buf[string]
+    val parts = split_path(pattern)
+    var head: Buf[string] = buf()
+
+    for part in parts
+        if is_pattern(part) then break
+
+        head.push(part)
+
+    // The last segment is the file's own name, never a directory to start in.
+    if head.len() == parts.len() then head.truncate(head.len() - 1)
+
+    val start = join(head.view(), "/")
+    var all: Buf[string] = buf()
+
+    files_under(under(tree, start), start, &all, 0)
+
+    var out: Buf[string] = buf()
+
+    for item in all
+        if glob_match(parts, split_path(item)) then out.push(item)
+
+    sort_names(out)
+end files_matching
+
+private files_under(dir: string, rel: string, out: *Buf[string], depth: usize)
+    if depth > 32 then return
+
+    val names = entries(dir) match
+        Err(_) -> return
+        Ok(found) -> found
+
+    for name in names
+        val full = join_path(dir, name)
+        val place = if rel == "" then name else s"$rel/$name"
+
+        if is_directory(full) then files_under(full, place, out, depth + 1)
+        else out.push(place)
+end files_under
+
+split_path(path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val parts = split(path, "/")
+
+    for i in 0..<parts.len
+        if parts[i] != "" then out.push(parts[i])
+
+    out
+end split_path
+
+// Whether a path's segments match a pattern's: `**` any number of whole segments, `*` and `?` within
+// one segment.
+glob_match(pattern: Buf[string], path: Buf[string]) -> bool = glob_from(pattern, 0, path, 0)
+
+private glob_from(pattern: Buf[string], i: usize, path: Buf[string], j: usize) -> bool
+    if i == pattern.len() then return j == path.len()
+
+    if pattern.at(i) == "**"
+        var k = j
+
+        loop
+            if glob_from(pattern, i + 1, path, k) then return true
+            if k == path.len() then return false
+
+            k += 1
+
+    if j == path.len() then return false
+
+    segment_match(pattern.at(i), 0, path.at(j), 0) && glob_from(pattern, i + 1, path, j + 1)
+end glob_from
+
+private segment_match(p: string, i: usize, s: string, j: usize) -> bool
+    if i == p.bytes.len then return j == s.bytes.len
+
+    if p.bytes[i] == u8('*')
+        var k = j
+
+        loop
+            if segment_match(p, i + 1, s, k) then return true
+            if k == s.bytes.len then return false
+
+            k += 1
+
+    if j == s.bytes.len then return false
+
+    (p.bytes[i] == u8('?') || p.bytes[i] == s.bytes[j]) && segment_match(p, i + 1, s, j + 1)
+end segment_match
+
+// Each library's files under the tree as the machine spells them, with the library each belongs to
+// -- or the refusal for one that is not there, or a directory a list names that is not there.
+//
+// **A missing file is a refusal and never a file skipped.** The list is the whole of what the library
+// compiles, so a file it names and the tree does not hold is a typo or an upgrade that renamed it,
+// and building without it is a link failure later naming a symbol rather than the file.
+library_sources(tree: string, m: &Manifest) -> Result[Buf[(string, usize)], string]
+    var out: Buf[(string, usize)] = buf()
+
+    for i in 0..<m.c_libraries.len()
+        val lib = m.c_libraries.at(i)
+
+        for rel in lib.sources
+            if !is_file(under(tree, rel))
+                return Err(s"'c.${lib.name}.sources' names '$rel', which this package does not " +
+                           "hold — a library compiles exactly the files it lists, so a missing one " +
+                           "is a mistake rather than a file to leave out")
+
+        val files = library_files(tree, lib)?
+
+        for rel in files
+            val file = under(tree, rel)
+
+            // A file two libraries reach -- by a pattern, which reading the manifest could not see.
+            for item in out
+                if item.0 == file
+                    return Err(s"'c.${lib.name}.sources' and " +
+                               s"'c.${m.c_libraries.at(item.1).name}.sources' both reach '$rel' — a " +
+                               "file is compiled once, so one library lists it")
+
+            out.push((file, i))
+
+        directories_held(tree, lib.name, "include", lib.include)?
+        directories_held(tree, lib.name, "export", lib.exports)?
+
+    Ok(out)
+end library_sources
+
+private directories_held(tree: string, name: string, key: string, dirs: Buf[string]) -> Result[unit, string]
+    for rel in dirs
+        if !is_directory(under(tree, rel))
+            return Err(s"'c.$name.$key' names '${if rel == "" then "." else rel}', which is not a " +
+                       "directory this package holds")
+
+    Ok(())
+end directories_held
+
+// What one C file of a tree is compiled with beyond the build's own flags.
+struct CUnit
+    src: string
+
+    // `-I`, `-isystem` and `-nostdlibinc`, in the order clang should search.
+    includes: Buf[string]
+
+    // As clang spells each after the `-D`.
+    macros: Buf[string]
+end CUnit
+
+// Why a tree's C cannot be listed: a refusal about the walk, or one about the manifest (which the
+// caller names the package in).
+struct CRefusal
+    why: string
+    of_manifest: bool
+end CRefusal
+
+// **Every C file a tree compiles and what each is compiled with**, which is one question both a build
+// and an archive ask -- the walked shims, then each library's list.
+//
+// - A **library's** file reads its own `include` roots, then the roots its dependencies publish, and
+//   is compiled with its own `defines` and any `defines` key naming it.
+// - A **walked** file -- a shim beside the sysl that declares its `extern`s -- reads every library's
+//   `include` roots and is compiled with every library's macros, for the reason a `c const` probe
+//   is (`probe_cflags_for`): a shim that includes `tusb.h` has to see the configuration the objects
+//   beside it were built with, or it is compiled against a different library.
+tree_c_units(tree: string, t: Target) -> Result[Buf[CUnit], CRefusal]
+    var out: Buf[CUnit] = buf()
+
+    val found = c_sources(tree, Some(t.os)) match
+        Err(e) -> return Err(CRefusal(e.message, false))
+        Ok(cs) -> cs
+
+    val declared: &Manifest = manifest_at(tree).unwrap_or(empty_manifest())
+
+    val listed = library_sources(tree, declared) match
+        Err(why) -> return Err(CRefusal(why, true))
+        Ok(got) -> got
+
+    var every: Buf[string] = buf()
+
+    for item in found
+        every.push(item)
+
+    for item in listed
+        every.push(item.0)
+
+    carried_defines(declared, every) match
+        Err(why) -> return Err(CRefusal(why, true))
+        Ok(_) -> ()
+
+    val published = dependency_c_flags(tree, t) match
+        Err(why) -> return Err(CRefusal(why, false))
+        Ok(got) -> got
+
+    // A consumer's directories come first of all, ahead of the package's own roots: they are how a
+    // consumer's `lwipopts.h` stands in for the default the package ships.
+    val configured = consumer_c_flags(tree) match
+        Err(why) -> return Err(CRefusal(why, false))
+        Ok(got) -> got
+
+    val shared = package_c_flags(tree, declared)
+
+    for item in found
+        var macros = shared.1.copy()
+
+        add_unique(&macros, defines_for(declared, item))
+        out.push(CUnit(item, joined_flags(joined_flags(configured, shared.0), published), macros))
+
+    for item in listed
+        val lib = declared.c_libraries.at(item.1)
+        var own = configured.copy()
+
+        for rel in lib.include
+            own.push(s"-I${under(tree, rel)}")
+
+        var macros = lib.macros.copy()
+
+        add_unique(&macros, defines_for(declared, item.0))
+        out.push(CUnit(item.0, joined_flags(own, published), macros))
+
+    Ok(out)
+end tree_c_units
+
+// Every library's include roots and macros, as the package's own shims and `c const` probes read
+// them: the union, in the order the libraries were written.
+package_c_flags(tree: string, m: &Manifest) -> (Buf[string], Buf[string])
+    var includes: Buf[string] = buf()
+    var macros: Buf[string] = buf()
+
+    for lib in m.c_libraries
+        for rel in lib.include
+            val flag = s"-I${under(tree, rel)}"
+
+            if !holds(includes, flag) then includes.push(flag)
+
+        add_unique(&macros, lib.macros)
+
+    (includes, macros)
+end package_c_flags
+
+private add_unique(into: *Buf[string], more: Buf[string])
+    for item in more
+        if !holds(*into, item) then into.push(item)
+
+// Whether a list holds a string.
+private holds(xs: Buf[string], x: string) -> bool
+    for item in xs
+        if item == x then return true
+
+    false
+end holds
+
+private joined_flags(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out = a.copy()
+
+    for item in b
+        out.push(item)
+
+    out
+end joined_flags
+
+// One package of the graph a build resolved, as far as the include roots it publishes go.
+struct CExporter
+    // Where it is, absolute.
+    root: string
+    canonical: string
+
+    // The canonical names of the packages it depends on directly.
+    deps: Buf[string]
+
+    // The roots it publishes, absolute; and the ones that are a C standard library's headers.
+    exports: Buf[string]
+    libc: Buf[string]
+
+    // The directories a consumer's `c_include` put ahead of this package's own roots, absolute, and
+    // the entry that said so (`dependencies.lwip` in the root project's manifest).
+    configured: Buf[string]
+    configured_by: string
+
+    // Where two consumers each gave one, the refusal -- said when this package's C is compiled.
+    conflict: string
+end CExporter
+
+// The graph the last resolution answered, kept because a `c const` probe is answered inside the
+// analysis, where there is no project to resolve -- only the file's own path. **It is replaced by
+// every resolution and emptied by every build without one**, so a build never reads another's.
+private var c_exporters: Buf[CExporter] = buf()
+
+// Forget the graph, for a build that resolves none.
+forget_c_exporters()
+    c_exporters = buf()
+
+// Keep what each package of a resolved graph publishes.
+note_c_exporters(g: &Graph)
+    var kept: Buf[CExporter] = buf()
+
+    for p in g.packages
+        var deps: Buf[string] = buf()
+
+        for item in p.imports
+            if !holds(deps, item.1) then deps.push(item.1)
+
+        var exports: Buf[string] = buf()
+        var libc: Buf[string] = buf()
+
+        for lib in p.manifest.c_libraries
+            for rel in lib.exports
+                if lib.libc then libc.push(under(p.root, rel)) else exports.push(under(p.root, rel))
+
+        kept.push(CExporter(absolute_path(p.root), p.canonical, deps, exports, libc, buf(), "", ""))
+
+    // **A consumer may stand its own headers ahead of a dependency's** -- a vendored library's
+    // configuration header, which the library is written to have its integrator supply.
+    for p in g.packages
+        consumer_entries(&kept, p, p.manifest.dependencies, "dependencies")
+        consumer_entries(&kept, p, p.manifest.dev_dependencies, "dev_dependencies")
+
+    c_exporters = kept
+end note_c_exporters
+
+private consumer_entries(kept: *Buf[CExporter], p: &ResolvedPackage, deps: Buf[Dependency], block: string)
+    for dep in deps
+        if dep.c_include.is_empty() then continue
+
+        var target = exporter_named(*kept, dependency_canonical(dep))
+
+        for item in p.imports
+            if target.is_none() && item.0 == dep.label then target = exporter_named(*kept, item.1)
+
+        val who = if p.canonical.is_empty() then s"$block.${dep.label}"
+        else s"${p.canonical}: $block.${dep.label}"
+
+        for j in 0..<kept.len()
+            if target.is_some() && target.unwrap() == j
+                var e = kept.at(j)
+
+                if !e.configured_by.is_empty() && e.configured_by != who
+                    e.conflict = s"'${e.configured_by}' and '$who' both give '${e.canonical}' headers of " +
+                                 "their own with 'c_include' — a package is compiled once, so one " +
+                                 "consumer configures it"
+                else
+                    var dirs: Buf[string] = buf()
+
+                    for rel in dep.c_include
+                        dirs.push(under(p.root, rel))
+
+                    e.configured = dirs
+                    e.configured_by = who
+
+                kept.set(j, e)
+end consumer_entries
+
+// The package a name an imports table answers belongs to: the package's own canonical prefix, or a
+// module path under it (`sh.sysl.cstd` under `cstd`'s), since a table maps the names a package's
+// import lines write to the modules they reach.
+private exporter_named(kept: Buf[CExporter], name: string) -> Option[usize]
+    for j in 0..<kept.len()
+        val c = kept.at(j).canonical
+
+        if !c.is_empty() && (name == c || name.starts_with(c + ".")) then return Some(j)
+
+    None
+end exporter_named
+
+// The directories a consumer stood ahead of this tree's own include roots, as flags -- or the refusal
+// for one that is not there, or for two consumers that each gave some.
+consumer_c_flags(tree: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    val me = absolute_path(tree)
+
+    for e in c_exporters
+        if e.root == me
+            if !e.conflict.is_empty() then return Err(e.conflict)
+
+            for dir in e.configured
+                if !is_directory(dir)
+                    return Err(s"'${e.configured_by}.c_include' names '$dir', which is not a directory")
+
+                out.push(s"-I$dir")
+
+    Ok(out)
+end consumer_c_flags
+
+// **The include roots the packages a tree depends on publish to its C**, directly or through another
+// -- as imports are transitive, so are the headers behind them.
+//
+// A root marked `libc` is the C standard library's headers for a machine that has none. Where the
+// target has no libc it replaces the machine's search for them (`-nostdlibinc`, which keeps clang's
+// own freestanding `stddef.h` and `stdint.h`) and goes on as `-isystem`; **where the target has a
+// libc it is not used at all**, since the program links that libc and its headers are the ones that
+// describe it. Two packages supplying one are refused: there is no telling which `string.h` was meant.
+dependency_c_flags(tree: string, t: Target) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    val me = absolute_path(tree)
+    var start: Option[usize] = None
+
+    for i in 0..<c_exporters.len()
+        if c_exporters.at(i).root == me then start = Some(i)
+
+    if start.is_none()
+        if !c_exporters.is_empty() then trace(s"c headers: '$me' is no package of the graph")
+
+        return Ok(out)
+
+    // Breadth first over the packages, each once.
+    var queue: Buf[usize] = buf()
+
+    queue.push(start.unwrap())
+
+    var at: usize = 0
+    var system: Buf[string] = buf()
+    var supplier = ""
+
+    while at < queue.len()
+        val p = c_exporters.at(queue.at(at))
+
+        at += 1
+
+        if at > 1
+            // A consumer's headers travel with the roots they stand in front of, so a dependent
+            // including `lwip/tcp.h` reads the same `lwipopts.h` the package was compiled with.
+            if !p.exports.is_empty()
+                for dir in p.configured
+                    val flag = s"-I$dir"
+
+                    if !holds(out, flag) then out.push(flag)
+
+            for dir in p.exports
+                val flag = s"-I$dir"
+
+                if !holds(out, flag) then out.push(flag)
+
+            if !p.libc.is_empty() && !t.provides_libc()
+                if supplier != "" && supplier != p.canonical
+                    return Err(s"'$supplier' and '${p.canonical}' both supply the C standard " +
+                               "library's headers — a file is compiled against one 'string.h', " +
+                               "so a build takes one of them")
+
+                supplier = p.canonical
+
+                for dir in p.libc
+                    system.push(dir)
+        end if
+
+        for name in p.deps
+            exporter_named(c_exporters, name) match
+                None -> ()
+                Some(j) ->
+                    var queued = false
+
+                    for k in 0..<queue.len()
+                        if queue.at(k) == j then queued = true
+
+                    if !queued then queue.push(j)
+
+    if !system.is_empty()
+        out.push("-nostdlibinc")
+
+        for dir in system
+            out.push(s"-isystem$dir")
+
+    trace(s"c headers: '$me' takes ${join(out.view(), " ")} from ${queue.len() - 1} package(s) it depends on")
+    Ok(out)
+end dependency_c_flags
+
+// The `c` block as what it means, one library to a line, for the run cache's key: a library's
+// configuration changes the program as surely as its files do.
+c_block_text(m: &Manifest) -> string
+    var out = ""
+
+    for lib in m.c_libraries
+        out = out + s"${lib.name} root=${lib.root} include=${join(lib.include.view(), ",")} " +
+            s"sources=${join(lib.sources.view(), ",")} patterns=${join(lib.patterns.view(), ",")} " +
+            s"exclude=${join(lib.exclude.view(), ",")} defines=${join(lib.macros.view(), ",")} " +
+            s"export=${join(lib.exports.view(), ",")} libc=${lib.libc}\n"
+
+    for item in m.defines
+        out = out + s"defines ${item.0}=${join(item.1.view(), ",")}\n"
+
+    for dep in m.dependencies
+        if !dep.c_include.is_empty()
+            out = out + s"c_include ${dep.label}=${join(dep.c_include.view(), ",")}\n"
+
+    for dep in m.dev_dependencies
+        if !dep.c_include.is_empty()
+            out = out + s"c_include ${dep.label}=${join(dep.c_include.view(), ",")}\n"
+
+    out
+end c_block_text
+
+// Every file a tree's libraries compile or could include -- each listed source, and every file under
+// an include or export root -- as `(place, text)`, for the run cache's key. A header edited inside a
+// vendored tree changes the objects compiled from it, and a run that replayed the old binary would
+// be answering about a library nobody has any more.
+c_library_inputs(tree: string, m: &Manifest) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var dirs: Buf[string] = buf()
+
+    for lib in m.c_libraries
+        // A pattern's matches are hashed as what they are now, so a file the next release adds
+        // misses too. A pattern that will not expand is the build's to refuse, not the cache's.
+        val files = library_files(tree, lib).unwrap_or(lib.sources)
+
+        for rel in files
+            val file = under(tree, rel)
+
+            read_text(file) match
+                Ok(text) -> out.push((rel, text))
+                Err(_) -> ()
+
+        for rel in lib.include
+            if !holds(dirs, rel) then dirs.push(rel)
+
+        for rel in lib.exports
+            if !holds(dirs, rel) then dirs.push(rel)
+
+    // And the headers this tree stands ahead of a dependency's: a consumer's `lwipopts.h` is
+    // compiled into the dependency's objects.
+    for dep in m.dependencies
+        for rel in dep.c_include
+            if !holds(dirs, rel) then dirs.push(rel)
+
+    for dep in m.dev_dependencies
+        for rel in dep.c_include
+            if !holds(dirs, rel) then dirs.push(rel)
+
+    for rel in dirs
+        headers_under(under(tree, rel), rel, &out, 0)
+
+    out
+end c_library_inputs
+
+// Every `.h` below a directory, depth-limited so that a link that loops cannot walk for ever.
+private headers_under(dir: string, rel: string, out: *Buf[(string, string)], depth: usize)
+    if depth > 32 then return
+
+    val names = entries(dir) match
+        Err(_) -> return
+        Ok(found) -> found
+
+    for name in names
+        val full = join_path(dir, name)
+        val place = if rel == "" then name else s"$rel/$name"
+
+        if is_directory(full) then headers_under(full, place, out, depth + 1)
+        else if name.ends_with(".h")
+            read_text(full) match
+                Ok(text) -> out.push((place, text))
+                Err(_) -> ()
+end headers_under
