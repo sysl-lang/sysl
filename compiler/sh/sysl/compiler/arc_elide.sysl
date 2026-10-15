@@ -36,19 +36,22 @@ import sysl.text.Search
 // of every predecessor, in their order, when that lets at least one predecessor cancel a retain
 // against one. Each path then gives back exactly what it gave back before, earlier only by the slot
 // loads the join opened with.
-elide_arc_pairs(blocks: Buf[IrBlock]) -> Buf[IrBlock]
+//
+// `inert` names the functions whose bodies release nothing and write nothing but their own locals
+// (`inert_callees`); a call to one may sit inside a covered window.
+elide_arc_pairs(blocks: Buf[IrBlock], inert: Set[string]) -> Buf[IrBlock]
     val clean = unescaped_slots(blocks)
     var out: Buf[IrBlock] = buf()
 
-    // A count a covering slot makes needless goes first, wherever it is given back
-    // (`arc_cover.sysl`); what is left is cancelled within its block.
-    for b in elide_covered(blocks, clean)
+    for b in blocks
         out.push(IrBlock(b.label, elide_in_block(b.instrs, clean), b.terminator))
 
     for j in 1..<out.len()
         hoist_join_releases(out, j, clean)
 
-    out
+    // What is left is a count a covering slot may make needless however far away it is given back
+    // (`arc_cover.sysl`).
+    elide_covered(out, clean, inert)
 end elide_arc_pairs
 
 // The stack slots whose address is used only as the address of a load or a store, so that nothing

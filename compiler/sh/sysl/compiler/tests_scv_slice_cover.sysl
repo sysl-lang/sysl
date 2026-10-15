@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{Status, capture}
@@ -38,6 +39,14 @@ private scv_insert(d: string, agg: Val, v: string, k: int) -> Inst =
 private scv_load(d: string, slot: string) -> Inst = InLoad(VReg(d), LPtr, VReg(slot), AccPlain, None)
 
 private scv_store(v: string, slot: string) -> Inst = InStore(LPtr, VReg(v), VReg(slot), AccPlain, None)
+
+// The pass, with `quiet` the one function counted as releasing nothing.
+private scv_pass(blocks: Buf[IrBlock]) -> Buf[IrBlock]
+    var inert: Set[string] = set()
+
+    inert.add("quiet")
+    elide_arc_pairs(blocks, inert)
+end scv_pass
 
 private scv_count(text: string, needle: string) -> int = int(text.count_of(needle))
 
@@ -135,7 +144,7 @@ scv_loop_before_and_after()
           ret void
         """)
 
-    val after = scv_text(elide_arc_pairs(before))
+    val after = scv_text(scv_pass(before))
 
     assert_eq(after.contains("@arc.retain_maybe"), false, after)
     assert_eq(after.contains("@arc.release_maybe"), false, after)
@@ -149,17 +158,17 @@ scv_parent_released_inside()
     between.push(scv_extract("p2", "p1", 0))
     between.push(scv_call("arc.release_maybe", "p2"))
 
-    val after = scv_text(elide_arc_pairs(scv_loop(between, 1)))
+    val after = scv_text(scv_pass(scv_loop(between, 1)))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
-    assert_eq(scv_count(after,"@arc.release_maybe"), 2, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.release_maybe"), 2, after)
 
 @test("a parent slot written more than once covers nothing")
 scv_parent_written_twice()
-    val after = scv_text(elide_arc_pairs(scv_loop(buf(), 2)))
+    val after = scv_text(scv_pass(scv_loop(buf(), 2)))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
-    assert_eq(scv_count(after,"@arc.release_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.release_maybe"), 1, after)
 
 @test("a store to the parent inside the window keeps the pair")
 scv_parent_stored_inside()
@@ -169,23 +178,45 @@ scv_parent_stored_inside()
     between.push(scv_call("arc.retain_maybe", "fresh"))
     between.push(scv_store("fresh", "src.addr"))
 
-    val after = scv_text(elide_arc_pairs(scv_loop(between, 0)))
+    val after = scv_text(scv_pass(scv_loop(between, 0)))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 2, after)
-    assert_eq(scv_count(after,"@arc.release_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 2, after)
+    assert_eq(scv_count(after, "@arc.release_maybe"), 1, after)
 
-@test("a release of something else, or a call, inside the window does not keep the pair")
-scv_other_release_inside()
+private scv_with(inst: Inst) -> string
     var between: Buf[Inst] = buf()
-    var args: Buf[IrArg] = buf()
 
-    between.push(scv_call("arc.release", "elsewhere"))
-    between.push(ir_call(None, LVoid, VGlobal("anything"), args))
+    between.push(inst)
+    scv_text(scv_pass(scv_loop(between, 1)))
+end scv_with
 
-    val after = scv_text(elide_arc_pairs(scv_loop(between, 1)))
+@test("a call to a function that releases nothing, a field read or another retain may sit inside")
+scv_blind_inside()
+    var none: Buf[IrArg] = buf()
+    var at: Buf[IrArg] = buf()
+    var read: Buf[Inst] = buf()
 
-    assert_eq(after.contains("@arc.retain_maybe"), false, after)
-    assert_eq(scv_count(after,"@arc.release"), 1, after)
+    at.push(ir_arg(l_i32(), VReg("k")))
+    read.push(InGep(VReg("f"), LInt(8), VReg("t8"), at))
+    read.push(InLoad(VReg("g"), LInt(8), VReg("f"), AccPlain, None))
+
+    val field = scv_text(scv_pass(scv_loop(read, 1)))
+
+    for after in [scv_with(ir_call(None, LVoid, VGlobal("quiet"), none)), scv_with(scv_call("arc.retain", "other")), field]
+        assert_eq(after.contains("@arc.retain_maybe"), false, after)
+        assert_eq(after.contains("@arc.release_maybe"), false, after)
+
+@test("any other call, any other release, or a load straight through a pointer keeps the pair")
+scv_count_could_be_read()
+    var none: Buf[IrArg] = buf()
+
+    // `slot_vacate` reads the strong count with a load through the owner itself.
+    for after in [scv_with(ir_call(None, LVoid, VGlobal("anything"), none)),
+                  scv_with(scv_call("arc.release", "elsewhere")),
+                  scv_with(InLoad(VReg("n"), LInt(64), VReg("t8"), AccPlain, None)),
+                  scv_with(InFence(OrdSeqCst))]
+        assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
+        assert_eq(scv_count(after, "@arc.release_maybe"), 1, after)
 
 @test("a path that returns before the release keeps the pair")
 scv_path_returns_first()
@@ -193,9 +224,9 @@ scv_path_returns_first()
 
     blocks[3] = IrBlock("each", blocks[3].instrs, Some(InCondBr(VReg("more"), "end", "done")))
 
-    val after = scv_text(elide_arc_pairs(blocks))
+    val after = scv_text(scv_pass(blocks))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
 
 @test("a path that takes the share again before giving it back keeps the pair")
 scv_path_loops_to_the_retain()
@@ -203,9 +234,9 @@ scv_path_loops_to_the_retain()
 
     blocks[3] = IrBlock("each", blocks[3].instrs, Some(InCondBr(VReg("more"), "body", "done")))
 
-    val after = scv_text(elide_arc_pairs(blocks))
+    val after = scv_text(scv_pass(blocks))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
 
 @test("a share of a slot that holds no count of its own is kept")
 scv_uncounted_parent()
@@ -219,9 +250,9 @@ scv_uncounted_parent()
     entry.push(scv_store("borrowed", "src.addr"))
     blocks[0] = IrBlock("entry", entry, blocks[0].terminator)
 
-    val after = scv_text(elide_arc_pairs(blocks))
+    val after = scv_text(scv_pass(blocks))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
 
 @test("a view stored outside the frame keeps its count")
 scv_view_escapes()
@@ -234,9 +265,9 @@ scv_view_escapes()
     body.push(scv_store("t19", "heap"))
     blocks[2] = IrBlock("body", body, blocks[2].terminator)
 
-    val after = scv_text(elide_arc_pairs(blocks))
+    val after = scv_text(scv_pass(blocks))
 
-    assert_eq(scv_count(after,"@arc.retain_maybe"), 1, after)
+    assert_eq(scv_count(after, "@arc.retain_maybe"), 1, after)
 
 // -- the emitted text -------------------------------------------------------------------------------------
 
@@ -286,6 +317,21 @@ private scv_source() -> string = raw"""
 
             n
 
+    struct Tag
+        id: int
+
+    struct Shelf
+        tag: &Tag
+
+    sum_ids(s: Shelf, rounds: int) -> int
+        var n = 0
+
+        for k in 0..<rounds
+            val t = s.tag
+            n += t.id
+
+        n
+
     moving(src: []const u8, other: []const u8) -> usize
         var from = src
         var n: usize = 0
@@ -304,7 +350,7 @@ private scv_source() -> string = raw"""
 
 @test("a view of a parameter taken every round, walked or passed to a call, takes no count")
 scv_emitted_loops()
-    for name in ["sums", "adler", "Holder.total"]
+    for name in ["sums", "adler", "Holder.total", "sum_ids"]
         val ir = emit_func_text(scv_source(), name)
 
         assert(ir.starts_with("define"), ir)
@@ -374,7 +420,17 @@ scv_drops_where_they_did()
 
             print("last", cur.id)
 
+        sum_ids(s: Shelf, rounds: int) -> int
+            var n = 0
+
+            for k in 0..<rounds
+                val t = s.tag
+                n += t.id
+
+            n
+
         label(Shelf(Tag(7)), 2)
+        print(sum_ids(Shelf(Tag(5)), 3))
         print("next")
         swap(2)
         print("done")
@@ -382,4 +438,4 @@ scv_drops_where_they_did()
 
     if got == "skipped" then return
 
-    assert_eq(got, "round 0 7\nround 1 7\ndrop 7\nnext\nheld 1\ndrop 1\nheld 10\ndrop 10\nlast 11\ndrop 11\ndone\n")
+    assert_eq(got, "round 0 7\nround 1 7\ndrop 7\n15\ndrop 5\nnext\nheld 1\ndrop 1\nheld 10\ndrop 10\nlast 11\ndrop 11\ndone\n")

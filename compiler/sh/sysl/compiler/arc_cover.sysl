@@ -21,21 +21,25 @@ import sysl.text.Search
 //
 // **The rule.** A retain of a reference read out of a *covering* slot is dropped with every release
 // that gives its count back when, on every path from the retain, one of those releases comes before
-// the function returns, before the retain runs again, and before anything gives back the count the
-// slot holds or writes the slot. A slot covers when nothing outside the frame can reach it, it is
-// stored to exactly once, and the value stored holds a count: a parameter (its caller's, or the one
-// the function took for it), or a value whose count was taken just before the store.
+// the function returns, before the retain runs again, before the slot is written and before any
+// other release. A slot covers when nothing outside the frame can reach it, it is stored to exactly
+// once, and the value stored holds a count: a parameter (its caller's, or the one the function took
+// for it), or a value whose count was taken just before the store.
 //
 // **What gives the count back** is followed through field reads and field writes, and through loads
-// of the one slot the new value was stored into. A release whose reference was put together by the
-// retain's own value, or read from that slot, gives back the retained count; a release of a value read
-// straight out of the covering slot gives back the slot's own. Anything else the window releases runs
-// a destructor that cannot reach a slot whose address never left the frame, so it may sit inside.
+// of the one slot the new value was stored into: a release whose reference was put together by the
+// retain's own value, or read from that slot, gives back the retained count.
+//
+// **A count is observable**, so the window must not look at it: `slot_vacate` lets storage go only
+// where the strong count is one, and a share dropped from under a view would let it free slots the
+// view still reads. What may sit in the window is listed at `count_blind`; a call to anything that
+// could release or write outside its own frame, and any other release (a destructor is such code),
+// keeps the pair.
 //
 // **Why it is sound.** The slot's count holds the object alive from before the retain until after the
-// last release dropped, so the count never reaches zero inside the window, and outside it the count
-// is what it was. Each path loses one retain and the one release that gave it back, so no count ends
-// anywhere else and no destructor moves.
+// last release dropped, so the count never reaches zero inside the window, nothing inside reads it,
+// and outside it the count is what it was. Each path loses one retain and the one release that gave
+// it back, so no count ends anywhere else and no destructor moves.
 
 // Where a value comes from: the value a walk back through field reads and writes stopped at, the
 // field of it (each index followed by a `.`), and the field writes it passed (`|name|`). Values are
@@ -97,7 +101,7 @@ private struct Cover
     into: string
     into_path: string
 
-elide_covered(blocks: Buf[IrBlock], clean: Set[string]) -> Buf[IrBlock]
+elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> Buf[IrBlock]
     var defs: Map[string, Inst] = map()
     var stores: Map[string, SlotStore] = map()
     var labels: Map[string, usize] = map()
@@ -112,6 +116,8 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string]) -> Buf[IrBlock]
 
             inst match
                 InLoad(d, _, _, _, _) -> defs.put(v_render(d), inst)
+                InGep(d, _, _, _) -> defs.put(v_render(d), inst)
+                InAlloca(d, _, _) -> defs.put(v_render(d), inst)
                 InExtract(d, _, _, _) -> defs.put(v_render(d), inst)
                 InInsert(d, _, _, _, _, _) -> defs.put(v_render(d), inst)
                 InStore(_, v, p, _, _) ->
@@ -132,7 +138,7 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string]) -> Buf[IrBlock]
         for i in 0..<instrs.len()
             cover_at(blocks, defs, stores, clean, b, i) match
                 Some(c) ->
-                    val ends = window_ends(blocks, defs, labels, c)
+                    val ends = window_ends(blocks, defs, labels, inert, c)
 
                     if !ends.is_empty()
                         var fresh = true
@@ -264,7 +270,8 @@ private same_place(a: Origin, b: Origin) -> bool = a.leaf == b.leaf && a.path ==
 // Every release that gives back the count `c` took, as `block:index`, when each path from the retain
 // reaches one before it returns, runs the retain again, gives back the covering slot's own count or
 // stores to that slot; otherwise nothing.
-private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize], c: Cover) -> Buf[string]
+private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize],
+                     inert: Set[string], c: Cover) -> Buf[string]
     var ends: Buf[string] = buf()
     var none: Buf[string] = buf()
     var seen: Set[usize] = set()
@@ -286,18 +293,20 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
                 InStore(_, _, p, _, _) -> if v_render(p) == c.slot then return none
                 _ -> ()
 
+            // The release that gives the share back ends the window; any other runs a destructor,
+            // which is code that could read a count, and so ends the search.
             arc_call_of(inst) match
                 Some((name, v)) ->
                     if is_release(name)
-                        val o = origin_of(defs, v, "", "")
-
-                        if name == c.release && gives_back(defs, c, o)
+                        if name == c.release && gives_back(defs, c, origin_of(defs, v, "", ""))
                             ends.push(s"$b:$i")
                             stopped = true
                             break
 
-                        if o.through == "" && loaded_slot(defs, o.leaf) == c.slot then return none
+                        return none
                 None -> ()
+
+            if !count_blind(defs, inert, inst) then return none
 
         if stopped then continue
 
@@ -326,6 +335,33 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
 
     ends
 end window_ends
+
+// Whether `inst` can neither read a count nor act on what one says. **A count can be read**: storage
+// is let go of by `slot_vacate` only where the strong count is one, so a share dropped from inside
+// the window would let it free slots the view still reads. That read is a load straight through an
+// owner, never through a field address, so what may sit in the window is: a load of a stack slot, a
+// global or a field (`getelementptr`); arithmetic and aggregate work; a count's own retain or
+// release; an intrinsic or the bounds trap; and a call to a function that releases nothing and
+// writes nothing but its own locals.
+private count_blind(defs: Map[string, Inst], inert: Set[string], inst: Inst) -> bool = inst match
+    InLoad(_, _, p, AccPlain, _) -> p match
+        VGlobal(_) -> true
+        VGep(_, _, _) -> true
+        _ -> defs.get(v_render(p)) match
+            Some(InAlloca(_, _, _)) -> true
+            Some(InGep(_, _, _, _)) -> true
+            _ -> false
+    InLoad(_, _, _, _, _) -> false
+    InCall(_, _, VGlobal(name), _, _, _, _, _) ->
+        arc_call_of(inst).is_some() && release_for(name).is_some() ||
+            name.starts_with("llvm.") || name == "sysl_bounds_fail" || inert.has(name)
+    InCall(_, _, _, _, _, _, _, _) -> false
+    InAsm(_, _, _, _, _) -> false
+    InAtomicRmw(_, _, _, _, _, _) -> false
+    InCmpXchg(_, _, _, _, _, _) -> false
+    InFence(_) -> false
+    InVaArg(_, _, _) -> false
+    _ -> true
 
 // Whether a release of a reference from `o` gives back the count `c` took: it was put into a value by
 // one of the retain's own field writes, or read out of the slot that value was stored into.
