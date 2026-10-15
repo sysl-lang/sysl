@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf, byte_sink}
-import sysl.text.{Search, str_builder, StrBuilder, parse_real, from_utf8}
+import sysl.text.{Search, split, str_builder, StrBuilder, parse_real, from_utf8}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text}
 import sysl.process.capture
 
@@ -72,8 +72,11 @@ end c_probe_wanted
 // Every file's blocks lowered to ordinary declarations, with whatever could not be measured reported
 // on the analysis and its file emptied so that nothing downstream reads a block.
 c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
+    probe_refused = false
+
     if !c_probe_wanted(units) then return units
 
+    val before = a.found.len()
     var out: Buf[Program] = buf()
 
     for unit in units
@@ -87,8 +90,17 @@ c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
         if unmeasurable(unit, t) then out.push(unit with { body = buf() })
         else out.push(lower_unit(a, unit, t))
 
+    probe_refused = a.found.len() > before
     out
 end c_probe_lower
+
+// Whether the last `c_probe_lower` refused a block. **A refused probe empties its file**, so every
+// declaration in it reads as undefined to everything that names it -- a cascade of a hundred errors
+// hiding the one that matters (`'string.h' file not found`). The analysis stops on this instead,
+// with the probe's own refusal as the whole report.
+private var probe_refused: bool = false
+
+c_probe_refused() -> bool = probe_refused
 
 //
 // **What is asked is every environment capability the file requires, against what the machine
@@ -194,8 +206,9 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
         Ok(made) -> made
 
     val src = join_path(dir, "probe.c")
+    val text = probe_text(unit, consts, plan, types)
 
-    write_text(src, probe_text(unit, consts, plan, types)) match
+    write_text(src, text) match
         Err(_) ->
             remove_dir_all(dir).unwrap_or(())
             return probe_fault(a, unit, where,s"cannot write $src")
@@ -233,6 +246,13 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     // **What a command line said, which on a cross build is the only thing there is to say.** A
     // `c const` reading an SDK's header is measured against the SDK the consumer named, and nothing
     // on this machine could have found it: `pkg-config` speaks for the host.
+    // **A vendored library's headers are where its package says**, and the probe reads them from
+    // there ahead of the command line's, as the objects beside it were compiled (`compile_c`).
+    val vendored = probe_includes_for(unit.src.name, t)
+
+    for item in vendored
+        args.push(item)
+
     val given = supplied_cflags()
 
     for item in given
@@ -261,7 +281,12 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     if !said.status.ok()
         val complaint = said.err.unwrap_or("")
 
-        return probe_fault(a, unit, where,s"the C compiler refused this file's " +
+        // **Pointed at the entry whose expression clang refused**, not the block's first: a block of
+        // forty constants with one wrong is otherwise a hunt. A refusal no entry owns -- a header
+        // that will not compile -- stays at the first.
+        val blamed = blamed_span(text, complaint, consts, types).unwrap_or(where)
+
+        return probe_fault(a, unit, blamed, s"the C compiler refused this file's " +
             s"${blocks_named(consts, types)}:\n${complaint.trim()}")
 
     val globals = read_globals(said.text)
@@ -349,8 +374,51 @@ private probe_cflags_for(file: string) -> Buf[string]
 
                             if !seen then out.push(s"-D${macros.at(j)}")
 
+                // **And under every vendored library's macros**, for the same reason: a probe that
+                // includes `tusb.h` measures the library the package compiled, configured as it was.
+                val shared = package_c_flags(root, m)
+
+                for j in 0..<shared.1.len()
+                    val flag = s"-D${shared.1.at(j)}"
+                    var seen = false
+
+                    for k in 0..<out.len()
+                        if out.at(k) == flag then seen = true
+
+                    if !seen then out.push(flag)
+
     out
 end probe_cflags_for
+
+// The include roots a file's probe reads: its package's vendored libraries' and those the packages it
+// depends on publish (`c_libraries.sysl`). A conflict between two suppliers of the standard headers
+// is left to the build to refuse, which names both; the probe then fails on what it cannot include.
+private probe_includes_for(file: string, t: Target) -> Buf[string]
+    val root = manifest_above(file).0 match
+        None -> return buf()
+        Some(found) -> found
+
+    val m = manifest_at(root) match
+        Err(_) -> return buf()
+        Ok(got) -> got
+
+    // A consumer's directories first, as the package's C is compiled: a probe sizing a pool from a
+    // configuration header has to read the one the consumer supplied, or the sizes disagree.
+    var out = consumer_c_flags(root).unwrap_or(buf())
+
+    val own = package_c_flags(root, m).0
+
+    for item in own
+        out.push(item)
+
+    dependency_c_flags(root, t) match
+        Ok(flags) ->
+            for item in flags
+                out.push(item)
+        Err(_) -> ()
+
+    out
+end probe_includes_for
 
 // The nearest directory at or above a file that carries a manifest, and how many directories the
 // climb crossed getting there.
@@ -465,6 +533,47 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
 
     out.finish()
 end probe_text
+
+// The entry the first error clang reported against the probe itself was written for: the probe's
+// line is read off `probe.c:<line>:` and the marker on that line names the entry. An error inside a
+// header the probe includes names that header rather than `probe.c`, and belongs to no entry.
+blamed_span(text: string, complaint: string, consts: Buf[CConstDecl], types: Buf[CTypeDecl]) -> Option[Span]
+    val said = split(complaint, "\n")
+
+    for k in 0..<said.len
+        val line = said[k]
+
+        if line.index_of(" error: ").is_none() then continue
+
+        val at = line.index_of("probe.c:")
+
+        if at.is_none() then continue
+
+        var n: usize = 0
+        var j = at.unwrap() + 8
+
+        while j < line.bytes.len && line.bytes[j] >= u8('0') && line.bytes[j] <= u8('9')
+            n = n * 10 + usize(line.bytes[j] - u8('0'))
+            j += 1
+
+        val lines = split(text, "\n")
+
+        if n == 0 || n > lines.len then return None
+
+        val written = lines[n - 1]
+
+        for i in 0..<consts.len()
+            if written.index_of(s"$ConstMarker$i =").is_some() then return Some(consts.at(i).span)
+
+        for i in 0..<types.len()
+            if (written.index_of(s"$ObjMarker$i;").is_some() || written.index_of(s"$KindMarker$i =").is_some() ||
+                written.index_of(s"$SizeMarker$i =").is_some())
+                return Some(types.at(i).span)
+
+        return None
+
+    None
+end blamed_span
 
 // The `_Generic` association list, and the numbering the answers are read back with. `0` is the
 // `default` arm, which is every type this feature does not resolve.

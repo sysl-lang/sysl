@@ -1,0 +1,711 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, split, Search}
+
+// **A vendored C library, declared in the manifest and compiled from an upstream tree left exactly
+// as it shipped** (`c_libraries.sysl`): a tree with no sysl in it, whose files reach their headers
+// through include roots, of which only the listed files are compiled; and a package publishing an
+// include root to the C of every package that depends on it.
+
+// -- reading the block -----------------------------------------------------------------------------
+
+private vcl_refused(block: string) -> string =
+    read_manifest(s"package { name = \"p\", version = \"0.1.0\" }\n$block\n") match
+        Err(why) -> why
+        Ok(_) -> "(read)"
+
+private vcl_read(block: string) -> Buf[CLibrary] =
+    read_manifest(s"package { name = \"p\", version = \"0.1.0\" }\n$block\n").unwrap().c_libraries
+
+@test("a library's paths are read relative to its root and kept relative to the package")
+vcl_reads_a_library()
+    val libs = vcl_read("c {\n  up {\n    root = \"c/up/src\"\n    include = [\".\", \"../../config\"]\n" +
+                        "    sources = [\"lib.c\", \"core/{core,extra}.c\"]\n" +
+                        "    defines { VL_SCALE = 3, VL_ON = true }\n    export = [\"core\"]\n  }\n}")
+
+    assert_eq(libs.len(), 1)
+    assert_eq(libs.at(0).name, "up")
+    assert_eq(libs.at(0).root, "c/up/src")
+    assert_eq(join(libs.at(0).include.view(), ","), "c/up/src,c/config")
+    assert_eq(join(libs.at(0).sources.view(), ","), "c/up/src/lib.c,c/up/src/core/core.c,c/up/src/core/extra.c")
+    assert_eq(join(libs.at(0).macros.view(), ","), "VL_ON,VL_SCALE=3")
+    assert_eq(join(libs.at(0).exports.view(), ","), "c/up/src/core")
+    assert(!libs.at(0).libc, "libc")
+
+@test("a library that only publishes headers is one")
+vcl_reads_a_header_library()
+    val libs = vcl_read("c { libc { export = [\"include\"], libc = true } }")
+
+    assert_eq(join(libs.at(0).exports.view(), ","), "include")
+    assert(libs.at(0).libc, "libc")
+
+@test("a pattern in sources is kept apart from the files named outright, with what it excludes")
+vcl_a_pattern()
+    val libs = vcl_read("c { up { root = \"src\", sources = [\"settings.c\", \"{aead,ec}/**/*.c\"], " +
+                        "exclude = [\"ec/ec_*_i15.c\"] } }")
+
+    assert_eq(join(libs.at(0).sources.view(), ","), "src/settings.c")
+    assert_eq(join(libs.at(0).patterns.view(), ","), "src/aead/**/*.c,src/ec/**/*.c")
+    assert_eq(join(libs.at(0).exclude.view(), ","), "src/ec/ec_*_i15.c")
+
+@test("a pattern matches whole segments for '**' and within one for '*' and '?'")
+vcl_glob_matching()
+    assert(glob_match(split_path("src/**/*.c"), split_path("src/a.c")), "zero directories")
+    assert(glob_match(split_path("src/**/*.c"), split_path("src/x/y/a.c")), "two directories")
+    assert(!glob_match(split_path("src/**/*.c"), split_path("src/x/a.h")), "another suffix")
+    assert(!glob_match(split_path("src/*.c"), split_path("src/x/a.c")), "'*' stays in its segment")
+    assert(glob_match(split_path("src/a?.c"), split_path("src/ab.c")), "'?' is one character")
+    assert(!glob_match(split_path("src/a?.c"), split_path("src/a.c")), "and not none")
+    assert(glob_match(split_path("**"), split_path("a/b")), "everything")
+
+@test("a pattern's misuses are refused")
+vcl_pattern_misuse()
+    assert_eq(vcl_refused("c { up { sources = [\"src/[ab].c\"] } }"),
+              "'c.up.sources' entry 'src/[ab].c' has a character class — a pattern is '*', '?' and " +
+              "'**', and braces ('{a,b}') say alternatives")
+    assert_eq(vcl_refused("c { up { sources = [\"src/x**/a.c\"] } }"),
+              "'c.up.sources' entry 'src/x**/a.c' puts '**' inside a name — '**' is a whole segment " +
+              "('src/**/*.c'), standing for any number of directories")
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], exclude = [\"b.c\"] } }"),
+              "'c.up.exclude' takes files out of what a pattern in 'sources' matches, and this " +
+              "library's sources are all named outright — leave the file out of the list")
+
+@test("a consumer's c_include stays inside the consumer")
+vcl_c_include_escaping()
+    assert_eq(vcl_refused("dependencies { g { path = \"../g\", c_include = [\"../conf\"] } }"),
+              "'dependencies.g.c_include' names '../conf', which climbs out of the package — a " +
+              "package compiles and publishes the C it carries and nothing else")
+
+@test("a path climbing out of the package is refused, and one staying inside is not")
+vcl_a_path_escaping()
+    assert_eq(vcl_refused("c { up { root = \"src\", sources = [\"../../x.c\"] } }"),
+              "'c.up.sources' names '../../x.c', which climbs out of the package — a package compiles " +
+              "and publishes the C it carries and nothing else")
+    assert_eq(vcl_refused("c { up { root = \"src\", include = [\"../..\"], sources = [\"a.c\"] } }"),
+              "'c.up.include' names '../..', which climbs out of the package — a package compiles " +
+              "and publishes the C it carries and nothing else")
+    assert_eq(vcl_refused("c { up { root = \"..\", sources = [\"a.c\"] } }"),
+              "'c.up.root' names '..', which climbs out of the package — a package compiles " +
+              "and publishes the C it carries and nothing else")
+    assert_eq(vcl_refused("c { up { root = \"src\", include = [\"..\"], sources = [\"a.c\"] } }"), "(read)")
+
+@test("a leading slash is the package root, and it still may not be climbed out of")
+vcl_a_rooted_path()
+    val libs = vcl_read("c { up { root = \"c/up/src\", include = [\".\", \"/config\"], sources = [\"a.c\"] } }")
+
+    assert_eq(join(libs.at(0).include.view(), ","), "c/up/src,config")
+    assert_eq(vcl_refused("c { up { root = \"c/up/src\", include = [\"/../x\"], sources = [\"a.c\"] } }"),
+              "'c.up.include' names '/../x', which climbs out of the package — a package compiles " +
+              "and publishes the C it carries and nothing else")
+
+@test("export = true publishes the include roots, and false or nothing to publish is refused")
+vcl_export_true()
+    val libs = vcl_read("c { up { root = \"src\", include = [\"include\", \"/config\"], export = true } }")
+
+    assert_eq(join(libs.at(0).exports.view(), ","), "src/include,config")
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], export = false } }"),
+              "'c.up.export' is false, which publishes nothing — leave the key out to publish nothing")
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], export = true } }"),
+              "'c.up.export' is true and the library has no 'include' roots to publish — name the " +
+              "directories instead")
+
+@test("include_private is read apart from include, and only by a library that compiles something")
+vcl_include_private_read()
+    val libs = vcl_read("c { up { root = \"src\", include = [\"inc\"], include_private = [\".\"], " +
+                        "sources = [\"a.c\"], export = true } }")
+
+    assert_eq(join(libs.at(0).private_include.view(), ","), "src")
+    assert_eq(join(libs.at(0).exports.view(), ","), "src/inc")
+    assert_eq(vcl_refused("c { up { include = [\"inc\"], include_private = [\"src\"] } }"),
+              "'c.up.include_private' is read by the library's own sources, and it compiles none — " +
+              "use 'include' for roots the package's other C reads")
+
+@test("what --verbose says a tree takes from its dependencies reads as a sentence")
+vcl_headers_said()
+    var flags: Buf[string] = buf()
+
+    assert_eq(c_headers_said("/p", flags, 0), "c headers: '/p' depends on no package")
+    assert_eq(c_headers_said("/p", flags, 2),
+              "c headers: '/p' takes no include roots from the 2 packages it depends on")
+
+    flags.push("-I/q/include")
+    assert_eq(c_headers_said("/p", flags, 1), "c headers: '/p' takes -I/q/include from the 1 package it depends on")
+
+@test("a brace is read as the defines block reads one, and misused the same way")
+vcl_brace_misuse()
+    assert_eq(vcl_refused("c { up { sources = [\"core/{a,b.c\"] } }"),
+              "'c.up.sources' entry 'core/{a,b.c' has an unbalanced brace — alternatives are written " +
+              "'{one,two}', as a shell writes them")
+    assert_eq(vcl_refused("c { up { sources = [\"core/{a,}.c\"] } }"),
+              "'c.up.sources' entry 'core/{a,}.c' has an empty alternative — whichever was meant can " +
+              "be written out, and a group naming nothing configures nothing")
+    assert_eq(vcl_refused("c { up { sources = [\"core/{a,{b,c}}.c\"] } }"),
+              "'c.up.sources' entry 'core/{a,{b,c}}.c' nests one group of alternatives inside " +
+              "another, which says nothing a flat list does not")
+
+@test("a source that is not a C file is refused")
+vcl_not_c()
+    assert_eq(vcl_refused("c { up { sources = [\"core/{a.c,a.h}\"] } }"),
+              "'c.up.sources' entry 'core/a.h' does not name a '.c' file — a header is reached " +
+              "through 'include', and only a translation unit is compiled")
+
+@test("an unknown key in a library is refused, not warned about")
+vcl_an_unknown_key()
+    assert_eq(vcl_refused("c { up { source = [\"a.c\"] } }"),
+              "'c.up.source' is not something a C library declares — a library says its 'root', " +
+              "'include', 'include_private', 'sources', 'exclude', 'defines', 'export' and 'libc'")
+
+@test("a library declaring nothing is refused")
+vcl_declares_nothing()
+    assert_eq(vcl_refused("c { up { root = \"src\" } }"),
+              "'c.up' declares nothing — a library compiles 'sources', reads 'include' or publishes " +
+              "'export', and one doing none of them is a block to delete")
+
+@test("libc with nothing exported is refused")
+vcl_libc_without_export()
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], libc = true } }"),
+              "'c.up.libc' is true and the library exports nothing — 'libc' says the roots in " +
+              "'export' are the C standard library's headers, so it needs some")
+
+@test("one file listed twice, or by two libraries, is refused")
+vcl_one_file_twice()
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\", \"./a.c\"] } }"),
+              "'c.up.sources' names './a.c' twice — a file is compiled once")
+    assert_eq(vcl_refused("c {\n  up { root = \"src\", sources = [\"a.c\"] }\n" +
+                          "  down { sources = [\"src/a.c\"] }\n}"),
+              "'c.down.sources' and 'c.up.sources' both name 'src/a.c' — a file is compiled once, " +
+              "so one library lists it")
+
+@test("a library's macros are refused as a defines block's are")
+vcl_a_false_macro()
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], defines { OFF = false } } }"),
+              "'c.up.defines.OFF' is false, which does not say which of two things is meant — leave " +
+              "the line out to not define it, or write '0' to define it as zero, which '#ifdef' " +
+              "still sees")
+
+// -- building it -----------------------------------------------------------------------------------
+
+private vcl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private vcl_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private vcl_write(root: string, at: string, text: string)
+    val file = s"$root/$at"
+
+    make_dir_all(parent_of(file).unwrap_or(root)).unwrap()
+    write_text(file, text).unwrap()
+
+// A package at a fresh directory: its manifest (with `extra` after the package block) and one module.
+// `at` places it in a workspace instead: a path dependency may not have one of its own, so a chain of
+// three packages is a workspace's members.
+private vcl_package(name: string, extra: string, module_name: string, text: string, at: string = "") -> string
+    val root = if at.is_empty() then vcl_temp("sysl-vcl-pkg") else at
+
+    vcl_write(root, "package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n$extra\n")
+    vcl_write(root, s"$module_name/$module_name.sysl", s"module $module_name\n\n$text\n")
+    root
+end vcl_package
+
+// The upstream tree: nothing in it is sysl, every file reaches its headers through the include root,
+// a file in a listed directory is not listed, and a directory nothing lists holds C that would not
+// compile -- inside a module, so only the library's claim on its root keeps the walk out of it.
+private vcl_upstream(root: string)
+    vcl_write(root, "c/up/src/lib.c",
+              "#include \"core/core.h\"\n#include \"vl_config.h\"\n#ifndef VL_ON\n#error VL_ON\n#endif\n" +
+              "int vl_value(void) { return core_base() * VL_SCALE + VL_FACTOR + core_extra(); }\n")
+    vcl_write(root, "c/up/src/core/core.h", "int core_base(void);\nint core_extra(void);\n")
+    vcl_write(root, "c/up/src/core/core.c", "#include \"core/core.h\"\nint core_base(void) { return 10; }\n")
+    vcl_write(root, "c/up/src/core/extra.c",
+              "#include \"core/core.h\"\n#ifdef WITH_SHARED\n#include <shared_k.h>\n" +
+              "int core_extra(void) { return 100 * SHARED_K; }\n#else\n" +
+              "int core_extra(void) { return 100; }\n#endif\n")
+    vcl_write(root, "c/up/src/core/unlisted.c", "#error a file the list does not name was compiled\n")
+    vcl_write(root, "c/up/src/portable/broken.c", "#error a directory the list does not reach was compiled\n")
+    vcl_write(root, "c/up/src/portable/portable.sysl", "module c.up.src.portable\n\nunused_port() -> int = 0\n")
+    vcl_write(root, "c/config/vl_config.h", "#define VL_FACTOR 5\n")
+end vcl_upstream
+
+private vcl_block(macros: string, sources: string) -> string =
+    "c {\n  up {\n    root = \"c/up/src\"\n    include = [\".\", \"../../config\"]\n" +
+    s"    sources = [$sources]\n    defines { $macros }\n  }\n}\n"
+
+private vcl_geom() -> string =
+    "@include(\"vl_config.h\")\n\nextern \"vl_value\" c() -> int\nextern \"shim_value\" s() -> int\n\n" +
+    "c const\n    FACTOR: int = \"VL_FACTOR * VL_SCALE\"\n\n" +
+    "value() -> int = c()\nshim() -> int = s()\nfactor() -> int = FACTOR"
+
+// The package with the library, and its shim beside the sysl -- which reads the library's headers.
+private vcl_lib(extra: string, deps: string, at: string = "") -> string
+    val root = vcl_package("vlib", extra + (if deps.is_empty() then "" else s"dependencies { $deps }\n"),
+                           "geom", vcl_geom(), at)
+
+    vcl_upstream(root)
+    vcl_write(root, "geom/shim.c",
+              "#include \"core/core.h\"\n#include \"vl_config.h\"\n" +
+              "int shim_value(void) { return VL_FACTOR * VL_SCALE; }\n")
+    root
+end vcl_lib
+
+private vcl_app(program: string, deps: string, at: string = "") -> string
+    val root = if at.is_empty() then vcl_temp("sysl-vcl-app") else at
+
+    vcl_write(root, "package.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n")
+    vcl_write(root, "main.sysl", program)
+    root
+end vcl_app
+
+// A workspace holding the members named, each laid out afterwards at `<root>/<name>`.
+private vcl_workspace(members: string) -> string
+    val root = vcl_temp("sysl-vcl-ws")
+
+    vcl_write(root, "package.hocon", s"workspace = [$members]\n")
+    root
+end vcl_workspace
+
+private vcl_run(root: string) -> string
+    val out_dir = vcl_temp("sysl-vcl-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end vcl_run
+
+private vcl_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+private vcl_three() -> string = "print(geom.value())\nprint(geom.shim())\nprint(geom.factor())"
+
+private vcl_listed() -> string = "\"lib.c\", \"core/{core,extra}.c\""
+
+@test("an upstream tree compiles from its list, its shim and its probe reading its headers")
+vcl_builds_the_listed_files()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "135\n15\n15\n")
+
+private vcl_patterned(exclude: string) -> string =
+    "c {\n  up {\n    root = \"c/up/src\"\n    include = [\".\", \"../../config\"]\n" +
+    s"    sources = [\"lib.c\", \"core/*.c\"]\n    exclude = [$exclude]\n" +
+    "    defines { VL_SCALE = 3, VL_ON = true }\n  }\n}\n"
+
+@test("a pattern compiles what it matches less what is excluded")
+vcl_a_pattern_builds()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_patterned("\"core/unlisted.c\""), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "135\n15\n15\n")
+
+@test("an exclusion that takes nothing out stops the build")
+vcl_an_exclusion_excluding_nothing()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_patterned("\"core/unlisted.c\", \"core/typo.c\""), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "refused: 'g': package.hocon: 'c.up.exclude' entry 'c/up/src/core/typo.c' takes " +
+                    "out no file the patterns in 'sources' match — an exclusion that excludes nothing " +
+                    "is a path that is wrong, and the file it meant is being compiled")
+
+@test("a pattern matching nothing stops the build")
+vcl_a_pattern_matching_nothing()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", "\"lib.c\", \"core/{core,extra}.c\", \"drivers/**/*.c\""), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "refused: 'g': package.hocon: 'c.up.sources' pattern 'c/up/src/drivers/**/*.c' " +
+                    "matches no file in this package — a pattern is there to name files, so one naming " +
+                    "none is a mistake")
+
+// The consumer's own `vl_config.h`, which the library, its shim and its probe all read in place of
+// the default the package ships.
+@test("a consumer's c_include stands ahead of the package's own configuration")
+vcl_a_consumer_configures()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\", c_include = [\"conf\"] }")
+
+    vcl_write(app, "conf/vl_config.h", "#define VL_FACTOR 9\n")
+
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "139\n27\n27\n")
+
+@test("a consumer's c_include that is not there stops the build")
+vcl_a_consumer_missing_dir()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\", c_include = [\"conf\"] }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, s"refused: 'dependencies.g.c_include' names '$app/conf', which is not a directory")
+
+@test("two consumers configuring one package is refused")
+vcl_two_consumers()
+    if !vcl_ready() then return
+
+    val ws = vcl_workspace("\"app\", \"mid\", \"vlib\"")
+
+    vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "", s"$ws/vlib")
+
+    val mid = vcl_package("mid", "dependencies { vlib { workspace = true, c_include = [\"mconf\"] } }\n",
+                          "mid", "import geom\n\nmid_value() -> int = geom.value()", s"$ws/mid")
+
+    vcl_write(mid, "mconf/vl_config.h", "#define VL_FACTOR 1\n")
+
+    val app = vcl_app("print(mid.mid_value())",
+                      "vlib { workspace = true, c_include = [\"conf\"] }\nmid { workspace = true }",
+                      s"$ws/app")
+
+    vcl_write(app, "conf/vl_config.h", "#define VL_FACTOR 9\n")
+
+    val said = vcl_run(app)
+
+    vcl_drop([ws])
+    assert(said.contains("both give") && said.contains("headers of their own with 'c_include'"), said)
+
+// The compile lines the last build handed clang for one file of the fixture.
+private vcl_compiles_of(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = c_compile_commands()
+
+    for line in lines
+        if line.contains(s"/$file ") then out.push(line)
+
+    out
+end vcl_compiles_of
+
+// `build-lib` compiles what every other build compiles: the library's list and the shim, each with
+// its include roots. It once took the walk alone, so the shim had no `-I` and the library was absent.
+private vcl_build_lib_on(target: Option[string])
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+
+    forget_c_compiles()
+
+    val built = build_library_of(lib, target)
+    val listed = vcl_compiles_of("c/up/src/lib.c")
+    val shim = vcl_compiles_of("geom/shim.c")
+
+    vcl_drop([lib])
+    assert(built.is_ok(), if built.is_ok() then "" else failure_text(built.unwrap_err()))
+    assert_eq(listed.len(), 1)
+    assert(listed.at(0).contains(s" -I$lib/c/up/src -I$lib/c/config "), listed.at(0))
+    assert(listed.at(0).contains(" -DVL_ON -DVL_SCALE=3"), listed.at(0))
+    assert_eq(shim.len(), 1)
+    assert(shim.at(0).contains(s" -I$lib/c/up/src -I$lib/c/config "), shim.at(0))
+
+@test("build-lib compiles the library and hands its shim the include roots, on the host")
+vcl_build_lib_host()
+    if !vcl_ready() then return
+
+    vcl_build_lib_on(None)
+
+@test("and for a board")
+vcl_build_lib_board()
+    if !vcl_ready() then return
+
+    vcl_build_lib_on(Some("thumbv7em-freestanding"))
+
+private vcl_private_block() -> string =
+    "c {\n  up {\n    root = \"c/up/src\"\n    include_private = [\".\"]\n    include = [\"/c/config\"]\n" +
+    s"    sources = [${vcl_listed()}]\n    defines { VL_SCALE = 3, VL_ON = true }\n  }\n}\n"
+
+@test("include_private reaches the library's own sources and not the package's shim")
+vcl_include_private_builds()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_private_block(), "")
+
+    vcl_write(lib, "geom/shim.c", "#include \"vl_config.h\"\nint shim_value(void) { return VL_FACTOR * VL_SCALE; }\n")
+
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "135\n15\n15\n")
+
+@test("a shim reaching for a private header is not given it")
+vcl_include_private_hidden()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_private_block(), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert(said.starts_with("refused: ") && said.contains("geom/shim.c did not compile") &&
+           said.contains("'core/core.h' file not found"), said)
+
+// One refused probe empties its file, and every use of what it declared used to read as undefined.
+@test("a refused probe is the whole report, not the first of a cascade")
+vcl_probe_refusal_alone()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib("c { up { root = \"c/up/src\", include = [\".\"], sources = [\"lib.c\"] } }", "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert(said.contains("the C compiler refused this file's 'c const' block") &&
+           said.contains("'vl_config.h' file not found"), said)
+    assert(!said.contains("undefined"), said)
+
+@test("a dependency's published include root reaches the library's C")
+vcl_a_published_root()
+    if !vcl_ready() then return
+
+    val ws = vcl_workspace("\"app\", \"hdrs\", \"vlib\"")
+    val hdrs = vcl_package("hdrs", "c { hdrs { export = [\"include\"] } }", "hk", "unused_hk() -> int = 0",
+                           s"$ws/hdrs")
+
+    vcl_write(hdrs, "include/shared_k.h", "#define SHARED_K 7\n")
+    vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true, WITH_SHARED = true", vcl_listed()),
+            "hdrs { workspace = true }", s"$ws/vlib")
+
+    val app = vcl_app("print(geom.value())", "vlib { workspace = true }", s"$ws/app")
+    val said = vcl_run(app)
+
+    vcl_drop([ws])
+    assert_eq(said, "735\n")
+
+@test("and does not reach a package that does not depend on it")
+vcl_an_unpublished_root()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true, WITH_SHARED = true", vcl_listed()), "")
+    val app = vcl_app("print(geom.value())", s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert(said.starts_with("refused: ") && said.contains("'shared_k.h' file not found"), said)
+
+@test("a listed file the tree does not hold stops the build")
+vcl_a_missing_source()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", "\"lib.c\", \"core/{core,gone}.c\""), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "refused: 'g': package.hocon: 'c.up.sources' names 'c/up/src/core/gone.c', which " +
+                    "this package does not hold — a library compiles exactly the files it lists, so a " +
+                    "missing one is a mistake rather than a file to leave out")
+
+@test("an include root the tree does not hold stops the build")
+vcl_a_missing_include()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib("c { up { root = \"c/up/src\", include = [\".\", \"../../config\", \"nowhere\"], " +
+                      "sources = [\"lib.c\"], defines { VL_SCALE = 3, VL_ON = true } } }", "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "refused: 'g': package.hocon: 'c.up.include' names 'c/up/src/nowhere', which is " +
+                    "not a directory this package holds")
+
+@test("a vendored tree's directories are not warned about as C nothing compiles")
+vcl_no_stray_warning()
+    val lib = vcl_lib(vcl_block("VL_ON = true", vcl_listed()), "")
+    val strays = stray_c_warnings(lib)
+
+    vcl_drop([lib])
+    assert_eq(strays.len(), 0, join(strays.view(), "\n"))
+
+@test("what the library is compiled with is in the run cache's key, as its headers are")
+vcl_run_cache_key()
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+    val first = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    write_text(s"$lib/package.hocon", "package { name = \"vlib\", version = \"1.0.0\" }\n" +
+               vcl_block("VL_SCALE = 4, VL_ON = true", vcl_listed())).unwrap()
+
+    val second = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    write_text(s"$lib/c/config/vl_config.h", "#define VL_FACTOR 6\n").unwrap()
+
+    val third = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    vcl_drop([lib])
+    assert(first.is_some() && second.is_some() && third.is_some(), "a key")
+    assert(first.unwrap() != second.unwrap(), "a changed macro must miss")
+    assert(second.unwrap() != third.unwrap(), "a changed header must miss")
+
+// -- the C standard library's headers, for a machine with none --------------------------------------
+
+// A package whose C includes `<string.h>`, and a package that supplies one marked `libc`.
+private vcl_fake_libc(ws: string, name: string) -> string
+    val root = vcl_package(name, "c { libc { export = [\"include\"], libc = true } }", name,
+                           s"unused_$name() -> int = 0", s"$ws/$name")
+
+    vcl_write(root, "include/string.h", "#define FAKE_LIBC_STRING 1\n")
+    root
+end vcl_fake_libc
+
+private vcl_string_user(ws: string, deps: string) -> string
+    val root = vcl_package("strpkg", s"c { s { root = \"c/s\", sources = [\"s.c\"] } }\ndependencies { $deps }\n",
+                           "sk", "extern \"s_kind\" k() -> int\n\nkind() -> int = k()", s"$ws/strpkg")
+
+    vcl_write(root, "c/s/s.c", "#include <string.h>\n#ifdef FAKE_LIBC_STRING\nint s_kind(void) { return 1; }\n" +
+                               "#else\nint s_kind(void) { return 2; }\n#endif\n")
+    root
+end vcl_string_user
+
+// The `s.c` compile lines the last build handed clang.
+private vcl_s_compiles() -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = c_compile_commands()
+
+    for line in lines
+        if line.contains("/c/s/s.c ") then out.push(line)
+
+    out
+end vcl_s_compiles
+
+@test("where the machine has a libc the supplied headers are not used")
+vcl_libc_ignored_when_hosted()
+    if !vcl_ready() then return
+
+    val ws = vcl_workspace("\"app\", \"strpkg\", \"fakelibc\"")
+
+    vcl_fake_libc(ws, "fakelibc")
+    vcl_string_user(ws, "fakelibc { workspace = true }")
+
+    val app = vcl_app("print(sk.kind())", "strpkg { workspace = true }", s"$ws/app")
+
+    forget_c_compiles()
+
+    val said = vcl_run(app)
+    val lines = vcl_s_compiles()
+
+    vcl_drop([ws])
+    assert_eq(said, "2\n")
+    assert(lines.len() > 0, "s.c was compiled")
+    assert(!lines.at(0).contains("-nostdlibinc"), lines.at(0))
+
+@test("where it has none they replace its search, and clang's own headers stay")
+vcl_libc_on_a_bare_machine()
+    if !vcl_ready() then return
+
+    val ws = vcl_workspace("\"app\", \"strpkg\", \"fakelibc\"")
+    val fake = vcl_fake_libc(ws, "fakelibc")
+
+    vcl_string_user(ws, "fakelibc { workspace = true }")
+
+    val app = vcl_app("import sk\n\n@export(\"vcl_entry\")\nentry() -> int = sk.kind()\n",
+                      "strpkg { workspace = true }", s"$ws/app")
+
+    forget_c_compiles()
+
+    val built = build_c_archive(app, Some("thumb-freestanding"), None, DefaultOptimization,
+                                Some(s"$app/out/app.a"), Some(s"$app/out/app.h"), (m) -> ())
+    val lines = vcl_s_compiles()
+
+    vcl_drop([ws])
+    assert(built.is_ok(), if built.is_ok() then "" else failure_text(built.unwrap_err()))
+    assert(lines.len() > 0, "s.c was compiled")
+    assert(lines.at(0).contains(s" -nostdlibinc -isystem$fake/include "), lines.at(0))
+
+@test("two packages supplying them is refused")
+vcl_two_libcs()
+    if !vcl_ready() then return
+
+    val ws = vcl_workspace("\"app\", \"strpkg\", \"onelibc\", \"twolibc\"")
+
+    vcl_fake_libc(ws, "onelibc")
+    vcl_fake_libc(ws, "twolibc")
+    vcl_string_user(ws, "onelibc { workspace = true }")
+
+    val app = vcl_app("import sk\n\n@export(\"vcl_entry\")\nentry() -> int = sk.kind()\n",
+                      "strpkg { workspace = true }\ntwolibc { workspace = true }", s"$ws/app")
+
+    val built = build_c_archive(app, Some("thumb-freestanding"), None, DefaultOptimization,
+                                Some(s"$app/out/app.a"), Some(s"$app/out/app.h"), (m) -> ())
+
+    vcl_drop([ws])
+    assert(built.is_err(), "built")
+    assert(failure_text(built.unwrap_err()).contains("both supply the C standard library's headers"),
+           failure_text(built.unwrap_err()))
+
+// -- one refused probe, one diagnostic -------------------------------------------------------------
+
+// How many diagnostics a report holds: each begins `error: ` at the start of a line.
+private vcl_errors_in(said: string) -> usize
+    var n: usize = 0
+    val lines = split(said, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("error: ") || lines[i].starts_with("refused: error: ") then n += 1
+
+    n
+end vcl_errors_in
+
+// A module whose block has one entry clang refuses among several, and declarations elsewhere -- an
+// array length, a field, a function -- written in terms of the block's names. The report is the
+// refusal alone, at the entry that failed: line 8, not the block's first entry on line 6.
+private vcl_one_broken(block: string) -> string
+    val app = vcl_app("import cb\n\nprint(cb.total())\n", "")
+
+    vcl_write(app, "package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n")
+    vcl_write(app, "cb/cb.sysl", s"module cb\n\n@include(\"stddef.h\")\n\n$block\n" +
+                                 "struct Holder\n    bytes: [BROKEN]u8\n    size: Size\n\n" +
+                                 "total() -> int = ONE + TWO\n")
+
+    val said = vcl_run(app)
+
+    vcl_drop([app])
+    said
+end vcl_one_broken
+
+@test("a 'c const' entry clang refuses is the one diagnostic, at its own line")
+vcl_broken_const_alone()
+    if !vcl_ready() then return
+
+    val said = vcl_one_broken("c const\n    ONE: int = \"1\"\n    TWO: int = \"2\"\n" +
+                              "    BROKEN: usize = \"sizeof(struct no_such_struct)\"\n    THREE: int = \"3\"\n\n" +
+                              "c type\n    Size = \"size_t\"\n")
+
+    assert_eq(vcl_errors_in(said), 1, said)
+    assert(said.contains("the C compiler refused this file's"), said)
+    assert(said.contains("cb/cb.sysl:8:"), said)
+
+@test("a 'c type' entry clang refuses is the one diagnostic, at its own line")
+vcl_broken_type_alone()
+    if !vcl_ready() then return
+
+    val said = vcl_one_broken("c type\n    Size = \"size_t\"\n    Other = \"int\"\n" +
+                              "    Broken = \"struct no_such_struct\"\n\n" +
+                              "c const\n    ONE: int = \"1\"\n    TWO: int = \"2\"\n    BROKEN: usize = \"4\"\n")
+
+    assert_eq(vcl_errors_in(said), 1, said)
+    assert(said.contains("the C compiler refused this file's"), said)
+    assert(said.contains("cb/cb.sysl:8:"), said)

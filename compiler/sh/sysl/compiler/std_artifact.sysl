@@ -234,6 +234,20 @@ std_files(root: string, t: Target) -> Result[Buf[(string, string)], string]
 
         files.push((place_below(at, item), from_utf8_unchecked(bytes.view())))
 
+    // A package built this way is fingerprinted with what its C is compiled with and its vendored
+    // libraries' files, as the run cache keys them; the standard module has no manifest to say any.
+    manifest_at(root) match
+        Ok(m) ->
+            val configured = c_block_text(m)
+
+            if !configured.is_empty() then files.push(("c", configured))
+
+            val vendored = c_library_inputs(root, m)
+
+            for item in vendored
+                files.push((s"c/${item.0}", item.1))
+        Err(_) -> ()
+
     Ok(files)
 end std_files
 
@@ -491,21 +505,29 @@ private build_members(clang: string, archiver: string, staging: string, root: st
     compile_object(clang, meta_ir, smeta, t, level, false)?
     members.push(smeta)
 
-    val carried = c_sources(root, Some(t.os)) match
-        Err(e) -> return Err(e.message)
-        Ok(cs) -> cs
+    // **What every other build compiles, the same way** (`tree_c_units`): the walked shims and each
+    // vendored library's list, with the include roots and macros the manifest gives each. An
+    // artifact built from the walk alone left out the library and handed its shim no `-I`.
+    val units = tree_c_units(root, t) match
+        Err(e) -> return Err(if e.of_manifest then manifest_refusal(e.why) else e.why)
+        Ok(us) -> us
+
+    var carried: Buf[string] = buf()
+
+    for unit in units
+        carried.push(unit.src)
 
     member_collision(root, carried) match
         Some(why) -> return Err(why)
         None -> ()
 
-    for item in carried
-        val obj = s"$staging/${native_member(root, item)}"
+    for unit in units
+        val obj = s"$staging/${native_member(root, unit.src)}"
 
         // **The standard module names no installed library**, so there is nothing for a probe to
         // have answered there: its C is what a hosted target's libc already carries. A package's is
         // another matter, which is why the answer arrives as an argument.
-        compile_c(clang, item, obj, t, level, probed)?
+        compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes)?
         members.push(obj)
 
     val pending = pending_name(out)
