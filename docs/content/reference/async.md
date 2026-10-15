@@ -843,6 +843,36 @@ A view handed to something that keeps it beyond the call — a device's static, 
 case [`--explain-escapes`](/reference/memory/) reports: the array is promoted to the heap, and the
 loan is just as safe.
 
+**A local lent across an `await` keeps its `@align(n)` too.** Whatever boundary it asks — of the
+binding, or of a type declared `@align(n)` — its storage in the frame begins on it, at every
+optimization level:
+
+```sysl
+@align(64)
+struct Line
+    bytes: [64]u8
+
+async fill() -> int
+    @align(64)
+    var buf: [64]u8 = [0; 64]
+    val head = buf[0..<4]
+    var line = Line([0; 64])
+    val p = &line
+
+    head[0] = 7
+    p.bytes[0] = 30
+    await yield_now()
+    print(usize(&buf) % 64, usize(p) % 64)
+    int(head[0]) + int(p.bytes[0])
+
+print(block_on(fill()))
+```
+
+```output
+0 0
+37
+```
+
 ## Dropping a task cancels it
 
 **There is no cancel operation: a task is cancelled by letting go of it.** A task dropped while it is

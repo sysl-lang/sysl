@@ -179,9 +179,21 @@ end using_coroutines
 //
 // The set is every declared local some view or address is taken of, whether or not the loan in fact
 // crosses an `await`: a local only lent between two suspensions costs its bytes in the frame rather
-// than on the stack, and nothing else. Left out are a local with no size, an array the escape analysis
-// moved into a buffer (its storage is a box already), and a slot asking for a raised boundary, which
-// a field of the promise could not be held to.
+// than on the stack, and nothing else. Left out are a local with no size, and an array the escape
+// analysis moved into a buffer (its storage is a box already).
+//
+// **A local asking for a raised boundary** -- a `@align(n)` binding, or one of a type declared
+// `@align(n)` -- is laid in the promise too, though a field of an LLVM struct begins only on its own
+// type's natural boundary. Its field is a run of bytes `n - 1` longer than the local, and the local's
+// slot is the first address in the run on the `n`-byte boundary, worked out from the address itself:
+// the boundary holds wherever LLVM places the promise in the frame and whatever the frame came from.
+private struct FrameLocal
+    name: string
+    ty: Type
+    // The boundary the slot is placed on by hand, or 0 where its field's own boundary is enough.
+    raised: int
+end FrameLocal
+
 private struct LentSink
     names: Set[string]
 
@@ -190,10 +202,10 @@ private struct LentSink
 end LentSink
 
 private struct DeclSink
-    decls: Buf[(string, Type)]
+    decls: Buf[(string, Type, Option[usize])]
 
-    add(*self, name: string, ty: Type)
-        self.decls.push((name, ty))
+    add(*self, name: string, ty: Type, align: Option[usize])
+        self.decls.push((name, ty, align))
 end DeclSink
 
 private lent_root(out: &LentSink, place: TExpr) = *place.kind match
@@ -209,11 +221,28 @@ private note_lent(out: &LentSink, x: TExpr) = *x.kind match
     _ -> ()
 
 private note_decl(out: &DeclSink, s: TStmt) = s match
-    TVarDecl(name, ty, _, align) -> if align.is_none() then out.add(name, ty)
+    TVarDecl(name, ty, _, align) -> out.add(name, ty, align)
     _ -> ()
 
+// The boundary a local's slot is placed on by hand: what its `@align(n)` asks, or its type's where
+// that type holds a raised one; 0 where neither does.
+private raised_boundary(e: *Emit, ty: Type, align: Option[usize]) -> int
+    var widest = 0
+
+    align match
+        Some(a) -> widest = int(a)
+        None -> ()
+
+    if slot_align(e, lty(e, ty)).is_some()
+        val a = int(e.layout.align(ty))
+
+        if a > widest then widest = a
+
+    widest
+end raised_boundary
+
 // The locals of `f` laid in its promise, in the order they were declared.
-frame_locals(e: *Emit, f: TFunc) -> Buf[(string, Type)]
+private frame_locals(e: *Emit, f: TFunc) -> Buf[FrameLocal]
     val lent: &LentSink = LentSink(set())
     val declared: &DeclSink = DeclSink(buf())
 
@@ -223,18 +252,23 @@ frame_locals(e: *Emit, f: TFunc) -> Buf[(string, Type)]
         walk_texpr(f.body.result.unwrap(), TWalk(false, x -> note_lent(lent, x), w -> (),
                                                    s -> note_decl(declared, s)))
 
-    var out: Buf[(string, Type)] = buf()
+    var out: Buf[FrameLocal] = buf()
 
     for item in declared.decls
-        if lent.names.has(item.0) && !zero_sized(item.1) && !is_promoted(e, item.0) &&
-           slot_align(e, lty(e, item.1)).is_none() then
-            out.push(item)
+        if lent.names.has(item.0) && !zero_sized(item.1) && !is_promoted(e, item.0)
+            out.push(FrameLocal(item.0, item.1, raised_boundary(e, item.1, item.2)))
 
     out
 end frame_locals
 
+// A local's field of the promise: its own type, or, for a slot placed by hand, the bytes it needs and
+// the `n - 1` it may have to skip to reach its boundary.
+private frame_field(e: *Emit, local: FrameLocal) -> LType =
+    if local.raised == 0 then lty(e, local.ty) else
+        LArr(int(e.layout.size(local.ty)) + local.raised - 1, LInt(8))
+
 // The promise of a task ending with `result`, with the locals `frame_locals` chose after its fields.
-private promise_with_locals(e: *Emit, result: Type, locals: Buf[(string, Type)]) -> LType
+private promise_with_locals(e: *Emit, result: Type, locals: Buf[FrameLocal]) -> LType
     var fields: Buf[LType] = buf()
 
     fields.push(word_lty(e))
@@ -245,39 +279,63 @@ private promise_with_locals(e: *Emit, result: Type, locals: Buf[(string, Type)])
     if !no_value(result) then fields.push(lty(e, result))
 
     for item in locals
-        fields.push(lty(e, item.1))
+        fields.push(frame_field(e, item))
 
     LStruct(fields)
 end promise_with_locals
 
-// The promise's boundary: its header's and its result's, and every local's it holds.
-private promise_align_with(e: *Emit, result: Type, locals: Buf[(string, Type)]) -> int
+// The promise's boundary: its header's and its result's, and every local's it holds as its own type
+// (a slot placed by hand is a run of bytes, and asks nothing of the promise).
+private promise_align_with(e: *Emit, result: Type, locals: Buf[FrameLocal]) -> int
     var widest = promise_align(e, result)
 
     for item in locals
-        val a = int(e.layout.align(item.1))
+        if item.raised == 0
+            val a = int(e.layout.align(item.ty))
 
-        if a > widest then widest = a
+            if a > widest then widest = a
 
     widest
 end promise_align_with
 
 // Names each local's slot as its field of the promise. Written after `llvm.coro.begin`, which every
 // use of the slot follows -- the body starts at the first resumption.
-private name_frame_slots(e: *Emit, whole: LType, promise: Val, result: Type, locals: Buf[(string, Type)])
+//
+// A slot placed by hand is its field's address moved forward to the next multiple of its boundary
+// `n`: by `(0 - address) & (n - 1)` bytes, a step through the field itself, so the slot is still
+// known to be the promise's.
+private name_frame_slots(e: *Emit, whole: LType, promise: Val, result: Type, locals: Buf[FrameLocal])
     val first: usize = if no_value(result) then 4 else 5
 
     for i in 0..<locals.len()
-        val slot = s"${locals.at(i).0}.addr"
+        val local = locals.at(i)
+        val slot = s"${local.name}.addr"
+        val field = if local.raised == 0 then VReg(slot) else VReg(s"${local.name}.field")
 
         e.declared.add(slot)
-        e.frame_slots.add(locals.at(i).0)
+        e.frame_slots.add(local.name)
 
         var idx: Buf[IrArg] = buf()
 
         idx.push(ir_arg(l_i32(), VInt(from_int(0))))
         idx.push(ir_arg(l_i32(), VInt(from_int(long(first + i)))))
-        emit(e, InGep(VReg(slot), whole, promise, idx))
+        emit(e, InGep(field, whole, promise, idx))
+
+        if local.raised != 0
+            val w = word_lty(e)
+            val at = VReg(s"${local.name}.field.at")
+            val back = VReg(s"${local.name}.field.back")
+            val skip = VReg(s"${local.name}.field.skip")
+
+            emit(e, InCast(at, CastPtrToInt, LPtr, field, w))
+            emit(e, InBin(back, OpSub, w, VInt(from_int(0)), at))
+            emit(e, InBin(skip, OpAnd, w, back, VInt(from_int(long(local.raised - 1)))))
+
+            var by: Buf[IrArg] = buf()
+
+            by.push(ir_arg(w, skip))
+            emit(e, InGep(VReg(slot), LInt(8), field, by))
+        end if
 end name_frame_slots
 
 // -- the ramp: what calling an async function does --------------------------------------------------
