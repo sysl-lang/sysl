@@ -214,3 +214,31 @@ pan_no_alloc()
     val text = "@no_alloc\nshow_point()\n    print(Point(1, 2), Red, Name(\"n\"))\n\nshow_point()\n"
 
     assert_eq(pan_ran(text), "Point(x: 1, y: 2) Color.Red Name(s: \"n\")\n")
+
+// A writer's table carries no `Debug` slot, so a bare `&Writer` prints `<writer>`; a trait that
+// requires `Debug` beside `Writer` is the escape hatch, and its objects print the concrete sink.
+private pan_sink() -> string =
+    "struct Tally\n    n: usize\n\nimpl Fallible for Tally\n\nimpl Writer for Tally\n" +
+    "    write(*self, bytes: []const u8)\n        self.n = self.n + bytes.len\n\n" +
+    "struct Quiet\n    n: usize\n\nimpl Fallible for Quiet\n\nimpl Writer for Quiet\n" +
+    "    write(*self, bytes: []const u8)\n        self.n = self.n + bytes.len\n\n" +
+    "impl Debug for Quiet\n    debug(self, out: *Writer, fmt: FormatSpec) = display_pad(\"Quiet\".bytes, out, fmt)\n\n" +
+    "trait LoggedWriter: Writer + Debug\n\n" +
+    "impl LoggedWriter for Tally\n\nimpl LoggedWriter for Quiet\n\n"
+
+@test("a bare writer object prints <writer>, and one whose trait requires Debug prints the sink")
+pan_logged_writer()
+    if xvr_no_library() then return
+
+    val text = pan_sink() +
+               "val w: &Writer = Tally(3)\nval l: &LoggedWriter = Tally(4)\nval q: &LoggedWriter = Quiet(5)\n" +
+               "print(w)\nprint(l)\nprint(q)\nprint(f\"${l}%?\")\n"
+
+    assert_eq(pan_ran(text), "<writer>\nTally(n: 4)\nQuiet\nTally(n: 4)\n")
+
+@test("a concrete writer prints through its supplied or its own Debug")
+pan_concrete_writer()
+    if xvr_no_library() then return
+
+    assert_eq(pan_ran(pan_sink() + "print(Tally(1))\nprint(Quiet(2))\nprint(debug(Tally(3)))\n"),
+              "Tally(n: 1)\nQuiet\nTally(n: 3)\n")

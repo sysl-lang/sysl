@@ -1335,6 +1335,34 @@ A few values have no block that could be written for them, and are shown by the 
   writes to one. The slot costs one word per table, and keeps the concrete type's `Debug` in the
   program wherever the table is.
 
+**A sink that should show itself says so in its trait**: a trait requiring `Debug` beside `Writer`
+puts the slot back, so its objects print the concrete sink while a bare `&Writer` stays `<writer>`.
+A concrete writer, never erased, prints through its `Debug` like any other value.
+
+```sysl
+struct Tally
+    n: usize
+
+impl Fallible for Tally
+
+impl Writer for Tally
+    write(*self, bytes: []const u8)
+        self.n = self.n + bytes.len
+
+trait LoggedWriter: Writer + Debug
+
+impl LoggedWriter for Tally
+
+val w: &Writer = Tally(1)
+val l: &LoggedWriter = Tally(2)
+
+print(w, l, Tally(3))
+```
+
+```output
+<writer> Tally(n: 2) Tally(n: 3)
+```
+
 **A rendering that nests deeper than thirty-two levels writes `…` and stops.** Following references
 is what makes a list or a tree show as one, and it is also what would make a structure that refers
 back to itself render for ever; the limit is what makes every value safe to show.

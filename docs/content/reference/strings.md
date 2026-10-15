@@ -539,7 +539,10 @@ Point(x: 1, y: 2)
 **A raw pointer is not reached through** — what it points at may be gone — so it prints its address
 in lower-case hex, the null one as `0x0`. A trait object keeps its reference, since the reference is
 what carries its table, and prints its concrete value: through `Display` where the trait requires
-it, and otherwise through the `Debug` every table carries. A callable prints as `<fn>`.
+it, and otherwise through the `Debug` every table carries. A callable prints as `<fn>`, and a
+`&Writer` as `<writer>`, their tables carrying no `Debug` slot; a trait such as
+`trait LoggedWriter: Writer + Debug` puts it back, so its objects print the concrete sink
+([what is shown by rule](/reference/traits/#what-is-shown-by-rule)).
 
 ```sysl
 trait Area
