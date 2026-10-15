@@ -267,6 +267,7 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     e.caller_exposed = exposed_in(no_stmts, None, p.vals)
     push_temps(e)
     push_owned(e)
+    gen_parent_watch(e)
     gen_computed_vals(e, p.vals)
     gen_alloc_count_mark(e)
 
@@ -346,6 +347,22 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
 
     Some(finish_func(e, entry_sig(e.target)))
 end gen_test_main
+
+// **A test process keeps what it prints and does not outlive the runner that started it.** The first
+// thing a test build's entry does on a machine with processes is `testprocess.c`'s start: standard
+// output a line at a time, so a test stopped for running too long still shows what it printed, and a
+// watch that ends the test -- and the process group the runner gave it -- once its parent is gone,
+// however the parent went. Before the module's `val`s are filled, since a computed `val` that never
+// finishes is as much a hang as a test that never does.
+private gen_parent_watch(e: *Emit)
+    if !posix_machine(e.target.os) then return
+
+    request_intrinsic(e, ir_sig(test_process_symbol(), ir_fn_type(LVoid, no_params())))
+    emit(e, ir_call(None, LVoid, VGlobal(test_process_symbol()), no_ir_args()))
+end gen_parent_watch
+
+// The C function a test build's entry calls first, where the machine has processes.
+test_process_symbol() -> string = "sysl_test_process_start"
 
 private dispatch_on(e: *Emit, want: Val, key: string, run: string, next: string)
     val named = request_text(e, test_named_symbol(), test_named_text(s"i${e.word_bits}"))

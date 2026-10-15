@@ -916,7 +916,8 @@ where_flags() -> string =
 private emit_typed_usage() -> string =
     "usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] " + where_flags() + " <path>"
 
-// `sysl test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>` --
+// `sysl test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>]
+// [-O<level>] <path>` --
 // the `@test` functions of a tree, built into one binary and run one process each.
 //
 // **The report is written as the run goes rather than at the end**, which is why it does not go
@@ -931,6 +932,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var filter: Option[string] = None
     var fail_fast = false
     var std = false
+    var seconds = DefaultTestSeconds
     var named_level: Option[string] = None
     var picked: Option[string] = None
     var file = ""
@@ -950,6 +952,19 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             if took == 2 then i += 1
         else if featured > 0
             if featured == 2 then i += 1
+        else if args[i] == "--timeout"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+
+            timeout_seconds(args[i]) match
+                Some(n) -> seconds = n
+                None ->
+                    mistakes.push(bad_timeout(args[i]))
+                    break
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
@@ -1020,17 +1035,39 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             return Failed
         Ok(found) -> found
 
+    val opts = TestOptions(filter, fail_fast)
+
     projects match
-        None -> test_project(file, named, cc, filter, fail_fast, std, named_level, note, report)
-        Some(members) -> test_members(members, named, cc, filter, fail_fast, std, named_level, say, note,
+        None -> test_project(file, named, cc, opts, seconds, std, named_level, note, report)
+        Some(members) -> test_members(members, named, cc, opts, seconds, std, named_level, say, note,
                                       report)
 end test_command
+
+// `--timeout`'s value: a whole number of seconds, zero for no limit, up to the most a test's own
+// `@test(timeout: n)` may say (`MostTestSeconds`). Anything else -- a sign, a unit, a fraction -- is
+// refused rather than read as far as it goes.
+timeout_seconds(text: string) -> Option[int]
+    if text.bytes.len == 0 || text.bytes.len > 7 then return None
+
+    var n = 0
+
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return None
+
+        n = n * 10 + int(c - u8('0'))
+
+    if n > MostTestSeconds then None else Some(n)
+end timeout_seconds
+
+private bad_timeout(text: string) -> string =
+    s"'--timeout' takes the seconds each test may run, a whole number from 0 to $MostTestSeconds " +
+        s"(0 is no limit), and '$text' is not one"
 
 // **Every member's suite, each reported under its own name**, and a line at the end saying how the
 // workspace came out. A failing member does not stop the others unless `--fail-fast` asked for that:
 // the point of testing a workspace at once is to hear about all of it.
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
-                     filter: Option[string], fail_fast: bool, std: bool, named_level: Option[string],
+                     opts: TestOptions, seconds: int, std: bool, named_level: Option[string],
                      say: string -> unit, note: string -> unit, report: string -> unit) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
@@ -1039,10 +1076,10 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, filter, fail_fast, std, named_level, note, report) != Fine
+        if test_project(mb.dir, named, cc, opts, seconds, std, named_level, note, report) != Fine
             failed.push(mb.name)
 
-            if fail_fast then break
+            if opts.fail_fast then break
         end if
 
     if members.len() > 1
@@ -1055,8 +1092,8 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
 end test_members
 
 // One project's suite, once the command line has been read.
-private test_project(file: string, named: Option[string], cc: Option[string], filter: Option[string],
-                     fail_fast: bool, std: bool, named_level: Option[string], note: string -> unit,
+private test_project(file: string, named: Option[string], cc: Option[string], opts: TestOptions,
+                     seconds: int, std: bool, named_level: Option[string], note: string -> unit,
                      report: string -> unit) -> int
     val level = build_level(file, named_level) match
         Err(why) ->
@@ -1072,7 +1109,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
 
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, filter, fail_fast, false, note, report)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, note, report)
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
@@ -1090,7 +1127,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     end if
 
     // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
-    nothing_to_run(file, build.tests, filter, note) match
+    nothing_to_run(file, build.tests, opts.filter, note) match
         Some(code) -> return code
         None -> ()
 
@@ -1104,7 +1141,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, note, report)
+    tests_run(file, made.0, build.tests, opts, seconds, !made.1, note, report)
 end test_project
 
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
@@ -1127,15 +1164,14 @@ end nothing_to_run
 
 // The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
 // whole point of it being there.
-private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[string],
-                  fail_fast: bool, discard: bool, note: string -> unit, report: string -> unit) -> int
-    nothing_to_run(file, all, filter, note) match
+private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
+                  discard: bool, note: string -> unit, report: string -> unit) -> int
+    nothing_to_run(file, all, opts.filter, note) match
         Some(code) -> return code
         None -> ()
 
-    val chosen = selected_tests(all, filter)
-    val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
-                                all.len() - chosen.len(), report)
+    val chosen = selected_tests(all, opts.filter)
+    val outcomes = run_selected(exe, chosen, opts, all.len() - chosen.len(), report, seconds)
 
     if discard then discard_test_binary(exe)
 
@@ -1147,7 +1183,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[str
     if failed == 0 then Fine else Failed
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     pipeline_usage() + " <path>"
 
@@ -1424,7 +1460,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | deps <path> | vendor <path> | tidy [--check] [<path>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +

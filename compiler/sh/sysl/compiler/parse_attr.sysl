@@ -575,16 +575,16 @@ private parse_section_attr(p: *Parser) -> Attr
 end parse_section_attr
 
 // `@test`, `@test("what it shows")`, `@test("...", should_trap)`, `@test(should_trap: "text")`,
-// `@test(ignore: "why")` — a description, then `should_trap`, then `ignore`, each optional and in
-// that order.
+// `@test(timeout: 30)`, `@test(ignore: "why")` — a description, then `should_trap`, then `timeout`,
+// then `ignore`, each optional and in that order.
 private parse_test_attr(p: *Parser, at: Span) -> TestAttr
-    if !p.at_kw("(") then return TestAttr(at.to(p.just_taken()), None, false, None, None)
+    if !p.at_kw("(") then return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
 
     if p.kw_at(1, ")")
         p.fault(p.here(), "'@test' takes a description or nothing at all, and '()' is neither — drop the parentheses, and the function's own name becomes its description")
         p.bump()
         p.bump()
-        return TestAttr(at.to(p.just_taken()), None, false, None, None)
+        return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
     end if
 
     p.bump()
@@ -593,6 +593,7 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
     var should_trap = false
     var expected: Option[string] = None
     var ignored: Option[string] = None
+    var timeout: Option[int] = None
 
     p.peek() match
         StrLit(v) ->
@@ -600,19 +601,29 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
             display = Some(v)
         _ -> ()
 
-    if display.is_none() && !p.at_word("should_trap") && !p.at_word("ignore")
-        p.fault(p.here(), "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
+    if display.is_none() && !p.at_word("should_trap") && !p.at_word("timeout") && !p.at_word("ignore")
+        p.fault(p.here(), "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, 'timeout: 30' for the seconds a run may take, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
         skip_line(p)
-        return TestAttr(at.to(p.just_taken()), None, false, None, None)
+        return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
     end if
 
-    if display.is_some() && p.kw_at(0, ",") && (p.word_at(1, "should_trap") || p.word_at(1, "ignore"))
-        p.bump()
+    if display.is_some() && p.kw_at(0, ",") && test_word_at(p, 1) then p.bump()
 
     if p.accept_word("should_trap")
         should_trap = true
 
         if p.accept_kw(":") then expected = accept_string(p)
+
+        if p.kw_at(0, ",") && (p.word_at(1, "timeout") || p.word_at(1, "ignore")) then p.bump()
+    end if
+
+    if p.accept_word("timeout")
+        timeout = parse_test_timeout(p)
+
+        if timeout.is_none()
+            skip_line(p)
+            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None, None)
+        end if
 
         if p.kw_at(0, ",") && p.word_at(1, "ignore") then p.bump()
     end if
@@ -622,15 +633,54 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
 
         if ignored.is_none()
             skip_line(p)
-            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None)
+            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None, timeout)
         end if
     end if
 
     if !p.accept_kw(")")
-        p.fault(p.here(), "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them")
+        p.fault(p.here(), "'@test' closes what it opened — the description, 'should_trap', 'timeout' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them")
 
-    TestAttr(at.to(p.just_taken()), display, should_trap, expected, ignored)
+    TestAttr(at.to(p.just_taken()), display, should_trap, expected, ignored, timeout)
 end parse_test_attr
+
+// Whether the token `n` ahead is one of the words `@test` takes after its description.
+private test_word_at(p: *Parser, n: usize) -> bool =
+    p.word_at(n, "should_trap") || p.word_at(n, "timeout") || p.word_at(n, "ignore")
+
+// What follows `timeout` inside `@test(...)`: a `:` and a whole number of seconds, zero meaning no
+// limit. The bound is the most a run's clock is asked to count in milliseconds, which is about
+// twenty-four days — a limit past it is not a limit anybody meant.
+private parse_test_timeout(p: *Parser) -> Option[int]
+    val refusal = s"'timeout' needs the seconds the test may run, written as a whole number from 0 " +
+        s"to ${MostTestSeconds} — '@test(timeout: 30)'; 0 is no limit at all"
+
+    if !p.accept_kw(":")
+        p.fault(p.here(), refusal)
+        return None
+    end if
+
+    val at = p.here()
+
+    p.peek() match
+        IntLit(digits, base, suffix) ->
+            p.bump()
+
+            val seconds = literal_value(digits, base).to_long()
+
+            if suffix != "" || seconds.is_none() || seconds.unwrap() > long(MostTestSeconds)
+                p.fault(at, refusal)
+                return None
+            end if
+
+            Some(int(seconds.unwrap()))
+        _ ->
+            p.fault(at, refusal)
+            None
+end parse_test_timeout
+
+// The longest limit a test may be given, in seconds: the most milliseconds an `int` holds, rounded
+// down to a whole second.
+const MostTestSeconds: int = 2147483
 
 // What follows `ignore` inside `@test(...)`: a `:` and the reason, which is not optional and may not
 // be blank — an ignored test that does not say what it is waiting for is the one nobody comes back

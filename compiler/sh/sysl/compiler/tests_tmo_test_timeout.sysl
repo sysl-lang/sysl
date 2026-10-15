@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, start}
+import sysl.signal.{send, KILL}
+import sysl.testing.compiler
+import sysl.text.Search
+import sysl.time.{sleep, millis}
+
+// A test that never ends: `sysl test --timeout <seconds>`, `@test(timeout: n)`, the limit every run
+// has without being given one, and the test process that does not outlive the runner that started it.
+
+// -- the attribute ----------------------------------------------------------------------------------
+
+@test("'timeout' gives a test a limit of its own")
+tmo_timeout_is_read()
+    assert_eq(pf("@test(timeout: 30)\nt() = 0\n"), "(fn @test@timeout(30) t () 0)")
+    assert_eq(pf("@test(timeout: 0)\nt() = 0\n"), "(fn @test@timeout(0) t () 0)")
+    assert_eq(pf("@test(timeout: 2147483)\nt() = 0\n"), "(fn @test@timeout(2147483) t () 0)")
+
+@test("'timeout' sits between 'should_trap' and 'ignore'")
+tmo_timeout_composes_in_order()
+    assert_eq(pf("@test(\"a sentence\", timeout: 5)\nt() = 0\n"), "(fn @test(\"a sentence\")@timeout(5) t () 0)")
+    assert_eq(pf("@test(should_trap, timeout: 5)\nt() = 0\n"), "(fn @test@should_trap@timeout(5) t () 0)")
+    assert_eq(pf("@test(\"d\", should_trap: \"x\", timeout: 5, ignore: \"y\")\nt() = 0\n"),
+        "(fn @test(\"d\")@should_trap(\"x\")@timeout(5)@ignore(\"y\") t () 0)")
+    assert_eq(pf("@test(timeout: 5, ignore: \"y\")\nt() = 0\n"), "(fn @test@timeout(5)@ignore(\"y\") t () 0)")
+
+private tmo_refusal() -> string =
+    "'timeout' needs the seconds the test may run, written as a whole number from 0 to 2147483 — '@test(timeout: 30)'; 0 is no limit at all"
+
+@test("'timeout' with no number, or with something else, is refused at the place it went wrong")
+tmo_timeout_needs_a_number()
+    assert_eq(pf_err("@test(timeout)\nt() = 0\n"), tmo_refusal())
+    assert_eq(pf_at("@test(timeout)\nt() = 0\n"), "1:14")
+    assert_eq(pf_err("@test(timeout: \"5\")\nt() = 0\n"), tmo_refusal())
+    assert_eq(pf_at("@test(timeout: \"5\")\nt() = 0\n"), "1:16")
+    assert_eq(pf_err("@test(timeout: -1)\nt() = 0\n"), tmo_refusal())
+    assert_eq(pf_err("@test(timeout: 1.5)\nt() = 0\n"), tmo_refusal())
+    assert_eq(pf_err("@test(timeout: 5i64)\nt() = 0\n"), tmo_refusal())
+
+@test("a limit past what a run's clock counts is refused")
+tmo_timeout_has_a_ceiling()
+    assert_eq(pf_err("@test(timeout: 2147484)\nt() = 0\n"), tmo_refusal())
+    assert_eq(pf_err("@test(timeout: 99999999999999999999)\nt() = 0\n"), tmo_refusal())
+
+@test("'timeout' after 'ignore' is told the order")
+tmo_timeout_out_of_order()
+    assert_eq(pf_err("@test(ignore: \"y\", timeout: 5)\nt() = 0\n"),
+        "'@test' closes what it opened — the description, 'should_trap', 'timeout' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them")
+
+// -- the flag ---------------------------------------------------------------------------------------
+
+@test("'--timeout' reads a whole number of seconds, and nothing else")
+tmo_the_flag_reads_seconds()
+    assert_eq(timeout_seconds("0").unwrap(), 0)
+    assert_eq(timeout_seconds("300").unwrap(), 300)
+    assert_eq(timeout_seconds("2147483").unwrap(), 2147483)
+    assert(timeout_seconds("2147484").is_none())
+    assert(timeout_seconds("").is_none())
+    assert(timeout_seconds("-1").is_none())
+    assert(timeout_seconds("1.5").is_none())
+    assert(timeout_seconds("10s").is_none())
+    assert(timeout_seconds("99999999999").is_none())
+
+@test("a run given no limit still has one, and it is five minutes")
+tmo_the_default_is_five_minutes()
+    assert_eq(DefaultTestSeconds, 300)
+
+@test("'--timeout' with something that is not seconds is refused, and says what it takes")
+tmo_a_bad_flag_is_refused()
+    if std_root().is_err() then return
+
+    val file = tmo_program("@test\nt() =\n    assert(true, \"up\")\n")
+    val (code, _, err) = clx_ran(["sysl", "test", file, "--timeout", "soon"])
+
+    assert_eq(code, Misused, err)
+    assert(err.contains("'--timeout' takes the seconds each test may run, a whole number from 0 to 2147483 (0 is no limit), and 'soon' is not one"), err)
+
+    val (bare, _, said) = clx_ran(["sysl", "test", file, "--timeout"])
+
+    assert_eq(bare, Misused, said)
+    assert(said.contains("Missing value after --timeout"), said)
+
+// -- the run ----------------------------------------------------------------------------------------
+
+private tmo_program(text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-tmo-test").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", text).unwrap()
+    s"$root/prog.sysl"
+end tmo_program
+
+private tmo_hangs(attr: string) -> string =
+    s"$attr\na_hangs()\n    print(\"got as far as the loop\")\n\n    loop\n        sleep(millis(10))\n\n"
+
+private tmo_head() -> string = "import sysl.time.{sleep, millis}\n\n"
+
+@test("a test that never ends times out by name, shows what it printed, and the next one still runs")
+tmo_a_hang_times_out_and_the_run_goes_on()
+    if !clx_ready() then return
+
+    val file = tmo_program(tmo_head() + tmo_hangs("@test") + "@test\nb_runs_after() =\n    assert(true, \"up\")\n")
+    val (code, out, _) = clx_ran(["sysl", "test", file, "--timeout", "1"])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("FAIL  a_hangs"), out)
+    assert(out.contains("timed out after 1s"), out)
+    assert(out.contains("> got as far as the loop"), out)
+    assert(out.contains("ok    b_runs_after"), out)
+    assert(out.contains("1 passed, 1 failed"), out)
+end tmo_a_hang_times_out_and_the_run_goes_on
+
+@test("a test's own limit beats the run's, in both directions")
+tmo_the_attribute_beats_the_flag()
+    if !clx_ready() then return
+
+    val file = tmo_program(tmo_head() + tmo_hangs("@test(timeout: 1)") +
+        "@test(timeout: 0)\nb_outlasts_the_run_limit() =\n    sleep(millis(2500))\n")
+    val (code, out, _) = clx_ran(["sysl", "test", file, "--timeout", "2"])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("timed out after 1s"), out)
+    assert(!out.contains("timed out after 2s"), out)
+    assert(out.contains("ok    b_outlasts_the_run_limit"), out)
+end tmo_the_attribute_beats_the_flag
+
+@test("'--timeout 0' is no limit, not a limit of nothing")
+tmo_zero_is_no_limit()
+    if !clx_ready() then return
+
+    val file = tmo_program(tmo_head() + "@test\nslow() =\n    sleep(millis(1500))\n")
+    val (bounded, said, _) = clx_ran(["sysl", "test", file, "--timeout", "1"])
+
+    assert_eq(bounded, Failed, said)
+    assert(said.contains("timed out after 1s"), said)
+
+    val (free, out, _) = clx_ran(["sysl", "test", file, "--timeout", "0"])
+
+    assert_eq(free, Fine, out)
+end tmo_zero_is_no_limit
+
+@test("a '@setup' that never ends is the reason its test did not run")
+tmo_a_hung_setup_is_named()
+    if !clx_ready() then return
+
+    val file = tmo_program(tmo_head() + "@setup\nprepare()\n    loop\n        sleep(millis(10))\n\n" +
+        "@test\nt() =\n    assert(true, \"up\")\n")
+    val (code, out, _) = clx_ran(["sysl", "test", file, "--timeout", "1"])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("'@setup', 'prepare', timed out after 1s, so this test did not run"), out)
+end tmo_a_hung_setup_is_named
+
+// The runner is a process of its own here, stopped with `SIGTERM` while its one test is looping. The
+// test writes its process group -- its own pid, the runner having made it a group leader -- and starts
+// a child of its own, so what is checked is that the whole group is gone, not only the test.
+@test("a runner stopped mid-run leaves no test process behind")
+tmo_a_stopped_runner_leaves_nothing()
+    if !clx_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-tmo-orphan").unwrap())
+    val marker = s"$root/group"
+    val file = tmo_program("import sysl.fs.write_text\nimport sysl.process.{process_group, start}\n" +
+        tmo_head() + "@test\nspins()\n    val child = start(\"sleep\", [\"1000\"]).unwrap()\n\n" +
+        "    write_text(\"" + marker + "\", str(process_group())).unwrap()\n\n" +
+        "    loop\n        sleep(millis(10))\n")
+    val runner = start(compiler(), ["test", file, "--timeout", "0"]).unwrap()
+
+    // The compile comes first, and is the slow part.
+    var waited = 0
+
+    while !exists(marker) && waited < 1200
+        sleep(millis(100))
+        waited += 1
+
+    assert(exists(marker), "the test never started")
+
+    val group = read_line_number_of(read_text(marker).unwrap())
+
+    runner.kill(15).unwrap()
+    runner.wait().unwrap()
+
+    // Gone means the group has no member a signal could reach, within a few of the watch's naps.
+    var gone = false
+
+    for _ in 0..<50
+        if send(-i64(group), 0).is_err()
+            gone = true
+            break
+        end if
+
+        sleep(millis(100))
+
+    val left = capture_ps(group)
+
+    if !gone then send(-i64(group), KILL)
+
+    remove_dir_all(root)
+    assert(group > 1, s"group $group")
+    assert(gone, s"process group $group outlived its runner: $left")
+    assert_eq(left, "")
+end tmo_a_stopped_runner_leaves_nothing
+
+// What `ps` says of one process: nothing at all once it is gone.
+private capture_ps(pid: int) -> string = capture("ps", ["-o", "pid=", "-p", s"$pid"]) match
+    Ok(o) -> o.text
+    Err(_) -> "ps would not run"
+
+private read_line_number_of(text: string) -> int
+    var n = 0
+
+    for c in text.bytes
+        if c >= u8('0') && c <= u8('9') then n = n * 10 + int(c - u8('0'))
+
+    n
+end read_line_number_of
