@@ -1584,6 +1584,81 @@ so it is refused the way a `git` beside a `path` is.
 [`sysl deps`](/getting-started/cli/#deps) lists them with the rest, marked `(dev)`, since what a
 project takes is a property of its manifests rather than of any one build.
 
+### A dependency only some machines take
+
+Some packages belong under a program on one kind of machine and must not be there on another. The
+plainest is a C library written for boards: a filesystem package needs `strlen` and `memcpy` from
+somewhere, a bare board has nothing to give them, and a hosted machine already has them from its own
+C library — where a second copy collides at the link. **An `if` on the entry says which machines take
+it:**
+
+```hocon
+dependencies {
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.3.0", if = "!libc" }
+}
+```
+
+The condition is [`#if`](/reference/attributes/#if-gating-lines-before-the-lexer)'s, in its own
+language — symbols, `!`, `&&`, `||` and parentheses — so the two places a project names a machine read
+one way. It knows every symbol `#if` does (each operating system, `freestanding`, `hosted`, `posix`,
+`bsd` and each processor) and one more, **`libc`**: true where the machine has a C library under the
+program. That is the [capability](#libc-the-one-a-freestanding-target-starts-without), as the **root
+project** states it, rather than a fact of the triple, because what a C library collides with is
+whatever is actually linked: a Pico SDK build that grants `libc` links newlib, and `!libc` keeps the
+second copy out there as it does on a Mac.
+
+| `if` | taken on |
+|---|---|
+| `"!libc"` | a machine with no C library under the program |
+| `"freestanding"` | every bare machine, whatever the board links |
+| `"hosted"` | every machine with an operating system |
+| `"freestanding && thumb"` | a bare Cortex-M |
+| `"linux \|\| macos"` | either system, on any processor |
+
+**The machine is the one being built for** — `--target`, or `targets.default`, or this one — and the
+entry is dropped before anything is fetched, exactly as an
+[optional dependency nobody turns on](#an-optional-dependency-nobody-turns-on-is-not-in-the-build) is:
+on a machine the condition leaves out, the package is not cloned, not asked for the libraries and
+headers its manifest requires, not walked for C, not on the link line, and not written to
+`sysl.sum`. A package that names a conditional dependency of its own hands the condition on with it:
+**imports are transitive** where the dependency is present, and nowhere in the graph where it is not.
+
+The two keys compose rather than compete. `optional = true` with an `if` is taken where a feature
+turns it on **and** the machine meets its condition; a feature cannot name a machine, and a condition
+cannot name a feature — `feature_x` is refused in an `if`, since a feature reaches a dependency by
+naming it. A [pinned commit](#pinning-a-commit) is a version and a condition is a machine, so `rev`
+and `if` sit side by side, and the sum a freestanding build recorded is left alone by a hosted one.
+
+**A question about the manifests takes every machine's dependencies.** `sysl deps`, `sysl tidy` and
+`sysl vendor` answer for every machine a project may be built for, as they answer for every feature,
+so a vendored tree or a tidied `sysl.sum` serves a board build made on a laptop.
+
+**An import of a dependency the machine leaves out says so.** Its tree was never fetched, so what
+modules it offers is unknown; the refusal of `import cstd.answer` on a Mac names what is known
+instead:
+
+```text
+error: no module is called 'cstd.answer', and nothing declares it — 'cstd', which this project
+takes only where 'freestanding' holds, is left out: 'aarch64-macos' is not such a machine, and
+nothing of it is in this build
+```
+
+Source that reaches such a dependency is gated by the same condition, `#if freestanding`, so the
+lines and the package come and go together.
+
+**The condition is checked when the file is read**, every symbol of it, whichever machine the build
+turns out to be for — a misspelling that read as false would leave the dependency out of every build
+with nothing said:
+
+```text
+'dependencies.cstd.if' is "frestanding", and 'frestanding' is not something a dependency's
+condition can ask about the machine — it knows aarch64, bsd, ..., freestanding, hosted, libc, ...
+```
+
+A target's name is refused with the condition it means (`"thumb-freestanding"` is written
+`"thumb && freestanding"`), as `#if` refuses it; so are a value that is not a string and an empty
+condition, which is a dependency every machine takes written without `if`.
+
 ## Features
 
 A package often has a part not every consumer wants — a server, a desktop window, a second codec —
