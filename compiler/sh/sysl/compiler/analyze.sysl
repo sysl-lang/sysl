@@ -295,7 +295,45 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
                       "everywhere and needs no import"))
     elif !declares(a, key) then out.push((at, s"'$home' declares no '$name' — there is no '$home.$name'"))
     elif !reachable_key(a, key, scope) then out.push((at, out_of_reach(a, key)))
+    else
+        val own = own_declaration(a, scope, bound)
+
+        if own.is_some() && reexported(a, own.unwrap()) != reexported(a, key)
+            var mine = "this program"
+
+            if scope.module_name != ""
+                mine = s"this module as '${module_qualify(scope.module_name, bound)}'"
+
+            out.push((at, s"'$bound' is declared by $mine, so importing '$home.$name' under that name " +
+                          "would mean two things — import it as another name with 'as', or write its path"))
+    end if
 end import_name
+
+// The declaration of a spelling the importing file's own module makes and the file could write bare:
+// its own file-private one first, then the module's. **A sibling file's file-private declaration is
+// not one** -- the file cannot see it, so an import of the spelling is the only thing the name means
+// there. A variant is not one either: a bare variant is settled by the type expected of it, which is
+// what keeps two variants of one spelling apart already.
+private own_declaration(a: &Analysis, scope: Scope, name: string) -> Option[string]
+    val plain = module_qualify(scope.module_name, name)
+    val here = file_private_key(a, scope.src.name, plain)
+
+    if own_visible(a, scope, here) then return Some(here)
+    if here != plain && own_visible(a, scope, plain) then return Some(plain)
+    None
+
+// Whether a key is a declaration a file reaches, as one declaration or as an overload set any member
+// of which it reaches.
+private own_visible(a: &Analysis, scope: Scope, key: string) -> bool
+    val single = a.tables.types.has(key) || a.tables.funcs.has(key) || a.tables.consts.has(key) ||
+        a.tables.vals.has(key) || a.tables.externs.has(key) || a.tables.extern_vars.has(key)
+
+    if single && reachable_key(a, key, scope) then return true
+
+    for item in overload_keys(a, key)
+        if reachable_key(a, item, scope) then return true
+
+    false
 
 // A name the compiler answers itself, which no module declares however the import spells its home.
 private imports_a_form(name: string) -> bool =

@@ -381,6 +381,7 @@ the library's
 | a wildcard offers a name that is also defined locally or imported selectively | the more specific one wins |
 | two wildcards both offer one name | an *unqualified* use is a compile error naming both — unless it is a variant and the expected type says whose |
 | two selectors bind one name, or two statements do | reported at the second import |
+| a selector binds a name the importing file's own module declares | a compile error at the import, naming both |
 
 **A wildcard offers a name; a selector binds one.** That is the whole of the difference: a wildcard
 neither collides with a selective import of a name it also offers, nor with a second wildcard over the
@@ -411,6 +412,30 @@ print(max(1, 2))
 ```error
 'max' is already imported
 ```
+
+**An import by name may not bind a spelling its own module declares.** The module's declaration
+answers first, so the import would be written, read, and then mean nothing — and the first sign of it
+would be a type error somewhere else naming two types of one spelling. The import is refused instead,
+naming both declarations. The spelling counted is the one the file could write bare: its own
+file-private declarations and the module's public ones, but not a sibling file's file-private one,
+which this file cannot see. An enum variant is not counted, since the type expected of a bare variant
+already says whose it is. A wildcard claims nothing, so it still yields to the module, as above.
+
+```sysl
+import sysl.math.max
+
+max(a: int, b: int) -> int = 99
+
+print(max(1, 2))
+```
+
+```error
+'max' is declared by this program, so importing 'sysl.math.max' under that name would mean two things — import it as another name with 'as', or write its path
+```
+
+Both ways out keep the two apart: `import sysl.math.{max as larger}`, or `sysl.math.max(1, 2)`
+written in full. An import of the module's own declaration by its full path is that declaration, not
+a second one, and is allowed.
 
 **An import may not take a name a module path begins with**, since `fs.read` would then mean one thing
 in a file that imported it and another in the file beside it. The name can always be bound to

@@ -1,0 +1,142 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **An import by name may not bind a spelling the importing file's own module declares.** The
+// module's declaration answers first, so the import would be read and then never mean anything: the
+// only symptom used to be a type error far away, naming two types of one spelling. The refusal is at
+// the import and names both declarations. A wildcard only offers names, so it still yields to the
+// module; `as` and a qualified path are the two ways out; and an import of the module's own
+// declaration by its full path is that declaration, not a rival.
+
+// The module imported from: a type, a function, and a struct spelled like a variant elsewhere.
+private icl_uv() -> string =
+    "module uv\nstruct Watch\n    id: int\nwatch(n: int) -> int = n * 100\nstruct Tick\n    n: int\n"
+
+// A program whose module `app` has two files: `a` declares, `b` imports. The entry file prints
+// `app.f()`, which `b` defines.
+private icl_out(a: string, b: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(app.f())\n"))
+    fs.push(("uv", "u.sysl", icl_uv()))
+    fs.push(("app", "a.sysl", "module app\n" + a))
+    fs.push(("app", "b.sysl", "module app\n" + b))
+
+    val root = im_write(fs)
+    val said = lbr_run(root, [])
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end icl_out
+
+@test("a type imported by name under a spelling the module declares is refused, naming both")
+icl_a_type_the_module_declares()
+    if im_can_run() then return
+
+    val said = icl_out("struct Watch\n    n: int\n", "import uv.{Watch}\nf() -> int = 1\n")
+
+    assert(said.contains("'Watch' is declared by this module as 'app.Watch', so importing 'uv.Watch' " +
+                         "under that name would mean two things — import it as another name with " +
+                         "'as', or write its path"), said)
+end icl_a_type_the_module_declares
+
+@test("so is a function, imported without braces")
+icl_a_function_the_module_declares()
+    if im_can_run() then return
+
+    val said = icl_out("watch(n: int) -> int = n + 1\n", "import uv.watch\nf() -> int = watch(1)\n")
+
+    assert(said.contains("'watch' is declared by this module as 'app.watch', so importing 'uv.watch'"),
+           said)
+
+@test("and a function the module declares as an overload set")
+icl_an_overload_set_the_module_declares()
+    if im_can_run() then return
+
+    val said = icl_out("watch(n: int) -> int = n + 1\nwatch(s: string) -> int = 0\n",
+                       "import uv.{watch}\nf() -> int = watch(1)\n")
+
+    assert(said.contains("'watch' is declared by this module as 'app.watch', so importing 'uv.watch'"),
+           said)
+
+@test("the name counted is the one bound, so a rename onto a declared spelling is refused")
+icl_a_rename_onto_a_declared_name()
+    if im_can_run() then return
+
+    val said = icl_out("tick(n: int) -> int = n\n", "import uv.{watch as tick}\nf() -> int = tick(1)\n")
+
+    assert(said.contains("'tick' is declared by this module as 'app.tick', so importing 'uv.watch'"),
+           said)
+
+@test("an import in a block is held to it too")
+icl_an_import_in_a_block()
+    if im_can_run() then return
+
+    val said = icl_out("watch(n: int) -> int = n + 1\n",
+                       "f() -> int =\n    import uv.watch\n    watch(1)\n")
+
+    assert(said.contains("'watch' is declared by this module as 'app.watch'"), said)
+
+@test("the importing file's own file-private declaration counts")
+icl_the_files_own_private_declaration()
+    if im_can_run() then return
+
+    val said = icl_out("g() -> int = 0\n",
+                       "import uv.watch\nprivate watch(n: int) -> int = n\nf() -> int = watch(1)\n")
+
+    assert(said.contains("'watch' is declared by this module as 'app.watch'"), said)
+
+@test("a sibling file's file-private declaration does not: the importing file cannot see it")
+icl_a_siblings_private_declaration()
+    if im_can_run() then return
+
+    val said = icl_out("private struct Watch\n    n: int\n", "import uv.{Watch}\nf() -> int = Watch(4).id\n")
+
+    assert_eq(said, "4\n")
+
+@test("'as' is one way out")
+icl_as_settles_it()
+    if im_can_run() then return
+
+    val said = icl_out("struct Watch\n    n: int\n",
+                       "import uv.{Watch as UvWatch}\nf() -> int = UvWatch(3).id + Watch(4).n\n")
+
+    assert_eq(said, "7\n")
+
+@test("and the qualified path is the other")
+icl_a_path_settles_it()
+    if im_can_run() then return
+
+    val said = icl_out("struct Watch\n    n: int\n", "f() -> int = uv.Watch(3).id + Watch(5).n\n")
+
+    assert_eq(said, "8\n")
+
+@test("a wildcard still yields to the module, unchanged")
+icl_a_wildcard_yields()
+    if im_can_run() then return
+
+    val said = icl_out("struct Watch\n    n: int\nwatch(n: int) -> int = n + 1\n",
+                       "import uv.*\nf() -> int = Watch(5).n + watch(1)\n")
+
+    assert_eq(said, "7\n")
+
+@test("an import of the module's own declaration by its full path is that declaration")
+icl_the_same_declaration()
+    if im_can_run() then return
+
+    val said = icl_out("struct Watch\n    n: int\nwatch(n: int) -> int = n + 1\n",
+                       "import app.{Watch, watch}\nf() -> int = Watch(5).n + watch(1)\n")
+
+    assert_eq(said, "7\n")
+
+@test("an enum variant of the module's own is not a declaration of the spelling it is refused for")
+icl_a_variant_is_not_counted()
+    if im_can_run() then return
+
+    val said = icl_out("enum Mode\n    Tick\n    Idle\n", "import uv.{Tick}\nf() -> int = Tick(6).n\n")
+
+    assert_eq(said, "6\n")
