@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.{exists, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.testing.skip
-import sysl.text.Search
+import sysl.text.{parse_int, Search}
 
 // The coroutine dialect a clang reads, and the one thing the rewrite into it may never touch: a
 // string constant. A literal's value is its bytes, so a program printing the text of an instruction
@@ -86,15 +86,16 @@ private cde_expected() -> string =
     "\"call void @llvm.coro.end(\" and \\declare void @llvm.coro.end(\n" +
     "42\n"
 
-// What the program prints when `cc` compiles it, or why it did not run.
-private cde_outcome(cc: string) -> string
+// What the program prints when `cc` compiles it -- the default clang where there is none -- or why
+// it did not run.
+private cde_outcome(cc: Option[string]) -> string
     val root = make_temp_dir("sysl-cde").unwrap()
 
     write_text(s"$root/main.sysl", cde_program()).unwrap()
 
     val exe = s"$root/built"
 
-    build_native_program(root, None, Some(cc), DefaultOptimization, Some(exe)) match
+    build_native_program(root, None, cc, DefaultOptimization, Some(exe)) match
         Err(why) ->
             remove_dir_all(root).unwrap_or(())
             return s"it did not build: ${failure_text(why)}"
@@ -110,21 +111,98 @@ private cde_outcome(cc: string) -> string
             s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
 end cde_outcome
 
-// Runs the program through `cc`, which has to read `llvm.coro.end` in the dialect `void_end` says.
-private cde_through(cc: string, void_end: bool)
+// Runs the program through `cc`, whichever dialect the probe finds that clang reads. **It never skips
+// on the probe's answer**: a probe that answered wrongly once made the void-dialect run skip itself
+// while every async program failed under that very clang.
+private cde_through(cc: string)
     if std_root().is_err() then skip("the standard module's source is not on this machine")
     if !exists(cc) then skip(s"there is no $cc on this machine")
-    if coro_end_is_void(cc) != void_end then skip(s"$cc does not read the dialect this test is about")
 
-    assert_eq(cde_outcome(cc), cde_expected())
+    assert_eq(cde_outcome(Some(cc)), cde_expected())
 end cde_through
 
 // Apple's clang 21 reads `llvm.coro.end` as answering `i1`.
 @test("a program printing the instruction's text prints it exactly through a clang of the i1 dialect")
 cde_literals_survive_the_i1_dialect()
-    cde_through("/usr/bin/clang", false)
+    cde_through("/usr/bin/clang")
 
 // Homebrew's LLVM (22 and later) reads it as answering nothing.
 @test("a program printing the instruction's text prints it exactly through a clang of the void dialect")
 cde_literals_survive_the_void_dialect()
-    cde_through("/opt/homebrew/opt/llvm/bin/clang", true)
+    cde_through("/opt/homebrew/opt/llvm/bin/clang")
+
+@test("an async program builds and runs through the default clang")
+cde_default_clang()
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+    if !clang_available() then skip("there is no clang on the PATH")
+
+    assert_eq(cde_outcome(None), cde_expected())
+
+@test("--cc naming no clang is refused by name, and the probe of it answers without failing")
+cde_missing_clang()
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val out = cde_outcome(Some("/nonexistent/sysl-cde/clang"))
+
+    assert(out.starts_with("it did not build: "), out)
+    assert(out.contains("cannot run '/nonexistent/sysl-cde/clang'"), out)
+    assert(coro_end_is_void("/nonexistent/sysl-cde/clang"))
+end cde_missing_clang
+
+// --- the dialect, against the clang's own version --------------------------------------------------
+
+// The LLVM major version an upstream clang's `--version` names (`clang version 23.1.3`, with or without
+// a vendor in front), or nothing for Apple's clang, whose version numbers are its own, and for
+// anything that is not a clang.
+private cde_llvm_major(text: string) -> Option[int]
+    if text.starts_with("Apple") then return None
+
+    val words = "clang version "
+    val from = text.index_of(words) match
+        Some(i) -> i + words.bytes.len
+        None -> return None
+
+    var to = from
+
+    while to < text.bytes.len && text.bytes[to] >= u8('0') && text.bytes[to] <= u8('9')
+        to += 1
+
+    parse_int(text[from..<to]) match
+        Ok(n) -> Some(n)
+        Err(_) -> None
+end cde_llvm_major
+
+// `llvm.coro.end` answers nothing from LLVM 22 on.
+private cde_void_from_version(text: string) -> Option[bool] = cde_llvm_major(text).map(m -> m >= 22)
+
+@test("the dialect a clang's version string names")
+cde_dialect_from_version_strings()
+    assert_eq(cde_void_from_version("Homebrew clang version 23.1.3\nTarget: arm64-apple-darwin25.6.0\n"), Some(true))
+    assert_eq(cde_void_from_version("clang version 22.0.0 (https://github.com/llvm/llvm-project abc)\n"), Some(true))
+    assert_eq(cde_void_from_version("Ubuntu clang version 21.1.8 (1ubuntu1)\n"), Some(false))
+    assert_eq(cde_void_from_version("Debian clang version 18.1.3\n"), Some(false))
+    assert_eq(cde_void_from_version("Apple clang version 21.0.0 (clang-2100.3.34.2)\n"), None)
+    assert_eq(cde_void_from_version("gcc (Homebrew GCC 15.2.0) 15.2.0\n"), None)
+    assert_eq(cde_void_from_version("clang version \n"), None)
+end cde_dialect_from_version_strings
+
+// The probe's answer for every upstream clang this machine has, against the version that clang names.
+// Homebrew's clang 23 crashed on the probe when it was compiled to an object, and the crash read as
+// the `i1` dialect.
+@test("the probe answers the dialect each upstream clang's own version names")
+cde_probe_agrees_with_the_version()
+    var checked = 0
+
+    for cc in ["clang", "/opt/homebrew/opt/llvm/bin/clang", "/usr/local/opt/llvm/bin/clang"]
+        val said = capture(cc, ["--version"], "", [], true) match
+            Ok(out) -> if out.status.ok() then out.text else ""
+            Err(_) -> ""
+
+        cde_void_from_version(said) match
+            Some(void_end) ->
+                assert_eq(coro_end_is_void(cc), void_end, cc)
+                checked += 1
+            None -> ()
+
+    if checked == 0 then skip("there is no upstream clang on this machine")
+end cde_probe_agrees_with_the_version
