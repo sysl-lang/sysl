@@ -826,7 +826,7 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
     rty match
         // A parameter standing in for itself: the call is checked against the *trait's* signature,
         // which is what lets one walk stand in for every instantiation.
-        Abstract(_, bounds) -> call_bound_method(cx, span, receiver, rty, name, bounds, args)
+        Abstract(_, bounds) -> call_bound_method(cx, span, receiver, rty, name, bounds, args, targs)
         // A trait object has forgotten which type it holds, and what it wrote down in its place is
         // the table -- so a call on one is an index into that table rather than a name.
         Trait(_, _, _) -> call_erased(cx, span, receiver, rty, name, args, expected)
@@ -1959,9 +1959,14 @@ method_written(cx: &Analyzer, recv: Expr, name: string) -> bool
     val t = sandboxed_arg(cx, recv, None)
     val rty = receiver_type(texpr_type(t))
 
+    // **A type parameter answers through its bounds**: `o.one[int]()` on an `o: *O` of `[O: Out]`
+    // names `Out`'s method exactly as it names `Sink`'s on a `Sink`.
     rty match
         Unknown -> return false
-        Abstract(_, _) -> return false
+        Abstract(_, bounds) ->
+            val found = bound_member(cx.an, rty, bounds, name)
+
+            return found.is_some() && found.unwrap().2.recv_mode().is_some()
         Trait(_, _, _) -> return false
         Weak(_) -> return false
         _ -> ()
