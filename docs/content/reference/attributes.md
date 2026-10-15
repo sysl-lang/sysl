@@ -1867,8 +1867,11 @@ still a hint, and the inliner still decides. What is never carried across:
 
 - a function marked `@noinline`, or `@cold` without `@inline` — the call stays a call;
 - an `async` function, an interrupt handler, one placed in a `@section`, or a variadic one;
-- a function that reaches the package's module storage, which is compiled by the program anyway
-  (the package keeps no copy of it), and so needs nothing carried;
+- a function that reaches the package's own module storage, which is compiled by the program anyway
+  (the package keeps no copy of it), and so needs nothing carried. The standard module's storage is
+  not that: it is laid down once, in the standard module's archive, and every package archive and
+  program names that one object — one address, one value — so a package function reaching it, one
+  that indexes a `Buf` say, is compiled into the package's archive like any other;
 - a generic, which needs none of this: it is instantiated in the module that uses it, beside its
   callers.
 

@@ -20,11 +20,22 @@ private val_init(e: *Emit, v: TVal) -> Val
 end val_init
 
 // The storage a program's `val`s come to.
-gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
+//
+// **Storage another object defines is declared, as a precompiled function is** (`precompiled`): the
+// standard module's, laid down once in its artifact (`library.sysl`'s `std_shared_storage`). That
+// half defines it with external linkage (`TVal.shared`), so the program and every package half
+// linked with it name one object -- one address, one value written.
+gen_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string]) -> Buf[IrGlobal]
     var out: Buf[IrGlobal] = buf()
 
     for i in 0..<vals.len()
         val v = vals.at(i)
+
+        if holds_string(precompiled, v.symbol)
+            val decl = ir_extern_global(v.symbol, lty(e, v.ty), binds_locally(e))
+
+            out.push(decl with { constant = !v.writable })
+            continue
 
         val init = val_init(e, v)
 
@@ -41,7 +52,7 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
         // module's own and stays private.
         val exported = v.exported.is_some()
         val name = v.exported.unwrap_or(v.symbol)
-        val linkage = if exported then LinkDefault else LinkPrivate
+        val linkage = if exported || v.shared then LinkDefault else LinkPrivate
 
         // **A `@per_cpu` binding is the image every core's copy is made from**, so it goes in
         // `.percpu` -- data even where it is all zeros, a named section keeping it out of `.bss` --
@@ -49,7 +60,8 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
         val section = if v.per_cpu then Some(per_cpu_section()) else v.section
 
         out.push(IrGlobal(name, !(v.computed || v.writable), lty(e, v.ty), Some(init),
-                          linkage, section, align, v.thread_local, exported && binds_locally(e),
+                          linkage, section, align, v.thread_local,
+                          (exported || v.shared) && binds_locally(e),
                           v.export_hidden))
 
     out

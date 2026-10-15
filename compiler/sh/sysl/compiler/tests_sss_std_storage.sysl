@@ -1,0 +1,107 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **The standard module's storage is laid down once, in its artifact**, and every program and package
+// half linked with it names that one object (`library.sysl`'s `std_shared_storage`). `Buf`'s shared
+// empty core is the case that made it matter: every `Buf` read reaches it, so while each program
+// carried a private copy, no function of a package that indexed a `Buf` could be precompiled.
+
+// The line laying down (or declaring) the storage whose key ends in `tail`, or "" where none does.
+private sss_storage_line(text: string, tail: string) -> string
+    for line in lines_of(text)
+        if line.starts_with("@") && line.index_of(s"$tail = ").is_some() then return line
+
+    ""
+end sss_storage_line
+
+private sss_any_ending(names: Buf[string], tail: string) -> bool
+    for item in names
+        if item.ends_with(tail) then return true
+
+    false
+end sss_any_ending
+
+// The half for a machine named, its line for `Buf`'s empty core and what it advertises.
+private sss_half_for(name: string) -> Option[LibraryHalf]
+    if std_root().is_err() then return None
+
+    std_library_half(target_named(name).unwrap()) match
+        Err(why) ->
+            assert(false, s"the standard module did not build for $name: $why")
+            None
+        Ok(h) -> Some(h)
+end sss_half_for
+
+@test("the standard module's storage is laid down once, in its artifact, with a symbol the linker sees, and advertised")
+sss_std_storage_is_defined_in_the_artifact()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val line = sss_storage_line(half.text, "buf$NoCore")
+
+    assert(line != "", "the half lays down Buf's empty core")
+    assert(line.index_of(" global ").is_some(), line)
+    assert(line.index_of("private").is_none() && line.index_of("internal").is_none(), line)
+    assert(line.index_of("external").is_none(), s"it is defined, not declared: $line")
+    assert(sss_any_ending(half.advertised, "buf$NoCore"), "and advertised")
+end sss_std_storage_is_defined_in_the_artifact
+
+@test("a function of the standard module that writes its storage is compiled in the artifact, not left to each program")
+sss_a_storage_writer_is_precompiled()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert(sss_any_ending(half.advertised, "log$set_level"), "log.set_level is advertised")
+    assert(sss_any_ending(sta_defines(half.text), "log$set_level"), "and defined by the half")
+end sss_a_storage_writer_is_precompiled
+
+@test("a program linking the artifact declares the standard module's storage, and one compiled from source lays its own copy down")
+sss_a_program_declares_std_storage()
+    val src = "import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(4)\nprint(b.at(0))\nprint(b.len())\n"
+
+    val linked = sta_emit(src, false) match
+        None -> return
+        Some(t) -> t
+
+    val line = sss_storage_line(linked, "buf$NoCore")
+
+    assert(line.index_of("= external global").is_some() || line.index_of("= external dso_local global").is_some(),
+           s"declared, as a precompiled function is: '$line'")
+
+    val alone = sta_emit(src, true) match
+        None -> return
+        Some(t) -> t
+
+    val own = sss_storage_line(alone, "buf$NoCore")
+
+    assert(own.index_of("= private global").is_some(), s"a program with no artifact keeps its copy: '$own'")
+end sss_a_program_declares_std_storage
+
+@test("a bare machine's half defines the storage bound locally, as it does a function")
+sss_a_bare_half_defines_std_storage_locally()
+    val half = sss_half_for("thumbv7em-freestanding") match
+        None -> return
+        Some(h) -> h
+
+    val line = sss_storage_line(half.text, "buf$NoCore")
+
+    assert(line.index_of("dso_local").is_some() && line.index_of("private").is_none(), line)
+    assert(sss_any_ending(half.advertised, "buf$NoCore"), "and advertises it")
+end sss_a_bare_half_defines_std_storage_locally
+
+@test("so does wasm's")
+sss_a_wasm_half_defines_std_storage()
+    val half = sss_half_for("wasm32-freestanding") match
+        None -> return
+        Some(h) -> h
+
+    val line = sss_storage_line(half.text, "buf$NoCore")
+
+    assert(line != "" && line.index_of("private").is_none() && line.index_of("external").is_none(), line)
+    assert(sss_any_ending(half.advertised, "buf$NoCore"), "and advertises it")
+end sss_a_wasm_half_defines_std_storage
