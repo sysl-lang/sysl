@@ -424,7 +424,7 @@ rtc_nested_roots_compile_from_source()
     rtc_end(dirs, [outer, app])
 end rtc_nested_roots_compile_from_source
 
-@test("a generic and a function reaching module storage are compiled by the program, never taken from the entry")
+@test("a generic and a function reaching computed module storage are compiled by the program, never taken from the entry; one reaching a constant table is the entry's")
 rtc_generics_and_storage_are_compiled_per_consumer()
     if !lbr_ready() then return
 
@@ -435,16 +435,21 @@ rtc_generics_and_storage_are_compiled_per_consumer()
         "private squares(n: int) -> Buf[int]\n    var out: Buf[int] = buf()\n\n" +
         "    for i in 0..<n\n        out.push(i * i)\n\n    out\nend squares\n\n" +
         "lookup(i: usize) -> int = table.at(i)\n\n" +
+        "private val cubes: [4]int = [0, 1, 8, 27]\n\n" +
+        "cube(i: usize) -> int = cubes[i]\n\n" +
         "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n\n" +
         "double(n: int) -> int = n * 2\n"))
-    val app = lbr_program("print(geom.lookup(3))\nprint(geom.larger(4, 9))\nprint(geom.double(8))\n")
+    val app = lbr_program("print(geom.lookup(3))\nprint(geom.larger(4, 9))\nprint(geom.double(8))\n" +
+        "print(geom.cube(3))\n")
 
-    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "9\n9\n16\n")
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "9\n9\n16\n27\n")
 
     val said = rtc_advertised(dirs.1)
 
     assert(holds_string(said, "geom$double"), "the determined function is advertised")
-    assert(!holds_string(said, "geom$lookup"), "a function reading module storage is not")
+    assert(!holds_string(said, "geom$lookup"), "a function reading computed module storage is not")
+    assert(holds_string(said, "geom$cube"), "one reading a constant table is")
+    assert(holds_string(said, "geom$cubes"), "and so is the table")
 
     for item in said
         assert(!item.contains("larger"), s"no instantiation of a generic: ${item}")
@@ -461,6 +466,7 @@ rtc_generics_and_storage_are_compiled_per_consumer()
     assert(rtc_line(text, "define ", "larger"), "the program defines the generic's instantiation")
     assert(rtc_line(text, "declare ", "geom$double"), "the program declares the kept function")
     assert(!rtc_line(text, "define ", "geom$double"), "and does not define it")
+    assert(rtc_line(text, "declare ", "geom$cube"), "nor the one reading a constant table")
     rtc_end(dirs, [geom, app])
 end rtc_generics_and_storage_are_compiled_per_consumer
 
@@ -557,6 +563,30 @@ sss_a_root_and_the_program_share_std_storage()
     assert(holds_string(said, "geom$where"), "and so is the one taking the address")
     rtc_end(dirs, [geom, app])
 end sss_a_root_and_the_program_share_std_storage
+
+// **And a root's own storage is one copy too**: its half lays it down and advertises it, and the
+// program declares it, so what the precompiled half writes the program reads at the same address.
+@test("a root half and the program share the root's own storage: one value, one address")
+sss_a_root_and_the_program_share_its_storage()
+    if !lbr_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = lbr_tree(lbr_one("geom/geom.sysl",
+        "module geom\n\nvar hits: int = 0\n\n" +
+        "bump()\n    hits += 1\n\n" +
+        "where() -> usize = usize(&hits)\n"))
+    val app = lbr_program("geom.bump()\ngeom.bump()\nprint(geom.hits)\ngeom.hits += 1\ngeom.bump()\n" +
+        "print(geom.hits)\nprint(geom.where() == usize(&geom.hits))\n")
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "2\n4\ntrue\n")
+
+    val said = rtc_advertised(dirs.1)
+
+    assert(holds_string(said, "geom$hits"), "the storage is the half's")
+    assert(holds_string(said, "geom$bump"), "the writer is precompiled")
+    assert(holds_string(said, "geom$where"), "and so is the one taking the address")
+    rtc_end(dirs, [geom, app])
+end sss_a_root_and_the_program_share_its_storage
 
 // -- a damaged entry ----------------------------------------------------------------------------
 

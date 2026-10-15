@@ -129,7 +129,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
 
     // What a test body made would still be dropped here, had anything been left to make it.
     val whole = strip_tests(checked)
-    val shared = std_shared_storage(done.an, whole.vals)
+    val shared = shared_storage(done.an, whole.vals, own)
     var defers = storage_reaching(whole, shared)
 
     if entries_left
@@ -181,12 +181,13 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
             // collision for them to have.
             determined.push(f.name)
 
-    // **The standard module's storage is defined once, in its own artifact**, and named everywhere
-    // else: the standard module's half lays its own down with external linkage and advertises it, and
-    // a package's half declares it as it declares a precompiled function. Copied privately into each
-    // object instead, a package half and the program it links into would each have had one -- two
-    // `Buf` empty cores, two harness counters -- which is why a function reaching it used to be
-    // deferred, and with it every package function that so much as indexed a `Buf`.
+    // **A library's constant storage is defined once, in its own half**, and named everywhere else:
+    // the half lays its own down with external linkage and advertises it, a package's half declares
+    // the standard module's as it declares a precompiled function, and a program declares whatever a
+    // half it links advertises. Copied privately into each object instead, a half and the program it
+    // links into would each have had one -- two `Buf` empty cores, two harness counters, two of a
+    // package's own tables -- which is why a function reaching any of it used to be deferred, and
+    // with it every package function that so much as indexed a `Buf` or read a lookup table.
     var vals: Buf[TVal] = buf()
 
     for v in whole.vals
@@ -205,15 +206,18 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
                  foreign)
 end library_build_of
 
-// The standard module's storage that is laid down once, in its artifact, rather than copied into
-// every object that names it: what the object file carries as an image and nothing has to fill.
+// The storage a library build lays down once or names from the artifact that does, rather than
+// leaving every function reaching it to the program: what the object file carries as an image and
+// nothing has to fill, declared by this library (`own`) or by the standard module.
 //
 // **What is left out keeps its copy**, and each for a reason of its own: storage filled at run time
 // is filled by the program's entry point, which a library has none of; `@thread_local`, `@per_cpu`
-// and `@main_thread` storage is reached through machinery the program sets up; and exported or
-// placed storage is already a symbol of the program's own, under a name or in a section somebody
-// chose.
-std_shared_storage(a: &Analysis, vals: Buf[TVal]) -> Set[string]
+// and `@main_thread` storage is reached through machinery the program sets up; exported or placed
+// storage is already a symbol of the program's own, under a name or in a section somebody chose; and
+// another package's storage is laid down by that package's half only where it has one -- a root
+// compiled from source keeps its storage private to the program -- so a function reaching it is
+// still the program's to compile.
+shared_storage(a: &Analysis, vals: Buf[TVal], own: Buf[string]) -> Set[string]
     var out: Set[string] = set()
 
     for v in vals
@@ -223,11 +227,13 @@ std_shared_storage(a: &Analysis, vals: Buf[TVal]) -> Set[string]
         if !image then continue
 
         a.tables.vals.get(v.symbol) match
-            Some(d) -> if d.scope.src.name.starts_with(s"$StdPrefix/") then out.add(v.symbol)
+            Some(d) ->
+                if d.scope.src.name.starts_with(s"$StdPrefix/") || holds_string(own, d.scope.module_name)
+                    out.add(v.symbol)
             None -> ()
 
     out
-end std_shared_storage
+end shared_storage
 
 // Whether a library build declared this storage itself, rather than reaching it in another.
 private storage_owned(a: &Analysis, symbol: string, own: Buf[string]) -> bool =
