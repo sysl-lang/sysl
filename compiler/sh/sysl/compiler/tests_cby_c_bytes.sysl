@@ -1,0 +1,137 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_bytes, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **C source is bytes.** A vendored library's copyright comment may be Latin-1 (u8g2's is), and
+// clang reads it without complaint; the compiler has to hash and carry such a file rather than
+// refuse it as text. Each case below puts one 0xFF byte -- never valid UTF-8 -- into a `.c` and a
+// `.h`, and every command that reads carried C has to get past it.
+
+private cby_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The text with a Latin-1 comment in front of it: the bytes of `"/* caf"`, 0xE9 (`é`), 0xFF, `" */\n"`,
+// then the rest.
+private cby_latin1(rest: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    val head = "/* caf"
+    val tail = " */\n"
+
+    for i in 0..<head.bytes.len
+        out.push(head.bytes[i])
+
+    out.push(0xE9)
+    out.push(0xFF)
+
+    for i in 0..<tail.bytes.len
+        out.push(tail.bytes[i])
+
+    for i in 0..<rest.bytes.len
+        out.push(rest.bytes[i])
+
+    out
+end cby_latin1
+
+private cby_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end cby_run
+
+// A package `cby` whose module carries `cby.c` and `cby.h`, both holding a non-UTF-8 byte, plus a
+// `main.sysl` and a test that call into the C.
+private cby_package(with_main: bool = true) -> string
+    val root = absolute_path(make_temp_dir("sysl-cby-").unwrap())
+
+    make_dir_all(s"$root/cby").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"cby\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/cby/cby.sysl",
+               "module cby\n\nextern \"cby_half\" half(n: int) -> int\n\ntwice(n: int) -> int = half(n) * 4\n")
+        .unwrap()
+    write_bytes(s"$root/cby/cby.h", cby_latin1("long cby_half(long n);\n").view()).unwrap()
+    write_bytes(s"$root/cby/cby.c",
+                cby_latin1("#include \"cby.h\"\nlong cby_half(long n) { return n / 2; }\n").view()).unwrap()
+    if with_main
+        write_text(s"$root/main.sysl",
+                   "@export(\"cby_twice\")\ncby_twice(n: int) -> int = cby.twice(n)\n\n" +
+                   "@test\nhalf_of_ten()\n    assert_eq(cby.half(10), 5)\n").unwrap()
+
+    root
+end cby_package
+
+@test("build-lib accepts carried C and headers that are not UTF-8")
+cby_build_lib_reads_latin1_c()
+    if !cby_ready() then return
+
+    val root = cby_package(false)
+    val got = cby_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+end cby_build_lib_reads_latin1_c
+
+@test("build-c accepts carried C and headers that are not UTF-8")
+cby_build_c_reads_latin1_c()
+    if !cby_ready() then return
+
+    val root = cby_package()
+    val got = cby_run(["sysl", "build-c", "-o", s"$root/out.a", root])
+
+    reset_search_paths()
+    assert_eq(got.0, Fine, got.1)
+    remove_dir_all(root).unwrap_or(())
+end cby_build_c_reads_latin1_c
+
+@test("test runs a package whose carried C and headers are not UTF-8, and the run cache keys it")
+cby_test_reads_latin1_c()
+    if !cby_ready() then return
+
+    val root = cby_package()
+    val got = cby_run(["sysl", "test", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(!got.1.contains("cannot read"), got.1)
+    remove_dir_all(root).unwrap_or(())
+end cby_test_reads_latin1_c
+
+@test("the fingerprint of a library tells two non-UTF-8 C files apart")
+cby_fingerprint_sees_every_byte()
+    if !cby_ready() then return
+
+    val root = cby_package()
+    val here = host_target()
+    val before = std_fingerprint(root, here).unwrap()
+
+    write_bytes(s"$root/cby/cby.c",
+                cby_latin1("#include \"cby.h\"\nlong cby_half(long n) { return n / 4; }\n").view()).unwrap()
+
+    assert(std_fingerprint(root, here).unwrap() != before, "an edit to the C did not move the fingerprint")
+    remove_dir_all(root).unwrap_or(())
+end cby_fingerprint_sees_every_byte
+
+// The error path: a file that cannot be read says why, with its path, instead of a bare "cannot read".
+@test("a carried C file that cannot be read is refused with its path and the reason")
+cby_unreadable_c_names_its_reason()
+    if !cby_ready() then return
+
+    val root = cby_package()
+
+    capture("chmod", ["000", s"$root/cby/cby.c"]) match
+        Err(_) -> return
+        Ok(_) -> ()
+
+    std_files(root, host_target()) match
+        Ok(_) -> () // running as a user who can read a mode-000 file: nothing to refuse
+        Err(why) ->
+            assert(why.starts_with(s"cannot read '$root/cby/cby.c': "), why)
+            assert(why.bytes.len > s"cannot read '$root/cby/cby.c': ".bytes.len, why)
+
+    capture("chmod", ["644", s"$root/cby/cby.c"]).is_ok()
+    remove_dir_all(root).unwrap_or(())
+end cby_unreadable_c_names_its_reason
