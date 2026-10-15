@@ -32,11 +32,19 @@ import sysl.text.{Search, StrBuilder, str_builder, from_utf8_unchecked, replace_
 // to survive. `chosen` is whether any branch of the group has been taken yet, which is what an
 // `#elif` and an `#else` consult. `else_line` is where this group's `#else` is, or `0` for a group
 // that has not reached one.
+//
+// `in_block` marks a group opened inside a text block, which has to close inside it too. `text` marks
+// a group of the text's own -- a C `#if LIMIT > 2` or `#ifdef` and the lines down to its `#endif`,
+// directive-shaped or not, which are all the block's text. It selects nothing: its `taken` is the
+// enclosing one's, and it is on the stack only so that its own `#else` and `#endif` are known to be
+// its own.
 private struct Frame
     line: usize
     taken: bool
     chosen: bool
     else_line: usize
+    in_block: bool
+    text: bool
 end Frame
 
 // The directive a line carries: the word, and the column its argument would start at.
@@ -66,15 +74,40 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     // Where the live code not yet read for literals begins (`inside_literal`).
     var scan_from: usize = 0
 
+    // The stretch of literals the last directive-shaped line was found inside: where it began, and
+    // where the code after it starts, or 0 outside every literal. A text block and a block comment can
+    // share one stretch (`*/ s = """`), so each line in it is asked which it is inside.
+    var block_from: usize = 0
+    var block_end: usize = 0
+
     for line in 1..lines
         val text = from_utf8_unchecked(src.line_text(line))
+        val start = src.line_span(line).start
 
-        // A margin line inside a text block or a block comment that opened in live code is that
-        // literal's text. An inactive branch is never read this way, since it need not even lex.
+        // Past the literal's end, a group opened inside it is one that crossed its end. The text's
+        // own groups end with it: C in a text block need not balance.
+        if block_end > 0 && start >= block_end
+            crossing(src, stack, line - 1) match
+                Some(bad) -> return Err(bad)
+                None -> ()
+
+            while stack.len() > 0 && stack.at(stack.len() - 1).in_block
+                stack.pop()
+
+            block_end = 0
+
+        // A margin line inside a literal that opened in live code is asked whether it is sysl's. In a
+        // block comment none is; in a text block a condition sysl can read gates, and everything
+        // else is the block's text (`in_text_block`). An inactive branch is never read this way,
+        // since it need not even lex.
         val found = directive_of(text) match
             Some(d) ->
-                if all_taken(stack) && inside_literal(src, &scan_from, src.line_span(line).start) then None
-                else Some(d)
+                if block_end == 0 && all_taken(stack) && inside_literal(src, &scan_from, &block_from, start)
+                    block_end = scan_from
+
+                if block_end == 0 then Some(d)
+                elif literal_reach_text(src, block_from, start).1 && in_text_block(d, text, line, &stack, on) then Some(d)
+                else None
             None -> None
 
         found match
@@ -90,8 +123,9 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
                 touched = true
                 keep.push(false)
 
-                // A directive line is not code, so live code starts again on the line after it.
-                scan_from = src.line_span(line + 1).start
+                // A directive line is not code, so live code starts again on the line after it --
+                // unless it is inside a text block, which goes on past it.
+                if block_end == 0 then scan_from = src.line_span(line + 1).start
 
                 val word = d.word
 
@@ -101,7 +135,7 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
 
                     if all_taken(stack) && value then taken = true
 
-                    stack.push(Frame(line, taken, value, 0))
+                    stack.push(Frame(line, taken, value, 0, block_end > 0, false))
                 elif word == "elif"
                     if stack.len() == 0
                         return Err(fail_at(src, line, 1,
@@ -121,7 +155,8 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
                     // however its own condition reads.
                     if outer_taken(stack) && !top.chosen && value then taken = true
 
-                    stack.set(stack.len() - 1, Frame(top.line, taken, top.chosen || value, top.else_line))
+                    stack.set(stack.len() - 1, Frame(top.line, taken, top.chosen || value, top.else_line,
+                        top.in_block, false))
                 elif word == "else"
                     trailing(src, line, text, d.at, word) match
                         Some(bad) -> return Err(bad)
@@ -141,7 +176,7 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
 
                     if outer_taken(stack) && !top.chosen then taken = true
 
-                    stack.set(stack.len() - 1, Frame(top.line, taken, true, line))
+                    stack.set(stack.len() - 1, Frame(top.line, taken, true, line, top.in_block, false))
                 elif word == "endif"
                     trailing(src, line, text, d.at, word) match
                         Some(bad) -> return Err(bad)
@@ -158,6 +193,14 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     // has to go and look at: an unterminated group is a missing `#endif`, and with several groups
     // open the end of the file says nothing about which one is missing it. The outermost is named
     // because it is the one whose `#endif` would have to come last.
+    if block_end > 0
+        crossing(src, stack, lines) match
+            Some(bad) -> return Err(bad)
+            None -> ()
+
+        while stack.len() > 0 && stack.at(stack.len() - 1).in_block
+            stack.pop()
+
     if stack.len() > 0
         return Err(fail_at(src, stack.at(0).line, 1, "this '#if' is never closed — add an '#endif'"))
 
@@ -172,16 +215,66 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     Ok(source_of(src.name, out.finish()))
 end gate
 
-// Whether the line starting at `start` is inside a text block or a block comment that opened in the
-// live code before it. The code from `scan_from` on is read with the lexer's own scans
+// Whether the line starting at `start` is inside a literal -- a text block or a block comment -- that
+// opened in the live code before it. The code from `scan_from` on is read with the lexer's own scans
 // (`literal_reach`), a line's reach at a time, so a file with no directive reads nothing twice and a
-// file with some reads only its live stretches.
-private inside_literal(src: Source, scan_from: *usize, start: usize) -> bool
+// file with some reads only its live stretches. Where the answer is yes, `scan_from` is left at the
+// code after the reach and `reach_start` where the reach began, which is where a line in it is asked
+// which of its literals it is inside (`literal_reach_text`).
+private inside_literal(src: Source, scan_from: *usize, reach_start: *usize, start: usize) -> bool
     while *scan_from < start
+        *reach_start = *scan_from
         *scan_from = literal_reach(src, *scan_from) + 1
 
     *scan_from > start
 end inside_literal
+
+// Whether a directive-shaped line inside a text block is sysl's -- and where it is the text's own,
+// what it opens or closes among the text's groups.
+//
+// **A condition sysl can read, over symbols sysl knows, gates; everything else is the text's.** The
+// test is the live-code reading itself: `#if feature_http2` and `#if posix` gate, and `#if LIMIT > 2`,
+// `#if defined(X)` and `#if NDEBUG` are C. A `feature_` name is read as it is in live code, where a
+// feature the manifest does not declare is false rather than refused -- so a misspelled one gates its
+// lines out, exactly as it would outside the block, instead of passing through as text. Every other
+// directive word -- `#ifdef`, `#define`, `#include` -- is text, and a text `#if` or `#ifdef` opens a
+// group of the text's own whose `#elif`, `#else` and `#endif` are text too, so a C conditional stays
+// whole inside a sysl group or around one. An `#elif`, `#else` or `#endif` is sysl's only where the
+// innermost group open is a sysl group opened in this block.
+private in_text_block(d: Directive, text: string, line: usize, stack: *Buf[Frame], on: Buf[string]) -> bool
+    val word = d.word
+    val n = stack.len()
+    val ours = n > 0 && stack.at(n - 1).in_block
+    val texts = ours && stack.at(n - 1).text
+
+    if word == "if"
+        if read_condition(argument(text, d.at), d.at, "#if", on, symbols(), true).is_ok() then return true
+
+        stack.push(Frame(line, all_taken(*stack), true, 0, true, true))
+        return false
+
+    if word == "ifdef" || word == "ifndef"
+        stack.push(Frame(line, all_taken(*stack), true, 0, true, true))
+        return false
+
+    if word == "elif" || word == "else" || word == "endif"
+        if ours && !texts then return true
+        if word == "endif" && texts then stack.pop()
+
+    false
+end in_text_block
+
+// A sysl group opened inside the text block that ends on line `closing` and is still open after it.
+// The group is reported at its `#if`, with the block's last line named: gating a block's lines is
+// something the block does, and a group reaching past it would gate code with the text's directives.
+private crossing(src: Source, stack: Buf[Frame], closing: usize) -> Option[Diagnostic]
+    for item in stack
+        if item.in_block && !item.text
+            return Some(fail_at(src, item.line, 1,
+                s"this '#if' opens a group inside the text block that ends on line $closing, and the group has to close inside the block — add its '#endif' before line $closing"))
+
+    None
+end crossing
 
 // Every symbol a condition may name, whatever the target.
 //

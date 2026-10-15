@@ -3930,12 +3930,39 @@ finds that is a build for each target — a thing to *run*, not a thing to desig
 conditions themselves are the part that is checked everywhere, and they are the part where a mistake
 would otherwise be silent.
 
-**A margin line inside a text block or a block comment is the literal's text, not a directive.** A
-text block carrying C — a header to compile, a template — has its `#define`, `#if` and `#include` at
-column 1, and they belong to the string. The gate asks the lexer itself where a literal opened in live
-code ends, with the same scans a token is read with, so there is one set of rules about strings and
-comments rather than two that could drift. A branch not taken is not read this way, since it need not
-lex at all — a text block that opens inside one does not hide the `#endif` that closes it.
+**Inside a text block, a condition sysl can read gates the block's lines, and every other margin
+line is the block's text.** A text block carrying C — a header to compile, a template — has its
+`#define`, `#if` and `#include` at column 1, and they belong to the string; a text block a program
+assembles may also want some of its lines only on some machines, or only with a feature on. The two
+are told apart by the condition: an `#if` or `#elif` whose condition reads as sysl's, over the
+symbols a condition may name here — the target's and the package's `feature_` ones — gates exactly
+as it does in live code, down to its own `#else` and `#endif`. Anything else is text: `#define`,
+`#include`, `#ifdef`, `#pragma` and every other word, an `#if` whose condition is not sysl's
+(`#if LIMIT > 2`, `#if defined(X)`, `#if NDEBUG`), and that `#if`'s own `#elif`, `#else` and
+`#endif`, so a C conditional stays whole with a sysl group around it or inside it.
+
+```sysl
+import sysl.text.Search
+
+val header = raw"""
+    #include <stddef.h>
+#if posix
+    #include <unistd.h>
+#else
+    #include <windows.h>
+#endif
+    """
+
+print(header.contains("<unistd.h>"), header.contains("<windows.h>"), header.starts_with("#include"))
+```
+
+```output
+true false true
+```
+
+The directive lines go as they do everywhere, leaving blank lines, and the block's incidental
+indentation is reckoned from what is left — the gated text, not the text as written. A condition
+over a C macro is the block's text whatever else is around it:
 
 ```sysl
 import sysl.text.Search
@@ -3953,11 +3980,49 @@ val kind = "posix"
 val kind = "other"
 #endif
 
-print(kind, header.contains("#define LIMIT 4"))
+print(kind, header.contains("#if LIMIT > 2\n#include <stdio.h>\n#endif"))
 ```
 
 ```output
 posix true
+```
+
+**`#if posix` in a block of C gates**, since `posix` is a symbol sysl knows; a C header that means
+its own macro of that name writes it as `#ifdef posix`, which is text. A `feature_` name the manifest
+does not declare is false, as it is in live code, so a misspelled one gates its lines out rather than
+passing into the text. **A group opened inside a text block closes inside it**: one whose `#endif`
+is below the block's closing delimiter is refused at its `#if`, naming the line the block ends on.
+
+```sysl
+val s = raw"""
+#if posix
+    on a posix machine
+    """
+#endif
+```
+
+```error
+this '#if' opens a group inside the text block that ends on line 4, and the group has to close inside the block — add its '#endif' before line 4
+```
+
+**A block comment is all text.** Nothing reads a comment's lines, so there is nothing for a condition
+in one to gate, and a C fragment quoted in a comment stays as written. The gate asks the lexer itself
+where a literal opened in live code ends, and which kind it is, with the same scans a token is read
+with, so there is one set of rules about strings and comments rather than two that could drift. A
+branch not taken is not read this way, since it need not lex at all — a text block that opens inside
+one does not hide the `#endif` that closes it.
+
+```sysl
+/*
+#if windows
+The quoted condition is the comment's, and so is the '#endif' below it.
+#endif
+*/
+print("a comment's lines are its own")
+```
+
+```output
+a comment's lines are its own
 ```
 
 ### The library is subject to it too
