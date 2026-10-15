@@ -39,7 +39,7 @@ private no_alloc_here(a: &Analysis, reach: Option[Set[string]], scope: Scope, mo
     if machine_has_no_heap(a) && !from_library(a, scope) && reached_module(reach, scope.module_name)
         return true
 
-    if scaffolding then return module_tests_narrowed(a, module_name, CapHeap)
+    if scaffolding then return module_tests_narrowed(a, tests_key(a, module_name, scope), CapHeap)
 
     module_narrowed(a, module_name, CapHeap)
 end no_alloc_here
@@ -52,11 +52,13 @@ private machine_has_no_heap(a: &Analysis) -> bool = a.tables.target.lacks_capabi
 // "declared 'no alloc'" when no file of it says any such thing would go looking for a clause that is
 // not there. Where the machine is what has no allocator, the thing to change is the config or the
 // target, and the message points there instead.
-private because(a: &Analysis, module_name: string, scaffolding: bool) -> string
-    if scaffolding && module_tests_own_narrowing(a, module_name, CapHeap) then
-        return "this module's '@tests' file declared '@no_alloc'"
+private because(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> string
+    val key = tests_key(a, module_name, scope)
 
-    val declared = if scaffolding then module_tests_narrowed(a, module_name, CapHeap)
+    if scaffolding && module_tests_own_narrowing(a, key, CapHeap) then
+        return s"this module's '@tests' file ${tests_file_named(scope)} declared '@no_alloc'"
+
+    val declared = if scaffolding then module_tests_narrowed(a, key, CapHeap)
     else module_narrowed(a, module_name, CapHeap)
 
     if declared then return "this module declared '@no_alloc'"
@@ -170,9 +172,9 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // scaffolding file read as the module's own and was held to a narrowing its `@tests` file had
         // taken back.
         //
-        // **A `@test` or a hook is scaffolding wherever it is written**, so one beside what it tests
-        // answers to the tests' clause as the `@tests` file beside it does, rather than putting a
-        // seam through the middle of one module's tests.
+        // **A `@test` or a hook is scaffolding wherever it is written**, so one beside what it tests is
+        // never held to the allocator by inheritance; it answers to the module's other clauses, as the
+        // code it tests does (`tests_key`).
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
         held_to(a, reach, scope, module_name, scaffolding, f, made) match
@@ -223,7 +225,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         if !no_alloc_here(a, reach, scope, module_name, scaffolding) then continue
 
-        val why = because(a, module_name, scaffolding)
+        val why = because(a, scope, module_name, scaffolding)
         val held = Promised(why, None, made, false)
         val skip: &Skipped = Skipped(buf())
         val said: &Counted = Counted(0)
@@ -258,7 +260,7 @@ struct Promised
 private held_to(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
                 scaffolding: bool, f: TFunc, made: Buf[(string, string)]) -> Option[Promised]
     if no_alloc_here(a, reach, scope, module_name, scaffolding) then
-        return Some(Promised(because(a, module_name, scaffolding), None, made, false))
+        return Some(Promised(because(a, scope, module_name, scaffolding), None, made, false))
 
     if !f.marks.gives_up(NoAllocWord) then return None
 

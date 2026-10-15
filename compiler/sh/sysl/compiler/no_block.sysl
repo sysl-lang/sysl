@@ -47,7 +47,7 @@ check_no_block(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val module_name = if copied then scope.module_name else module_of(f.name)
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        block_held_to(module_name, scaffolding, a, f) match
+        block_held_to(scope, module_name, scaffolding, a, f) match
             Some(held) -> blame_block(a, walk, scope, f.body, held)
             None -> ()
 
@@ -59,7 +59,7 @@ check_no_block(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         named.name = abstract_key(a, f)
 
-        block_held_to(scope.module_name, test_only_file(a, scope.src.name), a, named) match
+        block_held_to(scope, scope.module_name, test_only_file(a, scope.src.name), a, named) match
             Some(held) -> blame_block(a, walk, scope, f.body, held)
             None -> ()
 
@@ -76,12 +76,12 @@ check_no_block(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         val module_name = module_of(v.symbol)
         val scaffolding = holds_string(a.tables.test_only, v.symbol)
-
-        if !module_no_block(a, module_name, scaffolding) then continue
-
-        val held = Promised(module_block_why(a, module_name, scaffolding), None, buf(), true)
-        val said: &Counted = Counted(0)
         val scope = val_home(a, v.symbol)
+
+        if !module_no_block(a, scope, module_name, scaffolding) then continue
+
+        val held = Promised(module_block_why(a, scope, module_name, scaffolding), None, buf(), true)
+        val said: &Counted = Counted(0)
 
         walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
                                           w -> blame_write(a, walk, scope, w, held, said), st -> ()))
@@ -129,10 +129,10 @@ end blocking_seeds
 
 // The promise one body answers to, or nothing where it made none -- the module's first, as
 // `no_alloc.sysl`'s `held_to` reads it.
-private block_held_to(module_name: string, scaffolding: bool, a: &Analysis,
+private block_held_to(scope: Scope, module_name: string, scaffolding: bool, a: &Analysis,
                       f: TFunc) -> Option[Promised]
-    if module_no_block(a, module_name, scaffolding) then
-        return Some(Promised(module_block_why(a, module_name, scaffolding), None, buf(), true))
+    if module_no_block(a, scope, module_name, scaffolding) then
+        return Some(Promised(module_block_why(a, scope, module_name, scaffolding), None, buf(), true))
 
     if !f.marks.gives_up(NoBlockWord) then return None
 
@@ -141,12 +141,12 @@ end block_held_to
 
 // Whether a module promised not to block, and the same asked of what its tests may do -- a `@tests`
 // file takes the promise back by writing nothing that keeps it, exactly as with `@no_alloc`.
-private module_no_block(a: &Analysis, module_name: string, scaffolding: bool) -> bool =
-    if scaffolding then module_tests_narrowed(a, module_name, CapBlock)
+private module_no_block(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> bool =
+    if scaffolding then module_tests_narrowed(a, tests_key(a, module_name, scope), CapBlock)
     else module_narrowed(a, module_name, CapBlock)
 
-private module_block_why(a: &Analysis, module_name: string, scaffolding: bool) -> string
-    if scaffolding && module_tests_own_narrowing(a, module_name, CapBlock) then
-        return "this module's '@tests' file declared '@no_block'"
+private module_block_why(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> string
+    if scaffolding && module_tests_own_narrowing(a, tests_key(a, module_name, scope), CapBlock) then
+        return s"this module's '@tests' file ${tests_file_named(scope)} declared '@no_block'"
 
     "this module declared '@no_block'"

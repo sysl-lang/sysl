@@ -799,14 +799,28 @@ A `@tests` file may still hold itself to the allocator with a `@no_alloc` of its
 about its own line, since that is the line to go and read:
 
 ```text
-error: a reference needs an allocator, and this module's '@tests' file declared '@no_alloc' — it may
+error: a reference needs an allocator, and this module's '@tests' file tests.sysl declared '@no_alloc' — it may
 hold and release storage made elsewhere, and may make none of its own
 ```
 
-**A test is scaffolding wherever it is written.** A `@test` function written beside what it tests, in
-an ordinary file, answers to the `@tests` file's clause too — the alternative puts a seam through the
-middle of one module's tests. And a module's `@tests` files are held to agreeing with **each other**,
-for the reason its shipping files are: a module has one answer to what its tests may do.
+**Each `@tests` file states what its own bodies need, and nothing more.** Its clause binds the
+declarations and tests written in it, so a module's `@tests` files are not held to agreeing: one that
+renders vectors writes `@requires(heap)`, a sibling that does not need the allocator writes nothing,
+and neither repeats the other's needs. A body breaking its own file's clause is refused naming that
+file:
+
+```text
+error: a reference needs an allocator, and this module's '@tests' file t2.sysl declared '@no_alloc' — it may
+hold and release storage made elsewhere, and may make none of its own
+```
+
+**A `@test` written beside what it tests answers to the module's own clause**, as the code it tests
+does — less the allocator, which no test is held to by inheritance. A `@tests` file's `@requires`
+takes nothing back for it:
+
+```text
+error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
+```
 
 **Only the module's half of the two-level rule moves.** A `@tests` file may take back a promise the
 module made about what ships; it cannot take back a facility the machine does not have. On a target

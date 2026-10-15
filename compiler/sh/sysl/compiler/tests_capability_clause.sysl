@@ -452,7 +452,7 @@ cap_ta_a_tests_file_that_narrows_on_its_own_still_binds()
                                  "thing/tests.sysl", cap_thing("@tests\n@no_alloc\n\nboxed() -> &int = 1\n"),
                                  "print(thing.f())"))
 
-    cap_check(said, "this module's '@tests' file declared '@no_alloc'")
+    cap_check(said, "this module's '@tests' file tests.sysl declared '@no_alloc'")
 
 @test("and one that narrows on its own is held to that, where its module narrowed nothing")
 cap_a_tests_file_that_narrows_on_its_own()
@@ -462,7 +462,7 @@ cap_a_tests_file_that_narrows_on_its_own()
                                  "thing/tests.sysl", cap_thing("@tests\n@no_alloc\n\nboxed() -> &int = 1\n"),
                                  "print(*thing.f())"))
 
-    cap_check(said, "a reference needs an allocator, and this module's '@tests' file declared " +
+    cap_check(said, "a reference needs an allocator, and this module's '@tests' file tests.sysl declared " +
                     "'@no_alloc' — it may hold and release storage made elsewhere, and may make none " +
                     "of its own")
     cap_check(said, "thing/tests.sysl:5:19")
@@ -477,29 +477,39 @@ cap_the_clause_is_read_off_a_file_that_ships()
     cap_check(said, cap_needs("a reference"))
     cap_check(said, "thing/b.sysl:4:15")
 
-@test("two '@tests' files of one module state one thing between them")
-cap_two_tests_files_state_one_thing()
+@test("two '@tests' files of one module may state different clauses, each its own")
+cap_two_tests_files_state_their_own()
     if !cap_ready() then return
 
     var fs = cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
-                       "thing/t1.sysl", cap_thing("@tests\n@requires(heap)\n\nhelper() -> int = 2\n"),
+                       "thing/t1.sysl", cap_thing("@tests\n\nboxed() -> &int = 2\n"),
                        "print(thing.f())")
 
-    fs.push(("thing/t2.sysl", cap_thing("@tests\n\nother() -> int = 3\n")))
+    fs.push(("thing/t2.sysl", cap_thing("@tests\n@no_alloc\n\nother() -> int = 3\n")))
+
+    assert_eq(cap_tested_err(fs), "")
+
+@test("and one file's '@no_alloc' binds its own bodies, not a sibling's, naming the file")
+cap_one_tests_file_binds_only_itself()
+    if !cap_ready() then return
+
+    var fs = cap_three("thing/a.sysl", cap_thing("f() -> int = 1\n"),
+                       "thing/t1.sysl", cap_thing("@tests\n\nboxed() -> &int = 2\n"),
+                       "print(thing.f())")
+
+    fs.push(("thing/t2.sysl", cap_thing("@tests\n@no_alloc\n\nalso() -> &int = 3\n")))
 
     val said = cap_tested_err(fs)
 
-    cap_check(said, "/thing/t2.sysl and ")
-    cap_check(said, "/thing/t1.sysl are both files of 'thing', and they declare different " +
-                    "capabilities — the tests of a module are one body of scaffolding, so its '@tests' " +
-                    "files state one thing between them: none against '@requires(heap)'")
-    cap_check(said, "thing/t2.sysl:1:1")
+    cap_check(said, "this module's '@tests' file t2.sysl declared '@no_alloc'")
+    cap_check(said, "thing/t2.sysl:5:18")
+    assert(!said.contains("t1.sysl:"), said)
 
 private cap_beside() -> string =
     cap_thing("@no_alloc\n\nf() -> int = 1\n\n@test\n" +
               "beside_what_it_tests() =\n    val r: &int = 1\n    assert(*r == 1)\n")
 
-@test("a '@test' function in an ordinary file answers to the tests' clause too")
+@test("a '@test' function in an ordinary file may allocate under a '@no_alloc' module, as tests always may")
 cap_a_test_function_answers_to_the_tests_clause()
     if !cap_ready() then return
 
