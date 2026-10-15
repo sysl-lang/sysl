@@ -145,8 +145,8 @@ find out what the two values actually were — and running it again is exactly w
 have saved you.
 
 ```sysl
-assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", …)
-assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg: string = "", …)
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", …)
+assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "", …)
 ```
 
 ```sysl
@@ -167,10 +167,12 @@ print("both held")
 both held
 ```
 
-**The bound is `Eq + Display` and not `Eq` alone**, which is what lets the report say what the two
-values were rather than only that they differed — so a type reaches `assert_eq` by rendering as well
-as by comparing. Both halves are written for an [`Option` and a `Result`](/reference/errors/), so a
-function answering with one is asserted about directly:
+**The bound is `Eq + Debug` and not `Eq` alone**, which is what lets the report say what the two
+values were rather than only that they differed. Every type has a
+[`Debug`](/reference/traits/#every-type-has-a-debug), so the bound asks nothing more of a type than
+`Eq`; and the report shows each side through it, so a string keeps its quotes and `got "1", want 1`
+cannot read as two equal values. Both halves are written for an [`Option` and a
+`Result`](/reference/errors/), so a function answering with one is asserted about directly:
 
 ```sysl
 first_even(xs: []const int) -> Option[int]
@@ -195,14 +197,35 @@ panic: got 5, want 6 (main.sysl:9)
 panic: the running total: got 5, want 6 (main.sysl:10)
 ```
 
+Each side is shown through its `Debug`, so a string is quoted and a struct with no `Display` shows
+its fields:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+impl Eq for Point
+    eq(self, rhs: Self) -> bool = self.x == rhs.x && self.y == rhs.y
+
+assert_eq(Point(1, 2), Point(1, 2))
+print(f"${"1"}%? ${Point(1, 2)}%?")
+```
+
+```output
+"1" Point(x: 1, y: 2)
+```
+
+and a failed `assert_eq("1", "2")` reads `panic: got "1", want "2"`.
+
 **Why this is a function and not advice to write the message yourself.** The hand-written form is
 `assert(a == b, s"got $a, want $b")`, and it has two costs: it evaluates each side twice, and it
 builds a string. Building one makes heap storage, which puts it out of reach of a module that
 declared [`@no_alloc`](/reference/attributes/) — the module that wants an assertion most. Rendering
-through [`Display`](/library/core/) into the output costs neither.
+through `Debug` into the output costs neither.
 
-**One function rather than one per type.** `Eq` says the comparison means something and `Display`
-says the value can be shown, which together are the whole of what a report needs.
+**One function rather than one per type.** `Eq` says the comparison means something and `Debug`
+says how the value is shown, which together are the whole of what a report needs.
 
 `assert_slice_eq` earns a name of its own, and it is worth being exact about what for now that
 [a slice is `Eq` and `Display`](#a-slice-or-an-array-of-anything-equatable) and so reaches
@@ -945,7 +968,9 @@ is what the library's own multi-part renderings do, and what a `Point` printed i
 This recipe is the one to start from; that one is what to reach for when the rendering is hot, or the
 module has no allocator.
 
-A type with no `Display` cannot be printed, and the diagnostic says what to write:
+A type with no `Display` still prints, through the [`Debug`](/reference/traits/#every-type-has-a-debug)
+every type has — its name and its fields — so `Display` is the presentation you choose rather than a
+requirement for printing at all:
 
 ```sysl
 struct Scale
@@ -954,8 +979,8 @@ struct Scale
 print(Scale(3))
 ```
 
-```error
-cannot print a Scale value — write an 'impl sysl.Display for Scale' to say how it renders
+```output
+Scale(k: 3)
 ```
 
 ### A slice or an array of anything printable

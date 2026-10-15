@@ -751,6 +751,9 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     // `embed("file")` yields to a declaration of the name in the same way.
     if embed_form(cx, name) then return Some(embed_call(cx, span, args))
 
+    if debug_form(cx, name) then return Some(debug_string(cx, span, args))
+    if name == DebugPart then return Some(debug_part(cx, span, args))
+
     if name == "str_cast" then return Some(str_cast_call(cx, span, args))
     if name == "str_alias" then return Some(str_alias_call(cx, span, args))
 
@@ -766,6 +769,8 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
         if args.len() != 1 then return Some(cx.err(span, "str takes exactly one value"))
 
         val v = through_ref(cx, type_expr_bare(cx, args.at(0)))
+
+        warn_placeholder(cx, args.at(0).span, args.at(0), v)
 
         // A float is written as Rust's `{}` writes it, at its own width: the fewest digits that read
         // back as a value of that type, set out positionally (`sysl.fmt.format_real_plain`).
@@ -975,7 +980,7 @@ private is_trait_type(t: Type) -> bool = t match
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
     null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name) ||
-    embed_form(cx, name)
+    embed_form(cx, name) || debug_form(cx, name) || name == DebugPart
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
@@ -1606,6 +1611,12 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     if ty == Unknown then return TExpr(span, TFormat(v, spec, counts))
 
     val c = spec_conversion(spec)
+
+    // **`%?` takes any value at all** and shows it through its `Debug`, under the width the hole
+    // wrote.
+    if c == '?' || spec_is_str(c) then warn_placeholder(cx, arg.span, arg, v)
+
+    if c == '?' then return spec_render(cx, span, v, spec, counts)
 
     // A conversion says what kind of value it renders, and a value of another kind is a mistake in
     // the specifier rather than something to convert: `%d` over a float would silently truncate it.

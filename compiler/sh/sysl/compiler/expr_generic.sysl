@@ -294,6 +294,16 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 //
 // `nested` is the nested function the call is made to, where it is one: its instantiation is a member
 // of the environment the call is made on, which goes in front of what the reader wrote.
+// Whether a declaration asks `Debug` of one of its type parameters.
+private asks_debug(bounds: Buf[NamedBounds], tparam: string) -> bool
+    for nb in bounds
+        if nb.name == tparam
+            for b in nb.bounds
+                if b.name == "Debug" || b.name == "sysl.Debug" then return true
+
+    false
+end asks_debug
+
 generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
                   expected: Option[Type], report: bool, known: Buf[Binding],
                   nested: Option[&Nested] = None) -> TExpr
@@ -359,6 +369,20 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // came back would be a consequence of this one.
     if !check_param_bounds(cx.an, f.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
                            "type parameter", cx.scope) then return bad_expr(span)
+
+    // An argument meeting a `T: Debug` bound only as a placeholder -- `assert_eq` over two writer
+    // objects -- is shown as that placeholder, and the call is told so as `print` would be. A call the
+    // library makes is a part of some larger rendering, never something a program wrote.
+    val written_here = !from_library(cx.an, cx.scope)
+
+    for i in 0..<decl.tparams.len()
+        if written_here && i < targs.len() && asks_debug(decl.bounds, decl.tparams.at(i))
+            val found = placeholder_of(cx, targs.at(i))
+
+            if found.is_some() then
+                cx.an.caution(cx.scope, span, s"'$written' shows its '${decl.tparams.at(i)}' only as " +
+                              s"'${found.unwrap().0}': ${found.unwrap().1}")
+        end if
 
     val name = instantiated(cx, f, targs, nested)
     val sig = cx.an.tables.members.func_insts.get(name)

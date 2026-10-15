@@ -55,7 +55,7 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     // A bare variant reached through the **module** that declares it rather than through its enum --
     // `inflate.BadBlock`, which is the one spelling available to a file that imported the module and
     // not the name.
-    val in_module = module_variant(cx, span, receiver, name)
+    val in_module = module_variant(cx, span, receiver, name, expected)
 
     if in_module.is_some() then return in_module.unwrap()
 
@@ -673,9 +673,13 @@ private module_path(cx: &Analyzer, receiver: Expr, name: string) -> Option[strin
 // what it can write -- the enum need not be named, and often is not exported under a name worth
 // writing.
 //
-// The module says which enum is meant, so the variant is read against that instantiation rather
-// than against whatever the position expected.
-private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) -> Option[TExpr]
+// The module says which enum is meant, so the variant is read against that enum rather than against
+// whatever the position expected. **Which instantiation of it is the position's to say** where the
+// position expects that very enum: a generic enum has one instantiation per argument list, and the
+// first one recorded -- `Box[T]` itself, where any generic body in its module matched on the variant
+// -- is not the `Box[int]` a `val c: g.Box[int] = g.Empty` asked for.
+private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                       expected: Option[Type]) -> Option[TExpr]
     val head = dotted_name_written(cx, receiver)
 
     if head.is_none() then return None
@@ -696,8 +700,13 @@ private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) 
         t match
             Enum(d) ->
                 if module_of(d.base) == owner.unwrap() && reachable_key(cx.an, d.base, cx.scope) &&
-                        d.variant(name).is_some() then
-                    return named_variant_expr(cx, span, name, Some(t))
+                        d.variant(name).is_some()
+                    val wanted = expected match
+                        Some(Enum(e)) -> if e.base == d.base then expected else Some(t)
+                        _ -> Some(t)
+
+                    return named_variant_expr(cx, span, name, wanted)
+                end if
             _ -> ()
 
     None

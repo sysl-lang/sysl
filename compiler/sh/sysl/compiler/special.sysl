@@ -24,7 +24,10 @@ print_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     for i in 0..<args.len()
         if i > 0 then parts.push(print_char(cx, span, ' '))
 
-        parts.push(print_one(cx, span, through_ref(cx, type_expr_bare(cx, args.at(i)))))
+        val v = through_ref(cx, type_expr_bare(cx, args.at(i)))
+
+        warn_placeholder(cx, args.at(i).span, args.at(i), v)
+        parts.push(print_one(cx, span, v))
 
     parts.push(print_char(cx, span, '\n'))
     TExpr(span, TSeq(parts))
@@ -92,27 +95,29 @@ end print_one
 
 // One value written to standard output through its `Display`. An object dispatches through the slot
 // of its own table; every other value names the block that was written for it.
-private print_display(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
-    val found = renderer(cx, span, t, "print", "print")
-    val out = stdout_call(cx, span)
+private print_display(cx: &Analyzer, span: Span, t: TExpr) -> TExpr =
+    plan_call(span, renderer(cx, span, t, "print", "print"), stdout_call(cx, span), format_spec(cx, span))
 
+// A rendering written into `out` under `spec`: an object through the slot of its own table, every
+// other value through the function the plan names, handed the value the plan says.
+private plan_call(span: Span, plan: (TExpr, string, Option[int]), out: TExpr, spec: TExpr) -> TExpr
     var args: Buf[TExpr] = buf()
 
     args.push(out)
-    args.push(format_spec(cx, span))
+    args.push(spec)
 
-    found.1 match
-        Some(slot) -> TExpr(span, TVCall(t, slot, args, Unit, false))
+    plan.2 match
+        Some(slot) -> TExpr(span, TVCall(plan.0, slot, args, Unit, false))
         None ->
             var all: Buf[TExpr] = buf()
 
-            all.push(t)
+            all.push(plan.0)
 
             for item in args
                 all.push(item)
 
-            TExpr(span, TCall(found.0, all, Unit, false))
-end print_display
+            TExpr(span, TCall(plan.1, all, Unit, false))
+end plan_call
 
 // The sink a bare `print` writes into, which the library names and this compiler only calls.
 private stdout_call(cx: &Analyzer, span: Span) -> TExpr
@@ -155,26 +160,74 @@ scalar_render(t: Type) -> bool = t match
 str_render(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
     val found = renderer(cx, span, t, "make a string of", "str")
 
-    TExpr(span, TRender(t, found.0, format_spec(cx, span), found.1))
+    TExpr(span, TRender(found.0, found.1, format_spec(cx, span), found.2))
 end str_render
 
 // Whether a value has a rendering of its own for a `%s` to hand it to -- a type parameter its
-// bounds promised one, an object whose trait keeps the slot, anything else implementing `Display`.
-// A value with none is a mistake in the specifier rather than a missing implementation, so a `%s`
-// hole over one is refused in the specifier's words.
+// bounds promised one, an object, anything else implementing `Display` or `Debug`, which every
+// struct and enum does. A value with none is a mistake in the specifier rather than a missing
+// implementation, so a `%s` hole over one is refused in the specifier's words.
 renders_itself(cx: &Analyzer, ty: Type) -> bool
     val tr = display_bound(cx)
     val here = if !impls_of(cx.an, tr.name, owner_key(ty)).is_empty() then ty else underlying(ty)
 
-    if erased(here) then return display_slot(cx, here).is_some()
+    if erased(here) then return true
 
     here match
-        Abstract(_, _) -> satisfies(cx.an, tr, here)
-        _ -> conforms(cx.an, tr, here) || satisfies(cx.an, tr, here)
+        Abstract(_, _) -> satisfies(cx.an, tr, here) || satisfies(cx.an, debug_bound(), here)
+        _ -> conforms(cx.an, tr, here) || satisfies(cx.an, tr, here) || shows(cx, ty)
 end renders_itself
 
+// Whether a concrete value has a `Debug` rendering: its own or the one supplied for it, or the
+// compiler's for a pointer, a callable and a weak reference.
+private shows(cx: &Analyzer, ty: Type) -> bool
+    if shown_by_rule(ty) then return true
+
+    val dbg = debug_bound()
+    val here = if !impls_of(cx.an, dbg.name, owner_key(ty)).is_empty() then ty else underlying(ty)
+
+    is_fixed(here) || conforms(cx.an, dbg, here) || satisfies(cx.an, dbg, here)
+end shows
+
+// The values the compiler shows by rule, since no block may be written for them: a raw pointer
+// (`reference/traits.md § Any type may carry an impl` refuses a memory mode as a subject), and every
+// value `debug_by_rule` names.
+private shown_by_rule(ty: Type) -> bool = ty match
+    Ptr(inner) -> !is_trait(*inner) || slotless_debug(trait_bound_of(*inner).name)
+    Ref(inner, _) -> is_trait(*inner) && slotless_debug(trait_bound_of(*inner).name)
+    // A `volatile` value a program prints is read and printed as it always was; only a structure
+    // shown around one leaves it unread (`debugger`).
+    _ -> debug_by_rule(ty) && !is_device(ty)
+
+// The types that are `Debug` by the compiler's rule rather than through a block, as a bound reads it
+// and as `x.debug(…)` on one is answered (`rule_debug`): a callable, a C function pointer, a weak
+// reference (shown without being followed), `unit`, a task, and device memory -- a `volatile`
+// value, or an array or a view of them, which is shown by its type and never read: reading a
+// register is an act with consequences, and printing a struct must not perform it.
+debug_by_rule(ty: Type) -> bool = ty match
+    CFn(_, _) -> true
+    Weak(_) -> true
+    Unit -> true
+    _ -> is_closure_literal(ty) || task_result(ty).is_some() || is_device(ty)
+
+private is_device(ty: Type) -> bool = ty match
+    Volatile(_) -> true
+    Array(_, elem) -> is_device(*elem)
+    Slice(elem, _) -> is_device(*elem)
+    _ -> false
+
+// `x.debug(out, fmt)` on a value that is `Debug` by rule, answered with what the rule shows.
+rule_debug(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr]) -> TExpr
+    if args.len() != 2 then return cx.err(span, "'debug' takes a sink and a specifier")
+
+    plan_call(span, debugger(cx, span, through_ref(cx, receiver), "show", "debug"),
+              type_expr_bare(cx, args.at(0)), type_expr_bare(cx, args.at(1)))
+end rule_debug
+
 // Which `display` a value reaches, and the table slot to read it out of where the value is an
-// object rather than a type.
+// object rather than a type -- or, where it has no `Display`, which `debug`: **every value prints**,
+// and `Display` is the override rather than the requirement. The plan names the value handed over
+// too, since a pointer is handed over as its address.
 //
 // **A subtype renders exactly as its base does** -- a number or a character -- so it reaches the
 // base's renderer rather than needing a `Display` of its own, which is what keeps a
@@ -186,29 +239,27 @@ end renders_itself
 // special form a bound's refusal names -- the reference's `'str' needs 'T: Display'`, the form a
 // reader wrote (an interpolation hole is a `str` call) rather than a description of it.
 private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
-                 form: string) -> (string, Option[int])
+                 form: string) -> (TExpr, string, Option[int])
     val vt = texpr_type(t)
 
     // A value with no type is one whose mistake was already told -- a constant in a loop of
     // definitions, a name that was refused -- and rendering it is not a second one.
-    if vt == Unknown then return ("", None)
+    if vt == Unknown then return (t, "", None)
+
+    if shown_by_rule(vt) then return debugger(cx, span, t, asked, form)
 
     val tr = display_bound(cx)
     val here = if !impls_of(cx.an, tr.name, owner_key(vt)).is_empty() then vt else underlying(vt)
 
     // An object has forgotten which type it holds, so the renderer is a word read out of its own
-    // table -- and the trait it was erased at has to require `Display` for the table to hold one.
+    // table: its `Display` where the trait it was erased at requires one, and otherwise the `Debug`
+    // every table carries.
     if erased(here)
         val slot = display_slot(cx, here)
 
-        if slot.is_none()
-            cx.fault(span, s"cannot $asked a ${type_show(vt)} value — an object offers what its " +
-                     "trait declares and what that trait requires, so write " +
-                     s"'trait ${module_show(erased_bound_name(here))}: ${tr.show()}' to keep the " +
-                     "rendering the value had before it was erased")
-            return (s"${tr.name}.display", None)
+        if slot.is_none() then return debugger(cx, span, t, asked, form)
 
-        return (s"${tr.name}.display", slot)
+        return (t, s"${tr.name}.display", slot)
     end if
 
     // A type parameter renders through whatever its bounds promised, which is a dispatch to the
@@ -224,150 +275,249 @@ private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
             // `str` -- rather than in the verb a concrete type's refusal reads with.
             val form = if asked == "print" then "print" else "str"
 
+            // A parameter bounded by `Debug` alone prints through it, as a concrete type with no
+            // `Display` does.
+            if !satisfies(cx.an, tr, here) && satisfies(cx.an, debug_bound(), here) then
+                return (t, s"${debug_bound().name}.debug", None)
+
             if !satisfies(cx.an, tr, here) then
                 cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${tr.show()}'")
 
-            return (s"${tr.name}.display", None)
+            return (t, s"${tr.name}.display", None)
         _ -> ()
 
-    if !conforms(cx.an, tr, here) && !satisfies(cx.an, tr, here)
-        cx.fault(span, s"cannot $asked a ${type_show(here)} value — ${render_advice(cx, tr, here)}")
-        return ("", None)
-    end if
+    if !conforms(cx.an, tr, here) && !satisfies(cx.an, tr, here) then
+        return debugger(cx, span, t, asked, form)
 
     val fname = member_func_name(cx, span, here, "display")
 
     cx.an.uses(fname)
-    (fname, None)
+    (t, fname, None)
 end renderer
 
-// What to do about a value nothing renders.
+// Which `debug` a value reaches -- `renderer`'s answer for the other trait, which `f"${x}%?"`,
+// `debug(x)` and a supplied `Debug`'s fields always take.
 //
-// **Naming the `impl` to write is only advice where one could be written at all**: a memory mode is
-// a shape no block may be written for, so it is told what is true of it rather than pointed at a
-// block that would not compile. A generic type is written for as a whole, so the advice names the
-// block's own parameters rather than the arguments this value has. And a type an implementation
-// already covers is told what that implementation asked of it, since writing a second one is exactly
-// what it may not do.
+// **What no block may be written for is shown by rule**: a raw pointer as its address (an `impl` for
+// a memory mode is refused, and a member call would reach through to the pointee), a callable as
+// `<fn>`, a weak reference as `weak(…)` without following it. A fixed-point value renders itself as
+// it does for `print`. Everything else has a `Debug`, its own or the one supplied for it.
+private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
+                 form: string) -> (TExpr, string, Option[int])
+    val vt = texpr_type(t)
+
+    if vt == Unknown then return (t, "", None)
+
+    val dbg = debug_bound()
+
+    if is_device(vt) then return (shown_text(span, s"<${type_show(vt)}>"), lib_fn(cx, "display_str"), None)
+
+    if shown_by_rule(vt)
+        vt match
+            Ptr(inner) ->
+                if !is_trait(*inner) then
+                    return (TExpr(span, TCast(t, usize_type(word_bits(cx)))),
+                            lib_fn(cx, "debug_address"), None)
+            Weak(_) -> return (shown_after(span, t, "weak(…)"), lib_fn(cx, "display_str"), None)
+            Unit -> return (shown_after(span, t, "()"), lib_fn(cx, "display_str"), None)
+            _ -> ()
+
+        val text = if task_result(vt).is_some() then "<task>" else slotless_text(vt)
+
+        return (shown_after(span, t, text), lib_fn(cx, "display_str"), None)
+    end if
+
+    var shown = t
+    var here = if !impls_of(cx.an, dbg.name, owner_key(vt)).is_empty() then vt else underlying(vt)
+
+    // **An integer narrower than 64 bits is shown at 64**, by the one renderer each signedness has:
+    // the value is the same, a field of a bitfield's `u3` is shown as the number it holds, and a
+    // program printing a dozen widths carries one renderer rather than a dozen.
+    here match
+        Integer(bits, signed, _) ->
+            if bits < 64
+                here = Integer(64, signed, false)
+                shown = TExpr(span, TCast(t, here))
+            end if
+        _ -> ()
+
+    if erased(here)
+        val slot = debug_slot(cx, here)
+
+        if slot.is_none()
+            cx.fault(span, s"cannot $asked a ${type_show(vt)} value — its table carries no " +
+                     s"'${dbg.show()}'")
+            return (t, "", None)
+        end if
+
+        return (t, s"${dbg.name}.debug", slot)
+    end if
+
+    // A parameter is asked for its bound where a program wrote the form. A supplied `Debug`'s field
+    // (`asked` is "show") asks nothing: its bounds name the type's parameters, not a projection such
+    // as `C::Label`, and each instantiation is read again with the field's type known.
+    here match
+        Abstract(_, _) ->
+            if asked != "show" && !satisfies(cx.an, dbg, here) then
+                cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${dbg.show()}'")
+
+            return (t, s"${dbg.name}.debug", None)
+        _ -> ()
+
+    if is_fixed(here) then
+        return (TExpr(span, TIntOp("fixed_text", t, None, vt, Slice(byte_type(), true))),
+                lib_fn(cx, "display_pad"), None)
+
+    // A `never` is not a value at all -- the expression does not finish -- so there is nothing to
+    // show, and asking is the mistake.
+    if here == Never
+        cx.fault(span, s"cannot $asked a never value — it does not implement " +
+                 s"'${module_show(library_key("Display"))}'")
+        return (t, "", None)
+    end if
+
+    // **Nothing is refused for having no `Debug`**: a value whose type has none -- an opaque handle
+    // held by value where its layout is private, a generic shape whose part has none -- is shown as
+    // its type, in angle brackets, which is all that can be said about it from here.
+    if !conforms(cx.an, dbg, here) && !satisfies(cx.an, dbg, here) then
+        return (shown_after(span, t, s"<${type_show(here)}>"), lib_fn(cx, "display_str"), None)
+
+    val fname = member_func_name(cx, span, here, "debug")
+
+    cx.an.uses(fname)
+    (shown, fname, None)
+end debugger
+
+// What a value shown by rule with no table slot writes: `<writer>` for a sink, `<fn>` otherwise.
+private slotless_text(t: Type) -> string = erased_trait(t) match
+    Some(o) -> if trait_bound_of(o).name == library_key("Writer") then "<writer>" else "<fn>"
+    None -> "<fn>"
+
+// `f.debug(out, fmt)` on an object whose table carries no `Debug` slot, which a generic `Debug` body
+// reaches for an `Option[&Fn…]` or a `Buf` of callables: what `print(f)` writes, under the specifier.
+callable_debug(cx: &Analyzer, span: Span, rty: Type, args: Buf[Expr]) -> TExpr
+    if args.len() != 2 then return cx.err(span, "'debug' takes a sink and a specifier")
+
+    var all: Buf[TExpr] = buf()
+
+    all.push(shown_text(span, slotless_text(Ptr(rty))))
+    all.push(type_expr_bare(cx, args.at(0)))
+    all.push(type_expr_bare(cx, args.at(1)))
+    TExpr(span, TCall(lib_fn(cx, "display_str"), all, Unit, false))
+end callable_debug
+
+// -- a value whose whole printed form is a placeholder ---------------------------------------------
 //
-// **The trait is named by the key, never spelled**: advice is the one place where being shown a name
-// that means something else is worse than being shown a long one. A program with a `Display` of its
-// own reaches the library's only by path, and telling it to write `impl Display` would have it
-// implement its own trait and be refused again for the same reason.
-private render_advice(cx: &Analyzer, tr: Bound, ty: Type) -> string
-    val why = unmet_bound(cx.an, tr, ty)
+// **Printing one directly is told, as a warning**: the program still builds and prints the
+// placeholder, but a `print(w)` that shows `<writer>` was almost certainly meant to show something.
+// Only the forms a program wrote are asked -- `print`, `str` and an interpolation hole, a `format`
+// hole, `debug(x)`, and an argument meeting a `T: Debug` bound such as `assert_eq`'s -- and never a
+// field, an element or a payload, which a supplied `Debug` shows as part of something larger.
 
-    if why.is_some() then return why.unwrap()
+// The placeholder a value's whole rendering would be, and why, where it is one.
+placeholder_of(cx: &Analyzer, ty: Type) -> Option[(string, string)]
+    if ty == Unknown || ty == Never then return None
 
-    val name = module_show(tr.name)
+    if shown_by_rule(ty)
+        ty match
+            Ptr(inner) -> if !is_trait(*inner) then return None
+            Weak(_) -> return None
+            Unit -> return None
+            _ -> ()
 
-    named_base(ty) match
-        Some(base) ->
-            val tps = nominal_tparams(cx.an, base)
+        if task_result(ty).is_some() then
+            return Some(("<task>", "a task has nothing to show until it is awaited — print what " +
+                         "awaiting it answers"))
 
-            if tps.is_empty()
-                return s"write an 'impl $name for ${type_show(ty)}' to say how it renders"
+        if slotless_text(ty) == "<writer>" then
+            return Some(("<writer>", "a Writer object carries no Debug; print the concrete sink, or " +
+                         "ask for 'Writer + Debug'"))
 
-            val list = comma_list(tps)
+        return Some(("<fn>", "a callable carries nothing to show; print what calling it answers"))
+    end if
 
-            return s"write an 'impl[$list] $name for ${module_show(base)}[$list]' to say how it " +
-                   "renders"
-        None -> ()
+    if is_device(ty) || erased(ty) then return None
 
-    // A composed type is the module's when anything named in it is, so the advice holds for a
-    // `[]Point` and is impossible for a `[]int`.
-    if is_composed(ty)
-        if implementable_here(cx, ty)
-            return s"write an 'impl $name for ${type_show(ty)}' to say how it renders"
+    val dbg = debug_bound()
+    val here = if !impls_of(cx.an, dbg.name, owner_key(ty)).is_empty() then ty else underlying(ty)
 
-        return s"nothing renders a ${type_show(ty)}, and an 'impl $name' for it has no home " +
-               "outside the library — print the elements, or give them a type of your own to be " +
-               "held in"
+    here match
+        Abstract(_, _) -> return None
+        Integer(_, _, _) -> return None
+        _ -> ()
 
-    s"it does not implement '$name'"
-end render_advice
+    if is_fixed(here) || conforms(cx.an, dbg, here) || satisfies(cx.an, dbg, here) then return None
 
-// The key of a nominal type, where the type is one.
-private named_base(t: Type) -> Option[string] = t match
-    Struct(d) -> Some(d.base)
-    Enum(d) -> Some(d.base)
-    _ -> None
+    // A type with a `Display` of its own prints through it wherever a placeholder would be asked.
+    val tr = display_bound(cx)
 
-private is_composed(t: Type) -> bool = t match
-    Array(_, _) -> true
-    Slice(_, _) -> true
-    _ -> false
+    if conforms(cx.an, tr, here) || satisfies(cx.an, tr, here) then return None
 
-// The parameters a nominal type was declared with, which is what a block written for the whole
-// family names.
-private nominal_tparams(a: &Analysis, base: string) -> Buf[string]
-    a.tables.types.get(base) match
-        Some(d) -> d.kind match
-            StructOf(sd) -> sd.tparams
-            EnumOf(ed) -> ed.tparams
-            _ -> buf()
-        None -> buf()
-end nominal_tparams
+    Some((s"<${type_show(here)}>", s"'${type_show(here)}' has no Debug to show it with — an opaque " +
+          "type's layout is its own module's; print it through that module, or hold it by pointer"))
+end placeholder_of
 
-// Whether an `impl` for this type could be written **here** -- the coherence question, asked of a
-// resolved type rather than of a written subject.
-//
-// `Display` belongs to the library, so the only thing that can give the block a home is a type of
-// this module's named somewhere in the subject. The walk goes through the composed shapes for that
-// reason: it is the *elements* that carry the licence, which is what makes `[]Point` writable and
-// `[]int` not.
-private implementable_here(cx: &Analyzer, t: Type) -> bool = t match
-    Array(_, elem) -> implementable_here(cx, *elem)
-    Slice(elem, _) -> implementable_here(cx, *elem)
-    Struct(d) -> declared_here(cx, d.base) || any_implementable(cx, d.targs)
-    Enum(d) -> declared_here(cx, d.base) || any_implementable(cx, d.targs)
-    _ -> false
+// Tells a top-level rendering of `e` whose whole form is a placeholder, at `e`.
+warn_placeholder(cx: &Analyzer, span: Span, e: Expr, t: TExpr)
+    val found = placeholder_of(cx, texpr_type(t))
 
-private declared_here(cx: &Analyzer, base: string) -> bool =
-    cx.an.tables.types.get(base) match
-        Some(d) -> d.scope.module_name == cx.scope.module_name
-        None -> false
+    if found.is_none() then return
 
-private any_implementable(cx: &Analyzer, targs: Buf[Type]) -> bool
-    for targ in targs
-        if implementable_here(cx, targ) then return true
+    val written = *e.kind match
+        Ident(n) -> s"'$n'"
+        _ -> "this value"
 
-    false
-end any_implementable
+    cx.an.caution(cx.scope, span, s"printing $written shows only '${found.unwrap().0}': " +
+                  found.unwrap().1)
+end warn_placeholder
 
-private comma_list(parts: Buf[string]) -> string
-    var out = ""
+// A literal standing in for a value that is shown by rule.
+private shown_text(span: Span, text: string) -> TExpr = TExpr(span, TStrLit(text))
 
-    for i in 0..<parts.len()
-        if i > 0 then out = out + ", "
+// The same, after the value has been computed: **what is shown by rule is still evaluated**, since
+// `print(str(print(1)))` prints the `1` whatever the `()` it shows. Device memory alone is not, being
+// the one value whose reading is the act.
+private shown_after(span: Span, t: TExpr, text: string) -> TExpr
+    var stmts: Buf[TStmt] = buf()
 
-        out = out + parts.at(i)
+    stmts.push(TExprStmt(t))
+    TExpr(span, TBlockExpr(TBlock(stmts, Some(shown_text(span, text)), Str)))
+end shown_after
 
-    out
-end comma_list
+// A library function a plan calls, marked reached; empty where the compilation has no library.
+private lib_fn(cx: &Analyzer, name: string) -> string
+    val key = library_key(cx, name)
+
+    if key.is_none() then return ""
+
+    cx.an.uses(key.unwrap())
+    key.unwrap()
+end lib_fn
 
 // The library's `Display`, as the bound every rendering is asked about.
 private display_bound(cx: &Analyzer) -> Bound = Bound(library_key("Display"), buf())
 
+// The library's `Debug`, which every type has.
+private debug_bound() -> Bound = Bound(library_key("Debug"), buf())
+
 // Which slot of an object's table holds the renderer, where the trait it was erased at requires one.
-private display_slot(cx: &Analyzer, ty: Type) -> Option[int]
+private display_slot(cx: &Analyzer, ty: Type) -> Option[int] = trait_slot(cx, ty, display_bound(cx), "display")
+
+// Which slot holds `debug`, which every table carries (`slotted_members`).
+private debug_slot(cx: &Analyzer, ty: Type) -> Option[int] = trait_slot(cx, ty, debug_bound(), "debug")
+
+private trait_slot(cx: &Analyzer, ty: Type, tr: Bound, member: string) -> Option[int]
     val obj = erased_trait(ty)
 
     if obj.is_none() then return None
 
-    val tr = display_bound(cx)
     val members = slotted_members(cx.an, trait_bound_of(obj.unwrap()), self_binding(ty))
 
     for i in 0..<members.len()
-        if members.at(i).0.name == tr.name && members.at(i).1.name == "display" then return Some(int(i))
+        if members.at(i).0.name == tr.name && members.at(i).1.name == member then return Some(int(i))
 
     None
-end display_slot
-
-// The name of the trait an object was erased at, for the advice that says to widen it.
-private erased_bound_name(ty: Type) -> string = erased_trait(ty) match
-    Some(o) -> trait_bound_of(o).name
-    None -> ""
+end trait_slot
 
 // The specifier a bare rendering carries: no width, no precision, not left-aligned. A `f"…"` hole
 // is the same node with the three the reader wrote.
@@ -402,13 +552,46 @@ end spec_value
 // specifier), so the `FormatSpec` is then built by the library's `format_spec_of`, which applies C's
 // reading of a negative count. A specifier written out in full is still a constant.
 spec_render(cx: &Analyzer, span: Span, t: TExpr, spec: string, counts: Buf[TExpr]) -> TExpr
-    val found = renderer(cx, span, t, "make a string of", "str")
+    val found = if spec_conversion(spec) == '?' then debugger(cx, span, t, "make a string of", "debug")
+    else renderer(cx, span, t, "make a string of", "str")
     val parts = spec_parts(spec)
     val fmt = if counts.is_empty() then spec_value(cx, span, parts.0, parts.1, parts.2)
     else counted_spec(cx, span, spec, parts, counts)
 
-    TExpr(span, TRender(t, found.0, fmt, found.1))
+    TExpr(span, TRender(found.0, found.1, fmt, found.2))
 end spec_render
+
+// The form a supplied `Debug` shows each field through. Its name has a space in it, so no program
+// can call it by accident: it is the compiler's, written only by `deriving.sysl`.
+const DebugPart: string = "debug part"
+
+// `debug(x)` -- the string `x`'s `Debug` writes, which is `f"${x}%?"` with no width.
+debug_string(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then return cx.err(span, "debug takes exactly one value")
+
+    val v = through_ref(cx, type_expr_bare(cx, args.at(0)))
+
+    warn_placeholder(cx, args.at(0).span, args.at(0), v)
+
+    val found = debugger(cx, span, v, "make a string of", "debug")
+
+    TExpr(span, TRender(found.0, found.1, format_spec(cx, span), found.2))
+end debug_string
+
+// `debug part`(value, out, spec) -- one field of a supplied `Debug`, written through the field's own
+// `Debug` or the rule for what has none; a reference is followed to what it refers to.
+debug_part(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 3 then return cx.err(span, s"'$DebugPart' takes a value, a sink and a specifier")
+
+    val found = debugger(cx, span, through_ref(cx, type_expr_bare(cx, args.at(0))), "show", "debug")
+
+    plan_call(span, found, type_expr_bare(cx, args.at(1)), type_expr_bare(cx, args.at(2)))
+end debug_part
+
+// Whether `debug` in call position is the form: like `embed`, it is an ordinary enough word to be
+// somebody's own, so a function or a local of the name is what a call reaches.
+debug_form(cx: &Analyzer, name: string) -> bool =
+    name == "debug" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
 
 // The `FormatSpec` of a specifier with a `*` for its width, its precision or both: each `*` is the
 // next count, and a part written in digits is the constant it always was.

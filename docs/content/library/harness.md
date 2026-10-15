@@ -103,8 +103,8 @@ usually the same failure seen again through worse state.
 | | |
 |---|---|
 | `check(cond, msg = "")` | a condition that has to hold |
-| `check_eq[T: Eq + Display](got, want)` | two values that have to be equal, both rendered when they are not |
-| `check_slice_eq[T: Eq + Display](got, want)` | the same for a `[]const T`, naming the index that differs |
+| `check_eq[T: Eq + Debug](got, want)` | two values that have to be equal, both shown through their `Debug` when they are not |
+| `check_slice_eq[T: Eq + Debug](got, want)` | the same for a `[]const T`, naming the index that differs |
 
 One generic member stands in for Unity's several hundred assertion macros and does more than they
 can: `TEST_ASSERT_EQUAL_*` covers a fixed list of C's own types and falls back to a hex dump of the

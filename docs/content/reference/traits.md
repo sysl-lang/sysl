@@ -1238,6 +1238,170 @@ one that is hidden. The clause is part of the declaration, so the block it write
 that declares the type: a **private field is walked**, because the block is written where the type
 is.
 
+## Every type has a `Debug`
+
+`Debug` is the library's other rendering trait, shaped exactly as `Display` is — a sink and the field
+the whole value occupies — and it is the one exception to [conformance being explicit](#conformance-is-explicit-always):
+**every type has one, and none has to be written.** The compiler supplies a `Debug` for every struct
+and enum that does not write its own, the way a `derives` clause would but without being asked:
+the name, then each field by name, each shown through **its own** `Debug`, so a string inside a
+structure is quoted and escaped. An enum's variant is shown under the enum's name.
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+enum Color
+    Red
+    Green
+
+struct Label
+    text: string
+    at: Point
+    color: Color
+
+print(Label("a \"b\"", Point(1, 2), Red))
+```
+
+```output
+Label(text: "a \"b\"", at: Point(x: 1, y: 2), color: Color.Red)
+```
+
+The library writes the rest: the scalars (a `char` in single quotes, a `string` in double), tuples,
+arrays, slices, `Buf`, `Option` and `Result`, each shown as its `Display` shows it but with the parts
+through their `Debug`. So `print` of a value with neither block written still prints —
+**`print`, `str` and an interpolation hole reach `Display` where a value has one and `Debug` where it
+does not**, and `f"${x}%?"` and `debug(x)` always reach `Debug`
+([strings](/reference/strings/#format-specifiers)). `assert_eq` reports both sides through it, so
+`got "1", want 1` cannot read as equal.
+
+**An `impl Debug` of your own replaces the supplied one** — to hide a field, or to abbreviate a large
+buffer — and a structure holding the type shows it through that block too:
+
+```sysl
+struct Secret
+    key: string
+
+impl Debug for Secret
+    debug(self, out: *Writer, fmt: FormatSpec) = display_pad("Secret(***)".bytes, out, fmt)
+
+struct Login
+    user: string
+    secret: Secret
+
+print(Login("ed", Secret("hunter2")))
+```
+
+```output
+Login(user: "ed", secret: Secret(***))
+```
+
+A generic type's supplied block is conditional, as a derived one is, and every type meets the
+condition, so a `T: Debug` bound costs a caller nothing:
+
+```sysl
+show[T: Debug](x: T) = print(f"${x}%?")
+
+struct Box[T]
+    v: T
+
+show(Box("in"))
+show(3)
+```
+
+```output
+Box(v: "in")
+3
+```
+
+### What is shown by rule
+
+A few values have no block that could be written for them, and are shown by the compiler's own rule:
+
+- **a raw pointer `*T` shows its address**, in lower-case hex with no padding, the null one as `0x0`.
+  It is not followed: what it points at may be gone. *This is a split, and it is deliberate*: a
+  member call sees through one `*` (above), so in generic code a `T: Debug` instantiated at `*P`
+  reaches `P`'s `Debug` — the bound is met by what the pointer points at — while `print(p)`,
+  `f"${p}%?"` and a field of type `*P` show the address;
+- **a reference `&T` is followed** — it is a value — and shows as its referent;
+- **a callable shows as `<fn>`**, a `weak T` as `weak(…)` without following it, `unit` as `()` and
+  a task as `<task>`;
+- **device memory is shown by its type and never read** — a `volatile` field, or an array or a view
+  of them, inside a structure shows as `<volatile u32>` and the like, since reading a register is an
+  act with consequences;
+- **an `opaque struct` gets no supplied `Debug`** — its layout is its own module's — and is held
+  through a pointer, which shows its address; one shown by value where its layout is private shows
+  as its type in angle brackets, as does any value whose type has no `Debug` at all;
+- **a trait object shows its concrete value**: every object's table carries a `Debug` slot after
+  its own members, whether or not the trait requires `Debug`, so `print` of a `*Shape` reaches the
+  `Debug` of the `Rect` behind it. Two kinds of table carry none: a callable's, shown as `<fn>`, and
+  a `Writer`'s, shown as `<writer>` — a sink is where a rendering goes rather than a value to show,
+  and a slot in every writer's table would put a `Debug` of every sink into every program that
+  writes to one. The slot costs one word per table, and keeps the concrete type's `Debug` in the
+  program wherever the table is.
+
+**A sink that should show itself says so in its trait**: a trait requiring `Debug` beside `Writer`
+puts the slot back, so its objects print the concrete sink while a bare `&Writer` stays `<writer>`.
+A concrete writer, never erased, prints through its `Debug` like any other value.
+
+```sysl
+struct Tally
+    n: usize
+
+impl Fallible for Tally
+
+impl Writer for Tally
+    write(*self, bytes: []const u8)
+        self.n = self.n + bytes.len
+
+trait LoggedWriter: Writer + Debug
+
+impl LoggedWriter for Tally
+
+val w: &Writer = Tally(1)
+val l: &LoggedWriter = Tally(2)
+
+print(w, l, Tally(3))
+```
+
+```output
+<writer> Tally(n: 2) Tally(n: 3)
+```
+
+**Printing a placeholder directly is warned about**, and still builds: a value whose whole printed
+form is `<writer>`, `<fn>`, `<task>` or a `<Type>` with no `Debug`, handed straight to `print`,
+`str`, an interpolation or `format` hole, `debug(x)`, or an argument meeting a `T: Debug` bound such as
+`assert_eq`'s, was almost certainly meant to show something. The `print(w)` above says:
+
+```
+warning: printing 'w' shows only '<writer>': a Writer object carries no Debug; print the concrete
+sink, or ask for 'Writer + Debug'
+```
+
+A placeholder inside a structure — a field, an element, an option's payload — is part of a larger
+rendering and is never warned about, and an object whose trait asks for `Debug` has nothing to warn
+about. As with the compiler's other warning, there is no switch to silence it: the fix the sentence
+names is how it goes away.
+
+**A rendering that nests deeper than thirty-two levels writes `…` and stops.** Following references
+is what makes a list or a tree show as one, and it is also what would make a structure that refers
+back to itself render for ever; the limit is what makes every value safe to show.
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+val list: &Node = Node(1, Some(Node(2, None)))
+
+print(list)
+```
+
+```output
+Node(v: 1, next: Some(Node(v: 2, next: None)))
+```
+
 ## A trait may take type parameters
 
 A trait declares parameters in the same bracketed list every other generic declaration writes, and an
