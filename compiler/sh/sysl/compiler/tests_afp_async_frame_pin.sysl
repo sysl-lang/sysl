@@ -530,11 +530,14 @@ afp_frame_allocated_once_and_reached_through_its_handle()
 
     // The resumption is handed the frame's address and reaches the array through it, and nothing in
     // the module copies a frame: no `memcpy` anywhere moves the 1024 bytes or more a frame is.
-    val resume = afp_function(ir, "define internal void @handle.resume(")
+    val resume = afp_function(ir, "@handle.resume(")
 
+    assert(resume != "", ir)
     assert(afp_number_after(resume, "dereferenceable(") >= 1024, resume)
-    assert(resume.contains("getelementptr inbounds i8, ptr %task.hdl, i64 "), resume)
-    assert(!resume.contains("alloca [1024 x i8]"), resume)
+    assert(resume.contains("%task.promise.reload.addr = getelementptr inbounds ") &&
+           resume.contains(", ptr %task.hdl, i"), resume)
+    assert(!resume.contains("%buf.addr = alloca"), resume)
+    assert(!resume.contains("%head.addr = alloca"), resume)
     assert(!resume.contains("@sysl_task_alloc("), resume)
     assert(!ir.contains("i64 1024, i1 false)"), "a 1024-byte block copy")
 end afp_frame_allocated_once_and_reached_through_its_handle
@@ -583,7 +586,7 @@ afp_a_viewed_array_is_in_the_frame_at_o0()
         val resume = afp_function(ir, "@fill.resume(")
 
         assert(afp_number_after(resume, "dereferenceable(") >= 64, s"-O$level: $resume")
-        assert(!resume.contains("alloca [64 x i8]"), s"-O$level: $resume")
+        assert(!resume.contains("%buf.addr = alloca"), s"-O$level: $resume")
 
 // The other two shapes a loan takes: a raw `&x` to a scalar read back after the await only through
 // the pointer, and a view of an array declared inside a loop's body, a scope of its own, lent across
@@ -640,7 +643,8 @@ afp_raw_and_nested_are_frame_fields()
         val resume = afp_function(ir, "@raw_and_nested.resume(")
 
         assert(resume != "", s"-O$level: $ir")
-        assert(!resume.contains("alloca [8 x i8]"), s"-O$level: $resume")
+        assert(!resume.contains("%inner.addr = alloca"), s"-O$level: $resume")
+        assert(!resume.contains("%n.addr = alloca"), s"-O$level: $resume")
 
         // The promise holds its header, the result, `n` and `inner`, so the frame is at least that.
         assert(afp_number_after(resume, "dereferenceable(") >= 48, s"-O$level: $resume")
