@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{Json, Member as JsonMember, parse as parse_json, quoted as json_quote}
 import sysl.fs.{is_file, read_bytes}
 import sysl.io.{Reader, stdin}
 import sysl.text.{from_utf8, from_utf8_lossy, parse_uint, split, str_builder, to_lower, Search}
@@ -188,21 +189,21 @@ end lsp_content_length
 lsp_answer(server: *LspServer, body: string) -> Buf[string]
     var out: Buf[string] = buf()
 
-    val msg = read_json(body) match
+    val msg = parse_json(body) match
         Err(why) ->
-            out.push(lsp_error(JsonNull, LspParseError, s"the message is not JSON: $why"))
+            out.push(lsp_error(Json.Null, LspParseError, s"the message is not JSON: $why"))
             return out
         Ok(m) -> m
 
-    val id = json_get(msg, "id")
+    val id = msg.get("id")
 
     val method = json_text_at(msg, ["method"]) match
         Some(m) -> m
         None ->
             // A response to something the server asked is the one message with no method, and the
             // server asks nothing.
-            if id.is_none() || (json_get(msg, "result").is_none() && json_get(msg, "error").is_none())
-                out.push(lsp_error(id.unwrap_or(JsonNull), LspInvalidRequest, "a request names a method"))
+            if id.is_none() || (msg.get("result").is_none() && msg.get("error").is_none())
+                out.push(lsp_error(id.unwrap_or(Json.Null), LspInvalidRequest, "a request names a method"))
             return out
 
     // A notification has no id and is never answered, an unknown one included.
@@ -222,7 +223,7 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
         return out
     end if
 
-    val params = json_get(msg, "params").unwrap_or(JsonNull)
+    val params = msg.get("params").unwrap_or(Json.Null)
 
     out.push(method match
         "initialize" ->
@@ -230,7 +231,7 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
             lsp_result(asked, lsp_capabilities())
         "shutdown" ->
             server.shut_down = true
-            lsp_result(asked, JsonNull)
+            lsp_result(asked, Json.Null)
         "textDocument/hover" -> lsp_result(asked, lsp_hover(*server,params))
         "textDocument/definition" -> lsp_result(asked, lsp_definition(*server,params))
         _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method sysl lsp answers"))
@@ -239,7 +240,7 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
 end lsp_answer
 
 // A notification: what it changes, and the diagnostics a document's change publishes.
-private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[string])
+private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[string])
     if method == "exit"
         server.exit_code = Some(if server.shut_down then Fine else Failed)
         return
@@ -247,8 +248,8 @@ private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[s
 
     if !server.initialized || server.shut_down then return
 
-    val params = json_get(msg, "params").unwrap_or(JsonNull)
-    val uri = json_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    val params = msg.get("params").unwrap_or(Json.Null)
+    val uri =json_text_at(params, ["textDocument", "uri"]).unwrap_or("")
 
     if uri == "" then return
 
@@ -258,9 +259,9 @@ private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[s
             None -> ()
     else if method == "textDocument/didChange"
         // Full synchronization: every change carries the whole text, and the last is what it says now.
-        json_get(params, "contentChanges") match
-            Some(changes) -> *changes match
-                JsonArr(items) ->
+        params.get("contentChanges") match
+            Some(changes) -> changes match
+                Json.Arr(items) ->
                     if items.len() > 0
                         json_text_at(items.at(items.len() - 1), ["text"]) match
                             Some(text) -> lsp_changed(server, uri, text, out)
@@ -277,63 +278,88 @@ end lsp_notified
 
 // The capabilities the server announces: full-text synchronization, hover and definition, with
 // positions counted in UTF-16, which is the protocol's default and what every client speaks.
-private lsp_capabilities() -> &Json
-    var caps: Buf[(string, &Json)] = buf()
+private lsp_capabilities() -> Json
+    var caps: Buf[JsonMember] = buf()
 
-    json_put(&caps, "positionEncoding", JsonStr("utf-16"))
-    json_put(&caps, "textDocumentSync", JsonNum("1"))
-    json_put(&caps, "hoverProvider", JsonBool(true))
-    json_put(&caps, "definitionProvider", JsonBool(true))
+    json_put(&caps, "positionEncoding", Json.Str("utf-16"))
+    json_put(&caps, "textDocumentSync", Json.Int(1))
+    json_put(&caps, "hoverProvider", Json.Bool(true))
+    json_put(&caps, "definitionProvider", Json.Bool(true))
 
-    var info: Buf[(string, &Json)] = buf()
+    var info: Buf[JsonMember] = buf()
 
-    json_put(&info, "name", JsonStr("sysl"))
-    json_put(&info, "version", JsonStr(Version))
+    json_put(&info, "name", Json.Str("sysl"))
+    json_put(&info, "version", Json.Str(Version))
 
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "capabilities", JsonObj(caps))
-    json_put(&out, "serverInfo", JsonObj(info))
-    JsonObj(out)
+    json_put(&out, "capabilities", Json.Obj(caps))
+    json_put(&out, "serverInfo", Json.Obj(info))
+    Json.Obj(out)
 end lsp_capabilities
 
-private lsp_result(id: &Json, result: &Json) -> string
-    var out: Buf[(string, &Json)] = buf()
+private lsp_result(id: Json, result: Json) -> string
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "jsonrpc", JsonStr("2.0"))
+    json_put(&out, "jsonrpc", Json.Str("2.0"))
     json_put(&out, "id", id)
     json_put(&out, "result", result)
-    json_text(JsonObj(out))
+    str(Json.Obj(out))
 end lsp_result
 
-private lsp_error(id: &Json, code: int, message: string) -> string
-    var err: Buf[(string, &Json)] = buf()
+private lsp_error(id: Json, code: int, message: string) -> string
+    var err: Buf[JsonMember] = buf()
 
-    json_put(&err, "code", JsonNum(s"$code"))
-    json_put(&err, "message", JsonStr(message))
+    json_put(&err, "code", Json.Int(long(code)))
+    json_put(&err, "message", Json.Str(message))
 
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "jsonrpc", JsonStr("2.0"))
+    json_put(&out, "jsonrpc", Json.Str("2.0"))
     json_put(&out, "id", id)
-    json_put(&out, "error", JsonObj(err))
-    json_text(JsonObj(out))
+    json_put(&out, "error", Json.Obj(err))
+    str(Json.Obj(out))
 end lsp_error
 
 // `textDocument/publishDiagnostics` for one document.
-private lsp_publish(uri: string, diagnostics: Buf[&Json]) -> string
-    var params: Buf[(string, &Json)] = buf()
+private lsp_publish(uri: string, diagnostics: Buf[Json]) -> string
+    var params: Buf[JsonMember] = buf()
 
-    json_put(&params, "uri", JsonStr(uri))
-    json_put(&params, "diagnostics", JsonArr(diagnostics))
+    json_put(&params, "uri", Json.Str(uri))
+    json_put(&params, "diagnostics", Json.Arr(diagnostics))
 
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "jsonrpc", JsonStr("2.0"))
-    json_put(&out, "method", JsonStr("textDocument/publishDiagnostics"))
-    json_put(&out, "params", JsonObj(params))
-    json_text(JsonObj(out))
+    json_put(&out, "jsonrpc", Json.Str("2.0"))
+    json_put(&out, "method", Json.Str("textDocument/publishDiagnostics"))
+    json_put(&out, "params", Json.Obj(params))
+    str(Json.Obj(out))
 end lsp_publish
+
+// One member onto an object being built.
+json_put(members: *Buf[JsonMember], key: string, v: Json) = members.push(JsonMember(key, v))
+
+// The member under each key in turn: `json_at(m, ["params", "textDocument", "uri"])`.
+json_at(j: Json, keys: []const string) -> Option[Json]
+    var here = j
+
+    for key in keys
+        here = here.get(key) match
+            Some(v) -> v
+            None -> return None
+
+    Some(here)
+end json_at
+
+// The string at `keys`, where a string is there.
+json_text_at(j: Json, keys: []const string) -> Option[string] = json_at(j, keys).and_then(v -> v.as_str())
+
+// The integer at `keys`, where one is there and fits an `int`.
+json_int_at(j: Json, keys: []const string) -> Option[int]
+    json_at(j, keys).and_then(v -> v.as_int()) match
+        Some(n) -> if n >= -2147483648 && n <= 2147483647 then Some(int(n)) else None
+        None -> None
+end json_int_at
 
 // A document's new text: held in place of the disk, analyzed, remembered, and the diagnostics
 // published -- the document's own first, then every other file the analysis found something wrong
@@ -385,7 +411,7 @@ end lsp_changed
 // What one file is told: where it is on disk, and its diagnostics.
 struct LspFound
     file: string
-    diagnostics: Buf[&Json]
+    diagnostics: Buf[Json]
 end LspFound
 
 // The URI a file is published under: the one the editor opened it by where it is open, so that a
@@ -491,34 +517,34 @@ lsp_root(file: string) -> string
     file
 end lsp_root
 
-private lsp_diagnostic(src: Source, at: Span, severity: Severity, message: string) -> &Json
-    var out: Buf[(string, &Json)] = buf()
+private lsp_diagnostic(src: Source, at: Span, severity: Severity, message: string) -> Json
+    var out: Buf[JsonMember] = buf()
 
     json_put(&out, "range", lsp_range(src, at))
-    json_put(&out, "severity", JsonNum(lsp_severity(severity)))
-    json_put(&out, "source", JsonStr("sysl"))
-    json_put(&out, "message", JsonStr(message))
-    JsonObj(out)
+    json_put(&out, "severity", Json.Int(lsp_severity(severity)))
+    json_put(&out, "source", Json.Str("sysl"))
+    json_put(&out, "message", Json.Str(message))
+    Json.Obj(out)
 end lsp_diagnostic
 
-private lsp_severity(severity: Severity) -> string = severity match
-    Error -> "1"
-    Warning -> "2"
-    Note -> "3"
-    Help -> "4"
+private lsp_severity(severity: Severity) -> long = severity match
+    Error -> 1
+    Warning -> 2
+    Note -> 3
+    Help -> 4
 
-lsp_range(src: Source, at: Span) -> &Json
-    var out: Buf[(string, &Json)] = buf()
+lsp_range(src: Source, at: Span) -> Json
+    var out: Buf[JsonMember] = buf()
 
     json_put(&out, "start", lsp_position(src, at.start))
     json_put(&out, "end", lsp_position(src, if at.end > at.start then at.end else at.start))
-    JsonObj(out)
+    Json.Obj(out)
 end lsp_range
 
 // The protocol's position of a byte offset: the line from zero, and the character as the UTF-16 code
 // units before it on its line -- one for each character, two for one outside the Basic Multilingual
 // Plane, which is the one whose UTF-8 lead byte is `0xF0` or above.
-lsp_position(src: Source, offset: usize) -> &Json
+lsp_position(src: Source, offset: usize) -> Json
     val at = if offset > src.bytes.len then src.bytes.len else offset
     val line = src.locate(at).line
     var units = 0
@@ -528,11 +554,11 @@ lsp_position(src: Source, offset: usize) -> &Json
 
         if (b & 0xC0) != 0x80 then units += if b >= 0xF0 then 2 else 1
 
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "line", JsonNum(s"${line - 1}"))
-    json_put(&out, "character", JsonNum(s"$units"))
-    JsonObj(out)
+    json_put(&out, "line", Json.Int(long(line - 1)))
+    json_put(&out, "character", Json.Int(long(units)))
+    Json.Obj(out)
 end lsp_position
 
 // The byte offset of a protocol position: `lsp_position` turned around. A character past the end of
@@ -578,7 +604,7 @@ private lsp_reference_at(d: LspDocument, offset: usize) -> Option[Reference]
 end lsp_reference_at
 
 // The document and offset a `textDocument/*` request's `params` point at.
-private lsp_point(server: LspServer, params: &Json) -> Option[(LspDocument, usize)]
+private lsp_point(server: LspServer, params: Json) -> Option[(LspDocument, usize)]
     val uri = json_text_at(params, ["textDocument", "uri"]).unwrap_or("")
 
     val d = lsp_document(server,uri) match
@@ -592,48 +618,48 @@ private lsp_point(server: LspServer, params: &Json) -> Option[(LspDocument, usiz
 end lsp_point
 
 // `textDocument/hover`: what the analyzer knew about the name under the cursor, as a sysl code block.
-lsp_hover(server: LspServer, params: &Json) -> &Json
+lsp_hover(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server,params) match
         Some(p) -> p
-        None -> return JsonNull
+        None -> return Json.Null
 
     val r = lsp_reference_at(d, offset) match
         Some(r) -> r
-        None -> return JsonNull
+        None -> return Json.Null
 
     val shown = if r.detail == "" then r.name else r.detail
-    var contents: Buf[(string, &Json)] = buf()
+    var contents: Buf[JsonMember] = buf()
 
-    json_put(&contents, "kind", JsonStr("markdown"))
-    json_put(&contents, "value", JsonStr(s"```sysl\n$shown\n```"))
+    json_put(&contents, "kind", Json.Str("markdown"))
+    json_put(&contents, "value", Json.Str(s"```sysl\n$shown\n```"))
 
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "contents", JsonObj(contents))
+    json_put(&out, "contents", Json.Obj(contents))
     json_put(&out, "range", lsp_range(source(d.file, d.text.bytes), r.at_span))
-    JsonObj(out)
+    Json.Obj(out)
 end lsp_hover
 
 // `textDocument/definition`: where the name under the cursor was declared, its range the declared
 // name itself where the declaration spells it.
-lsp_definition(server: LspServer, params: &Json) -> &Json
+lsp_definition(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server,params) match
         Some(p) -> p
-        None -> return JsonNull
+        None -> return Json.Null
 
     val r = lsp_reference_at(d, offset) match
         Some(r) -> r
-        None -> return JsonNull
+        None -> return Json.Null
 
     val file = lsp_on_disk(r.declared_file)
     val text = if file == d.file then d.text else lsp_file_text(file)
     val src = source(file, text.bytes)
     val uri = if file == d.file then d.uri else lsp_file_uri(file)
-    var out: Buf[(string, &Json)] = buf()
+    var out: Buf[JsonMember] = buf()
 
-    json_put(&out, "uri", JsonStr(uri))
+    json_put(&out, "uri", Json.Str(uri))
     json_put(&out, "range", lsp_range(src, lsp_name_in(text, r.declared_span, last_segment(r.name))))
-    JsonObj(out)
+    Json.Obj(out)
 end lsp_definition
 
 // Where a file the compilation named is on disk. **A library file is named `library/sysl/…`**
