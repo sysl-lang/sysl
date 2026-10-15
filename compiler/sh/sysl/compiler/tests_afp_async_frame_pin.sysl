@@ -1,0 +1,716 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, Search}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A task's frame never moves once it exists**, so a body may lend out the address of its own local
+// -- a view of an array, a `*T` to a `Buf` or to a field -- and hold that loan across an `await`. The
+// frame is allocated once, by the ramp, through `sysl_task_alloc`; what a task value holds is the
+// address of the promise inside it; a resumption reaches every local through the frame's handle; and
+// handing a task on -- to `step`, to another task that awaits it, into a buffer, an `Option` or a
+// join -- copies that address and never the frame. There is no `Pin`, because there is nothing a
+// program could do that moves one.
+//
+// The programs here lend a frame's storage to a "device" that writes through it while the task is
+// parked, then read it back after the task resumes. They run at `-O0` and at the default level, and
+// again under AddressSanitizer, where a frame that had moved would leave the device writing into
+// storage that was given back. The IR case reads the frame layout LLVM's coroutine split produced.
+
+private extern "setenv" afp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" afp_c_unsetenv(name: *u8) -> int
+
+// --- the programs -------------------------------------------------------------------------------
+
+// The device every program shares: a staging area it fills, the addresses parked tasks lent it, and
+// every waker a parked read left with it.
+private afp_device() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    static var staged: [64]u8 = [0; 64]
+    static var into_buf: Option[*Buf[u8]] = None
+    static var into_word: Option[*int] = None
+    static var waiting: Buf[&Fn() -> unit] = buf()
+
+    arm(wake: &Fn() -> unit)
+        waiting.push(wake)
+
+    // The interrupt: stage bytes, write through every address a task lent, then wake every read.
+    deliver(base: u8)
+        for i in 0..<64
+            staged[i] = base + u8(i)
+
+        into_buf match
+            Some(b) ->
+                for i in 0..<4
+                    b.push(base + u8(i))
+            None -> ()
+
+        into_word match
+            Some(w) -> *w = int(base) * 1000
+            None -> ()
+
+        into_buf = None
+        into_word = None
+
+        val woken = waiting
+
+        waiting = buf()
+
+        for w in woken.view()
+            w()
+    end deliver
+
+    // Holds the caller's view across its own await, and fills it after it resumes.
+    async read_bytes(into: []u8)
+        await park(arm)
+
+        for i in 0..<into.len
+            into[i] = staged[i]
+
+    async read_buf(into: *Buf[u8])
+        into_buf = Some(into)
+        await park(arm)
+
+    async read_word(into: *int)
+        into_word = Some(into)
+        await park(arm)
+
+    sum(b: []u8) -> int
+        var s = 0
+
+        for x in b
+            s += int(x)
+
+        s
+    """
+
+// The loans: the case as asked, a local `Buf` lent by address, a struct local's field lent two ways,
+// several awaits over one array, and a closure that hands back a task.
+private afp_loans() -> string = afp_device() + raw"""
+
+    struct Conn
+        id: int
+
+        async read_into(*self, into: []u8) = await read_bytes(into)
+
+    async handle(conn: *Conn) -> int
+        var buf: [1024]u8 = [0; 1024]
+        val head = buf[0..<16]
+
+        await conn.read_into(head)
+        conn.id * 100000 + sum(head) * 10 + int(buf[16])
+
+    struct Packet
+        tag: int
+        body: [32]u8
+        len: int
+
+    async grow_local() -> int
+        var b: Buf[u8] = buf()
+
+        b.push(1)
+        await read_buf(&b)
+        await yield_now()
+        int(b.len()) * 1000 + sum(b.view())
+
+    async fill_packet() -> int
+        var p = Packet(5, [0; 32], 0)
+        val lenp = &p.len
+
+        await read_bytes(p.body[0..<8])
+        await read_word(lenp)
+        p.tag * 1000000 + p.len + sum(p.body[0..<8]) + int(p.body[8])
+
+    async three_reads() -> int
+        var buf: [1024]u8 = [0; 1024]
+        val a = buf[0..<4]
+        val b = buf[100..<104]
+        val c = buf[1020..<1024]
+
+        await read_bytes(a)
+        await read_bytes(b)
+        await yield_now()
+        await read_bytes(c)
+        sum(a) * 10000 + sum(b) * 100 + sum(c)
+
+    make_reader() -> &Fn(int) -> Task[int] = (n) -> fill_n(n)
+
+    async fill_n(n: int) -> int
+        var buf: [64]u8 = [0; 64]
+        val head = buf[0..<n]
+
+        await read_bytes(head)
+        sum(head)
+
+    static var woken: int = 0
+
+    drive(t: Task[int], base: u8) -> int
+        var round: u8 = 0
+
+        while !step(t, () -> woken += 1)
+            deliver(base + round)
+            round += 10
+
+        block_on(t)
+    end drive
+
+    static var conn: Conn = Conn(7)
+
+    print(drive(handle(&conn), 10))
+    print(drive(grow_local(), 10))
+    print(drive(fill_packet(), 3))
+    print(drive(three_reads(), 1))
+    print(drive(make_reader()(5), 20))
+    """
+
+// handle: 16 bytes from 10, so 280, and the byte after the view untouched. grow_local: one byte and
+// four more pushed by the device. fill_packet: eight bytes from 3, the word from the second delivery.
+// three_reads: three views from 1, 11 and 31 (the yield costs a delivery). fill_n: five bytes from 20.
+private afp_loans_said() -> string = "702800\n5047\n5013052\n105130\n110\n"
+
+// Tasks started and then handed on by value: to a second task that awaits it, to a join and to a
+// select, through an executor that keeps them in a buffer of `Option`s.
+private afp_handovers() -> string = afp_device() + raw"""
+
+    async reader(id: int, reads: int) -> int
+        var buf: [256]u8 = [0; 256]
+        var total = 0
+
+        for r in 0..<reads
+            val part = buf[r * 16..<r * 16 + 4]
+
+            await read_bytes(part)
+            total += sum(part)
+
+        var again = 0
+
+        for r in 0..<reads
+            again += sum(buf[r * 16..<r * 16 + 4])
+
+        if again != total then return -1
+
+        id * 10000 + total
+    end reader
+
+    async waiter(t: Task[int]) -> int = await t + 1
+
+    async join2(a: Task[int], b: Task[int]) -> int
+        var da = false
+        var db = false
+
+        while !(da && db)
+            if !da then da = step(a, () -> ())
+            if !db then db = step(b, () -> ())
+            if !(da && db) then await yield_now()
+
+        await a * 100000 + await b
+
+    static var loser: Option[Task[int]] = None
+
+    async select2(a: Task[int], b: Task[int]) -> int
+        loop
+            if step(a, () -> ())
+                loser = Some(b)
+                return await a
+
+            if step(b, () -> ())
+                loser = Some(a)
+                return await b
+
+            await yield_now()
+        end loop
+    end select2
+
+    static var queue: Buf[Option[Task[int]]] = buf()
+    static var results: Buf[int] = buf()
+
+    spawn(t: Task[int]) -> usize
+        queue.push(Some(t))
+        queue.len() - 1
+
+    round()
+        for i in 0..<queue.len()
+            queue[i] match
+                Some(t) ->
+                    if step(t, () -> ())
+                        results.push(block_on(t))
+                        queue[i] = None
+                None -> ()
+
+    take(i: usize) -> Task[int]
+        val t = queue[i].unwrap()
+
+        queue[i] = None
+        t
+
+    run(base: u8)
+        var b = base
+
+        round()
+
+        while waiting.len() > 0
+            deliver(b)
+            b += 1
+            round()
+
+    val a = spawn(reader(1, 3))
+
+    round()
+    spawn(waiter(take(a)))
+    run(10)
+    print(results.view())
+    results.clear()
+
+    val j1 = reader(2, 2)
+    val j2 = reader(3, 4)
+
+    step(j1, () -> ())
+    spawn(join2(j1, j2))
+    run(1)
+    print(results.view())
+    results.clear()
+
+    spawn(select2(reader(4, 1), reader(5, 3)))
+    run(40)
+    print(results.view())
+    results.clear()
+    spawn(loser.unwrap())
+    loser = None
+    run(50)
+    print(results.view())
+    """
+
+// The awaited reader: three views from 10, 11 and 12, plus the waiter's one. The join: two views from
+// 1 and 2, and four from 1 to 4. The select: the one-read task wins on the first delivery; the loser
+// was started and parked, and finishes later from 40, 50 and 51.
+private afp_handovers_said() -> string = "[10151]\n[2002430064]\n[40166]\n[50582]\n"
+
+// A view the device itself keeps: the array is promoted to the heap, which is the other way a loan
+// outlives its statement, and the loan is still read back after the resumption.
+private afp_device_holds() -> string = raw"""
+    static var landing: Option[[]u8] = None
+    static var on_done: Option[&Fn() -> unit] = None
+
+    arm(wake: &Fn() -> unit)
+        on_done = Some(wake)
+
+    deliver(base: u8)
+        landing match
+            Some(into) ->
+                for i in 0..<into.len
+                    into[i] = base + u8(i)
+            None -> ()
+
+        landing = None
+
+        on_done match
+            Some(wake) -> wake()
+            None -> ()
+
+    async read_into(into: []u8)
+        landing = Some(into)
+        await park(arm)
+
+    async handle() -> int
+        var buf: [1024]u8 = [0; 1024]
+        val head = buf[0..<16]
+        var s = 0
+
+        await read_into(head)
+
+        for b in head
+            s += int(b)
+
+        s * 10 + int(buf[16])
+
+    static var woken: int = 0
+
+    val t = handle()
+
+    print(step(t, () -> woken += 1))
+    deliver(10)
+    print(woken, step(t, () -> woken += 1), block_on(t))
+    """
+
+// --- building and running them ------------------------------------------------------------------
+
+private afp_flags(value: string)
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(value)
+
+    afp_c_setenv(n.ptr, v.ptr, 1)
+end afp_flags
+
+private afp_no_flags()
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+
+    afp_c_unsetenv(n.ptr)
+end afp_no_flags
+
+private afp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end afp_ready
+
+// What the program prints when built at `level` under `flags` (none where empty), or why it did not
+// build or run; and, under a sanitizer, how many of its report hooks the binary calls.
+private afp_outcome(program: string, level: string, flags: string) -> (string, usize)
+    val root = make_temp_dir("sysl-afp").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != "" then afp_flags(flags)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != "" then afp_no_flags()
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"it did not build: ${failure_text(why)}", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val said = ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+
+    (said, hooks)
+end afp_outcome
+
+// The program prints `want` at -O0 and at the default level.
+private afp_runs(program: string, want: string)
+    for level in ["0", DefaultOptimization]
+        val got = afp_outcome(program, level, "")
+
+        assert_eq(got.0, want, s"-O$level")
+
+// And under AddressSanitizer at both levels, with the sysl side instrumented: a loan into a frame that
+// had moved, or been given back, is a report and a failed run rather than a lucky read.
+private afp_runs_clean(program: string, want: string)
+    for level in ["0", DefaultOptimization]
+        val got = afp_outcome(program, level, "-fsanitize=address -g")
+
+        assert_eq(got.0, want, s"-O$level under ASan")
+        assert(got.1 > 1, s"-O$level: the binary calls ${got.1} ASan report hooks, so it is not instrumented")
+
+// --- the loans run --------------------------------------------------------------------------------
+
+@test("a local's view, a local Buf's address and a field's, held across awaits, read back what was written")
+afp_loans_run()
+    if !afp_ready() then return
+
+    afp_runs(afp_loans(), afp_loans_said())
+
+@test("the same loans run clean under AddressSanitizer at -O0 and the default level")
+afp_loans_run_clean_under_asan()
+    if !afp_ready() then return
+
+    afp_runs_clean(afp_loans(), afp_loans_said())
+
+@test("a started task handed on by value to an awaiting task, a join, a select and a buffer runs to its result")
+afp_handovers_run()
+    if !afp_ready() then return
+
+    afp_runs(afp_handovers(), afp_handovers_said())
+
+@test("the same hand-overs run clean under AddressSanitizer at -O0 and the default level")
+afp_handovers_run_clean_under_asan()
+    if !afp_ready() then return
+
+    afp_runs_clean(afp_handovers(), afp_handovers_said())
+
+@test("a view the device keeps promotes its array, and the loan runs clean under AddressSanitizer")
+afp_device_held_loan_runs_clean()
+    if !afp_ready() then return
+
+    afp_runs_clean(afp_device_holds(), "false\n1 true 2800\n")
+
+// --- the frame, as LLVM laid it out ---------------------------------------------------------------
+
+// The text of one function, from its `define` line to its closing brace, or "" where there is none.
+private afp_function(ir: string, head: string) -> string
+    val start = ir.index_of(head) match
+        Some(at) -> at
+        None -> return ""
+
+    val rest = ir[start..<ir.bytes.len]
+
+    rest.index_of("\n}\n") match
+        Some(at) -> rest[0..<at + 2]
+        None -> rest
+end afp_function
+
+// The decimal number that follows `after` in `text`, or -1.
+private afp_number_after(text: string, after: string) -> int
+    val at = text.index_of(after) match
+        Some(i) -> i + after.bytes.len
+        None -> return -1
+
+    var n = 0
+    var i = at
+
+    while i < text.bytes.len && text.bytes[i] >= u8('0') && text.bytes[i] <= u8('9')
+        n = n * 10 + int(text.bytes[i] - u8('0'))
+        i += 1
+
+    if i == at then -1 else n
+end afp_number_after
+
+// The module after LLVM's coroutine passes have split every async function, at `level` (-O0 where
+// none is named): sysl's text, handed to the clang a build uses and read back as IR rather than as an
+// object.
+private afp_split(program: string, level: string = "0") -> string
+    val root = make_temp_dir("sysl-afp").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val t = host_target()
+    val ir = emit_llvm_text(s"$root/main.sysl", None, level) match
+        Ok(emitted) -> emitted.text
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not lower: ${failure_text(why)}"
+
+    val cc = find_clang(t, None).unwrap()
+
+    write_text(s"$root/main.ll", in_coro_dialect(cc, for_clang(ir, t))).unwrap()
+
+    val made = capture(cc, ["-x", "ir", s"-O$level", "-S", "-emit-llvm", "-Wno-override-module",
+                            s"$root/main.ll", "-o", s"$root/split.ll"], "", [], true)
+    val text = made match
+        Ok(out) -> if out.status.ok() then (read_text(s"$root/split.ll").unwrap_or("")) else
+            s"clang refused it: ${out.err.unwrap_or("")}"
+        Err(_) -> "clang could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end afp_split
+
+@test("the frame is allocated once by the ramp, holds the lent array, and is reached only through its handle")
+afp_frame_allocated_once_and_reached_through_its_handle()
+    if !afp_ready() then return
+
+    val ir = afp_split(afp_loans())
+    val ramp = afp_function(ir, "define ptr @handle(")
+
+    assert(ramp != "", ir)
+
+    // One allocation, in the ramp, big enough for the 1024-byte array the body lends out: the array
+    // is in the frame, not on the ramp's stack and not promoted to a heap box of its own.
+    assert_eq(ramp.count_of("@sysl_task_alloc("), 1, ramp)
+    assert(afp_number_after(ramp, "call ptr @sysl_task_alloc(i64 ") >= 1024, ramp)
+    assert(!ramp.contains("@malloc("), ramp)
+
+    // What the call hands back is an address inside that allocation -- the promise -- not a copy of it.
+    assert(ramp.contains("ret ptr %task.promise"), ramp)
+
+    // The resumption is handed the frame's address and reaches the array through it, and nothing in
+    // the module copies a frame: no `memcpy` anywhere moves the 1024 bytes or more a frame is.
+    val resume = afp_function(ir, "@handle.resume(")
+
+    assert(resume != "", ir)
+    assert(afp_number_after(resume, "dereferenceable(") >= 1024, resume)
+    assert(resume.contains("%task.promise.reload.addr = getelementptr inbounds ") &&
+           resume.contains(", ptr %task.hdl, i"), resume)
+    assert(!resume.contains("%buf.addr = alloca"), resume)
+    assert(!resume.contains("%head.addr = alloca"), resume)
+    assert(!resume.contains("@sysl_task_alloc("), resume)
+    assert(!ir.contains("i64 1024, i1 false)"), "a 1024-byte block copy")
+end afp_frame_allocated_once_and_reached_through_its_handle
+
+// **The array a body reaches after an await only through a view of it is a frame field too.** At -O0
+// the coroutine split of the clang a macOS build uses by default (Apple clang 21) did not see the view
+// as a use of the array, kept the array on the resumption's own stack, and the view held in the frame
+// then pointed at a stack that was gone: the program below printed 0 where it should print 7. A lent
+// local now lives in the promise, so no split decides where it goes.
+private afp_view_only() -> string = raw"""
+    async fill() -> int
+        var buf: [64]u8 = [0; 64]
+        val head = buf[0..<4]
+
+        head[0] = 7
+        await yield_now()
+        int(head[0])
+
+    scribble() -> int
+        var junk: [256]u8 = [0; 256]
+
+        for i in 0..<256
+            junk[i] = 99
+
+        int(junk[255])
+
+    val t = fill()
+
+    print(step(t, () -> ()), scribble())
+    print(step(t, () -> ()), block_on(t))
+    """
+
+@test("an array read after an await only through a view keeps its value at -O0")
+afp_view_only_array_survives_at_o0()
+    if !afp_ready() then return
+
+    afp_runs(afp_view_only(), "false 99\ntrue 7\n")
+    afp_runs_clean(afp_view_only(), "false 99\ntrue 7\n")
+
+@test("a viewed array is in the frame at -O0 and at the default level")
+afp_a_viewed_array_is_in_the_frame_at_o0()
+    if !afp_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val ir = afp_split(afp_view_only(), level)
+        val resume = afp_function(ir, "@fill.resume(")
+
+        assert(afp_number_after(resume, "dereferenceable(") >= 64, s"-O$level: $resume")
+        assert(!resume.contains("%buf.addr = alloca"), s"-O$level: $resume")
+
+// The other two shapes a loan takes: a raw `&x` to a scalar read back after the await only through
+// the pointer, and a view of an array declared inside a loop's body, a scope of its own, lent across
+// an await on every round.
+private afp_raw_and_nested() -> string = raw"""
+    async raw_and_nested() -> int
+        var n = 0
+        val p = &n
+        var total = 0
+
+        for r in 0..<2
+            var inner: [8]u8 = [0; 8]
+            val v = inner[0..<4]
+
+            v[0] = u8(r + 5)
+            await yield_now()
+            total += int(v[0])
+
+        *p = 40
+        await yield_now()
+        *p + total
+    end raw_and_nested
+
+    scribble() -> int
+        var junk: [256]u8 = [0; 256]
+
+        for i in 0..<256
+            junk[i] = 99
+
+        int(junk[255])
+
+    val t = raw_and_nested()
+    var scribbled = 0
+
+    while !step(t, () -> ())
+        scribbled += scribble()
+
+    print(scribbled, block_on(t))
+    """
+
+@test("a raw address of a local and a view of a loop body's array survive their awaits, under ASan too")
+afp_raw_and_nested_loans_survive()
+    if !afp_ready() then return
+
+    afp_runs(afp_raw_and_nested(), "297 51\n")
+    afp_runs_clean(afp_raw_and_nested(), "297 51\n")
+
+@test("the raw-addressed local and the loop body's array are fields of the frame at both levels")
+afp_raw_and_nested_are_frame_fields()
+    if !afp_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val ir = afp_split(afp_raw_and_nested(), level)
+        val resume = afp_function(ir, "@raw_and_nested.resume(")
+
+        assert(resume != "", s"-O$level: $ir")
+        assert(!resume.contains("%inner.addr = alloca"), s"-O$level: $resume")
+        assert(!resume.contains("%n.addr = alloca"), s"-O$level: $resume")
+
+        // The promise holds its header, the result, `n` and `inner`, so the frame is at least that.
+        assert(afp_number_after(resume, "dereferenceable(") >= 48, s"-O$level: $resume")
+
+@test("a task handed on is its frame's address: join, select, step and an await take a ptr, never the frame")
+afp_tasks_travel_as_addresses()
+    if !afp_ready() then return
+
+    val ir = afp_split(afp_handovers())
+
+    assert(ir.contains("define ptr @join2(ptr %a.param, ptr %b.param)"), ir)
+    assert(ir.contains("define ptr @select2(ptr %a.param, ptr %b.param)"), ir)
+    assert(ir.contains("define ptr @waiter(ptr %t.param)"), ir)
+    assert(ir.contains("define i64 @spawn(ptr %t.param)"), ir)
+
+    // The ramps of the hand-over tasks allocate their own frames and copy none in: the task they are
+    // handed is stored into their frame as one pointer.
+    for head in ["define ptr @join2(", "define ptr @select2(", "define ptr @waiter("]
+        val ramp = afp_function(ir, head)
+
+        assert_eq(ramp.count_of("@sysl_task_alloc("), 1, ramp)
+        assert(!ramp.contains("memcpy"), ramp)
+end afp_tasks_travel_as_addresses
+
+// --- a box of nothing -----------------------------------------------------------------------------
+
+// **Found by the ASan runs above**: a closure that captures nothing is boxed with its empty
+// environment stored one past the end of the box, a zero-byte store AddressSanitizer reports at -O0.
+@test("a closure that captures nothing stores no environment into its box, and one that captures does")
+afp_empty_closure_stores_nothing()
+    if !afp_ready() then return
+
+    val root = make_temp_dir("sysl-afp").unwrap()
+
+    write_text(s"$root/main.sysl", raw"""
+        static var n: int = 0
+
+        call(f: &Fn() -> unit) = f()
+
+        val k = 5
+
+        call(() -> n += 1)
+        call(() -> n += k)
+        print(n)
+        """).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None, "0") match
+        Ok(emitted) -> emitted.text
+        Err(why) -> s"it did not lower: ${failure_text(why)}"
+
+    remove_dir_all(root).unwrap_or(())
+
+    // Two closures are boxed, and only the one with a capture has an environment to write.
+    assert_eq(ir.count_of("store %struct.$closure"), 1, ir)
+end afp_empty_closure_stores_nothing
+
+@test("a program boxing a closure that captures nothing runs clean under AddressSanitizer at -O0")
+afp_empty_closure_runs_clean_under_asan()
+    if !afp_ready() then return
+
+    afp_runs_clean(raw"""
+        static var n: int = 0
+
+        call(f: &Fn() -> unit) = f()
+
+        call(() -> n += 1)
+        call(() -> n += 2)
+        print(n)
+        """, "3\n")

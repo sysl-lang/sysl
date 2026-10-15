@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.math.bigint.{BigInt, from_int}
 
 // **An `async` function is an LLVM coroutine**, of the switched-resume kind: its frame is on the heap,
@@ -163,6 +164,122 @@ private using_coroutines(e: *Emit)
     e.traps = true
 end using_coroutines
 
+// -- the locals that live in the promise -------------------------------------------------------------
+
+// **A local whose address or view the body takes lives in the promise**, which is in the frame
+// whatever LLVM decides about the body's other slots. The frame never moves, so a view of such a
+// local, or a `*T` to it, may be held across an `await` -- by this body, by a task it awaits, or by
+// whatever that task handed the address to.
+//
+// LLVM's coroutine split decides on its own which of the other slots outlive a suspension, and
+// **at `-O0` some splits do not count a use made only through a view** as a use of the slot: an
+// array read after an `await` only through `buf[0..<4]` stays on the resumption's own stack, and the
+// view held in the frame then points at a stack that is gone. Laying these locals in the promise
+// takes the question away from that analysis at every level and with every clang.
+//
+// The set is every declared local some view or address is taken of, whether or not the loan in fact
+// crosses an `await`: a local only lent between two suspensions costs its bytes in the frame rather
+// than on the stack, and nothing else. Left out are a local with no size, an array the escape analysis
+// moved into a buffer (its storage is a box already), and a slot asking for a raised boundary, which
+// a field of the promise could not be held to.
+private struct LentSink
+    names: Set[string]
+
+    add(*self, name: string)
+        self.names.add(name)
+end LentSink
+
+private struct DeclSink
+    decls: Buf[(string, Type)]
+
+    add(*self, name: string, ty: Type)
+        self.decls.push((name, ty))
+end DeclSink
+
+private lent_root(out: &LentSink, place: TExpr) = *place.kind match
+    TLoad(name, _) -> out.add(name)
+    TField(r, _, _) -> lent_root(out, r)
+    TIndex(r, _, _) -> lent_root(out, r)
+    TLane(r, _, _) -> lent_root(out, r)
+    _ -> ()
+
+private note_lent(out: &LentSink, x: TExpr) = *x.kind match
+    TAddrOf(place, _) -> lent_root(out, place)
+    TSlice(base, _, _, _, _) -> lent_root(out, base)
+    _ -> ()
+
+private note_decl(out: &DeclSink, s: TStmt) = s match
+    TVarDecl(name, ty, _, align) -> if align.is_none() then out.add(name, ty)
+    _ -> ()
+
+// The locals of `f` laid in its promise, in the order they were declared.
+frame_locals(e: *Emit, f: TFunc) -> Buf[(string, Type)]
+    val lent: &LentSink = LentSink(set())
+    val declared: &DeclSink = DeclSink(buf())
+
+    walk_stmts(f.body.stmts, TWalk(false, x -> note_lent(lent, x), w -> (), s -> note_decl(declared, s)))
+
+    if f.body.result.is_some()
+        walk_texpr(f.body.result.unwrap(), TWalk(false, x -> note_lent(lent, x), w -> (),
+                                                   s -> note_decl(declared, s)))
+
+    var out: Buf[(string, Type)] = buf()
+
+    for item in declared.decls
+        if lent.names.has(item.0) && !zero_sized(item.1) && !is_promoted(e, item.0) &&
+           slot_align(e, lty(e, item.1)).is_none() then
+            out.push(item)
+
+    out
+end frame_locals
+
+// The promise of a task ending with `result`, with the locals `frame_locals` chose after its fields.
+private promise_with_locals(e: *Emit, result: Type, locals: Buf[(string, Type)]) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+
+    if !no_value(result) then fields.push(lty(e, result))
+
+    for item in locals
+        fields.push(lty(e, item.1))
+
+    LStruct(fields)
+end promise_with_locals
+
+// The promise's boundary: its header's and its result's, and every local's it holds.
+private promise_align_with(e: *Emit, result: Type, locals: Buf[(string, Type)]) -> int
+    var widest = promise_align(e, result)
+
+    for item in locals
+        val a = int(e.layout.align(item.1))
+
+        if a > widest then widest = a
+
+    widest
+end promise_align_with
+
+// Names each local's slot as its field of the promise. Written after `llvm.coro.begin`, which every
+// use of the slot follows -- the body starts at the first resumption.
+private name_frame_slots(e: *Emit, whole: LType, promise: Val, result: Type, locals: Buf[(string, Type)])
+    val first: usize = if no_value(result) then 4 else 5
+
+    for i in 0..<locals.len()
+        val slot = s"${locals.at(i).0}.addr"
+
+        e.declared.add(slot)
+        e.frame_slots.add(locals.at(i).0)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(first + i)))))
+        emit(e, InGep(VReg(slot), whole, promise, idx))
+end name_frame_slots
+
 // -- the ramp: what calling an async function does --------------------------------------------------
 
 // The frame, its promise's header, and the task's handle, written before the parameters are copied
@@ -173,14 +290,17 @@ begin_coroutine(e: *Emit, f: TFunc)
 
     val result = coro_body_result(f)
     val shape = promise_shape(e, result)
-    val promise = emit_alloca(e, VReg("task.promise"), shape, Some(promise_align(e, result)))
+    val locals = frame_locals(e, f)
+    val whole = promise_with_locals(e, result, locals)
+    val boundary_of_promise = promise_align_with(e, result, locals)
+    val promise = emit_alloca(e, VReg("task.promise"), whole, Some(boundary_of_promise))
     val mem_slot = emit_alloca(e, VReg("task.mem"), LPtr, None)
     val id = VReg("task.id")
     val hdl = VReg("task.hdl")
 
     var id_args: Buf[IrArg] = buf()
 
-    id_args.push(ir_arg(l_i32(), VInt(from_int(long(promise_align(e, result))))))
+    id_args.push(ir_arg(l_i32(), VInt(from_int(long(boundary_of_promise)))))
     id_args.push(ir_arg(LPtr, promise))
     id_args.push(ir_arg(LPtr, VNull))
     id_args.push(ir_arg(LPtr, VNull))
@@ -238,6 +358,7 @@ begin_coroutine(e: *Emit, f: TFunc)
     emit(e, InStore(LPtr, task_hook(e, result), field_addr(e, shape, promise, 1), AccPlain, None))
     emit(e, InStore(word_lty(e), VInt(from_int(1)), field_addr(e, shape, promise, 2), AccPlain, None))
     emit(e, InStore(LPtr, hdl, field_addr(e, shape, promise, task_handle_field()), AccPlain, None))
+    name_frame_slots(e, whole, promise, result, locals)
 
     e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out", aligned))
 end begin_coroutine

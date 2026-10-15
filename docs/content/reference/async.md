@@ -791,6 +791,58 @@ sensor_average(a: int, b: int) -> int = block_on(average(a, b))
 frame goes when the last share does — once, whether the task finished, stopped partway, or never
 started.
 
+### A frame never moves, so a borrow may cross an `await`
+
+**A task's frame is allocated once, by the call, and stays at that address until it is freed.** A
+task value is the address of the frame, not the frame: handing a task to `step`, to another task that
+awaits it, to a join, or into a buffer or an `Option` copies that address, and every resumption
+reaches the body's locals through it. Nothing a program can write copies a frame — so, unlike Rust,
+sysl needs no `Pin`: a body may lend out a view of its own array, or the address of its own local,
+and hold the loan across an `await`.
+
+```sysl
+static var staged: [16]u8 = [0; 16]
+static var on_irq: Option[&Fn() -> unit] = None
+
+arm(wake: &Fn() -> unit)
+    on_irq = Some(wake)
+
+// Holds its caller's view across its own await, and fills it once it is woken.
+async read_into(into: []u8)
+    await park(arm)
+
+    for i in 0..<into.len
+        into[i] = staged[i]
+
+async handle() -> int
+    var buf: [1024]u8 = [0; 1024]
+    val head = buf[0..<4]
+
+    await read_into(head)
+    int(head[0]) + int(head[3]) + int(buf[4])
+
+val t = handle()
+
+print(step(t, () -> ()))
+
+for i in 0..<16
+    staged[i] = u8(10 + i)
+
+on_irq.unwrap()()
+print(step(t, () -> ()), block_on(t))
+```
+
+```output
+false
+true 23
+```
+
+`buf` lives in `handle`'s frame, `head` views it, and `read_into`'s frame holds `head` while both
+tasks are parked; the bytes are written through it after the resumption and read back from `buf`.
+A view handed to something that keeps it beyond the call — a device's static, say — is instead the
+case [`--explain-escapes`](/reference/memory/) reports: the array is promoted to the heap, and the
+loan is just as safe.
+
 ## Dropping a task cancels it
 
 **There is no cancel operation: a task is cancelled by letting go of it.** A task dropped while it is
