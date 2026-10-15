@@ -290,8 +290,11 @@ directory_symbols() -> Buf[string]
 end directory_symbols
 
 // The whole vocabulary in one line, sorted, as a refusal names it.
-symbols_listed() -> string
-    val sorted = sorted_strings(symbols())
+symbols_listed() -> string = listed(symbols())
+
+// A vocabulary in one line, sorted.
+private listed(known: Buf[string]) -> string
+    val sorted = sorted_strings(known)
     var out = ""
 
     for i in 0..<sorted.len()
@@ -300,7 +303,7 @@ symbols_listed() -> string
         out = out + sorted.at(i)
 
     out
-end symbols_listed
+end listed
 
 // The symbol a package's feature is named by in a condition: `server` is `feature_server`. The
 // prefix keeps the two vocabularies apart, so a package cannot declare a feature called `linux` and
@@ -417,16 +420,24 @@ private struct CondTok
     col: usize
 end CondTok
 
-// A condition being read, which is a token list and a position in it.
+// A condition being read, which is a token list and a position in it. `word` is what a complaint
+// calls the place the condition was written (`#if`, or a manifest key), and `source` whether it gates
+// a source file -- where a package's `feature_` symbols may be named as well as the closed set `known`.
 private struct Cond
-    src: Source
-    line: usize
     word: string
     at: usize
     toks: Buf[CondTok]
     i: usize
     on: Buf[string]
+    known: Buf[string]
+    source: bool
 end Cond
+
+// What is wrong with a condition, and the column it is wrong at.
+private struct CondFault
+    col: usize
+    message: string
+end CondFault
 
 // Whether a directive's condition holds for the symbols given, or what is wrong with it.
 //
@@ -436,14 +447,55 @@ end Cond
 // condition can hold are exactly the ones that would otherwise gate code out with nothing said.
 private condition(src: Source, line: usize, text: string, at: usize, word: string,
                   on: Buf[string]) -> Result[bool, Diagnostic]
-    val arg = argument(text, at)
+    read_condition(argument(text, at), at, s"#$word", on, symbols(), true) match
+        Ok(value) -> Ok(value)
+        Err(fault) -> Err(fail_at(src, line, fault.col, fault.message))
+end condition
+
+// The symbols a dependency's `if` may name: everything a `#if` may, and `libc` -- the one capability
+// that says what is linked under the program, which is what a dependency's own C collides with
+// (`reference/packages.md § A dependency only some machines take`).
+dependency_symbols() -> Buf[string]
+    var out = symbols()
+
+    out.push("libc")
+    out
+end dependency_symbols
+
+// The symbols that are true for a machine as its project describes it, read by a dependency's `if`:
+// what `#if` reads, and `libc` where the machine has a C library under the program.
+dependency_defined(t: Target) -> Buf[string]
+    var out = defined(t)
+
+    if !t.lacks_capability("libc") then out.push("libc")
+
+    out
+end dependency_defined
+
+// Whether a dependency's `if` holds for the symbols given, or what is wrong with it. The grammar and
+// the checks are `#if`'s, so the two places a machine is asked about read one language; the
+// vocabulary is `dependency_symbols`, and a feature is not in it -- `optional` is how a feature turns
+// a dependency on.
+dependency_condition(text: string, on: Buf[string]) -> Result[bool, string]
+    if text.trim().is_empty()
+        return Err("is empty — a condition names at least one fact of the machine, and a dependency " +
+            "every machine takes is written without 'if'")
+
+    read_condition(text, 0, "if", on, dependency_symbols(), false) match
+        Ok(value) -> Ok(value)
+        Err(fault) -> Err(s"is \"$text\", and ${fault.message}")
+end dependency_condition
+
+// The condition `arg` read against `on`, `at` being the column it starts at.
+private read_condition(arg: string, at: usize, word: string, on: Buf[string], known: Buf[string],
+                       source: bool) -> Result[bool, CondFault]
     val named = arg.trim()
 
     // A target's *name* is the thing a reader most plausibly reaches for and the one thing that
     // cannot be a symbol: it has a `-` in it, which no identifier carries. Left to the tokenizer they
     // are told a `-` is not an operator, which is true and no help.
     if target_named(named).is_some()
-        return Err(fail_at(src, line, at + content_at(arg),
+        return Err(CondFault(at + content_at(arg),
             s"'${named}' is a target's name rather than something a condition asks about — a condition asks about one fact of the machine at a time, so this is written '${replace_all(named, "-", " && ")}'"))
 
     var toks: Buf[CondTok] = buf()
@@ -479,24 +531,24 @@ private condition(src: Source, line: usize, text: string, at: usize, word: strin
             toks.push(CondTok(arg[i..<i + 1], arg[i..<i + 1], col))
             i += 1
         else
-            return Err(fail_at(src, line, col,
+            return Err(CondFault(col,
                 s"a condition is built from symbols, '!', '&&', '||' and parentheses, and '${char_at(arg, i)}' is none of them"))
 
-    var c = Cond(src, line, word, at, toks, 0, on)
+    var c = Cond(word, at, toks, 0, on, known, source)
     val value = cond_or(&c)?
 
     if c.i < c.toks.len()
         val extra = c.toks.at(c.i)
 
-        return Err(fail_at(src, line, extra.col, s"the condition is complete before '${extra.text}'"))
+        return Err(CondFault(extra.col, s"the condition is complete before '${extra.text}'"))
 
     Ok(value)
-end condition
+end read_condition
 
 // **Both sides are evaluated even where the result is already settled** -- this is a checker as much
 // as an evaluator, and short-circuiting would let a misspelled symbol through whenever the other
 // half of the condition happened to decide the answer.
-private cond_or(c: *Cond) -> Result[bool, Diagnostic]
+private cond_or(c: *Cond) -> Result[bool, CondFault]
     var acc = cond_and(c)?
 
     loop
@@ -511,7 +563,7 @@ private cond_or(c: *Cond) -> Result[bool, Diagnostic]
     Ok(acc)
 end cond_or
 
-private cond_and(c: *Cond) -> Result[bool, Diagnostic]
+private cond_and(c: *Cond) -> Result[bool, CondFault]
     var acc = cond_unary(c)?
 
     loop
@@ -526,7 +578,7 @@ private cond_and(c: *Cond) -> Result[bool, Diagnostic]
     Ok(acc)
 end cond_and
 
-private cond_unary(c: *Cond) -> Result[bool, Diagnostic]
+private cond_unary(c: *Cond) -> Result[bool, CondFault]
     if cond_kind(c) != "!" then return cond_atom(c)
 
     c.i += 1
@@ -536,11 +588,10 @@ private cond_unary(c: *Cond) -> Result[bool, Diagnostic]
     Ok(!value)
 end cond_unary
 
-private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
+private cond_atom(c: *Cond) -> Result[bool, CondFault]
     val kind = cond_kind(c)
 
-    if kind == ""
-        return Err(fail_at(c.src, c.line, cond_end(c), s"'#${c.word}' needs a condition after it"))
+    if kind == "" then return Err(CondFault(cond_end(c), s"'${c.word}' needs a condition after it"))
 
     val tok = c.toks.at(c.i)
 
@@ -549,10 +600,15 @@ private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
 
         // **The feature family is open where the target's symbols are closed**: a feature exists
         // because the manifest of the file being gated says so, so `feature_x` in a package that
-        // declares no `x` is false rather than refused.
-        if !has(symbols(), tok.text) && !is_feature_symbol(tok.text)
-            return Err(fail_at(c.src, c.line, tok.col,
-                s"'${tok.text}' is not something a target says about itself — sysl knows ${symbols_listed()}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
+        // declares no `x` is false rather than refused. A dependency's condition has no feature
+        // family: `optional` is how a feature turns a dependency on.
+        if c.source && !has(c.known, tok.text) && !is_feature_symbol(tok.text)
+            return Err(CondFault(tok.col,
+                s"'${tok.text}' is not something a target says about itself — sysl knows ${listed(c.known)}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
+
+        if !c.source && !has(c.known, tok.text)
+            return Err(CondFault(tok.col,
+                s"'${tok.text}' is not something a dependency's condition can ask about the machine — it knows ${listed(c.known)}. A dependency a feature turns on is 'optional = true' and named by the feature"))
 
         return Ok(has(c.on, tok.text))
 
@@ -565,15 +621,13 @@ private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
             c.i += 1
             return Ok(inner)
 
-        if cond_kind(c) == ""
-            return Err(fail_at(c.src, c.line, cond_end(c), "this '(' is never closed"))
+        if cond_kind(c) == "" then return Err(CondFault(cond_end(c), "this '(' is never closed"))
 
         val next = c.toks.at(c.i)
 
-        return Err(fail_at(c.src, c.line, next.col, s"this '(' wants a ')' before '${next.text}'"))
+        return Err(CondFault(next.col, s"this '(' wants a ')' before '${next.text}'"))
 
-    Err(fail_at(c.src, c.line, tok.col,
-        s"a condition needs a symbol here, and '${tok.text}' is what is written"))
+    Err(CondFault(tok.col, s"a condition needs a symbol here, and '${tok.text}' is what is written"))
 end cond_atom
 
 private cond_kind(c: *Cond) -> string

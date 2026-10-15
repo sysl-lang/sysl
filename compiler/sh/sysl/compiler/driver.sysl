@@ -156,7 +156,7 @@ private lib_root_units(t: Target, fetched: &PackageSources) -> Result[Buf[Progra
         for j in 0..<theirs.len()
             var unit = theirs.at(j)
 
-            unit.pkg = Packaging("", buf(), true, manifest, name, version)
+            unit.pkg = Packaging("", buf(), true, manifest, name, version, "")
             out.push(unit)
 
     Ok(out)
@@ -346,14 +346,15 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true) -> Res
         var unit = item
 
         unit.pkg = Packaging("", fetched.root_mounts, true, unit.pkg.manifest, unit.pkg.name,
-                             unit.pkg.version)
+                             unit.pkg.version, fetched.root_absent)
         theirs.push(unit)
 
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
     // instead is the table the graph built for it.
     val (own_manifest, own_name, own_version) = manifest_of_tree(root, manifest.name, manifest.version)
-    val mine_pkg = Packaging("", fetched.root_mounts, false, own_manifest, own_name, own_version)
+    val mine_pkg = Packaging("", fetched.root_mounts, false, own_manifest, own_name, own_version,
+                             fetched.root_absent)
 
     var own: Buf[string] = buf()
 
@@ -589,6 +590,8 @@ typed_compilation(path: string, named_target: Option[string]) -> Result[Compilat
 
     val t = as_declared(manifest, registered)
 
+    use_resolution_machine(Some(t))
+
     root_floor_refusal(manifest.floor) match
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
@@ -785,6 +788,11 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     if is_directory(path) && manifest.workspace.is_some() && !manifest.has_package
         return Err(Refusal(virtual_root_refusal(absolute_path(root))))
+
+    // **The machine every resolution this build makes is for**, said before the first of them (the
+    // allocator claims below resolve the graph), so a dependency's `if` is read against the machine
+    // as the project describes it -- `libc` included -- by every one of them alike.
+    use_resolution_machine(Some(as_declared(manifest, t)))
 
     // **And the heap it allocates through**, settled here because this is the one funnel every
     // command that lowers anything comes through, and it comes through before the standard module's

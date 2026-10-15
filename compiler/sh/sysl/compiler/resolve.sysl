@@ -1177,10 +1177,14 @@ struct PackageSources
     // `dev_dependencies` entry -- what `check_dev_imports` holds an ordinary module to. Empty for
     // every command but `sysl test`, which is the only one that resolves the block.
     dev_modules: Buf[string]
+
+    // What a `no module is called` refusal in the project's own files adds, where its manifest names
+    // dependencies the machine being built for leaves out (`absent_note`).
+    root_absent: string
 end PackageSources
 
 // A project that depends on nothing, which is what an empty `dependencies` block means.
-no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf(), buf())
+no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf(), buf(), "")
 
 // The project's manifest as this build resolves it (`reference/packages.md § Dependencies a test
 // alone needs`): under `sysl test` its `dev_dependencies` join its `dependencies` in the one graph,
@@ -1294,6 +1298,12 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
     if feature_testing() then out.dev_modules = dev_module_paths(m, graph)
 
+    // **A dependency the machine leaves out is named where an import of it fails**: its tree was never
+    // fetched, so which modules it offers is unknown, and the refusal says what is known instead.
+    val left_out = absent_note(graph_absent(m, graph))
+
+    out.root_absent = left_out
+
     for item in libs
         out.lib_features.push((item,
                                feature_symbols(enabled_of(graph.features, lib_root_key(item)))))
@@ -1318,7 +1328,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         // mean whatever *its* manifest bound -- which is what makes a package's source read the
         // same whoever depends on it.
         val (manifest, name, version) = manifest_of_tree(p.root, p.manifest.name, p.manifest.version)
-        val theirs = Packaging(p.canonical, p.imports, true, manifest, name, version)
+        val theirs = Packaging(p.canonical, p.imports, true, manifest, name, version, left_out)
         val gated = feature_symbols(enabled_of(graph.features, p.canonical))
 
         // **A package's `@tests` files are its own `sysl test`'s and no consumer's**, so they are left
@@ -1363,6 +1373,31 @@ private header_says_tests(src: Source) -> bool
 
     false
 end header_says_tests
+
+// Every dependency the graph's manifests name, turned on by their features, that the machine being
+// built for leaves out -- each with who declared it. A package's own manifest is read again from its
+// tree, since the graph holds it already pruned.
+graph_absent(m: &Manifest, graph: &Graph) -> Buf[(string, Dependency)]
+    var out: Buf[(string, Dependency)] = buf()
+    val mine = absent_dependencies(with_dev_dependencies(m), graph.features, "")
+
+    for dep in mine
+        out.push(("this project", dep))
+
+    for p in graph.packages
+        if is_root_package(p) then continue
+
+        manifest_of_package(p.root) match
+            Err(_) -> ()
+            Ok(whole) ->
+                val theirs = absent_dependencies(whole, graph.features, p.canonical)
+                val asker = if whole.name.is_empty() then p.canonical else whole.name
+
+                for dep in theirs
+                    out.push((s"'$asker'", dep))
+
+    out
+end graph_absent
 
 // The graph alone, which is what a build and a listing of what a project takes have in common.
 //

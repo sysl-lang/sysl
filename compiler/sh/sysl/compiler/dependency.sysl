@@ -51,11 +51,73 @@ struct Dependency
     // the package's own include roots by every C file of the package (`c_libraries.sysl`) -- which is
     // how a consumer supplies the configuration header a vendored library is written to take.
     c_include: Buf[string]
+
+    // The machines the dependency is taken on, as the condition its `if` wrote -- `#if`'s language
+    // over `dependency_symbols` -- or the empty string where it is taken on every machine.
+    condition: string
 end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
 plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
-    Dependency(label, origin, mount, false, buf(), true, buf())
+    Dependency(label, origin, mount, false, buf(), true, buf(), "")
+
+// **The machine a graph is resolved for**, which decides the dependencies an `if` leaves out. Module
+// storage for the reason `features.sysl` gives for the feature request: it is written by the one
+// funnel a command that lowers anything comes through (`target_for`) and read by every resolution
+// that build makes -- the compilation, the C walk, the run cache's key -- which must all agree.
+//
+// **None takes every dependency whatever its condition**, which is what a question about the
+// manifests rather than about one build wants: `sysl deps`, `sysl tidy` and `sysl vendor` answer for
+// every machine a project may be built for, as they do for every feature.
+private var resolution_machine: Option[Target] = None
+
+// Said by a command once it knows the machine it builds for, and with `None` before any other.
+use_resolution_machine(t: Option[Target]) = resolution_machine = t
+
+// Whether a dependency is part of a graph resolved for the machine `use_resolution_machine` named.
+present_here(dep: &Dependency) -> bool
+    if dep.condition.is_empty() then return true
+
+    resolution_machine match
+        None -> true
+        Some(t) -> dependency_condition(dep.condition, dependency_defined(t)).unwrap_or(true)
+end present_here
+
+// The dependencies a list keeps on this machine, and the ones it leaves out.
+present_and_absent(deps: &Buf[Dependency]) -> (Buf[Dependency], Buf[Dependency])
+    var present: Buf[Dependency] = buf()
+    var absent: Buf[Dependency] = buf()
+
+    for dep in deps
+        if present_here(dep) then present.push(dep) else absent.push(dep)
+
+    (present, absent)
+end present_and_absent
+
+// What a `no module is called` refusal adds where the graph left a dependency out on this machine,
+// each with who declared it ("this project" or a package's name): the module may be one of those,
+// and the build is not for a machine that takes it. **The whole graph's, since imports are
+// transitive**: a package reached through another is importable where it is present, so its
+// absence is news to every file of the build.
+absent_note(absent: &Buf[(string, Dependency)]) -> string
+    if absent.is_empty() then return ""
+
+    val machine = resolution_machine match
+        None -> "this machine"
+        Some(t) -> s"'${t.name}'"
+
+    var out = ""
+
+    for i in 0..<absent.len()
+        val (asker, dep) = absent.at(i)
+
+        out = out + (if i == 0 then " — " else "; ") +
+            s"'${dep.label}', which $asker takes only where '${dep.condition}' holds"
+
+    val verb = if absent.len() == 1 then "is" else "are"
+
+    out + s", $verb left out: $machine is not such a machine, and nothing of it is in this build"
+end absent_note
 
 // The identity everything mangles, caches and resolves by -- the coordinate, with the separators a
 // module name is allowed to hold.
@@ -114,8 +176,7 @@ resolved_against(dep: &Dependency, declaring_dir: string) -> Dependency
         Local(dir) ->
             val joined = if dir.starts_with("/") then dir else join_path(declaring_dir, dir)
 
-            Dependency(dep.label, Local(absolute_path(joined)), dep.mount, dep.optional,
-                       dep.features, dep.default_features, dep.c_include)
+            (*dep) with { origin = Local(absolute_path(joined)) }
 end resolved_against
 
 // Every dependency of a list read against the directory holding the manifest that wrote it.
@@ -245,13 +306,14 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'c_include', 'default_features', 'features', 'git', 'mount', 'optional', 'path', 'rev', " +
-                "'version', 'workspace'")
+                "'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', 'path', " +
+                "'rev', 'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
     val origin = read_origin(sub, where)?
     val optional = read_yes_no(sub, where, "optional", false)?
     val defaults = read_yes_no(sub, where, "default_features", true)?
+    val condition = read_condition_key(sub, where)?
 
     val features = conf_at(sub, "features") match
         None -> buf()
@@ -270,12 +332,30 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
                 for dir in dirs
                     c_include.push(inside_package(s"$where.c_include", "", dir)?)
 
-    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include))
+    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, condition))
 end read_dependency
+
+// An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
+// the build turns out to be for -- so a misspelling is refused when the file is read rather than
+// leaving the dependency out of every build with nothing said.
+private read_condition_key(sub: &Conf, where: string) -> Result[string, string]
+    val text = conf_at(sub, "if") match
+        None -> return Ok("")
+        Some(v) -> *v match
+            Text(s) -> s
+            Word(s) -> s
+            _ -> return Err(s"'$where.if' is not a string — it is a condition, as '#if' writes " +
+                "one, in quotes: if = \"freestanding\"")
+
+    dependency_condition(text, buf()) match
+        Err(why) -> Err(s"'$where.if' $why")
+        Ok(_) -> Ok(text)
+end read_condition_key
 
 private known_dependency_key(key: string) -> bool =
     key == "git" || key == "version" || key == "rev" || key == "path" || key == "mount" || key == "optional" ||
-    key == "features" || key == "default_features" || key == "workspace" || key == "c_include"
+    key == "features" || key == "default_features" || key == "workspace" || key == "c_include" ||
+    key == "if"
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.
