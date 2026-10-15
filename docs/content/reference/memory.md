@@ -1943,6 +1943,34 @@ arguments into exactly `[a, b, c][..]`, so a `...T` member reached through a tra
 literal that has to outlive the frame. It costs an allocation there and nothing at a call whose slice
 stays put.
 
+**A literal written where a `[]T` is expected is the same temporary**, and it is laid in the frame
+on the same terms: handed straight to a call that keeps nothing of it, and whose answer could not
+carry a view of it out, it is the array `val xs: [N]T = [...]` would have been, viewed whole, and
+allocates nothing. Its elements may be anything the frame computes:
+
+```sysl
+sum(xs: []const int) -> int
+    var s = 0
+
+    for x in xs
+        s += x
+
+    s
+
+val g = 3
+
+print(sum([g, g * 2, sum([g, 1])]))
+```
+
+```output
+13
+```
+
+Everywhere else it is a buffer of its own, as before — bound to a name, returned, stored, handed to a
+callee that keeps it, to an `async` function (whose task holds its arguments until it runs), or to a
+call whose answer may be a view of it, such as `first([a, b])` answering `[]const int`. Those can
+outlive the statement that made them, and a slot cannot.
+
 A **call's answer** is the same temporary written a different way, and it is the one a reader meets
 first: a digest is a `[32]u8`, so slicing one straight into something that keeps it is a view of an
 array with no declaration behind it.
@@ -1985,7 +2013,11 @@ a slice of an array this frame owns is returned, so it would outlive the array, 
 ```
 
 **Without an allocator it is always a compile error.** Under `no alloc` there is nothing to promote
-into, so every promotion becomes a refusal reported at the view that leaves the frame. That is how
+into, so every promotion becomes a refusal reported at the view that leaves the frame — and so does
+every literal argument a callee keeps. A machine whose manifest took the heap away (`capabilities {
+heap = false }`) is held to the same line in every module it builds, without a clause written
+anywhere: the refusal names the machine, `'thumbv7em-freestanding' provides no allocator`, rather
+than leaving the link to say `undefined symbol: malloc`. That is how
 every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
 closures, and `&T` creation are all compile errors there — so it introduces no new rule.
 

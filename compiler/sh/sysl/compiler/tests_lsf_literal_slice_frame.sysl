@@ -1,0 +1,288 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// An array literal written where a `[]T` is expected and handed straight to a call that keeps
+// nothing of it is laid in the caller's frame, as `val xs: [N]T = [...]` then `f(xs)` would be:
+// `reference/memory.md § What happens when a slice escapes` says such a literal costs "nothing at a
+// call whose slice stays put". A callee that keeps it, or a call whose answer may carry it out, still
+// gets a buffer of its own -- and on a machine the manifest took the heap away from, that buffer and
+// every other promotion is a compile error rather than a call to a `malloc` the link cannot find.
+//
+// Lowered for `thumbv7em-freestanding`, the board the finding was made on, with the standard module
+// compiled from source beside the program.
+
+private const lsf_board: string = "thumbv7em-freestanding"
+
+private var lsf_library: Buf[Program] = buf()
+private var lsf_library_read: bool = false
+
+private lsf_units() -> Buf[Program]
+    if lsf_library_read then return lsf_library
+
+    lsf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, target_named(lsf_board).unwrap()) match
+            Err(_) -> ()
+            Ok(units) -> lsf_library = units
+
+    lsf_library
+end lsf_units
+
+private lsf_no_library() -> bool
+    if lsf_units().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end lsf_no_library
+
+// The board, with or without the heap a config can take away. A freestanding machine lacks a C
+// library before any manifest speaks, so that stays.
+private lsf_target(heap: bool) -> Target
+    val t = target_named(lsf_board).unwrap()
+
+    if heap then return t
+
+    var lacks: Buf[string] = buf()
+
+    lacks.push(CapLibc)
+    lacks.push(CapHeap)
+    t with { lacks = lacks }
+end lsf_target
+
+// The LLVM text of a one-file program lowered for the board, or every error the checks reported.
+// The program's statements call `probe`, which is what keeps it -- and everything it reaches -- in the
+// pruned module.
+private lsf_ir(src: string, heap: bool) -> string
+    val t = lsf_target(heap)
+    var units: Buf[Program] = buf()
+
+    for item in lsf_units()
+        units.push(item)
+
+    val parsed = parse(source_of("p.sysl", src + "\nval probed = probe()\n"))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end lsf_ir
+
+// The allocator functions the lowered program CALLS, as `@malloc` and `@free` whatever the pair is
+// named in this build (a test build may count them), space-separated: an unreferenced `declare` costs
+// a link nothing.
+private lsf_calls(src: string, heap: bool) -> string
+    val ir = lsf_ir(src, heap)
+
+    assert(ir.contains("probe(") && ir.contains("define "), s"did not compile for $lsf_board:\n$ir")
+
+    var said = ""
+
+    for f in [("@free", free_symbol()), ("@malloc", malloc_symbol())]
+        var called = false
+
+        for line in lines_of(ir).view()
+            if line.contains(s"@${f.1}(") && line.contains(" call ") then called = true
+
+        if called then said = said + f.0 + " "
+
+    said
+end lsf_calls
+
+// The program, built where there is a heap, calls the allocator.
+private lsf_allocates(src: string)
+    assert(lsf_calls(src, true).contains("@malloc"), lsf_ir(src, true))
+
+// The build is refused, and the refusal says `part`.
+private lsf_refused(src: string, part: string)
+    val said = lsf_ir(src, false)
+
+    assert(!said.contains("define "), s"compiled, and should have been refused:\n$said")
+    assert(said.contains(part), said)
+end lsf_refused
+
+private const lsf_sum: string = "var g: usize = 3\n\nsum(xs: []const usize) -> usize\n" +
+    "    var s: usize = 0\n    for x in xs\n        s += x\n    s\n\n"
+
+private const lsf_keep: string = "struct Held\n    xs: []const usize\n\n" +
+    "keep(into: *Held, xs: []const usize) -> usize\n    into.xs = xs\n    xs.len\n\n"
+
+private const lsf_first: string = "first(xs: []const usize) -> []const usize = xs[0..<1]\n\n"
+
+// What the board ends its tail with when a promotion has nowhere to go.
+private lsf_no_heap() -> string =
+    s"— and '$lsf_board' provides no allocator, so there is nothing to move it into"
+
+@test("a literal handed to a call that keeps nothing of it allocates nothing")
+lsf_literal_allocates_nothing()
+    if lsf_no_library() then return
+
+    assert_eq(lsf_calls(lsf_sum + "@export(\"probe_literal\")\nprobe_literal() -> usize = " +
+                        "sum([g, g + 1])\n\n@export(\"probe_named\")\nprobe_named() -> usize\n" +
+                        "    val xs: [2]usize = [g, g + 1]\n    sum(xs)\n\n" +
+                        "probe() -> usize = probe_literal() + probe_named()\n", true), "")
+
+@test("and its elements may be anything computed -- a call, arithmetic, a read")
+lsf_computed_elements()
+    if lsf_no_library() then return
+
+    assert_eq(lsf_calls(lsf_sum + "twice(n: usize) -> usize = n * 2\n\n@export(\"probe\")\n" +
+                        "probe() -> usize = sum([g, twice(g), g * g])\n", true), "")
+
+@test("a literal inside another literal's call is laid in the frame too")
+lsf_nested_call()
+    if lsf_no_library() then return
+
+    assert_eq(lsf_calls(lsf_sum + "@export(\"probe\")\nprobe() -> usize = sum([g, sum([g, 1])])\n",
+                        true), "")
+
+@test("a method's literal argument is one too")
+lsf_method_call()
+    if lsf_no_library() then return
+
+    assert_eq(lsf_calls(lsf_sum + "struct Acc\n    base: usize\n\nimpl Acc\n" +
+                        "    total(self, xs: []const usize) -> usize = self.base + sum(xs)\n\n" +
+                        "@export(\"probe\")\nprobe() -> usize\n    val a = Acc(g)\n" +
+                        "    a.total([g, 5])\n", true), "")
+
+@test("a callee that keeps the slice still gets a buffer, where there is a heap")
+lsf_kept_still_promotes()
+    if lsf_no_library() then return
+
+    lsf_allocates(lsf_sum + lsf_keep + "@export(\"probe\")\nprobe() -> usize\n" +
+                  "    var h = Held([])\n    keep(&h, [g, g + 1])\n")
+
+@test("a call whose answer may be a view of the literal still gets it a buffer")
+lsf_view_answer_keeps_a_buffer()
+    if lsf_no_library() then return
+
+    lsf_allocates(lsf_sum + lsf_first + "@export(\"probe\")\nprobe() -> usize = first([g, 1]).len\n")
+
+@test("a board with no heap builds a literal that stays put, and calls no allocator")
+lsf_heapless_board_frames()
+    if lsf_no_library() then return
+
+    assert_eq(lsf_calls(lsf_sum + "@export(\"probe\")\nprobe() -> usize = sum([g, sum([g, 1])])\n",
+                        false), "")
+
+@test("a board with no heap refuses a literal the callee keeps, at the literal")
+lsf_heapless_kept_refused()
+    if lsf_no_library() then return
+
+    lsf_refused(lsf_sum + lsf_keep + "@export(\"probe\")\nprobe() -> usize\n" +
+                "    var h = Held([])\n    keep(&h, [g, g + 1])\n",
+                "this view of an array literal is passed to 'keep', which holds on to it, so the " +
+                s"array would move to the heap to outlive the frame ${lsf_no_heap()}")
+
+@test("a board with no heap refuses a call whose answer may carry the literal out")
+lsf_heapless_view_answer_refused()
+    if lsf_no_library() then return
+
+    lsf_refused(lsf_sum + lsf_first + "@export(\"probe\")\nprobe() -> usize = first([g, 1]).len\n",
+                s"a slice with storage of its own needs an allocator, and '$lsf_board' provides " +
+                "no allocator")
+
+@test("a board with no heap refuses every promotion at compile time, temporary or declared")
+lsf_heapless_promotion_refused()
+    if lsf_no_library() then return
+
+    val src = "var g: usize = 3\n\nmake() -> []const usize = [g, g + 1][..]\n\n" +
+              "make_named() -> []const usize\n    val xs: [2]usize = [g, g + 1]\n    xs[..]\n\n" +
+              "@export(\"probe\")\nprobe() -> usize = make().len + make_named().len\n"
+
+    lsf_refused(src, s"this view of an array literal is returned, so the array would move to the " +
+                s"heap to outlive the frame ${lsf_no_heap()}")
+    lsf_refused(src, s"this view of 'xs' is returned, so the array would move to the heap to " +
+                s"outlive the frame ${lsf_no_heap()}")
+
+@test("a module that gave the allocator up builds a literal that stays put, and refuses a kept one")
+lsf_no_alloc_clause()
+    if lsf_no_library() then return
+
+    val head = "@no_alloc\n\n" + lsf_sum + lsf_keep
+
+    assert_eq(lsf_calls(head + "@export(\"probe\")\nprobe() -> usize = sum([g, 2])\n", true), "")
+
+    val said = lsf_ir(head + "@export(\"probe\")\nprobe() -> usize\n    var h = Held([])\n" +
+                      "    keep(&h, [g, 2])\n", true)
+
+    assert(said.contains("this view of an array literal is passed to 'keep', which holds on to " +
+                         "it, so the array would move to the heap to outlive the frame — and this " +
+                         "module declared '@no_alloc'"), said)
+end lsf_no_alloc_clause
+
+// -- what the program does, on this machine ------------------------------------------------------
+
+private lsf_prints(text: string, want: string)
+    if lsf_no_library() then return
+
+    val root = make_temp_dir("sysl-lsf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(failure_text(why), want)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text + out.err.unwrap_or(""), want)
+            assert_eq(shell_status(out.status), 0)
+end lsf_prints
+
+private const lsf_run_sum: string = "sum(xs: []const int) -> int\n    var s = 0\n    for x in xs\n" +
+    "        s += x\n    s\n\n"
+
+@test("a framed literal reads its elements, in a loop and nested")
+lsf_runs_in_a_loop()
+    lsf_prints(lsf_run_sum + "val g = 3\nvar total = 0\n\nfor i in 0..<4\n" +
+               "    total += sum([i, g, sum([i, 10])])\n\nprint(total)\n", "64\n")
+
+@test("a framed literal of strings holds each element for the length of the call")
+lsf_runs_with_strings()
+    lsf_prints("join(xs: []const string) -> string\n    var out = \"\"\n    for x in xs\n" +
+               "        out = out + x\n    out\n\nval g = 3\nprint(join([str(g) + \"a\", \"b\", " +
+               "str(g * 2)]))\n", "3ab6\n")
+
+@test("a literal the callee keeps, or that the call hands back, outlives the call on a hosted machine")
+lsf_runs_kept()
+    lsf_prints(lsf_run_sum + "var kept: []const int = []\n\nkeep(xs: []const int) -> int\n" +
+               "    kept = xs\n    int(xs.len)\n\nfirst(xs: []const int) -> []const int = xs[0..<1]\n\n" +
+               "val g = 3\nprint(keep([g, g + 1, 9]))\nprint(sum([1, 2]) + sum([100, 200]))\n" +
+               "print(kept[0], kept[1], kept[2])\nval f = first([g * 7, 2])\nprint(f[0])\n",
+               "3\n303\n3 4 9\n21\n")
+
+@test("a literal handed to an async function lives in the task until it runs")
+lsf_runs_async()
+    lsf_prints(lsf_run_sum + "async tally(xs: []const int) -> int = sum(xs)\n\nval g = 3\n" +
+               "val t = tally([g, 4])\nval u = tally([10, g])\nprint(block_on(t), block_on(u))\n",
+               "7 13\n")

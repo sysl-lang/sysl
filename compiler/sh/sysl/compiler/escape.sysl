@@ -38,6 +38,13 @@ struct Promotions
     // that made it.
     temporaries: Buf[Span]
 
+    // The **array literals laid in the frame** rather than in a buffer, per body: a literal written
+    // where a `[]T` is expected and handed straight to a call that keeps nothing of it and whose
+    // result can carry no view. Keyed as `by_func` is, and the entry file's statements under
+    // `framed_main`. Everything else a literal-as-slice is stays a buffer of its own.
+    framed: Buf[(string, Buf[Span])]
+    framed_main: Buf[Span]
+
     // **Why each array moved**, one line per array in the order the bodies were walked, each
     // `file:line:col: 'buf' is promoted to the heap, because this view of it is returned` -- the
     // view that forced it and the route it took out. Promotion is silent, not hidden: this is what
@@ -56,6 +63,16 @@ struct Promotions
         buf()
     end for_func
 
+    // The array literals this body lays in its frame, in the same terms.
+    framed_for(self, name: string) -> Buf[Span]
+        if name == "" then return self.framed_main
+
+        for item in self.framed
+            if item.0 == name then return item.1
+
+        buf()
+    end framed_for
+
     holds_temp(self, at: Span) -> bool
         for temporarie in self.temporaries
             if temporarie == at then return true
@@ -70,8 +87,10 @@ no_promotions() -> Promotions
     var in_main: Buf[string] = buf()
     var temporaries: Buf[Span] = buf()
     var notes: Buf[(string, string)] = buf()
+    var framed: Buf[(string, Buf[Span])] = buf()
+    var framed_main: Buf[Span] = buf()
 
-    Promotions(by_func, in_main, temporaries, notes)
+    Promotions(by_func, in_main, temporaries, framed, framed_main, notes)
 end no_promotions
 
 // What one body's walk found: the arrays it must move, the temporaries it must give storage to,
@@ -109,6 +128,14 @@ struct EscapeWalk
 
     // The arrays this body declared with a boundary of their own, and the boundary each asked for.
     aligned: Buf[(string, usize)]
+
+    // Every array literal written where a `[]T` is expected that the walk met, by span, and the
+    // ones among them a call's verdict laid in the frame. A span is only a position in one file, so
+    // a literal is framed where **every** literal the walk met at that span was: a default argument
+    // spliced in from another file is the one way two of them can share one, and it then stays a
+    // buffer rather than risking the frame for a literal that is kept.
+    lits: Buf[Span]
+    framed: Buf[Span]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -217,10 +244,24 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
         if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
 
+        val framed = settled_frames(w)
+
+        if !framed.is_empty() then out.framed.push((f.name, framed))
+
         for temp in w.temps
             out.temporaries.push(temp.0)
 
-    val mw = walk_body(p, keeps, p.main, None, true)
+    var mw = walk_body(p, keeps, p.main, None, true)
+
+    // The entry point lays the module's storage down as well as running the statements, and those
+    // initializers were written in other files: each literal among them is counted as met and never
+    // framed, so one sharing a span with a statement's literal keeps both in buffers.
+    for v in p.vals
+        v.init match
+            Some(init) -> count_literals(&mw, init)
+            None -> ()
+
+    out.framed_main = settled_frames(mw)
 
     val entry = entry_home(a)
 
@@ -388,8 +429,11 @@ private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)]
         ref_of = ref_bindings(stmts)
         aligned = aligned_arrays(stmts)
 
+    var lits: Buf[Span] = buf()
+    var framed: Buf[Span] = buf()
+
     val w: &EscapeWalk = EscapeWalk(seeds, promoted, temps, sites, false, None, returning, locals,
-                                    ref_of, aligned)
+                                    ref_of, aligned, lits, framed)
     val prog = p
     val kp = keeps
     var changed = true
@@ -537,8 +581,14 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         if op == "slot_place" && args.len() == 3 && views(p, keeps, w, args.at(2)).non_empty()
             gets_out(p, keeps, w, args.at(2), "is stored somewhere the frame does not own")
 
-    TCall(name, args, _, _) ->
+    TCall(name, args, ty, _) ->
+        val frames = frames_literals(ty)
+
         for i in 0..<args.len()
+            if frames && literal_argument(args.at(i))
+                frame_literal(w, args.at(i), kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
+                              s"is passed to '$name', which holds on to it")
+
             if views(p, keeps, w, args.at(i)).non_empty() && kept_by(p, keeps, name, i)
                 gets_out(p, keeps, w, args.at(i), s"is passed to '$name', which holds on to it")
 
@@ -546,13 +596,22 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     // consult -- the conservative answer is the only sound one, exactly as it is for a function
     // whose body this program does not have. A borrowing promise is the exception, and only because
     // every implementation of one has been checked to borrow rather than keep.
-    TVCall(recv, slot, args, _, _) ->
+    TVCall(recv, slot, args, ty, _) ->
         val promised = borrows_of(p, texpr_type(recv), slot)
+        val frames = frames_literals(ty)
 
         for i in 0..<args.len()
+            if frames && literal_argument(args.at(i))
+                frame_literal(w, args.at(i), !holds_index(promised, i),
+                              "is passed through a trait object, which may hold on to it")
+
             if !holds_index(promised, i) && views(p, keeps, w, args.at(i)).non_empty()
                 gets_out(p, keeps, w, args.at(i),
                          "is passed through a trait object, which may hold on to it")
+
+    // Every literal met is counted, whatever its parent, so that `settled_frames` can tell a span one
+    // call framed from a span two literals share.
+    TBufLit(elems, _) -> if !elems.is_empty() then w.lits.push(e.span)
 
     // Nothing is known about what is at the other end of a function pointer -- not even which
     // program compiled it -- so the worst is assumed of every argument, exactly as this analysis
@@ -618,6 +677,76 @@ private holds_index(xs: Buf[usize], i: usize) -> bool
 
     false
 end holds_index
+
+// -- array literals laid in the frame -----------------------------------------------------------------
+
+// **A literal written where a `[]T` is expected, handed straight to a call, is laid in the caller's
+// frame when nothing of it can outlive the call** -- the callee keeps no view of it, and the call's
+// result is of a type that could not carry one out. That is the call whose slice stays put, and the
+// literal costs what `val xs: [N]T = [...]` then `f(xs)` costs: a slot, and no allocation.
+//
+// Anything else is a buffer of its own, as it always was: a literal bound to a name, returned,
+// stored, or handed to a call whose answer may be a view of it. Those can outlive the statement
+// that made them, and a slot cannot.
+//
+// The two questions are separate because they are asked at different times. Whether the shape
+// qualifies is known from the tree, so `no_alloc.sysl` asks it while the program is still being
+// checked and leaves such a literal to this pass; whether the callee keeps the slice needs the
+// summaries, so it is answered here.
+literal_argument(e: TExpr) -> bool = *e.kind match
+    TBufLit(elems, _) -> !elems.is_empty()
+    _ -> false
+
+// Whether a call answering `result` lets a literal argument stay in the frame: its answer can carry
+// no view, and it is not a task, which holds its arguments until it is awaited.
+frames_literals(result: Type) -> bool = !carries_view(result) && task_result(result).is_none()
+
+// The verdict on one literal argument. A kept one is a buffer, and it is also a site, so that a body
+// with no allocator is told at the literal why it needs one -- exactly as a promoted array is.
+private frame_literal(w: &EscapeWalk, arg: TExpr, kept: bool, how: string)
+    if kept then w.sites.push(EscapeSite("", "an array literal", arg.span, how))
+    else w.framed.push(arg.span)
+end frame_literal
+
+// An async function's call makes a task that holds its arguments until it runs, so it keeps them all.
+private async_callee(p: TProgram, keeps: &KeptParams, name: string) -> bool =
+    keeps.index.get(name) match
+        Some(id) -> p.funcs.at(id).marks.is_async()
+        None -> false
+
+// Counts every literal under `e` as met, framing none of them.
+private count_literals(w: *EscapeWalk, e: TExpr)
+    val walk = w
+
+    walk_texpr(e, expr_walk(false, x -> count_literal(walk, x)))
+end count_literals
+
+private count_literal(w: *EscapeWalk, x: TExpr) = *x.kind match
+    TBufLit(elems, _) -> if !elems.is_empty() then w.lits.push(x.span)
+    _ -> ()
+
+// The spans a body lays in its frame: those where every literal met at the span was framed.
+private settled_frames(w: EscapeWalk) -> Buf[Span]
+    var out: Buf[Span] = buf()
+
+    for at in w.framed
+        if holds_span(out, at) then continue
+
+        if count_span(w.framed, at) == count_span(w.lits, at) then out.push(at)
+
+    out
+end settled_frames
+
+private holds_span(xs: Buf[Span], at: Span) -> bool = count_span(xs, at) > 0
+
+private count_span(xs: Buf[Span], at: Span) -> usize
+    var n: usize = 0
+
+    for item in xs
+        if item == at then n += 1
+
+    n
+end count_span
 
 // -- what a value views ---------------------------------------------------------------------------------
 
@@ -947,20 +1076,27 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
     // wrote nothing is being held to its module's line and that is the line to go and read.
     val theirs = scaffolding && !holds_string(p.no_alloc_modules, module_name)
 
-    if !narrowed && !own_promise
+    // **A machine the manifest took the heap away from holds every body to the same line**, without
+    // a clause written anywhere -- the library excepted, as `no_alloc.sysl` excepts it. Without this
+    // a promotion on such a machine went on to the link and failed there, naming `malloc`.
+    val machine = a.tables.target.lacks_capability(CapHeap) && !from_library(a, scope)
+
+    if !narrowed && !own_promise && !machine
         refuse_aligned(a, scope, w)
         return
 
     val promised = if narrowed then (if theirs then "this module's '@tests' file" else "this module")
     else s"'${qualified_name(who.unwrap_or(""))}'"
 
+    val nothing = if narrowed || own_promise then s"$promised declared '@no_alloc'"
+    else s"'${a.tables.target.name}' provides no allocator"
+
     for site in w.sites
         val subject = if site.name == "" then site.what else s"'${site.name}'"
 
         a.fault(scope, site.at,
             s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +
-            s"the frame — and $promised " +
-            "declared '@no_alloc', so there is nothing to move it into. Keep the view inside the " +
+            s"the frame — and $nothing, so there is nothing to move it into. Keep the view inside the " +
             "frame, or take the storage from a caller as a '[]T' parameter, which is already " +
             "wherever its owner put it")
 end refuse_no_alloc
