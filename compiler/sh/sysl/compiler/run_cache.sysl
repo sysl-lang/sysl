@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.seq.Sequence
-import sysl.fs.{entries, is_file, make_dir_all, metadata, read_text, remove_file, write_text_atomic}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text_atomic}
 import sysl.text.{from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
 
 // The executable `sysl run` and `sysl test` built last time, kept so that running the same tree
@@ -303,11 +303,12 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
             Ok(cs) -> cs
 
         for item in carried
-            val text = read_text(item) match
-                Err(_) -> return Err(Refusal(s"cannot read ${item}"))
+            // C is bytes, not text: a Latin-1 byte in a comment is still a file to hash.
+            val bytes = read_bytes(item) match
+                Err(e) -> return Err(Refusal(s"cannot read ${io_refusal(item, e)}"))
                 Ok(got) -> got
 
-            files.push((s"$i/${relative_to(trees.at(i), item)}", text))
+            files.push((s"$i/${relative_to(trees.at(i), item)}", from_utf8_unchecked(bytes.view())))
 
     Ok(library_fingerprint(files))
 end program_fingerprint
