@@ -36,9 +36,11 @@ on Arm, `__divdi3` and `__muldf3` on RISC-V — and the program carries them: `s
 `sysl.softfloat.binary64` export them, weak, wherever a reached body divides a `long` or computes with
 an `f64`. This machine has **no cross builtins at all**, so before they were the program's they were
 C stand-ins here, and a real project linked without `libgcc` stopped at the linker; now a
-`-nostdlib` link of a panicking image resolves. The Armv6-M board still supplies what that core
-alone lacks — 32-bit division, 64-bit shifts and multiply, the `__aeabi_mem*` family — and no board
-supplies `f32` routines for a core with no unit.
+`-nostdlib` link of a panicking image resolves. What the Armv6-M core alone lacks — 32-bit division,
+64-bit shifts and multiply, `__clzsi2` — is `sysl.softint`'s too, kept in every build for that core;
+the `__aeabi_mem*` family every Thumb core calls for a large struct copy is `sysl.softint.aeabi`'s,
+laid down in every Thumb build over the board's `memcpy` and `memset`; and the `f32` routines a core with no unit calls (`__aeabi_fadd`,
+`__addsf3`, …) are `sysl.softfloat.binary64`'s. No board supplies any arithmetic.
 
 ## The startup zeroes `.bss`, and that is not optional
 
@@ -214,13 +216,13 @@ the back end selects `__aeabi_fmul` where it would have selected `vmul.f32` and 
 the unit; a startup that wrote `CPACR` anyway would assemble and run — those bits are reserved rather
 than faulting — and would stand as a sentence telling the next reader this core has one.
 
-**Nothing here computes with a float, and that is on purpose rather than an omission.** The FPU test
-(`qmu_computes_with_the_fpu`) runs only on a target that is not `soft_float`, so this board is never asked for a multiply its core
-cannot do — which is why `bsp_thumbv7m.c` owes no `__aeabi_fmul`. A real Armv7-M project that computes
-with floats owes that family exactly as this file already owes `__aeabi_ldivmod`.
+**The FPU test (`qmu_computes_with_the_fpu`) runs only on a target that is not `soft_float`**, so this
+board is never asked for a unit its core does not have. An `f32` computed here is a call to
+`__aeabi_fmul` and its relatives, which the program carries from `sysl.softfloat.binary64` exactly as
+it carries `__aeabi_ldivmod` from `sysl.softint` — so `bsp_thumbv7m.c` owes neither.
 
-**Its 32-bit division helpers are absent for the opposite reason to Armv6-M's being present.** The M3
-has `sdiv` and `udiv`, so `/` on an `int` is an instruction here where it is a call on an M0+.
+**The M3 has `sdiv` and `udiv`**, so `/` on an `int` is an instruction here where it is a call on an
+M0+ — a call to `sysl.softint`'s `__aeabi_uidiv`, which only a build for Armv6-M keeps.
 
 **What this board is for is the architecture, not the chip.** Armv6-M code links into a Cortex-M3
 image, being a subset, so nothing about the *link* forced this row to exist. What forced it is that a

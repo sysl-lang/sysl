@@ -70,3 +70,78 @@ edges()
 @test("a zero divisor answers all ones and the dividend, which is what the long division falls into")
 zero_divisor()
     assert(gives(42, 0, MAX, 42))
+
+// -- what an Armv6-M core lacks, checked against the host's own instructions --------------------------
+
+@test("32-bit quotients and remainders agree with the divider, signed and unsigned")
+random_32_bit_division_agrees_with_hardware()
+    var g = rng(643, 7)
+
+    for step in 0..<20000
+        val n = u32(g.next_u64()) >> u32(g.next_u64() % 32)
+        val d = (u32(g.next_u64()) >> u32(g.next_u64() % 32)) | (if step % 5 == 0 then 0x8000_0000 else 1)
+        assert(gives32(n, d, n / d, n % d), s"$n / $d")
+
+        val sn = if step % 2 == 0 then i32(n >> 1) else -i32(n >> 1)
+        val sd = if step % 3 == 0 then i32(d >> 1) | 1 else -(i32(d >> 1) | 1)
+
+        assert(signed_gives32(sn, sd, sn / sd, sn % sd), s"$sn / $sd")
+
+@test("32-bit division at the edges: the largest values, every sign, the most negative value, zero")
+edges_32_bit_division()
+    val smin: i32 = -0x7FFF_FFFF - 1
+    val umax: u32 = 0xFFFF_FFFF
+
+    assert(gives32(umax, 1, umax, 0))
+    assert(gives32(umax, umax, 1, 0))
+    assert(gives32(umax, 0x8000_0001, 1, 0x7FFF_FFFE))
+    assert(gives32(umax, 10, 429496729, 5))
+    assert(signed_gives32(-7, 2, -3, -1))
+    assert(signed_gives32(7, -2, -3, 1))
+    assert(signed_gives32(smin, 10, -214748364, -8))
+    assert(signed_gives32(smin, smin, 1, 0))
+
+    // The one quotient with no value wraps to the most negative value; a zero divisor answers what
+    // the long division falls into.
+    assert(signed_gives32(smin, -1, smin, 0))
+    assert(gives32(42, 0, umax, 42))
+
+private gives32(n: u32, d: u32, q: u32, r: u32) -> bool
+    val got = unsigned_divide32(n, d)
+
+    got.0 == q && got.1 == r
+
+private signed_gives32(n: i32, d: i32, q: i32, r: i32) -> bool
+    val got = signed_divide32(n, d)
+
+    got.0 == q && got.1 == r
+
+@test("64-bit shifts by every count agree with the host's shift")
+shifts_agree_with_hardware()
+    var g = rng(644, 7)
+
+    for step in 0..<2000
+        val v = g.next_u64()
+
+        for n in 0..<64
+            assert(shift_left(v, n) == v << n, s"$v << $n")
+            assert(shift_right(v, n) == v >> n, s"$v >> $n")
+            assert(shift_right_signed(i64(v), n) == i64(v) >> n, s"$v >> $n, signed")
+
+@test("the low 64 bits of a product agree with the host's multiply, and so does the leading-zero count")
+multiply_and_leading_zeros_agree_with_hardware()
+    var g = rng(645, 7)
+
+    for step in 0..<20000
+        val a = g.next_u64() >> (g.next_u64() % 64)
+        val b = g.next_u64() >> (g.next_u64() % 64)
+
+        assert(multiply(a, b) == a * b, s"$a * $b")
+        assert(leading_zeros32(u32(a)) == int(u32(a).leading_zeros()), s"clz $a")
+
+    assert(multiply(MAX, MAX) == 1)
+    assert(multiply(0xFFFF_FFFF, 0xFFFF_FFFF) == 0xFFFF_FFFE_0000_0001)
+    assert(multiply(u64(SMIN), MAX) == u64(SMIN))
+    assert(leading_zeros32(0) == 32)
+    assert(leading_zeros32(1) == 31)
+    assert(leading_zeros32(0x8000_0000) == 0)
