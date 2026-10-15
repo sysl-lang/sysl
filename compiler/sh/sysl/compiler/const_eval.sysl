@@ -652,8 +652,10 @@ private unheld(t: Type) -> Option[string] = t match
     Unknown -> None
     Str -> None
     Slice(elem, _) -> unheld(*elem)
-    // The writer a rendering hands its `display` (`ConstWriter`).
-    Ptr(_) -> if writes_a_rendering(t) then None else unheld_other(t)
+    // The writer a rendering hands its `display` (`ConstWriter`), and an address the linker fills
+    // in (`ConstLink`): held and handed on, never read through.
+    Ptr(_) -> None
+    CFn(_, _) -> None
     _ -> unheld_other(t)
 
 private unheld_other(t: Type) -> Option[string] =
@@ -684,6 +686,7 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstRecord(variant, fields) -> record_text(variant, fields, t)
     ConstView(xs, lo, n, _) -> array_text(viewed(xs, lo, n), element_type(t))
     ConstWriter(_) -> "a writer"
+    ConstLink(image) -> s"&${link_key(image)}"
 
 // The elements a slice sees, as a buffer of their own.
 private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
@@ -822,6 +825,8 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
     ConstArray(xs) -> array_literal(span, xs, t)
     ConstRecord(variant, fields) -> record_literal(span, variant, fields, t)
+    // An address is laid down as the relocation it is: the folded place's address, or the function's.
+    ConstLink(image) -> Some(image)
     _ -> None
 
 // A struct as the constructor over literals it is laid down as, and an enum value as its variant.
@@ -1064,6 +1069,9 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TRecheck(after, recv, decl, inv_fn) -> recheck(r, e.span, after, recv, decl, inv_fn)
         TIndex(receiver, index, _) -> element_read(r, receiver, index)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
+        TAddrOf(place, ty) -> address_of(r, e.span, place, ty)
+        TFuncAddr(_, _, _) -> EvGave(ConstLink(e))
+        TDeref(operand, _) -> read_through(r, operand)
         TIntOp(op, operand, None, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
             else byte_order(r, e.span, op, operand, width)
@@ -1071,6 +1079,76 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
             refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
+
+// **The address of module storage is a value while compiling**, as it is in constant data: the
+// linker fills it in (`ConstLink`). So is the address of a field of it, or of an element at an index
+// that comes to a number the array has. Any other address -- of a local, of thread-local or
+// per-core storage, through a view or a pointer -- exists only when the program runs.
+@noinline
+private address_of(r: &EvRun, at: Span, place: TExpr, ty: Type) -> Flow =
+    linked_place(r, place) match
+        Ok(Some(p)) -> EvGave(ConstLink(TExpr(at, TAddrOf(p, ty))))
+        Ok(None) -> refuse_form(r, at, "the address of anything but module storage is not evaluated while " +
+                                "compiling — a local's, or a thread's or a core's own storage's, exists " +
+                                "only when the program runs")
+        Err(f) -> f
+
+// A place inside module storage, its indices run to the numbers they come to, or `None` where the
+// place is not one; an index the array does not have traps, as taking its address would.
+private linked_place(r: &EvRun, place: TExpr) -> Result[Option[TExpr], Flow] = *place.kind match
+    TGlobal(symbol, _, _) ->
+        val d = r.a.tables.vals.get(symbol)
+
+        if d.is_some() && (d.unwrap().thread_local || d.unwrap().per_cpu) then Ok(None) else Ok(Some(place))
+    TField(receiver, index, ty) ->
+        if bitfield_ranges_of(texpr_type(receiver)).is_some() then return Ok(None)
+
+        // A field reached through a pointer is a load before it is an address.
+        nameless(texpr_type(receiver)) match
+            Ptr(_) -> return Ok(None)
+            _ -> ()
+
+        linked_place(r, receiver) match
+            Ok(Some(p)) -> Ok(Some(TExpr(place.span, TField(p, index, ty))))
+            other -> other
+    TIndex(receiver, index, ty) ->
+        val length = nameless(texpr_type(receiver)) match
+            Array(n, _) -> usize(n)
+            _ -> return Ok(None)
+
+        val inside = linked_place(r, receiver) match
+            Ok(Some(p)) -> p
+            other -> return other
+
+        val i = element_index(r, index, length) match
+            Ok(found) -> found
+            Err(f) -> return Err(f)
+
+        val folded = TExpr(index.span, TIntLit(from_int(long(i)), texpr_type(index)))
+
+        Ok(Some(TExpr(place.span, TIndex(inside, folded, ty))))
+    _ -> Ok(None)
+
+// `*p`, where `p` came to an address: what is there exists only when the program runs.
+@noinline
+private read_through(r: &EvRun, operand: TExpr) -> Flow = eval_value(r, operand) match
+    Ok(_) -> refuse_form(r, operand.span, link_reason())
+    Err(f) -> f
+
+private link_reason() -> string =
+    "reading through an address is not evaluated while compiling — the linker fills an address in, " +
+    "and what it points at exists only when the program runs"
+
+// An address as a reader would write it: the storage, field and element it names, or the function.
+private link_key(image: TExpr) -> string = *image.kind match
+    TAddrOf(place, _) -> link_key(place)
+    TFuncAddr(name, _, _) -> qualified_name(name)
+    TGlobal(symbol, _, _) -> qualified_name(symbol)
+    TField(receiver, index, _) -> s"${link_key(receiver)}.$index"
+    TIndex(receiver, index, _) -> *index.kind match
+        TIntLit(n, _) -> s"${link_key(receiver)}[${to_string(n)}]"
+        _ -> s"${link_key(receiver)}[?]"
+    _ -> "?"
 
 // Expressions run in turn for their effects.
 @noinline
@@ -1238,6 +1316,7 @@ private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
         Ok(ConstStr(s)) -> return element_index(r, index, s.bytes.len) match
             Ok(i) -> EvGave(ConstInt(from_int(long(s.bytes[i]))))
             Err(f) -> f
+        Ok(ConstLink(_)) -> return refuse_form(r, receiver.span, link_reason())
         Ok(_) -> return refuse_form(r, receiver.span, s"an element of a '${type_show(texpr_type(receiver))}' " +
                                     "is not evaluated while compiling yet — a fixed array's, a slice's and a " +
                                     "string's are")
@@ -1707,6 +1786,7 @@ end record_new
 private field_read(r: &EvRun, receiver: TExpr, index: int) -> Flow
     eval_value(r, receiver) match
         Ok(ConstRecord(-1, fields)) -> EvGave(fields.at(usize(index)))
+        Ok(ConstLink(_)) -> refuse_form(r, receiver.span, link_reason())
         Ok(_) -> refuse_form(r, receiver.span, s"a field of a '${type_show(texpr_type(receiver))}' is not " +
                              "evaluated while compiling yet — a struct's is")
         Err(f) -> f
@@ -2067,6 +2147,18 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
     val why = unheld(ty)
 
     if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    // An address stays the address it is under another pointer type; as a number it is something
+    // only the linker knows.
+    v match
+        ConstLink(_) ->
+            return underlying(ty) match
+                Ptr(_) -> EvGave(v)
+                CFn(_, _) -> EvGave(v)
+                _ -> refuse_form(r, at, "an address converted to a number is not evaluated while compiling — " +
+                                 "the linker fills an address in, so its value exists only when the " +
+                                 "program runs")
+        _ -> ()
 
     // A bare enum converts as the integer its variant's tag is, at the enum's underlying type.
     val (held, from) = (v, underlying(texpr_type(operand))) match
@@ -2512,6 +2604,8 @@ private key_part(v: Const) -> string = v match
     ConstRecord(variant, fields) -> key_part(ConstInt(from_int(long(variant)))) + key_part(ConstArray(fields))
     // Never part of a key either: a call handed a writer writes through it.
     ConstWriter(_) -> "w"
+    // An address is the storage or function it names: two calls handed the same one answer alike.
+    ConstLink(image) -> s"&${link_key(image)};"
 
 // A float's own pattern, a NaN's included, so that two arguments differing in a bit are two runs.
 private float_pattern_exact(f: real) -> u64 = f.bits()

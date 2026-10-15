@@ -1744,8 +1744,7 @@ const K: int = head()
 'local' answers a slice of storage local to its call, which ends when the call returns
 ```
 
-**A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere,
-and such a pointer can only point at a local of the evaluation that made the call:
+**A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere:
 
 ```sysl
 struct Counter
@@ -1769,6 +1768,47 @@ print(counted(4))
 4
 ```
 
+**An address may come in, be stored, and go out, where the linker fills it in**: the address of
+module storage, of a field or an element inside it, and of a function. While compiling, such an
+address is held as the relocation it is, so a `const` constructor that stores one makes constant
+data, laid into the object file as C's `static Display oled = { &bus, setup };` is
+([ffi § What constant data is](/reference/ffi/#what-constant-data-is)):
+
+```sysl
+const f(p: *int) -> *int = p
+
+var x = 1
+val q = f(&x)
+print(q == &x)
+```
+
+```output
+true
+```
+
+What such an address points at exists only when the program runs, so reading through one, or
+converting one to a number, is not evaluated — and neither is the address of a local, or of
+thread-local or per-core storage. A function pointer may be stored and answered; calling through it
+is refused like any other call through a value. On a bare machine, where storage must be constant
+data, the refusal says which:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+var x: i32 = 1
+
+const peek(p: *i32) -> i32 = *p
+
+val seen: i32 = peek(&x)
+
+@export
+begin() -> i32 = seen
+```
+
+```error
+reading through an address is not evaluated while compiling — the linker fills an address in, and what it points at exists only when the program runs
+```
+
 **What it may not hold** is everything that exists only once the program runs, and the few kinds of
 value the compiler does not evaluate yet. Each is refused where it was written:
 
@@ -1783,7 +1823,6 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
 | a value rendered through a `display` that is not `const` | `… it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time` |
 | a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
-| a pointer answered | `… its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at` |
 | a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
 | atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
@@ -1840,18 +1879,6 @@ print(f())
 
 ```error
 'f' is 'const', so it runs while compiling, and it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap
-```
-
-```sysl
-const f(p: *int) -> *int = p
-
-var x = 1
-val q = f(&x)
-print(q == &x)
-```
-
-```error
-'f' is 'const', so it runs while compiling, and its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at
 ```
 
 ```sysl

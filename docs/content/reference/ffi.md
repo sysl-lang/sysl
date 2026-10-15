@@ -836,7 +836,7 @@ which is a load before it is an address — an [`embed`](/reference/arrays/#a-fi
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 
-**Three more things are constant data, all at any depth:**
+**Four more things are constant data, all at any depth:**
 
 - **A read of a module `val` whose own initializer is constant data** is that value, as a `const`'s
   name is — whatever order the two are declared in. `[ZERO; 4]` over `val ZERO: P = P(0)` is laid
@@ -847,6 +847,10 @@ which would trap where it ran — so it is left to run, and trap, as it would ha
   written into its payload, a relocation like any other. The linker fills a whole word, so an address
   is laid down where it starts a payload unit as wide as a pointer; a payload whose units are wider
   (an `Option` of a struct holding a `u64` beside the pointer, on a 32-bit target) stays code.
+- **A function's address, and a `const` function's answer holding these addresses.** `&setup` is a
+  relocation like `&bus`, and a [`const` function](/reference/declarations/) handed them, or taking
+  them itself, may store them in what it answers: C's `static Display oled = { &bus, setup };`.
+  Calling through the stored pointer is what runs when the program does.
 
 ```sysl build=c target=thumbv7em-freestanding
 module mylib
@@ -873,6 +877,35 @@ var chosen: Option[*u32] = Some(&target)
 
 @export
 total() -> u32 = table[1].v + current.ring() + *chosen.unwrap()
+```
+
+A display driver's constructor is the usual shape — the bus it talks over and the C setup function
+for its chip, both stored, neither called until the program runs:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+type Setup = *extern(*u32, u32) -> unit
+
+extern "chip_setup" chip_setup(state: *u32, n: u32)
+
+struct Bus
+    address: u8
+
+struct Display
+    state: [4]u32
+    bus: *Bus
+    setup: Setup
+
+    begin(*self) = (self.setup)(&self.state[0], u32(self.bus.address))
+
+const display(bus: *Bus, setup: Setup) -> Display = Display([0; 4], bus, setup)
+
+var bus: Bus = Bus(0x3c)
+var oled: Display = display(&bus, &chip_setup)
+
+@export
+start() = oled.begin()
 ```
 
 A `val` that reads another reading it back is no constant at all, and is refused where the cycle

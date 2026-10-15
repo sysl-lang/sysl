@@ -1,0 +1,144 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **An address is constant data through a `const` function too**: C's `static T x = { &bus, setup }`.
+// The address of module storage, of a place inside it, and of a function are relocations the linker
+// fills in, so a `const` constructor handed them, or taking them itself, lays its answer into the
+// object file of a bare machine with no loader. Calling through a function pointer, reading through
+// an address, and the address of a local are still refused, each saying why.
+
+private val adf_driver: string =
+    "type Setup = *extern(*u32, u32) -> unit\n\n" +
+    "extern \"probe_setup\" probe_setup(state: *u32, n: u32)\n\n" +
+    "struct Quiet\n    n: u32\n\n" +
+    "struct Display[B]\n    state: [4]u32\n    bus: *B\n    setup: Setup\n    begun: bool\n\n" +
+    "    configure(*self)\n        (self.setup)(&self.state[0], 3)\n        self.begun = true\n\n" +
+    "const display[B](bus: *B, setup: Setup) -> Display[B] = Display([0; 4], bus, setup, false)\n\n" +
+    "const ssd[B](bus: *B) -> Display[B] = display(bus, &probe_setup)\n\n"
+
+private val adf_main: string = "\n\n@export(\"main\")\nmain_entry() -> int = "
+
+private val adf_table: string = "struct P\n    a: u32\n    b: u32\n\nvar table: [4]P = [P(1, 2); 4]\n\n"
+
+@test("a 'const' constructor storing the address of storage and of an 'extern' is laid down")
+adf_the_driver_shape()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_driver + "var bus: Quiet = Quiet(0)\nvar oled: Display[Quiet] = ssd(&bus)\n" +
+                        "\n@export(\"main\")\nmain_entry()\n    oled.configure()\n")
+
+    cfv_laid_down(out, "@oled = ")
+    assert(out.contains("ptr @bus, ptr @probe_setup, i1 0 }"), out)
+end adf_the_driver_shape
+
+@test("a const function may take the address of module storage and of a function itself")
+adf_addresses_taken_inside()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_driver + "var bus: Quiet = Quiet(0)\n\nconst board() -> Display[Quiet] = " +
+                        "display(&bus, &probe_setup)\n\nvar oled: Display[Quiet] = board()" + adf_main +
+                        "int(oled.bus.n)\n")
+
+    cfv_laid_down(out, "@oled = ")
+    assert(out.contains("ptr @bus, ptr @probe_setup, i1 0 }"), out)
+end adf_addresses_taken_inside
+
+@test("a function's address written straight into storage, or in a variant, is a relocation")
+adf_a_function_address_without_a_call()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_driver + "struct Ops\n    setup: Setup\n\nvar ops: Ops = Ops(&probe_setup)\n" +
+                        "var maybe: Option[Setup] = Some(&probe_setup)" + adf_main +
+                        "if maybe.is_some() then 1 else 0\n")
+
+    cfv_laid_down(out, "@ops = ")
+    assert(out.contains("{ ptr @probe_setup }"), out)
+    assert(out.contains("[i32 ptrtoint (ptr @probe_setup to i32)]"), out)
+end adf_a_function_address_without_a_call
+
+@test("an element's address at an index a const function was handed folds to a constant 'getelementptr'")
+adf_an_element_at_a_computed_index()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_table + "const at(i: usize) -> *u32 = &table[i + 1].b\n\nvar p: *u32 = at(1)" +
+                        adf_main + "int(*p)\n")
+
+    cfv_laid_down(out, "@p = ")
+    assert(out.contains("@p = private global ptr getelementptr inbounds (%struct.P, ptr getelementptr " +
+                        "inbounds (%struct.P, ptr @table, i32 2), i32 0, i32 1)"), out)
+end adf_an_element_at_a_computed_index
+
+@test("an index the array does not have traps where the address is taken")
+adf_an_index_out_of_range_traps()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_table + "const at(i: usize) -> *u32 = &table[i].b\n\nvar p: *u32 = at(4)" +
+                        adf_main + "int(*p)\n")
+
+    assert(out.contains("'p' traps while it is being compiled"), out)
+end adf_an_index_out_of_range_traps
+
+@test("calling through a stored function pointer is still refused in a const function")
+adf_a_call_through_the_pointer_is_refused()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_driver + "const started(d: Display[Quiet]) -> bool\n    (d.setup)(null, 0)\n" +
+                        "    true\n\nvar bus: Quiet = Quiet(0)\nval ok: bool = started(ssd(&bus))" + adf_main +
+                        "if ok then 1 else 0\n")
+
+    assert(out.contains("'started' is 'const', so it runs while compiling, and it calls through a value " +
+                        "— which function that is is decided when the program runs"), out)
+end adf_a_call_through_the_pointer_is_refused
+
+@test("reading through an address is refused, and says why")
+adf_reading_through_is_refused()
+    if cfv_skip() then return
+
+    val out = cfv_built("var target: u32 = 5\n\nconst peek(p: *u32) -> u32 = *p\n\nvar x: u32 = peek(&target)" +
+                        adf_main + "int(x)\n")
+
+    cfv_refused(out, "x")
+    assert(out.contains("reading through an address is not evaluated while compiling — the linker fills " +
+                        "an address in, and what it points at exists only when the program runs"), out)
+end adf_reading_through_is_refused
+
+@test("a local's address is refused, and says why")
+adf_a_local_address_is_refused()
+    if cfv_skip() then return
+
+    val out = cfv_built("const mine() -> *u32\n    var x: u32 = 1\n    &x\n\nvar q: *u32 = mine()" + adf_main +
+                        "int(*q)\n")
+
+    cfv_refused(out, "q")
+    assert(out.contains("the address of anything but module storage is not evaluated while compiling"), out)
+end adf_a_local_address_is_refused
+
+@test("an address converted to a number is refused, and says why")
+adf_an_address_as_a_number_is_refused()
+    if cfv_skip() then return
+
+    val out = cfv_built("var target: u32 = 5\n\nconst where(p: *u32) -> *u32 = p\n\n" +
+                        "var n: usize = usize(where(&target))" + adf_main + "int(n)\n")
+
+    cfv_refused(out, "n")
+    assert(out.contains("an address converted to a number is not evaluated while compiling"), out)
+end adf_an_address_as_a_number_is_refused
+
+@test("on a hosted target the same program runs, and the addresses are the storage's and the function's")
+adf_the_hosted_build_is_unchanged()
+    if !enm_ready() then return
+
+    val prog = "type Setup = *extern(*u32, u32) -> unit\n\n" +
+               "setup(state: *u32, n: u32)\n    *state = n * 10\n\n" +
+               "struct Quiet\n    n: u32\n\n" +
+               "struct Display[B]\n    state: [4]u32\n    bus: *B\n    setup: Setup\n    begun: bool\n\n" +
+               "    configure(*self)\n        (self.setup)(&self.state[0], 3)\n        self.begun = true\n\n" +
+               "const display[B](bus: *B, s: Setup) -> Display[B] = Display([0; 4], bus, s, false)\n\n" +
+               "static var bus: Quiet = Quiet(7)\nstatic var oled: Display[Quiet] = display(&bus, &setup)\n\n" +
+               "oled.configure()\nprint(oled.state[0], oled.begun, oled.bus == &bus, oled.bus.n)\n" +
+               "bus = Quiet(9)\nprint(oled.bus.n)\n"
+
+    assert_eq(enm_ran(prog), "30 true true 7\n9\n")
+end adf_the_hosted_build_is_unchanged
