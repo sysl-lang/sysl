@@ -2174,10 +2174,19 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TStructNew(decl, args) -> static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
     TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
-    TAddrOf(place, ty) -> place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
+    TAddrOf(place, ty) ->
+        val device = device_place(cx, name, place)
+
+        if device.is_some() then return Some(device_address(cx, t, device.unwrap(), ty))
+
+        place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
     // A function's address is a relocation too, C's `static void (*f)(void) = setup;`.
     TFuncAddr(_, _, _) -> Some(t)
     TErase(operand, vtable, ty) -> erase_image(cx, name, t, operand, vtable, ty)
+    TGlobal(symbol, ty, writable) ->
+        val address = if writable || !is_pointerish(ty) then None else val_address(cx, name, symbol, ty)
+
+        if address.is_some() then address else leaf_image(cx, name, t)
     TEnumNew(en, variant, args) ->
         if !variant.carries then return leaf_image(cx, name, t)
 
@@ -2203,6 +2212,111 @@ private erase_image(cx: &Analyzer, name: string, t: TExpr, operand: TExpr, vtabl
         TAddrOf(_, _) -> Some(TExpr(t.span, TErase(inner.unwrap(), vtable, ty)))
         _ -> None
 end erase_image
+
+// **A module `val` holding a constant address is that address** where another initializer names it:
+// `val PAIR: *Pair = ptr_cast(AT)` read by `var named: *Pair = PAIR` is the same device address,
+// laid down as one, and so is `&target` read through a `val` over it. A `val` whose initializer is
+// anything else -- code, or a value that is not an address -- is left to the fold and the evaluator,
+// and one being worked out already is the cycle the initialization order reports.
+private val_address(cx: &Analyzer, name: string, symbol: string, ty: Type) -> Option[TExpr]
+    val ev = cx.an.evaluation
+
+    for item in ev.vals_reading
+        if item == symbol then return None
+
+    val typed = val_init_typed(cx, symbol, ty)
+
+    if typed.is_none() then return None
+
+    // The other initializer is imaged as its own storage's is, and what that says about it is said
+    // there: a trial here reports nothing.
+    val mark = cx.an.complaints()
+
+    ev.vals_reading.push(symbol)
+
+    val image = static_image(cx, name, typed.unwrap())
+
+    ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+    cx.an.restore_complaints(mark)
+
+    if image.is_none() then return None
+
+    *image.unwrap().kind match
+        TCast(_, _) -> image
+        TAddrOf(_, _) -> image
+        _ -> None
+end val_address
+
+private is_pointerish(t: Type) -> bool = t match
+    Ptr(_) -> true
+    CFn(_, _) -> true
+    _ -> false
+
+// **A place reached through a constant device address is at a constant address too**: `&PAIR.b`
+// over `val PAIR: *Pair = ptr_cast(AT)` is `AT` plus the field's offset, and an element at an index
+// the compiler can fold is the element's size that many times further on. A bitfield has no address
+// of its own, and an index the array does not have stays code that traps where it runs.
+private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] = *place.kind match
+    TDeref(operand, _) -> device_pointer(cx, name, operand)
+    TField(receiver, index, _) ->
+        val rty = texpr_type(receiver)
+        val through = pointee(rty)
+        val holder = if through.is_some() then through.unwrap() else rty
+        val d = underlying(holder) match
+            Struct(found) -> found
+            _ -> return None
+
+        if bitfield_ranges_of(holder).is_some() then return None
+
+        val base = if through.is_some() then device_pointer(cx, name, receiver)
+                   else device_place(cx, name, receiver)
+
+        if base.is_none() then return None
+
+        cx.an.tables.layout.field_offset(d, d.fields.at(usize(index)).0) match
+            Some(offset) -> word_address(cx, base.unwrap() + long(offset))
+            None -> None
+    TIndex(receiver, index, _) ->
+        val (length, elem) = nameless(texpr_type(receiver)) match
+            Array(n, el) -> (long(n), *el)
+            _ -> return None
+
+        val at = const_fold_typed(index, cx.an.tables.layout.little_endian) match
+            Some(ConstInt(n)) -> n.to_long()
+            _ -> None
+
+        if at.is_none() || at.unwrap() < 0 || at.unwrap() >= length then return None
+
+        val base = device_place(cx, name, receiver)
+
+        if base.is_none() then return None
+
+        word_address(cx, base.unwrap() + at.unwrap() * long(cx.an.tables.layout.size(elem)))
+    _ -> None
+
+// The device address a pointer-valued initializer comes to, where it comes to one.
+private device_pointer(cx: &Analyzer, name: string, pointer: TExpr) -> Option[long]
+    val image = static_image(cx, name, pointer)
+
+    if image.is_none() then return None
+
+    *image.unwrap().kind match
+        TCast(value, _) -> *value.kind match
+            TIntLit(n, _) -> n.to_long()
+            _ -> None
+        _ -> None
+end device_pointer
+
+// An address the target's word holds, or nothing where the sum ran past it.
+private word_address(cx: &Analyzer, at: long) -> Option[long]
+    val bits = int(cx.an.tables.layout.word_bits)
+
+    if at < 0 || (bits < 63 && at >= (long(1) << bits)) then None else Some(at)
+end word_address
+
+// A device address as the conversion the emitter writes as `inttoptr`, at the type the `&` gave it.
+private device_address(cx: &Analyzer, t: TExpr, at: long, ty: Type) -> TExpr =
+    TExpr(t.span, TCast(TExpr(t.span, TIntLit(from_int(at), usize_type(int(cx.an.tables.layout.word_bits)))), ty))
 
 // A scalar that is not an aggregate, a conversion or an address: a literal as it stands, an
 // expression the typed fold settles, or a `const` call the evaluator runs.
@@ -2230,7 +2344,11 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
 
         if d.is_some() && (d.unwrap().thread_local || d.unwrap().per_cpu) then None else Some(place)
     TField(receiver, index, ty) ->
-        if bitfield_ranges_of(texpr_type(receiver)).is_some() then return None
+        // A field through a pointer is a load before it is an address (`device_place` has the
+        // pointer that is a constant).
+        val rty = texpr_type(receiver)
+
+        if bitfield_ranges_of(rty).is_some() || pointee(rty).is_some() then return None
 
         place_image(cx, receiver).map(r -> TExpr(place.span, TField(r, index, ty)))
     TIndex(receiver, index, ty) ->
