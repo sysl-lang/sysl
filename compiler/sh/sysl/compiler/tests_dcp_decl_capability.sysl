@@ -289,24 +289,55 @@ dcp_a_test_refused_under_its_own_narrowing()
     val (code, out) = dcp_tested(root)
 
     assert_eq(code, 1, out)
-    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and the '@tests' file of 'sys' declared " +
-                         "'@no_os'", s"$root/sys/tests.sysl:7:12", "7 |     assert(pid() > 0)"), out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and the '@tests' file tests.sysl of " +
+                         "'sys' declared '@no_os'", s"$root/sys/tests.sysl:7:12",
+                    "7 |     assert(pid() > 0)"), out)
 end dcp_a_test_refused_under_its_own_narrowing
 
-// A test is scaffolding wherever it is written, so a `@test` beside what it tests answers to the
-// tests' clause.
-@test("a '@test' in an ordinary file answers to the tests' clause too")
+// A `@test` beside what it tests answers to the module's own clause, as the code it tests does: a
+// `@tests` file's `@requires` is that file's, and takes nothing back for anybody else.
+@test("a '@test' in an ordinary file is held to the module's clause, whatever a '@tests' file requires")
 dcp_a_test_in_an_ordinary_file()
     if !dcp_ready() then return
 
-    val files = [("sys/a.sysl", dcp_gave_up_os() + "\n@test\nbeside_what_it_tests() =\n    assert(pid() > 0)\n"),
-                 ("sys/tests.sysl", dcp_lifting_helper()),
-                 ("main.sysl", "print(1)\n")]
-    val (code, out) = dcp_tested(dcp_tree(files))
+    val root = dcp_tree([("sys/a.sysl", dcp_gave_up_os() + "\n@test\nbeside_what_it_tests() =\n    assert(pid() > 0)\n"),
+                         ("sys/tests.sysl", dcp_lifting_helper()),
+                         ("main.sysl", "print(1)\n")])
+    val (code, out) = dcp_tested(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'",
+                    s"$root/sys/a.sysl:9:12", "9 |     assert(pid() > 0)"), out)
+end dcp_a_test_in_an_ordinary_file
+
+private dcp_reaching_tests(clause: string) -> string =
+    s"module sys\n@tests\n$clause\n@test\nreaches() =\n    assert(pid() > 0)\n"
+
+@test("two '@tests' files may state different clauses, each binding only its own bodies")
+dcp_two_tests_files_state_their_own()
+    if !dcp_ready() then return
+
+    val (code, out) = dcp_tested(dcp_tree([("sys/a.sysl", dcp_gave_up_os()),
+                                           ("sys/t1.sysl", dcp_reaching_tests("@requires(os)\n")),
+                                           ("sys/t2.sysl", "module sys\n@tests\n\nplain() -> int = 3\n"),
+                                           ("main.sysl", "print(1)\n")]))
 
     assert_eq(code, 0, out)
-    assert_eq(dcp_ran(dcp_tree(files)), "1\n")
-end dcp_a_test_in_an_ordinary_file
+
+@test("a '@tests' body breaking only its own file's clause is refused, naming that file")
+dcp_one_tests_file_breaks_its_own_clause()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()),
+                         ("sys/t1.sysl", dcp_reaching_tests("")),
+                         ("sys/t2.sysl", dcp_reaching_tests("@no_os\n")),
+                         ("main.sysl", "print(1)\n")])
+    val (code, out) = dcp_tested(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and the '@tests' file t2.sysl of " +
+                         "'sys' declared '@no_os'", s"$root/sys/t2.sysl:7:12", "7 |     assert(pid() > 0)"), out)
+    assert(!out.contains("t1.sysl:"), out)
 
 // -- what the annotation may say ---------------------------------------------------------------------
 

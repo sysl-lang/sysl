@@ -121,6 +121,11 @@ end only_binds
 //
 // Several files carrying only bindings is **not** the two-beginnings mistake: a program in which
 // nothing runs has no beginning for a second one to compete with, so each holds module storage.
+//
+// **A `@tests` file of bindings is never the beginning.** No build but `sysl test` keeps it, so it
+// cannot be the body a script runs; its `var`s are the module's storage, and a `@test` reading one
+// stays a test rather than being nested into a body nobody runs. One holding a statement that runs is
+// still counted above, so that statement is refused where it stands rather than quietly kept.
 entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[usize]
     var running: Buf[usize] = buf()
 
@@ -146,7 +151,9 @@ entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[u
     var bound: Buf[usize] = buf()
 
     for i in 0..<units.len()
-        if units.at(i).module_name.is_none() && only_binds(units.at(i)) then bound.push(i)
+        val u = units.at(i)
+
+        if u.module_name.is_none() && !u.test_only && only_binds(u) then bound.push(i)
 
     if bound.len() == 1 then Some(bound.at(0)) else None
 end entry_file
@@ -224,6 +231,22 @@ refuse_two_beginnings(a: &Analysis, units: Buf[Program], entry: Option[usize])
                                 s"The declared 'main' is in ${declared.unwrap()}")
                         return
                 _ -> ()
+
+// A `@test` or a hook that reads one of the entry file's bindings -- itself, or through a sibling that
+// does -- would be nested into that file's body, out of the runner's reach, and so would never run.
+// **Every test either runs or is refused by name**, so this is refused rather than dropped.
+refuse_nested_tests(a: &Analysis, u: Program, captures: Buf[string])
+    for s in u.body
+        *s.kind match
+            FuncDecl(d) ->
+                if (d.test.is_some() || d.hook.is_some()) && holds_string(captures, d.name)
+                    val kind = if d.test.is_some() then "'@test'" else "hook"
+
+                    a.fault(scope_of_unit(a, u), s.span, s"'${d.name}' is a $kind that reads a " +
+                            "binding of the body of the file this program starts in, so it would be " +
+                            "nested inside that body where the test runner cannot reach it — mark " +
+                            "what it reads 'static', which makes it the module's")
+            _ -> ()
 
 // `static` is how a declaration in the entry file's body opts back into the module. Everywhere else
 // it says nothing, because everywhere else there is no body for a declaration to belong to instead

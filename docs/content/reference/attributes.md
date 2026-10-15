@@ -908,10 +908,69 @@ error: an 'impl' block in a file that said '@tests' has to be for a type that fi
 A closure is the one exception the compiler makes for itself, and it is not a hole: the table it
 writes is dropped with the closure.
 
+**Whatever the file writes goes with it, so whatever it writes may name its scaffolding.** A method of
+a type the file declares, written inline or in that type's `impl`, is as much the file's as a free
+function is, and may call the file's helpers:
+
+```sysl
+@tests
+
+helper() -> int = 41
+
+struct Probe
+    n: int
+
+    bumped(self) -> int = helper() + self.n
+
+impl Probe
+    twice(self) -> int = helper() + helper() + self.n
+
+@test("a stand-in's methods call the file's helper")
+probe_bumps() =
+    assert_eq(Probe(1).bumped(), 42)
+    assert_eq(Probe(0).twice(), 82)
+```
+
+**A `@tests` file of declarations and bindings is never where a program starts**, even a root file
+with no `module` header: no build but `sysl test` keeps it, so it cannot be the body a script runs.
+Its `var`s are the module's storage, and a test reading one is a test like any other:
+
+```sysl
+@tests
+
+var shared: int = 11
+
+@test("a test reads the file's storage")
+reads_it() =
+    shared += 1
+    assert_eq(shared, 12)
+```
+
+**Every test runs or is refused by name.** A `@test` or a hook written in the file a script starts in,
+reading one of that script's bindings, would be nested into the script's body where the runner cannot
+reach it — so it is refused, and marking the binding `static` makes it the module's:
+
+```sysl
+var n = 1
+print(n)
+
+@test("reads")
+reads() =
+    assert_eq(n, 1)
+```
+
+```error
+error: 'reads' is a '@test' that reads a binding of the body of the file this program starts in, so it would be nested inside that body where the test runner cannot reach it — mark what it reads 'static', which makes it the module's
+```
+
 **It stops at the package boundary.** A package is compiled from source and a library arrives as an
 artifact whose test files were never encoded, so a rule that let the reference cross would compile
 against one and fail against the other. A test-support library *meant* to be imported is therefore
 ordinary code that ships, and is a different thing from a file of scaffolding inside a package.
+
+A build that depends on a package does not read that package's `@tests` files at all — not
+analyzed, not even parsed, the header being enough to know one. One written for a newer compiler, or
+against a dev dependency the consumer never fetches, stops nothing but that package's own `sysl test`.
 
 ### The runner
 
