@@ -262,6 +262,26 @@ struct Target
     // processor answers false, which only matters on the 32-bit machines whose `f32` runtime it decides.
     single_unit(self) -> bool = self.cpu == Thumb && !self.no_fpu && self.fpu != ""
 
+    // Whether the machine has **floating-point registers**, whichever float ABI it is built for --
+    // what `#if fpu` asks. On Arm it is the row's unit, so a soft-float-ABI build of a core with one
+    // answers yes: the registers are there, and code that saves them must save them. Elsewhere it is
+    // the row's own `no_fpu`, so every hosted machine answers yes, and the freestanding RISC-V and
+    // CRAFT rows, built without an F extension or a unit, answer no. A wasm module computes in
+    // floating point natively and answers yes.
+    fp_registers(self) -> bool = if self.cpu == Thumb then self.single_unit() else !self.no_fpu
+
+    // Whether those registers hold a **double** as well as a single -- `#if fpu_dp`. On Arm, a unit
+    // whose `-mfpu` name carries no `-sp-`; every other machine with registers has double precision.
+    fp_double_registers(self) -> bool =
+        self.fp_registers() && !(self.cpu == Thumb && self.fpu.contains("-sp-"))
+
+    // The float ABI, for a machine that has registers to pass a float in: `#if hardfloat` where a
+    // float argument travels in one, `#if softfp` where it travels in an integer register although
+    // the unit is there. A machine with no registers is neither -- it is soft float throughout, and
+    // `!fpu` is what says so.
+    hard_float_abi(self) -> bool = self.fp_registers() && self.hard_float()
+    soft_fp_abi(self) -> bool = self.fp_registers() && self.soft_float
+
     // Whether the machine divides 32-bit integers itself. Armv6-M is the one core sysl targets that
     // has no divider -- nor a long multiply, `clz` or a two-word shift -- so LLVM calls a routine for
     // each, and `sysl.softint` answers them.

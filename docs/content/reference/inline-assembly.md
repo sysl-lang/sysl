@@ -51,6 +51,12 @@ An arm names one processor or several, spelled as [`#if`](/reference/attributes/
 `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft`. A name outside that
 set is an error rather than a machine nobody has heard of.
 
+**An arm is a processor, and what differs between the cores of one is `#if`'s.** Every Arm target is
+`thumb`, from a Cortex-M0+ with no floating-point registers to a Cortex-M7 with double-precision
+ones; the arm stays `[thumb]` and the lines that touch those registers sit behind
+[`#if fpu`](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)
+inside it, gated before the statement is parsed.
+
 **`wasm32` is the one that is not a processor**, and it will not carry instructions at all: a wasm
 module has no registers to name and no assembler behind it. Its arm is therefore always empty or
 `unavailable` — both forms are below — which makes it the standing reminder that these arms are
