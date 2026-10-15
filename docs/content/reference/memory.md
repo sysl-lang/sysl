@@ -2062,6 +2062,65 @@ into, so every promotion becomes a refusal reported at the view that leaves the 
 every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
 closures, and `&T` creation are all compile errors there — so it introduces no new rule.
 
+### A view of a temporary is used where it is made
+
+A temporary is freed at the **end of its statement**: what it holds is let go of there, and the
+slot it sat in is reused — by the next statement, or by the same statement on the next round of a
+loop. A view of it used within that statement, or one that leaves the frame and so is promoted
+above, is sound. One **kept in a local** is neither: the local is read on later lines, after the
+storage it views has gone. So it is refused, at the view, naming the local it is kept in:
+
+```sysl
+id(xs: []string) -> []string = xs
+
+val s = id([str(7) + "y"][..])
+
+print(s[0])
+```
+
+```error
+a view of an array literal is kept in 's', but the array is a temporary, freed at the end of this statement, so the view would outlive it. Bind the array to a name of its own and view that
+```
+
+A loop is the same refusal, and the case where reading the dead slot is quietest — every round is
+the same statement, so a view kept from the first round reads the last round's value:
+
+```sysl
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```error
+a view of an array literal is kept in 'keep', but the array is a temporary, freed at the end of this statement
+```
+
+Binding the array to a name is the fix, and it is not a workaround: a named array lives as long as
+its name, so a view of it may be kept while the name is in scope. Used within its statement, the temporary needs
+nothing:
+
+```sysl
+id(xs: []string) -> []string = xs
+
+print(id([str(7) + "y"][..])[0])
+
+val a = [str(7) + "y"]
+val s = a[..]
+
+print(s[0])
+```
+
+```output
+7y
+7y
+```
+
 ### Promotion is silent, not hidden
 
 Silent promotion earns the obvious objection: an allocation appears that nothing in the source asked

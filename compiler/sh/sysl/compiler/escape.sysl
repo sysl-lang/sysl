@@ -476,7 +476,10 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
     TReturn(v) -> v match
         Some(x) -> returned(p, keeps, w, x)
         None -> ()
-    TVarDecl(_, _, e, _) -> escaping(p, keeps, w, e)
+    TVarDecl(name, _, e, _) ->
+        escaping(p, keeps, w, e)
+        kept_past_statement(p, keeps, w, name, e)
+
     TRefDecl(_, _, e) -> escaping(p, keeps, w, e)
     TExprStmt(e) -> escaping(p, keeps, w, e)
 
@@ -487,7 +490,9 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
             escaping(p, keeps, w, write.value)
 
             *write.place.kind match
-                TLoad(_, _) -> escaping(p, keeps, w, write.place)
+                TLoad(name, _) ->
+                    escaping(p, keeps, w, write.place)
+                    kept_past_statement(p, keeps, w, name, write.value)
                 _ ->
                     if views(p, keeps, w, write.value).non_empty()
                         gets_out(p, keeps, w, write.value,
@@ -499,6 +504,44 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
         Some(x) -> escaping(p, keeps, w, x)
         None -> ()
     _ -> ()
+
+// A view of a temporary array kept in a local. The temporary is freed at the end of the statement
+// that made it -- what it holds is let go of there, and the slot it sat in is reused by the next one
+// (the next round of a loop is the same statement again) -- while a local is read on later lines.
+// So it is refused, at the view, naming the local; a temporary viewed only within its own statement
+// is untouched, and so is one whose view leaves the frame, which is promoted instead (`gets_out`).
+// Only a temporary made in this statement is this statement's to answer for: one reached through a
+// local was answered for where that local was given it.
+private kept_past_statement(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: string,
+                            v: TExpr)
+    if w.refusal.is_some() then return
+
+    for t in views(p, keeps, w, v).temps
+        temp_made_in(v, t.0) match
+            Some(at) ->
+                w.refusal = Some((at,
+                    s"a view of ${t.1} is kept in '$name', but the array is a temporary, freed at " +
+                    "the end of this statement, so the view would outlive it. Bind the array to a " +
+                    "name of its own and view that"))
+                return
+            None -> ()
+end kept_past_statement
+
+// Where the slice that made a temporary's view sits inside the value that carries it -- its bracket,
+// so the caret lands on the `[..]` as it does for every other refused view -- or nothing where the
+// temporary was made by an earlier statement.
+private temp_made_in(v: TExpr, at: Span) -> Option[Span]
+    val found: &SpanCell = SpanCell(None)
+
+    walk_texpr(v, expr_walk(false, x -> *x.kind match
+        TSlice(_, _, _, _, _) -> if x.span == at then found.at = Some(view_anchor(x))
+        _ -> ()))
+
+    found.at
+end temp_made_in
+
+private struct SpanCell
+    at: Option[Span]
 
 private returned(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, v: TExpr)
     if w.returning_escapes && views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
@@ -525,8 +568,11 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     TStrView(v) -> if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
         "is made into a string, which outlives the frame")
 
+    // A store into a plain local keeps the value in the frame, which is no escape -- but it is past
+    // the statement, which a temporary made in it does not live to see. It is met here rather than
+    // as a statement, because `if c then keep = …` stores as an `if` branch's value.
     TStore(place, v, _) -> *place.kind match
-        TLoad(_, _) -> ()
+        TLoad(name, _) -> kept_past_statement(p, keeps, w, name, v)
         _ ->
             if views(p, keeps, w, v).non_empty()
                 gets_out(p, keeps, w, v, "is stored somewhere the frame does not own")
