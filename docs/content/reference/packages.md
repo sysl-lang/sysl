@@ -1670,7 +1670,7 @@ with nothing said:
 
 ```text
 'dependencies.cstd.if' is "frestanding", and 'frestanding' is not something a dependency's
-condition can ask about the machine — it knows aarch64, bsd, ..., freestanding, hosted, libc, ...
+condition can ask about the machine — it knows aarch64, bsd, ..., freestanding, hardfloat, hosted, libc, ...
 ```
 
 A target's name is refused with the condition it means (`"thumb-freestanding"` is written
