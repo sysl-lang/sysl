@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, to_u64, negate, mul as big_mul, pow as big_pow, parse_radix, shl,
+                         shr, bit_length, trailing_zeros}
+import sysl.text.{Ascii, from_utf8_unchecked}
+
+// Hex float literals: `0x1.921fb54442d18p1`, a significand in hex and a power of two in decimal.
+//
+// **A hex float exists to be exact**, which is the whole of why C99 added it and why a libm is
+// written in it: the digits are the bits. So it is never rounded. A literal whose value its type
+// cannot hold exactly -- more significant bits than the format carries, a power past its largest
+// finite value, or a bit below its smallest subnormal -- is refused, naming the type, rather than
+// quietly becoming the nearest value, which is what a decimal literal is for.
+//
+// The lexer keeps the `0x` on the text it gives a `FloatLit`, and every reader of that text -- the
+// `double` a literal carries, the exact decimal a fixed-point or `f128` literal is read from -- asks
+// `is_hex_float_text` first.
+
+// A hex float's value as `sig × 2^exp`, the significand odd unless it is zero.
+struct HexValue
+    negative: bool
+    sig: BigInt
+    exp: long
+
+// Whether a literal's text is a hex float: an optional sign, `0x`, and a `p` exponent. An `0x` with no
+// `p` is an integer, or a C operand's raw bits, and not this.
+is_hex_float_text(text: string) -> bool
+    val b = text.bytes
+    var i: usize = 0
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+')) then i += 1
+
+    if i + 2 > b.len || b[i] != u8('0') || (b[i + 1] != u8('x') && b[i + 1] != u8('X')) then return false
+
+    for j in i + 2..<b.len
+        if b[j] == u8('p') || b[j] == u8('P') then return true
+
+    false
+end is_hex_float_text
+
+// The exact value a hex float's text spells. An exponent too large to mean anything is held at a
+// billion, which is past every format's range in either direction and so is refused the same way.
+hex_value(text: string) -> HexValue
+    val b = text.bytes
+    var i: usize = 0
+    var negative = false
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+        negative = b[i] == u8('-')
+        i += 1
+
+    i += 2
+
+    var digits: Buf[u8] = buf()
+    var places: long = 0
+    var dot = false
+
+    while i < b.len && b[i] != u8('p') && b[i] != u8('P')
+        val c = b[i]
+
+        if c == u8('.') then
+            dot = true
+        else if c.digit_value(16).is_some()
+            digits.push(c)
+
+            if dot then places += 1
+
+        i += 1
+
+    i += 1
+
+    var minus = false
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+        minus = b[i] == u8('-')
+        i += 1
+
+    var power: long = 0
+
+    while i < b.len && (b[i] == u8('_') || (b[i] >= u8('0') && b[i] <= u8('9')))
+        if b[i] != u8('_') && power < 1000000000 then power = power * 10 + long(b[i] - u8('0'))
+
+        i += 1
+
+    val sig = parse_radix(from_utf8_unchecked(digits.view()), 16).unwrap_or(from_int(0))
+    val exp = (if minus then -power else power) - 4 * places
+
+    if sig.is_zero() then return HexValue(negative, sig, 0)
+
+    val tz = trailing_zeros(sig)
+
+    HexValue(negative, shr(sig, tz), exp + long(tz))
+end hex_value
+
+// A binary format as its precision (the significand's bits, the leading one included) and the
+// exponents of its smallest normal and largest finite powers.
+struct FloatFormat
+    precision: long
+    emin: long
+    emax: long
+
+private float_format(t: Type) -> Option[FloatFormat]
+    val (bits, brain) = underlying(t) match
+        Floating(w, b) -> (w, b)
+        _ -> return None
+
+    if brain then return Some(FloatFormat(8, -126, 127))
+    if bits == 16 then return Some(FloatFormat(11, -14, 15))
+    if bits == 32 then return Some(FloatFormat(24, -126, 127))
+    if bits == 64 then return Some(FloatFormat(53, -1022, 1023))
+    if bits == 128 then return Some(FloatFormat(113, -16382, 16383))
+
+    None
+end float_format
+
+// Why a hex float literal's text cannot be held exactly at `ty`, or `None` where it can. A type with
+// no format of its own -- a type parameter -- is held at `real`, which is what its literal carries.
+hex_float_refusal(text: string, ty: Type) -> Option[string]
+    val at = if float_format(ty).is_some() then ty else real_type()
+    val f = float_format(at).unwrap()
+    val v = hex_value(text)
+
+    if v.sig.is_zero() then return None
+
+    val n = long(bit_length(v.sig))
+    val top = v.exp + n - 1
+    val shown = s"the hex float '$text' is not exactly a '${type_show(at)}'"
+
+    if top > f.emax
+        return Some(s"$shown: it is at least 2^$top, and the largest '${type_show(at)}' is below 2^${f.emax + 1}")
+
+    if n > f.precision
+        return Some(s"$shown: it has $n significant bits, and a '${type_show(at)}' holds ${f.precision}")
+
+    if v.exp < f.emin - f.precision + 1
+        return Some(s"$shown: its lowest bit is 2^${v.exp}, and the smallest '${type_show(at)}' is " +
+                    s"2^${f.emin - f.precision + 1}")
+
+    None
+end hex_float_refusal
+
+// The same at a fixed-point type, whose step is `2^-frac`: a bit below the step is a value between
+// two the format holds. The range is the fixed-point literal's own check.
+hex_fixed_refusal(text: string, ty: Type) -> Option[string]
+    val frac = ty match
+        Fixed(_, f, _) -> long(f)
+        _ -> return None
+
+    val v = hex_value(text)
+
+    if v.sig.is_zero() || v.exp >= -frac then return None
+
+    Some(s"the hex float '$text' is not exactly a '${type_show(ty)}': its lowest bit is 2^${v.exp}, " +
+         s"and a '${type_show(ty)}' steps by 2^${-frac}")
+end hex_fixed_refusal
+
+// The `double` a hex float spells, as its encoding, where it is exactly one.
+hex_double_bits(text: string) -> Option[u64]
+    val v = hex_value(text)
+    val sign: u64 = if v.negative then 0x8000000000000000 else 0
+
+    if v.sig.is_zero() then return Some(sign)
+
+    if hex_float_refusal(text, real_type()).is_some() then return None
+
+    val n = long(bit_length(v.sig))
+    val top = v.exp + n - 1
+
+    if top >= -1022
+        val fraction = to_u64(shl(v.sig, usize(53 - n))).unwrap_or(0) & 0x000FFFFFFFFFFFFF
+
+        return Some(sign | (u64(top + 1023) << 52) | fraction)
+
+    Some(sign | to_u64(shl(v.sig, usize(v.exp + 1074))).unwrap_or(0))
+end hex_double_bits
+
+// A hex float as `coef × 10^exp`, the form a fixed-point and an `f128` literal are read from. Every
+// power of two is a finite decimal -- `2^-k` is `5^k × 10^-k` -- so nothing is lost. A power past
+// every format's range answers `None` rather than building a number of a million digits to say so;
+// the literal is refused at its type before its value is asked for.
+hex_decimal(text: string) -> Option[(BigInt, int)]
+    val v = hex_value(text)
+
+    if v.sig.is_zero() then return Some((from_int(0), 0))
+    if v.exp > 20000 || v.exp < -20000 then return None
+
+    val signed = if v.negative then negate(v.sig) else v.sig
+
+    if v.exp >= 0 then return Some((shl(signed, usize(v.exp)), 0))
+
+    Some((big_mul(signed, big_pow(from_int(5), usize(-v.exp))), int(v.exp)))
+end hex_decimal

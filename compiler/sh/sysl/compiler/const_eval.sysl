@@ -166,6 +166,35 @@ const_byte_order(cx: &Analyzer, e: Expr) -> Option[Const]
         _ -> None
 end const_byte_order
 
+// `real.from_bits(0x3fe62e42fefa39ef)` and `x.bits()` written straight into a `const`: typed in a trial,
+// for the width only the typed tree knows, and folded where they reach `FloatBits` over a value that
+// folds (`float_bits_routine`).
+const_float_bits(cx: &Analyzer, e: Expr) -> Option[Const]
+    val callee = *e.kind match
+        Call(c, _) -> c
+        _ -> return None
+
+    val op = *callee.kind match
+        Field(_, name, _) -> name
+        _ -> return None
+
+    if op != "from_bits" && op != "bits" then return None
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return None
+
+    // The argument is folded rather than the call, so a width the typed fold does not hold a value of
+    // -- `f16`, `bf16`, `f128` -- is still reached: its encoding is an integer.
+    *typed.unwrap().kind match
+        TCall(name, args, _, _) ->
+            if !float_bits_routine(name) || args.len() != 1 then return None
+
+            const_fold_typed(args.at(0), cx.an.tables.layout.little_endian)
+                .and_then(c -> float_bits_folded(name, c))
+        _ -> None
+end const_float_bits
+
 // A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
 // constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
 // than worked out in `f64` the way the untyped fold works. Says nothing where it stops: the untyped
@@ -2242,6 +2271,13 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
     val shown = qualified_name(name)
 
     if const_renderer(shown) then return library_render(r, at, shown, vals)
+
+    // A float's encoding and back, which the library writes as a read through a pointer.
+    if float_bits_routine(name) && vals.len() == 1
+        val folded = float_bits_folded(name, vals.at(0))
+
+        if folded.is_some() then return EvGave(folded.unwrap())
+    end if
 
     val routine = qualified_name(r.a.tables.members.func_origin.get(name).unwrap_or(name))
 

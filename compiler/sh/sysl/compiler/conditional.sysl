@@ -63,10 +63,21 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     var keep: Buf[bool] = buf()
     var touched = false
 
+    // Where the live code not yet read for literals begins (`inside_literal`).
+    var scan_from: usize = 0
+
     for line in 1..lines
         val text = from_utf8_unchecked(src.line_text(line))
 
-        directive_of(text) match
+        // A margin line inside a text block or a block comment that opened in live code is that
+        // literal's text. An inactive branch is never read this way, since it need not even lex.
+        val found = directive_of(text) match
+            Some(d) ->
+                if all_taken(stack) && inside_literal(src, &scan_from, src.line_span(line).start) then None
+                else Some(d)
+            None -> None
+
+        found match
             None ->
                 // A line survives when every open group is in its taken branch: an `#if` inside a
                 // branch that was not taken selects nothing at all, however its own condition reads.
@@ -78,6 +89,9 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
             Some(d) ->
                 touched = true
                 keep.push(false)
+
+                // A directive line is not code, so live code starts again on the line after it.
+                scan_from = src.line_span(line + 1).start
 
                 val word = d.word
 
@@ -157,6 +171,17 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
 
     Ok(source_of(src.name, out.finish()))
 end gate
+
+// Whether the line starting at `start` is inside a text block or a block comment that opened in the
+// live code before it. The code from `scan_from` on is read with the lexer's own scans
+// (`literal_reach`), a line's reach at a time, so a file with no directive reads nothing twice and a
+// file with some reads only its live stretches.
+private inside_literal(src: Source, scan_from: *usize, start: usize) -> bool
+    while *scan_from < start
+        *scan_from = literal_reach(src, *scan_from) + 1
+
+    *scan_from > start
+end inside_literal
 
 // Every symbol a condition may name, whatever the target.
 //

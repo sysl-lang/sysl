@@ -614,15 +614,67 @@ a_directive_inside_an_inactive_branch()
     assert(refuses("#if windows\n#if linux\nnonsense ][\n#endif\nf() = 1\n").contains("never closed"),
         "the group still has to be closed")
 
-// -- the property this pass does NOT have ----------------------------------------------------------------
+// -- a margin line inside a literal is the literal's text -------------------------------------------
 
-@test("a line at the margin inside a text block reads as a directive")
+// C source with its preprocessor lines at the margin, as a text block of each form would carry it.
+private c_lines() -> string = "#define LIMIT 4\n#if LIMIT > 2\n#include <stdio.h>\n#endif\n"
+
+@test("a margin line inside a text block is the block's text, in every form of text block")
 a_margin_line_inside_a_text_block()
-    // Stated as a known property rather than left to be discovered. The gate runs before anything
-    // knows what a string is, so a text-block line that starts at the margin with a directive word
-    // is one. Recognizing it would mean a second copy of the lexer's rules about strings and
-    // comments, which is a worse defect than this -- two sets of rules drift, and nothing says so.
-    assert_eq(refuses("var s = \"\"\"\n#endif\n\"\"\"\n"), "'#endif' has no '#if' above it to close")
+    // The gate asks the lexer's own scans where a literal ends (`literal_reach`), so a `#define`
+    // in C carried by a text block is not a directive -- and there is one set of rules about strings.
+    for prefix in ["", "raw", "c", "s", "f"]
+        val text = s"var s = $prefix\"\"\"\n${c_lines()}\"\"\"\nf() = 1\n"
+
+        assert_eq(refuses(text), "")
+        assert_eq(gated(on_macos(), text), text)
+
+    assert_eq(refuses("var s = \"\"\"\n#endif\n\"\"\"\n"), "")
+end a_margin_line_inside_a_text_block
+
+@test("and inside a block comment, which the lexer also reads across lines")
+a_margin_line_inside_a_block_comment()
+    val text = s"/*\n${c_lines()}*/\nf() = 1\n"
+
+    assert_eq(gated(on_macos(), text), text)
+end a_margin_line_inside_a_block_comment
+
+@test("a real directive right after such a literal still gates")
+a_directive_after_a_text_block()
+    val text = s"val c = raw\"\"\"\n${c_lines()}\"\"\"\n#if windows\nw() = 1\n#else\nm() = 2\n#endif\n"
+
+    assert_eq(sees(on_macos(), text), "val c = raw\"\"\" #define LIMIT 4 #if LIMIT > 2 #include <stdio.h> #endif \"\"\" m() = 2")
+    assert_eq(sees(on_windows(), text), "val c = raw\"\"\" #define LIMIT 4 #if LIMIT > 2 #include <stdio.h> #endif \"\"\" w() = 1")
+end a_directive_after_a_text_block
+
+@test("a text block inside a taken branch carries a directive word, and the group still closes after it")
+a_text_block_inside_a_taken_branch()
+    val text = "#if macos\nval s = \"\"\"\n#else\n\"\"\"\n#endif\nf() = 1\n"
+
+    assert_eq(sees(on_macos(), text), "val s = \"\"\" #else \"\"\" f() = 1")
+
+    // Where the branch is not taken it is not read, so its '#else' is one -- a branch not taken is
+    // never asked to lex, and the text block it opens is not known to be one.
+    assert_eq(sees(on_linux(), text), "\"\"\" f() = 1")
+end a_text_block_inside_a_taken_branch
+
+@test("a text block opened in a branch not taken is not read, since that branch need not lex")
+a_text_block_in_an_untaken_branch()
+    assert_eq(sees(on_macos(), "#if windows\nval s = \"\"\"\n#endif\nf() = 1\n"), "f() = 1")
+end a_text_block_in_an_untaken_branch
+
+@test("quotes in a line comment, a plain string or a character open nothing")
+quotes_that_open_no_text_block()
+    assert_eq(sees(on_macos(), "// \"\"\"\n#if windows\nw() = 1\n#endif\nf() = 1\n"), "// \"\"\" f() = 1")
+    assert_eq(sees(on_macos(), "val s = \"\\\"\\\"\\\"\"\n#if windows\nw() = 1\n#endif\nf() = 1\n"),
+              "val s = \"\\\"\\\"\\\"\" f() = 1")
+    assert_eq(sees(on_macos(), "val q = '\"'\n#if windows\nw() = 1\n#endif\nf() = 1\n"), "val q = '\"' f() = 1")
+end quotes_that_open_no_text_block
+
+@test("an unterminated text block leaves the directives below it to the gate, and the lexer reports it")
+an_unterminated_text_block()
+    assert_eq(refuses("var s = \"\"\"\n#endif\n"), "'#endif' has no '#if' above it to close")
+end an_unterminated_text_block
 
 // -- a literate file ------------------------------------------------------------------------------
 

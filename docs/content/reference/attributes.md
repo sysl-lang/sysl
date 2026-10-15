@@ -3638,12 +3638,35 @@ finds that is a build for each target — a thing to *run*, not a thing to desig
 conditions themselves are the part that is checked everywhere, and they are the part where a mistake
 would otherwise be silent.
 
-**The gate runs before anything knows what a string or a comment is**, so a line that begins at the
-margin with a directive word is a directive even inside a text block or a block comment. Recognizing
-those would mean a second copy of the lexer's rules about literals, in a place where the two could
-drift with nothing to notice — a worse defect than this one. The margin rule is what keeps it rare: a
-text block written anywhere but the top level is indented in the source, whatever its value turns out
-to be.
+**A margin line inside a text block or a block comment is the literal's text, not a directive.** A
+text block carrying C — a header to compile, a template — has its `#define`, `#if` and `#include` at
+column 1, and they belong to the string. The gate asks the lexer itself where a literal opened in live
+code ends, with the same scans a token is read with, so there is one set of rules about strings and
+comments rather than two that could drift. A branch not taken is not read this way, since it need not
+lex at all — a text block that opens inside one does not hide the `#endif` that closes it.
+
+```sysl
+import sysl.text.Search
+
+val header = raw"""
+#define LIMIT 4
+#if LIMIT > 2
+#include <stdio.h>
+#endif
+"""
+
+#if posix
+val kind = "posix"
+#else
+val kind = "other"
+#endif
+
+print(kind, header.contains("#define LIMIT 4"))
+```
+
+```output
+posix true
+```
 
 ### The library is subject to it too
 
