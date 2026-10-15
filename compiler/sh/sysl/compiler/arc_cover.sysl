@@ -1,0 +1,338 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
+
+// **A share of something a held local already keeps alive is no share at all**, wherever in the
+// function it is given back.
+//
+// Taking a slice of a slice retains the owner, and the end of the new slice's scope releases it. Where
+// the parent is a parameter or a `val` -- a stack slot nothing outside the frame can name, written
+// once -- the parent's own count keeps the owner alive for as long as the parent is in scope, so a
+// view taken from it and given back before the parent is needs no count of its own. `arc_elide.sysl`
+// cancels a pair inside one basic block; a view taken in a loop and walked by a `for` is given back
+// blocks later, past the loop that read it, and is the shape this pass is for:
+//
+//     while i + most <= src.len
+//         val here = src[i..<i + most]     // retain src's owner
+//         for x in here ...
+//         i += most                        // release here's owner, every round
+//
+// **The rule.** A retain of a reference read out of a *covering* slot is dropped with every release
+// that gives its count back when, on every path from the retain, one of those releases comes before
+// the function returns, before the retain runs again, and before anything gives back the count the
+// slot holds or writes the slot. A slot covers when nothing outside the frame can reach it, it is
+// stored to exactly once, and the value stored holds a count: a parameter (its caller's, or the one
+// the function took for it), or a value whose count was taken just before the store.
+//
+// **What gives the count back** is followed through field reads and field writes, and through loads
+// of the one slot the new value was stored into. A release whose reference was put together by the
+// retain's own value, or read from that slot, gives back the retained count; a release of a value read
+// straight out of the covering slot gives back the slot's own. Anything else the window releases runs
+// a destructor that cannot reach a slot whose address never left the frame, so it may sit inside.
+//
+// **Why it is sound.** The slot's count holds the object alive from before the retain until after the
+// last release dropped, so the count never reaches zero inside the window, and outside it the count
+// is what it was. Each path loses one retain and the one release that gave it back, so no count ends
+// anywhere else and no destructor moves.
+
+// Where a value comes from: the value a walk back through field reads and writes stopped at, the
+// field of it (each index followed by a `.`), and the field writes it passed (`|name|`). Values are
+// named as they print (`%t7`), which is how `defs` is keyed.
+private struct Origin
+    leaf: string
+    path: string
+    through: string
+
+private index_text(idx: Buf[int]) -> string
+    var s = ""
+
+    for k in idx
+        s = s"$s$k."
+
+    s
+end index_text
+
+// The origin of field `path` of `v`, followed back through `extractvalue` and `insertvalue`.
+private origin_of(defs: Map[string, Inst], v: Val, path: string, through: string) -> Origin
+    val n = v_render(v)
+
+    defs.get(n) match
+        Some(InExtract(_, _, agg, idx)) -> origin_of(defs, agg, s"${index_text(idx)}$path", through)
+        Some(InInsert(_, _, agg, _, value, idx)) ->
+            val at = index_text(idx)
+
+            if path.starts_with(at)
+                origin_of(defs, value, path[at.bytes.len..<path.bytes.len], s"$through|$n|")
+            else if at.starts_with(path) then Origin(n, path, through)
+            else origin_of(defs, agg, path, through)
+        _ -> Origin(n, path, through)
+end origin_of
+
+// The slot a plain load `leaf` read, or "".
+private loaded_slot(defs: Map[string, Inst], leaf: string) -> string = defs.get(leaf) match
+    Some(InLoad(_, _, p, AccPlain, _)) -> v_render(p)
+    _ -> ""
+
+// Where a slot is stored to: its block, its index, the value. More than one store is no slot this
+// pass reads.
+private struct SlotStore
+    block: usize
+    at: usize
+    value: Val
+    count: int
+
+// A retain this pass may drop: where it is, the release that gives its count back, the slot whose
+// count covers it and the field of the slot the reference is, the field writes that put the reference
+// into a new value, and the slot that new value was stored into ("" for none) with the field of it.
+private struct Cover
+    block: usize
+    at: usize
+    release: string
+    slot: string
+    path: string
+    leaf: string
+    inserts: Set[string]
+    into: string
+    into_path: string
+
+elide_covered(blocks: Buf[IrBlock], clean: Set[string]) -> Buf[IrBlock]
+    var defs: Map[string, Inst] = map()
+    var stores: Map[string, SlotStore] = map()
+    var labels: Map[string, usize] = map()
+
+    for b in 0..<blocks.len()
+        labels.put(blocks[b].label, b)
+
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            val inst = instrs[i]
+
+            inst match
+                InLoad(d, _, _, _, _) -> defs.put(v_render(d), inst)
+                InExtract(d, _, _, _) -> defs.put(v_render(d), inst)
+                InInsert(d, _, _, _, _, _) -> defs.put(v_render(d), inst)
+                InStore(_, v, p, _, _) ->
+                    val slot = v_render(p)
+
+                    if clean.has(slot)
+                        stores.get(slot) match
+                            Some(s) -> stores.put(slot, s with { count = s.count + 1 })
+                            None -> stores.put(slot, SlotStore(b, i, v, 1))
+                _ -> ()
+
+    var dropped: Set[string] = set()
+    var claimed: Set[string] = set()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            cover_at(blocks, defs, stores, clean, b, i) match
+                Some(c) ->
+                    val ends = window_ends(blocks, defs, labels, c)
+
+                    if !ends.is_empty()
+                        var fresh = true
+
+                        for e in ends
+                            if claimed.has(e) then fresh = false
+
+                        if fresh
+                            dropped.add(s"$b:$i")
+
+                            for e in ends
+                                claimed.add(e)
+                                dropped.add(e)
+                None -> ()
+
+    if dropped.len() == 0 then return blocks
+
+    var out: Buf[IrBlock] = buf()
+
+    for b in 0..<blocks.len()
+        var kept: Buf[Inst] = buf()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            if !dropped.has(s"$b:$i") then kept.push(instrs[i])
+
+        out.push(IrBlock(blocks[b].label, kept, blocks[b].terminator))
+
+    out
+end elide_covered
+
+// The retain at `blocks[b].instrs[i]`, if it is one of a reference read out of a covering slot whose
+// new count goes nowhere but into values and one clean slot.
+private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
+                 clean: Set[string], b: usize, i: usize) -> Option[Cover]
+    val (name, x) = arc_call_of(blocks[b].instrs[i])?
+
+    if name == "arc.weak_retain" then return None
+
+    val release = release_for(name)?
+    // The reference may have been put into a value already, by the field writes of an earlier share;
+    // what it is a field of is what it was read out of.
+    val from = origin_of(defs, x, "", "")
+    val slot = loaded_slot(defs, from.leaf)
+
+    if slot == "" then return None
+
+    val held = stores.get(slot)?
+
+    if held.count != 1 || !holds_a_count(blocks, defs, held, from.path) then return None
+
+    val xs = v_render(x)
+    val instrs = blocks[b].instrs
+    var inserts: Set[string] = set()
+    var into = ""
+    var into_path = ""
+
+    for j in i + 1..<instrs.len()
+        instrs[j] match
+            InInsert(d, _, _, _, v, _) -> if v_render(v) == xs then inserts.add(v_render(d))
+            InStore(_, v, p, _, _) ->
+                carried(defs, v, from) match
+                    Some(at) ->
+                        val target = v_render(p)
+                        val s = stores.get(target)
+
+                        if into != "" || !clean.has(target) || s.is_none() || s.unwrap().count != 1 then return None
+
+                        into = target
+                        into_path = at
+                    None -> ()
+            _ -> ()
+
+    Some(Cover(b, i, release, slot, from.path, from.leaf, inserts, into, into_path))
+end cover_at
+
+// Whether the one value stored to a covering slot holds a count on field `path`: a parameter does,
+// and so does a value whose field had a count taken for it earlier in the store's own block.
+private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotStore, path: string) -> bool
+    held.value match
+        VReg(n) -> if held.block == 0 && n.ends_with(".param") then return true
+        _ -> ()
+
+    val want = origin_of(defs, held.value, path, "")
+    val instrs = blocks[held.block].instrs
+
+    for j in 0..<held.at
+        arc_call_of(instrs[j]) match
+            Some((name, v)) ->
+                if name != "arc.weak_retain" && release_for(name).is_some()
+                    val got = origin_of(defs, v, "", "")
+
+                    if got.leaf == want.leaf && got.path == want.path then return true
+            None -> ()
+
+    false
+end holds_a_count
+
+// The field of `v` that holds the reference `xs` (read out of `from`), if `v` carries it: a value
+// built by writing it into a field, or a read of the slot field it is part of.
+private carried(defs: Map[string, Inst], v: Val, from: Origin) -> Option[string]
+    var cur = v
+
+    loop
+        defs.get(v_render(cur)) match
+            Some(InInsert(_, _, agg, _, _, idx)) ->
+                val at = index_text(idx)
+
+                if same_place(origin_of(defs, v, at, ""), from) then return Some(at)
+
+                cur = agg
+                continue
+            _ -> ()
+
+        break
+
+    val o = origin_of(defs, cur, "", "")
+
+    if o.leaf == from.leaf && from.path.starts_with(o.path)
+        val at = from.path[o.path.bytes.len..<from.path.bytes.len]
+
+        if same_place(origin_of(defs, v, at, ""), from) then return Some(at)
+
+    None
+end carried
+
+private same_place(a: Origin, b: Origin) -> bool = a.leaf == b.leaf && a.path == b.path
+
+// Every release that gives back the count `c` took, as `block:index`, when each path from the retain
+// reaches one before it returns, runs the retain again, gives back the covering slot's own count or
+// stores to that slot; otherwise nothing.
+private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize], c: Cover) -> Buf[string]
+    var ends: Buf[string] = buf()
+    var none: Buf[string] = buf()
+    var seen: Set[usize] = set()
+    var work: Buf[(usize, usize)] = buf()
+
+    work.push((c.block, c.at + 1))
+
+    while !work.is_empty()
+        val (b, start) = work.pop().unwrap()
+        val instrs = blocks[b].instrs
+        var stopped = false
+
+        for i in start..<instrs.len()
+            if b == c.block && i == c.at then return none
+
+            val inst = instrs[i]
+
+            inst match
+                InStore(_, _, p, _, _) -> if v_render(p) == c.slot then return none
+                _ -> ()
+
+            arc_call_of(inst) match
+                Some((name, v)) ->
+                    if is_release(name)
+                        val o = origin_of(defs, v, "", "")
+
+                        if name == c.release && gives_back(defs, c, o)
+                            ends.push(s"$b:$i")
+                            stopped = true
+                            break
+
+                        if o.through == "" && loaded_slot(defs, o.leaf) == c.slot then return none
+                None -> ()
+
+        if stopped then continue
+
+        var next: Buf[string] = buf()
+
+        blocks[b].terminator match
+            Some(InBr(l)) -> next.push(l)
+            Some(InCondBr(_, t, f)) ->
+                next.push(t)
+                next.push(f)
+            Some(InSwitch(_, _, d, cases)) ->
+                next.push(d)
+
+                for k in cases
+                    next.push(k.1)
+            Some(InUnreachable) -> ()
+            _ -> return none
+
+        for l in next
+            labels.get(l) match
+                Some(to) ->
+                    if !seen.has(to)
+                        seen.add(to)
+                        work.push((to, 0))
+                None -> return none
+
+    ends
+end window_ends
+
+// Whether a release of a reference from `o` gives back the count `c` took: it was put into a value by
+// one of the retain's own field writes, or read out of the slot that value was stored into.
+private gives_back(defs: Map[string, Inst], c: Cover, o: Origin) -> bool
+    if o.leaf == c.leaf && o.path == c.path
+        for n in c.inserts
+            if o.through.contains(s"|$n|") then return true
+
+    c.into != "" && o.through == "" && loaded_slot(defs, o.leaf) == c.into && o.path == c.into_path
+end gives_back

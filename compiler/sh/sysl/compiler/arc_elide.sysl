@@ -40,7 +40,9 @@ elide_arc_pairs(blocks: Buf[IrBlock]) -> Buf[IrBlock]
     val clean = unescaped_slots(blocks)
     var out: Buf[IrBlock] = buf()
 
-    for b in blocks
+    // A count a covering slot makes needless goes first, wherever it is given back
+    // (`arc_cover.sysl`); what is left is cancelled within its block.
+    for b in elide_covered(blocks, clean)
         out.push(IrBlock(b.label, elide_in_block(b.instrs, clean), b.terminator))
 
     for j in 1..<out.len()
@@ -149,7 +151,7 @@ private escaping_operands(inst: Inst) -> Buf[Val]
 end escaping_operands
 
 // The release that gives back what `name` took, when `name` is a retain this pass knows.
-private release_for(name: string) -> Option[string]
+release_for(name: string) -> Option[string]
     if name == "arc.retain" then return Some("arc.release")
     if name == "arc.retain_sync" then return Some("arc.release_sync")
     if name == "arc.retain_maybe" then return Some("arc.release_maybe")
@@ -159,12 +161,12 @@ private release_for(name: string) -> Option[string]
     None
 end release_for
 
-private is_release(name: string) -> bool =
+is_release(name: string) -> bool =
     name == "arc.release" || name == "arc.release_sync" || name == "arc.release_maybe" ||
         name == "arc.weak_release" || name.starts_with("arc.dispose.")
 
 // The one-argument, no-result call to a named function `inst` is, if it is one.
-private arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
+arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
     InCall(None, _, VGlobal(n), args, _, _, _, _) -> if args.len() == 1 then Some((n, args[0].value)) else None
     _ -> None
 
