@@ -315,13 +315,13 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
                 if !is_trait(*inner) then
                     return (TExpr(span, TCast(t, usize_type(word_bits(cx)))),
                             lib_fn(cx, "debug_address"), None)
-            Weak(_) -> return (shown_text(span, "weak(…)"), lib_fn(cx, "display_str"), None)
-            Unit -> return (shown_text(span, "()"), lib_fn(cx, "display_str"), None)
+            Weak(_) -> return (shown_after(span, t, "weak(…)"), lib_fn(cx, "display_str"), None)
+            Unit -> return (shown_after(span, t, "()"), lib_fn(cx, "display_str"), None)
             _ -> ()
 
         val text = if task_result(vt).is_some() then "<task>" else slotless_text(vt)
 
-        return (shown_text(span, text), lib_fn(cx, "display_str"), None)
+        return (shown_after(span, t, text), lib_fn(cx, "display_str"), None)
     end if
 
     var shown = t
@@ -377,7 +377,7 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
     // held by value where its layout is private, a generic shape whose part has none -- is shown as
     // its type, in angle brackets, which is all that can be said about it from here.
     if !conforms(cx.an, dbg, here) && !satisfies(cx.an, dbg, here) then
-        return (shown_text(span, s"<${type_show(here)}>"), lib_fn(cx, "display_str"), None)
+        return (shown_after(span, t, s"<${type_show(here)}>"), lib_fn(cx, "display_str"), None)
 
     val fname = member_func_name(cx, span, here, "debug")
 
@@ -405,6 +405,16 @@ end callable_debug
 
 // A literal standing in for a value that is shown by rule.
 private shown_text(span: Span, text: string) -> TExpr = TExpr(span, TStrLit(text))
+
+// The same, after the value has been computed: **what is shown by rule is still evaluated**, since
+// `print(str(print(1)))` prints the `1` whatever the `()` it shows. Device memory alone is not, being
+// the one value whose reading is the act.
+private shown_after(span: Span, t: TExpr, text: string) -> TExpr
+    var stmts: Buf[TStmt] = buf()
+
+    stmts.push(TExprStmt(t))
+    TExpr(span, TBlockExpr(TBlock(stmts, Some(shown_text(span, text)), Str)))
+end shown_after
 
 // A library function a plan calls, marked reached; empty where the compilation has no library.
 private lib_fn(cx: &Analyzer, name: string) -> string
