@@ -282,6 +282,22 @@ struct Target
     hard_float_abi(self) -> bool = self.fp_registers() && self.hard_float()
     soft_fp_abi(self) -> bool = self.fp_registers() && self.soft_float
 
+    // Whether a fused multiply-add (`llvm.fma`) is one instruction at binary32, which is C's
+    // `FP_FAST_FMAF`. It is a fact about the **unit**, not the convention, so a soft-float ABI over a
+    // unit still fuses: every Arm unit a row names is VFPv4 or later, AArch64's is always there, and a
+    // hosted RISC-V machine is `rv64gc`. The x86 rows ask for no processor past the baseline, which has
+    // no FMA, and WebAssembly has none; a machine that answers false calls `fmaf`, which
+    // `sysl.softfloat` exports where there is no C library to ask.
+    fused_single(self) -> bool = self.cpu match
+        Aarch64 -> true
+        Riscv64 -> !self.soft_float
+        Thumb -> !self.no_fpu && self.fpu != ""
+        _ -> false
+
+    // The same at binary64, which is C's `FP_FAST_FMA`: on Arm only a double-precision unit has it.
+    fused_double(self) -> bool =
+        if self.cpu == Thumb then self.fused_single() && !self.fpu.contains("-sp-") else self.fused_single()
+
     // Whether the machine divides 32-bit integers itself. Armv6-M is the one core sysl targets that
     // has no divider -- nor a long multiply, `clz` or a two-word shift -- so LLVM calls a routine for
     // each, and `sysl.softint` answers them.

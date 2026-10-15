@@ -1,0 +1,275 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The float intrinsics past the seven the library itself declares: `llvm.fma`, the two roundings to
+// even (`llvm.rint`, `llvm.nearbyint`) and the four comparisons (`llvm.minnum`, `llvm.maxnum`,
+// `llvm.minimum`, `llvm.maximum`). Each is an `extern` in the `llvm.` namespace like the others
+// (`tests_itr_intrinsics.sysl`); what is new is the fused multiply-add's three facts -- it rounds once,
+// it is one instruction where the unit has one, and where it has none `sysl.softfloat` answers the
+// call a freestanding machine would otherwise leave undefined -- and the `#if` symbols saying which.
+
+private fmx_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private fmx_refused(text: string, message: string)
+    val said = xvr_ir(fmx_main(text))
+
+    assert(said.contains(s"error: $message\n --> main.sysl:1:1\n"), said)
+
+// -- the declarations ------------------------------------------------------------------------------
+
+@test("each new intrinsic is declared at the width its signature states")
+fmx_declared_at_both_widths()
+    if xvr_no_library() then return
+
+    val out = xvr_ir(fmx_main(raw"""
+        private extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+        private extern "llvm.fma" fmaf(a: f32, b: f32, c: f32) -> f32
+        private extern "llvm.rint" rint(x: f64) -> f64
+        private extern "llvm.nearbyint" nearbyintf(x: f32) -> f32
+        private extern "llvm.minnum" minnum(a: f64, b: f64) -> f64
+        private extern "llvm.maxnum" maxnumf(a: f32, b: f32) -> f32
+        private extern "llvm.minimum" minimumf(a: f32, b: f32) -> f32
+        private extern "llvm.maximum" maximum(a: f64, b: f64) -> f64
+
+        print(fma(1.0, 2.0, 3.0), fmaf(1.0f32, 2.0f32, 3.0f32), rint(1.5), nearbyintf(1.5f32))
+        print(minnum(1.0, 2.0), maxnumf(1.0f32, 2.0f32), minimumf(1.0f32, 2.0f32), maximum(1.0, 2.0))
+        """))
+
+    for line in ["declare double @llvm.fma.f64(double, double, double)",
+                 "declare float @llvm.fma.f32(float, float, float)", "declare double @llvm.rint.f64(double)",
+                 "declare float @llvm.nearbyint.f32(float)", "declare double @llvm.minnum.f64(double, double)",
+                 "declare float @llvm.maxnum.f32(float, float)", "declare float @llvm.minimum.f32(float, float)",
+                 "declare double @llvm.maximum.f64(double, double)"]
+        assert(out.contains(line), s"$line\n$out")
+end fmx_declared_at_both_widths
+
+@test("the roundings and comparisons have no half-width trouble, so f16 and bf16 take them")
+fmx_half_widths_take_the_rest()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran(fmx_main(raw"""
+        private extern "llvm.rint" rint(x: f16) -> f16
+        private extern "llvm.maxnum" maxnum(a: bf16, b: bf16) -> bf16
+
+        print(rint(2.5f16), rint(3.5f16), maxnum(1.0bf16, 2.0bf16))
+        """)), "2 4 2\n")
+
+// -- the values ------------------------------------------------------------------------------------
+
+// The classic case: `x * x` is `1 + 2^-29 + 2^-60`, whose last term a double cannot hold beside the
+// one. Rounded first, it is gone before `c` cancels the rest; fused, it is the whole answer.
+@test("a fused multiply-add keeps the product's low bits, where a multiply and an add lose them")
+fmx_fused_keeps_the_low_bits()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran(fmx_main(raw"""
+        private extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+        private extern "llvm.fma" fmaf(a: f32, b: f32, c: f32) -> f32
+
+        val x = 1.0 + 1.0 / 1073741824.0
+        val c = -(1.0 + 1.0 / 536870912.0)
+        val y = 1.0f32 + 1.0f32 / 4096.0f32
+        val d = -(1.0f32 + 1.0f32 / 2048.0f32)
+
+        print(fma(x, x, c) * 1152921504606846976.0, x * x + c)
+        print(fmaf(y, y, d) * 16777216.0f32, y * y + d)
+        print(fma(2.0, 3.0, 4.0), fmaf(-2.0f32, 3.0f32, 4.0f32))
+        """)), "1 0\n1 0\n10 -2\n")
+
+@test("the special operands: an infinity times zero, opposite infinities, and the signed zeros")
+fmx_special_operands()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran(fmx_main(raw"""
+        private extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+
+        print(fma(infinity, 0.0, 1.0), fma(infinity, 1.0, -infinity), fma(infinity, -1.0, 5.0))
+        print(fma(-0.0, 1.0, -0.0), fma(0.0, -1.0, 0.0), fma(1.0, 1.0, nan))
+        """)), "NaN NaN -inf\n-0 0 NaN\n")
+
+@test("rint and nearbyint take a tie to even, round takes it away from zero")
+fmx_roundings()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran(fmx_main(raw"""
+        private extern "llvm.rint" rint(x: f64) -> f64
+        private extern "llvm.nearbyint" nearbyint(x: f32) -> f32
+        private extern "llvm.round" round(x: f64) -> f64
+
+        print(rint(2.5), rint(3.5), rint(-2.5), rint(-0.4), rint(2.6))
+        print(nearbyint(0.5f32), nearbyint(1.5f32), nearbyint(-3.5f32), round(2.5), round(-2.5))
+        """)), "2 4 -2 -0 3\n0 2 -4 3 -3\n")
+
+@test("minnum and maxnum let a number beat a NaN; minimum and maximum let the NaN win")
+fmx_comparisons()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran(fmx_main(raw"""
+        private extern "llvm.minnum" minnum(a: f64, b: f64) -> f64
+        private extern "llvm.maxnum" maxnum(a: f64, b: f64) -> f64
+        private extern "llvm.minimum" minimum(a: f64, b: f64) -> f64
+        private extern "llvm.maximum" maximum(a: f64, b: f64) -> f64
+
+        print(minnum(1.0, nan), maxnum(nan, 2.0), minnum(-1.0, 3.0), maxnum(-1.0, 3.0))
+        print(minimum(1.0, nan), maximum(nan, 2.0), minimum(0.0, -0.0), maximum(-0.0, 0.0))
+        """)), "1 2 -1 3\nNaN NaN -0 0\n")
+
+// -- the error path --------------------------------------------------------------------------------
+
+@test("a fused multiply-add takes three operands")
+fmx_fma_arity()
+    if xvr_no_library() then return
+
+    fmx_refused("private extern \"llvm.fma\" f(a: f64, b: f64) -> f64\n\nprint(f(1.0, 2.0))\n",
+                "'llvm.fma' takes 3 arguments, but 2 were declared")
+
+@test("and the comparisons two")
+fmx_comparison_arity()
+    if xvr_no_library() then return
+
+    fmx_refused("private extern \"llvm.minimum\" f(a: f64) -> f64\n\nprint(f(1.0))\n",
+                "'llvm.minimum' takes 2 arguments, but 1 were declared")
+
+// A half-width fused multiply-add computed at `f32` rounds twice, so it is not offered.
+@test("a fused multiply-add at a half width is refused, naming the widths it is offered at")
+fmx_fma_half_width_refused()
+    if xvr_no_library() then return
+
+    fmx_refused("private extern \"llvm.fma\" f(a: f16, b: f16, c: f16) -> f16\n\nprint(f(1.0f16, 2.0f16, 3.0f16))\n",
+                "'llvm.fma' is offered at f32 and f64, and this declaration states f16")
+    fmx_refused("private extern \"llvm.fma\" f(a: bf16, b: bf16, c: bf16) -> bf16\n\n" +
+                "print(f(1.0bf16, 2.0bf16, 3.0bf16))\n",
+                "'llvm.fma' is offered at f32 and f64, and this declaration states bf16")
+    fmx_refused("private extern \"llvm.fma\" f(a: f128, b: f128, c: f128) -> f128\n\n" +
+                "print(f(1.0f128, 2.0f128, 3.0f128))\n",
+                "'llvm.fma' is offered at f32 and f64, and this declaration states f128")
+
+@test("widths that disagree are refused before the width rule is asked")
+fmx_fma_mixed_widths()
+    if xvr_no_library() then return
+
+    fmx_refused("private extern \"llvm.fma\" f(a: f64, b: f32, c: f64) -> f64\n\nprint(f(1.0, 2.0f32, 3.0))\n",
+                "'llvm.fma' takes and returns one floating-point type, and this declaration states real and f32")
+
+// -- the `#if` symbols -----------------------------------------------------------------------------
+
+// Every row, by name: which units fuse at binary32 and which at binary64. Measured against clang for
+// each triple with the row's own `-mfpu` -- `fmadd`/`vfma` where true, a call to `fma`/`fmaf` where
+// false.
+@test("fma and fma_dp are true exactly where the unit fuses at that width")
+fmx_symbols_per_target()
+    val both = ["aarch64-macos", "aarch64-linux", "aarch64-android", "aarch64-freestanding", "riscv64-linux",
+                "thumbv7em-freestanding-dp"]
+    val single = ["thumb-freestanding", "thumb-freestanding-softfp", "thumbv7em-freestanding"]
+    val targets = all_targets()
+
+    for t in targets
+        var fused = 0
+
+        for name in both
+            if name == t.name then fused = 2
+
+        for name in single
+            if name == t.name then fused = 1
+
+        val said = defined(t)
+
+        assert(fmx_has(said, "fma") == (fused >= 1), s"${t.name}: fma")
+        assert(fmx_has(said, "fma_dp") == (fused == 2), s"${t.name}: fma_dp")
+        assert(t.fused_single() == (fused >= 1) && t.fused_double() == (fused == 2), t.name)
+
+    // Both are names a condition may use on every machine, false ones included.
+    assert(fmx_has(symbols(), "fma") && fmx_has(symbols(), "fma_dp"), "the vocabulary")
+    assert(!fmx_has(directory_symbols(), "fma"), "a directory has no processor to ask")
+end fmx_symbols_per_target
+
+private fmx_has(items: Buf[string], word: string) -> bool
+    for item in items
+        if item == word then return true
+
+    false
+
+// -- the boards ------------------------------------------------------------------------------------
+
+private val fmx_board_program: string = raw"""
+    private extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+    private extern "llvm.fma" fmaf(a: f32, b: f32, c: f32) -> f32
+
+    @export("fused_single")
+    fused_single(a: f32, b: f32, c: f32) -> f32 = fmaf(a, b, c)
+
+    @export("fused_double")
+    fused_double(a: f64, b: f64, c: f64) -> f64 = fma(a, b, c)
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+@test("a Cortex-M4 fuses at f32 in one instruction and calls for f64")
+fmx_m4_fuses_single()
+    val single = fx2_board_code(fmx_board_program, "thumbv7em-freestanding", "fused_single")
+    val double = fx2_board_code(fmx_board_program, "thumbv7em-freestanding", "fused_double")
+
+    if single.is_none() || double.is_none() then return
+
+    assert(single.unwrap().contains("vfma.f32"), single.unwrap())
+    assert(!single.unwrap().contains("\tbl\t"), single.unwrap())
+    assert(!double.unwrap().contains("vfma.f64"), double.unwrap())
+    assert(double.unwrap().contains("\tbl\t") || double.unwrap().contains("\tb.w\t"), double.unwrap())
+end fmx_m4_fuses_single
+
+@test("a Cortex-M7 with a double-precision unit fuses at both widths")
+fmx_m7_fuses_both()
+    val single = fx2_board_code(fmx_board_program, "thumbv7em-freestanding-dp", "fused_single")
+    val double = fx2_board_code(fmx_board_program, "thumbv7em-freestanding-dp", "fused_double")
+
+    if single.is_none() || double.is_none() then return
+
+    assert(single.unwrap().contains("vfma.f32"), single.unwrap())
+    assert(double.unwrap().contains("vfma.f64"), double.unwrap())
+    assert(!double.unwrap().contains("\tbl\t"), double.unwrap())
+end fmx_m7_fuses_both
+
+// An Armv6-M has no unit at all, so both widths are calls -- and the image links with nothing to
+// supply them but the standard module, which a C library linked beside it would override.
+@test("an Armv6-M image that fuses at both widths links with no fma or fmaf left undefined")
+fmx_v6m_links()
+    if std_root().is_err() || !clang_available() then return
+
+    val lld = capture("ld.lld", ["--version"]) match
+        Ok(c) -> c.status.ok()
+        Err(_) -> false
+
+    assert(lld, "this test links a board image and there is no ld.lld on this machine")
+
+    val root = replace_all(make_temp_dir("sysl-fmx").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", fmx_board_program).unwrap()
+    write_text(s"$root/package.hocon", "targets {\n  default = \"thumbv6m-freestanding\"\n" +
+               "  thumbv6m-freestanding { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding", "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    // `--gc-sections` drops the library's `__aeabi_memcpy` family, which a board's C library answers
+    // with `memcpy`; what is left needing a symbol is the two exports and what they call.
+    val linked = capture("ld.lld", ["--gc-sections", "-e", "fused_single", "-u", "fused_double", s"$root/app.a", "-o",
+                                    s"$root/image.elf"], "", [], true) match
+        Err(_) ->
+            assert(false, "ld.lld could not be run")
+            return
+        Ok(o) -> o
+
+    assert(linked.status.ok(), linked.err.unwrap_or(""))
+    remove_dir_all(root).unwrap_or(())
+end fmx_v6m_links

@@ -1686,8 +1686,9 @@ something else. Writing the bare name says exactly that:
 
 ```
 'server' is not something a target says about itself — sysl knows aarch64, android, bsd, craft,
-fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thumb,
-wasi, wasm32, windows, x86, x86_64. A feature this package's manifest declares is named 'feature_server'
+fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64,
+softfp, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest declares is
+named 'feature_server'
 ```
 
 **A file is gated against its own package's features and nobody else's.** The root project's

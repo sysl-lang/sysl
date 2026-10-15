@@ -3539,7 +3539,7 @@ disturbs nothing.
 | operating system | `macos`, `linux`, `windows`, `freestanding`, `android`, `wasi` |
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
-| floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI) |
+| floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
 
 That is the whole vocabulary. There is **no `#define`**, nothing a project can add, and no dependence
 on a project config. A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
@@ -3561,6 +3561,14 @@ right: `errno` is reached through `__error` on one and `__errno_location` on the
 is 66 against 39, `ENAMETOOLONG` is 63 against 36, and `mode_t` is sixteen bits against thirty-two.
 Every one of those is a *libc* fact with nothing about any particular system in it, which is why the
 standard library's own gates for them say `bsd` and not `macos`.
+
+**`fma` and `fma_dp` are C's `FP_FAST_FMAF` and `FP_FAST_FMA`**: whether `llvm.fma`
+(`reference/ffi.md`) is a single instruction at that width, so that a fused multiply-add is no slower
+than a multiply and an add. They are facts about the unit, not the calling convention: AArch64 and a
+hosted RISC-V machine have both, every Arm unit sysl targets has `fma`, and only the Cortex-M7's
+double-precision one (`thumbv7em-freestanding-dp`) has `fma_dp` as well. The x86 rows ask for no
+processor past the baseline, which has no FMA, and WebAssembly has none. Where a symbol is false the
+operation is still exact — it is a call rather than an instruction.
 
 That distinction is worth making before it is needed rather than after. macOS is the only BSD sysl
 targets today, so `#if macos` and `#if bsd` select identically — and a second BSD would route into
@@ -3630,7 +3638,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to

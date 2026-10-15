@@ -214,7 +214,73 @@ print(bogus(1.0))
 ```
 
 ```error
-'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.round, llvm.sqrt, llvm.trunc
+'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.sqrt, llvm.trunc
+```
+
+**`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
+result can differ from writing the two operations — exactly where the product's low bits matter,
+which is what it is for (an error term, a compensated sum, a polynomial evaluated with one rounding
+per step):
+
+```sysl
+extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+
+val x = 1.0 + 1.0 / 1073741824.0
+val c = -(1.0 + 1.0 / 536870912.0)
+
+print(fma(x, x, c) * 1152921504606846976.0, x * x + c)
+```
+
+```output
+1 0
+```
+
+`x * x` is `1 + 2^-29 + 2^-60`, and the `2^-60` is below what a double holds beside a one: rounded
+first, it is gone before `c` cancels the rest; fused, it is the whole answer.
+
+The other six round or compare and nothing more. `llvm.rint` and `llvm.nearbyint` round to the
+nearest integer with a tie to the even one — sysl never changes the rounding mode, so the two
+always agree, and both differ from `llvm.round`, which takes a tie away from zero. `llvm.minnum`
+and `llvm.maxnum` are C's `fmin` and `fmax`, where a NaN loses to a number; `llvm.minimum` and
+`llvm.maximum` are IEEE 754-2019's, where a NaN wins and a negative zero is the lesser zero:
+
+```sysl
+extern "llvm.rint" rint(x: f64) -> f64
+extern "llvm.nearbyint" nearbyint(x: f32) -> f32
+extern "llvm.round" round(x: f64) -> f64
+extern "llvm.minnum" minnum(a: f64, b: f64) -> f64
+extern "llvm.maximum" maximum(a: f64, b: f64) -> f64
+extern "llvm.minimum" minimum(a: f64, b: f64) -> f64
+
+print(rint(2.5), nearbyint(-3.5f32), round(2.5))
+print(minnum(1.0, nan), maximum(1.0, nan), minimum(0.0, -0.0))
+```
+
+```output
+2 -4 3
+1 NaN -0
+```
+
+**Where the machine has no fused instruction, `llvm.fma` is a call to C's `fma` or `fmaf`**, and a
+freestanding machine has no C library to answer it — an Armv6-M at both widths, a Cortex-M4's
+single-precision unit at `f64`. So `sysl.softfloat` exports both on every Arm and 32-bit RISC-V
+target, correctly rounded and weak, as it does the binary64 arithmetic: a program that computes with
+`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins. Whether
+the width *is* an instruction is the `#if` symbols `fma` and `fma_dp` (C's `FP_FAST_FMAF` and
+`FP_FAST_FMA`; [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)).
+
+`llvm.fma` is offered at `f32` and `f64` only. A half-width one computed in a wider format, as LLVM
+does where there is no half-precision unit, rounds twice, and a binary128 one calls a routine no
+freestanding machine has:
+
+```sysl
+extern "llvm.fma" fma16(a: f16, b: f16, c: f16) -> f16
+
+print(fma16(1.0f16, 2.0f16, 3.0f16))
+```
+
+```error
+'llvm.fma' is offered at f32 and f64, and this declaration states f16
 ```
 
 **What it is for is not only speed.** An intrinsic that lowers to an instruction leaves no symbol

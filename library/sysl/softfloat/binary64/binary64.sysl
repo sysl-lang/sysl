@@ -20,6 +20,12 @@ import sysl.math.Bits
 // exactly where the caller put the double, and nothing here ever holds a floating value, which a
 // build that may not touch a float register depends on.
 //
+// **`fma` and `fmaf` are the exception, because they are C's and not the run-time ABI's.** LLVM calls
+// them for `llvm.fma` where the machine has no fused instruction at that width -- a Cortex-M4's
+// binary64, everything on an Armv6-M -- with the program's own convention, which on a hard-float
+// machine puts a double in a floating register. So those two take and answer the floating types and
+// read their bits, and are reached only by a program that already computes with them.
+//
 // **Rounding is to nearest, ties to even, always**, and a NaN operand comes back quieted with its
 // payload, as compiler-rt answers. The arithmetic below has no `#if`, so the host checks it against
 // its own double unit; only the exports are per machine.
@@ -233,6 +239,142 @@ private[binary64] mul(a: u64, b: u64) -> u64
 
     round_pack(sign, exponent, kept | (if below != 0 then 1 else 0))
 end mul
+
+// -- fused multiply-add ------------------------------------------------------------------------------
+//
+// A 128-bit number travels as its high and low words, as `wide_multiply` answers one: the exact
+// product of two significands is 106 bits, and the sum is rounded from all of them.
+
+private wide_shl(x: (u64, u64), n: int) -> (u64, u64)
+    if n <= 0 then return x
+    if n >= 128 then return (0, 0)
+    if n >= 64 then return (x.1 << (n - 64), 0)
+
+    ((x.0 << n) | (x.1 >> (64 - n)), x.1 << n)
+end wide_shl
+
+// `x >> n`, every bit shifted out folded into the lowest one, as `shr_sticky` does for one word.
+private wide_shr_sticky(x: (u64, u64), n: int) -> (u64, u64)
+    if n <= 0 then return x
+    if n >= 128 then return (0, if x.0 != 0 || x.1 != 0 then 1 else 0)
+
+    if n >= 64
+        val kept = if n == 64 then x.0 else x.0 >> (n - 64)
+        val lost = x.1 != 0 || (n > 64 && x.0 << (128 - n) != 0)
+
+        return (0, kept | (if lost then 1 else 0))
+    end if
+
+    val lost = x.1 << (64 - n) != 0
+
+    (x.0 >> n, (x.1 >> n) | (x.0 << (64 - n)) | (if lost then 1 else 0))
+end wide_shr_sticky
+
+private wide_add(a: (u64, u64), b: (u64, u64)) -> (u64, u64)
+    val lo = a.1 + b.1
+
+    (a.0 + b.0 + (if lo < a.1 then 1 else 0), lo)
+
+// `a - b`, where `a` is at least `b`.
+private wide_sub(a: (u64, u64), b: (u64, u64)) -> (u64, u64) =
+    (a.0 - b.0 - (if a.1 < b.1 then 1 else 0), a.1 - b.1)
+
+private wide_less(a: (u64, u64), b: (u64, u64)) -> bool = a.0 < b.0 || (a.0 == b.0 && a.1 < b.1)
+
+/** `a * b + c` rounded once, on encodings.
+ *
+ * The product is held exactly -- all 106 bits of it, in a 128-bit word with the addend beside it --
+ * and only the sum is rounded, which is the whole difference from `add(mul(a, b), c)`. Both are placed
+ * so that `2^124` is one at their own exponent (the product moved up by 20, the addend by 72), the
+ * smaller is aligned to the larger with what falls off kept as a sticky bit, and the result goes to
+ * `round_pack` like every other here. The sticky bit is always at least 60 bits below the last bit
+ * kept, so it can only say *whether* something was lost, which is all rounding asks.
+ *
+ * `odd` rounds to odd instead of to nearest: the kept bits truncated, and the last of them set where
+ * anything below was not zero. A binary64 result rounded that way rounds to binary32 exactly as the
+ * sum would have, which a result rounded to nearest twice does not (`fused_single`). */
+private[binary64] fused(a: u64, b: u64, c: u64, odd: bool) -> u64
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+    val c_abs = c & ABS_MASK
+    val product_sign = (a ^ b) & SIGN
+
+    if is_nan(a_abs) then return a | QUIET
+    if is_nan(b_abs) then return b | QUIET
+    if is_nan(c_abs) then return c | QUIET
+
+    if a_abs == INFINITY || b_abs == INFINITY
+        // An infinity times zero has no product, and an infinite product and the opposite infinity
+        // no sum.
+        if a_abs == 0 || b_abs == 0 then return QUIET_NAN
+        if c_abs == INFINITY && (c & SIGN) != product_sign then return QUIET_NAN
+
+        return INFINITY | product_sign
+    end if
+
+    if c_abs == INFINITY then return c
+
+    // A zero product leaves `c`, or a zero signed as `add` signs two of them.
+    if a_abs == 0 || b_abs == 0 then return if c_abs == 0 then product_sign & c else c
+
+    // A zero addend leaves the product, rounded once -- exact where `odd` asks, both operands being
+    // binary32 values.
+    if c_abs == 0 then return mul(a, b)
+
+    var a_exp = exponent_of(a)
+    var b_exp = exponent_of(b)
+    var c_exp = exponent_of(c)
+    var a_sig = a & FRACTION_MASK
+    var b_sig = b & FRACTION_MASK
+    var c_sig = c & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+    if c_exp == 0 then c_exp = normalize(&c_sig)
+
+    var p = wide_shl(wide_multiply(a_sig | IMPLICIT, b_sig | IMPLICIT), 20)
+    var q = wide_shl((0, c_sig | IMPLICIT), 72)
+    val p_exp = a_exp + b_exp - BIAS
+    var exponent = p_exp
+
+    if p_exp >= c_exp
+        q = wide_shr_sticky(q, p_exp - c_exp)
+    else
+        p = wide_shr_sticky(p, c_exp - p_exp)
+        exponent = c_exp
+
+    var sign = product_sign
+    var sum = wide_add(p, q)
+
+    if (c & SIGN) != product_sign
+        if wide_less(p, q)
+            sum = wide_sub(q, p)
+            sign = c & SIGN
+        else
+            sum = wide_sub(p, q)
+
+    // Exact cancellation is a positive zero, rounding to nearest.
+    if sum.0 == 0 && sum.1 == 0 then return 0
+
+    // The leading one's bit, brought to bit 55 of one word with three below it, as `round_pack` takes.
+    val top = if sum.0 != 0 then 127 - int(sum.0.leading_zeros()) else 63 - int(sum.1.leading_zeros())
+    val sig = if top >= 55 then wide_shr_sticky(sum, top - 55).1 else sum.1 << (55 - top)
+    val e = exponent + top - 124
+
+    if odd
+        // Two binary32 operands' product and a third's sum are far inside binary64's normal range,
+        // so there is no subnormal or overflow to round here.
+        return ((sig >> 3) & FRACTION_MASK) | (u64(e) << FRACTION_BITS) | sign |
+               (if sig & 7 != 0 then 1 else 0)
+    end if
+
+    round_pack(sign, e, sig)
+end fused
+
+/** `a * b + c` on binary32 encodings, rounded once: the operands widened, which is exact, the sum
+ * rounded to odd at binary64 and then to nearest at binary32. */
+private[binary64] fused_single(a: u32, b: u32, c: u32) -> u32 =
+    narrow_single(fused(widen_single(a), widen_single(b), widen_single(c), true))
 
 // -- division ----------------------------------------------------------------------------------------
 
@@ -810,5 +952,17 @@ fixsfsi(x: u32) -> int = int(to_signed(widen_single(x), 32))
 /** An `f32` toward zero as a `uint`. */
 @export("__fixunssfsi")
 fixunssfsi(x: u32) -> uint = uint(to_unsigned(widen_single(x), 32))
+
+#endif
+
+#if thumb || riscv32
+
+/** C's `fma`: `a * b + c` rounded once. */
+@export("fma")
+fma(a: real, b: real, c: real) -> real = real.from_bits(fused(a.bits(), b.bits(), c.bits(), false))
+
+/** C's `fmaf`: `a * b + c` rounded once. */
+@export("fmaf")
+fmaf(a: f32, b: f32, c: f32) -> f32 = f32.from_bits(fused_single(a.bits(), b.bits(), c.bits()))
 
 #endif
