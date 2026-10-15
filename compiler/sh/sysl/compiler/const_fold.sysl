@@ -6,9 +6,8 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, 
                          and as big_and, or as big_or, xor as big_xor, not as big_not,
                          from_real as big_of_real, to_real as big_to_real, zero as big_zero,
                          bit_length as big_bits, shl as big_shl, shr as big_shr,
-                         is_odd as big_odd}
+                         is_odd as big_odd, from_u64, to_u64}
 import sysl.math.Float
-import sysl.text.parse_real
 
 // What an expression comes to while compiling, where it comes to anything.
 //
@@ -56,7 +55,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     BoolLit(v) -> Some(ConstBool(v))
     CharLit(c) -> Some(ConstChar(c))
     StrLit(s) -> Some(ConstStr(s))
-    FloatLit(text, _) -> Some(ConstFloat(parse_real(text).unwrap_or(0.0)))
+    FloatLit(text, _) -> Some(ConstFloat(real_of_bits(double_bits(text))))
 
     // A **value parameter** is asked before a declared constant, and shadows one of the same name
     // for the same reason a type parameter shadows a type: the nearer binding is the one written
@@ -131,7 +130,11 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         val reordered = const_byte_order(cx, e)
 
-        if reordered.is_some() then reordered else const_call(cx, e)
+        if reordered.is_some() then return reordered
+
+        val reinterpreted = const_float_bits(cx, e)
+
+        if reinterpreted.is_some() then reinterpreted else const_call(cx, e)
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
@@ -743,12 +746,70 @@ const_fold_typed(t: TExpr, little: bool) -> Option[Const]
                 None
         TCast(inner, _) -> typed_conversion(inner, ty.unwrap(), little)
         TIntOp(op, operand, None, width, _) -> typed_byte_order(op, operand, width, little)
+        TCall(name, args, _, false) ->
+            if float_bits_routine(name) && args.len() == 1 then
+                const_fold_typed(args.at(0), little).and_then(c -> float_bits_folded(name, c))
+            else
+                None
         _ -> None
 
     if v.is_none() then return None
 
     held_at(v.unwrap(), ty.unwrap())
 end const_fold_typed
+
+// `FloatBits`' two members on a float the compiler folds -- `real.from_bits(0x3fe62e42fefa39ef)`,
+// `x.bits()` -- named as the standard module keys them. They reinterpret and round nothing, so the
+// answer is the one the program would get: a `libm`'s table of constants written as bit patterns is
+// data, as the same table written as hex floats is.
+float_bits_routine(name: string) -> bool = name match
+    "real.from_bits" | "real.bits" | "f32.from_bits" | "f32.bits" -> true
+    "f16.from_bits" | "f16.bits" | "bf16.from_bits" | "bf16.bits" -> true
+    "f128.from_bits" | "f128.bits" -> true
+    _ -> false
+
+// The value one of them gives for the value it was handed, as the evaluator holds both: a float of
+// any width narrower than `f128` as the `real` it widens to exactly, an `f128` as its two halves.
+float_bits_folded(name: string, arg: Const) -> Option[Const]
+    if name == "f128.bits"
+        return arg match
+            ConstQuad(hi, lo) -> Some(ConstInt(add(big_shl(from_u64(hi), 64), from_u64(lo))))
+            _ -> None
+
+    if name == "real.bits" || name == "f32.bits" || name == "f16.bits" || name == "bf16.bits"
+        val f = arg match
+            ConstFloat(x) -> x
+            _ -> return None
+
+        return name match
+            "real.bits" -> Some(ConstInt(from_u64(f.bits())))
+            "f32.bits" -> Some(ConstInt(from_u64(u64(f32(f).bits()))))
+            "f16.bits" -> Some(ConstInt(from_u64(u64(f16(f).bits()))))
+            "bf16.bits" -> Some(ConstInt(from_u64(u64(bf16(f).bits()))))
+            _ -> None
+    end if
+
+    val n = arg match
+        ConstInt(x) -> x
+        _ -> return None
+
+    if name == "f128.from_bits"
+        val w = wrap(n, 128, false)
+        val hi = to_u64(big_shr(w, 64))
+        val lo = to_u64(wrap(w, 64, false))
+
+        return if hi.is_none() || lo.is_none() then None else Some(ConstQuad(hi.unwrap(), lo.unwrap()))
+    end if
+
+    val u = to_u64(wrap(n, 64, false)).unwrap_or(0)
+
+    name match
+        "real.from_bits" -> Some(ConstFloat(real.from_bits(u)))
+        "f32.from_bits" -> Some(ConstFloat(real(f32.from_bits(u32(u & 0xFFFFFFFF)))))
+        "f16.from_bits" -> Some(ConstFloat(real(f16.from_bits(u16(u & 0xFFFF)))))
+        "bf16.from_bits" -> Some(ConstFloat(real(bf16.from_bits(u16(u & 0xFFFF)))))
+        _ -> None
+end float_bits_folded
 
 // `x.swap_bytes()` and the four directions of `sysl.math.ByteOrder`, over a value that folds: the
 // same reversal the machine makes, so storage initialized with `ADDR.to_be()` is laid down as data

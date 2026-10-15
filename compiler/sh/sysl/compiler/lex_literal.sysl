@@ -87,6 +87,20 @@ scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diag
         has_fraction = true
     end if
 
+    // A hex float's `.` is part of it only where a `p` exponent closes the fraction: `0x1.8p3`. Hex
+    // digits include letters, so without the exponent `0x1.b` could as well be a field read, and C
+    // requires the `p` for the same reason.
+    if base == 16 && s.peek() == Some(u8('.')) && hex_exponent_after_fraction(s)
+        s.bump()
+
+        fraction_at = s.offset
+
+        s.accept_while((c) -> c == u8('_') || c.digit_value(16).is_some())
+
+        fraction_end = s.offset
+        has_fraction = true
+    end if
+
     // An `e` is part of it only when digits, or a sign and then digits, follow. Where they do not
     // the `e` is left where it is and becomes the head of the suffix, which is what makes `1east` a
     // literal with a bad suffix rather than a number beside a name.
@@ -95,7 +109,10 @@ scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diag
     var exponent_sign = ""
     var has_exponent = false
 
-    if base == 10 && (s.peek() == Some(u8('e')) || s.peek() == Some(u8('E')))
+    // A hex float's exponent is `p` and a power of two, written in decimal: `e` is a hex digit.
+    val exponent_letter = if base == 16 then u8('p') else u8('e')
+
+    if (base == 10 || base == 16) && (s.peek() == Some(exponent_letter) || s.peek() == Some(exponent_letter - 32))
         val before_e = s.mark()
 
         s.bump()
@@ -147,14 +164,17 @@ scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diag
     if (has_fraction || has_exponent) && suffix.len > 0 && !float_suffix && !fixed_sfx
         return Err(error(point(m), s"floating-point literal cannot have the integer suffix '${suffix}'"))
 
-    if float_suffix && base != 10
+    if float_suffix && base != 10 && !has_exponent
         return Err(error(point(m), "floating-point suffix on a non-decimal literal"))
 
     if !has_fraction && !has_exponent && !float_suffix
         out.push(Spanned(IntLit(digits, base, suffix), at))
         return Ok(())
 
+    // A hex float keeps its `0x`, which is how every reader of the text tells the two apart.
     var text = str_builder()
+
+    if base == 16 then text.push("0x")
 
     text.push(digits)
 
@@ -166,8 +186,9 @@ scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diag
 
     if has_exponent
         // Always a lower-case `e`, whichever case it was written in, so that the text a token
-        // carries is canonical and two spellings of one value are one value.
-        text.push_char('e')
+        // carries is canonical and two spellings of one value are one value -- and a `p` for a hex
+        // float's power of two.
+        text.push_char(if base == 16 then 'p' else 'e')
         text.push(exponent_sign)
         text.push(clean_digits(s.src[exponent_at..<exponent_end], true) match
             Err(why) -> return Err(error(point(m), why))
@@ -234,6 +255,29 @@ private is_ascii_digit(c: Option[u8]) -> bool =
     c match
         Some(b) -> is_digit(b)
         None -> false
+
+// Whether the `.` the scanner is at opens a hex float's fraction: hex digits, then a `p` with an
+// optional sign and a decimal digit after it. Only looks; nothing is consumed.
+private hex_exponent_after_fraction(s: *Scanner) -> bool
+    var i: usize = 1
+
+    loop
+        val c = s.peek_at(i) match
+            Some(b) -> b
+            None -> return false
+
+        if c != u8('_') && c.digit_value(16).is_none() then break
+
+        i += 1
+
+    if s.peek_at(i) != Some(u8('p')) && s.peek_at(i) != Some(u8('P')) then return false
+
+    i += 1
+
+    if s.peek_at(i) == Some(u8('+')) || s.peek_at(i) == Some(u8('-')) then i += 1
+
+    is_ascii_digit(s.peek_at(i))
+end hex_exponent_after_fraction
 
 // -- characters and escapes -----------------------------------------------------------------------
 

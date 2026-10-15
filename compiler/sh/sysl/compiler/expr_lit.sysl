@@ -148,9 +148,25 @@ float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
     // At a fixed-point type the literal is read from its TEXT, exactly, and never through a double.
     val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
 
+    if fixed.is_some() && is_hex_float_text(text)
+        val refused = hex_fixed_refusal(text, fixed.unwrap())
+
+        if refused.is_some() then return cx.err(span, refused.unwrap())
+    end if
+
     if fixed.is_some() then return fixed_literal(cx, span, text, exact_of_text(text), fixed.unwrap())
 
     val ty = if suffix != "" then suffixed_float(cx, span, suffix) else expected_float(cx, expected)
+
+    // A hex float is exact or it is refused (`hex_float.sysl`).
+    if is_hex_float_text(text)
+        val refused = ty match
+            Floating(_, _) -> hex_float_refusal(text, ty)
+            Abstract(_, _) -> hex_float_refusal(text, ty)
+            _ -> None
+
+        if refused.is_some() then cx.fault(span, refused.unwrap())
+    end if
 
     // At `f128` the literal is read from its text too: a `double` would round it to 53 bits first.
     if is_quad(ty)
@@ -194,11 +210,14 @@ private expected_float(cx: &Analyzer, expected: Option[Type]) -> Type
         _ -> real_type()
 end expected_float
 
-// The bits of a decimal literal's `double` value, which is what the typed tree carries.
+// The bits of a literal's `double` value, which is what the typed tree carries.
 //
 // **The reference compiler holds a float literal as `doubleToLongBits` of the text**, so a narrower
-// type is reached by rounding that constant down to it and costs nothing at run time.
-double_bits(text: string) -> long = signed_bits(parse_real(text).unwrap_or(0.0).bits())
+// type is reached by rounding that constant down to it and costs nothing at run time. A hex float
+// narrower than `f128` was refused unless it is exact at its type, so it is exact here too.
+double_bits(text: string) -> long =
+    if is_hex_float_text(text) then signed_bits(hex_double_bits(text).unwrap_or(0))
+    else signed_bits(parse_real(text).unwrap_or(0.0).bits())
 
 // -- which operand a pair takes its type from ----------------------------------------------------
 

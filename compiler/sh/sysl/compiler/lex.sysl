@@ -527,6 +527,57 @@ private skip_trivia_quietly(s: *Scanner)
             Ok(_) -> ()
 end skip_trivia_quietly
 
+// How far the code that starts at `from` reaches before a line ends outside every literal and
+// comment: the offset of that line end. A text block or a block comment opened on the line carries
+// the answer down past every line it spans, and the rest of the line it closes on is read too.
+//
+// **This is the conditional-compilation gate's question, answered with this lexer's own rules** --
+// the same scans a token is read with, so what counts as inside a string cannot come to differ
+// between the two. A `#define` at the margin of a text block holding C is the block's text, not a
+// directive. Where the code does not lex, the answer is its own line's end, and the lexer proper
+// reports the mistake when it gets there.
+literal_reach(src: Source, from: usize) -> usize
+    var s = scan(src)
+    var out: Buf[Spanned[Tok]] = buf()
+    var docs: Buf[Spanned[string]] = buf()
+
+    s.reset(from)
+
+    loop
+        val m = s.mark()
+
+        if skip_trivia(&s, &docs).is_err() then return line_end_from(&s, m)
+        if s.at_end() || s.at_line_end() then return s.offset
+
+        val token = s.mark()
+        val scanned = s.peek_char() match
+            None -> return line_end_from(&s, token)
+            Some(c) ->
+                if c == '\'' then
+                    scan_label_or_char(&s, &out, token)
+                elif is_name_start(c) then
+                    scan_word(&s, &out, token)
+                elif c >= '0' && c <= '9' then
+                    scan_number(&s, &out, token)
+                elif c == '"' then
+                    scan_string(&s, &out, token, Quoted.Plain)
+                elif c == '`' then
+                    scan_quoted_ident(&s, &out, token)
+                else
+                    s.next_char()
+                    Ok(())
+
+        if scanned.is_err() then return line_end_from(&s, token)
+    end loop
+end literal_reach
+
+// The end of the line the offset `m` is on.
+private line_end_from(s: *Scanner, m: usize) -> usize
+    s.reset(m)
+    s.skip_to_line_end()
+    s.offset
+end line_end_from
+
 // One token, from wherever the cursor is standing.
 //
 // The cursor is known not to be at a blank, at a comment, at a line ending or at the end of the

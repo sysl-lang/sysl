@@ -740,7 +740,68 @@ print(f1, f2, f3)
 ```
 
 Note the rendering: a float prints in the shortest form that round-trips, so `2.5e3` shows as `2500`
-and carries no `.0`. Hexadecimal, binary and octal have no floating-point form.
+and carries no `.0`. Binary and octal have no floating-point form.
+
+**A hexadecimal float is C99's**: a hex significand, an optional `.` and hex fraction, and a `p`
+exponent — a power of **two**, written in decimal. The `p` is required (hex digits include letters, so
+`0x1.b` is an integer and a field read), either case is accepted, and a suffix goes after the
+exponent. It infers as a decimal float does: `real` unless the suffix or the context says otherwise.
+
+```sysl
+val ln2_hi = 0x1.62e42fefa39efp-1
+val pi = 0x1.921fb54442d18p1
+val third: f32 = 0x1.555556p-2
+
+print(0x1.8p3, 0x1p-2, pi, ln2_hi.bits() == 0x3fe62e42fefa39ef, third.bits() == 0x3eaaaaab)
+```
+
+```output
+12 0.25 3.141592653589793 true true
+```
+
+**A hex float is exact, or it is refused.** The digits *are* the bits — that is the whole reason a
+libm is written in them — so a literal whose type cannot hold its value exactly is an error naming
+the type, never a quiet rounding: too many significant bits, a power past the type's largest finite
+value, or a bit below its smallest subnormal. The same digits are fine at a type wide enough for them.
+
+```sysl
+val x: f32 = 0x1.000001p0
+```
+
+```error
+the hex float '0x1.000001p0' is not exactly a 'f32': it has 25 significant bits, and a 'f32' holds 24
+```
+
+```sysl
+val tiny = 0x1p-1075
+```
+
+```error
+the hex float '0x1p-1075' is not exactly a 'real': its lowest bit is 2^-1075, and the smallest 'real' is 2^-1074
+```
+
+At a [fixed-point](/reference/fixed-point/) type a hex float is exact when its lowest bit is no finer
+than the type's step: `0x1p-15` is the smallest `q15`, and `0x1p-16` is refused.
+
+A float's encoding is also reachable the other way, through `FloatBits`: `real.from_bits(b)`,
+`f32.from_bits(b)` and `x.bits()` reinterpret rather than convert, and **they fold while compiling**,
+so a table of constants written as bit patterns is constant data exactly as one written in hex floats
+is — in a `const`, in a module `val` laid into `.rodata`, and inside a `const` function.
+
+```sysl
+const LN2_HI: real = real.from_bits(0x3fe62e42fefa39ef)
+const ONE_BITS: u32 = f32(1.0).bits()
+const next_up(x: real) -> real = real.from_bits(x.bits() + 1)
+const AFTER_ONE: real = next_up(1.0)
+
+val TABLE: [2]real = [0x1.62e42fefa39efp-1, real.from_bits(0x3c7abc9e3b39803f)]
+
+print(LN2_HI == TABLE[0], ONE_BITS == 0x3f800000, AFTER_ONE.bits() == 0x3ff0000000000001)
+```
+
+```output
+true true true
+```
 
 A [fixed-point](/reference/fixed-point/) suffix (`0.6i32q31`, `1i32q16`) is the one integer-family
 suffix a fraction may carry. An unsuffixed decimal literal written where a fixed-point type is
