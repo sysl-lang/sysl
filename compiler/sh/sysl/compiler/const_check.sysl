@@ -140,6 +140,15 @@ end const_write
 private const_expr(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, e: TExpr)
     if cx.said.covers(e.span) then return
 
+    // `&bus` reads nothing from `bus`: the address of module storage is a constant the linker fills
+    // in, so the storage it names is not reached, whenever it is filled.
+    *e.kind match
+        TAddrOf(place, _) ->
+            val root = addressed_storage(place)
+
+            if root.is_some() then cx.said.cover(root.unwrap().span)
+        _ -> ()
+
     val form = const_form_refusal(a, cx, e)
 
     if form.is_some()
@@ -170,9 +179,6 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
         if writes_a_rendering(texpr_type(receiver)) then None
         else Some(s"it dispatches through a trait object — ${const_dispatch()}")
     TErase(_, _, _) -> Some(s"it makes a trait object — ${const_dispatch()}")
-    TFuncAddr(_, _, _) ->
-        Some("it takes a function's address — which function a call through it reaches is " +
-             "decided when the program runs")
 
     TBox(_, _) -> Some(s"it boxes a value, which allocates — ${const_heap()}")
     TBufLit(_, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
@@ -187,7 +193,6 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
         if names_an_address(ty) || names_an_address(texpr_type(operand)) then
             Some(s"it converts a pointer — ${const_address()}")
         else None
-    TNullLit(_) -> Some(s"it names 'null' — ${const_address()}")
     TCStrLit(_) -> Some(s"it takes the address of a C string — ${const_address()}")
 
     TGlobal(symbol, _, writable) -> const_global_refusal(cx, symbol, writable)
@@ -341,6 +346,13 @@ private dotted(symbol: string) -> Buf[string]
     out
 end dotted
 
+// The module storage a place is in, through its fields and elements, where it is in one.
+private addressed_storage(place: TExpr) -> Option[TExpr] = *place.kind match
+    TGlobal(_, _, _) -> Some(place)
+    TField(receiver, _, _) -> addressed_storage(receiver)
+    TIndex(receiver, _, _) -> addressed_storage(receiver)
+    _ -> None
+
 // Module storage a `const` function reaches: a `val` laid into the object file is a value like any
 // other, and storage filled while the program runs -- a `var`, or a `val` computed at startup -- is
 // not there yet. A variable an `extern` names is outside the program altogether.
@@ -363,45 +375,23 @@ private const_global_refusal(cx: &ConstSeen, symbol: string, writable: bool) -> 
     None
 end const_global_refusal
 
-// Whether a type is a raw pointer or a C function pointer -- an address, under either spelling.
 // A `*Writer`: what a `display` is handed to write into.
 writes_a_rendering(t: Type) -> bool = t match
     Ptr(inner) -> writes_a_rendering(*inner)
     Trait(name, _, _) -> qualified_name(name) == "sysl.Writer"
     _ -> false
 
+// Whether a type is a raw pointer or a C function pointer -- an address, under either spelling.
 private names_an_address(t: Type) -> bool = t match
     Ptr(_) -> true
     CFn(_, _) -> true
     _ -> false
 
-// Whether a type holds an address anywhere in it, which is what a `const` function may not answer.
-private holds_an_address(t: Type) -> bool = t match
-    Ptr(_) -> true
-    CFn(_, _) -> true
-    Volatile(inner) -> holds_an_address(*inner)
-    Array(_, elem) -> holds_an_address(*elem)
-    Constrained(decl) -> holds_an_address(decl.base)
-    Struct(decl) -> fields_hold_an_address(decl.fields)
-    Results(parts) -> fields_hold_an_address(parts.fields)
-    Enum(decl) ->
-        for item in decl.variants
-            if fields_hold_an_address(item.fields) then return true
-
-        false
-    _ -> false
-
-private fields_hold_an_address(fields: Buf[(string, Type)]) -> bool
-    for field in fields
-        if holds_an_address(field.1) then return true
-
-    false
-end fields_hold_an_address
-
 // Why a value of this type cannot be held while compiling, or nothing where it can. The values a
 // `const` function works with are numbers, `bool`, `char` and `unit`, and structs, tuples, arrays and
-// enums made of them, all by value; a raw pointer is admitted too, since it may point at a local the
-// evaluation itself made. A type parameter stands for whatever fills it, and is judged there.
+// enums made of them, all by value; a raw pointer and a function pointer are admitted too, held as
+// the addresses the linker fills in and never read or called through. A type parameter stands for
+// whatever fills it, and is judged there.
 const_type_refusal(t: Type) -> Option[string] = t match
     Floating(bits, _) ->
         // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), so it is in.
@@ -414,9 +404,6 @@ const_type_refusal(t: Type) -> Option[string] = t match
         _ -> Some(s"a reference is to an object on the heap, and ${const_heap()}")
     Weak(_) -> Some(s"a reference is to an object on the heap, and ${const_heap()}")
     Trait(_, _, _) -> Some(trait_object())
-    CFn(_, _) ->
-        Some("which function a call through a function pointer reaches is decided when the " +
-             "program runs")
     Volatile(inner) -> const_type_refusal(*inner)
     Array(_, elem) -> const_type_refusal(*elem)
     Constrained(decl) -> const_type_refusal(decl.base)
@@ -454,9 +441,9 @@ private types_refusal(ts: Buf[Type]) -> Option[string]
 end types_refusal
 
 // A `const` function's signature, held to the same values its body is: each parameter's type at the
-// parameter, the result at the result. **An address may come in and may not go out** -- a pointer
-// parameter can point at a local of the evaluation that called it, but a pointer answered would
-// outlive every local it could name.
+// parameter, the result at the result. **An address may come in and go out**: the only one an
+// evaluation holds is the address of module storage or of a function, which the linker fills in
+// (`const_eval.sysl`'s `address_of`), so one answered names nothing the evaluation made.
 check_const_signature(a: &Analysis, scope: Scope, name: string, d: FuncDecl,
                       params: Buf[(string, Type)], ret: Type)
     val opening = const_opening(name)
@@ -487,7 +474,4 @@ check_const_signature(a: &Analysis, scope: Scope, name: string, d: FuncDecl,
             return
         None -> ()
 
-    if holds_an_address(ret) then
-        a.fault(scope, at, s"$opening its result is a '${type_show(ret)}' — ${const_address()}, " +
-                "and a pointer answered would outlive every local it could point at")
 end check_const_signature

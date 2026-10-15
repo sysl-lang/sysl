@@ -13,8 +13,8 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub}
 // 64 bits, `char`, `bool`, `f32` and `f64`, and fixed arrays, plain structs and enums of them.
 //
 // **An address is the one thing in a payload that is not a bit pattern but is still constant data**:
-// the address of module storage (`analyze_body.sysl`'s `place_image`), `null`, and a trait object
-// made from such an address, which is the table's address and the object's. The linker fills an
+// the address of module storage (`analyze_body.sysl`'s `place_image`), a function's address, `null`,
+// and a trait object made from such an address, which is the table's address and the object's. The linker fills an
 // address in, so it has to fill a whole unit: one is written where it starts a unit exactly as wide
 // as a pointer, and anywhere else -- a unit wider than a pointer, which a 64-bit field beside it on a
 // 32-bit target makes -- the image is `None`. So is a payload holding anything else -- a string, a
@@ -26,6 +26,8 @@ enum PayloadUnit
     UnitBits(value: BigInt)
     UnitAddr(place: TExpr)
     UnitTable(symbol: string)
+    // A function's address, named by the entry `&f` names.
+    UnitFn(entry: string)
 
 // The units of a carrying variant's payload region, in order, each at the region's unit width.
 payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[PayloadUnit]]
@@ -168,6 +170,12 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[
         if l.size(ty) != l.pointer_bytes() then return false
 
         refs.push((at, UnitAddr(place)))
+        true
+    // A function's address: a word the linker fills in the same way.
+    TFuncAddr(_, entry, _) ->
+        if l.size(ty) != l.pointer_bytes() then return false
+
+        refs.push((at, UnitFn(entry)))
         true
     // A trait object over such an address is two words, the table's first, as `gen_erase` builds it.
     TErase(operand, vtable, _) -> *operand.kind match
