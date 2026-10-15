@@ -1,0 +1,350 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// An unsigned add the body proves cannot wrap is laid down as `add nuw` (`nowrap.sysl`), and a guard
+// in the non-wrapping form `n > L || len > L - n` is said again as an `llvm.assume`, so the bounds test
+// on `out[n + k]` in a loop under it folds at `-O2`. Every positive has a negative beside it -- no
+// guard, a guard written with a wrapping add, a write to `n` after the guard, an address taken -- and
+// a program whose `n` wraps the guard still stops at the subscript.
+
+private var nwb_library_cache: Buf[Program] = buf()
+private var nwb_library_read: bool = false
+
+private nwb_library() -> Buf[Program]
+    if nwb_library_read then return nwb_library_cache
+
+    nwb_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> nwb_library_cache = units
+
+    nwb_library_cache
+end nwb_library
+
+private nwb_no_library() -> bool
+    if nwb_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end nwb_no_library
+
+// The LLVM text a source lowers to, or the first thing it was refused with.
+private nwb_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in nwb_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end nwb_ir
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private nwb_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-nwb").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, nwb_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end nwb_optimized
+
+// The lines of the function whose `define` names `name`, up to the brace closing it.
+private nwb_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    assert(inside, s"nothing defines a function named '$name':\n$out")
+    body
+end nwb_body
+
+// How many adds a body flags.
+private nwb_flags(body: string) -> int
+    var n = 0
+
+    for l in lines_of(body)
+        if l.contains("= add nuw i64 ") then n += 1
+
+    n
+end nwb_flags
+
+// The method the feature exists for, png's shape: a view copied out of a field (which the count
+// handling retains, splitting the guard in two at `-O2`), an offset, and a run written below it.
+// `guard` is the statement before the loop and `inside` is laid after the store.
+private nwb_writer(guard: string, inside: string) -> string =
+    "struct S\n    out: []u8\n    n: usize\n\n    @noinline\n    go(*self, len: usize) -> bool\n" +
+    "        val out = self.out\n        var n = self.n\n\n" + guard +
+    "        for k in 0..<len\n            out[n + k] = 7\n" + inside + "\n        true\n\n" +
+    "var s = S([u8(0); 10], 2)\nprint(s.go(3))\n"
+
+private nwb_guard() -> string = "        if n > out.len || len > out.len - n then return false\n\n"
+
+// Whether the optimized method still tests its subscript.
+private nwb_still_traps(text: string) -> Option[bool] = nwb_optimized(text) match
+    None -> None
+    Some(out) -> Some(nwb_body(out, "S.go").contains("@llvm.trap"))
+
+// -- the guard ----------------------------------------------------------------------------------------
+
+@test("under a non-wrapping guard the subscript's test is folded away")
+nwb_under_a_non_wrapping_guard_the_test_is_folded_away()
+    if nwb_no_library() then return
+
+    nwb_still_traps(nwb_writer(nwb_guard(), "")) match
+        None -> ()
+        Some(t) -> assert(!t, nwb_body(nwb_optimized(nwb_writer(nwb_guard(), "")).unwrap(), "S.go"))
+
+@test("the guard's sum is said as an assumption and the index's add carries nuw")
+nwb_the_guard_is_said_as_an_assumption()
+    if nwb_no_library() then return
+
+    val body = nwb_body(nwb_ir(nwb_writer(nwb_guard(), "")), "S.go")
+
+    assert(body.contains("call void @llvm.assume(i1 "), body)
+    assert_eq(nwb_flags(body), 2)
+
+@test("without the guard the test stays")
+nwb_without_the_guard_the_test_stays()
+    if nwb_no_library() then return
+
+    val text = nwb_writer("", "")
+
+    assert(!nwb_body(nwb_ir(text), "S.go").contains("nuw"), nwb_ir(text))
+
+    nwb_still_traps(text) match
+        None -> ()
+        Some(t) -> assert(t)
+
+@test("a guard written with a wrapping add proves nothing")
+nwb_a_wrapping_guard_proves_nothing()
+    if nwb_no_library() then return
+
+    val text = nwb_writer("        if n + len > out.len then return false\n\n", "")
+    val body = nwb_body(nwb_ir(text), "S.go")
+
+    assert(!body.contains("nuw") && !body.contains("@llvm.assume"), body)
+
+    nwb_still_traps(text) match
+        None -> ()
+        Some(t) -> assert(t)
+
+@test("a write to the offset after the guard ends what it proved")
+nwb_a_write_after_the_guard_ends_it()
+    if nwb_no_library() then return
+
+    val text = nwb_writer(nwb_guard() + "        n = self.n + 1\n\n", "")
+    val body = nwb_body(nwb_ir(text), "S.go")
+
+    assert(body.contains("@llvm.assume"), body)
+    // The assumption's own sum is the one flagged add: the index's is not.
+    assert_eq(nwb_flags(body), 1)
+
+    nwb_still_traps(text) match
+        None -> ()
+        Some(t) -> assert(t)
+
+@test("a write to the offset inside the loop ends it before the loop")
+nwb_a_write_inside_the_loop_ends_it()
+    if nwb_no_library() then return
+
+    val text = nwb_writer(nwb_guard(), "            n += 1\n")
+    val body = nwb_body(nwb_ir(text), "S.go")
+
+    // The assumption itself still holds where it is said; nothing past it is flagged.
+    assert_eq(nwb_flags(body), 1)
+
+    nwb_still_traps(text) match
+        None -> ()
+        Some(t) -> assert(t)
+
+@test("a local whose address is taken never takes part")
+nwb_an_address_taken_never_takes_part()
+    if nwb_no_library() then return
+
+    val text = nwb_writer("        val p = &n\n\n" + nwb_guard(), "            *p = 9\n")
+    val body = nwb_body(nwb_ir(text), "S.go")
+
+    assert(!body.contains("nuw") && !body.contains("@llvm.assume"), body)
+
+@test("a loop entered before the guard is not bounded by it")
+nwb_a_loop_entered_before_the_guard()
+    if nwb_no_library() then return
+
+    val text = "@noinline\nfill(out: []u8, n: usize, len: usize) -> bool\n" +
+               "    for k in 0..<len\n        if n > out.len || len > out.len - n then return false\n\n" +
+               "        out[n + k] = 7\n\n    true\n\nvar b = [u8(0); 10]\nprint(fill(b, 2, 3))\n"
+    assert_eq(nwb_flags(nwb_body(nwb_ir(text), "@fill")), 1)
+
+@test("a guard whose then-block can fall through proves nothing")
+nwb_a_guard_that_falls_through()
+    if nwb_no_library() then return
+
+    val text = nwb_writer("        if n > out.len || len > out.len - n then print(1)\n\n", "")
+
+    assert(!nwb_body(nwb_ir(text), "S.go").contains("@llvm.assume"), text)
+
+// -- operands bounded by half the word ----------------------------------------------------------------
+
+// A function of `params` answering `sum`, and a call of it.
+private nwb_one(params: string, sum: string) -> string
+    var args = "1, 2"
+
+    if params.starts_with("v: []u8")
+        args = "[u8(1), u8(2)], 1, 2"
+
+    s"@noinline\nf($params) -> usize = $sum\n\nprint(f($args))\n"
+end nwb_one
+
+private nwb_flagged(params: string, sum: string) -> bool =
+    nwb_flags(nwb_body(nwb_ir(nwb_one(params, sum)), "@f")) > 0
+
+@test("two lengths, a length and a literal, and two widened narrower values add without wrapping")
+nwb_bounded_operands_are_flagged()
+    if nwb_no_library() then return
+
+    assert(nwb_flagged("v: []u8, a: usize, b: usize", "v.len + v.len"))
+    assert(nwb_flagged("v: []u8, a: usize, b: usize", "v.len + 1"))
+    assert(nwb_flagged("a: u32, b: u32", "usize(a) + usize(b)"))
+    assert(nwb_flagged("v: []u8, a: usize, b: usize", "(a & 255) + (b >> 1)"))
+    assert(nwb_flagged("v: []u8, a: usize, b: usize", "(a % v.len) + (b / 2)"))
+
+@test("an operand nothing bounds keeps the plain add")
+nwb_unbounded_operands_are_not()
+    if nwb_no_library() then return
+
+    assert(!nwb_flagged("v: []u8, a: usize, b: usize", "a + b"))
+    assert(!nwb_flagged("v: []u8, a: usize, b: usize", "v.len + a"))
+    assert(!nwb_flagged("v: []u8, a: usize, b: usize", "v.len + 9223372036854775808"))
+    assert(!nwb_flagged("v: []u8, a: usize, b: usize", "(a >> 0) + 1"))
+    assert(!nwb_flagged("a: u64, b: u64", "usize(a) + 1"))
+
+@test("a signed or narrower add is never flagged")
+nwb_only_word_unsigned()
+    if nwb_no_library() then return
+
+    val narrow = "@noinline\nf(a: u8) -> u32 = u32(a) + u32(a)\n\nprint(f(1))\n"
+    val signed = "@noinline\nf(v: []u8) -> isize = isize(v.len) + 1\n\nprint(f([u8(1)]))\n"
+
+    assert(!nwb_body(nwb_ir(narrow), "@f").contains("nuw"), nwb_ir(narrow))
+    assert(!nwb_body(nwb_ir(signed), "@f").contains("nuw"), nwb_ir(signed))
+
+@test("a length of zero-sized elements is not bounded")
+nwb_zero_sized_lengths()
+    if nwb_no_library() then return
+
+    val text = "struct E\nend E\n\n@noinline\ng(v: []E) -> usize = v.len + 1\n\nprint(g([E(), E()]))\n"
+
+    assert_eq(nwb_flags(nwb_body(nwb_ir(text), "@g")), 0)
+
+@test("an immutable local and a loop variable carry their bound")
+nwb_locals_carry_bounds()
+    if nwb_no_library() then return
+
+    val text = "@noinline\nf(v: []u8, w: []u8) -> usize\n    val m = v.len\n    var t = 0usize\n\n" +
+               "    for i in 0..<w.len\n        t = t ^ (i + m)\n\n    t\n\nprint(f([u8(1)], [u8(2)]))\n"
+
+    assert_eq(nwb_flags(nwb_body(nwb_ir(text), "@f")), 1)
+
+@test("a local written after its declaration carries nothing")
+nwb_a_written_local_carries_nothing()
+    if nwb_no_library() then return
+
+    val text = "@noinline\nf(v: []u8, a: usize) -> usize\n    var m = v.len\n\n    m = a\n    m + 1\n\n" +
+               "print(f([u8(1)], 5))\n"
+
+    assert(!nwb_body(nwb_ir(text), "@f").contains("nuw"))
+
+// -- what still stops ---------------------------------------------------------------------------------
+
+private nwb_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-nwb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end nwb_run
+
+private nwb_filler(guard: string) -> string =
+    "@noinline\nfill(out: []u8, n: usize, len: usize) -> bool\n" + guard +
+    "    for k in 0..<len\n        out[n + k] = 7\n\n    true\n\nvar b = [u8(0); 10]\n" +
+    "print(fill(b, 18446744073709551615, 3))\n"
+
+@test("an offset that wraps a wrapping guard still stops at the subscript")
+nwb_a_wrapping_offset_still_traps()
+    if !std_root().is_ok() || !clang_available() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) = nwb_run(nwb_filler("    if n + len > out.len then return false\n\n"), level)
+
+        assert(err.contains("index 18446744073709551615 out of bounds for length 10"), err)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$printed'")
+
+@test("the non-wrapping guard turns the same offset away")
+nwb_the_non_wrapping_guard_turns_it_away()
+    if !std_root().is_ok() || !clang_available() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) =
+            nwb_run(nwb_filler("    if n > out.len || len > out.len - n then return false\n\n"), level)
+
+        assert_eq(printed, "false\n")
+        assert(state == Status.Exited(0), s"-O$level stopped with $state: $err")

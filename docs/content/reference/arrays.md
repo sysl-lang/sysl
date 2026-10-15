@@ -519,6 +519,47 @@ message, and no unwinding. Output already written but not yet flushed goes with 
 does not appear, which is worth knowing before reading a truncated log as evidence of where a program
 got to.
 
+### A check a guard already paid for is folded
+
+Plain `+` on an unsigned integer [wraps](/reference/types/), so a guard written as
+`n + len > out.len` proves nothing about `out[n + k]`: a huge `n` wraps the guard's sum small, the
+guard passes, and the subscript's own check is the one thing that stops the program. Written so that
+nothing in it can wrap, the guard does settle the subscripts after it:
+
+```sysl
+fill(out: []u8, n: usize, len: usize, v: u8) -> bool
+    if n > out.len || len > out.len - n then return false
+
+    for k in 0..<len
+        out[n + k] = v
+
+    true
+
+var buf = [u8(0); 8]
+
+print(fill(buf, 2, 3, 7), fill(buf, 6, 3, 7), fill(buf, 18446744073709551615, 3, 7))
+print(buf)
+```
+
+```output
+true false false
+[0, 0, 7, 7, 7, 0, 0, 0]
+```
+
+Past that guard `n <= out.len` and `len <= out.len - n`, so the compiler lays `n + len` and `n + k`
+(for `k` running below `len`, in a loop entered after the guard) down as additions that cannot wrap
+— LLVM's `add nuw` — and repeats the guard's conclusion as an `llvm.assume` where the fall-through
+begins. The optimizer can then see that every `out[n + k]` is inside, and the check goes. It costs
+nothing at run time: the flag and the assumption emit no code.
+
+The fact lasts until the first statement that writes `n`, `len` or `out` — a loop whose body
+writes one of them is outside it from the start — and a local whose address is taken anywhere in the
+function never takes part. The same flag goes on any unsigned add both of whose operands are bounded
+by half the word: a view's `.len` (no object reaches past half the address space), a literal no
+larger than `isize::MAX`, a narrower unsigned value widened, a `&` with one of these, a `%` by one, a
+right shift or a division by a literal, or a local never written after its declaration, or a loop
+variable, bounded by one of them.
+
 ### A raw pointer is indexed anyway
 
 A `*T` is the one receiver with nothing to check against, and it is subscripted regardless — that is
