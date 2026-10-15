@@ -255,9 +255,10 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val why = because(a, scope, module_name, scaffolding)
         val held = Promised(why, None, made, false)
         val skip: &Skipped = Skipped(buf())
+        val kept: &Deferred = Deferred(buf(), false)
         val said: &Counted = Counted(0)
 
-        walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+        walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, kept, e, why)))
         walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
                                           w -> blame_write(a, walk, scope, w, held, said), st -> ()))
 end check_no_alloc
@@ -323,8 +324,10 @@ check_instances(a: &Analysis, walk: &Reaches, funcs: Buf[TFunc], from: usize, wo
                   s"'${qualified_name(f.name)}')"
         val held = Promised(why, Some(f.name), made, blocking)
         val said: &Counted = Counted(0)
+        val deferred: &Deferred = Deferred(buf(), true)
 
-        if !blocking then walk_block_stmts(f.body, expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+        if !blocking
+            walk_block_stmts(f.body, expr_walk(false, e -> scan_one(a, scope, skip, deferred, e, why)))
 
         walk_block_stmts(f.body, TWalk(false,
                                        e -> if !skip.covers(e.span) then blame_one(a, walk, scope, e, held, said),
@@ -408,7 +411,7 @@ end val_home
 
 // What the first construction under a body that makes heap storage makes, wherever it is.
 private first_allocation(b: TBlock) -> Option[string]
-    val found: &FirstMade = FirstMade(None)
+    val found: &FirstMade = FirstMade(None, Deferred(buf(), true))
 
     walk_block_stmts(b, expr_walk(false, e -> note_allocation(found, e)))
     found.what
@@ -416,10 +419,52 @@ end first_allocation
 
 private struct FirstMade
     what: Option[string]
+    deferred: &Deferred
 
 private note_allocation(found: &FirstMade, e: TExpr)
-    if found.what.is_none() then found.what = allocates(e)
+    if found.what.is_some() || found.deferred.passes(e) then return
+
+    found.what = allocates(e)
 end note_allocation
+
+// **An array literal handed straight to a call is the escape analysis's to answer for, not this
+// pass's** (`escape.sysl`'s `literal_argument`): where the callee keeps nothing of it, it is laid in
+// the caller's frame and allocates nothing, and where the callee keeps it, that pass reports it at the
+// literal under the same rule this one states. Which of the two it is needs every callee's summary,
+// and those are not settled until the program is.
+//
+// Only a body's own walk defers. An initializer of module storage is not walked by that pass, so a
+// literal there is answered here as it always was.
+struct Deferred
+    spans: Buf[Span]
+
+    // False for a walk over module storage, which defers nothing.
+    active: bool
+
+    // Whether `e` is a literal a call above it already left to the escape analysis. The walk is
+    // outermost-first, so the call is met before its arguments are; each call notes the literal
+    // arguments it hands on.
+    passes(*self, e: TExpr) -> bool
+        if !self.active then return false
+
+        *e.kind match
+            TCall(_, args, ty, _) -> self.note(args, ty)
+            TVCall(_, _, args, ty, _) -> self.note(args, ty)
+            TBufLit(_, _) ->
+                for at in self.spans
+                    if at == e.span then return true
+            _ -> ()
+
+        false
+    end passes
+
+    note(*self, args: Buf[TExpr], ty: Type)
+        if !frames_literals(ty) then return
+
+        for arg in args
+            if literal_argument(arg) then self.spans.push(arg.span)
+    end note
+end Deferred
 
 // Walks a body, reporting the OUTERMOST allocation on each path and going no deeper into one.
 //
@@ -429,8 +474,9 @@ end note_allocation
 // is inside one already reported is one of those pieces.
 private scan_allocations(a: &Analysis, scope: Scope, b: TBlock, why: string)
     val skip: &Skipped = Skipped(buf())
+    val deferred: &Deferred = Deferred(buf(), true)
 
-    walk_block_stmts(b, expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+    walk_block_stmts(b, expr_walk(false, e -> scan_one(a, scope, skip, deferred, e, why)))
 end scan_allocations
 
 // The spans of everything inside a node that has already been reported, so that the pieces of one
@@ -449,7 +495,10 @@ struct Skipped
         self.inside.push((span.start, span.end))
 end Skipped
 
-private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, e: TExpr, why: string)
+private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, deferred: &Deferred, e: TExpr,
+                 why: string)
+    if deferred.passes(e) then return
+
     val what = allocates(e)
 
     if what.is_none() || skip.covers(e.span) then return

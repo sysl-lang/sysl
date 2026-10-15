@@ -315,7 +315,18 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     // An empty view has no storage to make, so it is the zero value of its own representation:
     // `{owner = null, data = null, len = 0}`. It is not owned either -- there is no box for a
     // release to let go of, and a null owner is what a view that owns nothing already carries.
-    TBufLit(elems, slice_ty) -> gen_buf_lit(e, elems, slice_ty)
+    //
+    // **A literal the escape analysis framed is the other way round**: handed straight to a call
+    // that keeps nothing of it, so it is the array a `val xs: [N]T = [...]` would have been, viewed
+    // whole -- a slot of the frame and no allocation.
+    TBufLit(elems, slice_ty) ->
+        if !elems.is_empty() && is_framed_lit(e, x.span)
+            val elem = element(slice_ty).unwrap_or(int_type())
+            val array = TExpr(x.span, TArrayLit(elems, Array(int(elems.len()), elem)))
+
+            return gen_slice(e, array, None, None, false, slice_ty, x.span)
+
+        gen_buf_lit(e, elems, slice_ty)
 
     // The value is generated once, above the loop, which is what makes `[tick(); n]` one call whose
     // result lands in n places -- and the reason the count may be zero and the call still happen.
