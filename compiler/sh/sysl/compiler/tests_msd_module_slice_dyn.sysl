@@ -1,0 +1,149 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A slice of a FIELD of module storage -- `rows[i].words`, an array inside an element of a module
+// array -- is module storage, which lasts the whole run, so it is no frame's to own:
+// `reference/memory.md § What happens when a slice escapes`. The escape pass walked an index step to
+// the module array but stopped at the field step and called the storage a value's, so the slice was
+// refused wherever it could be kept (through a trait object, or returned from a callee that keeps
+// it) while a slice of a plain module array went through. A field of a FRAME's array is still
+// refused, which is what the last test holds.
+
+private msd_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-msd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end msd_outcome
+
+private msd_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = msd_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private msd_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = msd_outcome(text)
+
+    assert_eq(out.1, -1)
+    assert(out.0.contains(part), out.0)
+
+private msd_rows() -> string = raw"""
+    trait Sink
+        take(*self, words: []const u32)
+
+    struct Count
+        n: usize
+
+    impl Sink for Count
+        take(*self, words: []const u32) = self.n += words.len
+
+    struct Row
+        words: [4]u32
+        len: usize
+
+    var sink: Count = Count(0)
+
+    """
+
+@test("a slice of a field of indexed module storage goes through a trait object")
+msd_through_a_trait_object() =
+    msd_prints(msd_rows() + raw"""
+        var rows: [2]Row = [Row([0; 4], 0); 2]
+
+        feed(s: *Sink, i: usize)
+            s.take(rows[i].words[0..<rows[i].len])
+
+        rows[1].len = 3
+        feed(&sink, 1)
+        print(sink.n)
+        """, "3\n")
+
+@test("and nothing is promoted, so a module without an allocator builds it")
+msd_needs_no_allocator() =
+    msd_prints(raw"""
+        @no_alloc
+
+        """ + msd_rows() + raw"""
+        var rows: [2]Row = [Row([0; 4], 0); 2]
+
+        feed(s: *Sink, i: usize)
+            s.take(rows[i].words[0..<rows[i].len])
+
+        rows[1].len = 2
+        feed(&sink, 1)
+        print(sink.n)
+        """, "2\n")
+
+@test("a field of a field of module storage is module storage too")
+msd_two_field_steps() =
+    msd_prints(msd_rows() + raw"""
+        struct Table
+            rows: [2]Row
+
+        var table: Table = Table([Row([0; 4], 0); 2])
+
+        feed(s: *Sink, i: usize)
+            s.take(table.rows[i].words[0..<table.rows[i].len])
+
+        table.rows[0].len = 4
+        feed(&sink, 0)
+        print(sink.n)
+        """, "4\n")
+
+@test("a generic call over the same slice, and a generic callee that keeps it")
+msd_through_a_generic_call() =
+    msd_prints(msd_rows() + raw"""
+        var rows: [2]Row = [Row([7, 8, 9, 0], 0); 2]
+        static var kept: []const u32 = []
+
+        feed[S: Sink](s: *S, i: usize)
+            s.take(rows[i].words[0..<rows[i].len])
+
+        remember[T](xs: []const T) -> []const T = xs
+
+        keep(i: usize)
+            kept = remember(rows[i].words[0..<rows[i].len])
+
+        rows[1].len = 3
+        feed(&sink, 1)
+        keep(1)
+        print(sink.n, kept.len, kept[2])
+        """, "3 3 9\n")
+
+@test("a field of the frame's own array is still refused through a trait object")
+msd_a_frame_array_is_still_refused() =
+    msd_refused(msd_rows() + raw"""
+        feed(s: *Sink)
+            var rows: [2]Row = [Row([0; 4], 0); 2]
+
+            rows[1].len = 3
+            s.take(rows[1].words[0..<rows[1].len])
+
+        feed(&sink)
+        print(sink.n)
+        """, "a slice of an array this frame owns is passed through a trait object, which may hold " +
+             "on to it, so it would outlive the array, and the storage is not this body's to move")
