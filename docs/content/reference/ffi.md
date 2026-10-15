@@ -591,6 +591,56 @@ Two consequences follow:
   `dlsym` asks for are found in the dynamic symbol table, which is precisely where a hidden symbol is
   not.
 
+### A weak export
+
+`weak` after the symbol — or alone, `@export(weak)`, for the function's own name — publishes the
+entry as a **default**: a weak definition (ELF `W`, Mach-O `weak external`) that a strong definition
+of the same symbol anywhere in the link replaces, with no duplicate-symbol error. It is how a C
+library's operating-system stubs are written — `open`, `write`, `sbrk` answering -1, newlib's model —
+so that a board replaces them one at a time, in sysl or in its own C:
+
+```sysl
+// What a C library package carries: the default.
+@export("board_write", weak)
+stub_write(n: i32) -> i32 = -1
+
+// What a board supplies: the definition the link keeps.
+@export("board_write")
+uart_write(n: i32) -> i32 = n
+
+extern "board_write" c_write(n: i32) -> i32
+
+print(c_write(5))
+```
+
+```output
+5
+```
+
+Where the weak export and the strong one are in the same compilation, as here, only the strong one is
+emitted under the symbol; elsewhere — a package's own C, an artifact built separately — both are, and
+the linker keeps the strong one. A static linker does not pull an archive member in **to replace** a
+weak definition it already has, so a strong definition in a board's C is kept where something else in
+that file is already linked — its startup code, a function the board's sysl calls.
+
+`weak` is about a function's definition and nothing else, so three things are refused:
+
+- **The entry.** `main` is where the image starts, and a weak one is a default any other `main` in the
+  link replaces — the program would begin somewhere nobody wrote.
+- **Two defaults of one symbol** with no strong definition beside them: which one the link keeps is
+  the order it reads them in.
+- **`weak` on exported storage, a struct or a type**, none of which is a definition a strong one
+  replaces.
+
+```sysl
+@export("main", weak)
+start() -> i32 = 0
+```
+
+```error
+the entry point cannot be exported 'weak'
+```
+
 ### Exported storage
 
 [An `extern` reads a variable](#an-extern-also-declares-a-variable) C laid down; `@export` above a
