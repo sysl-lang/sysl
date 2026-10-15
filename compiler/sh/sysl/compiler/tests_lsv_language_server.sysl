@@ -3,7 +3,9 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Stdio}
 import sysl.io.{bytes_reader, bytes_writer, Reader}
 import sysl.text.{from_utf8_lossy, Search}
 import sysl.time.{monotonic, whole_millis}
@@ -128,7 +130,8 @@ lsv_editor_text_replaces_the_disk()
 
     assert_eq(lsv_texts(collect(s"$root/a.sysl", None).unwrap()), "a.sysl=main() = print(1)\n")
     assert_eq(lsv_texts(collect(s"$root/unsaved.sysl", None).unwrap()), "unsaved.sysl=f() = ()\n")
-    assert_eq(lsv_texts(collect(root, None).unwrap()), "a.sysl=main() = print(1)\n")
+    // A held file the disk does not have yet is one of the tree's too.
+    assert_eq(lsv_texts(collect(root, None).unwrap()), "a.sysl=main() = print(1)\nunsaved.sysl=f() = ()\n")
 
     release_editor_text(s"$root/a.sysl")
     release_editor_text(s"$root/unsaved.sysl")
@@ -415,3 +418,205 @@ lsv_reanalysis_latency()
 
     remove_dir_all(root).unwrap_or(())
 end lsv_reanalysis_latency
+
+private lsv_change(uri: string, version: int, text: string) -> string =
+    lsv_notify("textDocument/didChange",
+               s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":$version},\"contentChanges\":[{\"text\":${json_quote(text)}}]}")
+
+// One error diagnostic, as the server writes it.
+private lsv_error(range: string, message: string) -> string =
+    s"{\"range\":$range,\"severity\":1,\"source\":\"sysl\",\"message\":${json_quote(message)}}"
+
+@test("lsv: a package's other files are published too, and cleared when an analysis finds them clean")
+lsv_diagnostics_across_a_package()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/helper.sysl", "twice(n: int) -> int = n * 2\n\noops() = gone()\n").unwrap()
+
+    // The editor's URI is kept as it spelled it (`$TMPDIR` ends in a slash, so this one holds `//`);
+    // a file the editor has not opened is named by its normalized path.
+    val uri = lsp_file_uri(s"$root/main.sysl")
+    val helper = lsp_file_uri(absolute_path(s"$root/helper.sysl"))
+    val gone = lsv_publish(helper, lsv_error(lsv_range(2, 9, 2, 13), "undefined function 'gone'"))
+    var server = lsv_ready()
+
+    // The document's own list comes first, then the sibling the analysis found a mistake in.
+    val opened = lsp_answer(&server, lsv_open(uri, "main()\n    print(twice(1))\n"))
+
+    assert_eq(opened.len(), 2)
+    assert_eq(opened.at(0), lsv_publish(uri, ""))
+    assert_eq(opened.at(1), gone)
+
+    // Mended by a third file saved to the disk: the sibling's list is cleared by this document's next
+    // analysis. (The entry file's own functions are its own, so the mend cannot be written there.)
+    write_text(s"$root/more.sysl", "gone() = ()\n").unwrap()
+
+    val mended = lsp_answer(&server, lsv_change(uri, 2, "main()\n    print(twice(1))\n"))
+
+    assert_eq(mended.len(), 2)
+    assert_eq(mended.at(1), lsv_publish(helper, ""))
+
+    // A list already empty is not sent again.
+    assert_eq(lsp_answer(&server, lsv_change(uri, 3, "main()\n    print(twice(2))\n")).len(), 1)
+
+    // Broken again; then a syntax error here stops before the sibling is read, so its list stands.
+    write_text(s"$root/more.sysl", "\n").unwrap()
+
+    val broken = lsp_answer(&server, lsv_change(uri, 4, "main()\n    print(twice(2), nah)\n"))
+
+    assert_eq(broken.len(), 2)
+    assert_eq(broken.at(0), lsv_publish(uri, lsv_error(lsv_range(1, 20, 1, 23), "undefined name 'nah'")))
+    assert_eq(broken.at(1), gone)
+
+    val stopped = lsp_answer(&server, lsv_change(uri, 5, "main()\n    val = 3\n"))
+
+    assert_eq(stopped.len(), 1)
+    assert_eq(stopped.at(0), lsv_publish(uri, lsv_error(lsv_range(1, 8, 1, 9), "identifier expected")))
+
+    // Mended and then closed: closing clears the document's own list and nothing else.
+    write_text(s"$root/more.sysl", "gone() = ()\n").unwrap()
+    assert_eq(lsp_answer(&server, lsv_change(uri, 6, "main()\n    print(twice(2))\n")).len(), 2)
+    assert_eq(lsv_one(&server, lsv_notify("textDocument/didClose", s"{\"textDocument\":{\"uri\":\"$uri\"}}")),
+              lsv_publish(uri, ""))
+    assert_eq(server.published.len(), 0)
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_diagnostics_across_a_package
+
+// A function whose parameter has the function's name: the first word of the declaration spelling the
+// name is the function, so only the name's own recorded place answers with the parameter.
+@test("lsv: definition reaches the binding's own name, where the declaration spells it more than once")
+lsv_definition_at_the_name()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    val text = "n(n: int) -> int = n + 1\n\nmain()\n    sum(sum: int) -> int = sum * 2\n    print(n(sum(2)))\n" +
+        "    for `ref` in 0..<2\n        print(`ref`)\n"
+    var server = lsv_ready()
+
+    assert_eq(lsv_one(&server, lsv_open(uri, text)), lsv_publish(uri, ""))
+
+    val cases = [
+        (0, 19, lsv_range(0, 2, 0, 3)),
+        (3, 27, lsv_range(3, 8, 3, 11)),
+        (4, 10, lsv_range(0, 0, 0, 1)),
+        (6, 15, lsv_range(5, 9, 5, 12))
+    ]
+
+    for c in cases
+        assert_eq(lsv_one(&server, lsv_request(7, "textDocument/definition", lsv_at(uri, c.0, c.1))),
+                  s"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"uri\":\"$uri\",\"range\":${c.2}}}")
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_definition_at_the_name
+
+// What a session answers: the diagnostics of `n` analyses of one program, then a hover and a
+// definition, with the time the last analysis took.
+private lsv_answers(uri: string, n: int) -> (string, i64)
+    var server = lsv_ready()
+    var out = ""
+    var took: i64 = 0
+
+    for i in 0..<n
+        val started = monotonic()
+
+        for m in lsp_answer(&server, if i == 0 then lsv_open(uri, lsv_program()) else lsv_change(uri, i + 1, lsv_program()))
+            out = out + m + "\n"
+
+        took = whole_millis(monotonic() - started)
+
+    out = out + lsv_one(&server, lsv_request(2, "textDocument/hover", lsv_at(uri, 4, 10))) + "\n" +
+        lsv_one(&server, lsv_request(3, "textDocument/definition", lsv_at(uri, 1, 24)))
+    (out, took)
+end lsv_answers
+
+@test("lsv: the standard module is kept across analyses, answers the same, and is let go of when an editor holds a library file")
+lsv_keeps_the_standard_module()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+
+    keep_std_units(false)
+
+    val (fresh, cold) = lsv_answers(uri, 3)
+
+    assert_eq(kept_std_count(), 0)
+
+    keep_std_units(true)
+
+    // Three analyses over one kept module: the second and third read what the first prepared.
+    val (kept, warm) = lsv_answers(uri, 3)
+
+    assert_eq(kept_std_count(), 1)
+    assert_eq(kept, fresh)
+    eprints(s"lsv: re-analysis with the standard module prepared afresh $cold ms, kept $warm ms\n")
+    assert(warm < cold, s"kept $warm ms, afresh $cold ms")
+
+    // Unsaved text under the library's root: the module is prepared afresh and not kept.
+    val held = s"${std_root().unwrap()}/sysl/lsv_unsaved.sysl"
+
+    keep_std_units(false)
+    keep_std_units(true)
+    hold_editor_text(held, "lsv_unsaved() = ()\n")
+
+    val (meanwhile, _) = lsv_answers(uri, 1)
+
+    release_editor_text(held)
+
+    assert_eq(kept_std_count(), 0)
+    assert(meanwhile.contains("undefined name 'nope'"), meanwhile)
+
+    keep_std_units(false)
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_keeps_the_standard_module
+
+// The binary itself, through a pipe: what an editor's client sees. `SYSL_STAGE2` names a built
+// `sysl`; without it the test says so and returns.
+@test("lsv: sysl lsp --stdio answers a whole session through its standard streams")
+lsv_session_over_stdio()
+    val binary = env_var("SYSL_STAGE2") match
+        Some(b) -> b
+        None ->
+            print("skipped: SYSL_STAGE2 names no sysl binary on this machine")
+            return
+
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsv").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    val input = lsp_frame(lsv_request(1, "initialize", "{\"capabilities\":{}}")) +
+        lsp_frame(lsv_notify("initialized", "{}")) + lsp_frame(lsv_open(uri, lsv_program())) +
+        lsp_frame(lsv_request(2, "textDocument/hover", lsv_at(uri, 4, 10))) +
+        lsp_frame(lsv_request(3, "textDocument/definition", lsv_at(uri, 4, 10))) +
+        lsp_frame(lsv_request(4, "shutdown", "null")) + lsp_frame(lsv_notify("exit", "{}"))
+
+    write_text(s"$root/session", input).unwrap()
+
+    val out = capture(binary, ["lsp", "--stdio"], stdin = Stdio.FromPath(s"$root/session")).unwrap()
+
+    assert(out.status.ok(), out.text)
+    assert_eq(out.text,
+              lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
+                        "\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}," +
+                        s"\"serverInfo\":{\"name\":\"sysl\",\"version\":\"${Version}\"}}}") +
+              lsp_frame(lsv_publish(uri, lsv_error(lsv_range(4, 19, 4, 23), "undefined name 'nope'"))) +
+              lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"contents\":{\"kind\":\"markdown\"," +
+                        s"\"value\":\"```sysl\\nx: int\\n```\"},\"range\":${lsv_range(4, 10, 4, 11)}}}") +
+              lsp_frame(s"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"uri\":\"$uri\",\"range\":${lsv_range(3, 8, 3, 9)}}}") +
+              lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}"))
+
+    // Without `shutdown`, `exit` ends the process with status one.
+    write_text(s"$root/abrupt", lsp_frame(lsv_request(1, "initialize", "{}")) + lsp_frame(lsv_notify("exit", "{}"))).unwrap()
+
+    val abrupt = capture(binary, ["lsp", "--stdio"], stdin = Stdio.FromPath(s"$root/abrupt")).unwrap()
+
+    assert(!abrupt.status.ok())
+
+    remove_dir_all(root).unwrap_or(())
+end lsv_session_over_stdio

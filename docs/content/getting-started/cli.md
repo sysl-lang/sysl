@@ -887,14 +887,20 @@ open file — its text as the editor holds it, saved or not:
 
 | request | answer |
 |---|---|
-| `textDocument/didOpen`, `didChange` (full text) | `textDocument/publishDiagnostics`: the file's syntax error, or every diagnostic the analysis reports about it, ranged in UTF-16 columns as the protocol counts them |
+| `textDocument/didOpen`, `didChange` (full text) | `textDocument/publishDiagnostics`: the file's syntax error, or every diagnostic the analysis reports, ranged in UTF-16 columns as the protocol counts them — for the file itself and for every other file the analysis found a mistake in, open or not; a file whose mistakes are gone gets an empty list |
 | `textDocument/hover` | the type of a local or a module `val`/`var`, or a function's signature |
 | `textDocument/definition` | where that name is declared — in the file, another file of the package, or the standard library |
 
 A file is analyzed with the package whose `package.hocon` is nearest above it, or alone where there
-is none. A message that is not JSON is answered with the JSON-RPC parse error (`-32700`); a request
-the server does not answer, with `-32601`. The server ends at `exit`, with status 0 after `shutdown`
-and 1 without; input that ends or cannot be framed ends it with status 1.
+is none. The standard library is parsed once and kept for the life of the server, except while the
+editor holds unsaved text for one of the library's own files. A message that is not JSON is answered
+with the JSON-RPC parse error (`-32700`); a request the server does not answer, with `-32601`. The
+server ends at `exit`, with status 0 after `shutdown` and 1 without; input that ends or cannot be
+framed ends it with status 1.
+
+**Visual Studio Code**: the extension in `editors/vscode` of the compiler's repository starts
+`sysl lsp --stdio` and colours sysl with the grammar the documentation uses. Its settings are
+`sysl.path` (the compiler, `sysl` on the `PATH` by default) and `sysl.lib` (passed as `SYSL_LIB`).
 
 ## Flags every subcommand takes
 

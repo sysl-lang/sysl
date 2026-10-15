@@ -46,9 +46,19 @@ struct LspServer
     exit_code: Option[int]
 
     documents: Buf[LspDocument]
+
+    // Every file whose last published list was not empty, with the compilation it was published for:
+    // what has to be cleared when that compilation's next analysis finds nothing wrong there.
+    published: Buf[LspPublished]
 end LspServer
 
-lsp_server() -> LspServer = LspServer(false, false, None, buf())
+// A file the server last published diagnostics for, and the compilation that found them (`lsp_root`).
+struct LspPublished
+    root: string
+    uri: string
+end LspPublished
+
+lsp_server() -> LspServer = LspServer(false, false, None, buf(), buf())
 
 // `sysl lsp [--stdio]`. The flag is what an editor's client library passes to say which transport it
 // chose; standard input and output is the only one there is.
@@ -65,6 +75,9 @@ lsp_command(args: []string, note: string -> unit) -> int
         note(misused(mistakes, "usage: sysl lsp [--stdio]"))
         return Misused
     end if
+
+    // The process analyzes on every change, and the standard module is the same each time.
+    keep_std_units(true)
 
     var input = stdin()
 
@@ -238,7 +251,7 @@ private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[s
 
     if method == "textDocument/didOpen"
         json_text_at(params, ["textDocument", "text"]) match
-            Some(text) -> out.push(lsp_changed(server,uri, text))
+            Some(text) -> lsp_changed(server, uri, text, out)
             None -> ()
     else if method == "textDocument/didChange"
         // Full synchronization: every change carries the whole text, and the last is what it says now.
@@ -247,7 +260,7 @@ private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[s
                 JsonArr(items) ->
                     if items.len() > 0
                         json_text_at(items.at(items.len() - 1), ["text"]) match
-                            Some(text) -> out.push(lsp_changed(server,uri, text))
+                            Some(text) -> lsp_changed(server, uri, text, out)
                             None -> ()
                     end if
                 _ -> ()
@@ -255,6 +268,7 @@ private lsp_notified(server: *LspServer, method: string, msg: &Json, out: *Buf[s
     else if method == "textDocument/didClose"
         release_editor_text(lsp_uri_file(uri))
         lsp_forget(server,uri)
+        lsp_unpublish(server, uri)
         out.push(lsp_publish(uri, buf()))
 end lsp_notified
 
@@ -318,19 +332,75 @@ private lsp_publish(uri: string, diagnostics: Buf[&Json]) -> string
     json_text(JsonObj(out))
 end lsp_publish
 
-// A document's new text: held in place of the disk, analyzed, remembered, and its diagnostics
-// published.
-private lsp_changed(server: *LspServer, uri: string, text: string) -> string
+// A document's new text: held in place of the disk, analyzed, remembered, and the diagnostics
+// published -- the document's own first, then every other file the analysis found something wrong
+// in, then an empty list for each file this compilation had published for and no longer finds
+// anything wrong in.
+private lsp_changed(server: *LspServer, uri: string, text: string, out: *Buf[string])
     val file = lsp_uri_file(uri)
 
     hold_editor_text(file, text)
 
-    val (diagnostics, references) = lsp_analyze(file, text)
+    val (found, references, whole) = lsp_analyze(file, text)
 
     lsp_forget(server,uri)
     server.documents.push(LspDocument(uri, file, text, references))
-    lsp_publish(uri, diagnostics)
+
+    val root = lsp_root(file)
+    var now: Buf[LspPublished] = buf()
+
+    for f in found
+        val there = if absolute_path(f.file) == absolute_path(file) then uri else lsp_uri_of(*server, f.file)
+
+        out.push(lsp_publish(there, f.diagnostics))
+
+        if f.diagnostics.len() > 0 then now.push(LspPublished(root, there))
+
+    // A file is cleared only by an analysis that read it: a syntax error stops before the rest of
+    // the compilation is read, so what was published for the other files stands.
+    var kept: Buf[LspPublished] = buf()
+
+    for p in server.published
+        var still = p.uri == uri
+
+        for n in now
+            if n.uri == p.uri then still = true
+
+        if still then continue
+
+        if p.root == root && whole
+            out.push(lsp_publish(p.uri, buf()))
+        else
+            kept.push(p)
+
+    for n in now
+        kept.push(n)
+
+    server.published = kept
 end lsp_changed
+
+// What one file is told: where it is on disk, and its diagnostics.
+struct LspFound
+    file: string
+    diagnostics: Buf[&Json]
+end LspFound
+
+// The URI a file is published under: the one the editor opened it by where it is open, so that a
+// file has one list whichever analysis found its mistakes.
+private lsp_uri_of(server: LspServer, file: string) -> string
+    for d in server.documents
+        if absolute_path(d.file) == absolute_path(file) then return d.uri
+
+    lsp_file_uri(file)
+
+private lsp_unpublish(server: *LspServer, uri: string)
+    var kept: Buf[LspPublished] = buf()
+
+    for p in server.published
+        if p.uri != uri then kept.push(p)
+
+    server.published = kept
+end lsp_unpublish
 
 private lsp_forget(server: *LspServer, uri: string)
     var kept: Buf[LspDocument] = buf()
@@ -347,17 +417,23 @@ private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
 
     None
 
-// The diagnostics for `file`, and the references its analysis recorded.
+// The diagnostics an analysis of `file` found, file by file with `file`'s own first; the references
+// it recorded; and whether it read the whole compilation.
 //
 // **A syntax error stops at the parse**, as a build does, and is reported where it is -- the first
 // on each line, as `parse_report` shows them. A file that parses is analyzed with the compilation it
-// belongs to (`lsp_root`), and what that analysis reported about this file is what is published: a
-// mistake in another file is that file's to show. A compilation that cannot be assembled at all --
-// no standard library, an unreadable manifest -- is said once, at the top of the file.
-lsp_analyze(file: string, text: string) -> (Buf[&Json], Buf[Reference])
-    var diagnostics: Buf[&Json] = buf()
+// belongs to (`lsp_root`), and every file that analysis found something wrong in is answered for --
+// a sibling in the package, or a library file, named where it is on disk. A compilation that cannot
+// be assembled at all -- no standard library, an unreadable manifest -- is said once, at the top of
+// the file.
+lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool)
+    var found: Buf[LspFound] = buf()
     val src = source(file, text.bytes)
     val parsed = parse(src)
+
+    // Every file is named as it is made absolute and normalized, so a URI spelled `…/T//x` and a
+    // problem placed in `…/T/x` are one file.
+    found.push(LspFound(absolute_path(file), buf()))
 
     if !parsed.ok()
         var last_line: usize = 0
@@ -369,24 +445,29 @@ lsp_analyze(file: string, text: string) -> (Buf[&Json], Buf[Reference])
             if i > 0 && line <= last_line then continue
 
             last_line = line
-            diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
+            found.at(0).diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
 
-        return (diagnostics, buf())
+        return (found, buf(), false)
     end if
 
     indexed_file(lsp_root(file)) match
         Err(failure) ->
-            diagnostics.push(lsp_diagnostic(src, Span(0, 0), Error, failure.message))
-            (diagnostics, buf())
+            found.at(0).diagnostics.push(lsp_diagnostic(src, Span(0, 0), Error, failure.message))
+            (found, buf(), false)
         Ok(ix) ->
             for p in ix.problems
-                if p.src.name != file then continue
-
+                val there = absolute_path(lsp_on_disk(p.src.name))
                 val at = if p.at_place then p.diag.span else Span(0, 0)
+                var k: usize = 0
 
-                diagnostics.push(lsp_diagnostic(src, at, p.diag.severity, p.diag.message))
+                while k < found.len() && found.at(k).file != there
+                    k += 1
 
-            (diagnostics, ix.references)
+                if k == found.len() then found.push(LspFound(there, buf()))
+
+                found.at(k).diagnostics.push(lsp_diagnostic(p.src, at, p.diag.severity, p.diag.message))
+
+            (found, ix.references, true)
 end lsp_analyze
 
 // What a file is compiled as: the package whose manifest is nearest above it, or the file alone.
@@ -605,7 +686,7 @@ lsp_name_in(text: string, declared: Span, name: string) -> Span
     Span(declared.start, declared.start)
 end lsp_name_in
 
-private lsp_word_byte(c: u8) -> bool =
+lsp_word_byte(c: u8) -> bool =
     (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
     c == u8('_') || c >= 0x80
 

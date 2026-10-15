@@ -2,7 +2,10 @@
 
 The Language Server Protocol, served by the compiler itself over standard input and output. Every
 semantic answer comes from the analysis `sysl build` makes; nothing re-implements the language.
-Status: stage 1 (this document plus a working slice, branch `lsp`). Open questions are at the end.
+Status: stage 2 — the slice, the VS Code client (`editors/vscode`), diagnostics for every file an
+analysis touches, each binding's name recorded where it is written, and the standard module kept
+across analyses. The questions at the end are answered (Q2–Q5 by the user; Q1 is the move to
+`sysl.encoding.json`, a release after it ships).
 
 ## What exists in the compiler, and what was missing
 
@@ -25,8 +28,12 @@ file's editor text, re-runs the whole analysis, keeps that document's references
 diagnostics. Hover and definition read the kept references: they never analyze.
 
 **What is analyzed** is the compilation the file belongs to: the nearest directory above it with a
-`package.hocon`, or the file alone. Only this document's diagnostics are published; a mistake in a
-sibling file is published when that file is opened (Q4).
+`package.hocon`, or the file alone. Diagnostics are published for every file the analysis found a
+mistake in — the document first, then each sibling (or library file) under its URI, the one the
+editor opened it by where it is open (Q4). The server remembers which files of each compilation it
+last published a non-empty list for, and sends an empty list when that compilation's next whole
+analysis finds a file clean. A syntax error stops before the other files are read, so their lists
+stand.
 
 **Positions.** The compiler keeps byte offsets; the protocol counts lines from zero and characters in
 UTF-16 code units (the default and the one encoding every client speaks; the server announces
@@ -40,9 +47,11 @@ the same as for a 3-line file: the fixed cost (the std) dominates and the file's
 `sysl emit-typed` on the same files agrees (0.42 s vs 0.44 s). A scripted session of three
 analyses plus eight queries runs in 0.85 s. The `lsv` suite prints the number on every run.
 
-**Caching plan, in order of payoff** (none needed for the slice):
-1. *Keep the parsed and measured std* (`std_units` + `std_measured`) across analyses — it is a
-   function of the target alone. This removes most of the 0.4 s.
+**Caching plan, in order of payoff**:
+1. *Keep the parsed and measured std* — **done**: `std_prepared` (`std.sysl`) keeps
+   `std_usable_units` per library root and target once `keep_std_units(true)` is set, which only
+   `sysl lsp` does; a build prepares it afresh as before. While an editor holds unsaved text under
+   the library's root the module is prepared afresh and not kept. `lsv` prints both times.
 2. *Debounce* `didChange` (analyze 150–250 ms after the last keystroke) once the loop reads
    messages on a second thread; until then the client's own queue does it.
 3. *Keep each package's parsed units* keyed by the file's bytes; only the edited file is re-parsed.
@@ -62,7 +71,8 @@ one more reason to keep exactly one analysis running at a time.
    library).
 2. **Next:** hover and definition on a *declaration* itself and on types, fields and trait members
    (the index does not record these yet — the reference compiler's index did not either); doc comments
-   in hover (`doc_comments.sysl` already keeps them); diagnostics for the other open files of a package.
+   in hover (`doc_comments.sysl` already keeps them). Diagnostics for the other files of a package:
+   done.
 3. `documentSymbol` (outline) from the parse alone; `references` (the index inverted);
    `selectionRange` from `locate`.
 4. `completion` (scope + members of the receiver's type) — needs an analyzer entry point that answers
@@ -72,9 +82,15 @@ one more reason to keep exactly one analysis running at a time.
 
 ## Editor plugins are thin clients
 
-- **VS Code first:** an extension that runs `sysl lsp --stdio` through `vscode-languageclient`, a
-  TextMate grammar for colour (`docs/grammars` already has one for the site), and settings for the
-  `sysl` path and `SYSL_LIB`. No language logic in TypeScript.
+- **VS Code first — built, `editors/vscode`:** `extension.js` (plain JavaScript, so there is no build
+  step) runs `sysl lsp --stdio` through `vscode-languageclient`; the TextMate grammar is the site's
+  (`docs/grammars/sysl.tmLanguage.json`), copied in by `scripts/grammar.js` before packaging so the
+  two never drift; settings `sysl.path`, `sysl.lib` (→ `SYSL_LIB`), `sysl.trace.server`; a
+  restart command. No language logic in the extension. `npm test` runs `test/session.js`: a real
+  `sysl lsp --stdio` process driven through `vscode-jsonrpc`, the client's own JSON-RPC layer —
+  initialize, didOpen, diagnostics for the document and an unopened sibling, hover, definition into
+  the sibling, the sibling mended and cleared, shutdown, exit 0. The `lsv` suite runs the same
+  binary through a pipe when `SYSL_STAGE2` names one.
 - **Zed second:** an extension declaring the language server command and using the tree-sitter grammar
   (`sysl-lang/tree-sitter`) for highlighting, indentation and folding — Zed's own model.
 - tree-sitter serves *syntax* (colour, outline before analysis, folding); every *semantic* answer comes
@@ -95,16 +111,22 @@ one more reason to keep exactly one analysis running at a time.
 
 ## Known limits of the slice
 
-- A **binding's declared span is the whole declaration** (`val x = …`, and for a parameter the whole
-  function), so definition searches that span for the name as a word. It is right for every case the
-  tests cover; recording the name's own span at binding would make it exact (Q3).
-- A **new unsaved file** in a package is seen when analyzed alone but not by its siblings, since the
-  tree walk lists the disk.
+- A **binding records its name's own span** (Q3) for a parameter (a function's or a nested
+  function's), a pattern's name, a `val`/`var`/`ref` and a `for`/quantifier variable
+  (`written_name`, `name_after_keyword` in `definition_index.sysl`, read only while an index is
+  being filled). A closure parameter, a `val a, b = …` name and a binding statement that starts with
+  an attribute keep the statement as their place, which definition searches for the name as a word.
+- A **new unsaved file** in a package is part of the tree walk (`with_unsaved`, `project.sysl`), so
+  its siblings see it as they will once it is saved.
 - A **literate** file's columns are the tangled program's; the server does not yet add
   `literate_shift` back.
 - Hover on a reference only; no doc comments yet.
 
-## Open questions for the user
+## Questions, and what the user decided
+
+Decided: Q1 — `sysl.encoding.json`, the compiler moving onto it a release after it ships; Q2 — in the
+binary; Q3 — yes; Q4 — every file the analysis touched; Q5 — after the client works end to end
+(done). The questions as they were put:
 
 **Q1. JSON in the std.** There is no JSON reader/writer in the library. Recommendation: add
 `sysl.encoding.json` (value tree, reader with byte-offset errors, compact writer — `lsp_json.sysl`

@@ -92,6 +92,46 @@ note_reference(cx: &Analyzer, at: Span, home: Source, declared: Span, name: stri
         Some(ix) -> ix.note(cx.scope.src, at, home, declared, name, detail)
         None -> ()
 
+// Where a binding's name is written, when it starts at `at` in the file being read -- bare, or
+// quoted in backticks -- for the index to record as the binding's place (`Local.declared`). Nothing
+// when no index is being filled, or when what is written there is not the name.
+written_name(cx: &Analyzer, at: usize, name: string) -> Option[Span]
+    if cx.an.index.is_none() then return None
+
+    val b = cx.scope.src.bytes
+    val start = if at < b.len && b[at] == u8('`') then at + 1 else at
+    val n = name.bytes.len
+
+    if n == 0 || start + n > b.len then return None
+
+    for i in 0..<n
+        if b[start + i] != name.bytes[i] then return None
+
+    if start + n < b.len && lsp_word_byte(b[start + n]) then return None
+
+    Some(Span(start, start + n))
+end written_name
+
+// The name a binding statement writes after its keyword (`val`, `var`, `ref`, `for`), the statement
+// starting at `at`: the keyword, the blanks after it, then the name. Nothing where the statement
+// starts with something else -- an attribute, a label -- and the binding's place stays the statement.
+name_after_keyword(cx: &Analyzer, at: usize, name: string) -> Option[Span]
+    if cx.an.index.is_none() then return None
+
+    val b = cx.scope.src.bytes
+    var i = at
+
+    while i < b.len && b[i] >= u8('a') && b[i] <= u8('z')
+        i += 1
+
+    if i == at then return None
+
+    while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+
+    written_name(cx, i, name)
+end name_after_keyword
+
 // A reference to a local, whose binding is in the file being read.
 note_local_reference(cx: &Analyzer, at: Span, local: Local)
     if cx.an.index.is_none() then return
