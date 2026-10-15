@@ -198,6 +198,23 @@ refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     false
 end refuse_ref_captures
 
+// A capture is a copy, so a local whose type is `@pinned` cannot be captured: the closure would carry
+// a second value of it, which nothing C holds a pointer into. A pointer to it can be.
+private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+    for i in 0..<captured.len()
+        val local = cx.lookup(captured.at(i))
+
+        if local.is_some() && pinned_type(cx.an, local.unwrap().ty)
+            val held = type_show(local.unwrap().ty)
+
+            cx.fault(span, pinned_refusal(held, s"captures '${captured.at(i)}' by value in a closure",
+                                          s"Capture a pointer to it instead ('val p = &${captured.at(i)}')"))
+            return true
+        end if
+
+    false
+end refuse_pinned_captures
+
 // Builds the struct, the implementation and the body of one closure, and yields the struct value
 // that *is* the closure -- its captures, in the order the fields hold them.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
@@ -205,6 +222,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
+    if refuse_pinned_captures(cx, span, captured) then return bad_expr(span)
 
     var fields: Buf[(string, Type)] = buf()
 
@@ -873,7 +891,7 @@ with_impl_call_bounds(d: ImplDecl) -> ImplDecl
 with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
-               d.byte_order, d.guards)
+               d.byte_order, d.guards, d.pinned)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,
