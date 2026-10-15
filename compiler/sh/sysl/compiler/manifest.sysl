@@ -71,6 +71,10 @@ struct Manifest
     // them than choosing its warning flags.
     defines: Buf[(string, Buf[string])]
 
+    // The `c` block: each vendored C library this package carries, with the files it compiles, the
+    // include roots they read and the roots it publishes to its dependents (`c_libraries.sysl`).
+    c_libraries: Buf[CLibrary]
+
     // The machines the `targets` block describes, each with the triple it names -- `""` where the
     // block names none. `default` is not one of them: it names a machine rather than being one.
     targets: Buf[(string, string)]
@@ -139,7 +143,7 @@ end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
              buf(), buf())
 
@@ -462,6 +466,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val pkg_config = read_pkg_config(root)?
     val headers = read_headers(root)?
     val defines = read_defines(root)?
+    val c_libraries = read_c_libraries(root)?
 
     val capabilities = conf_at(root, "capabilities") match
         None -> buf()
@@ -546,7 +551,7 @@ read_manifest(text: string) -> Result[Manifest, string]
         if !known_top_key(keys.at(i)) then warnings.push(unknown_key(keys.at(i)))
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, pkg_config, headers, defines, targets, allocator, features,
+                target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
                 codegen_read.1, target_codegen_registers))
@@ -1251,7 +1256,7 @@ private read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
         // **Sorted by name**, so the command line a file is compiled with is a function of what the
         // block says rather than of the order somebody happened to write it in.
         for j in 0..<ordered.len()
-            macros.push(macro_of(key, ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
+            macros.push(macro_of(s"defines.\"$key\"", ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
 
         val paths = expand_alternatives(key)?
 
@@ -1276,11 +1281,16 @@ end read_defines
 // **A brace and not a glob.** A `*` would pick up a `.c` added later without anybody deciding, and
 // these are macros that change a struct's layout — a file joining the set by accident is the exact
 // failure this block exists to prevent, and it would fail the way the others do, silently.
-expand_alternatives(key: string) -> Result[Buf[string], string]
+//
+// `before` and `after` wrap the key into what a refusal calls it -- `'defines."<key>"'` by default,
+// `'c.tinyusb.sources' entry '<key>'` for a library's list.
+expand_alternatives(key: string, before: string = "'defines.\"",
+                    after: string = "\"'") -> Result[Buf[string], string]
     val start = key.index_of("{")
+    val who = before + key + after
 
     if start.is_none()
-        if key.index_of("}").is_some() then return Err(unbalanced_brace(key))
+        if key.index_of("}").is_some() then return Err(unbalanced_brace(who))
 
         var one: Buf[string] = buf()
 
@@ -1291,13 +1301,13 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
     val at = start.unwrap()
     val closed = key[at..].index_of("}")
 
-    if closed.is_none() then return Err(unbalanced_brace(key))
+    if closed.is_none() then return Err(unbalanced_brace(who))
 
     val end_at = at + closed.unwrap()
     val group = key[(at + 1)..<end_at]
 
     if group.index_of("{").is_some() then
-        return Err(s"'defines.\"$key\"' nests one group of alternatives inside another, which " +
+        return Err(s"$who nests one group of alternatives inside another, which " +
                    "says nothing a flat list does not")
 
     val parts = split_alternatives(group)
@@ -1305,10 +1315,10 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
 
     for i in 0..<parts.len()
         if parts.at(i) == "" then
-            return Err(s"'defines.\"$key\"' has an empty alternative — whichever was meant can be " +
+            return Err(s"$who has an empty alternative — whichever was meant can be " +
                        "written out, and a group naming nothing configures nothing")
 
-        val rest = expand_alternatives(key[0..<at] + parts.at(i) + key[(end_at + 1)..])?
+        val rest = expand_alternatives(key[0..<at] + parts.at(i) + key[(end_at + 1)..], before, after)?
 
         for j in 0..<rest.len()
             out.push(rest.at(j))
@@ -1316,8 +1326,8 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
     Ok(out)
 end expand_alternatives
 
-private unbalanced_brace(key: string) -> string =
-    s"'defines.\"$key\"' has an unbalanced brace — alternatives are written '{one,two}', as a " +
+private unbalanced_brace(who: string) -> string =
+    s"$who has an unbalanced brace — alternatives are written '{one,two}', as a " +
     "shell writes them"
 
 // One group's alternatives, which is a split on commas that keeps an empty one so it can be refused.
@@ -1338,19 +1348,22 @@ end split_alternatives
 //
 // **`false` is refused**: a reader would have to guess between "do not define this" and `-DNAME=0`,
 // and those differ under `#ifdef`. Whichever was meant can be said exactly.
-private macro_of(path: string, name: string, value: &Conf) -> Result[string, string]
+//
+// `owner` is the block the line sits in as a refusal names it: `defines."c/miniz.c"`, or
+// `c.tinyusb.defines`.
+macro_of(owner: string, name: string, value: &Conf) -> Result[string, string]
     if !macro_name(name) then
-        return Err(s"'defines.\"$path\".$name' is not a name a C macro can have — letters, digits " +
+        return Err(s"'$owner.$name' is not a name a C macro can have — letters, digits " +
                    "and '_', not starting with a digit")
 
     *value match
         Flag(true) -> Ok(name)
-        Flag(false) -> Err(s"'defines.\"$path\".$name' is false, which does not say which of two " +
+        Flag(false) -> Err(s"'$owner.$name' is false, which does not say which of two " +
                            "things is meant — leave the line out to not define it, or write '0' " +
                            "to define it as zero, which '#ifdef' still sees")
         Text(v) -> Ok(s"$name=$v")
         Word(v) -> Ok(s"$name=$v")
-        _ -> Err(s"'defines.\"$path\".$name' must be true or a scalar — a macro is text the C " +
+        _ -> Err(s"'$owner.$name' must be true or a scalar — a macro is text the C " +
                  "preprocessor substitutes, so there is nothing a block or a list could mean")
 end macro_of
 
@@ -1657,4 +1670,4 @@ private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace" || key == "codegen"
+    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c"

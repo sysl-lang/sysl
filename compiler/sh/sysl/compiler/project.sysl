@@ -253,7 +253,18 @@ c_sources(root: string, os: Option[Os]) -> Result[Buf[string], Selection]
 
     walk_c(root, absolute_path(root), buf(), os, None, &out)?
 
-    Ok(out)
+    // **The C under a vendored library's root is the library's list's to compile** (`c_libraries`),
+    // so a module that happens to sit inside such a tree does not compile the rest of it.
+    val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
+
+    if declared.c_libraries.is_empty() then return Ok(out)
+
+    var kept: Buf[string] = buf()
+
+    for item in out
+        if !claimed_by_library(root, declared, item) then kept.push(item)
+
+    Ok(kept)
 end c_sources
 
 private walk_c(root: string, path: string, dir: Buf[string], os: Option[Os], within: Option[string],
@@ -297,7 +308,12 @@ stray_c_warnings(root: string) -> Buf[string]
 
     var out: Buf[string] = buf()
 
+    // A vendored library's tree is no module and is meant to be none: its list says what is compiled.
+    val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
+
     for item in dirs
+        if claimed_by_library(root, declared, item) then continue
+
         out.push(s"'${item}' holds C and no sysl, so it is not a module and its '.c' files are " +
             "compiled by nothing — a directory becomes one by holding the '.sysl' that declares " +
             "those 'extern's")

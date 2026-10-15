@@ -233,6 +233,13 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     // **What a command line said, which on a cross build is the only thing there is to say.** A
     // `c const` reading an SDK's header is measured against the SDK the consumer named, and nothing
     // on this machine could have found it: `pkg-config` speaks for the host.
+    // **A vendored library's headers are where its package says**, and the probe reads them from
+    // there ahead of the command line's, as the objects beside it were compiled (`compile_c`).
+    val vendored = probe_includes_for(unit.src.name, t)
+
+    for item in vendored
+        args.push(item)
+
     val given = supplied_cflags()
 
     for item in given
@@ -349,8 +356,51 @@ private probe_cflags_for(file: string) -> Buf[string]
 
                             if !seen then out.push(s"-D${macros.at(j)}")
 
+                // **And under every vendored library's macros**, for the same reason: a probe that
+                // includes `tusb.h` measures the library the package compiled, configured as it was.
+                val shared = package_c_flags(root, m)
+
+                for j in 0..<shared.1.len()
+                    val flag = s"-D${shared.1.at(j)}"
+                    var seen = false
+
+                    for k in 0..<out.len()
+                        if out.at(k) == flag then seen = true
+
+                    if !seen then out.push(flag)
+
     out
 end probe_cflags_for
+
+// The include roots a file's probe reads: its package's vendored libraries' and those the packages it
+// depends on publish (`c_libraries.sysl`). A conflict between two suppliers of the standard headers
+// is left to the build to refuse, which names both; the probe then fails on what it cannot include.
+private probe_includes_for(file: string, t: Target) -> Buf[string]
+    val root = manifest_above(file).0 match
+        None -> return buf()
+        Some(found) -> found
+
+    val m = manifest_at(root) match
+        Err(_) -> return buf()
+        Ok(got) -> got
+
+    // A consumer's directories first, as the package's C is compiled: a probe sizing a pool from a
+    // configuration header has to read the one the consumer supplied, or the sizes disagree.
+    var out = consumer_c_flags(root).unwrap_or(buf())
+
+    val own = package_c_flags(root, m).0
+
+    for item in own
+        out.push(item)
+
+    dependency_c_flags(root, t) match
+        Ok(flags) ->
+            for item in flags
+                out.push(item)
+        Err(_) -> ()
+
+    out
+end probe_includes_for
 
 // The nearest directory at or above a file that carries a manifest, and how many directories the
 // climb crossed getting there.

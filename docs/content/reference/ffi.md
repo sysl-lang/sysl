@@ -2410,10 +2410,13 @@ a directory holding nothing itself. **The tree's own root is the exception**, si
 tree rather than a directory in it: a package namespaced by reverse DNS has its modules at
 `sh/sysl/foo/` and nothing at the top, so C belonging to no single module goes there.
 
-What this costs is a vendored C library laid out in sub-directories of its own: the ones holding no
-sysl are skipped, and a link error naming the symbols is what says so. Put the `.sysl` that declares
-those `extern`s in the directory and it is a module — which is where every binding written so far has
-put it anyway.
+What this leaves out is a vendored C library laid out in sub-directories of its own: the ones holding
+no sysl are skipped, and the build warns about each. A binding's own shim belongs beside the `.sysl`
+that declares its `extern`s, which is where every binding written so far has put it. **An upstream
+tree is declared instead**, in the manifest's `c` block
+([packages](/reference/packages/#a-vendored-c-library-left-as-upstream-shipped-it)): its root, its
+include roots, the exact list of files it compiles and the macros they take — so the tree stays byte
+for byte what upstream released, and the walk compiles none of the C under its root.
 
 **A shim can be per-machine, and that is a directory rather than a condition.** A `.c`
 cannot carry a sysl attribute, so `#if` is no help to it; what selects it is where it sits. A
