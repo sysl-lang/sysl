@@ -1,0 +1,398 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{parse_int, str_builder, StrBuilder}
+
+// JSON, read and written as far as `sysl lsp` needs it -- which is all of it, since the language
+// server protocol is JSON-RPC and an editor may send any value anywhere a message allows one.
+//
+// **The standard library has no JSON yet**, and a compiler is built by the release before it, so a
+// reader added to `sysl.encoding` now could not be called from here until the release after. This
+// is that reader, kept to the one tree the protocol needs and private to the server.
+
+// A JSON value.
+enum Json
+    JsonNull
+    JsonBool(on: bool)
+
+    // **A number is kept as the text it was written as.** The protocol's numbers are request ids,
+    // lines and characters -- integers a float would round -- and the server only ever reads one back
+    // as an integer (`json_int`).
+    JsonNum(text: string)
+
+    JsonStr(value: string)
+    JsonArr(items: Buf[&Json])
+
+    // The members, in the order they were written; a key written twice keeps both, and the first is
+    // the one read.
+    JsonObj(pairs: Buf[(string, &Json)])
+end Json
+
+// One whole JSON text, or why it is not one, with the byte offset the reading stopped at.
+read_json(text: string) -> Result[&Json, string]
+    var at: usize = 0
+    val out = json_value(text, &at)?
+
+    json_blank(text, &at)
+
+    if at < text.bytes.len then return Err(s"unexpected text after the value at offset $at")
+
+    Ok(out)
+end read_json
+
+private json_blank(text: string, at: *usize)
+    while *at < text.bytes.len
+        val c = text.bytes[*at]
+
+        if c != u8(' ') && c != u8('\t') && c != u8('\n') && c != u8('\r') then return
+
+        *at += 1
+end json_blank
+
+private json_value(text: string, at: *usize) -> Result[&Json, string]
+    json_blank(text, at)
+
+    if *at >= text.bytes.len then return Err(s"a value was expected at offset ${*at}")
+
+    val c = text.bytes[*at]
+
+    if c == u8('{') then return json_object(text, at)
+    if c == u8('[') then return json_array(text, at)
+    if c == u8('"') then return Ok(JsonStr(json_string(text, at)?))
+    if json_word(text, at, "true") then return Ok(JsonBool(true))
+    if json_word(text, at, "false") then return Ok(JsonBool(false))
+    if json_word(text, at, "null") then return Ok(JsonNull)
+    if c == u8('-') || is_json_digit(c) then return Ok(JsonNum(json_number(text, at)?))
+
+    Err(s"a value was expected at offset ${*at}")
+end json_value
+
+private is_json_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+// Whether `word` is written at `at`, stepping over it where it is.
+private json_word(text: string, at: *usize, word: string) -> bool
+    if *at + word.bytes.len > text.bytes.len then return false
+
+    for i in 0..<word.bytes.len
+        if text.bytes[*at + i] != word.bytes[i] then return false
+
+    *at += word.bytes.len
+    true
+end json_word
+
+// A number in JSON's grammar: a sign, an integer part with no leading zero, then an optional
+// fraction and exponent.
+private json_number(text: string, at: *usize) -> Result[string, string]
+    val start = *at
+
+    if text.bytes[*at] == u8('-') then *at += 1
+
+    val whole = json_digits(text, at)
+
+    if whole == 0 || (whole > 1 && text.bytes[*at - whole] == u8('0'))
+        return Err(s"a malformed number at offset $start")
+
+    if *at < text.bytes.len && text.bytes[*at] == u8('.')
+        *at += 1
+
+        if json_digits(text, at) == 0 then return Err(s"a malformed number at offset $start")
+    end if
+
+    if *at < text.bytes.len && (text.bytes[*at] == u8('e') || text.bytes[*at] == u8('E'))
+        *at += 1
+
+        if *at < text.bytes.len && (text.bytes[*at] == u8('+') || text.bytes[*at] == u8('-')) then *at += 1
+
+        if json_digits(text, at) == 0 then return Err(s"a malformed number at offset $start")
+    end if
+
+    Ok(text[start..<*at])
+end json_number
+
+private json_digits(text: string, at: *usize) -> usize
+    val start = *at
+
+    while *at < text.bytes.len && is_json_digit(text.bytes[*at])
+        *at += 1
+
+    *at - start
+end json_digits
+
+// A quoted string, its escapes read -- `\u` among them, a surrogate pair as the one character it
+// stands for.
+private json_string(text: string, at: *usize) -> Result[string, string]
+    var out = str_builder()
+
+    *at += 1
+
+    while *at < text.bytes.len
+        val c = text.bytes[*at]
+
+        if c == u8('"')
+            *at += 1
+            return Ok(out.finish())
+        end if
+
+        if c < 0x20 then return Err(s"a control character inside a string at offset ${*at}")
+
+        if c == u8('\\')
+            if *at + 1 >= text.bytes.len then break
+
+            val e = text.bytes[*at + 1]
+
+            *at += 2
+
+            if e == u8('u') then out.push_char(char(json_code_point(text, at)?))
+            else
+                json_escape(e) match
+                    Some(b) -> out.push_char(char(b))
+                    None -> return Err(s"'\\${text[(*at - 1)..<*at]}' is not a JSON escape, at offset ${*at - 2}")
+            end if
+        else
+            val start = *at
+
+            while *at < text.bytes.len && text.bytes[*at] != u8('"') && text.bytes[*at] != u8('\\') &&
+                  text.bytes[*at] >= 0x20
+                *at += 1
+
+            out.push(text[start..<*at])
+    end while
+
+    Err("a string was opened and never closed")
+end json_string
+
+private json_escape(e: u8) -> Option[u8] =
+    if e == u8('"') then Some(u8('"'))
+    else if e == u8('\\') then Some(u8('\\'))
+    else if e == u8('/') then Some(u8('/'))
+    else if e == u8('b') then Some(8)
+    else if e == u8('f') then Some(12)
+    else if e == u8('n') then Some(u8('\n'))
+    else if e == u8('r') then Some(u8('\r'))
+    else if e == u8('t') then Some(u8('\t'))
+    else None
+
+// The character after a `\u`: four hex digits, and a second four where the first are the high half
+// of a surrogate pair. A half on its own is no character, and is refused.
+private json_code_point(text: string, at: *usize) -> Result[u32, string]
+    val start = *at - 2
+    val high = json_hex4(text, at)?
+
+    if high >= 0xDC00 && high <= 0xDFFF then return Err(s"a lone low surrogate at offset $start")
+
+    if high < 0xD800 || high > 0xDBFF then return Ok(high)
+
+    if *at + 2 > text.bytes.len || text.bytes[*at] != u8('\\') || text.bytes[*at + 1] != u8('u')
+        return Err(s"a lone high surrogate at offset $start")
+
+    *at += 2
+
+    val low = json_hex4(text, at)?
+
+    if low < 0xDC00 || low > 0xDFFF then return Err(s"a lone high surrogate at offset $start")
+
+    Ok(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
+end json_code_point
+
+private json_hex4(text: string, at: *usize) -> Result[u32, string]
+    if *at + 4 > text.bytes.len then return Err(s"'\\u' wants four hex digits, at offset ${*at}")
+
+    var v: u32 = 0
+
+    for i in 0..<usize(4)
+        val c = text.bytes[*at + i]
+
+        val d: u32 =
+            if is_json_digit(c) then u32(c - u8('0'))
+            else if c >= u8('a') && c <= u8('f') then u32(c - u8('a')) + 10
+            else if c >= u8('A') && c <= u8('F') then u32(c - u8('A')) + 10
+            else return Err(s"'\\u' wants four hex digits, at offset ${*at}")
+
+        v = v * 16 + d
+
+    *at += 4
+    Ok(v)
+end json_hex4
+
+private json_array(text: string, at: *usize) -> Result[&Json, string]
+    var items: Buf[&Json] = buf()
+
+    *at += 1
+    json_blank(text, at)
+
+    if *at < text.bytes.len && text.bytes[*at] == u8(']')
+        *at += 1
+        return Ok(JsonArr(items))
+    end if
+
+    loop
+        items.push(json_value(text, at)?)
+        json_blank(text, at)
+
+        if *at >= text.bytes.len then return Err("a '[' was opened and never closed")
+
+        val c = text.bytes[*at]
+
+        *at += 1
+
+        if c == u8(']') then return Ok(JsonArr(items))
+
+        if c != u8(',') then return Err(s"',' or ']' expected at offset ${*at - 1}")
+end json_array
+
+private json_object(text: string, at: *usize) -> Result[&Json, string]
+    var pairs: Buf[(string, &Json)] = buf()
+
+    *at += 1
+    json_blank(text, at)
+
+    if *at < text.bytes.len && text.bytes[*at] == u8('}')
+        *at += 1
+        return Ok(JsonObj(pairs))
+    end if
+
+    loop
+        json_blank(text, at)
+
+        if *at >= text.bytes.len || text.bytes[*at] != u8('"') then
+            return Err(s"a quoted key expected at offset ${*at}")
+
+        val key = json_string(text, at)?
+
+        json_blank(text, at)
+
+        if *at >= text.bytes.len || text.bytes[*at] != u8(':') then return Err(s"':' expected at offset ${*at}")
+
+        *at += 1
+        pairs.push((key, json_value(text, at)?))
+        json_blank(text, at)
+
+        if *at >= text.bytes.len then return Err("a '{' was opened and never closed")
+
+        val c = text.bytes[*at]
+
+        *at += 1
+
+        if c == u8('}') then return Ok(JsonObj(pairs))
+
+        if c != u8(',') then return Err(s"',' or '}' expected at offset ${*at - 1}")
+end json_object
+
+// The member an object holds under `key`, or nothing -- for a value that is not an object too.
+json_get(j: &Json, key: string) -> Option[&Json]
+    *j match
+        JsonObj(pairs) ->
+            for pair in pairs
+                if pair.0 == key then return Some(pair.1)
+
+            None
+        _ -> None
+end json_get
+
+// The member under each key in turn: `json_at(m, ["params", "textDocument", "uri"])`.
+json_at(j: &Json, keys: []const string) -> Option[&Json]
+    var here = j
+
+    for key in keys
+        here = json_get(here, key) match
+            Some(v) -> v
+            None -> return None
+
+    Some(here)
+end json_at
+
+// The string at `keys`, where a string is there.
+json_text_at(j: &Json, keys: []const string) -> Option[string]
+    json_at(j, keys) match
+        Some(v) -> *v match
+            JsonStr(s) -> Some(s)
+            _ -> None
+        None -> None
+end json_text_at
+
+// The integer at `keys`, where an integer is there.
+json_int_at(j: &Json, keys: []const string) -> Option[int]
+    json_at(j, keys) match
+        Some(v) -> *v match
+            JsonNum(t) -> parse_int(t).ok()
+            _ -> None
+        None -> None
+end json_int_at
+
+// One member onto an object being built.
+json_put(pairs: *Buf[(string, &Json)], key: string, v: &Json) = pairs.push((key, v))
+
+// A value as compact JSON text: no space anywhere, members in the order they were put.
+json_text(j: &Json) -> string
+    var out = str_builder()
+
+    json_write(j, &out)
+    out.finish()
+end json_text
+
+private json_write(j: &Json, out: *StrBuilder)
+    *j match
+        JsonNull -> out.push("null")
+        JsonBool(on) -> out.push(if on then "true" else "false")
+        JsonNum(t) -> out.push(t)
+        JsonStr(s) -> out.push(json_quote(s))
+        JsonArr(items) ->
+            out.push("[")
+
+            for i in 0..<items.len()
+                if i > 0 then out.push(",")
+
+                json_write(items.at(i), out)
+
+            out.push("]")
+        JsonObj(pairs) ->
+            out.push("{")
+
+            for i in 0..<pairs.len()
+                if i > 0 then out.push(",")
+
+                out.push(json_quote(pairs.at(i).0))
+                out.push(":")
+                json_write(pairs.at(i).1, out)
+
+            out.push("}")
+end json_write
+
+// A string as a JSON string literal. Only what JSON requires is escaped -- the quote, the backslash
+// and the control characters -- and everything else is written as the UTF-8 it is.
+//
+// The text between two escapes is pushed as one slice: every byte escaped is ASCII, so each cut
+// falls between two characters.
+json_quote(text: string) -> string
+    var out = str_builder()
+    var start: usize = 0
+
+    out.push("\"")
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c == u8('"') || c == u8('\\') || c < 0x20
+            out.push(text[start..<i])
+            out.push(json_escaped(c))
+            start = i + 1
+        end if
+
+    out.push(text[start..<text.bytes.len])
+    out.push("\"")
+    out.finish()
+end json_quote
+
+private json_escaped(c: u8) -> string
+    if c == u8('"') then return "\\\""
+    if c == u8('\\') then return "\\\\"
+    if c == u8('\n') then return "\\n"
+    if c == u8('\r') then return "\\r"
+    if c == u8('\t') then return "\\t"
+
+    val hex = "0123456789abcdef"
+    val hi = usize(c >> 4)
+    val lo = usize(c & 15)
+
+    s"\\u00${hex[hi..<(hi + 1)]}${hex[lo..<(lo + 1)]}"
+end json_escaped
