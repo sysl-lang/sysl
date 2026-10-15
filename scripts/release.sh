@@ -421,13 +421,12 @@ cat > $notes <<NOTES
 
 <!-- A skeleton written by scripts/release.sh. Fill in every <...>, delete what does not apply. -->
 
-<ONE PARAGRAPH: what this release is for. For 0.1.0-alpha.1: the self-hosted compiler, written in
-sysl, replaces the Scala bootstrap as \`sysl\`.>
+<ONE PARAGRAPH: what this release is for.>
 
 ## Install
 
 \`\`\`
-brew install sysl-lang/tap/<sysl or sysl-alpha>
+brew install sysl-lang/tap/sysl
 \`\`\`
 
 or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler finds
@@ -447,7 +446,7 @@ or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler fin
 
 ## Platforms
 
-- **macOS arm64 only.** Linux (x86_64, arm64) and macOS x86_64 are not built for this alpha; the
+- **macOS arm64 only.** Linux (x86_64, arm64) and macOS x86_64 are not built for this release; the
   bootstrap's Linux tarballs came from \`.github/workflows/release-linux.yml\` on CI runners, and
   this compiler has no such workflow yet.
 

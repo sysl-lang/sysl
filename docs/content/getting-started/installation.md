@@ -41,8 +41,8 @@ sysl --version
 sysl --help
 ```
 
-**The alpha formula is macOS on Apple silicon only.** The `0.1.0` alphas are cut by the compiler
-itself on a Mac and ship one binary, `darwin-arm64`; Linux binaries return when a Linux build is part
+**The formula is macOS on Apple silicon only.** sysl 0.1.0 is cut by the compiler itself on a Mac
+and ships one binary, `darwin-arm64`; Linux binaries return when a Linux build is part
 of the release. Anything else builds from source, below.
 
 ## Your first compile
