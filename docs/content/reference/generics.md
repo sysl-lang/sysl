@@ -58,7 +58,7 @@ did not reach for.
 
 ## Writing the type arguments
 
-Five heads take the list. A **value** argument is written exactly as a type one is, since the two
+Six heads take the list. A **value** argument is written exactly as a type one is, since the two
 share a list and a position:
 
 | written | what it names |
@@ -66,9 +66,75 @@ share a list and a position:
 | `id[int](7)` | a function, qualified or not |
 | `chunk[8]()` | a value parameter — `[const N: usize]` |
 | `Pair[int, real](1, 2.5)` | a constructor, qualified or not |
-| `x.pick[int](3)` | a method — its **own** parameters, not the receiver's |
+| `x.pick[int](3)` | a method — its **own** parameters, not the receiver's — on any receiver, a bounded type parameter's included |
 | `Maybe[int].Just(1)` | a variant, which is a construction of its type — qualified or not |
+| `Box[int].of(1)` | an associated function, called at the instantiation the list names — qualified or not |
 | `va_arg[int](ap)` | a special form: `va_arg` and `ptr_cast` |
+
+**A method reached through a bound takes its list as one on a concrete receiver does.** The list
+names the trait member's own parameters, which is the only way to say what one is when no argument
+mentions it — and a trait's default body writes it on `self` the same way:
+
+```sysl
+trait Out
+    one[A](self) -> int
+
+    two(self) -> int = self.one[string]() + 1
+
+struct Sink
+    n: int
+
+impl Out for Sink
+    one[A](self) -> int = self.n
+
+via[O: Out](o: *O) -> int = o.one[int]()
+
+var s = Sink(41)
+print(s.one[int](), via(&s), s.two())
+```
+
+```output
+41 41 42
+```
+
+**An associated function called off an applied name is reached at that instantiation**, exactly as
+it is through an alias of it. One with no receiver may have nothing else that could say what the
+type's parameters are:
+
+```sysl
+struct Of[T]
+    x: T
+
+    twice() -> int = 2
+
+    of(x: T) -> Of[T] = Of(x)
+
+type OfInt = Of[int]
+
+val o = Of[u8].of(200)
+print(OfInt.twice(), Of[int].twice(), Of[Of[string]].twice(), o.x + 55)
+```
+
+```output
+2 2 2 255
+```
+
+The list is the type's, so a method is still refused there — a type in front of the dot is no value
+to call it on — and a member read without a call is told where the type is written instead:
+
+```sysl
+struct Of[T]
+    x: T
+
+    get(self) -> T = self.x
+
+val o = Of(3)
+print(Of[int].get(o))
+```
+
+```error
+'get' is an instance method of 'Of' — call it on a value, not the type
+```
 
 **A head reached through its module takes the list exactly where the bare name would**, so a type
 from another module is instantiated without importing its name:
@@ -133,14 +199,12 @@ add(xs[..], out[..])
 'W' is in neither the parameters of 'add' nor its result
 ```
 
-**Three things stay inferred.** A **type pack** — `..A` — stands for a list of types rather than one
-and has no expression spelling, so its instantiation is always solved. An **associated function
-selected from an applied type**, `Box[int].of(1)`, reads its type's parameters and its own from a
-single solve; the annotation on the binding reaches it, and unlike the kernel above there is always
-one, since an associated function has a result. And a **bare arrow's own parameter**, which is the
-case below.
+**Two things stay inferred.** A **type pack** — `..A` — stands for a list of types rather than one
+and has no expression spelling, so its instantiation is always solved. And a **bare arrow's own
+parameter**, which is the case below.
 
-The annotation reaches it through an `unwrap()` or an `expect(…)` as well, where the function answers
+An associated function selected from the **plain** name of a generic type reads its type's
+parameters from the annotation on the binding. The annotation reaches it through an `unwrap()` or an `expect(…)` as well, where the function answers
 an `Option` or a `Result` of what it makes: the binding says what the wrapper carries, and that is
 what settles the type. The call's own arguments are read first, so where they settle the type the
 binding is checked against it as usual:

@@ -187,9 +187,16 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // the reader wrote the instantiation of.
             val on_type_args = written_on_generic_type(cx, receiver)
 
-            if on_type_args.is_some() then
+            if on_type_args.is_some()
+                val on_applied = applied_associated_call(cx, span, on_type_args.unwrap().0,
+                                                         on_type_args.unwrap().1, member, args,
+                                                         expected)
+
+                if on_applied.is_some() then return on_applied.unwrap()
+
                 return type_args_at_selection(cx, span, on_type_args.unwrap().0,
                                               on_type_args.unwrap().1, member, args)
+            end if
 
             val dotted = module_path_of(cx, receiver, member)
 
@@ -484,10 +491,50 @@ written_on_generic_type(cx: &Analyzer, e: Expr) -> Option[((string, string), Buf
     Some((found.unwrap(), targs))
 end written_on_generic_type
 
+// `Of[int].twice()` -- an associated function CALLED through the instantiation its type's name was
+// written at, which is the spelling `type OfInt = Of[int]; OfInt.twice()` already is without the
+// alias. A member with no receiver may have nothing else that could carry the type's arguments, so
+// the list is the type's, settled outright, and the member's own parameters are solved from the
+// call as they are through the alias. Everything a member declared on
+// the type can be is asked the alias's way: a METHOD reached so is refused there in the words
+// `T.method(x)` is, since a type in front of the dot is no value to call it on.
+//
+// Nothing where the name selects a variant, or nothing the type declares, which `type_args_at_selection`
+// answers.
+private applied_associated_call(cx: &Analyzer, span: Span, head: (string, string),
+                                targ_exprs: Buf[Expr], sel: string, args: Buf[Expr],
+                                expected: Option[Type]) -> Option[TExpr]
+    val variant = cx.an.tables.types.get(head.0).unwrap().kind match
+        EnumOf(ed) -> variant_decl_named(ed, sel).is_some()
+        _ -> false
+
+    if variant then return None
+
+    var targs: Buf[Type] = buf()
+
+    for targ_expr in targ_exprs
+        val t = written_type_arg(cx, targ_expr)
+
+        if t == Unknown then return Some(bad_expr(span))
+
+        targs.push(t)
+
+    val ty = reinstantiate_at(cx.an, cx.scope, span, head.0, targs)
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    val key = member_key(cx.an, ty, sel).0
+
+    if member_at(cx.an, key, sel).is_none() && !cx.an.tables.members.alts.has(member_key_of(key, sel)) then
+        return None
+
+    associated_on(cx, span, ty, sel, args, expected, no_bound_traits())
+end applied_associated_call
+
 // `Maybe[int].Just(3)`, and `b.Maybe[string].Nothing` with nothing called -- a variant selected from
-// the instantiation its enum's name was written at. **A variant is the only thing a written list
-// may be selected from**: an associated function takes its type from what receives the result, so
-// the list is refused there with the place to write it instead.
+// the instantiation its enum's name was written at. **A variant and a called associated function are
+// the only things a written list may be selected from** (`applied_associated_call` is the second):
+// read without a call, a member is refused with the place to write the type instead.
 type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_exprs: Buf[Expr],
                        sel: string, args: Buf[Expr]) -> TExpr
     val variant = cx.an.tables.types.get(head.0).unwrap().kind match

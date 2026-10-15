@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Type arguments written at a SELECTION (`reference/generics.md`): a list on a member reached
+// through a bounded type parameter, `o.one[int]()`, which names the trait's member exactly as it
+// names the type's on a concrete receiver; and a list on a generic type's name with an associated
+// function called off it, `Of[int].twice()`, which is the spelling an alias of that instantiation
+// already allowed.
+
+private tys_says(text: string, part: string) -> bool = text.contains(part)
+
+// -- a method through a bound -----------------------------------------------------------------------
+
+@test("a list on a method called through a bound names the trait's member")
+tys_a_list_through_a_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Out
+            one[A](self) -> int
+
+        struct Sink
+            n: int
+
+        impl Out for Sink
+            one[A](self) -> int = self.n + 1
+
+        viafree[O: Out](o: *O) -> int = o.one[int]()
+
+        byval[O: Out](o: O) -> int = o.one[string]()
+
+        var s = Sink(41)
+        print(s.one[int](), viafree(&s), byval(s))
+        """), "42 42 42\n")
+
+@test("and the written argument is what the member's result is read at")
+tys_the_written_argument_settles_the_result()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Echo
+            echo[A](self, x: A) -> A
+
+        struct E
+            n: int
+
+        struct Pair[A]
+            a: A
+            b: A
+
+        impl Echo for E
+            echo[A](self, x: A) -> A = x
+
+        small[O: Echo](o: O) -> u8 = o.echo[u8](200) + 50
+
+        nested[O: Echo](o: O) -> int
+            val p = o.echo[Pair[int]](Pair(3, 4))
+
+            p.a + p.b
+
+        print(small(E(0)), nested(E(0)))
+        """), "250 7\n")
+
+@test("a trait's default body writes one on 'self', with its own parameter as the argument")
+tys_a_list_in_a_default_body()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Out
+            one[A](self) -> int
+
+            two(self) -> int = self.one[int]() + 1
+
+            three[N](self) -> int = self.one[N]() + 2
+
+        struct Sink
+            n: int
+
+        impl Out for Sink
+            one[A](self) -> int = self.n
+
+        val s = Sink(40)
+        print(s.two(), s.three[string]())
+        """), "41 42\n")
+
+@test("a list of the wrong length through a bound is refused at the call")
+tys_a_wrong_count_through_a_bound()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Out
+            one[A](self) -> int
+
+        f[O: Out](o: O) -> int = o.one[int, string]()
+
+        print(1)
+        """)
+
+    assert(tys_says(said, "'one' takes 1 type argument ('A'), and 2 were written"), said)
+
+@test("and a list on a member of the bound that has no parameters is refused")
+tys_a_list_on_a_plain_member_through_a_bound()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Out
+            plain(self) -> int
+
+        f[O: Out](o: O) -> int = o.plain[int]()
+
+        print(1)
+        """)
+
+    assert(tys_says(said, "'plain' is not generic, so it has no type arguments to write — the call " +
+                          "is 'plain(…)'"), said)
+
+// -- an associated function off an applied type name ----------------------------------------------
+
+@test("an associated function is called off the instantiation written on its type's name")
+tys_an_associated_function_off_an_applied_name()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Of[T]
+            x: T
+
+            twice() -> int = 2
+
+            of(x: T) -> Of[T] = Of(x)
+
+        type OfInt = Of[int]
+
+        val o = Of[u8].of(255)
+        print(OfInt.twice(), Of[int].twice(), Of[Of[string]].twice(), o.x)
+        """), "2 2 2 255\n")
+
+@test("including at a type parameter, inside a generic body")
+tys_an_associated_function_at_a_parameter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Of[T]
+            x: T
+
+            of(x: T) -> Of[T] = Of(x)
+
+        g[T](x: T) -> T = Of[T].of(x).x
+
+        h[T](x: T) -> T = Of[Of[T]].of(Of(x)).x.x
+
+        print(g[u8](200) + 55, h("deep"), Of[Of[u16]].of(Of(7)).x.x)
+        """), "255 deep 7\n")
+
+@test("a method called off an applied name is still refused, as it is off the alias")
+tys_a_method_off_an_applied_name_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        struct Of[T]
+            x: T
+
+            get(self) -> T = self.x
+
+        val o = Of(3)
+        print(Of[int].get(o))
+        """)
+
+    assert(tys_says(said, "'get' is an instance method of 'Of' — call it on a value, not the type"),
+           said)
+
+@test("as is a member read off an applied name without a call")
+tys_an_uncalled_member_off_an_applied_name_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        struct Of[T]
+            x: T
+
+            twice() -> int = 2
+
+        val f = Of[int].twice
+        print(1)
+        """)
+
+    assert(tys_says(said, "'Of' cannot be given type arguments where 'twice' is selected from it"),
+           said)
+
+@test("and a name the type does not declare")
+tys_an_undeclared_member_off_an_applied_name_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        struct Of[T]
+            x: T
+
+        print(Of[int].nope())
+        """)
+
+    assert(tys_says(said, "'Of' cannot be given type arguments where 'nope' is selected from it"),
+           said)
