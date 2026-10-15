@@ -933,10 +933,32 @@ private variant_in_scope(cx: &Analyzer, base: string, name: string) -> bool
     for item in im.wildcards
         if item == owner then return true
 
-    imported_variant_enum(cx, name) match
-        Some(owner) -> owner == base
-        None -> false
+    val chosen = imported_variant_enum(cx, name)
+
+    if chosen.is_some() then return chosen.unwrap() == base
+
+    // **An enum imported by name puts its variants in scope for its own expected type**
+    // (`reference/types.md § A variant belongs to its enum`): `import lib.m.Why` makes
+    // `val w: Why = Empty` and `return Err(Empty)` at a `Result[T, Why]` the enum's, as they are in
+    // its own module. A name this file already has for something else -- its own function or value
+    // of the spelling -- is still that, never re-pointed at a distant variant.
+    enum_imported_by_name(cx, base) && !names_something_else(cx, name)
 end variant_in_scope
+
+// Whether some level of this file's imports binds a name to the enum `base` itself.
+private enum_imported_by_name(cx: &Analyzer, base: string) -> bool
+    for bound in cx.scope.imports.names
+        if bound.1 == base then return true
+
+    false
+end enum_imported_by_name
+
+// Whether a bare name already reaches a binding, a function or a value here, which a variant reached
+// only through its enum's import does not take over.
+private names_something_else(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_some() || names_a_function(cx, name) || cx.nested_of(name).is_some() ||
+        value_key_of(cx, a_consts(cx), name).is_some() || value_key_of(cx, a_vals(cx), name).is_some() ||
+        value_key_of(cx, a_extern_vars(cx), name).is_some()
 
 // A nullary variant of an enum something other than the bare name already chose -- a module or a
 // type in front of a dot, or a value parameter's declared enum -- so no import of the name is asked

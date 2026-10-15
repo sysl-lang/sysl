@@ -905,6 +905,30 @@ library's variant is what a bare name reaches; where it is the module's own, the
 qualified `Status.Ok` says so outright for a site whose expected type is a `Result` and whose meaning
 is not.
 
+**An enum imported by name lends its bare variants the same way**, at every position that expects
+it — nested inside an `Err` or a `Some` too. Only the enum is imported here, and none of its
+variants:
+
+```sysl
+import sysl.fs.IoError
+
+open_it(there: bool) -> Result[int, IoError]
+    if !there then return Err(NotFound)
+    Ok(3)
+
+val clash: IoError = AlreadyExists
+
+print(open_it(false).unwrap_err().code(), clash.code(), open_it(true).unwrap())
+```
+
+```output
+2 17 3
+```
+
+A name the file already has for something else — its own function `NotFound()`, say — keeps that
+meaning, and an enum the file never imported lends nothing; `sysl.fs.IoError.NotFound` is the spelling
+that needs no import at all.
+
 This is Rust's arrangement — a variant is namespaced under its enum — without Rust's use site, where
 `Link::Failed` is required everywhere unless a scope opts into `use Link::*`. A variant still may not
 share a name with a constant, a `val`, a module `var` or an `extern` variable: two variants of a name
