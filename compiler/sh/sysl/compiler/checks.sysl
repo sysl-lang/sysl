@@ -14,7 +14,8 @@ import sysl.text.{Search, from_utf8_unchecked}
 // about what it says.
 
 // Everything a program has to answer for, run in the order the reference runs them.
-whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals: Buf[TVal])
+whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals: Buf[TVal],
+                     typed: TypedBodies)
     check_conventions(a)
     check_exports(a)
     check_doc_comments(a, units)
@@ -23,7 +24,7 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_module_graph(a)
     check_target_refusals(a, funcs)
     check_gated_modules(a, funcs, vals, reached_vtables(a))
-    check_no_alloc(a, funcs, vals, reached_vtables(a))
+    check_no_alloc(a, funcs, vals, reached_vtables(a), typed)
     check_no_block(a, funcs, vals, reached_vtables(a))
     check_decl_capabilities(a, funcs, vals, reached_vtables(a))
     check_atomic_reach(a, funcs, reached_vtables(a))
@@ -300,6 +301,34 @@ program_reach(a: &Analysis, funcs: Buf[TFunc]) -> Option[Set[string]]
 
     Some(reached)
 end program_reach
+
+// The functions the program's roots arrive at -- its entry, its `@export`s, its tests and hooks in a
+// build that runs them, and the tables of closures written where it reaches (`funcs_reached`) -- or
+// nothing where every function counts: a build of a library, which is compiled for whichever program
+// reaches it, or a compilation with no program of its own.
+//
+// **The image is what the machine's half is asked of**, and a body nothing arrives at is not in it:
+// `sh.sysl.parsing`'s `render`, in a module the program reaches for its `Span`, or a trait's default
+// that an implementing type never has called. The entry file's statements are a body of their own
+// (`entry_check_name`) and are always reached.
+program_func_reach(done: TypedBodies) -> Option[Set[string]]
+    val a = done.an
+
+    if !a.producing.is_empty() then return None
+
+    var own: Buf[string] = buf()
+
+    for item in a.tables.modules
+        if !holds_string(a.tables.supplied_modules, item) then own.push(item)
+
+    if own.is_empty() then return None
+
+    var reached = funcs_reached(program_of(done, done.main_module), own)
+
+    reached.add(entry_check_name(done.main_module))
+
+    Some(reached)
+end program_func_reach
 
 // Whether a module is one the program reaches, where `reach` came from `program_reach`.
 reached_module(reach: Option[Set[string]], module_name: string) -> bool = reach match

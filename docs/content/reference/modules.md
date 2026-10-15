@@ -879,6 +879,16 @@ package boxes its tasks and keeps per-thread storage, and none of the pool's cod
 tables included — is in the image. The program's own modules and the standard module's are asked as
 before.
 
+**And within a module the program reaches, a heap-less machine asks only about the functions the
+program arrives at.** The machine is a statement about the image, and the image holds what the
+program's roots reach: its entry, its `@export`s, each `@test` and hook in a build that runs them, and
+the tables of the closures it keeps. A board program that names a parser module for its span type
+builds although the module's error renderer allocates; a trait's default that no implementing type is
+called through is not asked; a generic is asked, by the body it was written as, once something
+reached instantiates it. What the program does reach is refused exactly as before, at the construct
+and at the call. A module's own `@no_alloc` is different: it is a promise about everything the module
+wrote, and holds every body in it whether anything calls that body or not.
+
 ### A generic answers for what it wrote, not for what its caller chose
 
 A generic has no execution until a type is chosen, and whoever chose it is usually somebody else. So

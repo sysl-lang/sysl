@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.container.Set
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // A module that gave the allocator up, and what that costs it.
@@ -33,11 +33,18 @@ import sysl.text.Search
 // `checks.sysl`'s `program_reach`): a package is a set of modules, and one the program never names is
 // not asked, so a board build that imports only `sh.sysl.pool.deque` is not refused over the thread
 // pool beside it. One it does name is held like the program's own.
+//
+// **And a body answers to the machine only where the program arrives at it** (`in_image`, from
+// `checks.sysl`'s `program_func_reach`): the machine is a statement about the image, and a function
+// nothing reaches -- a renderer in a module the program names for one type, a trait's default no
+// implementing type is ever called through -- is not in it. A module's own `@no_alloc` is a promise
+// about everything it wrote, so it is asked of every body whether reached or not.
 private no_alloc_here(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
-                      scaffolding: bool) -> bool
+                      scaffolding: bool, in_image: bool) -> bool
     // The file answers which module that is: a lifted closure's key names no module of its own.
-    if machine_has_no_heap(a) && !from_library(a, scope) && reached_module(reach, scope.module_name)
-        return true
+    val machine = machine_has_no_heap(a) && !from_library(a, scope)
+
+    if machine && reached_module(reach, scope.module_name) && in_image then return true
 
     if scaffolding then return module_tests_narrowed(a, tests_key(a, module_name, scope), CapHeap)
 
@@ -109,7 +116,8 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 // clause holds each of its bodies, and its callees through the second -- so a sibling in the same
 // module may allocate, and a function under a module that already declared the clause answers to the
 // module's, the stronger of the two.
-check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable],
+               typed: TypedBodies)
     var any = machine_has_no_heap(a)
 
     for module_narrow in a.tables.module_narrows
@@ -129,6 +137,21 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     if !any then return
 
     val reach = program_reach(a, funcs)
+
+    // The functions in the image, asked only where the machine has no heap -- the one half of the
+    // promise that is about the image -- and the generic declarations an instance in it was made from.
+    val live = if machine_has_no_heap(a) then program_func_reach(typed) else None
+    var origins: Set[string] = set()
+
+    if live.is_some()
+        for i in 0..<funcs.len()
+            val name = funcs.at(i).name
+
+            if live.unwrap().has(name)
+                a.tables.members.func_origin.get(name) match
+                    Some(origin) -> origins.add(origin)
+                    None -> ()
+
     var seeds: Buf[string] = buf()
     var made: Buf[(string, string)] = buf()
     val graph = with_abstract_callees(a, funcs)
@@ -177,7 +200,9 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // code it tests does (`tests_key`).
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        held_to(a, reach, scope, module_name, scaffolding, f, made) match
+        val in_image = live.is_none() || live.unwrap().has(f.name)
+
+        held_to(a, reach, scope, module_name, scaffolding, in_image, f, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
@@ -203,7 +228,9 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         named.name = abstract_key(a, f)
 
-        held_to(a, reach, scope, module_name, scaffolding, named, made) match
+        val in_image = live.is_none() || origins.has(named.name)
+
+        held_to(a, reach, scope, module_name, scaffolding, in_image, named, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
@@ -223,7 +250,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val scope = val_home(a, v.symbol)
         val scaffolding = holds_string(a.tables.test_only, v.symbol)
 
-        if !no_alloc_here(a, reach, scope, module_name, scaffolding) then continue
+        if !no_alloc_here(a, reach, scope, module_name, scaffolding, true) then continue
 
         val why = because(a, scope, module_name, scaffolding)
         val held = Promised(why, None, made, false)
@@ -258,8 +285,9 @@ struct Promised
 // holds every body in the module, so a function there carrying `@no_alloc` as well says nothing the
 // module did not, and the refusal names the clause that would still hold were the annotation gone.
 private held_to(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
-                scaffolding: bool, f: TFunc, made: Buf[(string, string)]) -> Option[Promised]
-    if no_alloc_here(a, reach, scope, module_name, scaffolding) then
+                scaffolding: bool, in_image: bool, f: TFunc,
+                made: Buf[(string, string)]) -> Option[Promised]
+    if no_alloc_here(a, reach, scope, module_name, scaffolding, in_image) then
         return Some(Promised(because(a, scope, module_name, scaffolding), None, made, false))
 
     if !f.marks.gives_up(NoAllocWord) then return None
