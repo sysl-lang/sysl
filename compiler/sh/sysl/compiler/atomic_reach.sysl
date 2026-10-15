@@ -33,11 +33,34 @@ private rmw_name(e: TExpr) -> string = *e.kind match
 
 // Whether a function is the standard module's own. Its bodies are typed for every machine, so what
 // it reaches is charged to the program that calls into it.
-private standard_body(name: string) -> bool
-    val m = module_of(name)
+private standard_body(name: string) -> bool = standard_body_module(module_of(name))
 
-    m == "sysl" || m.starts_with("sysl.")
-end standard_body
+standard_body_module(m: string) -> bool = m == "sysl" || m.starts_with("sysl.")
+
+// Whether a typed form runs at a width the processor has no instruction for. A word-wide integer is
+// the machine's word wherever it runs, so it always fits; the program's own forms are refused where
+// they are typed (`atomic_pointee`), so only the standard module's bodies hold one.
+private is_too_wide(e: TExpr, t: Target) -> bool = *e.kind match
+    TAtomic(_, _, _, _, at, _) -> underlying(at) match
+        Integer(bits, _, pointer_width) -> !pointer_width && bits > t.atomic_bits()
+        _ -> false
+    _ -> false
+
+// Every body holding an atomic form wider than the processor's.
+private wide_seeds(graph: Buf[TFunc], t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<graph.len()
+        val f = graph.at(i)
+        val found: &Counted = Counted(0)
+
+        walk_block_stmts(f.body, TWalk(false, e -> if is_too_wide(e, t) then found.n = found.n + 1,
+                                       w -> (), st -> ()))
+
+        if found.n > 0 && !holds_string(out, f.name) then out.push(f.name)
+
+    out
+end wide_seeds
 
 // Asked of a key as a diagnostic spells it, which is the one form that names the owner plainly.
 private is_irq_lock(key: string) -> bool = qualified_name(key).starts_with("sysl.sync.IrqLock.")
@@ -79,12 +102,14 @@ check_atomic_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     val t = a.tables.target
     val no_rmw = t.atomic_rmw_bits() == 0
     val no_primask = !t.has_primask()
+    val wide = wide_seeds(funcs, t)
 
-    if !no_rmw && !no_primask then return
+    if !no_rmw && !no_primask && wide.is_empty() then return
 
     val graph = with_abstract_callees(a, funcs)
     val rmw_walk = reaches_over(graph, vtables, if no_rmw then rmw_seeds(graph) else buf())
     val irq_walk = reaches_over(graph, vtables, if no_primask then irq_seeds(graph) else buf())
+    val wide_walk = reaches_over(graph, vtables, wide_seeds(graph, t))
 
     for i in 0..<funcs.len()
         val f = funcs.at(i)
@@ -97,12 +122,12 @@ check_atomic_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         val scope = func_home(a, f.name)
 
         walk_block_stmts(f.body, TWalk(false, e -> blame_atomic(a, t, scope, rmw_walk, irq_walk,
-                                                                no_rmw, e),
+                                                                wide_walk, no_rmw, e),
                                        w -> (), st -> ()))
 end check_atomic_reach
 
 private blame_atomic(a: &Analysis, t: Target, scope: Scope, rmw_walk: &Reaches, irq_walk: &Reaches,
-                     no_rmw: bool, e: TExpr)
+                     wide_walk: &Reaches, no_rmw: bool, e: TExpr)
     if no_rmw && is_rmw(e)
         a.fault(scope, e.span, s"'${rmw_name(e)}' is an atomic read-modify-write, and " +
                 s"'${t.name}' has no instruction for one: an Armv6-M core reads and writes a word " +
@@ -116,6 +141,18 @@ private blame_atomic(a: &Analysis, t: Target, scope: Scope, rmw_walk: &Reaches, 
         a.fault(scope, e.span, s"'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and " +
                 s"'${t.name}' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; elsewhere " +
                 "use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are threads")
+        return
+    end if
+
+    val wide = named_reach(wide_walk, own_refs(e))
+
+    if wide.is_some() && !reaches_a_seed(wide_walk, strict_refs(e))
+        val (who, seed) = wide.unwrap()
+        val through = if who == seed then "" else s" through '${shown(a, seed)}'"
+
+        a.fault(scope, e.span, s"this reaches '${shown(a, who)}'$through, which runs an atomic " +
+                s"wider than '${t.name}' has one for — ${t.atomic_bits()} bits at most, so there is " +
+                "nothing to emit. Count at a width the machine has where the value fits one")
         return
     end if
 
