@@ -616,6 +616,10 @@ struct CExporter
 
     // Where two consumers each gave one, the refusal -- said when this package's C is compiled.
     conflict: string
+
+    // A `--lib` root's modules, which keep the names they were written with rather than sitting under
+    // a canonical prefix -- so an import table reaches it by one of them. Empty for any other package.
+    modules: Buf[string]
 end CExporter
 
 // The graph the last resolution answered, kept because a `c const` probe is answered inside the
@@ -627,9 +631,13 @@ private var c_exporters: Buf[CExporter] = buf()
 forget_c_exporters()
     c_exporters = buf()
 
-// Keep what each package of a resolved graph publishes.
-note_c_exporters(g: &Graph)
+// Keep what each package of a resolved graph publishes -- and each `--lib` source root, which is a
+// package of the graph too (`reference/packages.md § A source root stands in for the package it is`):
+// its `c { export }` roots reach whatever imports its modules, and the roots of what it depends on
+// reach its own C, as a fetched copy's would.
+note_c_exporters(g: &Graph, roots: &Buf[(string, Manifest)])
     var kept: Buf[CExporter] = buf()
+    var project: Buf[string] = buf()
 
     for p in g.packages
         var deps: Buf[string] = buf()
@@ -637,29 +645,49 @@ note_c_exporters(g: &Graph)
         for item in p.imports
             if !holds(deps, item.1) then deps.push(item.1)
 
-        var exports: Buf[string] = buf()
-        var libc: Buf[string] = buf()
+        if is_root_package(p) then project = deps.copy()
 
-        for lib in p.manifest.c_libraries
-            for rel in lib.exports
-                if lib.libc then libc.push(under(p.root, rel)) else exports.push(under(p.root, rel))
+        kept.push(CExporter(absolute_path(p.root), p.canonical, deps, exported(p.root, p.manifest, false),
+                            exported(p.root, p.manifest, true), buf(), "", "", buf()))
 
-        kept.push(CExporter(absolute_path(p.root), p.canonical, deps, exports, libc, buf(), "", ""))
+    // A root's modules are filed under the project's names and what its manifest binds is bound into
+    // the project's own table, so what it depends on is read off that table.
+    for item in roots
+        val (dir, m) = item
+
+        kept.push(CExporter(absolute_path(dir), lib_root_key(dir), project, exported(dir, m, false),
+                            exported(dir, m, true), buf(), "", "", package_modules(dir).unwrap_or(buf())))
 
     // **A consumer may stand its own headers ahead of a dependency's** -- a vendored library's
     // configuration header, which the library is written to have its integrator supply.
     for p in g.packages
-        consumer_entries(&kept, p, p.manifest.dependencies, "dependencies")
-        consumer_entries(&kept, p, p.manifest.dev_dependencies, "dev_dependencies")
+        consumer_entries(&kept, p, p.manifest.dependencies, "dependencies", roots)
+        consumer_entries(&kept, p, p.manifest.dev_dependencies, "dev_dependencies", roots)
 
     c_exporters = kept
 end note_c_exporters
 
-private consumer_entries(kept: *Buf[CExporter], p: &ResolvedPackage, deps: Buf[Dependency], block: string)
+// The roots a package's `c` block publishes, absolute: the ordinary ones, or with `libc` the ones that
+// are a C standard library's headers.
+private exported(root: string, m: &Manifest, libc: bool) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for lib in m.c_libraries
+        if lib.libc == libc
+            for rel in lib.exports
+                out.push(under(root, rel))
+
+    out
+end exported
+
+private consumer_entries(kept: *Buf[CExporter], p: &ResolvedPackage, deps: Buf[Dependency], block: string,
+                         roots: &Buf[(string, Manifest)])
     for dep in deps
         if dep.c_include.is_empty() then continue
 
-        var target = exporter_named(*kept, dependency_canonical(dep))
+        var target = stood_in_by(roots, dep) match
+            Some(i) -> exporter_named(*kept, lib_root_key(roots.at(i).0))
+            None -> exporter_named(*kept, dependency_canonical(dep))
 
         for item in p.imports
             if target.is_none() && item.0 == dep.label then target = exporter_named(*kept, item.1)
@@ -695,6 +723,7 @@ private exporter_named(kept: Buf[CExporter], name: string) -> Option[usize]
         val c = kept.at(j).canonical
 
         if !c.is_empty() && (name == c || name.starts_with(c + ".")) then return Some(j)
+        if holds(kept.at(j).modules, name) then return Some(j)
 
     None
 end exporter_named
@@ -796,9 +825,18 @@ dependency_c_flags(tree: string, t: Target) -> Result[Buf[string], string]
         for dir in system
             out.push(s"-isystem$dir")
 
-    trace(s"c headers: '$me' takes ${join(out.view(), " ")} from ${queue.len() - 1} package(s) it depends on")
+    trace(s"c headers: '$me' takes ${headers_taken(out)} from ${counted(queue.len() - 1, "package")} " +
+          "it depends on")
     Ok(out)
 end dependency_c_flags
+
+// What `-v` says a tree took, which is something even where it took nothing.
+headers_taken(flags: &Buf[string]) -> string =
+    if flags.is_empty() then "no include roots" else join(flags.view(), " ")
+
+// `n` things, in the number the count is.
+private counted(n: usize, thing: string) -> string =
+    if n == 1 then s"1 $thing" else s"$n ${thing}s"
 
 // The `c` block as what it means, one library to a line, for the run cache's key: a library's
 // configuration changes the program as surely as its files do.

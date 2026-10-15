@@ -1,0 +1,413 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **A directory that is a package counts as that package everywhere in the graph** -- a `--lib` root
+// standing in for a coordinate publishes its C headers as the fetched copy would, a path dependency
+// stands in for a coordinate by the same repository-name rule, a path dependency may name paths of its
+// own, and `build-lib` resolves a graph made only of directories. The tree all of them came from is a
+// board, the network stack it runs and the C library both take, checked out side by side.
+
+private lov_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private lov_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lov_write(root: string, at: string, text: string)
+    val file = s"$root/$at"
+
+    make_dir_all(parent_of(file).unwrap_or(root)).unwrap()
+    write_text(file, text).unwrap()
+
+// A package at a fresh directory: a manifest naming it, `extra` after the package block, what it
+// depends on, and one module holding `text`.
+private lov_package(name: string, extra: string, deps: string, module_name: string, text: string) -> string
+    val root = lov_temp(s"sysl-lov-$name")
+
+    lov_write(root, "package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n$extra\n" +
+              (if deps.is_empty() then "" else s"dependencies { $deps }\n"))
+    lov_write(root, s"$module_name/$module_name.sysl", s"module $module_name\n\n$text\n")
+    root
+end lov_package
+
+private lov_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+private lov_graph(root: string, cache: string) -> Result[Graph, string] =
+    resolve_graph(root, manifest_of_package(root).unwrap(), empty_sums(), cache)
+
+private lov_selected(g: &Graph) -> string
+    var rows: Buf[string] = buf()
+
+    for p in g.packages
+        if is_root_package(p) then continue
+
+        p.version match
+            None -> rows.push(s"${p.canonical}=path")
+            Some(v) -> rows.push(s"${p.canonical}=${release_shown(v)}")
+
+    join(sorted_labels(rows).view(), " ")
+end lov_selected
+
+private lov_imports(g: &Graph, canonical: string) -> string
+    for item in g.packages
+        if item.canonical != canonical then continue
+
+        var rows: Buf[string] = buf()
+
+        for j in 0..<item.imports.len()
+            rows.push(s"${item.imports.at(j).0}->${item.imports.at(j).1}")
+
+        return join(sorted_labels(rows).view(), " ")
+
+    s"no package '$canonical'"
+end lov_imports
+
+private lov_last_segment(dir: string) -> string
+    var at: usize = 0
+
+    for i in 0..<dir.bytes.len
+        if dir.bytes[i] == u8('/') then at = i + 1
+
+    dir[at..<dir.bytes.len]
+end lov_last_segment
+
+// -- a path dependency's own path dependencies -------------------------------------------------------
+
+@test("a path dependency's own path dependency is read against the manifest that wrote it")
+lov_a_nested_path_is_read_where_it_was_written()
+    val cache = lov_temp("sysl-lov-cache")
+    val inner = lov_package("inner", "", "", "inner", "")
+    val side = lov_package("side", "", s"inner { path = \"../${lov_last_segment(inner)}\" }", "side", "")
+    val app = lov_package("app", "", s"side { path = \"$side\" }", "app", "")
+
+    val said = lov_graph(app, cache) match
+        Err(why) -> why
+        Ok(g) -> s"${lov_selected(g)} | ${lov_imports(g, "side")}"
+
+    lov_drop([cache, inner, side, app])
+    assert_eq(said, "inner=path side=path | inner->inner.inner")
+end lov_a_nested_path_is_read_where_it_was_written
+
+@test("a nested path that is not there is refused, naming the directory it was read against")
+lov_a_nested_path_that_is_not_there()
+    val cache = lov_temp("sysl-lov-cache")
+    val side = lov_package("side", "", "inner { path = \"nowhere\" }", "side", "")
+    val app = lov_package("app", "", s"side { path = \"$side\" }", "app", "")
+
+    val said = lov_graph(app, cache) match
+        Err(why) -> why
+        Ok(_) -> "resolved"
+
+    lov_drop([cache, side, app])
+    assert_eq(said, s"'inner' is a path dependency, and '$side/nowhere' is not a directory")
+end lov_a_nested_path_that_is_not_there
+
+@test("one name for two directories is refused, naming both")
+lov_one_name_two_directories()
+    val cache = lov_temp("sysl-lov-cache")
+    val first = lov_package("util", "", "", "util", "")
+    val second = lov_package("util", "", "", "util", "")
+    val side = lov_package("side", "", s"util { path = \"$first\" }", "side", "")
+    val app = lov_package("app", "", s"side { path = \"$side\" }, util { path = \"$second\" }", "app", "")
+
+    val said = lov_graph(app, cache) match
+        Err(why) -> why
+        Ok(_) -> "resolved"
+
+    lov_drop([cache, first, second, side, app])
+    assert_eq(said, s"'util' names two directories, '$first' and '$second' — a package's modules are " +
+              "named by it, so one build holds one package called 'util'")
+end lov_one_name_two_directories
+
+@test("a cycle of path dependencies reads each directory once")
+lov_a_cycle_of_paths()
+    val cache = lov_temp("sysl-lov-cache")
+    val a = lov_temp("sysl-lov-a")
+    val b = lov_temp("sysl-lov-b")
+
+    lov_write(a, "package.hocon", s"package { name = \"a\" }\ndependencies { b { path = \"$b\" } }\n")
+    lov_write(a, "a/a.sysl", "module a\n")
+    lov_write(b, "package.hocon", s"package { name = \"b\" }\ndependencies { a { path = \"$a\" } }\n")
+    lov_write(b, "b/b.sysl", "module b\n")
+
+    val app = lov_package("app", "", s"a { path = \"$a\" }", "app", "")
+
+    val said = lov_graph(app, cache) match
+        Err(why) -> why
+        Ok(g) -> lov_selected(g)
+
+    lov_drop([cache, a, b, app])
+    assert_eq(said, "a=path b=path")
+end lov_a_cycle_of_paths
+
+// -- a path dependency standing in for a coordinate ----------------------------------------------------
+
+// The board names the C library by path and the network stack by path; the stack names the C library's
+// coordinate. Nothing is published, so a fetch would fail: the directory has to answer for it -- and
+// the stack is named FIRST, so its claim on the coordinate is read before the board's directory is.
+@test("a path dependency stands in for the coordinate its package.name is the repository of")
+lov_a_path_stands_in_for_a_coordinate()
+    val cache = lov_temp("sysl-lov-cache")
+    val cstd = lov_package("cstd", "", "", "cstd", "")
+    val lwip = lov_package("lwip", "", "cstd { git = \"github.com/e/cstd\", version = \"0.1.0\" }", "lwip", "")
+    val board = lov_package("board", "", s"lwip { path = \"$lwip\" }, cstd { path = \"$cstd\" }", "board", "")
+
+    val said = lov_graph(board, cache) match
+        Err(why) -> why
+        Ok(g) -> s"${lov_selected(g)} | ${lov_imports(g, "lwip")} | ${g.claims.len()} claims"
+
+    lov_drop([cache, cstd, lwip, board])
+    assert_eq(said, "cstd=path lwip=path | cstd->cstd.cstd | 0 claims")
+end lov_a_path_stands_in_for_a_coordinate
+
+// A directory naming itself anything else is not the package, so the coordinate is selected and read
+// from the cache as ever, beside the directory.
+@test("a path dependency with another package.name does not stand in")
+lov_another_name_does_not_stand_in()
+    val cache = lov_temp("sysl-lov-cache")
+    val coordinate = "github.com/e/cstd"
+    val fetched = fetch_directory(cache, coordinate, Release(0, 1, 0, ""))
+
+    lov_write(fetched, "package.hocon", "package { name = \"cstd\", version = \"0.1.0\" }\n")
+    lov_write(fetched, "cstd/cstd.sysl", "module cstd\n")
+
+    val other = lov_package("libc", "", "", "libc", "")
+    val lwip = lov_package("lwip", "", s"cstd { git = \"$coordinate\", version = \"0.1.0\" }", "lwip", "")
+    val board = lov_package("board", "", s"lwip { path = \"$lwip\" }, libc { path = \"$other\" }", "board", "")
+
+    val said = lov_graph(board, cache) match
+        Err(why) -> why
+        Ok(g) -> s"${lov_selected(g)} | ${lov_imports(g, "lwip")}"
+
+    val prefix = canonical_prefix(coordinate)
+
+    lov_drop([cache, other, lwip, board])
+    assert_eq(said, s"$prefix=0.1.0 libc=path lwip=path | cstd->$prefix.cstd")
+end lov_another_name_does_not_stand_in
+
+// -- a directory's C headers reach the C of what depends on it -----------------------------------------
+
+// A package that publishes one header, and a package whose vendored C includes it.
+private lov_headers() -> string
+    val root = lov_package("hdrs", "c { hdrs { export = [\"include\"] } }", "", "hk", "unused_hk() -> int = 0")
+
+    lov_write(root, "include/k.h", "#define K 7\n")
+    root
+end lov_headers
+
+private lov_vlib(deps: string) -> string
+    val root = lov_package("vlib", "c {\n  v {\n    root = \"c\"\n    sources = [\"v.c\"]\n  }\n}\n", deps,
+                           "geom", "extern \"v_value\" c() -> int\n\nvalue() -> int = c()")
+
+    lov_write(root, "c/v.c", "#include <k.h>\nint v_value(void) { return K * 5; }\n")
+    root
+end lov_vlib
+
+private lov_app(deps: string) -> string
+    val root = lov_temp("sysl-lov-app")
+
+    lov_write(root, "package.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n")
+    lov_write(root, "main.sysl", "print(geom.value())")
+    root
+end lov_app
+
+private lov_run(root: string) -> string
+    val out_dir = lov_temp("sysl-lov-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end lov_run
+
+@test("a --lib root standing in for a coordinate publishes its include roots as the package would")
+lov_a_lib_root_publishes_its_headers()
+    if !lov_ready() then return
+
+    val hdrs = lov_headers()
+    val vlib = lov_vlib("hdrs { git = \"github.com/e/hdrs\", version = \"1.0.0\" }")
+    val app = lov_app(s"vlib { path = \"$vlib\" }")
+
+    reset_search_paths()
+    add_lib_root(hdrs)
+
+    val said = lov_run(app)
+
+    reset_search_paths()
+    lov_drop([hdrs, vlib, app])
+    assert_eq(said, "35\n")
+end lov_a_lib_root_publishes_its_headers
+
+@test("a path dependency standing in for a coordinate publishes its include roots")
+lov_a_standing_path_publishes_its_headers()
+    if !lov_ready() then return
+
+    val hdrs = lov_headers()
+    val vlib = lov_vlib("hdrs { git = \"github.com/e/hdrs\", version = \"1.0.0\" }")
+    val app = lov_app(s"vlib { path = \"$vlib\" }, hdrs { path = \"$hdrs\" }")
+    val said = lov_run(app)
+
+    lov_drop([hdrs, vlib, app])
+    assert_eq(said, "35\n")
+end lov_a_standing_path_publishes_its_headers
+
+@test("a nested path dependency publishes its include roots, with no workspace around the three")
+lov_a_nested_path_publishes_its_headers()
+    if !lov_ready() then return
+
+    val hdrs = lov_headers()
+    val vlib = lov_vlib(s"hdrs { path = \"../${lov_last_segment(hdrs)}\" }")
+    val app = lov_app(s"vlib { path = \"$vlib\" }")
+    val said = lov_run(app)
+
+    lov_drop([hdrs, vlib, app])
+    assert_eq(said, "35\n")
+end lov_a_nested_path_publishes_its_headers
+
+// Without the header's package in the graph at all, the include fails -- the check the three above
+// could have failed.
+@test("and with nothing supplying the header the C does not compile")
+lov_no_supplier_no_header()
+    if !lov_ready() then return
+
+    val vlib = lov_vlib("")
+    val app = lov_app(s"vlib { path = \"$vlib\" }")
+    val said = lov_run(app)
+
+    lov_drop([vlib, app])
+    assert(said.starts_with("refused: ") && said.contains("'k.h' file not found"), said)
+end lov_no_supplier_no_header
+
+@test("-v says a tree that took no include roots took none, in words")
+lov_headers_taken_says_none()
+    assert_eq(headers_taken(buf()), "no include roots")
+
+    var two: Buf[string] = buf()
+
+    two.push("-I/a")
+    two.push("-I/b")
+    assert_eq(headers_taken(two), "-I/a -I/b")
+end lov_headers_taken_says_none
+
+// -- build-lib over a graph of directories -----------------------------------------------------------
+
+private lov_checked(lib: string) -> string =
+    build_library_of(lib, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "checked"
+
+@test("build-lib reads a path dependency where it is")
+lov_build_lib_reads_a_path()
+    if !lov_ready() then return
+
+    val geom = lov_package("geom", "", "", "geom", "area(w: int, h: int) -> int = w * h")
+    val lib = lov_package("shapes", "", s"g { path = \"$geom\" }", "shapes", "square(n: int) -> int = geom.area(n, n)")
+    val said = lov_checked(lib)
+
+    lov_drop([geom, lib])
+    assert_eq(said, "checked")
+end lov_build_lib_reads_a_path
+
+@test("build-lib takes a coordinate a --lib root stands in for")
+lov_build_lib_takes_a_stood_in_coordinate()
+    if !lov_ready() then return
+
+    val geom = lov_package("geom", "", "", "geom", "area(w: int, h: int) -> int = w * h")
+    val lib = lov_package("shapes", "", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }", "shapes",
+                          "square(n: int) -> int = geom.area(n, n)")
+
+    reset_search_paths()
+    add_lib_root(geom)
+
+    val said = lov_checked(lib)
+
+    reset_search_paths()
+    lov_drop([geom, lib])
+    assert_eq(said, "checked")
+end lov_build_lib_takes_a_stood_in_coordinate
+
+@test("build-lib refuses a coordinate nothing stands in for, saying what would")
+lov_build_lib_refuses_an_unsupplied_coordinate()
+    if !lov_ready() then return
+
+    val lib = lov_package("shapes", "", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }", "shapes",
+                          "square(n: int) -> int = n * n")
+    val said = lov_checked(lib)
+
+    lov_drop([lib])
+    assert_eq(said, "build-lib compiles the trees it is given and fetches nothing, so github.com/e/geom " +
+              "reaches it through a directory — supply a checkout of it as --lib <dir>, or name one with " +
+              "'path'; either stands in for the coordinate when its package.hocon names it 'geom'")
+end lov_build_lib_refuses_an_unsupplied_coordinate
+
+private lov_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end lov_cli
+
+// The shape kairos has: a binding of libuv nothing on a board turns on. It is pruned before anything
+// is fetched, as under every command that resolves a graph.
+private lov_optional(features: string) -> string =
+    lov_package("kai", s"features { $features }",
+                "uv { git = \"github.com/e/libuv\", version = \"1.0.0\", optional = true }", "kai",
+                "f() -> int = 1")
+
+@test("build-lib prunes an optional dependency no feature turns on")
+lov_build_lib_prunes_an_unselected_optional()
+    if !lov_ready() then return
+
+    val lib = lov_optional("uv = [uv]")
+    val got = lov_cli(["sysl", "build-lib", lib, "--target", "thumbv7em-freestanding"])
+
+    lov_drop([lib])
+    assert_eq(got.1, s"checked $lib")
+    assert_eq(got.0, Fine)
+end lov_build_lib_prunes_an_unselected_optional
+
+@test("build-lib takes the feature flags: default turns the dependency on, and is turned off")
+lov_build_lib_takes_the_feature_flags()
+    if !lov_ready() then return
+
+    val lib = lov_optional("default = [uv]")
+    val on = lov_cli(["sysl", "build-lib", lib])
+    val off = lov_cli(["sysl", "build-lib", lib, "--no-default-features"])
+    val asked = lov_cli(["sysl", "build-lib", lib, "--no-default-features", "--features", "default"])
+
+    lov_drop([lib])
+    assert_eq(on.0, Failed, on.1)
+    assert(on.1.contains("fetches nothing, so github.com/e/libuv reaches it through a directory"), on.1)
+    assert_eq(off.1, s"checked $lib")
+    assert_eq(asked.0, Failed, asked.1)
+end lov_build_lib_takes_the_feature_flags
+
+// A --lib root with another name is not the package, so the coordinate is still refused.
+@test("build-lib refuses a coordinate a --lib root of another name does not stand in for")
+lov_build_lib_refuses_a_root_of_another_name()
+    if !lov_ready() then return
+
+    val other = lov_package("shapes2", "", "", "geom", "area(w: int, h: int) -> int = w * h")
+    val lib = lov_package("shapes", "", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }", "shapes",
+                          "square(n: int) -> int = n * n")
+
+    reset_search_paths()
+    add_lib_root(other)
+
+    val said = lov_checked(lib)
+
+    reset_search_paths()
+    lov_drop([other, lib])
+    assert(said.starts_with("build-lib compiles the trees it is given and fetches nothing"), said)
+end lov_build_lib_refuses_a_root_of_another_name

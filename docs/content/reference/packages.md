@@ -1293,9 +1293,18 @@ selection sees every claim at once and a package two roots share is one copy at 
 root's manifest binds is reachable from your own files as well, which is no more true of a
 dependency's name than it always was of the root's own modules.
 
-`build-lib` is the one command that refuses them instead, and that is not an inconsistency: it
-compiles one tree into an artifact for one machine and does not reach the network, so it has nothing
-to fetch **with**. It says so, and names `--lib` as what to write instead.
+`build-lib` resolves them too, but **only over directories**: it compiles the trees it is handed for
+one machine and does not reach the network, so it has nothing to fetch **with**. A `path` dependency
+is read where it is, and a coordinate is reached through a `--lib` root or a path dependency that
+[stands in](#a-source-root-stands-in-for-the-package-it-is) for it. A coordinate nothing stands in for
+is refused where it would have been fetched — even one already in the cache, which is a tree nobody
+handed over — naming the directory that would answer it:
+
+```text
+build-lib compiles the trees it is given and fetches nothing, so github.com/e/geom reaches it through a
+directory — supply a checkout of it as --lib <dir>, or name one with 'path'; either stands in for the
+coordinate when its package.hocon names it 'geom'
+```
 
 What is still not read is the rest of the manifest. A root's capabilities are the program's to state,
 and they have none of the one-answer-per-program character that makes the allocator settle for
@@ -1419,6 +1428,12 @@ dependencies {
   helper { path = "../helper" }
 }
 ```
+
+**A path dependency may name paths of its own**, each read against the manifest that wrote it, so a
+tree of packages checked out side by side builds with no [workspace](#workspaces) around it. A
+directory reached twice is read once; two different directories reached under one name are refused,
+since a package's modules are named by it. A *fetched* package may not name a path: it would be
+relative to a checkout that exists only on the machine that published it.
 
 A third kind names **a member of the workspace the project is in**, by its `package.name`, and is
 resolved to that member's directory ([workspaces](#workspaces)):
@@ -1841,7 +1856,7 @@ graph that somehow did not settle is refused rather than built against whichever
 
 ### Choosing them on the command line
 
-Three flags, and [`run`, `build`, `build-c`, `test` and
+Three flags, and [`run`, `build`, `build-c`, `build-lib`, `test` and
 `deps`](/getting-started/cli/#the-feature-flags) take them, and so does `vendor`:
 
 | | |
@@ -2114,6 +2129,25 @@ it is that package — when its package.hocon names it 'geom'
 ```
 
 A `mount` on the stood-in dependency still renames it for the manifest that wrote one.
+
+**A `path` dependency stands in by the same rule.** A directory any manifest of the graph names, whose
+`package.name` is a coordinate's repository name, is that package wherever the coordinate is named —
+nothing is selected or fetched for it, and every edge naming it reaches the directory. A board
+checked out beside the network stack and the C library both use names the two by `path`, and the
+stack's own `cstd { git = "github.com/you/cstd", version = "0.1.0" }` reads the board's checkout:
+
+```hocon
+dependencies {
+  lwip { path = "../lwip" }
+  cstd { path = "../cstd" }
+}
+```
+
+It is the same decision `--lib` makes, written in the manifest instead of on the command line, and it
+holds for the same reason: the directory was named on purpose, and a graph holding two copies of one
+package — the checkout and the published release — is the outcome nobody wanted. A `--lib` root that
+stands in for the coordinate as well wins, being the later and more explicit of the two. A directory
+naming itself anything else is not the package, and the coordinate is fetched as ever beside it.
 
 ## `sysl.sum`
 
@@ -2630,6 +2664,13 @@ c {
   headers { export = ["include"] }
 }
 ```
+
+**However the package arrived, it publishes the same roots**: fetched by its coordinate, read from a
+`path`, or a `--lib` root [standing in](#a-source-root-stands-in-for-the-package-it-is) for the
+coordinate. A checkout handed over with `--lib` is that package to the C of everything depending on it,
+and the roots of what the checkout itself depends on reach its own C, as they would a fetched copy's.
+`sysl build -v` says what each tree took — `c headers: '<tree>' takes -I… from 2 packages it depends
+on`, or `takes no include roots` where nothing it depends on publishes any.
 
 ### A consumer's own configuration header
 

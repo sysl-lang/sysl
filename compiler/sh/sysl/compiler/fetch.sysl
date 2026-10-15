@@ -64,6 +64,8 @@ fetch_directory(cache: string, coordinate: string, version: Release) -> string =
 // line at all, and so was never checked afterwards. Whether the line is *new* is the caller's
 // question, and it can only be answered against the sums it holds.
 fetch_ensure(dep: &Dependency, sums: &Sums, cache: string) -> Result[Fetched, string]
+    if fetches_refused && is_git_dependency(dep) then return Err(not_fetched_here(dep))
+
     dep.origin match
         // Nothing to fetch and nothing to check: no entry is kept for a directory that is expected
         // to change under you, which is the whole point of developing a package beside its consumer.
@@ -85,6 +87,23 @@ fetch_ensure(dep: &Dependency, sums: &Sums, cache: string) -> Result[Fetched, st
             else
                 Ok(Fetched(dir, Some(clone_at_tag(dep, coordinate, version, dir, sums)?)))
 end fetch_ensure
+
+// **Whether the command running reaches the network at all**, which `build-lib` does not: it compiles
+// the trees it is handed, so a coordinate no directory stands in for is refused where it would have
+// been fetched -- and a copy already in the cache is refused too, being a tree nobody handed it.
+// Module storage, set and cleared around the one compilation it governs, for the reason the feature
+// request is (`features.sysl`).
+private var fetches_refused: bool = false
+
+refuse_fetches(on: bool) = fetches_refused = on
+
+private not_fetched_here(dep: &Dependency) -> string
+    val coordinate = dependency_coordinate(dep).unwrap_or(dep.label)
+
+    s"build-lib compiles the trees it is given and fetches nothing, so $coordinate reaches it through " +
+        s"a directory — supply a checkout of it as --lib <dir>, or name one with 'path'; either stands " +
+        s"in for the coordinate when its $ManifestName names it '${repository_name(coordinate)}'"
+end not_fetched_here
 
 // A cache entry checked against `sysl.sum`, by way of the hash recorded when it was written.
 //
