@@ -1315,6 +1315,44 @@ Box(v: "in")
 3
 ```
 
+**A type's own `debug` is untouched by the supplied one.** A field, a variant or a member named
+`debug` keeps the name on the type, and `%?`, `debug(x)` and a `T: Debug` bound still reach the
+supplied rendering:
+
+```sysl
+struct Options
+    title: string
+    debug: bool
+
+impl Options
+    describe(self) -> string = if self.debug then "verbose" else "quiet"
+
+var o = Options("run", false)
+o.debug = true
+print(o.debug, o.describe())
+print(f"${o}%?")
+```
+
+```output
+true verbose
+Options(title: "run", debug: true)
+```
+
+An `impl Debug` *written* for such a type is refused, as any trait's member is that shares a field's
+name:
+
+```sysl
+struct Flags
+    debug: bool
+
+impl Debug for Flags
+    debug(self, out: *Writer, fmt: FormatSpec) = display_pad("Flags".bytes, out, fmt)
+```
+
+```error
+type 'Flags' has both a field and a member named 'debug'
+```
+
 ### What is shown by rule
 
 A few values have no block that could be written for them, and are shown by the compiler's own rule:

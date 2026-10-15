@@ -1,0 +1,104 @@
+module sh.sysl.compiler
+@tests
+
+// A type's own `debug` -- a field, a variant or a member -- and the `Debug` the compiler supplies for
+// every type (`reference/traits.md § Every type has a Debug`). The supplied member steps aside: on
+// the type, `o.debug` is the type's own, while `%?`, `debug(x)` and a `T: Debug` bound still reach
+// the supplied rendering. A `Debug` somebody wrote collides with a field as any trait's member does.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds, links and runs a program, and
+// `xvr_ir` answers a program's report.
+
+private dbm_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private dbm_options() -> string = raw"""
+    struct Options
+        title: string
+        debug: bool
+
+    """
+
+@test("a field named debug is read and written on the type")
+dbm_field_read_written()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran(dbm_options() + "var o = Options(\"t\", false)\nprint(o.debug)\n" +
+                      "o.debug = true\nprint(o.debug)\n"),
+              "false\ntrue\n")
+
+@test("a string field named debug read through a module val")
+dbm_module_val_string_field()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran("struct Flags\n    debug: string\nval f = Flags(\"off\")\nprint(f.debug)\n"),
+              "off\n")
+
+@test("%? and debug(x) of a struct with a debug field still show every field")
+dbm_field_shown()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran(dbm_options() + "val o = Options(\"t\", true)\nprint(f\"${o}%?\")\n" +
+                      "print(debug(o))\nprint(o)\n"),
+              "Options(title: \"t\", debug: true)\nOptions(title: \"t\", debug: true)\n" +
+              "Options(title: \"t\", debug: true)\n")
+
+@test("an inherent debug() wins on the type, and %? still shows the supplied rendering")
+dbm_inherent_method()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran("struct P\n    n: int\nimpl P\n    debug(self) -> string = \"mine\"\n" +
+                      "val p = P(1)\nprint(p.debug())\nprint(f\"${p}%?\")\nprint(debug(p))\n"),
+              "mine\nP(n: 1)\nP(n: 1)\n")
+
+@test("a debug() declared in the struct's own body wins on the type too")
+dbm_body_method()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran("struct P\n    n: int\n    debug(self) -> int = self.n * 10\n" +
+                      "val p = P(4)\nprint(p.debug())\nprint(f\"${p}%?\")\n"),
+              "40\nP(n: 4)\n")
+
+@test("a generic over T: Debug reaches the supplied Debug of a type with a debug field")
+dbm_generic_bound()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran(dbm_options() + "show[T: Debug](x: T) = print(f\"${x}%?\")\n" +
+                      "text[T: Debug](x: T) -> string = debug(x)\n" +
+                      "val o = Options(\"g\", false)\nshow(o)\nprint(text(o))\nshow([o])\n"),
+              "Options(title: \"g\", debug: false)\nOptions(title: \"g\", debug: false)\n" +
+              "[Options(title: \"g\", debug: false)]\n")
+
+@test("a struct with a debug field nested in another shows through the outer one")
+dbm_nested()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran(dbm_options() + "struct Outer\n    o: Options\n" +
+                      "print(Outer(Options(\"n\", true)))\n"),
+              "Outer(o: Options(title: \"n\", debug: true))\n")
+
+@test("an enum variant named debug, and a payload field named debug")
+dbm_enum_variant()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran("enum Level\n    info\n    debug\nenum Opt\n    On(debug: bool)\n" +
+                      "print(Level.debug)\nprint(f\"${Level.info}%?\")\nprint(On(true))\n"),
+              "Level.debug\nLevel.info\nOpt.On(debug: true)\n")
+
+@test("a written impl Debug on a type with a debug field keeps the collision")
+dbm_written_impl_collides()
+    if xvr_no_library() then return
+
+    val e = xvr_ir([("main.sysl", "struct O\n    debug: bool\nimpl Debug for O\n" +
+                                  "    debug(self, out: *Writer, fmt: FormatSpec) = " +
+                                  "display_pad(\"O\".bytes, out, fmt)\nprint(O(true).debug)\n")])
+
+    assert(e.contains("type 'O' has both a field and a member named 'debug'"), e)
+
+@test("a written impl Debug on a type with no debug field replaces the supplied one")
+dbm_written_impl_plain()
+    if xvr_no_library() then return
+
+    assert_eq(dbm_ran("struct O\n    n: int\nimpl Debug for O\n" +
+                      "    debug(self, out: *Writer, fmt: FormatSpec) = " +
+                      "display_pad(\"O!\".bytes, out, fmt)\nprint(f\"${O(1)}%?\")\n"),
+              "O!\n")
