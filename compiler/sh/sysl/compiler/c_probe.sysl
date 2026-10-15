@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf, byte_sink}
-import sysl.text.{Search, str_builder, StrBuilder, parse_real, from_utf8}
+import sysl.text.{Search, split, str_builder, StrBuilder, parse_real, from_utf8}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text}
 import sysl.process.capture
 
@@ -206,8 +206,9 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
         Ok(made) -> made
 
     val src = join_path(dir, "probe.c")
+    val text = probe_text(unit, consts, plan, types)
 
-    write_text(src, probe_text(unit, consts, plan, types)) match
+    write_text(src, text) match
         Err(_) ->
             remove_dir_all(dir).unwrap_or(())
             return probe_fault(a, unit, where,s"cannot write $src")
@@ -280,7 +281,12 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     if !said.status.ok()
         val complaint = said.err.unwrap_or("")
 
-        return probe_fault(a, unit, where,s"the C compiler refused this file's " +
+        // **Pointed at the entry whose expression clang refused**, not the block's first: a block of
+        // forty constants with one wrong is otherwise a hunt. A refusal no entry owns -- a header
+        // that will not compile -- stays at the first.
+        val blamed = blamed_span(text, complaint, consts, types).unwrap_or(where)
+
+        return probe_fault(a, unit, blamed, s"the C compiler refused this file's " +
             s"${blocks_named(consts, types)}:\n${complaint.trim()}")
 
     val globals = read_globals(said.text)
@@ -527,6 +533,47 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
 
     out.finish()
 end probe_text
+
+// The entry the first error clang reported against the probe itself was written for: the probe's
+// line is read off `probe.c:<line>:` and the marker on that line names the entry. An error inside a
+// header the probe includes names that header rather than `probe.c`, and belongs to no entry.
+blamed_span(text: string, complaint: string, consts: Buf[CConstDecl], types: Buf[CTypeDecl]) -> Option[Span]
+    val said = split(complaint, "\n")
+
+    for k in 0..<said.len
+        val line = said[k]
+
+        if line.index_of(" error: ").is_none() then continue
+
+        val at = line.index_of("probe.c:")
+
+        if at.is_none() then continue
+
+        var n: usize = 0
+        var j = at.unwrap() + 8
+
+        while j < line.bytes.len && line.bytes[j] >= u8('0') && line.bytes[j] <= u8('9')
+            n = n * 10 + usize(line.bytes[j] - u8('0'))
+            j += 1
+
+        val lines = split(text, "\n")
+
+        if n == 0 || n > lines.len then return None
+
+        val written = lines[n - 1]
+
+        for i in 0..<consts.len()
+            if written.index_of(s"$ConstMarker$i =").is_some() then return Some(consts.at(i).span)
+
+        for i in 0..<types.len()
+            if (written.index_of(s"$ObjMarker$i;").is_some() || written.index_of(s"$KindMarker$i =").is_some() ||
+                written.index_of(s"$SizeMarker$i =").is_some())
+                return Some(types.at(i).span)
+
+        return None
+
+    None
+end blamed_span
 
 // The `_Generic` association list, and the numbering the answers are read back with. `0` is the
 // `default` arm, which is every type this feature does not resolve.

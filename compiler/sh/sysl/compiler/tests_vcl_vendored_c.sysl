@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
-import sysl.text.{join, replace_all, Search}
+import sysl.text.{join, replace_all, split, Search}
 
 // **A vendored C library, declared in the manifest and compiled from an upstream tree left exactly
 // as it shipped** (`c_libraries.sysl`): a tree with no sysl in it, whose files reach their headers
@@ -655,3 +655,57 @@ vcl_two_libcs()
     assert(built.is_err(), "built")
     assert(failure_text(built.unwrap_err()).contains("both supply the C standard library's headers"),
            failure_text(built.unwrap_err()))
+
+// -- one refused probe, one diagnostic -------------------------------------------------------------
+
+// How many diagnostics a report holds: each begins `error: ` at the start of a line.
+private vcl_errors_in(said: string) -> usize
+    var n: usize = 0
+    val lines = split(said, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("error: ") || lines[i].starts_with("refused: error: ") then n += 1
+
+    n
+end vcl_errors_in
+
+// A module whose block has one entry clang refuses among several, and declarations elsewhere -- an
+// array length, a field, a function -- written in terms of the block's names. The report is the
+// refusal alone, at the entry that failed: line 8, not the block's first entry on line 6.
+private vcl_one_broken(block: string) -> string
+    val app = vcl_app("import cb\n\nprint(cb.total())\n", "")
+
+    vcl_write(app, "package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n")
+    vcl_write(app, "cb/cb.sysl", s"module cb\n\n@include(\"stddef.h\")\n\n$block\n" +
+                                 "struct Holder\n    bytes: [BROKEN]u8\n    size: Size\n\n" +
+                                 "total() -> int = ONE + TWO\n")
+
+    val said = vcl_run(app)
+
+    vcl_drop([app])
+    said
+end vcl_one_broken
+
+@test("a 'c const' entry clang refuses is the one diagnostic, at its own line")
+vcl_broken_const_alone()
+    if !vcl_ready() then return
+
+    val said = vcl_one_broken("c const\n    ONE: int = \"1\"\n    TWO: int = \"2\"\n" +
+                              "    BROKEN: usize = \"sizeof(struct no_such_struct)\"\n    THREE: int = \"3\"\n\n" +
+                              "c type\n    Size = \"size_t\"\n")
+
+    assert_eq(vcl_errors_in(said), 1, said)
+    assert(said.contains("the C compiler refused this file's"), said)
+    assert(said.contains("cb/cb.sysl:8:"), said)
+
+@test("a 'c type' entry clang refuses is the one diagnostic, at its own line")
+vcl_broken_type_alone()
+    if !vcl_ready() then return
+
+    val said = vcl_one_broken("c type\n    Size = \"size_t\"\n    Other = \"int\"\n" +
+                              "    Broken = \"struct no_such_struct\"\n\n" +
+                              "c const\n    ONE: int = \"1\"\n    TWO: int = \"2\"\n    BROKEN: usize = \"4\"\n")
+
+    assert_eq(vcl_errors_in(said), 1, said)
+    assert(said.contains("the C compiler refused this file's"), said)
+    assert(said.contains("cb/cb.sysl:8:"), said)
