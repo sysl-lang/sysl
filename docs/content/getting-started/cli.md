@@ -220,6 +220,7 @@ headers as a build step.
 sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --fail-fast
+sysl test <path> --timeout <seconds>
 sysl test <path> --std
 ```
 
@@ -285,6 +286,17 @@ as a failing entry of its own, named after the hook, alongside whatever the test
 how many are running. `--fail-fast` stops the loop rather than the report: what ran is still
 reported and what never ran is simply absent, because "skipped" would be a third verdict for
 something that is not a verdict.
+
+**Every test has a time limit, so a test that never ends fails rather than hanging the run.**
+`--timeout <seconds>` sets it for each test the run starts — 300 seconds when it is not given, and
+`--timeout 0` for none at all — and a test's own [`@test(timeout: n)`](/reference/attributes/#a-test-may-be-given-a-limit)
+takes its place for that test. A test that outlasts its limit is stopped, together with everything it
+started, and its `FAIL` line reads **`timed out after Ns`**, with whatever it had printed by then
+underneath; the run carries on with the next test. A module's hooks are held to the run's limit.
+
+**A test process does not outlive its run.** Each one watches the runner that started it, and if the
+runner goes — interrupted, killed, its terminal closed — the test ends itself and everything it
+started, so a stopped run leaves nothing behind it still running.
 
 **Exit status is 0 if and only if every test that ran passed.** A tree with no tests at all, and a
 filter that matched none of the tests there are, both exit 0 — neither is a failure, and each says

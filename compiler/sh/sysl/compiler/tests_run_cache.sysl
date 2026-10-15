@@ -20,9 +20,9 @@ a_plain_test_list_round_trips()
     var tests: Buf[TTest] = buf()
 
     tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
-                     None))
+                     None, None))
     tests.push(TTest(module_qualify("m", "two"), "two plus two", false, None, "m/t.sysl", 9,
-                     no_hooks(), None))
+                     no_hooks(), None, Some(45)))
 
     val read = decode_test_list(encode_test_list(tests)).unwrap()
 
@@ -35,6 +35,19 @@ a_plain_test_list_round_trips()
     assert(read.at(0).expected.is_none())
     assert_eq(read.at(1).display, "two plus two")
     assert_eq(read.at(1).line, 9)
+    assert(read.at(0).timeout.is_none())
+    assert_eq(read.at(1).timeout.unwrap(), 45)
+
+// `@test(timeout: 0)` is a test with no limit even where the run has one, and a round trip that read
+// it back as "said nothing" would put the run's limit back on it.
+@test("a test's own timeout of zero is not a test without one")
+tmo_a_zero_timeout_round_trips()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "slow"), "slow", false, None, "m/t.sysl", 4, no_hooks(),
+                     None, Some(0)))
+
+    assert_eq(decode_test_list(encode_test_list(tests)).unwrap().at(0).timeout.unwrap(), 0)
 
 // **The three fields the executable does not carry**, which is the whole reason there is a sidecar at
 // all: whether a test is meant to trap, what it should have printed on its way out, and the hooks a
@@ -51,7 +64,7 @@ a_test_with_hooks_round_trips()
     var tests: Buf[TTest] = buf()
 
     tests.push(TTest(module_qualify("m", "boom"), "boom", true, Some("index 3 is past the end"),
-                     "m/t.sysl", 12, hooks_of(hooks), None))
+                     "m/t.sysl", 12, hooks_of(hooks), None, None))
 
     val read = decode_test_list(encode_test_list(tests)).unwrap()
 
@@ -72,14 +85,14 @@ an_empty_expectation_is_kept()
     var wanting: Buf[TTest] = buf()
 
     wanting.push(TTest(module_qualify("m", "quiet"), "quiet", true, Some(""), "m/t.sysl", 1,
-                       no_hooks(), None))
+                       no_hooks(), None, None))
 
     assert_eq(decode_test_list(encode_test_list(wanting)).unwrap().at(0).expected.unwrap(), "")
 
     var silent: Buf[TTest] = buf()
 
     silent.push(TTest(module_qualify("m", "quiet"), "quiet", true, None, "m/t.sysl", 1, no_hooks(),
-                      None))
+                      None, None))
 
     assert(decode_test_list(encode_test_list(silent)).unwrap().at(0).expected.is_none())
 
@@ -90,9 +103,9 @@ an_ignored_test_round_trips()
     var tests: Buf[TTest] = buf()
 
     tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
-                     None))
+                     None, None))
     tests.push(TTest(module_qualify("m", "waits"), "one that is ignored", false, None, "m/t.sysl",
-                     30, no_hooks(), Some("the parser drops the second arm")))
+                     30, no_hooks(), Some("the parser drops the second arm"), None))
 
     val read = decode_test_list(encode_test_list(tests)).unwrap()
 
@@ -109,14 +122,28 @@ an_older_sidecar_is_no_cache()
     var tests: Buf[TTest] = buf()
 
     tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
-                     None))
+                     None, None))
 
     val line = encode_test_list(tests)
-    // The last three bytes are the two fields `ignore` added: a separator and an empty reason, a
-    // separator and the `0` saying there is none.
-    val older = line[0..<(line.bytes.len - 3)]
+    // The last four bytes are the three fields `ignore` and `timeout` added: a separator and an empty
+    // reason, a separator and the `0` saying there is none, and a separator before an empty timeout.
+    val older = line[0..<(line.bytes.len - 4)]
 
     assert(decode_test_list(line).is_some())
+    assert(decode_test_list(older).is_none())
+
+// The same for a sidecar written before a test could carry its own timeout: one field short, so a
+// rebuild, rather than a suite that has lost every limit it was given.
+@test("a sidecar written before 'timeout' existed is no cache at all")
+tmo_a_sidecar_without_timeouts_is_no_cache()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
+                     None, None))
+
+    val line = encode_test_list(tests)
+    val older = line[0..<(line.bytes.len - 1)]
+
     assert(decode_test_list(older).is_none())
 
 // **A list that will not read is no cache at all**, which is a rebuild rather than a guess at what

@@ -86,9 +86,10 @@ const CacheStale: long = 604800000000
 private const Nul: string = "\0"
 
 // How many separators a well-formed line of the test list has: seven fields for the test, three for
-// each of the four hooks, and two for why it is ignored. A line written before `ignore` existed has
-// two fewer, and reads as no cache rather than as a suite with nothing ignored.
-private const Marks: usize = 20
+// each of the four hooks, two for why it is ignored, and one for its own timeout (empty where it has
+// none). A line written before a field existed is short of it, and reads as no cache rather than as a
+// suite where nothing was ignored or bounded.
+private const Marks: usize = 21
 
 // --- the key --------------------------------------------------------------------------
 
@@ -512,6 +513,11 @@ encode_test_list(tests: Buf[TTest]) -> string
         b.push(t.ignored.unwrap_or(""))
         b.push(Nul)
         b.push(if t.ignored.is_some() then "1" else "0")
+        b.push(Nul)
+
+        t.timeout match
+            Some(n) -> b.push(s"$n")
+            None -> ()
 
     b.finish()
 end encode_test_list
@@ -547,11 +553,12 @@ decode_test_list(text: string) -> Option[Buf[TTest]]
 
         val expected = if f[4] == "1" then Some(f[3]) else None
         val ignored = if f[20] == "1" then Some(f[19]) else None
+        val timeout = if f[21] == "" then None else Some(read_line_number(f[21]))
 
         out.push(TTest(f[0], f[1], f[2] == "true", expected, f[5], read_line_number(f[6]),
                        THooks(hook_from(Setup, f, 7), hook_from(Teardown, f, 10),
                               hook_from(SetupAll, f, 13), hook_from(TeardownAll, f, 16)),
-                       ignored))
+                       ignored, timeout))
 
     Some(out)
 end decode_test_list

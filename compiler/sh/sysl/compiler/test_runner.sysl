@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.process.{capture, Status}
+import sysl.process.{start, Group, Status}
+import sysl.signal.{send, KILL}
 import sysl.text.{from_utf8_unchecked, repeat, split, Search}
 import sysl.time.{monotonic, whole_millis}
 
@@ -26,6 +27,14 @@ import sysl.time.{monotonic, whole_millis}
 // nothing left of the first one. `@setup_all` and `@teardown_all` are their own invocations, so a
 // module reaches its tests from one of them only through what outlives a process. Which part of a run
 // ended it cannot be read from an exit status, so the dispatcher marks each boundary it crosses.
+//
+// **Every process is bounded, so a test that never ends is a failure rather than a hung run.** Each
+// one is started in a process group of its own and given the run's limit (`--timeout`, five minutes
+// unless asked otherwise) or its own (`@test(timeout: n)`); one that outlasts it is stopped, the whole
+// group with it, and reported as timed out with whatever it had printed, and the run goes on to the
+// next test. The other half is the test binary's own: it watches this process, and a runner that dies
+// -- however it dies -- takes every test process and everything they started with it
+// (`testprocess.c`), so nothing is left spinning under `init`.
 
 // What was asked of a run, beyond which tree to run.
 //
@@ -82,8 +91,11 @@ end Outcome
 // once every test has. A suite that takes half an hour is watched from a log file while it runs
 // rather than staying silent until it exits, and a run that is killed partway still has a report of
 // everything up to the kill.
+//
+// `seconds` is the run's limit on each process it starts, zero for none; a test's own
+// `@test(timeout: n)` takes its place for that test, in either direction.
 run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
-             emit: string -> unit) -> Buf[Outcome]
+             emit: string -> unit, seconds: int = DefaultTestSeconds) -> Buf[Outcome]
     var done: Buf[Outcome] = buf()
     var stop = false
     var shown = ""
@@ -115,7 +127,7 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
 
         hooks.setup_all match
             Some(h) ->
-                val r = run_test_hook(exe, h)
+                val r = run_test_hook(exe, h, seconds)
 
                 if r.status != 0
                     val outcome = hook_outcome(h, r)
@@ -135,7 +147,7 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
                 // `@teardown` either, since those bracket a run and there is none.
                 val t = group.at(i)
                 val outcome = if t.ignored.is_some() then Outcome(t, None, "", 0, None)
-                else run_one_test(exe, t)
+                else run_one_test(exe, t, seconds)
 
                 done.push(outcome)
                 show_outcome(outcome, width, &shown, &any_shown, emit)
@@ -147,7 +159,7 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
         // taken some of it.
         hooks.teardown_all match
             Some(h) ->
-                val r = run_test_hook(exe, h)
+                val r = run_test_hook(exe, h, seconds)
 
                 if r.status != 0
                     val outcome = hook_outcome(h, r)
@@ -249,16 +261,12 @@ end index_of_module
 // honouring "teardown runs even when the test failed" any other way would mean not running it at all.
 // What a fresh process can release is what outlives a process, which is what the hook is documented
 // to be for.
-private run_one_test(exe: string, t: TTest) -> Outcome
+private run_one_test(exe: string, t: TTest, run_seconds: int) -> Outcome
     val started = monotonic()
-    var raw = ""
-    var state = NotStarted
-
-    capture(exe, [t.func], "", running_compiler_env().view(), true) match
-        Err(_) -> ()
-        Ok(o) ->
-            raw = o.text + o.err.unwrap_or("")
-            state = shell_status(o.status)
+    val limit = t.timeout.unwrap_or(run_seconds)
+    val ran = run_bounded(exe, t.func, limit)
+    val raw = ran.raw
+    val state = ran.state
 
     val took = whole_millis(monotonic() - started)
     val output = unmarked_output(raw)
@@ -268,17 +276,21 @@ private run_one_test(exe: string, t: TTest) -> Outcome
     // A skip is the mark AND a clean exit: a test that failed before it called `skip` never wrote the
     // mark, and one that wrote it and then died did not skip. Asked first, since a `@setup` that
     // skips leaves no setup mark behind it and is the module saying none of its tests can run here.
-    val skipped = if state == 0 then skip_reason(raw) else None
+    val skipped = if state == 0 && !ran.timed_out then skip_reason(raw) else None
 
     var detail: Option[string] = None
 
     if skipped.is_some()
         ()
     else if !setup_ran
-        detail = Some(guarded_by_setup(t.hooks.setup.unwrap(), state))
+        detail = Some(guarded_by_setup(t.hooks.setup.unwrap(), ending_of(state, ran.timed_out, limit)))
     else if entered_down && state != 0
-        detail = Some(hook_did_not_return(t.hooks.teardown.unwrap(), state) +
+        detail = Some(hook_ended(t.hooks.teardown.unwrap(), ending_of(state, ran.timed_out, limit)) +
             ", after the test returned")
+    else if ran.timed_out
+        // Whatever the test said it would do, it did not get to do it: a `should_trap` test that never
+        // ends has not trapped, and a run that was stopped is not one that returned.
+        detail = Some(timed_out_after(limit))
     else
         detail = test_verdict(t, state, output)
 
@@ -288,35 +300,85 @@ private run_one_test(exe: string, t: TTest) -> Outcome
 
     if t.hooks.teardown.is_some() && !entered_down
         val h = t.hooks.teardown.unwrap()
-        val r = run_test_hook(exe, h)
+        val r = run_test_hook(exe, h, run_seconds)
 
         trailing = r.output
 
-        if r.status != 0 && detail.is_none() then detail = Some(hook_did_not_return(h, r.status))
+        if r.status != 0 && detail.is_none() then detail = Some(hook_ended(h, r.ending))
 
     Outcome(t, detail, output + trailing, took, skipped)
 end run_one_test
 
-// What one hook's own process did.
+// What one hook's own process did. `ending` is how a report says it did not come back, where it did
+// not: an exit status, or the limit it outlasted.
 struct HookRun
     status: int
     output: string
     millis: long
+    ending: string
 end HookRun
 
-private run_test_hook(exe: string, h: THook) -> HookRun
+private run_test_hook(exe: string, h: THook, seconds: int) -> HookRun
     val started = monotonic()
-    var state = NotStarted
-    var output = ""
+    val ran = run_bounded(exe, h.func, seconds)
 
-    capture(exe, [h.func], "", running_compiler_env().view(), true) match
-        Err(_) -> ()
-        Ok(o) ->
-            state = shell_status(o.status)
-            output = unmarked_output(o.text + o.err.unwrap_or(""))
-
-    HookRun(state, output, whole_millis(monotonic() - started))
+    HookRun(ran.state, unmarked_output(ran.raw), whole_millis(monotonic() - started),
+            ending_of(ran.state, ran.timed_out, seconds))
 end run_test_hook
+
+// What one run of the test binary came to: the status a shell would report, everything it printed on
+// either stream, and whether it was stopped for outlasting its limit -- which a status cannot say,
+// since a program may exit with any number it likes.
+struct BoundedRun
+    state: int
+    raw: string
+    timed_out: bool
+end BoundedRun
+
+// One entry point of the test binary, run in a **process group of its own** and stopped once it has
+// run for `seconds` (never, for zero).
+//
+// The group is what makes stopping it mean stopping everything it started. The library stops the
+// process it was asked to run; a test that started a server, or a compiler that started a linker, has
+// children of its own, and those are in the group -- so the group is ended too, once the test is. A
+// test that returned is left alone: what it leaves running is its own business, and the runner's
+// part is only the limit it set. Output goes to files rather than pipes (`sysl.process`), so what a
+// stopped test printed before it was stopped is all still there to show.
+private run_bounded(exe: string, name: string, seconds: int) -> BoundedRun
+    var state = NotStarted
+    var raw = ""
+    var timed_out = false
+
+    start(exe, [name], "", running_compiler_env().view(), true, seconds * 1000, group = Group.New) match
+        Err(_) -> ()
+        Ok(child) ->
+            val gid = child.group()
+
+            child.wait() match
+                Err(_) -> ()
+                Ok(o) ->
+                    raw = o.text + o.err.unwrap_or("")
+                    state = shell_status(o.status)
+
+                    o.status match
+                        TimedOut -> timed_out = true
+                        _ -> ()
+
+            if timed_out then send(-i64(gid), KILL)
+
+    BoundedRun(state, raw, timed_out)
+end run_bounded
+
+// The run's limit where a run is not given one: long enough that no real test comes near it, short
+// enough that a test that will never end costs a run five minutes rather than the rest of the night.
+const DefaultTestSeconds: int = 300
+
+// A run that was stopped for taking too long, as its report row says it.
+timed_out_after(seconds: int) -> string = s"timed out after ${seconds}s"
+
+// How a process that did not come back ended, as a report says it.
+private ending_of(state: int, timed_out: bool, seconds: int) -> string =
+    if timed_out then timed_out_after(seconds) else s"did not return — exit status $state"
 
 // What a run reports where the binary could not be started at all. It is not a status any child left
 // behind -- a process that never ran left none -- and the number is the shell's own word for a command
@@ -329,15 +391,15 @@ const NotStarted: int = 127
 // a file and a line, and a hook has all three. It is shown under the name it was declared with, which
 // is what a reader greps for.
 private hook_outcome(h: THook, r: HookRun) -> Outcome =
-    Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks(), None),
-            Some(hook_did_not_return(h, r.status)), r.output, r.millis, None)
+    Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks(), None, None),
+            Some(hook_ended(h, r.ending)), r.output, r.millis, None)
 
-private hook_did_not_return(h: THook, state: int) -> string =
-    s"the module's '@${hook_word(h.kind)}', '${qualified_name(h.func)}', did not return — " +
-        s"exit status $state"
+// A hook that did not come back, and how (`ending_of`).
+private hook_ended(h: THook, ending: string) -> string =
+    s"the module's '@${hook_word(h.kind)}', '${qualified_name(h.func)}', $ending"
 
-private guarded_by_setup(h: THook, state: int) -> string =
-    s"${hook_did_not_return(h, state)}, so this test did not run"
+private guarded_by_setup(h: THook, ending: string) -> string =
+    s"${hook_ended(h, ending)}, so this test did not run"
 
 // Whether a test's run was what the test said it would be, and if not, what it was instead.
 //

@@ -486,7 +486,7 @@ print(add(2, 3))
 That program prints `5` and runs neither test, which is the whole of the arrangement: `sysl run`
 builds the program, and the tests are for `sysl test`.
 
-Five forms of the annotation:
+Six forms of the annotation:
 
 | written | means |
 |---|---|
@@ -494,12 +494,13 @@ Five forms of the annotation:
 | `@test("a sentence")` | named by the sentence instead |
 | `@test(should_trap)` | the test **passes** by stopping the program |
 | `@test(should_trap: "past the end")` | …and the run must have printed that text |
+| `@test(timeout: 30)` | the test may run for 30 seconds, whatever the run's own limit |
 | `@test(ignore: "why")` | the test is compiled and checked, and **not run** |
 
 They compose, in the order the table gives them — `@test("a sentence", should_trap: "past the end",
-ignore: "why")` is one annotation.
+timeout: 30, ignore: "why")` is one annotation.
 
-**Five, and `@test()` is not a sixth.** An empty argument list would mean what bare `@test` means, and
+**Six, and `@test()` is not a seventh.** An empty argument list would mean what bare `@test` means, and
 it is refused rather than accepted as a synonym: it is not a shorter way of saying nothing, it reads
 as a description that was going to be there and got lost, and a reader who saw it accepted could not
 tell which.
@@ -607,6 +608,47 @@ keeps_both_arms()
 
 Ignoring is something a *test* is, so there is no `@ignore` of its own; written above a function it
 is answered with the spelling above.
+
+### A test may be given a limit
+
+Every test `sysl test` runs has a time limit — [the run's](/getting-started/cli/#test), 300 seconds
+unless `--timeout` says otherwise — and a test that outlasts it **fails**, reading `timed out after
+Ns`, rather than holding up every test after it. `timeout` gives one test a limit of its own, in whole
+seconds, in place of the run's: longer for a test that is slow on purpose, shorter for one whose whole
+point is that it finishes quickly, and `0` for none at all.
+
+```sysl
+import sysl.time.{sleep, millis}
+
+@test(timeout: 2)
+answers_promptly()
+    sleep(millis(10))
+
+@test("a soak that is meant to take a while", timeout: 0)
+soaks()
+    sleep(millis(10))
+
+print("built")
+```
+
+```output
+built
+```
+
+**The test's own limit beats the run's in both directions**, `--timeout 0` included: a run that asked
+for no limit still stops a test that said `timeout: 5`, because the test is the one that knows. The
+limit is a whole number of seconds from `0` to `2147483`, the most milliseconds an `int` counts, and
+anything else is refused where it is written:
+
+```sysl
+@test(timeout: 1.5)
+answers_promptly()
+    assert(true, "prompt")
+```
+
+```error
+'timeout' needs the seconds the test may run, written as a whole number from 0 to 2147483 — '@test(timeout: 30)'; 0 is no limit at all
+```
 
 ### A test may find out that it cannot run
 
@@ -919,6 +961,7 @@ ordinary code that ships, and is a different thing from a file of scaffolding in
 sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --fail-fast
+sysl test <path> --timeout <seconds>
 ```
 
 **One build, one process per test.** The tree is compiled once, into a binary whose entry point takes
@@ -936,6 +979,14 @@ it. The compile is the slow half, and there is only ever one of it.
 
 Exit status is 0 if and only if every test that ran passed. A tree with no tests, and a filter that
 matched none of the tests there are, both exit 0 and say which happened.
+
+**A process that does not come back in time is stopped, and the run goes on.** Each test's process
+is started in a process group of its own and given its limit ([`timeout`](#a-test-may-be-given-a-limit),
+or the run's `--timeout`, 300 seconds by default); past it, the process and everything it started are
+ended, the row reads `timed out after Ns` with what the test had printed underneath — a test's output
+is written a line at a time, so a stopped test still has it — and the next test starts. In the other
+direction, a test process watches the runner that started it and ends itself and its group once the
+runner is gone, so a run stopped by hand, or killed outright, leaves nothing running behind it.
 
 **An ignored test is reported, never left out.** It starts no process — not its own, and not its
 module's `@setup` or `@teardown` — and its row says why in place of a time. The summary counts it,
