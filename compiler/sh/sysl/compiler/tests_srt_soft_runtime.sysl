@@ -2,8 +2,11 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
-import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.math.Bits
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{split, Search}
 
 // **The arithmetic a 32-bit machine calls out for is the program's own**: 64-bit division
 // (`sysl.softint`) and binary64 on a machine with no double-precision unit (`sysl.softfloat.binary64`).
@@ -53,12 +56,22 @@ private val SrtCells: string = raw"""
         w.write(" ".bytes)
 
     show_flag(w: *Writer, x: bool) = w.write((if x then "1 " else "0 ").bytes)
+
+    /** The `f32` `bits` encodes, as nothing could fold. */
+    hidden_single(bits: u32) -> f32
+        cell.v = u64(bits)
+        f32.from_bits(u32(cell.v))
+
+    /** An `f32`'s encoding and a space, or `nan`. */
+    show_single(w: *Writer, x: f32)
+        if x != x then w.write("nan".bytes) else u64(x.bits()).display(w, FormatSpec(0, -1, false))
+        w.write(" ".bytes)
     """
 
 private srt_program(b: QemuBoard, body: string) -> Buf[(string, string)]
     var files: Buf[(string, string)] = buf()
 
-    files.push(("p.sysl", "import board.*\n\nval w = console()\n\n" + body))
+    files.push(("p.sysl", "import board.*\nimport sysl.math.Bits\n\nval w = console()\n\n" + body))
     files.push(("board/board.sysl", qemu_board_module(b, SrtCells)))
     files
 end srt_program
@@ -161,10 +174,8 @@ private srt_shown(x: real) -> string = if x != x then "nan " else s"${x.bits()} 
 
 private srt_flag(x: bool) -> string = if x then "1 " else "0 "
 
-// The boards whose machine has no double-precision unit, which is every one of them; the Armv6-M
-// board is left out because its support file is what supplies a 64-bit multiply and shift there, and
-// that is a different test's subject.
-private srt_binary64_board(b: QemuBoard) -> bool = b.name != "microbit"
+// Every board's machine has no double-precision unit -- the Armv6-M one included, whose 64-bit
+// multiply, shift and leading-zero count are the program's own too -- so these run on all of them.
 
 @test("multiplies, divides, adds, compares and narrows doubles exactly as the host's double unit")
 srt_binary64_agrees_with_the_host()
@@ -194,7 +205,7 @@ srt_binary64_agrees_with_the_host()
         body = body + s"show(w, real(f32(hidden(${SrtOperands[i]}))))\n"
         want = want + srt_shown(real(f32(real.from_bits(SrtOperands[i]))))
 
-    srt_sweep(srt_binary64_board, body, want)
+    srt_sweep(srt_every, body, want)
 end srt_binary64_agrees_with_the_host
 
 // Each conversion between a double and an integer, and between an `f32` and a 64-bit integer -- which
@@ -238,8 +249,103 @@ srt_conversions_agree_with_the_host()
                    s"show_ulong(w, u64(hidden($bits)))\n"
             want = want + s"${long(uint(x))} ${u64(x)} "
 
-    srt_sweep(srt_binary64_board, body, want)
+    srt_sweep(srt_every, body, want)
 end srt_conversions_agree_with_the_host
+
+// -- what an Armv6-M core lacks ----------------------------------------------------------------------
+
+// 32-bit division, a 64-bit multiply and variable shift, and a leading-zero count: instructions on
+// every board but the micro:bit, whose core calls `sysl.softint` for each -- so the same answers from
+// all of them are the host's instructions and the routines agreeing.
+@test("divides ints, multiplies and shifts longs, and counts leading zeros as the host does")
+srt_core_integer_operations_agree_with_the_host()
+    val pairs: []const (long, long) = [(0, 7), (7, 1), (-7, 2), (7, -2), (-7, -2), (2147483647, 10),
+                                       (-2147483647, 3), (-2147483647, 2147483647), (123456789, -9876)]
+    val wide: []const u64 = [0, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0xFFFF_FFFF_FFFF_FFFF,
+                             0x8000_0000_0000_0001, 0x0123_4567_89AB_CDEF]
+    val counts: []const long = [0, 1, 31, 32, 33, 63]
+    var body = ""
+    var want = ""
+
+    for p in pairs
+        body = body + s"show_long(w, long(int(hidden_long(${p.0})) / int(hidden_long(${p.1}))))\n" +
+               s"show_long(w, long(int(hidden_long(${p.0})) % int(hidden_long(${p.1}))))\n"
+        want = want + s"${long(int(p.0) / int(p.1))} ${long(int(p.0) % int(p.1))} "
+
+        if p.0 >= 0 && p.1 > 0
+            body = body + s"show_long(w, long(u32(hidden_long(${p.0})) / u32(hidden_long(${p.1}))))\n" +
+                   s"show_long(w, long(u32(hidden_long(${p.0})) % u32(hidden_long(${p.1}))))\n"
+            want = want + s"${long(u32(p.0) / u32(p.1))} ${long(u32(p.0) % u32(p.1))} "
+
+    for i in 0..<wide.len
+        val a = wide[i]
+        val b = wide[(i + 3) % wide.len]
+
+        body = body + s"show_ulong(w, hidden_ulong($a) * hidden_ulong($b))\n" +
+               s"show_long(w, long(u32(hidden_ulong($a)).leading_zeros()))\n"
+        want = want + s"${a * b} ${long(u32(a).leading_zeros())} "
+
+        for n in counts
+            body = body + s"show_ulong(w, hidden_ulong($a) << hidden_long($n))\n" +
+                   s"show_ulong(w, hidden_ulong($a) >> hidden_long($n))\n" +
+                   s"show_long(w, i64(hidden_ulong($a)) >> hidden_long($n))\n"
+            want = want + s"${a << n} ${a >> n} ${i64(a) >> n} "
+
+    srt_sweep(srt_every, body, want)
+end srt_core_integer_operations_agree_with_the_host
+
+// -- binary32 ----------------------------------------------------------------------------------------
+
+// The `f32` operands, as encodings: ordinary values, values whose results round, the largest finite
+// value, a subnormal, both zeros, an infinity, and 1 with 2^-24, half way to the next float.
+private val SrtSingles: []const u32 = [0x3F80_0000, 0x4040_0000, 0x3DCC_CCCD, 0x3E4C_CCCD, 0x7F7F_FFFF,
+                                       0x0000_0003, 0x8000_0000, 0x0000_0000, 0x7F80_0000, 0xC2F6_E979,
+                                       0x3380_0000, 0x0080_0000]
+
+private srt_single_shown(x: f32) -> string = if x != x then "nan " else s"${u64(x.bits())} "
+
+// An `f32` computed on a core with no floating-point unit -- the micro:bit's, the Cortex-M3's, and
+// RISC-V with no `F` -- is a call per operation; on the others it is an instruction. Both must answer
+// what the host's float unit does, bit for bit.
+@test("adds, multiplies, divides and converts f32 exactly as the host's float unit")
+srt_binary32_agrees_with_the_host()
+    var body = ""
+    var want = ""
+
+    for i in 0..<SrtSingles.len
+        val steps: []const usize = [0, 1, 5, 10]
+
+        for j in steps
+            val ab = SrtSingles[i]
+            val bb = SrtSingles[(i + j) % SrtSingles.len]
+            val a = f32.from_bits(ab)
+            val b = f32.from_bits(bb)
+            val pa = s"hidden_single($ab)"
+            val pb = s"hidden_single($bb)"
+
+            body = body + s"show_single(w, $pa * $pb)\nshow_single(w, $pa / $pb)\n" +
+                   s"show_single(w, $pa + $pb)\nshow_single(w, $pa - $pb)\nshow_flag(w, $pa < $pb)\n"
+            want = want + srt_single_shown(a * b) + srt_single_shown(a / b) + srt_single_shown(a + b) +
+                   srt_single_shown(a - b) + srt_flag(a < b)
+
+        val x = f32.from_bits(SrtSingles[i])
+
+        body = body + s"show_long(w, long(int(hidden_single(${SrtSingles[i]}))))\n" +
+               s"show_long(w, long(uint(hidden_single(${SrtSingles[i]}))))\n"
+        want = want + s"${long(int(x))} ${long(uint(x))} "
+
+    val ints: []const long = [0, -1, 16777217, -2147483647, 2147483647, 123456789]
+
+    for n in ints
+        body = body + s"show_single(w, f32(int(hidden_long($n))))\n"
+        want = want + srt_single_shown(f32(int(n)))
+
+        if n >= 0
+            body = body + s"show_single(w, f32(uint(hidden_long($n))))\n"
+            want = want + srt_single_shown(f32(uint(n)))
+
+    srt_sweep(srt_every, body, want)
+end srt_binary32_agrees_with_the_host
 
 // -- what is left out --------------------------------------------------------------------------------
 
@@ -301,6 +407,157 @@ srt_double_unit_keeps_the_runtime_only_for_conversions()
 
     assert(single.contains("__aeabi_dmul"), single)
 end srt_double_unit_keeps_the_runtime_only_for_conversions
+
+// **An Armv6-M build keeps the integer runtime whatever it computes**, because LLVM calls it for a
+// struct copied or a constant divided; a core with a divider keeps it only where a `long` is divided.
+@test("a core with no divider carries the integer runtime in every build, and no other core does")
+srt_core_without_a_divider_keeps_the_integer_runtime()
+    val src = raw"""
+        @export("main")
+        probe(x: int) -> int = x * 3 + x
+        """
+    val v6m = srt_emitted("thumbv6m-freestanding", src)
+
+    assert(v6m.contains("@__aeabi_uidiv") && v6m.contains("@__aeabi_lmul") &&
+           v6m.contains("@__clzsi2") && v6m.contains("__aeabi_uidivmod:") &&
+           v6m.contains("@__udivmoddi4") && !v6m.contains("__aeabi_dmul"), v6m)
+
+    for target in ["thumbv7m-freestanding", "thumbv7em-freestanding", "thumb-freestanding"]
+        val other = srt_emitted(target, src)
+
+        assert(!other.contains("__aeabi_uidiv") && !other.contains("__aeabi_lmul") &&
+               !other.contains("__udivmoddi4"), s"$target: $other")
+end srt_core_without_a_divider_keeps_the_integer_runtime
+
+// -- the block operations ----------------------------------------------------------------------------
+
+// A copy large enough that LLVM calls `__aeabi_memcpy4` or `8` for it on every Thumb core, rather than
+// unrolling it into loads and stores.
+private val SrtBigCopy: string = raw"""
+    struct Big
+        v: [48]u64
+
+    var first: Big = Big([0; 48])
+    var second: Big = Big([0; 48])
+
+    """
+
+// **Every Thumb core calls the run-time ABI's block operations**, so every Thumb build carries them;
+// no other machine has the names.
+@test("every Thumb build carries the __aeabi_mem* family, and no other machine's does")
+srt_every_thumb_build_carries_the_block_operations()
+    val src = raw"""
+        @export("main")
+        probe(x: int) -> int = x * 3 + x
+        """
+
+    for target in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                   "thumb-freestanding"]
+        val text = srt_emitted(target, src)
+
+        assert(text.contains("__aeabi_memcpy4:") && text.contains("__aeabi_memset:") &&
+               text.contains("__aeabi_memclr8:"), s"$target: $text")
+
+    val riscv = srt_emitted("riscv32-freestanding", src)
+
+    assert(!riscv.contains("__aeabi_mem"), riscv)
+end srt_every_thumb_build_carries_the_block_operations
+
+// The object a large struct copy compiles to on an Armv7-M core leaves only C's `memcpy` and `memset`
+// undefined: the `__aeabi_memcpy4` its copy calls is the program's own.
+@test("a large struct copy on Armv7-M leaves only memcpy and memset undefined")
+srt_struct_copy_needs_only_memcpy_and_memset()
+    val nm = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+    if !is_file(nm) then skip(s"there is no llvm-nm at $nm to read the object")
+
+    for name in ["thumbv7em-freestanding", "thumbv7m-freestanding"]
+        val t = target_named(name).unwrap()
+
+        val cc = find_backend_clang(t) match
+            Ok(c) -> c
+            Err(why) ->
+                skip(why)
+                return
+
+        val text = srt_emitted(name, SrtBigCopy + raw"""
+            @export("copy_probe")
+            probe(x: u64) -> u64
+                first.v[3] = x
+                second = first
+                second.v[3] + second.v[40]
+            """)
+        val dir = make_temp_dir("sysl-srt").unwrap()
+        val obj = s"$dir/probe.o"
+
+        compile_object(cc, text, obj, t, DefaultOptimization) match
+            Err(why) ->
+                assert(false, s"$name: $why\n$text")
+                return
+            Ok(_) -> ()
+
+        val all = capture(nm, [obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+        val undefined = capture(nm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+        val lines = split(undefined, "\n")
+
+        assert(all.contains("W __aeabi_memcpy4") && all.contains("W __aeabi_memclr8"), s"$name: $all")
+
+        for i in 0..<lines.len
+            val line = lines[i].trim()
+
+            assert(line == "" || line == "U memcpy" || line == "U memset", s"$name undefined: $undefined")
+
+        remove_dir_all(dir).unwrap_or(())
+end srt_struct_copy_needs_only_memcpy_and_memset
+
+// The same copy run on every board: the Thumb ones resolve its `__aeabi_memcpy` to the program's own,
+// with nothing from the board but `memcpy`.
+@test("a large struct copy runs on every board, its block copy the program's own")
+srt_struct_copy_runs_everywhere()
+    val body = SrtBigCopy + raw"""
+        for i in 0..<48
+            first.v[i] = hidden_ulong(u64(i) * 3 + 1)
+
+        second = first
+        first.v[47] = 0
+
+        var sum: u64 = 0
+
+        for i in 0..<48
+            sum += second.v[i]
+
+        show_ulong(w, sum)
+        show_ulong(w, first.v[47])
+        """
+
+    // 48 terms of 3i + 1: 3 * (47 * 48 / 2) + 48.
+    srt_sweep(srt_every, body, "3432 0 ")
+end srt_struct_copy_runs_everywhere
+
+// **A core with no floating-point unit keeps the binary32 routines where a reached body computes
+// with an `f32`**; a core with any unit computes with one itself and keeps nothing for it.
+@test("an f32 keeps the float runtime only on a core with no floating-point unit")
+srt_single_keeps_the_runtime_only_without_a_unit()
+    val src = raw"""
+        @export("main")
+        probe(x: f32) -> f32 = x * 3.0
+        """
+
+    for target in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding-soft"]
+        val soft = srt_emitted(target, src)
+
+        assert(soft.contains("@__aeabi_fmul") && soft.contains("@__aeabi_fadd"), s"$target: $soft")
+
+    val riscv = srt_emitted("riscv32-freestanding", src)
+
+    assert(riscv.contains("@__mulsf3") && riscv.contains("@__fixsfsi"), riscv)
+
+    for target in ["thumbv7em-freestanding", "thumb-freestanding-softfp", "thumbv7em-freestanding-dp"]
+        val unit = srt_emitted(target, src)
+
+        assert(unit.contains("fmul float") && !unit.contains("__aeabi_fmul") &&
+               !unit.contains("__aeabi_dmul"), s"$target: $unit")
+end srt_single_keeps_the_runtime_only_without_a_unit
 
 // The LLVM text a one-file program emits for `target`.
 private srt_emitted(target: string, src: string) -> string
