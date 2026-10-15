@@ -2722,6 +2722,14 @@ print(send(c))
 '&Cell' and '&sync Cell' are distinct types, and neither converts to the other: a count is atomic or it is not from the moment the object is allocated, and a conversion would put an ordinary retain beside an atomic one. Allocate Cell as a '&sync Cell' where it is constructed
 ```
 
+Taking a share of a `&sync T` is a relaxed increment, since a count you already hold cannot reach
+zero underneath you. Giving one back is a decrement with release ordering, and the share that takes
+the count to zero acquires before destroying the object, so the thread that frees it sees every
+other thread's writes to it. The acquire is a `fence acquire` — except in a build whose
+`SYSL_EXTRA_CFLAGS` ask for `-fsanitize=thread`, where it is an acquire load of the count instead.
+The two order the same things, but ThreadSanitizer does not model a standalone fence, and with it
+every `&sync` object freed on another thread than its last user's would be reported as a race.
+
 A conversion would put an ordinary retain beside an atomic one, so the count is atomic or it is not
 from the moment the object exists. **`&sync T` makes the *reference* safe to share, not the object
 safe to mutate** — that still wants a `Mutex`.

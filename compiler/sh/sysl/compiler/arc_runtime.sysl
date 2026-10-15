@@ -229,8 +229,18 @@ arc_weak(t: Target) -> string
 end arc_weak
 
 // The atomic pair, emitted only into a module that has a `&sync` in it.
-arc_atomic(t: Target) -> string
+//
+// **Under ThreadSanitizer the acquire before the free is a load of the count, not a fence.** TSan
+// models orderings through the memory they are attached to and does not model a standalone `fence`,
+// so with the fence every `&sync` object freed on another thread than the one that last wrote it is
+// reported as a race that cannot happen. An acquire load of the count the release just decremented
+// synchronizes with every earlier release of it exactly as the fence does -- it is a little dearer,
+// which is why only a thread-sanitized build pays it. Rust's `Arc` makes the same exchange.
+arc_atomic(t: Target, tsan: bool = thread_sanitized(extra_cflags())) -> string
     val word = word_llvm(t)
+    var acquire = "  fence acquire\n"
+
+    if tsan then acquire = s"  %a = load atomic $word, ptr %p acquire, align ${t.pointer_bits() / 8}\n"
 
     "define private void @arc.retain_sync(ptr %p) {\n" +
     "entry:\n" +
@@ -252,7 +262,7 @@ arc_atomic(t: Target) -> string
     s"  %z = icmp eq $word %o, 1\n" +
     "  br i1 %z, label %reap, label %live\n" +
     "reap:\n" +
-    "  fence acquire\n" +
+    acquire +
     "  call void @arc.reap(ptr %p)\n" +
     "  ret void\n" +
     "live:\n" +
