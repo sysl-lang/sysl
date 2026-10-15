@@ -358,7 +358,7 @@ below.
 **C state that points into itself is declared `@pinned`.** A library handed the address of its state
 — littlefs's `lfs_t`, which keeps a pointer to its configuration and a list of open files threaded
 through itself — goes on writing through that address after the call returns, so the struct sysl
-lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct--a-value-c-holds-pointers-into),
+lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a-value-c-holds-pointers-into),
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 

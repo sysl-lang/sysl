@@ -3039,7 +3039,7 @@ is `@relocates`, since that member moves its elements — which is why `Buf[Fs]`
 
 A `drop` is the one member taking `self` that a pinned struct may have: it is handed the value as the
 value is destroyed. And `@pinned` marks a struct beside `@packed`, `@align(n)` and `@export(...)`;
-above a function it is still the per-core promise of [`@per_cpu`](#per_cpu--one-copy-per-processor-core).
+above a function it is still the per-core promise of [`@per_cpu`](#per-cpu-one-copy-per-processor-core).
 
 ## `@section("...")` — where a symbol lands
 
