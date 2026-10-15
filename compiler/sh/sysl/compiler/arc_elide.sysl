@@ -82,7 +82,7 @@ end unescaped_slots
 
 // Every operand of `inst` an address could escape through: all of them, except the address a load
 // reads or a store writes.
-private escaping_operands(inst: Inst) -> Buf[Val]
+escaping_operands(inst: Inst) -> Buf[Val]
     var vs: Buf[Val] = buf()
 
     inst match
@@ -164,8 +164,22 @@ private is_release(name: string) -> bool =
         name == "arc.weak_release" || name.starts_with("arc.dispose.")
 
 // The one-argument, no-result call to a named function `inst` is, if it is one.
+//
+// A walk at an address handed a large **value** (`emit_arc.sysl`'s `aggregate_arc`) is the value walk
+// it stands for until `emit_large.sysl` gives it the address, so it is paired as one. A walk handed
+// an address is not: what is at an address can change between the two halves.
 private arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
-    InCall(None, _, VGlobal(n), args, _, _, _, _) -> if args.len() == 1 then Some((n, args[0].value)) else None
+    InCall(None, _, VGlobal(n), args, _, _, _, _) ->
+        if args.len() == 1
+            val by_value = args[0].ty match
+                LPtr -> false
+                _ -> true
+
+            if by_value && n.starts_with("arc.copy_at.") then Some((s"arc.copy.${n[12..<n.bytes.len]}", args[0].value))
+            else if by_value && n.starts_with("arc.dispose_at.") then
+                Some((s"arc.dispose.${n[15..<n.bytes.len]}", args[0].value))
+            else Some((n, args[0].value))
+        else None
     _ -> None
 
 // A window still open: the retain's index, the release that closes it, the reference, and whether a

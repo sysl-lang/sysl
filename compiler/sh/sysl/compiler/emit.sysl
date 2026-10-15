@@ -272,6 +272,10 @@ struct Emit
 
     // What the body being lowered has proved about its unsigned adds (`nowrap.sysl`).
     nowrap: NoWrap
+
+    // Every named LLVM type of the program by its printed name: its size, its boundary and its
+    // members (`emit_large.sysl`, which copies a large one as bytes).
+    shapes: Map[string, TypeShape]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -428,7 +432,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
-         no_wrap_none())
+         no_wrap_none(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -609,7 +613,11 @@ memcpy_symbol() -> string = llvm_memcpy_entry().at([LPtr, LPtr, LInt(64)])
 // The one call in the module the intrinsic is declared for, so the flag that declares it is set here
 // rather than at each site that copies -- a caller that stops copying stops declaring it, and one
 // that starts brings the declaration with it.
-emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int)
+emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int) =
+    emit(e, memcpy_inst(e, dst, src, bytes, align))
+
+// The copy itself, for a pass that places it rather than emitting it where the body is.
+memcpy_inst(e: *Emit, dst: Val, src: Val, bytes: int, align: int) -> Inst
     e.uses_memcpy = true
 
     var args: Buf[IrArg] = buf()
@@ -622,9 +630,8 @@ emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int)
     args.push(IrArg(LPtr, src, src_attrs))
     args.push(ir_arg(LInt(64), VInt(from_int(long(bytes)))))
     args.push(ir_arg(LInt(1), VBool(false)))
-    emit(e, InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None,
-                   no_fast_math(), false))
-end emit_memcpy
+    InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None, no_fast_math(), false)
+end memcpy_inst
 
 // Emits a block terminator, marks the block closed, and records wherever it sends control -- which
 // is what makes the labels it names reachable.
@@ -713,7 +720,9 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
         else
             out.push(b)
 
-    IrFunc(sig, elide_arc_pairs(out))
+    // The pairs are cancelled while every value is still a register, and only then is a large one
+    // turned into the bytes it is copied as.
+    IrFunc(sig, lower_large_values(e, elide_arc_pairs(out)))
 end finish_func
 
 // -- the constants a body folds against ------------------------------------------------------------
