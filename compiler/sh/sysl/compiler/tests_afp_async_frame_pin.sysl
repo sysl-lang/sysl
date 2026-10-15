@@ -425,7 +425,7 @@ afp_loans_run()
 
     afp_runs(afp_loans(), afp_loans_said())
 
-@test("the same loans run clean under AddressSanitizer at -O0 and the default level", ignore: "at -O0 Apple clang 21's coroutine split leaves an array reached after a suspension only through a view outside the frame (afp_a_viewed_array_is_in_the_frame_at_o0)")
+@test("the same loans run clean under AddressSanitizer at -O0 and the default level")
 afp_loans_run_clean_under_asan()
     if !afp_ready() then return
 
@@ -480,15 +480,16 @@ private afp_number_after(text: string, after: string) -> int
     if i == at then -1 else n
 end afp_number_after
 
-// The module after LLVM's coroutine passes have split every async function, at -O0: sysl's text,
-// handed to the clang a build uses and read back as IR rather than as an object.
-private afp_split(program: string) -> string
+// The module after LLVM's coroutine passes have split every async function, at `level` (-O0 where
+// none is named): sysl's text, handed to the clang a build uses and read back as IR rather than as an
+// object.
+private afp_split(program: string, level: string = "0") -> string
     val root = make_temp_dir("sysl-afp").unwrap()
 
     write_text(s"$root/main.sysl", program).unwrap()
 
     val t = host_target()
-    val ir = emit_llvm_text(s"$root/main.sysl", None, "0") match
+    val ir = emit_llvm_text(s"$root/main.sysl", None, level) match
         Ok(emitted) -> emitted.text
         Err(why) ->
             remove_dir_all(root).unwrap_or(())
@@ -498,7 +499,7 @@ private afp_split(program: string) -> string
 
     write_text(s"$root/main.ll", in_coro_dialect(cc, for_clang(ir, t))).unwrap()
 
-    val made = capture(cc, ["-x", "ir", "-O0", "-S", "-emit-llvm", "-Wno-override-module",
+    val made = capture(cc, ["-x", "ir", s"-O$level", "-S", "-emit-llvm", "-Wno-override-module",
                             s"$root/main.ll", "-o", s"$root/split.ll"], "", [], true)
     val text = made match
         Ok(out) -> if out.status.ok() then (read_text(s"$root/split.ll").unwrap_or("")) else
@@ -532,16 +533,17 @@ afp_frame_allocated_once_and_reached_through_its_handle()
     val resume = afp_function(ir, "define internal void @handle.resume(")
 
     assert(afp_number_after(resume, "dereferenceable(") >= 1024, resume)
-    assert(resume.contains("%buf.addr.reload.addr = getelementptr inbounds i8, ptr %task.hdl, i64 "), resume)
-    assert(resume.contains("%head.addr.reload.addr = getelementptr inbounds i8, ptr %task.hdl, i64 "), resume)
+    assert(resume.contains("getelementptr inbounds i8, ptr %task.hdl, i64 "), resume)
+    assert(!resume.contains("alloca [1024 x i8]"), resume)
     assert(!resume.contains("@sysl_task_alloc("), resume)
     assert(!ir.contains("i64 1024, i1 false)"), "a 1024-byte block copy")
 end afp_frame_allocated_once_and_reached_through_its_handle
 
 // **The array a body reaches after an await only through a view of it is a frame field too.** At -O0
-// the coroutine split of the clang a macOS build uses by default (Apple clang 21) does not see the
-// view as a use of the array, keeps the array on the resumption's own stack, and the view held in the
-// frame then points at a stack that is gone: the program below prints 0 where it should print 7.
+// the coroutine split of the clang a macOS build uses by default (Apple clang 21) did not see the view
+// as a use of the array, kept the array on the resumption's own stack, and the view held in the frame
+// then pointed at a stack that was gone: the program below printed 0 where it should print 7. A lent
+// local now lives in the promise, so no split decides where it goes.
 private afp_view_only() -> string = raw"""
     async fill() -> int
         var buf: [64]u8 = [0; 64]
@@ -565,21 +567,83 @@ private afp_view_only() -> string = raw"""
     print(step(t, () -> ()), block_on(t))
     """
 
-@test("an array read after an await only through a view keeps its value at -O0", ignore: "at -O0 Apple clang 21's coroutine split keeps the array off the frame; it prints 0")
+@test("an array read after an await only through a view keeps its value at -O0")
 afp_view_only_array_survives_at_o0()
     if !afp_ready() then return
 
     afp_runs(afp_view_only(), "false 99\ntrue 7\n")
+    afp_runs_clean(afp_view_only(), "false 99\ntrue 7\n")
 
-@test("a viewed array is in the frame at -O0", ignore: "at -O0 Apple clang 21's coroutine split keeps the array off the frame")
+@test("a viewed array is in the frame at -O0 and at the default level")
 afp_a_viewed_array_is_in_the_frame_at_o0()
     if !afp_ready() then return
 
-    val ir = afp_split(afp_view_only())
-    val resume = afp_function(ir, "@fill.resume(")
+    for level in ["0", DefaultOptimization]
+        val ir = afp_split(afp_view_only(), level)
+        val resume = afp_function(ir, "@fill.resume(")
 
-    assert(afp_number_after(resume, "dereferenceable(") >= 64, resume)
-    assert(!resume.contains("alloca [64 x i8]"), resume)
+        assert(afp_number_after(resume, "dereferenceable(") >= 64, s"-O$level: $resume")
+        assert(!resume.contains("alloca [64 x i8]"), s"-O$level: $resume")
+
+// The other two shapes a loan takes: a raw `&x` to a scalar read back after the await only through
+// the pointer, and a view of an array declared inside a loop's body, a scope of its own, lent across
+// an await on every round.
+private afp_raw_and_nested() -> string = raw"""
+    async raw_and_nested() -> int
+        var n = 0
+        val p = &n
+        var total = 0
+
+        for r in 0..<2
+            var inner: [8]u8 = [0; 8]
+            val v = inner[0..<4]
+
+            v[0] = u8(r + 5)
+            await yield_now()
+            total += int(v[0])
+
+        *p = 40
+        await yield_now()
+        *p + total
+    end raw_and_nested
+
+    scribble() -> int
+        var junk: [256]u8 = [0; 256]
+
+        for i in 0..<256
+            junk[i] = 99
+
+        int(junk[255])
+
+    val t = raw_and_nested()
+    var scribbled = 0
+
+    while !step(t, () -> ())
+        scribbled += scribble()
+
+    print(scribbled, block_on(t))
+    """
+
+@test("a raw address of a local and a view of a loop body's array survive their awaits, under ASan too")
+afp_raw_and_nested_loans_survive()
+    if !afp_ready() then return
+
+    afp_runs(afp_raw_and_nested(), "297 51\n")
+    afp_runs_clean(afp_raw_and_nested(), "297 51\n")
+
+@test("the raw-addressed local and the loop body's array are fields of the frame at both levels")
+afp_raw_and_nested_are_frame_fields()
+    if !afp_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val ir = afp_split(afp_raw_and_nested(), level)
+        val resume = afp_function(ir, "@raw_and_nested.resume(")
+
+        assert(resume != "", s"-O$level: $ir")
+        assert(!resume.contains("alloca [8 x i8]"), s"-O$level: $resume")
+
+        // The promise holds its header, the result, `n` and `inner`, so the frame is at least that.
+        assert(afp_number_after(resume, "dereferenceable(") >= 48, s"-O$level: $resume")
 
 @test("a task handed on is its frame's address: join, select, step and an await take a ptr, never the frame")
 afp_tasks_travel_as_addresses()
