@@ -605,6 +605,34 @@ print(p.x, q.x)
 1 99
 ```
 
+**A large struct is copied as its bytes.** Every copy of a struct, enum or variant payload over 128
+bytes — a literal built from calls, an assignment, an argument, a return, a payload bound by a pattern
+— is a block copy (`memcpy`) from where the value was read, and reading one field of it reads that
+field alone. So a struct holding a big array costs what copying the array costs, at compile time as
+well as at run time, and the copy is still a copy: it holds what its source held when it was made.
+
+```sysl
+struct Frame
+    pixels: [32768]u8
+    id: int
+
+frame(id: int) -> Frame = Frame([u8(id); 32768], id)
+
+struct Pair
+    a: Frame
+    b: Frame
+
+var p = Pair(frame(1), frame(2))
+val kept = p.a
+
+p.a = frame(3)
+print(kept.id, kept.pixels[32767], p.a.id, p.b.pixels[0])
+```
+
+```output
+1 1 3 2
+```
+
 Structs may carry methods, an `invariant`, and a visibility modifier per field. A struct may also be
 declared `opaque`, which withholds its layout from everyone outside its own module — a different axis
 from visibility, covered under [modules](/tour/modules/).
