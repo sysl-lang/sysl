@@ -3,6 +3,7 @@ module sysl.process.hosted
 
 import sysl.process.sys.{Text, ended_exited, ended_signalled, ended_timed_out, id_group,
                          id_real_group, id_real_user, id_user}
+import sysl.slices.as_mut_ptr
 import sysl.sys.host_status
 
 // `sysl.process.sys`'s hooks answered over a POSIX host -- `posix_spawn`, or `fork` and `exec` where
@@ -214,4 +215,39 @@ proc_setsid() -> i64
     val sid = c_setsid()
 
     if sid >= 0 then i64(sid) else i64(host_status(errno_location()[0]))
+
+private extern "gethostname" c_gethostname(into: *u8, room: usize) -> int
+
+// `ENAMETOOLONG`, negated: 63 on a BSD and 36 under glibc.
+#if bsd
+private const name_too_long: isize = -63
+#else
+private const name_too_long: isize = -36
+#endif
+
+// `gethostname` truncates silently on some C libraries and fails with `ENAMETOOLONG` on others, so
+// it is always given the whole scratch buffer (a host name is at most 255 bytes) and the length is
+// compared with the caller's `room` afterwards: a name longer than `room` is refused here with
+// `ENAMETOOLONG` on every library.
+@export("sysl_proc_hostname")
+proc_hostname(into: *u8, room: usize) -> isize
+    var scratch: []u8 = [0; 1025]
+
+    if c_gethostname(as_mut_ptr(scratch), 1024) != 0 then return isize(host_status(errno_location()[0]))
+
+    var n: usize = 0
+
+    loop
+        if n >= 1024 || scratch[n] == 0 then break
+        n += 1
+    end loop
+
+    if n > room then return name_too_long
+
+    for i in 0..<n
+        into[i] = scratch[i]
+    end for
+
+    isize(n)
+end proc_hostname
 #endif

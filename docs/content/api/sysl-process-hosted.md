@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { posix }"
 
 ## Index
 
-[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_kill`](#proc_kill) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_wait`](#proc_wait)
+[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_hostname`](#proc_hostname) [`proc_kill`](#proc_kill) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_wait`](#proc_wait)
 
 ## Functions
 
@@ -29,6 +29,12 @@ proc_get_id(which: int) -> i64
 
 ```sysl
 proc_getpgrp() -> i64
+```
+
+### `proc_hostname`
+
+```sysl
+proc_hostname(into: *u8, room: usize) -> isize
 ```
 
 ### `proc_kill`
