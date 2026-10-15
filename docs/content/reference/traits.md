@@ -2065,6 +2065,25 @@ from a bare value. Where the data word already *is* the receiver an implementati
 names that implementation itself; otherwise it names a small adapter that steps over the box header,
 loads the value, or both. So the common case costs one indirect call and nothing else.
 
+**A table is in the output only where a function the program reaches erases a value into it**, and
+what it points at comes with it. The standard library's own tables follow the same rule: a body of
+the library that makes an object, reached from nowhere, keeps neither the table nor the functions it
+names, so a board image that never makes a `Buf` carries no `malloc` on account of `Buf`'s `Writer`
+table. Erasing a library type in the program's own code keeps that type's table:
+
+```sysl
+main()
+    var c = Counting(0)
+    val w: *Writer = &c
+
+    w.write("abc".bytes)
+    print(c.n)
+```
+
+```output
+3
+```
+
 ### Object safety
 
 Erasure forgets the type, so a member may promise nothing that depends on knowing it. A trait may be

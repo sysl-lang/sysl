@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// **A standard-library table is kept only where a function the program reaches erases a value into
+// it** (`reference/traits.md § Trait objects`). Analysis builds a table wherever it erases, including
+// in bodies the program never runs; one rooted for being the standard library's kept `ByteSink.write`,
+// and through `Buf.grow` `malloc` and `free`, in a board archive that never made a buffer.
+
+// A board program over `main.sysl`, with a capability block where one is given.
+private pst_board(program: string, capabilities: string) -> string
+    lbr_tree(lbr_two("package.hocon",
+                     "package {\n  name = \"pst-board\"\n  version = \"0.1.0\"\n}\n" + capabilities,
+                     "main.sysl", program))
+end pst_board
+
+// A function that erases a `ByteSink` into a `Writer` inside the standard library, by way of
+// `StrBuilder.push_real`, and an entry that calls it or not.
+private pst_program(calls: bool) -> string =
+    "import sysl.text.str_builder\n\n" +
+    "shown() -> usize\n" +
+    "    var b = str_builder()\n" +
+    "    b.push_real(3.0)\n" +
+    "    b.finish().len\n\n" +
+    "@export(\"main\")\n" +
+    (if calls then "probe_main() -> int = int(shown())\n" else "probe_main() -> int = 7\n")
+
+// The archive a build-c of `dir` for thumbv7em makes, its status and report, and its symbols: the
+// undefined ones and the defined ones.
+private pst_build(dir: string) -> (int, string, string, string)
+    val archive = s"$dir/out.a"
+    val got = lbr_cli(["sysl", "build-c", dir, "--target", "thumbv7em-freestanding", "-o", archive])
+
+    if got.0 != 0 then return (got.0, got.1, "", "")
+
+    val undefined = capture("nm", ["-u", archive], "", [], true).unwrap().text
+    val defined = capture("nm", ["-U", archive], "", [], true).unwrap().text
+
+    (got.0, got.1, undefined, defined)
+end pst_build
+
+@test("a board archive whose only erasure into a std table is in a function nothing calls needs no malloc")
+pst_an_unreached_std_erasure_keeps_no_table()
+    if !lbr_ready() then return
+
+    val dir = pst_board(pst_program(false), "")
+    val got = pst_build(dir)
+
+    assert(got.0 == 0, got.1)
+    assert(got.2.index_of("malloc").is_none(), got.2)
+    assert(got.2.index_of("free").is_none(), got.2)
+    assert(got.3.index_of("ByteSink.write").is_none(), got.3)
+
+    remove_dir_all(dir).unwrap_or(())
+end pst_an_unreached_std_erasure_keeps_no_table
+
+@test("and the same erasure in a function the entry calls keeps the table and what it points at")
+pst_a_reached_std_erasure_keeps_its_table()
+    if !lbr_ready() then return
+
+    val dir = pst_board(pst_program(true), "")
+    val got = pst_build(dir)
+
+    assert(got.0 == 0, got.1)
+    assert(got.3.index_of("sysl.buf$ByteSink.write").is_some(), got.3)
+    assert(got.2.index_of("malloc").is_some(), got.2)
+
+    remove_dir_all(dir).unwrap_or(())
+end pst_a_reached_std_erasure_keeps_its_table
+
+@test("a board archive that prints still links its sink, and needs no malloc")
+pst_a_printing_board_program_links()
+    if !lbr_ready() then return
+
+    val dir = pst_board("@export(\"main\")\nprobe_main() -> int\n    print(42)\n    7\n", "")
+    val got = pst_build(dir)
+
+    assert(got.0 == 0, got.1)
+    assert(got.2.index_of("putchar").is_some(), got.2)
+    assert(got.2.index_of("malloc").is_none(), got.2)
+
+    remove_dir_all(dir).unwrap_or(())
+end pst_a_printing_board_program_links
+
+@test("a std type erased into a std trait in the program's own code keeps its table, and runs")
+pst_a_std_table_the_program_erases_into_runs()
+    if !lbr_ready() then return
+
+    val program = lbr_program("main()\n" +
+                              "    var c = Counting(0)\n" +
+                              "    val w: *Writer = &c\n" +
+                              "    w.write(\"abc\".bytes)\n" +
+                              "    print(c.n)\n" +
+                              "    var b = sysl.text.str_builder()\n" +
+                              "    b.push_real(3.5)\n" +
+                              "    print(b.finish())\n")
+
+    assert(lbr_run(program, []) == "3\n3.5\n")
+
+    lbr_drop([program])
+end pst_a_std_table_the_program_erases_into_runs
+
+@test("a heap-less board whose entry reaches the erasure is still refused, naming the function")
+pst_a_reached_std_erasure_is_still_refused_without_a_heap()
+    if !lbr_ready() then return
+
+    val dir = pst_board(pst_program(true), "\ncapabilities { heap = false }\n")
+    val got = pst_build(dir)
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("error: this reaches 'shown', which makes heap storage through " +
+                          "'sysl.buf.Buf.grow.byte', and 'thumbv7em-freestanding' provides no " +
+                          "allocator").is_some(), got.1)
+
+    remove_dir_all(dir).unwrap_or(())
+end pst_a_reached_std_erasure_is_still_refused_without_a_heap
