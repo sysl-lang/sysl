@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_dir, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, Search}
+
+// A dependency only some machines take, `if = "<condition>"` on its entry
+// (`reference/packages.md § A dependency only some machines take`): what the manifest accepts and
+// refuses, which machines take it, how it travels through the package that declared it, what an
+// import of it says where it is left out, and how it sits beside a pinned commit and `sysl.sum`.
+//
+// A packaged graph is laid out in the project's `vendor/` tree with its hash beside it, as a fetch
+// would have left it, so nothing reaches the network. **Every case that names a machine clears it
+// again** (`tgd_done`), since the machine is module storage a later case in this process would read.
+
+// -- the manifest -----------------------------------------------------------------------------------
+
+private tgd_read(entry: string) -> Result[Manifest, string] = read_manifest(s"dependencies { $entry }")
+
+@test("tgd: an if is read as the condition the dependency is taken under")
+tgd_if_is_read()
+    val m = tgd_read("cstd { path = \"../cstd\", if = \"!libc\" }").unwrap()
+
+    assert_eq(m.dependencies.at(0).condition, "!libc")
+    assert_eq(tgd_read("cstd { path = \"../cstd\" }").unwrap().dependencies.at(0).condition, "")
+
+    val both = read_manifest("dependencies { cstd { git = \"github.com/e/cstd\", version = \"1.0.0\", " +
+                             "optional = true, if = \"freestanding && (thumb || aarch64)\" } }\n" +
+                             "features { bare = [cstd] }\n").unwrap()
+
+    assert_eq(both.dependencies.at(0).condition, "freestanding && (thumb || aarch64)")
+    assert(both.dependencies.at(0).optional)
+
+@test("tgd: a symbol no machine has is refused when the file is read, naming the vocabulary")
+tgd_unknown_symbol_refused()
+    val said = tgd_read("cstd { path = \"../cstd\", if = \"frestanding\" }").unwrap_err()
+
+    assert(said.starts_with("'dependencies.cstd.if' is \"frestanding\", and 'frestanding' is not " +
+                            "something a dependency's condition can ask about the machine — it knows "), said)
+    assert(said.contains("freestanding, hosted, libc, linux"), said)
+    assert(said.ends_with("A dependency a feature turns on is 'optional = true' and named by the feature"), said)
+
+@test("tgd: a feature symbol is refused, since optional is how a feature turns a dependency on")
+tgd_feature_symbol_refused()
+    val said = tgd_read("cstd { path = \"../cstd\", if = \"feature_server\" }").unwrap_err()
+
+    assert(said.starts_with("'dependencies.cstd.if' is \"feature_server\", and 'feature_server' is " +
+                            "not something a dependency's condition can ask about the machine"), said)
+
+@test("tgd: a target's name is refused with the condition it means, exactly as #if refuses it")
+tgd_target_name_refused()
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = \"thumb-freestanding\" }").unwrap_err(),
+              "'dependencies.cstd.if' is \"thumb-freestanding\", and 'thumb-freestanding' is a " +
+              "target's name rather than something a condition asks about — a condition asks about " +
+              "one fact of the machine at a time, so this is written 'thumb && freestanding'")
+
+@test("tgd: an if that is not a string, or is empty, or does not parse, is refused with the exact error")
+tgd_malformed_if_refused()
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = true }").unwrap_err(),
+              "'dependencies.cstd.if' is not a string — it is a condition, as '#if' writes one, in " +
+              "quotes: if = \"freestanding\"")
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = \"\" }").unwrap_err(),
+              "'dependencies.cstd.if' is empty — a condition names at least one fact of the machine, " +
+              "and a dependency every machine takes is written without 'if'")
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = \"libc &&\" }").unwrap_err(),
+              "'dependencies.cstd.if' is \"libc &&\", and 'if' needs a condition after it")
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = \"(libc\" }").unwrap_err(),
+              "'dependencies.cstd.if' is \"(libc\", and this '(' is never closed")
+    assert_eq(tgd_read("cstd { path = \"../cstd\", if = \"libc + hosted\" }").unwrap_err(),
+              "'dependencies.cstd.if' is \"libc + hosted\", and a condition is built from symbols, " +
+              "'!', '&&', '||' and parentheses, and '+' is none of them")
+
+// A dev dependency may be conditional too: it is the same entry, read by the same reader.
+@test("tgd: a dev dependency takes an if as well")
+tgd_dev_dependency_if()
+    val m = read_manifest("dev_dependencies { probe { path = \"../probe\", if = \"hosted\" } }").unwrap()
+
+    assert_eq(m.dev_dependencies.at(0).condition, "hosted")
+
+// -- the machine ------------------------------------------------------------------------------------
+
+private tgd_machine(manifest: string, name: string) -> Target =
+    as_declared(read_manifest(manifest).unwrap(), target_resolved(name).unwrap())
+
+private tgd_holds(cond: string, t: Target) -> bool = dependency_condition(cond, dependency_defined(t)).unwrap()
+
+@test("tgd: libc is true on a hosted machine and false on a freestanding one until the manifest grants it")
+tgd_libc_follows_the_capability()
+    val hosted = tgd_machine("", "aarch64-macos")
+    val bare = tgd_machine("", "thumb-freestanding")
+    val newlib = tgd_machine("targets { thumb-freestanding { capabilities { libc = true } } }",
+                             "thumb-freestanding")
+
+    assert(tgd_holds("libc", hosted))
+    assert(!tgd_holds("!libc", hosted))
+    assert(tgd_holds("!libc", bare))
+    assert(!tgd_holds("!libc", newlib))
+    assert(tgd_holds("hosted", hosted) && !tgd_holds("hosted", bare))
+    assert(tgd_holds("freestanding && thumb", bare))
+    assert(!tgd_holds("freestanding && aarch64", bare))
+    assert(tgd_holds("macos || linux", hosted))
+
+// -- resolution -------------------------------------------------------------------------------------
+
+private tgd_temp() -> string = absolute_path(make_temp_dir("sysl-tgd").unwrap())
+
+// A package at a coordinate in the project's `vendor/` tree, holding one module named after it with
+// one function, as a fetch would have left it.
+private tgd_publish(root: string, coordinate: string, name: string, deps: string)
+    val dir = s"$root/vendor/$coordinate/@v1.0.0"
+
+    make_dir_all(s"$dir/$name").unwrap()
+    write_text(s"$dir/package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n" +
+               (if deps.is_empty() then "" else s"dependencies { $deps }\n")).unwrap()
+    write_text(s"$dir/$name/$name.sysl", s"module $name\n\nanswer() -> int = 42\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end tgd_publish
+
+private tgd_entry(name: string, extra: string) -> string =
+    s"$name { git = \"github.com/e/$name\", version = \"1.0.0\"" +
+    (if extra.is_empty() then "" else s", $extra") + " }"
+
+// The graph the project at `root` resolves to for a machine, every package but the root by canonical
+// name, sorted and comma-joined; `None` for the whole manifest.
+private tgd_selected(root: string, text: string, machine: Option[string]) -> string
+    val m = read_manifest(text).unwrap()
+
+    use_resolution_machine(machine match
+        None -> None
+        Some(name) -> Some(as_declared(m, target_resolved(name).unwrap())))
+
+    val g = resolve_graph(root, m, empty_sums(), s"$root/vendor").unwrap()
+    var names: Buf[string] = buf()
+
+    for item in g.packages
+        if !is_root_package(item) then names.push(item.canonical)
+
+    use_resolution_machine(None)
+    join(sorted_labels(names).view(), ",")
+end tgd_selected
+
+@test("tgd: a dependency the project takes only where it is freestanding")
+tgd_hosted_and_freestanding()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("cstd", "if = \"freestanding\"")} }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+
+    assert_eq(tgd_selected(root, text, Some("aarch64-macos")), "")
+    assert_eq(tgd_selected(root, text, Some("x86_64-linux")), "")
+    assert_eq(tgd_selected(root, text, Some("thumb-freestanding")), "github.com.e.cstd")
+    assert_eq(tgd_selected(root, text, Some("aarch64-freestanding")), "github.com.e.cstd")
+    remove_dir_all(root).unwrap_or(())
+
+@test("tgd: a machine's name, through its arch and system, picks a dependency")
+tgd_arch_condition()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("cstd", "if = \"freestanding && thumb\"")} }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+
+    assert_eq(tgd_selected(root, text, Some("thumbv7em-freestanding")), "github.com.e.cstd")
+    assert_eq(tgd_selected(root, text, Some("aarch64-freestanding")), "")
+    remove_dir_all(root).unwrap_or(())
+
+// `cstd` is a C library: where the board links newlib it would collide with it exactly as with a
+// hosted libc, so the condition that says what is meant is `!libc`, and the root's grant decides it.
+@test("tgd: !libc follows the root project's capabilities, not the triple")
+tgd_libc_condition()
+    val root = tgd_temp()
+    val deps = s"dependencies { ${tgd_entry("cstd", "if = \"!libc\"")} }\n"
+    val newlib = deps + "targets { thumb-freestanding { capabilities { libc = true } } }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+
+    assert_eq(tgd_selected(root, deps, Some("aarch64-macos")), "")
+    assert_eq(tgd_selected(root, deps, Some("thumb-freestanding")), "github.com.e.cstd")
+    assert_eq(tgd_selected(root, newlib, Some("thumb-freestanding")), "")
+    remove_dir_all(root).unwrap_or(())
+
+// The left-out package is not in the vendor tree at all, so a resolution that tried to read it would
+// be refused: it is neither fetched nor read. (That a taken one is fetched is the pinned case below.)
+@test("tgd: a dependency the machine leaves out is not fetched or read")
+tgd_absent_not_fetched()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("cstd", "if = \"freestanding\"")} }\n"
+    val m = read_manifest(text).unwrap()
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val hosted = resolve_graph(root, m, empty_sums(), s"$root/vendor")
+
+    use_resolution_machine(None)
+    assert(hosted.is_ok())
+    assert(!hosted.unwrap().sums_changed)
+    remove_dir_all(root).unwrap_or(())
+
+// With no machine named the graph is every machine's, which is what `sysl deps`, `sysl tidy` and
+// `sysl vendor` answer for.
+@test("tgd: with no machine named, every conditional dependency is taken")
+tgd_no_machine_takes_everything()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("cstd", "if = \"freestanding\"")}, " +
+               s"${tgd_entry("host", "if = \"hosted\"")} }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+    tgd_publish(root, "github.com/e/host", "host", "")
+
+    assert_eq(tgd_selected(root, text, None), "github.com.e.cstd,github.com.e.host")
+    assert_eq(tgd_selected(root, text, Some("aarch64-macos")), "github.com.e.host")
+    remove_dir_all(root).unwrap_or(())
+
+// `lfs` takes `cstd` where there is no C library; the project names only `lfs`. Imports are
+// transitive, so where `cstd` is present it is in the project's graph, and where it is not it is
+// nowhere in it.
+@test("tgd: a package's conditional dependency travels into its consumer's graph on the machines it names")
+tgd_transitive()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("lfs", "")} }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+    tgd_publish(root, "github.com/e/lfs", "lfs", tgd_entry("cstd", "if = \"!libc\""))
+
+    assert_eq(tgd_selected(root, text, Some("aarch64-macos")), "github.com.e.lfs")
+    assert_eq(tgd_selected(root, text, Some("thumb-freestanding")), "github.com.e.cstd,github.com.e.lfs")
+    remove_dir_all(root).unwrap_or(())
+
+// A feature turns an optional dependency on, and its `if` still decides which machines take it.
+@test("tgd: an optional dependency with an if needs both its feature and its machine")
+tgd_optional_and_if()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("cstd", "optional = true, if = \"freestanding\"")} }\n" +
+               "features { default = [cstd] }\n"
+    val off = s"dependencies { ${tgd_entry("cstd", "optional = true, if = \"freestanding\"")} }\n" +
+              "features { bare = [cstd] }\n"
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+
+    assert_eq(tgd_selected(root, text, Some("thumb-freestanding")), "github.com.e.cstd")
+    assert_eq(tgd_selected(root, text, Some("aarch64-macos")), "")
+    assert_eq(tgd_selected(root, off, Some("thumb-freestanding")), "")
+    remove_dir_all(root).unwrap_or(())
+
+// -- what an import of a left-out dependency says ---------------------------------------------------
+
+@test("tgd: the note names each left-out dependency, who takes it, and the machine")
+tgd_absent_note_text()
+    val root = tgd_temp()
+    val text = s"dependencies { ${tgd_entry("lfs", "")}, ${tgd_entry("dbg", "if = \"hosted\"")} }\n"
+    val m = read_manifest(text).unwrap()
+
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+    tgd_publish(root, "github.com/e/dbg", "dbg", "")
+    tgd_publish(root, "github.com/e/lfs", "lfs", tgd_entry("cstd", "if = \"!libc\""))
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val bare = resolve_graph(root, m, empty_sums(), s"$root/vendor").unwrap()
+    val bare_note = absent_note(graph_absent(m, bare))
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val hosted = resolve_graph(root, m, empty_sums(), s"$root/vendor").unwrap()
+    val hosted_note = absent_note(graph_absent(m, hosted))
+
+    use_resolution_machine(None)
+
+    assert_eq(bare_note, " — 'dbg', which this project takes only where 'hosted' holds, is left out: " +
+              "'thumb-freestanding' is not such a machine, and nothing of it is in this build")
+    assert_eq(hosted_note, " — 'cstd', which 'lfs' takes only where '!libc' holds, is left out: " +
+              "'aarch64-macos' is not such a machine, and nothing of it is in this build")
+    remove_dir_all(root).unwrap_or(())
+
+// A project whose own file imports a dependency it takes only where it is freestanding.
+private tgd_importing_project() -> string
+    val root = tgd_temp()
+
+    write_text(s"$root/package.hocon",
+               s"dependencies { ${tgd_entry("cstd", "if = \"freestanding\"")} }\n").unwrap()
+    write_text(s"$root/main.sysl",
+               "import cstd.answer\n\nmain()\n    if answer() != 42 then return\n").unwrap()
+    tgd_publish(root, "github.com/e/cstd", "cstd", "")
+    root
+end tgd_importing_project
+
+@test("tgd: importing a dependency the machine leaves out is refused, naming the dependency and the machine")
+tgd_absent_import_refused()
+    val root = tgd_importing_project()
+    val host = host_target().name
+
+    val said = emit_typed_text(root, Some(host), false) match
+        Err(f) -> failure_text(f)
+        Ok(e) -> analysis_report(e.report)
+
+    use_resolution_machine(None)
+    assert(said.contains(s"no module is called 'cstd.answer', and nothing declares it — 'cstd', which this project takes only where " +
+                         s"'freestanding' holds, is left out: '$host' is not such a machine, and " +
+                         "nothing of it is in this build"), said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("tgd: and on a machine that takes it, the same import compiles")
+tgd_present_import_compiles()
+    val root = tgd_importing_project()
+
+    val said = emit_typed_text(root, Some("aarch64-freestanding"), false) match
+        Err(f) -> failure_text(f)
+        Ok(e) -> analysis_report(e.report)
+
+    use_resolution_machine(None)
+    assert_eq(said, "")
+    remove_dir_all(root).unwrap_or(())
+
+// -- a pinned commit, and sysl.sum ------------------------------------------------------------------
+
+private extern "setenv" tgd_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private tgd_set(name: string, value: string)
+    val k = cstring(name)
+    val v = cstring(value)
+
+    tgd_c_setenv(k.ptr, v.ptr, 1)
+
+private tgd_git(dir: string, args: []const string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("-C")
+    all.push(dir)
+    all.push("-c")
+    all.push("user.name=t")
+    all.push("-c")
+    all.push("user.email=t@t")
+
+    for a in args
+        all.push(a)
+
+    val o = capture("git", all.view(), "", [], true).unwrap()
+
+    assert(o.status.ok(), s"git ${args[0]} failed: ${o.err.unwrap_or("")}")
+    o.text.trim()
+end tgd_git
+
+// A repository at `<base>/e/cstd.git` holding package `cstd` with one commit; answers its sha.
+// `github.com/` is pointed at `<base>/` for every git started after.
+private tgd_repo(base: string) -> string
+    val dir = s"$base/e/cstd.git"
+
+    make_dir_all(s"$dir/cstd").unwrap()
+    tgd_git(dir, ["init", "--quiet"])
+    tgd_git(dir, ["config", "uploadpack.allowAnySHA1InWant", "true"])
+    write_text(s"$dir/package.hocon", "package { name = \"cstd\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$dir/cstd/cstd.sysl", "module cstd\n\nanswer() -> int = 42\n").unwrap()
+    tgd_git(dir, ["add", "-A"])
+    tgd_git(dir, ["commit", "--quiet", "-m", "one"])
+
+    tgd_set("GIT_CONFIG_COUNT", "1")
+    tgd_set("GIT_CONFIG_KEY_0", s"url.file://$base/.insteadOf")
+    tgd_set("GIT_CONFIG_VALUE_0", "https://github.com/")
+    tgd_git(dir, ["rev-parse", "HEAD"])
+end tgd_repo
+
+// A pin is a commit and a condition is a machine: the two are independent, so a pinned dependency
+// left out is neither fetched nor recorded, and where it is taken it is fetched at its commit and
+// recorded by it -- and the line a freestanding build wrote is not disturbed by a hosted one.
+@test("tgd: a pinned dependency with an if is fetched and recorded only where it is taken")
+tgd_pinned_rev()
+    val base = absolute_path(make_temp_dir("sysl-tgd-git").unwrap())
+    val sha = tgd_repo(base)
+    val cache = make_temp_dir("sysl-tgd-cache").unwrap()
+    val root = tgd_temp()
+    val m = read_manifest(s"dependencies { cstd { git = \"github.com/e/cstd\", rev = \"$sha\", " +
+                          "if = \"!libc\" } }\n").unwrap()
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val hosted = resolve_graph(root, m, empty_sums(), cache).unwrap()
+
+    assert(!hosted.sums_changed)
+    assert(!is_dir(fetch_directory(cache, "github.com/e/cstd", release_at_rev(sha))))
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val bare = resolve_graph(root, m, empty_sums(), cache).unwrap()
+
+    assert(bare.sums_changed)
+    assert(is_dir(fetch_directory(cache, "github.com/e/cstd", release_at_rev(sha))))
+    assert(sums_render(bare.sums).starts_with(s"github.com/e/cstd $sha "), sums_render(bare.sums))
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val again = resolve_graph(root, m, bare.sums, cache).unwrap()
+
+    use_resolution_machine(None)
+    assert(!again.sums_changed)
+    assert_eq(sums_render(again.sums), sums_render(bare.sums))
+
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
