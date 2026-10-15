@@ -3539,6 +3539,7 @@ disturbs nothing.
 | operating system | `macos`, `linux`, `windows`, `freestanding`, `android`, `wasi` |
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
+| floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI) |
 
 That is the whole vocabulary. There is **no `#define`**, nothing a project can add, and no dependence
 on a project config. A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
@@ -3568,6 +3569,54 @@ accessor fails at the link, while a wrong `ENOTEMPTY` merely stops matching and 
 wrong width appears to work. **A symbol that means what it says costs nothing today and is the whole
 of the fix later.**
 
+**The floating-point four are facts of the whole target, not of the processor.** Seven Arm targets
+are all `thumb`, and they differ in exactly this: a Cortex-M0+ has no floating-point registers, a
+Cortex-M4F has single-precision ones, a Cortex-M7 double-precision ones, and a core with a unit may
+still be built to pass a float in an integer register. Code that *saves* those registers — a
+`setjmp`, a context switch — has to know, because an instruction naming `s16` faults on a core with
+none:
+
+| target | `fpu` | `fpu_dp` | `hardfloat` | `softfp` |
+|---|---|---|---|---|
+| every hosted target, `aarch64-freestanding`, `x86_64-freestanding`, both `wasm32` | yes | yes | yes | no |
+| `thumb-freestanding`, `thumbv7em-freestanding` | yes | no | yes | no |
+| `thumb-freestanding-softfp` | yes | no | no | yes |
+| `thumbv7em-freestanding-dp` | yes | yes | yes | no |
+| `thumbv6m-`, `thumbv7m-`, `thumb-freestanding-soft`, `thumbv7em-freestanding-soft`, both RISC-V freestanding, `craft-freestanding` | no | no | no | no |
+
+`fpu` asks about the **registers**, whichever ABI passes a value, so a soft-float-ABI build of a core
+that has them still answers yes — the registers are there and a context switch must save them. A
+machine with registers is exactly one of `hardfloat` and `softfp`; one without is neither, and `!fpu`
+is how a condition says *soft float throughout*. Every hosted machine answers yes, which is what this
+host says:
+
+```sysl
+#if fpu && fpu_dp && hardfloat
+print("floating-point registers, doubles in them, and floats passed in them")
+#else
+print("something else")
+#endif
+```
+
+```output
+floating-point registers, doubles in them, and floats passed in them
+```
+
+Inside an `asm` statement the arm is still chosen by processor, and what differs between the cores
+of one processor is gated by `#if` inside its arm — a `setjmp` saving the callee-saved single
+registers only where there are any:
+
+```sysl
+save_fp(at: usize)
+    asm
+        [thumb]
+#if fpu
+            "vstmia {at}, {{s16-s31}}"
+            in at : reg
+#endif
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "not this example"
+```
+
 **A symbol nobody knows is an error, not false:**
 
 ```sysl
@@ -3581,7 +3630,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, freestanding, hosted, linux, macos, posix, riscv32, riscv64, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to
