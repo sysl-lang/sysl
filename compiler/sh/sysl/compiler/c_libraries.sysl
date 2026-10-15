@@ -39,6 +39,10 @@ struct CLibrary
     // to the package root.
     include: Buf[string]
 
+    // The directories only its own sources read (`include_private`) -- BearSSL's `src/`, whose
+    // `inner.h` is no business of the package's shim, its probes or its dependents.
+    private_include: Buf[string]
+
     // The files compiled, relative to the package root, braces expanded.
     sources: Buf[string]
 
@@ -100,10 +104,11 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
     // misspelt `source` would otherwise compile nothing, and the first anybody heard of it would
     // be a link that cannot find the library's symbols.
     for key in keys
-        if !(key == "root" || key == "include" || key == "sources" || key == "exclude" ||
-             key == "defines" || key == "export" || key == "libc")
+        if !(key == "root" || key == "include" || key == "include_private" || key == "sources" ||
+             key == "exclude" || key == "defines" || key == "export" || key == "libc")
             return Err(s"'c.$name.$key' is not something a C library declares — a library says " +
-                       "its 'root', 'include', 'sources', 'exclude', 'defines', 'export' and 'libc'")
+                       "its 'root', 'include', 'include_private', 'sources', 'exclude', 'defines', " +
+                       "'export' and 'libc'")
 
     val root = conf_at(sub, "root") match
         None -> ""
@@ -114,7 +119,24 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
                             "is in, relative to the package root")
 
     val include = path_list(sub, name, "include", root)?
-    val exports = path_list(sub, name, "export", root)?
+    val private_include = path_list(sub, name, "include_private", root)?
+
+    // **`export = true` publishes the library's `include` roots**, which is what a library's public
+    // headers usually are; a list says otherwise where they differ.
+    val exports = conf_at(sub, "export") match
+        Some(v) -> *v match
+            Flag(true) ->
+                if include.is_empty()
+                    return Err(s"'c.$name.export' is true and the library has no 'include' roots " +
+                               "to publish — name the directories instead")
+
+                include.copy()
+            Flag(false) ->
+                return Err(s"'c.$name.export' is false, which publishes nothing — leave the key " +
+                           "out to publish nothing")
+            _ -> path_list(sub, name, "export", root)?
+        None -> buf()
+
     var sources: Buf[string] = buf()
     var patterns: Buf[string] = buf()
 
@@ -201,7 +223,11 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
         return Err(s"'c.$name' declares nothing — a library compiles 'sources', reads 'include' " +
                    "or publishes 'export', and one doing none of them is a block to delete")
 
-    Ok(CLibrary(name, root, include, sources, patterns, exclude, macros, exports, libc))
+    if !private_include.is_empty() && sources.is_empty() && patterns.is_empty()
+        return Err(s"'c.$name.include_private' is read by the library's own sources, and it " +
+                   "compiles none — use 'include' for roots the package's other C reads")
+
+    Ok(CLibrary(name, root, include, private_include, sources, patterns, exclude, macros, exports, libc))
 end read_c_library
 
 // Whether a path is a pattern rather than a file.
@@ -246,15 +272,18 @@ end path_list
 // `item` joined to `base`, both relative to the package root, with `.` and `..` worked out -- or the
 // refusal where the result is not inside the package. `""` is the package root itself.
 //
+// **A leading `/` is the package root**, not the machine's: `"/config"` names the package's own
+// configuration directory from a library whose root is three directories down, where the relative
+// spelling would be `"../../../config"`. There is no way to name the machine's root at all, since
+// the package is the same tree wherever it was fetched to.
+//
 // **`..` is allowed while it stays inside**, which is what lets an include list reach a sibling of
-// the library's tree (`../../config`, where the package keeps the configuration header it supplies).
+// the library's tree.
 inside_package(key: string, base: string, item: string) -> Result[string, string]
-    if item.starts_with("/")
-        return Err(s"'$key' names '$item', an absolute path — a path is relative, since the " +
-                   "package is the same tree wherever it was fetched to")
-
     var parts: Buf[string] = buf()
-    val whole = if base == "" then item else s"$base/$item"
+    val rooted = item.starts_with("/")
+    val written = if rooted then item[1..] else item
+    val whole = if base == "" || rooted then written else s"$base/$written"
     val segments = split(whole, "/")
 
     for i in 0..<segments.len
@@ -459,6 +488,7 @@ library_sources(tree: string, m: &Manifest) -> Result[Buf[(string, usize)], stri
             out.push((file, i))
 
         directories_held(tree, lib.name, "include", lib.include)?
+        directories_held(tree, lib.name, "include_private", lib.private_include)?
         directories_held(tree, lib.name, "export", lib.exports)?
 
     Ok(out)
@@ -546,6 +576,9 @@ tree_c_units(tree: string, t: Target) -> Result[Buf[CUnit], CRefusal]
     for item in listed
         val lib = declared.c_libraries.at(item.1)
         var own = configured.copy()
+
+        for rel in lib.private_include
+            own.push(s"-I${under(tree, rel)}")
 
         for rel in lib.include
             own.push(s"-I${under(tree, rel)}")
@@ -796,9 +829,18 @@ dependency_c_flags(tree: string, t: Target) -> Result[Buf[string], string]
         for dir in system
             out.push(s"-isystem$dir")
 
-    trace(s"c headers: '$me' takes ${join(out.view(), " ")} from ${queue.len() - 1} package(s) it depends on")
+    trace(c_headers_said(me, out, queue.len() - 1))
     Ok(out)
 end dependency_c_flags
+
+// What `--verbose` says a tree's C takes from the packages it depends on.
+c_headers_said(tree: string, flags: Buf[string], reached: usize) -> string
+    val packages = if reached == 1 then "the 1 package" else s"the $reached packages"
+
+    if reached == 0 then s"c headers: '$tree' depends on no package"
+    else if flags.is_empty() then s"c headers: '$tree' takes no include roots from $packages it depends on"
+    else s"c headers: '$tree' takes ${join(flags.view(), " ")} from $packages it depends on"
+end c_headers_said
 
 // The `c` block as what it means, one library to a line, for the run cache's key: a library's
 // configuration changes the program as surely as its files do.
@@ -807,6 +849,7 @@ c_block_text(m: &Manifest) -> string
 
     for lib in m.c_libraries
         out = out + s"${lib.name} root=${lib.root} include=${join(lib.include.view(), ",")} " +
+            s"include_private=${join(lib.private_include.view(), ",")} " +
             s"sources=${join(lib.sources.view(), ",")} patterns=${join(lib.patterns.view(), ",")} " +
             s"exclude=${join(lib.exclude.view(), ",")} defines=${join(lib.macros.view(), ",")} " +
             s"export=${join(lib.exports.view(), ",")} libc=${lib.libc}\n"
@@ -846,6 +889,9 @@ c_library_inputs(tree: string, m: &Manifest) -> Buf[(string, string)]
                 Err(_) -> ()
 
         for rel in lib.include
+            if !holds(dirs, rel) then dirs.push(rel)
+
+        for rel in lib.private_include
             if !holds(dirs, rel) then dirs.push(rel)
 
         for rel in lib.exports

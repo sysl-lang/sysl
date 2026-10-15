@@ -72,8 +72,11 @@ end c_probe_wanted
 // Every file's blocks lowered to ordinary declarations, with whatever could not be measured reported
 // on the analysis and its file emptied so that nothing downstream reads a block.
 c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
+    probe_refused = false
+
     if !c_probe_wanted(units) then return units
 
+    val before = a.found.len()
     var out: Buf[Program] = buf()
 
     for unit in units
@@ -87,8 +90,17 @@ c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
         if unmeasurable(unit, t) then out.push(unit with { body = buf() })
         else out.push(lower_unit(a, unit, t))
 
+    probe_refused = a.found.len() > before
     out
 end c_probe_lower
+
+// Whether the last `c_probe_lower` refused a block. **A refused probe empties its file**, so every
+// declaration in it reads as undefined to everything that names it -- a cascade of a hundred errors
+// hiding the one that matters (`'string.h' file not found`). The analysis stops on this instead,
+// with the probe's own refusal as the whole report.
+private var probe_refused: bool = false
+
+c_probe_refused() -> bool = probe_refused
 
 //
 // **What is asked is every environment capability the file requires, against what the machine

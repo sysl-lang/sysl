@@ -2477,10 +2477,11 @@ Each key is one library, named for refusals to call it by:
 |---|---|
 | `root` | where the library's tree is, relative to the package root; the package root if left out |
 | `include` | the directories its files are compiled with `-I` on, relative to `root`, searched in the order written |
+| `include_private` | directories only its own files read, searched ahead of `include` — never the package's shims, probes or dependents |
 | `sources` | the files it compiles, relative to `root`: named outright, or by a pattern |
 | `exclude` | files taken back out of what the patterns match, by path or by pattern |
 | `defines` | the macros every one of them is compiled with, as a `defines` block's are |
-| `export` | include roots it publishes to the C of the packages that depend on this one |
+| `export` | include roots it publishes to the C of the packages that depend on this one; `true` publishes its `include` roots |
 | `libc` | `true` where those roots are the C standard library's headers |
 
 **The list is the whole of what is compiled under the root.** The walk compiles none of the C there,
@@ -2513,9 +2514,11 @@ The rest of the rules are the `defines` block's, for the same reasons:
   is merely wrong, and either would otherwise build — short of what it meant, or compiling the file
   it meant to leave out. An `exclude` beside no pattern is refused when the manifest is read; leave
   the file out of the list instead.
-- **Every path is relative and stays inside the package.** `..` may climb while it stays there —
-  `"../../config"` is the package's own configuration directory beside the vendored tree — and one
-  that climbs out is refused when the manifest is read.
+- **Every path is relative and stays inside the package.** A path is relative to `root`, and **a
+  leading `/` makes it relative to the package root instead** — `"/config"` is the package's own
+  configuration directory however deep the vendored tree sits, where the relative spelling would be
+  `"../../../config"`. There is no way to name the machine's root. `..` may climb while it stays in
+  the package, and one that climbs out is refused when the manifest is read.
 - **A named file the tree does not hold stops the build**, as does an include or export root that is
   not a directory. The list is everything the library compiles, so a missing file is a typo or an
   upgrade that renamed it, never a file to leave out.
@@ -2543,6 +2546,17 @@ beside it, carried one step further.
 
 A package's include roots come before any `--include-path`: a configuration header is the package's,
 and one of the same name elsewhere on the machine is not the one the library was written against.
+
+`include_private` roots are the exception: they are the library's internals (BearSSL's `src/`,
+holding `inner.h`), read by its own files and by nothing else. A shim reaching for a header there is
+told it is not found.
+
+**A probe the C compiler refuses is the whole report.** Its file loses every declaration it holds, so
+going on would report each use of them elsewhere as undefined and bury the one line that explains
+them all; the build stops at the refusal, quoting clang.
+
+`sysl build-lib` compiles a package's C exactly as every other command does — the library's list,
+its shims, and the roots and macros each is given.
 
 ### Publishing headers to the packages that depend on this one
 
@@ -2578,6 +2592,29 @@ reads the same `lwipopts.h`.
 
 A package is compiled once, so **two consumers each configuring it is refused**, naming both entries.
 A `c_include` directory that is not there stops the build.
+
+**The pattern that works: defaults the package guards, overrides the consumer chains to them.** The
+package's own `lwipopts.h` gives every option it cares about with `#ifndef`, so each is a default
+rather than a decision:
+
+```c
+/* the package's config/lwipopts.h */
+#ifndef MEMP_NUM_PBUF
+#define MEMP_NUM_PBUF 16
+#endif
+```
+
+The consumer's header of the same name, found first, sets only what it changes and then includes the
+package's with `#include_next`, which continues the search after the directory it was found in:
+
+```c
+/* the consumer's config/lwipopts.h */
+#define MEMP_NUM_PBUF 23
+#include_next <lwipopts.h>
+```
+
+The consumer then writes three lines rather than a copy of the package's whole configuration, and a
+default the package adds in a later release reaches it without an edit.
 
 ### A package that supplies the C standard library's headers
 

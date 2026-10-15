@@ -93,11 +93,47 @@ vcl_a_path_escaping()
               "and publishes the C it carries and nothing else")
     assert_eq(vcl_refused("c { up { root = \"src\", include = [\"..\"], sources = [\"a.c\"] } }"), "(read)")
 
-@test("an absolute path is refused")
-vcl_an_absolute_path()
-    assert_eq(vcl_refused("c { up { export = [\"/usr/include\"] } }"),
-              "'c.up.export' names '/usr/include', an absolute path — a path is relative, since the " +
-              "package is the same tree wherever it was fetched to")
+@test("a leading slash is the package root, and it still may not be climbed out of")
+vcl_a_rooted_path()
+    val libs = vcl_read("c { up { root = \"c/up/src\", include = [\".\", \"/config\"], sources = [\"a.c\"] } }")
+
+    assert_eq(join(libs.at(0).include.view(), ","), "c/up/src,config")
+    assert_eq(vcl_refused("c { up { root = \"c/up/src\", include = [\"/../x\"], sources = [\"a.c\"] } }"),
+              "'c.up.include' names '/../x', which climbs out of the package — a package compiles " +
+              "and publishes the C it carries and nothing else")
+
+@test("export = true publishes the include roots, and false or nothing to publish is refused")
+vcl_export_true()
+    val libs = vcl_read("c { up { root = \"src\", include = [\"include\", \"/config\"], export = true } }")
+
+    assert_eq(join(libs.at(0).exports.view(), ","), "src/include,config")
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], export = false } }"),
+              "'c.up.export' is false, which publishes nothing — leave the key out to publish nothing")
+    assert_eq(vcl_refused("c { up { sources = [\"a.c\"], export = true } }"),
+              "'c.up.export' is true and the library has no 'include' roots to publish — name the " +
+              "directories instead")
+
+@test("include_private is read apart from include, and only by a library that compiles something")
+vcl_include_private_read()
+    val libs = vcl_read("c { up { root = \"src\", include = [\"inc\"], include_private = [\".\"], " +
+                        "sources = [\"a.c\"], export = true } }")
+
+    assert_eq(join(libs.at(0).private_include.view(), ","), "src")
+    assert_eq(join(libs.at(0).exports.view(), ","), "src/inc")
+    assert_eq(vcl_refused("c { up { include = [\"inc\"], include_private = [\"src\"] } }"),
+              "'c.up.include_private' is read by the library's own sources, and it compiles none — " +
+              "use 'include' for roots the package's other C reads")
+
+@test("what --verbose says a tree takes from its dependencies reads as a sentence")
+vcl_headers_said()
+    var flags: Buf[string] = buf()
+
+    assert_eq(c_headers_said("/p", flags, 0), "c headers: '/p' depends on no package")
+    assert_eq(c_headers_said("/p", flags, 2),
+              "c headers: '/p' takes no include roots from the 2 packages it depends on")
+
+    flags.push("-I/q/include")
+    assert_eq(c_headers_said("/p", flags, 1), "c headers: '/p' takes -I/q/include from the 1 package it depends on")
 
 @test("a brace is read as the defines block reads one, and misused the same way")
 vcl_brace_misuse()
@@ -121,7 +157,7 @@ vcl_not_c()
 vcl_an_unknown_key()
     assert_eq(vcl_refused("c { up { source = [\"a.c\"] } }"),
               "'c.up.source' is not something a C library declares — a library says its 'root', " +
-              "'include', 'sources', 'exclude', 'defines', 'export' and 'libc'")
+              "'include', 'include_private', 'sources', 'exclude', 'defines', 'export' and 'libc'")
 
 @test("a library declaring nothing is refused")
 vcl_declares_nothing()
@@ -355,6 +391,92 @@ vcl_two_consumers()
 
     vcl_drop([ws])
     assert(said.contains("both give") && said.contains("headers of their own with 'c_include'"), said)
+
+// The compile lines the last build handed clang for one file of the fixture.
+private vcl_compiles_of(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = c_compile_commands()
+
+    for line in lines
+        if line.contains(s"/$file ") then out.push(line)
+
+    out
+end vcl_compiles_of
+
+// `build-lib` compiles what every other build compiles: the library's list and the shim, each with
+// its include roots. It once took the walk alone, so the shim had no `-I` and the library was absent.
+private vcl_build_lib_on(target: Option[string])
+    val lib = vcl_lib(vcl_block("VL_SCALE = 3, VL_ON = true", vcl_listed()), "")
+
+    forget_c_compiles()
+
+    val built = build_library_of(lib, target)
+    val listed = vcl_compiles_of("c/up/src/lib.c")
+    val shim = vcl_compiles_of("geom/shim.c")
+
+    vcl_drop([lib])
+    assert(built.is_ok(), if built.is_ok() then "" else failure_text(built.unwrap_err()))
+    assert_eq(listed.len(), 1)
+    assert(listed.at(0).contains(s" -I$lib/c/up/src -I$lib/c/config "), listed.at(0))
+    assert(listed.at(0).contains(" -DVL_ON -DVL_SCALE=3"), listed.at(0))
+    assert_eq(shim.len(), 1)
+    assert(shim.at(0).contains(s" -I$lib/c/up/src -I$lib/c/config "), shim.at(0))
+
+@test("build-lib compiles the library and hands its shim the include roots, on the host")
+vcl_build_lib_host()
+    if !vcl_ready() then return
+
+    vcl_build_lib_on(None)
+
+@test("and for a board")
+vcl_build_lib_board()
+    if !vcl_ready() then return
+
+    vcl_build_lib_on(Some("thumbv7em-freestanding"))
+
+private vcl_private_block() -> string =
+    "c {\n  up {\n    root = \"c/up/src\"\n    include_private = [\".\"]\n    include = [\"/c/config\"]\n" +
+    s"    sources = [${vcl_listed()}]\n    defines { VL_SCALE = 3, VL_ON = true }\n  }\n}\n"
+
+@test("include_private reaches the library's own sources and not the package's shim")
+vcl_include_private_builds()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_private_block(), "")
+
+    vcl_write(lib, "geom/shim.c", "#include \"vl_config.h\"\nint shim_value(void) { return VL_FACTOR * VL_SCALE; }\n")
+
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert_eq(said, "135\n15\n15\n")
+
+@test("a shim reaching for a private header is not given it")
+vcl_include_private_hidden()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib(vcl_private_block(), "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert(said.starts_with("refused: ") && said.contains("geom/shim.c did not compile") &&
+           said.contains("'core/core.h' file not found"), said)
+
+// One refused probe empties its file, and every use of what it declared used to read as undefined.
+@test("a refused probe is the whole report, not the first of a cascade")
+vcl_probe_refusal_alone()
+    if !vcl_ready() then return
+
+    val lib = vcl_lib("c { up { root = \"c/up/src\", include = [\".\"], sources = [\"lib.c\"] } }", "")
+    val app = vcl_app(vcl_three(), s"g { path = \"$lib\" }")
+    val said = vcl_run(app)
+
+    vcl_drop([app, lib])
+    assert(said.contains("the C compiler refused this file's 'c const' block") &&
+           said.contains("'vl_config.h' file not found"), said)
+    assert(!said.contains("undefined"), said)
 
 @test("a dependency's published include root reaches the library's C")
 vcl_a_published_root()
