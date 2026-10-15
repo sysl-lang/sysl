@@ -334,8 +334,9 @@ end holds_func
 // lowered has a table, and that module may be one the program never names: `sh.sysl.pool`'s
 // closures, rooted, kept its scheduler -- and through it `sysl.threads`'s futex hooks -- in a board
 // build that imports only `sh.sysl.pool.deque`. A slot's module is the function's `declared_in`,
-// since a closure's key names none. A module a kept supplier (`extra`) was written in counts, and
-// the standard module's tables are left as they were.
+// since a closure's key names none. A module a kept supplier (`extra`) was written in counts; a
+// standard-library slot never makes a table a root, and the walk keeps the table instead once a
+// reached body erases a value into it.
 private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
                  reached: Option[Set[string]]) -> &Live
     val out = no_reached()
@@ -394,7 +395,13 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
 end roots_of
 
 // Whether a table is a root: where every module counts, where one of its slots was written in a
-// module that does, or where one was written in the standard module or names no body here.
+// module that does, or where one names no body here.
+//
+// **A slot written in the standard module is no reason to keep a table.** The standard library's
+// tables are built wherever analysis erased a value into one, whether or not the body that did it
+// survives -- `Counting`'s and `Buf`'s `ByteSink` tables, rooted, kept `BufCore.grow` and with it
+// `malloc` in a board image that never made a `Buf`. Such a table is kept by the walk instead, once
+// a body it reaches erases a value into it (`take_all`).
 private table_counts(t: TVtable, homes: Map[string, string], counted: Option[Set[string]]) -> bool
     if counted.is_none() then return true
 
@@ -405,7 +412,9 @@ private table_counts(t: TVtable, homes: Map[string, string], counted: Option[Set
 
         val m = home.unwrap()
 
-        if m == "sysl" || m.starts_with("sysl.") || counted.unwrap().has(m) then return true
+        if m == "sysl" || m.starts_with("sysl.") then continue
+
+        if counted.unwrap().has(m) then return true
 
     false
 end table_counts
@@ -420,9 +429,14 @@ private reached_from(p: TProgram, index: FuncIndex, root: &Live) -> &Live
     val out = no_reached()
     val none = p.funcs.len()
 
+    var tables: Map[string, usize] = map()
+
+    for i in 0..<p.vtables.len()
+        tables.put(p.vtables.at(i).name, i)
+
     var queue: Buf[string] = buf()
 
-    take_all(out, root, &queue)
+    take_all(p, tables, out, root, &queue)
 
     while !queue.is_empty()
         val name = queue.at(queue.len() - 1)
@@ -432,7 +446,7 @@ private reached_from(p: TProgram, index: FuncIndex, root: &Live) -> &Live
         var at = index.first.get_or(name, none)
 
         while at < none
-            take_all(out, body_refs(p, p.funcs.at(at)), &queue)
+            take_all(p, tables, out, body_refs(p, p.funcs.at(at)), &queue)
 
             at = index.next.at(at)
 
@@ -565,12 +579,21 @@ private func_index(p: TProgram) -> FuncIndex
     FuncIndex(first, next)
 end func_index
 
-private take_all(out: &Live, from: &Live, queue: *Buf[string])
+// What one body names, added to the walk. **A table a reached body erases a value into has its slots
+// reached**: the object can be called through wherever it goes, so whatever the table points at has to
+// survive. That is the only thing keeping a standard-library table (`table_counts`).
+private take_all(p: TProgram, tables: Map[string, usize], out: &Live, from: &Live,
+                 queue: *Buf[string])
     for i in 0..<from.vals.len()
         add_val(out, from.vals.at(i))
 
     for item in from.erased
-        add_erased(out, item)
+        if add_erased(out, item)
+            tables.get(item) match
+                Some(k) ->
+                    for slot in p.vtables.at(k).slots
+                        if add_call(out, slot.target) then queue.push(slot.target)
+                None -> ()
 
     for item in from.calls
         if add_call(out, item) then queue.push(item)
