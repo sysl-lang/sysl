@@ -1,0 +1,115 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A writable view and a read-only one of the same elements are met at the read-only one wherever a
+// type is settled from what is read, and a reserved word after a `.` is told how to be a field name.
+
+private sdg_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end sdg_skipped
+
+private sdg_write(text: string) -> string
+    val root = make_temp_dir("sysl-small-diags").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end sdg_write
+
+private sdg_prints(text: string, printed: string)
+    val root = sdg_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: ${failure_text(why)}", printed)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end sdg_prints
+
+private sdg_err(text: string) -> string
+    val root = sdg_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end sdg_err
+
+@test("assert_eq over a writable view and a read-only one compares them, in either order")
+sdg_a_generic_pair_of_views_meets_at_the_read_only_one()
+    if sdg_skipped() then return
+
+    sdg_prints(raw"""
+        both(a: []int, b: []const int) -> bool = a == b
+        var store: [3]int = [1, 2, 3]
+        val fixed: [3]int = [1, 2, 3]
+        assert_eq(store[..], fixed[..])
+        assert_eq(fixed[..], store[..])
+        print(both(store[..], fixed[..]))
+        """, "true\n")
+
+@test("a writable view is still not accepted where a writable one is asked for from a read-only one")
+sdg_assignment_stays_refused()
+    if sdg_skipped() then return
+
+    val said = sdg_err(raw"""
+        take(a: []int) = a[0] = 1
+        val fixed: [3]int = [1, 2, 3]
+        take(fixed[..])
+        """)
+
+    assert(said.contains("a '[]const int' views elements it may not write, and a '[]int' is a licence"),
+           said)
+
+@test("a reserved word after a dot is told it is reserved and how to write it")
+sdg_a_reserved_word_after_a_dot_is_told_the_backticks()
+    if sdg_skipped() then return
+
+    val said = sdg_err(raw"""
+        struct G
+            module: int
+        val g = G(1)
+        print(g.module)
+        """)
+
+    assert(said.contains("'module' is a reserved word"), said)
+    assert(said.contains("write it in backticks: '.`module`'"), said)
+    assert(!said.contains("tuple index expected"), said)
+
+@test("a field written in backticks after a dot is read")
+sdg_a_backticked_field_after_a_dot_is_read()
+    if sdg_skipped() then return
+
+    sdg_prints(raw"""
+        struct G
+            `module`: int
+            `match`: int
+        val g = G(1, 2)
+        print(g.`module`, g.`match`)
+        """, "1 2\n")
