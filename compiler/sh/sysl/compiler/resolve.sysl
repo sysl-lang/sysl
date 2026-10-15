@@ -237,7 +237,10 @@ end WorkspaceSelection
 // `{ workspace = true }` entries add nothing here, every member being read in its own right.
 workspace_selection(ws: &Workspace, sums: Sums, cache: string) -> Result[WorkspaceSelection, string]
     var state = new_resolve_state(sums, buf(), root_packages()?, buf(), true)
+    var asks: Buf[(string, Buf[Dependency])] = buf()
+    var pending: Buf[(string, Buf[Dependency])] = buf()
 
+    // Every directory first, then every claim, as a single project's resolution does (`resolve_once`).
     for mb in ws.members
         val m = resolving_local_paths(mb.manifest, mb.dir)
         var all: Buf[Dependency] = buf()
@@ -254,9 +257,11 @@ workspace_selection(ws: &Workspace, sums: Sums, cache: string) -> Result[Workspa
                 Local(_) -> paths.push(all.at(j))
                 _ -> ()
 
-        read_locals(paths, &state, cache)?
-        demanding(&state, mb.name, all)?
+        collect_locals(paths, &state, cache, &pending)?
+        asks.push((mb.name, all))
 
+    demand_locals(&state, pending)?
+    demand_locals(&state, asks)?
     select_versions(&state, cache)?
 
     var read: Buf[(string, Release)] = buf()
@@ -309,7 +314,20 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     val roots = pruned_roots(root_packages()?, enabled)
     var state = new_resolve_state(sums, enabled, roots, floors, false)
 
-    read_locals(config.dependencies, &state, cache)?
+    // Every directory the project and its roots name is read before anything is claimed, so a path
+    // dependency anywhere stands in for its coordinate whichever edge names it first.
+    var mine: Buf[(string, Buf[Dependency])] = buf()
+    var rooted: Buf[Buf[(string, Buf[Dependency])]] = buf()
+
+    collect_locals(config.dependencies, &state, cache, &mine)?
+
+    for item in roots
+        var theirs: Buf[(string, Buf[Dependency])] = buf()
+
+        collect_locals(item.1.dependencies, &state, cache, &theirs)?
+        rooted.push(theirs)
+
+    demand_locals(&state, mine)?
     demanding(&state, root_asker(config), config.dependencies)?
 
     // **A `--lib` source root's `dependencies` join the one graph**, so selection sees every claim
@@ -322,22 +340,25 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     for dependencie in config.dependencies
         declared.push(dependencie)
 
-    for item in roots
-        val theirs = item.1.dependencies
+    for r in 0..<roots.len()
+        val theirs = roots.at(r).1.dependencies
 
-        read_locals(theirs, &state, cache)?
+        demand_locals(&state, rooted.at(r))?
         demanding(&state, root_asker(config), theirs)?
 
         for j in 0..<theirs.len()
             declared.push(theirs.at(j))
 
     select_versions(&state, cache)?
+    stand_locals_in(&state)
 
-    val root_table = table_of(ManifestName, root, declared, state)?
+    val root_table = table_of(ManifestName, root, standing_edges(state, declared), state)?
     val settled = materialize(state)
     var packages: Buf[ResolvedPackage] = buf()
+    var own = config
 
-    packages.push(ResolvedPackage("", root, config, root_table, None))
+    own.dependencies = standing_edges(state, config.dependencies)
+    packages.push(ResolvedPackage("", root, own, root_table, None))
 
     for item in settled
         var p = item
@@ -428,8 +449,8 @@ end dependency_floor_refusal
 private demanding(state: *ResolveState, asker: string,
                   deps: &Buf[Dependency]) -> Result[unit, string]
     for item in deps
-        // A coordinate a source root stands in for takes no part in selection at all.
-        if stand_in_for(*state, item).is_some() then continue
+        // A coordinate a source root or a path dependency stands in for takes no part in selection.
+        if stand_in_for(*state, item).is_some() || standing_local(*state, item).is_some() then continue
 
         item.origin match
             Git(coordinate, written) ->
@@ -521,54 +542,112 @@ private with_fetch(state: *ResolveState, dep: &Dependency, got: &Fetched)
         _ -> ()
 end with_fetch
 
-// The path dependencies of the **root** manifest, which are not part of version selection.
+// **Every directory a manifest names, and every one those name in turn**, read into the state -- which
+// takes no part in selection, a directory having no version to select and no coordinate to be
+// identified by. What each asks for is left in `pending`, to be claimed once every directory is known
+// (`demand_locals`): a directory may be the package a coordinate names (`standing_local`), and which
+// edge reaches that coordinate first must not decide whether it is fetched.
 //
-// A directory beside the consumer has no version to select and no coordinate to be identified by, so
-// it takes no part in selection and is simply read. A *dependency* may not have one: a relative path
-// in a fetched package would be relative to a checkout that only exists on the machine that made it,
-// which is a build that works for its author and nobody else.
-private read_locals(deps: &Buf[Dependency], state: *ResolveState,
-                    cache: string) -> Result[unit, string]
+// **A path dependency's own `path` is read against the manifest that wrote it** (`manifest_of_package`
+// resolves it there), so a tree of directories checked out side by side -- a board, its network stack
+// and the C library both take -- builds with no workspace around it. A *fetched* package may not have
+// one (`select_versions`): a relative path in it would be relative to a checkout that only exists on
+// the machine that made it.
+private collect_locals(deps: &Buf[Dependency], state: *ResolveState, cache: string,
+                       pending: *Buf[(string, Buf[Dependency])]) -> Result[unit, string]
     for dep in deps
         if is_git_dependency(dep) then continue
 
         // The project and a source root, or two roots, naming one directory under one label is one
         // package read once.
-        if already_local(*state, dep) then continue
+        if already_local(*state, dep)? then continue
 
         val got = fetch_ensure(dep, state.sums, cache)?
         val read = manifest_of_package(got.root)?
         val theirs = if state.everything then read
         else pruned_manifest(read, state.enabled, dependency_canonical(dep))
 
-        // **A workspace member is the one directory whose own directories mean something**: the
-        // workspace is one checkout, so a member's members and paths are read as the root's are.
-        val member = is_member_dependency(dep)
-
-        if !member
-            for j in 0..<theirs.dependencies.len()
-                if !is_git_dependency(theirs.dependencies.at(j))
-                    return Err(s"'${dep.label}' is a path dependency that itself has a path " +
-                        "dependency — a relative path only means something in the project it was " +
-                        "written in")
-
         state.locals.push(ReadPackage(dependency_canonical(dep), "", None, got.root, theirs))
-        demanding(state, dep.label, theirs.dependencies)?
-
-        if member then read_locals(theirs.dependencies, state, cache)?
+        pending.push((dep.label, theirs.dependencies))
+        collect_locals(theirs.dependencies, state, cache, pending)?
 
     Ok(())
-end read_locals
+end collect_locals
 
-private already_local(state: &ResolveState, dep: &Dependency) -> bool
+// The claims of the directories `collect_locals` read, in the order it read them.
+private demand_locals(state: *ResolveState, pending: &Buf[(string, Buf[Dependency])]) -> Result[unit, string]
+    for item in pending
+        demanding(state, item.0, item.1)?
+
+    Ok(())
+end demand_locals
+
+// Whether `dep` names a directory already read under its name -- or, refused, a different directory
+// under the same one: a package's modules are named by it, so one build cannot hold two of them.
+private already_local(state: &ResolveState, dep: &Dependency) -> Result[bool, string]
     val canonical = dependency_canonical(dep)
     val dir = dependency_dir(dep).unwrap_or("")
 
     for had in state.locals
-        if had.canonical == canonical && had.dir == dir then return true
+        if had.canonical == canonical
+            if had.dir == dir then return Ok(true)
 
-    false
+            return Err(s"'${dep.label}' names two directories, '${had.dir}' and '$dir' — a package's " +
+                s"modules are named by it, so one build holds one package called '$canonical'")
+
+    Ok(false)
 end already_local
+
+// **The path dependency that IS the package a coordinate names**, where the graph holds one: the rule
+// a `--lib` root stands in by (`stood_in_by`), its `package.name` against the coordinate's repository
+// name. The coordinate is then neither selected nor fetched anywhere in the graph, and every edge
+// naming it is an edge to the directory (`standing_edges`) -- so a board naming `cstd { path = … }`
+// gives the network stack beside it, which names cstd's coordinate, the same checkout. A `--lib` root
+// that stands in for the coordinate wins, being named on the command line.
+private standing_local(state: &ResolveState, dep: &Dependency) -> Option[ReadPackage]
+    val coordinate = dependency_coordinate(dep) match
+        None -> return None
+        Some(c) -> c
+
+    if stand_in_for(state, dep).is_some() then return None
+
+    val repository = repository_name(coordinate)
+
+    for had in state.locals
+        if had.manifest.name == repository then return Some(had)
+
+    None
+end standing_local
+
+// A list of edges with each one to a coordinate a path dependency stands in for made an edge to that
+// directory, under the name it was read by -- so what it binds, the features it asks for and the
+// headers it reaches are the directory's. The entry's own label, mount and features are kept.
+private standing_edges(state: &ResolveState, deps: &Buf[Dependency]) -> Buf[Dependency]
+    var out: Buf[Dependency] = buf()
+
+    for dep in deps
+        standing_local(state, dep) match
+            None -> out.push(dep)
+            Some(had) -> out.push(dep with { origin = Member(had.dir, had.canonical) })
+
+    out
+end standing_edges
+
+// Every manifest the state read with its edges to stood-in coordinates redirected (`standing_edges`),
+// which is done once selection is over and before anything binds a name.
+private stand_locals_in(state: *ResolveState)
+    for j in 0..<state.manifests.len()
+        var had = state.manifests.at(j)
+
+        had.manifest.dependencies = standing_edges(*state, had.manifest.dependencies)
+        state.manifests.set(j, had)
+
+    for j in 0..<state.locals.len()
+        var had = state.locals.at(j)
+
+        had.manifest.dependencies = standing_edges(*state, had.manifest.dependencies)
+        state.locals.set(j, had)
+end stand_locals_in
 
 // Every `--lib` source root that is a directory and its manifest, in the order the roots were given,
 // each `path` read against the root's own directory. A root with no manifest answers the empty one,
@@ -846,7 +925,7 @@ private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[De
         val standing = stand_in_for(state, dep)
 
         if standing.is_some()
-            val root_deps = standing.unwrap().1.dependencies
+            val root_deps = standing_edges(state, standing.unwrap().1.dependencies)
 
             for root_dep in root_deps
                 queue.push(root_dep)
@@ -1294,7 +1373,11 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
     var out = no_package_sources()
     val libs = lib_roots()
 
-    note_c_exporters(graph)
+    val roots = root_packages() match
+        Err(why) -> return Err(said(Refusal(why)))
+        Ok(got) -> got
+
+    note_c_exporters(graph, roots)
 
     if feature_testing() then out.dev_modules = dev_module_paths(m, graph)
 

@@ -146,10 +146,13 @@ sysl: error: build-lib writes nothing anybody names — it checks a library, and
 **A library may itself be built on another one**, and `--lib` naming the other's directory is what
 says so, exactly as it does for a compilation.
 
-**Unlike `build`, `run` and `test`, this does not fetch.** A package with a `dependencies` block is
-refused rather than resolved over the network, and the message names the dependency and points at
-`--lib`. A command whose whole job is to check one tree for one machine should not be the thing that
-goes looking; the cost is that such a package writes its dependency down twice.
+**Unlike `build`, `run` and `test`, this does not fetch.** A `dependencies` block is resolved as theirs
+is — optional dependencies no feature turns on are pruned first, and the [feature
+flags](#the-feature-flags) choose which those are — but only over directories: a `path` dependency is
+read where it is, and a coordinate has to be answered by a `--lib` root or a path dependency that
+[stands in](/reference/packages/#a-source-root-stands-in-for-the-package-it-is) for it. One that
+nothing answers is refused, naming the coordinate and the directory that would. A command whose whole
+job is to check one tree for one machine should not be the thing that goes looking.
 
 **`--cc` names the clang, where a search would not find the right one.**
 
@@ -1032,7 +1035,7 @@ training looked like, expect less.
 
 ### The feature flags
 
-`run`, `build`, `build-c`, `test`, `deps` and `vendor` take three more, which choose the root
+`run`, `build`, `build-c`, `build-lib`, `test`, `deps` and `vendor` take three more, which choose the root
 project's [features](/reference/packages/#features) — and so which optional dependencies are fetched
 at all:
 

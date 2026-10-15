@@ -1698,9 +1698,11 @@ private discard_staging(staging: Option[string])
 // assembles is discarded; what the command is run for is that the whole of it went through, which
 // for a board package is the only check it gets.
 //
-// **It compiles the tree it is given and fetches nothing**, which is the one thing about the command
-// a reader has to be told: a `dependencies` block every other command honours is refused here by
-// name, and what the tree depends on is handed over as a source root of its own.
+// **It compiles the trees it is given and fetches nothing**, which is the one thing about the command
+// a reader has to be told. A `dependencies` block resolves as every other command's does, but only
+// over directories: a `path` dependency is read where it is, and a coordinate is reached through a
+// `--lib` root -- or a path dependency -- that stands in for it. One that nothing stands in for is
+// refused where the resolver would have fetched it, naming the flag (`refuse_fetches`).
 build_library_of(path: string, named_target: Option[string],
                  level: string = DefaultOptimization) -> Result[string, Failure]
     val t = target_for(path, named_target)?
@@ -1710,48 +1712,18 @@ build_library_of(path: string, named_target: Option[string],
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
-    if !manifest.dependencies.is_empty()
-        var labels = ""
-
-        for i in 0..<manifest.dependencies.len()
-            if i > 0 then labels = labels + ", "
-
-            labels = labels + s"'${manifest.dependencies.at(i).label}'"
-
-        return Err(said(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
-            s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
-            s"supply $labels as --lib <dir>")))
-    end if
-
-    // A source root's `dependencies` are refused on the same terms: a root is there to type-check
-    // against, and what it depends on reaches `build-lib` as a root of its own.
-    val libs = lib_roots()
-
-    for item in libs
-        if !is_directory(item) then continue
-
-        val theirs = manifest_of_package(item) match
-            Err(why) -> return Err(said(Refusal(why)))
-            Ok(got) -> got
-
-        if theirs.dependencies.is_empty() then continue
-
-        var labels = ""
-
-        for j in 0..<theirs.dependencies.len()
-            if j > 0 then labels = labels + ", "
-
-            labels = labels + s"'${theirs.dependencies.at(j).label}'"
-
-        return Err(said(Refusal(s"build-lib compiles the trees it is given and fetches nothing, so " +
-            s"the source root '${item}' has its dependencies reach it through --lib rather " +
-            s"than through 'dependencies' — supply $labels as --lib <dir> too")))
-
     // The two requirements a command line answers, asked before anything is compiled: a package
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
     // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
     val probed = supplied_or_refused(path, t, false)?
-    val c = packaged_compilation_of(path, t, false)?
+
+    refuse_fetches(true)
+
+    val compiled = packaged_compilation_of(path, t, false)
+
+    refuse_fetches(false)
+
+    val c = compiled?
 
     // **A library is reached by naming its module**, so a file of the tree that declares none sits in
     // the anonymous root module: no program could write a path to what it declares, and its keys would

@@ -2095,7 +2095,7 @@ an archive that does not match is built again rather than linked.
      lbm_a_roots_header_requirement_is_asked, lbm_a_roots_pkg_config_is_probed,
      lbm_a_root_with_no_manifest_requires_nothing) and tests_lib_root_deps.sysl
      (lbd_two_roots_dependencies_claim_one_module, lbd_a_roots_dependency_and_the_projects_module,
-     lbd_build_lib_refuses_a_roots_dependencies). A page cannot run a build of two directories, so
+     lbd_build_lib_reads_a_roots_path_dependency). A page cannot run a build of two directories, so
      the command line is a `text` block and the tests are the evidence. -->
 
 A directory handed to `--lib` is a **source root**: a tree of modules that joins the compilation
@@ -2126,7 +2126,8 @@ macros the root's manifest defines for it and linked with the program's — into
 
 **A root's `dependencies` resolve in the one graph** with the project's, under the same rule: two
 packages offering one module are refused, and so is a root's dependency offering a module the project
-declares. `build-lib` fetches nothing, so it refuses a root that declares dependencies by name.
+declares. `build-lib` fetches nothing, so it resolves them only over directories: a `path` is read
+where it is, and a coordinate nothing stands in for is refused, naming the flag that would supply it.
 
 A root that *is* one of the project's dependencies — its manifest names the package the coordinate
 does — stands in for that dependency instead;
