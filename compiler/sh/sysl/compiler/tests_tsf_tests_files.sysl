@@ -1,0 +1,223 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// Three things a `@tests` file may write and be read as written (`reference/attributes.md § @tests --
+// a file of scaffolding`): storage a test reads, a type whose methods call the file's helpers, and --
+// in a package someone else depends on -- anything at all, since no consumer's build reads it.
+//
+// **Every `@test` either runs or is refused by name.** A test read as something else -- a function
+// nested into the body of the file a script starts in -- is never compiled, never counted and never
+// reported, and the run that lost it still says every test passed.
+
+private tsf_ready() -> bool = std_root().is_ok() && clang_available()
+
+private tsf_files(files: [](string, string)) -> Buf[(string, string)]
+    var b: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len
+        b.push(files[i])
+
+    b
+end tsf_files
+
+// The display names of the tests a test build of a tree keeps, in order, and what `sysl test` says
+// and answers for it. The tree is removed afterwards.
+private tsf_tested(files: [](string, string)) -> (string, int, string)
+    val root = lbr_tree(tsf_files(files))
+
+    reset_search_paths()
+
+    val names = test_build_of(root, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(built) ->
+            var out: Buf[string] = buf()
+
+            for item in built.tests
+                out.push(item.display)
+
+            join(out.view(), ", ")
+
+    val ran = lbr_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    (names, ran.0, ran.1)
+end tsf_tested
+
+// -- a test reading storage its own '@tests' file declares ----------------------------------------
+
+private tsf_storage(second: string) -> string =
+    "@tests\n\nvar shared: int = 11\n\n@test(\"first\")\nfirst() =\n    assert_eq(1, 1)\n\n" +
+    s"@test(\"second\")\nsecond() =\n$second\n"
+
+@test("a root '@tests' file's 'var' is module storage, and the test reading it runs beside the other")
+tsf_a_root_tests_file_var_is_storage()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([("tests.sysl", tsf_storage("    assert_eq(shared, 11)"))])
+
+    assert_eq(names, "first, second")
+    assert_eq(code, 0, said)
+
+@test("and a test that writes that storage and then fails is counted as failed, not dropped")
+tsf_a_failing_test_of_that_storage_is_counted()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([
+        ("tests.sysl", tsf_storage("    shared += 1\n    assert_eq(shared, 13)"))])
+
+    assert_eq(names, "first, second")
+    // `first` cannot fail, so a failed run is `second` counted.
+    assert(code != 0, said)
+
+@test("a root '@tests' file beside a program that runs is still not where the program starts")
+tsf_beside_a_program_that_runs()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([
+        ("main.sysl", "print(\"main\")\n"),
+        ("tests.sysl", tsf_storage("    assert_eq(shared, 11)"))])
+
+    assert_eq(names, "first, second")
+    assert_eq(code, 0, said)
+
+private tsf_nested(kind: string) -> string =
+    s"'reads' is a $kind that reads a binding of the body of the file this program starts in, so it " +
+    "would be nested inside that body where the test runner cannot reach it — mark what it reads " +
+    "'static', which makes it the module's"
+
+@test("a '@test' in a script's own file that reads the script's binding is refused by name")
+tsf_a_test_reading_a_script_binding_is_refused()
+    if !tsf_ready() then return
+
+    val (_, code, said) = tsf_tested([
+        ("main.sysl", "var n = 1\nprint(n)\n\n@test(\"reads\")\nreads() =\n    assert_eq(n, 1)\n")])
+
+    assert(code != 0, said)
+    assert(said.contains(s"error: ${tsf_nested("'@test'")}"), said)
+
+@test("so is one reaching the binding through a sibling, and so is a hook")
+tsf_through_a_sibling_and_a_hook()
+    if !tsf_ready() then return
+
+    val (_, code, said) = tsf_tested([
+        ("main.sysl", "var n = 1\nprint(n)\n\nlook() -> int = n\n\n@setup\nreads() =\n" +
+                      "    assert_eq(look(), 1)\n\n@test(\"t\")\nt() =\n    assert(true)\n")])
+
+    assert(code != 0, said)
+    assert(said.contains(s"error: ${tsf_nested("hook")}"), said)
+
+@test("the same test over a 'static' binding is the module's, and runs")
+tsf_over_a_static_binding_it_runs()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([
+        ("main.sysl", "static var n: int = 1\nprint(n)\n\n@test(\"reads\")\nreads() =\n    assert_eq(n, 1)\n")])
+
+    assert_eq(names, "reads")
+    assert_eq(code, 0, said)
+
+// -- a type a '@tests' file declares is scaffolding too -------------------------------------------
+
+private tsf_probe() -> string =
+    "@tests\n\nhelper() -> int = 41\n\nstruct Probe\n    n: int\n\n    bumped(self) -> int = helper() + self.n\n\n" +
+    "impl Probe\n    twice(self) -> int = helper() + helper() + self.n\n\n" +
+    "@test(\"names the helper\")\nnames_the_helper() =\n    assert_eq(Probe(1).bumped(), 42)\n" +
+    "    assert_eq(Probe(0).twice(), 82)\n"
+
+@test("a method of a type a '@tests' file declares, inline or in its 'impl', may call the file's helper")
+tsf_a_tests_type_may_call_its_helper()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([("tests.sysl", tsf_probe())])
+
+    assert_eq(names, "names the helper")
+    assert_eq(code, 0, said)
+
+@test("a method of a type in an ordinary file still may not")
+tsf_an_ordinary_type_still_may_not()
+    if !tsf_ready() then return
+
+    val (_, code, said) = tsf_tested([
+        ("m/m.sysl", "module m\n\nstruct Plain\n    n: int\n\n    bumped(self) -> int = helper() + self.n\n"),
+        ("m/tests.sysl", "module m\n@tests\n\nhelper() -> int = 41\n\n@test\nt() =\n" +
+                         "    assert_eq(Plain(1).bumped(), 42)\n")])
+
+    assert(code != 0, said)
+    assert(said.contains("error: 'm.helper' is declared in a file that said '@tests'"), said)
+
+// -- a dependency's '@tests' files are never read by its consumer ---------------------------------
+
+// The package `github.com/e/extra` at 1.0.0, whose module `sh.sysl.extra` holds `seven` and whatever
+// else is given, vendored in the project as a fetch would have left it.
+private tsf_publish_extra(project: string, others: [](string, string))
+    val dir = s"$project/vendor/github.com/e/extra/@v1.0.0"
+
+    make_dir_all(s"$dir/sh/sysl/extra").unwrap()
+    write_text(s"$dir/package.hocon", "package { name = \"extra\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$dir/sh/sysl/extra/extra.sysl", "module sh.sysl.extra\n\nseven() -> int = 7\n").unwrap()
+
+    for i in 0..<others.len
+        val (name, text) = others[i]
+
+        write_text(s"$dir/sh/sysl/extra/$name", text).unwrap()
+
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end tsf_publish_extra
+
+// What `sysl build` and then the built program say, for a consumer of `extra` holding these files.
+private tsf_consumer_built(others: [](string, string)) -> (int, string)
+    val root = lbr_tree(tsf_files([
+        ("package.hocon", "package { name = \"app\", version = \"1.0.0\" }\n" +
+                          "dependencies { extra { git = \"github.com/e/extra\", version = \"1.0.0\" } }\n"),
+        ("main.sysl", "import sh.sysl.extra\n\nprint(extra.seven())\n")]))
+
+    tsf_publish_extra(root, others)
+
+    val exe = s"$root/built"
+    val built = lbr_cli(["sysl", "build", root, "-o", exe])
+
+    if built.0 != 0
+        remove_dir_all(root).unwrap_or(())
+        return built
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> (1, "the program that was built could not be run")
+        Ok(out) -> (if out.status.ok() then 0 else 1, out.text)
+end tsf_consumer_built
+
+@test("a dependency's '@tests' file that does not parse does not stop its consumer's build")
+tsf_a_dependency_tests_file_that_does_not_parse()
+    if !tsf_ready() then return
+
+    val got = tsf_consumer_built([("tests.sysl", "module sh.sysl.extra\n@tests\n\nf( -> int\n")])
+
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, "7\n")
+
+@test("nor one that does not lex, under a header with a comment and another annotation in it")
+tsf_a_dependency_tests_file_that_does_not_lex()
+    if !tsf_ready() then return
+
+    val got = tsf_consumer_built([
+        ("tests.sysl", "module sh.sysl.extra\n// the vectors\n@requires(heap)\n@tests // scaffolding\n\n" +
+                       "val s = \"never closed\n")])
+
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, "7\n")
+
+@test("a dependency's ordinary file that does not parse still stops the build")
+tsf_a_dependency_ordinary_file_still_stops_it()
+    if !tsf_ready() then return
+
+    val got = tsf_consumer_built([("broken.sysl", "module sh.sysl.extra\n\n// @tests\nf( -> int\n")])
+
+    assert(got.0 != 0, got.1)

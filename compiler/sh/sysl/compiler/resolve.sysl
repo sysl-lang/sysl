@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.fs.{is_file, read_text}
 import sysl.text.Search
@@ -1314,9 +1315,17 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         val theirs = Packaging(p.canonical, p.imports, true, manifest, name, version)
         val gated = feature_symbols(enabled_of(graph.features, p.canonical))
 
+        // **A package's `@tests` files are its own `sysl test`'s and no consumer's**, so they are left
+        // unread: one that would not even parse -- written against a newer compiler, or against a
+        // dev dependency the consumer never fetches -- cannot stop a program that only links it.
         for j in 0..<found.len()
-            val parsed = parse(found.at(j).src, t, gated)
+            val src = found.at(j).src
 
+            if header_says_tests(src) then continue
+
+            val parsed = parse(src, t, gated)
+
+            if parsed.program.test_only then continue
             if !parsed.ok() then return Err(Reported(parse_report(parsed)))
 
             var unit = parsed.program
@@ -1326,6 +1335,28 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
     Ok(out)
 end package_sources
+
+// Whether a file's header says `@tests`, asked of its text alone, so that a test file is known for one
+// before it is lexed. The header is a `module` line and the annotation lines under it, with blank lines
+// and comments between; the first line that is none of those ends it.
+private header_says_tests(src: Source) -> bool
+    val lines = src.line_count()
+
+    for i in 0..<lines
+        val hi = if i + 1 < lines then src.starts.at(i + 1) else src.bytes.len
+        val line = src.bytes[src.starts.at(i)..<hi].trim()
+
+        if line.is_empty() || line.starts_with("//".bytes) || line.starts_with("module ".bytes)
+            continue
+
+        if line[0] != u8('@') then return false
+
+        if line.starts_with("@tests".bytes)
+            if line.len == 6 || line[6] == u8(' ') || line[6] == u8('\t') || line[6] == u8('/')
+                return true
+
+    false
+end header_says_tests
 
 // The graph alone, which is what a build and a listing of what a project takes have in common.
 //
