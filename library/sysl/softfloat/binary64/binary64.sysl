@@ -455,6 +455,26 @@ private[binary64] to_unsigned(r: u64, width: int) -> u64
         Some(m) -> m
         None -> if width == 64 then ALL_ONES else (ONE << width) - 1
 
+// -- binary32 ----------------------------------------------------------------------------------------
+//
+// **`f32` arithmetic on a core with no floating-point unit at all** -- Armv6-M, a Cortex-M3, RISC-V
+// with no `F` -- is the binary64 arithmetic between a widening and a narrowing. Widening is exact, and
+// rounding twice is harmless here: binary64 carries 53 bits against binary32's 24, and a sum,
+// difference, product or quotient of two binary32 values rounded to 2 * 24 + 2 bits or more and then
+// to 24 is the value rounded to 24 once (Figueroa, "When is double rounding innocuous?", 1995).
+
+/** `a + b` on binary32 encodings. */
+private[binary64] add_single(a: u32, b: u32) -> u32 = narrow_single(add(widen_single(a), widen_single(b)))
+
+/** `a - b` on binary32 encodings. */
+private[binary64] sub_single(a: u32, b: u32) -> u32 = narrow_single(sub(widen_single(a), widen_single(b)))
+
+/** `a * b` on binary32 encodings. */
+private[binary64] mul_single(a: u32, b: u32) -> u32 = narrow_single(mul(widen_single(a), widen_single(b)))
+
+/** `a / b` on binary32 encodings. */
+private[binary64] div_single(a: u32, b: u32) -> u32 = narrow_single(div(widen_single(a), widen_single(b)))
+
 // -- the exports -------------------------------------------------------------------------------------
 //
 // Arm's run-time ABI answers a comparison as a truth value -- `__aeabi_dcmplt` is 1 where `a < b` and
@@ -586,6 +606,41 @@ aeabi_fcmpgt(a: u32, b: u32) -> int = aeabi_dcmpgt(widen_single(a), widen_single
 /** 1 where either is a NaN. */
 @export("__aeabi_fcmpun")
 aeabi_fcmpun(a: u32, b: u32) -> int = aeabi_dcmpun(widen_single(a), widen_single(b))
+
+// The `f32` arithmetic and its conversions to and from a 32-bit integer, which a core with no unit
+// calls for every `f32` operation.
+
+/** `a + b` on `f32`. */
+@export("__aeabi_fadd")
+aeabi_fadd(a: u32, b: u32) -> u32 = add_single(a, b)
+
+/** `a - b` on `f32`. */
+@export("__aeabi_fsub")
+aeabi_fsub(a: u32, b: u32) -> u32 = sub_single(a, b)
+
+/** `a * b` on `f32`. */
+@export("__aeabi_fmul")
+aeabi_fmul(a: u32, b: u32) -> u32 = mul_single(a, b)
+
+/** `a / b` on `f32`. */
+@export("__aeabi_fdiv")
+aeabi_fdiv(a: u32, b: u32) -> u32 = div_single(a, b)
+
+/** An `int` as an `f32`, rounded once. */
+@export("__aeabi_i2f")
+aeabi_i2f(x: int) -> u32 = single_from_signed(i64(x))
+
+/** A `uint` as an `f32`, rounded once. */
+@export("__aeabi_ui2f")
+aeabi_ui2f(x: uint) -> u32 = single_from_unsigned(u64(x))
+
+/** An `f32` toward zero as an `int`. */
+@export("__aeabi_f2iz")
+aeabi_f2iz(x: u32) -> int = int(to_signed(widen_single(x), 32))
+
+/** An `f32` toward zero as a `uint`. */
+@export("__aeabi_f2uiz")
+aeabi_f2uiz(x: u32) -> uint = uint(to_unsigned(widen_single(x), 32))
 
 #elif riscv32
 
@@ -720,5 +775,40 @@ gesf2(a: u32, b: u32) -> int = compare(widen_single(a), widen_single(b), -1)
 /** Not zero where either is a NaN. */
 @export("__unordsf2")
 unordsf2(a: u32, b: u32) -> int = if unordered(widen_single(a), widen_single(b)) then 1 else 0
+
+// The `f32` arithmetic and its conversions to and from a 32-bit integer, which a machine with no `F`
+// calls for every `f32` operation.
+
+/** `a + b` on `f32`. */
+@export("__addsf3")
+addsf3(a: u32, b: u32) -> u32 = add_single(a, b)
+
+/** `a - b` on `f32`. */
+@export("__subsf3")
+subsf3(a: u32, b: u32) -> u32 = sub_single(a, b)
+
+/** `a * b` on `f32`. */
+@export("__mulsf3")
+mulsf3(a: u32, b: u32) -> u32 = mul_single(a, b)
+
+/** `a / b` on `f32`. */
+@export("__divsf3")
+divsf3(a: u32, b: u32) -> u32 = div_single(a, b)
+
+/** An `int` as an `f32`, rounded once. */
+@export("__floatsisf")
+floatsisf(x: int) -> u32 = single_from_signed(i64(x))
+
+/** A `uint` as an `f32`, rounded once. */
+@export("__floatunsisf")
+floatunsisf(x: uint) -> u32 = single_from_unsigned(u64(x))
+
+/** An `f32` toward zero as an `int`. */
+@export("__fixsfsi")
+fixsfsi(x: u32) -> int = int(to_signed(widen_single(x), 32))
+
+/** An `f32` toward zero as a `uint`. */
+@export("__fixunssfsi")
+fixunssfsi(x: u32) -> uint = uint(to_unsigned(widen_single(x), 32))
 
 #endif
