@@ -15,32 +15,32 @@ import sysl.process.capture
 // count is what TSan does follow, so a thread-sanitized build gets that and every other build keeps
 // the fence.
 
-private extern "setenv" tsf_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
-private extern "unsetenv" tsf_c_unsetenv(name: *u8) -> int
+private extern "setenv" tsn_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tsn_c_unsetenv(name: *u8) -> int
 
-private tsf_flags(value: string)
+private tsn_flags(value: string)
     val n = cstring("SYSL_EXTRA_CFLAGS")
     val v = cstring(value)
 
-    tsf_c_setenv(n.ptr, v.ptr, 1)
-end tsf_flags
+    tsn_c_setenv(n.ptr, v.ptr, 1)
+end tsn_flags
 
-private tsf_no_flags()
+private tsn_no_flags()
     val n = cstring("SYSL_EXTRA_CFLAGS")
 
-    tsf_c_unsetenv(n.ptr)
-end tsf_no_flags
+    tsn_c_unsetenv(n.ptr)
+end tsn_no_flags
 
-private tsf_list(words: []const string) -> Buf[string]
+private tsn_list(words: []const string) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<words.len
         out.push(words[i])
 
     out
-end tsf_list
+end tsn_list
 
-private tsf_ready() -> bool
+private tsn_ready() -> bool
     std_root() match
         Err(_) ->
             print("skipped: the standard module's source is not on this machine")
@@ -53,12 +53,12 @@ private tsf_ready() -> bool
     end if
 
     true
-end tsf_ready
+end tsn_ready
 
 // The last share of `d` is given back by `start` on the main thread, after the spawned thread has
 // read `d.value` and given back its own share; the flag between them is relaxed, so the only order
 // TSan can see between the read and the free is the one the reference count makes.
-private tsf_program() -> string = raw"""
+private tsn_program() -> string = raw"""
     import sysl.sync.*
     import sysl.threads.*
 
@@ -97,56 +97,56 @@ private tsf_program() -> string = raw"""
     print(w.seen + 1)
     """
 
-private tsf_root() -> string
+private tsn_root() -> string
     val root = make_temp_dir("sysl-tsan-fence").unwrap()
 
     make_dir_all(root).unwrap()
-    write_text(s"$root/main.sysl", tsf_program()).unwrap()
+    write_text(s"$root/main.sysl", tsn_program()).unwrap()
     root
-end tsf_root
+end tsn_root
 
 // What `emit-llvm` prints for the program under `flags`, or with none where empty.
-private tsf_emitted(root: string, flags: string) -> string
+private tsn_emitted(root: string, flags: string) -> string
     var lines: Buf[string] = buf()
     val sink = &lines
 
-    if flags == "" then tsf_no_flags() else tsf_flags(flags)
+    if flags == "" then tsn_no_flags() else tsn_flags(flags)
 
     val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
 
-    tsf_no_flags()
+    tsn_no_flags()
 
     if code != 0 then return s"emit-llvm failed with $code: ${join(lines.view(), "\n")}"
 
     join(lines.view(), "\n")
-end tsf_emitted
+end tsn_emitted
 
 // --- which flags ask for it ------------------------------------------------------------------------
 
 @test("thread sanitizing is asked for by -fsanitize=thread, alone or in a list")
-tsf_thread_is_asked_for()
-    assert(thread_sanitized(tsf_list(["-fsanitize=thread"])))
-    assert(thread_sanitized(tsf_list(["-g", "-fsanitize=address,thread"])))
-    assert(thread_sanitized(tsf_list(["-fsanitize=undefined", "-fsanitize=thread"])))
+tsn_thread_is_asked_for()
+    assert(thread_sanitized(tsn_list(["-fsanitize=thread"])))
+    assert(thread_sanitized(tsn_list(["-g", "-fsanitize=address,thread"])))
+    assert(thread_sanitized(tsn_list(["-fsanitize=undefined", "-fsanitize=thread"])))
 
 @test("and by nothing else: another sanitizer, a suppression, or no flags")
-tsf_nothing_else_asks()
-    assert(!thread_sanitized(tsf_list([])))
-    assert(!thread_sanitized(tsf_list(["-fsanitize=address", "-g"])))
-    assert(!thread_sanitized(tsf_list(["-fno-sanitize=thread"])))
-    assert(!thread_sanitized(tsf_list(["-fsanitize=threads"])))
+tsn_nothing_else_asks()
+    assert(!thread_sanitized(tsn_list([])))
+    assert(!thread_sanitized(tsn_list(["-fsanitize=address", "-g"])))
+    assert(!thread_sanitized(tsn_list(["-fno-sanitize=thread"])))
+    assert(!thread_sanitized(tsn_list(["-fsanitize=threads"])))
 
 // --- the runtime text --------------------------------------------------------------------------------
 
 @test("a plain build acquires with a fence before the free")
-tsf_plain_build_keeps_the_fence()
+tsn_plain_build_keeps_the_fence()
     val text = arc_atomic(host_target(), false)
 
     assert(text.contains("reap:\n  fence acquire\n  call void @arc.reap(ptr %p)"), text)
     assert(!text.contains("load atomic"), text)
 
 @test("a thread-sanitized build acquires with a load of the count it released")
-tsf_tsan_build_loads_the_count()
+tsn_tsan_build_loads_the_count()
     val text = arc_atomic(host_target(), true)
     val word = host_target().pointer_bits()
 
@@ -156,7 +156,7 @@ tsf_tsan_build_loads_the_count()
     assert(!text.contains("fence"), text)
 
 @test("on a 32-bit machine the load is as wide and as aligned as its count")
-tsf_tsan_load_on_a_32_bit_target()
+tsn_tsan_load_on_a_32_bit_target()
     val text = arc_atomic(target_named("thumbv7em-freestanding").unwrap(), true)
 
     assert(text.contains("%a = load atomic i32, ptr %p acquire, align 4\n"), text)
@@ -166,13 +166,13 @@ tsf_tsan_load_on_a_32_bit_target()
 // --- through the driver -------------------------------------------------------------------------------
 
 @test("emit-llvm under -fsanitize=thread loads where a plain emit-llvm fences")
-tsf_emit_llvm_follows_the_flag()
-    if !tsf_ready() then return
+tsn_emit_llvm_follows_the_flag()
+    if !tsn_ready() then return
 
-    val root = tsf_root()
-    val tsan = tsf_emitted(root, "-fsanitize=thread")
-    val asan = tsf_emitted(root, "-fsanitize=address")
-    val plain = tsf_emitted(root, "")
+    val root = tsn_root()
+    val tsan = tsn_emitted(root, "-fsanitize=thread")
+    val asan = tsn_emitted(root, "-fsanitize=address")
+    val plain = tsn_emitted(root, "")
 
     remove_dir_all(root).unwrap_or(())
 
@@ -186,17 +186,17 @@ tsf_emit_llvm_follows_the_flag()
 // **The measurement.** Built by alpha.12, whose release fenced under TSan too, this program reports
 // one race: the free in `start` against the decrement in `touch`. With the load it reports none.
 @test("a &sync object freed on another thread than its last reader is a clean TSan run")
-tsf_tsan_run_is_clean()
-    if !tsf_ready() then return
+tsn_tsan_run_is_clean()
+    if !tsn_ready() then return
 
-    val root = tsf_root()
+    val root = tsn_root()
     val exe = s"$root/built"
 
-    tsf_flags("-fsanitize=thread -g")
+    tsn_flags("-fsanitize=thread -g")
 
     val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
 
-    tsf_no_flags()
+    tsn_no_flags()
 
     made match
         Err(why) ->
