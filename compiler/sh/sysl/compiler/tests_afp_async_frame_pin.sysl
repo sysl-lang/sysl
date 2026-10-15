@@ -649,6 +649,131 @@ afp_raw_and_nested_are_frame_fields()
         // The promise holds its header, the result, `n` and `inner`, so the frame is at least that.
         assert(afp_number_after(resume, "dereferenceable(") >= 48, s"-O$level: $resume")
 
+// **A lent local asking for a raised boundary is in the frame too, on that boundary.** A field of the
+// promise begins only on its type's own boundary, so such a local was left on the stack, where the
+// -O0 split lost it exactly as it lost `afp_view_only`'s array: the first program printed 0. Its field
+// is now a run of bytes and its slot the first address in the run on its boundary.
+private afp_aligned_view_only() -> string = raw"""
+    async fill() -> int
+        @align(64)
+        var buf: [64]u8 = [0; 64]
+        val head = buf[0..<4]
+
+        head[0] = 7
+        await yield_now()
+        int(head[0])
+
+    scribble() -> int
+        var junk: [256]u8 = [0; 256]
+
+        for i in 0..<256
+            junk[i] = 99
+
+        int(junk[255])
+
+    val t = fill()
+
+    print(step(t, () -> ()), scribble())
+    print(step(t, () -> ()), block_on(t))
+    """
+
+// Every shape of raised boundary at once -- an `@align(n)` array viewed, a value of an `@align(64)`
+// type and an `@align(128)` scalar each addressed, and an `@align(2)` array no wider than its field
+// already is -- each read back after the await, with the remainder of each address by its boundary
+// added in, so a slot off its boundary changes the sum.
+private afp_aligned_loans() -> string = raw"""
+    @align(64)
+    struct Line
+        bytes: [64]u8
+
+    async fill() -> int
+        @align(64)
+        var buf: [64]u8 = [0; 64]
+        val head = buf[0..<4]
+        var line = Line([0; 64])
+        val p = &line
+        @align(128)
+        var n = 0
+        val q = &n
+        @align(2)
+        var small: [3]u8 = [0; 3]
+        val s = small[0..<2]
+
+        head[0] = 7
+        p.bytes[0] = 30
+        *q = 5
+        s[1] = 100
+        await yield_now()
+
+        val off = usize(&buf) % 64 + usize(p) % 64 + usize(q) % 128 + usize(&small) % 2
+
+        int(head[0]) + int(p.bytes[0]) + *q + int(s[1]) + int(off)
+    end fill
+
+    scribble() -> int
+        var junk: [256]u8 = [0; 256]
+
+        for i in 0..<256
+            junk[i] = 99
+
+        int(junk[255])
+
+    val t = fill()
+
+    print(step(t, () -> ()), scribble())
+    print(step(t, () -> ()), block_on(t))
+    """
+
+// The module as sysl lowers it, before clang has run a pass over it.
+private afp_lowered(program: string) -> string
+    val root = make_temp_dir("sysl-afp").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val text = emit_llvm_text(s"$root/main.sysl", None, "0") match
+        Ok(emitted) -> emitted.text
+        Err(why) -> s"it did not lower: ${failure_text(why)}"
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end afp_lowered
+
+@test("an @align(64) array read after an await only through a view keeps its value at -O0, under ASan too")
+afp_aligned_view_only_survives()
+    if !afp_ready() then return
+
+    afp_runs(afp_aligned_view_only(), "false 99\ntrue 7\n")
+    afp_runs_clean(afp_aligned_view_only(), "false 99\ntrue 7\n")
+
+@test("lent locals of raised boundaries keep their values and their boundaries across an await, under ASan too")
+afp_aligned_loans_keep_their_boundaries()
+    if !afp_ready() then return
+
+    afp_runs(afp_aligned_loans(), "false 99\ntrue 142\n")
+    afp_runs_clean(afp_aligned_loans(), "false 99\ntrue 142\n")
+
+@test("an @align(64) local's slot is a promise field moved to its boundary, and no stack slot at either level")
+afp_aligned_local_is_an_aligned_frame_field()
+    if !afp_ready() then return
+
+    val ramp = afp_function(afp_lowered(afp_aligned_view_only()), "define ptr @fill(")
+
+    // The promise holds the header, the result and 64 + 63 bytes for the array; the slot is the
+    // field's address moved forward by `(0 - address) & 63`.
+    assert(ramp.contains("%task.promise = alloca { i64, ptr, i64, ptr, i32, [127 x i8] }"), ramp)
+    assert(ramp.contains("%buf.field = getelementptr { i64, ptr, i64, ptr, i32, [127 x i8] }, ptr %task.promise, i32 0, i32 5"), ramp)
+    assert(ramp.contains("%buf.field.back = sub i64 0, %buf.field.at"), ramp)
+    assert(ramp.contains("%buf.field.skip = and i64 %buf.field.back, 63"), ramp)
+    assert(ramp.contains("%buf.addr = getelementptr i8, ptr %buf.field, i64 %buf.field.skip"), ramp)
+    assert(!ramp.contains("%buf.addr = alloca"), ramp)
+
+    for level in ["0", DefaultOptimization]
+        val resume = afp_function(afp_split(afp_aligned_view_only(), level), "@fill.resume(")
+
+        assert(resume != "", s"-O$level")
+        assert(!resume.contains("%buf.addr = alloca"), s"-O$level: $resume")
+        assert(afp_number_after(resume, "dereferenceable(") >= 127, s"-O$level: $resume")
+
 @test("a task handed on is its frame's address: join, select, step and an await take a ptr, never the frame")
 afp_tasks_travel_as_addresses()
     if !afp_ready() then return
