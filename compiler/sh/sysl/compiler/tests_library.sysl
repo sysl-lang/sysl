@@ -407,18 +407,43 @@ a_private_declaration_is_not_advertised()
            "a private function is not advertised")
 end a_private_declaration_is_not_advertised
 
-// **The storage for a `val` is initialized by the entry point and a library has none**, so a
-// function that reads one is compiled in the program instead, where the initialization it depends on
-// actually happens.
-@test("a function that reads module storage is left to the program, and so is anything calling it")
-a_reader_of_storage_is_deferred()
+// **A library's constant storage is laid down by its own half**, which advertises it beside the
+// functions reading it: an image needs no entry point to fill it, so nothing about reading one
+// keeps a function out of the half (`library.sysl`'s `shared_storage`).
+@test("a function that reads the library's constant storage is compiled into its half, which lays the storage down")
+a_reader_of_constant_storage_is_the_librarys()
     val src = "module lib\n\nval room: int = 3\n\nreads() -> int = room\n\n" +
         "calls() -> int = reads() + 1\n\nneither() -> int = 7\n"
 
+    assert(advertises(src, "lib$room"), "the storage is advertised")
+    assert(advertises(src, "lib$reads"), "the reader is compiled here")
+    assert(advertises(src, "lib$calls"), "and its caller with it")
+    assert(advertises(src, "lib$neither"), "as is everything else")
+end a_reader_of_constant_storage_is_the_librarys
+
+// **Storage the entry point fills is another matter, and a library has no entry point**, so a
+// function reading it is still compiled in the program, where the initialization happens.
+@test("a function that reads computed module storage is left to the program, and so is anything calling it")
+a_reader_of_computed_storage_is_deferred()
+    val src = "module lib\n\nval room: int = three()\n\nthree() -> int = 3\n\nreads() -> int = room\n\n" +
+        "calls() -> int = reads() + 1\n\nneither() -> int = 7\n"
+
+    assert(!advertises(src, "lib$room"), "the storage is not advertised")
     assert(!advertises(src, "lib$reads"), "the reader is deferred")
     assert(!advertises(src, "lib$calls"), "and its caller with it")
     assert(advertises(src, "lib$neither"), "while everything else is compiled here")
-end a_reader_of_storage_is_deferred
+end a_reader_of_computed_storage_is_deferred
+
+// **And so is a `@thread_local`'s**, each thread's copy being made by machinery the program sets up.
+@test("a function that reads @thread_local storage is left to the program")
+a_reader_of_thread_local_storage_is_deferred()
+    val src = "module lib\n\n@thread_local\nvar count: int = 0\n\nbump() -> int\n    count += 1\n    count\n\n" +
+        "neither() -> int = 7\n"
+
+    assert(!advertises(src, "lib$count"), "the storage is not advertised")
+    assert(!advertises(src, "lib$bump"), "the reader is deferred")
+    assert(advertises(src, "lib$neither"), "while everything else is compiled here")
+end a_reader_of_thread_local_storage_is_deferred
 
 // **A generic has nothing to compile until a caller fixes its type arguments**, so it travels as
 // source and is monomorphized in the program that fixes them.
