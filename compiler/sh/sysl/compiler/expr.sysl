@@ -1649,31 +1649,27 @@ end analyze_operands
 // which is where a `M.one()` beside an `M[int]` gets the argument its own call could not supply --
 // and read again at nothing where the pair settled nothing, so the complaint is made for real.
 private attempt_operand(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TExpr]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
 
     // An operand is never a place a result list may stand, so one is refused here as `type_expr`
     // refuses it -- and the refusal sends the operand back to be read for real.
     val t = unwrap_results(cx, e, analyze_expected(cx, e, expected), false)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_operand
 
 // One reading of an operand with everything it said put back, which is what lets the top tier come
 // back empty rather than complaining on behalf of a tier that had nothing to offer it.
 sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
-    val mark = cx.an.complaints()
+    val tried = begin_trial(cx)
     val t = analyze_expected(cx, e, expected)
 
-    cx.an.restore_complaints(mark)
+    discard_trial(cx, tried)
     t
 end sandboxed_read
 
@@ -1692,14 +1688,18 @@ reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type) -> TExpr
     // than that a `u8` cannot be compared with a `char`.
     if is_char_literal(src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
 
-    val mark = cx.an.complaints()
+    val tried = begin_trial(cx)
     val again = analyze_expected(cx, src, Some(want))
-
-    cx.an.restore_complaints(mark)
 
     // A re-reading that was refused comes back `Unknown`, which agrees with everything -- kept, it
     // would carry a refusal whose complaint was just put back, and the operand would pass unreported.
-    if texpr_type(again) == Unknown || disagree(texpr_type(again), want) then t else again
+    if texpr_type(again) == Unknown || disagree(texpr_type(again), want)
+        discard_trial(cx, tried)
+        return t
+
+    cx.an.restore_complaints(tried.said)
+    keep_trial(cx)
+    again
 end reread
 
 // Which of the operands the pair takes its type from: the first that stands on its own, and only

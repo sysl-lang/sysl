@@ -550,16 +550,17 @@ unwrapped_associated(cx: &Analyzer, receiver: Expr, member: string, margs: Buf[E
 
     // The arguments alone, read as the ordinary path would read them: where they settle the type,
     // that reading is the one the program gets.
-    val said = cx.an.complaints()
+    val first = begin_trial(cx)
     val alone = solved_subject(cx, receiver.span, key, fname, cargs, None, None)
 
-    cx.an.restore_complaints(said)
+    discard_trial(cx, first)
 
     if alone.is_some() then return None
 
+    val second = begin_trial(cx)
     val solved = solved_subject(cx, receiver.span, key, fname, cargs, expected, carried)
 
-    cx.an.restore_complaints(said)
+    discard_trial(cx, second)
 
     if solved.is_none() then return None
 
@@ -1545,10 +1546,10 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
     var arg_tys: Buf[Option[Type]] = buf()
 
     for arg in args
-        val mark = cx.an.complaints()
+        val tried = begin_trial(cx)
         val t = type_expr(cx, arg, None)
 
-        cx.an.restore_complaints(mark)
+        discard_trial(cx, tried)
 
         if texpr_type(t) == Unknown then arg_tys.push(None) else arg_tys.push(Some(texpr_type(t)))
 
@@ -1813,21 +1814,11 @@ private declines(e: Expr) -> bool = *e.kind match
 // question a call of one candidate answers for each argument. Every trace of the reading is put back,
 // the instantiations and closures it made included, since the candidate may not be the one chosen.
 private reads_at(cx: &Analyzer, e: Expr, want: Type) -> bool
-    val sandbox = cx.an.sandboxed()
-    val queued = cx.an.tables.members.pending.len()
-    val tables = cx.an.tables.members.vtables.len()
-    val mark = cx.an.complaints()
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val t = analyze_expected(cx, e, Some(want))
-    val refused = cx.an.complaints() > mark
+    val refused = refused_since(cx, tried)
 
-    cx.an.restore_complaints(mark)
-    cx.an.closure_count = lowered
-    cx.an.closure_funcs.truncate(made)
-    cx.an.release(sandbox)
-    rewind_instantiations(cx.an, queued, tables)
-
+    discard_trial(cx, tried)
     !refused && type_eq(texpr_type(t), want)
 end reads_at
 
