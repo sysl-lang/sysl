@@ -1,0 +1,206 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.split
+import sysl.testing.skip
+
+// **A bare image whose manifest names neither an entry nor a linker script starts at `main`.** The
+// link is `--gc-sections`, and an executable's only roots are its entry and what a script keeps; with
+// neither, lld looked for a `_start` nobody defines and dropped every section, so `sysl build` of an
+// `@export("main")` for a Cortex-M wrote an ELF holding four absolute symbols and starting at zero,
+// while `build-c` of the same tree kept `main`. Each case links a real image with `ld.lld` and reads
+// it back: the entry in the header, and the symbols that survived the collection.
+
+private val bee_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+private val bee_readelf: string = "/opt/homebrew/opt/llvm/bin/llvm-readelf"
+private val bee_targets: []const string = ["thumbv6m-freestanding", "thumbv7em-freestanding"]
+
+private bee_ready() -> bool
+    if !lbr_ready() then return false
+    if !is_file(bee_nm) || !is_file(bee_readelf) then skip("llvm-nm and llvm-readelf read the image")
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+
+    true
+end bee_ready
+
+private bee_tool(tool: string, args: []string) -> string = capture(tool, args, "", [], true) match
+    Ok(o) -> o.text
+    Err(_) -> s"$tool could not be run"
+
+// What one image says of itself: the build's status and text, the header's entry, and the symbols.
+struct BeeImage
+    code: int
+    said: string
+    entry: long
+    symbols: string
+    // The header and the section table, as `llvm-readelf -h -S` lists them.
+    header: string
+
+private bee_hex(word: string) -> long
+    var v: long = 0
+
+    for c in word.bytes
+        if c == u8('x')
+            v = 0
+            continue
+
+        val d = if c >= u8('a') then long(c - u8('a')) + 10 else long(c - u8('0'))
+
+        v = v * 16 + d
+    end for
+
+    v
+end bee_hex
+
+// The entry in an `llvm-readelf -h` listing, or -1 where there is no such line.
+private bee_entry_of(header: string) -> long
+    for line in lines_of(header)
+        val t = line.trim()
+
+        if t.starts_with("Entry point address:")
+            val words = split(t, " ")
+
+            return bee_hex(words[words.len - 1])
+    end for
+
+    -1
+end bee_entry_of
+
+// The address `llvm-nm` gives `symbol`, or -1 where it names no such symbol.
+private bee_address(symbols: string, symbol: string) -> long
+    for line in lines_of(symbols)
+        val t = line.trim()
+
+        if t.ends_with(s" $symbol")
+            return bee_hex(split(t, " ")[0])
+    end for
+
+    -1
+end bee_address
+
+private bee_build(program: string, manifest: string, target: string) -> BeeImage
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", manifest))
+    val out = lbr_temp("sysl-bee-elf")
+    val img = s"$out/img.elf"
+    val said = lbr_cli(["sysl", "build", "--target", target, "-o", img, p])
+
+    val header = if said.0 != 0 then "" else bee_tool(bee_readelf, ["-h", "-S", img])
+    val image = if said.0 != 0 then BeeImage(said.0, said.1, -1, "", "") else
+        BeeImage(said.0, said.1, bee_entry_of(header), bee_tool(bee_nm, [img]), header)
+
+    lbr_drop([p, out])
+    image
+end bee_build
+
+private val bee_manifest: string = "package { name = \"probe\", version = \"0.1.0\" }\n"
+
+private val bee_export_main: string = raw"""
+    @no_os
+
+    @export("main")
+    probe_main() -> int = 7
+    """
+
+private val bee_export_storage: string = raw"""
+    @no_os
+
+    var ticks: int = 0
+    var last: int = 7
+
+    @export("main")
+    probe_main() -> int
+        ticks = ticks + 1
+        last = last + ticks
+        last
+    """
+
+// The entry is `main`, and `main` is in the image. `llvm-nm` lists a Thumb function at its even
+// address and the header carries the Thumb bit, so the entry is the symbol plus one.
+private bee_starts_at_main(image: BeeImage, target: string)
+    assert(image.code == 0, image.said)
+
+    val main_at = bee_address(image.symbols, "main")
+
+    assert(main_at > 0, s"$target: no main in the image\n${image.symbols}")
+    assert_eq(image.entry, main_at + 1)
+    assert(image.header.contains(" .text "), s"$target: no code in the image\n${image.header}")
+end bee_starts_at_main
+
+@test("an @export(\"main\") image with no entry and no script starts at main, on v6-M and v7E-M")
+bee_export_main_is_the_entry()
+    if !bee_ready() then return
+
+    for target in bee_targets
+        bee_starts_at_main(bee_build(bee_export_main, bee_manifest, target), target)
+end bee_export_main_is_the_entry
+
+@test("and the storage main reaches survives the collection beside it")
+bee_storage_survives()
+    if !bee_ready() then return
+
+    for target in bee_targets
+        val image = bee_build(bee_export_storage, bee_manifest, target)
+
+        bee_starts_at_main(image, target)
+        assert(image.header.contains(" .data "), s"$target: last was collected\n${image.header}")
+        assert(image.header.contains(" .bss "), s"$target: ticks was collected\n${image.header}")
+end bee_storage_survives
+
+@test("an image of statements, with no entry and no script, starts at the main they run in")
+bee_statements_start_at_main()
+    if !bee_ready() then return
+
+    val program = raw"""
+        @no_os
+
+        var hits: int = 0
+
+        hits = hits + 3
+        """
+
+    for target in bee_targets
+        bee_starts_at_main(bee_build(program, bee_manifest, target), target)
+end bee_statements_start_at_main
+
+@test("an entry the manifest names still wins over main, script or none")
+bee_named_entry_wins()
+    if !bee_ready() then return
+
+    val program = raw"""
+        @no_os
+
+        @export("kstart")
+        kstart() -> never
+            loop
+                ()
+        """
+
+    val manifest = "package { name = \"probe\", version = \"0.1.0\" }\n" +
+        "targets {\n  thumbv7em-freestanding {\n    entry = \"kstart\"\n  }\n}\n"
+
+    val image = bee_build(program, manifest, "thumbv7em-freestanding")
+
+    assert(image.code == 0, image.said)
+
+    val at = bee_address(image.symbols, "kstart")
+
+    assert(at > 0, image.symbols)
+    assert_eq(image.entry, at + 1)
+    assert(bee_address(image.symbols, "main") < 0, s"a main nothing calls\n${image.symbols}")
+end bee_named_entry_wins
+
+@test("and an entry the manifest names that nothing defines is refused, not replaced by main")
+bee_undefined_entry_refused()
+    if !bee_ready() then return
+
+    val manifest = "package { name = \"probe\", version = \"0.1.0\" }\n" +
+        "targets {\n  thumbv6m-freestanding {\n    entry = \"reset\"\n  }\n}\n"
+
+    val image = bee_build(bee_export_main, manifest, "thumbv6m-freestanding")
+
+    assert(image.code != 0, "an image with nowhere to start linked")
+    assert(image.said.contains("'targets.thumbv6m-freestanding.entry' names 'reset', and nothing the " +
+        "program links defines it"), image.said)
+end bee_undefined_entry_refused

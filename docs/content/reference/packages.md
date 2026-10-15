@@ -511,13 +511,31 @@ to link by hand and no flags in the environment.
 |---|---|---|
 | `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `package.hocon` | `ld.lld` |
 | `linker_script` | the script the image is laid out by, relative to `package.hocon`; handed over as `-T <script>` | none — the linker's own layout |
-| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | none — the script's `ENTRY`, if it has one |
+| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | the script's `ENTRY` where there is a script; `main` where there is none |
 
 **A freestanding target never reaches the host's linker, whether or not the block says anything.**
 Its image is linked with `-nostdlib` through `ld.lld` (or the `linker` named), so no start file, no
 libc and no compiler runtime is on the line; a library is there only because a `@link` directive or a
 `pkg_config` block named it. WebAssembly is the exception and keeps its own link: `wasm-ld` has no
 script, and a module starts at `main`.
+
+**An image whose block names neither a script nor an entry starts at `main`**, and `main` is
+required in the same way a named entry is. The link collects the garbage, and an executable's only
+roots are its entry and what a script keeps, so with neither the linker would look for a `_start`
+nothing defines and drop every section — an empty image starting at address zero. A function
+exported as `main` is that `main`, so the smallest board program needs no block at all:
+
+```sysl build=c target=thumbv6m-freestanding
+@no_os
+
+@export("main")
+probe_main() -> int = 7
+```
+
+`sysl build --target thumbv6m-freestanding -o probe.elf .` writes an image whose entry is `main`;
+it is laid out by the linker's own defaults, which say nothing about a board's flash, so an image a
+board is to run names its `linker_script` too. Where there is a script and no `entry`, the script's
+`ENTRY` decides and the command line names none.
 
 ### When the image has a `main`
 
