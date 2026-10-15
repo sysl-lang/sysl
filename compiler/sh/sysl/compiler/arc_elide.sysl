@@ -36,7 +36,10 @@ import sysl.text.Search
 // of every predecessor, in their order, when that lets at least one predecessor cancel a retain
 // against one. Each path then gives back exactly what it gave back before, earlier only by the slot
 // loads the join opened with.
-elide_arc_pairs(blocks: Buf[IrBlock]) -> Buf[IrBlock]
+//
+// `inert` names the functions whose bodies release nothing and write nothing but their own locals
+// (`inert_callees`); a call to one may sit inside a covered window.
+elide_arc_pairs(blocks: Buf[IrBlock], inert: Set[string]) -> Buf[IrBlock]
     val clean = unescaped_slots(blocks)
     var out: Buf[IrBlock] = buf()
 
@@ -46,8 +49,30 @@ elide_arc_pairs(blocks: Buf[IrBlock]) -> Buf[IrBlock]
     for j in 1..<out.len()
         hoist_join_releases(out, j, clean)
 
+    // What is left is a count a covering slot may make needless however far away it is given back
+    // (`arc_cover.sysl`). A view of a view is given back inside its parent's window, so the parent's
+    // pair can go only once the view's has: each round removes the innermost, until none goes.
+    var rounds = 0
+
+    loop
+        val before = instr_count(out)
+
+        out = elide_covered(out, clean, inert)
+        rounds += 1
+
+        if instr_count(out) == before || rounds == 8 then break
+
     out
 end elide_arc_pairs
+
+private instr_count(blocks: Buf[IrBlock]) -> usize
+    var n: usize = 0
+
+    for b in blocks
+        n += b.instrs.len()
+
+    n
+end instr_count
 
 // The stack slots whose address is used only as the address of a load or a store, so that nothing
 // outside the frame can read or write them.
@@ -149,7 +174,7 @@ escaping_operands(inst: Inst) -> Buf[Val]
 end escaping_operands
 
 // The release that gives back what `name` took, when `name` is a retain this pass knows.
-private release_for(name: string) -> Option[string]
+release_for(name: string) -> Option[string]
     if name == "arc.retain" then return Some("arc.release")
     if name == "arc.retain_sync" then return Some("arc.release_sync")
     if name == "arc.retain_maybe" then return Some("arc.release_maybe")
@@ -159,16 +184,17 @@ private release_for(name: string) -> Option[string]
     None
 end release_for
 
-private is_release(name: string) -> bool =
+is_release(name: string) -> bool =
     name == "arc.release" || name == "arc.release_sync" || name == "arc.release_maybe" ||
         name == "arc.weak_release" || name.starts_with("arc.dispose.")
 
 // The one-argument, no-result call to a named function `inst` is, if it is one.
 //
 // A walk at an address handed a large **value** (`emit_arc.sysl`'s `aggregate_arc`) is the value walk
-// it stands for until `emit_large.sysl` gives it the address, so it is paired as one. A walk handed
-// an address is not: what is at an address can change between the two halves.
-private arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
+// it stands for until `emit_large.sysl` gives it the address, so it is paired as one -- here and in
+// `arc_cover.sysl`, which both run before that lowering. A walk handed an address is not: what is at
+// an address can change between the two halves.
+arc_call_of(inst: Inst) -> Option[(string, Val)] = inst match
     InCall(None, _, VGlobal(n), args, _, _, _, _) ->
         if args.len() == 1
             val by_value = args[0].ty match

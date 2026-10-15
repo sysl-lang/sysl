@@ -491,6 +491,79 @@ got 2
 drop 2
 ```
 
+### A view of something the frame already holds takes no count
+
+A slice of a slice retains the owner, and a `val` copied out of a field retains what it refers to.
+Where the value it was read from is a **parameter or a `val`** — written once, in a slot nothing
+outside the function can reach — that value's own count already keeps the object alive, and **a
+share taken from it and given back before it is given back its own is dropped**, however far apart
+the two are: across a `for` that walks the view, or the rest of a loop's round. A view taken every
+time round a loop then costs nothing:
+
+- the parent must stay put: a `var` assigned in the loop, or one whose address is taken, keeps every
+  count;
+- a view that leaves the function, or is stored anywhere but a local, keeps its count;
+- **a count can be looked at**, so nothing between the share and its return may look: storage is let
+  go of by `slot_vacate` only where the strong count is one, and a view whose share had been dropped
+  would leave it free to give back slots the view still reads. So the stretch may hold arithmetic,
+  reads of locals and of fields and elements, and calls to functions that release nothing and write
+  nothing but their own locals; any other call, and any other release (a destructor is code too),
+  keeps the count.
+
+The parent's count holds the object from before the share is taken until after it would have been
+given back, so the object's count never reaches zero inside, nothing inside reads it, and **no
+destructor moves**. Below, `sums` takes no count at all; `label`'s `print` is a call that could, so
+`t` keeps its share there.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Shelf
+    tag: &Tag
+
+sums(src: []const u8, most: usize) -> u32
+    var t: u32 = 0
+    var i: usize = 0
+
+    while i + most <= src.len
+        val here = src[i..<i + most]
+
+        for x in here
+            t += u32(x)
+
+        i += most
+
+    t
+
+label(s: Shelf, rounds: int)
+    for k in 0..<rounds
+        val t = s.tag
+        print("round", k, t.id)
+
+var b: Buf[u8] = buf()
+
+for k in 0..<10
+    b.push(u8(k))
+
+print(sums(b.view(), 5))
+label(Shelf(Tag(7)), 2)
+print("done")
+```
+
+```output
+45
+round 0 7
+round 1 7
+drop 7
+done
+```
+
 ## `weak T` — breaking cycles
 
 Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent
