@@ -24,7 +24,10 @@ print_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     for i in 0..<args.len()
         if i > 0 then parts.push(print_char(cx, span, ' '))
 
-        parts.push(print_one(cx, span, through_ref(cx, type_expr_bare(cx, args.at(i)))))
+        val v = through_ref(cx, type_expr_bare(cx, args.at(i)))
+
+        warn_placeholder(cx, args.at(i).span, args.at(i), v)
+        parts.push(print_one(cx, span, v))
 
     parts.push(print_char(cx, span, '\n'))
     TExpr(span, TSeq(parts))
@@ -403,6 +406,71 @@ callable_debug(cx: &Analyzer, span: Span, rty: Type, args: Buf[Expr]) -> TExpr
     TExpr(span, TCall(lib_fn(cx, "display_str"), all, Unit, false))
 end callable_debug
 
+// -- a value whose whole printed form is a placeholder ---------------------------------------------
+//
+// **Printing one directly is told, as a warning**: the program still builds and prints the
+// placeholder, but a `print(w)` that shows `<writer>` was almost certainly meant to show something.
+// Only the forms a program wrote are asked -- `print`, `str` and an interpolation hole, a `format`
+// hole, `debug(x)`, and an argument meeting a `T: Debug` bound such as `assert_eq`'s -- and never a
+// field, an element or a payload, which a supplied `Debug` shows as part of something larger.
+
+// The placeholder a value's whole rendering would be, and why, where it is one.
+placeholder_of(cx: &Analyzer, ty: Type) -> Option[(string, string)]
+    if ty == Unknown || ty == Never then return None
+
+    if shown_by_rule(ty)
+        ty match
+            Ptr(inner) -> if !is_trait(*inner) then return None
+            Weak(_) -> return None
+            Unit -> return None
+            _ -> ()
+
+        if task_result(ty).is_some() then
+            return Some(("<task>", "a task has nothing to show until it is awaited — print what " +
+                         "awaiting it answers"))
+
+        if slotless_text(ty) == "<writer>" then
+            return Some(("<writer>", "a Writer object carries no Debug; print the concrete sink, or " +
+                         "ask for 'Writer + Debug'"))
+
+        return Some(("<fn>", "a callable carries nothing to show; print what calling it answers"))
+    end if
+
+    if is_device(ty) || erased(ty) then return None
+
+    val dbg = debug_bound()
+    val here = if !impls_of(cx.an, dbg.name, owner_key(ty)).is_empty() then ty else underlying(ty)
+
+    here match
+        Abstract(_, _) -> return None
+        Integer(_, _, _) -> return None
+        _ -> ()
+
+    if is_fixed(here) || conforms(cx.an, dbg, here) || satisfies(cx.an, dbg, here) then return None
+
+    // A type with a `Display` of its own prints through it wherever a placeholder would be asked.
+    val tr = display_bound(cx)
+
+    if conforms(cx.an, tr, here) || satisfies(cx.an, tr, here) then return None
+
+    Some((s"<${type_show(here)}>", s"'${type_show(here)}' has no Debug to show it with — an opaque " +
+          "type's layout is its own module's; print it through that module, or hold it by pointer"))
+end placeholder_of
+
+// Tells a top-level rendering of `e` whose whole form is a placeholder, at `e`.
+warn_placeholder(cx: &Analyzer, span: Span, e: Expr, t: TExpr)
+    val found = placeholder_of(cx, texpr_type(t))
+
+    if found.is_none() then return
+
+    val written = *e.kind match
+        Ident(n) -> s"'$n'"
+        _ -> "this value"
+
+    cx.an.caution(cx.scope, span, s"printing $written shows only '${found.unwrap().0}': " +
+                  found.unwrap().1)
+end warn_placeholder
+
 // A literal standing in for a value that is shown by rule.
 private shown_text(span: Span, text: string) -> TExpr = TExpr(span, TStrLit(text))
 
@@ -501,8 +569,11 @@ const DebugPart: string = "debug part"
 debug_string(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     if args.len() != 1 then return cx.err(span, "debug takes exactly one value")
 
-    val found = debugger(cx, span, through_ref(cx, type_expr_bare(cx, args.at(0))), "make a string of",
-                         "debug")
+    val v = through_ref(cx, type_expr_bare(cx, args.at(0)))
+
+    warn_placeholder(cx, args.at(0).span, args.at(0), v)
+
+    val found = debugger(cx, span, v, "make a string of", "debug")
 
     TExpr(span, TRender(found.0, found.1, format_spec(cx, span), found.2))
 end debug_string

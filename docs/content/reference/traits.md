@@ -1369,6 +1369,21 @@ print(w, l, Tally(3))
 <writer> Tally(n: 2) Tally(n: 3)
 ```
 
+**Printing a placeholder directly is warned about**, and still builds: a value whose whole printed
+form is `<writer>`, `<fn>`, `<task>` or a `<Type>` with no `Debug`, handed straight to `print`,
+`str`, an interpolation or `format` hole, `debug(x)`, or an argument meeting a `T: Debug` bound such as
+`assert_eq`'s, was almost certainly meant to show something. The `print(w)` above says:
+
+```
+warning: printing 'w' shows only '<writer>': a Writer object carries no Debug; print the concrete
+sink, or ask for 'Writer + Debug'
+```
+
+A placeholder inside a structure — a field, an element, an option's payload — is part of a larger
+rendering and is never warned about, and an object whose trait asks for `Debug` has nothing to warn
+about. As with the compiler's other warning, there is no switch to silence it: the fix the sentence
+names is how it goes away.
+
 **A rendering that nests deeper than thirty-two levels writes `…` and stops.** Following references
 is what makes a list or a tree show as one, and it is also what would make a structure that refers
 back to itself render for ever; the limit is what makes every value safe to show.

@@ -1,6 +1,8 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
 import sysl.text.Search
 
 // Every value prints (`reference/traits.md § Every type has a Debug`). A value with a `Display` prints
@@ -242,3 +244,87 @@ pan_concrete_writer()
 
     assert_eq(pan_ran(pan_sink() + "print(Tally(1))\nprint(Quiet(2))\nprint(debug(Tally(3)))\n"),
               "Tally(n: 1)\nQuiet\nTally(n: 3)\n")
+
+// -- printing a placeholder directly is warned about -----------------------------------------------
+
+private var pan_library_cache: Buf[Program] = buf()
+private var pan_library_read: bool = false
+
+private pan_library() -> Buf[Program]
+    if pan_library_read then return pan_library_cache
+
+    pan_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> pan_library_cache = units
+
+    pan_library_cache
+end pan_library
+
+// The warnings a program is given, as their messages, in source order.
+private pan_warnings(text: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+
+    for item in pan_library()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", pan_types() + pan_sink() + text)).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in done.an.warnings()
+        out.push(item.diag.message)
+
+    out
+end pan_warnings
+
+private pan_warned(text: string, said: string)
+    val got = pan_warnings(text)
+
+    assert_eq(got.len(), 1)
+    assert(got.at(0).contains(said), got.at(0))
+
+@test("printing a bare writer object warns once, and still prints <writer>")
+pan_warns_on_a_writer()
+    if xvr_no_library() then return
+
+    pan_warned("val w: &Writer = Tally(1)\nprint(w)\n",
+               "printing 'w' shows only '<writer>': a Writer object carries no Debug; print the " +
+               "concrete sink, or ask for 'Writer + Debug'")
+    pan_warned("val w: &Writer = Tally(1)\nval s = str(w)\n", "shows only '<writer>'")
+    pan_warned("val w: &Writer = Tally(1)\nval s = s\"${w}\"\n", "shows only '<writer>'")
+    pan_warned("val w: &Writer = Tally(1)\nval s = f\"${w}%?\"\n", "shows only '<writer>'")
+    pan_warned("val w: &Writer = Tally(1)\nval s = debug(w)\n", "shows only '<writer>'")
+    assert_eq(pan_ran(pan_sink() + "val w: &Writer = Tally(1)\nprint(w)\n"), "<writer>\n")
+
+@test("printing a callable, or a type with no Debug, warns once")
+pan_warns_on_a_callable()
+    if xvr_no_library() then return
+
+    pan_warned("val f: &Fn(int) -> int = (x: int) -> x + 1\nprint(f)\n", "printing 'f' shows only '<fn>'")
+    pan_warned("opaque struct H\n    x: int\n\nval h = H(1)\nprint(h)\n", "printing 'h' shows only '<H>'")
+    assert_eq(pan_ran("opaque struct H\n    x: int\n\nval h = H(1)\nprint(h)\n"), "<H>\n")
+
+@test("an assert_eq whose sides are shown only as placeholders warns at the call")
+pan_warns_on_assert_eq()
+    if xvr_no_library() then return
+
+    pan_warned("show[T: Debug](x: T) = ()\nval f: &Fn(int) -> int = (x: int) -> x + 1\nshow(f)\n",
+               "'show' shows its 'T' only as '<fn>'")
+
+@test("a placeholder inside a structure, and a writer whose trait asks Debug, warn about nothing")
+pan_nested_placeholders_do_not_warn()
+    if xvr_no_library() then return
+
+    val text = "struct Job\n    run: &Fn(int) -> int\n\n" +
+               "val f: &Fn(int) -> int = (x: int) -> x + 1\nval l: &LoggedWriter = Tally(2)\n" +
+               "val o: Option[&Fn(int) -> int] = Some(f)\n" +
+               "print(Job(f))\nprint(o)\nprint(l)\nprint(f\"${l}%?\")\n"
+
+    val said = pan_warnings(text)
+
+    assert(said.is_empty(), if said.is_empty() then "" else said.at(0))

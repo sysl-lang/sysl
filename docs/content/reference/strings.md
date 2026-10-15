@@ -542,7 +542,8 @@ what carries its table, and prints its concrete value: through `Display` where t
 it, and otherwise through the `Debug` every table carries. A callable prints as `<fn>`, and a
 `&Writer` as `<writer>`, their tables carrying no `Debug` slot; a trait such as
 `trait LoggedWriter: Writer + Debug` puts it back, so its objects print the concrete sink
-([what is shown by rule](/reference/traits/#what-is-shown-by-rule)).
+([what is shown by rule](/reference/traits/#what-is-shown-by-rule)). Printing such a placeholder
+directly builds, with a warning that names the value and what to print instead.
 
 ```sysl
 trait Area
