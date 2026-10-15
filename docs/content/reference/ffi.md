@@ -831,8 +831,8 @@ fd_of_stdout() -> i32 = stdout.fd + i32(*stdout_flags)
 
 Three addresses are not constants, and storage holding one stays code, filled before the program's
 statements like any other computed initializer: the address of `@thread_local` or `@per_cpu`
-storage, which is a different one on every thread or core; an element of a view or through a pointer,
-which is a load before it is an address — an [`embed`](/reference/arrays/#a-file-s-bytes-embedded)
+storage, which is a different one on every thread or core; an element of a view or through a pointer
+whose value is not a constant device address, which is a load before it is an address — an [`embed`](/reference/arrays/#a-file-s-bytes-embedded)
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 
@@ -873,6 +873,31 @@ var chosen: Option[*u32] = Some(&target)
 
 @export
 total() -> u32 = table[1].v + current.ring() + *chosen.unwrap()
+```
+
+**A `val` holding a device address is that address, too**, where another initializer names it, and
+so is a place reached through it: `&PAIR.b` is `PAIR`'s address plus the field's offset, and an
+element at an index the compiler can fold is that many elements further on. A board names its
+fixed-address hardware once and builds the rest from the name:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+struct Ring
+    head: u32
+    tail: u32
+    slots: [8]u32
+
+const AT: usize = 0x3000_0000
+
+val RING: *Ring = ptr_cast(AT)
+
+var current: *Ring = RING
+var tail: *u32 = &RING.tail
+var third: *u32 = &RING.slots[2]
+
+@export
+peek() -> u32 = current.head + *tail + *third
 ```
 
 A `val` that reads another reading it back is no constant at all, and is refused where the cycle

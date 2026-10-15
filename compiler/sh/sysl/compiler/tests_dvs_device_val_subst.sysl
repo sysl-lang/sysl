@@ -1,0 +1,160 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A module `val` over a constant device address is that address** where another initializer names
+// it, on a bare machine that has no loader to fill storage: the plain reference, the address of a
+// field through it, and a `val` over such a `val` are all laid into the object file. A `val` whose
+// pointer is computed while the program runs is still code, refused as before.
+
+private dvs_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end dvs_library_for
+
+private dvs_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end dvs_first_of
+
+private dvs_target() -> Target = target_named("thumbv7em-freestanding").unwrap()
+
+private dvs_skip() -> bool
+    if dvs_library_for(dvs_target()).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dvs_skip
+
+// A `thumbv7em-freestanding` archive, as `build-c` makes one: the first thing the compilation had to
+// say, or the LLVM text it lowered to.
+private dvs_built(text: string) -> string
+    val t = dvs_target()
+    var units = dvs_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = dvs_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = dvs_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end dvs_built
+
+// The storage is the constant the object file carries, and nothing runs before the program to fill it.
+private dvs_laid_down(out: string, global: string)
+    assert(out.contains(global), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end dvs_laid_down
+
+private val dvs_pair: string = "struct Pair\n    a: u32\n    b: u32\n\nprivate const AT: usize = 0x3000_0000\n" +
+                               "private val PAIR: *Pair = ptr_cast(AT)\n"
+private val dvs_main: string = "\n\n@export(\"main\")\nmain_entry() -> int = "
+
+@test("storage naming a 'val' over a constant device address is that address")
+dvs_the_plain_reference()
+    if dvs_skip() then return
+
+    val out = dvs_built(dvs_pair + "private var whole: *Pair = ptr_cast(AT)\nprivate var named: *Pair = PAIR" +
+                        dvs_main + "int(whole.a + named.a)\n")
+
+    dvs_laid_down(out, "@whole = private global ptr inttoptr (i32 805306368 to ptr)")
+    dvs_laid_down(out, "@named = private global ptr inttoptr (i32 805306368 to ptr)")
+end dvs_the_plain_reference
+
+@test("the address of a field through such a 'val' is the address plus the field's offset")
+dvs_the_address_of_a_field()
+    if dvs_skip() then return
+
+    val out = dvs_built(dvs_pair + "private var fixed_field: *u32 = &PAIR.b\n" +
+                        "private val first: *u32 = &(*PAIR).a" + dvs_main + "int(*fixed_field + *first)\n")
+
+    dvs_laid_down(out, "@fixed_field = private global ptr inttoptr (i32 805306372 to ptr)")
+    dvs_laid_down(out, "@first = private constant ptr inttoptr (i32 805306368 to ptr)")
+end dvs_the_address_of_a_field
+
+@test("an element at a folded index through such a 'val' is that many elements further on")
+dvs_an_element_through_it()
+    if dvs_skip() then return
+
+    val out = dvs_built("struct Regs\n    ctl: u32\n    data: [4]u16\n\n" +
+                        "private val REGS: *Regs = ptr_cast(usize(0x4000_0000))\n" +
+                        "private var third: *u16 = &REGS.data[2]" + dvs_main + "int(*third)\n")
+
+    dvs_laid_down(out, "@third = private global ptr inttoptr (i32 1073741832 to ptr)")
+end dvs_an_element_through_it
+
+@test("a 'val' over such a 'val' is folded through both")
+dvs_a_chain_of_two_vals()
+    if dvs_skip() then return
+
+    val out = dvs_built(dvs_pair + "private val ALIAS: *Pair = PAIR\nprivate var c: *Pair = ALIAS\n" +
+                        "private var cb: *u32 = &ALIAS.b" + dvs_main + "int(c.a + *cb)\n")
+
+    dvs_laid_down(out, "@c = private global ptr inttoptr (i32 805306368 to ptr)")
+    dvs_laid_down(out, "@cb = private global ptr inttoptr (i32 805306372 to ptr)")
+end dvs_a_chain_of_two_vals
+
+@test("storage naming a 'val' whose pointer is computed at run time is still refused")
+dvs_a_runtime_val_is_refused()
+    if dvs_skip() then return
+
+    val out = dvs_built("struct Pair\n    a: u32\n    b: u32\n\nbase() -> usize = 0x3000_0000\n\n" +
+                        "private val PAIR: *Pair = ptr_cast(base())\nprivate var named: *Pair = PAIR" +
+                        dvs_main + "int(named.a)\n")
+
+    assert(out.contains("and reaches 'named', which is module storage an initializer fills"), out)
+    assert(out.contains("'named' cannot be computed while compiling: 'PAIR' is filled when the program runs"),
+           out)
+end dvs_a_runtime_val_is_refused
+
+@test("the address of a field through a run-time 'val' is still refused")
+dvs_a_runtime_field_is_refused()
+    if dvs_skip() then return
+
+    val out = dvs_built("struct Pair\n    a: u32\n    b: u32\n\nbase() -> usize = 0x3000_0000\n\n" +
+                        "private val PAIR: *Pair = ptr_cast(base())\nprivate var field: *u32 = &PAIR.b" +
+                        dvs_main + "int(*field)\n")
+
+    assert(out.contains("and reaches 'field', which is module storage an initializer fills"), out)
+end dvs_a_runtime_field_is_refused
+
+@test("the laid-down addresses are the ones the same initializers computed at run time")
+dvs_the_hosted_values_are_unchanged()
+    if !enm_ready() then return
+
+    val prog = "struct Pair\n    a: u32\n    b: u32\n\nstatic val AT: usize = 0x3000_0000\n" +
+               "static val PAIR: *Pair = ptr_cast(AT)\nstatic val ALIAS: *Pair = PAIR\n" +
+               "static var named: *Pair = ALIAS\nstatic var field: *u32 = &ALIAS.b\n\n" +
+               "print(usize(named), usize(field))\n"
+
+    assert_eq(enm_ran(prog), "805306368 805306372\n")
+end dvs_the_hosted_values_are_unchanged
