@@ -1769,7 +1769,8 @@ print(counted(4))
 ```
 
 **An address may come in, be stored, and go out, where the linker fills it in**: the address of
-module storage, of a field or an element inside it, and of a function. While compiling, such an
+module storage, of a field or an element inside it, and of a function — and `null`, which needs no
+linker at all. While compiling, such an
 address is held as the relocation it is, so a `const` constructor that stores one makes constant
 data, laid into the object file as C's `static Display oled = { &bus, setup };` is
 ([ffi § What constant data is](/reference/ffi/#what-constant-data-is)):
@@ -1822,7 +1823,7 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
 | a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
 | a value rendered through a `display` that is not `const` | `… it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time` |
-| a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
+| a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
 | a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
 | atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |

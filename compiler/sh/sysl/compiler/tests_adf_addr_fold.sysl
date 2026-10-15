@@ -126,6 +126,50 @@ adf_an_address_as_a_number_is_refused()
     assert(out.contains("an address converted to a number is not evaluated while compiling"), out)
 end adf_an_address_as_a_number_is_refused
 
+private val adf_holder: string = "struct Holder\n    p: *u8\n    n: u32\n\nconst holder(n: u32) -> Holder = Holder(null, n)\n\n"
+
+@test("a const constructor storing 'null' is laid down, as the literal written out is")
+adf_null_fields()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_holder + "var held: Holder = holder(2)\nval direct: Holder = Holder(null, 1)" +
+                        adf_main + "int(held.n + direct.n)\n")
+
+    cfv_laid_down(out, "@held = ")
+    assert(out.contains("{ ptr null, i32 2 }"), out)
+    assert(out.contains("{ ptr null, i32 1 }"), out)
+end adf_null_fields
+
+@test("'null' and the address of storage mix in one constructor")
+adf_null_beside_an_address()
+    if cfv_skip() then return
+
+    val out = cfv_built("struct Pair\n    a: *u8\n    b: *u32\n\nconst pair(b: *u32) -> Pair = Pair(null, b)\n\n" +
+                        "var target: u32 = 5\nvar both: Pair = pair(&target)" + adf_main + "int(*both.b)\n")
+
+    cfv_laid_down(out, "@both = ")
+    assert(out.contains("{ ptr null, ptr @target }"), out)
+end adf_null_beside_an_address
+
+@test("reading through a stored 'null' is still refused")
+adf_reading_through_null_is_refused()
+    if cfv_skip() then return
+
+    val out = cfv_built(adf_holder + "const first(h: Holder) -> u8 = *h.p\n\nvar x: u8 = first(holder(1))" +
+                        adf_main + "int(x)\n")
+
+    cfv_refused(out, "x")
+    assert(out.contains("reading through an address is not evaluated while compiling"), out)
+end adf_reading_through_null_is_refused
+
+@test("on a hosted target a constructor storing 'null' runs as the literal does")
+adf_null_on_the_host()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(adf_holder + "static val direct: Holder = Holder(null, 1)\nstatic val called: Holder = holder(2)\n\n" +
+                      "print(direct.n + called.n, called.p == null)\n"), "3 true\n")
+end adf_null_on_the_host
+
 @test("on a hosted target the same program runs, and the addresses are the storage's and the function's")
 adf_the_hosted_build_is_unchanged()
     if !enm_ready() then return

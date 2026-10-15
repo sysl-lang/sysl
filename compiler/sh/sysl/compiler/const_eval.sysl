@@ -686,7 +686,9 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstRecord(variant, fields) -> record_text(variant, fields, t)
     ConstView(xs, lo, n, _) -> array_text(viewed(xs, lo, n), element_type(t))
     ConstWriter(_) -> "a writer"
-    ConstLink(image) -> s"&${link_key(image)}"
+    ConstLink(image) -> *image.kind match
+        TNullLit(_) -> "null"
+        _ -> s"&${link_key(image)}"
 
 // The elements a slice sees, as a buffer of their own.
 private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
@@ -1071,6 +1073,8 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
         TAddrOf(place, ty) -> address_of(r, e.span, place, ty)
         TFuncAddr(_, _, _) -> EvGave(ConstLink(e))
+        // `null` is the one address known before the linker runs, and is held the same way.
+        TNullLit(_) -> EvGave(ConstLink(e))
         TDeref(operand, _) -> read_through(r, operand)
         TIntOp(op, operand, None, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
@@ -1143,6 +1147,7 @@ private link_reason() -> string =
 private link_key(image: TExpr) -> string = *image.kind match
     TAddrOf(place, _) -> link_key(place)
     TFuncAddr(name, _, _) -> qualified_name(name)
+    TNullLit(_) -> "null"
     TGlobal(symbol, _, _) -> qualified_name(symbol)
     TField(receiver, index, _) -> s"${link_key(receiver)}.$index"
     TIndex(receiver, index, _) -> *index.kind match
