@@ -499,18 +499,14 @@ private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type
     // has since settled -- has nothing to say with nothing expected of it, and the parameter is what
     // it should have been read against all along. The probe is rewound and that reading is the one
     // the program gets.
-    val mark = cx.an.complaints()
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val bare = type_expr(cx, e, None)
 
-    if cx.an.complaints() > mark
-        cx.an.restore_complaints(mark)
-        cx.an.closure_count = lowered
-        cx.an.closure_funcs.truncate(made)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return type_expr(cx, e, Some(want))
-    end if
+
+    keep_trial(cx)
 
     if becomes_slice(texpr_type(bare), want) then return type_expr(cx, e, Some(want))
 
@@ -811,18 +807,14 @@ end arg_reader
 
 // One reading of an argument with everything it said put back.
 sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
-    val mark = cx.an.complaints()
     // **A reading that is thrown away lowers no closure**, because the argument is read again at the
     // parameter the solve arrived at and the second reading is the one the program gets. The counter
     // is what makes a closure's name its own, so leaving it forward here would number every closure
     // after a generic call one higher than the compilation actually lowered.
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val t = type_expr(cx, e, expected)
 
-    cx.an.restore_complaints(mark)
-    cx.an.closure_count = lowered
-    cx.an.closure_funcs.truncate(made)
+    discard_trial(cx, tried)
     t
 end sandboxed_arg
 
@@ -836,15 +828,11 @@ end sandboxed_attempt
 
 // The same bare reading, answering what it produced and whether it was refused on the way.
 sandboxed_reading(cx: &Analyzer, e: Expr) -> (TExpr, bool)
-    val mark = cx.an.complaints()
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val t = type_expr(cx, e, None)
-    val refused = cx.an.complaints() > mark
+    val refused = refused_since(cx, tried)
 
-    cx.an.restore_complaints(mark)
-    cx.an.closure_count = lowered
-    cx.an.closure_funcs.truncate(made)
+    discard_trial(cx, tried)
     (t, refused)
 end sandboxed_reading
 

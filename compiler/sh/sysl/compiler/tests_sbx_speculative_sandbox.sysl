@@ -1,0 +1,165 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A reading thrown away leaves nothing behind (`trial.sysl`): what a trial said, the complaints a
+// generic's definition walk would otherwise keep, the names its locals took, the views it borrowed
+// and the checks it left for the end of the body all go with it, and a trial that is kept keeps them.
+
+private sbx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sbx_ready
+
+private sbx_analyzer() -> &Analyzer = analyzer_for(analysis_for(host_target()), empty_scope())
+
+// What a program printed, or what the compiler said instead.
+private sbx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-speculative-sandbox").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end sbx_ran
+
+// An object owning C memory that hands out a view of it, borrowed from its receiver.
+private sbx_owner() -> string =
+    "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n\n" +
+    "struct Owner\n    p: *u8\n    n: usize\n\n" +
+    "    @views(self)\n    view(&self) -> []const u8 = self.p[0..<self.n]\n\n" +
+    "impl Drop for Owner\n    drop(self)\n        c_free(self.p)\n\n" +
+    "open(n: usize) -> &Owner\n    val p = c_malloc(n)\n\n    for i in 0..<n do p[i] = u8(65 + i)\n\n" +
+    "    Owner(p, n)\n\n"
+
+@test("a discarded trial puts back what it said, kept, named, borrowed and left for later")
+sbx_discard_puts_everything_back()
+    val cx = sbx_analyzer()
+    val a = cx.an
+    val at = span_zero()
+    val t = begin_trial(cx)
+
+    assert(!refused_since(cx, t))
+
+    cx.at_definition = true
+
+    val _ = cx.err_whatever_the_types(at, "undefined name 'n'")
+
+    a.caution(cx.scope, at, "a warning")
+
+    val _ = cx.fresh_name("o")
+
+    cx.view_calls.push((at, ViewRoot(bad_expr(at), "o", "o")))
+    cx.view_borrows.push(("v", buf()))
+    cx.consume_calls.push(ConsumeCall(at, "o", "o", "close"))
+    cx.by_name.push("o")
+    cx.refused_nested.push("helper")
+    cx.variant_seq = cx.variant_seq + 1
+    cx.reach = 99
+    a.closure_count += 1
+    a.ref_refusals.push(0)
+    a.target_refusals.push((cx.scope, at, "a target refusal"))
+    a.const_cycles.push(("a", "b", "a cycle"))
+
+    assert(refused_since(cx, t))
+
+    discard_trial(cx, t)
+
+    assert_eq(a.complaints(), 0)
+    assert_eq(a.diagnostics().len(), 0)
+    assert_eq(a.warnings().len(), 0)
+    assert_eq(cx.fresh_name("o"), "o")
+    assert_eq(cx.view_calls.len(), 0)
+    assert_eq(cx.view_borrows.len(), 0)
+    assert_eq(cx.consume_calls.len(), 0)
+    assert_eq(cx.by_name.len(), 0)
+    assert_eq(cx.refused_nested.len(), 0)
+    assert_eq(cx.variant_seq, 0)
+    assert_eq(cx.reach, 0)
+    assert_eq(a.closure_count, 0)
+    assert_eq(a.ref_refusals.len(), 0)
+    assert_eq(a.target_refusals.len(), 0)
+    assert_eq(a.const_cycles.len(), 0)
+    assert(!a.journal.recording())
+
+@test("a kept trial keeps what it wrote, and an outer discard takes back an inner keep")
+sbx_keep_and_nesting()
+    val cx = sbx_analyzer()
+    val a = cx.an
+    val at = span_zero()
+    val kept = begin_trial(cx)
+
+    cx.fault(at, "said for real")
+
+    val _ = cx.fresh_name("x")
+
+    keep_trial(cx)
+
+    assert(refused_since(cx, kept))
+    assert_eq(a.complaints(), 1)
+    assert_eq(cx.fresh_name("x"), "x.1")
+
+    val outer = begin_trial(cx)
+    val inner = begin_trial(cx)
+
+    cx.fault(Span(1, 2), "said inside")
+    cx.view_borrows.push(("w", buf()))
+
+    keep_trial(cx)
+
+    assert(refused_since(cx, inner))
+
+    discard_trial(cx, outer)
+
+    assert_eq(a.complaints(), 1)
+    assert_eq(cx.view_borrows.len(), 0)
+    assert(!a.journal.recording())
+
+@test("a branch read in a trial and again for real borrows its view once, from the local it binds")
+sbx_branch_view_read_twice()
+    if !sbx_ready() then return
+
+    val out = sbx_ran(sbx_owner() +
+                      "run(c: bool)\n    val (a, b) = if c\n        val o = open(3)\n" +
+                      "        val v = o.view()\n\n        (v.len, 0)\n    else\n        (0, usize(5))\n\n" +
+                      "    print(a, b)\n\nrun(true)\nrun(false)\n")
+
+    assert_eq(out, "3 0\n0 5\n")
+
+@test("a view that does outlive its receiver's block is refused by the reading that is kept")
+sbx_branch_view_escape_refused()
+    if !sbx_ready() then return
+
+    val out = sbx_ran(sbx_owner() +
+                      "run(c: bool)\n    val q = open(1)\n    val (a, b) = if c\n        val o = open(3)\n\n" +
+                      "        (o.view(), 0)\n    else\n        (q.view(), usize(5))\n\n" +
+                      "    print(a.len, b)\n\nrun(true)\n")
+
+    assert(out.contains("a view borrowed from 'o', which is let go of at the end of the block " +
+                        "that bound it"), s"expected the borrow refused, got: $out")

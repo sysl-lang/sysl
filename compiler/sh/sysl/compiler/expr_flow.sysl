@@ -1233,16 +1233,14 @@ end road_offered
 // Whether calling `mname` on the sequence with no arguments answers with something a `for` walks:
 // an array, a slice, an erased `Iterate`, or a type implementing it. Nothing the trial wrote is kept.
 private answers_a_walk(cx: &Analyzer, seq: TExpr, mname: string, iterate: Option[string]) -> bool
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     var none_args: Buf[Expr] = buf()
     val t = texpr_type(call_member(cx, seq.span, seq, mname, none_args, None))
-    val clean = cx.an.complaints() == said
+    val refused = refused_since(cx, tried)
 
-    cx.an.release(mark)
-    cx.an.restore_complaints(said)
+    discard_trial(cx, tried)
 
-    if !clean then return false
+    if refused then return false
 
     t match
         Array(_, _) -> true
@@ -1514,13 +1512,11 @@ end common_offer
 // A reading made only to learn the type it comes to, and then thrown away whole -- registrations,
 // closures and complaints alike. A reading that complained comes to nothing.
 private trial(cx: &Analyzer, read: () -> TBlock) -> Option[Type]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = read()
-    val refused = cx.an.complaints() > said
+    val refused = refused_since(cx, tried)
 
-    cx.an.release(mark)
-    cx.an.restore_complaints(said)
+    discard_trial(cx, tried)
 
     if refused then None else settles(t)
 end trial
@@ -1664,51 +1660,39 @@ end settles
 // mistake *and* leave the mistake reported.
 private attempt_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
                       discarded: bool) -> Option[TBlock]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = type_value_block(cx, stmts, expected, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_block
 
 private attempt_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[Type],
                     discarded: bool) -> Option[TArm]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = analyze_arm(cx, scrut, arm, expected, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_arm
 
 private attempt_then(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                      want: Option[Type], discarded: bool) -> Option[(Buf[TCondTerm], TBlock)]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = then_side(cx, span, cond, then_body, want, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_then

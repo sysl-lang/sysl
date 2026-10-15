@@ -2501,22 +2501,17 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
         // at the very call a written-out `copy` on bytes wins -- and the chosen one is read again
         // from scratch. So the whole trial is rewound, not only what it had to say: a name a
         // discarded reading registered is a body the program never calls.
-        val mark = cx.an.complaints()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
+        val tried = begin_trial(cx)
         val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
-        val said = cx.an.complaints() > mark
+        val said = refused_since(cx, tried)
 
         // The signature the fit arrived at is read before the instantiation it made is dropped:
         // the types outlive the trial, and for a generic candidate they are what the call solved.
         val sig = if said then buf() else fitted_signature(cx, keys.at(i), trial)
 
-        if said then first_said.push(cx.an.found.at(mark))
+        if said then first_said.push(cx.an.found.at(tried.said))
 
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-        cx.an.restore_complaints(mark)
+        discard_trial(cx, tried)
 
         if !said
             fitting.push(keys.at(i))
@@ -2841,14 +2836,7 @@ private natural_types(cx: &Analyzer, args: Buf[Expr]) -> Buf[Option[Type]]
     var out: Buf[Option[Type]] = buf()
 
     for i in 0..<args.len()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
         val read = sandboxed_reading(cx, args.at(i))
-
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-
         val own = texpr_type(read.0)
 
         out.push(if read.1 || own == Unknown then None else Some(own))
@@ -3328,18 +3316,13 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
     var first_said: Buf[Placed] = buf()
 
     for i in 0..<keys.len()
-        val mark = cx.an.complaints()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
+        val tried = begin_trial(cx)
         val trial = extern_call(cx, span, written, keys.at(i), args)
-        val said = cx.an.complaints() > mark
+        val said = refused_since(cx, tried)
 
-        if said then first_said.push(cx.an.found.at(mark))
+        if said then first_said.push(cx.an.found.at(tried.said))
 
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-        cx.an.restore_complaints(mark)
+        discard_trial(cx, tried)
 
         if !said then return extern_call(cx, span, written, keys.at(i), args)
 
