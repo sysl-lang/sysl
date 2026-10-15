@@ -785,7 +785,19 @@ private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
     // wrong for it.
     TGlobal(_, _, _) -> no_view()
     TIndex(r, _, _) -> array_root(w, r)
+
+    // A field of module storage -- `rows[i].words` -- is module storage too, and lasts the whole run
+    // as its record does. A field of anything else is a value's, and is refused as before.
+    TField(r, _, _) -> if in_module_storage(r) then no_view() else unnamed_view()
     _ -> unnamed_view()
+
+// Whether a place is rooted at module storage through fields and elements alone. A step through a
+// pointer or a reference leaves it, since what is reached then is wherever the address points.
+private in_module_storage(e: TExpr) -> bool = *e.kind match
+    TGlobal(_, _, _) -> true
+    TField(r, _, _) -> in_module_storage(r)
+    TIndex(r, _, _) -> in_module_storage(r)
+    _ -> false
 
 private ref_place(w: &EscapeWalk, name: string) -> Option[TExpr]
     for item in w.ref_of

@@ -2057,6 +2057,39 @@ print(first_two([1, 2, 3, 4]).len)
 a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value, an array a caller passed by value, or part of an array literal, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
 ```
 
+**Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it
+outlives every frame without moving anywhere: a field of a module array's element is as static as the
+array, and a slice of it goes through a trait object, or anywhere else, with nothing promoted.
+
+```sysl
+trait Sink
+    take(*self, words: []const u32)
+
+struct Count
+    n: usize
+
+impl Sink for Count
+    take(*self, words: []const u32) = self.n += words.len
+
+struct Row
+    words: [4]u32
+    len: usize
+
+var rows: [2]Row = [Row([0; 4], 0); 2]
+var sink: Count = Count(0)
+
+feed(s: *Sink, i: usize)
+    s.take(rows[i].words[0..<rows[i].len])
+
+rows[1].len = 3
+feed(&sink, 1)
+print(sink.n)
+```
+
+```output
+3
+```
+
 **Without an allocator it is always a compile error.** Under `no alloc` there is nothing to promote
 into, so every promotion becomes a refusal reported at the view that leaves the frame. That is how
 every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
