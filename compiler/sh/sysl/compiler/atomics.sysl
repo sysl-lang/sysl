@@ -146,6 +146,15 @@ private halves_agree(cx: &Analyzer, span: Span, name: string, ord: string) -> bo
     true
 end halves_agree
 
+// Whether a body's substitution names no type parameter -- a plain function, or a method of a type
+// that has none, which binds `Self` alone.
+private binds_only_self(subst: Buf[Binding]) -> bool
+    for b in subst
+        if b.name != "Self" then return false
+
+    true
+end binds_only_self
+
 // The type an atomic form runs at, read off the address it was given.
 //
 // The refusals name what the machine cannot do rather than what the type is not, because the reader
@@ -165,7 +174,15 @@ private atomic_pointee(cx: &Analyzer, span: Span, name: string, addr: TExpr) -> 
                     // A `usize` is the machine's word wherever it runs, so it always fits.
                     val machine_width = bits == 8 || bits == 16 || bits == 32 || bits == 64
 
-                    if machine_width && !pointer_width && bits > t.atomic_bits()
+                    // **The standard module's own bodies are typed for every machine**, so a flag
+                    // it keeps at a width some processor lacks (`SpinLock`'s `int` on a 16-bit
+                    // CRAFT) is refused where a program reaches it (`atomic_reach.sysl`). An
+                    // instantiation is the program's choice of type, and is refused here: it binds
+                    // a type parameter, where a method of a plain type binds only `Self`.
+                    val deferred = standard_body_module(cx.scope.module_name) &&
+                                   binds_only_self(cx.subst)
+
+                    if machine_width && !pointer_width && bits > t.atomic_bits() && !deferred
                         cx.fault(span, s"'$name' is one machine instruction, and '${t.name}' has " +
                                  s"one for ${t.atomic_bits()} bits at most — " +
                                  s"${type_show(*inner)} is $bits, so there is nothing to emit. " +
