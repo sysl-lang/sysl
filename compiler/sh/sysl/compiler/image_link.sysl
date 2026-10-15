@@ -238,6 +238,14 @@ end settle_image
 // when nothing defines the symbol, and links an image that starts at address zero; lld has no
 // `--require-defined`, so the entry is also the value of an absolute symbol, `__sysl_entry`, and a
 // `--defsym` naming a symbol nothing defines is an error.
+//
+// **An image that names neither an entry nor a script starts at `main`**, and is told so the same
+// way. Nothing else would say where it starts: lld looks for a `_start` the program does not have,
+// and `--gc-sections` -- whose only roots in an executable are the entry and what a script keeps --
+// then drops every section, linking an empty ELF that starts at address zero, green. Such an image
+// always has a `main` (`image_emits_main`): the program's own, or a function exported as `main`.
+// A script is the author's word on the layout, its `ENTRY` included, so where there is one the
+// command line says nothing it did not ask for.
 image_link_flags() -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -250,9 +258,11 @@ image_link_flags() -> Buf[string]
         out.push("-T")
         out.push(image_script)
 
-    if image_entry != ""
-        out.push(s"-Wl,--entry=$image_entry")
-        out.push(s"-Wl,--defsym=__sysl_entry=$image_entry")
+    val entry = if image_entry == "" && image_script == "" then "main" else image_entry
+
+    if entry != ""
+        out.push(s"-Wl,--entry=$entry")
+        out.push(s"-Wl,--defsym=__sysl_entry=$entry")
 
     for line in tls_template_symbols()
         out.push(s"-Wl,--defsym=$line")
