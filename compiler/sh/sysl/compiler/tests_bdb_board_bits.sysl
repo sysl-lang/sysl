@@ -394,3 +394,53 @@ bdb_a_small_module_var_is_unchanged()
     remove_dir_all(root).unwrap_or(())
     assert_eq(said, "5 w4\n")
 end bdb_a_small_module_var_is_unchanged
+
+// =================================================================================================
+// The standard module's own flag is charged to the program that reaches it
+// =================================================================================================
+
+// `sysl emit-llvm` of a one-file program for the 16-bit CRAFT, whose atomics stop at 16 bits: the
+// exit code and what was said.
+private bdb_craft(program: string) -> (int, string)
+    val root = bdb_root(program, "")
+    val got = bdb_cli(["sysl", "emit-llvm", "--target", "craft-freestanding", root])
+
+    remove_dir_all(root).unwrap_or(())
+    (got.0, replace_all(got.1, root, "@"))
+end bdb_craft
+
+@test("a 16-bit CRAFT build takes the standard module whole although SpinLock's flag is an i32")
+bdb_craft_builds_past_the_spinlock_flag()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("@export(\"seven\")\nseven() -> int = 7\n")
+
+    assert(got.0 == Fine, got.1)
+    assert(!got.1.contains("one machine instruction"), got.1)
+end bdb_craft_builds_past_the_spinlock_flag
+
+@test("while a program reaching SpinLock there is refused at its own call, naming the width")
+bdb_craft_refuses_a_reached_spinlock()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\n\n" +
+                        "@export(\"take\")\ntake() = lock.lock()\n")
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("this reaches 'sysl.sync.SpinLock.lock', which runs an atomic wider than " +
+                          "'craft-freestanding' has one for — 16 bits at most, so there is nothing " +
+                          "to emit"), got.1)
+    assert(got.1.contains("@/main.sysl:6:"), got.1)
+end bdb_craft_refuses_a_reached_spinlock
+
+@test("and an instantiation the program chose is still refused where it is typed, on CRAFT too")
+bdb_craft_refuses_a_wide_instantiation()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("import sysl.sync.*\n\nvar n: Atomic[i32] = Atomic(0)\n\n" +
+                        "@export(\"tick\")\ntick() -> i32 = n.add(1, Relaxed)\n")
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("'atomic_add' is one machine instruction, and 'craft-freestanding' has " +
+                          "one for 16 bits at most — int is 32"), got.1)
+end bdb_craft_refuses_a_wide_instantiation
