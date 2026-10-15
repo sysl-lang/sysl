@@ -183,3 +183,85 @@ single_edges()
     assert(to_signed(widen_single(0x4F00_0000), 32) == 2147483647)
     assert(to_signed(widen_single(0xC2F6_E979), 32) == -123)
     assert(to_unsigned(widen_single(0xBF80_0000), 32) == 0)
+
+// -- the fused multiply-add -------------------------------------------------------------------------
+//
+// The oracle is the host's own fused instruction, reached as the intrinsic: AArch64's `fmadd` is
+// correctly rounded at both widths, and no part of it is this file's.
+
+private extern "llvm.fma" hardware_fma(a: real, b: real, c: real) -> real
+private extern "llvm.fma" hardware_fmaf(a: f32, b: f32, c: f32) -> f32
+
+@test("a fused multiply-add of random doubles agrees with the fused instruction")
+random_fused_agree_with_hardware()
+    var g = rng(68, 7)
+
+    for step in 0..<40000
+        val a = any_double(&g)
+        val b = any_double(&g)
+
+        // Every third addend is the negated rounded product nudged, so the sum cancels most of it
+        // and what is left is the product's low bits -- the case a fused operation exists for.
+        val c = if step % 3 == 0 then real.from_bits((a * b).bits() ^ SIGN ^ (g.next_u64() & 0xF))
+                else if step % 3 == 1 then any_double(&g)
+                else real.from_bits(g.next_u64() & 0x81FF_FFFF_FFFF_FFFF)
+
+        assert(same(fused(a.bits(), b.bits(), c.bits(), false), hardware_fma(a, b, c)), s"fma($a, $b, $c)")
+
+@test("and of operands near the bottom of the range, whose sums are subnormal")
+random_fused_subnormal_agree_with_hardware()
+    var g = rng(69, 7)
+
+    for step in 0..<20000
+        val a = real.from_bits(g.next_u64() & 0x81FF_FFFF_FFFF_FFFF)
+        val b = real.from_bits((g.next_u64() & 0x803F_FFFF_FFFF_FFFF) | 0x3C00_0000_0000_0000)
+        val c = real.from_bits(g.next_u64() & 0x801F_FFFF_FFFF_FFFF)
+
+        assert(same(fused(a.bits(), b.bits(), c.bits(), false), hardware_fma(a, b, c)), s"fma($a, $b, $c)")
+
+@test("a binary32 fused multiply-add of random floats agrees with the fused instruction")
+random_fused_single_agree_with_hardware()
+    var g = rng(70, 7)
+
+    for step in 0..<40000
+        val a = f32.from_bits(u32(g.next_u64() >> 32))
+        val b = f32.from_bits(u32(g.next_u64() >> 32))
+        val c = if step % 2 == 0 then f32.from_bits((a * b).bits() ^ 0x8000_0000 ^ u32(g.next_u64() & 0xF))
+                else f32.from_bits(u32(g.next_u64() >> 32))
+
+        assert(same_single(fused_single(a.bits(), b.bits(), c.bits()), hardware_fmaf(a, b, c)),
+               s"fmaf($a, $b, $c)")
+
+@test("the fused results a multiply and an add would get wrong")
+fused_known_values()
+    // (1 + 2^-30)^2 - (1 + 2^-29) is 2^-60 exactly; the rounded product has already lost it.
+    val x: u64 = 0x3FF0_0000_0400_0000
+    val c: u64 = 0xBFF0_0000_0800_0000
+
+    assert(fused(x, x, c, false) == 0x3C30_0000_0000_0000)
+    assert(add(mul(x, x), c) == 0)
+
+    // 2^-12 (1 + 2^-15) times 2^-12 (1 - 2^-15) is 2^-24 - 2^-54, and plus 1 + 2^-23 it is a hair
+    // below the half-way point to the next float up: the answer is 1 + 2^-23. Rounded to nearest at
+    // binary64 first, the hair is gone, the tie goes to even, and the answer is one float too high --
+    // the double rounding that rounding to odd at binary64 exists to prevent.
+    val a: u32 = 0x3980_0100
+    val b: u32 = 0x397F_FE00
+    val d: u32 = 0x3F80_0001
+
+    assert(fused_single(a, b, d) == 0x3F80_0001)
+    assert(narrow_single(fused(widen_single(a), widen_single(b), widen_single(d), false)) == 0x3F80_0002)
+    assert(hardware_fmaf(f32.from_bits(a), f32.from_bits(b), f32.from_bits(d)).bits() == 0x3F80_0001)
+
+    // An infinity times zero, opposite infinities, and the zeros signed as `add` signs them.
+    assert(fused(INFINITY, 0, ONE, false) == QUIET_NAN)
+    assert(fused(INFINITY, 0x3FF0_0000_0000_0000, INFINITY | SIGN, false) == QUIET_NAN)
+    assert(fused(SIGN, 0x3FF0_0000_0000_0000, SIGN, false) == SIGN)
+    assert(fused(SIGN, 0x3FF0_0000_0000_0000, 0, false) == 0)
+    assert(fused(0x3FF0_0000_0000_0000, 0x3FF0_0000_0000_0000, 0xBFF0_0000_0000_0000, false) == 0)
+
+    // The largest finite value squared overflows, whatever is added; an addend alone survives a
+    // product far below it.
+    assert(fused(0x7FEF_FFFF_FFFF_FFFF, 0x7FEF_FFFF_FFFF_FFFF, 0xFFEF_FFFF_FFFF_FFFF, false) == INFINITY)
+    assert(fused(1, 1, 0x3FF0_0000_0000_0000, false) == 0x3FF0_0000_0000_0000)
+end fused_known_values
