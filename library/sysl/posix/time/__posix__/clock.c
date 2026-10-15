@@ -31,3 +31,9 @@ long long sysl_posix_time_realtime_us(void) {
 long long sysl_posix_time_monotonic_us(void) {
     return micros_of(CLOCK_MONOTONIC);
 }
+
+// User plus system time of this process, summed by the kernel. `CLOCK_PROCESS_CPUTIME_ID` is a
+// macro (2 on Linux, 12 on macOS), which is why it is named here and not in sysl.
+long long sysl_posix_time_cpu_us(void) {
+    return micros_of(CLOCK_PROCESS_CPUTIME_ID);
+}
