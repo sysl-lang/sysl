@@ -931,9 +931,9 @@ probe_bumps() =
     assert_eq(Probe(0).twice(), 82)
 ```
 
-**A `@tests` file is never where a program starts**, even a root file with no `module` header and
-nothing in it but bindings: no build but `sysl test` keeps it, so it cannot be the body a script
-runs. Its `var`s are the module's storage, and a test reading one is a test like any other:
+**A `@tests` file of declarations and bindings is never where a program starts**, even a root file
+with no `module` header: no build but `sysl test` keeps it, so it cannot be the body a script runs.
+Its `var`s are the module's storage, and a test reading one is a test like any other:
 
 ```sysl
 @tests

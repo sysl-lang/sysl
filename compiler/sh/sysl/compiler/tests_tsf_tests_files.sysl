@@ -100,6 +100,17 @@ tsf_a_test_reading_a_script_binding_is_refused()
     assert(code != 0, said)
     assert(said.contains(s"error: ${tsf_nested("'@test'")}"), said)
 
+@test("and so is one in a '@tests' file holding a statement that runs, which makes that file a body")
+tsf_a_tests_file_that_runs_something()
+    if !tsf_ready() then return
+
+    val (_, code, said) = tsf_tested([
+        ("tests.sysl", "@tests\n\nvar n: int = 1\nprint(n)\n\n@test(\"reads\")\nreads() =\n" +
+                       "    assert_eq(n, 1)\n")])
+
+    assert(code != 0, said)
+    assert(said.contains(s"error: ${tsf_nested("'@test'")}"), said)
+
 @test("so is one reaching the binding through a sibling, and so is a hook")
 tsf_through_a_sibling_and_a_hook()
     if !tsf_ready() then return
@@ -136,6 +147,30 @@ tsf_a_tests_type_may_call_its_helper()
     val (names, code, said) = tsf_tested([("tests.sysl", tsf_probe())])
 
     assert_eq(names, "names the helper")
+    assert_eq(code, 0, said)
+
+@test("a lambda in a '@tests' function that takes a closure, so is made real per argument, may call a helper")
+tsf_a_lambda_in_an_instantiation_may_call_a_helper()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([
+        ("a/b/tests.sysl", "module a.b\n@tests\n\npicked() -> int = 1\n\nrigged(build: () -> int) -> int\n" +
+                           "    val f = () -> picked()\n    f() + build()\n\n@test\nT()\n" +
+                           "    assert_eq(rigged(() -> 2), 3)\n")])
+
+    assert_eq(names, "T")
+    assert_eq(code, 0, said)
+
+@test("and so may a lambda inside a method of a type the file declares")
+tsf_a_lambda_in_a_tests_method_may_call_a_helper()
+    if !tsf_ready() then return
+
+    val (names, code, said) = tsf_tested([
+        ("tests.sysl", "@tests\n\nhelper() -> int = 41\n\nstruct Probe\n    n: int\n\n" +
+                       "    later(self) -> int\n        val f = () -> helper()\n        f() + self.n\n\n" +
+                       "@test(\"t\")\nt() =\n    assert_eq(Probe(1).later(), 42)\n")])
+
+    assert_eq(names, "t")
     assert_eq(code, 0, said)
 
 @test("a method of a type in an ordinary file still may not")
