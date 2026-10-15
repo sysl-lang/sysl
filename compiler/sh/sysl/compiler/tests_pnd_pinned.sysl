@@ -1,0 +1,387 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// `@pinned` on a struct (`reference/attributes.md § @pinned on a struct`): a value C holds pointers
+// into -- littlefs's `lfs_t`, which keeps a pointer to its config and a list of open files threaded
+// through itself -- so once it is built it is never copied or moved. A new value may land once (a
+// binding, module storage, a `&T` box, a field of another pinned value, what a function hands back);
+// after that it is reached only through a field, an address or a `*self` method. Every refused form
+// is pinned here by its diagnostic, every allowed one by running it, and the module-storage shape by a
+// `thumbv7em-freestanding` build.
+
+private var pnd_std_cache: Buf[Program] = buf()
+private var pnd_std_read: bool = false
+
+private pnd_std() -> Buf[Program]
+    if pnd_std_read then return pnd_std_cache
+
+    pnd_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> pnd_std_cache = units
+
+    pnd_std_cache
+end pnd_std
+
+private pnd_skip() -> bool
+    if pnd_std().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end pnd_skip
+
+// Everything the compilation of one file said about that file, one message to a line.
+private pnd_said(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    for item in pnd_std()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in done.reported
+        if item.src.name == "main.sysl" then out.push(item.diag.message)
+
+    join(out.view(), "\n")
+end pnd_said
+
+// The refusal holds both the type's sentence and what this form does.
+private pnd_refused(text: string, how: string)
+    val said = pnd_said(text)
+
+    assert(said.contains("'Fs' is '@pinned' — C may hold pointers into a value of it, so a value is " +
+                         "never copied or moved once it is built"), said)
+    assert(said.contains(how), said)
+end pnd_refused
+
+private val pnd_fs: string = "@pinned\nstruct Fs\n    open: int\n\nvar fs: Fs = Fs(0)\n\n"
+
+// -- the refused forms --------------------------------------------------------------------------
+
+@test("binding a pinned value already built is refused")
+pnd_binding_copies()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "main()\n    var b = fs\n    print(b.open)\n",
+                "and this binds a copy of it. Take its address ('&') or name it with a 'ref' instead")
+end pnd_binding_copies
+
+@test("assigning a placed pinned value is refused")
+pnd_assigning_copies()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "main()\n    var c = Fs(1)\n    c = fs\n    print(c.open)\n",
+                "and this assigns a copy of it. Take its address ('&') instead")
+end pnd_assigning_copies
+
+@test("assigning a new value over an existing pinned binding is refused")
+pnd_assigning_over()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "made() -> Fs = Fs(3)\n\nmain()\n    fs = made()\n    fs = Fs(2)\n",
+                "and this assigns over a value already built, which C may still hold pointers into")
+end pnd_assigning_over
+
+@test("a parameter taking a pinned value by value is refused, and so is the argument")
+pnd_parameter_by_value()
+    if pnd_skip() then return
+
+    val said = pnd_said(pnd_fs + "take(f: Fs) -> int = f.open\n\nmain()\n    print(take(Fs(2)))\n")
+
+    assert(said.contains("and this parameter 'f' of 'take' takes it by value. Take a '*Fs' or a '&Fs' " +
+                         "instead"), said)
+    assert(said.contains("and this passes it by value. Pass its address ('&') to a '*T' parameter " +
+                         "instead"), said)
+end pnd_parameter_by_value
+
+@test("a '(self)' receiver on a pinned struct is refused")
+pnd_self_receiver()
+    if pnd_skip() then return
+
+    pnd_refused("@pinned\nstruct Fs\n    open: int\n\n    peek(self) -> int = self.open\n\n" +
+                "var fs: Fs = Fs(0)\n\nmain()\n    print(fs.open)\n",
+                "and this receiver of 'Fs.peek' is taken as '(self)', which is a copy. Take '(*self)' " +
+                "instead")
+end pnd_self_receiver
+
+@test("returning a pinned value that is already bound is refused, a local or module storage")
+pnd_returning_a_bound_value()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "give() -> Fs = fs\n\nmain()\n    print(give().open)\n",
+                "and this returns it by value. Return a value built in place, or a '&T' box of it")
+    pnd_refused(pnd_fs + "use(p: *Fs) -> int = p.open\n\nkept() -> Fs\n    var here = Fs(4)\n" +
+                "    print(use(&here))\n    here\n\nmain()\n    var d = kept()\n    print(d.open)\n",
+                "and this returns it by value")
+end pnd_returning_a_bound_value
+
+@test("a struct holding a pinned value by value must be pinned itself")
+pnd_unmarked_holder()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "struct Holder\n    fs: Fs\n\nvar h: Holder = Holder(Fs(1))\n\n" +
+                "main()\n    print(h.fs.open)\n",
+                "and this holds it by value in field 'fs' of 'Holder', which moves it whenever it " +
+                "moves. Mark 'Holder' '@pinned' too, or hold a '&Fs' or a '*Fs'")
+end pnd_unmarked_holder
+
+@test("capturing a pinned local by value in a closure is refused")
+pnd_capture()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "main()\n    var here = Fs(5)\n    val f = () -> here.open\n    print(f())\n",
+                "and this captures 'here' by value in a closure. Capture a pointer to it instead " +
+                "('val p = &here')")
+end pnd_capture
+
+@test("destructuring a pinned value is refused, at a binding and in a match")
+pnd_destructuring()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "main()\n    val Fs(n) = fs\n    print(n)\n",
+                "and this takes it apart, which reads it whole into a copy first. Read the fields " +
+                "through it instead")
+    pnd_refused(pnd_fs + "main()\n    fs match\n        Fs(k) -> print(k)\n",
+                "and this matches on it, which reads it whole into a copy first")
+end pnd_destructuring
+
+@test("a tuple, an enum payload and a loop variable cannot hold a pinned value by value")
+pnd_other_holders()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "main()\n    val t = (Fs(3), 1)\n    print(t.1)\n",
+                "and this puts it in a tuple, which moves it whenever the tuple moves")
+    pnd_refused(pnd_fs + "main()\n    val o: Option[Fs] = None\n    print(o.is_none())\n",
+                "and this carries it by value in variant 'Some' of 'sysl.Option[Fs]'")
+    pnd_refused(pnd_fs + "var all: [2]Fs = [Fs(1), Fs(2)]\n\nmain()\n    for item in all\n" +
+                "        print(item.open)\n",
+                "and this copies each element into the loop variable. Loop over the indices")
+end pnd_other_holders
+
+@test("a 'Buf' of a pinned type is refused, since its storage moves when it grows")
+pnd_buf_of_pinned()
+    if pnd_skip() then return
+
+    pnd_refused(pnd_fs + "import sysl.buf.{Buf, buf}\n\nmain()\n    var list: Buf[Fs] = buf()\n" +
+                "    print(list.len())\n",
+                "and this makes it an element of 'sysl.buf.Buf[Fs]', whose storage moves when it grows")
+end pnd_buf_of_pinned
+
+@test("a generic whose body copies its parameter is refused at a pinned instance, naming it")
+pnd_generic_instance()
+    if pnd_skip() then return
+
+    val said = pnd_said(pnd_fs + "first[T](x: *T) -> T = *x\n\nid[T](x: T) -> T = x\n\n" +
+                        "made() -> Fs = Fs(3)\n\nmain()\n    val g = first(&fs)\n    val h = id(made())\n" +
+                        "    print(g.open, h.open)\n")
+
+    assert(said.contains("and this returns it by value (instance 'first.Fs')"), said)
+    assert(said.contains("and this parameter 'x' of 'id.Fs' takes it by value"), said)
+    assert(said.contains("and this passes it by value"), said)
+end pnd_generic_instance
+
+@test("a generic that only reaches its parameter through a pointer is fine at a pinned instance")
+pnd_generic_through_a_pointer()
+    if pnd_skip() then return
+
+    val said = pnd_said(pnd_fs + "addr[T](x: *T) -> *T = x\n\nmain()\n    print(addr(&fs).open)\n")
+
+    assert(said == "", said)
+end pnd_generic_through_a_pointer
+
+@test("'@pinned' marks a struct beside the layout annotations, and a function as it always did")
+pnd_beside_layout()
+    if pnd_skip() then return
+
+    assert(pnd_said("@pinned\n@align(16)\nstruct Fs\n    open: int\n\nvar fs: Fs = Fs(0)\n\n" +
+                    "main()\n    print(fs.open)\n") == "", "a pinned, aligned struct is refused")
+end pnd_beside_layout
+
+// -- the allowed forms, run ------------------------------------------------------------------------
+
+private pnd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-pnd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end pnd_ran
+
+// littlefs's shape: a filesystem holding a pointer to its config, in module storage, inside another
+// pinned struct, boxed, in an array, as a local, and made by a constructor -- a generic one too, as
+// a binding of `filesystem[D, L](dev, g) -> Fs[D, L]` would be.
+private val pnd_allowed: string = raw"""
+    struct Config
+        block: int
+
+    @pinned
+    struct Fs
+        cfg: *Config
+        open: int
+
+        mount(*self, cfg: *Config)
+            self.cfg = cfg
+            self.open = 1
+
+        count(*self) -> int = self.open + self.cfg.block
+
+    @pinned
+    struct Board
+        fs: Fs
+        id: int
+
+    new_fs(open: int) -> Fs = Fs(null, open)
+
+    var cfg: Config = Config(512)
+    var fs: Fs = Fs(null, 0)
+    var board: Board = Board(Fs(null, 2), 7)
+    var made: Fs = new_fs(3)
+    var many: [2]Fs = [Fs(null, 0), Fs(null, 0)]
+
+    touch(p: *Fs) -> int = p.open
+
+    local()
+        var here = Fs(null, 9)
+        here.mount(&cfg)
+        val p = &here
+        print(p.open, here.count())
+
+    struct Flash
+        size: int
+
+    @pinned
+    struct Gfs[D, L]
+        dev: *D
+        geometry: int
+        lock: L
+
+    filesystem[D, L](dev: *D, g: int, lock: L) -> Gfs[D, L] = Gfs(dev, g, lock)
+
+    wrapped[D, L](dev: *D, g: int, lock: L) -> Gfs[D, L] = filesystem(dev, g + 1, lock)
+
+    var flash: Flash = Flash(4096)
+    var gfs: Gfs[Flash, int] = filesystem(&flash, 8, 0)
+
+    late()
+        var mine = wrapped(&flash, 5, 1)
+        print(mine.geometry)
+
+    main()
+        fs.mount(&cfg)
+        print(fs.count(), fs.open, touch(&fs))
+        board.fs.mount(&cfg)
+        print(board.fs.count(), board.id)
+
+        val boxed: &Fs = Fs(null, 4)
+
+        boxed.mount(&cfg)
+        print(boxed.count(), made.open)
+        many[1].mount(&cfg)
+        print(many[1].count())
+        print(gfs.geometry, gfs.dev.size)
+
+        val boxed_g: &Gfs[Flash, bool] = wrapped(&flash, 2, true)
+
+        print(boxed_g.geometry)
+        local()
+        late()
+    """
+
+@test("every allowed form builds and runs: module storage, a box, a pinned parent, a constructor")
+pnd_allowed_forms_run()
+    if pnd_skip() then return
+
+    assert_eq(pnd_ran(pnd_allowed), "513 1 1\n513 7\n513 3\n513\n8 4096\n3\n1 513\n6\n")
+end pnd_allowed_forms_run
+
+// -- on a board -------------------------------------------------------------------------------------
+
+private pnd_board(text: string) -> string
+    val t = target_named("thumbv7em-freestanding").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(got) -> units = got
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+
+    for item in done.reported
+        if item.src.name == "main.sysl" then return item.diag.message
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    for item in done.an.diagnostics()
+        if item.src.name == "main.sysl" then return item.diag.message
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end pnd_board
+
+@test("a pinned value in module storage on a bare board is the constant the object file carries")
+pnd_board_module_storage()
+    if pnd_skip() then return
+
+    val out = pnd_board(raw"""
+        struct Flash
+            size: u32
+
+        @pinned
+        struct Fs[D]
+            dev: *D
+            geometry: u32
+            open: u32
+
+            mount(*self) -> u32
+                self.open += 1
+                self.geometry + self.open
+
+        var flash: Flash = Flash(4096)
+        var fs: Fs[Flash] = Fs(&flash, 8, 0)
+
+        @export("main")
+        run() -> u32 = fs.mount() + fs.dev.size
+        """)
+
+    assert(out.contains("@fs = private global %struct.Fs.Flash { ptr @flash, i32 8, i32 0 }"), out)
+    assert(!out.contains("module_init"), out)
+end pnd_board_module_storage

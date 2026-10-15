@@ -2806,6 +2806,125 @@ A value that is not in a struct is put in an order with
 out of bytes, every `bool` and enum in it checked, with
 [`sysl.encoding.Plain`](/library/encoding/)'s `decode`.
 
+## `@pinned` on a struct — a value C holds pointers into
+
+Some C state points into itself. littlefs's `lfs_t` keeps a pointer to its configuration and a list of
+open files threaded through its own storage; a USB stack's device struct is handed to interrupt
+handlers by address. Copy one, and C goes on writing through pointers into the copy that is gone.
+**`@pinned` above a struct says a value of it is never copied or moved once it is built.**
+
+A new value has no address yet, so it may land once — in a binding, in module storage, in a `&T`
+box, in a field of another pinned value, or as what a function hands back, where it is built in the
+caller's slot. After that it is reached only **through** it: a field, `&`, or a method taking `*self`.
+
+```sysl
+struct Config
+    block: int
+
+@pinned
+struct Fs
+    cfg: *Config
+    open: int
+
+    mount(*self, cfg: *Config)
+        self.cfg = cfg
+        self.open = 1
+
+    size(*self) -> int = self.open * self.cfg.block
+
+// A constructor hands back a value it has just built, and the caller's storage is where it lands.
+filesystem(open: int) -> Fs = Fs(null, open)
+
+var cfg: Config = Config(512)
+var fs: Fs = filesystem(0)
+
+main()
+    fs.mount(&cfg)
+
+    val boxed: &Fs = filesystem(2)
+
+    boxed.mount(&cfg)
+    print(fs.size(), boxed.open, fs.cfg.block)
+```
+
+```output
+512 1 512
+```
+
+Everything that would read the value whole is refused, each with what it does to the value:
+
+```sysl
+@pinned
+struct Fs
+    open: int
+
+var fs: Fs = Fs(0)
+
+main()
+    var b = fs
+    print(b.open)
+```
+
+```error
+'Fs' is '@pinned' — C may hold pointers into a value of it, so a value is never copied or moved once it is built, and this binds a copy of it. Take its address ('&') or name it with a 'ref' instead, or build the value in place
+```
+
+The same sentence ends differently for each form:
+
+| written | refused because this… |
+|---|---|
+| `var b = fs`, `val p: &Fs = fs` | binds a copy of it / copies it into a new box |
+| `c = fs`, `fs = Fs(2)` | assigns a copy of it / assigns over a value already built, which C may still hold pointers into |
+| `take(f: Fs)`, `take(fs)` | parameter 'f' of 'take' takes it by value / passes it by value |
+| `peek(self)` in the struct | receiver of 'Fs.peek' is taken as '(self)', which is a copy |
+| `give() -> Fs = fs` | returns it by value — only a value built right there may be handed back |
+| `() -> here.open` over a local | captures 'here' by value in a closure |
+| `val Fs(n) = fs`, `fs match` | takes it apart / matches on it, which reads it whole into a copy first |
+| `(Fs(3), 1)`, `Option[Fs]` | puts it in a tuple / carries it by value in variant 'Some' |
+| `for item in all` over `[2]Fs` | copies each element into the loop variable |
+| `Buf[Fs]` | makes it an element of a buffer whose storage moves when it grows |
+
+**Assignment is refused even of a new value**: the one already there may be what C points into. A
+pinned value is built once, where it lives, and changed afterwards through its own members.
+
+### A type holding one is pinned too, and says so
+
+A struct holding a pinned value by value moves it whenever the struct moves, so it is pinned as well —
+and it is **marked**, not inferred, so the reader of the outer declaration sees that its address
+matters:
+
+```sysl
+@pinned
+struct Fs
+    open: int
+
+struct Holder
+    fs: Fs
+
+var h: Holder = Holder(Fs(1))
+
+main()
+    print(h.fs.open)
+```
+
+```error
+and this holds it by value in field 'fs' of 'Holder', which moves it whenever it moves. Mark 'Holder' '@pinned' too, or hold a '&Fs' or a '*Fs'
+```
+
+An array of pinned values is pinned the same way, and a `[]Fs` view, a `*Fs` and a `&Fs` are all
+fine: none of them is the value.
+
+### A generic is held to it at the instance
+
+A generic instantiated at a pinned type is checked as the instance, the way an instance is held to its
+declaration's `@no_alloc`: `addr[T](x: *T) -> *T` is fine at `Fs`, and `first[T](x: *T) -> T = *x`
+is refused, the refusal naming `first.Fs`. A container is refused at the type when any of its members
+is `@relocates`, since that member moves its elements — which is why `Buf[Fs]` is.
+
+A `drop` is the one member taking `self` that a pinned struct may have: it is handed the value as the
+value is destroyed. And `@pinned` marks a struct beside `@packed`, `@align(n)` and `@export(...)`;
+above a function it is still the per-core promise of [`@per_cpu`](#per_cpu--one-copy-per-processor-core).
+
 ## `@section("...")` — where a symbol lands
 
 `@align(n)` says what boundary storage begins on. `@section` says **where the storage is**, and it is
