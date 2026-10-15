@@ -790,7 +790,7 @@ debug_units(units: Buf[Program]) -> Buf[Program]
 
             val name = declared_name(s)
 
-            if name.bytes.len > 0 && !holds_string(written, s"$home.$name")
+            if name.bytes.len > 0 && !opaque_decl(s) && !holds_string(written, s"$home.$name")
                 for item in debug_blocks(s)
                     body.push(item)
 
@@ -802,6 +802,12 @@ debug_units(units: Buf[Program]) -> Buf[Program]
 
     out
 end debug_units
+
+// **An opaque struct gets none**: its layout is its module's alone, and a rendering is reached from
+// wherever the value is printed. It is held through a pointer, which shows its address.
+private opaque_decl(s: Stmt) -> bool = *s.kind match
+    StructDecl(d) -> d.opaque
+    _ -> false
 
 private declares_debug(units: Buf[Program]) -> bool
     for unit in units
@@ -833,6 +839,20 @@ private written_debug(units: Buf[Program]) -> Buf[string]
 
     out
 end written_debug
+
+// **The specifier of a supplied `debug` carries a name no program can write**, a space in it as
+// `render_name`'s has, and it is what marks the member as the compiler's: a supplied member is typed
+// only once something reaches it, as a library member is (`analyze_body.sysl`), so a program that
+// declares a struct and never shows it carries none of the showing.
+const SuppliedSpec: string = "debug fmt"
+
+// Whether a lowered member is one this file supplied.
+supplied_debug(params: Buf[Param]) -> bool
+    for item in params
+        if item.name == SuppliedSpec then return true
+
+    false
+end supplied_debug
 
 // What a supplied `debug` writes through: the library's, by path.
 private lib(at: Span, name: string) -> Expr = field_of(at, ident(at, "sysl"), name)
@@ -902,12 +922,12 @@ private debug_literal_method(at: Span, name: string, s: Stmt) -> MethodDecl
 
     args.push(field_of(at, text, "bytes"))
     args.push(ident(at, "out"))
-    args.push(ident(at, "fmt"))
+    args.push(ident(at, SuppliedSpec))
 
     var params: Buf[Param] = buf()
 
     params.push(lib_writer(at))
-    params.push(lib_spec(at, "fmt"))
+    params.push(lib_spec(at, SuppliedSpec))
     method_of(at, "debug", params, None,
               one_stmt_of(stmt(at, ExprStmt(call_of(at, lib(at, "display_pad"), args)))))
 end debug_literal_method
@@ -958,7 +978,7 @@ private debug_parts_method(at: Span, name: string, s: Stmt) -> MethodDecl
 
     padded.push(ident(at, "self"))
     padded.push(ident(at, "out"))
-    padded.push(ident(at, "fmt"))
+    padded.push(ident(at, SuppliedSpec))
 
     var measured: Buf[Stmt] = buf()
 
@@ -973,7 +993,7 @@ private debug_parts_method(at: Span, name: string, s: Stmt) -> MethodDecl
 
     var body: Buf[Stmt] = buf()
 
-    body.push(stmt(at, ExprStmt(expr(at, IfExpr(compare(at, ">", field_of(at, ident(at, "fmt"), "width"),
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(compare(at, ">", field_of(at, ident(at, SuppliedSpec), "width"),
                                                          int_of(at, "0")),
                                                 measured, None, false)))))
     body.push(stmt(at, ValDecl("parts", None, call_of(at, lib(at, "FormatSpec"), spec_args), Public,
@@ -985,7 +1005,7 @@ private debug_parts_method(at: Span, name: string, s: Stmt) -> MethodDecl
     var params: Buf[Param] = buf()
 
     params.push(lib_writer(at))
-    params.push(lib_spec(at, "fmt"))
+    params.push(lib_spec(at, SuppliedSpec))
     method_of(at, "debug", params, None, body)
 end debug_parts_method
 

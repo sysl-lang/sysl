@@ -576,14 +576,13 @@ end trait_members
 //
 // **Every table carries `Debug` after its own slots**, whether or not the trait requires it, because
 // every type has one: an object is shown through its concrete value's `Debug` exactly as a value is.
-// It goes last so that adding it moves no slot a trait's own members already had. A callable's table
-// carries none -- a callable is shown as `<fn>`, and the value behind it is a closure's capture
-// record, which has no `Debug` to point at.
+// It goes last so that adding it moves no slot a trait's own members already had. Two kinds of table
+// carry none (`slotless_debug`).
 slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, MethodDecl)]
     var out: Buf[(Bound, MethodDecl)] = buf()
     val all = trait_members(a, b, self_bind)
     val dbg = library_key("Debug")
-    var shown = b.name == dbg || fn_is_call(b.name)
+    var shown = b.name == dbg || slotless_debug(b.name)
 
     for item in all
         if item.1.tparams.is_empty() then out.push(item)
@@ -598,6 +597,13 @@ slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, 
 
     out
 end slotted_members
+
+// The traits whose tables carry no `Debug` slot, an object of one being shown by rule instead: a
+// **callable**, whose value is a closure's capture record with no `Debug` to point at (`<fn>`), and
+// a **`Writer`** -- a sink is where a rendering goes rather than a value to show (`<writer>`), the
+// string a `str` gathers into has a table the compiler lays down itself, and a slot in every
+// writer's table would put a `Debug` of every sink into every program that writes to one.
+slotless_debug(name: string) -> bool = fn_is_call(name) || name == library_key("Writer")
 
 // Whether a trait has a member no table can hold, which is what stops an **object** standing at a
 // bound on it: the members a bound licenses would then be more than the table can reach.
@@ -633,10 +639,12 @@ satisfies(a: &Analysis, tr: Bound, t: Type) -> bool = t match
 // **A reference or a pointer is `Debug` where what it reaches is**, because a member call sees
 // through one level of `&` or `*` to find its receiver (`reference/traits.md § Any type may carry an
 // impl`), so `x.debug(…)` on one reaches the referent's -- which is what lets an `Option[&Node]` or a
-// `Buf[*P]` meet `T: Debug`. An object reaches the `Debug` every table carries, and a callable's
-// `debug` is answered by the compiler as `<fn>` (`callable_debug`).
+// `Buf[*P]` meet `T: Debug`. An object reaches the `Debug` its table carries, and a callable's or a
+// writer's `debug` is answered by the compiler (`callable_debug`), as is every type `Debug` by rule
+// (`debug_by_rule`).
 private debug_through(a: &Analysis, tr: Bound, t: Type) -> bool
     if tr.name != library_key("Debug") then return false
+    if debug_by_rule(t) then return true
 
     val inner = t match
         Ref(i, _) -> *i

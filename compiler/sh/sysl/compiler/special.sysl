@@ -187,14 +187,39 @@ private shows(cx: &Analyzer, ty: Type) -> bool
 end shows
 
 // The values the compiler shows by rule, since no block may be written for them: a raw pointer
-// (`reference/traits.md § Any type may carry an impl` refuses a memory mode as a subject), a
-// callable, and a weak reference, which is shown without being followed.
+// (`reference/traits.md § Any type may carry an impl` refuses a memory mode as a subject), and every
+// value `debug_by_rule` names.
 private shown_by_rule(ty: Type) -> bool = ty match
-    Ptr(inner) -> !is_trait(*inner) || fn_is_call(trait_bound_of(*inner).name)
-    Ref(inner, _) -> is_trait(*inner) && fn_is_call(trait_bound_of(*inner).name)
+    Ptr(inner) -> !is_trait(*inner) || slotless_debug(trait_bound_of(*inner).name)
+    Ref(inner, _) -> is_trait(*inner) && slotless_debug(trait_bound_of(*inner).name)
+    // A `volatile` value a program prints is read and printed as it always was; only a structure
+    // shown around one leaves it unread (`debugger`).
+    _ -> debug_by_rule(ty) && !is_device(ty)
+
+// The types that are `Debug` by the compiler's rule rather than through a block, as a bound reads it
+// and as `x.debug(…)` on one is answered (`rule_debug`): a callable, a C function pointer, a weak
+// reference (shown without being followed), `unit`, a task, and device memory -- a `volatile`
+// value, or an array or a view of them, which is shown by its type and never read: reading a
+// register is an act with consequences, and printing a struct must not perform it.
+debug_by_rule(ty: Type) -> bool = ty match
     CFn(_, _) -> true
     Weak(_) -> true
-    _ -> is_closure_literal(ty)
+    Unit -> true
+    _ -> is_closure_literal(ty) || task_result(ty).is_some() || is_device(ty)
+
+private is_device(ty: Type) -> bool = ty match
+    Volatile(_) -> true
+    Array(_, elem) -> is_device(*elem)
+    Slice(elem, _) -> is_device(*elem)
+    _ -> false
+
+// `x.debug(out, fmt)` on a value that is `Debug` by rule, answered with what the rule shows.
+rule_debug(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr]) -> TExpr
+    if args.len() != 2 then return cx.err(span, "'debug' takes a sink and a specifier")
+
+    plan_call(span, debugger(cx, span, through_ref(cx, receiver), "show", "debug"),
+              type_expr_bare(cx, args.at(0)), type_expr_bare(cx, args.at(1)))
+end rule_debug
 
 // Which `display` a value reaches, and the table slot to read it out of where the value is an
 // object rather than a type -- or, where it has no `Display`, which `debug`: **every value prints**,
@@ -282,6 +307,8 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
 
     val dbg = debug_bound()
 
+    if is_device(vt) then return (shown_text(span, s"<${type_show(vt)}>"), lib_fn(cx, "display_str"), None)
+
     if shown_by_rule(vt)
         vt match
             Ptr(inner) ->
@@ -289,12 +316,27 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
                     return (TExpr(span, TCast(t, usize_type(word_bits(cx)))),
                             lib_fn(cx, "debug_address"), None)
             Weak(_) -> return (shown_text(span, "weak(…)"), lib_fn(cx, "display_str"), None)
+            Unit -> return (shown_text(span, "()"), lib_fn(cx, "display_str"), None)
             _ -> ()
 
-        return (shown_text(span, "<fn>"), lib_fn(cx, "display_str"), None)
+        val text = if task_result(vt).is_some() then "<task>" else slotless_text(vt)
+
+        return (shown_text(span, text), lib_fn(cx, "display_str"), None)
     end if
 
-    val here = if !impls_of(cx.an, dbg.name, owner_key(vt)).is_empty() then vt else underlying(vt)
+    var shown = t
+    var here = if !impls_of(cx.an, dbg.name, owner_key(vt)).is_empty() then vt else underlying(vt)
+
+    // **An integer narrower than 64 bits is shown at 64**, by the one renderer each signedness has:
+    // the value is the same, a field of a bitfield's `u3` is shown as the number it holds, and a
+    // program printing a dozen widths carries one renderer rather than a dozen.
+    here match
+        Integer(bits, signed, _) ->
+            if bits < 64
+                here = Integer(64, signed, false)
+                shown = TExpr(span, TCast(t, here))
+            end if
+        _ -> ()
 
     if erased(here)
         val slot = debug_slot(cx, here)
@@ -308,9 +350,12 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
         return (t, s"${dbg.name}.debug", slot)
     end if
 
+    // A parameter is asked for its bound where a program wrote the form. A supplied `Debug`'s field
+    // (`asked` is "show") asks nothing: its bounds name the type's parameters, not a projection such
+    // as `C::Label`, and each instantiation is read again with the field's type known.
     here match
         Abstract(_, _) ->
-            if !satisfies(cx.an, dbg, here) then
+            if asked != "show" && !satisfies(cx.an, dbg, here) then
                 cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${dbg.show()}'")
 
             return (t, s"${dbg.name}.debug", None)
@@ -320,26 +365,39 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
         return (TExpr(span, TIntOp("fixed_text", t, None, vt, Slice(byte_type(), true))),
                 lib_fn(cx, "display_pad"), None)
 
-    if !conforms(cx.an, dbg, here) && !satisfies(cx.an, dbg, here)
-        cx.fault(span, s"cannot $asked a ${type_show(here)} value — it has no " +
-                 s"'${module_show(dbg.name)}', and only a struct or an enum is given one")
+    // A `never` is not a value at all -- the expression does not finish -- so there is nothing to
+    // show, and asking is the mistake.
+    if here == Never
+        cx.fault(span, s"cannot $asked a never value — it does not implement " +
+                 s"'${module_show(library_key("Display"))}'")
         return (t, "", None)
     end if
+
+    // **Nothing is refused for having no `Debug`**: a value whose type has none -- an opaque handle
+    // held by value where its layout is private, a generic shape whose part has none -- is shown as
+    // its type, in angle brackets, which is all that can be said about it from here.
+    if !conforms(cx.an, dbg, here) && !satisfies(cx.an, dbg, here) then
+        return (shown_text(span, s"<${type_show(here)}>"), lib_fn(cx, "display_str"), None)
 
     val fname = member_func_name(cx, span, here, "debug")
 
     cx.an.uses(fname)
-    (t, fname, None)
+    (shown, fname, None)
 end debugger
 
-// `f.debug(out, fmt)` on a callable object, which a generic `Debug` body reaches for an `Option[&Fn…]`
-// or a `Buf` of callables: `<fn>`, under the specifier, as `print(f)` writes it.
-callable_debug(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+// What a value shown by rule with no table slot writes: `<writer>` for a sink, `<fn>` otherwise.
+private slotless_text(t: Type) -> string = erased_trait(t) match
+    Some(o) -> if trait_bound_of(o).name == library_key("Writer") then "<writer>" else "<fn>"
+    None -> "<fn>"
+
+// `f.debug(out, fmt)` on an object whose table carries no `Debug` slot, which a generic `Debug` body
+// reaches for an `Option[&Fn…]` or a `Buf` of callables: what `print(f)` writes, under the specifier.
+callable_debug(cx: &Analyzer, span: Span, rty: Type, args: Buf[Expr]) -> TExpr
     if args.len() != 2 then return cx.err(span, "'debug' takes a sink and a specifier")
 
     var all: Buf[TExpr] = buf()
 
-    all.push(shown_text(span, "<fn>"))
+    all.push(shown_text(span, slotless_text(Ptr(rty))))
     all.push(type_expr_bare(cx, args.at(0)))
     all.push(type_expr_bare(cx, args.at(1)))
     TExpr(span, TCall(lib_fn(cx, "display_str"), all, Unit, false))

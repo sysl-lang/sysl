@@ -6,8 +6,8 @@ import sysl.text.Search
 // A reference renders as what it refers to (`reference/strings.md § Any other type renders through
 // Display`). A member call reaches through one `&` to find an `impl`, which is why no block may be
 // written for `&T` itself, and every rendering form -- `print`, `str`, an interpolation hole, a
-// `format` hole -- reaches through the same one level. A pointer is still refused, and a reference
-// whose referent does not render is refused in the referent's words, naming the `impl` to write.
+// `format` hole -- reaches through the same one level. A pointer is not reached through and prints
+// its address, and a reference whose referent has no `Display` prints the referent's `Debug`.
 //
 // The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ir` lowers a program or answers its report,
 // `xvr_ran` builds, links and runs it.
@@ -24,10 +24,6 @@ private prd_point() -> string = raw"""
 
 private prd_ran(body: string) -> string = xvr_ran([("main.sysl", prd_point() + body)])
 
-private prd_refused(text: string, said: string)
-    val e = xvr_ir([("main.sysl", text)])
-
-    assert(e.contains(said), s"expected '$said', got: $e")
 
 @test("print renders a counted reference as its referent")
 prd_print_renders_a_reference()
@@ -76,19 +72,16 @@ prd_scalar_reference()
 
     assert_eq(xvr_ran([("main.sysl", "var n: &int = 42\nprint(n)\nprint(s\"${n}!\")\n")]), "42\n42!\n")
 
-@test("a reference whose referent does not render is refused in the referent's words")
-prd_refuses_a_referent_without_display()
+@test("a reference whose referent has no Display prints the referent's Debug")
+prd_referent_without_display_prints_its_debug()
     if xvr_no_library() then return
 
-    prd_refused("struct Q\n    x: int\nvar q: &Q = Q(1)\nprint(q)\n",
-                "cannot print a Q value — write an 'impl sysl.Display for Q' to say how it renders")
-    prd_refused("struct Q\n    x: int\nvar q: &Q = Q(1)\nprint(str(q))\n",
-                "cannot make a string of a Q value — write an 'impl sysl.Display for Q' to say how it " +
-                "renders")
+    assert_eq(xvr_ran([("main.sysl", "struct Q\n    x: int\nvar q: &Q = Q(1)\nprint(q)\nprint(str(q))\n")]),
+              "Q(x: 1)\nQ(x: 1)\n")
 
-@test("a pointer is still not reached through")
-prd_pointer_still_refused()
+@test("a pointer is still not reached through: it prints its address")
+prd_pointer_prints_its_address()
     if xvr_no_library() then return
 
-    prd_refused(prd_point() + "var p = P(1)\nprint(&p)\n",
-                "cannot print a *P value — it does not implement 'sysl.Display'")
+    assert_eq(xvr_ran([("main.sysl", prd_point() + "val p: *P = ptr_cast(usize(0x40))\nprint(p)\n")]),
+              "0x40\n")

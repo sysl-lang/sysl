@@ -816,6 +816,10 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
+    // A value that is `Debug` by the compiler's rule has no block to call, so its `debug` is the
+    // rule's (`reference/traits.md § What is shown by rule`).
+    if name == "debug" && debug_by_rule(rty) then return rule_debug(cx, span, receiver, args)
+
     rty match
         // A parameter standing in for itself: the call is checked against the *trait's* signature,
         // which is what lets one walk stand in for every instantiation.
@@ -2058,8 +2062,9 @@ private indirection_message(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
 // A call through a trait object: the slot the member sits in, and the table the value carries.
 private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
                     args: Buf[Expr], expected: Option[Type]) -> TExpr
-    // A callable's table carries no `Debug` slot, and `debug` on one is answered here: `<fn>`.
-    if name == "debug" && fn_is_call(trait_bound_of(rty).name) then return callable_debug(cx, span, args)
+    // A callable's table and a writer's carry no `Debug` slot, and `debug` on one is answered here.
+    if name == "debug" && slotless_debug(trait_bound_of(rty).name) then
+        return callable_debug(cx, span, rty, args)
 
     val slot = erased_slot(cx, rty, name)
 
@@ -2118,15 +2123,19 @@ private unslotted_member(cx: &Analyzer, rty: Type, name: string) -> bool
     false
 end unslotted_member
 
-// The members a table lays out, as a message lists them.
+// The members a table lays out for its trait, as a message lists them -- without the `debug` every
+// table carries, which is not what the reader is looking for.
 private slot_names(cx: &Analyzer, rty: Type) -> string
-    val members = slotted_members(cx.an, trait_bound_of(rty), self_binding(rty))
+    val members = trait_members(cx.an, trait_bound_of(rty), self_binding(rty))
     var b = str_builder()
+    var n = 0
 
-    for i in 0..<members.len()
-        if i > 0 then b.push("', '")
+    for item in members
+        if item.1.tparams.is_empty()
+            if n > 0 then b.push("', '")
 
-        b.push(members.at(i).1.name)
+            b.push(item.1.name)
+            n += 1
 
     s"'${b.finish()}'"
 end slot_names

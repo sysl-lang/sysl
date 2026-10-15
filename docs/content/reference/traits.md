@@ -1319,10 +1319,21 @@ A few values have no block that could be written for them, and are shown by the 
   reaches `P`'s `Debug` — the bound is met by what the pointer points at — while `print(p)`,
   `f"${p}%?"` and a field of type `*P` show the address;
 - **a reference `&T` is followed** — it is a value — and shows as its referent;
-- **a callable shows as `<fn>`**, and a `weak T` as `weak(…)`, without following it;
+- **a callable shows as `<fn>`**, a `weak T` as `weak(…)` without following it, `unit` as `()` and
+  a task as `<task>`;
+- **device memory is shown by its type and never read** — a `volatile` field, or an array or a view
+  of them, inside a structure shows as `<volatile u32>` and the like, since reading a register is an
+  act with consequences;
+- **an `opaque struct` gets no supplied `Debug`** — its layout is its own module's — and is held
+  through a pointer, which shows its address; one shown by value where its layout is private shows
+  as its type in angle brackets, as does any value whose type has no `Debug` at all;
 - **a trait object shows its concrete value**: every object's table carries a `Debug` slot after
   its own members, whether or not the trait requires `Debug`, so `print` of a `*Shape` reaches the
-  `Debug` of the `Rect` behind it. A callable's table carries none, being `<fn>`.
+  `Debug` of the `Rect` behind it. Two kinds of table carry none: a callable's, shown as `<fn>`, and
+  a `Writer`'s, shown as `<writer>` — a sink is where a rendering goes rather than a value to show,
+  and a slot in every writer's table would put a `Debug` of every sink into every program that
+  writes to one. The slot costs one word per table, and keeps the concrete type's `Debug` in the
+  program wherever the table is.
 
 **A rendering that nests deeper than thirty-two levels writes `…` and stops.** Following references
 is what makes a list or a tree show as one, and it is also what would make a structure that refers
