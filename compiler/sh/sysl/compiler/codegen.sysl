@@ -140,7 +140,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f)
+        if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f) &&
+           !overridden_weak(p, f)
             val enters = export_entry && f.exported.unwrap() == "main"
 
             gen_export_thunk(e, f, symbol_of(e, f.name), enters) match
@@ -431,6 +432,23 @@ end allocates
 private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
     !f.internal && holds_string(p.precompiled, f.name)
 
+// **A weak export this same compilation also exports strongly is not emitted under its symbol.** The
+// link would keep the strong one anyway, and the two in one module are two definitions of one name,
+// which LLVM refuses before any linker could choose. A weak export whose replacement is in another
+// object -- a board package's C, a precompiled artifact -- is emitted, and the linker chooses.
+private overridden_weak(p: TProgram, f: TFunc) -> bool
+    if !f.marks.weak_export then return false
+
+    val symbol = f.exported.unwrap()
+
+    for g in p.funcs
+        if !g.ghost && !g.marks.weak_export && g.exported.unwrap_or("") == symbol &&
+           !declared_elsewhere(p, g) then
+            return true
+
+    false
+end overridden_weak
+
 // **Whether the program's entry is a function it exports as `main`** -- the way a bare-metal root
 // file names where it starts, and on the host a program written the same way. That export is the
 // platform's `main`, so the program gets no `@main` of the compiler's own beside it (a second
@@ -597,7 +615,7 @@ private record_symbols(e: *Emit, p: TProgram)
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if f.variadic && f.exported.is_some()
+        if f.variadic && f.exported.is_some() && !overridden_weak(p, f)
             e.symbols.push((f.name, f.exported.unwrap()))
         else if is_displaced(e, f.name)
             e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))

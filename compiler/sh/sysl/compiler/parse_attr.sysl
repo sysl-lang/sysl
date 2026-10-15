@@ -507,24 +507,47 @@ private parse_byte_order_attr(p: *Parser) -> Option[Attr]
 end parse_byte_order_attr
 
 // `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
-// a struct's `typedef` carries in a generated header.
+// a struct's `typedef` carries in a generated header. `weak` after the symbol, or alone
+// (`@export("write", weak)`, `@export(weak)`), publishes the function as a default any strong
+// definition of the symbol in the link replaces.
 private parse_export_attr(p: *Parser, at: Span) -> Attr
-    if !p.accept_kw("(") then return Export(ExportAttr(at.to(p.just_taken()), None))
+    if !p.accept_kw("(") then return Export(ExportAttr(at.to(p.just_taken()), None, false))
 
     var symbol: Option[string] = None
+    var weakly = p.accept_kw("weak")
 
-    p.peek() match
-        StrLit(v) ->
-            p.bump()
-            symbol = Some(v)
-        _ ->
-            p.fault(p.here(), "'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no parentheses at all, which exports the function under its own name")
-            skip_line(p)
-            return Export(ExportAttr(at.to(p.just_taken()), None))
+    if !weakly
+        p.peek() match
+            StrLit(v) ->
+                p.bump()
+                symbol = Some(v)
+            _ ->
+                p.fault(p.here(), "'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no parentheses at all, which exports the function under its own name")
+                skip_line(p)
+                return Export(ExportAttr(at.to(p.just_taken()), None, false))
+
+        if p.accept_kw(",")
+            if !p.accept_kw("weak")
+                p.fault(p.here(), "'weak' expected — the one word '@export' takes after its symbol is 'weak', '@export(\"write\", weak)', which publishes a default a strong definition of the symbol replaces")
+                skip_line(p)
+                return Export(ExportAttr(at.to(p.just_taken()), symbol, false))
+            end if
+
+            weakly = true
+        end if
+    end if
 
     p.expect_kw(")")
-    Export(ExportAttr(at.to(p.just_taken()), symbol))
+    Export(ExportAttr(at.to(p.just_taken()), symbol, weakly))
 end parse_export_attr
+
+// `weak` is about a function's definition, the one thing a strong definition elsewhere can replace;
+// above anything else it is refused with the reason that declaration has none.
+private refuse_weak_export(p: *Parser, attrs: Buf[Attr], why: string)
+    for attr in attrs
+        attr match
+            Export(e) -> if e.weakly then p.fault(e.span, s"only a function's '@export' may be 'weak' — $why")
+            _ -> ()
 
 private parse_section_attr(p: *Parser) -> Attr
     val bad = "'@section' names the linker section as a string — '@section(\".vectors\")' on the storage or the definition that goes there. The spelling is the target's: '.noinit' and '.ramfunc' are ELF's, '__DATA,__mysection' is Mach-O's"
@@ -648,7 +671,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Ghost -> f.ghost = true
             Reads(ns) -> f.reads = Some(ns)
             Writes(ns) -> f.writes = Some(ns)
-            Export(e) -> f.exported = Some(e)
+            Export(e) ->
+                f.exported = Some(e)
+                f.marks.weak_export = e.weakly
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
             Domain(d) -> f.marks.domain = Some(d)
@@ -734,6 +759,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         // **`@packed`, `@align(n)` and `@export("...")` are the three that mark a struct**, and
         // anything else above one is about a function that is not here.
         refuse_unless(p, at, attrs, "struct")
+        refuse_weak_export(p, attrs, "a struct's '@export' names a type in a generated header, which is no definition the link could replace")
 
         val hidden = p.at_word("opaque")
 
@@ -755,6 +781,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // and between them they are what a binding may carry.
     if storage
         refuse_unless(p, at, attrs, "binding")
+        refuse_weak_export(p, attrs, "exported storage is one object every reader and writer names, and 'weak' is a default only a function may be")
         return from_first(start, placed(p, parse_stmt_at(p, false), attrs, vis))
     end if
 
@@ -788,6 +815,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
     // of a declaration with no fields -- so it takes `@export` alone and nothing that lays out.
     if p.at_kw("type") && all_are(attrs, "export")
+        refuse_weak_export(p, attrs, "a type's '@export' names it in a generated header, which is no definition the link could replace")
         return from_first(start, exported_type(parse_type_decl(p, at, vis), attrs))
 
     // At the end of the file there is no declaration below for the annotations to be about, so

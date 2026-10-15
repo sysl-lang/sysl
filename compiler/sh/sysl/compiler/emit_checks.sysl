@@ -1136,17 +1136,29 @@ private export_duplicates(a: &Analysis, exported: Buf[TFunc])
             seen.push(symbol)
 
             var claimants: Buf[string] = buf()
+            var defaults: Buf[string] = buf()
             var first = exported.at(i)
 
             for item in exported
                 if item.exported.unwrap() == symbol &&
                    !refused_overload_export(a, item.name)
-                    claimants.push(s"'${qualified_name(item.name)}'")
+                    if item.marks.weak_export then defaults.push(s"'${qualified_name(item.name)}'")
+                    else claimants.push(s"'${qualified_name(item.name)}'")
 
+            // **A weak export is a default, not a claimant**: one strong definition beside it is
+            // exactly what it is for, and the strong one is the one emitted (`codegen.sysl`'s
+            // `overridden_weak`). Two weak ones and no strong one are two defaults of one symbol, and
+            // which the linker keeps is the order it happens to read them in.
             if claimants.len() > 1
                 a.fault(func_home(a, first.name), first.span,
                         s"'$symbol' is exported by ${joined_and(sorted_names(claimants))} — one " +
                         "symbol is one definition, and the linker has no way to tell which was meant")
+            else if claimants.is_empty() && defaults.len() > 1
+                a.fault(func_home(a, first.name), first.span,
+                        s"'$symbol' is exported 'weak' by ${joined_and(sorted_names(defaults))} — two " +
+                        "defaults of one symbol, and which the link keeps is the order it reads them " +
+                        "in. Keep one default; a definition meant to replace it is exported without " +
+                        "'weak'")
 end export_duplicates
 
 // Whether a function is an overload exported under its own name, which `check_export` refuses.
