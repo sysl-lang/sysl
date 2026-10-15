@@ -1,0 +1,207 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A local read after a `@consumes` member took what it held (`reference/attributes.md § @consumes`):
+// refused on every path the body can take to the read -- after a branch that consumed on one side,
+// on a later turn of a loop -- until the local is assigned again. A receiver that is not a local is
+// accepted, and the run-time emptying answers it.
+
+private csm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end csm_ready
+
+private csm_root(text: string) -> string
+    val root = make_temp_dir("sysl-consumes").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.{Buf, buf}\n\n" + text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private csm_ran(text: string) -> string
+    val root = csm_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end csm_ran
+
+// What analysing a program said, all of it.
+private csm_said(text: string) -> string
+    val root = csm_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private csm_refused(text: string, part: string)
+    val out = csm_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private csm_clean(text: string)
+    val out = csm_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+
+// The refusal of a read of `name` after `name.member()`.
+private csm_read(name: string, member: string) -> string =
+    s"'$name' is read here after '$name.$member()' took everything it held — '$member' is " +
+    s"'@consumes', so '$name' has nothing in it on this path until it is assigned again. Read what " +
+    "the call answered instead"
+
+private csm_filled() -> string = "    var b: Buf[int] = buf()\n\n    b.push(1)\n    b.push(2)\n"
+
+@test("a buffer frozen and then assigned again is read freely, and the frozen copy holds what it had")
+csm_reassigned_runs()
+    if !csm_ready() then return
+
+    val out = csm_ran("run()\n" + csm_filled() + "    val f = b.freeze()\n\n    b = buf()\n    b.push(7)\n" +
+                      "    print(f.len(), b.len(), b[0])\n\nrun()\n")
+
+    assert_eq(out, "2 1 7\n")
+
+@test("a read straight after the consuming call is refused, naming the call")
+csm_straight_line()
+    if !csm_ready() then return
+
+    csm_refused("run()\n" + csm_filled() + "    val f = b.freeze()\n\n    print(f.len(), b.len())\n\nrun()\n",
+                csm_read("b", "freeze"))
+
+    // A second freeze is a read of the first one's leftovers.
+    csm_refused("run()\n" + csm_filled() + "    val f = b.freeze()\n    val g = b.freeze()\n\n" +
+                "    print(f.len(), g.len())\n\nrun()\n", csm_read("b", "freeze"))
+
+    // A parameter is a local of the function it is given to.
+    csm_refused("count(b: Buf[int]) -> usize\n    val f = b.freeze()\n\n    f.len() + b.len()\n\n" +
+                "print(count(buf()))\n", csm_read("b", "freeze"))
+
+@test("a read is refused once on each path it is reached by, and only after the call")
+csm_reported_once()
+    if !csm_ready() then return
+
+    val out = csm_said("run()\n" + csm_filled() + "    print(b.len())\n    val f = b.freeze()\n\n" +
+                       "    print(f.len(), b.len())\n\nrun()\n")
+
+    assert_eq(out.count_of("took everything it held"), 1)
+
+@test("consumed on one branch only, a read after the join is refused")
+csm_branches()
+    if !csm_ready() then return
+
+    csm_refused("run(c: bool)\n" + csm_filled() + "    if c\n        val f = b.freeze()\n\n" +
+                "        print(f.len())\n\n    print(b.len())\n\nrun(true)\n",
+                csm_read("b", "freeze"))
+
+    csm_refused("run(n: int)\n" + csm_filled() + "    n match\n        0 -> print(b.freeze().len())\n" +
+                "        _ -> print(n)\n\n    print(b.len())\n\nrun(0)\n", csm_read("b", "freeze"))
+
+    // The other branch reads it before anything consumed it, and nothing reads it after.
+    csm_clean("run(c: bool)\n" + csm_filled() + "    if c then print(b.freeze().len()) else print(b.len())\n\nrun(true)\n")
+
+    // Every branch that consumed it fills it again.
+    csm_clean("run(c: bool)\n" + csm_filled() + "    if c\n        print(b.freeze().len())\n        b = buf()\n" +
+              "\n    print(b.len())\n\nrun(true)\n")
+
+    // A branch that consumed it and then left the function never reaches the read.
+    csm_clean("run(c: bool)\n" + csm_filled() + "    if c\n        print(b.freeze().len())\n        return\n" +
+              "\n    print(b.len())\n\nrun(true)\n")
+
+@test("a read on a later turn of a loop counts")
+csm_loop()
+    if !csm_ready() then return
+
+    csm_refused("run()\n" + csm_filled() + "    for i in 0..<3\n        b.push(i)\n\n" +
+                "        if i == 2 then print(b.freeze().len())\n\nrun()\n", csm_read("b", "freeze"))
+
+    csm_refused("run()\n" + csm_filled() + "    var i = 0\n\n    while i < 2\n        print(b.freeze().len())\n" +
+                "        i += 1\n\nrun()\n", csm_read("b", "freeze"))
+
+    // A read after the loop, through a 'break' that followed the call.
+    csm_refused("run()\n" + csm_filled() + "    loop\n        print(b.freeze().len())\n        break\n\n" +
+                "    print(b.len())\n\nrun()\n", csm_read("b", "freeze"))
+
+    // A buffer bound inside the body is a new one every turn.
+    csm_clean("run()\n    for i in 0..<3\n        var b: Buf[int] = buf()\n\n        b.push(i)\n" +
+              "        print(b.freeze().len())\n\nrun()\n")
+
+    // Filled again before the next turn reads it.
+    csm_clean("run()\n" + csm_filled() + "    for i in 0..<3\n        b.push(i)\n        print(b.freeze().len())\n" +
+              "        b = buf()\n\nrun()\n")
+
+    // The call is the last thing the loop does.
+    csm_clean("run()\n" + csm_filled() + "    loop\n        b.push(3)\n        print(b.freeze().len())\n" +
+              "        break\n\nrun()\n")
+
+@test("a receiver that is not a local is accepted, and is left empty at run time")
+csm_field_receiver()
+    if !csm_ready() then return
+
+    val out = csm_ran("struct Holder\n    b: Buf[int]\n\nrun()\n    val h: &Holder = Holder(buf())\n\n" +
+                      "    h.b.push(1)\n\n    val f = h.b.freeze()\n\n    print(f.len(), h.b.len())\n\nrun()\n")
+
+    assert_eq(out, "1 0\n")
+
+@test("a member of the program's own marked '@consumes' is held to the same rule")
+csm_own_member()
+    if !csm_ready() then return
+
+    val bag = "struct Bag\n    n: int\n\n    @consumes\n    take(*self) -> int\n        val n = self.n\n\n" +
+              "        self.n = 0\n        n\n\n"
+
+    csm_refused(bag + "run()\n    var g = Bag(3)\n\n    print(g.take())\n    print(g.n)\n\nrun()\n",
+                csm_read("g", "take"))
+
+    assert_eq(csm_ran(bag + "run()\n    var g = Bag(3)\n\n    print(g.take())\n    g = Bag(4)\n" +
+                      "    print(g.n)\n\nrun()\n"), "3\n4\n")
+
+// There is no second spelling of the call for the check to miss: a method selected from its type
+// and handed its receiver is refused before any reading of the receiver happens.
+@test("a '@consumes' member named through its type is refused as every instance method is")
+csm_static_form_refused()
+    if !csm_ready() then return
+
+    val bag = "struct Bag\n    n: int\n\n    @consumes\n    take(self) -> int = self.n\n\n"
+
+    csm_refused(bag + "run()\n    var g = Bag(3)\n\n    print(Bag.take(g))\n    print(g.n)\n\nrun()\n",
+                "'take' is an instance method of 'Bag' — call it on a value, not the type")
+
+    csm_refused("run()\n" + csm_filled() + "    val f = Buf.freeze(b)\n\n    b = buf()\n    print(f.len(), b.len())\n\nrun()\n",
+                "'freeze' is an instance method of 'sysl.buf.Buf' — call it on a value, not the type")
+
+@test("'@consumes' marks a method, and takes no arguments")
+csm_marks_a_method()
+    assert_eq(pf_err("@consumes\nf() -> int = 1\n"),
+              "'@consumes' says a call takes everything its receiver holds, so it marks a method — and this declares none")
+
+    assert_eq(pf_err("struct S\n    v: int\n\n    @consumes\n    make() -> S = S(1)\n"),
+              "'@consumes' says a call to 'make' takes everything its receiver holds, and it has none — it takes no 'self'")
+
+    assert_eq(pf_err("struct S\n    v: int\n\n    @consumes(self)\n    take(self) -> int = self.v\n"),
+              "'@consumes' takes no arguments — what a call takes is everything its receiver holds")

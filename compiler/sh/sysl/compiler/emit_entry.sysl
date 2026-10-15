@@ -111,7 +111,7 @@ end gen_main
 // also what keeps it, since nothing here calls it.
 gen_module_init(e: *Emit, p: TProgram) -> Option[IrInit]
     val sig = ir_sig(module_init_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal }
-    val f = gen_init_body(e, p, sig)?
+    val f = gen_init_body(e, p, sig, false)?
 
     // LLVM's own element type for the list: a priority, the function, and the global the entry is
     // tied to the liveness of -- nothing here, so the entry lives as long as the object does.
@@ -144,15 +144,32 @@ end gen_module_init
 // (`runtime_init_symbol`). It is defined whether or not anything needs filling, so a start file may
 // call it unconditionally and keep calling it as the storage grows.
 gen_runtime_init(e: *Emit, p: TProgram) -> Option[IrFunc]
-    gen_init_body(e, p, ir_sig(runtime_init_symbol(), ir_fn_type(LVoid, buf())))
+    gen_init_body(e, p, ir_sig(runtime_init_symbol(), ir_fn_type(LVoid, buf())), false)
 
-// The filling both share: every computed `val`, each in a region of its own, in the order `@main`
-// lays them down.
-private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig) -> Option[IrFunc]
+// **What a program whose entry is a function exported as `main` runs first.** That export *is* the
+// program's `main` -- the platform's start-up code, or a bare image's start file, calls it by that
+// symbol -- so no `@main` of the compiler's own is emitted beside it, and the work `@main` would have
+// done before the program's own code runs is done here instead: the stack guard where the machine has
+// signals, then every computed `val`. The export's thunk calls this before anything else
+// (`gen_export_thunk`), so the export's body finds its storage filled exactly as a declared `main`
+// does. It is `internal`: nothing but that thunk names it.
+gen_entry_prologue(e: *Emit, p: TProgram) -> Option[IrFunc] =
+    gen_init_body(e, p, ir_sig(entry_prologue_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal },
+                  true)
+
+// The prologue's symbol, spelled as a runtime helper's so nothing a module declares lands on it.
+entry_prologue_symbol() -> string = "sysl.entry_prologue"
+
+// The filling all three share: every computed `val`, each in a region of its own, in the order `@main`
+// lays them down -- behind the stack guard where the body is a program's entry (`guard`).
+private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig, guard: bool) -> Option[IrFunc]
     start_function(e)
     e.caller_exposed = exposed_in(buf(), None, p.vals)
     push_temps(e)
     push_owned(e)
+
+    if guard then gen_stack_guard(e)
+
     gen_computed_vals(e, p.vals)
     gen_alloc_count_mark(e)
     release_all(e)
@@ -192,11 +209,11 @@ private gen_computed_vals(e: *Emit, vals: Buf[TVal])
         if v.computed && v.init.is_some()
             push_temps(e)
 
-            val value = gen_expr(e, v.init.unwrap())
-
-            if contains_counted(v.ty) then retain_value(e, v.ty, value)
-
-            emit(e, InStore(lty(e, v.ty), value, VGlobal(v.symbol), AccPlain, None))
+            // **A large value is built where it is going.** `gen_into` writes an aggregate field by
+            // field into the storage itself, so a struct holding a two-megabyte array is neither
+            // staged in a frame the size of the array nor loaded and stored as one LLVM value --
+            // which clang takes minutes to lower, and which a board has no stack for.
+            gen_into(e, VGlobal(v.symbol), v.init.unwrap())
             pop_temps(e)
 end gen_computed_vals
 

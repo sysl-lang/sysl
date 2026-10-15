@@ -141,7 +141,7 @@ entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[u
 
         return Some(running.at(0))
 
-    if !has_entry_point || names_its_entry(units) then return None
+    if !has_entry_point || names_its_entry(a, units) then return None
 
     var bound: Buf[usize] = buf()
 
@@ -151,22 +151,33 @@ entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[u
     if bound.len() == 1 then Some(bound.at(0)) else None
 end entry_file
 
-// Whether any file of the compilation writes where the program begins: a top-level `main`, or a
-// function exported under that symbol.
-private names_its_entry(units: Buf[Program]) -> bool
+// Whether the program writes where it begins somewhere other than a file's top level: a top-level
+// `main`, a function exported under that symbol, or a bare image whose manifest names an entry of its
+// own (`targets.<machine>.entry`) -- a start file is then where the program begins, and it reaches
+// whatever it runs by symbol.
+private names_its_entry(a: &Analysis, units: Buf[Program]) -> bool
+    if a.image_entry != "" && a.image_entry != "main" then return true
+
     for u in units
         for s in u.body
             *s.kind match
-                FuncDecl(d) ->
-                    if d.name == "main" then return true
-
-                    d.exported match
-                        Some(x) -> if x.symbol.unwrap_or("") == "main" then return true
-                        None -> ()
+                FuncDecl(d) -> if d.name == "main" || exported_as_main(d) then return true
                 _ -> ()
 
     false
 end names_its_entry
+
+// How a refusal names a function that is a beginning of its own, and `""` for one that is not.
+private beginning_named(d: FuncDecl) -> string
+    if d.name == "main" then return "this 'main'"
+    if exported_as_main(d) then return "this function exported as 'main'"
+
+    ""
+
+// Whether a function is exported under the platform's entry symbol.
+private exported_as_main(d: FuncDecl) -> bool = d.exported match
+    Some(x) -> x.symbol.unwrap_or("") == "main"
+    None -> false
 
 // A program starts in **one** place, and statements at the top of a file and a `main` are two ways
 // of writing that place.
@@ -179,24 +190,38 @@ end names_its_entry
 // Reported here rather than where `main` is resolved, because it is the *cause* of whatever else
 // goes wrong: a `main` written beside statements reaches for their bindings and is told about each
 // one of them, and those complaints are consequences of a program having two beginnings.
+//
+// **A function exported as `main` is a beginning too**, being the platform's `main` itself: beside
+// statements it is refused the same way, and beside a declared `main` it is the second of two.
 refuse_two_beginnings(a: &Analysis, units: Buf[Program], entry: Option[usize])
-    if entry.is_none() then return
-
-    val first = units.at(entry.unwrap())
+    var declared: Option[string] = None
 
     for u in units
-        for j in 0..<u.body.len()
-            val s = u.body.at(j)
+        for s in u.body
+            *s.kind match
+                FuncDecl(d) -> if d.name == "main" && declared.is_none() then declared = Some(u.src.name)
+                _ -> ()
 
+    for u in units
+        for s in u.body
             *s.kind match
                 FuncDecl(d) ->
-                    if d.name == "main"
-                        // The file's name goes last so that a page quoting this can quote the
-                        // sentence and leave the name out.
-                        a.fault(scope_of_unit(a, u), s.span, "a program starts in one place, and " +
-                                "this 'main' is a second — whichever of the two the program means, " +
-                                "the other belongs inside it. The statements this program starts " +
-                                s"with are in ${first.src.name}")
+                    // The file's name goes last so that a page quoting this can quote the sentence
+                    // and leave the name out.
+                    if entry.is_some()
+                        val what = beginning_named(d)
+
+                        if what != ""
+                            a.fault(scope_of_unit(a, u), s.span, s"a program starts in one place, and $what " +
+                                    "is a second — whichever of the two the program means, the other " +
+                                    "belongs inside it. The statements this program starts with are in " +
+                                    units.at(entry.unwrap()).src.name)
+                            return
+                    else if exported_as_main(d) && d.name != "main" && declared.is_some()
+                        a.fault(scope_of_unit(a, u), s.span, "a program starts in one place, and this " +
+                                "function exported as 'main' is a second beside the declared 'main' — " +
+                                "whichever of the two the program means, the other belongs inside it. " +
+                                s"The declared 'main' is in ${declared.unwrap()}")
                         return
                 _ -> ()
 

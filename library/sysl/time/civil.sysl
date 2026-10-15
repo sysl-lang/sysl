@@ -1,5 +1,7 @@
 module sysl.time
 
+import sysl.math.{div_floor, mod_floor}
+
 /** The calendar: a date and a time of day with no zone attached, and the arithmetic that turns one
  * into the other.
  *
@@ -56,20 +58,9 @@ enum Weekday
     Saturday
 end Weekday
 
-/** Division that rounds toward minus infinity, which is the only kind a calendar can use: the day
- * containing an instant is `floor(us / us_per_day)`, and a `/` that truncates toward zero puts every
- * moment of the day before the epoch into the day after it.
- *
- * Private to this file, which is where every caller is: it is a step of the civil-calendar algorithm
- * rather than arithmetic the library offers. A program wanting flooring division over its own
- * integers is asking a different question, and one `sysl.math` would answer.
- */
-private floor_div(a: long, b: long) -> long
-    var q = a / b
-
-    if a % b != 0 && (a < 0) != (b < 0) then q - 1 else q
-
-private floor_mod(a: long, b: long) -> long = a - floor_div(a, b) * b
+// Every division here rounds toward minus infinity (`sysl.math.div_floor`), which is the only kind a
+// calendar can use: the day containing an instant is `floor(us / us_per_day)`, and a `/` that
+// truncates toward zero puts every moment of the day before the epoch into the day after it.
 
 /** Howard Hinnant's civil-from-days pair, which is the standard way to do this and is worth using
  * rather than rediscovering. It works by shifting the epoch to the start of a 400-year era, after
@@ -80,7 +71,7 @@ private floor_mod(a: long, b: long) -> long = a - floor_div(a, b) * b
  */
 days_from_civil(c: Civil) -> LocalDate
     var y = if c.month <= 2 then c.year - 1 else c.year
-    var era = floor_div(long(y), 400)
+    var era = div_floor(long(y), 400)
     var yoe = long(y) - era * 400
     var mp = if c.month > 2 then c.month - 3 else c.month + 9
     var doy = long(153 * mp + 2) / 5 + long(c.day) - 1
@@ -91,7 +82,7 @@ end days_from_civil
 
 civil_from_days(d: LocalDate) -> Civil
     var z = long(d.day) + 719468
-    var era = floor_div(z, 146097)
+    var era = div_floor(z, 146097)
     var doe = z - era * 146097
     var yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
     var doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
@@ -129,7 +120,7 @@ day_of_year(d: LocalDate) -> int
  * remainder is in range by construction, which is what makes the conversion back total rather than
  * something that has to be checked.
  */
-weekday(d: LocalDate) -> Weekday = Weekday(int(floor_mod(long(d.day) + 4, 7)))
+weekday(d: LocalDate) -> Weekday = Weekday(int(mod_floor(long(d.day) + 4, 7)))
 
 /** The day's name, which is the variant's own name and so is not written twice. `Weekday::Image`
  * answers a simple enum's variant with the word it is spelled with (`reference/attributes.md § A
@@ -159,7 +150,7 @@ month_name(m: int) -> string = m match
  * once a rule has been given a starting point.
  */
 on_or_after(d: LocalDate, w: Weekday) -> LocalDate =
-    LocalDate(d.day + int(floor_mod(long(int(w) - int(weekday(d))), 7)))
+    LocalDate(d.day + int(mod_floor(long(int(w) - int(weekday(d))), 7)))
 
 date_at(y: int, m: int, d: int) -> LocalDate = days_from_civil(Civil(y, m, d))
 
@@ -208,7 +199,7 @@ us_of(t: LocalTime) -> long = t.us % us_per_second
 wall_us(ldt: LocalDateTime) -> long = long(ldt.date.day) * us_per_day + ldt.time.us
 
 wall_of(us: long) -> LocalDateTime =
-    LocalDateTime(LocalDate(int(floor_div(us, us_per_day))), LocalTime(floor_mod(us, us_per_day)))
+    LocalDateTime(LocalDate(int(div_floor(us, us_per_day))), LocalTime(mod_floor(us, us_per_day)))
 
 /** An instant read against a wall set a fixed distance from UTC, and back. **Both directions are
  * total**, which is what separates a fixed offset from a zone: a zone whose clocks move answers the
@@ -241,8 +232,8 @@ plus_days(ldt: LocalDateTime, n: int) -> LocalDateTime =
 plus_months(d: LocalDate, n: int) -> LocalDate
     var c = civil_from_days(d)
     var total = c.year * 12 + (c.month - 1) + n
-    var y = int(floor_div(long(total), 12))
-    var m = int(floor_mod(long(total), 12)) + 1
+    var y = int(div_floor(long(total), 12))
+    var m = int(mod_floor(long(total), 12)) + 1
     var last = days_in_month(y, m)
 
     date_at(y, m, if c.day < last then c.day else last)

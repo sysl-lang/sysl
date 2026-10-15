@@ -1,0 +1,408 @@
+module sysl.encoding.json
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, from_utf8_unchecked, parse_real}
+
+// Reading: RFC 8259's grammar, exactly -- no comments, no trailing commas, no single quotes, no
+// leading `+` or leading zero, no `NaN`. Every refusal names the byte it happened at.
+
+/** How deep arrays and objects may nest before a document is refused.
+ *
+ * The reader is recursive, so without a bound a hostile document of a hundred thousand `[` would
+ * exhaust the stack. 128 is far past what a real document nests and small enough for a board's
+ * stack.
+ */
+const max_depth: usize = 128
+
+/** What was wrong at the place a `JsonError` names. */
+enum Fault
+    /** Something else was found where this was expected. */
+    Expected(what: string)
+    /** The text ended where this was expected. */
+    Ended(what: string)
+    /** A whole value was read and more text follows it. */
+    Trailing
+    LeadingZero
+    /** A backslash followed by something that is not one of JSON's escapes. */
+    BadEscape
+    /** A `\u` not followed by four hexadecimal digits. */
+    BadHex
+    /** A `\u` escape naming half of a surrogate pair without the other half. */
+    LoneSurrogate
+    /** A byte below a space inside a string, which JSON requires to be escaped. */
+    Control
+    /** A string opened at this quote and never closed. */
+    Unclosed
+    /** A string whose bytes are not UTF-8. */
+    NotUtf8
+    /** Arrays and objects nested past `max_depth`. */
+    TooDeep
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            Expected(what) -> s"$what expected"
+            Ended(what) -> s"the text ends where $what was expected"
+            Trailing -> "more text after the value"
+            LeadingZero -> "a number may not have a leading zero"
+            BadEscape -> "not one of JSON's escapes: \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX"
+            BadHex -> "a \\u escape is four hexadecimal digits"
+            LoneSurrogate -> "half of a surrogate pair, without the other half"
+            Control -> "a control character has to be escaped inside a string"
+            Unclosed -> "this string is never closed"
+            NotUtf8 -> "this string is not UTF-8"
+            TooDeep -> s"arrays and objects nested more than $max_depth deep"
+
+        display_str(text, out, fmt)
+    end display
+
+/** Why a document was refused, and where.
+ *
+ * `line` and `col` count from one; a column counts characters, not bytes, so it is what an editor
+ * shows. `offset` is the byte offset from the start of the text, counting from zero.
+ */
+struct JsonError
+    fault: Fault
+    line: usize
+    col: usize
+    offset: usize
+
+/** `line:col: what`, the shape a compiler's diagnostic has. */
+impl Display for JsonError
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_str(s"${self.line}:${self.col}: ${self.fault}", out, fmt)
+
+/** One whole JSON text read into a value, or why it is not one.
+ *
+ * Whitespace may surround the value; anything else after it is refused. A number too large for a
+ * `real` reads as an infinity.
+ */
+parse(text: string) -> Result[Json, JsonError] = parse_bytes(text.bytes)
+
+/** The same over bytes that may not be text, which is what arrives from a socket or a file: a string
+ * holding bytes that are not UTF-8 is refused with `NotUtf8` rather than taken.
+ */
+parse_bytes(b: []const u8) -> Result[Json, JsonError]
+    var r = Reader(b, 0, 0)
+
+    blank(&r)
+
+    val v = value(&r)?
+
+    blank(&r)
+
+    if r.at < b.len then return Err(fail(&r, r.at, Trailing))
+
+    Ok(v)
+end parse_bytes
+
+private struct Reader
+    b: []const u8
+    at: usize
+    depth: usize
+
+// The error at a byte offset, with its line and column counted from the start.
+private fail(r: *Reader, at: usize, fault: Fault) -> JsonError
+    var line: usize = 1
+    var col: usize = 1
+
+    for i in 0..<at
+        val c = r.b[i]
+
+        if c == u8('\n')
+            line += 1
+            col = 1
+        elif c & 0xC0 != 0x80
+            col += 1
+
+    JsonError(fault, line, col, at)
+end fail
+
+// `what` expected at the reader's position, told apart from the text having ended there.
+private missing(r: *Reader, what: string) -> JsonError =
+    fail(r, r.at, if r.at >= r.b.len then Ended(what) else Expected(what))
+
+private blank(r: *Reader)
+    while r.at < r.b.len
+        val c = r.b[r.at]
+
+        if c != u8(' ') && c != u8('\t') && c != u8('\n') && c != u8('\r') then return
+
+        r.at += 1
+end blank
+
+private peek_is(r: *Reader, c: u8) -> bool = r.at < r.b.len && r.b[r.at] == c
+
+private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+private value(r: *Reader) -> Result[Json, JsonError]
+    if r.at >= r.b.len then return Err(missing(r, "a value"))
+
+    val c = r.b[r.at]
+
+    if c == u8('{') then object(r)
+    elif c == u8('[') then array(r)
+    elif c == u8('"') then Ok(Str(text(r)?))
+    elif c == u8('-') || is_digit(c) then number(r)
+    elif word(r, "true") then Ok(Bool(true))
+    elif word(r, "false") then Ok(Bool(false))
+    elif word(r, "null") then Ok(Null)
+    else Err(missing(r, "a value"))
+end value
+
+// Whether `w` is written at the reader's position, stepping over it where it is.
+private word(r: *Reader, w: string) -> bool
+    if r.at + w.bytes.len > r.b.len then return false
+
+    for i in 0..<w.bytes.len
+        if r.b[r.at + i] != w.bytes[i] then return false
+
+    r.at += w.bytes.len
+    true
+end word
+
+private digits(r: *Reader, what: string) -> Result[unit, JsonError]
+    if r.at >= r.b.len || !is_digit(r.b[r.at]) then return Err(missing(r, what))
+
+    while r.at < r.b.len && is_digit(r.b[r.at]) do r.at += 1
+
+    Ok(())
+end digits
+
+private number(r: *Reader) -> Result[Json, JsonError]
+    val start = r.at
+    val negative = peek_is(r, u8('-'))
+
+    if negative then r.at += 1
+
+    val first = r.at
+
+    digits(r, "a digit")?
+
+    if r.b[first] == u8('0') && r.at - first > 1 then return Err(fail(r, first, LeadingZero))
+
+    var whole = true
+
+    if peek_is(r, u8('.'))
+        r.at += 1
+        digits(r, "a digit after the decimal point")?
+        whole = false
+
+    if peek_is(r, u8('e')) || peek_is(r, u8('E'))
+        r.at += 1
+
+        if peek_is(r, u8('+')) || peek_is(r, u8('-')) then r.at += 1
+
+        digits(r, "a digit in the exponent")?
+        whole = false
+
+    val run = r.b[start..<r.at]
+
+    if !whole then return Ok(Real(parse_real(run).unwrap()))
+
+    // The magnitude in a `ulong`, or the digits themselves where it would overflow. The most
+    // negative `long` is the one magnitude past the largest positive that still fits.
+    var v: ulong = 0
+
+    for i in first..<r.at
+        val d = ulong(r.b[i] - u8('0'))
+
+        if v > (18446744073709551615 - d) / 10 then return Ok(Big(from_utf8_unchecked(run)))
+
+        v = v * 10 + d
+
+    val most: ulong = 9223372036854775807
+
+    if v <= most then Ok(Int(if negative then -long(v) else long(v)))
+    elif negative && v == most + 1 then Ok(Int(-9223372036854775807 - 1))
+    else Ok(Big(from_utf8_unchecked(run)))
+end number
+
+// A quoted string, decoded. A run with no escape in it is copied out whole; an escape writes the
+// bytes of the character it names. The gathered bytes are checked as UTF-8 once, at the end.
+private text(r: *Reader) -> Result[string, JsonError]
+    val open = r.at
+
+    r.at += 1
+
+    var out: Buf[u8] = buf()
+    var run = r.at
+
+    loop
+        if r.at >= r.b.len then return Err(fail(r, open, Unclosed))
+
+        val c = r.b[r.at]
+
+        if c == u8('"')
+            out.extend(r.b[run..<r.at])
+            r.at += 1
+            break
+        elif c == u8('\\')
+            out.extend(r.b[run..<r.at])
+            escape(r, &out)?
+            run = r.at
+        elif c < 32
+            return Err(fail(r, r.at, Control))
+        else
+            r.at += 1
+
+    from_utf8(out.view()) match
+        Ok(s) -> Ok(s)
+        Err(e) -> Err(fail(r, open + 1 + bad_byte(r.b[open + 1..<r.at], e.offset), NotUtf8))
+end text
+
+// Where in the input the `n`th gathered byte came from is not tracked through escapes, which only
+// ever produce valid UTF-8; so the bad byte is found again in the raw run, where it stands as itself.
+private bad_byte(raw: []const u8, fallback: usize) -> usize
+    from_utf8(raw) match
+        Err(e) -> e.offset
+        Ok(_) -> fallback
+
+// One escape, the backslash under the reader; its character's bytes go into `out`.
+private escape(r: *Reader, out: *Buf[u8]) -> Result[unit, JsonError]
+    val at = r.at
+
+    if at + 1 >= r.b.len then return Err(fail(r, at, BadEscape))
+
+    val e = r.b[at + 1]
+
+    r.at += 2
+
+    val simple = simple_escape(e)
+
+    if simple != 0
+        out.push(simple)
+        return Ok(())
+
+    if e != u8('u') then return Err(fail(r, at, BadEscape))
+
+    var cp = hex4(r, at)?
+
+    if cp >= 0xDC00 && cp < 0xE000 then return Err(fail(r, at, LoneSurrogate))
+
+    if cp >= 0xD800 && cp < 0xDC00
+        if !(peek_is(r, u8('\\')) && r.at + 1 < r.b.len && r.b[r.at + 1] == u8('u')) then
+            return Err(fail(r, at, LoneSurrogate))
+
+        val second = r.at
+
+        r.at += 2
+
+        val low = hex4(r, second)?
+
+        if low < 0xDC00 || low >= 0xE000 then return Err(fail(r, at, LoneSurrogate))
+
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+
+    var tmp: [4]u8
+
+    out.extend(tmp[0..<encode_utf8(char(cp), tmp[0..<4])])
+    Ok(())
+end escape
+
+// The four hexadecimal digits after a `\u` whose backslash is at `at`.
+private hex4(r: *Reader, at: usize) -> Result[u32, JsonError]
+    if r.at + 4 > r.b.len then return Err(fail(r, at, BadHex))
+
+    var v: u32 = 0
+
+    for i in 0usize..<4
+        val d = hex_digit(r.b[r.at + i])
+
+        if d > 15 then return Err(fail(r, at, BadHex))
+
+        v = v * 16 + d
+
+    r.at += 4
+    Ok(v)
+end hex4
+
+// A hexadecimal digit's value, or 16 for a byte that is not one.
+private hex_digit(c: u8) -> u32
+    if is_digit(c) then return u32(c - u8('0'))
+    if c >= u8('a') && c <= u8('f') then return u32(c - u8('a')) + 10
+    if c >= u8('A') && c <= u8('F') then return u32(c - u8('A')) + 10
+
+    16
+end hex_digit
+
+// The byte a one-letter escape stands for, or 0 for a letter that is not one of them (`\u` included).
+private simple_escape(e: u8) -> u8
+    if e == u8('"') || e == u8('\\') || e == u8('/') then return e
+    if e == u8('b') then return 8
+    if e == u8('f') then return 12
+    if e == u8('n') then return u8('\n')
+    if e == u8('r') then return u8('\r')
+    if e == u8('t') then return u8('\t')
+
+    0
+end simple_escape
+
+private enter(r: *Reader) -> Result[unit, JsonError]
+    if r.depth >= max_depth then return Err(fail(r, r.at, TooDeep))
+
+    r.depth += 1
+    r.at += 1
+    Ok(())
+
+private array(r: *Reader) -> Result[Json, JsonError]
+    enter(r)?
+    blank(r)
+
+    var items: Buf[Json] = buf()
+
+    if peek_is(r, u8(']'))
+        r.at += 1
+    else
+        loop
+            items.push(value(r)?)
+            blank(r)
+
+            if peek_is(r, u8(','))
+                r.at += 1
+                blank(r)
+            elif peek_is(r, u8(']'))
+                r.at += 1
+                break
+            else
+                return Err(missing(r, "',' or ']'"))
+
+    r.depth -= 1
+    Ok(Arr(items))
+end array
+
+private object(r: *Reader) -> Result[Json, JsonError]
+    enter(r)?
+    blank(r)
+
+    var members: Buf[Member] = buf()
+
+    if peek_is(r, u8('}'))
+        r.at += 1
+    else
+        loop
+            if !peek_is(r, u8('"')) then return Err(missing(r, "a member name"))
+
+            val key = text(r)?
+
+            blank(r)
+
+            if !peek_is(r, u8(':')) then return Err(missing(r, "':'"))
+
+            r.at += 1
+            blank(r)
+            members.push(Member(key, value(r)?))
+            blank(r)
+
+            if peek_is(r, u8(','))
+                r.at += 1
+                blank(r)
+            elif peek_is(r, u8('}'))
+                r.at += 1
+                break
+            else
+                return Err(missing(r, "',' or '}'"))
+
+    r.depth -= 1
+    Ok(Obj(members))
+end object

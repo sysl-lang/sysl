@@ -27,6 +27,7 @@ check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: 
             check_signature(a, span, home.label, shown, tm, im.unwrap(), sig,
                             trait_scope_of(a, block.trait_name), home.scope)
             check_override_marking(a, home.scope, shown, tm, im.unwrap())
+            check_views_marking(a, home.scope, home.label, shown, tm, im.unwrap())
         else if !tm.body.is_empty() then inherited.push(tm)
         else
             a.fault(scope, span, s"'${home.label}' does not implement '$shown': ${member_kind(tm)} " +
@@ -121,6 +122,24 @@ check_override_marking(a: &Analysis, scope: Scope, trait_name: string, tm: Metho
                 "without a body, so this member supplies what the trait asked for rather than " +
                 "replacing anything — 'override' says a body was replaced")
 end check_override_marking
+
+// **`@views(self)` is the trait's to say, because a call through an object reads only the trait's
+// member** (`view_borrow.sysl`). An implementation marked where the trait is not hands a borrowed
+// view to every caller reaching it through a `&Trait`, and none of them is held to it, so that is
+// refused here, naming both members. The other way round is sound -- the implementation inherits
+// the mark (`hoist_impl.sysl`'s `with_trait_marks`), so a call on the type is held as one through
+// the object is.
+private check_views_marking(a: &Analysis, scope: Scope, for_type: string, trait_name: string,
+                            tm: MethodDecl, im: MethodDecl)
+    if !im.marks.views || tm.marks.views then return
+
+    val name = source_member_name(im.name)
+
+    a.fault(scope, method_anchor(im), s"'$name' of 'impl $trait_name for $for_type' is marked " +
+            s"'@views(self)', but trait '$trait_name' declares '$name' without it — a call through " +
+            s"a '&$trait_name' reads only the trait's member, so the view it answers would be held to " +
+            s"nothing. Mark '$trait_name.$name' '@views(self)' as well")
+end check_views_marking
 
 // Compares one implementing method against the trait's signature: the same receiver mode -- except that
 // a `self` may stand for the trait's `*self`, the call handing the implementation a copy of what it

@@ -673,13 +673,22 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     val outer = a.tables.members.selves.get(f.name)
 
     val opened = a.tables.members.opened.get(f.name).unwrap_or(buf())
-
-    if outer.is_some()
-        for i in 0..<outer.unwrap().len()
-            subst.push(fixed_value(outer.unwrap().at(i), opened, f.tparams, targs))
+    var own: Buf[Binding] = buf()
 
     for i in 0..<f.tparams.len()
-        if i < targs.len() then subst.push(Binding(f.tparams.at(i), targs.at(i)))
+        if i < targs.len() then own.push(Binding(f.tparams.at(i), targs.at(i)))
+
+    // **A trait argument the block wrote at one of its own parameters is that parameter here**, at
+    // this instantiation's argument: `impl[U] Get[U] for W[U]` binds the trait's `T` to the block's
+    // `U`, so an inherited default's `-> T` is a `W[f64]` call's `f64`, not the `U` it stood at.
+    if outer.is_some()
+        for i in 0..<outer.unwrap().len()
+            val b = fixed_value(outer.unwrap().at(i), opened, f.tparams, targs)
+
+            subst.push(Binding(b.name, subst_params(a, b.ty, own)))
+
+    for item in own
+        subst.push(item)
 
     // On a generic type `Self` is the type applied to its own parameters, which is not a type until
     // the parameters are fixed -- so the receiver is kept as written and resolved here, where they

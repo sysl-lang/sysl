@@ -122,6 +122,19 @@ private become_refusal(a: &Analysis, p: TProgram, f: TFunc, scope: Scope, deferr
                       "or a value that carries no count")
         return
 
+    // The replaced frame's storage is gone once the callee runs, so an argument that may point into
+    // it is a pointer to nothing. A pointer handed down from this function's own caller is not.
+    val args = *call.kind match
+        TCall(_, xs, _, _) -> xs
+        TCallPtr(_, xs, _, _) -> xs
+        _ -> buf()
+
+    if may_reach_frame(f, args)
+        refuse_become(a, scope, at, "an argument may point into this frame — its storage is " +
+                      "given up before the callee runs, so the callee would read storage that is " +
+                      "no longer there. Pass a pointer this function was handed, or keep it a 'return'")
+        return
+
     *call.kind match
         TCall(name, _, _, _) ->
             if is_extern_name(p, name)

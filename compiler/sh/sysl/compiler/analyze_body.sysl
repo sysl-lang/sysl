@@ -60,9 +60,11 @@ end refused_default
 // Reads a compilation's declarations and types every body it can.
 //
 // `also_auto_imported` names modules auto-imported beside the standard one; see
-// `Analysis.also_auto_imported`. Every command hands nothing.
-analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string] = buf()) -> TypedBodies =
-    analyze_produced(written, t, buf(), true, None, also_auto_imported)
+// `Analysis.also_auto_imported`. Every command hands nothing. `image_entry` is the symbol the root
+// manifest says a bare image starts at (`Analysis.image_entry`).
+analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string] = buf(),
+               image_entry: string = "") -> TypedBodies =
+    analyze_produced(written, t, buf(), true, None, also_auto_imported, image_entry)
 
 // The same, told which of the files it was handed are the library's own being **built** rather than
 // supplied. Every other caller hands nothing and gets the ordinary reading, where the library's
@@ -70,11 +72,13 @@ analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string]
 analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
                  has_entry_point: bool = true,
                  index: Option[&DefinitionIndex] = None,
-                 also_auto_imported: Buf[string] = buf()) -> TypedBodies
+                 also_auto_imported: Buf[string] = buf(),
+                 image_entry: string = "") -> TypedBodies
     val a = analysis_producing(t, producing)
 
     a.index = index
     a.also_auto_imported = also_auto_imported
+    a.image_entry = image_entry
 
     val units = read_decls(a, written, has_entry_point)
 
@@ -566,7 +570,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     for p in d.params
         val ty = resolve_type(a, scope, p.typ, no_bindings())
-        val unique = cx.bind(p.name, ty)
+        val unique = cx.bind(p.name, ty, written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
@@ -720,7 +724,7 @@ end check_defaults_of
 
 // The function a trait's default reads as: the receiver becomes a `self` at `Self`, and `Self` is a
 // type parameter in front of the trait's own, bounded by the trait at those parameters.
-private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
+trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
     var params: Buf[Param] = buf()
     val recv = receiver_param(m, named_type(m.span, "Self"))
 
@@ -811,7 +815,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
@@ -869,8 +873,14 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     // parameter stands for whatever an instantiation picks, and what it is made of is checked there.
     if d.const_fn then check_const_signature(a, scope, d.name, d, params, ret)
 
-    a.tables.homes.put(d.name, scope)
-    a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
+    // **Filed under its module's key, not the name it was written with**: a free generic is declared
+    // as `spawn`, and `sh.sysl.pool`'s `spawn` and `sysl.threads`'s are two bodies -- filed under the
+    // bare name, the second one's file replaced the first's, and the standard module's body was held
+    // to the package's clause and reported at an offset of its own in the package's file.
+    val key = if d.name.contains("$") then d.name else module_qualify(scope.module_name, d.name)
+
+    a.tables.homes.put(key, scope)
+    a.tables.abstracts.push(TFunc(span_zero(), key, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
                                   None, None, d.marks, cx.owner, d.const_fn, Some(scope.src), false))
 
@@ -922,7 +932,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
@@ -1167,6 +1177,9 @@ body_block(cx: &Analyzer, rest: Buf[Stmt], ret: Type) -> TBlock
     cx.an.close_region(outer)
 
     if gave_up then return TBlock(block.stmts, block.result, Unknown)
+
+    // A local read after a `@consumes` call emptied it, on any path (`consumes.sysl`).
+    check_consumes(cx, block)
 
     // What the body comes to leaves the function as a `return` does, after every local it bound
     // has been let go of (`view_borrow.sysl`).
@@ -1792,6 +1805,17 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 // the keyword, and a freestanding one silently gets the local-exec model, whose offset is read from
 // a register nothing on a bare machine has written -- so the alternative to this refusal is a
 // program that reads a wild address.
+// Refuses a declaration over what the machine lacks -- at once in the program's own modules and the
+// standard module's, and in a dependency's only once the program is known to reach that module
+// (`checks.sysl`'s `program_reach`), since a module the program never names is not asked.
+private refuse_for_target(cx: &Analyzer, span: Span, message: string)
+    val a = cx.an
+    val handed = holds_string(a.tables.supplied_modules, cx.scope.module_name)
+
+    if !handed || from_library(a, cx.scope) then cx.fault(span, message)
+    else a.target_refusals.push((cx.scope, span, message))
+end refuse_for_target
+
 private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool,
                          init: Option[TExpr])
     val t = cx.an.tables.target
@@ -1802,7 +1826,7 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
     val owned = t.cpu == Aarch64 && thread_pointer_register().is_some()
 
     if !t.thread_local_storage() && !owned && t.cpu == Aarch64
-        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
+        refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
                  "program says which register holds the thread pointer: there is no loader here to " +
                  "lay a thread's storage down, so the program does it — 'sysl.threads' lays the block " +
                  "of every thread it starts and 'sysl.threads.tls_place' lays the first's, and the " +
@@ -1811,7 +1835,7 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
                  "('tpidr_el0', 'tpidrro_el0', 'tpidr_el2' and 'tpidr_el3' are the others), or declare " +
                  "it as a plain module 'var' and let the scheduler answer for which thread is running")
     else if !t.thread_local_storage() && !owned
-        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
+        refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
                  "is no loader and no libc on this target, so nothing lays a thread's storage down " +
                  "and nothing writes the thread pointer the offset would be read from. Declare it " +
                  "as a plain module 'var' and let the port's scheduler answer for which task is " +

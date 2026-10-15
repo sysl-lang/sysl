@@ -855,6 +855,16 @@ a module of a path or git dependency is asked the same question as one into the 
 program on a `posix = false` target, or one that wrote `@no_posix`, is refused at the line that
 reaches a dependency's `@requires(posix)` module, naming that module by its package-qualified name.
 
+**What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
+target whose `package.hocon` says `heap = false`, or one with no thread-local storage, a fetched
+package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
+at the construct, in its own file — when the program names that module or names one that does. A
+package is a set of modules, and the program uses the ones it names: a board program that imports
+only a package's fixed-capacity queue builds, although the thread pool beside the queue in the same
+package boxes its tasks and keeps per-thread storage, and none of the pool's code — its closures'
+tables included — is in the image. The program's own modules and the standard module's are asked as
+before.
+
 ### A generic answers for what it wrote, not for what its caller chose
 
 A generic has no execution until a type is chosen, and whoever chose it is usually somebody else. So
@@ -1173,6 +1183,41 @@ main() -> int = 0
 
 ```error
 'main' yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status is not something a signature can say
+```
+
+**A function exported as `main` is the third way to write the beginning**, and the one a bare-metal
+root file uses: the [export](/reference/ffi/) *is* the platform's `main`, called by that symbol by the
+host's start-up code or by a board's reset handler, so the program gets no `main` of the compiler's own
+beside it. What that one would have done first is done on the way into the export instead — the
+program's computed `val`s are filled before its body runs — and what it answers is C's status, at C's
+signature:
+
+```sysl
+seed() -> int = 41
+
+val answer: int = seed() + 1
+
+@export("main")
+start() -> i32
+    print("the answer is", answer)
+    0
+```
+
+```output
+the answer is 42
+```
+
+It is a beginning like the other two, so it is refused beside statements, and beside a declared `main`:
+
+```sysl
+print("initialization")
+
+@export("main")
+start() -> i32 = 0
+```
+
+```error
+a program starts in one place, and this function exported as 'main' is a second — whichever of the two the program means, the other belongs inside it
 ```
 
 **A program in which no file carries a statement is a complete program that does nothing.** The entry

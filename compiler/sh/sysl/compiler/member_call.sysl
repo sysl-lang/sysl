@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.from_int
-import sysl.text.{str_builder, Search, StrBuilder}
+import sysl.text.{from_utf8_unchecked, str_builder, Search, StrBuilder}
 
 // Reaching a member: what a type declares of its own, what a trait gave it, and what a table
 // dispatches to when the value has forgotten which type it holds.
@@ -201,6 +201,13 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     end if
 
     val decl = m.unwrap()
+
+    // **A subject written as a bounded type parameter was refused at the generic's definition**
+    // (`call_bound_associated`), where the walk over the body read `T.f(…)` against the bound. Read
+    // again at a concrete type, the same call would be told a second time under the concrete name.
+    if !via.is_empty() && (decl.recv_mode().is_some() || (decl.is_property && !decl.is_static)) then
+        return Some(bad_expr(span))
+
     val receiving = receiving_member(cx, span, found.0, name, decl)
 
     if receiving.is_some() then return receiving
@@ -1091,6 +1098,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     if receiver.is_some() && m.marks.relocates then check_ref_call(cx, span, receiver.unwrap(), m.name)
     if receiver.is_some() && m.marks.views then note_view_call(cx, span, receiver.unwrap(), m.name)
+    if receiver.is_some() && m.marks.consumes then note_consume_call(cx, span, receiver.unwrap(), m.name)
 
     val before = cx.an.complaints()
     var given: Buf[TExpr] = buf()
@@ -1200,6 +1208,9 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     // A `@views(self)` member's answer is borrowed from the receiver (`view_borrow.sysl`).
     if m.marks.views then note_view_call(cx, span, receiver, m.name)
 
+    // A `@consumes` member leaves a local receiver empty (`consumes.sysl`).
+    if m.marks.consumes then note_consume_call(cx, span, receiver, m.name)
+
     val before = cx.an.complaints()
     var given: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
@@ -1281,7 +1292,7 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
                     if m.params.at(j).name == name then idx = int(j)
 
                 if idx < 0
-                    member_args_fault(cx, a.span, kept, s"$shown declares no parameter named " +
+                    member_args_fault(cx, a.span, kept, shown, s"$shown declares no parameter named " +
                                       s"'$name' — it takes ${name_list(m.params)}")
                     return None
 
@@ -1298,7 +1309,7 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
         if slots.at(i).is_none() && m.params.at(i).default.is_none() then missing += 1
 
     if missing > 0 || (extra > 0 && !m.variadic)
-        member_args_fault(cx, span, kept, arity_refusal(shown, m.params, args, slots, named_seen, extra,
+        member_args_fault(cx, span, kept, shown, arity_refusal(shown, m.params, args, slots, named_seen, extra,
                                                         m.variadic))
         return None
     end if
@@ -1306,9 +1317,17 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
     Some(slots)
 end bind_member_args
 
-private member_args_fault(cx: &Analyzer, span: Span, kept: bool, message: string)
+//
+// **A refusal the definition kept is not said again by an instantiation.** The call is the same
+// written call either way, and its mistake is the same one; only the subject differs -- the trait's
+// member at the definition, the instantiated type's at each instantiation -- so the one the reader
+// gets is the trait's, which is the signature the call was read against.
+private member_args_fault(cx: &Analyzer, span: Span, kept: bool, shown: string, message: string)
     if kept then cx.an.bound_fault(cx.scope, span, message)
-    else cx.fault(span, message)
+    else if !cx.an.said_through_bound(cx.scope, span,
+                                      from_utf8_unchecked(message.bytes[shown.bytes.len..<
+                                                                        message.bytes.len])) then
+        cx.fault(span, message)
 
 // **The tail of a variadic member**: every positional argument past the ones its parameters took,
 // each read at whatever type it has and passed as C's promotions leave it -- the free function's
@@ -2169,6 +2188,10 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
 
     if slots.is_none() then return bad_expr(span)
 
+    // A trait member marked `@views(self)` answers a view borrowed from the object, whichever body
+    // the slot dispatches to (`view_borrow.sysl`).
+    if m.marks.views then note_view_call(cx, span, receiver, m.name)
+
     // **A call trait's parameters are named `a`, `b` and `c`** — names the trait's own declaration
     // chose and no reader wrote — so what a message about one can say is where it stood.
     val by_position = shown == "this callable"
@@ -2194,7 +2217,10 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
             None ->
                 val inner = analyzer_for(cx.an, scope)
 
+                // The object's trait arguments stand for the trait's parameters here as they do
+                // in the signature: `by: T = T.zero()` through a `&Pad[f64]` is `f64.zero()`.
                 inner.here = Some(call_site(cx, span))
+                inner.subst = subst
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), want))
 
     val ret =

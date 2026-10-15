@@ -1,0 +1,320 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, str_builder}
+
+// A self tail call whose arguments may point into the caller's own frame stays a call
+// (`reference/declarations.md § Tail calls`). A jump reuses the frame: the locals are released on
+// the way to it and every slot is written again by the next round, so an argument holding `&local`
+// would hand the next round storage that is already freed or about to be overwritten.
+
+private tfa_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private tfa_ir(text: string) -> string = xvr_ir(tfa_main(text))
+
+private tfa_ran(text: string) -> string = xvr_ran(tfa_main(text))
+
+// The function named, from its `define` line up to the brace that closes it.
+private tfa_define(out: string, name: string) -> string
+    var said = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end tfa_define
+
+// The parser a C declarator reader is written as: a sub-parser over a fresh buffer, built in the
+// caller's frame and handed down by address.
+private tfa_declarator() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct P
+        toks: Buf[string]
+        pos: usize
+
+    peek(p: *P) -> string = if p.pos < p.toks.len() then p.toks[p.pos] else ""
+
+    decl(p: *P, base: string) -> string
+        var t = base
+        loop
+            if peek(p) == "*"
+                p.pos += 1
+                t = t + "*"
+            else break
+        if peek(p) == "("
+            var inner: Buf[string] = buf()
+            inner.push("*")
+            var sub = P(inner, 0)
+            return decl(&sub, t + "()")
+        t
+
+    var toks: Buf[string] = buf()
+    toks.push("(")
+    var top = P(toks, 0)
+    print(decl(&top, "void"))
+    """
+
+@test("a tail call handed the address of a local holding a buffer reads the buffer")
+tfa_buffer_local_runs()
+    if xvr_no_library() then return
+
+    assert_eq(tfa_ran(tfa_declarator()), "void()*\n")
+end tfa_buffer_local_runs
+
+@test("a tail call handed the address of a local stays a call")
+tfa_buffer_local_is_a_call()
+    if xvr_no_library() then return
+
+    val out = tfa_define(tfa_ir(tfa_declarator()), "decl")
+
+    assert(out.contains("@decl(ptr %sub.addr, "), out)
+    assert(!out.contains("tailrec"), out)
+end tfa_buffer_local_is_a_call
+
+@test("the address of a plain struct local keeps the call")
+tfa_plain_struct_local()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct S
+            n: int
+            seen: int
+
+        walk(s: *S, acc: int) -> int
+            if s.n == 0 then return acc + s.seen
+            var next = S(s.n - 1, s.seen + 1)
+            return walk(&next, acc + s.n)
+
+        var s = S(4, 0)
+        print(walk(&s, 0))
+        """
+
+    assert_eq(tfa_ran(text), "14\n")
+    assert(!tfa_define(tfa_ir(text), "walk").contains("tailrec"))
+end tfa_plain_struct_local
+
+@test("the address of a local buffer keeps the call")
+tfa_buffer_directly()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        import sysl.buf.{Buf, buf}
+
+        total(b: *Buf[int], n: int) -> int
+            var sum = 0
+            for x in *b
+                sum += x
+            if n == 0 then return sum
+            var next: Buf[int] = buf()
+            next.push(sum)
+            next.push(n)
+            return total(&next, n - 1)
+
+        var first: Buf[int] = buf()
+        first.push(1)
+        print(total(&first, 3))
+        """
+
+    assert_eq(tfa_ran(text), "7\n")
+    assert(!tfa_define(tfa_ir(text), "total").contains("tailrec"))
+end tfa_buffer_directly
+
+@test("an address taken in one place and passed in another keeps the call")
+tfa_address_through_a_name()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct S
+            n: int
+
+        walk(s: *S, acc: int) -> int
+            if s.n == 0 then return acc
+            var next = S(s.n - 1)
+            val q = &next
+            walk(q, acc + s.n)
+
+        var s = S(4)
+        print(walk(&s, 0))
+        """
+
+    assert_eq(tfa_ran(text), "10\n")
+    assert(!tfa_define(tfa_ir(text), "walk").contains("tailrec"))
+end tfa_address_through_a_name
+
+@test("a slice of a local array keeps the call")
+tfa_slice_of_a_local_array()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        sum(xs: []int, n: int) -> int
+            var acc = 0
+            for x in xs
+                acc += x
+            if n == 0 then return acc
+            var more: [2]int = [acc, n]
+            sum(more[..], n - 1)
+
+        var a: [1]int = [1]
+        print(sum(a[..], 3))
+        """
+
+    assert_eq(tfa_ran(text), "7\n")
+    assert(!tfa_define(tfa_ir(text), "sum").contains("tailrec"))
+end tfa_slice_of_a_local_array
+
+@test("a pointer passed straight through still jumps")
+tfa_pointer_passed_through_jumps()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct C
+            left: int
+
+        drain(c: *C, acc: int) -> int
+            if c.left == 0 then return acc
+            c.left -= 1
+            drain(c, acc + 1)
+
+        var c = C(1000000)
+        print(drain(&c, 0))
+        """
+
+    assert_eq(tfa_ran(text), "1000000\n")
+
+    val out = tfa_define(tfa_ir(text), "drain")
+
+    assert(out.contains("br label %tailrec1"), out)
+    assert(!out.contains("call i32 @drain"), out)
+end tfa_pointer_passed_through_jumps
+
+@test("scalar arguments still jump where the body takes a local's address")
+tfa_scalars_jump_beside_an_address()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct S
+            n: int
+
+        bump(s: *S)
+            s.n += 1
+
+        count(n: int, acc: int) -> int
+            var s = S(acc)
+            bump(&s)
+            if n == 0 then s.n else count(n - 1, s.n)
+
+        print(count(1000000, 0))
+        """
+
+    assert_eq(tfa_ran(text), "1000001\n")
+    assert(tfa_define(tfa_ir(text), "count").contains("br label %tailrec1"))
+end tfa_scalars_jump_beside_an_address
+
+@test("'@tailrec' on a call that passes a frame address is refused")
+tfa_tailrec_refused()
+    if xvr_no_library() then return
+
+    val said = tfa_ran(raw"""
+        struct S
+            n: int
+
+        @tailrec
+        walk(s: *S, acc: int) -> int
+            if s.n == 0 then return acc
+            var next = S(s.n - 1)
+            walk(&next, acc + s.n)
+
+        var s = S(4)
+        print(walk(&s, 0))
+        """)
+
+    assert(said.contains("error: 'walk' is marked '@tailrec' but its tail call may pass an " +
+                         "address in its own frame — a jump reuses the frame, so what the " +
+                         "argument points at would be released and written over before the next " +
+                         "round reads it\n --> "), said)
+    assert(said.contains("/main.sysl:4:1\n"), said)
+end tfa_tailrec_refused
+
+@test("a self-call passing a parameter straight on jumps, even where the body takes an address")
+tfa_parameter_through_a_framed_body_jumps()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct C
+            left: int
+
+        drain(c: *C, acc: int) -> int
+            var probe = C(0)
+            val seen = &probe
+            if c.left == 0 then return acc + seen.left
+            c.left -= 1
+            drain(c, acc + 1)
+
+        var c = C(1000000)
+        print(drain(&c, 0))
+        """
+
+    assert_eq(tfa_ran(text), "1000000\n")
+    assert(tfa_define(tfa_ir(text), "drain").contains("br label %tailrec1"))
+end tfa_parameter_through_a_framed_body_jumps
+
+// -- become -----------------------------------------------------------------------------------------
+
+private tfa_become(arg: string) -> string = tfa_become_after("s.n -= 1", arg)
+
+// The `become` program, with `write` as the statement before the jump.
+private tfa_become_after(write: string, arg: string) -> string = s"""
+    struct S
+        n: int
+
+    f(s: *S, acc: int) -> int
+        var probe = S(0)
+        val seen = &probe
+        if s.n == 0 then return acc + seen.n
+        var next = S(s.n - 1)
+        $write
+        become g($arg, acc + 1)
+
+    g(s: *S, acc: int) -> int = f(s, acc)
+
+    var s = S(4)
+    print(f(&s, 0))
+    """
+
+@test("a 'become' handing on the address of a local is refused")
+tfa_become_local_refused()
+    if xvr_no_library() then return
+
+    val said = tfa_ir(tfa_become("&next"))
+
+    assert(said.contains("error: 'become' replaces this frame with the call's, and an argument " +
+                         "may point into this frame — its storage is given up before the callee " +
+                         "runs, so the callee would read storage that is no longer there. Pass a " +
+                         "pointer this function was handed, or keep it a 'return'\n  --> main.sysl:10:12\n"), said)
+end tfa_become_local_refused
+
+@test("a 'become' handing on a parameter that was pointed at a local is refused")
+tfa_become_reassigned_parameter_refused()
+    if xvr_no_library() then return
+
+    val said = tfa_ir(tfa_become_after("s = &next", "s"))
+
+    assert(said.contains("an argument may point into this frame"), said)
+end tfa_become_reassigned_parameter_refused
+
+@test("a 'become' handing on a parameter as it arrived is allowed")
+tfa_become_parameter_through()
+    if xvr_no_library() then return
+
+    assert_eq(tfa_ran(tfa_become("s")), "4\n")
+    assert(tfa_define(tfa_ir(tfa_become("s")), "f").contains("musttail call"))
+end tfa_become_parameter_through

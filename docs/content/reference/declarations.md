@@ -465,14 +465,53 @@ A tail call is a call, so the jump lands where a call would: **every `require` i
 the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
 its own precondition at depth four stops at depth four.
 
-Two things end a tail position instead of being optimized around:
+Three things end a tail position instead of being optimized around:
 
 - **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
   ordinary call, and before it is entered for a jump;
 - **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
-  returns.
+  returns;
+- **an argument that may point into the frame**. A jump reuses the frame: the locals are released on
+  the way to it, and the next round writes every slot again, so `&sub` handed down would be read
+  after `sub` was freed or written over. Where the body takes the address of its own storage
+  anywhere — `&` of a local, a parameter or a temporary, or a slice of a local array — a self-call
+  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call. A
+  parameter passed on as it arrived — never written, its address never taken — is the caller's, and
+  does not count.
 
-Either one leaves the function compiled exactly as written.
+Any of them leaves the function compiled exactly as written:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct P
+    toks: Buf[string]
+    pos: usize
+
+decl(p: *P, base: string) -> string
+    if p.pos < p.toks.len() && p.toks[p.pos] == "*" then
+        p.pos += 1
+        return decl(p, base + "*")
+
+    if p.pos < p.toks.len() && p.toks[p.pos] == "("
+        var inner: Buf[string] = buf()
+        inner.push("*")
+        var sub = P(inner, 0)
+        return decl(&sub, base + "()")
+
+    base
+
+var toks: Buf[string] = buf()
+toks.push("(")
+var top = P(toks, 0)
+print(decl(&top, "void"))
+```
+
+```output
+void()*
+```
+
+The call that passes `&sub` keeps its frame, so `sub`'s buffer is alive while the callee reads it.
 
 It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
 calls, however they are written.
@@ -492,6 +531,29 @@ print(sum(5))
 
 ```error
 calls itself nowhere the jump can replace
+```
+
+A self-call in tail position that may hand down an address in the frame is refused with its own
+reason:
+
+```sysl
+struct S
+    n: int
+
+@tailrec
+walk(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    walk(&next, acc + s.n)
+
+var s = S(4)
+print(walk(&s, 0))
+```
+
+```error
+its tail call may pass an address in its own frame
 ```
 
 It changes nothing about what is emitted — write it on the functions where losing the jump silently
@@ -605,6 +667,60 @@ print(f(x))
 
 ```error
 counted value
+```
+
+**No argument may point into the frame being replaced.** The callee runs in the replaced frame's
+place, so `&` of a local, a parameter or a temporary — or a slice of a local array — would hand it
+storage that no longer exists. The test is the one a self tail call is held to: where the body takes
+the address of its own storage anywhere, an argument that can hold an address (a pointer, a slice,
+or a value made of one) is refused, unless it is one of the function's own parameters passed on as
+it arrived, which points at its caller's storage:
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    become g(&next, acc + s.n)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```error
+an argument may point into this frame
+```
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    var probe = S(0)
+    val seen = &probe
+
+    if s.n == 0 then return acc + seen.n
+
+    s.n -= 1
+
+    become g(s, acc + 1)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```output
+4
 ```
 
 The rest are the tail call's own, for the reasons `Tail calls` gives: an `ensures` is checked when a
@@ -932,6 +1048,46 @@ print(A(1).greet(), via(A(1)), named(A(1)), obj(A(1)))
 
 ```output
 13 13 103 10
+```
+
+A trait's default may name **the trait's own type parameters**, and it is read at what the `impl`
+fixed them to — `f64` below, on every one of those paths. Where the `impl` is generic itself, at what
+each instantiation gives its parameter. The default is still held to the trait's bounds where it is
+written: `T.zero()` in a `trait Pad[T]` with no `Zero` among `T`'s bounds is refused, though every
+type that implements it might have a `zero`.
+
+```sysl
+trait Pad[T: Zero + Add]
+    pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+struct A
+    x: int
+
+struct W[U]
+    u: U
+
+impl Pad[f64] for A
+impl[U: Zero + Add] Pad[U] for W[U]
+
+via[P: Pad[f64]](p: P) -> f64 = p.pad(2.5)
+obj(p: &Pad[f64]) -> f64 = p.pad(4.5)
+
+val n: int = W(3).pad(4)
+
+print(A(1).pad(1.5), via(A(1)), obj(A(1)), n)
+```
+
+```output
+1.5 2.5 4.5 4
+```
+
+```sysl
+trait Pad[T]
+    pad(self, x: T, by: T = T.zero()) -> T = x
+```
+
+```error
+'zero' needs 'T: sysl.Zero'
 ```
 
 ```sysl

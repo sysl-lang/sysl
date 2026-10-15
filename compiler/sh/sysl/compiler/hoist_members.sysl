@@ -488,17 +488,23 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
 
         // An inherited default is asked again under the implementing type's name, as the reference
         // asks it: the copy is a function of that type's, whose callers the message is about.
-        check_member_signature(a, default_home(a, fd.name).unwrap_or(home.scope), m.span,
-                               s"${home.label}.$written", m)
+        //
+        // **Its signature, like its body, is read where it was written**: the trait's module, with
+        // the trait's imports, and its spans in the trait's file. Read in the block's module, a type
+        // only the trait imported would be unknown there, and reported at the trait's offsets in the
+        // block's file.
+        val written_in = default_home(a, fd.name).unwrap_or(home.scope)
+
+        check_member_signature(a, written_in, m.span, s"${home.label}.$written", m)
 
         // A member is filed under the type it belongs to, which an `impl` in another module may have
         // named -- and an inherited default's body is the trait's source, wherever the trait is.
-        a.tables.members.decl_scope.put(fd.name, default_home(a, fd.name).unwrap_or(home.scope))
+        a.tables.members.decl_scope.put(fd.name, written_in)
         // Declared here, though: the copy is this block's member, whichever module wrote its body.
         a.tables.members.decl_owner.put(fd.name, home.scope.module_name)
         a.tables.members.decl_spans.put(fd.name, method_anchor(m))
         lowered.push(fd)
-        check_pack_spellings(a, home.scope, m.span, fd.tparams, fd.tpacks, fd.tvalues, fd.params,
+        check_pack_spellings(a, written_in, m.span, fd.tparams, fd.tpacks, fd.tvalues, fd.params,
                              fd.ret_type)
 
         // A signature mentioning a type parameter -- the type's own, or the member's -- has no
@@ -529,12 +535,12 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
 
             for j in 0..<fd.params.len()
                 params.push((fd.params.at(j).name,
-                             resolve_type(a, home.scope, fd.params.at(j).typ, fixed)))
+                             resolve_type(a, written_in, fd.params.at(j).typ, fixed)))
 
             var ret = Unit
 
             if fd.ret_type.is_some() then
-                ret = declared_result_type(Some(resolve_result(a, home.scope, fd.ret_type.unwrap(),
+                ret = declared_result_type(Some(resolve_result(a, written_in, fd.ret_type.unwrap(),
                                                              fixed)))
 
             a.shares_asked_at_trait = false

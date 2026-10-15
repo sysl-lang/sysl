@@ -188,6 +188,12 @@ when nothing implements the trait at all.**
 It may not read a **field** of its receiver either. A bound promises behaviour and a field is layout,
 so no bound could ever license one — see [generics](/reference/generics/).
 
+**Every name in a default is read in the trait's module** — its signature as much as its body. A
+default returning `Buf[int]`, or taking a struct the trait's module declares, is inherited by an
+`impl` in a module that imports neither, from another package too; and a type of the same name in
+the implementing module never answers for one the trait's module cannot see — that is reported once,
+at the trait. `Self` is the one name a copy takes from the `impl`.
+
 What a default buys beyond convenience is that **a trait can grow**: adding a member with a default
 does not break the implementations that already exist, which is the difference between a trait a
 library can evolve and one frozen at its first release.

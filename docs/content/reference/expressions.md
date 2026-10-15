@@ -347,7 +347,9 @@ anything with a cursor rather than a second kind of loop. The cursor moves, but 
 **Its bounds are read by the same two rules a `for` header's are** — they must agree, and they must
 be integers — so the value and the loop cannot come to disagree about what a range is. Note that a
 bound written as a literal takes its type from the other end, so `0..<3u8` is a `u8` range rather
-than a disagreement; it takes two names to write one.
+than a disagreement; it takes two names to write one. A range of literals standing where a
+`Range[T]` is wanted takes `T` the same way, so `total(0..<4)` passes a `Range[usize]` to a
+`total(r: Range[usize])`, and `val r: Range[u8] = 0..<3` is a `u8` range.
 
 ```sysl
 f(a: int, b: u8) -> int
@@ -359,6 +361,24 @@ print(f(0, 3))
 
 ```error
 a range needs matching bounds
+```
+
+A range of literals where a `Range[usize]` is wanted:
+
+```sysl
+total(r: Range[usize]) -> usize
+    var acc: usize = 0
+
+    for i in r
+        acc += i
+
+    acc
+
+print(total(0..<4), total(1..3))
+```
+
+```output
+6 6
 ```
 
 **An open end has no value reading.** `..`, `lo..` and `..hi` mean something only in a slice index,
@@ -401,7 +421,42 @@ rectangular
 ```
 
 Its level — between `&&` and the comparisons — is what makes `a is P && b > 0` a chain of two terms
-rather than an `is` against a conjunction. Both `is` and `not` are **soft** words: neither is
+rather than an `is` against a conjunction.
+
+**Under `||` a test stands so long as it binds nothing.** A name bound by `is` is live from its own
+`is` rightward and through the branch, and under `||` the branch runs when either side held — so a
+name bound on one side would hold nothing when the other side was the one that did. A test that binds
+nothing has no such question to answer:
+
+```sysl
+enum Push
+    NoRoom
+    Pushed(at: int)
+
+full(e: Push, room: int, limit: int) -> bool
+    if e is not NoRoom || room == limit then return true
+
+    false
+
+print(full(NoRoom, 3, 3), full(Pushed(1), 0, 3), full(NoRoom, 0, 3))
+```
+
+```output
+true true false
+```
+
+```sysl
+var o: Option[int] = Some(1)
+
+if o is Some(n) || false
+    print(n)
+```
+
+```error
+a pattern under '||' cannot bind a name
+```
+
+Both `is` and `not` are **soft** words: neither is
 reserved, so both remain usable as ordinary names, and this is the only place either reads as a
 keyword.
 

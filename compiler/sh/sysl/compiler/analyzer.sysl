@@ -43,8 +43,10 @@ struct Local
     // for as long as the name is in scope, which is exactly as long as this entry is.
     stands_for: Option[TExpr]
 
-    // Where the binding was made -- the statement, function header, closure or arm being read when
-    // the name was bound (`Analyzer.bind_site`). Read by the definition index and by nothing in a
+    // Where the binding was made -- the name itself where its binding form records where it wrote
+    // it (a parameter, a pattern, a `val`/`var`/`ref`, a `for`), and otherwise the statement,
+    // function header, closure or arm being read when the name was bound (`Analyzer.bind_site`),
+    // which `lsp_name_in` searches for the name. Read by the definition index and by nothing in a
     // build: carried in the binding rather than in a table keyed by the unique name, because a
     // unique name is unique within one function and a table keyed by it collides across functions.
     declared: Option[Span]
@@ -341,6 +343,11 @@ struct Analyzer
     // borrowed from `self`.
     views_self: bool
 
+    // Every call to a `@consumes` member this body made on a local, by the call's span: the local's
+    // unique name, its name as written, and the member -- what a later read of it is refused against
+    // (`consumes.sysl`).
+    consume_calls: Buf[ConsumeCall]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -424,23 +431,29 @@ struct Analyzer
             None -> ()
     end refuse_reserved_binding
 
-    // Binds a name in the innermost scope, under a unique name of its own.
-    bind(*self, name: string, ty: Type) -> string
+    // Where a binding is recorded as declared: the name's own place where the binding form says
+    // where it wrote it (`named`), and the binding site where it does not.
+    private declared_at(self, named: Option[Span]) -> Option[Span] =
+        if named.is_some() then named else self.bind_site
+
+    // Binds a name in the innermost scope, under a unique name of its own. `named` is where the
+    // name itself is written, where the caller knows it.
+    bind(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named)))
         unique
     end bind
 
     // Binds a name that may not be assigned to again -- what a local `val` declares.
-    bind_read_only(*self, name: string, ty: Type) -> string
+    bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named)))
         unique
     end bind_read_only
 
@@ -448,24 +461,24 @@ struct Analyzer
     // place's, a `ref` stating nothing of its own, and the name is written once exactly where the
     // storage it found is: reaching into a `val` keeps the property, and a `ref` is a way of
     // reaching in.
-    bind_ref(*self, name: string, place: TExpr, read_only: bool) -> string
+    bind_ref(*self, name: string, place: TExpr, read_only: bool, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
-                               self.bind_site))
+                               self.declared_at(named)))
         unique
     end bind_ref
 
     // Binds a name a **pattern** captured, which is written once for the reason a `val` is and
     // says so in its own words.
-    bind_pattern(*self, name: string, ty: Type) -> string
+    bind_pattern(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named)))
         unique
     end bind_pattern
 
@@ -557,7 +570,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
-             false)
+             false, buf())
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

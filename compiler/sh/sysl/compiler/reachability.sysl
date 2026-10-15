@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
 
 // **What a program can arrive at**, and the declarations that go when nothing can.
 //
@@ -47,7 +48,25 @@ prune(p: TProgram, own: Buf[string]) -> TProgram
     for i in 0..<p.funcs.len()
         if live.call_set.has(p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
 
-    with_declarations(p, externs, funcs)
+    // A table goes with its bodies: one the walk did not count (`table_counts`) names bodies that
+    // are no longer emitted.
+    var index: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        index.add(p.funcs.at(i).name)
+
+    var vtables: Buf[TVtable] = buf()
+
+    for i in 0..<p.vtables.len()
+        val t = p.vtables.at(i)
+        var whole = true
+
+        for item in t.slots
+            if index.has(item.target) && !live.call_set.has(item.target) then whole = false
+
+        if whole then vtables.push(t)
+
+    with_declarations(p, externs, funcs) with { vtables = vtables }
 end prune
 
 // The whole walk, including the one root kind that cannot be decided before it has run.
@@ -61,6 +80,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val entries = entry_points(p, own)
     val index = func_index(p)
     val exports = exports_of(p)
+    val reached = reached_modules(p, own)
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
@@ -68,7 +88,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val scan = type_scan()
 
     while more
-        live = reached_from(p, index, roots_of(p, entries, extra))
+        live = reached_from(p, index, roots_of(p, entries, extra, reached))
 
         for entrie in entries
             add_call(live, entrie.name)
@@ -177,9 +197,14 @@ end holds_runtime
 // Whether anything the walk reached computes what `r` answers: a signature, a value a body computes,
 // the program's own statements or its storage. The runtime's own bodies are not asked.
 private reaches_runtime(p: TProgram, live: &Live, r: Runtime) -> bool
+    // **A core with no divider calls the integer runtime from code that spells none of it**: a
+    // constant divided is `__aeabi_uidiv`, a `long` multiplied `__aeabi_lmul`, a `real` normalized
+    // `__clzsi2`. No walk could name every such operation, so there it is kept in every build.
+    if r == WideDivision && !p.divider then return true
+
     var hits: Buf[Span] = buf()
     val sink = &hits
-    val unit = p.double_unit
+    val unit = Units(p.double_unit, p.single_unit)
     val walk = expr_walk(false, (e) -> note_runtime(sink, e, r, unit))
     val home = runtime_home(r)
 
@@ -212,14 +237,20 @@ private reaches_runtime(p: TProgram, live: &Live, r: Runtime) -> bool
     !hits.is_empty()
 end reaches_runtime
 
-// Whether holding a value of `t` is itself `r`'s concern: a binary128 value, or a binary64 one on a
-// machine with no double-precision `unit`. A wide integer is not -- only dividing one is.
-private runtime_type(t: Type, r: Runtime, unit: bool) -> bool = r match
+// The floating-point units a machine has: one computing in double precision, and one at all.
+private struct Units
+    binary64: bool
+    binary32: bool
+
+// Whether holding a value of `t` is itself `r`'s concern: a binary128 value, a binary64 one on a
+// machine with no double-precision unit, or a binary32 one on a machine with no unit at all. A wide
+// integer is not -- only dividing one is.
+private runtime_type(t: Type, r: Runtime, unit: Units) -> bool = r match
     QuadArithmetic -> is_quad(t)
-    DoubleArithmetic -> !unit && is_binary64(t)
+    DoubleArithmetic -> (!unit.binary64 && is_binary64(t)) || (!unit.binary32 && is_binary32(t))
     WideDivision -> false
 
-private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: bool)
+private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: Units)
     if sink.is_empty() && runtime_node(e, r, unit) then sink.push(e.span)
 
 // Whether `e` is an operation `r` answers. A binary64 runtime also answers the conversions between
@@ -228,15 +259,17 @@ private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: bool)
 // conversions between a 64-bit integer and either float width -- which that unit has no
 // instruction for -- still need it. A division runtime answers `/` and `%` on anything wider than
 // 32 bits, a fixed-point value included, since its quotient is formed in a register twice its width.
-private runtime_node(e: TExpr, r: Runtime, unit: bool) -> bool
+// On a machine with no unit at all the binary64 runtime also carries the `f32` routines, and any
+// `f32` value asks for it.
+private runtime_node(e: TExpr, r: Runtime, unit: Units) -> bool
     if r == QuadArithmetic then return is_quad(texpr_type(e))
 
     if r == DoubleArithmetic
-        if !unit && is_binary64(texpr_type(e)) then return true
+        if runtime_type(texpr_type(e), r, unit) then return true
 
         return *e.kind match
             TCast(operand, ty) -> converts_wide_single(texpr_type(operand), ty) ||
-                                  (unit && converts_wide_double(texpr_type(operand), ty))
+                                  (unit.binary64 && converts_wide_double(texpr_type(operand), ty))
             _ -> false
 
     *e.kind match
@@ -279,7 +312,16 @@ end holds_func
 
 // The trees a walk starts from: the program's own statements, the storage it lays down, the tables
 // it built, the entry point, and every function nothing in the program names.
-private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
+//
+// **A table counts only where the program reaches the module its slots were written in** (`reached`,
+// from `reached_modules`; nothing means every module counts). Every closure a dependency's module
+// lowered has a table, and that module may be one the program never names: `sh.sysl.pool`'s
+// closures, rooted, kept its scheduler -- and through it `sysl.threads`'s futex hooks -- in a board
+// build that imports only `sh.sysl.pool.deque`. A slot's module is the function's `declared_in`,
+// since a closure's key names none. A module a kept supplier (`extra`) was written in counts, and
+// the standard module's tables are left as they were.
+private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
+                 reached: Option[Set[string]]) -> &Live
     val out = no_reached()
 
     walk_stmts(p.main, expr_walk(false, e -> take_node(out, e)))
@@ -289,8 +331,26 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
             Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(out, e)))
             None -> ()
 
+    var homes: Map[string, string] = map()
+
+    if reached.is_some()
+        for i in 0..<p.funcs.len()
+            homes.put(p.funcs.at(i).name, p.funcs.at(i).declared_in)
+
+    var counted = reached
+
+    if counted.is_some()
+        var names = counted.unwrap()
+
+        for item in extra
+            names.add(item.declared_in)
+
+        counted = Some(names)
+
     for i in 0..<p.vtables.len()
         val t = p.vtables.at(i)
+
+        if !table_counts(t, homes, counted) then continue
 
         for item in t.slots
             add_call(out, item.target)
@@ -316,6 +376,23 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
 
     out
 end roots_of
+
+// Whether a table is a root: where every module counts, where one of its slots was written in a
+// module that does, or where one was written in the standard module or names no body here.
+private table_counts(t: TVtable, homes: Map[string, string], counted: Option[Set[string]]) -> bool
+    if counted.is_none() then return true
+
+    for item in t.slots
+        val home = homes.get(item.target)
+
+        if home.is_none() then return true
+
+        val m = home.unwrap()
+
+        if m == "sysl" || m.starts_with("sysl.") || counted.unwrap().has(m) then return true
+
+    false
+end table_counts
 
 // Everything a set of roots can arrive at, following each call into the body it lands in.
 //
@@ -433,7 +510,7 @@ end domain_refs
 vals_read_by(init: TExpr, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> Buf[string]
     val p = TProgram(buf(), buf(), vtables, buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
                      buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
-                     false)
+                     false, false, true)
     val root = no_reached()
 
     walk_texpr(init, expr_walk(false, e -> take_node_of(p, root, e)))
@@ -933,7 +1010,7 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
              p.warnings, p.module_deps, p.main_src, runtime_asm_kept(p.module_asm, funcs), p.c_runtime,
-             p.double_unit)
+             p.double_unit, p.single_unit, p.divider)
 
 // The top-of-file blocks a pruned program lays down. **A runtime's block goes with its routines**:
 // Arm's `__aeabi_uldivmod` answers in four registers, which no sysl signature can, so it is a block
@@ -985,7 +1062,7 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     var more = true
 
     while more
-        val root = roots_of(kept, entries, extra)
+        val root = roots_of(kept, entries, extra, None)
 
         for item in kept.tests
             add_call(root, item.func)
@@ -1025,7 +1102,8 @@ private without_program_entry(p: TProgram) -> TProgram =
     TProgram(p.structs, p.enums, p.vtables, p.externs, p.vals, p.funcs, buf(), None, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit)
+             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit,
+             p.single_unit, p.divider)
 
 // **The scaffolding a module's tests are written against, taken out of the build that runs none.**
 //
@@ -1173,7 +1251,8 @@ private without_scaffolding(p: TProgram, gone: Set[string]) -> TProgram
     TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, tests, hooks, p.extern_vars, only, p.destructors,
-             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit)
+             p.warnings, p.module_deps, p.main_src, p.module_asm, p.c_runtime, p.double_unit,
+             p.single_unit, p.divider)
 end without_scaffolding
 
 private fills_a_slot(gone: Set[string], t: TVtable) -> bool

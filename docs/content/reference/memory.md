@@ -433,6 +433,64 @@ back:
 Storing a parameter is *not* one of them: an assignment takes a count for the value arriving, so
 `latest = h` above is where the new owner's share comes from, and the callee never held one.
 
+### A count that would be taken and given straight back is not taken
+
+Binding a call's result to a `val`, or returning a local through an `if` or a `match`, moves a value
+from one owner in the frame to another: the new owner takes a share and the old one gives its share
+back at the end of the statement or scope. On a `&sync T` each of those is an atomic operation on a
+count every thread shares, so a value copied up a recursive search would pay two contended atomics
+per level for a count that ends where it began. **The compiler drops such a pair.** A retain is
+cancelled against a later release of the same reference when nothing between them can give back the
+count that release would have given back:
+
+- loads and stores of the frame's own slots, arithmetic, and other retains never can;
+- the release of a different value may run a destructor, which is arbitrary code, but it cannot reach
+  a slot of this frame whose address never left it. So it may sit between the pair, unless the stretch
+  between them also writes to memory outside those slots;
+- any other call ends the stretch.
+
+Where the pair would be split by the arms of an `if` or a `match`, the releases at the end of the scope
+are given back at the end of each arm instead, so that the arm which returns a local takes no count
+for it. A count therefore never reaches zero at a different point, and **no destructor runs earlier,
+later or in a different order** than it would with every count taken. Nothing about it is visible
+except the time it saves: on a recursive search over a tree of `&sync` shapes it removes three of every
+four atomic operations.
+
+```sysl
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Hit
+    t: int
+    tag: &sync Tag
+
+probe(t: int, tag: &sync Tag) -> Option[Hit] = Some(Hit(t, tag))
+
+pick(near: bool) -> Option[Hit]
+    val x = probe(1, Tag(1))
+    val y = probe(2, Tag(2))
+    if near then x else y
+
+show(near: bool)
+    val h = pick(near)
+    print("got", h.unwrap().t)
+
+show(true)
+show(false)
+```
+
+```output
+drop 2
+got 1
+drop 1
+drop 1
+got 2
+drop 2
+```
+
 ## `weak T` — breaking cycles
 
 Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent
@@ -1676,9 +1734,52 @@ run()
 ```
 
 What a view is copied into is borrowed from the same receiver — a sub-slice, a struct or `Option`
-built around it, a closure that captures it, a name a pattern binds out of it — so each of those is
-held to the same places. A value that cannot hold a view (`v.len`, `v[0]`, a string rendered from
-it) is not borrowed from anything.
+built around it, a closure that captures it, a name a pattern binds out of it, a loop variable
+walking a view of views — so each of those is held to the same places. A value that cannot hold a
+view (`v.len`, `v[0]`, a string rendered from it, a byte a loop takes out of it) is not borrowed from
+anything:
+
+```sysl
+struct Table
+    rows: []const []const u8
+
+    @views(self)
+    all(&self) -> []const []const u8 = self.rows
+
+run()
+    var keep: []const u8 = []
+    val t: &Table = Table(["ab".bytes, "cde".bytes])
+
+    for row in t.all() do keep = row
+```
+
+```error
+'keep' is bound before 't', so it outlives it, and this stores in it a view borrowed from 't'
+```
+
+A trait member may carry the mark too, and then a call through a trait object (`&Viewer`) is held
+to it exactly as a call on the type is. An implementation of a marked member inherits the mark, so
+it need not repeat it. The other way round is refused — a call through the object reads only the
+trait's member, so a mark the trait does not carry would hold nobody to anything:
+
+```sysl
+trait Viewer
+    look(&self) -> []const u8
+
+struct S
+    n: int
+
+impl Viewer for S
+    @views(self)
+    look(&self) -> []const u8 = []
+```
+
+```error
+'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares 'look' without it
+```
+
+A marked member is only ever called on a value: `Column.bytes(c)` is refused, as every method
+reached through its type is.
 
 **Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
 `*self` call on it, and a call that may write an object of its type — which a member that frees the
@@ -2940,6 +3041,30 @@ assignment needs a variable, a field, an element, or a dereference — something
 `f.push(2)` is refused as a method `Frozen` does not have, and a store through `view()` is refused as
 a store through any `[]const T`.
 
+**Reading a local after `freeze` is refused**, since all it can find is the empty buffer: `freeze`
+is [`@consumes`](/reference/attributes/), so on every path after the call the local may not be read
+until it is assigned a new value. A field, or module storage like `b` above, is not followed, and
+reads as empty:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+pixels() -> usize
+    var b: Buf[u8] = buf()
+
+    b.push(1)
+
+    val f = b.freeze()
+
+    f.len() + b.len()
+
+print(pixels())
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
 **A frozen buffer shares exactly what its elements share.** Every thread reading one reads its
 elements, so the element type is held to the rule a `&sync` struct's fields are: a scalar, a `&sync
 U` (a `&sync` trait object among them), a raw pointer, another frozen buffer, and arrays and structs
@@ -3157,6 +3282,37 @@ c.with((v) -> keep(hp, v))
 
 ```error
 and this one is passed to 'keep', which holds on to it
+```
+
+**What a call answers is followed the same way.** A callee whose answer is made of the pointer — the
+pointer itself, or the address of something inside what it points at — hands the body the lent
+pointer back, and the body is held to it. A pointer the callee **read out of** the lent value is
+somebody else's address, and is the body's to keep:
+
+```sysl
+struct Node
+    v: int
+
+struct Queue
+    head: *Node
+
+    first(*self) -> *Node = self.head
+
+struct Guard
+    q: Queue
+
+    @lends(body)
+    with[R](*self, body: *Queue -> R) -> R = body(&self.q)
+
+var n = Node(7)
+var g = Guard(Queue(&n))
+val p = g.with((q) -> q.first())
+
+print(p.v)
+```
+
+```output
+7
 ```
 
 An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed

@@ -1,0 +1,98 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **A trait's default is read in the trait's module, signature and body alike**, whichever module
+// the `impl` that inherits it is written in. The copy made for the implementing type is that type's
+// member, but every name in it other than `Self` was written beside the trait: a type the trait's
+// module imported, a struct it declared, a function or a constant of its own. The module writing the
+// `impl` need not import any of them, and a name it declares of its own never answers for one.
+
+// The trait's module: a default whose parameter and result name a type only it imported (`Buf`) and
+// one only it declared (`Pair`), and whose body calls its own function over its own constant.
+private tds_lib() -> string =
+    "module lib\n\nimport sysl.buf.{Buf, buf}\n\nval SCALE: int = 3\n\nstruct Pair\n    a: int\n    b: int\n\n" +
+    "scaled(n: int) -> int = n * SCALE\n\ntrait Many\n    one(self) -> int\n\n" +
+    "    many(self, p: Pair) -> Buf[int]\n        var out: Buf[int] = buf()\n" +
+    "        out.push(scaled(self.one()))\n        out.push(p.a + p.b + SCALE)\n        out\n"
+
+// The implementing module imports the trait and nothing else of `lib`'s.
+private tds_user() -> string =
+    "module user\n\nimport lib.Many\n\nstruct Thing\n    n: int\n\nimpl Many for Thing\n    one(self) -> int = self.n\n"
+
+private tds_main() -> string =
+    "import lib.{Many, Pair}\nimport user.Thing\n\nval got = Thing(7).many(Pair(1, 2))\nprint(got.len(), got[0], got[1])\n"
+
+// What a program of these modules prints, or what the build said instead.
+private tds_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val said = lbr_run(root, [])
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end tds_out
+
+private tds_tree(lib: string, user: string, main: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("lib", "lib.sysl", lib))
+    fs.push(("user", "user.sysl", user))
+    fs
+end tds_tree
+
+@test("a default's signature names a type only the trait's module imported or declared, and an impl elsewhere inherits it")
+tds_a_default_reads_the_traits_imports()
+    if im_can_run() then return
+
+    assert_eq(tds_out(tds_tree(tds_lib(), tds_user(), tds_main())), "2 21 6\n")
+end tds_a_default_reads_the_traits_imports
+
+// A generic subject's copy is made per instantiation rather than once, by another path; it reads the
+// trait's module the same way, and its `Self` still means the type the `impl` named.
+@test("and so does a generic type's copy, made at each instantiation")
+tds_a_generic_impl_reads_the_traits_imports()
+    if im_can_run() then return
+
+    val user = "module user\n\nimport lib.Many\n\nstruct Thing[T]\n    n: int\n    tag: T\n\n" +
+               "impl[T] Many for Thing[T]\n    one(self) -> int = self.n\n"
+    val main = "import lib.{Many, Pair}\nimport user.Thing\n\n" +
+               "val got = Thing(7, true).many(Pair(1, 2))\nprint(got.len(), got[0], got[1])\n"
+
+    assert_eq(tds_out(tds_tree(tds_lib(), user, main)), "2 21 6\n")
+end tds_a_generic_impl_reads_the_traits_imports
+
+// Across a package boundary: the trait is a library root's, the `impl` and its caller the program's.
+@test("and so it does when the trait is a library's and the impl is the program's")
+tds_a_default_reads_the_traits_imports_across_a_library()
+    if im_can_run() then return
+
+    val lib = lbr_tree(lbr_one("lib/lib.sysl", tds_lib()))
+    val prog = lbr_program("import lib.{Many, Pair}\n\nstruct Thing\n    n: int\n\n" +
+                           "impl Many for Thing\n    one(self) -> int = self.n\n\n" +
+                           "val got = Thing(7).many(Pair(1, 2))\nprint(got.len(), got[0], got[1])\n")
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "2 21 6\n")
+end tds_a_default_reads_the_traits_imports_across_a_library
+
+// A name the trait's module cannot see is refused there, once, at the trait's own text -- and a type
+// of that name in the implementing module does not answer for it.
+@test("a name the trait's module cannot see is refused at the trait, and the impl's module does not supply it")
+tds_the_impls_names_do_not_answer()
+    if im_can_run() then return
+
+    val lib = "module lib\n\ntrait Many\n    one(self) -> int\n\n    many(self) -> Nope = self.one()\n"
+    val user = "module user\n\nimport lib.Many\n\nstruct Nope\n    n: int\n\nstruct Thing\n    n: int\n\n" +
+               "impl Many for Thing\n    one(self) -> int = self.n\n"
+    val said = tds_out(tds_tree(lib, user, "import lib.Many\nimport user.Thing\n\nprint(Thing(7).one())\n"))
+
+    assert(said.contains("error: unknown type 'Nope'\n --> "), said)
+    assert(said.contains("lib/lib.sysl:6:19\n"), said)
+    assert(!said.contains("user.sysl"), said)
+    assert(!said.contains("user.Nope"), said)
+end tds_the_impls_names_do_not_answer

@@ -608,17 +608,24 @@ private trn_report_m(text: string) -> Option[string]
     Some(said)
 end trn_report_m
 
-// Tests are dropped after the whole-program checks, so a module's capability clause reaches them.
-@test("a module's 'no alloc' clause reaches its tests")
-trn_no_alloc_reaches_the_tests()
+// A test is hosted code that checks its module, so a module's '@no_alloc' binds the module's own
+// functions and not a '@test' written beside them (`reference/modules.md`): the test may render a
+// string, while the function it calls is still held to the clause.
+@test("a module's 'no alloc' clause binds its functions and not its tests")
+trn_no_alloc_spares_the_tests()
     trn_report_m("module m\n@no_alloc\n\nadd(a: int, b: int) -> int = a + b\n\n" +
                  "@test\nadding() =\n    val s = str(add(2, 2))\n    assert(s == \"4\", \"adding\")\n") match
+        None -> ()
+        Some(said) -> assert(!said.contains("declared '@no_alloc'"), said)
+
+    trn_report_m("module m\n@no_alloc\n\nshow(a: int) -> string = str(a)\n\n" +
+                 "@test\nshowing() =\n    assert(show(4) == \"4\", \"showing\")\n") match
         None -> ()
         Some(said) ->
             assert(said.contains("the string a value renders as needs an allocator, and this module " +
                                  "declared '@no_alloc' — it may hold and release storage made elsewhere, " +
                                  "and may make none of its own"), said)
-            assert(said.contains("m.sysl:8:13"), said)
+            assert(said.contains("m.sysl:4:26"), said)
 
 @test("a test that allocates nothing is fine in the same module")
 trn_no_alloc_allows_a_quiet_test()

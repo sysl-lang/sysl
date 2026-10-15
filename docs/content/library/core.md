@@ -755,7 +755,8 @@ Every rendering the language does ends up in this family, one function per shape
 the library forwarding to the function above. The `iN`/`uN` families are open — `i5` and `u24` are
 types you may write — so no finite list of blocks reaches them; what reaches them is a single
 **blanket** block, `impl[T: Integer] Display for T`, whose buffer is measured from the width it is
-instantiated at.
+instantiated at. `unit` has a written block too, printing `()`, beside its `Eq`, `Ord` and `Hash`
+([`unit` and `never`](/reference/types/#unit-and-never)).
 
 Either way they are `Display` exactly the way your own struct is, and **a `*Display` can carry any
 of them**. That is what the blanket bought: a `[]*Display` holding an `int`, a `u8`, a `string` and

@@ -95,6 +95,23 @@ cpu_bits(cpu: Cpu) -> usize
         Craft -> 16
 end cpu_bits
 
+// The widest integer a processor reads, writes and changes indivisibly in one instruction (or one
+// exclusive pair). **Every 32-bit Arm M-profile core stops at 32**: Armv6-M, Armv7-M and Armv8-M have
+// `ldrex`/`strex` at most for a word and no `ldrexd`, and RV32's A extension is a word too. A 64-bit
+// atomic there is a call into `__atomic_*_8`, which no board's runtime defines. 32-bit x86 has
+// `cmpxchg8b`, and wasm's threads proposal has `i64.atomic.*`.
+cpu_atomic_bits(cpu: Cpu) -> int
+    cpu match
+        Aarch64 -> 64
+        X86_64 -> 64
+        Riscv64 -> 64
+        X86 -> 64
+        Wasm32 -> 64
+        Riscv32 -> 32
+        Thumb -> 32
+        Craft -> 16
+end cpu_atomic_bits
+
 // Which order a processor's memory holds a value's bytes in. Every processor sysl targets is
 // little-endian -- aarch64 and Arm run that way under every system sysl names, and CRAFT is specified
 // so -- and the answer is a match rather than a constant so that a processor added later has to say.
@@ -240,6 +257,16 @@ struct Target
     double_unit(self) -> bool =
         self.cpu == Thumb && self.hard_float() && !self.no_fpu && self.fpu != "" && !self.fpu.contains("-sp-")
 
+    // Whether the machine has a floating-point unit at all, so an `f32` operation is an instruction:
+    // any Arm unit, single precision or double, whichever float ABI passes the values. Every other
+    // processor answers false, which only matters on the 32-bit machines whose `f32` runtime it decides.
+    single_unit(self) -> bool = self.cpu == Thumb && !self.no_fpu && self.fpu != ""
+
+    // Whether the machine divides 32-bit integers itself. Armv6-M is the one core sysl targets that
+    // has no divider -- nor a long multiply, `clz` or a two-word shift -- so LLVM calls a routine for
+    // each, and `sysl.softint` answers them.
+    divider(self) -> bool = !(self.cpu == Thumb && self.triple.starts_with("thumbv6m"))
+
     // Whether the manifest took this capability away from this machine.
     lacks_capability(self, cap: string) -> bool
         for lack in self.lacks
@@ -256,6 +283,18 @@ struct Target
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
 
     pointer_bytes(self) -> usize = cpu_bits(self.cpu) / 8
+
+    // The widest integer an atomic form may run at here (`cpu_atomic_bits`).
+    atomic_bits(self) -> int = cpu_atomic_bits(self.cpu)
+
+    // The widest integer an atomic read-modify-write -- an exchange, an add, a compare-and-swap -- may
+    // change here. **Armv6-M has none at all**: no `ldrex`/`strex`, so it reads and writes a word
+    // indivisibly and changes nothing (`atomic_reach.sysl`).
+    atomic_rmw_bits(self) -> int = if self.triple.starts_with("thumbv6m") then 0 else self.atomic_bits()
+
+    // Whether the processor masks interrupts through PRIMASK, which is what an `IrqLock` takes: every
+    // Thumb row is a Cortex-M core.
+    has_primask(self) -> bool = self.cpu == Thumb
 
     // Whether memory holds a value's least significant byte first, which is what `to_be` and a
     // `@byte_order(big)` field reverse against.

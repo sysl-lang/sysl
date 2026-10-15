@@ -354,6 +354,18 @@ and `__aeabi_dmul` itself:
 scale(x: real, n: long) -> real = x * real(n / 1000)
 ```
 
+**An `f32` on a core with no floating-point unit at all** — a Cortex-M0+ or M3, RISC-V with no `F` —
+is a call as well, `__aeabi_fmul` or `__mulsf3`, from the same module and under the same rule. It is
+the binary64 arithmetic between an exact widening and a narrowing, which rounds once in effect: 53
+bits is more than twice 24 plus two, so the double rounding is innocuous, and the result is bit for
+bit what a single-precision unit gives. This archive for a Cortex-M0+ computes with an `f32` and needs
+nothing from its board but `memcpy` and `memset`:
+
+```sysl build=c target=thumbv6m-freestanding
+@export("mix")
+mix(a: f32, b: f32, t: f32) -> f32 = a + (b - a) * t
+```
+
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
 it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
 program does not hold. A format
@@ -461,7 +473,33 @@ with a UTF-8 `string` has to do. Conversion to `u32` is total and written `u32(c
 ## `unit` and `never`
 
 `unit` is the type with exactly one value — what a function that returns nothing returns. It is a real
-type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery.
+type, so it composes: a `Fn() -> unit` needs no special case in the callable machinery. Its value is
+written `()`, and so is its [pattern](/reference/patterns/#the-pattern-forms).
+
+**It has the four memberships a tuple has, each with the one answer a single value allows**: `Eq`
+(every `()` equals every other), `Ord` (none is less than another), `Hash` (all hash alike) and
+`Display` (it prints as `()`). They are what let a `Result[unit, E]` or an `Option[unit]` compare,
+print and go through `assert_eq`, and they occupy no storage: a `unit` operand is passed as nothing.
+A program may implement its own traits for `unit` too.
+
+```sysl
+enum Fault
+    Low
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec) = display_str("Low", out, fmt)
+
+check(n: int) -> Result[unit, Fault] = if n > 0 then Ok(()) else Err(Low)
+
+print(check(1) == Ok(()), check(0) == Err(Low), () < ())
+print(check(1), check(0))
+assert_eq(check(0), Err(Low))
+```
+
+```output
+true true false
+Ok(()) Err(Low)
+```
 
 `never` is the type with **no** values, and it is what an expression that does not finish has. A call
 to `exit` has type `never`, as does a `return` or a `break` considered as an expression. Because there
@@ -683,7 +721,8 @@ lighter and says so. If yes, only the tuple will do.
 
 `Eq`, `Ord`, `Hash` and `Display` are provided structurally, at **every** arity, whenever every
 component has the row. Ordering is lexicographic, first component first, which is the only ordering a
-positional product has a claim to.
+positional product has a claim to. `unit`, the tuple with no parts, has the same four
+([`unit` and `never`](#unit-and-never)).
 
 ```sysl
 val pair = (1, "one")
