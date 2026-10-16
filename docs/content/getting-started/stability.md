@@ -96,7 +96,7 @@ Releases carry three binaries:
 | `linux-arm64` | |
 | `linux-x86_64` | |
 
-**0.1.3 carries only the first**, `darwin-arm64`: they are cut by the self-hosted compiler
+**0.1.4 carries only the first**, `darwin-arm64`: they are cut by the self-hosted compiler
 on a Mac, and the two Linux binaries return when a Linux build of it is part of the release.
 
 There is **no darwin-x86_64 build and no Windows build**, and neither is an oversight. Building from
