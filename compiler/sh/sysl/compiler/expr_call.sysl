@@ -2515,6 +2515,9 @@ end first_dot_in
 private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: string, args: Buf[Expr],
                       expected: Option[Type]) -> TExpr
     val keys = function_keys(cx, written)
+    val shadowing = extern_over_library(cx, written, keys)
+
+    if shadowing.is_some() then return extern_named_call(cx, span, written, shadowing.unwrap(), args)
 
     if !keys.is_empty() then depends_on(cx.an, cx.scope, keys.at(0), callee_at)
 
@@ -3311,6 +3314,24 @@ name_list(params: Buf[Param]) -> string
 end name_list
 
 // -- the calls a later stage resolves --------------------------------------------------------------
+
+// The `extern` a call means where the only function of the spelling is the standard module's.
+//
+// **The library is searched after everything else**, and an `extern` the reader's own module
+// declares, or one it imports, is part of "everything else" exactly as a function is: `trap` the
+// module binds from C answers before `sysl.trap`.
+extern_over_library(cx: &Analyzer, written: string, keys: Buf[string]) -> Option[string]
+    if keys.is_empty() then return None
+
+    val library = module_qualify(AutoImportedModule, written)
+
+    for i in 0..<keys.len()
+        if keys.at(i) != library then return None
+
+    val ext = extern_key(cx, written)
+
+    if ext.is_some() && ext.unwrap() != library then ext else None
+end extern_over_library
 
 extern_key(cx: &Analyzer, written: string) -> Option[string]
     // **A module written before the dot**, which a call to a *function* has always asked for and a
