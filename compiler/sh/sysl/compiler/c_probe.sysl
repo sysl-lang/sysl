@@ -58,16 +58,22 @@ end CGlobal
 // Whether any file of this compilation asks a question of the C compiler.
 c_probe_wanted(units: Buf[Program]) -> bool
     for item in units
-        val body = item.body
-
-        for j in 0..<body.len()
-            *body.at(j).kind match
-                CConstBlock(_) -> return true
-                CTypeBlock(_) -> return true
-                _ -> ()
+        if carries_probe(item) then return true
 
     false
-end c_probe_wanted
+
+// Whether this one file asks a question of the C compiler.
+private carries_probe(unit: Program) -> bool
+    val body = unit.body
+
+    for j in 0..<body.len()
+        *body.at(j).kind match
+            CConstBlock(_) -> return true
+            CTypeBlock(_) -> return true
+            _ -> ()
+
+    false
+end carries_probe
 
 // Every file's blocks lowered to ordinary declarations, with whatever could not be measured reported
 // on the analysis and its file emptied so that nothing downstream reads a block.
@@ -87,8 +93,17 @@ c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
         // declarations around it are written in terms of; **the header stays so the module goes on
         // being answerable**, so that a program naming it on such a target is told what it requires
         // rather than told the name does not exist.
-        if unmeasurable(unit, t) then out.push(unit with { body = buf() })
-        else out.push(lower_unit(a, unit, t))
+        //
+        // **Only a file that carries a block is asked any of this.** A file with no probe asks
+        // clang nothing, so it is read whatever it requires, exactly as it is in a compilation
+        // where no file carries one: `sysl.threads` requires `os` and still answers `tls_place` on
+        // a bare machine, and a dependency's `c type` somewhere else does not take that away.
+        if !carries_probe(unit) then out.push(unit)
+        else unmeasurable(unit, t) match
+            Some(cap) ->
+                a.withheld.push((module_of_unit(unit), cap))
+                out.push(unit with { body = buf() })
+            None -> out.push(lower_unit(a, unit, t))
 
     probe_refused = a.found.len() > before
     out
@@ -106,7 +121,10 @@ c_probe_refused() -> bool = probe_refused
 // **What is asked is every environment capability the file requires, against what the machine
 // physically has** -- not whether it is hosted alone. Windows is hosted and is not POSIX, so a file
 // requiring `posix` has no `<regex.h>` there either; asking `hosted` measured it and refused it.
-private unmeasurable(unit: Program, t: Target) -> bool
+//
+// The answer is the requirement as the file wrote it, which is what a program reaching the module is
+// told it asked for.
+private unmeasurable(unit: Program, t: Target) -> Option[string]
     val machine = inherent_capabilities(t)
 
     for c in unit.capabilities
@@ -117,11 +135,11 @@ private unmeasurable(unit: Program, t: Target) -> bool
                 for j in 0..<needed.len()
                     val cap = needed.at(j)
 
-                    if (cap == CapOs || cap == CapPosix) && !has(machine, cap) then return true
-                    if cap == CapLibc && t.lacks_capability(CapLibc) then return true
+                    if (cap == CapOs || cap == CapPosix) && !has(machine, cap) then return Some(c.name)
+                    if cap == CapLibc && t.lacks_capability(CapLibc) then return Some(c.name)
             _ -> ()
 
-    false
+    None
 end unmeasurable
 
 private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program

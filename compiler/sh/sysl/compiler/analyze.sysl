@@ -293,7 +293,10 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
     if !declares(a, key) && imports_a_form(name)
         out.push((at, s"'$name' is a built-in form rather than a member of any module — it is in scope " +
                       "everywhere and needs no import"))
-    elif !declares(a, key) then out.push((at, s"'$home' declares no '$name' — there is no '$home.$name'"))
+    elif !declares(a, key)
+        withheld_for(a, home) match
+            Some(cap) -> out.push((at, withheld_refusal(a, home, name, cap)))
+            None -> out.push((at, s"'$home' declares no '$name' — there is no '$home.$name'"))
     elif !reachable_key(a, key, scope) then out.push((at, out_of_reach(a, key)))
     else
         val own = own_declaration(a, scope, bound)
@@ -308,6 +311,23 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
                           "would mean two things — import it as another name with 'as', or write its path"))
     end if
 end import_name
+
+// The requirement a module's emptied file wrote, where `c_probe_lower` withheld one of its files.
+private withheld_for(a: &Analysis, home: string) -> Option[string]
+    for pair in a.withheld
+        if pair.0 == home then return Some(pair.1)
+
+    None
+
+// **A withheld module is not one that declares nothing**, and saying so would send a reader looking
+// for a misspelling. It names the requirement and the machine, which are the two things to change.
+private withheld_refusal(a: &Analysis, home: string, name: string, cap: string) -> string
+    val machine = a.tables.target.name
+
+    s"'$home' is withheld on '$machine': it asks the C compiler about headers and requires '$cap', " +
+        s"which '$machine' does not provide, so it declares nothing here — there is no '$home.$name' " +
+        "on this machine"
+end withheld_refusal
 
 // The declaration of a spelling the importing file's own module makes and the file could write bare:
 // its own file-private one first, then the module's. **A sibling file's file-private declaration is

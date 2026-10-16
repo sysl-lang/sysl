@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// A C probe empties only the file that carries it. A file asking clang a question on a machine whose
+// headers it said it cannot have is withheld; every other file is read as it would be in a
+// compilation with no probe anywhere. So a C library package carrying a `c type` does not take
+// `sysl.threads.tls_place` away from the bare AArch64 program that lays its first thread's block
+// (`reference/attributes.md § @thread_local`), and a module that really is withheld says why.
+
+private wtl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private wtl_owned() -> string = "codegen {\n  thread_pointer = \"tpidr_el0\"\n}\n"
+
+// keel's probe: the first thread's block laid from an exported function.
+private wtl_lays() -> string =
+    "import sysl.threads.{tls_place, tls_room}\n\n" +
+    "private var first_block: [512]u8\n\n" +
+    "@export(\"probe_lay\")\n" +
+    "probe_lay() -> u64\n" +
+    "    val tp = tls_place(first_block[..]) match\n" +
+    "        Some(p) -> p\n" +
+    "        None -> trap()\n" +
+    "    u64(usize(tp)) + u64(tls_room())\n"
+
+// A package standing where a C library would, as cstd does: `libc = true` headers, and a file that
+// measures something with clang. `body` follows the probe in its one file.
+private wtl_libc(root: string, body: string)
+    make_dir_all(s"$root/cs/include").unwrap()
+    make_dir_all(s"$root/cs/cs").unwrap()
+    write_text(s"$root/cs/package.hocon",
+               "package { name = \"cs\", version = \"0.1.0\" }\n" +
+               "c {\n  libc { export = [\"include\"], libc = true }\n}\n").unwrap()
+    write_text(s"$root/cs/cs/cs.sysl",
+               s"module cs\n@include(\"limits.h\")\n\nc const\n    BIGGEST: i32 = \"INT_MAX\"\n\n" +
+               s"@export(\"cs_biggest\")\ncs_biggest() -> i32 = BIGGEST\n\n$body").unwrap()
+end wtl_libc
+
+// `sysl build-c` of module `k` holding `main` for `target`, under the manifest text `extra`.
+private wtl_build(target: string, extra: string, main: string) -> (int, string)
+    val root = absolute_path(make_temp_dir("sysl-wtl").unwrap())
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\n$extra").unwrap()
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/k/k.sysl", s"module k\n\n$main").unwrap()
+
+    var args: [7]string = ["sysl", "build-c", root, "--target", target, "-o", s"$root/out.a"]
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    use_machine_registers(no_machine_registers())
+    remove_dir_all(root).unwrap_or(())
+    (code, text)
+end wtl_build
+
+private wtl_with(deps: string) -> string = s"dependencies {\n  cs { path = \"$deps/cs\" }\n}\n"
+
+@test("wtl: tls_place is reachable on bare AArch64 beside a C library package that probes clang")
+wtl_beside_a_libc_package()
+    if !wtl_ready() then return
+
+    val deps = absolute_path(make_temp_dir("sysl-wtl-deps").unwrap())
+
+    wtl_libc(deps, "")
+
+    val got = wtl_build("aarch64-freestanding", wtl_owned() + wtl_with(deps),
+                        "import cs.cs_biggest\n\n" + wtl_lays() +
+                        "\n@export(\"probe_big\")\nprobe_big() -> i32 = cs_biggest()\n")
+
+    remove_dir_all(deps).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(!got.1.contains("declares no"), got.1)
+end wtl_beside_a_libc_package
+
+@test("wtl: and with no dependency at all, as before")
+wtl_without_the_dependency()
+    if !wtl_ready() then return
+
+    val got = wtl_build("aarch64-freestanding", wtl_owned(), wtl_lays())
+
+    assert_eq(got.0, 0, got.1)
+
+// cstd's own shape: its `errno` is per-thread where the build has thread-local storage, in the same
+// build as the crt0 that lays the block.
+@test("wtl: a '#if thread_local' errno in the C library and tls_place in one build")
+wtl_errno_and_tls_place()
+    if !wtl_ready() then return
+
+    val deps = absolute_path(make_temp_dir("sysl-wtl-deps").unwrap())
+
+    wtl_libc(deps, "#if thread_local\n@thread_local\n#endif\nvar errno: i32 = 0\n\n" +
+                   "@export(\"__errno_location\")\nerrno_location() -> *i32 = &errno\n")
+
+    val got = wtl_build("aarch64-freestanding", wtl_owned() + wtl_with(deps),
+                        "import cs.errno_location\n\n" + wtl_lays() +
+                        "\n@export(\"probe_errno\")\nprobe_errno() -> i32 = *errno_location()\n")
+
+    remove_dir_all(deps).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+end wtl_errno_and_tls_place
+
+// -- the error path ---------------------------------------------------------------------------------
+
+@test("wtl: a module withheld for its probe says so, naming the requirement and the machine")
+wtl_a_withheld_module_says_why()
+    if !wtl_ready() then return
+
+    val deps = absolute_path(make_temp_dir("sysl-wtl-deps").unwrap())
+
+    make_dir_all(s"$deps/rx/rx").unwrap()
+    write_text(s"$deps/rx/package.hocon", "package { name = \"rx\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$deps/rx/rx/rx.sysl",
+               "module rx\n@requires(posix)\n@include(\"regex.h\")\n\nc const\n" +
+               "    REGEX_SIZE: usize = \"sizeof(regex_t)\"\n\nsize() -> usize = REGEX_SIZE\n").unwrap()
+
+    val got = wtl_build("aarch64-freestanding", s"dependencies {\n  rx { path = \"$deps/rx\" }\n}\n",
+                        "import rx.size\n\n@export(\"probe_size\")\nprobe_size() -> usize = size()\n")
+
+    remove_dir_all(deps).unwrap_or(())
+    assert_eq(got.0, 1, got.1)
+    assert(got.1.contains("'rx.rx' is withheld on 'aarch64-freestanding': it asks the C compiler about " +
+                          "headers and requires 'posix', which 'aarch64-freestanding' does not " +
+                          "provide, so it declares nothing here — there is no 'rx.rx.size' on this machine"),
+           got.1)
+    assert(!got.1.contains("declares no 'size'"), got.1)
+    assert(!got.1.contains("regex.h"), got.1)
+end wtl_a_withheld_module_says_why
+
+// The other half: a name a module really does not declare is still that, probe or no probe.
+@test("wtl: a name a measured module does not declare is still refused as undeclared")
+wtl_an_undeclared_name_is_still_undeclared()
+    if !wtl_ready() then return
+
+    val deps = absolute_path(make_temp_dir("sysl-wtl-deps").unwrap())
+
+    wtl_libc(deps, "")
+
+    val got = wtl_build("aarch64-freestanding", wtl_with(deps),
+                        "import cs.nothing\n\n@export(\"probe_n\")\nprobe_n() -> i32 = nothing()\n")
+
+    remove_dir_all(deps).unwrap_or(())
+    assert_eq(got.0, 1, got.1)
+    assert(got.1.contains("'cs.cs' declares no 'nothing' — there is no 'cs.cs.nothing'"), got.1)
+    assert(!got.1.contains("withheld"), got.1)
+end wtl_an_undeclared_name_is_still_undeclared

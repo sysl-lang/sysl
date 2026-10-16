@@ -2949,6 +2949,19 @@ answered with an undefined name:
 this reaches 'sysl.posix.regex', which requires 'posix', and this module declared 'no posix'
 ```
 
+An `import` of one of its names says the module is withheld, and why, rather than that it declares
+no such name:
+
+```
+'sysl.posix.regex' is withheld on 'thumbv7em-freestanding': it asks the C compiler about headers and
+requires 'posix', which 'thumbv7em-freestanding' does not provide, so it declares nothing here
+```
+
+**Only the file carrying the block is skipped.** Every other file is read exactly as it is in a
+compilation with no probe anywhere, whatever it requires: `sysl.threads` is `@requires(os)` and still
+answers `tls_place` on a bare AArch64 machine, beside a C library package whose own `c type` was
+measured in the same build.
+
 **What is asked is whether the machine can have the capability, not whether the project provides
 it.** [`package.hocon`](/reference/packages/#capabilities) treats a capability it does not mention as
 provided, so a freestanding target nominally offers `posix` — a gate reading that would gate nothing
