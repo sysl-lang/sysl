@@ -339,15 +339,21 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         fill_elements(e, elem, made.1, n, v)
         buffer_view(e, slice_ty, made.0, made.1, n)
 
-    // **A view of some of what a place holds.** A whole temporary array whose view *escapes* is the
+    // **A view of some of what a place holds.** A temporary array whose view *outlives it* is the
     // one case that is not a narrowing: the value the frame just computed is written into a buffer
     // instead of into the slot it would otherwise have had, and the view counts against that buffer.
     // The two literal forms are the same case done better -- built straight into the buffer rather
     // than produced and copied -- and everything else has no such form, so the value is made and
     // moved.
     TSlice(base, lo, hi, inclusive, slice_ty) ->
-        if lo.is_none() && hi.is_none() && is_promoted_temp(e, x.span)
-            return gen_promoted_slice(e, base, slice_ty)
+        if is_promoted_temp(e, x.span)
+            val whole = gen_promoted_slice(e, base, slice_ty)
+
+            if lo.is_none() && hi.is_none() then return whole
+
+            // Part of a promoted temporary: the whole of it moved, and the part is narrowed over
+            // the buffer it moved into.
+            return gen_slice_of_view(e, whole, lo, hi, inclusive, slice_ty, x.span)
 
         gen_slice(e, base, lo, hi, inclusive, slice_ty, x.span)
 

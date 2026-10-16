@@ -2072,8 +2072,8 @@ one frame slot, so refusing the shorter one bought nothing.
 Two roots have nowhere to be promoted to, and are diagnostics rather than promotions — an array a
 caller passed **by value**, which is the caller's layout, and an array that is a **field** of a
 **named** struct on the frame, where moving the field alone or the struct with it is the choice this
-reference leaves unspecified. A **part** of a temporary is a third: it is a different node from its
-own storage, so there is nothing whole to move.
+reference leaves unspecified. A **part** of a temporary is not one of them: the whole temporary
+moves, and the view is narrowed over the buffer it moved into.
 
 ```sysl
 first_two(a: [4]int) -> []int = a[0..<2]
@@ -2126,6 +2126,111 @@ anywhere: the refusal names the machine, `'thumbv7em-freestanding' provides no a
 than leaving the link to say `undefined symbol: malloc`. That is how
 every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
 closures, and `&T` creation are all compile errors there — so it introduces no new rule.
+
+### A view that outlives its scope is promoted too
+
+Leaving the frame is the widest way for a view to outlive its storage, and not the only one. The
+rule is the same at every width: **storage whose view outlives the storage's scope is promoted**.
+
+A **temporary**'s scope is its statement. What it holds is let go of at the end of it, and the slot
+it sat in is reused, by the next statement or by the same one on the next round of a loop. A view of
+it **kept in a local** is read on later lines, so the temporary moves to the heap and the local reads
+what was written:
+
+```sysl
+id(xs: []string) -> []string = xs
+
+val s = id([str(7) + "y"][..])
+
+print(s[0])
+
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```output
+7y
+0
+```
+
+A **named array**'s scope is the block that declares it. One declared in a loop's body or an `if`'s
+branch is gone when that block closes, so a view of it kept in a local of an enclosing block moves it
+the same way. A part of either is the same case: the whole array moves, and the view names its part
+of the buffer.
+
+```sysl
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        var row = [i * 10, i]
+
+        if i == 0 then keep = row[..]
+
+    keep[0]
+
+tail() -> []string
+    var keep: []string = []
+
+    if true
+        keep = [str(1), str(2) + "b", "c"][1..<2]
+
+    keep
+
+print(first(), tail()[0])
+```
+
+```output
+0 2b
+```
+
+Nothing moves where nothing outlives anything: a view used within its own statement, and a view of
+a named array kept while that array is still in scope, stay where they are.
+
+```sysl
+id(xs: []string) -> []string = xs
+
+print(id([str(7) + "y"][..])[0])
+
+val a = [str(7) + "y"]
+val s = a[..]
+
+print(s[0])
+```
+
+```output
+7y
+7y
+```
+
+Without an allocator, each of these promotions is a compile error at the view, as an escape from the
+frame is. A machine whose manifest says `heap = false` is told that it provides no allocator, and a
+module that declared `@no_alloc` is told that it did:
+
+```sysl
+@no_alloc
+
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```error
+this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
+```
 
 ### Promotion is silent, not hidden
 

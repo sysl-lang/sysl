@@ -741,8 +741,32 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
           slice_ty: Type, site: Span) -> Val
+    gen_slice_of(e, slice_base(e, base), lo, hi, inclusive, slice_ty, site)
+end gen_slice
+
+// A slice of a view already made: what keeps its elements alive, where the first is, and how many.
+// A temporary promoted for a part of it is this -- the whole array moved into a buffer, and the
+// part narrowed over that buffer.
+gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
+                  slice_ty: Type, site: Span) -> Val
+    val wty = lty(e, slice_ty)
+    val o = fresh_reg(e)
+
+    emit(e, InExtract(o, wty, whole, index_list(0)))
+
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, wty, whole, index_list(1)))
+
+    val l = fresh_reg(e)
+
+    emit(e, InExtract(l, wty, whole, index_list(2)))
+    gen_slice_of(e, (o, p, Some(l)), lo, hi, inclusive, slice_ty, site)
+end gen_slice_of_view
+
+private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr], hi: Option[TExpr],
+                     inclusive: bool, slice_ty: Type, site: Span) -> Val
     val elem = element(slice_ty).unwrap_or(byte_type())
-    val parts = slice_base(e, base)
     val owner = parts.0
     val first = parts.1
     val len = parts.2
@@ -857,7 +881,7 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
 
     emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
     own_temp(e, whole, slice_ty)
-end gen_slice
+end gen_slice_of
 
 // What a slice's base gives up: what keeps the elements alive, where the first of them is, and how
 // many there are -- which a `*T` region does not know.

@@ -1,0 +1,374 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A view that outlives its storage's SCOPE without leaving the frame (`reference/memory.md § A view
+// that outlives its scope is promoted too`). A temporary's scope is its statement -- what it holds is
+// let go of at the end, and its slot is reused by the next round of a loop -- and a named array's is
+// the block that declares it. A view of either kept in a local that outlives it promotes the storage,
+// exactly as a view leaving the frame does, so the program reads what was written; a module or a
+// machine with no allocator is refused at the view instead. A view used within its own statement and
+// a view of a named array still in scope move nothing.
+
+// What a program does: what it printed and the status it exited with. A failure to build is its
+// message and `-1`, which no program exits with.
+private tvk_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-tvk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end tvk_outcome
+
+private tvk_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = tvk_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end tvk_prints
+
+private tvk_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = tvk_outcome(text)
+
+    assert_eq(out.1, -1)
+    assert(out.0.contains(part), out.0)
+end tvk_refused
+
+// A board whose manifest took the heap away, built for a Cortex-M4: what the compiler said, and
+// whether it built.
+private tvk_heapless(program: string) -> (int, string)
+    val root = lbr_tree(lbr_two("package.hocon",
+                                "package {\n  name = \"tvk-board\"\n  version = \"0.1.0\"\n}\n\n" +
+                                "capabilities { heap = false }\n",
+                                "main.sysl", program))
+    val got = lbr_cli(["sysl", "build-c", root, "--target", "thumbv7em-freestanding", "-o",
+                       s"$root/out.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end tvk_heapless
+
+private tvk_kept_tail() -> string =
+    "so there is nothing to move it into. Keep the view inside its statement"
+
+// -- a temporary kept past its statement is promoted ----------------------------------------------
+
+// The element is a counted string the statement let go of, so the view read an empty string.
+@test("a view of a literal kept through a call's answer reads what was written")
+tvk_kept_through_a_call_is_promoted() =
+    tvk_prints(raw"""
+        id(xs: []string) -> []string = xs
+
+        val s = id([str(7) + "y"][..])
+
+        print(s[0])
+        """, "7y\n")
+
+// Every round is the same statement again, so the slot the first round's view names held the last
+// round's value: the program printed 20.
+@test("a view kept from one round of a loop to after it reads the round that made it")
+tvk_kept_across_a_loop_is_promoted() =
+    tvk_prints(raw"""
+        first() -> int
+            var keep: []int = []
+
+            for i in 0..<3
+                if i == 0 then keep = [i * 10][..]
+
+            keep[0]
+
+        print(first())
+        """, "0\n")
+
+@test("a view bound in a loop's body and kept after it is the same case")
+tvk_bound_in_a_loop_is_promoted() =
+    tvk_prints(raw"""
+        first() -> int
+            var keep: []int = []
+
+            for i in 0..<3
+                val v = [i * 10][..]
+
+                if i == 0 then keep = v
+
+            keep[0]
+
+        print(first())
+        """, "0\n")
+
+@test("a view that is the value of an 'if' is kept by the local it is bound to")
+tvk_an_if_value_is_promoted() =
+    tvk_prints(raw"""
+        pick(c: bool) -> []string
+            val v = if c then [str(1) + "a"][..] else [str(2), "b"][..]
+
+            v
+
+        print(pick(true)[0], pick(false)[1])
+        """, "1a b\n")
+
+@test("a call's answer is the same temporary")
+tvk_a_call_result_kept_is_promoted() =
+    tvk_prints(raw"""
+        pair(n: int) -> [2]string = [s"a${n}", s"b${n}"]
+
+        first() -> []string
+            var keep: []string = []
+
+            for i in 0..<3
+                if i == 1 then keep = pair(i)[..]
+
+            keep
+
+        val k = first()
+
+        print(k[0], k[1])
+        """, "a1 b1\n")
+
+@test("a view kept in a local that is then returned is promoted, as it always was")
+tvk_kept_then_returned_is_promoted() =
+    tvk_prints(raw"""
+        make() -> []int
+            val v = [1, 2, 3][..]
+
+            v
+
+        print(make()[2])
+        """, "3\n")
+
+@test("part of a temporary kept past its statement moves the whole and views the part")
+tvk_a_partial_slice_is_promoted() =
+    tvk_prints(raw"""
+        tail() -> []string
+            var keep: []string = []
+
+            for i in 0..<3
+                if i == 0 then keep = [str(i + 1), str(i + 2) + "b", "z"][1..<2]
+
+            keep
+
+        val t = tail()
+
+        print(t.len, t[0])
+        """, "1 2b\n")
+
+// -- a named array kept past its own scope is promoted --------------------------------------------
+
+@test("a named array declared in a loop's body, viewed from after the loop, keeps its first round")
+tvk_a_named_array_in_a_loop_is_promoted() =
+    tvk_prints(raw"""
+        first() -> int
+            var keep: []int = []
+
+            for i in 0..<3
+                var row = [i * 10, i]
+
+                if i == 0 then keep = row[..]
+
+            keep[0] + keep[1]
+
+        print(first())
+        """, "0\n")
+
+@test("a named array declared in a nested block, viewed from outside it")
+tvk_a_named_array_in_a_nested_block_is_promoted() =
+    tvk_prints(raw"""
+        pick(c: bool) -> int
+            var keep: []string = []
+
+            if c
+                var a = [str(5) + "x", "y"]
+
+                keep = a[..]
+
+            var junk = [str(9), str(9)]
+
+            junk[0] = "q"
+            int(keep.len) * 100 + int(keep[0].len)
+
+        print(pick(true))
+        """, "202\n")
+
+@test("a named array declared in an 'if' branch and handed out as the branch's value")
+tvk_a_named_array_as_a_block_value_is_promoted() =
+    tvk_prints(raw"""
+        pick(c: bool) -> int
+            val v = if c
+                var a = [3, 4]
+
+                a[..]
+            else
+                var b = [5, 6]
+
+                b[..]
+
+            v[1]
+
+        print(pick(true), pick(false))
+        """, "4 6\n")
+
+// -- what moves nothing --------------------------------------------------------------------------
+
+@test("a view used within its own statement still reads what was written")
+tvk_used_in_its_statement_works() =
+    tvk_prints(raw"""
+        id(xs: []string) -> []string = xs
+
+        count(xs: []const int) -> usize = xs.len
+
+        print(id([str(7) + "y"][..])[0], count([1, 2, 3][..]))
+
+        for i in 0..<3
+            print(id([str(i * 10)][..])[0])
+        """, "7y 3\n0\n10\n20\n")
+
+@test("a view of a named array kept while it is in scope reads what was written")
+tvk_a_named_array_in_scope_is_untouched() =
+    tvk_prints(raw"""
+        val a = [1, 2, 3]
+        val v = a[..]
+
+        var b = [str(4) + "x"]
+        val w = b[..]
+
+        print(v[2], w[0])
+        """, "3 4x\n")
+
+// A module with no allocator compiles only what moves nothing, so a clean build is the proof that
+// neither of these was promoted.
+@test("and neither of those needs an allocator")
+tvk_what_stays_needs_no_allocator() =
+    tvk_prints(raw"""
+        @no_alloc
+
+        count(xs: []const int) -> usize = xs.len
+
+        total(n: int) -> int
+            var s = 0
+
+            for i in 0..<n
+                val row = [i, i + 1]
+                val v = row[..]
+
+                s += v[1] + int(count([i, n][..]))
+
+            s
+
+        print(total(3))
+        """, "12\n")
+
+// -- with nothing to move it into --------------------------------------------------------------------
+
+@test("a module that gave the allocator up is refused at the view, naming the local")
+tvk_no_alloc_refuses_a_kept_temporary() =
+    tvk_refused(raw"""
+        @no_alloc
+
+        first() -> int
+            var keep: []int = []
+
+            for i in 0..<3
+                if i == 0 then keep = [i * 10][..]
+
+            keep[0]
+
+        print(first())
+        """, "this view of an array literal is kept in 'keep', which outlives it, so the array would " +
+        "move to the heap to outlive its statement — and this module declared '@no_alloc', " +
+        tvk_kept_tail())
+
+@test("and so is a named array kept past its scope, naming the array")
+tvk_no_alloc_refuses_a_named_array() =
+    tvk_refused(raw"""
+        @no_alloc
+
+        first() -> int
+            var keep: []int = []
+
+            for i in 0..<3
+                var row = [i * 10]
+
+                if i == 0 then keep = row[..]
+
+            keep[0]
+
+        print(first())
+        """, "this view of 'row' is kept in 'keep', which outlives it, so the array would move to the " +
+        "heap to outlive its scope — and this module declared '@no_alloc'")
+
+@test("a machine the manifest took the heap from is refused the same, and named")
+tvk_a_heapless_machine_refuses_a_kept_temporary()
+    if !lbr_ready() then return
+
+    val got = tvk_heapless(raw"""
+        total(n: int) -> int
+            var keep: []int = []
+
+            for i in 0..<n
+                if i == 0 then keep = [i * 10, n][..]
+
+            keep[1]
+
+        var out: int = 0
+
+        @export("main")
+        main()
+            out = total(3)
+        """)
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("this view of an array literal is kept in 'keep', which outlives it, so the " +
+                          "array would move to the heap to outlive its statement — and " +
+                          s"'thumbv7em-freestanding' provides no allocator, ${tvk_kept_tail()}"), got.1)
+    assert(got.1.contains("main.sysl:5:42"), got.1)
+end tvk_a_heapless_machine_refuses_a_kept_temporary
+
+@test("while what moves nothing builds on that machine")
+tvk_a_heapless_machine_builds_what_stays()
+    if !lbr_ready() then return
+
+    val got = tvk_heapless(raw"""
+        count(xs: []const int) -> int = int(xs.len)
+
+        sum(n: int) -> int
+            var s = 0
+
+            for x in [n, n + 1][..]
+                s += x
+
+            val t = [n, 4]
+            val v = t[..]
+
+            s + v[1] + count([n, 2][..])
+
+        var out: int = 0
+
+        @export("main")
+        main()
+            out = sum(2)
+        """)
+
+    assert(got.0 == 0, got.1)
+end tvk_a_heapless_machine_builds_what_stays
