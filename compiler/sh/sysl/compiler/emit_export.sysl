@@ -115,13 +115,19 @@ end gen_export_thunk
 // **A package says the same thing with `@export("write", weak)`**: a C library's OS stubs (`open`,
 // `sbrk`, ... answering -1, newlib's model) are defaults a board replaces one at a time with a strong
 // definition -- in sysl or in its own C -- and the link keeps the strong one with no duplicate.
-export_linkage(f: TFunc) -> IrLinkage
-    if f.marks.weak_export then return LinkWeak
+export_linkage(f: TFunc) -> IrLinkage = if exported_weak(f) then LinkWeak else LinkDefault
+
+// Whether an export is a default a strong definition replaces: one written `weak`, or any of the
+// standard library's. The duplicate-export check and the one-compilation override (`codegen.sysl`'s
+// `overridden_weak`) ask this same question, so a package exporting `fma` strongly beside
+// `sysl.softfloat`'s is the one definition the link keeps rather than a second claimant.
+exported_weak(f: TFunc) -> bool
+    if f.marks.weak_export then return true
 
     f.src match
-        Some(s) -> if s.name.starts_with(s"$StdPrefix/") then LinkWeak else LinkDefault
-        None -> LinkDefault
-end export_linkage
+        Some(s) -> s.name.starts_with(s"$StdPrefix/")
+        None -> false
+end exported_weak
 
 // The LLVM name of each incoming parameter, grouped by the sysl parameter it belongs to -- one name
 // for most, several where the convention hands an aggregate over in more than one register.

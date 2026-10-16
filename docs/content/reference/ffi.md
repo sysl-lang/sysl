@@ -265,7 +265,8 @@ print(minnum(1.0, nan), maximum(1.0, nan), minimum(0.0, -0.0))
 freestanding machine has no C library to answer it — an Armv6-M at both widths, a Cortex-M4's
 single-precision unit at `f64`. So `sysl.softfloat` exports both on every Arm and 32-bit RISC-V
 target, correctly rounded and weak, as it does the binary64 arithmetic: a program that computes with
-`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins. Whether
+`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins — a
+package exporting its own `fma` included, which is the one definition the link keeps. Whether
 the width *is* an instruction is the `#if` symbols `fma` and `fma_dp` (C's `FP_FAST_FMAF` and
 `FP_FAST_FMA`; [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)).
 

@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.testing.skip
+
+// **A package's strong `fma` beside `sysl.softfloat`'s.**
+//
+// On every Thumb and 32-bit RISC-V target the standard library exports C's `fma` and `fmaf`, so a
+// program computing with `llvm.fma` links on a machine with no C library. Those exports are defaults
+// (`exported_weak` in `emit_export.sysl`): a C library package exporting its own `fma` is the one
+// definition the link keeps, not a second claimant of the symbol. Two strong exports of one symbol are
+// still refused.
+
+private val sfw_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// A C library's `fma`, exported strongly -- what `cstd` carries.
+private val sfw_lib_text: string = raw"""
+    module fmadup
+
+    @export("fma")
+    my_fma(a: f64, b: f64, c: f64) -> f64 = a * b + c
+
+    extern "fma" c_fma(a: f64, b: f64, c: f64) -> f64
+
+    fused(a: f64, b: f64, c: f64) -> f64 = c_fma(a, b, c)
+    """
+
+private sfw_lib() -> string = lbr_tree(lbr_one("fmadup/fmadup.sysl", sfw_lib_text))
+
+// What `sysl build-lib <root> --target <target>` answers.
+private sfw_build_lib(root: string, target: string) -> (int, string) =
+    lbr_cli(["sysl", "build-lib", root, "--target", target])
+
+@test("a package's strong fma builds beside the standard library's on thumbv7em")
+sfw_thumbv7em()
+    if !lbr_ready() then return
+
+    val root = sfw_lib()
+    val got = sfw_build_lib(root, "thumbv7em-freestanding")
+
+    lbr_drop([root])
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, s"checked $root")
+end sfw_thumbv7em
+
+@test("a package's strong fma builds beside the standard library's on thumbv6m")
+sfw_thumbv6m()
+    if !lbr_ready() then return
+
+    val root = sfw_lib()
+    val got = sfw_build_lib(root, "thumbv6m-freestanding")
+
+    lbr_drop([root])
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, s"checked $root")
+end sfw_thumbv6m
+
+@test("a package's strong fma builds beside the standard library's on riscv32")
+sfw_riscv32()
+    if !lbr_ready() then return
+
+    val root = sfw_lib()
+    val got = sfw_build_lib(root, "riscv32-freestanding")
+
+    lbr_drop([root])
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, s"checked $root")
+end sfw_riscv32
+
+@test("and on aarch64, where the standard library exports no fma, nothing changes")
+sfw_aarch64()
+    if !lbr_ready() then return
+
+    val root = sfw_lib()
+    val got = sfw_build_lib(root, "aarch64-freestanding")
+
+    lbr_drop([root])
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1, s"checked $root")
+end sfw_aarch64
+
+@test("a package's strong fma and a second strong one are still refused, naming both")
+sfw_two_strong()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_two(
+        "fmadup/fmadup.sysl", sfw_lib_text,
+        "other/other.sysl", "module other\n\n@export(\"fma\")\nmine(a: f64, b: f64, c: f64) -> f64 = c\n"))
+    val got = sfw_build_lib(root, "thumbv7em-freestanding")
+
+    lbr_drop([root])
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'fma' is exported by 'fmadup.my_fma' and 'other.mine' — one symbol is one " +
+                          "definition"), got.1)
+    assert(!got.1.contains("sysl.softfloat"), got.1)
+end sfw_two_strong
+
+// The symbols of the archive a program calling the package's `fused` builds into for `target`.
+private sfw_archive_symbols(target: string) -> string
+    val lib = sfw_lib()
+    val main = lbr_program("@export(\"main\")\nstart() -> i32 = i32(fmadup.fused(2.0, 3.0, 1.0))\n")
+    val dir = parent_of(main).unwrap_or(main)
+    val out = s"$dir/out.a"
+    val built = lbr_cli(["sysl", "build-c", dir, "--lib", lib, "-o", out, "--target", target])
+
+    if built.0 != 0
+        lbr_drop([main, lib])
+        return s"refused: ${built.1}"
+    end if
+
+    val said = capture(sfw_nm, [out], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    lbr_drop([main, lib])
+    said
+end sfw_archive_symbols
+
+// How many lines of an `llvm-nm` listing define `symbol` with this kind letter.
+private sfw_count(said: string, kind: string) -> int
+    var n = 0
+
+    for line in lines_of(said)
+        if line.ends_with(s" $kind") then n += 1
+
+    n
+end sfw_count
+
+@test("on thumbv6m the archive defines fma once, strongly: the package's")
+sfw_thumb_nm()
+    if !lbr_ready() then return
+    if !is_file(sfw_nm) then skip(s"there is no llvm-nm at $sfw_nm to read the archive")
+
+    val said = sfw_archive_symbols("thumbv6m-freestanding")
+
+    // The standard library's soft float is in this archive -- its exports beside the package's.
+    assert_eq(sfw_count(said, "W __aeabi_dmul"), 1, said)
+    assert_eq(sfw_count(said, "T fma"), 1, said)
+    assert_eq(sfw_count(said, "W fma"), 0, said)
+end sfw_thumb_nm
+
+@test("on aarch64 the archive defines the package's fma strongly, as before")
+sfw_aarch64_nm()
+    if !lbr_ready() then return
+    if !is_file(sfw_nm) then skip(s"there is no llvm-nm at $sfw_nm to read the archive")
+
+    val said = sfw_archive_symbols("aarch64-freestanding")
+
+    assert_eq(sfw_count(said, "T fma"), 1, said)
+    assert_eq(sfw_count(said, "W fma"), 0, said)
+end sfw_aarch64_nm
