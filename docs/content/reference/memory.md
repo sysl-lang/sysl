@@ -2082,7 +2082,7 @@ print(first_two([1, 2, 3, 4]).len)
 ```
 
 ```error
-a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value, an array a caller passed by value, or part of an array literal, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value or an array a caller passed by value, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
 ```
 
 **Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it
