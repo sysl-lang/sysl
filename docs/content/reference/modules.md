@@ -194,6 +194,29 @@ in `n` is what `LIMIT` means in that file, beside a sibling's `private const LIM
 Where nothing else answers at all, the restriction is then reported, because at that point it is the
 whole story and a better one than an undefined name.
 
+**A bare name in a pattern binds unless it means something the file can see**, so a sibling file's
+private `val`, `var` or `const` leaves the name free to bind:
+
+```sysl
+// m/one.sysl
+module m
+pick(o: Option[u32]) -> u32 = o match
+    Some(a) -> a
+    None -> 0
+```
+
+```sysl
+// m/two.sysl
+module m
+private val a: u32 = 3
+```
+
+`m.pick(Some(7u32))` is `7`: the `a` in `one.sysl` is a new binding, and `two.sysl`'s `a` plays no
+part. Make the `val` public, `private[m]`, or declare it in `one.sysl` itself, and the file can see
+it — the pattern is then [refused](/reference/patterns/#a-backticked-name-references-rather-than-binds)
+as a bare name that would bind rather than match. A qualified `m.a` cannot bind, so there the reader
+is told the `val` is private.
+
 **A wildcard offers only what is visible; a selector is refused where it is not.** A wildcard has
 claimed nothing, so a name it cannot see is simply not among what it brings in, and cannot make
 another module's name ambiguous either. Naming something deliberately is the opposite case, and being

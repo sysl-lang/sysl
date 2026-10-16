@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+@tests
+
+// A bare name in a pattern binds unless it already means a value the file can see. A sibling
+// file's file-private declaration is not one -- a bare `private` scopes the name to its file
+// (`reference/modules.md § A file-private name is scoped to its file`) -- so in every other file
+// of the module the pattern binds it. What the file CAN see -- its own private one, a module-wide
+// `private[m]` one, a sibling's public one -- is still refused as a bare name, and the refusal says
+// whether it is a `val` or a `var`.
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private fpv_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+// One file of module `m` whose match binds `a` at 4:10, a sibling declaring `two`, and an entry.
+private fpv_with(two: string) -> string =
+    xvr_ran([("m/one.sysl", "module m\n\npick(o: Option[u32]) -> u32 = o match\n    Some(a) -> a\n    None -> 0\n"),
+             ("m/two.sysl", s"module m\n\n$two\n"),
+             ("main.sysl", "print(m.pick(Some(7u32)))\nprint(m.pick(None))\n")])
+
+private fpv_says(kind: string) -> string =
+    s"'a' is a '$kind', which is read while the program runs, so a bare name here would bind " +
+    "rather than match — write it as '`a`' to test the value it holds, or bind a different name"
+
+@test("a sibling file's private val does not stop a pattern binding its name")
+fpv_sibling_private_val_binds()
+    if xvr_no_library() then return
+
+    assert_eq(fpv_with("private val a: u32 = 3"), "7\n0\n")
+
+@test("nor does a sibling file's private var")
+fpv_sibling_private_var_binds()
+    if xvr_no_library() then return
+
+    assert_eq(fpv_with("private var a: u32 = 3"), "7\n0\n")
+
+@test("nor a sibling file's private const")
+fpv_sibling_private_const_binds()
+    if xvr_no_library() then return
+
+    assert_eq(fpv_with("private const a: u32 = 3"), "7\n0\n")
+
+@test("a private val of the pattern's own file is still refused")
+fpv_same_file_private_val_refused()
+    if xvr_no_library() then return
+
+    val one = "module m\n\nprivate val a: u32 = 3\npick(o: Option[u32]) -> u32 = o match\n    Some(a) -> a\n" +
+              "    None -> a\n"
+
+    fpv_refused(xvr_ran([("m/one.sysl", one), ("main.sysl", "print(m.pick(None))\n")]),
+                fpv_says("val"), "m/one.sysl:5:10")
+
+@test("a module-wide private[m] val in a sibling file is visible, so it is still refused")
+fpv_module_private_val_refused()
+    if xvr_no_library() then return
+
+    fpv_refused(fpv_with("private[m] val a: u32 = 3"), fpv_says("val"), "m/one.sysl:4:10")
+
+@test("a public val in a sibling file is still refused")
+fpv_public_val_refused()
+    if xvr_no_library() then return
+
+    fpv_refused(fpv_with("val a: u32 = 3"), fpv_says("val"), "m/one.sysl:4:10")
+
+@test("a module var is called a 'var' in the refusal, not a 'val'")
+fpv_var_wording()
+    if xvr_no_library() then return
+
+    fpv_refused(fpv_with("var a: u32 = 3"), fpv_says("var"), "m/one.sysl:4:10")
+
+@test("and so is a private var of the pattern's own file")
+fpv_same_file_private_var_wording()
+    if xvr_no_library() then return
+
+    val one = "module m\n\nprivate var a: u32 = 3\npick(o: Option[u32]) -> u32 = o match\n    Some(a) -> a\n" +
+              "    None -> a\n"
+
+    fpv_refused(xvr_ran([("m/one.sysl", one), ("main.sysl", "print(m.pick(None))\n")]),
+                fpv_says("var"), "m/one.sysl:5:10")
+
+@test("a qualified name reaching a sibling file's private val is told it is private")
+fpv_qualified_private_refused()
+    if xvr_no_library() then return
+
+    val one = "module m\n\npick(o: u32) -> u32 = o match\n    m.a -> 1\n    _ -> 0\n"
+
+    val said = xvr_ran([("m/one.sysl", one), ("m/two.sysl", "module m\n\nprivate val a: u32 = 3\n"),
+                        ("main.sysl", "print(m.pick(3u32))\n")])
+
+    // The file is named by the absolute path it was read from, which here is a temporary directory.
+    assert(said.contains("error: 'm.a' is private to '"), said)
+    assert(said.contains("/m/two.sysl', the file that declares it\n --> "), said)
+    assert(said.contains("/m/one.sysl:4:5\n"), said)
+    assert(!said.contains("cannot bind"), said)
+
+@test("a for binding of a sibling file's private name is unchanged")
+fpv_for_binding_unchanged()
+    if xvr_no_library() then return
+
+    val one = "module m\n\nsum() -> u32\n    var t = 0u32\n    for a in [1u32, 2u32]\n        t += a\n    t\n"
+
+    assert_eq(xvr_ran([("m/one.sysl", one), ("m/two.sysl", "module m\n\nprivate val a: u32 = 3\n"),
+                       ("main.sysl", "print(m.sum())\n")]),
+              "3\n")
