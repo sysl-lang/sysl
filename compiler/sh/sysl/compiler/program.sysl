@@ -635,6 +635,10 @@ end intrinsics_supported
 // The name to emit, or why the declaration cannot be honoured. The checks are the ones the LLVM
 // verifier would otherwise find.
 private resolve_intrinsic(base: string, params: Buf[Type], ret: Type) -> Result[string, string]
+    // The one that is not a float operation: it takes nothing, answers nothing and has no overload
+    // suffix, so it is checked on its own.
+    if base == llvm_trap_entry().base then return resolve_trap(params, ret)
+
     val arity = intrinsic_arity(base) match
         Some(n) -> n
         None -> return Err(s"'$base' is not an intrinsic sysl supports — it has " +
@@ -680,6 +684,18 @@ private resolve_intrinsic(base: string, params: Buf[Type], ret: Type) -> Result[
 
     Ok(if brain then s"$base.bf16" else s"$base.f$bits")
 end resolve_intrinsic
+
+// `llvm.trap` stops the program at once and never returns, so a declaration of it states no
+// arguments and answers `never`.
+private resolve_trap(params: Buf[Type], ret: Type) -> Result[string, string]
+    if params.len() != 0
+        return Err(s"'llvm.trap' takes 0 arguments, but ${params.len()} were declared")
+
+    ret match
+        Never -> Ok("llvm.trap")
+        _ -> Err(s"'llvm.trap' never returns, so a declaration of it answers 'never' — this one " +
+                 s"answers '${type_show(ret)}'")
+end resolve_trap
 
 // The distinct types a declaration named, as the refusal lists them.
 private intrinsic_states(params: Buf[Type], ret: Type) -> string

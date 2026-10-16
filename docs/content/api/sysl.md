@@ -20,7 +20,20 @@ were the middle.
 
 ## Index
 
-[`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`exit`](#exit) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+
+## Constants
+
+### `DebugDepth`
+
+```sysl
+const DebugDepth: int = 32
+```
+
+How deep a supplied rendering may nest before it stops and writes `…` in place of the rest. A
+reference is followed like any field, so a structure that refers back to itself would otherwise
+render for ever; the limit is what makes every value safe to show, and it is deep enough that
+only a cycle or a very long chain reaches it.
 
 ## Values
 
@@ -55,7 +68,7 @@ than the reader's. Forwarding them is how a location travels through a helper.
 ### `assert_eq`
 
 ```sysl
-assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
 ```
 
 `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
@@ -64,7 +77,7 @@ then what was meant to.
 ### `assert_slice_eq`
 
 ```sysl
-assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
 ```
 
 The same for a slice, which needs more than `==` to be useful: a report saying two slices differ
@@ -102,6 +115,49 @@ It is never less than one, since no program runs on zero processors, and a calle
 by it should not have to say so. **It needs an operating system to ask, and says so**: a module
 that has given up `os` is refused at the call. Where there is no POSIX `sysconf` to ask -- a
 freestanding image, WASI -- the answer is that one.
+
+### `debug_address`
+
+```sysl
+debug_address(a: usize, out: *Writer, fmt: FormatSpec)
+```
+
+An address, in lower-case hex with a `0x` and no padding digits -- what a raw pointer shows as,
+the null one as `0x0`. A pointer is shown rather than followed: what it points at may be gone.
+
+### `debug_enter`
+
+```sysl
+debug_enter() -> bool
+```
+
+Entered by every supplied rendering of a value with parts; whether there is room to go one level
+deeper. Each call is paired with a `debug_leave`, whatever it answered.
+
+### `debug_leave`
+
+```sysl
+debug_leave()
+```
+
+### `debug_padded`
+
+```sysl
+debug_padded[T: Debug](x: T, out: *Writer, fmt: FormatSpec)
+```
+
+`x`'s debug rendering in the field `fmt` describes, which is how a supplied `Debug` honours a
+width: the value is shown once into a counting sink with no width to learn how long it comes out,
+then padded once around a second showing. Nothing is gathered.
+
+### `debug_quoted`
+
+```sysl
+debug_quoted(text: []const u8, quote: u8, out: *Writer, fmt: FormatSpec)
+```
+
+`text` between two `quote` bytes, escaped, in the field `fmt` describes. Measured first where a
+width was asked for, so nothing is gathered.
 
 ### `display_bf16`
 
@@ -522,6 +578,16 @@ stderr() -> *Writer
 stdout() -> *Writer
 ```
 
+### `trap`
+
+```sysl
+trap() -> never
+```
+
+Stops the program at once, silently, with the target's trap instruction: `udf` on Thumb, `brk`
+on AArch64, `unimp` on RISC-V, `ud2` on x86-64. It never returns, runs no `defer` and flushes nothing, which is what
+a compiler-inserted check does, and it is legal on every target and under `@no_alloc`.
+
 ## Externs
 
 ### `exit`
@@ -807,6 +873,33 @@ trait BitXor[Rhs = Self, Out = Self]
 | Member | Signature | Description |
 |---|---|---|
 | `bitxor` | `bitxor(self, rhs: Rhs) -> Out` |  |
+
+### `Debug`
+
+```sysl
+trait Debug
+    debug(self, out: *Writer, fmt: FormatSpec)
+```
+
+How a value is shown to the person debugging it: its structure, with nothing hidden.
+
+**Every type has one, and none has to be written.** The compiler supplies a `Debug` for every
+struct and enum that does not write its own -- `Point(x: 1, y: 2)`, `Shape.Circle(r: 3.0)`,
+`Color.Red` -- each field shown through its own `Debug`, so a string inside a structure is quoted
+and escaped where a top-level one prints raw. The blocks below are the library's half: the scalars,
+and every shape the library builds out of parts.
+
+**An `impl Debug` of a program's own replaces the supplied one**, to hide a field or abbreviate a
+large buffer, and a structure holding the type shows it through that block.
+
+`print`, `str` and an interpolation hole reach `Display` where a value has one and this where it
+does not, which is what makes every value printable; `f"${x}%?"` and `debug(x)` always reach this.
+The shape is `Display`'s -- a sink and the field the whole value occupies -- so a debug rendering
+allocates nothing either.
+
+| Member | Signature | Description |
+|---|---|---|
+| `debug` | `debug(self, out: *Writer, fmt: FormatSpec)` |  |
 
 ### `Display`
 
@@ -1330,6 +1423,112 @@ The value `x + zero() == x` holds for.
 
 ## Implementations
 
+### Debug for (..A)
+
+```sysl
+impl[A: Debug] Debug for (..A)
+```
+
+A tuple shows each element through its own `Debug`, so `(1, "a")` keeps its quotes.
+
+### Debug for []T
+
+```sysl
+impl[T: Debug] Debug for []T
+```
+
+A slice shows as its `Display` does, `[1, 2, 3]`, with each element through its own `Debug`.
+
+### Debug for [N]T
+
+```sysl
+impl[const N: usize, T: Debug] Debug for [N]T
+```
+
+### Debug for bf16
+
+```sysl
+impl Debug for bf16
+```
+
+### Debug for bool
+
+```sysl
+impl Debug for bool
+```
+
+### Debug for char
+
+```sysl
+impl Debug for char
+```
+
+A character is shown as its literal too, in single quotes.
+
+### Debug for f128
+
+```sysl
+impl Debug for f128
+```
+
+### Debug for f16
+
+```sysl
+impl Debug for f16
+```
+
+### Debug for f32
+
+```sysl
+impl Debug for f32
+```
+
+### Debug for Option[T]
+
+```sysl
+impl[T: Debug] Debug for Option[T]
+```
+
+An option shows as its `Display` does -- `Some(3)`, `None` -- with the payload through its own
+`Debug`, so `Some("x")` keeps its quotes.
+
+### Debug for real
+
+```sysl
+impl Debug for real
+```
+
+### Debug for Result[T, E]
+
+```sysl
+impl[T: Debug, E: Debug] Debug for Result[T, E]
+```
+
+A result shows as its `Display` does -- `Ok(3)`, `Err("x")` -- with the payload through its own
+`Debug`.
+
+### Debug for string
+
+```sysl
+impl Debug for string
+```
+
+A string is shown as the literal that would write it: quoted, with every quote, backslash and
+control character escaped the way `reference/lexical.md` spells it. The quoting is what tells
+`Name(s: "a, b")` from two fields.
+
+### Debug for T
+
+```sysl
+impl[T: Integer + Display] Debug for T
+```
+
+### Debug for unit
+
+```sysl
+impl Debug for unit
+```
+
 ### Display for (..A)
 
 ```sysl
@@ -1456,6 +1655,12 @@ impl Display for string
 impl[T: Integer] Display for T
 ```
 
+### Display for unit
+
+```sysl
+impl Display for unit
+```
+
 ### Eq for (..A)
 
 ```sysl
@@ -1510,6 +1715,12 @@ Two results are equal when they took the same road and agree at the end of it --
 reading that keeps `==` agreeing with `match`. An `Ok` is never equal to an `Err` however the two
 payloads compare, and they need not even be comparable to each other: the bounds are on the two
 parameters separately, so a `Result[int, IoError]` compares exactly when both halves do.
+
+### Eq for unit
+
+```sysl
+impl Eq for unit
+```
 
 ### Fallible for Counting
 
@@ -1620,6 +1831,12 @@ mixer having become the same `u64`. Past 64 bits the value is mixed in two halve
 truncated, because a 128-bit identifier is the reason to have the width at all and dropping its
 top half would bucket every one of them together.
 
+### Hash for unit
+
+```sysl
+impl Hash for unit
+```
+
 ### Iterate for Range[T]
 
 ```sysl
@@ -1698,6 +1915,12 @@ impl[const N: usize, T: Ord] Ord for [N]T
 
 Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
 one type have one length, so the length test the slice ends on can never decide here.
+
+### Ord for unit
+
+```sysl
+impl Ord for unit
+```
 
 ### Writer for Counting
 
