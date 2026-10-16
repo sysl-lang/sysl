@@ -1,0 +1,144 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_dir, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join}
+
+// **`build-lib` resolves its dependencies through the one resolver `build-c` and `test` use**, so a
+// git dependency it is not handed a directory for is fetched, and one a target's `if` leaves out is
+// not. A repository is made on disk and `github.com/` pointed at it, and the project's `vendor/`
+// stands for the cache, so nothing reaches the network.
+
+private blf_ready() -> bool = std_root().is_ok() && clang_available()
+
+private extern "setenv" blf_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private blf_set(name: string, value: string)
+    val k = cstring(name)
+    val v = cstring(value)
+
+    blf_c_setenv(k.ptr, v.ptr, 1)
+
+private blf_git(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+
+    all.push("-C")
+    all.push(dir)
+    all.push("-c")
+    all.push("user.name=t")
+    all.push("-c")
+    all.push("user.email=t@t")
+
+    for a in args
+        all.push(a)
+
+    val o = capture("git", all.view(), "", [], true).unwrap()
+
+    assert(o.status.ok(), s"git ${args[0]} failed: ${o.err.unwrap_or("")}")
+end blf_git
+
+// A repository at `<base>/e/cstd.git` holding package `cstd` with one commit and the tag `v0.1.0`.
+private blf_repo() -> string
+    val base = absolute_path(make_temp_dir("sysl-blf-git").unwrap())
+    val dir = s"$base/e/cstd.git"
+
+    make_dir_all(s"$dir/cstd").unwrap()
+    blf_git(dir, ["init", "--quiet"])
+    write_text(s"$dir/package.hocon", "package { name = \"cstd\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$dir/cstd/cstd.sysl", "module cstd\n\nanswer() -> int = 42\n").unwrap()
+    blf_git(dir, ["add", "-A"])
+    blf_git(dir, ["commit", "--quiet", "-m", "one"])
+    blf_git(dir, ["tag", "v0.1.0"])
+
+    blf_set("GIT_CONFIG_COUNT", "1")
+    blf_set("GIT_CONFIG_KEY_0", s"url.file://$base/.insteadOf")
+    blf_set("GIT_CONFIG_VALUE_0", "https://github.com/")
+    base
+end blf_repo
+
+// A library `blf` depending on `cstd` as `cond` says, with a `vendor/` for the fetch to land in. Its
+// body calls `cstd` only when `uses` is set, so a build that leaves the dependency out has no import
+// of it to refuse.
+private blf_library(cond: string, uses: bool) -> string
+    val root = absolute_path(make_temp_dir("sysl-blf-lib").unwrap())
+    val body = if uses then "answer() -> int = cstd.answer()" else "answer() -> int = 1"
+
+    make_dir_all(s"$root/vendor").unwrap()
+    make_dir_all(s"$root/blf").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"blf\", version = \"1.0.0\" }\n" +
+               s"dependencies { cstd { git = \"github.com/e/cstd\", version = \"0.1.0\"$cond } }\n").unwrap()
+    write_text(s"$root/blf/blf.sysl", s"module blf\n\n$body\n").unwrap()
+    root
+end blf_library
+
+private blf_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end blf_cli
+
+private blf_fetched(lib: string) -> bool = is_dir(s"$lib/vendor/github.com/e/cstd/@v0.1.0")
+
+@test("blf: build-lib fetches a plain git dependency")
+blf_fetches_a_plain_dependency()
+    if !blf_ready() then return
+
+    val base = blf_repo()
+    val lib = blf_library("", true)
+    val got = blf_cli(["sysl", "build-lib", lib])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $lib")
+    assert(blf_fetched(lib), "the dependency was not fetched into vendor/")
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+
+@test("blf: build-lib fetches a dependency guarded by if = \"!libc\" on a freestanding target")
+blf_fetches_a_guarded_dependency_freestanding()
+    if !blf_ready() then return
+
+    val base = blf_repo()
+    val lib = blf_library(", if = \"!libc\"", true)
+    val got = blf_cli(["sysl", "build-lib", lib, "--target", "thumbv7em-freestanding"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $lib")
+    assert(blf_fetched(lib), "the guarded dependency was not fetched into vendor/")
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+
+@test("blf: the same guarded dependency is not fetched on a host target")
+blf_does_not_fetch_a_guarded_dependency_on_host()
+    if !blf_ready() then return
+
+    val base = blf_repo()
+    val lib = blf_library(", if = \"!libc\"", false)
+    val got = blf_cli(["sysl", "build-lib", lib])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $lib")
+    assert(!blf_fetched(lib), "the guarded dependency was fetched on a host target")
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+
+@test("blf: a dependency that cannot be fetched is reported by build-lib as by any command")
+blf_reports_a_failed_fetch()
+    if !blf_ready() then return
+
+    val base = blf_repo()
+    val lib = blf_library("", true)
+
+    write_text(s"$lib/package.hocon", "package { name = \"blf\", version = \"1.0.0\" }\n" +
+               "dependencies { cstd { git = \"github.com/e/missing\", version = \"0.1.0\" } }\n").unwrap()
+
+    val got = blf_cli(["sysl", "build-lib", lib])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.contains("github.com/e/missing"), got.1)
+    assert(!got.1.contains("fetches nothing"), got.1)
+    remove_dir_all(base).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())

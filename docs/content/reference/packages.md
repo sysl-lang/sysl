@@ -1311,18 +1311,12 @@ selection sees every claim at once and a package two roots share is one copy at 
 root's manifest binds is reachable from your own files as well, which is no more true of a
 dependency's name than it always was of the root's own modules.
 
-`build-lib` resolves them too, but **only over directories**: it compiles the trees it is handed for
-one machine and does not reach the network, so it has nothing to fetch **with**. A `path` dependency
-is read where it is, and a coordinate is reached through a `--lib` root or a path dependency that
-[stands in](#a-source-root-stands-in-for-the-package-it-is) for it. A coordinate nothing stands in for
-is refused where it would have been fetched — even one already in the cache, which is a tree nobody
-handed over — naming the directory that would answer it:
-
-```text
-build-lib compiles the trees it is given and fetches nothing, so github.com/e/geom reaches it through a
-directory — supply a checkout of it as --lib <dir>, or name one with 'path'; either stands in for the
-coordinate when its package.hocon names it 'geom'
-```
+`build-lib` resolves them too, through the same resolver as `build-c` and `test`: a `path` dependency
+is read where it is, a coordinate a `--lib` root or a path dependency
+[stands in](#a-source-root-stands-in-for-the-package-it-is) for is never fetched, and any other
+coordinate is fetched into the cache (or the project's `vendor/`) and checked against `sysl.sum`. A
+dependency an `if` leaves out for the target being checked is not fetched either, so a freestanding
+check of a board package fetches the packages that target takes and no others.
 
 What is still not read is the rest of the manifest. A root's capabilities are the program's to state,
 and they have none of the one-answer-per-program character that makes the allocator settle for

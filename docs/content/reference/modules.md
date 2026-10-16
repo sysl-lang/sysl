@@ -2174,8 +2174,8 @@ macros the root's manifest defines for it and linked with the program's — into
 
 **A root's `dependencies` resolve in the one graph** with the project's, under the same rule: two
 packages offering one module are refused, and so is a root's dependency offering a module the project
-declares. `build-lib` fetches nothing, so it resolves them only over directories: a `path` is read
-where it is, and a coordinate nothing stands in for is refused, naming the flag that would supply it.
+declares. `build-lib` resolves them as every other command does: a `path` is read where it is, a
+coordinate a `--lib` root stands in for is not fetched, and any other is fetched.
 
 A root that *is* one of the project's dependencies — its manifest names the package the coordinate
 does — stands in for that dependency instead;
