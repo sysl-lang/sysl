@@ -130,21 +130,25 @@ private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> T
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
 
-    val ck = lookup_value_key(cx, cx.an.tables.consts, written)
+    val ck = visible_value_key(cx, cx.an.tables.consts, written)
 
     if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
 
     // A `val` is storage read while the program runs, so there is no value here to compare against
     // -- and letting the name bind instead is precisely the trap this order is written to avoid.
-    if lookup_value_key(cx, cx.an.tables.vals, written).is_some() then
-        cx.fault(span, s"'$written' is a 'val', which is read while the program runs, so a bare " +
+    val vk = visible_value_key(cx, cx.an.tables.vals, written)
+
+    if vk.is_some()
+        val kind = if is_writable_key(cx, vk.unwrap()) then "var" else "val"
+
+        cx.fault(span, s"'$written' is a '$kind', which is read while the program runs, so a bare " +
                  s"name here would bind rather than match — write it as '`$name`' to test the " +
                  "value it holds, or bind a different name")
 
         return TWildPattern(ty)
     end if
 
-    if lookup_value_key(cx, cx.an.tables.extern_vars, written).is_some() then
+    if visible_value_key(cx, cx.an.tables.extern_vars, written).is_some() then
         cx.fault(span, s"'$written' is an 'extern' variable, which is read while the program runs, " +
                  s"so a bare name here would bind rather than match — write it as '`$name`' to " +
                  "test the value it holds, or bind a different name")
@@ -152,15 +156,49 @@ private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> T
         return TWildPattern(ty)
     end if
 
+    // A qualified name cannot bind, so one that reaches a declaration the file may not see is told
+    // that it is private rather than that it names nothing.
     if written != name then
-        cx.fault(span, s"'$written' names no variant of ${type_show(ty)} and no constant, and a " +
-                 "qualified name cannot bind — write the name a program can declare")
+        val hidden = hidden_value_key(cx, written)
+
+        if hidden.is_some()
+            cx.fault(span, out_of_reach(cx.an, hidden.unwrap()))
+        else
+            cx.fault(span, s"'$written' names no variant of ${type_show(ty)} and no constant, and a " +
+                     "qualified name cannot bind — write the name a program can declare")
 
         return TWildPattern(ty)
     end if
 
     TBindPattern(bind_once(cx, span, name, ty), ty)
 end ident_pattern
+
+// The module-level value a pattern name already means, in the terms of the file that wrote it.
+//
+// **A sibling file's file-private declaration is not one**: a bare `private` scopes the name to its
+// file (`reference/modules.md § A file-private name is scoped to its file`), so in every other file
+// the name is free and the pattern binds it. A name an import clause already refused is read as
+// reachable, as the expression resolver reads it, so the one mistake is reported once.
+private visible_value_key(cx: &Analyzer, from: &Table[ValueDecl], written: string) -> Option[string]
+    val key = lookup_value_key(cx, from, written)
+
+    if key.is_none() then return None
+    if reachable_key(cx.an, key.unwrap(), cx.scope) || refused_at_import(cx.scope, written, key.unwrap())
+        return key
+
+    None
+end visible_value_key
+
+// The declaration of a constant, `val`, `var` or `extern` variable that a name reaches but the file
+// may not see.
+private hidden_value_key(cx: &Analyzer, written: string) -> Option[string]
+    for from in [cx.an.tables.consts, cx.an.tables.vals, cx.an.tables.extern_vars]
+        val key = lookup_value_key(cx, from, written)
+
+        if key.is_some() && visible_value_key(cx, from, written).is_none() then return key
+
+    None
+end hidden_value_key
 
 // `` `name` `` -- the quoting says a reference was meant, so this never binds.
 //
