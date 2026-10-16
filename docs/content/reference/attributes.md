@@ -1176,6 +1176,32 @@ cannot see, and the message is the whole point of it.** The message is required 
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
 
+### `trap` — the instruction without the message
+
+`trap()` is the other half: it stops the program at once with the target's trap instruction and says
+nothing. It answers `never`, so a function may end in it with no value to return; it needs no
+capability, allocates nothing and is legal under `@no_alloc` and on every freestanding target.
+Reach for it where a message cannot be written — a bare-metal `abort`, a fault handler — and for
+`assert` or `panic` everywhere a reader would want to be told what broke.
+
+```sysl
+@no_alloc
+halt() -> never = trap()
+
+pick(n: int) -> int
+    if n > 0 then return n
+    halt()
+
+print(pick(4))
+```
+
+```output
+4
+```
+
+Like a compiler-inserted check it runs no `defer` and flushes nothing, and a
+[`should_trap`](#a-test-passes-by-returning) test passes by it.
+
 ## `@assert` — a condition settled while compiling
 
 ```sysl
