@@ -98,13 +98,19 @@ sfw_two_strong()
     assert(!got.1.contains("sysl.softfloat"), got.1)
 end sfw_two_strong
 
-// The symbols of the archive a program calling the package's `fused` builds into for `target`.
+// The symbols of the archive a program computing with `llvm.fma` and calling the package's `fused`
+// builds into for `target` -- on Thumb the intrinsic is a call to C's `fma`, which keeps the
+// standard library's soft float in the build -- the
+// standard module compiled from its source into the same build (`--no-std-lib`) so that its exports
+// are in the archive beside the package's.
 private sfw_archive_symbols(target: string) -> string
     val lib = sfw_lib()
-    val main = lbr_program("@export(\"main\")\nstart() -> i32 = i32(fmadup.fused(2.0, 3.0, 1.0))\n")
+    val main = lbr_program("extern \"llvm.fma\" fused(a: f64, b: f64, c: f64) -> f64\n\n" +
+        "@export(\"main\")\nstart() -> i32 = i32(fused(2.0, 3.0, 1.0)) + i32(fmadup.fused(2.0, 3.0, 1.0))\n")
     val dir = parent_of(main).unwrap_or(main)
     val out = s"$dir/out.a"
-    val built = lbr_cli(["sysl", "build-c", dir, "--lib", lib, "-o", out, "--target", target])
+    val built = lbr_cli(["sysl", "build-c", dir, "--no-std-lib", "--lib", lib, "-o", out,
+                         "--target", target])
 
     if built.0 != 0
         lbr_drop([main, lib])
@@ -136,8 +142,9 @@ sfw_thumb_nm()
 
     val said = sfw_archive_symbols("thumbv6m-freestanding")
 
-    // The standard library's soft float is in this archive -- its exports beside the package's.
-    assert_eq(sfw_count(said, "W __aeabi_dmul"), 1, said)
+    // The standard library's `fma` is in this archive, as its own routine; the package's strong
+    // export is the only definition of the C symbol.
+    assert_eq(sfw_count(said, "T sysl.softfloat.binary64$fma"), 1, said)
     assert_eq(sfw_count(said, "T fma"), 1, said)
     assert_eq(sfw_count(said, "W fma"), 0, said)
 end sfw_thumb_nm
@@ -149,6 +156,7 @@ sfw_aarch64_nm()
 
     val said = sfw_archive_symbols("aarch64-freestanding")
 
+    assert_eq(sfw_count(said, "T sysl.softfloat.binary64$fma"), 0, said)
     assert_eq(sfw_count(said, "T fma"), 1, said)
     assert_eq(sfw_count(said, "W fma"), 0, said)
 end sfw_aarch64_nm
