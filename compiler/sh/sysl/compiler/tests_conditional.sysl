@@ -20,8 +20,11 @@ private on_bare() -> Target = target_named("riscv64-freestanding").unwrap()
 
 // What a target sees, as the lines it kept with the blank ones dropped -- which is the observable
 // half of the pass and reads far better in a failing assertion than a text full of newlines.
-private sees(target: Target, text: string) -> string
-    gate(source_of("<input>", text), target) match
+private sees(target: Target, text: string) -> string = sees_with(target, buf(), text)
+
+// The same, for a file whose package enables the `feature_` symbols `on`.
+private sees_with(target: Target, on: Buf[string], text: string) -> string
+    gate(source_of("<input>", text), target, on) match
         Err(d) -> s"!${d.message}"
         Ok(out) ->
             var acc = ""
@@ -35,7 +38,7 @@ private sees(target: Target, text: string) -> string
                     acc = acc + kept
 
             acc
-end sees
+end sees_with
 
 // The gated text exactly as it comes out, for the claims that are about its shape.
 private gated(target: Target, text: string) -> string
@@ -675,6 +678,141 @@ end quotes_that_open_no_text_block
 an_unterminated_text_block()
     assert_eq(refuses("var s = \"\"\"\n#endif\n"), "'#endif' has no '#if' above it to close")
 end an_unterminated_text_block
+
+// -- inside a text block, a condition sysl can read gates, and everything else is text --------------
+
+private feature_f() -> Buf[string]
+    var on: Buf[string] = buf()
+
+    on.push("feature_f")
+    on
+
+// slate gates parts of its raw blocks on its own features; the block below is its reduction.
+private txg_slate() -> string = "raw_text() -> string = raw\"\"\"\n    a\n#if feature_f\n    c\n#endif\n    d\n    \"\"\"\n"
+
+@test("txg: a feature condition in a text block gates the block's lines")
+txg_a_feature_gates_a_text_block()
+    assert_eq(sees_with(on_macos(), feature_f(), txg_slate()), "raw_text() -> string = raw\"\"\" a c d \"\"\"")
+    assert_eq(sees(on_macos(), txg_slate()), "raw_text() -> string = raw\"\"\" a d \"\"\"")
+end txg_a_feature_gates_a_text_block
+
+@test("txg: the block's incidental indentation is reckoned from the gated text")
+txg_the_indent_is_stripped_after_the_gate()
+    // The directive lines sit at column 0 and are gone before the lexer reckons the block's indent,
+    // so the four columns every kept line carries are still incidental.
+    val parsed = show_stmts(parse(source_of("t.sysl", txg_slate()), on_macos(), feature_f()).program.body)
+    val plain = show_stmts(parse(source_of("t.sysl",
+        "raw_text() -> string = raw\"\"\"\n    a\n\n    c\n\n    d\n    \"\"\"\n"), on_macos()).program.body)
+
+    assert_eq(parsed, plain)
+    assert(!parsed.contains("    a"), parsed)
+end txg_the_indent_is_stripped_after_the_gate
+
+@test("txg: every prefix of text block is gated alike")
+txg_every_prefix_is_gated()
+    for prefix in ["", "raw", "c", "s", "f"]
+        val text = s"var s = $prefix\"\"\"\nx\n#if windows\nw\n#elif macos\nm\n#else\no\n#endif\n\"\"\"\nf() = 1\n"
+
+        assert_eq(sees(on_macos(), text), s"var s = $prefix\"\"\" x m \"\"\" f() = 1")
+        assert_eq(sees(on_windows(), text), s"var s = $prefix\"\"\" x w \"\"\" f() = 1")
+        assert_eq(sees(on_linux(), text), s"var s = $prefix\"\"\" x o \"\"\" f() = 1")
+end txg_every_prefix_is_gated
+
+@test("txg: a target symbol gates C text too, '#if posix' included")
+txg_a_target_symbol_gates_c_text()
+    val text = "val h = raw\"\"\"\n#include <stddef.h>\n#if posix\n#include <unistd.h>\n#endif\n\"\"\"\n"
+
+    assert_eq(sees(on_macos(), text), "val h = raw\"\"\" #include <stddef.h> #include <unistd.h> \"\"\"")
+    assert_eq(sees(on_windows(), text), "val h = raw\"\"\" #include <stddef.h> \"\"\"")
+end txg_a_target_symbol_gates_c_text
+
+@test("txg: a condition sysl cannot read, and every other directive word, is the text's")
+txg_c_directives_are_text()
+    for line in ["#define LIMIT 4", "#include <stdio.h>", "#pragma once", "#undef X", "#elseif", "#ifdef X\n#endif",
+                 "#ifndef X\n#endif", "#if LIMIT > 2\n#endif", "#if defined(X)\n#endif", "#if NDEBUG\n#endif",
+                 "#if 1\n#endif", "#if posix && LIMIT\n#endif", "#if aarch64-macos\n#endif"]
+        val text = s"var s = \"\"\"\n$line\n\"\"\"\n"
+
+        assert_eq(gated(on_macos(), text), text)
+end txg_c_directives_are_text
+
+@test("txg: a C group's own '#elif', '#else' and '#endif' are its text, whatever they read")
+txg_a_c_group_keeps_its_own_closers()
+    val text = "var s = raw\"\"\"\n#if LIMIT > 2\na\n#elif posix\nb\n#else\nc\n#endif\n\"\"\"\n"
+
+    assert_eq(gated(on_macos(), text), text)
+end txg_a_c_group_keeps_its_own_closers
+
+@test("txg: a C group inside a sysl group is the sysl group's text")
+txg_a_c_group_inside_a_sysl_group()
+    val text = "var s = raw\"\"\"\n#if macos\n#if LIMIT > 2\nbig\n#else\nsmall\n#endif\n#endif\n\"\"\"\n"
+
+    assert_eq(sees(on_macos(), text), "var s = raw\"\"\" #if LIMIT > 2 big #else small #endif \"\"\"")
+    assert_eq(sees(on_linux(), text), "var s = raw\"\"\" \"\"\"")
+end txg_a_c_group_inside_a_sysl_group
+
+@test("txg: a sysl group inside a C group gates, and the C group stays whole")
+txg_a_sysl_group_inside_a_c_group()
+    val text = "var s = raw\"\"\"\n#ifdef X\n#if macos\nm\n#else\no\n#endif\n#else\ny\n#endif\n\"\"\"\n"
+
+    assert_eq(sees(on_macos(), text), "var s = raw\"\"\" #ifdef X m #else y #endif \"\"\"")
+    assert_eq(sees(on_linux(), text), "var s = raw\"\"\" #ifdef X o #else y #endif \"\"\"")
+end txg_a_sysl_group_inside_a_c_group
+
+@test("txg: a sysl group nested in a sysl group in a text block")
+txg_sysl_groups_nest_in_a_text_block()
+    val text = "var s = \"\"\"\n#if posix\n#if macos\nm\n#else\np\n#endif\n#else\nw\n#endif\n\"\"\"\n"
+
+    assert_eq(sees(on_macos(), text), "var s = \"\"\" m \"\"\"")
+    assert_eq(sees(on_linux(), text), "var s = \"\"\" p \"\"\"")
+    assert_eq(sees(on_windows(), text), "var s = \"\"\" w \"\"\"")
+end txg_sysl_groups_nest_in_a_text_block
+
+@test("txg: a text block inside a live group gates its own lines, and the live group closes after it")
+txg_a_text_block_inside_a_live_group()
+    val text = "#if posix\nvar s = \"\"\"\n#if macos\nm\n#endif\n#else\n\"\"\"\n#endif\nf() = 1\n"
+
+    assert_eq(sees(on_macos(), text), "var s = \"\"\" m #else \"\"\" f() = 1")
+    assert_eq(sees(on_linux(), text), "var s = \"\"\" #else \"\"\" f() = 1")
+end txg_a_text_block_inside_a_live_group
+
+@test("txg: a sysl group that reaches past its text block's end is refused, naming both lines")
+txg_a_group_crossing_the_block_end()
+    val text = "var s = raw\"\"\"\n#if macos\nm\n\"\"\"\n#endif\nf() = 1\n"
+
+    assert_eq(refuses(text), "this '#if' opens a group inside the text block that ends on line 4, and the group has to close inside the block — add its '#endif' before line 4")
+    assert_eq(refuses_at(text), "2:1")
+
+    // A block closing on the file's last line is checked at the end of the file.
+    assert_eq(refuses("var s = raw\"\"\"\n#if macos\nm\n\"\"\""),
+        "this '#if' opens a group inside the text block that ends on line 4, and the group has to close inside the block — add its '#endif' before line 4")
+end txg_a_group_crossing_the_block_end
+
+@test("txg: an '#elif' on a sysl group in a text block is read as sysl, and a C condition there is refused")
+txg_an_elif_on_a_sysl_group_is_sysl()
+    assert(refuses("var s = \"\"\"\n#if macos\nm\n#elif LIMIT > 2\nx\n#endif\n\"\"\"\n")
+        .contains("a condition is built from symbols"), "the group is sysl's, so its '#elif' is")
+end txg_an_elif_on_a_sysl_group_is_sysl
+
+@test("txg: a misspelled feature gates its lines out, as in live code, rather than passing as text")
+txg_a_misspelled_feature_gates_out()
+    val text = "var s = \"\"\"\n#if feature_ff\nc\n#endif\nd\n\"\"\"\n"
+
+    assert_eq(sees_with(on_macos(), feature_f(), text), "var s = \"\"\" d \"\"\"")
+    assert_eq(sees_with(on_macos(), feature_f(), "#if feature_ff\nc\n#endif\nd() = 1\n"), "d() = 1")
+end txg_a_misspelled_feature_gates_out
+
+@test("txg: a block comment is all text, a sysl condition in it included")
+txg_a_block_comment_is_all_text()
+    val text = "/*\n#if windows\nw\n#else\nm\n#endif\n*/\nf() = 1\n"
+
+    assert_eq(gated(on_macos(), text), text)
+
+    // A comment and a text block opening on one line are told apart by which one a line is inside.
+    val both = "/* one\n#if windows\n*/ var s = \"\"\"\n#if windows\nw\n#endif\n\"\"\"\n"
+
+    assert_eq(sees(on_macos(), both), "/* one #if windows */ var s = \"\"\" \"\"\"")
+end txg_a_block_comment_is_all_text
 
 // -- a literate file ------------------------------------------------------------------------------
 

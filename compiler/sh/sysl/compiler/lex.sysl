@@ -536,22 +536,31 @@ end skip_trivia_quietly
 // between the two. A `#define` at the margin of a text block holding C is the block's text, not a
 // directive. Where the code does not lex, the answer is its own line's end, and the lexer proper
 // reports the mistake when it gets there.
-literal_reach(src: Source, from: usize) -> usize
+literal_reach(src: Source, from: usize) -> usize = reach_from(src, from, from).0
+
+// The reach from `from`, and whether what carries it across the line start `at` is a text block
+// (a string of any prefix) rather than a block comment. The gate asks the second half once per
+// literal, at the first directive-shaped line inside it: inside a text block a condition sysl can read
+// gates the block's lines, and inside a comment every line is the comment's.
+literal_reach_text(src: Source, from: usize, at: usize) -> (usize, bool) = reach_from(src, from, at)
+
+private reach_from(src: Source, from: usize, at: usize) -> (usize, bool)
     var s = scan(src)
     var out: Buf[Spanned[Tok]] = buf()
     var docs: Buf[Spanned[string]] = buf()
+    var text = false
 
     s.reset(from)
 
     loop
         val m = s.mark()
 
-        if skip_trivia(&s, &docs).is_err() then return line_end_from(&s, m)
-        if s.at_end() || s.at_line_end() then return s.offset
+        if skip_trivia(&s, &docs).is_err() then return (line_end_from(&s, m), text)
+        if s.at_end() || s.at_line_end() then return (s.offset, text)
 
         val token = s.mark()
         val scanned = s.peek_char() match
-            None -> return line_end_from(&s, token)
+            None -> return (line_end_from(&s, token), text)
             Some(c) ->
                 if c == '\'' then
                     scan_label_or_char(&s, &out, token)
@@ -567,9 +576,12 @@ literal_reach(src: Source, from: usize) -> usize
                     s.next_char()
                     Ok(())
 
-        if scanned.is_err() then return line_end_from(&s, token)
+        if scanned.is_err() then return (line_end_from(&s, token), text)
+
+        // Only a string's token reads across a line end, so a token spanning `at` is a text block.
+        if token < at && s.offset > at then text = true
     end loop
-end literal_reach
+end reach_from
 
 // The end of the line the offset `m` is on.
 private line_end_from(s: *Scanner, m: usize) -> usize
