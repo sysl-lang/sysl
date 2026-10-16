@@ -10,7 +10,7 @@ import sysl.text.Search
 // declaration to move, so `reference/memory.md § What happens when a slice escapes` gives the
 // temporary storage of its own; a `...T` pack is exactly `[a, b, c][..]`, which is why a variadic
 // member through a trait object meets it. A module that gave the allocator up is refused at the view
-// that leaves the frame, naming the temporary; a partial slice of a literal is not promoted at all.
+// that leaves the frame, naming the temporary; a partial slice of a literal moves the whole literal.
 //
 // Every output and diagnostic here was read out of the reference compiler (0.0.162) by handing the
 // installed `sysl` the same program.
@@ -316,17 +316,22 @@ ptp_a_temporary_that_stays_needs_no_allocator() =
         print(count(triple(7)[..]))
         """, "3\n")
 
-// -- a partial slice of a literal is not promoted ----------------------------------------------------
+// -- a partial slice of a literal is promoted the same way ------------------------------------------
 
-@test("a partial slice of a literal is still refused, and says so")
-ptp_a_partial_slice_of_a_literal_is_refused() =
-    ptp_refused(ptp_sink() + raw"""
+// The whole literal moves and the part is narrowed over the buffer it moved into.
+@test("a partial slice of a literal is promoted too, and views the part it named")
+ptp_a_partial_slice_of_a_literal_is_promoted() =
+    ptp_prints(ptp_sink() + raw"""
         var a = Adder(10)
         val d: &Sink = a
 
         print(d.take([4, 5, 6][1..]))
-        """, "a slice of an array this frame owns is passed through a trait object, which may hold " +
-        "on to it, so it would outlive the array, and the storage is not this body's to move — it is " +
-        "a field of a value, an array a caller passed by value, or part of an array literal, which " +
-        "has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns " +
-        "it, or as a '&[N]T' where the length is fixed")
+
+        static var kept: []string = []
+
+        fill()
+            kept = [str(1), str(2) + "b", "c"][1..<2]
+
+        fill()
+        print(kept.len, kept[0])
+        """, "12\n1 2b\n")

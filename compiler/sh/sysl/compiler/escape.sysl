@@ -109,6 +109,11 @@ struct EscapeWalk
 
     // The arrays this body declared with a boundary of their own, and the boundary each asked for.
     aligned: Buf[(string, usize)]
+
+    // Where each local is declared, and every form that opens a block -- which together say whose
+    // scope encloses whose (`outlives`).
+    decl_at: Buf[(string, Span)]
+    blocks: Buf[Span]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -121,6 +126,10 @@ struct EscapeSite
     what: string
     at: Span
     how: string
+
+    // What the storage would otherwise not outlive: the frame, where the view leaves it, or the
+    // statement or scope that made it, where a local of the frame keeps the view.
+    outlives: string
 end EscapeSite
 
 // What frame-owned storage a value may view: the local arrays it roots at by name, the temporaries
@@ -382,14 +391,21 @@ private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)]
     var locals: Buf[string] = buf()
     var ref_of: Buf[(string, TExpr)] = buf()
     var aligned: Buf[(string, usize)] = buf()
+    var decl_at: Buf[(string, Span)] = buf()
+    var blocks: Buf[Span] = buf()
 
     if gather
         locals = local_arrays(stmts)
         ref_of = ref_bindings(stmts)
         aligned = aligned_arrays(stmts)
 
+        val found = scopes(stmts)
+
+        decl_at = found.0
+        blocks = found.1
+
     val w: &EscapeWalk = EscapeWalk(seeds, promoted, temps, sites, false, None, returning, locals,
-                                    ref_of, aligned)
+                                    ref_of, aligned, decl_at, blocks)
     val prog = p
     val kp = keeps
     var changed = true
@@ -478,7 +494,7 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
         None -> ()
     TVarDecl(name, _, e, _) ->
         escaping(p, keeps, w, e)
-        kept_past_statement(p, keeps, w, name, e)
+        kept_in_local(p, keeps, w, name,e)
 
     TRefDecl(_, _, e) -> escaping(p, keeps, w, e)
     TExprStmt(e) -> escaping(p, keeps, w, e)
@@ -492,7 +508,7 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
             *write.place.kind match
                 TLoad(name, _) ->
                     escaping(p, keeps, w, write.place)
-                    kept_past_statement(p, keeps, w, name, write.value)
+                    kept_in_local(p, keeps, w, name,write.value)
                 _ ->
                     if views(p, keeps, w, write.value).non_empty()
                         gets_out(p, keeps, w, write.value,
@@ -505,43 +521,97 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
         None -> ()
     _ -> ()
 
-// A view of a temporary array kept in a local. The temporary is freed at the end of the statement
-// that made it -- what it holds is let go of there, and the slot it sat in is reused by the next one
-// (the next round of a loop is the same statement again) -- while a local is read on later lines.
-// So it is refused, at the view, naming the local; a temporary viewed only within its own statement
-// is untouched, and so is one whose view leaves the frame, which is promoted instead (`gets_out`).
-// Only a temporary made in this statement is this statement's to answer for: one reached through a
-// local was answered for where that local was given it.
-private kept_past_statement(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: string,
-                            v: TExpr)
-    if w.refusal.is_some() then return
+// A value kept in the local `name`. **Storage whose view outlives the storage's scope is promoted**,
+// exactly as storage whose view leaves the frame is (`gets_out`), because it is the same hazard one
+// scope further in:
+//
+// - a **temporary** is freed at the end of the statement that made it -- what it holds is let go
+//   of, and its slot is reused by the next round of a loop, which is the same statement again -- and
+//   a local is read on later lines, so every temporary the value views moves;
+// - a **named array** declared in a block the local does not sit inside (a loop's body, an `if`'s
+//   branch, a block's value) is gone when that block closes, while the local is still in scope, so
+//   it moves too. One whose scope encloses the local's lives at least as long, and stays put.
+//
+// Neither is an escape from the frame, so a parameter summary is not told about it.
+private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: string, v: TExpr)
+    val seen = views(p, keeps, w, v)
+    val how = s"is kept in '$name', which outlives it"
 
-    for t in views(p, keeps, w, v).temps
-        temp_made_in(v, t.0) match
-            Some(at) ->
-                w.refusal = Some((at,
-                    s"a view of ${t.1} is kept in '$name', but the array is a temporary, freed at " +
-                    "the end of this statement, so the view would outlive it. Bind the array to a " +
-                    "name of its own and view that"))
-                return
-            None -> ()
-end kept_past_statement
+    for item in seen.named
+        if !holds_string(w.promoted, item) && !outlives(w, item, name)
+            w.sites.push(EscapeSite(item, "", view_anchor(v), how, "its scope"))
+            w.promoted.push(item)
 
-// Where the slice that made a temporary's view sits inside the value that carries it -- its bracket,
-// so the caret lands on the `[..]` as it does for every other refused view -- or nothing where the
-// temporary was made by an earlier statement.
-private temp_made_in(v: TExpr, at: Span) -> Option[Span]
-    val found: &SpanCell = SpanCell(None)
+    for t in seen.temps
+        if !holds_temp_span(w.temps, t.0)
+            w.sites.push(EscapeSite("", t.1, t.0, how, "its statement"))
+            w.temps.push(t)
+end kept_in_local
 
-    walk_texpr(v, expr_walk(false, x -> *x.kind match
-        TSlice(_, _, _, _, _) -> if x.span == at then found.at = Some(view_anchor(x))
+// Whether the array `array` is in scope for as long as the local `holder` is: the innermost block
+// that declared the array encloses the one that declared the holder. A name the body did not declare
+// -- a parameter -- is the body's for the whole call.
+private outlives(w: &EscapeWalk, array: string, holder: string) -> bool
+    val a = scope_of(w, array)
+    val h = scope_of(w, holder)
+
+    a match
+        None -> true
+        Some(outer) -> h match
+            None -> false
+            Some(inner) -> outer.start <= inner.start && inner.end <= outer.end
+end outlives
+
+// The innermost block-holding form around a local's declaration, or nothing for the body itself.
+private scope_of(w: &EscapeWalk, name: string) -> Option[Span]
+    var at: Option[Span] = None
+
+    for item in w.decl_at
+        if item.0 == name then at = Some(item.1)
+
+    if at.is_none() then return None
+
+    val d = at.unwrap()
+    var best: Option[Span] = None
+
+    for b in w.blocks
+        if b != d && b.start <= d.start && d.end <= b.end
+            best = best match
+                Some(now) -> if now.start <= b.start && b.end <= now.end then Some(b) else best
+                None -> Some(b)
+
+    best
+end scope_of
+
+// Where each local of a body is declared, by its initializer's span, and the span of every form that
+// opens a block of its own -- which is what `scope_of` reads a local's scope out of.
+private scopes(stmts: Buf[TStmt]) -> (Buf[(string, Span)], Buf[Span])
+    val found: &ScopeList = ScopeList(buf(), buf())
+
+    walk_stmts(stmts, TWalk(false, x -> note_block(found, x), wr -> (), s -> s match
+        TVarDecl(name, _, init, _) -> found.decls.push((name, init.span))
         _ -> ()))
 
-    found.at
-end temp_made_in
+    (found.decls, found.blocks)
+end scopes
 
-private struct SpanCell
-    at: Option[Span]
+private note_block(found: &ScopeList, x: TExpr) = *x.kind match
+    TIf(_, _, _, _) -> found.blocks.push(x.span)
+    TMatch(_, _, _) -> found.blocks.push(x.span)
+    TBlockExpr(_) -> found.blocks.push(x.span)
+    TWhile(_, _, _, _) -> found.blocks.push(x.span)
+    TDoWhile(_, _, _, _) -> found.blocks.push(x.span)
+    TLoop(_, _) -> found.blocks.push(x.span)
+    TFor(_, _, _, _, _, _, _, _) -> found.blocks.push(x.span)
+    TCFor(_, _, _, _, _, _) -> found.blocks.push(x.span)
+    TForEach(_, _, _, _, _, _) -> found.blocks.push(x.span)
+    TIterate(_, _, _, _, _, _, _, _) -> found.blocks.push(x.span)
+    TCheckedLoop(_, _, _) -> found.blocks.push(x.span)
+    _ -> ()
+
+private struct ScopeList
+    decls: Buf[(string, Span)]
+    blocks: Buf[Span]
 
 private returned(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, v: TExpr)
     if w.returning_escapes && views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
@@ -568,11 +638,11 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     TStrView(v) -> if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
         "is made into a string, which outlives the frame")
 
-    // A store into a plain local keeps the value in the frame, which is no escape -- but it is past
-    // the statement, which a temporary made in it does not live to see. It is met here rather than
-    // as a statement, because `if c then keep = …` stores as an `if` branch's value.
+    // A store into a plain local keeps the value in the frame, which is no escape -- but it may keep
+    // it past the statement or the scope its storage belongs to (`kept_in_local`). It is met here
+    // rather than as a statement, because `if c then keep = …` stores as an `if` branch's value.
     TStore(place, v, _) -> *place.kind match
-        TLoad(name, _) -> kept_past_statement(p, keeps, w, name, v)
+        TLoad(name, _) -> kept_in_local(p, keeps, w, name, v)
         _ ->
             if views(p, keeps, w, v).non_empty()
                 gets_out(p, keeps, w, v, "is stored somewhere the frame does not own")
@@ -627,7 +697,7 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
 
     for name in v.named
         if !holds_string(w.promoted, name)
-            w.sites.push(EscapeSite(name, "", view_anchor(at), how))
+            w.sites.push(EscapeSite(name, "", view_anchor(at), how, "the frame"))
             w.promoted.push(name)
 
     // A temporary is promoted like a named array and is reported like one under `no alloc`, since
@@ -635,7 +705,7 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
     // what it is.
     for t in v.temps
         if !holds_temp_span(w.temps, t.0)
-            w.sites.push(EscapeSite("", t.1, t.0, how))
+            w.sites.push(EscapeSite("", t.1, t.0, how, "the frame"))
             w.temps.push(t)
 
     w.got_out = true
@@ -718,8 +788,11 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
     // lowering asks before giving a computed value a slot. Storage with an address is left to
     // `array_root` below, which is what keeps a field of a *named* value and an array a caller
     // passed by value refused: those are somebody else's to move, and a temporary is nobody's.
-    TSlice(base, lo, hi, _, _) ->
-        if lo.is_none() && hi.is_none() && is_array(texpr_type(base)) && !is_place(base)
+    //
+    // **Part of one is the same case**: the whole temporary moves and the view is narrowed over the
+    // buffer it moved into, exactly as a part of a promoted named array is.
+    TSlice(base, _, _, _, _) ->
+        if is_array(texpr_type(base)) && !is_place(base)
             join_views(views(p, keeps, w, base), temp_view(e.span, describe_temp(base)))
         else if is_array(texpr_type(base))
             // A view of a `*T` region is the programmer's problem, like every `*T`. Storage inside a
@@ -993,22 +1066,29 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
     // wrote nothing is being held to its module's line and that is the line to go and read.
     val theirs = scaffolding && !holds_string(p.no_alloc_modules, module_name)
 
-    if !narrowed && !own_promise
+    // **A machine the manifest took the heap away from holds every body to the same line**, without
+    // a clause written anywhere -- the library excepted, as `no_alloc.sysl` excepts it. Without this
+    // a promotion on such a machine went on to the link and failed there, naming `malloc`.
+    val machine = a.tables.target.lacks_capability(CapHeap) && !from_library(a, scope)
+
+    if !narrowed && !own_promise && !machine
         refuse_aligned(a, scope, w)
         return
 
     val promised = if narrowed then (if theirs then "this module's '@tests' file" else "this module")
     else s"'${qualified_name(who.unwrap_or(""))}'"
 
+    val nothing = if narrowed || own_promise then s"$promised declared '@no_alloc'"
+    else s"'${a.tables.target.name}' provides no allocator"
+
     for site in w.sites
         val subject = if site.name == "" then site.what else s"'${site.name}'"
 
         a.fault(scope, site.at,
             s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +
-            s"the frame — and $promised " +
-            "declared '@no_alloc', so there is nothing to move it into. Keep the view inside the " +
-            "frame, or take the storage from a caller as a '[]T' parameter, which is already " +
-            "wherever its owner put it")
+            s"${site.outlives} — and $nothing, so there is nothing to move it into. Keep the view " +
+            s"inside ${site.outlives}, or take the storage from a caller as a '[]T' parameter, " +
+            "which is already wherever its owner put it")
 end refuse_no_alloc
 
 // A promotion of storage that asked for a boundary of its own, refused for the reason the
