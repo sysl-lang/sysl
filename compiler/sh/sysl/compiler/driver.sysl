@@ -590,6 +590,10 @@ typed_compilation(path: string, named_target: Option[string]) -> Result[Compilat
 
     val t = as_declared(manifest, registered)
 
+    settle_machine_registers(manifest, registered) match
+        Some(why) -> return Err(said(Refusal(why)))
+        None -> ()
+
     use_resolution_machine(Some(t))
 
     root_floor_refusal(manifest.floor) match
@@ -791,7 +795,12 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     // **The machine every resolution this build makes is for**, said before the first of them (the
     // allocator claims below resolve the graph), so a dependency's `if` is read against the machine
-    // as the project describes it -- `libc` included -- by every one of them alike.
+    // as the project describes it -- `libc` included -- by every one of them alike. The registers
+    // the program owns come first, because `thread_local` in that `if` reads them.
+    settle_machine_registers(manifest, t) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
     use_resolution_machine(Some(as_declared(manifest, t)))
 
     // **And the heap it allocates through**, settled here because this is the one funnel every
@@ -847,20 +856,27 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     use_codegen_features(features)
 
-    // **And which registers the program owns** (`codegen.thread_pointer`, `codegen.per_cpu_offset`),
-    // refused where the machine is not a bare AArch64 one.
+    // The machine as the project describes it, which is what the analysis holds a module to.
+    Ok(as_declared(manifest, t))
+end target_for
+
+// **Which registers the program owns** (`codegen.thread_pointer`, `codegen.per_cpu_offset`), from
+// the ROOT manifest, refused where the machine is not a bare AArch64 one -- or why not.
+//
+// Settled before the first condition is read, by every command that reads one: `#if thread_local`
+// and a dependency's `if thread_local` read the thread pointer's register, and a dependency's `if`
+// is read as soon as the graph is first resolved.
+private settle_machine_registers(manifest: &Manifest, t: Target) -> Option[string]
     val registers = MachineRegisters(codegen_register_given(manifest, t.name, "thread_pointer"),
                                      codegen_register_given(manifest, t.name, "per_cpu_offset"))
 
     machine_register_refusal(t, registers) match
-        Some(why) -> return Err(Refusal(why))
+        Some(why) -> return Some(why)
         None -> ()
 
     use_machine_registers(registers)
-
-    // The machine as the project describes it, which is what the analysis holds a module to.
-    Ok(as_declared(manifest, t))
-end target_for
+    None
+end settle_machine_registers
 
 // The level every clang a build drives is handed: what the command line named, then the ROOT
 // manifest's `optimization`, then `DefaultOptimization`.

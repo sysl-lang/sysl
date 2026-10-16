@@ -3366,6 +3366,43 @@ print(n)
 cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
 ```
 
+### One file for every machine: `#if thread_local`
+
+A library that runs both where there are threads and on a board — a C library's `errno` is the usual
+case — wants one variable that is per-thread wherever the build has thread-local storage and a plain
+module `var` everywhere else. The `#if` symbol `thread_local` (`§ #if`) is true exactly where the
+attribute is accepted, so the attribute line is gated by it and the declaration is written once:
+
+```sysl
+import sysl.threads.*
+
+#if thread_local
+@thread_local
+#endif
+static var errno: int = 0
+
+fail(state: *int)
+    errno = 22
+    print(errno)
+
+var t = spawn(&fail, null).unwrap()
+t.join()
+
+print(errno)
+```
+
+```output
+22
+0
+```
+
+On this hosted machine `errno` is one per thread, so the worker's `22` never reaches main. On a board,
+and on `aarch64-freestanding` with no `codegen.thread_pointer`, the same file builds with a plain
+module `var` the scheduler answers for; on `aarch64-freestanding` with the register named it is a
+thread-local again. **`thread_local` is the one `#if` symbol the target alone does not settle**: it
+also reads the root manifest's `codegen.thread_pointer`, which is why the register is the root's to
+name and why it is read before any condition is.
+
 ## `@main_thread` — storage only the main thread reaches
 
 A body that may run on another thread — a closure held as a `&sync Fn`, a named function read into
@@ -3801,9 +3838,11 @@ disturbs nothing.
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
 | floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
+| storage | `thread_local` (a `@thread_local` is accepted on this build) |
 
-That is the whole vocabulary. There is **no `#define`**, nothing a project can add, and no dependence
-on a project config. A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
+That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
+symbol depends on a project config: `thread_local`, which also reads the root manifest's
+`codegen.thread_pointer` (below). A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
 than `||`.
 
 `posix` is a name for the commonest disjunction rather than a replacement for writing it — `#if linux
@@ -3830,6 +3869,12 @@ hosted RISC-V machine have both, every Arm unit sysl targets has `fma`, and only
 double-precision one (`thumbv7em-freestanding-dp`) has `fma_dp` as well. The x86 rows ask for no
 processor past the baseline, which has no FMA, and WebAssembly has none. Where a symbol is false the
 operation is still exact — it is a call rather than an instruction.
+
+**`thread_local` is true exactly where a `@thread_local` would be accepted** (`§ @thread_local`): on
+every hosted machine, and on bare AArch64 when the root manifest says which register holds the thread
+pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and on bare AArch64 with
+no such setting. It is the one symbol the target alone does not settle, because the register is the
+program's to name; the compiler reads it before the first condition, a dependency's `if` included.
 
 That distinction is worth making before it is needed rather than after. macOS is the only BSD sysl
 targets today, so `#if macos` and `#if bsd` select identically — and a second BSD would route into
@@ -3899,7 +3944,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to

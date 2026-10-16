@@ -1832,9 +1832,10 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
     // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
     // thread pointer itself on every switch, so once the manifest says which register that is
     // (`codegen.thread_pointer`), the local-exec offset is read from storage the program answers for.
-    val owned = t.cpu == Aarch64 && thread_pointer_register().is_some()
+    // `thread_local_accepted` is that answer, and `#if thread_local` reads the same one.
+    val accepted = thread_local_accepted(t)
 
-    if !t.thread_local_storage() && !owned && t.cpu == Aarch64
+    if !accepted && t.cpu == Aarch64
         refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
                  "program says which register holds the thread pointer: there is no loader here to " +
                  "lay a thread's storage down, so the program does it — 'sysl.threads' lays the block " +
@@ -1843,7 +1844,7 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
                  "Name the register in package.hocon as 'codegen { thread_pointer = \"tpidr_el1\" }' " +
                  "('tpidr_el0', 'tpidrro_el0', 'tpidr_el2' and 'tpidr_el3' are the others), or declare " +
                  "it as a plain module 'var' and let the scheduler answer for which thread is running")
-    else if !t.thread_local_storage() && !owned
+    else if !accepted
         refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
                  "is no loader and no libc on this target, so nothing lays a thread's storage down " +
                  "and nothing writes the thread pointer the offset would be read from. Declare it " +
