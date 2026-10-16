@@ -960,6 +960,20 @@ whose value is not a constant device address, which is a load before it is an ad
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 
+**A `c"…"` literal is constant data**: it is the address of the literal's bytes in read-only data,
+a relocation like `&files[1]`. C's `char *tzname[2] = {"UTC", "UTC"};` is therefore written as it
+reads, bare, in an array or in a struct constructor, exported or not:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+@export("tzname")
+var tzname: [2]*u8 = [c"UTC", c"UTC"]
+
+@export("zone")
+val zone: *u8 = c"UTC"
+```
+
 **Four more things are constant data, all at any depth:**
 
 - **A read of a module `val` whose own initializer is constant data** is that value, as a `const`'s
