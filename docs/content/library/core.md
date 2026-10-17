@@ -156,7 +156,7 @@ impl AnyBits for Flag
 
 Unlike `Integer` it is not a family a blanket `impl` is written over: it holds every integer, and a
 blanket over each would be two implementations at every one of them. What reads it is
-[`Buf`'s `spare` and `set_len`](/library/buf/#filling-the-spare-room-reserve-spare-set_len), which
+[`Buf`'s `spare` and `set_len`](/library/buf/#filling-the-spare-room), which
 take a buffer's unwritten room into its length.
 
 ## Stopping the program

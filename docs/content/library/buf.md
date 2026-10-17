@@ -643,7 +643,7 @@ print(cells[0].n, cells[1].n, cells[2].n)
 
 A buffer of separate objects is a loop that makes one per element.
 
-### Filling the spare room: `reserve`, `spare`, `set_len`
+### Filling the spare room
 
 A buffer can be filled by something other than `push` — a C function handed an address, a
 `read(fd, p, n)`, a decoder writing into a `[]u8` — and then told how much of its room now holds
