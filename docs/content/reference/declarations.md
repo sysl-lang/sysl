@@ -2561,6 +2561,26 @@ print(P(1).show())
 type 'P' already has a member named 'show'
 ```
 
+**A member of the block may be `private` or `private[m]`**, with the same reach as one written in the
+body — the file that wrote it, or the module it names. A trait's `impl` has no such modifier, since
+what it supplies is as visible as the trait:
+
+```sysl
+struct P
+    n: int
+
+impl P
+    private twice(self) -> int = self.n * 2
+
+    shown(self) -> int = self.twice()
+
+print(P(4).shown())
+```
+
+```output
+8
+```
+
 **The block's header binds the type's parameters**, under names of its own, as a trait's `impl`
 does. **A bound it adds is a condition on the members it brings**: they exist only where the
 receiver's arguments meet it, while the type and its body's members stay as they were. It is the
