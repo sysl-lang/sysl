@@ -223,6 +223,12 @@ end RecvMode
 // pair is refused where it is written; `cold` states a frequency and composes with either. They
 // belong to the **declaration**, so every instantiation of a generic carries them.
 //
+// `inline_always` is `@inline(always)`: the request made an instruction (LLVM's `alwaysinline`,
+// which the always-inliner honours at every optimization level, `-O0` included). It sets `inline`
+// too, so everything that copies a hinted body to where its callers are -- a precompiled package's
+// `available_externally` copy, a codegen unit's -- copies this one; only the word on the `define`
+// line differs.
+//
 // `async_at` rides here too, being said of the declaration and carried to every lowered copy of it
 // the same way: where the `async` word was written, or nothing. It is not one of the optimizer's
 // three, so `any` does not count it. An async function's written result has already been made
@@ -285,6 +291,9 @@ struct FuncMarks
     // of the same symbol anywhere in the link replaces (`emit_export.sysl`'s `export_linkage`).
     weak_export: bool
 
+    // `@inline(always)`; `inline` is set beside it.
+    inline_always: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -301,7 +310,7 @@ end FuncMarks
 
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false, buf(),
-                                    false, false, false, false, false)
+                                    false, false, false, false, false, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -453,7 +462,8 @@ enum Attr
     Guards(names: Buf[string])
     Needs(caps: Buf[string])
     NoInline
-    Inline
+    // `@inline`, or `@inline(always)` where `always` is set.
+    Inline(always: bool)
     Cold
     ThreadLocal
     Abandons
@@ -495,7 +505,7 @@ attr_word(a: Attr) -> string = a match
     Guards(_) -> "guards"
     Needs(_) -> "needs"
     NoInline -> "noinline"
-    Inline -> "inline"
+    Inline(always) -> if always then "inline(always)" else "inline"
     Cold -> "cold"
     ThreadLocal -> "thread_local"
     Abandons -> "abandons"

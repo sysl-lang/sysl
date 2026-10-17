@@ -1,0 +1,378 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{str_builder, Search}
+
+// `@inline(always)` (`reference/attributes.md § @noinline, @inline and @cold`): the request made an
+// instruction. It lowers to LLVM's `alwaysinline` in the place `@inline`'s `inlinehint` takes, and
+// LLVM's always-inliner honours it at every optimization level -- so the claim that matters is
+// asked of clang at `-O0`, where nothing else inlines anything.
+
+private var alw_library_cache: Buf[Program] = buf()
+private var alw_library_read: bool = false
+
+private alw_library() -> Buf[Program]
+    if alw_library_read then return alw_library_cache
+
+    alw_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> alw_library_cache = units
+
+    alw_library_cache
+end alw_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private alw_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in alw_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end alw_ir
+
+// Whether the standard module's source is here to lower a program against.
+private alw_no_library() -> bool
+    if alw_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end alw_no_library
+
+// Every `define` line naming `name`.
+private alw_defines(out: string, name: string) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    for item in lines_of(out)
+        if item.starts_with("define") && item.contains(name) then found.push(item)
+
+    found
+end alw_defines
+
+// The lines of the definition whose `define` line holds `name`.
+private alw_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+
+    body
+end alw_body
+
+private alw_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end alw_calls
+
+private alw_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end alw_lines
+
+// A program's IR through clang at `-O0`: what is left as LLVM text. `None` where there is no clang.
+// What the programs print is the reference page's to show: its blocks are built and run.
+private alw_at_o0(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-alw").unwrap()
+    val file = s"$dir/t.ll"
+    val ir = alw_ir(text)
+
+    assert(ir.contains("define"), ir)
+    write_text(file, ir).unwrap()
+
+    val got = capture("clang", ["-O0", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end alw_at_o0
+
+// -- the word on the `define` line ---------------------------------------------------------------
+
+@test("'@inline(always)' is 'alwaysinline' on the define line, in the hint's place")
+alw_marks_the_define()
+    if alw_no_library() then return
+
+    val out = alw_ir("@inline(always)\ntwice(n: int) -> int = n * 2\n\n@inline\nhinted(n: int) -> int = n + 1\n\nprint(twice(hinted(20)))\n")
+    val always = alw_defines(out, "twice(")
+    val hinted = alw_defines(out, "hinted(")
+
+    assert_eq(always.len(), 1)
+    assert(always.at(0).contains(" alwaysinline"), always.at(0))
+    assert(!always.at(0).contains("inlinehint"), always.at(0))
+    assert_eq(hinted.len(), 1)
+    assert(hinted.at(0).contains(" inlinehint"), hinted.at(0))
+    assert(!hinted.at(0).contains("alwaysinline"), hinted.at(0))
+end alw_marks_the_define
+
+@test("beside '@cold' both words are written, in the fixed order")
+alw_composes_with_cold()
+    if alw_no_library() then return
+
+    val out = alw_ir("@cold\n@inline(always)\nrare(n: int) -> int = n * 2\n\nprint(rare(21))\n")
+    val lines = alw_defines(out, "rare(")
+
+    assert_eq(lines.len(), 1)
+    assert(lines.at(0).contains(" alwaysinline cold"), lines.at(0))
+end alw_composes_with_cold
+
+@test("at -O0 every call to an '@inline(always)' function is gone, and a plain call stays")
+alw_inlines_at_o0()
+    if alw_no_library() then return
+
+    val src = "@inline(always)\ntwice(n: int) -> int = n * 2\n\n@noinline\nkept(n: int) -> int = n + 0\n\n" +
+              "alw_use(n: int) -> int = kept(twice(n))\n\nprint(alw_use(21))\n"
+    val got = alw_at_o0(src)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+    val body = alw_body(ir, "alw_use(")
+
+    assert(body != "", ir)
+    assert(!alw_calls(body, "twice("), body)
+    assert(alw_calls(body, "kept("), "a call to a plain function stays a call at -O0, so the check could fail")
+end alw_inlines_at_o0
+
+@test("a plain '@inline' function stays a call at -O0 -- the hint is not the instruction")
+alw_hint_is_not_forced_at_o0()
+    if alw_no_library() then return
+
+    val got = alw_at_o0("@inline\ntwice(n: int) -> int = n * 2\n\nalw_use(n: int) -> int = twice(n)\n\nprint(alw_use(21))\n")
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(alw_calls(alw_body(ir, "alw_use("), "twice("), ir)
+end alw_hint_is_not_forced_at_o0
+
+// -- members, generics, traits, exports ----------------------------------------------------------
+
+@test("on a generic member, every instantiation carries it")
+alw_every_instantiation()
+    if alw_no_library() then return
+
+    val src = "struct Box[T]\n    v: T\n\n    @inline(always)\n    alw_peek(self) -> T = self.v\n\n" +
+              "print(Box(21).alw_peek() * 2)\nprint(Box(1.5).alw_peek())\n"
+    val out = alw_ir(src)
+    val lines = alw_defines(out, "alw_peek")
+
+    assert(lines.len() >= 2, out)
+
+    for l in lines
+        assert(l.contains(" alwaysinline"), l)
+end alw_every_instantiation
+
+@test("on a generic free function, every instantiation carries it, and at -O0 none is called")
+alw_generic_free_function()
+    if alw_no_library() then return
+
+    val src = "@inline(always)\npick[T](a: T, b: T, first: bool) -> T = if first then a else b\n\n" +
+              "alw_use(n: int, x: real) -> int\n    val y = pick(x, 0.5, false)\n    pick(n, 0, true) + int(y * 2.0)\n\nprint(alw_use(41, 3.0))\n"
+    val got = alw_at_o0(src)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(!alw_calls(alw_body(ir, "alw_use("), "pick"), ir)
+end alw_generic_free_function
+
+@test("on a trait method's implementation, the implementation carries it")
+alw_trait_member()
+    if alw_no_library() then return
+
+    val src = "trait Doubles\n    doubled(self) -> int\n\nimpl Doubles for int\n    @inline(always)\n    doubled(self) -> int = self * 2\n\n" +
+              "alw_use[T: Doubles](x: T) -> int = x.doubled()\n\nprint(alw_use(21))\n"
+    val got = alw_at_o0(src)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(!alw_calls(alw_body(ir, "alw_use"), "doubled"), ir)
+    val lines = alw_defines(alw_ir(src), "doubled")
+
+    assert(!lines.is_empty())
+
+    for l in lines
+        assert(l.contains(" alwaysinline"), l)
+end alw_trait_member
+
+@test("'@export' beside it is allowed: the symbol is still defined for C to call")
+alw_beside_export()
+    if alw_no_library() then return
+
+    val out = alw_ir("@export(\"alw_twice\")\n@inline(always)\ntwice(n: int) -> int = n * 2\n\nprint(twice(21))\n")
+
+    assert(alw_defines(out, "@alw_twice(").len() == 1, out)
+end alw_beside_export
+
+// -- recursion is left to LLVM, as clang and rustc leave it --------------------------------------
+//
+// LLVM will not inline a body that calls itself, anywhere, so the mark is inert on one -- and the
+// program is still right. `@tailrec` makes the self-call a jump, and then the body is absorbed.
+
+@test("a recursive '@inline(always)' function compiles, carrying the word; LLVM leaves its calls as calls")
+alw_recursion_is_left_to_llvm()
+    if alw_no_library() then return
+
+    val src = "@inline(always)\nfact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+              "alw_use(n: int) -> int = fact(n)\n\nprint(alw_use(5))\n"
+
+    assert(alw_defines(alw_ir(src), "@fact(").at(0).contains(" alwaysinline"))
+
+    val got = alw_at_o0(src)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(alw_calls(alw_body(ir, "alw_use("), "fact("), ir)
+end alw_recursion_is_left_to_llvm
+
+@test("beside '@tailrec' the self-call is a jump, so the body is absorbed at -O0")
+alw_tailrec_makes_it_inlinable()
+    if alw_no_library() then return
+
+    val src = "@tailrec\n@inline(always)\nfact(n: int, acc: int) -> int = if n <= 1 then acc else fact(n - 1, acc * n)\n\n" +
+              "alw_use(n: int) -> int = fact(n, 1)\n\nprint(alw_use(5))\n"
+    val got = alw_at_o0(src)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(!alw_calls(alw_body(ir, "alw_use("), "fact("), ir)
+end alw_tailrec_makes_it_inlinable
+
+// -- codegen units ---------------------------------------------------------------------------------
+
+@test("a unit calling a long 'alwaysinline' function defined in another carries a copy, as a hinted one does")
+alw_units_copy_it()
+    var b = str_builder()
+
+    b.push("define i32 @huge(i32 %x) alwaysinline {\n  %v0 = add i32 %x, 1\n")
+
+    for i in 1..<200
+        b.push(s"  %v$i = add i32 %v${i - 1}, 1\n")
+
+    b.push("  ret i32 %v199\n}\n")
+    b.push("define internal i32 @local(i32 %x) alwaysinline {\n  %v0 = add i32 %x, 1\n")
+
+    for i in 1..<200
+        b.push(s"  %v$i = add i32 %v${i - 1}, 1\n")
+
+    b.push("  ret i32 %v199\n}\n")
+
+    for k in 0..<16
+        b.push(s"define i32 @c$k(i32 %x) {\n  %a = call i32 @huge(i32 %x)\n  %b = call i32 @local(i32 %a)\n  ret i32 %b\n}\n")
+
+    val parts = split_module(b.finish(), 4).unwrap()
+    var copies = 0
+    var homes = 0
+
+    for p in parts
+        homes += alw_lines(p, "define i32 @huge(", "")
+
+        if alw_calls(p, "@huge(")
+            assert_eq(alw_lines(p, "define i32 @huge(", "") + alw_lines(p, "define available_externally i32 @huge(", ""), 1)
+            copies += alw_lines(p, "define available_externally i32 @huge(", "")
+
+        if alw_calls(p, "@local(") then assert_eq(alw_lines(p, "define internal i32 @local(", ""), 1)
+
+    assert_eq(homes, 1)
+    assert(copies >= 1, "some unit called '@huge' from outside its home")
+end alw_units_copy_it
+
+// -- the printers ----------------------------------------------------------------------------------
+
+@test("the tree printer writes it as it was written, and the bare word as before")
+alw_printed()
+    assert_eq(pf("@inline(always)\nf() = 1\n"), "(fn @inline(always) f () 1)")
+    assert_eq(pf("@inline(always)\n@cold\nf() = 1\n"), "(fn @inline(always) @cold f () 1)")
+    assert_eq(pf("@inline\nf() = 1\n"), "(fn @inline f () 1)")
+
+// -- the refusals ----------------------------------------------------------------------------------
+
+@test("'@inline(sometimes)' names the one argument there is")
+alw_unknown_argument()
+    val e = pf_err("@inline(sometimes)\nf() -> int = 1\n")
+
+    assert(e.contains("'@inline' takes no argument but 'always' — '@inline' alone raises what the inliner will spend on this definition rather than naming a number, '@inline(always)' puts the body in place of every call at every optimization level, and '@noinline' keeps every call a call"), e)
+    assert(pf_err("@inline(always, always)\nf() -> int = 1\n").contains("'@inline' takes no argument but 'always'"))
+    assert(pf_err("@inline(\"always\")\nf() -> int = 1\n").contains("'@inline' takes no argument but 'always'"))
+
+@test("'@inline(never)' is pointed at '@noinline'")
+alw_never_is_noinline()
+    val e = pf_err("@inline(never)\nf() -> int = 1\n")
+
+    assert(e.contains("'@inline(never)' is written '@noinline' — keeping every call a call is a request of its own, not a degree of '@inline'"), e)
+
+@test("beside '@noinline' it contradicts")
+alw_beside_noinline()
+    val e = pf_err("@noinline\n@inline(always)\nf() -> int = 1\n")
+
+    assert(e.contains("'@noinline' forbids inlining and '@inline(always)' demands it, so they contradict above one declaration"), e)
+
+@test("beside '@inline' it says one thing twice")
+alw_beside_inline()
+    val e = pf_err("@inline\n@inline(always)\nf() -> int = 1\n")
+
+    assert(e.contains("'@inline(always)' already asks for everything '@inline' does, so the two together say one thing twice"), e)
+
+@test("an 'extern' has no body to put in place of a call")
+alw_on_extern()
+    val e = pf_err("@inline(always)\nextern abs(n: i32) -> i32\n")
+
+    assert(e.contains("'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere"), e)
+
+@test("a struct and a ghost have nothing to inline either")
+alw_on_struct_and_ghost()
+    assert(pf_err("@inline(always)\nstruct S\n    a: int\n").contains("'@inline(always)' puts a function's body in place of every call to it"))
+    assert(pf_err("@ghost\n@inline(always)\nf(n: int) -> bool = n > 0\n").contains("'@inline(always)' tell the optimizer about a definition, and '@ghost' means there is none"))
