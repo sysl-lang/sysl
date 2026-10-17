@@ -786,9 +786,11 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
 
             val before = p.report.len()
 
-            if refuse_stray_member(p, first, InImpl) then ()
+            val site = if trait_name == "" then InOwnImpl else InImpl
+
+            if refuse_stray_member(p, first, site) then ()
             elif at_assoc(p) then decl.assocs.push(parse_assoc_bind(p))
-            else parse_member_line(p, &decl.methods, InImpl)
+            else parse_member_line(p, &decl.methods, site)
 
             if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
@@ -885,8 +887,12 @@ enum MemberSite
     // member an implementation must supply.
     InTrait
 
-    // An `impl` block's: no visibility either, and `override` is written here and nowhere else.
+    // A trait implementation's: no visibility either, and `override` is written here and nowhere else.
     InImpl
+
+    // An inherent `impl` block's: the members are the type's own exactly as its body's are, so one
+    // may be `private`, and `override` is written here as in any `impl`.
+    InOwnImpl
 end MemberSite
 
 // One line of a type's body that is neither a field, a variant nor an invariant.
@@ -942,7 +948,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
     var vis = Public
 
     if p.at_kw("private")
-        if site != InType
+        if site != InType && site != InOwnImpl
             // The complaint sits on what the word was written in front of, as the reference has it.
             p.bump()
             p.fault(p.here(), "a trait's members and an 'impl' block's carry no visibility of their own — a trait's member is as visible as the trait, and an implementation supplies what the trait asked for")
@@ -956,7 +962,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
     var overrides = false
 
     if p.at_kw("override")
-        if site != InImpl
+        if site != InImpl && site != InOwnImpl
             // The complaint sits on what the word was written in front of, as the reference has it.
             p.bump()
             p.fault(p.here(), "'override' says a member replaces a body its trait supplied, and it is written on that member inside the 'impl' block — a trait's own member is where a default is written rather than replaced, and a member of a type's body implements no trait")

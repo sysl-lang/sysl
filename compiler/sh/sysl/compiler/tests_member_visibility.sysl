@@ -616,3 +616,54 @@ mv_an_invariant_over_private_fields_is_still_checked()
                     "    invariant lo <= hi\n    of(a: int, b: int) -> Span = Span(a, b)\n" +
                     "    low(self) -> int = self.lo\nend Span\nprint(Span.of(5, 1).low())\n"),
         "the program did not come back")
+
+// -- a member of a type's own `impl` block may be `private` -----------------------------------------
+
+@test("a private member of an inherent impl is called from its own file")
+ipv_a_private_impl_member_is_called_from_its_own_file()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct P\n    n: int\n\nimpl P\n    private twice(self) -> int = self.n * 2\n" +
+                         "    shown(self) -> int = self.twice()\n\nprint(P(4).shown())\n"), "8\n")
+
+@test("and is refused from another file of the module")
+ipv_a_private_impl_member_is_refused_from_another_file()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    n: int\n\nimpl P\n    private twice(self) -> int = self.n * 2",
+                          "go(p: P) -> int = p.twice()")
+
+    assert(out.contains("method 'twice' of 'geom.P' is private to 'g.sysl'"), out)
+
+@test("a scoped member of an inherent impl is reached from a sibling file")
+ipv_a_scoped_impl_member_is_reached_from_a_sibling_file()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "import geom.{P, go}\nprint(go(P(5)))\n"),
+                      ("geom/g.sysl",
+                       "module geom\nstruct P\n    n: int\n\nimpl P\n    private[geom] twice(self) -> int = self.n * 2\n"),
+                      ("geom/h.sysl", "module geom\ngo(p: P) -> int = p.twice()\n")]), "10\n")
+
+@test("and is refused from outside the module")
+ipv_a_scoped_impl_member_is_refused_from_outside_the_module()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "import geom.P\ngo(p: P) -> int = p.twice()\nprint(1)\n"),
+                      ("g.sysl",
+                       "module geom\nstruct P\n    n: int\n\nimpl P\n    private[geom] twice(self) -> int = self.n * 2\n")])
+
+    assert(out.contains("method 'twice' of 'geom.P' is private to module 'geom'"), out)
+
+@test("a conditional inherent impl takes one too")
+ipv_a_conditional_impl_member_may_be_private()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct Box[T]\n    v: T\n\nimpl[T: Eq] Box[T]\n" +
+                         "    private same(self, o: T) -> bool = self.v == o\n" +
+                         "    check(self, o: T) -> bool = self.same(o)\n\nprint(Box(3).check(3))\n"), "true\n")
+
+@test("a trait implementation's member is still refused one")
+ipv_a_trait_impl_member_is_still_refused_a_modifier()
+    assert(pf_err("trait Show\n    show(self) -> int\nstruct P\n    n: int\nimpl Show for P\n" +
+                  "    private show(self) -> int = self.n\n")
+        .contains("carry no visibility of their own"), "the refusal says why")
