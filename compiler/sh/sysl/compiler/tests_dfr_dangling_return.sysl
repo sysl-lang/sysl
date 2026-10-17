@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `reference/memory.md § An address of the frame's own storage is not an answer`: the address of a
+// by-value parameter, `(self)` among them, of a local `val` or `var`, or of a field or element of one,
+// may not be what a function returns -- the frame is gone by the time anyone reads through it. What
+// reaches through a pointer or a reference, and module storage, is somebody else's to keep alive and
+// is left alone.
+
+// Every refusal the checks before lowering make, one per line.
+private dfr_said(src: string) -> string
+    var all = ""
+
+    for m in emit_diagnostics(src) do all = all + m + "\n"
+
+    all
+end dfr_said
+
+private dfr_refused(src: string, name: string)
+    val said = dfr_said(src)
+
+    assert(said.contains(s"the address of '$name' is returned"), said)
+    assert(said.contains("its storage ends when the function returns"), said)
+end dfr_refused
+
+private dfr_allowed(src: string) = assert_eq(dfr_said(src), "")
+
+private dfr_pair() -> string = "struct Pair\n    a: int\n    b: int\n"
+
+// -- refused ------------------------------------------------------------------------------------------
+
+@test("dfr: the address of a local var, as the body's value, is refused with the whole sentence")
+dfr_a_local_var() =
+    assert_eq(dfr_said("f() -> *int\n    var x = 1\n    &x\n"),
+              "the address of 'x' is returned, but 'x' is a local of this function, and its storage " +
+              "ends when the function returns — return the value itself, or take the storage from " +
+              "the caller as a '*T' parameter\n")
+
+@test("dfr: the address of a local, returned by a return statement inside a branch")
+dfr_a_local_returned() =
+    dfr_refused("f(c: bool) -> *int\n    var x = 1\n    if c\n        return &x\n    null\n", "x")
+
+// A `val` has no address to hand out at all, so it is refused before the question of the frame is
+// asked -- and stays refused.
+@test("dfr: a local val is already refused, as storage written once")
+dfr_a_local_val() =
+    assert(dfr_said("f() -> *int\n    val x = 1\n    return &x\n").contains("a 'val' is written once"))
+
+@test("dfr: a by-value parameter, as an expression body, is named as a copy in this frame")
+dfr_a_by_value_parameter()
+    val said = dfr_said("f(x: int) -> *int = &x\n")
+
+    assert(said.contains("'x' is a parameter passed by value, a copy in this frame"), said)
+end dfr_a_by_value_parameter
+
+@test("dfr: a field of '(self)', through ptr_cast, is refused and pointed at '*self'")
+dfr_a_field_of_self_through_ptr_cast()
+    val said = dfr_said(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(self) -> *u8 = ptr_cast(&self.rec)\n")
+
+    assert_eq(said, "the address of 'self' is returned, but '(self)' is a copy of the receiver in this " +
+              "frame, and its storage ends when the function returns — return the value itself, or " +
+              "take '*self', so the address is of the caller's value\n")
+end dfr_a_field_of_self_through_ptr_cast
+
+@test("dfr: a field of a local struct")
+dfr_a_field_of_a_local() = dfr_refused(dfr_pair() + "f() -> *int\n    var p = Pair(1, 2)\n    &p.b\n", "p")
+
+@test("dfr: an element of a local array, and of an array parameter passed by value")
+dfr_an_element_of_a_local_array()
+    dfr_refused("f() -> *int\n    var xs: [4]int = [1, 2, 3, 4]\n    &xs[2]\n", "xs")
+    dfr_refused("f(xs: [4]int) -> *int = &xs[2]\n", "xs")
+end dfr_an_element_of_a_local_array
+
+@test("dfr: both arms of an if, and a match arm, are tails that are returned")
+dfr_the_tails_of_if_and_match()
+    val said = dfr_said("f(c: bool) -> *int\n    var x = 1\n    var y = 2\n    if c then &x else &y\n")
+
+    assert(said.contains("the address of 'x'") && said.contains("the address of 'y'"), said)
+
+    dfr_refused("f(n: int) -> *int\n    var x = 1\n    n match\n        0 -> &x\n        _ -> &x\n", "x")
+end dfr_the_tails_of_if_and_match
+
+@test("dfr: a ref names its place, so the address of a ref to a local is the local's")
+dfr_through_a_ref() =
+    dfr_refused("f() -> *int\n    var xs: [4]int = [1, 2, 3, 4]\n    ref r = xs[1]\n    &r\n", "xs")
+
+@test("dfr: the address of a value made in place is a local with the name left out")
+dfr_a_value_made_in_place()
+    val said = dfr_said("make() -> int = 7\nf() -> *int = &make()\n")
+
+    assert(said.contains("the address of a value made in place is returned"), said)
+end dfr_a_value_made_in_place
+
+// -- allowed ------------------------------------------------------------------------------------------
+
+@test("dfr: a field reached through '*self' is the caller's storage")
+dfr_through_a_pointer_receiver() =
+    dfr_allowed(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(*self) -> *u8 = ptr_cast(&self.rec)\n")
+
+@test("dfr: a field reached through a '*T' parameter, and an element of a '[]T' parameter")
+dfr_through_a_pointer_parameter()
+    dfr_allowed(dfr_pair() + "f(p: *Pair) -> *int = &p.b\n")
+    dfr_allowed("f(xs: []int) -> *int = &xs[0]\n")
+end dfr_through_a_pointer_parameter
+
+@test("dfr: a field reached through a counted reference lives on the heap")
+dfr_through_a_reference() = dfr_allowed(dfr_pair() + "f(p: &Pair) -> *int = &p.b\n")
+
+@test("dfr: module storage outlives every frame")
+dfr_module_storage() =
+    dfr_allowed("var g = 1\nvar xs: [4]int = [1, 2, 3, 4]\nf() -> *int = &g\nh() -> *int = &xs[1]\n")
+
+@test("dfr: an address used inside the frame, or stored somewhere other than the result, is not asked about")
+dfr_not_the_result()
+    dfr_allowed("f() -> int\n    var x = 1\n    val p = &x\n    *p\n")
+    dfr_allowed("var keep: *int = null\nf()\n    var x = 1\n    keep = &x\n")
+end dfr_not_the_result
