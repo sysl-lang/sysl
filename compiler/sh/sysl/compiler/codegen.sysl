@@ -107,7 +107,9 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
             e.main_thread_checks = e.off_main.has(f.name)
 
             gen_function(e, f) match
-                Some(built) -> funcs.push(built)
+                Some(built) ->
+                    for item in split_disjoint(f, built)
+                        funcs.push(item)
                 None -> gaps.push((f.name, gap_text(e)))
         elif imports && importable(f) && only.map((names) -> names.has(f.name)).unwrap_or(true)
             set_promoted(e, pr, f.name)
@@ -117,7 +119,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
             gen_function(e, f) match
                 Some(built) ->
                     if keeps_import(f, built)
-                        funcs.push(built with { sig = built.sig with { linkage = LinkAvailableExternally } })
+                        val parts = split_disjoint(f, built)
+
+                        funcs.push(parts.at(0) with { sig = parts.at(0).sig with { linkage = LinkAvailableExternally } })
+
+                        // A view's body half is this unit's own `internal` copy, which is inlined
+                        // into the copy above and never linked against.
+                        for i in 1..<parts.len()
+                            funcs.push(parts.at(i))
+
                         imported.add(f.name)
                 None -> ()
 

@@ -1,0 +1,266 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `@disjoint(a, b)` -- a function's promise that, while a call runs, no memory reached through one
+// named parameter is reached through another named one or through any other pointer the body uses.
+// It is C's `restrict`, and what it buys is LLVM's `noalias` on the named parameters
+// (`emit_disjoint.sysl`): a loop writing through one and reading through the other no longer needs
+// the run-time overlap check that keeps a vectorized loop correct when the two do overlap
+// (`reference/attributes.md § @disjoint`).
+//
+// **The promise is checked where a call shows it broken, and trusted everywhere else.** Two
+// arguments are refused only when their storage provably overlaps -- the same local twice, two
+// slices of one array or view with constant bounds that share an element, a view and the address of
+// one of its own elements. Anything the call cannot settle -- an index computed at run time, two
+// views a caller was handed, a pointer from a field -- is taken at its word, as C takes `restrict`,
+// and a call that breaks the promise anyway is undefined behaviour.
+
+// What `@disjoint` may name: parameters of the function it is written above, each once. Settled at
+// the declaration, as `@lends`' names are -- a misspelling would otherwise promise nothing and read
+// exactly like a promise. What each named parameter's type is settled per instantiation, by
+// `check_disjoint`, since a generic's parameter is a type only there.
+check_disjoint_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val ns = d.marks.disjoint
+    val ps = d.params
+
+    if ns.is_empty() then return
+
+    // A task's body runs after the call that made it has returned, so "while the call runs" names no
+    // stretch of the body at all.
+    if d.marks.is_async()
+        a.fault(scope, span, s"'@disjoint' marks '$shown', which is 'async' — its body runs after " +
+                "the call that made the task has returned, so there is no call for the parameters " +
+                "to be kept apart during")
+        return
+    end if
+
+    for i in 0..<ns.len()
+        var declared = false
+
+        for item in ps
+            if item.name == ns.at(i) then declared = true
+
+        var twice = false
+
+        for j in 0..<i
+            if ns.at(j) == ns.at(i) then twice = true
+
+        if !declared
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@disjoint' names '${ns.at(i)}', which is not a parameter of " +
+                    s"'$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@disjoint' names '${ns.at(i)}' twice, and a parameter is kept " +
+                    "apart from the others or it is not — the second says nothing the first does not")
+end check_disjoint_names
+
+// Whether a parameter of this type reaches memory other than its own copy: a pointer, a counted
+// reference, or a view. Everything else arrives as a value nothing else can reach.
+disjoint_reaches(t: Type) -> bool = underlying(t) match
+    Ptr(_) -> true
+    Ref(_, _) -> true
+    Slice(_, _) -> true
+    _ -> false
+
+// What the walk over a program's calls keeps between bodies.
+struct Disjoints
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+
+    // Each complaint once: an instantiation of a generic is asked what its declaration was.
+    said: Buf[string]
+
+    find(self, name: string) -> Option[TFunc] = self.index.get(name) match
+        Some(i) -> Some(self.funcs.at(i))
+        None -> None
+end Disjoints
+
+// Every function's named parameters held to reaching memory, and every call of one held to handing
+// the named parameters storage that is not provably shared.
+check_disjoint(a: &Analysis, funcs: Buf[TFunc])
+    var any = false
+
+    for f in funcs
+        if !f.marks.disjoint.is_empty() then any = true
+
+    if !any then return
+
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
+
+    val cx: &Disjoints = Disjoints(funcs, index, buf())
+    val an = a
+
+    for f in funcs
+        disjoint_types(a, cx, f)
+
+    for f in funcs
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> disjoint_call(an, cx, scope, e)))
+end check_disjoint
+
+// A value parameter cannot overlap anything -- it is a copy -- so naming one promises nothing, and is
+// refused rather than let read like a promise about the value's contents.
+private disjoint_types(a: &Analysis, cx: &Disjoints, f: TFunc)
+    for name in f.marks.disjoint
+        for p in f.params
+            if p.0 == name && !disjoint_reaches(p.1)
+                val shown = qualified_name(a.tables.members.func_origin.get(f.name).unwrap_or(f.name))
+                val said = s"'@disjoint' names '$name', a parameter of '$shown' whose type " +
+                    s"'${type_show(p.1)}' is a value — the promise is about memory reached through a " +
+                    "parameter, so it names a pointer ('*T', '&T') or a view ('[]T', '[]const T'), " +
+                    "and a value is a copy nothing else reaches"
+
+                if !holds_string(cx.said, said)
+                    cx.said.push(said)
+                    a.fault(func_home(a, f.name), f.span, said)
+end disjoint_types
+
+private disjoint_call(a: &Analysis, cx: &Disjoints, scope: Scope, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) -> disjoint_call_of(a, cx, scope, e.span, name, args)
+        _ -> ()
+end disjoint_call
+
+// Where some memory an argument reaches lives, as far as the call shows it: the storage it is in
+// (`root`), how the argument is written (`text`), and which elements of that storage it covers.
+struct DjRegion
+    root: string
+    text: string
+    extent: DjExtent
+end DjRegion
+
+// Which part of a storage an argument covers.
+enum DjExtent
+    // All of it.
+    DjWhole
+
+    // The elements `lo` up to but not including `hi`.
+    DjElems(lo: long, hi: long)
+
+    // Some part the call does not settle -- an element at an index computed at run time.
+    DjSomewhere
+end DjExtent
+
+private disjoint_call_of(a: &Analysis, cx: &Disjoints, scope: Scope, at: Span, name: string,
+                         args: Buf[TExpr])
+    val callee = cx.find(name)
+
+    if callee.is_none() || callee.unwrap().marks.disjoint.is_empty() then return
+
+    val f = callee.unwrap()
+
+    if f.params.len() != args.len() then return
+
+    var named: Buf[(string, DjRegion)] = buf()
+
+    for n in f.marks.disjoint
+        for k in 0..<f.params.len()
+            if f.params.at(k).0 == n
+                dj_region(args.at(k)) match
+                    Some(r) -> named.push((n, r))
+                    None -> ()
+
+    val shown = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+
+    for i in 0..<named.len()
+        for j in 0..<i
+            val (n1, r1) = named.at(j)
+            val (n2, r2) = named.at(i)
+
+            if dj_overlaps(r1, r2)
+                val how = if dj_whole(r1) && dj_whole(r2) then "are the same memory" else "overlap"
+
+                a.fault(scope, at, s"'$shown' is '@disjoint' over '$n1' and '$n2', and this call " +
+                        s"hands them storage that overlaps — ${r1.text} and ${r2.text} $how, and a " +
+                        "body told they never do may keep a value it read through one after the " +
+                        "other has written it")
+                return
+            end if
+end disjoint_call_of
+
+private dj_whole(r: DjRegion) -> bool = r.extent match
+    DjWhole -> true
+    _ -> false
+
+// Whether two regions provably share memory. Only the same storage can; a whole storage shares with
+// any non-empty part of it, and two runs of elements with every bound known share where they meet.
+// A part the call does not settle shares with nothing it can prove.
+private dj_overlaps(x: DjRegion, y: DjRegion) -> bool
+    if x.root != y.root then return false
+
+    x.extent match
+        DjWhole -> y.extent match
+            DjWhole -> true
+            DjElems(lo, hi) -> lo < hi
+            DjSomewhere -> true
+        DjElems(a, b) -> y.extent match
+            DjWhole -> a < b
+            DjElems(c, d) -> a < b && c < d && a < d && c < b
+            DjSomewhere -> false
+        DjSomewhere -> y.extent match
+            DjWhole -> true
+            _ -> false
+end dj_overlaps
+
+// The memory an argument reaches, where the call shows it; `None` where it does not.
+private dj_region(x: TExpr) -> Option[DjRegion] = *x.kind match
+    TConstView(arg) -> dj_region(arg)
+    TLoad(name, ty) -> if disjoint_reaches(ty) then Some(DjRegion(dj_root(name, ty), s"'$name'", DjWhole)) else None
+    TSlice(base, lo, hi, inclusive, _) -> dj_slice(base, lo, hi, inclusive)
+    TAddrOf(place, _) -> *place.kind match
+        TLoad(name, _) -> Some(DjRegion(name, s"'&$name'", DjWhole))
+        TIndex(receiver, index, _) -> *receiver.kind match
+            TLoad(name, ty) -> dj_literal(index) match
+                Some(k) -> Some(DjRegion(dj_root(name, ty), s"'&$name[$k]'", DjElems(k, k + 1)))
+                None -> Some(DjRegion(dj_root(name, ty), s"'&$name[...]'", DjSomewhere))
+            _ -> None
+        _ -> None
+    _ -> None
+
+// The storage a local's name stands for when it is indexed or sliced: a view, a pointer or a counted
+// reference reaches storage elsewhere (`*name`); anything else is its own storage (`name`), which is
+// what taking its address reaches too.
+private dj_root(name: string, ty: Type) -> string = if disjoint_reaches(ty) then s"*$name" else name
+
+// A slice of a local, with whichever bounds are written as integer literals.
+private dj_slice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool) -> Option[DjRegion] =
+    *base.kind match
+        TLoad(name, ty) -> Some(dj_slice_of(name, dj_root(name, ty), lo, hi, inclusive))
+        _ -> None
+
+private dj_slice_of(name: string, root: string, lo: Option[TExpr], hi: Option[TExpr],
+                    inclusive: bool) -> DjRegion
+    if lo.is_none() && hi.is_none() then return DjRegion(root, s"'$name[..]'", DjWhole)
+
+    val from: Option[long] = if lo.is_none() then Some(0) else dj_literal(lo.unwrap())
+
+    // An open end runs to the end of the storage, which is past every element a literal can name.
+    val upto: Option[long] = if hi.is_none() then Some(dj_open_end()) else dj_literal(hi.unwrap()) match
+        Some(h) -> Some(if inclusive then h + 1 else h)
+        None -> None
+
+    if from.is_none() || upto.is_none() then return DjRegion(root, s"'$name[...]'", DjSomewhere)
+
+    val shown_hi = if hi.is_none() then "" else s"${upto.unwrap()}"
+
+    DjRegion(root, s"'$name[${from.unwrap()}..<$shown_hi]'", DjElems(from.unwrap(), upto.unwrap()))
+end dj_slice_of
+
+private dj_open_end() -> long = 9223372036854775807
+
+private dj_literal(x: TExpr) -> Option[long] = *x.kind match
+    TIntLit(v, _) -> v.to_long()
+    _ -> None

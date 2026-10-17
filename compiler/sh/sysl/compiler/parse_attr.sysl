@@ -170,7 +170,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes"]
+                 "relocates", "views", "consumes", "disjoint"]
         if word == w then return true
 
     false
@@ -241,6 +241,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
+    if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
@@ -463,6 +464,8 @@ private named_list_refusal(word: string) -> string
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
+
+    if word == "disjoint" then return "'@disjoint' names the pointer and slice parameters whose memory nothing else reaches while a call runs, in parentheses — '@disjoint(y, x)'. There is no empty form: a function whose parameters may overlap says so by not writing the annotation"
 
     "'@needs' names the capabilities reaching this declaration requires, in parentheses — '@needs(heap)', '@needs(os, posix)'. There is no empty form: a declaration that needs nothing beyond what its module has says so by not writing the annotation"
 end named_list_refusal
@@ -729,6 +732,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
             Lends(ns) -> f.marks.lends = ns
+            Disjoint(ns) -> f.marks.disjoint = ns
             NoInline -> f.marks.noinline = true
             Inline -> f.marks.inline = true
             Cold -> f.marks.cold = true
@@ -746,6 +750,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Crossing(ns) -> m.crossing = ns
             Borrows(ns) -> m.borrows = ns
             Lends(ns) -> m.marks.lends = ns
+            Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
             NoInline -> m.marks.noinline = true
@@ -943,6 +948,11 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
+
+    // An `extern`'s body is C, compiled where the sysl declaration is never read, so the promise
+    // could not reach the code it is about; the C declaration's `restrict` is where it is made.
+    if any_is(attrs, "disjoint")
+        return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

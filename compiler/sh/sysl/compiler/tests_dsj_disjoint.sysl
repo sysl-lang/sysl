@@ -1,0 +1,421 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@disjoint(a, b)` (`reference/attributes.md § @disjoint`): the parameters it names reach memory
+// nothing else reaches while a call runs. A pointer it names carries `noalias`; a view is split into a
+// function and an always-inlined body taking the view's parts, the element address `noalias`. The
+// text shows the marks, clang's `-O2` shows what they buy -- a vectorized loop with no run-time overlap
+// check -- and the call sites show which overlaps are refused and which are trusted.
+
+private var dsj_library_cache: Buf[Program] = buf()
+private var dsj_library_read: bool = false
+
+private dsj_library() -> Buf[Program]
+    if dsj_library_read then return dsj_library_cache
+
+    dsj_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dsj_library_cache = units
+
+    dsj_library_cache
+end dsj_library
+
+private dsj_no_library() -> bool
+    if dsj_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dsj_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private dsj_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in dsj_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end dsj_ir
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private dsj_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-dsj").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, dsj_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end dsj_optimized
+
+// The `define` line holding `name`, or the empty string.
+private dsj_define(out: string, name: string) -> string
+    for l in lines_of(out)
+        if l.starts_with("define") && l.contains(name) then return l
+
+    ""
+end dsj_define
+
+// The body of the function whose `define` line holds `name`.
+private dsj_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end dsj_body
+
+private dsj_kernels() -> string = raw"""
+    module demo
+
+    @noinline
+    @disjoint(y, x)
+    axpy(y: []real, x: []const real, a: real)
+        for i in 0..<y.len
+            y[i] = y[i] + a * x[i]
+
+    @noinline
+    axpy_plain(y: []real, x: []const real, a: real)
+        for i in 0..<y.len
+            y[i] = y[i] + a * x[i]
+
+    @disjoint(p, q)
+    bump(p: *int, q: *int)
+        *p = *p + 1
+        *q = *q + 1
+
+    @disjoint(p)
+    bump_one(p: *int, q: *int)
+        *p = *p + 1
+        *q = *q + 1
+
+    bump_plain(p: *int, q: *int)
+        *p = *p + 1
+        *q = *q + 1
+
+    main()
+        var ys: [8]real = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        val xs: [8]real = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        var u = 1
+        var v = 2
+
+        axpy(ys[0..<8], xs[0..<8], 2.0)
+        axpy_plain(ys[0..<8], xs[0..<8], 2.0)
+        bump(&u, &v)
+        bump_one(&u, &v)
+        bump_plain(&u, &v)
+        print(ys[3], u + v)
+    """
+
+// -- what is emitted ---------------------------------------------------------------------------------
+
+@test("a pointer '@disjoint' names is 'noalias' on the define line, and an unnamed or unmarked one is not")
+dsj_pointer_is_noalias()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(dsj_kernels())
+
+    assert(dsj_define(out, "bump(").contains("(ptr noalias %p.param, ptr noalias %q.param)"), out)
+    assert(dsj_define(out, "bump_one(").contains("(ptr noalias %p.param, ptr %q.param)"), out)
+    assert(dsj_define(out, "bump_plain(").contains("(ptr %p.param, ptr %q.param)"), out)
+end dsj_pointer_is_noalias
+
+@test("a view '@disjoint' names keeps its signature and calls an always-inlined body whose element address is 'noalias'")
+dsj_view_is_split()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(dsj_kernels())
+    val outer = dsj_define(out, "axpy(")
+    val inner = dsj_define(out, "axpy.disjoint(")
+
+    // The function keeps the signature every caller uses, `[]const real` included, and only calls.
+    assert(outer.contains("({ ptr, ptr, i64 } %y.param, { ptr, ptr, i64 } %x.param, double %a.param)"), out)
+    assert(dsj_body(out, "axpy(").contains("axpy.disjoint(ptr %y.arg.0, ptr %y.arg.1, i64 %y.arg.2, ptr %x.arg.0, ptr %x.arg.1, i64 %x.arg.2, double %a.param)"), out)
+
+    // The body takes the parts, the element address -- and only it -- `noalias`.
+    assert(inner.starts_with("define internal void "), inner)
+    assert(inner.contains("(ptr %y.part.0, ptr noalias %y.part.1, i64 %y.part.2, ptr %x.part.0, ptr noalias %x.part.1, i64 %x.part.2, double %a.param)"), inner)
+    assert(inner.contains("alwaysinline"), inner)
+
+    // Nothing of it reaches an unmarked function.
+    assert(!out.contains("axpy_plain.disjoint"), out)
+    assert(!dsj_define(out, "axpy_plain(").contains("noalias"), out)
+end dsj_view_is_split
+
+@test("at -O2 the marked kernel is vectorized with no run-time overlap check, and the unmarked one keeps it")
+dsj_marked_kernel_needs_no_overlap_check()
+    if dsj_no_library() then return
+
+    dsj_optimized(dsj_kernels()) match
+        None -> ()
+        Some(opt) ->
+            val marked = dsj_body(opt, "@\"demo$axpy\"(")
+            val plain = dsj_body(opt, "@\"demo$axpy_plain\"(")
+
+            assert(marked.contains(" x double>"), marked)
+            assert(!marked.contains("vector.memcheck"), marked)
+            assert(plain.contains(" x double>"), plain)
+            assert(plain.contains("vector.memcheck"), plain)
+end dsj_marked_kernel_needs_no_overlap_check
+
+@test("each instantiation of a generic carries the promise")
+dsj_generic_instantiations()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(raw"""
+        module demo
+
+        @disjoint(y, x)
+        copy_into[T](y: []T, x: []const T)
+            for i in 0..<y.len
+                y[i] = x[i]
+
+        @disjoint(p, q)
+        swap[T](p: *T, q: *T)
+            val t = *p
+            *p = *q
+            *q = t
+
+        run(a: []real, b: []real, c: []int, d: []int, p: *real, q: *real, r: *int, s: *int)
+            copy_into(a, b)
+            copy_into(c, d)
+            swap(p, q)
+            swap(r, s)
+
+        main()
+            var a: [2]real = [1.0, 2.0]
+            var b: [2]real = [3.0, 4.0]
+            var c: [2]int = [1, 2]
+            var d: [2]int = [3, 4]
+
+            run(a[0..<2], b[0..<2], c[0..<2], d[0..<2], &a[0], &b[0], &c[0], &d[0])
+            print(a[0], c[0])
+        """)
+
+    var bodies = 0
+    var swaps = 0
+
+    for l in lines_of(out)
+        if l.starts_with("define internal ") && l.contains("copy_into") && l.contains(".disjoint(") &&
+           l.contains("ptr noalias %y.part.1") && l.contains("ptr noalias %x.part.1")
+            bodies += 1
+
+        if l.starts_with("define") && l.contains("swap") && l.contains("(ptr noalias %p.param, ptr noalias %q.param)")
+            swaps += 1
+
+    assert_eq(bodies, 2)
+    assert_eq(swaps, 2)
+end dsj_generic_instantiations
+
+@test("inlined into a caller, the promise survives as scoped alias metadata and the caller's loop needs no overlap check")
+dsj_survives_inlining()
+    if dsj_no_library() then return
+
+    val text = raw"""
+        module demo
+
+        @inline
+        @disjoint(y, x)
+        axpy(y: []real, x: []const real, a: real)
+            for i in 0..<y.len
+                y[i] = y[i] + a * x[i]
+
+        @noinline
+        run(y: []real, x: []real)
+            axpy(y, x, 2.0)
+
+        main()
+            var a: [8]real = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            var b: [8]real = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+            run(a[0..<8], b[0..<8])
+            print(a[3])
+        """
+
+    dsj_optimized(text) match
+        None -> ()
+        Some(opt) ->
+            val body = dsj_body(opt, "@\"demo$run\"(")
+
+            // `axpy` is gone from it: the loop below is its body, inlined.
+            for l in lines_of(body)
+                assert(!(l.contains("call ") && l.contains("axpy") && !l.contains(".cold.")), body)
+
+            assert(body.contains("!alias.scope"), body)
+            assert(body.contains("!noalias"), body)
+            assert(body.contains(" x double>"), body)
+            assert(!body.contains("vector.memcheck"), body)
+end dsj_survives_inlining
+
+// -- what is refused where it is written ---------------------------------------------------------------
+
+@test("'@disjoint' naming a value parameter is refused")
+dsj_value_parameter_refused()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(raw"""
+        module demo
+
+        @disjoint(n, p)
+        f(n: int, p: *int) = *p = n
+
+        g(p: *int) = f(1, p)
+        """)
+
+    assert(out.contains("'@disjoint' names 'n', a parameter of 'demo.f' whose type 'int' is a value — the promise is about memory reached through a parameter"), out)
+end dsj_value_parameter_refused
+
+@test("'@disjoint' naming something that is not a parameter, or one twice, is refused")
+dsj_names_refused()
+    if dsj_no_library() then return
+
+    val missing = dsj_ir(raw"""
+        module demo
+
+        @disjoint(p, z)
+        f(p: *int, q: *int) = *p = *q
+        """)
+
+    assert(missing.contains("'@disjoint' names 'z', which is not a parameter of 'demo.f' — its parameters are 'p', 'q'"), missing)
+
+    val twice = dsj_ir(raw"""
+        module demo
+
+        @disjoint(p, p)
+        f(p: *int, q: *int) = *p = *q
+        """)
+
+    assert(twice.contains("'@disjoint' names 'p' twice"), twice)
+
+    val empty = dsj_ir(raw"""
+        module demo
+
+        @disjoint()
+        f(p: *int, q: *int) = *p = *q
+        """)
+
+    assert(empty.contains("'@disjoint' names the pointer and slice parameters"), empty)
+end dsj_names_refused
+
+@test("'@disjoint' above an 'extern' is refused: the body is C, and the promise is its 'restrict'")
+dsj_extern_refused()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(raw"""
+        module demo
+
+        @disjoint(d, s)
+        extern "memcpy" c_memcpy(d: *u8, s: *u8, n: usize) -> *u8
+        """)
+
+    assert(out.contains("an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"), out)
+end dsj_extern_refused
+
+// -- what a call is held to ----------------------------------------------------------------------------
+
+private dsj_caller(body: string) -> string =
+    "module demo\n\n" +
+    "@disjoint(y, x)\nk(y: []real, x: []const real) = ()\n\n" +
+    "@disjoint(p, q)\nptrs(p: *real, q: *real) = ()\n\n" +
+    "@disjoint(y, p)\nmixed(y: []real, p: *real) = ()\n\n" +
+    s"run(s: []real, t: []real, i: usize)\n    var arr: [8]real = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]\n    var v = 1.0\n$body"
+
+@test("a call handing one local to two '@disjoint' parameters is refused")
+dsj_same_local_refused()
+    if dsj_no_library() then return
+
+    val views = dsj_ir(dsj_caller("    k(s, s)\n"))
+
+    assert(views.contains("'demo.k' is '@disjoint' over 'y' and 'x', and this call hands them storage that overlaps — 's' and 's' are the same memory"), views)
+
+    val ptrs = dsj_ir(dsj_caller("    ptrs(&v, &v)\n"))
+
+    assert(ptrs.contains("'demo.ptrs' is '@disjoint' over 'p' and 'q', and this call hands them storage that overlaps — '&v' and '&v' are the same memory"), ptrs)
+end dsj_same_local_refused
+
+@test("two constant slices of one array that share an element are refused, and two that do not are not")
+dsj_overlapping_slices_refused()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(dsj_caller("    k(arr[0..<4], arr[2..<6])\n"))
+
+    assert(out.contains("hands them storage that overlaps — 'arr[0..<4]' and 'arr[2..<6]' overlap"), out)
+
+    val element = dsj_ir(dsj_caller("    ptrs(&arr[3], &arr[3])\n"))
+
+    assert(element.contains("'&arr[3]' and '&arr[3]' overlap"), element)
+
+    val apart = dsj_ir(dsj_caller("    k(arr[0..<4], arr[4..<8])\n    ptrs(&arr[0], &arr[1])\n"))
+
+    assert(apart.contains("define "), apart)
+    assert(!apart.contains("overlaps"), apart)
+end dsj_overlapping_slices_refused
+
+@test("a view and the address of one of its own elements are refused")
+dsj_view_and_pointer_into_it_refused()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(dsj_caller("    mixed(s, &s[2])\n"))
+
+    assert(out.contains("'demo.mixed' is '@disjoint' over 'y' and 'p', and this call hands them storage that overlaps — 's' and '&s[2]' overlap"), out)
+
+    val computed = dsj_ir(dsj_caller("    mixed(s, &s[i])\n"))
+
+    assert(computed.contains("'s' and '&s[...]' overlap"), computed)
+end dsj_view_and_pointer_into_it_refused
+
+@test("a call the check cannot settle compiles: the promise is trusted, as C trusts 'restrict'")
+dsj_unprovable_call_compiles()
+    if dsj_no_library() then return
+
+    val out = dsj_ir(dsj_caller("    k(s, t)\n    k(arr[0..<i], arr[i..<8])\n    ptrs(&arr[i], &arr[1])\n    mixed(s, &t[0])\n"))
+
+    assert(out.contains("define "), out)
+    assert(!out.contains("overlaps"), out)
+end dsj_unprovable_call_compiles
