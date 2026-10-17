@@ -933,6 +933,81 @@ print(u32(i))
 the literal 4294967296 does not fit uint
 ```
 
+A literal the base would not take is no more the `new` type's than the base's: `3` is not a `real`,
+so it is not a `Phase` over one either.
+
+```sysl
+type Phase = new real
+
+val p: Phase = 3
+```
+
+```error
+cannot initialize 'p': declared Phase but the value is int
+```
+
+#### A `new` type's name converts from whatever its base's name converts from
+
+**`N(x)` is `N(B(x))`**, accepted exactly where `B(x)` is: `Phase(3)` over `real` is
+`Phase(real(3))`, a variable of any type `real(…)` takes converts the same way, and a value already
+at the base is wrapped as before. The base's conversion is the one that runs, with its own rules —
+a float into an integer base is truncated, a value into a fixed-point base is rounded and saturated
+as `q15(x)` is and takes a rounding mode where that conversion takes one — and then the `new`
+type's own `within` or `where` is checked on the result. A chain of `new` types converts through to
+the scalar at the bottom, so over `type A = new B` and `type B = new real`, `A(3)` is `A(B(real(3)))`:
+
+```sysl
+type Phase = new real
+type Slot = new u8 within 0..<8
+type Gain = new i32q16
+type Turn = new Phase
+
+val n = 3
+val f = 2.9
+
+print(f64(Phase(3)) / 2.0, u8(Slot(f)), i32q16(Gain(n)), i32q16(Gain(0.1, Floor)), f64(Turn(n)))
+```
+
+```output
+1.5 2 3 0.09999 3
+```
+
+What the conversion refuses, the `new` type's name refuses, told about the type the line names:
+
+```sysl
+type Phase = new real
+
+print(f64(Phase(true)))
+```
+
+```error
+cannot make Phase from bool
+```
+
+What is **not** inherited is the silence: only the written `Phase(…)` converts. A value that already
+has a type is still refused wherever a `Phase` is wanted, as above, and converting out — `f64(p)`,
+`int(p)` — is the base's own conversion out of the value it holds, as it always was.
+
+**A `new` type's own `From` comes first.** Where the type implements `From[X]` and the value is an
+`X`, `N(x)` is that `from`, whatever the base would have made of it; a value of any other type still
+takes the base's conversion. Inside that very `from`, `N(x)` is the base's conversion, so the
+impl may be written in terms of it. A constant made through a `from` is a call, not a constant:
+
+```sysl
+type Phase = new real
+
+impl From[int] for Phase
+    from(n: int) -> Phase = Phase(n) * 2.0
+
+val i = 3
+
+print(f64(Phase(i)), f64(Phase(i8(3))), f64(Phase(1.5)))
+```
+
+```output
+6 3 1.5
+```
+
 The payoff is a specific bug. A table-driven program has several small integers that index different
 things — a task number, a lock number, a priority level — and the mistake such a program actually
 makes is passing one where another was wanted. Three `new u8`s with three ranges make that a compile

@@ -1885,8 +1885,26 @@ end constrained_call
 // A value made into a subtype: converted to its base where it is not already that, then checked
 // against what the subtype states. A type parameter standing for a subtype comes here too, so
 // `T(n)` at `Small` checks the range exactly as `Small(n)` written out does.
+//
+// **A subtype's name converts from whatever its base's name converts from**, a `new` type's included:
+// `Phase(3)` over `real` is `Phase(real(3))`, accepted exactly where `real(3)` is and refused with
+// that conversion's own refusal, and a rounding mode is taken where the base's conversion takes one.
+// A value already at the base is wrapped, not converted. A chain of `new` types reaches the scalar at
+// the bottom, since the base's own conversion is asked the same question.
+//
+// **A `new` type's own `From[X]` comes first**: where the type implements `From` for the value's
+// type, `N(x)` is that `from`, whatever the base would have made of `x` -- except inside that very
+// `from`, where `N(x)` is the base's conversion, so the impl can be written in terms of it.
 private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
                      args: Buf[Expr]) -> TExpr
+    if args.len() == 2 then
+        val rounded = rounded_convert(cx, span, written, underlying(target), args)
+
+        if texpr_type(rounded) == Unknown then return rounded
+
+        return subtype_from(cx, span, rounded, target, written)
+    end if
+
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
@@ -1894,19 +1912,42 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
         Constrained(d) ->
             val t = type_expr(cx, args.at(0), Some(d.base))
 
-            // A derived type's name WRAPS a value already at its base; only a transparent subtype's
-            // name converts, being its base's name with a check after it.
-            if disagree(texpr_type(t), d.base) && d.derived then
-                return cx.err(span, refusal(Some(written), texpr_type(t), target))
+            if texpr_type(t) == Unknown then return t
 
-            if disagree(texpr_type(t), d.base) then
-                val converted = convert_to(cx, span, t, d.base, Some(written))
-
-                return TExpr(span, TConstrainedCheck(converted, target))
-
-            TExpr(span, TConstrainedCheck(t, target))
+            subtype_from(cx, span, t, target, written)
         _ -> bad_expr(span)
 end into_subtype
+
+// A typed value made into a subtype, by the rule `into_subtype` states: wrapped where it is at the
+// base, through the type's own `from` where it has one for the value, and otherwise converted to the
+// base -- itself a subtype's conversion where the base is one -- and then checked.
+private subtype_from(cx: &Analyzer, span: Span, t: TExpr, target: Type, written: string) -> TExpr
+    target match
+        Constrained(d) ->
+            if !disagree(texpr_type(t), d.base) then return TExpr(span, TConstrainedCheck(t, target))
+
+            if d.derived
+                val own = from_conversion(cx.an, texpr_type(t), target)
+
+                if own.is_some() && own.unwrap() != cx.body
+                    cx.an.uses(own.unwrap())
+
+                    var ts: Buf[TExpr] = buf()
+
+                    ts.push(t)
+
+                    return TExpr(span, TCall(own.unwrap(), ts, target, false))
+            end if
+
+            val converted = d.base match
+                Constrained(_) -> subtype_from(cx, span, t, d.base, written)
+                _ -> convert_to(cx, span, t, d.base, Some(written))
+
+            if texpr_type(converted) == Unknown then return converted
+
+            TExpr(span, TConstrainedCheck(converted, target))
+        _ -> bad_expr(span)
+end subtype_from
 
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,

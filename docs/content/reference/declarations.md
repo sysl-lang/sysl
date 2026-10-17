@@ -2757,8 +2757,25 @@ print(f64(d) * 2.0, u8(s))
 3 3
 ```
 
+A `new` type's name converts from whatever its base's name converts from: `Phase(3)` over
+`type Phase = new real` is `Phase(real(3))`, accepted exactly where `real(3)` is. Only the written
+conversion does it — a `3` or an `int` is still not a `Phase` where one is wanted:
+
+```sysl
+type Phase = new real
+
+val n = 3
+
+print(f64(Phase(3)) + f64(Phase(n)))
+```
+
+```output
+6
+```
+
 `new`, `within` and `where` are contextual words, so a function or field may still be named `where`.
-See [errors and contracts](/reference/errors/) for what a bound costs and when it is checked.
+See [errors and contracts](/reference/errors/) for what a bound costs and when it is checked, and for
+[how a `new` type converts](/reference/errors/#a-new-type-s-name-converts-from-whatever-its-base-s-name-converts-from).
 
 ### A `new` type may take parameters
 
