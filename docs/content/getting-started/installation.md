@@ -41,7 +41,7 @@ sysl --version
 sysl --help
 ```
 
-**The formula is macOS on Apple silicon only.** sysl 0.1.4 is cut by the compiler itself on a Mac
+**The formula is macOS on Apple silicon only.** sysl 0.1.5 is cut by the compiler itself on a Mac
 and ships one binary, `darwin-arm64`; Linux binaries return when a Linux build is part
 of the release. Anything else builds from source, below.
 
