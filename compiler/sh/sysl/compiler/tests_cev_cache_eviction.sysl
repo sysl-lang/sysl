@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.fs.{entries, is_dir, is_file, make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.repeat
 
@@ -19,6 +19,8 @@ private cev_begin() -> (string, string)
 
     use_c_object_cache_dir(Some(cache))
     use_run_cache_dir(Some(cache))
+    use_root_cache_dir(Some(cache))
+    reset_std_sweep()
     clear_c_object_counts()
     make_dir_all(s"$cache/sysl/cobj").unwrap()
     (work, cache)
@@ -27,6 +29,8 @@ end cev_begin
 private cev_end(dirs: (string, string))
     use_c_object_cache_dir(None)
     use_run_cache_dir(None)
+    use_root_cache_dir(None)
+    reset_std_sweep()
     use_cache_bound(None)
     remove_dir_all(dirs.0).unwrap_or(())
     remove_dir_all(dirs.1).unwrap_or(())
@@ -218,3 +222,161 @@ cev_run_cache_is_bounded()
     assert_eq(run_cache_sweep_count(), before + 1)
     cev_end(dirs)
 end cev_run_cache_is_bounded
+
+// `n` root archives -- `<stem><i>.syslib` of `size` bytes and its `.sum` -- in `dir`.
+private cev_roots(dir: string, stem: string, n: usize, size: usize)
+    for i in 0..<n
+        write_text(s"$dir/$stem${i}.syslib", repeat("x", size)).unwrap()
+        write_text(s"$dir/$stem${i}.syslib.sum", "1:0").unwrap()
+
+@test("the roots cache sweeps once per process, however many roots were built, and stamps it")
+cev_roots_sweep_once_per_process()
+    val dirs = cev_begin()
+    val roots = s"${dirs.1}/sysl/roots"
+
+    make_dir_all(roots).unwrap()
+    write_text(s"$roots/lonely.syslib.sum", "1:0").unwrap()
+
+    val before = root_sweep_count()
+
+    sweep_roots()
+    assert_eq(root_sweep_count(), before)
+
+    note_roots_dir(roots)
+    note_roots_dir(roots)
+    sweep_roots()
+    sweep_roots()
+    assert_eq(root_sweep_count(), before + 1)
+    assert(!is_file(s"$roots/lonely.syslib.sum"), "a sidecar with no archive was swept")
+    assert(is_file(s"$roots.swept"), "the sweep left its stamp beside the directory")
+
+    // More roots built in the same process sweep nothing more.
+    write_text(s"$roots/other.syslib.sum", "1:0").unwrap()
+    note_roots_dir(roots)
+    sweep_roots()
+    assert_eq(root_sweep_count(), before + 1)
+    assert(is_file(s"$roots/other.syslib.sum"), "nothing was swept the second time")
+    cev_end(dirs)
+end cev_roots_sweep_once_per_process
+
+@test("the roots cache is held to the byte bound, oldest first, keeping what the build used")
+cev_roots_are_bounded_and_spare_what_was_used()
+    val dirs = cev_begin()
+    val roots = s"${dirs.1}/sysl/roots"
+
+    make_dir_all(roots).unwrap()
+
+    for i in 0..<10
+        cev_roots(roots, s"k${i}_", 1, 1000)
+        cev_date(roots, s"k${i}_*", s"20200101010${i}")
+
+    cev_roots(roots, "fresh", 1, 1000)
+    note_root_use(s"$roots/k0_0.syslib")
+    use_cache_bound(Some(8000))
+    note_roots_dir(roots)
+    sweep_roots()
+
+    assert(is_file(s"$roots/k0_0.syslib") && is_file(s"$roots/k0_0.syslib.sum"),
+        "what the build used stays, though it is the oldest")
+    assert(!is_file(s"$roots/k1_0.syslib") && !is_file(s"$roots/k1_0.syslib.sum"),
+        "the oldest other archive and its sidecar went")
+    assert(is_file(s"$roots/k9_0.syslib"), "the newest of the old ones stayed")
+    assert(is_file(s"$roots/fresh0.syslib"), "this hour's entry stayed")
+
+    var total: long = 0
+
+    for item in entries(roots).unwrap()
+        total += metadata(s"$roots/${item}").unwrap().size
+
+    assert(total <= 8000, s"the directory fits its bound: $total bytes")
+    cev_end(dirs)
+end cev_roots_are_bounded_and_spare_what_was_used
+
+@test("the roots cache never takes what was written in the last hour, over the bound or not")
+cev_roots_fresh_entries_are_spared()
+    val dirs = cev_begin()
+    val roots = s"${dirs.1}/sysl/roots"
+
+    make_dir_all(roots).unwrap()
+    cev_roots(roots, "new", 8, 1000)
+    use_cache_bound(Some(1000))
+    note_roots_dir(roots)
+    sweep_roots()
+    assert_eq(cev_count(roots, ".syslib"), 8)
+    cev_end(dirs)
+end cev_roots_fresh_entries_are_spared
+
+// `n` standard-module entries `<stem><i>/std.syslib` of `size` bytes under `dir`.
+private cev_std_entries(dir: string, stem: string, n: usize, size: usize)
+    for i in 0..<n
+        make_dir_all(s"$dir/$stem$i").unwrap()
+        write_text(s"$dir/$stem$i/std.syslib", repeat("x", size)).unwrap()
+
+@test("the standard module's entries sweep once per process, and only where one was used")
+cev_std_entries_sweep_once_per_process()
+    val dirs = cev_begin()
+    val sysl = s"${dirs.1}/sysl"
+
+    cev_std_entries(sysl, "e", 3, 100)
+
+    sweep_std_artifacts()
+    assert_eq(std_sweep_count(), 0)
+
+    note_std_use(s"$sysl/e0/std.syslib")
+    note_std_use(s"$sysl/e1/std.syslib")
+    sweep_std_artifacts()
+    sweep_std_artifacts()
+    assert_eq(std_sweep_count(), 1)
+    assert(is_file(s"$sysl/std.swept"), "the sweep left its stamp beside the entries")
+
+    note_std_use(s"$sysl/e2/std.syslib")
+    sweep_std_artifacts()
+    assert_eq(std_sweep_count(), 1)
+    cev_end(dirs)
+end cev_std_entries_sweep_once_per_process
+
+@test("the standard module's entries are held to the byte bound whole, oldest first, sparing every one in use")
+cev_std_entries_are_bounded_and_spare_the_ones_in_use()
+    val dirs = cev_begin()
+    val sysl = s"${dirs.1}/sysl"
+
+    cev_std_entries(sysl, "e", 10, 1000)
+
+    for i in 0..<10
+        cev_date(sysl, s"e$i/std.syslib", s"20200101010$i")
+
+    cev_std_entries(sysl, "fresh", 1, 1000)
+    make_dir_all(s"$sysl/other").unwrap()
+    write_text(s"$sysl/other/note", "not an entry").unwrap()
+    cev_date(sysl, "other/note", "202001010000")
+
+    // A stage 1 and a stage 2 in use at once: the two oldest.
+    note_std_use(s"$sysl/e0/std.syslib")
+    note_std_use(s"$sysl/e1/std.syslib")
+    use_cache_bound(Some(8000))
+    sweep_std_artifacts()
+
+    assert(is_file(s"$sysl/e0/std.syslib") && is_file(s"$sysl/e1/std.syslib"), "both entries in use stayed")
+    assert(!is_dir(s"$sysl/e2") && !is_dir(s"$sysl/e3") && !is_dir(s"$sysl/e4"),
+        "the oldest others went, whole directories")
+    assert(is_file(s"$sysl/e5/std.syslib") && is_file(s"$sysl/e9/std.syslib"), "the newer ones stayed")
+    assert(is_file(s"$sysl/fresh0/std.syslib"), "this hour's entry stayed")
+    assert(is_file(s"$sysl/other/note"), "a directory that is no entry is none of the sweep's business")
+    cev_end(dirs)
+end cev_std_entries_are_bounded_and_spare_the_ones_in_use
+
+@test("the standard module's entries are never taken within the hour, over the bound or not")
+cev_std_fresh_entries_are_spared()
+    val dirs = cev_begin()
+    val sysl = s"${dirs.1}/sysl"
+
+    cev_std_entries(sysl, "n", 6, 1000)
+    note_std_use(s"$sysl/n0/std.syslib")
+    use_cache_bound(Some(1000))
+    sweep_std_artifacts()
+
+    for i in 0..<6
+        assert(is_file(s"$sysl/n$i/std.syslib"), s"entry $i is this hour's")
+
+    cev_end(dirs)
+end cev_std_fresh_entries_are_spared

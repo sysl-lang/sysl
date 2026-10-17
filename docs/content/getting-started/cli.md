@@ -87,7 +87,10 @@ on Linux — holds at most 4 GB: past that the oldest entries go, though never o
 last hour and never one the build in hand used. Past 256 entries, anything a week older than the
 newest goes too. The sweep runs once, when a build that compiled something is done, and is skipped
 where another build swept the same directory in the last ten minutes. Deleting either directory
-costs one rebuild and nothing else.
+costs one rebuild and nothing else. The same bound, sweep and sparing rules hold for the compiled
+roots under `roots/` and for the standard module's own entries (one directory per compiler build,
+target and optimisation level, directly under `sysl/`), which are removed whole, oldest first, and
+never the one the running compiler uses.
 
 **Everything after a bare `--` belongs to the program**, not to sysl:
 

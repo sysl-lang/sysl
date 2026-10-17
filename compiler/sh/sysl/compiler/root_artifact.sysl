@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.env.get as env_var
 import sysl.fs.{entries, is_file, metadata, read_bytes, read_text, remove_file, write_text_atomic}
 import sysl.text.{from_utf8_unchecked, Search}
@@ -59,6 +60,8 @@ private var root_from_source: int = 0
 // machine's with `None`.
 use_root_cache_dir(dir: Option[string])
     root_home = dir.unwrap_or("")
+    roots_pending = ""
+    roots_swept = false
 
 // `(hits, built, from source)` since the last `clear_root_artifact_counts`.
 root_artifact_counts() -> (int, int, int) = (root_hits, root_built, root_from_source)
@@ -182,7 +185,7 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
     keep_sum(place)?
     root_built += 1
     in_use(place)
-    evict_roots(dir)
+    note_roots_dir(dir)
     trace(s"source root ${libs.at(at)}: compiled into $place")
     take(out, symbols, place)
     Ok(())
@@ -380,38 +383,73 @@ end read_into
 // measured against the newest entry, and never what this process used or made. A sidecar with no
 // archive is garbage at any age, nothing ever completing it.
 
-private var roots_in_use: Buf[string] = buf()
+//
+// **And past `CacheBytes` the oldest go until the directory fits**, sparing the last hour's
+// (`CacheFresh`), as in the other two caches.
+//
+// **One sweep per process, after its compilations** -- `sweep_roots`, which the driver calls when a
+// command line is answered. A miss only notes the directory, and none runs where another process swept
+// it in the last ten minutes (`claim_sweep`).
+
+private var roots_in_use: Set[string] = set()
+private var roots_pending: string = ""
+private var roots_swept: bool = false
+private var root_sweeps: int = 0
 
 private in_use(place: string)
-    roots_in_use.push(place)
-    roots_in_use.push(sum_of(place))
+    roots_in_use.add(place)
+    roots_in_use.add(sum_of(place))
 end in_use
 
-evict_roots(dir: string)
-    val names = entries(dir) match
-        Ok(n) -> n
-        Err(_) -> return
+// How many sweeps this process has made of the roots cache, for a test to count.
+root_sweep_count() -> int = root_sweeps
 
+// A root was built into `dir`: it is swept when the command line is answered.
+note_roots_dir(dir: string)
+    roots_pending = dir
+
+// An archive this process used or made, which the sweep never takes.
+note_root_use(place: string) = in_use(place)
+
+// The cache swept where this process built a root and has not swept it yet.
+sweep_roots()
+    if roots_pending == "" || roots_swept then return
+
+    val dir = roots_pending
+
+    roots_pending = ""
+    roots_swept = true
+
+    if claim_sweep(dir) then evict_roots(dir)
+end sweep_roots
+
+private evict_roots(dir: string)
+    root_sweeps += 1
+
+    val files = cache_files(dir) match
+        Some(f) -> f
+        None -> return
+
+    var gone: Set[string] = set()
     var kept: usize = 0
     var now: long = 0
+    val sum = s"$SyslibExtension.sum"
 
-    for n in names
-        val one = s"$dir/$n"
+    for f in files
+        if f.modified > now then now = f.modified
+        if f.file.ends_with(SyslibExtension) then kept += 1
 
-        if n.ends_with(SyslibExtension) then kept += 1
-        else if n.ends_with(s"$SyslibExtension.sum")
-            if !is_file(one[0..<one.len - 4]) && !holds_string(roots_in_use, one)
-                remove_file(one).unwrap_or(())
+    // A sidecar with no archive is garbage at any age.
+    for f in files
+        if f.file.ends_with(sum) && !is_file(f.file[0..<f.file.len - 4]) && !roots_in_use.has(f.file)
+            remove_file(f.file).unwrap_or(())
+            gone.add(f.file)
 
-        val at = cache_modified_at(one)
+    if kept >= CacheKeep
+        for f in files
+            if !gone.has(f.file) && !roots_in_use.has(f.file) && now - f.modified > CacheStale
+                remove_file(f.file).unwrap_or(())
+                gone.add(f.file)
 
-        if at > now then now = at
-
-    if kept < CacheKeep then return
-
-    for item in names
-        val one = s"$dir/${item}"
-
-        if is_file(one) && !holds_string(roots_in_use, one) && now - cache_modified_at(one) > CacheStale
-            remove_file(one).unwrap_or(())
+    trim_to_bound(files, &gone, (one) -> roots_in_use.has(one), ".sum")
 end evict_roots
