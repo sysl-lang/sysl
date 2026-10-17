@@ -28,16 +28,22 @@ import sysl.testing.skip
 //
 // Ported from the reference's `AbiAgainstClangTests` (0.0.162), whose shapes these are.
 
+// `kind` is `struct` or `union`, the keyword both languages spell `S` with; `before` is declared
+// ahead of `S` in each language, for a shape that holds another.
 private struct AbcShape
     what: string
     sysl: string
     c: string
     packed: bool
+    kind: string
+    sysl_before: string
+    c_before: string
 
 private abc_shapes() -> Buf[AbcShape]
     var out: Buf[AbcShape] = buf()
-    val sh = (w: string, s: string, c: string) -> AbcShape(w, s, c, false)
-    val pk = (w: string, s: string, c: string) -> AbcShape(w, s, c, true)
+    val sh = (w: string, s: string, c: string) -> AbcShape(w, s, c, false, "struct", "", "")
+    val pk = (w: string, s: string, c: string) -> AbcShape(w, s, c, true, "struct", "", "")
+    val un = (w: string, s: string, c: string) -> AbcShape(w, s, c, false, "union", "", "")
 
     out.push(sh("one byte", "    a: u8", "unsigned char a;"))
     out.push(sh("three bytes", "    a: u8\n    b: u8\n    c: u8", "unsigned char a; unsigned char b; unsigned char c;"))
@@ -69,6 +75,23 @@ private abc_shapes() -> Buf[AbcShape]
     out.push(pk("bitfields straddling a byte", "    a: u3\n    b: u16\n    c: u5", "unsigned char x[3];"))
     out.push(pk("a word of bitfields", "    a: u3\n    b: u29", "unsigned int x;"))
     out.push(pk("eight bytes of bitfields", "    a: u5\n    b: u59", "unsigned long long x;"))
+
+    // The ten shapes of `docs/design/union-probes/abi.c`: each convention's union rule -- AAPCS's
+    // HFA counted by size, System V's overlapping eightbytes, RISC-V's refusal to flatten one, and
+    // wasm's one-field unwrap -- is asked of clang here rather than of the design note's table.
+    out.push(un("a union of a float and a word", "    f: f32\n    i: u32", "float f; unsigned int i;"))
+    out.push(un("a union of one float", "    f: f32", "float f;"))
+    out.push(un("a union of a float and two floats", "    a: f32\n    b: [2]f32", "float a; float b[2];"))
+    out.push(un("a union of a double and a long", "    d: f64\n    i: u64", "double d; unsigned long long i;"))
+    out.push(un("a union of two doubles", "    d: [2]f64", "double d[2];"))
+    out.push(un("a union of four floats and two doubles", "    f: [4]f32\n    d: [2]f64", "float f[4]; double d[2];"))
+    out.push(un("a twelve-byte union of integers", "    b: [12]u8\n    w: [3]u32",
+                "unsigned char b[12]; unsigned int w[3];"))
+    out.push(un("a twenty-four-byte union of integers", "    b: [24]u8\n    w: [3]u64",
+                "unsigned char b[24]; unsigned long long w[3];"))
+    out.push(un("a union of a pointer and a word", "    p: *u8\n    n: u32", "void *p; unsigned int n;"))
+    out.push(AbcShape("a struct holding a union", "    x: f32\n    u: U", "float x; union U u;", false, "struct",
+                      "union U\n    y: f32\n    z: u32\n", "union U { float y; unsigned int z; };\n"))
     out
 end abc_shapes
 
@@ -82,6 +105,10 @@ private abc_normalize(t: Target, line: string) -> string
     for junk in ["dso_local ", " #0", " #1", " #2", "noundef ", " noundef", "dead_on_unwind ",
                  "writable ", "dead_on_return ", " dead_on_return"]
         s = replace_all(s, junk, "")
+
+    // clang names a union's IR type `%union.S` and sysl names every aggregate's `%struct.S`; the name
+    // is a label, and the convention's answer is what is around it.
+    s = replace_all(s, "%union.", "%struct.")
 
     replace_all(abc_squeeze(s), " x ptr]", s" x i${t.pointer_bits()}]")
 end abc_normalize
@@ -114,6 +141,18 @@ private abc_declaring(t: Target, ir: string, symbol: string) -> Option[string]
 
     None
 end abc_declaring
+
+// The line defining `S`'s IR type, where the module has one. For a union it is part of the answer:
+// where a convention passes the aggregate as its own type -- an HFA under AAPCS32 hard-float -- the
+// back end reads the registers off the type's body, and a union's body is the one the compiler chose.
+private abc_type_line(t: Target, ir: string) -> Option[string]
+    for l in lines_of(ir)
+        val n = abc_normalize(t, l)
+
+        if n.starts_with("%struct.S = type") then return Some(n)
+
+    None
+end abc_type_line
 
 // The major version a clang reports on its first line — `clang version 23.1.2`.
 private abc_major(cc: string) -> Option[int]
@@ -164,8 +203,8 @@ private abc_clang_says(cc: string, t: Target, dir: string, s: AbcShape) -> strin
     val src = s"$dir/x.c"
     val attr = if s.packed then " __attribute__((packed))" else ""
 
-    write_text(src, s"struct$attr S { ${s.c} };\nextern struct S give(void);\nextern void take(struct S v);\n" +
-                    "void go(void) { take(give()); }\n").unwrap()
+    write_text(src, s"${s.c_before}${s.kind}$attr S { ${s.c} };\nextern ${s.kind} S give(void);\n" +
+                    s"extern void take(${s.kind} S v);\nvoid go(void) { take(give()); }\n").unwrap()
 
     var args: Buf[string] = buf()
 
@@ -188,8 +227,8 @@ end abc_has
 
 // sysl's half, compiled in-process against the standard module parsed for this machine.
 private abc_sysl_says(t: Target, library: Buf[Program], s: AbcShape) -> string
-    val text = (if s.packed then "@packed\n" else "") +
-               s"struct S\n${s.sysl}\nextern give() -> S\nextern take(v: S)\ntake(give())\n"
+    val text = s.sysl_before + (if s.packed then "@packed\n" else "") +
+               s"${s.kind} S\n${s.sysl}\nextern give() -> S\nextern take(v: S)\ntake(give())\n"
     val parsed = parse(source_of("t.sysl", text), t)
 
     if !parsed.ok() then return parsed.first().message
@@ -253,15 +292,19 @@ abc_every_machine_agrees_with_clang()
                       s"$what, returning it: ${abc_declaring(t, c, "give")}")
             assert_eq(s"$what, passing it: ${abc_declaring(t, m, "take")}",
                       s"$what, passing it: ${abc_declaring(t, c, "take")}")
+
+            if s.kind == "union" && abc_type_line(t, c).is_some()
+                assert_eq(s"$what, its type: ${abc_type_line(t, m)}", s"$what, its type: ${abc_type_line(t, c)}")
+
             asked += 1
 
     remove_dir_all(dir).unwrap_or(())
 
-    // Twenty shapes on each of the twenty-one machines sysl builds for with clang. A machine whose
+    // Thirty shapes on each of the twenty-one machines sysl builds for with clang. A machine whose
     // back end this clang lacks was named above; where that is every one, nothing was measured at all.
     if machines == 0 then skip(s"'$cc' has none of the back ends these machines need")
 
     assert_eq(machines + passed_over, 21)
-    assert_eq(shapes.len(), 20)
-    assert_eq(asked, machines * 20)
+    assert_eq(shapes.len(), 30)
+    assert_eq(asked, machines * 30)
 end abc_every_machine_agrees_with_clang

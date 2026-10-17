@@ -228,3 +228,59 @@ unk_ref_to_checked_field_refused()
             r = 2
             print(c.raw)
         """, "2\n")
+
+// Methods on `Pair`, appended to `unk_decls`: one reads through `*self` and one takes a copy.
+private val unk_pair_methods: string = raw"""
+    impl Pair
+        bump(*self)
+            self.n += 1
+
+        total(self) -> u16 = self.n
+
+    """
+
+@test("a '*self' method may not be called on a checked field, and may on an AnyBits one")
+unk_ptr_self_on_checked_field_refused()
+    if !unk_ready() then return
+
+    val (_, _, err) = unk_run(unk_decls + unk_pair_methods + raw"""
+        main()
+            var c = Cell(raw = 1)
+            c.pair.bump()
+        """, "0")
+
+    assert(err.contains("error: the '*self' method 'bump' cannot be called on a field of a union that is Pair — a read of it checks its bytes, a read through '*self' would not, and a write to another field changes them. Read it into a 'var' and call the method on that\n"), err)
+    assert(err.contains("/main.sysl:28:12\n"), err)
+    assert_eq(err.count_of("error: "), 1)
+
+    unk_prints(raw"""
+        struct Count
+            n: u32
+
+        impl Count
+            bump(*self)
+                self.n += 1
+
+        union Wide
+            count: Count
+            raw: u32
+
+        main()
+            var w = Wide(raw = 41)
+            w.count.bump()
+            print(w.raw)
+        """, "42\n")
+
+@test("a by-value 'self' method on a checked field is a checked read: it traps or passes")
+unk_value_self_on_checked_field_is_checked()
+    unk_prints(unk_decls + unk_pair_methods + raw"""
+        main()
+            var c = Cell(pair = Pair(on = true, n = 7))
+            print(c.pair.total())
+        """, "7\n")
+
+    unk_traps(unk_decls + unk_pair_methods + raw"""
+        main()
+            var c = Cell(raw = 2)
+            print(c.pair.total())
+        """, "")

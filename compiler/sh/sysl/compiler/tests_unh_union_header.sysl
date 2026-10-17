@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A union reaches C as C declares one, and crosses to C by value as clang passes one.** The header
+// half checks each union from both sides with the same numbers -- an `@assert` in the sysl module,
+// which the header's own analysis settles, and a `_Static_assert` in a C file that includes the
+// header, which clang settles for each machine -- so C is the oracle for the layout. The call half
+// links real C, compiled by clang, against sysl on this machine: sysl calling C with each union by
+// value and C calling sysl's exports the same way. `tests_abc_abi_against_clang.sysl` checks the
+// signatures on every other machine.
+
+private unh_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The machines the header is checked on: sysl's target and clang's triple for it, the host first.
+private unh_target(i: int) -> (string, string) = i match
+    0 -> ("", "")
+    1 -> ("thumbv7em-freestanding", "thumbv7em-none-eabi")
+    2 -> ("aarch64-freestanding", "aarch64-none-elf")
+    _ -> ("x86_64-windows", "x86_64-pc-windows-msvc")
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private unh_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end unh_cli
+
+// A project holding nothing but `mylib`, as an archive project is.
+private unh_project(lib: string) -> string
+    val root = make_temp_dir("sysl-unh").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$lib").unwrap()
+    root
+end unh_project
+
+// The header for `root` on a sysl target ("" for the host).
+private unh_header(root: string, target: string) -> (int, string)
+    var hosted: [3]string = ["sysl", "emit-header", root]
+    var bare: [5]string = ["sysl", "emit-header", "--target", target, root]
+
+    if target == "" then unh_cli(hosted[..]) else unh_cli(bare[..])
+end unh_header
+
+// clang reading `c` beside `header` for `triple` ("" for the host): whether it compiled, and what it
+// said. `msvc` takes `__clang__` away, so the header's MSVC side is the one read.
+private unh_clang(root: string, header: string, c: string, triple: string, msvc: bool = false) -> (bool, string)
+    write_text(s"$root/probe.h", header).unwrap()
+    write_text(s"$root/probe.c", s"#include <stddef.h>\n#include \"probe.h\"\n\n$c").unwrap()
+
+    val cc = find_clang(host_target(), None).unwrap()
+    var args: Buf[string] = buf()
+
+    if triple != "" then
+        args.push("-target")
+        args.push(triple)
+        args.push("-ffreestanding")
+
+    if msvc then
+        args.push("-fms-extensions")
+        args.push("-U__clang__")
+        args.push("-Wno-builtin-macro-redefined")
+
+    args.push("-std=c11")
+    args.push("-Wall")
+    args.push("-Werror")
+    args.push("-fsyntax-only")
+    args.push(s"-I$root")
+    args.push(s"$root/probe.c")
+
+    val ran = capture(cc, args.view(), "", [], true).unwrap()
+
+    (ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+end unh_clang
+
+// The sysl half: the unions of the design note's `layout.c`, each with an `@assert` of its size,
+// alignment and offsets, all reached from one exported signature and one piece of exported storage.
+private unh_lib() -> string =
+    "@export(\"u_word\")\nunion UWord\n    a: u8\n    b: u32\n\n" +
+    "@export(\"u_round\")\nunion URound\n    a: [5]u8\n    b: u32\n\n" +
+    "@export(\"u_half\")\nunion UHalf\n    a: [3]u8\n    b: u16\n\n" +
+    "@packed\n@export(\"u_packed\")\nunion UPacked\n    a: [5]u8\n    b: u32\n\n" +
+    "@align(16)\n@export(\"u_aligned\")\nunion UAligned\n    a: [5]u8\n    b: u32\n\n" +
+    "@export(\"u_epoll\")\nunion UEpoll\n    p: *u8\n    fd: i32\n    u: u32\n    w: u64\n\n" +
+    "@export(\"u_fi\")\nunion UFi\n    i: u32\n    f: f32\n\n" +
+    "@export(\"u_tagged\")\nstruct UTagged\n    tag: u8\n    v: UFi\n    t: u8\n\n" +
+    "@packed\n@export(\"u_tagged_packed\")\nstruct UTaggedPacked\n    tag: u8\n    v: UFi\n\n" +
+    "@export(\"u_dw\")\nunion UDw\n    d: f64\n    w: [2]u32\n\n" +
+    "@export(\"u_pn\")\nunion UPn\n    p: *u8\n    n: u32\n\n" +
+    "@export(\"u_table\")\nvar table: [2]URound\n\n" +
+    "@assert(sizeof(UWord) == 4 && alignof(UWord) == 4 && offsetof(UWord, a) == 0 && offsetof(UWord, b) == 0)\n" +
+    "@assert(sizeof(URound) == 8 && alignof(URound) == 4 && offsetof(URound, b) == 0)\n" +
+    "@assert(sizeof(UHalf) == 4 && alignof(UHalf) == 2 && offsetof(UHalf, b) == 0)\n" +
+    "@assert(sizeof(UPacked) == 5 && alignof(UPacked) == 1 && offsetof(UPacked, b) == 0)\n" +
+    "@assert(sizeof(UAligned) == 16 && alignof(UAligned) == 16)\n" +
+    "@assert(sizeof(UEpoll) == 8 && alignof(UEpoll) == alignof(u64) && offsetof(UEpoll, w) == 0 && offsetof(UEpoll, fd) == 0)\n" +
+    "@assert(sizeof(UTagged) == 12 && offsetof(UTagged, v) == 4 && offsetof(UTagged, t) == 8)\n" +
+    "@assert(sizeof(UTaggedPacked) == 5 && alignof(UTaggedPacked) == 1 && offsetof(UTaggedPacked, v) == 1)\n" +
+    "@assert(sizeof(UDw) == 8 && alignof(UDw) == alignof(f64) && offsetof(UDw, w) == 0)\n" +
+    "@assert(sizeof(UPn) == sizeof(*u8) && offsetof(UPn, n) == 0)\n\n" +
+    "@export(\"unh_take\")\ntake(a: UWord, b: URound, c: UHalf, d: UPacked, e: *UAligned, f: UEpoll, g: UTagged, " +
+    "h: UTaggedPacked, i: UDw, j: UPn) -> UFi = UFi(i = 0)\n"
+
+// The C half: the same numbers, as the header declares the types.
+private unh_c() -> string =
+    "_Static_assert(sizeof(u_word) == 4 && _Alignof(u_word) == 4 && offsetof(u_word, a) == 0 && offsetof(u_word, b) == 0, \"u_word\");\n" +
+    "_Static_assert(sizeof(u_round) == 8 && _Alignof(u_round) == 4 && offsetof(u_round, b) == 0, \"u_round\");\n" +
+    "_Static_assert(sizeof(u_half) == 4 && _Alignof(u_half) == 2 && offsetof(u_half, b) == 0, \"u_half\");\n" +
+    "_Static_assert(sizeof(u_packed) == 5 && _Alignof(u_packed) == 1 && offsetof(u_packed, b) == 0, \"u_packed\");\n" +
+    "_Static_assert(sizeof(u_aligned) == 16 && _Alignof(u_aligned) == 16, \"u_aligned\");\n" +
+    "_Static_assert(sizeof(u_epoll) == 8 && _Alignof(u_epoll) == _Alignof(uint64_t) && offsetof(u_epoll, w) == 0 && offsetof(u_epoll, fd) == 0, \"u_epoll\");\n" +
+    "_Static_assert(sizeof(u_tagged) == 12 && offsetof(u_tagged, v) == 4 && offsetof(u_tagged, t) == 8, \"u_tagged\");\n" +
+    "_Static_assert(sizeof(u_tagged_packed) == 5 && _Alignof(u_tagged_packed) == 1 && offsetof(u_tagged_packed, v) == 1, \"u_tagged_packed\");\n" +
+    "_Static_assert(sizeof(u_dw) == 8 && _Alignof(u_dw) == _Alignof(double) && offsetof(u_dw, w) == 0, \"u_dw\");\n" +
+    "_Static_assert(sizeof(u_pn) == sizeof(void *) && offsetof(u_pn, n) == 0, \"u_pn\");\n" +
+    "_Static_assert(sizeof(u_table) == 16, \"u_table\");\n"
+
+// Both halves on one machine: the header is written, so every `@assert` held, and clang agrees.
+private unh_agrees(target: string, triple: string, msvc: bool = false) -> string
+    val root = unh_project(unh_lib())
+    val got = unh_header(root, target)
+
+    assert_eq(got.0, 0, got.1)
+
+    val compiled = unh_clang(root, got.1, unh_c(), triple, msvc)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(compiled.0, s"on '$triple':\n${compiled.1}\n${got.1}")
+    got.1
+end unh_agrees
+
+@test("every union of layout.c is laid out alike by sysl and by C, on the host and the bare machines")
+unh_layouts_agree()
+    if !unh_ready() then return
+
+    for i in 0..<4
+        unh_agrees(unh_target(i).0, unh_target(i).1)
+end unh_layouts_agree
+
+@test("MSVC's spelling of a packed and an aligned union lays them out alike too")
+unh_msvc_spelling_agrees()
+    if !unh_ready() then return
+
+    unh_agrees("x86_64-windows", "x86_64-pc-windows-msvc", true)
+end unh_msvc_spelling_agrees
+
+@test("the header writes a union as 'typedef union', with its layout attributes")
+unh_the_header_text()
+    if !unh_ready() then return
+
+    val h = unh_agrees("", "")
+
+    assert(h.contains("typedef union {\n\tuint8_t a;\n\tuint32_t b;\n} u_word;\n"), h)
+    assert(h.contains("typedef union {\n\tuint8_t a[5];\n\tuint32_t b;\n} u_round;\n"), h)
+    assert(h.contains("SYSL_PACK_PUSH\ntypedef union SYSL_PACKED {\n\tuint8_t a[5];\n\tuint32_t b;\n} u_packed;\nSYSL_PACK_POP\n"), h)
+    assert(h.contains("typedef union SYSL_ALIGNED(16) {\n"), h)
+    assert(h.contains("typedef struct {\n\tuint8_t tag;\n\tu_fi v;\n\tuint8_t t;\n} u_tagged;\n"), h)
+    assert(h.contains("extern u_round u_table[2];\n"), h)
+    assert(h.contains("u_fi unh_take(u_word a, u_round b, u_half c, u_packed d, u_aligned * e, u_epoll f, u_tagged g, u_tagged_packed h, u_dw i, u_pn j);\n"), h)
+
+    // A union is declared before the struct that holds it, as a struct is.
+    assert(h.index_of("} u_fi;").unwrap() < h.index_of("} u_tagged;").unwrap(), h)
+end unh_the_header_text
+
+// -- by value, against C clang compiled ---------------------------------------------------------------
+
+// The ten shapes of the design note's `abi.c`, in sysl.
+private unh_shapes() -> string =
+    "union Fi\n    i: u32\n    f: f32\n\n" +
+    "union F1\n    f: f32\n\n" +
+    "union Ff\n    a: f32\n    b: [2]f32\n\n" +
+    "union Di\n    d: f64\n    i: u64\n\n" +
+    "union D2\n    d: [2]f64\n\n" +
+    "union Fd\n    f: [4]f32\n    d: [2]f64\n\n" +
+    "union B12\n    b: [12]u8\n    w: [3]u32\n\n" +
+    "union B24\n    b: [24]u8\n    w: [3]u64\n\n" +
+    "union Pi\n    p: *u8\n    n: u32\n\n" +
+    "struct Sfu\n    x: f32\n    u: Fi\n\n"
+
+// The same ten, in C.
+private unh_c_shapes() -> string =
+    "#include <stdint.h>\n" +
+    "union FI { uint32_t i; float f; };\nunion F1 { float f; };\nunion FF { float a; float b[2]; };\n" +
+    "union DI { double d; uint64_t i; };\nunion D2 { double d[2]; };\nunion FD { float f[4]; double d[2]; };\n" +
+    "union B12 { uint8_t b[12]; uint32_t w[3]; };\nunion B24 { uint8_t b[24]; uint64_t w[3]; };\n" +
+    "union PI { void *p; uint32_t n; };\nstruct SFU { float x; union FI u; };\n\n"
+
+// A project whose module `p` carries the C, and a `main.sysl` printing `p.check()` -- what it printed.
+private unh_project_run(sysl: string, c: string) -> string
+    val root = make_temp_dir("sysl-unh").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl").unwrap()
+    write_text(s"$root/p/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end unh_project_run
+
+@test("sysl hands each union of abi.c to a C function by value and reads the one it returns")
+unh_sysl_calls_c_by_value()
+    if !unh_ready() then return
+
+    val sysl = unh_shapes() +
+        "extern c_fi(a: Fi) -> Fi\nextern c_f1(a: F1) -> F1\nextern c_ff(a: Ff) -> Ff\n" +
+        "extern c_di(a: Di) -> Di\nextern c_d2(a: D2) -> D2\nextern c_fd(a: Fd) -> Fd\n" +
+        "extern c_b12(a: B12) -> B12\nextern c_b24(a: B24) -> B24\nextern c_pi(a: Pi) -> Pi\n" +
+        "extern c_sfu(a: Sfu) -> Sfu\n\n" +
+        "check() -> string\n" +
+        "    val ff = c_ff(Ff(b = [1.5, 2.5]))\n" +
+        "    val d2 = c_d2(D2(d = [0.5, 1.5]))\n" +
+        "    val fd = c_fd(Fd(d = [1.25, 2.5]))\n" +
+        "    val b12 = c_b12(B12(w = [10, 20, 30]))\n" +
+        "    val sfu = c_sfu(Sfu(x = 1.5, u = Fi(i = 9)))\n" +
+        "    s\"${c_fi(Fi(i = 41)).i} ${c_f1(F1(f = 1.5)).f} ${ff.b[0]} ${ff.b[1]} ${c_di(Di(d = 1.0)).d} \" +\n" +
+        "        s\"${d2.d[0]} ${d2.d[1]} ${fd.d[0]} ${fd.d[1]} ${b12.w[0]} ${b12.w[1]} ${b12.w[2]} \" +\n" +
+        "        s\"${c_b24(B24(w = [5, 6, 7])).w[2]} ${c_pi(Pi(n = 35)).n} ${sfu.x} ${sfu.u.i}\"\n"
+    val c = unh_c_shapes() +
+        "union FI c_fi(union FI a) { a.i += 1; return a; }\n" +
+        "union F1 c_f1(union F1 a) { a.f *= 2; return a; }\n" +
+        "union FF c_ff(union FF a) { a.b[0] += 1; a.b[1] += 1; return a; }\n" +
+        "union DI c_di(union DI a) { a.d += 0.5; return a; }\n" +
+        "union D2 c_d2(union D2 a) { a.d[0] += 1; a.d[1] += 1; return a; }\n" +
+        "union FD c_fd(union FD a) { a.d[0] *= 2; a.d[1] *= 2; return a; }\n" +
+        "union B12 c_b12(union B12 a) { a.w[0] += 1; a.w[1] += 2; a.w[2] += 3; return a; }\n" +
+        "union B24 c_b24(union B24 a) { a.w[2] += a.w[0] * a.w[1]; return a; }\n" +
+        "union PI c_pi(union PI a) { a.n += 7; return a; }\n" +
+        "struct SFU c_sfu(struct SFU a) { a.x += 1; a.u.i += 1; return a; }\n"
+
+    assert_eq(unh_project_run(sysl, c), "42 3 2.5 3.5 1.5 1.5 2.5 2.5 5 11 22 33 37 42 2.5 10\n")
+end unh_sysl_calls_c_by_value
+
+@test("C hands each union of abi.c to an exported sysl function by value and reads the one it returns")
+unh_c_calls_sysl_by_value()
+    if !unh_ready() then return
+
+    val sysl = unh_shapes() +
+        "@export(\"s_fi\")\ns_fi(a: Fi) -> Fi = Fi(i = a.i * 2)\n" +
+        "@export(\"s_f1\")\ns_f1(a: F1) -> F1 = F1(f = a.f + 1.0)\n" +
+        "@export(\"s_ff\")\ns_ff(a: Ff) -> Ff = Ff(b = [a.b[1], a.b[0]])\n" +
+        "@export(\"s_di\")\ns_di(a: Di) -> Di = Di(i = a.i + 1)\n" +
+        "@export(\"s_d2\")\ns_d2(a: D2) -> D2 = D2(d = [a.d[1], a.d[0]])\n" +
+        "@export(\"s_fd\")\ns_fd(a: Fd) -> Fd = Fd(f = [a.f[3], a.f[2], a.f[1], a.f[0]])\n" +
+        "@export(\"s_b12\")\ns_b12(a: B12) -> B12 = B12(w = [a.w[2], a.w[1], a.w[0]])\n" +
+        "@export(\"s_b24\")\ns_b24(a: B24) -> B24 = B24(w = [a.w[0] + a.w[1] + a.w[2], 0, 1])\n" +
+        "@export(\"s_pi\")\ns_pi(a: Pi) -> Pi = Pi(n = a.n + 1)\n" +
+        "@export(\"s_sfu\")\ns_sfu(a: Sfu) -> Sfu = Sfu(x = a.x * 2.0, u = Fi(i = a.u.i + 3))\n\n" +
+        "extern c_score() -> u32\n\n" +
+        "check() -> u32 = c_score()\n"
+
+    // One bit per shape that came back as expected, so a wrong one is named by its bit.
+    val c = unh_c_shapes() +
+        "union FI s_fi(union FI);\nunion F1 s_f1(union F1);\nunion FF s_ff(union FF);\n" +
+        "union DI s_di(union DI);\nunion D2 s_d2(union D2);\nunion FD s_fd(union FD);\n" +
+        "union B12 s_b12(union B12);\nunion B24 s_b24(union B24);\nunion PI s_pi(union PI);\n" +
+        "struct SFU s_sfu(struct SFU);\n\n" +
+        "uint32_t c_score(void) {\n" +
+        "    uint32_t got = 0;\n" +
+        "    union FI fi = { .i = 21 }; if (s_fi(fi).i == 42) got |= 1;\n" +
+        "    union F1 f1 = { .f = 1.5f }; if (s_f1(f1).f == 2.5f) got |= 2;\n" +
+        "    union FF ff = { .b = { 1.0f, 4.0f } }; union FF ffr = s_ff(ff);\n" +
+        "    if (ffr.b[0] == 4.0f && ffr.b[1] == 1.0f) got |= 4;\n" +
+        "    union DI di = { .i = 99 }; if (s_di(di).i == 100) got |= 8;\n" +
+        "    union D2 d2 = { .d = { 1.5, 2.5 } }; union D2 d2r = s_d2(d2);\n" +
+        "    if (d2r.d[0] == 2.5 && d2r.d[1] == 1.5) got |= 16;\n" +
+        "    union FD fd = { .f = { 1, 2, 3, 4 } }; union FD fdr = s_fd(fd);\n" +
+        "    if (fdr.f[0] == 4 && fdr.f[1] == 3 && fdr.f[2] == 2 && fdr.f[3] == 1) got |= 32;\n" +
+        "    union B12 b12 = { .w = { 7, 8, 9 } }; union B12 b12r = s_b12(b12);\n" +
+        "    if (b12r.w[0] == 9 && b12r.w[1] == 8 && b12r.w[2] == 7) got |= 64;\n" +
+        "    union B24 b24 = { .w = { 1, 2, 3 } }; union B24 b24r = s_b24(b24);\n" +
+        "    if (b24r.w[0] == 6 && b24r.w[1] == 0 && b24r.w[2] == 1) got |= 128;\n" +
+        "    union PI pi = { .p = 0 }; pi.n = 41; if (s_pi(pi).n == 42) got |= 256;\n" +
+        "    struct SFU sfu = { 1.25f, { .i = 4 } }; struct SFU sfur = s_sfu(sfu);\n" +
+        "    if (sfur.x == 2.5f && sfur.u.i == 7) got |= 512;\n" +
+        "    return got;\n" +
+        "}\n"
+
+    assert_eq(unh_project_run(sysl, c), "1023\n")
+end unh_c_calls_sysl_by_value
