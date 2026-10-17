@@ -1,0 +1,149 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// How a view `@disjoint` names reaches LLVM as `noalias` (`disjoint.sysl`).
+//
+// **LLVM says `noalias` of a pointer parameter only, and a view travels as one value** -- its owner,
+// the address of its first element, and its count, `{ ptr, ptr, i64 }` -- so the attribute has
+// nowhere to go on the function's own signature. Changing that signature would change every call,
+// every function pointer and every export of it. Instead the function is emitted in two halves:
+//
+// - **the body**, under `<symbol>.disjoint`, `internal` and `alwaysinline`, taking each named view
+//   as its three parts with `noalias` on the element address, and putting the view back together at
+//   its entry so the body reads it exactly as it always did;
+// - **the function itself**, with the signature every caller already uses, taking each named view
+//   apart and calling the body.
+//
+// The body is always inlined into the function, at every optimization level, and LLVM's inliner turns
+// each `noalias` parameter into the scoped metadata and `llvm.experimental.noalias.scope.decl` it
+// uses for inlined `restrict` -- which is what survives a further inlining into a caller, and a loop
+// unrolled around that. Only the element address is said to be unaliased: the owner is the count's
+// home, which two disjoint parts of one buffer share.
+
+// The functions a defined body is emitted as: itself, or the function and its body where a view is
+// named by `@disjoint`.
+split_disjoint(f: TFunc, built: IrFunc) -> Buf[IrFunc]
+    var out: Buf[IrFunc] = buf()
+    var views: Buf[string] = buf()
+
+    for n in f.marks.disjoint
+        for p in f.params
+            if p.0 == n && is_view_param(p.1) then views.push(n)
+
+    // A task's body runs after the call, a C-variadic one cannot be forwarded, and a function with a
+    // convention of its own is entered by hardware or by C as it is.
+    if views.is_empty() || f.marks.is_async() || f.variadic || built.sig.cconv.is_some()
+        out.push(built)
+        return out
+    end if
+
+    val sig = built.sig
+    val body_name = s"${sig.name}.disjoint"
+
+    var body_params: Buf[IrParam] = buf()
+    var rebuild: Buf[Inst] = buf()
+    var unpack: Buf[Inst] = buf()
+    var args: Buf[IrArg] = buf()
+
+    for p in sig.ty.params
+        val view = view_named(views, p.name)
+
+        val fields: Buf[LType] = p.ty match
+            LStruct(fs) -> fs
+            _ -> buf()
+
+        if view.is_some() && fields.len() == 3
+            val n = view.unwrap()
+            var whole = VUndef
+
+            for k in 0..<fields.len()
+                val part = VReg(s"$n.part.$k")
+                var attrs = no_ir_attrs()
+
+                if k == 1 then attrs.push(AttrNoAlias)
+
+                body_params.push(IrParam(fields.at(k), attrs, Some(part)))
+
+                val next = if k + 1 == fields.len() then VReg(s"$n.param") else VReg(s"$n.whole.$k")
+
+                rebuild.push(InInsert(next, p.ty, whole, fields.at(k), part, index_list(k)))
+                whole = next
+
+                val taken = VReg(s"$n.arg.$k")
+
+                unpack.push(InExtract(taken, p.ty, VReg(s"$n.param"), index_list(k)))
+                args.push(ir_arg(fields.at(k), taken))
+        else
+            body_params.push(p)
+            args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+
+    // The body: the function as it was emitted, under its own name, with the views put back together
+    // ahead of everything its entry block does.
+    var blocks: Buf[IrBlock] = buf()
+
+    for i in 0..<built.blocks.len()
+        val b = built.blocks.at(i)
+
+        if i == 0
+            var instrs: Buf[Inst] = buf()
+
+            for item in rebuild
+                instrs.push(item)
+
+            for item in b.instrs
+                instrs.push(item)
+
+            blocks.push(IrBlock(b.label, instrs, b.terminator))
+        else
+            blocks.push(b)
+
+    var bare: Buf[string] = buf()
+
+    bare.push("alwaysinline")
+
+    val body_sig = sig with { name = body_name, ty = IrFnType(sig.ty.ret, body_params, false, sig.ty.ret_attrs),
+                              linkage = LinkInternal, section = None, bare = bare, dso_local = false,
+                              hidden = false }
+
+    // The function: the views taken apart, and the body called with them.
+    val nothing = sig.ty.ret match
+        LVoid -> true
+        _ -> false
+
+    val result = if nothing then None else Some(VReg("disjoint.result"))
+    var fast: Buf[FastMath] = buf()
+
+    unpack.push(InCall(result, sig.ty.ret, VGlobal(body_name), args, sig.ty.ret_attrs, None, fast, false))
+
+    val ret = if nothing then InRet(None, None) else InRet(Some(sig.ty.ret), result)
+    var entry: Buf[IrBlock] = buf()
+
+    entry.push(IrBlock("entry", unpack, Some(ret)))
+    out.push(IrFunc(sig, entry))
+    out.push(IrFunc(body_sig, blocks))
+    out
+end split_disjoint
+
+// A view: the one parameter kind split here.
+private is_view_param(t: Type) -> bool = underlying(t) match
+    Slice(_, _) -> true
+    _ -> false
+
+// Which named view a parameter of the emitted signature is, by the register it arrives in.
+private view_named(views: Buf[string], name: Option[Val]) -> Option[string]
+    name match
+        Some(VReg(r)) ->
+            for n in views
+                if r == s"$n.param" then return Some(n)
+        _ -> ()
+
+    None
+end view_named
+
+private index_list(k: usize) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(int(k))
+    out
+end index_list

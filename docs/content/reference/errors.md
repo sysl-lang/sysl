@@ -1656,6 +1656,10 @@ local and a question about types, rather than alias *use*, which would need the 
 does not have. Four parts, and **none of them applies to a program that declares no invariants** —
 each is a question asked about a clause, and there is no clause to ask about.
 
+That is a different question from whether two parameters may overlap at all, which is what a
+function's [`@disjoint(...)`](/reference/attributes/#disjoint-parameters-whose-memory-nothing-else-reaches)
+promises the optimizer; neither rule reads the other.
+
 **A pointer that would be typed below a clause is refused where it is made:**
 
 ```sysl

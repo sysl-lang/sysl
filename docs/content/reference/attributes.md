@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the seventeen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the eighteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons`, one of the two an `extern` takes | the grammar |
@@ -36,11 +36,11 @@ with. That is a rule about directives, not the thing that distinguishes them.
 Annotations come in groups, by what they attach to — and the last of them is the empty one, which is
 as much a rule as the others.
 
-**On a function** there are seventeen, each written on its own line above the declaration. More than
+**On a function** there are eighteen, each written on its own line above the declaration. More than
 one may be stacked, and writing the same one twice is refused. `@test` and `@tailrec` are below, and
 so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@setup_all` and
-`@teardown_all` — and the three that tell the optimizer what a definition is for, `@noinline`,
-`@inline` and `@cold`; `@pure`,
+`@teardown_all` — the three that tell the optimizer what a definition is for, `@noinline`,
+`@inline` and `@cold`, and `@disjoint(...)`, which tells it which parameters never overlap; `@pure`,
 `@ghost`, `@reads` and `@writes` belong to the specification vocabulary and are on the
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
@@ -2209,6 +2209,149 @@ They stand beside everything else. `@tailrec` is about this function's call to *
 jump and `@noinline` about the call into it from elsewhere staying a call — two different calls, so
 there is nothing for them to disagree about; and `@test` only says who calls the function.
 
+## `@disjoint` — parameters whose memory nothing else reaches
+
+A kernel that writes through one view and reads through another is the loop a vectorizer exists
+for, and the one it is least sure of. `axpy` below adds `a * x[i]` into `y[i]`; if `y` and `x` could
+be two views of one array, offset by an element, then a store to `y[i]` changes what a later read of
+`x` sees, and doing four elements at once would get the wrong answer. The optimizer cannot tell from
+the function, so it vectorizes the loop *and* keeps a scalar copy, choosing between them at run time
+by comparing the two address ranges on every call.
+
+`@disjoint(y, x)` is the function saying the comparison is never needed:
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [4]f64 = [1.0, 1.0, 1.0, 1.0]
+val xs: [4]f64 = [1.0, 2.0, 3.0, 4.0]
+
+axpy(ys[0..<4], xs[0..<4], 2.0)
+print(ys[3])
+```
+
+```output
+9
+```
+
+**What it promises is C's `restrict`.** While a call runs, no memory reached through one named
+parameter is reached through another named parameter, or through any other pointer the body uses.
+The parameters are named on the function, as `@lends(...)` and `@crossing(...)` name theirs — a
+parameter carries no annotation of its own.
+
+It names pointers and views: `*T`, `&T`, `[]T` and `[]const T`. A parameter of any other type
+arrives as a copy, which nothing else can reach, so naming one promises nothing and is refused:
+
+```sysl
+@disjoint(n, p)
+store(n: int, p: *int) = *p = n
+
+var v = 0
+store(42, &v)
+print(v)
+```
+
+```error
+'@disjoint' names 'n', a parameter of 'store' whose type 'int' is a value
+```
+
+A generic is held to that at each instantiation, where its parameters have types — the views and
+pointers of every instance carry the promise. A name that is not a parameter, or one written twice,
+is refused where it is written, as `@lends`' are; so is the annotation above an `async` function,
+whose body runs after the call that made the task has returned, so that there is no call for the
+parameters to be kept apart during:
+
+```sysl
+@disjoint(p)
+async fill(p: *int) -> int = 1
+
+print(1)
+```
+
+```error
+'@disjoint' marks 'fill', which is 'async'
+```
+
+**It is not `@no_overlap`**: the `@no_` words are the capabilities a module or a definition gives up — `@no_alloc`,
+`@no_block` — and every `@no_<word>` is read as one, so a promise about two parameters takes a word of
+its own.
+
+### Checked where a call shows it broken
+
+A call is refused where the arguments it hands two named parameters are provably the same storage:
+the same local twice, two slices of one array or view whose constant bounds share an element, or a
+view and the address of one of its own elements.
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [8]f64 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+axpy(ys[0..<4], ys[2..<6], 2.0)
+```
+
+```error
+'axpy' is '@disjoint' over 'y' and 'x', and this call hands them storage that overlaps — 'ys[0..<4]' and 'ys[2..<6]' overlap
+```
+
+Slices that only meet at a boundary are separate storage, and a call handing them over compiles:
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [8]f64 = [1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0]
+
+axpy(ys[0..<4], ys[4..<8], 2.0)
+print(ys[3])
+```
+
+```output
+9
+```
+
+**Where the call cannot settle it, the promise is trusted, as C trusts `restrict`.** Two views a
+caller was itself handed, a bound or an index computed at run time, a pointer read out of a field —
+none of these is refused, and none is checked when the program runs. **A call that breaks the promise
+anyway is undefined behaviour**: the optimizer has been told the loads and stores through the two
+parameters never touch the same memory, and the code it makes is free to read a value before the
+store that should have changed it, or after.
+
+### What the back end is told
+
+A pointer `@disjoint` names carries LLVM's `noalias` on the function's definition. A view is two
+pointers and a count in one value, and `noalias` attaches only to a pointer parameter, so a function
+naming a view is emitted as two: the function with the signature every caller already uses, taking
+each named view apart, and an `internal`, always-inlined body taking the parts, its element address
+`noalias`. Its callers, function pointers and exports are unchanged.
+
+The body is inlined into the function at every optimization level, and LLVM's inliner turns each
+`noalias` parameter into the scoped alias metadata it uses for an inlined `restrict` — the form that
+survives the function being inlined further, into a caller and a loop unrolled around it. `axpy`
+above, built at `-O2`, is a vector loop with no run-time comparison of the two ranges; the same
+function without the annotation keeps both copies of its loop and the comparison between them.
+
+An `@export` of one is the same function behind a C entry point. An `extern` may not carry it — its
+body is C, which never reads the sysl declaration, so the promise is made on the C side, as
+`restrict`:
+
+```sysl
+@disjoint(d, s)
+extern "memcpy" c_memcpy(d: *u8, s: *u8, n: usize) -> *u8
+```
+
+```error
+an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'
+```
+
 ## `@packed` and `@align(n)` — where a struct's fields sit
 
 By default a struct pads: each field begins on its own alignment, and the aggregate takes the widest
@@ -4190,7 +4333,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@export("...")` on a module binding, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@disjoint(...)`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@export("...")` on a module binding, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
 | `@naked`, a function with no frame | code that must run before there is a stack — a reset entry, a vector table — is an [`asm` block at the top of a file](/reference/inline-assembly/), which is not a function and so has no frame to leave out |
 | bitfield syntax | there is nothing to write: inside `@packed` an `iN` field already occupies exactly N bits, so a five-bit register field is `u5` and needs no `: 5` beside it. The open integer family does the work C's declarator syntax was invented for |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
