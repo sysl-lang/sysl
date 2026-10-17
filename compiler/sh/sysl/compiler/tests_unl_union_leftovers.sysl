@@ -366,3 +366,114 @@ unl_bool_led_union_copy()
 
             print(g.f.raw)
         """, "7\n")
+
+// -- a union led by an aggregate holding bools ----------------------------------------------------
+//
+// Each union below is led by its first field (the widest boundary, and the larger on a tie), which
+// holds a `bool`. The bytes written through `raw` put something other than 0 or 1 where the bool is,
+// and a copy, a by-value argument and a return must each carry every one of those bytes.
+
+// `decls` declares the union `U` and `show`, which prints its `raw` field.
+private unl_bool_aggregate(decls: string, built: string, printed: string)
+    unl_prints(s"""
+        $decls
+
+        struct Holder
+            tag: int
+            u: U
+
+        @noinline
+        pass(u: U) -> U = u
+
+        main()
+            val h = Holder(1, U(raw = $built))
+            val g = h
+
+            show(g.u.raw)
+            show(pass(h.u).raw)
+        """, s"$printed\n$printed\n")
+end unl_bool_aggregate
+
+@test("a union led by an array of bools keeps every bit another field wrote through a copy, an argument and a return")
+unl_bool_array_led_union_copy()
+    unl_bool_aggregate(raw"""
+        union U
+            flags: [4]bool
+            raw: [4]u8
+
+        show(r: [4]u8) = print(s"${r[0]} ${r[1]} ${r[2]} ${r[3]}")
+        """, "[7, 254, 9, 128]", "7 254 9 128")
+
+@test("a union led by a struct holding a bool keeps every bit another field wrote through a copy, an argument and a return")
+unl_bool_struct_led_union_copy()
+    unl_bool_aggregate(raw"""
+        struct S
+            on: bool
+            n: u32
+
+        union U
+            s: S
+            raw: [2]u32
+
+        show(r: [2]u32) = print(s"${r[0]} ${r[1]}")
+        """, "[0xfe07, 9]", "65031 9")
+
+@test("a union led by a struct whose nested struct holds a bool keeps every bit through a copy, an argument and a return")
+unl_bool_nested_struct_led_union_copy()
+    unl_bool_aggregate(raw"""
+        struct Inner
+            on: bool
+            x: u16
+
+        struct Outer
+            i: Inner
+            y: u16
+
+        union U
+            o: Outer
+            raw: [3]u16
+
+        show(r: [3]u16) = print(s"${r[0]} ${r[1]} ${r[2]}")
+        """, "[0x3f07, 5, 6]", "16135 5 6")
+
+@test("a union led by a struct holding a bool is stored as bytes, @packed or inside a @packed struct")
+unl_bool_struct_led_union_packed()
+    val text = raw"""
+        struct S
+            on: bool
+            n: u32
+
+        union U
+            s: S
+            raw: [2]u32
+
+        @packed
+        union P
+            s: S
+            raw: [8]u8
+
+        @packed
+        struct Wire
+            tag: u8
+            u: U
+            p: P
+
+        @noinline
+        pass(w: Wire) -> Wire = w
+
+        main()
+            val w = Wire(tag = 1, u = U(raw = [0xfe07, 9]), p = P(raw = [7, 254, 0, 0, 9, 0, 0, 0]))
+            val v = pass(w)
+
+            print(v.tag, v.u.raw[0], v.u.raw[1], v.p.raw[0], v.p.raw[1], v.p.raw[4], sizeof(Wire))
+        """
+
+    unl_prints(text, "1 65031 9 7 254 9 17\n")
+
+    if !unl_ready() then return
+
+    val ir = unl_ir(text)
+
+    assert(ir.contains("%struct.U = type { [0 x %struct.S], [8 x i8] }"), ir)
+    assert(ir.contains("%struct.P = type <{ [0 x %struct.S], [8 x i8] }>"), ir)
+end unl_bool_struct_led_union_packed

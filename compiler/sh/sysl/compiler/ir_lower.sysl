@@ -138,7 +138,9 @@ end struct_type_def
 // two tie) and then bytes up to the union's size. LLVM's size and boundary for it are then the
 // layout's, and **every field is element 0** -- the address of element 0 is the union's own, which is
 // where each of them begins (`struct_field_index`). A raised `@align(n)` is stated where storage is
-// made, as for a struct; the padding already reaches the raised size.
+// made, as for a struct; the padding already reaches the raised size. **No bit of a union is ever held
+// in an integer narrower than its bytes**: another field may have written any byte, and a copy at the
+// union's type must carry all of them (`holds_short_bits`).
 private union_type_def(d: &StructType, l: TargetLayout) -> IrTypeDef
     val word_bits = int(l.word_bits)
     val name = s"%struct.${mangled(d.base, d.targs)}"
@@ -146,6 +148,7 @@ private union_type_def(d: &StructType, l: TargetLayout) -> IrTypeDef
     var fields: Buf[LType] = buf()
     var lead: Option[(LType, usize)] = None
     var lead_align: usize = 0
+    var lead_bits_short = false
 
     for item in d.stored()
         val a = l.align(item.1)
@@ -166,20 +169,60 @@ private union_type_def(d: &StructType, l: TargetLayout) -> IrTypeDef
                 if wider
                     lead = Some((stored, n))
                     lead_align = a
+                    lead_bits_short = t match
+                        LInt(1) -> false
+                        _ -> holds_short_bits(item.1)
             None -> ()
 
     var used: usize = 0
 
+    // A lead holding a `bool` (or another integer narrower than its bytes) somewhere inside would be
+    // carried by LLVM as that many bits, and a copy of the union would drop what another field wrote
+    // there. It goes in as `[0 x lead]`, which gives the union the lead's boundary and holds nothing,
+    // so every byte of the union is a byte.
     lead match
         Some(k) ->
-            fields.push(k.0)
-            used = k.1
+            if lead_bits_short
+                fields.push(LArr(0, k.0))
+            else
+                fields.push(k.0)
+                used = k.1
         None -> ()
 
     if total > used then fields.push(gap_lty(total - used))
 
     IrTypeDef(name, fields, d.packed)
 end union_type_def
+
+// Whether a value of `t` is held, somewhere inside, in an LLVM integer narrower than the bytes it
+// occupies -- a `bool`'s `i1`, a `u5`, a bitfield struct's container -- whose other bits a copy at
+// that type does not keep. A union holds its own bytes (`union_type_def`); a data enum is answered
+// yes, which costs nothing but the lead's shape.
+private holds_short_bits(t: Type) -> bool = t match
+    Bool -> true
+    Integer(bits, _, _) -> bits % 8 != 0
+    Fixed(bits, _, _) -> bits % 8 != 0
+    Volatile(inner) -> holds_short_bits(*inner)
+    Constrained(d) -> holds_short_bits(d.base)
+    Array(_, elem) -> holds_short_bits(*elem)
+    Vector(_, elem) -> holds_short_bits(*elem)
+    Struct(d) -> struct_holds_short_bits(d)
+    Results(d) -> struct_holds_short_bits(d)
+    Enum(d) -> if d.simple then holds_short_bits(d.underlying) else true
+    _ -> false
+
+private struct_holds_short_bits(d: &StructType) -> bool
+    if d.base == TaskBase || d.union_layout || !d.c_bits.is_empty() then return false
+
+    bitfield_ranges(d) match
+        Some(ranges) -> return bitfield_bits(ranges) % 8 != 0
+        None -> ()
+
+    for item in d.stored()
+        if holds_short_bits(item.1) then return true
+
+    false
+end struct_holds_short_bits
 
 // A struct with C bitfields, as packed bytes at the offsets C gives them (`c_bitfields.sysl`): each
 // ordinary field as itself, each run of bitfields between them as one element covering the bytes the

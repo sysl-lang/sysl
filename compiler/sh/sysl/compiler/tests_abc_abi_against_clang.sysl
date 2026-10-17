@@ -92,6 +92,12 @@ private abc_shapes() -> Buf[AbcShape]
     out.push(un("a union of a pointer and a word", "    p: *u8\n    n: u32", "void *p; unsigned int n;"))
     out.push(AbcShape("a struct holding a union", "    x: f32\n    u: U", "float x; union U u;", false, "struct",
                       "union U\n    y: f32\n    z: u32\n", "union U { float y; unsigned int z; };\n"))
+    // A union led by an aggregate holding a bool is stored as bytes (`union_type_def`); what it
+    // travels as is still asked of its fields.
+    out.push(AbcShape("a union led by a struct holding a bool and a float", "    b: B\n    w: [2]u32",
+                      "struct B b; unsigned int w[2];", false, "union",
+                      "struct B\n    on: bool\n    f: f32\n", "struct B { _Bool on; float f; };\n"))
+    out.push(un("a union led by an array of bools", "    b: [8]bool\n    w: [8]u8", "_Bool b[8]; unsigned char w[8];"))
 
     // Anonymous members (C11), which C lays out and passes exactly as the named member they stand for:
     // a union inside a struct, a struct inside a union, and the float-only shape a convention could
@@ -306,18 +312,23 @@ abc_every_machine_agrees_with_clang()
             assert_eq(s"$what, passing it: ${abc_declaring(t, m, "take")}",
                       s"$what, passing it: ${abc_declaring(t, c, "take")}")
 
-            if s.kind == "union" && abc_type_line(t, c).is_some()
+            // A union led by something holding a `bool` is not written as clang writes it: clang's
+            // `_Bool` is an `i8` in memory and sysl's `bool` an `i1`, so the lead goes in as
+            // `[0 x lead]` before the union's bytes (`union_type_def`). How it travels is still clang's.
+            val bool_led = s.sysl.contains("bool") || s.sysl_before.contains("bool")
+
+            if s.kind == "union" && !bool_led && abc_type_line(t, c).is_some()
                 assert_eq(s"$what, its type: ${abc_type_line(t, m)}", s"$what, its type: ${abc_type_line(t, c)}")
 
             asked += 1
 
     remove_dir_all(dir).unwrap_or(())
 
-    // Thirty-four shapes on each of the twenty-one machines sysl builds for with clang. A machine whose
+    // Thirty-six shapes on each of the twenty-one machines sysl builds for with clang. A machine whose
     // back end this clang lacks was named above; where that is every one, nothing was measured at all.
     if machines == 0 then skip(s"'$cc' has none of the back ends these machines need")
 
     assert_eq(machines + passed_over, 21)
-    assert_eq(shapes.len(), 34)
-    assert_eq(asked, machines * 34)
+    assert_eq(shapes.len(), 36)
+    assert_eq(asked, machines * 36)
 end abc_every_machine_agrees_with_clang
