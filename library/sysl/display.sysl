@@ -112,7 +112,22 @@ trait Integer: Div + Rem + Ord + Eq + Sub + Mul
 // computing loop folds away, and what is left is the loop that was always there. It was found by a
 // factorial program in which rendering the answer was 98% of the run and the arithmetic 0.075s of it.
 
+/** Ten as a `T`, reached through a conversion because the literal `10` is refused at a width that
+ * cannot hold it. At such a width the conversion wraps and the result is not ten, which is what
+ * `holds_ten` tests; a caller that has not asked it must not use the value.
+ */
+private ten_of[T: Integer]() -> T
+    val wide: i64 = 10
+    T(wide)
+
+/** Whether `T` can hold ten, which is false for `u1` to `u3` and `i1` to `i4`. A pure function of
+ * `T` alone, so it folds and an ordinary render pays nothing for it.
+ */
+private holds_ten[T: Integer]() -> bool = u64(ten_of[T]()) == 10
+
 /** The largest power of ten that fits in both `T` and a `u64`, and how many digits that is.
+ *
+ * **Only called at a width that holds ten** (`holds_ten`); a narrower one renders through `i64`.
  *
  * **It is computed rather than written down, and it has to be.** The block below is generic over the
  * whole open integer family, so a literal `10000000000000000000` is refused at every narrow member of
@@ -130,8 +145,9 @@ trait Integer: Div + Rem + Ord + Eq + Sub + Mul
  * unconnected to the value being printed.
  */
 private chunk_of[T: Integer]() -> (T, usize)
-    val ten: T = 10
-    var c: T = 1
+    val ten = ten_of[T]()
+    val one: T = ten / ten
+    var c: T = one
     var per: usize = 0
 
     while per < 19
@@ -149,6 +165,11 @@ end chunk_of
 
 impl[T: Integer] Display for T
     display(self, out: *Writer, fmt: FormatSpec)
+        // Every width that cannot hold ten fits an `i64`, sign included.
+        if !holds_ten[T]()
+            i64(self).display(out, fmt)
+            return
+
         var buf: [sizeof(T) * 3 + 2]u8
         val zero: T = 0
         var i = buf.len

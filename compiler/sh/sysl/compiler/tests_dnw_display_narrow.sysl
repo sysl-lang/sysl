@@ -1,0 +1,57 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`Display` of an integer too narrow to hold ten** (`library/sysl/display.sysl`). The generic
+// block renders in chunks of a power of ten the width holds, so a width that cannot spell `10` has
+// to render another way. Reached here through `derives Display` on a `@packed` bitfield struct and
+// on a C-bitfield struct, whose fields are exactly such widths; the bare integers are checked in
+// `library/sysl/tests.sysl`.
+
+private dnw_ready() -> bool = std_root().is_ok() && clang_available()
+
+private dnw_run(text: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-dnw").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end dnw_run
+
+private dnw_prints(text: string, printed: string)
+    if !dnw_ready() then return
+
+    val (state, out, err) = dnw_run(text)
+
+    assert_eq(err, "")
+    assert_eq(out, printed)
+    assert(state == Status.Exited(0), s"stopped with $state")
+end dnw_prints
+
+@test("a '@packed' struct with a 'u3' field derives 'Display'")
+dnw_packed()
+    dnw_prints("@packed\nstruct P derives Display\n    a: u3\n    b: i3\n    c: u2\n\n" +
+               "main()\n    print(P(7, -4, 3))\n    print(P(0, 3, 0))\n",
+               "P(7, -4, 3)\nP(0, 3, 0)\n")
+
+@test("a C-bitfield struct with a 'u3' field derives 'Display'")
+dnw_c_bitfield()
+    dnw_prints("struct W derives Display\n    a: u3 in u32\n    b: i3 in i32\n    c: u12 in u32\n\n" +
+               "main()\n    print(W(7, -4, 4000))\n    print(W(0, 3, 0))\n",
+               "W(7, -4, 4000)\nW(0, 3, 0)\n")
