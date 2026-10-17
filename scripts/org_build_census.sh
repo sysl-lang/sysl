@@ -140,6 +140,47 @@ done
 "$bin" build --target aarch64-freestanding -o scratch/keel.elf kernel
 KEEL
 
+# **A repository whose own gate is several commands is run by all of them.** `commands` holds one
+# command per line (the common case is the single `command`), and the row fails if any one fails.
+# `$1` is `ours` or `theirs`; the caller has already changed into the directory to run in.
+run_row() {
+    rr_rc=0
+    rr_nl='
+'
+    rr_list=$commands
+    [ -n "$rr_list" ] || rr_list=" "
+
+    while [ -n "$rr_list" ]; do
+        case $rr_list in
+            *"$rr_nl"*) rr_cmd=${rr_list%%"$rr_nl"*}; rr_list=${rr_list#*"$rr_nl"} ;;
+            *) rr_cmd=$rr_list; rr_list="" ;;
+        esac
+
+        if [ "$1" = ours ]; then
+            PATH=$ours_path limited $via "$ours_bin" $rr_cmd $flags || rr_rc=1
+        else
+            limited env $theirs_env PATH="$theirs_path" $via "$theirs_bin" $rr_cmd $flags || rr_rc=1
+        fi
+    done
+
+    return $rr_rc
+}
+
+# **A path dependency is a sibling checkout, so the copy gets its siblings.** The names are read off
+# the manifest's own `path = "../<name>"` lines, and each is copied beside the repository's copy
+# (`$work/<name>`), which is where `../<name>` resolves to.
+copy_path_deps() {
+    cpd_dir=$1
+    [ -f "$cpd_dir/package.hocon" ] || return 0
+
+    for cpd_name in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$cpd_dir/package.hocon"); do
+        [ -d "$work/$cpd_name" ] && continue
+        [ -d "$org/$cpd_name" ] || continue
+        mkdir -p "$work/$cpd_name"
+        ( cd "$org/$cpd_name" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$work/$cpd_name" && tar xf - )
+    done
+}
+
 ok_test=0
 ok_build=0
 ok_build_c=0
@@ -150,6 +191,7 @@ both_refused=0
 no_sdk=0
 setup=0
 serverless=0
+needs_lib=0
 rows=0
 
 for dir in "$org"/*/; do
@@ -329,19 +371,31 @@ for dir in "$org"/*/; do
     # no business writing into a repository it does not own. **The copy is the files git knows of,
     # tracked or not yet added, and never the ignored ones**: a scratch directory a session left
     # behind can hold a file nobody may read, and tar then stops short of the files after it.
+    commands=$command
+
+    case $name in
+        # skiff is gated per directory (its CLAUDE.md, "Gate"): `sysl test .` is not what it runs.
+        skiff)
+            commands="test kernel
+test arch/pmsa"
+            label="test kernel; test arch/pmsa"
+            ;;
+    esac
+
     here=$work/$name
     rm -rf "$here"
     mkdir -p "$here"
     ( cd "$dir" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$here" && tar xf - )
+    copy_path_deps "$dir"
 
     rows=$((rows + 1))
     ours_ok=0
 
-    ( cd "$here" && PATH=$ours_path limited $via "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
+    ( cd "$here" && run_row ours ) > "$work/$name.out" 2>&1 || ours_ok=1
 
     if [ $ours_ok -eq 0 ]; then
         case $label in
-            test) ok_test=$((ok_test + 1)) ;;
+            test|"test kernel; test arch/pmsa") ok_test=$((ok_test + 1)) ;;
             build) ok_build=$((ok_build + 1)) ;;
             build-lib) ok_typecheck=$((ok_typecheck + 1)) ;;
             *)
@@ -379,7 +433,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && limited env $theirs_env PATH="$theirs_path" $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && run_row theirs ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it
@@ -394,6 +448,17 @@ for dir in "$org"/*/; do
         continue
     fi
 
+    # **A library nobody installed is the package working as designed, like a server nobody started.**
+    # Both compilers must say the same thing -- "needs the '<x>' headers and nothing supplied them" --
+    # so a failure of any other kind in either run is still a failure.
+    if [ $theirs_ok -ne 0 ] \
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.out" \
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.theirs"; then
+        needs_lib=$((needs_lib + 1))
+        echo "needs a library     $name -- $(grep -m1 -o "needs the '[^']*' headers" "$work/$name.out")"
+        continue
+    fi
+
     if [ $theirs_ok -ne 0 ]; then
         both_refused=$((both_refused + 1))
         echo "refused by both     $name ($label) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
@@ -403,12 +468,12 @@ for dir in "$org"/*/; do
     fi
 done
 
-total=$((ok_test + ok_build + ok_build_c + ok_board + ok_typecheck + failed + both_refused + no_sdk + setup + serverless))
+total=$((ok_test + ok_build + ok_build_c + ok_board + ok_typecheck + failed + both_refused + no_sdk + setup + serverless + needs_lib))
 
 echo
 echo "ok(test) $ok_test, ok(build) $ok_build, ok(build-c) $ok_build_c, ok(board) $ok_board,"
 echo "ok(type-check) $ok_typecheck, FAILED $failed, refused by both $both_refused,"
-echo "needs SDK $no_sdk, needs kernel tree $setup, needs a server $serverless"
+echo "needs SDK $no_sdk, needs kernel tree $setup, needs a server $serverless, needs a library $needs_lib"
 echo "total $total over $rows rows"
 echo "output: $work"
 
