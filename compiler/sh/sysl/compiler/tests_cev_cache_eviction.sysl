@@ -1,0 +1,220 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.repeat
+
+// **How the C object cache and the run cache are kept bounded** (`c_object_cache.sysl`,
+// `run_cache.sysl`): one sweep per build rather than one per miss, nothing the build used taken, and a
+// directory held to a size as well as an age. What a case observes is the caches' own count of
+// sweeps and what is left on disk, never a clock; every case keeps its entries in a directory of its
+// own and holds it to a bound of its own, both put back before it returns.
+
+// A directory for the case's sources and one for its caches, with the counts cleared.
+private cev_begin() -> (string, string)
+    val work = absolute_path(make_temp_dir("sysl-cev").unwrap())
+    val cache = make_temp_dir("sysl-cev-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    use_run_cache_dir(Some(cache))
+    clear_c_object_counts()
+    make_dir_all(s"$cache/sysl/cobj").unwrap()
+    (work, cache)
+end cev_begin
+
+private cev_end(dirs: (string, string))
+    use_c_object_cache_dir(None)
+    use_run_cache_dir(None)
+    use_cache_bound(None)
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())
+end cev_end
+
+// `n` C files compiled for the host, each a miss.
+private cev_compile_many(work: string, n: usize)
+    for i in 0..<n
+        val src = s"$work/f${i}.c"
+
+        write_text(src, s"int cev_f${i}(void) { return ${i}; }\n").unwrap()
+        compile_c(find_clang(host_target(), None).unwrap(), src, s"$work/f${i}.o", host_target(), "1",
+            no_probe(), buf()).unwrap()
+end cev_compile_many
+
+// `n` complete entries -- an object of `size` bytes and its sidecar -- named `<stem><i>`.
+private cev_entries(dir: string, stem: string, n: usize, size: usize)
+    for i in 0..<n
+        write_text(s"$dir/$stem${i}.o", repeat("x", size)).unwrap()
+        write_text(s"$dir/$stem${i}.o.sum", "1:0").unwrap()
+
+// The files matching `pattern` in `dir` dated `stamp` (`touch -t`'s form), years before anything a
+// test writes now.
+private cev_date(dir: string, pattern: string, stamp: string)
+    capture("/bin/sh", ["-c", s"touch -t $stamp '$dir'/$pattern"]).unwrap()
+
+// How many files in `dir` end in `suffix`.
+private cev_count(dir: string, suffix: string) -> usize
+    var n: usize = 0
+
+    entries(dir) match
+        Err(_) -> ()
+        Ok(names) ->
+            for item in names
+                if item.ends_with(suffix) then n += 1
+
+    n
+end cev_count
+
+@test("a build that misses many times against a large directory sweeps it once, when it is done")
+cev_one_sweep_per_build()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+
+    cev_entries(cobj, "old", 600, 1)
+    cev_compile_many(dirs.0, 6)
+    assert_eq(c_object_counts(), (0, 6))
+    assert_eq(c_object_sweep_count(), 0)
+
+    sweep_c_objects()
+    sweep_c_objects()
+    assert_eq(c_object_sweep_count(), 1)
+
+    // More misses in the same process sweep nothing more.
+    cev_compile_many(dirs.1, 2)
+    sweep_c_objects()
+    assert_eq(c_object_sweep_count(), 1)
+    cev_end(dirs)
+end cev_one_sweep_per_build
+
+@test("a build that hits everything does not sweep")
+cev_no_miss_no_sweep()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+
+    cev_compile_many(dirs.0, 2)
+    use_c_object_cache_dir(Some(dirs.1))
+    clear_c_object_counts()
+    cev_compile_many(dirs.0, 2)
+    assert_eq(c_object_counts(), (2, 0))
+    sweep_c_objects()
+    assert_eq(c_object_sweep_count(), 0)
+    cev_end(dirs)
+end cev_no_miss_no_sweep
+
+@test("a directory over the byte bound is brought under it, oldest first, keeping what the build used")
+cev_over_the_bound_is_brought_under_it()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+
+    // Ten 1000-byte entries from 2020, a minute apart, then this build's own two objects -- also dated
+    // 2020, the oldest of all, which is what makes keeping them a test.
+    cev_compile_many(dirs.0, 2)
+    cev_date(cobj, "*", "202001010000")
+
+    for i in 0..<10
+        cev_entries(cobj, s"m${i}_", 1, 1000)
+        cev_date(cobj, s"m${i}_*", s"20200101010${i}")
+
+    use_cache_bound(Some(8000))
+    cev_sweep_with_a_miss(dirs.0, 1)
+
+    var total: long = 0
+
+    for item in entries(cobj).unwrap()
+        assert(!item.starts_with("."), s"the sweep keeps its own files beside the directory: ${item}")
+        total += metadata(s"$cobj/${item}").unwrap().size
+
+    assert(total <= 8000, s"the directory fits its bound: $total bytes")
+    assert(is_file(s"$cobj.swept"), "the sweep left its stamp beside the directory")
+    assert(!is_file(s"$cobj/m0_0.o") && !is_file(s"$cobj/m0_0.o.sum"), "the oldest entry and its sidecar went")
+    assert(is_file(s"$cobj/m9_0.o"), "the newest entry stayed")
+
+    // The build's own objects are hits still, though they were the oldest things there.
+    clear_c_object_counts()
+    cev_compile_many(dirs.0, 2)
+    assert_eq(c_object_counts(), (2, 0))
+    cev_end(dirs)
+end cev_over_the_bound_is_brought_under_it
+
+// One more miss, from a file of its own answering `n`, then the end-of-build sweep.
+private cev_sweep_with_a_miss(work: string, n: int)
+    val src = s"$work/last.c"
+
+    write_text(src, s"int cev_last(void) { return $n; }\n").unwrap()
+    compile_c(find_clang(host_target(), None).unwrap(), src, s"$work/last.o", host_target(), "1",
+        no_probe(), buf()).unwrap()
+    sweep_c_objects()
+end cev_sweep_with_a_miss
+
+@test("the byte bound never takes what was written in the last hour")
+cev_fresh_entries_are_spared()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+
+    cev_entries(cobj, "new", 8, 1000)
+    use_cache_bound(Some(1000))
+    cev_sweep_with_a_miss(dirs.0, 1)
+    assert_eq(c_object_sweep_count(), 1)
+    assert_eq(cev_count(cobj, ".o"), 9)
+    cev_end(dirs)
+end cev_fresh_entries_are_spared
+
+@test("a sweep another process made in the last ten minutes is not repeated, and an older one is")
+cev_a_recent_sweep_elsewhere_skips()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+
+    write_text(s"$cobj/lonely.o", "x").unwrap()
+    write_text(s"$cobj.swept", "swept").unwrap()
+    cev_sweep_with_a_miss(dirs.0, 1)
+    assert_eq(c_object_sweep_count(), 0)
+    assert(is_file(s"$cobj/lonely.o"), "nothing was swept")
+
+    // The other sweep long ago: this process's is due.
+    cev_date(s"${dirs.1}/sysl", "cobj.swept", "202001010000")
+    use_c_object_cache_dir(Some(dirs.1))
+    cev_sweep_with_a_miss(dirs.0, 2)
+    assert_eq(c_object_sweep_count(), 1)
+    assert(!is_file(s"$cobj/lonely.o"), "the half entry was swept")
+    cev_end(dirs)
+end cev_a_recent_sweep_elsewhere_skips
+
+@test("the run cache sweeps once per process and is held to the byte bound, sparing the entry being made")
+cev_run_cache_is_bounded()
+    val dirs = cev_begin()
+    val run = s"${dirs.1}/sysl/run"
+
+    make_dir_all(run).unwrap()
+
+    for i in 0..<10
+        write_text(s"$run/k${i}", repeat("x", 1000)).unwrap()
+        write_text(s"$run/k${i}.tests", "t").unwrap()
+        cev_date(run, s"k${i}*", s"20200101010${i}")
+
+    // The newest thing there, which is what `now` is read from.
+    write_text(s"$run/fresh", "x").unwrap()
+    use_cache_bound(Some(4000))
+
+    val before = run_cache_sweep_count()
+    val slot = run_cache_reserve("k0").unwrap()
+
+    assert_eq(slot, s"$run/k0")
+    assert_eq(run_cache_sweep_count(), before + 1)
+    assert(is_file(s"$run/k0"), "the entry being reserved is spared, though it is the oldest")
+    assert(!is_file(s"$run/k1") && !is_file(s"$run/k1.tests"), "the oldest other entry and its list went")
+    assert(is_file(s"$run/k9"), "the newest entry stayed")
+
+    run_cache_reserve("k9").unwrap()
+    assert_eq(run_cache_sweep_count(), before + 1)
+    cev_end(dirs)
+end cev_run_cache_is_bounded

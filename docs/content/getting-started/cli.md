@@ -81,6 +81,14 @@ case a cache cannot see, and the same one the standard module's cache has. No ot
 consults it: `build` writes a binary somebody named, and `build-c` and `build-lib` write artifacts
 for somebody else's toolchain.
 
+**The kept binaries, and the C objects every build keeps beside them, are bounded.** Each directory
+— `~/Library/Caches/sysl/run/` and `~/Library/Caches/sysl/cobj/` on macOS, under `~/.cache/sysl/`
+on Linux — holds at most 4 GB: past that the oldest entries go, though never one written in the
+last hour and never one the build in hand used. Past 256 entries, anything a week older than the
+newest goes too. The sweep runs once, when a build that compiled something is done, and is skipped
+where another build swept the same directory in the last ten minutes. Deleting either directory
+costs one rebuild and nothing else.
+
 **Everything after a bare `--` belongs to the program**, not to sysl:
 
 ```bash
