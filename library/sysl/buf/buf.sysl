@@ -260,10 +260,27 @@ private[buf] struct BufCore[T]
         gone
     end remove
 
+    /** Room for at least `more` elements past the count, grown once now -- geometrically, as a push
+     * grows it -- where there is not that much already.
+     */
+    reserve(*self, more: usize)
+        if more > self.elems.len - self.count then self.grow(self.count + more)
+
+    /** The count moved to `n`. Past the storage is a mistake and panics; below the count is
+     * `truncate`, giving the elements up; above it, the slots between are taken as they are.
+     */
+    set_len(*self, n: usize)
+        if n > self.elems.len then past_room(n, self.elems.len)
+
+        if n < self.count then self.truncate(n) else self.count = n
+
     /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
      * a view of the storage rather than a copy, so it is only valid while nothing pushes.
      */
     view(self) -> []T = self.elems[..<self.count]
+
+    // The storage past the count.
+    spare(self) -> []T = self.elems[self.count..]
 end BufCore
 
 /** A sequence that grows, and the name every holder of it shares.
@@ -367,6 +384,17 @@ struct Buf[T]
         if is_null(self.core) then unassigned(BufUnassigned)
         self.core.insert(i, v)
 
+    /** Room for at least `more` elements past `len()`, so that many pushes -- or that many slots
+     * written through `spare()` -- need no growth. `cap()` afterwards is at least `len() + more`;
+     * the storage grows the way a push grows it, so asking for one more at a time still costs
+     * amortized constant time. The elements already here keep their values, and their addresses only
+     * where nothing had to grow.
+     */
+    @relocates
+    reserve(self, more: usize)
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.reserve(more)
+
     @relocates
     remove(self, i: usize) -> T
         if is_null(self.core) then past_end(i, 0)
@@ -456,6 +484,46 @@ private past_end(i: usize, n: usize) -> never
     print("panic: index", i, "past the", n, "elements of a Buf")
     exit(1)
 end past_end
+
+// The report a length past the storage makes, out of line for `past_end`'s reason.
+private past_room(n: usize, room: usize) -> never
+    print("panic: length", n, "past the", room, "slots a Buf has room for")
+    exit(1)
+end past_room
+
+/** The storage past a buffer's elements, filled by something other than `push` -- a C function
+ * handed its address, or a writer handed it as a `[]T` -- and then taken into the count without a
+ * second copy:
+ *
+ * ```
+ * b.reserve(n)
+ * val got = fill(b.spare())       // writes into the first `got` slots
+ * b.set_len(b.len() + got)
+ * ```
+ *
+ * **Only a buffer whose element type is `AnyBits` has these.** A slot `set_len` takes in holds
+ * whatever was in its storage: the bytes written there, or, for a slot nobody wrote, whatever the
+ * allocator left -- an unspecified value, which for an `AnyBits` type is still a value of it. A
+ * `bool`, an enum, a `string` or a `&T` read out of bytes nobody wrote would not be one, so those
+ * buffers are refused the call at compile time.
+ */
+impl[T: AnyBits] Buf[T]
+
+    /** The slots past `len()`, as a slice of `cap() - len()` -- the room a writer may fill. It is a
+     * view of the storage, so it is valid only until the buffer next grows.
+     */
+    spare(self) -> []T = if !is_null(self.core) then self.core.spare() else []
+
+    /** The length set to `n`, taking the slots between the old length and `n` as the elements they
+     * already hold. **Nothing is written** -- not a fill, not a zero: a slot holds what was last
+     * stored in it, which for a slot never written is whatever the allocator left, and for one
+     * `truncate` gave up is the value it had. Below `len()` it is `truncate(n)`. Past `cap()` it
+     * panics, the way an index past the end does.
+     */
+    @relocates
+    set_len(self, n: usize)
+        if !is_null(self.core) then self.core.set_len(n)
+        else if n > 0 then past_room(n, 0)
 
 /** A buffer compares as the sequence it holds, which is `view()` -- the elements it actually has,
  * rather than the backing slice, whose slots past `count` were never written.

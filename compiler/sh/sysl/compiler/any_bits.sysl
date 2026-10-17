@@ -1,0 +1,80 @@
+module sh.sysl.compiler
+
+// `sysl.AnyBits` -- a type every bit pattern of whose storage is a value of it, so storage nobody
+// wrote still reads as *some* value: an unspecified one, never an invalid one.
+//
+// **The membership is the compiler's**, as `Integer`'s is, and a program cannot join it with an
+// `impl`: it is a question about every part of a type. A type is a member where every part of it is
+// an integer of whole bytes, a float, a fixed-point number of whole bytes, a raw pointer, or an array
+// or a struct of members. What is left out is everything with a byte pattern that is not a value:
+// a `bool` (only `0` and `1` are), an enum (only its variants' numbers are), a `char` (most numbers
+// are not a scalar value), a subtype with a range or a predicate, and everything the program counts
+// or reads an address through -- a reference, a string, a slice, a function pointer.
+//
+// **An integer that is not a whole number of bytes is left out** although it has no invalid value of
+// its own: a `u12` in a slot sits in two bytes, and the four bits above it are not its own, so storage
+// nobody wrote holds a `u12` whose stored form a `u12` never has. It is in when it is a field of a
+// bitfield struct, whose storage is one integer and whose every field reads a few bits of it.
+//
+// It is what `sysl.buf`'s `set_len` is bounded by: the slots a length is moved over were written by
+// C or not written at all, and for a member type either way each one holds a value.
+
+// Whether every bit pattern of a type's storage is a value of it.
+is_any_bits(t: Type) -> bool = any_bits_refusal(t).is_none()
+
+// Why a type has a bit pattern that is not a value, naming the first part of it that does, or
+// nothing where it has none.
+any_bits_refusal(t: Type) -> Option[string] = t match
+    Constrained(d) ->
+        if d.lo.is_some() || d.hi.is_some() || d.pred_fn.is_some() then
+            Some(s"'${type_show(t)}' admits only the values its check passes")
+        else any_bits_refusal(d.base)
+    Volatile(inner) -> any_bits_refusal(*inner)
+    Integer(bits, _, _) ->
+        if bits % 8 == 0 then None
+        else Some(s"'${type_show(t)}' is not a whole number of bytes, so the bits above it in its " +
+                  "slot are not its own")
+    Fixed(bits, _, _) ->
+        if bits % 8 == 0 then None
+        else Some(s"'${type_show(t)}' is not a whole number of bytes, so the bits above it in its " +
+                  "slot are not its own")
+    Floating(_, _) -> None
+    Ptr(_) -> None
+    Unit -> None
+    Bool -> Some("a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither")
+    Enum(_) -> Some(s"'${type_show(t)}' is one of its variants, and most numbers its tag can hold are none")
+    Char -> Some("a 'char' is a Unicode scalar value, and most numbers its four bytes can hold are not one")
+    Array(_, elem) -> any_bits_refusal(*elem)
+    Struct(d) -> struct_any_bits_refusal(d)
+    Str -> Some("a string is an address and a length the program made")
+    Slice(_, _) -> Some("a slice is an address and a length the program made")
+    Ref(_, _) -> Some("a counted reference names an object the program allocated")
+    Weak(_) -> Some("a weak reference names an object the program allocated")
+    CFn(_, _) -> Some("a function pointer has to name a function")
+    _ -> Some(s"'${type_show(t)}' is not a value its bits can stand for")
+
+private struct_any_bits_refusal(d: &StructType) -> Option[string]
+    if d.opaque || d.base == TaskBase then
+        return Some(s"'${type_show(Struct(d))}' has no layout this program can see")
+
+    // A bitfield struct is one integer; a field of it is a few of its bits, and every pattern of
+    // those is a value unless the field is an enum.
+    bitfield_ranges(d) match
+        Some(_) ->
+            for item in d.fields
+                underlying(item.1) match
+                    Enum(_) ->
+                        return Some(s"its field '${item.0}' is an enum held in a few bits, and most " +
+                                    "numbers those bits can hold are none of its variants")
+                    _ -> ()
+
+            return None
+        None -> ()
+
+    for item in d.fields
+        val why = any_bits_refusal(item.1)
+
+        if why.is_some() then return Some(s"its field '${item.0}' is ${type_show(item.1)} — ${why.unwrap()}")
+
+    None
+end struct_any_bits_refusal

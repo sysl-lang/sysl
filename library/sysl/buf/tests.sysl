@@ -957,3 +957,125 @@ private freeze_view_of_sync() -> []const int
     b.push(20)
 
     b.freeze().view()
+
+// -- reserve, spare, set_len --------------------------------------------------------------------------
+
+// A writer that knows nothing of `Buf`: it fills the front of the slice it is handed and says how much
+// it wrote, as `read(2)` does.
+private fill_from(out: []u8, first: u8, n: usize) -> usize
+    for i in 0..<n
+        out[i] = first + u8(i)
+
+    n
+
+@test("reserve makes room past the length and keeps the elements")
+reserve_keeps_elements()
+    var b: Buf[int] = buf()
+
+    b.push(5)
+    b.reserve(20)
+    assert(b.cap() >= 21)
+    assert_eq(b.view(), [5])
+
+    val before = b.cap()
+
+    b.reserve(before - 1)
+    assert_eq(b.cap(), before)
+
+@test("a writer fills the spare slots and set_len takes them in")
+spare_then_set_len()
+    var b: Buf[u8] = buf()
+
+    b.push(1)
+    b.reserve(8)
+
+    val got = fill_from(b.spare(), 10, 3)
+
+    b.set_len(b.len() + got)
+    assert_eq(b.view(), [1u8, 10, 11, 12])
+    assert_eq(b.spare().len, b.cap() - 4)
+end spare_then_set_len
+
+@test("set_len reaches exactly the capacity and the spare room is then empty")
+set_len_to_cap()
+    var b: Buf[f64] = buf()
+
+    b.reserve(4)
+
+    val s = b.spare()
+
+    for i in 0..<s.len
+        s[i] = 0.5
+
+    b.set_len(b.cap())
+    assert_eq(b.len(), b.cap())
+    assert_eq(b.spare().len, 0)
+    assert_eq(b[b.len() - 1], 0.5)
+end set_len_to_cap
+
+@test("set_len to zero empties the buffer and keeps the storage")
+set_len_to_zero()
+    var b: Buf[i32] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val room = b.cap()
+
+    b.set_len(0)
+    assert_eq(b.len(), 0)
+    assert_eq(b.cap(), room)
+
+// Nothing is written by `set_len`: a slot holds what was last stored in it. A slot `truncate` gave up
+// comes back with its value, and so does one written through `spare()` beyond the new length.
+@test("set_len writes nothing into the slots it takes in")
+set_len_writes_nothing()
+    var b: Buf[u16] = buf()
+
+    b.extend([1u16, 2, 3, 4])
+    b.truncate(1)
+    b.spare()[5] = 99
+    b.set_len(4)
+    assert_eq(b.view(), [1u16, 2, 3, 4])
+    b.set_len(7)
+    assert_eq(b[6], 99)
+end set_len_writes_nothing
+
+private struct Cell
+    at: *u8
+    weight: f32
+
+@test("a buffer of structs of pointers and floats has set_len")
+set_len_on_plain_struct()
+    var x: u8 = 7
+    var b: Buf[Cell] = buf()
+
+    b.reserve(1)
+    b.spare()[0] = Cell(&x, 1.5f32)
+    b.set_len(1)
+    assert_eq(*b[0].at, 7)
+    assert_eq(b[0].weight, 1.5f32)
+end set_len_on_plain_struct
+
+@test(should_trap)
+set_len_past_cap_traps()
+    var b: Buf[u8] = buf()
+
+    b.reserve(1)
+    b.set_len(b.cap() + 1)
+
+@test(should_trap)
+zeroed_set_len_traps()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.set_len(1)
+
+@test("a handle naming nothing has no spare room and takes set_len(0)")
+zeroed_spare_is_empty()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    assert_eq(p.spare().len, 0)
+    p.set_len(0)
+    assert_eq(p.len(), 0)

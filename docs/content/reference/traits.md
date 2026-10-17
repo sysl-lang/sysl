@@ -177,6 +177,30 @@ method 'show' of 'impl Show for P' takes a different receiver than the trait dec
 `impl` it is the subject applied to that block's parameters, so `-> Self` and `-> Box[T]` are the one
 signature conformance compares.
 
+**A trait that declares nothing is written closed by its `end` marker**, as a struct with no fields
+is: the emptiness is written rather than inferred from a missing body, so a misindented member list
+cannot quietly become one. Such a trait is a name a bound can ask for, and an `impl` of it has
+nothing to supply:
+
+```sysl
+trait Marked
+end Marked
+
+tagged[T: Marked](x: T) -> T = x
+
+impl Marked for int
+
+print(tagged(4))
+```
+
+```output
+4
+```
+
+Without the marker the body is still expected (`indent expected`). The library's
+[`AnyBits`](/library/core/#anybits-storage-whose-every-bit-pattern-is-a-value) is one, whose
+membership the compiler settles.
+
 ### A default may assume exactly what its own trait declares
 
 That is not a restriction bolted on; it is what a default *is*, since the body must serve every
@@ -815,8 +839,31 @@ bbi
 ```
 
 Everything that asks whether a type conforms asks it the same way — a generic function's bound, an
-erasure to a trait object, `print` reaching for a `Display` — so an instantiation that fails the
-condition is refused at each of them while its siblings are not.
+erasure to a trait object, `print` reaching for a `Display`, a call of the member itself — so an
+instantiation that fails the condition is refused at each of them while its siblings are not:
+
+```sysl
+struct Box[T]
+    v: T
+
+trait Show
+    show(self) -> string
+
+trait Mark
+    m(self) -> int
+
+impl[T: Mark] Show for Box[T]
+    show(self) -> string = "b"
+
+struct N
+    n: int
+
+print(Box(N(1)).show())
+```
+
+```error
+'show' is a member the 'impl' of 'Show' gives 'Box[N]' only where its condition holds, and it asks 'Mark' of N, which does not implement it
+```
 
 What the bounds buy beyond deciding conformance is that **the members become checkable at their
 definition**: a block states what it assumes, so its bodies are walked once against those bounds

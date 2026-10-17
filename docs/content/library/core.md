@@ -41,6 +41,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | destruction | `Drop` | [the memory model](/reference/memory/) |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
 | their identities | `Zero`, `One` | [expressions](/reference/expressions/), and [math](/library/math/) |
+| storage whose every bit pattern is a value | `AnyBits` | below |
 | conversion between two types | `From` | [errors and contracts](/reference/errors/#a-converts-through-from) |
 | a range as a value | `Range` | [expressions](/reference/expressions/), and [seq](/library/seq/) |
 | subscripting and walking | `Index`, `IndexSet`, `Iterate`, `Walk` | below |
@@ -87,6 +88,76 @@ sources — and a call says which it means by the argument it wrote.
 **`?` is the one thing in the language that reads it**, and it is what makes two layers of error type
 compose; see [errors](/reference/errors/#a-converts-through-from). Everywhere else it is an ordinary
 trait a program declares and calls for itself.
+
+## `AnyBits` — storage whose every bit pattern is a value
+
+**`AnyBits` is the types for which storage nobody wrote still holds a value** — an unspecified one,
+never an invalid one. It declares nothing, and its membership is the compiler's: a type is one
+where every part of it is
+
+- an integer of a whole number of bytes (`u8` … `u128`, `i24`), a float, or a fixed-point number of
+  whole bytes (`q15`);
+- a raw pointer `*T`;
+- or an array or a struct made only of those, padding and all. A field of a bitfield struct is a few
+  bits of one integer, so it counts as an integer unless it is an enum.
+
+Everything with a bit pattern that is no value is out: a `bool` (only 0 and 1 are), an enum (only its
+variants' numbers are), a `char` (most numbers are not a scalar value), a subtype with a range or a
+predicate, and whatever names something the program made — `&T`, `weak T`, a string, a slice, a
+function pointer. **An integer that is not a whole number of bytes is out too**: a `u12` sits in two
+bytes of its slot, and the four bits above it are not its own, so storage nobody wrote holds a `u12`
+whose stored form no `u12` has.
+
+```sysl
+same_size[T: AnyBits](x: T) -> usize = sizeof(T)
+
+struct Sample
+    at: *u8
+    level: f32
+    pair: [2]u16
+
+var x: u8 = 0
+
+print(same_size(1u32), same_size(Sample(&x, 0.5f32, [1u16, 2])))
+```
+
+```output
+4 16
+```
+
+A type outside it is refused at the bound, with the part of it that has a bit pattern no value has:
+
+```sysl
+same_size[T: AnyBits](x: T) -> usize = sizeof(T)
+
+struct Flagged
+    n: u32
+    on: bool
+
+print(same_size(Flagged(1, true)))
+```
+
+```error
+'same_size' requires its type parameter 'T' to implement 'sysl.AnyBits', but Flagged does not — storage nobody wrote would not hold a valid value of it: its field 'on' is bool — a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
+```
+
+**Nothing implements it**, as nothing implements `Integer`: a type is one or it is not.
+
+```sysl
+struct Flag
+    on: bool
+
+impl AnyBits for Flag
+```
+
+```error
+'sysl.AnyBits' names a family of types the compiler settles, so nothing implements it — a type is one of them or it is not, and 'Flag' is not
+```
+
+Unlike `Integer` it is not a family a blanket `impl` is written over: it holds every integer, and a
+blanket over each would be two implementations at every one of them. What reads it is
+[`Buf`'s `spare` and `set_len`](/library/buf/#filling-the-spare-room), which
+take a buffer's unwritten room into its length.
 
 ## Stopping the program
 

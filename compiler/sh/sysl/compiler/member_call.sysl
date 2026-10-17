@@ -241,6 +241,7 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     if sig.is_none() then return Some(bad_expr(span))
 
     check_member_visible(cx, span, found.0, picked, decl, via)
+    check_impl_condition(cx, span, ty, found.0, picked)
 
     // The arity names what kind of thing was called, and an argument's refusal names the callee
     // alone -- `'x' of 'Box.of' is int`, as a free function's does.
@@ -1177,6 +1178,7 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
                         chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
                         written: string, via: Buf[string] = no_bound_traits()) -> TExpr
     check_member_visible(cx, span, base, chosen, m, via)
+    check_impl_condition(cx, span, rty, base, chosen)
 
     val shown = member_subject(cx, rty, chosen)
     val fname = member_func_name(cx, span, rty, chosen)
@@ -1970,6 +1972,45 @@ method_written(cx: &Analyzer, recv: Expr, name: string) -> bool
 
     m.is_some() && m.unwrap().recv_mode().is_some()
 end method_written
+
+// Whether the receiver meets the condition of the `impl` that gave it a member. The member table is
+// keyed by the type and not by its arguments, so a conditional block -- `impl[T: Show] Show for
+// Box[T]` -- files its members under every `Box`, and the condition is asked here, of the arguments
+// this receiver was made with. Without it a `Box` of something that is not `Show` would call `show`.
+private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string)
+    val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
+
+    if from.is_none() then return
+
+    val owner = member_owner(rty)
+
+    if owner.0 != base then return
+
+    val name = source_member_name(filed)
+
+    for ti in impls_of(cx.an, from.unwrap(), base)
+        if !ti.conditional || name + ti.alt != filed || ti.tparams.len() != owner.1.len() then continue
+
+        var subst: Buf[Binding] = buf()
+
+        for i in 0..<ti.tparams.len()
+            subst.push(Binding(ti.tparams.at(i), owner.1.at(i)))
+
+        val unmet = unmet_condition_of(cx.an, ti, subst)
+
+        if unmet.is_some()
+            val (arg, tr) = unmet.unwrap()
+            val why = unmet_bound(cx.an, tr, arg)
+            val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+
+            cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
+                     s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
+                     s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
+        end if
+
+        return
+    end for
+end check_impl_condition
 
 // Whether a member the reader named is one their file may reach.
 private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl,
