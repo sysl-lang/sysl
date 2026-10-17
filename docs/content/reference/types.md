@@ -778,9 +778,11 @@ print(w == w)
 '==' is not defined for the union Word — comparing its bytes is wrong for a float and for the bytes past a short field. Write 'impl Eq' comparing the field you know is there
 ```
 
-**Not built yet, and refused by name until it is**: a union crossing to C by value (an `extern`'s
-parameter or result — pass a `*U`), an exported signature or storage holding one, `@export` and
-`@byte_order` on a union, a union in a `const`, and C11's anonymous `union` / `struct` members.
+A union crosses to C by value and is declared in a generated header as C's own union; see
+[a union at the boundary](/reference/ffi/#a-union-at-the-boundary).
+
+**Not built yet, and refused by name until it is**: `@byte_order` on a union, a union in a `const`,
+and C11's anonymous `union` / `struct` members.
 
 ## Tuples
 

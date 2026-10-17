@@ -363,6 +363,64 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
+### A union at the boundary
+
+A [`union`](/reference/types/#unions) crosses to C by value as C's own union does, in either
+direction: an `extern` takes and returns one, and an exported function is handed one. Each
+convention has its own answer for a union, and the compiler gives clang's on every machine it
+builds for. AArch64 counts a union of floats as a homogeneous float aggregate **by its size**, so
+`union { float a; float b[2]; }` travels in two float registers. System V asks of each eightbyte
+whether every field over it is floating, so a `float` sharing bytes with a `u32` goes in an integer
+register. RISC-V never spreads a union, or anything holding one, across float registers, where it
+would a struct of the same fields. WebAssembly passes a union of one field as that field, and any
+other union in memory.
+
+Here one module calls `u_scale` through an `extern` as C would, and the exported function on the
+other side of it is sysl's; each union crosses in the registers C's convention names:
+
+```sysl
+union Pair
+    f: [2]f32
+    bits: u64
+
+@export("u_scale")
+scale(p: Pair, by: f32) -> Pair = Pair(f = [p.f[0] * by, p.f[1] * by])
+
+extern "u_scale" c_scale(p: Pair, by: f32) -> Pair
+
+val got = c_scale(Pair(f = [1.5, 2.0]), 2.0)
+
+print(got.f[0], got.f[1])
+```
+
+```output
+3 4
+```
+
+The header `build-c` writes declares a union as `typedef union`, and an exported signature may hold
+one. `@packed` and `@align(n)` are written into the `typedef` as they are for a struct:
+
+```sysl build=c
+module mylib
+
+@export("mylib_key")
+union Key
+    code: u32
+    bytes: [4]u8
+
+@export("mylib_flip")
+flip(k: Key) -> Key = Key(bytes = [k.bytes[3], k.bytes[2], k.bytes[1], k.bytes[0]])
+```
+
+```c
+typedef union {
+	uint32_t code;
+	uint8_t bytes[4];
+} mylib_key;
+
+mylib_key mylib_flip(mylib_key k);
+```
+
 ### Several `extern`s may share a name
 
 **Two `extern`s of one name are two functions exactly when they name two symbols.** A C library's
@@ -2708,7 +2766,7 @@ reachable from C and from nothing else, and each blocks an ordinary POSIX interf
 |---|---|
 | **a caller-allocated opaque type** | `regcomp` wants a `regex_t` the caller supplies, and its size is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows |
 | **a macro** | `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is nothing for a linker to resolve and nothing for `extern` to name |
-| **a shape with no sysl spelling** | an untagged union, an inline function, and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
+| **a shape with no sysl spelling** | an inline function, a union with an anonymous member, and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
 
 Each becomes an ordinary function in three lines of C:
 
