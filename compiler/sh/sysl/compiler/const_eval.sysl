@@ -2894,10 +2894,13 @@ private variant_check(r: &EvRun, slot: string, e: TExpr) -> Flow
 end variant_check
 
 // Where a write lands: a local, or one element of an array or field of a struct a local holds, at any
-// depth -- an element and a field are both a position in a buffer of values.
+// depth -- an element and a field are both a position in a buffer of values. A union's field is a
+// slot of its own: a write into it changes which field the union was last written through, which is
+// part of the union's value and so lands in the slot that holds the union.
 private enum EvSlot
     SlotLocal(name: string)
     SlotElem(elems: Buf[Const], at: usize)
+    SlotUnion(holder: &EvSlot, fields: Buf[Const], written: int, at: usize, ty: Type)
 end EvSlot
 
 // The slot a place names, its indices worked out: a local, an element, a field, at any depth.
@@ -2922,12 +2925,14 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
             element_index(r, index, n).map(i -> SlotElem(xs, lo + i))
         // A field is a slot in the struct's own fields, so a write into it lands where it is held.
         TField(receiver, index, _) ->
-            val held = slot_of(r, receiver) match
-                Ok(s) -> slot_value(r, receiver.span, s)
+            val outer = slot_of(r, receiver) match
+                Ok(s) -> s
                 Err(f) -> return Err(f)
 
-            held match
+            slot_value(r, receiver.span, outer) match
                 Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index)))
+                Ok(ConstRecord(v, fields)) if v <= -2 ->
+                    Ok(SlotUnion(outer, fields, union_written(v), usize(index), texpr_type(receiver)))
                 Ok(_) -> Err(no_place(r, place))
                 Err(f) -> Err(f)
         _ -> Err(no_place(r, place))
@@ -2941,14 +2946,23 @@ private slot_value(r: &EvRun, at: Span, s: EvSlot) -> Result[Const, Flow] = s ma
         if v.is_some() then Ok(v.unwrap())
         else Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
     SlotElem(xs, i) -> Ok(xs.at(i))
+    SlotUnion(_, xs, written, i, ty) ->
+        if written == int(i) then Ok(xs.at(i))
+        else Err(refuse_form(r, at, union_cross_read(ty, written, int(i))))
 
-// A value written into a slot, as a copy of its own.
+// A value written into a slot, as a copy of its own. A union written through a field is the union
+// built with that field.
 private slot_write(r: &EvRun, s: EvSlot, v: Const) = s match
     SlotLocal(name) -> assign(r, name, v)
     SlotElem(xs, i) ->
         var held = xs
 
         held.set(i, copied(v))
+    SlotUnion(holder, xs, _, i, _) ->
+        var held = xs
+
+        held.set(i, copied(v))
+        slot_write(r, *holder, ConstRecord(union_variant(int(i)), xs))
 
 private assign(r: &EvRun, name: string, v: Const)
     val frame = r.frames.at(r.frames.len() - 1)

@@ -1,0 +1,227 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// Three places a union met a rule written for structs: a `const` function writing a union's field, a
+// `@packed` struct holding a union laid down as data, and `&` of an anonymous union's field in a struct
+// with an `invariant` (`reference/types.md § Unions`).
+
+private unl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private unl_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-unl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end unl_run
+
+private unl_prints(text: string, printed: string)
+    if !unl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = unl_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end unl_prints
+
+private unl_refused(text: string, message: string, line: int, col: int)
+    if !unl_ready() then return
+
+    val (_, _, err) = unl_run(text, "0")
+    val head = s"error: $message"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end unl_refused
+
+// The LLVM text a program lowers to on this machine, or what its analysis said.
+private unl_ir(text: string) -> string
+    val root = make_temp_dir("sysl-unl-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end unl_ir
+
+// -- a const function writes a union's field ------------------------------------------------------
+
+@test("a const function writes a union's field, and the union is then the one built with it")
+unl_const_write()
+    unl_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        struct Box
+            tag: u8
+            r: Reg
+
+        const set(n: u32) -> u32
+            var r = Reg(level = 1.0)
+
+            r.bits = n
+            r.bits += 1
+            r.bits
+
+        const boxed(n: u32) -> Reg
+            var b = Box(tag = 1, r = Reg(level = 2.0))
+            var rs: [2]Reg = [Reg(bits = 1), Reg(bits = 2)]
+
+            b.r.bits = n
+            rs[1].level = 0.5
+            b.r
+
+        const K: u32 = set(7)
+        val B: Reg = boxed(9)
+
+        main()
+            print(K, B.bits)
+        """, "8 9\n")
+
+@test("a const function reads a union back only through the field last written")
+unl_const_write_then_cross_read()
+    unl_refused(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const flip(n: u32) -> f32
+            var r = Reg(level = 1.0)
+
+            r.bits = n
+            r.level
+
+        const K: f32 = flip(7)
+
+        main()
+            print(K)
+        """, "'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'bits', and 'level' would read its bytes as another type", 11, 16)
+
+@test("a compound assignment to a field the union was not written through is a read of it, and refused")
+unl_const_update_cross_field()
+    unl_refused(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const bump() -> u32
+            var r = Reg(level = 1.0)
+
+            r.bits += 1
+            r.bits
+
+        const K: u32 = bump()
+
+        main()
+            print(K)
+        """, "'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'level', and 'bits' would read its bytes as another type", 11, 16)
+
+// -- a @packed struct holding a union is laid down as data -----------------------------------------
+
+@test("a module 'val' of a @packed struct holding a union is data, its union at the packed offset")
+unl_packed_static_image()
+    val text = raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        @packed
+        struct Wire
+            tag: u8
+            v: Reg
+
+        @packed
+        union Thin
+            word: u32
+            byte: u8
+
+        struct Holder
+            a: u8
+            t: Thin
+            b: u8
+
+        val table: [2]Wire = [Wire(tag = 1, v = Reg(bits = 5)), Wire(tag = 2, v = Reg(level = 1.0))]
+        val one: Wire = Wire(tag = 3, v = Reg(bits = 6))
+        val h: Holder = Holder(a = 7, t = Thin(word = 8), b = 9)
+
+        main()
+            print(table[0].tag, table[0].v.bits, table[1].tag, table[1].v.bits, one.v.bits, sizeof(Wire))
+            print(h.a, h.t.word, h.b, sizeof(Holder))
+        """
+
+    unl_prints(text, "1 5 2 1065353216 6 5\n7 8 9 6\n")
+
+    if !unl_ready() then return
+
+    val ir = unl_ir(text)
+
+    assert(ir.contains("@one = private constant <{ i8, { [0 x %struct.Reg], i32 } }> <{ i8 3, "), ir)
+    assert(ir.contains("@h = private constant { i8, <{ [0 x %struct.Thin], i32 }>, i8 }"), ir)
+end unl_packed_static_image
+
+// -- & into an anonymous union of a struct with an invariant --------------------------------------
+
+@test("'&' of an anonymous union's field is allowed where the invariant reads none of its fields")
+unl_anonymous_address_allowed()
+    unl_prints(raw"""
+        struct Cell
+            n: int
+            union
+                bits: u32
+                level: f32
+            invariant n >= 0
+
+        poke(p: *u32)
+            *p = 9
+
+        main()
+            var c = Cell(n = 1, bits = 3)
+
+            poke(&c.bits)
+            print(c.bits, c.n)
+        """, "9 1\n")
+
+@test("beside an anonymous union's field, '&' of the field the invariant reads is still refused")
+unl_anonymous_address_refused()
+    unl_refused(raw"""
+        struct Cell
+            n: int
+            union
+                bits: u32
+                level: f32
+            invariant n >= 0
+
+        main()
+            var c = Cell(n = 1, bits = 3)
+            val p = &c.bits
+            val q = &c.n
+
+            print(c.n)
+        """, "'&' here makes a '*int' pointing inside Cell, whose invariant reads 'n'", 11, 13)

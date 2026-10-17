@@ -870,9 +870,11 @@ struct Packet
 
 A module `val` built from constants is **laid down as data**, a union in it as the bytes of the field
 it was built with followed by zeros — so a register map or a protocol table holding unions costs
-nothing at start-up and works on a bare machine. A `const` function may build one and read it back
-**through the field it was built with**; evaluation while compiling has values, not bytes, so a read
-through another field is refused there (at run time it is the ordinary reinterpreting read).
+nothing at start-up and works on a bare machine; so is a `@packed` struct holding one, its union at
+the unaligned offset the struct gives it. A `const` function may build one, write a field of it, and
+read it back **through the field it was built or last written with**; evaluation while compiling has
+values, not bytes, so a read through another field is refused there (at run time it is the ordinary
+reinterpreting read).
 
 ```sysl
 union Reg
@@ -883,13 +885,21 @@ const make(n: u32) -> Reg = Reg(bits = n)
 const bits_of(r: Reg) -> u32 = r.bits
 const K: u32 = bits_of(make(7))
 
+const rewritten(n: u32) -> u32
+    var r = Reg(level = 1.0)
+
+    r.bits = n
+    r.bits
+
+const W: u32 = rewritten(5)
+
 val table: [2]Reg = [Reg(level = 1.0), make(9)]
 
-print(K, table[0].bits, table[1].bits)
+print(K, W, table[0].bits, table[1].bits)
 ```
 
 ```output
-7 1065353216 9
+7 5 1065353216 9
 ```
 
 ```sysl

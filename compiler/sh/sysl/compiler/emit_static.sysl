@@ -55,7 +55,7 @@ constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
 
                     fields.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
 
-            literal_image(gapped_values(fields, struct_gaps(e.layout, decl)))
+            literal_image(gapped_values(fields, struct_gaps(e.layout, decl)), decl.packed)
         TArrayLit(items, array_ty) ->
             val ety = element(array_ty).unwrap_or(int_type())
             var parts: Buf[IrArg] = buf()
@@ -63,7 +63,7 @@ constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
             for item in items
                 parts.push(constant_image(e, ety, item))
 
-            literal_image(parts)
+            literal_image(parts, false)
         TArrayFill(value, array_ty) ->
             val ety = element(array_ty).unwrap_or(int_type())
             val part = constant_image(e, ety, value)
@@ -75,17 +75,20 @@ constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
             for i in 0..<n
                 parts.push(part)
 
-            literal_image(parts)
+            literal_image(parts, false)
         _ -> ir_arg(lty(e, ty), constant_value(e, t))
 end constant_image
 
-private literal_image(parts: Buf[IrArg]) -> IrArg
+// The parts as one literal aggregate. A `@packed` type's is packed too: a literal struct rounds each
+// part up to its own alignment, which would move every field after the first one that is not
+// byte-aligned away from where the declared type has it.
+private literal_image(parts: Buf[IrArg], packed: bool) -> IrArg
     var types: Buf[LType] = buf()
 
     for p in parts
         types.push(p.ty)
 
-    ir_arg(LStruct(types), VAgg(parts))
+    if packed then ir_arg(LPackedStruct(types), VPackedAgg(parts)) else ir_arg(LStruct(types), VAgg(parts))
 end literal_image
 
 // A union built from constants: the one field it was built with, at its first byte, in the stated byte
@@ -115,7 +118,7 @@ private union_image(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> IrArg
 
     if total > used then parts.push(ir_arg(LArr(int(total - used), LInt(8)), VZero))
 
-    literal_image(parts)
+    literal_image(parts, decl.packed)
 end union_image
 
 // The storage a program's `val`s come to.
