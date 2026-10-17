@@ -379,7 +379,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && limited env PATH="$theirs_path" $theirs_env $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && limited env $theirs_env PATH="$theirs_path" $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it
