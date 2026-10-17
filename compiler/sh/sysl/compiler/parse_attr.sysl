@@ -244,7 +244,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
-    if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
+    if word == "inline" then return parse_inline_attr(p)
     if word == "cold" then return no_inlining_args(p, Cold, "how rare a rare path is is not a number a program has")
 
     // `@thread_local` takes no parentheses for `@packed`'s reason: which thread-local model the
@@ -295,6 +295,33 @@ private no_inlining_args(p: *Parser, a: Attr, because: string) -> Option[Attr]
 
     Some(a)
 end no_inlining_args
+
+// `@inline` or `@inline(always)` (`reference/attributes.md § @noinline, @inline and @cold`). Bare,
+// it raises what the inliner will spend on the definition; `always` makes it an instruction. There
+// is no other argument: a budget is not a number a program has, and the opposite request is a word
+// of its own, `@noinline`, which `never` is pointed at.
+private parse_inline_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") then return Some(Inline(false))
+
+    val at = p.here()
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word == "always"
+        p.bump()
+
+        if p.accept_kw(")") then return Some(Inline(true))
+    end if
+
+    if word == "never"
+        p.fault(at, "'@inline(never)' is written '@noinline' — keeping every call a call is a request of its own, not a degree of '@inline'")
+    else
+        p.fault(at, "'@inline' takes no argument but 'always' — '@inline' alone raises what the inliner will spend on this definition rather than naming a number, '@inline(always)' puts the body in place of every call at every optimization level, and '@noinline' keeps every call a call")
+
+    skip_line(p)
+    None
+end parse_inline_attr
 
 private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
     if p.at_kw("(")
@@ -730,7 +757,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Needs(cs) -> f.needs = cs
             Lends(ns) -> f.marks.lends = ns
             NoInline -> f.marks.noinline = true
-            Inline -> f.marks.inline = true
+            Inline(always) ->
+                f.marks.inline = true
+                f.marks.inline_always = always
             Cold -> f.marks.cold = true
             Abandons -> f.marks.abandons = true
             Pinned -> f.marks.pinned = true
@@ -749,7 +778,9 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
             NoInline -> m.marks.noinline = true
-            Inline -> m.marks.inline = true
+            Inline(always) ->
+                m.marks.inline = true
+                m.marks.inline_always = always
             Cold -> m.marks.cold = true
             Pinned -> m.marks.pinned = true
             Pins -> m.marks.pins = true
@@ -944,6 +975,11 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
 
+    // An `extern` is where this is most often tried, and it has no body here to put in place of a
+    // call: the definition is the linked object's, and only its own compiler can inline it.
+    if any_is(attrs, "inline(always)")
+        return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
+
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
 
@@ -1014,6 +1050,8 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     var ghost = false
     var noinline = false
     var inline = false
+    var hinted = false
+    var always = false
     var marks = ""
 
     for attr in attrs
@@ -1027,7 +1065,10 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
             Section(_) -> section = true
             Ghost -> ghost = true
             NoInline -> noinline = true
-            Inline -> inline = true
+            Inline(a) ->
+                always = always || a
+                hinted = hinted || !a
+                inline = true
             _ -> ()
 
         if is_inlining(attr) then marks = joined(marks, attr_word(attr))
@@ -1057,8 +1098,20 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // `@noinline` forbids inlining and `@inline` asks for it, so the two above one declaration are
     // contradictory requests rather than a stronger one. Answered before `@ghost` is looked at,
     // because the pair is wrong whatever else stands beside it.
+    if noinline && always
+        p.fault(p.here(), "'@noinline' forbids inlining and '@inline(always)' demands it, so they contradict above one declaration — write the one the definition is for, and '@cold' beside it if it is also reached rarely, which is a different thing to say")
+        return
+    end if
+
     if noinline && inline
         p.fault(p.here(), "'@noinline' forbids inlining and '@inline' asks for it, so they contradict above one declaration — write the one the definition is for, and '@cold' beside it if it is also reached rarely, which is a different thing to say")
+        return
+    end if
+
+    // `@inline(always)` already says everything `@inline` does, and more, so the two together say
+    // one thing twice -- and the weaker word would leave a reader wondering which was meant.
+    if hinted && always
+        p.fault(p.here(), "'@inline(always)' already asks for everything '@inline' does, so the two together say one thing twice — write '@inline(always)' alone where every call is to be replaced by the body, and '@inline' alone where it is a hint")
         return
     end if
 
@@ -1160,7 +1213,7 @@ end joined
 // is what `@ghost` takes away.
 private is_inlining(a: Attr) -> bool = a match
     NoInline -> true
-    Inline -> true
+    Inline(_) -> true
     Cold -> true
     _ -> false
 

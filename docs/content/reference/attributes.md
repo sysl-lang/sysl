@@ -1926,10 +1926,44 @@ print(push(21))
 42
 ```
 
-**It is a hint, not an instruction.** The inliner is told to spend more and then decides as it
-decides; nothing here forces a call to disappear, and a definition that is enormous is still a
-definition. That is deliberate — an instruction would make a library's opinion about one member
-override a caller's whole code size.
+**Bare, it is a hint, not an instruction.** The inliner is told to spend more and then decides as
+it decides, and a definition that is enormous is still a definition. That is the right default — an
+instruction would make a library's opinion about one member override a caller's whole code size.
+
+**`@inline(always)` is the instruction.** Every call is replaced by the body, at every optimization
+level — `-O0` included, where nothing else is inlined at all — so it is for the definition whose
+call is known to cost more than its body: a decoder's per-symbol step, a fixed-point multiply, a
+register accessor on a board built for debugging:
+
+```sysl
+@inline(always)
+symbol(bits: int) -> int = bits & 0xff
+
+print(symbol(298))
+```
+
+```output
+42
+```
+
+It lowers to LLVM's `alwaysinline` in the place `@inline`'s `inlinehint` takes, and a member, a
+generic — every instantiation — and an `@export`ed function may carry it like the bare word; the
+exported symbol is still defined for C to call. **A function that calls itself is not inlined**,
+whatever it is marked — LLVM leaves such a body out of line, as clang and rustc do with theirs, and
+the program is still right. `@tailrec` turns the self-call into a jump, and a body that no longer
+calls itself is absorbed like any other:
+
+```sysl
+@tailrec
+@inline(always)
+fact(n: int, acc: int) -> int = if n <= 1 then acc else fact(n - 1, acc * n)
+
+print(fact(5, 1))
+```
+
+```output
+120
+```
 
 `@cold` says the definition is reached rarely. The optimizer spends nothing on it and keeps its
 blocks away from the hot ones — but it is a frequency, not a prohibition, and a cold function may
@@ -1983,7 +2017,7 @@ codegen units compiled side by side. A call from one module into another is ordi
 optimizer cannot see through. **At every optimization level but `-O0`, an optimized build carries
 the body across that wall** for:
 
-- every function marked `@inline`, whatever its length, and
+- every function marked `@inline` or `@inline(always)`, whatever its length, and
 - every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
   multiply — whether marked or not.
 
@@ -2047,10 +2081,11 @@ whole of it, and `@inline` is what keeps the element type from deciding whether 
 
 They are the only three annotations a member may carry that are not about a parameter.
 
-### None of the three takes an argument
+### None of the three takes an argument but `always`
 
 Whether a call stays a call is the whole of what the first says, `@inline` raises a budget rather
-than naming one, and how rare a rare path is is not a number a program has:
+than naming one, and how rare a rare path is is not a number a program has. `always` is the one
+argument there is:
 
 ```sysl
 @noinline(2)
@@ -2071,7 +2106,20 @@ print(grow(21))
 ```
 
 ```error
-'@inline' takes no arguments
+'@inline' takes no argument but 'always'
+```
+
+The opposite request is a word of its own, so `never` is pointed at it:
+
+```sysl
+@inline(never)
+grow(n: int) -> int = n * 2
+
+print(grow(21))
+```
+
+```error
+'@inline(never)' is written '@noinline'
 ```
 
 ### What they may not mark
@@ -2090,6 +2138,20 @@ print(1)
 
 ```error
 an annotation marks a function
+```
+
+`@inline(always)` above an `extern` is the case most often tried, and it says why — the body is in
+the object the `extern` is linked from, and only that object's own compiler can put it anywhere:
+
+```sysl
+@inline(always)
+extern abs(n: i32) -> i32
+
+print(1)
+```
+
+```error
+An 'extern' has no body in this program to put anywhere
 ```
 
 `@ghost` is the one *other* annotation they contradict rather than merely have nothing to do with. A
@@ -2123,6 +2185,21 @@ print(grow(21))
 
 ```error
 they contradict above one declaration
+```
+
+`@inline(always)` beside `@noinline` is refused the same way, and beside a bare `@inline` it says
+one thing twice — the instruction already asks for everything the hint does:
+
+```sysl
+@inline
+@inline(always)
+grow(n: int) -> int = n * 2
+
+print(grow(21))
+```
+
+```error
+the two together say one thing twice
 ```
 
 If what you meant was *keep it out of the hot path*, that is `@cold`, and it stands beside either of
