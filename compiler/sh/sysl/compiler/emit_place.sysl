@@ -134,7 +134,7 @@ address(e: *Emit, place: TExpr) -> Val = *place.kind match
 
         val rty = texpr_type(receiver)
 
-        if bitfield_ranges_of(rty).is_some()
+        if bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index)
             return gap_at(e, "address of a bitfield")
 
         val base = address(e, receiver)
@@ -335,9 +335,21 @@ end bounds_check
 // Where a write to this place goes: a bitfield's **container**, since the field itself has no
 // address at all, and the place's own otherwise. A field of a bitfield struct that is itself a field
 // of one has no address either, so the walk goes on out to the outermost container.
+//
+// A **C bitfield** is reached through its struct's address, which is what `load_place` and
+// `store_over` take for one (`emit_c_bits.sysl`).
 place_addr(e: *Emit, place: TExpr) -> Val = bit_place(place) match
     Some(p) -> place_addr(e, p.0)
-    None -> address(e, place)
+    None -> c_bit_place(place) match
+        Some(c) -> address(e, c.0)
+        None -> address(e, place)
+
+// A place that is a C bitfield: the receiver, the struct and the field's position in it.
+c_bit_place(place: TExpr) -> Option[(TExpr, &StructType, usize)] = *place.kind match
+    TField(receiver, index, _) -> c_bit_struct(texpr_type(receiver), index) match
+        Some(d) -> Some((receiver, d, usize(index)))
+        None -> None
+    _ -> None
 
 // A place that is a bit range of a bitfield struct: the receiver holding the container, the struct's
 // ranges, and this field's one -- or nothing for every other place, which is nearly all of them.
@@ -356,6 +368,10 @@ bit_place(place: TExpr) -> Option[(TExpr, Buf[BitRange], BitRange)] = *place.kin
 // reversed for a field of a `@byte_order` struct whose order is not the machine's.
 load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
     Some(b) -> read_bits(e, b.1, b.2, container_at(e, b.1, b.0, p))
+    None if c_bit_place(place).is_some() ->
+        val c = c_bit_place(place).unwrap()
+
+        c_bit_load(e, c.1, c.2, p, place_ty(c.0))
     None ->
         val t = fresh_reg(e)
 
@@ -419,6 +435,11 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place
 
         emit(e, InStore(container_lty(b.1), reordered(e, back, write_bits(e, b.1, b.2, c, v)), p, acc,
                         None))
+    // A C bitfield holds an integer, an enum or a `bool`, none of which carries a count.
+    None if c_bit_place(place).is_some() ->
+        val c = c_bit_place(place).unwrap()
+
+        c_bit_store(e, c.1, c.2, p, place_ty(c.0), v)
     None ->
         val ty = texpr_type(place)
         val acc = place_access(e, place)

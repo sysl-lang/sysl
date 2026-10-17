@@ -2116,11 +2116,12 @@ private laid_down(t: TExpr) -> bool = *t.kind match
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
     TBufLit(elems, _) -> all_laid_down(elems)
-    // A `@packed` struct holding a union stays code: its constant would need the packed brackets
+    // A `@packed` struct holding a union stays code, and so does one with C bitfields, which LLVM
+    // also sees as packed: its constant would need the packed brackets
     // around a union's image, which LLVM's literal types do not take.
     TStructNew(decl, args) ->
         if decl.union_layout then written_laid_down(args)
-        else !(decl.packed && holds_union(Struct(decl))) && all_laid_down(args)
+        else !((decl.packed || !decl.c_bits.is_empty()) && holds_union(Struct(decl))) && all_laid_down(args)
     TEnumNew(_, variant, _) -> !variant.carries
     TCast(inner, to) ->
         val pointerish = to match
@@ -2287,7 +2288,7 @@ private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] 
             Struct(found) -> found
             _ -> return None
 
-        if bitfield_ranges_of(holder).is_some() then return None
+        if bitfield_ranges_of(holder).is_some() || c_bit_field(holder, index) then return None
 
         val base = if through.is_some() then device_pointer(cx, name, receiver)
                    else device_place(cx, name, receiver)
@@ -2369,7 +2370,8 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
         // pointer that is a constant).
         val rty = texpr_type(receiver)
 
-        if bitfield_ranges_of(rty).is_some() || pointee(rty).is_some() then return None
+        if bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index) || pointee(rty).is_some() then
+            return None
 
         place_image(cx, receiver).map(r -> TExpr(place.span, TField(r, index, ty)))
     TIndex(receiver, index, ty) ->

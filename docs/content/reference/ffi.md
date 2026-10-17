@@ -1401,7 +1401,10 @@ Three cases need a word each:
 
 - **A bitfield struct is the one integer it is stored as**, a `uint8_t` array where that width has no
   C name, under a comment per field saying which bits it holds (`/* b: bits 3..7 */`). It is never a
-  C bitfield struct, whose allocation unit is the C compiler's choice.
+  C bitfield struct, whose allocation unit is the C compiler's choice. A struct whose fields are
+  written as C's — `mode: u3 in u32` — is laid out by that choice instead
+  ([attributes](/reference/attributes/)); this release writes it into the header as an incomplete
+  type, reached through a pointer.
 - **`@byte_order` has no C spelling.** The layout is the same, but each integer's bytes are in the
   declared order rather than the machine's, so the header says so in a comment above the `typedef`
   and the C side swaps a field where the orders differ.
@@ -2766,7 +2769,7 @@ reachable from C and from nothing else, and each blocks an ordinary POSIX interf
 |---|---|
 | **a caller-allocated opaque type** | `regcomp` wants a `regex_t` the caller supplies, and its size is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows |
 | **a macro** | `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is nothing for a linker to resolve and nothing for `extern` to name |
-| **a shape with no sysl spelling** | an inline function and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
+| **a shape with no sysl spelling** | an inline function. A **C bitfield struct is spelled** field for field — `mode: u3 in u32` — and laid out by the target's C rule ([attributes](/reference/attributes/)); only a bitfield struct under `#pragma pack(n)` for `n` other than 1 has no spelling. Passing one **by value** across the boundary, and its declaration in a generated header, come in a later release: until then it crosses as a pointer |
 
 Each becomes an ordinary function in three lines of C:
 

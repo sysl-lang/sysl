@@ -124,8 +124,16 @@ unchecked_field_parts(t: TExpr) -> Option[(TExpr, int, Buf[BitRange])] = *t.kind
     _ -> None
 
 // Whether `t` is such a field, of the enum `en` itself.
+// A C bitfield holding an enum is one too.
 unchecked_enum_field(t: TExpr, en: Type) -> bool =
-    unchecked_field_parts(t).is_some() && repr(texpr_type(t)) == repr(en)
+    (unchecked_field_parts(t).is_some() || c_enum_field(t)) && repr(texpr_type(t)) == repr(en)
+
+// Whether `t` is a C bitfield holding an enum.
+private c_enum_field(t: TExpr) -> bool = *t.kind match
+    TField(receiver, index, ty) -> repr(ty) match
+        Enum(_) -> c_bit_field(texpr_type(receiver), index)
+        _ -> false
+    _ -> false
 
 // `Colour.try(n)` — the fallible conversion. The membership test picks the branch: a match builds
 // `Some(n as Colour)` and a miss builds `None`, so the result is an ordinary `Option[Colour]` whose
@@ -142,7 +150,10 @@ gen_enum_try(e: *Emit, value: TExpr, en: Type, opt_ty: Type, some: EnumVariant,
     val (vt, v) = unchecked_field_parts(value) match
         Some((receiver, index, ranges)) ->
             (repr(ed.unwrap().underlying), bitfield_field_bits(e, receiver, index, ranges))
-        None -> (repr(texpr_type(value)), gen_expr(e, value))
+        None -> c_bit_place(value) match
+            Some(c) if c_enum_field(value) ->
+                (repr(ed.unwrap().underlying), c_bit_load(e, c.1, c.2, address(e, c.0), place_ty(c.0)))
+            _ -> (repr(texpr_type(value)), gen_expr(e, value))
 
     var carried: Buf[Val] = buf()
 

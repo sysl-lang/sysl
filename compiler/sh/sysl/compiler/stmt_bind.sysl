@@ -381,9 +381,6 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
                 Struct(d) if d.union_layout ->
                     cx.fault(span, union_pattern_refusal(d))
                     buf()
-                Struct(d) if !d.c_bits.is_empty() ->
-                    cx.fault(span, c_bits_unbuilt(d, "binding its fields by a pattern"))
-                    unknown_parts(cx, span, args, bad_expr(subject.span), mutable)
                 Struct(d) -> bind_positional(cx, span, written, args, subject, mutable, d)
                 // A `?` value was refused where it was made. Its names are not bound -- the
                 // reference reports a later use of one as undefined -- and nothing is said here.
@@ -476,9 +473,6 @@ private bind_fields(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPa
         Struct(d) if d.union_layout ->
             cx.fault(span, union_pattern_refusal(d))
             buf()
-        Struct(d) if !d.c_bits.is_empty() ->
-            cx.fault(span, c_bits_unbuilt(d, "binding its fields by a pattern"))
-            buf()
         Struct(d) ->
             if !struct_named(cx, name, d)
                 cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")
@@ -544,13 +538,16 @@ private bind_positional(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
         return buf()
     end if
 
-    if args.len() != d.fields.len()
+    // An unnamed bitfield has no part to bind: a `_` stands in for it (`c_bitfields.sysl`).
+    val parts = with_unnamed_wild(d, args)
+
+    if parts.len() != d.fields.len()
         cx.fault(span, s"struct '${qualified_name(d.base)}' has " +
-                 s"${quantity(d.fields.len(), "field")}, but ${supplied(args.len(), "sub-pattern")}")
+                 s"${quantity(named_field_count(d), "field")}, but ${supplied(args.len(), "sub-pattern")}")
         return buf()
     end if
 
-    bind_parts(cx, span, args, subject, mutable, false)
+    bind_parts(cx, span, parts, subject, mutable, false)
 end bind_positional
 
 private struct_named(cx: &Analyzer, written: string, d: &StructType) -> bool

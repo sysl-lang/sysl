@@ -2805,7 +2805,144 @@ It has no address either, which is the packed rule above and needs no separate r
 bitfield struct. Those are different things on some machines, and it is C's own doing: MSVC allocates
 `unsigned a:1` into a four-byte unit where the Itanium ABI packs it into a byte, so a C bitfield
 struct of the same fields need not even be the same *size* everywhere. A sysl bitfield struct is one
-integer on every target.
+integer on every target. Where the point is to match a C header's bitfields, the fields are written
+as C writes them — the next section.
+
+### C bitfields — `name: uW in T`, laid out as C lays it out
+
+**A field written `name: uW in T` is C's `T name : W;`**: `W` bits allocated in a unit of `T`, the
+type C declares the field with, by the target's own C rule. A struct with any such field is an
+ordinary struct whose other fields sit where C puts them after a bitfield, so its size, its boundary
+and every offset are what the C compiler for that target gives the same declaration. There are three
+rules: **Itanium** (Linux, macOS, the BSDs, RISC-V, WebAssembly, i386 and CRAFT), **AAPCS** (Arm
+outside Apple's platforms: an unnamed or zero-width field raises the struct's boundary too) and
+**MSVC** (Windows: a run of bitfields shares a unit only while their declared types have one size, and
+no field ever straddles a unit).
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+    count: u12 in u32
+    tag: u8
+
+var s = Status(true, 5, 4000, 7)
+
+s.mode = 6
+s.count += 1
+print(sizeof(Status), alignof(Status), offsetof(Status, tag), s.ready, s.mode, s.count, s.tag)
+```
+
+```output
+4 4 2 true 6 4001 7
+```
+
+The field's value type is an integer of `W` bits, a simple enum whose underlying type is `W` bits
+wide, or `bool` (`bool in bool` is C's `_Bool b : 1`). `T` is an integer type of 8, 16, 32 or 64 bits
+or `bool`, `W` fits in it, and the value's signedness is `T`'s — `i3 in u32` is refused, because C's
+read of the same field would disagree with sysl's.
+
+**A read loads the unit, shifts the field down and cuts it to its width**, so a signed field comes
+back with its sign; **a write is a read-modify-write of the unit**, so the fields beside it — in the
+unit, in the next unit, and the ordinary fields around them — keep what they held. Compound
+assignment reads the field, computes at its type and writes it back. An enum field is checked where it
+is read, as any enum read from storage is, and `E.try(s.field)` answers instead of trapping:
+
+```sysl
+struct Range
+    lo: i3 in i32
+    hi: i3 in i32
+    rest: u8
+
+var r = Range(-4, 3, 255)
+
+r.lo += 1
+r.hi = -4
+print(r.lo, r.hi, r.rest)
+```
+
+```output
+-3 -4 255
+```
+
+**An unnamed field, `_: uW in T`, and a zero-width one, `_: in T`**, only move the fields after them —
+C's `T : W;` and `T : 0;`. As in C, nothing initializes them: a construction and a positional pattern
+name every field but these, and a value built field by field holds zero in their bits. A derived
+`Eq`, `Ord`, `Hash` or `Display` reads every named field:
+
+```sysl
+struct Reg derives Eq, Display
+    lo: i8 in i32
+    _: u4 in u32
+    hi: u8 in u32
+    _: in u32
+    next: u16 in u32
+
+val r = Reg(-3, 200, 9)
+val Reg(lo, hi, next) = r
+val s = r with { hi = 7 }
+
+print(sizeof(Reg), lo, hi, next, s, r == s)
+```
+
+```output
+8 -3 200 9 Reg(-3, 7, 9) false
+```
+
+A module `val` of one is laid down as data, its bits where C puts them, as any constant struct is.
+
+**`volatile` makes every access to the field's unit exactly the declared type's width** — one load of
+the whole unit, and for a write one load and one store of it, never merged with a neighbour and never
+narrowed. That is the AAPCS rule for volatile bitfields, and what a peripheral register needs: a
+device may ignore, or fault on, an access narrower than its register. As with today's bitfields, the
+qualifier on any field of a unit qualifies every access to that unit, and nothing diagnoses what a
+read-modify-write costs a register whose read clears it. Under `@packed` a volatile field that lies
+across two units of its declared type has no single access to make, and is refused.
+
+`@packed` on such a struct is GNU's `packed` (MSVC's `pack(1)`): the fields abut bit for bit, and
+`@align(n)` raises it as it raises any struct. The two kinds of bitfield do not mix in one struct — a
+`@packed` struct with an `in` field may not also hold today's narrow fields — and `@byte_order` is
+refused on one, there being no portable C spelling of a bitfield stored the other way round.
+
+**A C bitfield has no address**: it is bits inside a unit and begins on no byte, so `&`, `ref` and
+`offsetof` refuse it, and the struct is reached instead:
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+
+var s = Status(true, 5)
+val p = &s.mode
+
+print(p[0])
+```
+
+```error
+'&' here would reach 'Status.mode', a C bitfield — it is bits inside a unit of its declared type and has no address of its own
+```
+
+**What carries a count stays out**: a struct with C bitfields is laid out as C lays its counterpart
+out, so a string, a slice or a reference among its fields is refused.
+
+**Not built in this release**: passing one by value to an `extern` or returning one from an
+`@export` — how C passes one differs from an ordinary struct on WebAssembly and on RISC-V's `lp64d`,
+so it crosses as a pointer — and its declaration in a generated header, which writes it as an
+incomplete type C reaches through a pointer:
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+
+extern apply(s: Status)
+
+apply(Status(true, 5))
+```
+
+```error
+'Status' has C bitfields, and passing it by value to the 'extern' 'apply' is not built in this release — pass its address, as a '*Status'
+```
 
 ### `@align(n)` — where the aggregate begins
 

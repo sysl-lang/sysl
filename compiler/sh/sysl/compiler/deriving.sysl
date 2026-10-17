@@ -123,10 +123,6 @@ private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[stri
                 return Some(s"a union has no tag to say which field it holds, so a derived " +
                             s"'$simple' would read fields that are not there — write an 'impl' block " +
                             "that reads the field you know is there")
-
-            if !d.bits.is_empty() then
-                return Some(s"a derived '$simple' reads every field, and '${d.name}' has C bitfields, " +
-                            "whose reads are not yet built")
         _ -> ()
 
     // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
@@ -262,8 +258,11 @@ private fields_of(s: Stmt) -> Buf[string] = *s.kind match
     StructDecl(d) ->
         var out: Buf[string] = buf()
 
-        for item in d.fields
-            out.push(item.name)
+        // An unnamed C bitfield is not read: it only moves the fields after it.
+        for i in 0..<d.fields.len()
+            val item = d.fields.at(i)
+
+            if item.name != "_" || c_bit_written(d, i).is_none() then out.push(item.name)
 
         out
     _ -> buf()
@@ -1012,9 +1011,9 @@ private debug_parts_method(at: Span, name: string, s: Stmt) -> MethodDecl
         var parts: Buf[(string, Expr)] = buf()
 
         *s.kind match
-            StructDecl(d) ->
-                for item in d.fields
-                    parts.push((item.name, self_field(at, item.name)))
+            StructDecl(_) ->
+                for item in fields_of(s)
+                    parts.push((item, self_field(at, item)))
             _ -> ()
 
         shown = debug_writes(at, name, parts)

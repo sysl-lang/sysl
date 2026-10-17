@@ -189,7 +189,18 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
         if !field_visible(cx, d.base, name) then
             return cx.err(span, field_out_of_reach(cx, d.base, name))
 
-        if d.c_bit(usize(idx)).is_some() then return cx.err(span, c_bit_unreached(d, name))
+        // An unnamed bitfield is C's `S : W`: it holds the place of bits nothing reads.
+        if unnamed_c_bit(d, usize(idx)) then
+            return cx.err(span, s"'${type_show(Struct(d))}' has no field named '_' — an unnamed bitfield " +
+                          "only moves the fields after it, and nothing reads or writes it")
+
+        // A `volatile` bitfield is reached by one access of its declared type's width, and under
+        // `@packed` one may lie across two such units, where there is no single access to make.
+        if d.c_bit(usize(idx)).is_some() && volatile_in(d.fields.at(usize(idx)).1) &&
+           c_volatile_unit(cx.an.tables.layout, d, usize(idx)).is_none() then
+            return cx.err(span, s"'${type_show(Struct(d))}.$name' is a 'volatile' bitfield that lies across " +
+                          "two units of its declared type in a '@packed' struct — a volatile access is " +
+                          "exactly one unit, and no one unit holds it")
 
         // Whatever qualifier the field was declared with stays in the struct's field list and comes
         // off here: reading a register yields an ordinary value.

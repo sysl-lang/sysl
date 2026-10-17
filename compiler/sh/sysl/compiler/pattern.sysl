@@ -307,23 +307,23 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
         Struct(d) if d.union_layout ->
             cx.fault(span, union_pattern_refusal(d))
             TWildPattern(ty)
-        Struct(d) if !d.c_bits.is_empty() ->
-            cx.fault(span, c_bits_unbuilt(d, "matching it field by field"))
-            TWildPattern(ty)
         Struct(d) ->
             if !names_this_type(cx, written, d) then
                 cx.fault(span, s"'$written(…)' does not match a ${type_show(Struct(d))} value")
 
-            if args.len() != d.fields.len() then
+            // An unnamed bitfield has no part to write: a `_` stands in for it (`c_bitfields.sysl`).
+            val parts = with_unnamed_wild(d, args)
+
+            if parts.len() != d.fields.len() then
                 cx.fault(span, s"struct '${qualified_name(d.base)}' has " +
-                         s"${quantity(d.fields.len(), "field")}, but " +
+                         s"${quantity(named_field_count(d), "field")}, but " +
                          s"${supplied(args.len(), "sub-pattern")}")
 
             // Naming every field is reading every field, so the positional pattern needs each of
             // them visible -- the same rule the positional constructor is held to.
             every_field_visible(cx, span, d, "this pattern",
                                 "match the fields it does offer by name, as 'Name{…}'")
-            TStructPattern(d, sub_patterns(cx, args, d.fields))
+            TStructPattern(d, sub_patterns(cx, parts, d.fields))
 
         Unknown -> unknown_subject(cx, args, ty)
 
@@ -380,9 +380,6 @@ private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[Fiel
     underlying(ty) match
         Struct(d) if d.union_layout ->
             cx.fault(span, union_pattern_refusal(d))
-            TWildPattern(ty)
-        Struct(d) if !d.c_bits.is_empty() ->
-            cx.fault(span, c_bits_unbuilt(d, "matching it field by field"))
             TWildPattern(ty)
         Struct(d) ->
             if !names_this_type(cx, name, d) then

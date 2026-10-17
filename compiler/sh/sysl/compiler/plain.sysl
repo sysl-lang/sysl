@@ -91,7 +91,22 @@ private struct_plain_refusal(d: &StructType) -> Option[string]
             return None
         None -> ()
 
-    for item in d.fields
+    for i in 0..<d.fields.len()
+        val item = d.fields.at(i)
+
+        // A C bitfield is bits of an integer unit: an integer or a `bool` there has no pattern that
+        // is not a value, and an enum is refused as one in a bitfield struct is.
+        if d.c_bit(i).is_some()
+            underlying(item.1) match
+                Enum(_) ->
+                    return Some(s"'${type_show(Struct(d))}.${item.0}' is an enum held in a few " +
+                                "bits, which is read unchecked. Hold the field as an integer and " +
+                                "convert it with 'try'")
+                _ -> ()
+
+            continue
+        end if
+
         val why = plain_refusal(item.1)
 
         if why.is_some() then
@@ -282,7 +297,7 @@ plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
             for i in 0..<d.fields.len()
                 val ft = d.fields.at(i).1
 
-                if !zero_sized(ft) && needs_check(ft)
+                if !zero_sized(ft) && needs_check(ft) && d.c_bit(i).is_none()
                     val fp = fresh_reg(e)
 
                     var idx: Buf[IrArg] = buf()
@@ -311,8 +326,8 @@ private needs_check(t: Type) -> bool = underlying(t) match
     _ -> false
 
 private any_field_needs_check(d: &StructType) -> bool
-    for item in d.fields
-        if needs_check(item.1) then return true
+    for i in 0..<d.fields.len()
+        if d.c_bit(i).is_none() && needs_check(d.fields.at(i).1) then return true
 
     false
 end any_field_needs_check
@@ -449,7 +464,11 @@ private copy_dense(e: *Emit, src: Val, dst: Val, t: Type)
             for i in 0..<d.fields.len()
                 val ft = d.fields.at(i).1
 
-                if !zero_sized(ft)
+                // A C bitfield is read out of its unit and written into the other one's.
+                if d.c_bit(i).is_some()
+                    if !unnamed_c_bit(d, i) then
+                        c_bit_store(e, d, i, dst, Struct(d), c_bit_load(e, d, i, src, Struct(d)))
+                elif !zero_sized(ft)
                     val at = struct_field_index(e.layout, d, d.slot(i))
                     val sp = field_address(e, d, src, at)
                     val dp = field_address(e, d, dst, at)
@@ -522,6 +541,9 @@ private padded(e: *Emit, t: Type) -> bool
     underlying(t) match
         Struct(d) ->
             if bitfield_ranges(d).is_some() then return int(e.layout.size(t)) != own_bytes(t)
+
+            // The bits between C bitfields are padding, so their fields are copied one by one.
+            if !d.c_bits.is_empty() then return true
 
             var used = 0
 

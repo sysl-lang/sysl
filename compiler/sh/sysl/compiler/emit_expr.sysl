@@ -460,6 +460,16 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
 
     val rty = texpr_type(receiver)
 
+    // A C bitfield is read out of its unit, at the receiver's address -- a computed receiver is given
+    // a slot (`address`) -- and an enum one held to its variants (`emit_c_bits.sysl`).
+    c_bit_struct(rty, index) match
+        Some(d) ->
+            val bits = c_bit_load(e, d, usize(index), address(e, receiver), place_ty(receiver))
+
+            check_variant(e, ty, bits, x.span)
+            return bits
+        None -> ()
+
     bitfield_ranges_of(rty) match
         Some(ranges) ->
             val bits = bitfield_field_bits(e, receiver, index, ranges)
@@ -534,7 +544,9 @@ has_address(x: TExpr) -> bool = *x.kind match
     TLoad(_, _) -> true
     TGlobal(_, _, _) -> true
     TDeref(_, _) -> true
-    TField(receiver, _, _) -> bitfield_ranges_of(texpr_type(receiver)).is_none() && has_address(receiver)
+    TField(receiver, index, _) ->
+        bitfield_ranges_of(texpr_type(receiver)).is_none() && !c_bit_field(texpr_type(receiver), index) &&
+            has_address(receiver)
     TIndex(_, _, _) -> true
     _ -> false
 
@@ -1151,6 +1163,8 @@ end gen_enum_new
 // fields that occupy nothing skipped exactly as the layout skips them. A **bitfield** struct is one
 // integer instead, and its fields are ranges of it.
 private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
+    if !decl.c_bits.is_empty() then return c_bits_new(e, decl, args)
+
     bitfield_ranges(decl) match
         Some(ranges) ->
             var vals: Buf[Val] = buf()

@@ -115,25 +115,59 @@ private c_bit_fault(whole: string, field: string, value: Type, b: CBit, vt: stri
     None
 end c_bit_fault
 
-// -- what is not built yet ----------------------------------------------------------------------------
+// -- the fields a program names ----------------------------------------------------------------------
 //
-// A struct with C bitfields has its layout -- `sizeof`, `alignof`, `offsetof` of its other fields,
-// and those fields' reads and writes. Reaching a bitfield, building a value field by field, and the
-// features that do either for you are refused in these words until they are built.
+// An **unnamed** bitfield -- `_: uW in S` or `_: in S` -- is C's `S : W` or `S : 0`: it only moves
+// the fields after it, and C leaves it out of initialization (C11 6.7.9 ¶9). So a construction, a
+// positional pattern and a derived trait pass over it as if it were not written, and its bits are
+// zero in every value a construction builds.
 
-// A read or a write of a C bitfield.
-c_bit_unreached(d: &StructType, field: string) -> string =
-    s"'${type_show(Struct(d))}.$field' is a C bitfield, and reading or writing one is not yet built " +
-    "— its struct is laid out as C lays it out, and the struct's other fields are reached as usual"
+// Whether the field at `i` is a bitfield with no name.
+unnamed_c_bit(d: &StructType, i: usize) -> bool = d.c_bit(i).is_some() && d.fields.at(i).0 == "_"
 
-// Something the struct is used for that is not built for one with C bitfields yet.
-c_bits_unbuilt(d: &StructType, what: string) -> string =
-    s"'${type_show(Struct(d))}' has C bitfields, and $what is not yet built for such a struct"
+// How many fields a construction or a positional pattern writes: every one but the unnamed bitfields.
+named_field_count(d: &StructType) -> usize
+    var n: usize = 0
 
-// A struct with C bitfields crossing a C boundary by value: how C passes one is not built yet (it
-// differs from an ordinary struct's on wasm32 and on riscv64's lp64d).
+    for i in 0..<d.fields.len()
+        if !unnamed_c_bit(d, i) then n += 1
+
+    n
+end named_field_count
+
+// A positional pattern's parts with a `_` standing at each unnamed bitfield, so the parts line up
+// with the fields again -- or the parts as written where their count is not the named fields'.
+with_unnamed_wild(d: &StructType, args: Buf[Pattern]) -> Buf[Pattern]
+    if d.c_bits.is_empty() || args.len() != named_field_count(d) then return args
+
+    val at = if args.is_empty() then span_zero() else args.at(0).span
+    var out: Buf[Pattern] = buf()
+    var next: usize = 0
+
+    for i in 0..<d.fields.len()
+        if unnamed_c_bit(d, i)
+            out.push(pattern_of(at, WildcardPattern))
+        else
+            out.push(args.at(next))
+            next += 1
+
+    out
+end with_unnamed_wild
+
+// Whether `receiver.<index>` is a C bitfield: bits inside a unit, with no address of its own.
+c_bit_field(receiver: Type, index: int) -> bool = underlying(receiver) match
+    Struct(d) -> index >= 0 && d.c_bit(usize(index)).is_some()
+    _ -> false
+
+// -- what is not built in this release ------------------------------------------------------------------
+//
+// A struct with C bitfields crossing a C boundary by value: how C passes one is not built in this
+// release (it differs from an ordinary struct's on wasm32 and on riscv64's lp64d), so it crosses as
+// an address.
 c_bits_by_value(t: Type, what: string) -> string = underlying(t) match
-    Struct(d) -> c_bits_unbuilt(d, what) + " — pass its address, as a '*" + type_show(t) + "'"
+    Struct(d) ->
+        s"'${type_show(t)}' has C bitfields, and $what is not built in this release — pass its " +
+        s"address, as a '*${type_show(t)}'"
     _ -> what
 
 // Whether the type is a struct with C bitfields.
@@ -184,6 +218,26 @@ c_field_offset(l: TargetLayout, s: &StructType, field: string) -> Option[usize]
 
     None
 end c_field_offset
+
+// **The one access a `volatile` bitfield is read and written with**: its unit, exactly the declared
+// type's width. Under `@packed` on the generic rule a field's place is only the bytes it spans, so
+// the unit is the block of the declared type's size, on a multiple of that size, holding it -- and
+// there is none where the field straddles two such blocks or the block runs past the struct's end.
+c_volatile_unit(l: TargetLayout, s: &StructType, i: usize) -> Option[(usize, usize)]
+    val p = c_bitfield_layout(l, s).places.at(i)
+
+    if !s.packed || l.bitfield_rule == BfMsvc then return Some((p.unit, p.unit_bytes))
+
+    val size = l.size(s.c_bit(i).unwrap().storage)
+    val bits = int(size) * 8
+    val last = p.bit + (if p.width > 0 then p.width - 1 else 0)
+
+    if p.bit / bits != last / bits then return None
+
+    val at = usize(p.bit / bits) * size
+
+    if at + size > l.size(Struct(s)) then None else Some((at, size))
+end c_volatile_unit
 
 // A declared type's unit: its size, and the boundary C aligns it to inside a struct.
 private c_unit(l: TargetLayout, storage: Type) -> (usize, usize)

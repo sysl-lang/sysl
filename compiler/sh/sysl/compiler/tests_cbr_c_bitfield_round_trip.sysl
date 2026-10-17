@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{parse_int_base, replace_all, split}
+
+// **Reads and writes of C bitfields, against C's own** (`emit_c_bits.sysl`; `docs/design/bitfields.md`
+// §5). Every probe struct of `tests_cbl_c_bitfield_layout.sysl` is declared on both sides of one
+// program: C fills one and sysl reads every field back, and sysl writes one -- field by field, and
+// built whole -- and C checks every field. Each field gets a value with its own pattern, a signed one
+// its most negative or its largest, so a field read from a neighbour's bits, a sign lost, or a
+// neighbour's bits written over are each a mismatch. A union is reached through its first named field.
+
+// A field of a probe that a program names: its name, and its value type as written.
+private struct CbrField
+    name: string
+    ty: string
+end CbrField
+
+// The named fields of a probe's sysl declaration -- an unnamed one, `_`, holds no value.
+private cbr_fields(sysl: string) -> Buf[CbrField]
+    var out: Buf[CbrField] = buf()
+
+    for line in split(sysl, "\n")
+        if !line.starts_with("    ") then continue
+
+        val parts = split(line.trim(), ": ")
+        val name = parts[0]
+
+        if name == "_" then continue
+
+        val ty = split(parts[1], " in ")[0]
+
+        out.push(CbrField(name, ty))
+
+    out
+end cbr_fields
+
+// The value the `k`th named field is given, as the digits both languages read: a `bool` is set, an
+// unsigned field alternates `0101…` and `0011…`, and a signed one alternates its most negative and its
+// largest value.
+private cbr_value(ty: string, k: usize) -> string
+    if ty == "bool" then return "1"
+
+    val w = parse_int_base(ty[1..<ty.len], 10).unwrap()
+
+    if ty.starts_with("i")
+        val top = long(1) << (w - 1)
+
+        return if k % 2 == 0 then s"${-top}" else s"${top - 1}"
+    end if
+
+    val mask = if w >= 63 then 0x7FFFFFFFFFFFFFFF else (long(1) << w) - 1
+    val pattern: long = if k % 2 == 0 then 0x5555555555555555 else 0x3333333333333333
+
+    s"${mask & pattern}"
+end cbr_value
+
+// The same value as sysl writes it: a `bool` is `true`.
+private cbr_sysl_value(ty: string, k: usize) -> string = if ty == "bool" then "true" else cbr_value(ty, k)
+
+// A value of the field's type that is all zero bits.
+private cbr_zero(ty: string) -> string = if ty == "bool" then "false" else "0"
+
+// C's view: `<kind> <name>`.
+private cbr_c_type(p: CblProbe) -> string = if is_union_probe(p) then s"union ${p.cname}" else s"struct ${p.cname}"
+
+private is_union_probe(p: CblProbe) -> bool = p.sysl.contains("union ")
+
+// The fields a check reaches: every named one, or a union's first.
+private cbr_reached(p: CblProbe) -> Buf[CbrField]
+    val all = cbr_fields(p.sysl)
+
+    if !is_union_probe(p) then return all
+
+    var one: Buf[CbrField] = buf()
+
+    one.push(all.at(0))
+    one
+end cbr_reached
+
+// The C half: each probe, and a fill and a check of its reached fields.
+private cbr_c(probes: Buf[CblProbe]) -> string
+    var out = "#include <stdint.h>\n\n"
+
+    for p in probes
+        val t = cbr_c_type(p)
+        val fs = cbr_reached(p)
+        var fill = ""
+        var test = "1"
+
+        for k in 0..<fs.len()
+            val v = cbr_value(fs.at(k).ty, k)
+            val lit = if fs.at(k).ty.starts_with("u") then s"${v}ULL" else s"${v}LL"
+
+            fill = fill + s"    p->${fs.at(k).name} = $lit;\n"
+            test = test + s" && p->${fs.at(k).name} == $lit"
+
+        out = out + p.c + "\n" +
+              s"void cbr_fill_${p.cname}($t *p) {\n$fill}\n" +
+              s"int cbr_check_${p.cname}(const $t *p) { return $test; }\n\n"
+
+    out
+end cbr_c
+
+// One probe's value of all zero bits, built as sysl builds one: every named field, or a union's first
+// by name.
+private cbr_zeroed(p: CblProbe) -> string
+    val fs = cbr_fields(p.sysl)
+
+    if is_union_probe(p) then return s"${p.sname}(${fs.at(0).name} = ${cbr_zero(fs.at(0).ty)})"
+
+    var args = ""
+
+    for k in 0..<fs.len()
+        args = args + (if k > 0 then ", " else "") + cbr_zero(fs.at(k).ty)
+
+    s"${p.sname}($args)"
+end cbr_zeroed
+
+// The sysl half: the probes, the C functions, and `check`, which names every mismatch.
+private cbr_sysl(probes: Buf[CblProbe]) -> string
+    var decls = ""
+    var body = "check() -> string\n    var bad = \"\"\n"
+
+    for i in 0..<probes.len()
+        val p = probes.at(i)
+        val fs = cbr_reached(p)
+
+        decls = decls + p.sysl + "\n" + s"extern cbr_fill_${p.cname}(p: *${p.sname})\n" +
+                s"extern cbr_check_${p.cname}(p: *${p.sname}) -> i32\n\n"
+
+        // sysl writes field by field over a zeroed value, and C checks it.
+        body = body + s"    var w$i = ${cbr_zeroed(p)}\n"
+
+        for k in 0..<fs.len()
+            body = body + s"    w$i.${fs.at(k).name} = ${cbr_sysl_value(fs.at(k).ty, k)}\n"
+
+        body = body + s"    if cbr_check_${p.cname}(&w$i) != 1 then bad = bad + \"write ${p.cname}\\n\"\n"
+
+        // sysl builds one whole, and C checks it.
+        if !is_union_probe(p)
+            var args = ""
+
+            for k in 0..<fs.len()
+                args = args + (if k > 0 then ", " else "") + cbr_sysl_value(fs.at(k).ty, k)
+
+            body = body + s"    var b$i = ${p.sname}($args)\n" +
+                   s"    if cbr_check_${p.cname}(&b$i) != 1 then bad = bad + \"build ${p.cname}\\n\"\n"
+        end if
+
+        // C fills one, and sysl reads every field back.
+        body = body + s"    var r$i = ${cbr_zeroed(p)}\n    cbr_fill_${p.cname}(&r$i)\n"
+
+        for k in 0..<fs.len()
+            body = body + s"    if r$i.${fs.at(k).name} != ${cbr_sysl_value(fs.at(k).ty, k)} then " +
+                   s"bad = bad + \"read ${p.cname}.${fs.at(k).name}\\n\"\n"
+
+    decls + body + "    if bad == \"\" then \"ok\" else bad\n"
+end cbr_sysl
+
+// A project whose module `p` carries both halves, and a `main.sysl` printing `p.check()`.
+private cbr_project_run(sysl: string, c: string) -> string
+    val root = make_temp_dir("sysl-cbr").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl").unwrap()
+    write_text(s"$root/p/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end cbr_project_run
+
+private cbr_ready() -> bool = std_root().is_ok() && clang_available()
+
+@test("every probe struct round-trips through C: C fills and sysl reads, sysl writes and builds and C checks")
+cbr_every_probe_round_trips()
+    if !cbr_ready() then return
+
+    val probes = cbl_probes()
+
+    assert_eq(cbr_project_run(cbr_sysl(probes), cbr_c(probes)), "ok\n")
+end cbr_every_probe_round_trips
+
+@test("the round trip can fail: a C check expecting another value is told so, field by field")
+cbr_a_wrong_value_is_caught()
+    if !cbr_ready() then return
+
+    val probes = cbl_probes()
+    // Every probe whose first field is a `u3` fills it with, and checks it for, 5.
+    val c = replace_all(replace_all(cbr_c(probes), "p->a = 5ULL;", "p->a = 4ULL;"), "p->a == 5ULL", "p->a == 4ULL")
+
+    val said = cbr_project_run(cbr_sysl(probes), c)
+
+    assert(said.contains("write mixed\n"), said)
+    assert(said.contains("build mixed\n"), said)
+    assert(said.contains("read mixed.a\n"), said)
+    assert(!said.contains("read mixed.b\n"), said)
+end cbr_a_wrong_value_is_caught

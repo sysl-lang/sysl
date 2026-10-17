@@ -637,6 +637,29 @@ Structs may carry methods, an `invariant`, and a visibility modifier per field. 
 declared `opaque`, which withholds its layout from everyone outside its own module — a different axis
 from visibility, covered under [modules](/tour/modules/).
 
+**A field may be a C bitfield**, written `name: uW in T` — C's `T name : W;`. It holds `W` bits
+allocated in a unit of `T`, the type C declares it with, and a struct with any such field is laid out
+as the target's C compiler lays its counterpart out. The value type is an integer of `W` bits, a
+simple enum, or `bool`; `_: uW in T` is an unnamed field and `_: in T` a zero-width one. The field is
+read, written, built and matched like any other ([attributes](/reference/attributes/) has the rules):
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+    _: u4 in u32
+    count: i12 in i32
+
+var s = Status(true, 5, -7)
+
+s.count -= 1
+print(sizeof(Status), s.ready, s.mode, s.count)
+```
+
+```output
+4 true 5 -8
+```
+
 ## Unions
 
 A `union` is storage its fields **share**: every field begins at its first byte, and nothing records

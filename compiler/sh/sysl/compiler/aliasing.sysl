@@ -383,6 +383,8 @@ end severed
 // `&o` is left alone -- a `*Outer` names the struct, so a write through it is found by the ordinary
 // walk and checked. What is refused is the pointer that drops the name on the way out.
 check_addressable(cx: &Analyzer, span: Span, place: TExpr)
+    if refuse_c_bit_place(cx, span, place, "'&'") then return
+
     if ordered_field(place).is_some()
         refuse_ordered_field(cx, span, place, "'&'")
         return
@@ -424,6 +426,25 @@ refuse_ordered_field(cx: &Analyzer, span: Span, place: TExpr, form: string)
              s"or write the field through the struct, which is where the order is applied, or take " +
              s"the address of the $owner itself")
 end refuse_ordered_field
+
+// `&` or `ref` of a C bitfield, refused: it is bits inside a unit of its declared type, and begins
+// on no byte. Answers whether it refused.
+refuse_c_bit_place(cx: &Analyzer, span: Span, place: TExpr, form: string) -> bool = *place.kind match
+    TField(receiver, index, _) ->
+        if !c_bit_field(texpr_type(receiver), index) then return false
+
+        underlying(texpr_type(receiver)) match
+            Struct(s) ->
+                val owner = type_show(Struct(s))
+
+                cx.fault(span, s"$form here would reach '$owner.${s.fields.at(usize(index)).0}', a C " +
+                         "bitfield — it is bits inside a unit of its declared type and has no address " +
+                         s"of its own. Read or write it through the struct, or take the address of the " +
+                         s"$owner itself")
+            _ -> ()
+
+        true
+    _ -> false
 
 // `&` of a field inside a `@packed` struct, refused.
 //
