@@ -380,3 +380,109 @@ cev_std_fresh_entries_are_spared()
 
     cev_end(dirs)
 end cev_std_fresh_entries_are_spared
+
+@test("a standard-module entry written long ago and used just now survives a sweep past the bound; unused ones go")
+cev_std_entry_used_now_survives()
+    val dirs = cev_begin()
+    val sysl = s"${dirs.1}/sysl"
+
+    cev_std_entries(sysl, "e", 6, 1000)
+
+    for i in 0..<6
+        cev_date(sysl, s"e$i/std.syslib", s"20200101010$i")
+
+    // The oldest is used, by a process that has since ended: nothing but its age says so.
+    note_std_use(s"$sysl/e0/std.syslib")
+    reset_std_sweep()
+    cev_std_entries(sysl, "n", 1, 1000)
+    note_std_use(s"$sysl/n0/std.syslib")
+    use_cache_bound(Some(3000))
+    sweep_std_artifacts()
+
+    assert(is_file(s"$sysl/e0/std.syslib"), "the entry used just now stayed, though it was written in 2020")
+    assert(!is_dir(s"$sysl/e1") && !is_dir(s"$sysl/e4"), "unused entries went, oldest first")
+    assert(is_file(s"$sysl/e5/std.syslib"), "the newest unused entry stayed")
+    cev_end(dirs)
+end cev_std_entry_used_now_survives
+
+@test("a root archive written long ago and used just now survives a sweep past the bound; unused ones go")
+cev_root_used_now_survives()
+    val dirs = cev_begin()
+    val roots = s"${dirs.1}/sysl/roots"
+
+    make_dir_all(roots).unwrap()
+
+    for i in 0..<10
+        cev_roots(roots, s"k${i}_", 1, 1000)
+        cev_date(roots, s"k${i}_*", s"20200101010${i}")
+
+    cev_roots(roots, "fresh", 1, 1000)
+    note_root_use(s"$roots/k0_0.syslib")
+    use_root_cache_dir(Some(dirs.1))
+    use_cache_bound(Some(8000))
+    note_roots_dir(roots)
+    sweep_roots()
+
+    assert(is_file(s"$roots/k0_0.syslib") && is_file(s"$roots/k0_0.syslib.sum"),
+        "the archive used just now stayed, though it was written in 2020")
+    assert(!is_file(s"$roots/k1_0.syslib"), "an unused archive went")
+    cev_end(dirs)
+end cev_root_used_now_survives
+
+@test("a C object written long ago and hit just now survives a sweep past the bound; unused ones go")
+cev_c_object_hit_now_survives()
+    if !clang_available() then return
+
+    val dirs = cev_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+
+    cev_compile_many(dirs.0, 2)
+    cev_date(cobj, "*", "202001010000")
+
+    for i in 0..<10
+        cev_entries(cobj, s"m${i}_", 1, 1000)
+        cev_date(cobj, s"m${i}_*", s"20200101010${i}")
+
+    // A new process: what the first one used is forgotten, and its hits are this one's uses.
+    use_c_object_cache_dir(Some(dirs.1))
+    forget_touched()
+    clear_c_object_counts()
+    cev_compile_many(dirs.0, 2)
+    assert_eq(c_object_counts(), (2, 0))
+
+    use_c_object_cache_dir(Some(dirs.1))
+    use_cache_bound(Some(8000))
+    cev_sweep_with_a_miss(dirs.0, 1)
+    assert(!is_file(s"$cobj/m0_0.o"), "an unused object went")
+
+    clear_c_object_counts()
+    cev_compile_many(dirs.0, 2)
+    assert_eq(c_object_counts(), (2, 0))
+    cev_end(dirs)
+end cev_c_object_hit_now_survives
+
+@test("a run-cache entry written long ago and hit just now survives a sweep past the bound; unused ones go")
+cev_run_entry_hit_now_survives()
+    val dirs = cev_begin()
+    val run = s"${dirs.1}/sysl/run"
+
+    make_dir_all(run).unwrap()
+
+    for i in 0..<10
+        write_text(s"$run/k${i}", repeat("x", 1000)).unwrap()
+        write_text(s"$run/k${i}.tests", "t").unwrap()
+        cev_date(run, s"k${i}*", s"20200101010${i}")
+
+    capture("/bin/chmod", ["+x", s"$run/k0"]).unwrap()
+    forget_touched()
+    assert(run_cache_hit("k0").is_some(), "the entry is a hit")
+
+    use_run_cache_dir(Some(dirs.1))
+    use_cache_bound(Some(4000))
+    run_cache_reserve("zz").unwrap()
+
+    assert(is_file(s"$run/k0") && is_file(s"$run/k0.tests"),
+        "the entry hit just now stayed, though it was written in 2020")
+    assert(!is_file(s"$run/k1"), "an unused entry went")
+    cev_end(dirs)
+end cev_run_entry_hit_now_survives

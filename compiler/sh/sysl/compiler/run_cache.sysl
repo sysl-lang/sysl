@@ -7,7 +7,7 @@ import sysl.container.{Map, map, Set, set}
 import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text,
                 write_text_atomic}
 import sysl.slices.sort_by
-import sysl.text.{from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
+import sysl.text.{cstring, from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
 
 // The executable `sysl run` and `sysl test` built last time, kept so that running the same tree
 // twice costs the second one nothing.
@@ -104,6 +104,33 @@ const SweepGap: long = 600000000
 // filesystem's own clock.
 private const SweepStamp: string = ".swept"
 private const SweepClock: string = ".clock"
+
+// The installed compiler's stand-in for `sysl.fs.set_modified`, which sets a time to now where it is
+// given none: this compiler is built by the installed release, whose library cannot yet set a time.
+// It is replaced by `set_modified` once a release that ships it is installed.
+private extern "utimes" c_utimes(path: *u8, times: *u8) -> int
+
+// What this process has already marked as used, so each file is touched once however often it is hit.
+private var touched: Set[string] = set()
+
+// Mark a cache file as used now -- its modification time is what every sweep reads as its age, so an
+// entry that is used stays among the newest however long ago it was made, and a sweep removes the
+// least recently used first. Once per file per process, one `utimes`; a file that is not there, or a
+// filesystem that will not take a time, costs the entry nothing but its age.
+touch_used(file: string)
+    if touched.has(file) then return
+
+    touched.add(file)
+
+    val name = cstring(file)
+
+    c_utimes(name.ptr, null)
+    ()
+end touch_used
+
+// Forget what was touched, as a new process would have.
+forget_touched()
+    touched = set()
 
 // A bound a test holds a directory to in place of `CacheBytes`. Zero is none.
 private var cache_bound_override: long = 0
@@ -500,9 +527,18 @@ private run_cache_slot(key: string) -> Option[string]
 end run_cache_slot
 
 // The program built for this key, where one is there and is still executable.
-run_cache_hit(key: string) -> Option[string] = run_cache_slot(key) match
-    Some(path) -> if is_file(path) && is_executable(path) then Some(path) else None
-    None -> None
+run_cache_hit(key: string) -> Option[string]
+    val path = run_cache_slot(key) match
+        Some(p) -> p
+        None -> return None
+
+    if !is_file(path) || !is_executable(path) then return None
+
+    // A hit is a use: the entry and its test list are as young as this run.
+    touch_used(path)
+    touch_used(s"$path.tests")
+    Some(path)
+end run_cache_hit
 
 // Where to link, for a build that is about to happen: a path in the cache with the directory already
 // made, or nothing where there is no cache to write into.

@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -664,6 +664,29 @@ already has is the one change anybody may make. A symbolic link is followed, as 
 follows one, and there is no variant that changes the link itself, there being none for its
 permissions either. A target whose filesystem has no owners answers *not supported on this target*.
 
+**`set_modified(path, when)` sets the modification time** of a file or a directory, and its access
+time with it, over one `utimensat` hook. It is how a program records that something was used without
+writing to it: a cache that evicts the least recently used entry touches what it hands out. A path
+that is not there is `NotFound`; the filesystem keeps the time to its own resolution, so a reading
+may round what was set.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_modified, remove_file}
+import sysl.time.Instant
+
+val path = "/tmp/sysl-fs-doc-modified.txt"
+
+write_text(path, "x").unwrap()
+set_modified(path, Instant(1500000000000000)).unwrap()
+print(metadata(path).unwrap().modified.us / 1000000)
+
+remove_file(path).unwrap()
+```
+
+```output
+1500000000
+```
+
 ### Links, and the path the filesystem agrees on
 
 ```sysl
@@ -1045,7 +1068,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata`, `set_permissions` and `set_owner` are one `stat`, `chmod` or `chown` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions`, `set_owner` and `set_modified` are one `stat`, `chmod`, `chown` or `utimensat` hook, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

@@ -142,7 +142,8 @@ wherever `XDG_CACHE_HOME` points — under a fingerprint of the library it was b
 built once per machine rather than once per project, nothing is written into your source tree, and
 installing a compiler with a different library gets its own entry instead of a stale hit. Entries
 are held to 4 GB together: past that the oldest go, whole, though never one written in the last hour
-or the one the running compiler uses.
+or the one the running compiler uses. Using an entry refreshes its age, so what goes first is
+what was used least recently.
 
 **The entry also names the compiler that built it — its version and a digest of its own executable — so
 a different build of the same version never reads back another build's archive.** The same key

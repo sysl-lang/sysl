@@ -86,6 +86,7 @@ use_c_object_cache_dir(dir: Option[string])
     c_object_home = dir.unwrap_or("")
     c_objects_pending = ""
     c_objects_swept = false
+    c_objects_in_use = set()
 
 // `(hits, compilations)` since the last `clear_c_object_counts`.
 c_object_counts() -> (int, int) = (c_object_hits, c_object_compiled)
@@ -237,9 +238,10 @@ end unit_object_kept
 // nothing -- and two things are exempt from it:
 //
 //   - **what this process has used or made**, whatever its age: a build never evicts an object it
-//     already linked from, nor the file list that found it. A hit does not refresh an object's age, so
-//     an object compiled long ago and hit every day is recompiled once when it ages out, as a run-cache
-//     entry is rebuilt.
+//     already linked from, nor the file list that found it. **A hit refreshes an object's age** (once per
+//     file per process, `touch_used`), so the last hour is the last hour it was USED and the oldest
+//     go first by least recent use: an object hit all week is never the one a concurrent build's
+//     sweep takes, however long ago it was compiled.
 //   - nothing else. **A half entry is garbage at any age** -- an object with no `.o.sum` beside it, or
 //     a `.o.sum` with no object -- since a lookup reads it as a miss and nothing ever completes it. One
 //     removed while another build is between its two renames costs that build's next compilation.
@@ -251,6 +253,9 @@ private in_use(object: string, listed: string)
     c_objects_in_use.add(object)
     c_objects_in_use.add(s"$object.sum")
     c_objects_in_use.add(listed)
+    touch_used(object)
+    touch_used(s"$object.sum")
+    touch_used(listed)
 end in_use
 
 private used_here(one: string) -> bool = c_objects_in_use.has(one)

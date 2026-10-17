@@ -84,7 +84,8 @@ for somebody else's toolchain.
 **The kept binaries, and the C objects every build keeps beside them, are bounded.** Each directory
 — `~/Library/Caches/sysl/run/` and `~/Library/Caches/sysl/cobj/` on macOS, under `~/.cache/sysl/`
 on Linux — holds at most 4 GB: past that the oldest entries go, though never one written in the
-last hour and never one the build in hand used. Past 256 entries, anything a week older than the
+last hour and never one the build in hand used. Using an entry — a hit — refreshes its age, so
+"the last hour" means used in the last hour and the oldest are the least recently used. Past 256 entries, anything a week older than the
 newest goes too. The sweep runs once, when a build that compiled something is done, and is skipped
 where another build swept the same directory in the last ten minutes. Deleting either directory
 costs one rebuild and nothing else. The same bound, sweep and sparing rules hold for the compiled
