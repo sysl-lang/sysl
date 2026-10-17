@@ -1291,6 +1291,67 @@ private struct Id
 name, and C links nothing on a type name — which is what makes this a spelling an author may decide
 rather than a fact anything else depends on.
 
+### A struct's layout in the header
+
+A `@packed` or `@align(n)` struct is declared with its layout, since without it C would lay the type
+out its own way — a packed `u8` and `u32` is five bytes in sysl and eight in plain C, and every field
+after the first would be read from the wrong place:
+
+```sysl
+module mylib
+
+@packed
+@export("wire_hdr")
+struct WireHdr
+    tag: u8
+    len: u32
+
+@align(16)
+@export("slot")
+struct Slot
+    x: u8
+
+@export("mylib_send")
+send(h: WireHdr, s: *Slot) -> u32 = h.len
+
+print(sizeof(WireHdr), alignof(WireHdr), offsetof(WireHdr, len), sizeof(Slot), alignof(Slot))
+```
+
+```output
+5 1 1 16 16
+```
+
+```c
+SYSL_PACK_PUSH
+typedef struct SYSL_PACKED {
+	uint8_t tag;
+	uint32_t len;
+} wire_hdr;
+SYSL_PACK_POP
+
+typedef struct SYSL_ALIGNED(16) {
+	uint8_t x;
+} slot;
+```
+
+The three macros are defined once at the top of a header that needs them: clang and gcc get
+`__attribute__((packed))` and `__attribute__((aligned(n)))` and an empty pragma pair, MSVC gets
+`#pragma pack(push, 1)` / `pop` around the definition and `__declspec(align(n))`. A struct holding one
+of these as a field, or an array of them, needs nothing more — its layout follows from the member's.
+
+Three cases need a word each:
+
+- **A bitfield struct is the one integer it is stored as**, a `uint8_t` array where that width has no
+  C name, under a comment per field saying which bits it holds (`/* b: bits 3..7 */`). It is never a
+  C bitfield struct, whose allocation unit is the C compiler's choice.
+- **`@byte_order` has no C spelling.** The layout is the same, but each integer's bytes are in the
+  declared order rather than the machine's, so the header says so in a comment above the `typedef`
+  and the C side swaps a field where the orders differ.
+- **A `@packed` struct holding a field of an `@align(n)` type has no MSVC declaration.** clang and gcc
+  pack that field to one byte, as sysl does; MSVC's layout — clang-cl's included — keeps its
+  alignment. The header carries an `#error` for that struct under `_MSC_VER`, so the mismatch stops
+  the C build rather than corrupting memory across the boundary.
+
 ### Naming a type in the header
 
 A [`type`](/reference/declarations/#type-declarations) is a second name for something that already

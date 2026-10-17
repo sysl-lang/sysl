@@ -155,13 +155,15 @@ c_header_render(funcs: Buf[TFunc], name: string, vals: Buf[TVal] = buf()) -> str
     if reaches_never(exports) then out.push(noreturn_macro())
     if per_thread_storage(storage) then out.push(thread_local_macro())
 
-    out.push("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
-
     // The aggregates the prototypes below name, defined before anything uses one. They come in
     // dependency order -- a struct with a struct in it after what it holds -- because C needs a
     // complete type to lay a member out, and there is nothing here to forward-declare around: a
     // by-value member is the case a forward declaration does not serve.
     val aggregates = header_aggregates(exports, storage)
+
+    if any_laid_out(aggregates) then out.push(layout_macros())
+
+    out.push("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 
     for item in aggregates
         out.push(s"${c_aggregate_definition(item)}\n")
@@ -358,19 +360,126 @@ end c_prototype
 // is exactly C's `struct foo;`: the C caller may hold a `*h` and never see inside. **An exported
 // `type` declares its name over what it stands for**, which is the declarator walk with the new name
 // where a variable's would go: `typedef int32_t (*on_event)(int32_t);`.
+//
+// **A struct's layout attributes are written into its `typedef`**, since a header that left them off
+// declares a type C lays out differently from sysl: a `@packed` struct of a `u8` and a `u32` is five
+// bytes in sysl and eight in the C that included the header, and every field after the first is read
+// from the wrong place. `@align(n)` goes between `struct` and the brace and `@packed` beside it, through
+// the macros `layout_macros` defines, and a packed one is also bracketed by MSVC's pragma.
+//
+// **A bitfield struct is written as the one integer it is**, never as a C bitfield struct, whose
+// allocation unit is the C compiler's own choice; a comment above the integer says which bits each
+// field is. **`@byte_order` has no C spelling**: the layout is the same, the bytes of each integer are
+// not the machine's order, and a comment above the `typedef` says so where C will read it.
 private c_aggregate_definition(t: Type) -> string = t match
     Constrained(d) -> s"typedef ${c_declare(d.base, c_name(t))};\n"
     Struct(d) ->
         if d.opaque then return s"typedef struct ${c_name(t)} ${c_name(t)};\n"
 
         var fields = ""
-        val stored = d.stored()
 
-        for item in stored
-            fields += s"\t${c_declare(item.1, item.0)};\n"
+        bitfield_ranges(d) match
+            Some(ranges) -> fields = bitfield_container(ranges)
+            None ->
+                val stored = d.stored()
 
-        s"typedef struct {\n$fields} ${c_name(t)};\n"
+                for item in stored
+                    fields += s"\t${c_declare(item.1, item.0)};\n"
+
+        var attrs = ""
+
+        d.min_align match
+            Some(n) -> attrs += s" SYSL_ALIGNED($n)"
+            None -> ()
+
+        if d.packed then attrs += " SYSL_PACKED"
+
+        val body = s"${msvc_refusal(d, c_name(t))}${byte_order_note(d)}typedef struct$attrs {\n$fields} ${c_name(t)};\n"
+
+        if d.packed then s"SYSL_PACK_PUSH\n${body}SYSL_PACK_POP\n" else body
     _ -> ""
+
+// **MSVC's layout keeps an aligned member's alignment inside a packed struct**, where clang and gcc
+// pack it to one byte as sysl does -- so a `@packed` struct holding an `@align(n)` one has no
+// declaration that compiler lays out the same, clang-cl included. The header says so to that compiler
+// at the line it would otherwise read wrongly, and every other compiler reads past it.
+private msvc_refusal(d: &StructType, name: string) -> string
+    if !d.packed || bitfield_ranges(d).is_some() then return ""
+
+    val fields = d.stored()
+
+    for item in fields
+        if raises_align(item.1)
+            return s"#if defined(_MSC_VER)\n#error \"'$name' is a @packed struct holding a field of an @align(n) type, and MSVC's layout keeps that field's alignment where sysl packs it\"\n#endif\n"
+
+    ""
+end msvc_refusal
+
+// Whether a field of type `t` carries an alignment `@align(n)` raised -- its own, an array element's,
+// or a member's of an unpacked struct, which takes its widest member's.
+private raises_align(t: Type) -> bool = header_surface(t) match
+    Struct(s) ->
+        if s.min_align.is_some() then return true
+        if s.packed || s.opaque then return false
+
+        val fields = s.stored()
+
+        for item in fields
+            if raises_align(item.1) then return true
+
+        false
+    Array(_, elem) -> raises_align(*elem)
+    _ -> false
+
+// A bitfield struct's body: the integer it is stored as -- a `uint8_t` array where its width is not
+// one C has a name for -- under a line per field saying where in that integer the field sits.
+private bitfield_container(ranges: Buf[BitRange]) -> string
+    val bytes = bitfield_bits(ranges) / 8
+    var out = ""
+
+    for r in ranges
+        out += s"\t/* ${r.name}: bits ${r.offset}..${r.offset + r.width - 1} */\n"
+
+    if bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 then out + s"\tuint${bytes * 8}_t bits;\n"
+    else out + s"\tuint8_t bits[$bytes];\n"
+end bitfield_container
+
+// The warning above a `@byte_order` struct, which C has no attribute for.
+private byte_order_note(d: &StructType) -> string = d.big_endian match
+    Some(big) ->
+        val order = if big then "big" else "little"
+        val first = if big then "most" else "least"
+
+        s"/* @byte_order($order): each integer field holds its bytes $first significant first on every machine, which C cannot declare -- swap a field where this machine's order differs. */\n"
+    None -> ""
+
+// Whether any aggregate in the header is `@packed` or `@align(n)`, which is what the macros are for.
+private any_laid_out(aggregates: Buf[Type]) -> bool
+    for item in aggregates
+        item match
+            Struct(d) -> if !d.opaque && (d.packed || d.min_align.is_some()) then return true
+            _ -> ()
+
+    false
+end any_laid_out
+
+// The two layout attributes, as the compiler reading the header spells them: clang and gcc take
+// `__attribute__`, and MSVC packs with a pragma around the definition and aligns with `__declspec`.
+// clang-cl defines `_MSC_VER` and takes the `__attribute__` side, which it understands.
+private layout_macros() -> string =
+    "#ifndef SYSL_PACKED\n" +
+    "#if defined(_MSC_VER) && !defined(__clang__)\n" +
+    "#define SYSL_PACKED\n" +
+    "#define SYSL_PACK_PUSH __pragma(pack(push, 1))\n" +
+    "#define SYSL_PACK_POP __pragma(pack(pop))\n" +
+    "#define SYSL_ALIGNED(n) __declspec(align(n))\n" +
+    "#else\n" +
+    "#define SYSL_PACKED __attribute__((packed))\n" +
+    "#define SYSL_PACK_PUSH\n" +
+    "#define SYSL_PACK_POP\n" +
+    "#define SYSL_ALIGNED(n) __attribute__((aligned(n)))\n" +
+    "#endif\n" +
+    "#endif\n\n"
 
 // A sysl type declaring `name` -- a parameter, a field, or (with `name` holding the function's own
 // name and parameter list) a whole prototype.
