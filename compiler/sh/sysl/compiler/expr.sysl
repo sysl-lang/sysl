@@ -392,6 +392,24 @@ capture_source(cx: &Analyzer, span: Span, name: string) -> TExpr
 
     cx.capture_read(local.unique).unwrap_or(TExpr(span, TLoad(local.unique, local.ty)))
 
+// The binding holding an anonymous member that shows a field of this name, at any depth. Only a
+// clause function binds one: no program can write the name.
+private anonymous_holder_local(cx: &Analyzer, name: string) -> Option[string]
+    var i = cx.locals.len()
+
+    while i > 0
+        i = i - 1
+
+        val local = cx.locals.at(i)
+
+        if is_anonymous_field(local.name)
+            local.ty match
+                Struct(d) -> if holds_string(visible_field_names(d), name) then return Some(local.name)
+                _ -> ()
+
+    None
+end anonymous_holder_local
+
 // What a bare name reads.
 //
 // **The order is the reader's**: a name the compiler answers for itself, then `result`, then what
@@ -450,6 +468,17 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
         return load
     end if
+
+    // **A field an anonymous member shows is the holder's own** (C11), so a struct's `invariant`
+    // clause names it bare although its function takes the member whole (`predicates.sysl`). The name
+    // reads as the member's field does, where the clause reaches it -- a union's checked read
+    // included.
+    val holder = anonymous_holder_local(cx, name)
+
+    if holder.is_some()
+        val recv = expr(span, Ident(holder.unwrap()))
+
+        return analyze_value(cx, expr(span, Field(recv, name, span)), expected)
 
     // A **value parameter**, folded into its use exactly as a declared constant is -- which is what
     // it is, a `const` whose value the instantiation supplied. The substitution holds one for it

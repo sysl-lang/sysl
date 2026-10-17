@@ -866,6 +866,28 @@ struct Packet
 'tag' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels
 ```
 
+An `invariant` names them bare too, at any depth. A clause reads a union's field **only where it
+reaches the name**, so a field it does not evaluate is never read: below, `raw = 7` is no `bool`, and
+the clause answers at `tag == 0` without looking at `ok`.
+
+```sysl
+struct Packet
+    tag: int
+    union
+        ok: bool
+        raw: u8
+    invariant tag == 0 || ok
+
+val p = Packet(tag = 0, raw = 7)
+val q = Packet(tag = 1, ok = true)
+
+print(p.raw, q.ok)
+```
+
+```output
+7 true
+```
+
 ### Unions in constant data and with a byte order
 
 A module `val` built from constants is **laid down as data**, a union in it as the bytes of the field

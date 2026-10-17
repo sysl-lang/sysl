@@ -225,3 +225,144 @@ unl_anonymous_address_refused()
 
             print(c.n)
         """, "'&' here makes a '*int' pointing inside Cell, whose invariant reads 'n'", 11, 13)
+
+// -- an invariant names an anonymous member's fields ------------------------------------------------
+
+// At both levels, the program stops on SIGTRAP. What it printed before is still in its buffer, so
+// the value it starts from is shown to hold by the test beside each of these that builds the same one.
+private unl_traps(text: string)
+    if !unl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, _, _) = unl_run(text, level)
+
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
+
+private val UnlNested: string = raw"""
+    struct Span
+        lo: int
+        struct
+            len: int
+            struct
+                cap: int
+        invariant len <= cap
+
+    """
+
+@test("an invariant names an anonymous struct's fields at any depth, and a write keeping it holds")
+unl_invariant_anonymous_struct()
+    unl_prints(UnlNested + raw"""
+        main()
+            var s = Span(lo = 0, len = 2, cap = 4)
+
+            s.len = 4
+            s.cap = 9
+            print(s.lo, s.len, s.cap)
+        """, "0 4 9\n")
+
+@test("a write breaking an invariant over an anonymous struct's field traps")
+unl_invariant_anonymous_struct_violated()
+    unl_traps(UnlNested + raw"""
+        main()
+            var s = Span(lo = 0, len = 2, cap = 4)
+
+            s.len = 5
+            print(s.len)
+        """)
+
+private val UnlTagged: string = raw"""
+    struct Packet
+        tag: int
+        union
+            ok: bool
+            raw: u8
+        invariant tag == 0 || ok
+
+    """
+
+@test("an invariant names an anonymous union's field, and a value keeping it is built")
+unl_invariant_anonymous_union()
+    unl_prints(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+
+            p.tag = 2
+            print(p.tag, p.ok)
+        """, "2 true\n")
+
+@test("a value breaking an invariant over an anonymous union's field traps")
+unl_invariant_anonymous_union_violated()
+    unl_traps(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+
+            p.ok = false
+            print(p.ok)
+        """)
+
+// The clause reads the union's field only where it reaches the name, so a bool holding a byte that is
+// no bool is not read while `tag == 0` answers -- and is read, and traps, once the clause gets there.
+@test("a union field the clause does not reach is not read, so a pattern it would refuse cannot trap")
+unl_invariant_anonymous_union_lazy()
+    unl_prints(UnlTagged + raw"""
+        main()
+            val p = Packet(tag = 0, raw = 7)
+
+            print(p.tag, p.raw)
+        """, "0 7\n")
+
+@test("a union field the clause reaches is a checked read, and a pattern no bool has traps")
+unl_invariant_anonymous_union_reached()
+    unl_traps(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 0, raw = 7)
+
+            p.tag = 1
+            print(p.tag)
+        """)
+
+@test("'&' of the anonymous union's field an invariant reads is refused")
+unl_invariant_anonymous_union_address()
+    unl_refused(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+            val q = &p.raw
+
+            print(p.tag)
+        """, "'&' here makes a '*byte' pointing inside Packet, whose invariant reads 'ok'", 10, 13)
+
+@test("a struct whose invariant reads a union field passes the union to the clause by its address")
+unl_invariant_named_union()
+    unl_prints(raw"""
+        union Word
+            n: u32
+            f: f32
+
+        struct Reg
+            w: Word
+            invariant w.n < 100
+
+        main()
+            var r = Reg(Word(n = 5))
+
+            r.w = Word(n = 99)
+            print(r.w.n)
+        """, "99\n")
+
+@test("a union led by a bool keeps every bit another field wrote through a copy")
+unl_bool_led_union_copy()
+    unl_prints(raw"""
+        union Flag
+            on: bool
+            raw: u8
+
+        struct Holder
+            tag: int
+            f: Flag
+
+        main()
+            val h = Holder(1, Flag(raw = 7))
+            val g = h
+
+            print(g.f.raw)
+        """, "7\n")
