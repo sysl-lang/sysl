@@ -247,6 +247,11 @@ directories would be a `test` most packages could not run.
 **It takes the [feature flags](#the-feature-flags) too**, and given none of them it enables every
 feature the manifest declares rather than only `default`.
 
+**It also compiles each program in the root's `tests/refused/`**, one at a time with the package's
+modules in scope, and passes one only where the compiler refuses it with a diagnostic containing every
+`// error:` line at its head. Those rows are named by path, counted with the rest and selected by
+`--filter` ([packages](/reference/packages/#a-package-may-test-what-it-refuses)).
+
 `--std` says the tree **is** the standard module, which is how sysl's own library is tested. The
 compiler supplies `sysl` to every compilation, so without it the library arrives twice — once as the
 tree being compiled and once as the copy handed over — and every declaration is already declared.

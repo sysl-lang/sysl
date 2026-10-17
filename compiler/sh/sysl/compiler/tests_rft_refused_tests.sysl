@@ -1,0 +1,190 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, write_text}
+import sysl.text.Search
+
+// A package's `tests/refused/` programs, run by `sysl test` through the command line: each must be
+// refused with a diagnostic containing every one of its `// error:` lines, each is compiled on its own
+// with the package's modules in scope, and no build reads the directory.
+
+// A package whose `pin` module declares a `@pinned` struct, with each refused program given as a
+// (file name, text) pair, and the package's root. `tests` is the text of a root file of `@test`
+// functions, or empty for none.
+private rft_package(refused: [](string, string), tests: string = "") -> string
+    val root = absolute_path(make_temp_dir("sysl-rft").unwrap())
+
+    make_dir_all(s"$root/pin").unwrap()
+    make_dir_all(s"$root/tests/refused").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"pin\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/pin/pin.sysl",
+               "module pin\n\n@pinned\nstruct Fs\n    open: int\n\nfilesystem(open: int) -> Fs = Fs(open)\n")
+        .unwrap()
+
+    if tests != "" then write_text(s"$root/checks.sysl", tests).unwrap()
+
+    for item in refused
+        write_text(s"$root/tests/refused/${item.0}", item.1).unwrap()
+
+    root
+end rft_package
+
+// A program that moves the package's `@pinned` value, under the given leading comment.
+private rft_moves(comment: string, helper: string = "1") -> string =
+    comment + "import pin.Fs\n\nvar fs: Fs = Fs(0)\n\nhelper() -> int = " + helper + "\n\n" +
+        "moved() -> int\n    var b = fs\n    b.open\n"
+
+private rft_pinned() -> string = "// error: is '@pinned'\n"
+
+private rft_one_test() -> string = "@test\nholds() =\n    assert(1 + 1 == 2, \"two\")\n"
+
+@test("a refused file whose diagnostic matches passes, counted with the @test functions")
+rft_matching_refusal_passes()
+    if !clx_ready() then return
+
+    val root = rft_package([("move.sysl", rft_moves(rft_pinned()))], rft_one_test())
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("running 2 tests"), out)
+    assert(out.contains("ok    tests/refused/move.sysl"), out)
+    assert(out.contains("2 passed, 0 failed"), out)
+end rft_matching_refusal_passes
+
+@test("a refused file that compiles fails, saying so")
+rft_a_file_that_compiles_fails()
+    if !clx_ready() then return
+
+    val root = rft_package([("fine.sysl", "// error: is '@pinned'\nimport pin.Fs\n\nfine() -> int = 1\n")])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("tests/refused/fine.sysl was expected to be refused, but it compiled"), out)
+    assert(out.contains("0 passed, 1 failed"), out)
+end rft_a_file_that_compiles_fails
+
+@test("a refusal in other words fails, naming the pattern and showing what the compiler said")
+rft_a_wrong_pattern_fails()
+    if !clx_ready() then return
+
+    val root = rft_package([("move.sysl", rft_moves("// error: no such words\n"))])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("tests/refused/move.sysl was refused, but no diagnostic contains \"no such words\""),
+           out)
+    assert(out.contains("> error: 'pin.Fs' is '@pinned'"), out)
+end rft_a_wrong_pattern_fails
+
+@test("a refused file with no '// error:' line is an error, not a pass")
+rft_no_error_line_is_an_error()
+    if !clx_ready() then return
+
+    val root = rft_package([("bare.sysl", rft_moves("// moves it\n"))])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("tests/refused/bare.sysl has no '// error: <text>' line saying what the refusal " +
+                        "must contain"), out)
+end rft_no_error_line_is_an_error
+
+@test("an '// error:' line with nothing after it is an error")
+rft_an_empty_error_line_is_an_error()
+    if !clx_ready() then return
+
+    val root = rft_package([("empty.sysl", rft_moves("// error:\n"))])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("tests/refused/empty.sysl has an empty '// error:' line"), out)
+end rft_an_empty_error_line_is_an_error
+
+@test("several '// error:' lines must every one match")
+rft_several_lines_all_match()
+    if !clx_ready() then return
+
+    val both = "// The move is refused.\n// error: is '@pinned'\n\n// error: binds a copy of it\n"
+    val second_wrong = "// error: is '@pinned'\n// error: no such words\n"
+    val root = rft_package([("both.sysl", rft_moves(both)), ("wrong.sysl", rft_moves(second_wrong))])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("ok    tests/refused/both.sysl"), out)
+    assert(out.contains("tests/refused/wrong.sysl was refused, but no diagnostic contains \"no such words\""),
+           out)
+    assert(out.contains("1 passed, 1 failed"), out)
+end rft_several_lines_all_match
+
+@test("a refused file reaches the package's own module, and a package of refused files alone runs")
+rft_imports_the_packages_module()
+    if !clx_ready() then return
+
+    // Without the import the name is unknown, so the refusal the file asks for comes only through it.
+    val root = rft_package([("move.sysl", rft_moves(rft_pinned()))])
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("running 1 test\n"), out)
+    assert(out.contains("1 passed, 0 failed"), out)
+end rft_imports_the_packages_module
+
+@test("each refused file is compiled on its own")
+rft_one_file_does_not_affect_another()
+    if !clx_ready() then return
+
+    // Compiled together the two `helper`s would collide; and the file that compiles fails alone.
+    val root = rft_package([("a.sysl", rft_moves(rft_pinned(), "1")), ("b.sysl", rft_moves(rft_pinned(), "2")),
+                            ("c.sysl", "// error: is '@pinned'\nc() -> int = 3\n")])
+    val (code, out, _) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Failed, out)
+    assert(out.contains("ok    tests/refused/a.sysl"), out)
+    assert(out.contains("ok    tests/refused/b.sysl"), out)
+    assert(out.contains("tests/refused/c.sysl was expected to be refused, but it compiled"), out)
+    assert(out.contains("2 passed, 1 failed"), out)
+end rft_one_file_does_not_affect_another
+
+@test("--filter selects one refused file")
+rft_filter_selects_one()
+    if !clx_ready() then return
+
+    val root = rft_package([("a.sysl", rft_moves(rft_pinned())), ("b.sysl", "// error: x\nb() -> int = 1\n")],
+                           rft_one_test())
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--filter", "refused/a.sysl"])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("running 1 test of 3"), out)
+    assert(!out.contains("b.sysl"), out)
+
+    val (_, none_out, none_err) = clx_ran(["sysl", "test", root, "--filter", "no such test"])
+
+    assert_eq(none_out, "")
+    assert_eq(none_err, "no test matches 'no such test' — 3 to choose from")
+end rft_filter_selects_one
+
+@test("sysl build ignores tests/refused/")
+rft_build_ignores_the_directory()
+    if !clx_ready() then return
+
+    val root = rft_package([("move.sysl", rft_moves(rft_pinned()))])
+
+    write_text(s"$root/main.sysl", "import pin.filesystem\n\nmain()\n    print(filesystem(3).open)\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build", root, "-o", s"$root/app"])
+
+    assert_eq(code, Fine, out + err)
+end rft_build_ignores_the_directory
+
+@test("the leading comment's '// error:' lines are the patterns, and nothing below it")
+rft_patterns_are_read_from_the_leading_comment()
+    val text = "\n// what it checks\n//error:  first  \n// error: second\nx() = ()\n// error: later\n"
+
+    refused_patterns("t.sysl", text) match
+        Err(why) -> assert(false, why)
+        Ok(found) ->
+            assert_eq(found.len(), 2)
+            assert_eq(found.at(0), "first")
+            assert_eq(found.at(1), "second")
+
+    assert(refused_patterns("t.sysl", "x() = ()\n// error: later\n").is_err())
+end rft_patterns_are_read_from_the_leading_comment

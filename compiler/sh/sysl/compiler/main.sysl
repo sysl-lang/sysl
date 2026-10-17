@@ -1108,8 +1108,12 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     // one, so the same sources at the same machine come to different bytes.
     val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
 
+    // The package's `tests/refused/` programs: never cached, since what each comes to is a
+    // compilation of its own, and that compilation is the whole of what it tests.
+    val run = RefusedRun(if std then buf() else refused_files(file), named, level)
+
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, note, report)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report)
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
@@ -1127,9 +1131,13 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     end if
 
     // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
-    nothing_to_run(file, build.tests, opts.filter, note) match
+    nothing_to_run(file, build.tests, run.files, opts.filter, note) match
         Some(code) -> return code
         None -> ()
+
+    // Refused programs and no `@test` function the filter keeps: there is no binary to link.
+    if selected_tests(build.tests, opts.filter).is_empty()
+        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report)
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
@@ -1141,21 +1149,29 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    tests_run(file, made.0, build.tests, opts, seconds, !made.1, note, report)
+    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report)
 end test_project
+
+// What a project's refused programs are compiled with: the files, and the run's own target and
+// optimization, so each is compiled as the test build was.
+private struct RefusedRun
+    files: Buf[string]
+    named: Option[string]
+    level: string
+end RefusedRun
 
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
 // the tests there are lead to the same empty report and are different mistakes, so each is named.
-// Neither is a failure: a program is allowed to have no tests.
-private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
+// Neither is a failure: a program is allowed to have no tests. A refused program is a test here.
+private nothing_to_run(file: string, all: Buf[TTest], programs: Buf[string], filter: Option[string],
                        note: string -> unit) -> Option[int]
-    if all.is_empty()
+    if all.is_empty() && programs.is_empty()
         note(s"no '@test' functions in $file")
         return Some(Fine)
     end if
 
-    if selected_tests(all, filter).is_empty()
-        note(s"no test matches '${filter.unwrap_or("")}' — ${all.len()} to choose from")
+    if selected_tests(all, filter).is_empty() && selected_refused(programs, filter).is_empty()
+        note(s"no test matches '${filter.unwrap_or("")}' — ${all.len() + programs.len()} to choose from")
         return Some(Fine)
     end if
 
@@ -1163,15 +1179,22 @@ private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
 end nothing_to_run
 
 // The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
-// whole point of it being there.
+// whole point of it being there. `exe` is empty where no `@test` function was chosen.
 private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
-                  discard: bool, note: string -> unit, report: string -> unit) -> int
-    nothing_to_run(file, all, opts.filter, note) match
+                  discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit) -> int
+    nothing_to_run(file, all, run.files, opts.filter, note) match
         Some(code) -> return code
         None -> ()
 
     val chosen = selected_tests(all, opts.filter)
-    val outcomes = run_selected(exe, chosen, opts, all.len() - chosen.len(), report, seconds)
+    val picked = selected_refused(run.files, opts.filter)
+    var judged: Buf[Outcome] = buf()
+
+    for item in picked
+        judged.push(refused_outcome(file, run.named, run.level, item))
+
+    val filtered = all.len() - chosen.len() + run.files.len() - picked.len()
+    val outcomes = run_selected(exe, chosen, opts, filtered, report, seconds, judged)
 
     if discard then discard_test_binary(exe)
 
