@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
+import sysl.testing.skip
 import sysl.text.replace_all
 
 // **`union`** -- storage its fields share, all of them at its first byte, with nothing recording which
@@ -74,6 +75,21 @@ private uni_report(text: string, target: string) -> string
     remove_dir_all(root).unwrap_or(())
     out
 end uni_report
+
+// The LLVM text a program lowers to on this machine, or what its analysis said.
+private uni_ir(text: string) -> string
+    val root = make_temp_dir("sysl-uni-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end uni_ir
 
 // `docs/design/union-probes/layout.c`, claim for claim, as compile-time assertions. `P` is a pointer's
 // width; an 8-byte integer and a `f64` are 8-aligned on every one of the nine targets.
@@ -351,7 +367,7 @@ uni_pointer_beside_integer()
             print(PI(n = 0).p == null, PI(n = 16).p == null)
         """, "true false\n")
 
-@test("a union module 'val' is built when the program starts")
+@test("a union module 'val' is read as it was built")
 uni_module_val()
     uni_prints(raw"""
         union Key
@@ -397,18 +413,169 @@ uni_invariant_refused()
             print(1)
         """, "a union states no 'invariant' — nothing records which of 'I''s fields was written last, so there is no field a clause could be stated over", 3, 5)
 
-@test("an anonymous member is refused until it is built")
-uni_anonymous_member_refused()
-    uni_refused(raw"""
-        struct P
+// -- anonymous members ----------------------------------------------------------------------------
+
+@test("an anonymous union's fields are the struct's: read, written, measured and built by name")
+uni_anonymous_union()
+    uni_prints(raw"""
+        struct Packet
             tag: u8
             union
                 word: u32
                 level: f32
+            len: u16
+
+        main()
+            var p = Packet(tag = 1, word = 7, len = 2)
+
+            print(p.word, offsetof(Packet, word), offsetof(Packet, level), offsetof(Packet, len), sizeof(Packet))
+            p.word = 0x3f800000
+            print(p.level, p.tag, p.len)
+            p.level = 2.0
+            print(p.word)
+            print(p)
+        """, "7 4 4 8 12\n1 1 2\n1073741824\nPacket(tag: 1, union(00 00 00 40), len: 2)\n")
+
+@test("an anonymous struct in a union, and members nested two deep, are laid out as C lays them out")
+uni_anonymous_nested()
+    uni_prints(raw"""
+        union Split
+            all: u64
+            struct
+                lo: u32
+                hi: u32
+
+        struct Deep
+            a: u8
+            struct
+                b: u16
+                union
+                    c: u32
+                    d: [2]u16
+                end union
+            e: u8
+
+        main()
+            val s = Split(lo = 1, hi = 2)
+            val t = Split(all = 0x0000000300000004)
+
+            print(s.all, s.hi, t.lo, t.hi, offsetof(Split, hi), sizeof(Split))
+
+            var d = Deep(a = 1, b = 2, c = 0x00050006, e = 9)
+
+            print(d.d[0], d.d[1], offsetof(Deep, b), offsetof(Deep, c), offsetof(Deep, d), offsetof(Deep, e), sizeof(Deep))
+            d.d[1] = 7
+            print(d.c, d)
+        """, "8589934593 2 4 3 4 8\n6 5 4 8 8 12 16\n458758 Deep(a: 1, struct(b: 2, union(06 00 07 00)), e: 9)\n")
+
+@test("a generic struct's anonymous member is generic over the struct's parameters")
+uni_anonymous_generic()
+    uni_prints(raw"""
+        struct Cell[T: AnyBits]
+            tag: u8
+            union
+                value: T
+                raw: u64
+
+        main()
+            val c = Cell[u32](tag = 1, value = 9)
+            val d = Cell[f64](tag = 2, raw = 0x3ff0000000000000)
+
+            print(c.value, c.raw, d.value, offsetof(Cell[u32], raw), sizeof(Cell[u16]))
+        """, "9 9 1 8 16\n")
+
+@test("an anonymous member is held to the union field rule, and named by the type holding it")
+uni_anonymous_field_rule()
+    uni_refused(raw"""
+        struct P
+            tag: u8
+            union
+                name: string
+                n: u32
 
         main()
             print(1)
-        """, "an anonymous 'union' member is not built yet — declare the union with a name of its own and hold it as a named field", 3, 5)
+        """, "the anonymous union in 'P' cannot hold its field 'name': a string is counted, and nothing in a union says whether one is there to release", 4, 9)
+
+@test("a name an anonymous member declares may not appear at another level")
+uni_anonymous_duplicate()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                a: u16
+                b: u32
+
+        main()
+            print(1)
+        """, "'a' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels", 4, 9)
+
+@test("a struct with an anonymous union is built naming one of its fields")
+uni_anonymous_unnamed()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(a = 1).a)
+        """, "struct 'P' is built naming a field of its anonymous union — one of 'b' and 'c'", 8, 11)
+
+@test("an anonymous union is built from one of its fields, not two")
+uni_anonymous_two()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(a = 1, b = 2, c = 3).a)
+        """, "the anonymous union in 'P' is built from exactly one field, and 2 were named — it holds 'b' and 'c'", 8, 11)
+
+@test("a struct with an anonymous member is built by name, every value of it")
+uni_anonymous_positional()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(1, b = 2).a)
+        """, "struct 'P' holds an anonymous member, so it is built by naming its fields — a value by position would have to count the member's fields as one or as many", 8, 13)
+
+@test("an anonymous member holds fields only")
+uni_anonymous_method()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                twice(self) -> u16 = self.b * 2
+
+        main()
+            print(1)
+        """, "an anonymous 'union' member holds fields only — a method or an 'invariant' belongs to 'P' itself", 3, 5)
+
+@test("offsetof through an anonymous member names a field it holds")
+uni_anonymous_offsetof_missing()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        const at: usize = offsetof(P, d)
+
+        main()
+            print(at)
+        """, "'P' has no field 'd' — it stores 'a', 'b', 'c'", 7, 19)
 
 @test("a union is built by name: a value by position is refused")
 uni_positional_refused()
@@ -490,7 +657,7 @@ uni_derives_refused()
             print(1)
         """, "a union has no tag to say which field it holds, so a derived 'Eq' would read fields that are not there — write an 'impl' block that reads the field you know is there", 1, 18)
 
-@test("a union as a 'const' is refused until compile-time evaluation reads one")
+@test("a union is storage, so a 'const' of one is refused and a 'val' is the spelling")
 uni_const_refused()
     uni_refused(raw"""
         union Key
@@ -503,14 +670,166 @@ uni_const_refused()
             print(k.raw)
         """, "a constant is a scalar, and Key is storage — write 'k' as a 'val', which is laid into the object file as constant data", 5, 1)
 
-@test("'@byte_order' on a union is refused until it is built")
-uni_byte_order_refused()
-    uni_refused(raw"""
+@test("'@byte_order' on a union orders every integer field: a word reads in network order")
+uni_byte_order()
+    uni_prints(raw"""
         @byte_order(big)
         union B
             raw: [4]u8
             word: u32
 
         main()
-            print(1)
-        """, "'@byte_order' on the union 'B' is not built yet — declare it on the structs its fields hold, which reverse their own integers", 1, 1)
+            val b = B(raw = [0, 0, 1, 2])
+
+            print(b.word, B(word = 3).raw[3])
+        """, "258 3\n")
+
+// -- const evaluation and static data -------------------------------------------------------------
+
+@test("a const function builds a union and reads it through the field it was built with")
+uni_const_function()
+    uni_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const pick(r: Reg) -> u32 = r.bits
+        const make(n: u32) -> Reg = Reg(bits = n)
+        const zeroed() -> Reg
+            var r: Reg
+
+            r
+        const K: u32 = pick(make(7))
+        const Z: u32 = pick(zeroed())
+
+        val made: Reg = make(9)
+
+        main()
+            print(K, Z, made.bits, made.level > 0.0)
+        """, "7 0 9 true\n")
+
+@test("a compile-time read through a field a union was not built with is refused")
+uni_const_cross_read()
+    if !uni_ready() then return
+
+    val (_, _, err) = uni_run(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const level_of(r: Reg) -> f32 = r.level
+        const K: f32 = level_of(Reg(bits = 7))
+
+        main()
+            print(K)
+        """, "0")
+
+    assert(err.contains("error: 'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'bits', and 'level' would read its bytes as another type ("), err)
+    assert(err.contains("/main.sysl:6:16\n"), err)
+    assert_eq(err.count_of("error: "), 1)
+end uni_const_cross_read
+
+@test("a module 'val' holding unions is laid down as data, each in the literal type of its image")
+uni_static_image()
+    uni_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        struct Map
+            tag: u8
+            union
+                word: u32
+                half: u16
+            len: u16
+
+        val r: Reg = Reg(level = 1.0)
+        val m: Map = Map(tag = 3, half = 0x1234, len = 9)
+        val t: [3]Reg = [Reg(bits = 5), Reg(level = 2.0), Reg(bits = 6)]
+        val f: [2]Map = [Map(tag = 1, word = 2, len = 3); 2]
+
+        main()
+            print(r.bits, m.half, m.word, m.len, m.tag, t[0].bits, t[1].level, t[2].bits, f[1].word, sizeof(Map))
+        """, "1065353216 4660 4660 9 3 5 2 6 2 12\n")
+
+    if !uni_ready() then return
+
+    val ir = uni_ir(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        val r: Reg = Reg(level = 1.0)
+
+        main()
+            print(r.bits)
+        """)
+
+    assert(ir.contains("@r = private constant { [0 x %struct.Reg], float } { [0 x %struct.Reg] zeroinitializer, float 0x3FF0000000000000 }"), ir)
+end uni_static_image
+
+@test("a module 'val' union is data on a bare machine: its bytes are in the object's read-only data")
+uni_static_image_on_a_board()
+    if !uni_ready() then return
+
+    val root = make_temp_dir("sysl-uni-board").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        struct Map
+            ctrl: u32
+            union
+                level: f32
+                raw: u32
+            pad: u16
+
+        @export("reg_map")
+        val REG: Map = Map(ctrl = 1, level = 1.0, pad = 2)
+
+        @export("main")
+        main_entry() -> u32 = REG.raw + REG.ctrl
+        """).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "thumb-freestanding", "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    assert_eq(code, 0)
+
+    val dump = capture("/opt/homebrew/opt/llvm/bin/llvm-objdump", ["-s", "-j", ".rodata.reg_map", s"$root/probe.a"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    dump match
+        Err(_) -> skip("llvm-objdump could not be run")
+        Ok(out) -> assert(out.text.contains(" 0000 01000000 0000803f 02000000 "), out.text)
+end uni_static_image_on_a_board
+
+// -- aliasing -------------------------------------------------------------------------------------
+
+@test("a union's fields are one place: an address of one is an alias of the field a clause reads")
+uni_alias_one_place()
+    if !uni_ready() then return
+
+    val (_, _, err) = uni_run(raw"""
+        union U
+            a: u32
+            b: [4]u8
+
+        struct Guarded
+            u: U
+            invariant u.a < 100
+
+        main()
+            var g = Guarded(U(a = 1))
+            val p = &g.u.b
+
+            print(g.u.a)
+        """, "0")
+
+    assert(err.contains("/main.sysl:11:13\n"), err)
+    assert(err.contains("'u.a'"), err)
+    assert_eq(err.count_of("error: "), 1)
+end uni_alias_one_place

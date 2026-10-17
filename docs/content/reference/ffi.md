@@ -2766,7 +2766,7 @@ reachable from C and from nothing else, and each blocks an ordinary POSIX interf
 |---|---|
 | **a caller-allocated opaque type** | `regcomp` wants a `regex_t` the caller supplies, and its size is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows |
 | **a macro** | `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is nothing for a linker to resolve and nothing for `extern` to name |
-| **a shape with no sysl spelling** | an inline function, a union with an anonymous member, and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
+| **a shape with no sysl spelling** | an inline function and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
 
 Each becomes an ordinary function in three lines of C:
 

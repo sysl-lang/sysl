@@ -401,3 +401,43 @@ bor_attribute_refusals()
                 "it stands above the struct — a format whose fields disagree is two structs, one of " +
                 "them held as a field of the other", 2, 5)
 end bor_attribute_refusals
+
+// -- a union ------------------------------------------------------------------------------------------
+
+@test("a union's byte order is every field's: built, written, read, laid down, and through an anonymous member")
+bor_union()
+    bor_prints(bor_bytes_of + raw"""
+        @byte_order(big)
+        union Wire
+            raw: [4]u8
+            word: u32
+
+        @byte_order(big)
+        struct Frame
+            kind: u16
+            union
+                port: u16
+                bytes: [2]u8
+
+        val fixed: Wire = Wire(word = 0x01020304)
+
+        val w = Wire(word = 0x0A0B0C0D)
+        var v = Wire(raw = [0, 0, 1, 2])
+
+        print(w.raw[0], w.raw[3], w.word, v.word)
+        v.word = 0x05060708
+        print(v.raw[0], v.raw[3], fixed.raw[0], fixed.raw[3], fixed.word)
+
+        var f = Frame(kind = 0x0102, port = 0x0304)
+
+        print(bytes_of(&f, sizeof(Frame)), f.port, f.bytes[0])
+        """, "10 13 168496141 258\n5 8 1 4 16909060\n1 2 3 4  772 3\n")
+end bor_union
+
+@test("a union's field with no byte order to keep is refused as a struct's is")
+bor_union_float_refused()
+    bor_refused("@byte_order(big)\nunion B\n    f: f32\n    w: u32\n\nprint(1)\n",
+                "'B.f' is f32, and 'B' is '@byte_order(big)' — a float is put in an order through its " +
+                "bits, which the language does not do behind a field read. Hold it as the unsigned " +
+                "integer of its width and convert with '.bits()' and 'from_bits'", 1, 1)
+end bor_union_float_refused

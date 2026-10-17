@@ -100,6 +100,11 @@ private unh_lib() -> string =
     "@export(\"u_dw\")\nunion UDw\n    d: f64\n    w: [2]u32\n\n" +
     "@export(\"u_pn\")\nunion UPn\n    p: *u8\n    n: u32\n\n" +
     "@export(\"u_table\")\nvar table: [2]URound\n\n" +
+    "@export(\"u_anon\")\nstruct UAnon\n    tag: u8\n    union\n        word: u32\n        level: f32\n" +
+    "    struct\n        lo: u16\n        hi: u16\n    len: u16\n\n" +
+    "@export(\"u_anon_union\")\nunion UAnonUnion\n    all: u64\n    struct\n        lo: u32\n        hi: u32\n\n" +
+    "@assert(sizeof(UAnon) == 16 && alignof(UAnon) == 4 && offsetof(UAnon, word) == 4 && offsetof(UAnon, level) == 4 && offsetof(UAnon, lo) == 8 && offsetof(UAnon, hi) == 10 && offsetof(UAnon, len) == 12)\n" +
+    "@assert(sizeof(UAnonUnion) == 8 && offsetof(UAnonUnion, all) == 0 && offsetof(UAnonUnion, lo) == 0 && offsetof(UAnonUnion, hi) == 4)\n" +
     "@assert(sizeof(UWord) == 4 && alignof(UWord) == 4 && offsetof(UWord, a) == 0 && offsetof(UWord, b) == 0)\n" +
     "@assert(sizeof(URound) == 8 && alignof(URound) == 4 && offsetof(URound, b) == 0)\n" +
     "@assert(sizeof(UHalf) == 4 && alignof(UHalf) == 2 && offsetof(UHalf, b) == 0)\n" +
@@ -111,7 +116,7 @@ private unh_lib() -> string =
     "@assert(sizeof(UDw) == 8 && alignof(UDw) == alignof(f64) && offsetof(UDw, w) == 0)\n" +
     "@assert(sizeof(UPn) == sizeof(*u8) && offsetof(UPn, n) == 0)\n\n" +
     "@export(\"unh_take\")\ntake(a: UWord, b: URound, c: UHalf, d: UPacked, e: *UAligned, f: UEpoll, g: UTagged, " +
-    "h: UTaggedPacked, i: UDw, j: UPn) -> UFi = UFi(i = 0)\n"
+    "h: UTaggedPacked, i: UDw, j: UPn, k: UAnon, l: UAnonUnion) -> UFi = UFi(i = 0)\n"
 
 // The C half: the same numbers, as the header declares the types.
 private unh_c() -> string =
@@ -125,7 +130,9 @@ private unh_c() -> string =
     "_Static_assert(sizeof(u_tagged_packed) == 5 && _Alignof(u_tagged_packed) == 1 && offsetof(u_tagged_packed, v) == 1, \"u_tagged_packed\");\n" +
     "_Static_assert(sizeof(u_dw) == 8 && _Alignof(u_dw) == _Alignof(double) && offsetof(u_dw, w) == 0, \"u_dw\");\n" +
     "_Static_assert(sizeof(u_pn) == sizeof(void *) && offsetof(u_pn, n) == 0, \"u_pn\");\n" +
-    "_Static_assert(sizeof(u_table) == 16, \"u_table\");\n"
+    "_Static_assert(sizeof(u_table) == 16, \"u_table\");\n" +
+    "_Static_assert(sizeof(u_anon) == 16 && _Alignof(u_anon) == 4 && offsetof(u_anon, word) == 4 && offsetof(u_anon, level) == 4 && offsetof(u_anon, lo) == 8 && offsetof(u_anon, hi) == 10 && offsetof(u_anon, len) == 12, \"u_anon\");\n" +
+    "_Static_assert(sizeof(u_anon_union) == 8 && offsetof(u_anon_union, all) == 0 && offsetof(u_anon_union, lo) == 0 && offsetof(u_anon_union, hi) == 4, \"u_anon_union\");\n"
 
 // Both halves on one machine: the header is written, so every `@assert` held, and clang agrees.
 private unh_agrees(target: string, triple: string, msvc: bool = false) -> string
@@ -168,7 +175,12 @@ unh_the_header_text()
     assert(h.contains("typedef union SYSL_ALIGNED(16) {\n"), h)
     assert(h.contains("typedef struct {\n\tuint8_t tag;\n\tu_fi v;\n\tuint8_t t;\n} u_tagged;\n"), h)
     assert(h.contains("extern u_round u_table[2];\n"), h)
-    assert(h.contains("u_fi unh_take(u_word a, u_round b, u_half c, u_packed d, u_aligned * e, u_epoll f, u_tagged g, u_tagged_packed h, u_dw i, u_pn j);\n"), h)
+    assert(h.contains("u_fi unh_take(u_word a, u_round b, u_half c, u_packed d, u_aligned * e, u_epoll f, u_tagged g, u_tagged_packed h, u_dw i, u_pn j, u_anon k, u_anon_union l);\n"), h)
+
+    // An anonymous member is written in place, as C11 writes one, and has no declaration of its own.
+    assert(h.contains("typedef struct {\n\tuint8_t tag;\n\tunion {\n\t\tuint32_t word;\n\t\tfloat level;\n\t};\n\tstruct {\n\t\tuint16_t lo;\n\t\tuint16_t hi;\n\t};\n\tuint16_t len;\n} u_anon;\n"), h)
+    assert(h.contains("typedef union {\n\tuint64_t all;\n\tstruct {\n\t\tuint32_t lo;\n\t\tuint32_t hi;\n\t};\n} u_anon_union;\n"), h)
+    assert(!h.contains("#1"), h)
 
     // A union is declared before the struct that holds it, as a struct is.
     assert(h.index_of("} u_fi;").unwrap() < h.index_of("} u_tagged;").unwrap(), h)

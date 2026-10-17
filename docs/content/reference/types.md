@@ -781,8 +781,111 @@ print(w == w)
 A union crosses to C by value and is declared in a generated header as C's own union; see
 [a union at the boundary](/reference/ffi/#a-union-at-the-boundary).
 
-**Not built yet, and refused by name until it is**: `@byte_order` on a union, a union in a `const`,
-and C11's anonymous `union` / `struct` members.
+### Anonymous members
+
+Inside a struct or a union, a line that is exactly `union` or `struct` opens an **anonymous member**,
+as C11 has: its fields are the enclosing type's own, so `p.word` reads one, `offsetof(Packet, level)`
+measures one, and a construction names one. It is laid out as C lays it out — where a named field of
+the same shape would be — and the generated header writes it in place as `union { … };`. It may close
+with `end union` or `end struct`.
+
+```sysl
+struct Packet
+    tag: u8
+    union
+        word: u32
+        level: f32
+    len: u16
+
+union Split
+    all: u64
+    struct
+        lo: u32
+        hi: u32
+
+var p = Packet(tag = 1, word = 0x3f800000, len = 2)
+
+print(p.level, offsetof(Packet, level), offsetof(Packet, len), sizeof(Packet))
+print(Split(lo = 1, hi = 2).all, p)
+```
+
+```output
+1 4 8 12
+8589934593 Packet(tag: 1, union(00 00 80 3f), len: 2)
+```
+
+A type holding an anonymous member is **built by naming its fields**: every field a struct holds,
+and exactly one of each anonymous union. A name may appear once across all the levels, as in C11.
+
+```sysl
+struct Packet
+    tag: u8
+    union
+        word: u32
+        level: f32
+
+val p = Packet(tag = 1, word = 7, level = 2.0)
+```
+
+```error
+the anonymous union in 'Packet' is built from exactly one field, and 2 were named — it holds 'word' and 'level'
+```
+
+```sysl
+struct Packet
+    tag: u8
+    union
+        tag: u16
+        level: f32
+```
+
+```error
+'tag' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels
+```
+
+### Unions in constant data and with a byte order
+
+A module `val` built from constants is **laid down as data**, a union in it as the bytes of the field
+it was built with followed by zeros — so a register map or a protocol table holding unions costs
+nothing at start-up and works on a bare machine. A `const` function may build one and read it back
+**through the field it was built with**; evaluation while compiling has values, not bytes, so a read
+through another field is refused there (at run time it is the ordinary reinterpreting read).
+
+```sysl
+union Reg
+    bits: u32
+    level: f32
+
+const make(n: u32) -> Reg = Reg(bits = n)
+const bits_of(r: Reg) -> u32 = r.bits
+const K: u32 = bits_of(make(7))
+
+val table: [2]Reg = [Reg(level = 1.0), make(9)]
+
+print(K, table[0].bits, table[1].bits)
+```
+
+```output
+7 1065353216 9
+```
+
+```sysl
+union Reg
+    bits: u32
+    level: f32
+
+const level_of(r: Reg) -> f32 = r.level
+const K: f32 = level_of(Reg(bits = 7))
+```
+
+```error
+evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'bits', and 'level' would read its bytes as another type
+```
+
+`@byte_order(big)` or `(little)` on a union orders every integer of every field, as on a struct
+([`@byte_order`](/reference/attributes/#byte_order)), and reaches the fields of its anonymous members.
+`sysl prove` refuses a union by name: WhyML has no model of bytes to say what reading another field
+means.
 
 ## Tuples
 

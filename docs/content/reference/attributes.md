@@ -3138,7 +3138,30 @@ The ranges are taken from the integer, as they are for any bitfield struct, so `
 `0x4000` and the wire holds `0x40 0x00`. A bitfield struct with no order of its own is refused as a
 field of one that has an order, its integer being in the machine's.
 
-The order is one of two words, and the attribute marks a struct and nothing else:
+**A union takes one too**, and it orders every integer of every field — the bytes are shared, so a
+word written through one field reads back in network order through another, and building the union
+from that field stores it in the stated order. An anonymous member's fields are the enclosing type's,
+so the order above the type reaches them as well. Each field is held to the rule above:
+
+```sysl
+@byte_order(big)
+union Wire
+    raw: [4]u8
+    word: u32
+
+var w = Wire(word = 0x01020304)
+
+print(w.raw[0], w.raw[3])
+w.raw = [0, 0, 1, 2]
+print(w.word)
+```
+
+```output
+1 4
+258
+```
+
+The order is one of two words, and the attribute marks a struct or a union and nothing else:
 
 ```sysl
 @byte_order(middle)
