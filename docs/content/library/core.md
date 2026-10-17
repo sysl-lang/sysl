@@ -98,7 +98,7 @@ where every part of it is
 - an integer of a whole number of bytes (`u8` … `u128`, `i24`), a float, or a fixed-point number of
   whole bytes (`q15`);
 - a raw pointer `*T`;
-- or an array or a struct made only of those, padding and all. A field of a bitfield struct is a few
+- or an array, a vector (`<4>f32`) or a struct made only of those, padding and all. A field of a bitfield struct is a few
   bits of one integer, so it counts as an integer unless it is an enum.
 
 Everything with a bit pattern that is no value is out: a `bool` (only 0 and 1 are), an enum (only its
