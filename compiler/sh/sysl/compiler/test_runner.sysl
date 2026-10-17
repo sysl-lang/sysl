@@ -94,8 +94,13 @@ end Outcome
 //
 // `seconds` is the run's limit on each process it starts, zero for none; a test's own
 // `@test(timeout: n)` takes its place for that test, in either direction.
+//
+// `refused` are the package's `tests/refused/` programs, already compiled and judged
+// (`refused_outcome`): they are reported after the `@test` functions, as rows of the same report and
+// counts of the same summary.
 run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
-             emit: string -> unit, seconds: int = DefaultTestSeconds) -> Buf[Outcome]
+             emit: string -> unit, seconds: int = DefaultTestSeconds,
+             refused: Buf[Outcome] = buf()) -> Buf[Outcome]
     var done: Buf[Outcome] = buf()
     var stop = false
     var shown = ""
@@ -104,9 +109,12 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
     // Fixed before the first test runs, from every name a row could carry -- a test's own, or the
     // bare name of a hook that might stand in for one -- because the alternative is not printing a
     // row until the last test is known to be the widest, which is the whole run.
-    val width = widest_row_name(tests)
+    var width = widest_row_name(tests)
 
-    emit(tests_header(tests.len(), filtered))
+    for item in refused
+        if item.test.display.len > width then width = item.test.display.len
+
+    emit(tests_header(tests.len() + refused.len(), filtered))
 
     val groups = by_module_order(tests)
 
@@ -169,6 +177,14 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
 
                     if opts.fail_fast then stop = true
             None -> ()
+
+    for item in refused
+        if stop then break
+
+        done.push(item)
+        show_outcome(item, width, &shown, &any_shown, emit)
+
+        if opts.fail_fast && !item.passed() then stop = true
 
     emit(tests_summary(done))
     done

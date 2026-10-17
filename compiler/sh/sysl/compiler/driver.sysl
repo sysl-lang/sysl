@@ -277,7 +277,11 @@ end adopt_owning_package
 // -- each `@tests` file whole, and every `@test` function and hook -- out after the parse and before
 // anything is resolved, exactly as a library's and a dependency's are: a test's imports, its dev
 // dependencies and its errors belong to the one command that runs it.
-packaged_compilation_of(path: string, t: Target, keep_tests: bool = true) -> Result[Compilation, Failure]
+//
+// **`extra` is one more file of the project's root module**, read as though it sat at the root: a
+// program from `tests/refused/`, compiled with the package it is about (`refused_check`).
+packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
+                        extra: Option[string] = None) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     adopt_owning_package(root)
@@ -292,9 +296,18 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true) -> Res
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
 
-    val mine = collect(path, Some(t.os)) match
+    var mine = collect(path, Some(t.os)) match
         Err(e) -> return Err(said(Refusal(e.message)))
         Ok(f) -> f
+
+    extra match
+        None -> ()
+        Some(file) ->
+            collect(file, Some(t.os)) match
+                Err(e) -> return Err(said(Refusal(e.message)))
+                Ok(f) ->
+                    for item in f
+                        mine.push(item)
 
     if mine.is_empty()
         return Err(said(Refusal(s"$path holds no sysl source files")))
@@ -1847,6 +1860,27 @@ std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuil
 
     Ok(test_build_from(std_compilation_of(path, t)?, true, DefaultOptimization)?)
 end std_test_build_of
+
+// One program from a package's `tests/refused/`, compiled exactly as the package's test build is --
+// the same target, features and optimization, the package's own modules and dependencies in scope --
+// with that one file added at the root. `Ok` is that it compiled; `Err` carries everything the
+// compiler said in refusing it, as a reader would have seen it.
+//
+// **One compilation per file**, so a file that is refused for one reason cannot hide another that
+// would have compiled.
+refused_check(path: string, named_target: Option[string], level: string,
+              file: string) -> Result[unit, string]
+    val t = test_target_of(path, named_target).map_err(r -> r.message)?
+
+    headers_refused(path).map_err(r -> r.message)?
+
+    val program = packaged_compilation_of(path, t, true, Some(file)).map_err(f -> failure_text(f))?
+    val build = test_build_from(program, false, level, path).map_err(r -> r.message)?
+
+    if !build.emitted.report.is_empty() then return Err(analysis_report(build.emitted.report))
+
+    Ok(())
+end refused_check
 
 // What both ask of the machine before anything is read: it has to be this one, because a test run
 // executes what it builds, and it has to have a toolchain.

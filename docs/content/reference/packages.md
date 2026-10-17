@@ -108,6 +108,70 @@ that walked upward would make a build depend on directories above the one it was
 **The exclusion is at the root and nowhere else.** `sh/sysl/mypkg/examples/` is an ordinary module
 named `sh.sysl.mypkg.examples`, so a package that wants the word still has it.
 
+## A package may test what it refuses
+
+**`tests/refused/` at a project root holds programs that `sysl test` requires the compiler to
+refuse.** A `@test` function can only say what code does once it compiles. What a package promises
+its users *cannot* compile — moving a value C holds pointers into, building a type through a
+constructor it keeps to itself — needs a program that is refused, and a run that notices the day it
+stops being refused.
+
+```
+mypkg/package.hocon
+mypkg/sh/sysl/mypkg/mypkg.sysl          the library
+mypkg/tests/refused/move.sysl           a program the compiler must refuse
+```
+
+Each file is one program, and its leading comment says what the refusal must say, in one or more
+`// error:` lines:
+
+```sysl
+// A mounted filesystem is never moved: C holds pointers into it.
+// error: 'sh.sysl.mypkg.Fs' is '@pinned'
+// error: binds a copy of it
+import sh.sysl.mypkg.Fs
+
+var fs: Fs = Fs(0)
+
+moved() -> int
+    var copy = fs
+    copy.open
+```
+
+where the library declares
+
+```sysl
+module sh.sysl.mypkg
+
+@pinned
+struct Fs
+    open: int
+```
+
+**The file passes when compiling it is refused and some diagnostic *contains* every `// error:`
+text** — a substring, the rule a page's `error` block is held to, so a line may quote one clause of a
+message rather than the whole of it. The `// error:` lines are read from the comment at the head of
+the file, up to its first line of code.
+
+- **It compiled** is a failure: `tests/refused/move.sysl was expected to be refused, but it compiled`.
+- **It was refused in other words** is a failure that names the text no diagnostic contained and
+  shows, under the row, everything the compiler did say.
+- **A file with no `// error:` line, or one with nothing after the colon, is a failure too** — a
+  refused test that asks nothing of the refusal would pass whatever the compiler said.
+
+**Each file is compiled on its own, with the package it tests**: as a file of the package's root
+module (so it writes no `module` header), for the run's target, features and optimization, with the
+package's own modules and its dependencies in scope, exactly as a consumer's program would see them.
+One file being refused cannot hide another that compiles, and two files may declare the same names.
+
+**The rows are tests like any other.** Each is named by its path — `tests/refused/move.sysl` — counted
+in the summary, and selected by `--filter`. A package whose only tests are refused programs runs
+them and links nothing.
+
+**Only `sysl test` reads the directory.** Every build, the library build and the walk that collects a
+tree's modules leave `tests/refused/` out, as they leave out `examples/`; the rest of `tests/` is an
+ordinary module directory.
+
 ## A key this compiler does not know is reported and ignored
 
 A manifest is read by whatever compiler is in hand, which may be older than the manifest. So an
