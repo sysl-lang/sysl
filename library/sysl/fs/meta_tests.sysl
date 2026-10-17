@@ -4,6 +4,7 @@ module sysl.fs
 
 import sysl.path.file_name
 import sysl.text.Search
+import sysl.time.Instant
 
 // What one reading of an entry claims, and what a link is.
 //
@@ -110,6 +111,33 @@ end owner_round_trip
 owner_of_nothing()
     set_owner("/tmp/sysl-fs-meta-nothing-is-here", 0, 0) match
         Ok(_) -> assert(false, "a path that does not exist was given away")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+@test("set_modified sets a file's modification time, to the microsecond the filesystem keeps")
+modified_of_a_file()
+    val dir = scratch("set-modified-file")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_modified(path, Instant(1500000000123456)).unwrap()
+    assert_eq(metadata(path).unwrap().modified.us / 1000, 1500000000123456 / 1000)
+    assert_eq(metadata(path).unwrap().modified.us / 1000000, 1500000000)
+    ignore(remove_dir_all(dir))
+end modified_of_a_file
+
+@test("set_modified sets a directory's modification time")
+modified_of_a_directory()
+    val dir = scratch("set-modified-dir")
+
+    set_modified(dir, Instant(1400000000000000)).unwrap()
+    assert_eq(metadata(dir).unwrap().modified.us / 1000000, 1400000000)
+    ignore(remove_dir_all(dir))
+end modified_of_a_directory
+
+@test("set_modified on a path that is not there reports NotFound")
+modified_of_nothing()
+    set_modified("/tmp/sysl-fs-meta-nothing-is-here", Instant(1500000000000000)) match
+        Ok(_) -> assert(false, "a time was set on a path that does not exist")
         Err(e) -> assert_eq(e, IoError.NotFound)
 
 /** The type bits and the permission bits share one number, so a `permissions` that forgot to mask

@@ -1,9 +1,10 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.env.get as env_var
 import sysl.process.capture
-import sysl.fs.{current_dir, entries, is_file, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
+import sysl.fs.{current_dir, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
                 write_bytes_atomic, write_text_atomic}
 import sysl.text.{from_utf8_unchecked, join, split, Search}
 
@@ -83,6 +84,9 @@ private var cc_said: string = ""
 // machine's with `None`.
 use_c_object_cache_dir(dir: Option[string])
     c_object_home = dir.unwrap_or("")
+    c_objects_pending = ""
+    c_objects_swept = false
+    c_objects_in_use = set()
 
 // `(hits, compilations)` since the last `clear_c_object_counts`.
 c_object_counts() -> (int, int) = (c_object_hits, c_object_compiled)
@@ -90,6 +94,7 @@ c_object_counts() -> (int, int) = (c_object_hits, c_object_compiled)
 clear_c_object_counts()
     c_object_hits = 0
     c_object_compiled = 0
+    c_object_sweeps = 0
 
 // Where objects are kept, or nothing where the cache is off or the machine has no cache directory.
 private c_object_dir() -> Option[string]
@@ -154,7 +159,7 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
     // A list that cannot be written costs the next build its compilation and nothing else.
     write_text_atomic(listed, join(read.view(), "\n")).unwrap_or(())
     in_use(s"$dir/$second.o", listed)
-    evict_c_objects(dir)
+    c_objects_pending = dir
     Ok(())
 end cached_c_compile
 
@@ -218,73 +223,107 @@ unit_object_kept(cached: string, obj: string)
 
     keep(dir, cached, obj)
     in_use(cached, cached)
-    evict_c_objects(dir)
+    c_objects_pending = dir
 end unit_object_kept
 
 // --- eviction ----------------------------------------------------------------------------
 //
-// **The run cache's policy, with the run cache's two numbers** (`CacheKeep`, `CacheStale`), so there
-// is one rule to know about what the machine's cache keeps: nothing is removed until the directory
-// holds `CacheKeep` objects, and then only what is older than `CacheStale`, measured against the newest
-// entry rather than a clock. Age is what makes it safe beside another build using the directory.
+// **The run cache's policy, with the run cache's numbers** (`CacheKeep`, `CacheStale`, `CacheBytes`), so
+// there is one rule to know about what the machine's cache keeps: nothing is removed for age until the
+// directory holds `CacheKeep` objects, and then only what is older than `CacheStale`, measured against
+// the newest entry rather than a clock; past `CacheBytes`, the oldest go until it fits, sparing the last
+// hour's (`CacheFresh`). Age is what makes it safe beside another build using the directory.
 //
-// It runs after a miss has kept its object -- a build that hits everything lists nothing -- and two
-// things are exempt from it:
+// It runs once, when a build that missed at least once is done -- a build that hits everything lists
+// nothing -- and two things are exempt from it:
 //
 //   - **what this process has used or made**, whatever its age: a build never evicts an object it
-//     already linked from, nor the file list that found it. A hit does not refresh an object's age, so
-//     an object compiled long ago and hit every day is recompiled once when it ages out, as a run-cache
-//     entry is rebuilt.
+//     already linked from, nor the file list that found it. **A hit refreshes an object's age** (once per
+//     file per process, `touch_used`), so the last hour is the last hour it was USED and the oldest
+//     go first by least recent use: an object hit all week is never the one a concurrent build's
+//     sweep takes, however long ago it was compiled.
 //   - nothing else. **A half entry is garbage at any age** -- an object with no `.o.sum` beside it, or
 //     a `.o.sum` with no object -- since a lookup reads it as a miss and nothing ever completes it. One
 //     removed while another build is between its two renames costs that build's next compilation.
 
 // The objects, and the file lists naming them, this process has used or made.
-private var c_objects_in_use: Buf[string] = buf()
+private var c_objects_in_use: Set[string] = set()
 
 private in_use(object: string, listed: string)
-    c_objects_in_use.push(object)
-    c_objects_in_use.push(s"$object.sum")
-    c_objects_in_use.push(listed)
+    c_objects_in_use.add(object)
+    c_objects_in_use.add(s"$object.sum")
+    c_objects_in_use.add(listed)
+    touch_used(object)
+    touch_used(s"$object.sum")
+    touch_used(listed)
 end in_use
 
-private used_here(one: string) -> bool
-    for item in c_objects_in_use
-        if item == one then return true
+private used_here(one: string) -> bool = c_objects_in_use.has(one)
 
-    false
-end used_here
+// **One sweep per process, after its compilations** -- `sweep_c_objects`, which the driver calls when
+// a command line is answered. A miss only notes the directory; a sweep lists and stats every entry,
+// and one per miss made a build of M files against a directory of N entries cost M x N.
+private var c_objects_pending: string = ""
+private var c_objects_swept: bool = false
+private var c_object_sweeps: int = 0
+
+// How many sweeps since the last `clear_c_object_counts` -- what a test counts.
+c_object_sweep_count() -> int = c_object_sweeps
+
+// The cache swept where this process missed and has not swept it yet, and no other process swept it
+// in the last `SweepGap`.
+sweep_c_objects()
+    if c_objects_pending == "" || c_objects_swept then return
+
+    val dir = c_objects_pending
+
+    c_objects_pending = ""
+    c_objects_swept = true
+
+    if claim_sweep(dir) then evict_c_objects(dir)
+end sweep_c_objects
 
 // Half entries removed, then -- where `CacheKeep` objects are kept -- every entry older than
-// `CacheStale` that this process has not used. A failure is not the build's: the worst an unevicted
-// cache costs is disk.
-evict_c_objects(dir: string)
-    val names = entries(dir) match
-        Ok(n) -> n
-        Err(_) -> return
+// `CacheStale` that this process has not used, then the oldest until the directory fits in
+// `CacheBytes`. A failure is not the build's: the worst an unevicted cache costs is disk.
+private evict_c_objects(dir: string)
+    c_object_sweeps += 1
 
+    val files = cache_files(dir) match
+        Some(f) -> f
+        None -> return
+
+    var listed: Set[string] = set()
+    var gone: Set[string] = set()
     var objects: usize = 0
     var now: long = 0
 
-    for n in names
-        val one = s"$dir/$n"
+    for f in files
+        listed.add(f.file)
 
-        if n.ends_with(".o")
-            if is_file(s"$one.sum") then objects += 1
-            else if !used_here(one) then remove_file(one).unwrap_or(())
-        else if n.ends_with(".o.sum")
-            if !is_file(one[0..<one.len - 4]) && !used_here(one) then remove_file(one).unwrap_or(())
+        if f.modified > now then now = f.modified
 
-        val at = cache_modified_at(one)
+    for f in files
+        val one = f.file
 
-        if at > now then now = at
+        if one.ends_with(".o")
+            if listed.has(s"$one.sum")
+                objects += 1
+            else if !used_here(one)
+                remove_file(one).unwrap_or(())
+                gone.add(one)
+        else if one.ends_with(".o.sum")
+            if !listed.has(one[0..<one.len - 4]) && !used_here(one)
+                remove_file(one).unwrap_or(())
+                gone.add(one)
 
-    if objects < CacheKeep then return
+    if objects >= CacheKeep
+        for f in files
+            if !gone.has(f.file) && !used_here(f.file) && now - f.modified > CacheStale
+                remove_file(f.file).unwrap_or(())
+                gone.add(f.file)
 
-    for item in names
-        val one = s"$dir/${item}"
-
-        if !used_here(one) && now - cache_modified_at(one) > CacheStale then remove_file(one).unwrap_or(())
+    trim_to_bound(files, &gone, (one) -> used_here(one), ".sum")
 end evict_c_objects
 
 private split_lines(text: string) -> Buf[string]
