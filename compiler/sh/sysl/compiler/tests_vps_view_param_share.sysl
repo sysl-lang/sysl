@@ -1,0 +1,227 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{cstring, Search}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A writable view parameter is read through the count its caller holds for the length of the call,
+// as a `[]const` one is (`reference/memory.md` § Passing a reference to a call): writing an element
+// through it writes the storage the view reaches and leaves the parameter's own slot alone, so it is
+// no reason for the callee to take a share of the owner on entry (`borrowing.sysl`'s `add_root`).
+// Where the callee keeps the view -- stores it, returns it, captures it -- that is where the count is
+// taken; and a callee that reassigns the parameter still owns it.
+
+private extern "setenv" vps_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" vps_c_unsetenv(name: *u8) -> int
+
+private vps_retains(ir: string) -> int =
+    int(ir.count_of("@arc.retain")) + int(ir.count_of("@arc.release"))
+
+@test("a writable view parameter written through takes no share of its owner on entry or exit")
+vps_writing_through_takes_no_share()
+    val ir = emit_func_text("zero(v: []u32)\n    for i in 0..<v.len do v[i] = 0\n", "zero")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(vps_retains(ir), 0, ir)
+
+@test("a [] const view parameter takes no share either")
+vps_const_view_takes_no_share()
+    val ir = emit_func_text("total(v: []const u32) -> u32\n    var s: u32 = 0\n    for x in v do s += x\n    s\n",
+                            "total")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(vps_retains(ir), 0, ir)
+
+@test("a compound write and an increment through the view take no share")
+vps_compound_writes_take_no_share()
+    val ir = emit_func_text("bump(v: []int)\n    v[0] += 2\n    v[1]++\n", "bump")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(vps_retains(ir), 0, ir)
+
+@test("recursion passing the view on takes no share at any depth")
+vps_recursion_takes_no_share()
+    val ir = emit_func_text(raw"""
+        down(v: []u32, n: int)
+            if n == 0 then return
+            v[n - 1] = u32(n)
+            down(v, n - 1)
+            v[n - 1] += 1
+        """, "down")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(vps_retains(ir), 0, ir)
+
+@test("a parameter reassigned inside the callee still keeps a count of its own")
+vps_reassigned_parameter_owns()
+    val ir = emit_func_text(raw"""
+        swap(v: []u32, other: []u32) -> u32
+            v[0] = 1
+            v = other
+            v[0]
+        """, "swap")
+
+    assert(ir.starts_with("define"), ir)
+    assert(ir.contains("@arc.retain"), ir)
+
+@test("an element of a by-value array parameter is still the parameter's own storage")
+vps_array_element_is_the_slot()
+    val ir = emit_func_text(raw"""
+        struct Node
+            v: int
+
+        put(a: [2]&Node, n: &Node) -> int
+            a[0] = n
+            a[1].v
+        """, "put")
+
+    assert(ir.starts_with("define"), ir)
+    assert(ir.contains("@arc.retain"), ir)
+
+// -- programs: the callee that keeps the view takes its count where it keeps it ----------------------
+
+private vps_flags(value: string)
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(value)
+
+    vps_c_setenv(n.ptr, v.ptr, 1)
+
+private vps_no_flags()
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+
+    vps_c_unsetenv(n.ptr)
+
+private struct VpsRun
+    out: string
+    err: string
+    hooks: usize
+
+// What the program prints, built counted or under `flags`, and how many ASan report hooks it calls.
+private vps_run(program: string, counted: bool, flags: string) -> VpsRun
+    val root = make_temp_dir("sysl-vps").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != "" then vps_flags(flags)
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "0", Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != "" then vps_no_flags()
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return VpsRun(s"it did not build: ${failure_text(why)}", "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> VpsRun("the program that was built could not be run", "", hooks)
+        Ok(o) -> VpsRun(if o.status.ok() then o.text else s"it did not run to the end: ${o.text}",
+                        o.err.unwrap_or(""), hooks)
+end vps_run
+
+private vps_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Keeper
+        held: []u32
+
+    zero(v: []u32)
+        for i in 0..<v.len do v[i] = 0
+
+    store(k: &Keeper, v: []u32)
+        v[0] = 7
+        k.held = v
+
+    give(v: []u32) -> []u32
+        v[0] = 8
+        v
+
+    capture(v: []u32) -> &Fn() -> u32
+        v[0] = 9
+        () -> v[0]
+
+    swap(v: []u32, other: []u32) -> u32
+        v[0] = 1
+        v = other
+        v[0] = 2
+        v[0]
+
+    down(v: []u32, n: int)
+        if n == 0 then return
+        v[n - 1] = u32(n * 10)
+        down(v, n - 1)
+        v[n - 1] += 1
+
+    clobber(k: &Keeper, v: []u32) -> u32
+        k.held = []
+        v[0] = 5
+        v[0] + v[1]
+
+    fresh(n: int) -> Buf[u32]
+        var b: Buf[u32] = buf()
+        for i in 0..<n do b.push(u32(i + 1))
+        b
+
+    val z = fresh(3)
+    zero(z.view())
+    print(s"${z.view()[0] + z.view()[2]}")
+
+    val k: &Keeper = Keeper([])
+    store(k, fresh(2).view())
+    print(s"${k.held[0]} ${k.held[1]}")
+
+    val g = give(fresh(2).view())
+    print(s"${g[0]} ${g[1]}")
+
+    val f = capture(fresh(2).view())
+    print(s"${f()}")
+
+    val o = fresh(2)
+    print(s"${swap(fresh(2).view(), o.view())} ${o.view()[0]}")
+
+    var b = fresh(4)
+    val v = b.view()
+    down(v, 4)
+    b = fresh(1)
+    print(s"${v[0]} ${v[1]} ${v[2]} ${v[3]}")
+
+    val c: &Keeper = Keeper(fresh(2).view())
+    print(s"${clobber(c, c.held)}")
+    """
+
+private vps_want() -> string = "0\n7 2\n8 2\n9\n2 2\n11 21 31 41\n7\n"
+
+@test("a view stored, returned, captured, reassigned, recursed with or outliving its Buf gives every allocation back")
+vps_kept_views_count_to_zero()
+    if std_root().is_err() || !clang_available() then return
+
+    val run = vps_run(vps_program(), true, "")
+
+    assert_eq(run.out, vps_want())
+    assert_eq(run.err, "")
+    assert_eq(alloc_count_reported(run.err), 0)
+
+@test("the same program reads nothing freed under AddressSanitizer")
+vps_kept_views_clean_under_asan()
+    if std_root().is_err() || !clang_available() then return
+
+    val run = vps_run(vps_program(), false, "-fsanitize=address -g")
+
+    assert_eq(run.out, vps_want())
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
