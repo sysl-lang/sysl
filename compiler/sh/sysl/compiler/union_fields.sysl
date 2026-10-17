@@ -1,0 +1,291 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// What a `union` may hold, and what reading one of its fields owes.
+//
+// **A union records nothing about which field was written last**, so two things follow, and this
+// file is both of them.
+//
+// **A field must be plain data or a raw pointer, every part of it.** sysl releases what a value
+// counts when the value goes, and nothing could tell a union's release which field is there, whether
+// one is, or whether the bytes are an integer that happens to look like an address. So a field
+// holding anything counted or program-made -- a reference, a string, a slice, a data enum, a type
+// with a `drop` -- is refused where the union is declared, and a generic union where an instance
+// gives it one.
+//
+// **A read of a field whose bytes can be wrong checks them.** Every bit pattern of an `AnyBits` field
+// is a value, so its read is a load and nothing more. A `bool`, a simple enum, a `char` and a subtype
+// with a range or a predicate are not -- 2 is no `bool` -- and a read of one traps on a bad pattern
+// rather than handing the optimizer a value it may assume cannot exist. A read through a field of a
+// field (`ev.key.down`) checks the part it reads.
+
+// -- the field rule ---------------------------------------------------------------------------------
+
+// Whether a type is a union.
+is_union(t: Type) -> bool = underlying(t) match
+    Struct(d) -> d.union_layout
+    _ -> false
+
+// Why a union may not hold a field of this type, or nothing where it may. `drops` names the types
+// with a `drop` of their own.
+union_field_refusal(t: Type, drops: Buf[string]) -> Option[string] = t match
+    Constrained(d) -> union_field_refusal(d.base, drops)
+    Volatile(inner) -> union_field_refusal(*inner, drops)
+    Integer(bits, _, _) -> if bits % 8 == 0 then None else Some(sub_byte(t))
+    Fixed(bits, _, _) -> if bits % 8 == 0 then None else Some(sub_byte(t))
+    Floating(_, _) -> None
+    Ptr(_) -> None
+    CFn(_, _) -> None
+    Unit -> None
+    Bool -> None
+    Char -> None
+    Enum(d) ->
+        if d.simple then None
+        else Some(s"'${type_show(t)}' carries data, and which variant it is decides what its other " +
+                  "bytes mean")
+    Array(_, elem) -> union_field_refusal(*elem, drops)
+    Vector(_, elem) -> any_bits_refusal(*elem)
+    Struct(d) -> struct_union_refusal(d, drops)
+    Str -> Some(s"a string is counted, ${no_tag_to_release()}")
+    Slice(_, _) -> Some("a slice is a view of storage the program keeps, and nothing in a union says " +
+                        "whether one is there")
+    Ref(_, _) -> Some(s"a counted reference is released when its holder goes, ${no_tag_to_release()}")
+    Weak(_) -> Some(s"a weak reference is released when its holder goes, ${no_tag_to_release()}")
+    _ -> Some(s"'${type_show(t)}' is not plain data or a raw pointer")
+
+private no_tag_to_release() -> string = "and nothing in a union says whether one is there to release"
+
+private sub_byte(t: Type) -> string =
+    s"'${type_show(t)}' is not a whole number of bytes, so the bits above it in its byte are not its " +
+    "own — hold it in a bitfield struct"
+
+private struct_union_refusal(d: &StructType, drops: Buf[string]) -> Option[string]
+    if d.opaque || d.base == TaskBase then
+        return Some(s"'${type_show(Struct(d))}' has no layout this program can see")
+
+    if holds_string(drops, d.base) then
+        return Some(s"'${type_show(Struct(d))}' has a 'drop', and nothing in a union says whether one " +
+                    "is there to drop")
+
+    // A bitfield struct is one integer; its fields are bits of it, read and checked one at a time.
+    if bitfield_ranges(d).is_some() then return None
+
+    for item in d.fields
+        val why = union_field_refusal(item.1, drops)
+
+        if why.is_some() then return Some(s"its field '${item.0}' is ${type_show(item.1)} — ${why.unwrap()}")
+
+    None
+end struct_union_refusal
+
+// Holds every field of a union to the rule. A non-generic union is told at the field, which is where
+// the mistake is written; an instance of a generic one at the place the instance was made, since the
+// argument is what broke it.
+check_union_fields(a: &Analysis, scope: Scope, span: Span, d: &StructType)
+    if !d.union_layout then return
+
+    val drops = drops_declared(a)
+    val decl = a.tables.types.get(d.base)
+
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        // A type parameter is asked at each instance, where it is a type.
+        if mentions_unknown(f.1) || mentions_abstract(f.1) then continue
+
+        union_field_refusal(f.1, drops) match
+            Some(why) ->
+                var at_scope = scope
+                var at_span = span
+
+                if d.targs.is_empty() && decl.is_some()
+                    decl.unwrap().kind match
+                        StructOf(sd) ->
+                            if i < sd.fields.len()
+                                at_scope = decl.unwrap().scope
+                                at_span = sd.fields.at(i).span
+                            end if
+                        _ -> ()
+                end if
+
+                a.fault(at_scope, at_span, s"union '${type_show(Struct(d))}' cannot hold its field " +
+                        s"'${f.0}': $why")
+            None -> ()
+end check_union_fields
+
+// Every union declared and instantiated so far, held to the rule once every `impl` is in -- a `drop`
+// is an `impl`, so the rule cannot be asked sooner. An instance made after this is asked where it is
+// made (`instantiate_struct`).
+settle_union_fields(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(sd) -> if sd.union_layout then refuse_union_attrs(a, decl.scope, decl.span, sd)
+            _ -> ()
+
+    for i in 0..<a.tables.struct_insts.len()
+        a.tables.struct_insts.at(i) match
+            Struct(d) ->
+                if d.union_layout
+                    val decl = a.tables.types.get(d.base)
+
+                    if decl.is_some() then check_union_fields(a, decl.unwrap().scope, decl.unwrap().span, d)
+                end if
+            _ -> ()
+end settle_union_fields
+
+// What a union's declaration may not carry yet: the header and the byte order of one are built in a
+// later step, and until then saying nothing would publish a header that is wrong.
+private refuse_union_attrs(a: &Analysis, scope: Scope, span: Span, d: StructDecl)
+    if d.cname.is_some() then
+        a.fault(scope, span, s"'@export' on the union '${d.name}' is not built yet — a generated header " +
+                "does not spell a union, so it would name a type C cannot see. Pass it by pointer, and " +
+                "declare the union on the C side")
+
+    if d.byte_order.is_some() then
+        a.fault(scope, span, s"'@byte_order' on the union '${d.name}' is not built yet — declare it on the " +
+                "structs its fields hold, which reverse their own integers")
+end refuse_union_attrs
+
+// What a pattern that takes a union apart is told. Binding one whole is fine.
+union_pattern_refusal(d: &StructType) -> string =
+    s"a union has no tag to match on, so '${type_show(Struct(d))}' cannot be taken apart by a pattern — " +
+    "read the field you know is there"
+
+// -- reading a field ------------------------------------------------------------------------------
+
+// Whether a read of a value of this type has bytes to check: a `bool`, an enum, a `char`, a subtype
+// with a range or a predicate, or a struct or array holding one. A union read whole checks nothing:
+// its own fields' reads do.
+needs_union_check(t: Type) -> bool = t match
+    Constrained(d) -> checks_values(d) || needs_union_check(d.base)
+    Volatile(inner) -> needs_union_check(*inner)
+    Bool -> true
+    Enum(_) -> true
+    Char -> true
+    Array(_, elem) -> needs_union_check(*elem)
+    Struct(d) ->
+        if d.union_layout || bitfield_ranges(d).is_some() then false
+        else any_part_checked(d)
+    _ -> false
+
+private checks_values(d: &ConstrainedType) -> bool =
+    d.lo.is_some() || d.hi.is_some() || d.pred_fn.is_some()
+
+private any_part_checked(d: &StructType) -> bool
+    for item in d.fields
+        if needs_union_check(item.1) then return true
+
+    false
+end any_part_checked
+
+// Whether a place is reached through a field of a union: the field itself, or a field or an element
+// of an array inside one. An element of a slice belongs to whoever owns it, and so does what a
+// pointer points at, so the walk stops there.
+read_under_union(x: TExpr) -> bool = *x.kind match
+    TField(receiver, _, _) -> is_union(texpr_type(receiver)) || read_under_union(receiver)
+    TIndex(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Array(_, _) -> read_under_union(receiver)
+        _ -> false
+    _ -> false
+
+// Whether a place is a union field whose read checks it -- the place a `ref` may not name, since a
+// read through the name would skip the check and a sibling field can change the bytes under it.
+checked_union_place(x: TExpr) -> bool = read_under_union(x) && needs_union_check(texpr_type(x))
+
+// Traps unless the value of type `t` lying at `p` is one its type can hold. An enum holding no
+// variant's number reports the number and `site` first, as a bitfield's enum field does
+// (`check_variant`); a `bool`, a `char` and a subtype trap as their conversions do.
+emit_union_check(e: *Emit, p: Val, t: Type, site: Span)
+    if !needs_union_check(t) then return
+
+    t match
+        Constrained(d) ->
+            if !checks_values(d)
+                emit_union_check(e, p, d.base, site)
+                return
+            end if
+
+            val bt = underlying(d.base)
+            val v = fresh_reg(e)
+
+            emit(e, InLoad(v, lty(e, bt), p, AccPlain, None))
+
+            if bt == Char then checked_char(e, 32, false, v)
+
+            emit_constraint_checks(e, v, t)
+            return
+        Volatile(inner) ->
+            emit_union_check(e, p, *inner, site)
+            return
+        _ -> ()
+
+    underlying(t) match
+        Bool -> trap_unless(e, plain_check(e, p, t, 0), "union")
+        Enum(d) ->
+            val v = fresh_reg(e)
+
+            emit(e, InLoad(v, lty(e, d.underlying), p, AccPlain, None))
+            check_variant(e, underlying(t), v, site)
+        Char ->
+            val v = fresh_reg(e)
+
+            emit(e, InLoad(v, LInt(32), p, AccPlain, None))
+            checked_char(e, 32, false, v)
+        Struct(d) ->
+            for i in 0..<d.fields.len()
+                val ft = d.fields.at(i).1
+
+                if !zero_sized(ft) && needs_union_check(ft)
+                    val fp = fresh_reg(e)
+
+                    var idx: Buf[IrArg] = buf()
+
+                    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                    idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, d, d.slot(i)))))))
+                    emit(e, InGep(fp, struct_lty(d), p, idx))
+                    emit_union_check(e, fp, ft, site)
+        Array(n, elem) -> each_checked(e, p, n, *elem, site)
+        _ -> ()
+end emit_union_check
+
+// The check of every element of an array, as a loop over a counter in a slot: a check may trap, so
+// the body is blocks of its own, and a slot rather than a phi keeps the loop indifferent to them.
+private each_checked(e: *Emit, p: Val, n: int, elem: Type, site: Span)
+    val wl = LInt(64)
+    val counter = alloca(e, fresh_reg(e), wl)
+    val head = fresh_label(e, "union.each")
+    val body = fresh_label(e, "union.elem")
+    val done = fresh_label(e, "union.done")
+
+    emit(e, InStore(wl, VInt(from_int(0)), counter, AccPlain, None))
+    emit_term(e, InBr(head))
+    emit_label(e, head)
+
+    val i = fresh_reg(e)
+    val more = fresh_reg(e)
+
+    emit(e, InLoad(i, wl, counter, AccPlain, None))
+    emit(e, InIntCmp(more, IUlt, wl, i, VInt(from_int(long(n)))))
+    emit_term(e, InCondBr(more, body, done))
+    emit_label(e, body)
+
+    val ep = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(wl, i))
+    emit(e, InGep(ep, lty(e, elem), p, idx))
+    emit_union_check(e, ep, elem, site)
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, wl, i, VInt(from_int(1))))
+    emit(e, InStore(wl, next, counter, AccPlain, None))
+    emit_term(e, InBr(head))
+    emit_label(e, done)
+end each_checked

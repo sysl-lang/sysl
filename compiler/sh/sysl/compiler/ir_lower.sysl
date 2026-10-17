@@ -114,6 +114,8 @@ struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
     val word_bits = int(l.word_bits)
     var fields: Buf[LType] = buf()
 
+    if d.union_layout then return Some(union_type_def(d, l))
+
     bitfield_ranges(d) match
         Some(ranges) -> fields.push(LInt(bitfield_bits(ranges)))
         None ->
@@ -130,6 +132,47 @@ struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
         Some(g) -> Some(IrTypeDef(name, gapped_fields(fields, g), d.packed))
         None -> Some(IrTypeDef(name, fields, d.packed))
 end struct_type_def
+
+// A union's definition, as clang writes one: the field with the widest boundary (the larger, where
+// two tie) and then bytes up to the union's size. LLVM's size and boundary for it are then the
+// layout's, and **every field is element 0** -- the address of element 0 is the union's own, which is
+// where each of them begins (`struct_field_index`). A raised `@align(n)` is stated where storage is
+// made, as for a struct; the padding already reaches the raised size.
+private union_type_def(d: &StructType, l: TargetLayout) -> IrTypeDef
+    val word_bits = int(l.word_bits)
+    val name = s"%struct.${mangled(d.base, d.targs)}"
+    val total = l.size(Struct(d))
+    var fields: Buf[LType] = buf()
+    var lead: Option[(LType, usize)] = None
+    var lead_align: usize = 0
+
+    for item in d.stored()
+        val a = l.align(item.1)
+        val n = l.size(item.1)
+
+        type_lty(item.1, word_bits) match
+            Some(t) ->
+                val wider = lead match
+                    Some(k) -> a > lead_align || (a == lead_align && n > k.1)
+                    None -> true
+
+                if wider
+                    lead = Some((t, n))
+                    lead_align = a
+            None -> ()
+
+    var used: usize = 0
+
+    lead match
+        Some(k) ->
+            fields.push(k.0)
+            used = k.1
+        None -> ()
+
+    if total > used then fields.push(gap_lty(total - used))
+
+    IrTypeDef(name, fields, d.packed)
+end union_type_def
 
 // -- the gaps a raised boundary writes out -------------------------------------------------------
 //
@@ -154,7 +197,7 @@ end Gaps
 // A struct's gaps, where it holds a raised boundary. A bitfield struct's one integer sits at zero
 // and takes what LLVM allocates for it.
 struct_gaps(l: TargetLayout, d: &StructType) -> Option[Gaps]
-    if !l.struct_holds_raised(d) then return None
+    if d.union_layout || !l.struct_holds_raised(d) then return None
 
     var offsets: Buf[usize] = buf()
     var sizes: Buf[usize] = buf()
@@ -271,7 +314,9 @@ gapped_values(values: Buf[IrArg], g: Option[Gaps]) -> Buf[IrArg]
 end gapped_values
 
 // The index of a struct's `k`th stored field.
-struct_field_index(l: TargetLayout, d: &StructType, k: usize) -> int = llvm_index(struct_gaps(l, d), k)
+// Every field of a union is element 0, whose address is the union's own.
+struct_field_index(l: TargetLayout, d: &StructType, k: usize) -> int =
+    if d.union_layout then 0 else llvm_index(struct_gaps(l, d), k)
 
 // The index of a variant payload's `k`th stored field.
 variant_field_index(l: TargetLayout, v: EnumVariant, k: usize) -> int = llvm_index(variant_gaps(l, v), k)

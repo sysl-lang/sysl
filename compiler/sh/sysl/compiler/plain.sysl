@@ -69,6 +69,14 @@ private struct_plain_refusal(d: &StructType) -> Option[string]
     if d.opaque || d.base == TaskBase then
         return Some(s"'${type_show(Struct(d))}' has no layout this program can see")
 
+    // Nothing in a union's bytes says which field is there, so a decode cannot know which field's
+    // bytes to check: a union is plain only where no field has any byte to check.
+    if d.union_layout
+        for item in d.fields
+            if !is_any_bits(item.1)
+                return Some(s"its field '${item.0}' is ${type_show(item.1)}, and nothing in a union's " +
+                            "bytes says which field is there to be checked")
+
     // A bitfield struct is one integer, and an enum range in it would be an unchecked read.
     bitfield_ranges(d) match
         Some(_) ->
@@ -249,7 +257,7 @@ end gen_decode
 
 // Whether the value of type `t` lying at `p` is one its type can hold, as an `i1`. `reversed` is the
 // width an enum here is held reversed at -- the field's, inside a `@byte_order` struct.
-private plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
+plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
     if !needs_check(t) then return VBool(true)
 
     underlying(t) match

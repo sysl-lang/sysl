@@ -41,6 +41,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_pinning(a, p)
     check_exports_emitted(a, emitted, own)
     check_quad_externs(a, emitted)
+    check_union_externs(a, emitted)
     check_general_regs(a, emitted, own, pruned)
     promotions
 end checks_before_lowering
@@ -916,6 +917,16 @@ end joined_list
 private export_names(a: &Analysis, exported: Buf[TFunc], storage: Buf[TVal])
     val types = header_aggregates(exported, storage)
 
+    for v in storage
+        if mentions_union(v.ty)
+            val d = a.tables.vals.get(v.symbol)
+
+            if d.is_some() then
+                a.fault(d.unwrap().scope, d.unwrap().span, s"the exported storage " +
+                        s"'${qualified_name(v.symbol)}' is ${type_show(v.ty)}, and the generated header " +
+                        "does not spell a union yet")
+        end if
+
     var names: Buf[string] = buf()
     var what: Buf[Buf[string]] = buf()
 
@@ -998,7 +1009,10 @@ private export_signature(a: &Analysis, f: TFunc)
     for p in f.params
         if mentions_unknown(p.1) then continue
 
-        if !export_crosses(p.1) && !is_va_list(p.1)
+        if mentions_union(p.1)
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                    s"${type_show(p.1)}, and ${union_export_reason()}")
+        else if !export_crosses(p.1) && !is_va_list(p.1)
             a.fault(scope, f.span, advised(s"'${p.0}' of the exported '${qualified_name(f.name)}' " +
                                            s"is ${type_show(p.1)}, which C has no way to spell — an " +
                                            s"exported function takes ${export_spellable()}",
@@ -1014,7 +1028,10 @@ private export_signature(a: &Analysis, f: TFunc)
     // A `va_list` result was refused where the signature was read, for every function.
     if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then return
 
-    if !export_crosses(f.ret_ty) && !is_va_list(f.ret_ty)
+    if mentions_union(f.ret_ty)
+        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                s"${type_show(f.ret_ty)}, and ${union_export_reason()}")
+    else if !export_crosses(f.ret_ty) && !is_va_list(f.ret_ty)
         a.fault(scope, f.span, advised(s"the exported '${qualified_name(f.name)}' returns " +
                                        s"${type_show(f.ret_ty)}, which C has no way to spell — an " +
                                        "exported function returns that or nothing at all",
@@ -1075,6 +1092,60 @@ private quad_unspellable(t: Target) -> string =
     s"and C on '${t.name}' has no binary128 type to spell it with — its 'long double' is " +
     s"${c_long_double_kind(t)} there. A 'c type' measured as \"long double\" is the type that " +
     "matches C's on every machine"
+
+// A union at a C boundary waits on its calling conventions and its header spelling, which are
+// built separately; until then it is refused, never passed in registers C reads differently.
+check_union_externs(a: &Analysis, p: TProgram)
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+        val decl = a.tables.externs.get(x.name)
+
+        if home.is_none() || decl.is_none() then continue
+
+        val at = home.unwrap()
+        val d = decl.unwrap()
+
+        for i in 0..<x.params.len()
+            val ty = x.params.at(i)
+
+            if mentions_unknown(ty) || !holds_union(ty) then continue
+
+            val name = if i < d.params.len() then d.params.at(i).name else s"parameter ${i + 1}"
+
+            a.fault(at.scope, at.span, s"'$name' of the 'extern' '${d.name}' is ${type_show(ty)}, " +
+                    s"and ${union_boundary_reason()}")
+
+        if !mentions_unknown(x.ret_ty) && holds_union(x.ret_ty)
+            a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns ${type_show(x.ret_ty)}, " +
+                    s"and ${union_boundary_reason()}")
+end check_union_externs
+
+private union_export_reason() -> string =
+    "an exported signature holding a union is not built yet — the generated header does not spell " +
+    "one, and a union does not cross to C by value"
+
+private union_boundary_reason() -> string =
+    "a union crossing to C by value is not built yet — pass a pointer to it ('*U'), which C reads " +
+    "as the same bytes"
+
+// Whether a union is anywhere in what crosses by value: itself, or a field or element of something
+// passed by value.
+private holds_union(t: Type) -> bool = repr(t) match
+    Struct(d) ->
+        if d.union_layout then return true
+
+        for item in d.stored()
+            if holds_union(item.1) then return true
+
+        false
+    Array(_, elem) -> holds_union(*elem)
+    _ -> false
+
+// Whether a union is anywhere in a type an export's header has to spell -- by value, or behind a
+// pointer, since the header declares what the pointer points at.
+private mentions_union(t: Type) -> bool = repr(t) match
+    Ptr(inner) -> mentions_union(*inner)
+    _ -> holds_union(t)
 
 // Whether an `f128` is anywhere in what crosses: itself, or a field of a struct passed by value.
 private holds_quad(t: Type) -> bool

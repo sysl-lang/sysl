@@ -1,0 +1,230 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **A union field whose bytes can be no value of its type is checked where it is read**
+// (`union_fields.sysl`): a `bool` holding 2, an enum holding no variant's number, a `char` that is no
+// scalar value, a subtype outside its range -- each traps rather than handing the optimizer a value it
+// may assume cannot exist. A read through a field of a field checks the part it reads, and an
+// `AnyBits` field's read is a load and nothing else. `docs/design/union.md § 5 (d)` is the spec.
+
+private unk_ready() -> bool = std_root().is_ok() && clang_available()
+
+private unk_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-unk").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end unk_run
+
+// At both levels the program stops on SIGTRAP, having written exactly `said` on standard error. What
+// it printed before is buffered and goes with it, so the valid reads are `unk_valid_passes`'s.
+private unk_traps(text: string, said: string)
+    if !unk_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = unk_run(text, level)
+
+        assert_eq(err, said)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end unk_traps
+
+private unk_prints(text: string, printed: string)
+    if !unk_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = unk_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end unk_prints
+
+// The definition of the function whose symbol ends in `name`, out of the LLVM text a program lowers to.
+private unk_define(text: string, name: string) -> string
+    val root = make_temp_dir("sysl-unk-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val ir = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    for chunk in split(ir, "\ndefine ")
+        val head = split(chunk, "(")[0]
+
+        if head.ends_with(name) then return split(chunk, "\n}")[0]
+
+    s"no definition of '$name' in\n$ir"
+end unk_define
+
+private val unk_decls: string = raw"""
+    enum Mode
+        Off
+        On
+
+    type Small = u8 within 0..10
+
+    struct Pair
+        on: bool
+        n: u16
+
+    union Cell
+        raw: u32
+        on: bool
+        m: Mode
+        ch: char
+        s: Small
+        pair: Pair
+        flags: [4]bool
+
+    """
+
+@test("a bool field holding 2 traps where it is read")
+unk_bool_traps()
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 1)
+            print(c.on)
+            c.raw = 2
+            print(c.on)
+        """, "")
+
+@test("an enum field holding no variant's number traps")
+unk_enum_traps()
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 1)
+            print(c.m)
+            c.raw = 7
+            print(c.m)
+        """, "value 7 is not one of the enum's variants (main.sysl:24:13)\n")
+
+@test("a char field holding a surrogate traps")
+unk_char_traps()
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 65)
+            print(c.ch)
+            c.raw = 0xd800
+            print(c.ch)
+        """, "")
+
+@test("a subtype field outside its range traps")
+unk_subtype_traps()
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 9)
+            print(c.s)
+            c.raw = 11
+            print(c.s)
+        """, "")
+
+@test("a whole struct field is checked part by part, and so is an element of an array field")
+unk_struct_and_array_traps()
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 0x00050001)
+            val p = c.pair
+            print(p.on, p.n)
+            c.raw = 0x00050002
+            print(c.pair.n)
+            val q = c.pair
+            print(q.n)
+        """, "")
+
+    unk_traps(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 0x01000001)
+            print(c.flags[3])
+            c.raw = 0x02000001
+            print(c.flags[0])
+            print(c.flags[3])
+        """, "")
+
+@test("a read through a pointer to a union is checked as well")
+unk_through_pointer_traps()
+    unk_traps(unk_decls + raw"""
+        peek(p: *Cell) -> bool = p.on
+
+        main()
+            var c = Cell(raw = 3)
+            print(c.raw)
+            print(peek(&c))
+        """, "")
+
+@test("a read of a valid value passes the check")
+unk_valid_passes()
+    unk_prints(unk_decls + raw"""
+        main()
+            val c = Cell(on = true)
+            val d = Cell(m = Mode.On)
+            val e = Cell(ch = 'z')
+            val f = Cell(s = Small(4))
+            print(c.on, c.raw, d.m, e.ch, f.s, Cell(flags = [false, true, false, true]).flags[3])
+        """, "true 1 Mode.On z 4 true\n")
+
+@test("an AnyBits read carries no check, and a checked one carries its trap")
+unk_any_bits_read_is_a_load()
+    if !unk_ready() then return
+
+    val text = unk_decls + raw"""
+        read_raw(c: Cell) -> u32 = c.raw
+        read_on(c: Cell) -> bool = c.on
+
+        main()
+            print(read_raw(Cell(raw = 1)), read_on(Cell(raw = 1)))
+        """
+    val raw_body = unk_define(text, "read_raw")
+    val on_body = unk_define(text, "read_on")
+
+    assert(raw_body.contains("load i32"), raw_body)
+    assert(!raw_body.contains("llvm.trap"), raw_body)
+    assert(!raw_body.contains("icmp"), raw_body)
+    assert(on_body.contains("call void @llvm.trap()"), on_body)
+
+@test("'ref' may not name a checked field, and may name an AnyBits one")
+unk_ref_to_checked_field_refused()
+    if !unk_ready() then return
+
+    val (_, _, err) = unk_run(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 1)
+            ref r = c.on
+            print(r)
+        """, "0")
+
+    assert(err.contains("error: 'ref' cannot name a field of a union that is bool — a read of it checks its bytes, a read through the name would not, and a write to another field changes them. Read it into a 'val', or take its address with '&'\n"), err)
+    assert(err.contains("/main.sysl:22:5\n"), err)
+    assert_eq(err.count_of("error: "), 1)
+
+    unk_prints(unk_decls + raw"""
+        main()
+            var c = Cell(raw = 1)
+            ref r = c.raw
+            r = 2
+            print(c.raw)
+        """, "2\n")

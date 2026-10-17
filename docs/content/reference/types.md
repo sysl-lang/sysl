@@ -637,6 +637,151 @@ Structs may carry methods, an `invariant`, and a visibility modifier per field. 
 declared `opaque`, which withholds its layout from everyone outside its own module — a different axis
 from visibility, covered under [modules](/tour/modules/).
 
+## Unions
+
+A `union` is storage its fields **share**: every field begins at its first byte, and nothing records
+which one was written last. It exists for the C structures that hold one — `in6_addr`, `epoll_data`,
+`SDL_Event`, a register read as a word or as its bits. It is declared as a struct is, and `union` is
+a soft word, so a function named `union` is still a function.
+
+```sysl
+union In6
+    b8: [16]u8
+    b16: [8]u16
+    b32: [4]u32
+
+var a = In6(b32 = [0, 0, 0, 0])
+a.b8[15] = 1
+
+print(sizeof(In6), alignof(In6), a.b32[3])
+```
+
+```output
+16 4 16777216
+```
+
+**The layout is C's**: the largest field rounded up to the widest boundary among them, every field at
+offset 0, `@packed` giving a boundary of one and no rounding, `@align(n)` raising both — the same
+answer on every target, which `@assert(sizeof(U) == …)` can state. A union is a field, an element
+and a value like any other: it is copied, passed and returned whole.
+
+**A union is built from exactly one field, by name, and the bytes past it are zero.** The name is
+the only thing that says which field the value is for, so a value by position is refused even where
+there is one field — adding a field never changes what an existing construction means. A write to a
+field stores that field's bytes and leaves the rest as they were. Every field having a zero value,
+the union has one too: all zero bytes.
+
+```sysl
+union Wide
+    small: u8
+    big: u32
+
+var w = Wide(big = 0x01020304)
+w.small = 0xff
+print(w.big, Wide(small = 7).big)
+```
+
+```output
+16909311 7
+```
+
+```sysl
+union Wide
+    small: u8
+    big: u32
+
+val w = Wide(7)
+```
+
+```error
+union 'Wide' is built from one field, named — 'Wide(small = …)': a value by position would mean another field once one is declared in front of it
+```
+
+**A field is plain data or a raw pointer, every part of it.** A union does not know which field it
+holds, so nothing could release a counted one: a reference, a string, a slice, a closure, a data enum,
+a `Buf` or a type with a `drop` is refused at the field — and an instance of a generic union where the
+instance is made. An integer narrower than its byte is refused too; a bitfield struct holds one.
+
+```sysl
+union Name
+    s: string
+    n: u64
+```
+
+```error
+union 'Name' cannot hold its field 's': a string is counted, and nothing in a union says whether one is there to release
+```
+
+**A field whose bytes can be no value of its type is checked where it is read.** Every bit pattern
+of an [`AnyBits`](/library/core/) field — integers of whole bytes, floats, raw and function pointers,
+arrays, vectors and structs of them — is a value, so reading one is a load and nothing more. A
+`bool`, a simple enum, a `char` and a subtype with a range or a predicate are not: reading one that
+holds no value of its type (a `bool` holding 2, an enum holding no variant's number) **traps**, an
+enum's read saying which number it found and where, as a bitfield's enum field does. Reading a field
+of a field (`ev.key.down`) checks the part it reads, and reading a whole struct checks each part of it
+that can be wrong. A `ref` may not name a checked field — a read through the name would skip the
+check while a write to a sibling field changes the bytes under it.
+
+```sysl
+union Key
+    raw: u8
+    down: bool
+
+var k = Key(raw = 1)
+print(k.down)
+k.raw = 0
+print(k.down)
+```
+
+```output
+true
+false
+```
+
+**A `*T` field beside an integer converts the integer to a pointer without `ptr_cast`**, which is
+what `epoll_data` and `sigval` are. Making that pointer is harmless — dereferencing any `*T` is
+already the raw tier — but `union … *` is now a second greppable spelling of the conversion.
+
+A union is `AnyBits` where every field is, and [`Plain`](/library/encoding/) where every field is both
+`AnyBits` and `Plain` — a decode cannot know which field's bytes to check.
+
+**What a union does not have**, since nothing records which field is there:
+
+- **no `==`**: comparing bytes is wrong for a float (`+0.0` and `-0.0`) and for the bytes past a
+  short field. An `impl Eq` of the program's own compares the field it knows; `derives` is refused.
+- **no destructuring**: a pattern cannot take one apart, though binding one whole is fine.
+- **a `Debug` that shows the bytes**: the name and every byte in hex, so showing a union never reads a
+  field and never traps. An `impl Debug` of the program's own replaces it.
+
+```sysl
+union Word
+    whole: u32
+    f: f32
+
+print(Word(f = 1.0))
+```
+
+```output
+Word(00 00 80 3f)
+```
+
+```sysl
+union Word
+    whole: u32
+    f: f32
+
+val w = Word(whole = 1)
+print(w == w)
+```
+
+```error
+'==' is not defined for the union Word — comparing its bytes is wrong for a float and for the bytes past a short field. Write 'impl Eq' comparing the field you know is there
+```
+
+**Not built yet, and refused by name until it is**: a union crossing to C by value (an `extern`'s
+parameter or result — pass a `*U`), an exported signature or storage holding one, `@export` and
+`@byte_order` on a union, a union in a `const`, and C11's anonymous `union` / `struct` members.
+
 ## Tuples
 
 A product type with no name: a fixed-length, positional group of values, written with parentheses.

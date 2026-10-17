@@ -704,7 +704,7 @@ tuple_type(written: Buf[Type]) -> &StructType
     for i in 0..<ts.len()
         fields.push((str(i), ts.at(i)))
 
-    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf())
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false)
 end tuple_type
 
 // The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
@@ -1598,7 +1598,7 @@ private opaque_c_type(a: &Analysis, key: string) -> Type
 
     if already.is_some() then return already.unwrap()
 
-    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf()))
+    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false))
 
     a.tables.struct_insts.put(key, made)
     made
@@ -1790,7 +1790,8 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // bare name is what it chose.
     val made: &StructType = StructType(key, targs, buf(), d.packed,
                                        aligned_to(a, scope, span, written, d.alignment),
-                                       exported_c_name(d), d.opaque, d.byte_order, d.guards)
+                                       exported_c_name(d), d.opaque, d.byte_order, d.guards,
+                                       d.union_layout)
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -1809,6 +1810,9 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     check_bitfields(a, scope, span, made)
     check_byte_order(a, scope, span, made)
     check_pinned_holder(a, scope, span, d, made)
+
+    // Before every `impl` is in, `settle_union_fields` asks this for every union made so far.
+    if made.union_layout && a.tables.members.hoisted then check_union_fields(a, scope, span, made)
 
     a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)

@@ -14,20 +14,36 @@ import sysl.buf.{Buf, buf}
 
 parse_opaque_struct(p: *Parser, start: Span, vis: Visibility) -> Stmt
     p.bump()
-    parse_struct_decl(p, start, vis, true)
+    parse_struct_decl(p, start, vis, true, at_union_head(p, 0))
 end parse_opaque_struct
 
-parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool) -> Stmt
+// **`union` is a soft word**: it opens a declaration only where a name follows it, so `union(a, b)`
+// and `union[K](a, b)` stay a call and a function of that name -- `sysl.container.set` declares one.
+// Two names side by side are never an expression, so the test needs nothing past the second token.
+at_union_head(p: *Parser, at: usize) -> bool
+    if !p.word_at(at, "union") then return false
+
+    p.peek_at(at + 1) match
+        Ident(_) -> true
+        _ -> false
+end at_union_head
+
+// `opaque union Name`, which the header spells as a union tag with no body.
+at_opaque_union(p: *Parser) -> bool = p.at_word("opaque") && at_union_head(p, 1)
+
+parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool,
+                  union_layout: bool = false) -> Stmt
     p.bump()
 
     val name = parse_bound_name(p)
+    val word = if union_layout then "union" else "struct"
     var tp = no_type_params()
 
     if p.at_kw("[") then tp = parse_type_params(p)
 
     val derives = parse_deriving(p)
 
-    refuse_packs(p, tp, "a struct")
+    refuse_packs(p, tp, s"a $word")
 
     tp = parse_where_on(p, tp)
 
@@ -40,11 +56,19 @@ parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool) -> Stm
     decl.opaque = opaque
     decl.tvalues = tp.values
     decl.deriving = derives
+    decl.union_layout = union_layout
 
     if p.block_ahead()
         parse_struct_body(p, &decl)
         accept_end_name(p, name)
         return stmt(start.to(p.just_taken()), StructDecl(decl))
+    end if
+
+    // A union with no fields has no storage to share, and C refuses `union {}` too.
+    if union_layout && !opaque
+        p.fault(p.here(), s"'union ${name}' declares no fields — a union is storage its fields share, and one with none has nothing to share (C refuses an empty union too). One with no layout of its own is written 'opaque union ${name}'")
+        if at_end_marker(p) then accept_end_name(p, name)
+        return stmt(start.to(p.just_taken()), Bad)
     end if
 
     // A struct with **no fields**, whose emptiness is written rather than inferred from an absence:
@@ -90,9 +114,17 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
         val before = p.report.len()
 
         if refuse_stray_member(p, first, InType) then ()
+        elif at_invariant_clause(p) && decl.union_layout
+            p.fault(p.here(), s"a union states no 'invariant' — nothing records which of '${decl.name}''s fields was written last, so there is no field a clause could be stated over")
+            skip_line(p)
         elif at_invariant_clause(p)
             p.bump()
             decl.invariants.push(parse_expr(p))
+        elif at_anonymous_member(p)
+            val kind = if p.at_word("union") then "union" else "struct"
+
+            p.fault(p.here(), s"an anonymous '$kind' member is not built yet — declare the $kind with a name of its own and hold it as a named field")
+            skip_line(p)
         elif at_field(p)
             val vis = parse_visibility(p)
             var field = parse_field_param(p)
@@ -146,6 +178,10 @@ parse_type_members(p: *Parser, out: *Buf[MethodDecl], name: string)
 
     accept_end_type(p, named_type(at, name))
 end parse_type_members
+
+// A line that is exactly `union` or `struct`, which in C11 opens an anonymous member.
+private at_anonymous_member(p: *Parser) -> bool =
+    (p.at_word("union") || p.at_kw("struct")) && p.peek_at(1) == Newline
 
 // `invariant cond` inside a type's body. The word is contextual, so a field called `invariant` is
 // told apart by the `:` that follows it.

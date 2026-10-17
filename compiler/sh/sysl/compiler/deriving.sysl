@@ -115,6 +115,14 @@ private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[stri
                             "implementation would have nothing to walk — every value would compare " +
                             "equal and render the same. An opaque handle is reached as a pointer; " +
                             "write an 'impl' block where one genuinely needs a trait")
+
+            // A derived implementation walks every field, and a union holds one of them -- which,
+            // nothing records. Its bytes are not its value either: `+0.0` and `-0.0` differ in them,
+            // and so do the bytes past a short field.
+            if d.union_layout then
+                return Some(s"a union has no tag to say which field it holds, so a derived " +
+                            s"'$simple' would read fields that are not there — write an 'impl' block " +
+                            "that reads the field you know is there")
         _ -> ()
 
     // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
@@ -894,6 +902,7 @@ private debug_blocks(s: Stmt) -> Buf[Stmt]
     var method = debug_literal_method(at, name, s)
 
     if has_parts(s) then method = debug_parts_method(at, name, s)
+    if union_decl(s) then method = debug_union_method(at, name)
 
     var methods: Buf[MethodDecl] = buf()
 
@@ -902,6 +911,28 @@ private debug_blocks(s: Stmt) -> Buf[Stmt]
                                         false, tvalues, buf(), buf()))))
     out
 end debug_blocks
+
+private union_decl(s: Stmt) -> bool = *s.kind match
+    StructDecl(d) -> d.union_layout
+    _ -> false
+
+// A union: its name and its bytes in hex, `In6(00 00 … 01)` (`sysl.debug_union`). Nothing records which
+// field it holds, so no field is read -- and showing one never traps, whatever its bytes are.
+private debug_union_method(at: Span, name: string) -> MethodDecl
+    var args: Buf[Expr] = buf()
+
+    args.push(expr(at, StrLit(name)))
+    args.push(expr(at, Unary("&", ident(at, "self"))))
+    args.push(ident(at, "out"))
+    args.push(ident(at, SuppliedSpec))
+
+    var params: Buf[Param] = buf()
+
+    params.push(lib_writer(at))
+    params.push(lib_spec(at, SuppliedSpec))
+    method_of(at, "debug", params, None,
+              one_stmt_of(stmt(at, ExprStmt(call_of(at, lib(at, "debug_union"), args)))))
+end debug_union_method
 
 // A shape with no parts: the struct's name, or the enum's and the variant's, as one literal.
 private debug_literal_method(at: Span, name: string, s: Stmt) -> MethodDecl

@@ -138,6 +138,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         val p = element_addr(e, receiver, index, x.span)
         val r = fresh_reg(e)
 
+        if read_under_union(x) then emit_union_check(e, p, ty, x.span)
+
         emit(e, InLoad(r, lty(e, ty), p, place_access(e, x), None))
         r
 
@@ -471,8 +473,22 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
         val p = address(e, x)
         val r = fresh_reg(e)
 
+        if read_under_union(x) then emit_union_check(e, p, ty, x.span)
+
         emit(e, InLoad(r, lty(e, ty), p, AccVolatile, None))
         return r
+
+    // A field of a union, or a part of one, is read where it lies -- every field of a union is at its
+    // first byte, which no register aggregate can say -- and its bytes are checked first where they
+    // can be no value of its type (`union_fields.sysl`).
+    if read_under_union(x)
+        val p = address(e, x)
+        val r = fresh_reg(e)
+
+        emit_union_check(e, p, ty, x.span)
+        emit(e, InLoad(r, lty(e, ty), p, AccPlain, None))
+        return r
+    end if
 
     if e.layout.indirect(rty) && has_address(receiver)
         val p = address(e, x)
@@ -1545,7 +1561,7 @@ end cast_to
 // A Unicode scalar value is at most `0x10FFFF` and is never a surrogate; anything else traps, in
 // the same runtime-safety category as a bounds check. **The test runs at 64 bits** so that a wider
 // source cannot smuggle a value past it.
-private checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
+checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
     val wide = convert_int(e, from_bits, from_signed, 64, v)
     val i64 = LInt(64)
     val in_range = fresh_reg(e)

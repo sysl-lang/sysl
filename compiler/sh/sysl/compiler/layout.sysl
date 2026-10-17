@@ -51,7 +51,7 @@ range_width(t: Type) -> Option[int] = bitfield_width(t) match
 // decides it**: a bitfield struct held in an otherwise whole-byte `@packed` struct is a field of its
 // container's size there, and only inside a bitfield struct does it shrink to its own width.
 bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
-    if !s.packed then return None
+    if !s.packed || s.union_layout then return None
 
     val fields = s.stored()
     var any_odd = false
@@ -169,8 +169,12 @@ struct TargetLayout
         if d.simple then self.size(d.underlying) else self.enum_size(d)
 
     // Whether a value of the type is handed to a function by address rather than in registers.
+    //
+    // **A union is always handed by address**: its fields share one offset, so a field is reached
+    // through storage and never lifted out of a register aggregate whose element type is some other
+    // field's.
     indirect(self, t: Type) -> bool = underlying(t) match
-        Struct(_) -> self.size(t) > DirectBytes
+        Struct(d) -> d.union_layout || self.size(t) > DirectBytes
         Array(_, _) -> self.size(t) > DirectBytes
         Enum(d) -> !d.simple && self.size(t) > DirectBytes
         _ -> false
@@ -249,7 +253,12 @@ struct TargetLayout
                 bytes = usize(bitfield_bits(ranges) / 8)
                 alignment = 1
             None ->
-                if s.packed then
+                if s.union_layout then
+                    val both = self.union_extent(members, s.packed)
+
+                    bytes = both.0
+                    alignment = both.1
+                else if s.packed then
                     var total: usize = 0
 
                     for item in members
@@ -268,8 +277,24 @@ struct TargetLayout
             None -> (bytes, alignment)
     end struct_computed
 
-    // Where a field begins inside its struct.
+    // A union's size and boundary, C's on every target the design note measured: the largest field
+    // rounded up to the widest boundary among them, and under `@packed` a boundary of one and no
+    // rounding. `@align(n)` raises both afterwards, as for a struct.
+    private union_extent(self, members: Buf[Type], packed: bool) -> (usize, usize)
+        var largest: usize = 0
+        var widest: usize = 1
+
+        for m in members
+            largest = max_usize(largest, self.size(m))
+            widest = max_usize(widest, self.align(m))
+
+        if packed then (largest, 1) else (round_up(largest, widest), widest)
+    end union_extent
+
+    // Where a field begins inside its struct. Every field of a union begins at its first byte.
     field_offset(self, s: &StructType, field: string) -> Option[usize]
+        if s.union_layout then return if s.field_index(field) >= 0 then Some(0) else None
+
         var offset: usize = 0
         val fields = s.stored()
 

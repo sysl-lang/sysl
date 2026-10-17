@@ -1316,6 +1316,8 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             // **The count and naming refusals quote the DECLARATION, not the spelling** -- `struct
             // 'b.T'` where the call wrote a bare `T` it imported, as a callee is quoted: a reader with
             // only the bare name has nowhere to go and read the fields.
+            if d.union_layout then return union_call(cx, span, key, d, args)
+
             val slots = bind_field_args(cx, span, qualified_name(key), d, args)
 
             if slots.is_none() then return bad_expr(span)
@@ -1356,6 +1358,63 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// `U(f = v)`: a union is built from **exactly one field, and by name** -- the name is the only thing
+// that says which field, so a value by position is refused even where there is one field, and adding
+// a field never changes what an existing construction means. **The bytes past the field are zero**,
+// so a union's bytes never carry what the stack held before.
+//
+// The node is the struct's, with the one value at its field's position and a `()` standing at every
+// other (`gen_borrowed_into` zeroes the storage and stores the one).
+private union_call(cx: &Analyzer, span: Span, key: string, d: &StructType, args: Buf[Expr]) -> TExpr
+    val written = qualified_name(key)
+    val example = s"'$written(${d.fields.at(0).0} = …)'"
+
+    if args.len() != 1
+        return cx.err(span, s"union '$written' is built from exactly one field, named — $example — and " +
+                      s"${supplied(args.len(), "value")}")
+
+    val one = args.at(0)
+
+    *one.kind match
+        NamedArg(name, value) ->
+            val idx = d.field_index(name)
+
+            if idx < 0 then
+                return cx.err(one.span, s"union '$written' declares no field named '$name' — it holds " +
+                              field_name_list(d))
+
+            if !layout_known(cx.an, cx.scope, span, key, written) then return bad_expr(span)
+
+            every_field_visible(cx, span, d, "the constructor",
+                                "build it through an associated function of its own")
+
+            val field = d.fields.at(usize(idx))
+            val before = cx.an.complaints()
+            val typed = type_expr(cx, value, Some(field.1))
+
+            var fields: Buf[(string, Type)] = buf()
+            var given: Buf[Expr] = buf()
+            var checked: Buf[TExpr] = buf()
+
+            fields.push(field)
+            given.push(value)
+            checked.push(typed)
+
+            val refused = refused_field(cx, span, qualified(written, d.targs), fields, given, checked, before)
+
+            if refused.is_some() then return refused.unwrap()
+
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<d.fields.len()
+                ts.push(if i == usize(idx) then typed else TExpr(span, TUnitLit))
+
+            TExpr(span, TStructNew(d, ts))
+        _ ->
+            cx.err(one.span, s"union '$written' is built from one field, named — $example: a value by " +
+                   "position would mean another field once one is declared in front of it")
+end union_call
 
 // Whether the position expects an instantiation of the struct declared under `key`.
 private expects_struct(expected: Option[Type], key: string) -> bool = expected match
@@ -1456,26 +1515,32 @@ private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: St
             _ -> ()
     end if
 
+    // Each value is read against the field it fills -- a named one against the field of its name,
+    // which is where `G(value = 3)` says its `T` is -- and the solve is handed the pairs in that order.
+    val placed = field_args(sd, args)
     var field_refs: Buf[TypeRef] = buf()
-
-    for i in 0..<sd.fields.len()
-        field_refs.push(sd.fields.at(i).typ)
-
     var prov: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
-    for i in 0..<args.len()
-        if i < field_refs.len() && !ref_mentions(field_refs.at(i), sd.tparams)
-            val want = resolve_qualified(cx.an, home, field_refs.at(i), no_bindings())
-            val t = sandboxed_read(cx, args.at(i), Some(want))
+    for item in placed
+        if item.0 < 0 then continue
+
+        val value = item.1
+        val typ = sd.fields.at(usize(item.0)).typ
+
+        field_refs.push(typ)
+
+        if !ref_mentions(typ, sd.tparams)
+            val want = resolve_qualified(cx.an, home, typ, no_bindings())
+            val t = sandboxed_read(cx, value, Some(want))
 
             prov.push(texpr_type(t))
             soft.push(false)
         else
-            val t = sandboxed_read(cx, args.at(i), None)
+            val t = sandboxed_read(cx, value, None)
 
             prov.push(texpr_type(t))
-            soft.push(adaptable(args.at(i), t))
+            soft.push(adaptable(value, t))
 
     solve(cx.an, home, cx.scope, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
           buf())
@@ -1486,13 +1551,36 @@ end struct_targs
 // readings are sandboxed, and the solve stays quiet about a parameter an unknown value left open,
 // taking the value to have spoken already. Only the leftmost speaks.
 private voice_unknown_fields(cx: &Analyzer, sd: StructDecl, args: Buf[Expr])
-    for i in 0..<args.len()
-        if i < sd.fields.len() && ref_mentions(sd.fields.at(i).typ, sd.tparams) &&
-           mentions_unknown(texpr_type(sandboxed_read(cx, args.at(i), None)))
-            type_expr(cx, args.at(i), None)
+    for item in field_args(sd, args)
+        if item.0 >= 0 && ref_mentions(sd.fields.at(usize(item.0)).typ, sd.tparams) &&
+           mentions_unknown(texpr_type(sandboxed_read(cx, item.1, None)))
+            type_expr(cx, item.1, None)
             return
         end if
 end voice_unknown_fields
+
+// Which field each written value fills, and the value itself with any `name =` taken off: a name
+// chooses its field, everything else takes the next by position, and -1 is a value that fills none
+// (a name the struct does not declare, or one past the end, which `bind_field_args` refuses).
+private field_args(sd: StructDecl, args: Buf[Expr]) -> Buf[(int, Expr)]
+    var out: Buf[(int, Expr)] = buf()
+    var next = 0
+
+    for a in args
+        *a.kind match
+            NamedArg(name, value) ->
+                var at = -1
+
+                for i in 0..<sd.fields.len()
+                    if sd.fields.at(i).name == name then at = int(i)
+
+                out.push((at, value))
+            _ ->
+                out.push((if next < int(sd.fields.len()) then next else -1, a))
+                next += 1
+
+    out
+end field_args
 
 // A simple enum's name in call position is a checked cast from an integer.
 private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,

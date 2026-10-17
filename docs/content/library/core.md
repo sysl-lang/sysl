@@ -97,14 +97,16 @@ where every part of it is
 
 - an integer of a whole number of bytes (`u8` … `u128`, `i24`), a float, or a fixed-point number of
   whole bytes (`q15`);
-- a raw pointer `*T`;
-- or an array, a vector (`<4>f32`) or a struct made only of those, padding and all. A field of a bitfield struct is a few
-  bits of one integer, so it counts as an integer unless it is an enum.
+- a raw pointer `*T`, or a function pointer `*extern(…) -> R` — one may already be `null`, and
+  calling one that names no function is the same act as dereferencing a `*T` that names nothing;
+- or an array, a vector (`<4>f32`), a struct or a union (`reference/types.md § Unions`) made only
+  of those, padding and all. A field of a bitfield struct is a few bits of one integer, so it counts
+  as an integer unless it is an enum.
 
 Everything with a bit pattern that is no value is out: a `bool` (only 0 and 1 are), an enum (only its
 variants' numbers are), a `char` (most numbers are not a scalar value), a subtype with a range or a
-predicate, and whatever names something the program made — `&T`, `weak T`, a string, a slice, a
-function pointer. **An integer that is not a whole number of bytes is out too**: a `u12` sits in two
+predicate, and whatever names something the program made — `&T`, `weak T`, a string, a slice.
+**An integer that is not a whole number of bytes is out too**: a `u12` sits in two
 bytes of its slot, and the four bits above it are not its own, so storage nobody wrote holds a `u12`
 whose stored form no `u12` has.
 

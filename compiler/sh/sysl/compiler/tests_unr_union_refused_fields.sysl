@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.split
+
+// **What a union may not hold** (`union_fields.sysl`): a field must be plain data or a raw pointer,
+// every part of it, since nothing in a union records which field is there to release. Each refused
+// kind is told at the field, naming the reason; an instance of a generic union is told where the
+// instance is made. `docs/design/union.md § 5` and `reference/types.md § Unions` are the spec.
+
+private unr_ready() -> bool = std_root().is_ok() && clang_available()
+
+private unr_errors(text: string) -> string
+    val root = make_temp_dir("sysl-unr").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = build_native_program(root, None, None, "0", Some(s"$root/built")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end unr_errors
+
+// A union `U` holding `field` beside a `u64`, declared after `prelude`, refused with `why` at the
+// field's line -- the prelude's line count plus two -- and column 5.
+private unr_field(prelude: string, field: string, why: string)
+    if !unr_ready() then return
+
+    val lines = if prelude == "" then 0 else prelude.count_of("\n")
+    val text = s"${prelude}union U\n    $field\n    ok: u64\n\nmain()\n    print(sizeof(U))\n"
+    val err = unr_errors(text)
+    val name = split(field, ":")[0]
+    val head = s"error: union 'U' cannot hold its field '$name': $why\n"
+    val at = s"/main.sysl:${lines + 2}:5\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end unr_field
+
+@test("a string field is refused: it is counted")
+unr_string()
+    unr_field("", "s: string", "a string is counted, and nothing in a union says whether one is there to release")
+
+@test("a slice field is refused: it views storage the program keeps")
+unr_slice()
+    unr_field("", "sl: []u8", "a slice is a view of storage the program keeps, and nothing in a union says whether one is there")
+
+@test("a counted reference and a weak one are refused")
+unr_references()
+    unr_field("struct Node\n    n: int\n\n", "r: &Node",
+              "a counted reference is released when its holder goes, and nothing in a union says whether one is there to release")
+    unr_field("struct Node\n    n: int\n\n", "w: weak Node",
+              "a weak reference is released when its holder goes, and nothing in a union says whether one is there to release")
+
+@test("a closure is refused: it is a counted reference")
+unr_closure()
+    unr_field("", "c: &Fn(int) -> int",
+              "a counted reference is released when its holder goes, and nothing in a union says whether one is there to release")
+
+@test("a Buf is refused, by the reference it holds")
+unr_buf()
+    unr_field("import sysl.buf.Buf\n\n", "b: Buf[u8]",
+              "its field 'core' is &sysl.buf.BufCore[byte] — a counted reference is released when its holder goes, and nothing in a union says whether one is there to release")
+
+@test("a data enum is refused: its variant decides what its bytes mean")
+unr_data_enum()
+    unr_field("enum Shape\n    Circle(r: f64)\n    Empty\n\n", "sh: Shape",
+              "'Shape' carries data, and which variant it is decides what its other bytes mean")
+
+@test("an integer narrower than its byte is refused")
+unr_sub_byte()
+    unr_field("", "n: u3",
+              "'u3' is not a whole number of bytes, so the bits above it in its byte are not its own — hold it in a bitfield struct")
+
+@test("a struct holding a refused type is refused, naming the part")
+unr_struct_holding_string()
+    unr_field("struct Named\n    tag: u8\n    s: string\n\n", "h: Named",
+              "its field 's' is string — a string is counted, and nothing in a union says whether one is there to release")
+
+@test("a type with a drop is refused, though its fields are plain")
+unr_drop()
+    unr_field("struct Holder\n    n: u32\n\nimpl Drop for Holder\n    drop(self)\n        print(self.n)\n\n", "h: Holder",
+              "'Holder' has a 'drop', and nothing in a union says whether one is there to drop")
+
+@test("an opaque struct by value is refused")
+unr_opaque()
+    unr_field("opaque struct Hidden\n\n", "h: Hidden", "'Hidden' has no layout this program can see")
+
+@test("an instance of a generic union is held to the rule where it is made")
+unr_generic_instance()
+    if !unr_ready() then return
+
+    val err = unr_errors(raw"""
+        union Gen[T]
+            value: T
+            raw: u64
+
+        main()
+            val g = Gen[string](raw = 1)
+            print(g.raw)
+        """)
+    val head = "error: union 'Gen[string]' cannot hold its field 'value': a string is counted, and nothing in a union says whether one is there to release\n"
+
+    assert(err.contains(head), err)
+    assert(err.contains("/main.sysl:6:16\n"), err)
+    assert_eq(err.count_of("error: "), 1)
+
+@test("the accepted kinds are accepted: plain data, raw and function pointers, checked scalars, bitfield structs, vectors")
+unr_accepted()
+    if !unr_ready() then return
+
+    val err = unr_errors(raw"""
+        enum Mode
+            Off
+            On
+
+        type Small = int within 0..10
+
+        @packed
+        struct Ctrl
+            a: u3
+            b: u5
+
+        struct Pair
+            on: bool
+            n: u16
+
+        union Ok
+            a: u32
+            b: f64
+            p: *u8
+            f: *extern(i32) -> i32
+            on: bool
+            m: Mode
+            ch: char
+            s: Small
+            bits: Ctrl
+            pair: Pair
+            v: <4>f32
+            arr: [3]bool
+
+        main()
+            print(sizeof(Ok))
+        """)
+
+    assert_eq(err, "")
