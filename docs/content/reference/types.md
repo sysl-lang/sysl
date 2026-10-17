@@ -883,7 +883,7 @@ evaluation while compiling reads a union only through the field it was built wit
 ```
 
 `@byte_order(big)` or `(little)` on a union orders every integer of every field, as on a struct
-([`@byte_order`](/reference/attributes/#byte_order)), and reaches the fields of its anonymous members.
+([`@byte_order`](/reference/attributes/#byte-order-big-and-byte-order-little-the-order-a-struct-s-integers-keep-their-bytes-in)), and reaches the fields of its anonymous members.
 `sysl prove` refuses a union by name: WhyML has no model of bytes to say what reading another field
 means.
 
