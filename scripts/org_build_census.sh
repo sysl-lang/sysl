@@ -181,6 +181,38 @@ copy_path_deps() {
     done
 }
 
+# **A `headers { <name> = "..." }` block says a library ships no `.pc` file, so the include path is
+# passed rather than probed** -- which is what the repository's own instructions pass. For each name in
+# the repository's block and its path dependencies' blocks, `<prefix>/include/<name>.h` is looked for
+# under the Homebrew prefix (no brew call), and where it is there the flags are handed to both
+# compilers. A header that is absent leaves the flags off, and the row says it needs a library.
+header_flags() {
+    hf_out=""
+    hf_prefix=/opt/homebrew
+    hf_manifests="$1/package.hocon"
+
+    for hf_dep in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$1/package.hocon" 2> /dev/null); do
+        hf_manifests="$hf_manifests $org/$hf_dep/package.hocon"
+    done
+
+    for hf_file in $hf_manifests; do
+        [ -f "$hf_file" ] || continue
+
+        for hf_name in $(awk '
+            /^[ \t]*headers[ \t]*\{/ { on = 1; next }
+            on && /\}/ { on = 0 }
+            on && match($0, /^[ \t]*[A-Za-z0-9_.-]+/) { s = substr($0, RSTART, RLENGTH); gsub(/[ \t]/, "", s); print s }
+        ' "$hf_file"); do
+            [ -f "$hf_prefix/include/$hf_name.h" ] || continue
+            case " $hf_out " in *" --include-path $hf_name="*) continue ;; esac
+            hf_out="$hf_out --include-path $hf_name=$hf_prefix/include"
+        done
+    done
+
+    [ -z "$hf_out" ] || hf_out="$hf_out --link-path $hf_prefix/lib"
+    echo $hf_out
+}
+
 ok_test=0
 ok_build=0
 ok_build_c=0
@@ -300,14 +332,9 @@ for dir in "$org"/*/; do
         label="build aarch64-freestanding"
     fi
 
-    # The two repositories that cannot be read with the bare command and can be read with flags.
-    # quickjs-ng ships no `.pc` file at all, which its own manifest says in the sentence a consumer
-    # is shown, so the paths are handed over instead.
+    # A library with no `.pc` file (quickjs-ng, duckdb) has its paths handed over from its `headers`
+    # block by `header_flags`, below.
     flags=""
-
-    case $name in
-        quickjs-ng) flags="--include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib" ;;
-    esac
 
     # **A board repository's command is its CMake's, one flag at a time.** `pico` and `pico2` are
     # packages, so the analysis is reached by `build-lib`; the four programs keep their project in a
@@ -382,6 +409,15 @@ test arch/pmsa"
             ;;
     esac
 
+    found_flags=$(header_flags "$dir")
+
+    shown=$label
+
+    if [ -n "$found_flags" ]; then
+        flags="$flags $found_flags"
+        shown="$label $found_flags"
+    fi
+
     here=$work/$name
     rm -rf "$here"
     mkdir -p "$here"
@@ -410,7 +446,7 @@ test arch/pmsa"
                 ;;
         esac
 
-        echo "ok ($label)  $name"
+        echo "ok ($shown)  $name"
         continue
     fi
 
@@ -461,10 +497,10 @@ test arch/pmsa"
 
     if [ $theirs_ok -ne 0 ]; then
         both_refused=$((both_refused + 1))
-        echo "refused by both     $name ($label) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+        echo "refused by both     $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
     else
         failed=$((failed + 1))
-        echo "FAILED              $name ($label) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+        echo "FAILED              $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
     fi
 done
 
