@@ -1042,8 +1042,9 @@ print(*p, *p, calls)
 
 **The scope is the one the `&` was written in**, so a pointer carried out of that scope is stale —
 which is the raw tier behaving as advertised rather than a hole this form opens. The same pointer can
-be had by naming the local yourself and taking its address, and neither is checked — what a `*T`
-promises is spelled out above, and it is not lifetime.
+be had by naming the local yourself and taking its address, and neither is checked in general — what
+a `*T` promises is spelled out above, and it is not lifetime. The one route that is checked is the
+function's own answer, below.
 
 **A name is answered rather than copied.** `&x`, `&t.f`, `&xs[i]` and `&*p` are asking for *that
 thing's* address, so they go on meaning what they always did — and go on being refused where what
@@ -1101,6 +1102,58 @@ print(p.w)
 ```output
 2
 ```
+
+### An address of the frame's own storage is not an answer
+
+A parameter passed by value — `(self)` among them — and a local `var` live in the function's frame,
+and the frame is gone the moment the function returns. So **the address of one, or of a field or an
+element of one, may not be what a function returns**: whether it is the body's value, a `return`'s,
+the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method handing out a field is
+the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
+
+```sysl
+struct Rec
+    a: int
+    b: int
+
+struct Ev
+    rec: Rec
+
+    key(self) -> *u8 = ptr_cast(&self.rec)
+```
+
+```error
+the address of 'self' is returned, but '(self)' is a copy of the receiver in this frame, and its storage ends when the function returns — return the value itself, or take '*self', so the address is of the caller's value
+```
+
+Storage reached **through** a pointer or a reference is wherever the address points, which is the
+caller's to keep alive, so `*self`, `&self`, a `*T` or `&T` parameter and an element of a `[]T` are all
+fine — as is module storage, which outlives every frame:
+
+```sysl
+struct Rec
+    a: int
+    b: int
+
+struct Ev
+    rec: Rec
+
+    key(*self) -> *int = &self.rec.b
+
+var e = Ev(Rec(1, 2))
+val p = e.key()
+
+*p = 9
+print(e.rec.b)
+```
+
+```output
+9
+```
+
+`&make()` makes a slot in the frame (§ Addressing a value), so returning it is refused the same way.
+What is checked is the result only: a pointer to a local stored into module storage or into a struct
+somewhere else is still the raw tier's bargain.
 
 **The `&` in a type is a different thing, and neither is a way of writing the other.** `&T` is a
 counted box, which owns what is in it; the operator takes an address, which owns nothing. So a box

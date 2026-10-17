@@ -249,6 +249,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
         val home = func_home(a, f.name)
 
         report_body(a, p, home, Some(f.name), f.marks.gives_up("alloc"), w)
+        refuse_dangling(a, home, f)
         note_promotions(&out.notes, home, w)
 
         if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
@@ -1161,6 +1162,100 @@ end AlignList
 struct ExprList
     exprs: Buf[TExpr]
 end ExprList
+
+// -- an address of the frame's own storage, returned ---------------------------------------------------
+
+// **The address of this frame's own storage may not be what a function answers.** A parameter passed
+// by value -- `(self)` among them -- and a local `val` or `var` live in the frame, and the frame is
+// gone the moment the function returns, so such an address points at whatever the next call lays
+// there. Unlike a slice there is nothing to promote: a pointer carries no owner, so moving the storage
+// would leave nothing to let it go.
+//
+// What answers is every `return`'s value and the body's own value, followed through a conversion
+// (`ptr_cast` among them) and into the tail of a block, an `if` branch or a `match` arm. The place is
+// walked through fields, through the elements of a fixed array and through a `ref`, and stops at a
+// pointer or a reference -- storage reached through either is wherever the address points, which is
+// the caller's to keep alive. Module storage is never the frame's. `&` of a value with no storage of
+// its own makes a slot in this frame, so it is refused the same way. A pointer stored somewhere else
+// than the result is not asked about here.
+private refuse_dangling(a: &Analysis, scope: Scope, f: TFunc)
+    val refs = ref_bindings(f.body.stmts)
+    val params = f.params
+    val an = a
+
+    walk_stmts(f.body.stmts, stmt_walk(false, s -> s match
+        TReturn(v) -> v match
+            Some(x) -> dangling_tail(an, scope, refs, params, x)
+            None -> ()
+        _ -> ()))
+
+    f.body.result match
+        Some(r) -> dangling_tail(a, scope, refs, params, r)
+        None -> ()
+end refuse_dangling
+
+private dangling_tail(a: &Analysis, scope: Scope, refs: Buf[(string, TExpr)],
+                      params: Buf[(string, Type)], e: TExpr)
+    *e.kind match
+        TAddrOf(place, _) -> frame_root(refs, place) match
+            Some(name) -> a.fault(scope, e.span, dangling_message(name, params))
+            None -> ()
+
+        // `&make()` is a local with the name left out: its slot is laid in this frame too.
+        TTempAddr(_, _) -> a.fault(scope, e.span,
+            "the address of a value made in place is returned, but the slot made to hold it is this " +
+            "function's own, and its storage ends when the function returns — return the value " +
+            "itself, or take the storage from the caller as a '*T' parameter")
+        TCast(operand, _) -> dangling_tail(a, scope, refs, params, operand)
+        TBlockExpr(block) -> dangling_block(a, scope, refs, params, block)
+        TIf(_, then_block, else_block, _) ->
+            dangling_block(a, scope, refs, params, then_block)
+
+            else_block match
+                Some(b) -> dangling_block(a, scope, refs, params, b)
+                None -> ()
+        TMatch(_, arms, _) ->
+            for arm in arms
+                dangling_block(a, scope, refs, params, arm.body)
+        _ -> ()
+end dangling_tail
+
+private dangling_block(a: &Analysis, scope: Scope, refs: Buf[(string, TExpr)],
+                       params: Buf[(string, Type)], b: TBlock) = b.result match
+    Some(r) -> dangling_tail(a, scope, refs, params, r)
+    None -> ()
+
+// The binding a place's storage belongs to, when that storage is the frame's own.
+private frame_root(refs: Buf[(string, TExpr)], place: TExpr) -> Option[string]
+    *place.kind match
+        TLoad(name, _) ->
+            for item in refs
+                if item.0 == name then return frame_root(refs, item.1)
+
+            Some(name)
+        TField(r, _, _) -> frame_root(refs, r)
+        TIndex(r, _, _) -> if is_array(texpr_type(r)) then frame_root(refs, r) else None
+        _ -> None
+end frame_root
+
+private dangling_message(name: string, params: Buf[(string, Type)]) -> string
+    val dot = name.index_of(".")
+    val shown = if dot.is_some() then name[0..<dot.unwrap()] else name
+    var param = false
+
+    for item in params
+        if item.0 == name then param = true
+
+    val what = if shown == "self" && param then "'(self)' is a copy of the receiver in this frame"
+    else if param then s"'$shown' is a parameter passed by value, a copy in this frame"
+    else s"'$shown' is a local of this function"
+
+    val instead = if shown == "self" && param then "take '*self', so the address is of the caller's value"
+    else "take the storage from the caller as a '*T' parameter"
+
+    s"the address of '$shown' is returned, but $what, and its storage ends when the function " +
+        s"returns — return the value itself, or $instead"
+end dangling_message
 
 // -- the refusals ------------------------------------------------------------------------------------
 
