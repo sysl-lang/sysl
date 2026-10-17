@@ -1,0 +1,126 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A mistake written inside an argument of a generic call is said once, where it was written, with
+// the message the same mistake gets outside one. A generic call reads its arguments twice -- once
+// provisionally, to solve the type arguments, and once at the parameters the solve settled -- and
+// the first reading is rewound, so these hold that the rewind takes nothing the second reading owes
+// the reader, and that the second does not repeat what the first said. The last test holds that a
+// correct call still infers from those same readings and runs.
+
+private gar_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end gar_skip
+
+private gar_write(main: string) -> string
+    val root = make_temp_dir("sysl-gar").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end gar_write
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private gar_report(main: string) -> string
+    val root = gar_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gar_report
+
+// The program is refused with this message at this line and column of `main.sysl`, and with
+// nothing else: one diagnostic, said once.
+private gar_once(main: string, message: string, at: string)
+    val out = gar_report(main)
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert(out.index_of("\nerror: ").is_none(), s"expected one diagnostic, got: $out")
+end gar_once
+
+private gar_struct() -> string = "struct P\n    a: int\n\ntake[T](x: T, n: int) -> T = x\n\n"
+
+@test("a field the struct does not declare, as an argument of a generic call, is refused there once")
+gar_missing_field()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "main()\n    val p = P(1)\n    print(take(p.b, 1))\n",
+             "'P' has no field or property 'b'", "8:18")
+
+@test("a missing field two generic calls deep, read against the type the outer call expects")
+gar_missing_field_nested()
+    if gar_skip() then return
+
+    gar_once(gar_struct() +
+             "main()\n    val p = P(1)\n    val o: Option[int] = take(Some(take(p.b, 1)), 2)\n" +
+             "    print(o.is_some())\n",
+             "'P' has no field or property 'b'", "8:43")
+
+@test("a missing field at a parameter another argument already settled")
+gar_missing_field_settled()
+    if gar_skip() then return
+
+    gar_once("struct P\n    a: int\n\nboth[T](x: T, y: T) -> T = x\n\n" +
+             "main()\n    val p = P(1)\n    print(both(p.a, p.c))\n",
+             "'P' has no field or property 'c'", "8:23")
+
+@test("a missing method two generic calls deep")
+gar_missing_method_nested()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "main()\n    val p = P(1)\n    print(take(take(p.nope(), 1), 2))\n",
+             "type 'P' has no method 'nope'", "8:23")
+
+@test("an undefined name two generic calls deep")
+gar_undefined_name_nested()
+    if gar_skip() then return
+
+    gar_once("take[T](x: T, n: int) -> T = x\n\nmain()\n    print(take(take(missing, 1), 2))\n",
+             "undefined name 'missing'", "4:21")
+
+@test("a type error two generic calls deep")
+gar_type_error_nested()
+    if gar_skip() then return
+
+    gar_once("take[T](x: T, n: int) -> T = x\n\nmain()\n    print(take(take(1 + \"s\", 1), 2))\n",
+             "'+' needs matching types, got int and string", "4:25")
+
+@test("a correct generic call still infers from its arguments and runs")
+gar_correct_call_runs()
+    if gar_skip() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+
+    val root = gar_write(gar_struct() +
+                         "both[T](x: T, y: T) -> T = y\n\n" +
+                         "main()\n    val p = P(7)\n    val o: Option[int] = take(Some(take(p.a, 1)), 2)\n" +
+                         "    print(take(p.a, 1))\n    print(both(p.a, 3))\n    print(o.unwrap())\n" +
+                         "    print(take(\"s\", 0))\n")
+    val exe = root + "/built"
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    assert(built.is_ok(), "the program builds")
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert(out.text == "7\n3\n7\ns\n", s"expected '7\\n3\\n7\\ns\\n', got: ${out.text}")
+end gar_correct_call_runs
