@@ -643,6 +643,76 @@ print(cells[0].n, cells[1].n, cells[2].n)
 
 A buffer of separate objects is a loop that makes one per element.
 
+### Filling the spare room: `reserve`, `spare`, `set_len`
+
+A buffer can be filled by something other than `push` — a C function handed an address, a
+`read(fd, p, n)`, a decoder writing into a `[]u8` — and then told how much of its room now holds
+elements, with no second copy and no fill pass first:
+
+- **`reserve(more)`** grows the storage once, the way a push grows it, until `cap()` is at least
+  `len() + more`. It is on every `Buf`.
+- **`spare()`** is the room past the length, a `[]T` of `cap() - len()` slots — a view of the
+  storage, so valid until the buffer next grows.
+- **`set_len(n)`** moves the length to `n`, taking the slots in between as the elements they already
+  hold. Below `len()` it is `truncate(n)`; past `cap()` it panics, as an index past the end does
+  (`panic: length 17 past the 16 slots a Buf has room for`).
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+extern memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+
+// Stands in for read(fd, p, room): C writes up to `room` bytes at `p` and says how many it wrote.
+c_read(p: *u8, room: usize) -> usize
+    var src: [5]u8 = [104, 101, 108, 108, 111]
+    val n = if room < 5 then room else 5
+
+    memcpy(p, &src[0], n)
+    n
+
+var b: Buf[u8] = buf()
+
+b.push(62)
+b.reserve(64)
+
+val got = c_read(&b.spare()[0], b.spare().len)
+
+b.set_len(b.len() + got)
+
+print(b.len(), b)
+```
+
+```output
+6 [62, 104, 101, 108, 108, 111]
+```
+
+**`set_len` writes nothing.** A slot it takes in holds what was last stored there: the bytes the
+writer put in, the value a `truncate` gave up, or — for a slot nobody ever wrote — whatever the
+allocator left, since the spare room comes from
+[`slot_storage`](/reference/memory/#slot-storage-room-that-holds-no-value-yet) and is never cleared.
+Taking in a slot nobody wrote is not a crash, but its value is unspecified; write every slot you
+claim.
+
+**That is why only a buffer of an [`AnyBits`](/library/core/#anybits-storage-whose-every-bit-pattern-is-a-value)
+type has `spare` and `set_len`.** For such a type every bit pattern is *some* value, so the worst a
+stale slot holds is a wrong number. A `bool`, an enum, a `char`, a string or a `&T` has bit patterns
+that are no value at all, and a buffer of one is refused the call where it is written:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var flags: Buf[bool] = buf()
+
+flags.set_len(0)
+```
+
+```error
+'sysl.buf.Buf.set_len' requires its type parameter 'T' to implement 'sysl.AnyBits', but bool does not — storage nobody wrote would not hold a valid value of it: a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
+```
+
+A buffer of such a type is filled with `push` or `extend`, or with `buf_filled` and then written in
+place.
+
 ## It needs an allocator, and says so
 
 ```sysl

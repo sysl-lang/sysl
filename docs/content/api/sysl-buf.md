@@ -15,7 +15,7 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 
 ## Index
 
-[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`freeze_buf`](#freeze_buf) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`freeze_buf`](#freeze_buf) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -130,6 +130,7 @@ asks on purpose.
 | `truncate` | `truncate(self, n: usize)` |  |
 | `clear` | `clear(self)` |  |
 | `insert` | `insert(self, i: usize, v: T)` |  |
+| `reserve` | `reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
 | `remove` | `remove(self, i: usize) -> T` |  |
 | `copy` | `copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
 | `freeze` | `freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
@@ -204,6 +205,49 @@ The cursor a `for` over a frozen buffer walks: the storage's address and length,
 frozen buffer the `for` was handed keeps it alive.
 
 ## Implementations
+
+### Buf[T]
+
+```sysl
+impl[T: AnyBits] Buf[T]
+```
+
+The storage past a buffer's elements, filled by something other than `push` -- a C function
+handed its address, or a writer handed it as a `[]T` -- and then taken into the count without a
+second copy:
+
+```
+b.reserve(n)
+val got = fill(b.spare())       // writes into the first `got` slots
+b.set_len(b.len() + got)
+```
+
+**Only a buffer whose element type is `AnyBits` has these.** A slot `set_len` takes in holds
+whatever was in its storage: the bytes written there, or, for a slot nobody wrote, whatever the
+allocator left -- an unspecified value, which for an `AnyBits` type is still a value of it. A
+`bool`, an enum, a `string` or a `&T` read out of bytes nobody wrote would not be one, so those
+buffers are refused the call at compile time.
+
+| Member | Signature | Description |
+|---|---|---|
+| `spare` | `spare(self) -> []T` | The slots past `len()`, as a slice of `cap() - len()` -- the room a writer may fill. |
+| `set_len` | `set_len(self, n: usize)` | The length set to `n`, taking the slots between the old length and `n` as the elements they already hold. |
+
+### Debug for Buf[T]
+
+```sysl
+impl[T: Debug] Debug for Buf[T]
+```
+
+A `Buf` shows as the sequence it holds, `[1, 2, 3]`, rather than as the storage it is built from.
+
+### Debug for Frozen[T]
+
+```sysl
+impl[T: Debug] Debug for Frozen[T]
+```
+
+A frozen buffer shows as the sequence it holds, as a `Buf` does.
 
 ### Display for Buf[T]
 

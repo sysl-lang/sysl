@@ -345,6 +345,10 @@ checks that `&self.tasks[i]` would have given up.
   trait.
 - **A blanket `impl[T: Bound]` is allowed only over a family the compiler closes** — `Integer` is
   one; `Float` is an ordinary trait, so its two widths need two blocks.
+- **Some memberships are the compiler's, and nothing implements them**: `Integer`; `AnyBits`, every
+  type whose every bit pattern is a value (whole-byte integers, floats, whole-byte fixed point, `*T`,
+  arrays and structs of them — not `bool`, enums, `char`, `&T`, strings or slices); and
+  `sysl.encoding.Plain`. A trait that declares nothing is written closed by `end Name`.
 
 **Trait objects** are fat pointers: `*Trait` points at the value, `&Trait` at the box. A trait is
 erasable when it declares no associated type and every member has a receiver, mentions `Self` nowhere
