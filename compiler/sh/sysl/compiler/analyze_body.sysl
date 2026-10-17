@@ -2116,7 +2116,11 @@ private laid_down(t: TExpr) -> bool = *t.kind match
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
     TBufLit(elems, _) -> all_laid_down(elems)
-    TStructNew(decl, args) -> !decl.union_layout && all_laid_down(args)
+    // A `@packed` struct holding a union stays code: its constant would need the packed brackets
+    // around a union's image, which LLVM's literal types do not take.
+    TStructNew(decl, args) ->
+        if decl.union_layout then written_laid_down(args)
+        else !(decl.packed && holds_union(Struct(decl))) && all_laid_down(args)
     TEnumNew(_, variant, _) -> !variant.carries
     TCast(inner, to) ->
         val pointerish = to match
@@ -2135,6 +2139,17 @@ private all_laid_down(xs: Buf[TExpr]) -> bool
 
     true
 end all_laid_down
+
+// A union's construction holds its one value among `()`s standing for the fields it was not built
+// with (`union_call`), and only the value is asked.
+private written_laid_down(xs: Buf[TExpr]) -> bool
+    for item in xs
+        *item.kind match
+            TUnitLit -> ()
+            _ -> if !laid_down(item) then return false
+
+    true
+end written_laid_down
 
 // Whether an initializer laid down as data would build a view: a slice literal, anywhere inside the
 // arrays and structs it is made of.
@@ -2173,8 +2188,10 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TArrayLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
     TArrayFill(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
     TBufLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
+    // A union is data as a struct is: its one value laid down at its first byte, and the rest of its
+    // bytes zero (`emit_static.sysl`'s `union_image`).
     TStructNew(decl, args) ->
-        if decl.union_layout then None
+        if decl.union_layout then written_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
         else static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
     TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
@@ -2441,6 +2458,23 @@ private fixed_image(t: TExpr, from: TExpr, to: Type) -> Option[TExpr] =
             TIntLit(raw, _) -> Some(TExpr(t.span, TIntLit(raw, to)))
             _ -> None
         None -> None
+
+// The same over a union's construction: its `()`s stay where they are.
+private written_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
+    var out: Buf[TExpr] = buf()
+
+    for item in xs
+        *item.kind match
+            TUnitLit -> out.push(item)
+            _ ->
+                val x = static_image(cx, name, item)
+
+                if x.is_none() then return None
+
+                out.push(x.unwrap())
+
+    Some(out)
+end written_images
 
 private static_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
     var out: Buf[TExpr] = buf()

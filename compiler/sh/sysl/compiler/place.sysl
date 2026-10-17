@@ -336,7 +336,14 @@ place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
         if stood.is_some() then stood else Some(name)
     TGlobal(symbol, _, _) -> Some(s"@$symbol")
     TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
-    TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
+    // Every field of a union is the same bytes, so all of them are one place: a view of one and a
+    // write through another overlap.
+    TField(recv, index, _) ->
+        val step = underlying(texpr_type(recv)) match
+            Struct(d) -> if d.union_layout then "u" else s"$index"
+            _ -> s"$index"
+
+        key_step(place_key(cx, recv), step)
     TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
     TCall(_, _, _, _) -> placed_by(cx, t) match
         Some(recv) -> key_step(place_key(cx, recv), "[]")

@@ -19,6 +19,105 @@ private val_init(e: *Emit, v: TVal) -> Val
         None -> VZero
 end val_init
 
+// A `val`'s storage as LLVM declares it: its type's own, or -- where the value laid down holds a union
+// -- the literal type of the image (`constant_image`).
+private val_image(e: *Emit, v: TVal) -> IrArg
+    if v.computed || !holds_union(v.ty) then return ir_arg(lty(e, v.ty), val_init(e, v))
+
+    v.init match
+        Some(x) -> constant_image(e, v.ty, x)
+        None -> ir_arg(lty(e, v.ty), VZero)
+end val_image
+
+// **A constant holding a union is written in a literal type of its own.** LLVM's constant for an
+// aggregate names a value for each element of its type, and a union's type has one element -- the
+// field `union_type_def` chose -- which is not the one a constant was built with whenever another
+// field was. So the image of a union is `{ [0 x %struct.U], <field>, [pad x i8] }`: the empty array
+// gives it the union's own alignment, then the one field it was built with and zeros to the union's
+// size. Everything holding one is written in literal types too, element for element as its own type
+// would lay it out (a struct's gaps included), so every offset is the one the declared type has; an
+// array of them is a literal struct, since its elements' images need not be one type.
+constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
+    if !holds_union(ty) then return ir_arg(lty(e, ty), constant_value(e, t))
+
+    *t.kind match
+        TStructNew(decl, args) ->
+            if decl.union_layout then return union_image(e, decl, args)
+
+            var fields: Buf[IrArg] = buf()
+
+            for i in 0..<args.len()
+                val ft = decl.fields.at(i).1
+
+                if !zero_sized(ft)
+                    val part = constant_image(e, ft, args.at(i))
+                    val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                    fields.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
+
+            literal_image(gapped_values(fields, struct_gaps(e.layout, decl)))
+        TArrayLit(items, array_ty) ->
+            val ety = element(array_ty).unwrap_or(int_type())
+            var parts: Buf[IrArg] = buf()
+
+            for item in items
+                parts.push(constant_image(e, ety, item))
+
+            literal_image(parts)
+        TArrayFill(value, array_ty) ->
+            val ety = element(array_ty).unwrap_or(int_type())
+            val part = constant_image(e, ety, value)
+            val n = underlying(array_ty) match
+                Array(len, _) -> len
+                _ -> 0
+            var parts: Buf[IrArg] = buf()
+
+            for i in 0..<n
+                parts.push(part)
+
+            literal_image(parts)
+        _ -> ir_arg(lty(e, ty), constant_value(e, t))
+end constant_image
+
+private literal_image(parts: Buf[IrArg]) -> IrArg
+    var types: Buf[LType] = buf()
+
+    for p in parts
+        types.push(p.ty)
+
+    ir_arg(LStruct(types), VAgg(parts))
+end literal_image
+
+// A union built from constants: the one field it was built with, at its first byte, in the stated byte
+// order where it has one, and zeros to its size.
+private union_image(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> IrArg
+    var parts: Buf[IrArg] = buf()
+
+    parts.push(ir_arg(LArr(0, struct_lty(decl)), VZero))
+
+    var used: usize = 0
+
+    for i in 0..<args.len()
+        val ft = decl.fields.at(i).1
+
+        *args.at(i).kind match
+            TUnitLit -> ()
+            _ ->
+                if !zero_sized(ft)
+                    val part = constant_image(e, ft, args.at(i))
+                    val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                    parts.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
+                    used = e.layout.size(ft)
+                end if
+
+    val total = e.layout.size(Struct(decl))
+
+    if total > used then parts.push(ir_arg(LArr(int(total - used), LInt(8)), VZero))
+
+    literal_image(parts)
+end union_image
+
 // The storage a program's `val`s come to.
 //
 // **Storage another object defines is declared, as a precompiled function is** (`precompiled`): a
@@ -37,7 +136,7 @@ gen_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string]) -> Buf[IrGlobal]
             out.push(decl with { constant = !v.writable })
             continue
 
-        val init = val_init(e, v)
+        val image = val_image(e, v)
 
         // The binding's own `@align(n)`, or the boundary its type raises -- the greater of the two.
         val own: Option[int] = v.align match
@@ -59,7 +158,7 @@ gen_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string]) -> Buf[IrGlobal]
         // and a linker script bounds that section for the program to copy.
         val section = if v.per_cpu then Some(per_cpu_section()) else v.section
 
-        out.push(IrGlobal(name, !(v.computed || v.writable), lty(e, v.ty), Some(init),
+        out.push(IrGlobal(name, !(v.computed || v.writable), image.ty, Some(image.value),
                           linkage, section, align, v.thread_local,
                           (exported || v.shared) && binds_locally(e),
                           v.export_hidden))

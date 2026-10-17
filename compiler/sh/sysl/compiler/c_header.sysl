@@ -166,7 +166,10 @@ c_header_render(funcs: Buf[TFunc], name: string, vals: Buf[TVal] = buf()) -> str
     out.push("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 
     for item in aggregates
-        out.push(s"${c_aggregate_definition(item)}\n")
+        val written = c_aggregate_definition(item)
+
+        // An anonymous member is written inside the type that holds it, and nowhere of its own.
+        if !written.is_empty() then out.push(s"$written\n")
 
     if exports.is_empty() && storage.is_empty()
         // A header with nothing in it is worth writing rather than refusing: a build that exported
@@ -375,16 +378,13 @@ private c_aggregate_definition(t: Type) -> string = t match
     Constrained(d) -> s"typedef ${c_declare(d.base, c_name(t))};\n"
     Struct(d) ->
         if d.opaque then return s"typedef struct ${c_name(t)} ${c_name(t)};\n"
+        if is_anonymous_type(d) then return ""
 
         var fields = ""
 
         bitfield_ranges(d) match
             Some(ranges) -> fields = bitfield_container(ranges)
-            None ->
-                val stored = d.stored()
-
-                for item in stored
-                    fields += s"\t${c_declare(item.1, item.0)};\n"
+            None -> fields = c_fields(d, "\t")
 
         var attrs = ""
 
@@ -401,6 +401,26 @@ private c_aggregate_definition(t: Type) -> string = t match
 
         if d.packed then s"SYSL_PACK_PUSH\n${body}SYSL_PACK_POP\n" else body
     _ -> ""
+
+// A struct's or union's members, one per line. **An anonymous member is written as C11 writes it**, a
+// `union { … };` or `struct { … };` with no name, so the C reader names its fields as the sysl one does.
+private c_fields(d: &StructType, indent: string) -> string
+    var out = ""
+    val stored = d.stored()
+
+    for item in stored
+        if is_anonymous_field(item.0)
+            item.1 match
+                Struct(inner) ->
+                    val keyword = if inner.union_layout then "union" else "struct"
+
+                    out += s"$indent$keyword {\n${c_fields(inner, indent + "\t")}$indent};\n"
+                _ -> ()
+        else
+            out += s"$indent${c_declare(item.1, item.0)};\n"
+
+    out
+end c_fields
 
 // **MSVC's layout keeps an aligned member's alignment inside a packed struct**, where clang and gcc
 // pack it to one byte as sysl does -- so a `@packed` struct holding an `@align(n)` one has no

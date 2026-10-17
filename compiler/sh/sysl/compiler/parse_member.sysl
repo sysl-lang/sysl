@@ -61,6 +61,9 @@ parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool,
     if p.block_ahead()
         parse_struct_body(p, &decl)
         accept_end_name(p, name)
+
+        if !decl.anon.is_empty() then refuse_names_across_levels(p, decl)
+
         return stmt(start.to(p.just_taken()), StructDecl(decl))
     end if
 
@@ -121,10 +124,7 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
             p.bump()
             decl.invariants.push(parse_expr(p))
         elif at_anonymous_member(p)
-            val kind = if p.at_word("union") then "union" else "struct"
-
-            p.fault(p.here(), s"an anonymous '$kind' member is not built yet — declare the $kind with a name of its own and hold it as a named field")
-            skip_line(p)
+            parse_anonymous_member(p, decl)
         elif at_field(p)
             val vis = parse_visibility(p)
             var field = parse_field_param(p)
@@ -179,6 +179,86 @@ parse_type_members(p: *Parser, out: *Buf[MethodDecl], name: string)
     accept_end_type(p, named_type(at, name))
 end parse_type_members
 
+// An anonymous `union` or `struct` member (C11). Its body is a declaration of its own, `<Outer>#<n>`,
+// generic over the outer type's parameters and held by a field `#<n>`; neither name can be written in
+// a program, and the outer type answers for the inner one's fields (`anonymous.sysl`).
+private parse_anonymous_member(p: *Parser, decl: *StructDecl)
+    val at = p.here()
+    val is_union = p.at_word("union")
+    val kind = if is_union then "union" else "struct"
+    val n = decl.anon.len() + 1
+    var inner = blank_struct(s"${decl.name}#$n")
+
+    p.bump()
+    inner.tparams = decl.tparams
+    inner.bounds = decl.bounds
+    inner.tvalues = decl.tvalues
+    inner.vis = decl.vis
+    inner.union_layout = is_union
+
+    if !p.block_ahead()
+        p.fault(at, s"an anonymous '$kind' member declares no fields — they are indented under it")
+        return
+    end if
+
+    parse_struct_body(p, &inner)
+    accept_anonymous_end(p, kind)
+
+    if !inner.members.is_empty() || !inner.invariants.is_empty() then
+        p.fault(at, s"an anonymous '$kind' member holds fields only — a method or an 'invariant' belongs to '${decl.name}' itself")
+
+    var args: Buf[TypeRef] = buf()
+
+    for t in decl.tparams
+        args.push(named_type(at, t))
+
+    decl.fields.push(Param(at, s"#$n", type_ref(at, NamedType(inner.name, args)), Public, None, false,
+                           false))
+    decl.anon.push(inner)
+end parse_anonymous_member
+
+// The `end union` / `end struct` an anonymous member may close with.
+private accept_anonymous_end(p: *Parser, kind: string)
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_word("end") && (p.accept_word(kind) || p.accept_kw(kind)) then return
+
+    p.rewind(tokens_at, errors_at)
+end accept_anonymous_end
+
+// C11's rule: an anonymous member's fields are the enclosing type's, so a name may appear once across
+// all the levels. A name twice at one level is the field rule's to refuse.
+private refuse_names_across_levels(p: *Parser, decl: StructDecl)
+    var seen: Buf[string] = buf()
+    var nested: Buf[bool] = buf()
+
+    note_level_names(p, decl, false, &seen, &nested)
+end refuse_names_across_levels
+
+private note_level_names(p: *Parser, decl: StructDecl, inside: bool, seen: *Buf[string],
+                         nested: *Buf[bool])
+    for f in decl.fields
+        if f.name.starts_with("#")
+            for inner in decl.anon
+                if inner.name == s"${decl.name}${f.name}" then
+                    note_level_names(p, inner, true, seen, nested)
+
+            continue
+        end if
+
+        for i in 0..<seen.len()
+            if seen.at(i) == f.name && (inside || nested.at(i))
+                p.fault(f.span, s"'${f.name}' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels")
+                break
+            end if
+
+        seen.push(f.name)
+        nested.push(inside)
+end note_level_names
+
 // A line that is exactly `union` or `struct`, which in C11 opens an anonymous member.
 private at_anonymous_member(p: *Parser) -> bool =
     (p.at_word("union") || p.at_kw("struct")) && p.peek_at(1) == Newline
@@ -220,6 +300,7 @@ private can_begin_member(p: *Parser, site: MemberSite) -> bool = p.peek() match
     QuotedIdent(_) -> true
     Keyword(w) -> w == "@" || w == "#" || w == "private" || w == "static" || w == "override" ||
         (w == "type" && site != InType) || (is_reserved(w) && p.kw_at(1, ":")) ||
+        (site == InType && at_anonymous_member(p)) ||
         at_reserved_member_head(p) || at_const_member(p)
     _ -> false
 

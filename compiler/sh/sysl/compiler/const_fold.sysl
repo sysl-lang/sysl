@@ -422,6 +422,29 @@ offset_bytes(cx: &Analyzer, span: Span, t: Type, field: string) -> Option[Const]
 
             if at.is_some() then return Some(ConstInt(from_int(long(at.unwrap()))))
 
+            // A field an anonymous member holds begins where the member does, plus where it sits
+            // inside the member, at every level down.
+            val through = anonymous_path(d, field)
+
+            if !through.is_empty()
+                var sum: usize = 0
+                var level = d
+
+                for k in 0..<through.len()
+                    val f = level.fields.at(usize(through.at(k)))
+                    val here = cx.an.tables.layout.field_offset(level, f.0)
+
+                    if here.is_none() then return refuse(cx, span, s"'$shown.$field' occupies no storage, so it has no offset")
+
+                    sum = sum + here.unwrap()
+
+                    f.1 match
+                        Struct(next) -> level = next
+                        _ -> ()
+
+                return Some(ConstInt(from_int(long(sum))))
+            end if
+
             if d.field_index(field) >= 0
                 return refuse(cx, span, s"'$shown.$field' occupies no storage, so it has no offset — a " +
                     "zero-sized field lands nowhere, and a C struct that is being mirrored has no member " +
@@ -433,7 +456,7 @@ end offset_bytes
 
 // The fields a struct declares, quoted, as the tail of a refusal naming one it does not.
 private stored_names(d: &StructType) -> string
-    val fields = d.fields
+    val fields = visible_field_names(d)
 
     if fields.len() == 0 then return ""
 
@@ -441,7 +464,7 @@ private stored_names(d: &StructType) -> string
 
     for i in 0..<fields.len()
         if i > 0 then out = out + ", "
-        out = out + s"'${fields.at(i).0}'"
+        out = out + s"'${fields.at(i)}'"
 
     out
 end stored_names

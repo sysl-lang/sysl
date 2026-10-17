@@ -802,6 +802,9 @@ debug_units(units: Buf[Program]) -> Buf[Program]
                 for item in debug_blocks(s)
                     body.push(item)
 
+                for item in anonymous_debug_blocks(s)
+                    body.push(item)
+
                 grew = true
 
         if !grew then out.push(unit)
@@ -872,9 +875,10 @@ private lib_writer(at: Span) -> Param = param_of(at, "out", TypeRef(at, PtrType(
 private lib_spec(at: Span, name: string) -> Param = param_of(at, name, lib_type(at, "FormatSpec"))
 
 // The block, and the function it renders through where the shape has parts.
-private debug_blocks(s: Stmt) -> Buf[Stmt]
+private debug_blocks(s: Stmt, shown: Option[string] = None) -> Buf[Stmt]
     val at = s.span
     val name = declared_name(s)
+    val display = shown.unwrap_or(name)
     val tparams = declared_tparams(s)
     val tvalues = declared_tvalues(s)
     var out: Buf[Stmt] = buf()
@@ -899,10 +903,10 @@ private debug_blocks(s: Stmt) -> Buf[Stmt]
         targs.push(TypeRef(at, NamedType(tparam, buf())))
 
     val subject = TypeRef(at, NamedType(name, targs))
-    var method = debug_literal_method(at, name, s)
+    var method = debug_literal_method(at, display, s)
 
-    if has_parts(s) then method = debug_parts_method(at, name, s)
-    if union_decl(s) then method = debug_union_method(at, name)
+    if has_parts(s) then method = debug_parts_method(at, display, s)
+    if union_decl(s) then method = debug_union_method(at, display)
 
     var methods: Buf[MethodDecl] = buf()
 
@@ -911,6 +915,28 @@ private debug_blocks(s: Stmt) -> Buf[Stmt]
                                         false, tvalues, buf(), buf()))))
     out
 end debug_blocks
+
+// The blocks for the anonymous members a struct or union declares, at every level. One shows as the
+// word that opened it, `union(07 00 00 00)` or `struct(lo: 1, hi: 2)`, with no label in front, since
+// its fields are the enclosing type's and it has no name of its own.
+private anonymous_debug_blocks(s: Stmt) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    *s.kind match
+        StructDecl(d) ->
+            for inner in d.anon
+                val each = stmt(s.span, StructDecl(inner))
+                val word = if inner.union_layout then "union" else "struct"
+
+                for item in debug_blocks(each, Some(word))
+                    out.push(item)
+
+                for item in anonymous_debug_blocks(each)
+                    out.push(item)
+        _ -> ()
+
+    out
+end anonymous_debug_blocks
 
 private union_decl(s: Stmt) -> bool = *s.kind match
     StructDecl(d) -> d.union_layout
@@ -1052,7 +1078,9 @@ private debug_writes(at: Span, name: string, parts: Buf[(string, Expr)]) -> Buf[
     for i in 0..<parts.len()
         val lead = if i == 0 then s"$name(" else ", "
 
-        out.push(write_text(at, s"$lead${parts.at(i).0}: "))
+        val label = if is_anonymous_field(parts.at(i).0) then "" else s"${parts.at(i).0}: "
+
+        out.push(write_text(at, s"$lead$label"))
 
         var args: Buf[Expr] = buf()
 

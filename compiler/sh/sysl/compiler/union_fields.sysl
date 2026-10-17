@@ -111,8 +111,7 @@ check_union_fields(a: &Analysis, scope: Scope, span: Span, d: &StructType)
                         _ -> ()
                 end if
 
-                a.fault(at_scope, at_span, s"union '${type_show(Struct(d))}' cannot hold its field " +
-                        s"'${f.0}': $why")
+                a.fault(at_scope, at_span, s"${union_named(d)} cannot hold its field '${f.0}': $why")
             None -> ()
 end check_union_fields
 
@@ -120,13 +119,6 @@ end check_union_fields
 // is an `impl`, so the rule cannot be asked sooner. An instance made after this is asked where it is
 // made (`instantiate_struct`).
 settle_union_fields(a: &Analysis)
-    for i in 0..<a.tables.types.len()
-        val decl = a.tables.types.at(i)
-
-        decl.kind match
-            StructOf(sd) -> if sd.union_layout then refuse_union_attrs(a, decl.scope, decl.span, sd)
-            _ -> ()
-
     for i in 0..<a.tables.struct_insts.len()
         a.tables.struct_insts.at(i) match
             Struct(d) ->
@@ -138,13 +130,30 @@ settle_union_fields(a: &Analysis)
             _ -> ()
 end settle_union_fields
 
-// What a union's declaration may not carry yet: the byte order of one is built in a later step, and
-// until then saying nothing would reverse integers no field asked to have reversed.
-private refuse_union_attrs(a: &Analysis, scope: Scope, span: Span, d: StructDecl)
-    if d.byte_order.is_some() then
-        a.fault(scope, span, s"'@byte_order' on the union '${d.name}' is not built yet — declare it on the " +
-                "structs its fields hold, which reverse their own integers")
-end refuse_union_attrs
+// A union as a diagnostic names it: an anonymous one by the type that holds it.
+private union_named(d: &StructType) -> string
+    if !is_anonymous_type(d) then return s"union '${type_show(Struct(d))}'"
+
+    val shown = type_show(Struct(d))
+    val holder = shown.index_of("#") match
+        Some(i) -> shown[0..<i]
+        None -> shown
+
+    s"the anonymous union in '$holder'"
+end union_named
+
+// Whether a value of this type holds a union in its own storage -- itself, a field, an element --
+// which is what decides whether its constant needs an image of its own (`emit_static.sysl`).
+holds_union(t: Type) -> bool = underlying(t) match
+    Struct(d) ->
+        if d.union_layout then return true
+
+        for f in d.fields
+            if holds_union(f.1) then return true
+
+        false
+    Array(_, elem) -> holds_union(*elem)
+    _ -> false
 
 // What a pattern that takes a union apart is told. Binding one whole is fine.
 union_pattern_refusal(d: &StructType) -> string =

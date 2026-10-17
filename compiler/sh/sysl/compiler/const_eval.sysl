@@ -748,6 +748,13 @@ end viewed
 // A struct as `Name(a, b)`, an enum value as its variant's name and what it carries.
 @noinline
 private record_text(variant: int, fields: Buf[Const], t: Type) -> string
+    if variant <= -2
+        val (named, declared) = record_shape(-1, t)
+        val i = usize(union_written(variant))
+
+        return s"$named(${declared.at(i).0} = ${value_text(fields.at(i), declared.at(i).1)})"
+    end if
+
     val (head, types) = record_shape(variant, t)
     var out = head
 
@@ -881,10 +888,16 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
 // value stays code, and `const_val_run` says why.
 @noinline
 private record_literal(span: Span, variant: int, fields: Buf[Const], t: Type) -> Option[TExpr]
-    val (_, types) = record_shape(variant, t)
+    val (_, types) = record_shape(if variant <= -2 then -1 else variant, t)
     var args: Buf[TExpr] = buf()
 
     for i in 0..<fields.len()
+        // A union lays down the one field it was built with; the rest of its bytes are zero.
+        if variant <= -2 && int(i) != union_written(variant)
+            args.push(TExpr(span, TUnitLit))
+            continue
+        end if
+
         val lit = value_literal(span, fields.at(i), types.at(i).1)
 
         if lit.is_none() then return None
@@ -1107,7 +1120,9 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TFromBytes(arg) -> text_of(r, arg)
         TStrView(arg) -> text_of(r, arg)
         TConstView(arg) -> eval(r, arg)
-        TStructNew(decl, args) -> record_new(r, e.span, -1, args, Struct(decl))
+        TStructNew(decl, args) ->
+            if decl.union_layout then union_new(r, e.span, decl, args)
+            else record_new(r, e.span, -1, args, Struct(decl))
         TEnumNew(enum_ty, variant, args) -> record_new(r, e.span, variant_position(enum_ty, variant), args, enum_ty)
         TArrayLit(elems, ty) -> array_lit(r, e.span, elems, ty)
         TArrayFill(value, ty) -> array_fill(r, e.span, value, ty)
@@ -1261,12 +1276,18 @@ private zero_record(r: &EvRun, at: Span, d: &StructType) -> Flow
     var out: Buf[Const] = buf()
 
     for f in d.fields
+        // A union's zero is all-zero bytes, which is its first field's zero; the rest stand in.
+        if d.union_layout && !out.is_empty()
+            out.push(ConstBool(false))
+            continue
+        end if
+
         zero_value(r, at, f.1) match
             EvGave(v) -> out.push(v)
             EvNone -> return refuse_form(r, at, "a 'unit' field is not evaluated while compiling yet")
             other -> return other
 
-    EvGave(ConstRecord(-1, out))
+    EvGave(ConstRecord(if d.union_layout then union_variant(0) else -1, out))
 end zero_record
 
 // -- arrays ------------------------------------------------------------------------------------------
@@ -1831,11 +1852,52 @@ private record_new(r: &EvRun, at: Span, variant: int, args: Buf[TExpr], ty: Type
     EvGave(ConstRecord(variant, out))
 end record_new
 
+// **A union is held as the field it was built with**: a record whose variant is `-2 - i` for the `i`th
+// field, with that field's value at its position and a stand-in at every other. Evaluation has a value
+// model, not a byte model, so it has no answer for what another field's bytes would read as.
+private union_variant(i: int) -> int = -2 - i
+
+private union_written(variant: int) -> int = -2 - variant
+
+// `U(f = v)`: the one value, at its field's position.
+@noinline
+private union_new(r: &EvRun, at: Span, decl: &StructType, args: Buf[TExpr]) -> Flow
+    val why = unheld(Struct(decl))
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    var written = 0
+    var out: Buf[Const] = buf()
+
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            TUnitLit -> out.push(ConstBool(false))
+            _ ->
+                written = int(i)
+
+                eval_value(r, args.at(i)) match
+                    Ok(v) -> out.push(copied(v))
+                    Err(f) -> return f
+
+    EvGave(ConstRecord(union_variant(written), out))
+end union_new
+
+// What a read through a field other than the one a union was built with is told.
+private union_cross_read(t: Type, written: int, index: int) -> string = underlying(t) match
+    Struct(d) ->
+        s"evaluation while compiling reads a union only through the field it was built with — this " +
+            s"'${type_show(t)}' was built with '${d.fields.at(usize(written)).0}', and " +
+            s"'${d.fields.at(usize(index)).0}' would read its bytes as another type"
+    _ -> "evaluation while compiling reads a union only through the field it was built with"
+
 // `s.f`, read: the struct is read where it is held, without a copy.
 @noinline
 private field_read(r: &EvRun, receiver: TExpr, index: int) -> Flow
     eval_value(r, receiver) match
         Ok(ConstRecord(-1, fields)) -> EvGave(fields.at(usize(index)))
+        Ok(ConstRecord(v, fields)) if v <= -2 ->
+            if union_written(v) == index then EvGave(fields.at(usize(index)))
+            else refuse_form(r, receiver.span, union_cross_read(texpr_type(receiver), union_written(v), index))
         Ok(ConstLink(_)) -> refuse_form(r, receiver.span, link_reason())
         Ok(_) -> refuse_form(r, receiver.span, s"a field of a '${type_show(texpr_type(receiver))}' is not " +
                              "evaluated while compiling yet — a struct's is")

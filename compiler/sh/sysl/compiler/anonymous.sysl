@@ -1,0 +1,79 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Anonymous members (C11): an unnamed `union` or `struct` block inside a struct or a union.
+//
+// **One is an ordinary type held by an ordinary field, under names no program can write.** The
+// parser declares the block as `<Outer>#<n>` and the outer type holds it in a field `#<n>`
+// (`parse_member.sysl`), so layout, the C ABI, the field rule and every place computation see a
+// nested struct or union exactly as C lays one out. What is anonymous about it is only how its fields
+// are named: `s.x`, `offsetof(S, x)` and `S(x = 1)` reach through it as if `x` were the outer type's
+// own, which this file answers.
+
+// Whether a field is the one holding an anonymous member.
+is_anonymous_field(name: string) -> bool = name.starts_with("#")
+
+// Whether a type is one an anonymous member declared.
+is_anonymous_type(d: &StructType) -> bool = d.base.contains("#")
+
+// The field indices from `d` down to the field `name` through its anonymous members, outermost first,
+// or nothing where no anonymous member holds a field of that name.
+anonymous_path(d: &StructType, name: string) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        if !is_anonymous_field(f.0) then continue
+
+        f.1 match
+            Struct(inner) ->
+                val own = inner.field_index(name)
+                val rest = if own >= 0 then single_index(own) else anonymous_path(inner, name)
+
+                if !rest.is_empty()
+                    out.push(int(i))
+
+                    for k in rest
+                        out.push(k)
+
+                    return out
+                end if
+            _ -> ()
+
+    out
+end anonymous_path
+
+private single_index(i: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(i)
+    out
+end single_index
+
+// The anonymous member of `d` that holds the field `name`, as its index in `d`, or -1.
+anonymous_holder(d: &StructType, name: string) -> int
+    val p = anonymous_path(d, name)
+
+    if p.is_empty() then -1 else p.at(0)
+end anonymous_holder
+
+// The fields a reader names at this level: a field of its own, or one an anonymous member holds, in
+// declaration order. What a diagnostic lists and a header writes.
+visible_field_names(d: &StructType) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    note_visible(d, &out)
+    out
+end visible_field_names
+
+private note_visible(d: &StructType, out: *Buf[string])
+    for f in d.fields
+        if is_anonymous_field(f.0)
+            f.1 match
+                Struct(inner) -> note_visible(inner, out)
+                _ -> ()
+        else
+            out.push(f.0)
+end note_visible

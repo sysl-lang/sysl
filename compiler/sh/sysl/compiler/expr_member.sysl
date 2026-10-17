@@ -147,6 +147,33 @@ private beyond_one_level(cx: &Analyzer, span: Span, outer: TExpr, tr: TExpr, nam
            s"'$name' off the ${type_show(left)} it leaves")
 end beyond_one_level
 
+// The selection of a field an anonymous member holds: one `TField` per level, the last one's
+// qualifier taken off as a direct field's is.
+private through_anonymous(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
+                          path: Buf[int]) -> TExpr
+    var at = tr
+    var level = d
+
+    for k in 0..<path.len()
+        val i = path.at(k)
+        val t = level.fields.at(usize(i)).1
+
+        if k + 1 == path.len()
+            if !field_visible(cx, level.base, name) then
+                return cx.err(span, field_out_of_reach(cx, level.base, name))
+
+            at = TExpr(span, TField(at, i, unqualified(t)))
+        else
+            at = TExpr(span, TField(at, i, t))
+
+            t match
+                Struct(next) -> level = next
+                _ -> ()
+        end if
+
+    at
+end through_anonymous
+
 // A struct's field, by the index the declaration gave it. A tuple's parts are named for their
 // positions, so `t.0` arrives here as an ordinary field selection.
 private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
@@ -165,6 +192,17 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
         // Whatever qualifier the field was declared with stays in the struct's field list and comes
         // off here: reading a register yields an ordinary value.
         return TExpr(span, TField(tr, idx, unqualified(d.fields.at(usize(idx)).1)))
+
+    // A field an anonymous member holds is the outer type's own to name (`anonymous.sysl`), so the
+    // selection is the chain of fields down to it.
+    val through = anonymous_path(d, name)
+
+    if !through.is_empty()
+        if !layout_known(cx.an, cx.scope, span, d.base, qualified_name(d.base)) then
+            return bad_expr(span)
+
+        return through_anonymous(cx, span, tr, d, name, through)
+    end if
 
     // A **compile-time constant** selects a part by its value, which is what makes one written line
     // cover parts of different types inside a `for const`. It is the same selection `t.0` already

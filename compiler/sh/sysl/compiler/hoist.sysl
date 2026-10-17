@@ -281,12 +281,23 @@ private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
         check_member_signature(a, scope, m.span, s"${d.name}.${m.name}", m)
 end check_trait_defaults
 
+// A struct or union, and the anonymous members its body declares: each is a type of its own, and
+// one `@byte_order` above the outer declaration reaches the integers of every level, as its fields
+// are the outer type's.
+private hoist_struct(a: &Analysis, scope: Scope, span: Span, d: StructDecl)
+    hoist_type_name(a, scope, span, d.name, d.vis, StructOf(with_struct_call_bounds(d)))
+
+    for inner in d.anon
+        var each = inner
+
+        each.byte_order = d.byte_order
+        hoist_struct(a, scope, span, each)
+end hoist_struct
+
 // Registers one top-level declaration.
 hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
     *s.kind match
-        StructDecl(d) ->
-            hoist_type_name(a, scope, s.span, d.name, d.vis,
-                            StructOf(with_struct_call_bounds(d)))
+        StructDecl(d) -> hoist_struct(a, scope, s.span, d)
         EnumDecl(d) ->
             hoist_type_name(a, scope, s.span, d.name, d.vis,
                             EnumOf(with_enum_call_bounds(d)))

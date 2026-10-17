@@ -1316,6 +1316,15 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             // **The count and naming refusals quote the DECLARATION, not the spelling** -- `struct
             // 'b.T'` where the call wrote a bare `T` it imported, as a callee is quoted: a reader with
             // only the bare name has nowhere to go and read the fields.
+            if has_anonymous_member(d)
+                if !layout_known(cx.an, cx.scope, span, key, qualified_name(key)) then
+                    return bad_expr(span)
+
+                val made = anonymous_new(cx, span, qualified_name(key), d, args, true)
+
+                return if d.union_layout then made else checked_new(cx, span, made, d)
+            end if
+
             if d.union_layout then return union_call(cx, span, key, d, args)
 
             val slots = bind_field_args(cx, span, qualified_name(key), d, args)
@@ -1415,6 +1424,124 @@ private union_call(cx: &Analyzer, span: Span, key: string, d: &StructType, args:
             cx.err(one.span, s"union '$written' is built from one field, named — $example: a value by " +
                    "position would mean another field once one is declared in front of it")
 end union_call
+
+private has_anonymous_member(d: &StructType) -> bool
+    for f in d.fields
+        if is_anonymous_field(f.0) then return true
+
+    false
+end has_anonymous_member
+
+// A struct or union holding an anonymous member, built by the names of the fields at every level:
+// `Packet(tag = 1, word = 7, len = 2)` fills `word` in the anonymous union between the other two.
+// **Every value is named**, since a position would have to count the anonymous member's fields as
+// one or as many and either reading surprises someone. A struct names every field of its own and
+// one field of each anonymous union it holds; a union names exactly one field at its level, and the
+// rest of its bytes are zero (`union_call`).
+private anonymous_new(cx: &Analyzer, span: Span, written: string, d: &StructType, args: Buf[Expr],
+                      outermost: bool) -> TExpr
+    val kind = if d.union_layout then "union" else "struct"
+
+    for one in args
+        *one.kind match
+            NamedArg(name, _) ->
+                if outermost && d.field_index(name) < 0 && anonymous_path(d, name).is_empty() then
+                    return cx.err(one.span, s"$kind '$written' declares no field named '$name' — it holds " +
+                                  quoted_names(visible_field_names(d)))
+            _ ->
+                return cx.err(one.span, s"$kind '$written' holds an anonymous member, so it is built by " +
+                              "naming its fields — a value by position would have to count the member's " +
+                              "fields as one or as many")
+
+    every_field_visible(cx, span, d, "the constructor", "build it through an associated function of its own")
+
+    val before = cx.an.complaints()
+    var ts: Buf[TExpr] = buf()
+    var fields: Buf[(string, Type)] = buf()
+    var given: Buf[Expr] = buf()
+    var checked: Buf[TExpr] = buf()
+    var filled: usize = 0
+
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        if is_anonymous_field(f.0)
+            var sub: Buf[Expr] = buf()
+            var inner_names: Buf[string] = buf()
+
+            f.1 match
+                Struct(inner) ->
+                    inner_names = visible_field_names(inner)
+
+                    for one in args
+                        *one.kind match
+                            NamedArg(name, _) ->
+                                if inner.field_index(name) >= 0 || !anonymous_path(inner, name).is_empty() then
+                                    sub.push(one)
+                            _ -> ()
+
+                    if sub.is_empty()
+                        if !d.union_layout then
+                            return cx.err(span, s"struct '$written' is built naming a field of its anonymous " +
+                                          s"${anonymous_kind(inner)} — one of ${quoted_names(inner_names)}")
+
+                        ts.push(TExpr(span, TUnitLit))
+                    else
+                        ts.push(anonymous_new(cx, span, written, inner, sub, false))
+                        filled += 1
+                    end if
+                _ -> ts.push(bad_expr(span))
+        else
+            var value: Option[Expr] = None
+
+            for one in args
+                *one.kind match
+                    NamedArg(name, v) -> if name == f.0 then value = Some(v)
+                    _ -> ()
+
+            if value.is_none()
+                if !d.union_layout then
+                    return cx.err(span, s"struct '$written' is built naming every field, and '${f.0}' is missing")
+
+                ts.push(TExpr(span, TUnitLit))
+            else
+                val typed = type_expr(cx, value.unwrap(), Some(f.1))
+
+                fields.push(f)
+                given.push(value.unwrap())
+                checked.push(typed)
+                ts.push(typed)
+                filled += 1
+            end if
+        end if
+
+    if d.union_layout && filled != 1
+        val which = if outermost then s"union '$written'" else s"the anonymous union in '$written'"
+
+        return cx.err(span, s"$which is built from exactly one field, and " +
+                      s"${supplied(filled, "value")} name its fields — one of " +
+                      quoted_names(visible_field_names(d)))
+    end if
+
+    val refused = refused_field(cx, span, qualified(written, d.targs), fields, given, checked, before)
+
+    if refused.is_some() then return refused.unwrap()
+
+    TExpr(span, TStructNew(d, ts))
+end anonymous_new
+
+private anonymous_kind(d: &StructType) -> string = if d.union_layout then "union" else "struct"
+
+private quoted_names(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i + 1 == names.len() then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
+
+    out
+end quoted_names
 
 // Whether the position expects an instantiation of the struct declared under `key`.
 private expects_struct(expected: Option[Type], key: string) -> bool = expected match
