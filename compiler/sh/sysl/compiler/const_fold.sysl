@@ -498,12 +498,39 @@ end const_conversion
 // wrap is a change of name and not of number, so nothing narrows here, and the constant's declared
 // type is what then holds the number to the base's width and to a `within` range. A type with a
 // `where` predicate has a check only a run can make, and folds nothing.
+//
+// **A value of another kind is converted as the base's own name would convert it**, since `Phase(3)`
+// over `real` is `Phase(real(3))`: an integer at a float base becomes that float, a float at an
+// integer base is truncated, and an integer and a `char` cross as their conversions do.
 private made_new_const(cx: &Analyzer, callee: Expr, arg: Expr) -> Option[Const]
-    subject_named(cx, callee) match
-        Some(Constrained(d)) -> if !d.derived || d.pred_fn.is_some() then return None
+    val subject = subject_named(cx, callee)
+
+    val base = subject match
+        Some(Constrained(d)) ->
+            if !d.derived || d.pred_fn.is_some() then return None
+            underlying(d.base)
         _ -> return None
 
-    const_fold(cx, arg)
+    val value = const_fold(cx, arg)
+
+    if value.is_none() then return None
+
+    val crosses = (value.unwrap(), base) match
+        (ConstInt(_), Floating(_, _)) -> true
+        (ConstInt(_), Char) -> true
+        (ConstFloat(_), Integer(_, _, _)) -> true
+        (ConstChar(_), Integer(_, _, _)) -> true
+        _ -> false
+
+    if !crosses then return value
+
+    // A value that is converted may be converted by the type's own `from`, which is a call, not a
+    // fold.
+    val owner = member_key(cx.an, subject.unwrap(), "from").0
+
+    if cx.an.tables.members.from_trait.get(member_key_of(owner, "from")).is_some() then return None
+
+    converted(cx, arg.span, value.unwrap(), base)
 end made_new_const
 
 private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[Const] = v match

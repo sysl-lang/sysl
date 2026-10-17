@@ -1,0 +1,138 @@
+module sh.sysl.compiler
+@tests
+
+// A `new` type's name converts from whatever its base's name converts from: `Phase(3)` over `real`
+// is `Phase(real(3))`, accepted exactly where `real(3)` is. What it does not take from its base is
+// the silent coercion of a value that already has a type, and converting out is unchanged.
+
+private nbc_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private nbc_refused(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private nbc_phase() -> string = "type Phase = new real\n\n"
+
+@test("an int literal converts into a new type over a float")
+nbc_int_literal_into_new_float()
+    if xvr_no_library() then return
+
+    assert_eq(nbc_ran(nbc_phase() + "val p = Phase(3)\n\nprint(real(p) / 2.0)\n"), "1.5\n")
+
+@test("a variable converts into a new type wherever its base's name converts it")
+nbc_variable_into_new()
+    if xvr_no_library() then return
+
+    val text = nbc_phase() + "type Slot = new u8\n\nval i = 3\nval b: i16 = -2\nval f = 2.75\n\n" +
+               "print(real(Phase(i)), real(Phase(b)), u8(Slot(f)), u8(Slot(i)))\n"
+
+    assert_eq(nbc_ran(text), "3 -2 2 3\n")
+
+@test("a value already at the base is wrapped, not converted, and a constant folds through the base")
+nbc_wrap_and_constant()
+    if xvr_no_library() then return
+
+    val text = nbc_phase() + "const P: Phase = Phase(3)\nconst C: int = 7\nconst Q: Phase = Phase(C)\n\n" +
+               "print(real(Phase(1.25)), real(P), real(Q))\n"
+
+    assert_eq(nbc_ran(text), "1.25 3 7\n")
+
+@test("a conversion the base refuses is refused for the new type, naming the type written")
+nbc_refused_where_the_base_is()
+    if xvr_no_library() then return
+
+    assert_eq(nbc_refused("print(real(true))\n").contains("cannot convert bool to real"), true)
+
+    val said = nbc_refused(nbc_phase() + "print(real(Phase(true)))\n")
+
+    assert(said.contains("cannot make Phase from bool"), said)
+
+@test("a within new type converts first and checks the converted value")
+nbc_within_checks_the_converted_value()
+    if xvr_no_library() then return
+
+    val text = "type Slot = new u8 within 0..<8\n\nval f = 3.9\n\nprint(u8(Slot(f)))\n"
+
+    assert_eq(nbc_ran(text), "3\n")
+
+@test("a chain of new types converts through to the scalar at the bottom")
+nbc_chained_new_types()
+    if xvr_no_library() then return
+
+    val text = "type B = new real\ntype A = new B\ntype Meters = new real\ntype G = new i32q16\n" +
+               "type H = new G\n\nval i = 4\nval m = Meters(0.5)\nval a = A(1.0)\nval x = 0.1\n\n" +
+               "print(real(A(i)), real(A(B(1.5))), real(B(A(2.5))), real(A(m)), real(A(a)))\n" +
+               "print(i32q16(H(x, Floor)), i32q16(H(i)))\n"
+
+    assert_eq(nbc_ran(text), "4 1.5 2.5 0.5 1\n0.09999 4\n")
+
+@test("a new type over a fixed-point type converts from an int and a float by the fixed rules")
+nbc_fixed_point_base()
+    if xvr_no_library() then return
+
+    val text = "type Gain = new i32q16\ntype Unit = new q15\n\nval i = 3\nval x = 1.25\nval big = 5.0\n\n" +
+               "print(i32q16(Gain(i)), i32q16(Gain(x)), i32q16(Gain(0.1, Floor)), i32q16(Gain(0.1)), " +
+               "q15(Unit(big)), q15(Unit(-0.5)))\n"
+
+    assert_eq(nbc_ran(text), "3 1.25 0.09999 0.1 0.99997 -0.5\n")
+
+@test("a rounding mode is refused where the base's conversion refuses one")
+nbc_rounding_mode_refused_as_the_base_does()
+    if xvr_no_library() then return
+
+    val said = nbc_refused(nbc_phase() + "val i: int = 3\nprint(real(Phase(i, Floor)))\n")
+
+    assert(said.contains("a 'Phase' conversion takes exactly one value"), said)
+
+@test("the new type's own From wins over its base's conversion, except inside that from")
+nbc_own_from_wins()
+    if xvr_no_library() then return
+
+    val text = nbc_phase() + "impl From[int] for Phase\n    from(n: int) -> Phase = Phase(n) * 2.0\n\n" +
+               "val i = 3\n\nprint(real(Phase(3)), real(Phase(i)), real(Phase(i8(3))), real(Phase(1.5)))\n"
+
+    assert_eq(nbc_ran(text), "6 6 3 1.5\n")
+
+@test("a constant made through the type's own From is a call, not a fold")
+nbc_own_from_is_not_folded()
+    if xvr_no_library() then return
+
+    val text = nbc_phase() + "impl From[int] for Phase\n    from(n: int) -> Phase = Phase(n) * 2.0\n\n" +
+               "const P: Phase = Phase(3)\n"
+    val said = nbc_refused(text)
+
+    assert(said.contains("the value of 'P' is not a constant expression"), said)
+
+@test("an int is still not silently a new type over a float, literal or variable")
+nbc_no_implicit_coercion()
+    if xvr_no_library() then return
+
+    val lit = nbc_refused(nbc_phase() + "val p: Phase = 3\n")
+
+    assert(lit.contains("cannot initialize 'p': declared Phase but the value is int"), lit)
+
+    val arg = nbc_refused(nbc_phase() + "take(p: Phase) -> real = real(p)\n\nprint(take(3))\n")
+
+    assert(arg.contains("'p' of 'take' is Phase, but int was given"), arg)
+
+    val var_ = nbc_refused(nbc_phase() + "val i: int = 3\nval p: Phase = i\n")
+
+    assert(var_.contains("cannot initialize 'p': declared Phase but the value is int"), var_)
+
+    val flt = nbc_refused("type N = new i32\n\nval n: N = 3.0\n")
+
+    assert(flt.contains("cannot initialize 'n': declared N but the value is real"), flt)
+
+@test("a literal the base takes still makes the new type where one is wanted")
+nbc_literal_at_base_still_made()
+    if xvr_no_library() then return
+
+    assert_eq(nbc_ran(nbc_phase() + "type N = new i32\n\nval p: Phase = 3.5\nval n: N = 3\n\n" +
+                      "print(real(p), i32(n))\n"), "3.5 3\n")
+
+@test("converting out of a new type is unchanged")
+nbc_converting_out_unchanged()
+    if xvr_no_library() then return
+
+    val text = nbc_phase() + "type Slot = new u8\n\nval p = Phase(2.75)\nval s = Slot(200)\n\n" +
+               "print(real(p), int(p), u8(s), i8(s), real(s))\n"
+
+    assert_eq(nbc_ran(text), "2.75 2 200 -56 200\n")
