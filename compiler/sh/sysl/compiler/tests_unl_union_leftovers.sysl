@@ -228,14 +228,15 @@ unl_anonymous_address_refused()
 
 // -- an invariant names an anonymous member's fields ------------------------------------------------
 
-// At both levels, the program stops on SIGTRAP. What it printed before is still in its buffer, so
-// the value it starts from is shown to hold by the test beside each of these that builds the same one.
-private unl_traps(text: string)
+// At both levels, the program stops on SIGTRAP, having written exactly `printed` -- a trap flushes
+// standard output first, so the value each starts from is shown to hold before the write that breaks it.
+private unl_traps(text: string, printed: string)
     if !unl_ready() then return
 
     for level in ["0", DefaultOptimization]
-        val (state, _, _) = unl_run(text, level)
+        val (state, out, _) = unl_run(text, level)
 
+        assert_eq(out, printed)
         assert(state == Status.Signalled(5), s"-O$level stopped with $state")
 
 private val UnlNested: string = raw"""
@@ -266,9 +267,10 @@ unl_invariant_anonymous_struct_violated()
         main()
             var s = Span(lo = 0, len = 2, cap = 4)
 
+            print(s.len)
             s.len = 5
             print(s.len)
-        """)
+        """, "2\n")
 
 private val UnlTagged: string = raw"""
     struct Packet
@@ -296,9 +298,10 @@ unl_invariant_anonymous_union_violated()
         main()
             var p = Packet(tag = 1, ok = true)
 
+            print(p.ok)
             p.ok = false
             print(p.ok)
-        """)
+        """, "true\n")
 
 // The clause reads the union's field only where it reaches the name, so a bool holding a byte that is
 // no bool is not read while `tag == 0` answers -- and is read, and traps, once the clause gets there.
@@ -317,9 +320,10 @@ unl_invariant_anonymous_union_reached()
         main()
             var p = Packet(tag = 0, raw = 7)
 
+            print(p.raw)
             p.tag = 1
             print(p.tag)
-        """)
+        """, "7\n")
 
 @test("'&' of the anonymous union's field an invariant reads is refused")
 unl_invariant_anonymous_union_address()

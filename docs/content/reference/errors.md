@@ -474,8 +474,7 @@ print(steps)
 'steps' traps while it is being compiled: integer division by zero
 ```
 
-The program never runs, so nothing of it is lost the way buffered output is lost at a run-time trap;
-the full message names the division, then each call the run was inside — `inside 'per(1024, 0)'`,
+The program never runs, so it prints nothing at all; the full message names the division, then each call the run was inside — `inside 'per(1024, 0)'`,
 `inside 'buckets(1024, 0)'` — with where each was called.
 
 ### What stopping looks like
@@ -489,13 +488,38 @@ before you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **bounds check** — an index, a range, a substring cut inside a character | one line on stderr saying what failed and where, then the trap; **buffered output already written by the program is lost** | the platform's signal status for a trap instruction |
-| any other **compiler-inserted check** — a cast, a constrained range, a contract | nothing at all, and buffered output is lost the same way | the same |
+| a **bounds check** — an index, a range, a substring cut inside a character | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
+| any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message>` on stdout, after everything the program printed before it | 1 |
 
-The library's route goes through `exit`, which flushes on its way out; a compiler check goes to the
-target's trap instruction, which does not. So a program that printed diagnostics right up to the
-failing line will appear to have printed **none** of them if a check is what stopped it.
+**A trap flushes standard output before it stops the program.** Standard output is buffered — fully,
+when it goes to a file or a pipe rather than a terminal — so what a program printed may still be in
+the buffer when a check fails. Every trap, the compiler's checks and the library's `trap()` alike,
+goes through one runtime point that flushes every open output stream and then executes the trap
+instruction, so the status is the trap's and a program that printed diagnostics right up to the
+failing line shows all of them:
+
+```sysl
+main()
+    val xs = [1, 2, 3]
+    var i = 0
+
+    loop
+        print(s"element $i is ${xs[i]}")
+        i += 1
+```
+
+```text
+element 0 is 1
+element 1 is 2
+element 2 is 3
+index 3 out of bounds for length 3 (main.sysl:6:35)
+```
+
+The flush happens once: a trap raised while it runs goes straight to the instruction, so a stream in
+a state that makes flushing fail cannot loop. **On a freestanding target there is nothing to flush**
+— its `putchar` is whatever the board supplies, buffering nothing a trap could lose — so a trap
+there is the instruction alone, and a program that never prints links no C stream function at all.
 
 **A bounds check says what failed before it traps**, written straight to standard error so that it
 survives the trap:

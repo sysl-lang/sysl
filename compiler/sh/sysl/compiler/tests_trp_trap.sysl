@@ -86,26 +86,44 @@ trp_is_never()
 
 // -- the emitted code -------------------------------------------------------------------------------
 
-@test("trap() is the llvm.trap call and nothing that prints or exits")
+@test("trap() is the llvm.trap call preceded by a flush of standard output, and nothing that prints or exits")
 trp_is_the_instruction()
     if xvr_no_library() then return
 
     val ir = xvr_ir(trp_main("stop() -> never = trap()\n\nstop()\n"))
 
-    assert(ir.contains("call void @llvm.trap()"), ir)
-
-    // The function that holds the trap holds nothing else of note: no print, no exit.
+    // `trap()` calls the one stop, and the stop is the flush, then the instruction, and nothing else
+    // of note: no print, no exit.
     val defs = split(ir, "\ndefine ")
     var found = false
+    var stop_found = false
 
     for i in 0..<defs.len
-        if defs[i].contains("call void @llvm.trap()") && defs[i].contains("@sysl$trap()")
+        val d = split(defs[i], "\n}")[0]
+        val head = split(d, "\n")[0]
+
+        if head.contains("@sysl$trap()")
             found = true
-            assert(!defs[i].contains("@printf"), defs[i])
-            assert(!defs[i].contains("@exit"), defs[i])
-            assert(!defs[i].contains("@putbytes"), defs[i])
+            assert(d.contains("call void @sysl.trap()"), d)
+            assert(!d.contains("@printf"), d)
+            assert(!d.contains("@exit"), d)
+            assert(!d.contains("@putbytes"), d)
+
+        if head.contains("@sysl.trap() cold noinline noreturn")
+            stop_found = true
+
+            val flush = d.index_of("call i32 @fflush(ptr null)")
+            val instruction = d.index_of("call void @llvm.trap()")
+
+            assert(flush.is_some() && instruction.is_some(), d)
+            assert(flush.unwrap() < instruction.unwrap(), d)
+            assert_eq(d.count_of("call "), 2)
+            assert(!d.contains("@printf"), d)
+            assert(!d.contains("@exit"), d)
+            assert(!d.contains("@putbytes"), d)
 
     assert(found, ir)
+    assert(stop_found, ir)
 
 @test("trap() takes no capability and is legal under @no_alloc")
 trp_needs_nothing()

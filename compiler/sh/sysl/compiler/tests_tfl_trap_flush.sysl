@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **A trap flushes standard output before it stops the program** (`trap_stop.sysl`,
+// `reference/errors.md § What stopping looks like`). Every way a program traps -- a bounds check, a
+// checked union read, an overflow, a failed `require`, the library's `trap()` -- goes through one
+// stop that flushes, so what the program printed reaches its standard output, and the process still
+// ends by SIGTRAP. Each program here runs with its output captured, which is a pipe, so stdio holds it
+// fully buffered until something flushes it.
+
+private tfl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private tfl_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-tfl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end tfl_run
+
+// At both levels the program writes exactly `printed` on standard output and `said` on standard error,
+// and stops by SIGTRAP.
+private tfl_traps(text: string, printed: string, said: string)
+    if !tfl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = tfl_run(text, level)
+
+        assert_eq(err, said)
+        assert_eq(out, printed)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end tfl_traps
+
+@test("a bounds trap leaves what was printed before it on stdout, and still stops by SIGTRAP")
+tfl_bounds()
+    tfl_traps(raw"""
+        main()
+            val xs = [1, 2, 3]
+            var i = 0
+
+            loop
+                print(s"element $i is ${xs[i]}")
+                i += 1
+        """, "element 0 is 1\nelement 1 is 2\nelement 2 is 3\n",
+        "index 3 out of bounds for length 3 (main.sysl:6:35)\n")
+
+@test("a checked union read that traps leaves what was printed before it on stdout")
+tfl_union_read()
+    tfl_traps(raw"""
+        union Cell
+            raw: u8
+            on: bool
+
+        main()
+            var c = Cell(raw = 1)
+            print(c.on)
+            c.raw = 2
+            print(c.on)
+        """, "true\n", "")
+
+@test("an overflow trap leaves what was printed before it on stdout")
+tfl_overflow()
+    tfl_traps(raw"""
+        type Big = i32 within -2000000000..2000000000
+
+        twice(b: Big) -> Big = b + b
+
+        main()
+            print(twice(Big(1000)))
+            print(twice(Big(2000000000)))
+        """, "2000\n", "")
+
+@test("a failed require leaves what was printed before it on stdout")
+tfl_require()
+    tfl_traps(raw"""
+        half(x: int) -> int
+            require x >= 0
+            x / 2
+
+        main()
+            print(half(10))
+            print(half(-1))
+        """, "5\n", "")
+
+@test("trap() leaves what was printed before it on stdout")
+tfl_explicit_trap()
+    tfl_traps(raw"""
+        main()
+            print("before")
+            trap()
+        """, "before\n", "")
+
+@test("output written without a newline before a trap still reaches stdout")
+tfl_no_newline()
+    tfl_traps(raw"""
+        main()
+            prints("no newline, ")
+            prints("still here")
+            trap()
+        """, "no newline, still here", "")
+
+@test("an exported sysl_bounds_fail runs first, and the flush still follows it")
+tfl_override_then_flush()
+    tfl_traps(raw"""
+        @export("sysl_bounds_fail")
+        report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+            print("override")
+
+        main()
+            val xs = [1, 2]
+            var i = 0
+
+            loop
+                print(xs[i])
+                i += 1
+        """, "1\n2\noverride\n", "")
+
+// The LLVM text `text` lowers to for `target` (the host where it is `None`).
+private tfl_ir(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-tfl-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val ir = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    ir
+end tfl_ir
+
+private val TflChecks: string = raw"""
+    pick(xs: []const int, i: usize) -> int = xs[i]
+
+    @export("run")
+    run(i: usize) -> int
+        if pick([1, 2], i) == 0 then trap()
+        0
+    """
+
+@test("a hosted trap goes through the flushing stop; a board's trap is the instruction and declares no fflush")
+tfl_ir_by_target()
+    if !tfl_ready() then return
+
+    val hosted = tfl_ir(TflChecks + "\nmain()\n    print(run(1))\n", None)
+
+    assert(hosted.contains("declare i32 @fflush(ptr)"), hosted)
+    assert(hosted.contains("define private void @sysl.trap() cold noinline noreturn"), hosted)
+    assert(hosted.contains("atomicrmw xchg ptr @sysl.trap.busy, i8 1"), hosted)
+    assert(hosted.contains("call void @sysl.trap()"), hosted)
+
+    val board = tfl_ir(TflChecks, Some("thumbv7em-freestanding"))
+
+    assert(board.contains("call void @llvm.trap()"), board)
+    assert(!board.contains("fflush"), board)
+    assert(!board.contains("@sysl.trap"), board)
+end tfl_ir_by_target

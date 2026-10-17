@@ -28,7 +28,8 @@ import sysl.text.{replace_all, Search, split}
 // override that returns -- one that only counts, say -- still stops the program where it was.
 //
 // **On a hosted target the default renders the message itself and writes it to standard error** with
-// one `write`, then traps. It renders its own digits rather than calling `snprintf`, so a program
+// one `write`, then stops through `@sysl.trap`, which flushes standard output and traps
+// (`trap_stop.sysl`). It renders its own digits rather than calling `snprintf`, so a program
 // that formats nothing still links no C formatter -- and `write` is the one thing it asks of libc.
 // **On a freestanding target it returns at once and the trap at the call site stops the program**,
 // exactly as before this existed: there is no standard error to write to. The call is kept rather
@@ -151,7 +152,7 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     args.push(ir_arg(w, n))
     args.push(ir_arg(LPtr, location_of(e, site)))
     emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
-    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
 end bounds_unless
@@ -200,7 +201,7 @@ check_variant(e: *Emit, en: Type, v: Val, site: Span)
 
     val name = llvm_safe(s"sysl.enum.check.${mangle(underlying(en))}")
 
-    request_text(e, name, variant_check_text(name, d.unwrap(), bits, signed, e.word_bits))
+    request_text(e, name, variant_check_text(name, d.unwrap(), bits, signed, e.word_bits, trap_symbol(e)))
 
     var args: Buf[IrArg] = buf()
 
@@ -219,7 +220,8 @@ end every_value_a_variant
 
 // The helper: the membership test at 64 bits, as `E(n)`'s is, so a signed representation compares
 // with its sign; the report through `sysl_bounds_fail` with the value widened to the word; the trap.
-private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, word_bits: int) -> string
+private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, word_bits: int,
+                           stop: string) -> string
     val ext = if signed then "sext" else "zext"
     val word = s"i$word_bits"
 
@@ -254,7 +256,7 @@ private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, 
     val kind = bounds_kind(BoundsNoVariant, signed, false)
 
     text + s"  call void @${bounds_fail_symbol()}(i32 $kind, $word $a, $word 0, $word 0, ptr %at)\n" +
-        s"  call void @${llvm_trap()}()\n" +
+        s"  call void @$stop()\n" +
         "  unreachable\n" +
         "ok:\n" +
         "  ret void\n" +
@@ -387,7 +389,7 @@ bounds_runtime(t: Target) -> string
         s"  %mi = ptrtoint ptr %msg to $word\n" +
         s"  %len = sub $word %fi, %mi\n" +
         s"  %w = call $word @write(i32 2, ptr %msg, $word %len)\n" +
-        "  call void @llvm.trap()\n" +
+        "  call void @sysl.trap()\n" +
         "  unreachable\n" +
         "}\n\n"
 end bounds_runtime

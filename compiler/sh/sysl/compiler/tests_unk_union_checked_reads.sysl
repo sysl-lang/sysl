@@ -36,15 +36,16 @@ private unk_run(text: string, level: string) -> (Status, string, string)
         Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
 end unk_run
 
-// At both levels the program stops on SIGTRAP, having written exactly `said` on standard error. What
-// it printed before is buffered and goes with it, so the valid reads are `unk_valid_passes`'s.
-private unk_traps(text: string, said: string)
+// At both levels the program stops on SIGTRAP, having written exactly `said` on standard error and
+// exactly `printed` on standard output -- a trap flushes what the valid reads before it printed.
+private unk_traps(text: string, printed: string, said: string)
     if !unk_ready() then return
 
     for level in ["0", DefaultOptimization]
         val (state, out, err) = unk_run(text, level)
 
         assert_eq(err, said)
+        assert_eq(out, printed)
         assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
 end unk_traps
 
@@ -111,7 +112,7 @@ unk_bool_traps()
             print(c.on)
             c.raw = 2
             print(c.on)
-        """, "")
+        """, "true\n", "")
 
 @test("an enum field holding no variant's number traps")
 unk_enum_traps()
@@ -121,7 +122,7 @@ unk_enum_traps()
             print(c.m)
             c.raw = 7
             print(c.m)
-        """, "value 7 is not one of the enum's variants (main.sysl:24:13)\n")
+        """, "Mode.On\n", "value 7 is not one of the enum's variants (main.sysl:24:13)\n")
 
 @test("a char field holding a surrogate traps")
 unk_char_traps()
@@ -131,7 +132,7 @@ unk_char_traps()
             print(c.ch)
             c.raw = 0xd800
             print(c.ch)
-        """, "")
+        """, "A\n", "")
 
 @test("a subtype field outside its range traps")
 unk_subtype_traps()
@@ -141,7 +142,7 @@ unk_subtype_traps()
             print(c.s)
             c.raw = 11
             print(c.s)
-        """, "")
+        """, "9\n", "")
 
 @test("a whole struct field is checked part by part, and so is an element of an array field")
 unk_struct_and_array_traps()
@@ -154,7 +155,7 @@ unk_struct_and_array_traps()
             print(c.pair.n)
             val q = c.pair
             print(q.n)
-        """, "")
+        """, "true 5\n5\n", "")
 
     unk_traps(unk_decls + raw"""
         main()
@@ -163,7 +164,7 @@ unk_struct_and_array_traps()
             c.raw = 0x02000001
             print(c.flags[0])
             print(c.flags[3])
-        """, "")
+        """, "true\ntrue\n", "")
 
 @test("a read through a pointer to a union is checked as well")
 unk_through_pointer_traps()
@@ -174,7 +175,7 @@ unk_through_pointer_traps()
             var c = Cell(raw = 3)
             print(c.raw)
             print(peek(&c))
-        """, "")
+        """, "3\n", "")
 
 @test("a read of a valid value passes the check")
 unk_valid_passes()
@@ -204,7 +205,7 @@ unk_any_bits_read_is_a_load()
     assert(raw_body.contains("load i32"), raw_body)
     assert(!raw_body.contains("llvm.trap"), raw_body)
     assert(!raw_body.contains("icmp"), raw_body)
-    assert(on_body.contains("call void @llvm.trap()"), on_body)
+    assert(on_body.contains("call void @sysl.trap()"), on_body)
 
 @test("'ref' may not name a checked field, and may name an AnyBits one")
 unk_ref_to_checked_field_refused()
@@ -283,7 +284,7 @@ unk_value_self_on_checked_field_is_checked()
         main()
             var c = Cell(raw = 2)
             print(c.pair.total())
-        """, "")
+        """, "", "")
 
 private val unk_anon: string = raw"""
     struct Key
@@ -308,7 +309,7 @@ unk_anonymous_checked()
         main()
             var k = Key(tag = 1, raw = 2)
             print(k.down)
-        """, "")
+        """, "", "")
 end unk_anonymous_checked
 
 @test("'ref' may not name a checked field an anonymous union holds")

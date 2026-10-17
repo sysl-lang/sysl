@@ -383,6 +383,9 @@ private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool,
     if e.bounds_fails && !bounds_overridden
         out.push(RtTemplate("sysl.bounds", bounds_runtime(t)))
 
+    // The stop every trap goes through, where there is output to flush first (`trap_stop.sysl`).
+    if e.traps && trap_flushes(t) then out.push(RtTemplate("sysl.trap", trap_runtime()))
+
     out
 end runtime_bundles
 
@@ -668,6 +671,16 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if e.traps then out.push(declared_sig(e,llvm_trap(), ir_fn_type(LVoid, no_params())))
 
+    // What the stop flushes with, at the signature the library's own `extern`s bind it at. A program
+    // exporting `fflush` itself is answered by its own definition.
+    val trap_flushes_here = e.traps && trap_flushes(e.target)
+
+    if trap_flushes_here && !emits_export(p, trap_flush_symbol())
+        var flush_params: Buf[IrParam] = buf()
+
+        flush_params.push(ir_param(LPtr))
+        out.push(declared_sig(e, trap_flush_symbol(), ir_fn_type(l_i32(), flush_params)))
+
     coro_declares(e, &out)
 
     // **The allocating pair is declared only where this module does not define it**: a manifest may
@@ -804,6 +817,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             seen.push(s)
 
     if dispatcher_marks(p) || bounds_prints then seen.push("write")
+    if trap_flushes_here then seen.push(trap_flush_symbol())
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
