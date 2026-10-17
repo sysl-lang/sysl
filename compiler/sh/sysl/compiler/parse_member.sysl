@@ -127,10 +127,21 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
             parse_anonymous_member(p, decl)
         elif at_field(p)
             val vis = parse_visibility(p)
-            var field = parse_field_param(p)
 
-            field.vis = vis
-            decl.fields.push(field)
+            if p.kw_at(1, ":") && p.kw_at(2, "in")
+                parse_zero_width(p, decl, vis)
+            else
+                var field = parse_field_param(p)
+
+                field.vis = vis
+
+                if p.accept_kw("in")
+                    val storage = parse_type(p)
+
+                    decl.bits.push(BitInDecl(field.span.to(p.just_taken()), decl.fields.len(), storage, false))
+                end if
+
+                decl.fields.push(field)
         else
             parse_member_line(p, &decl.members, InType)
 
@@ -142,6 +153,34 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
 
     if !p.accept(Dedent) then p.want("dedent")
 end parse_struct_body
+
+// `_: in S`: C's zero-width bitfield `S : 0`, which holds nothing and moves the next field onto a
+// boundary of `S`. It has no width to write, so its field's type is its declared type, and the
+// record marks it as holding nothing.
+private parse_zero_width(p: *Parser, decl: *StructDecl, vis: Visibility)
+    val start = p.here()
+    val name = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    p.bump()
+    p.expect_kw(":")
+    p.expect_kw("in")
+
+    val storage = parse_type(p)
+    val at = start.to(p.just_taken())
+
+    if name != "_"
+        val c = type_text(storage)
+
+        p.fault(at, s"a zero-width bitfield holds nothing, so it has no name: write '_: in $c', C's '$c : 0'")
+        return
+    end if
+
+    decl.bits.push(BitInDecl(at, decl.fields.len(), storage, true))
+    decl.fields.push(Param(at, name, storage, vis, None, false, false))
+end parse_zero_width
 
 // The body of a `type` declaration: its members, and nothing else. A `new` type's value is its base,
 // so there is no field for a line to declare -- and one written as a field is told so, rather than

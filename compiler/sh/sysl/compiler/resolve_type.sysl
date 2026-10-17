@@ -704,7 +704,7 @@ tuple_type(written: Buf[Type]) -> &StructType
     for i in 0..<ts.len()
         fields.push((str(i), ts.at(i)))
 
-    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false)
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false, buf())
 end tuple_type
 
 // The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
@@ -1598,7 +1598,7 @@ private opaque_c_type(a: &Analysis, key: string) -> Type
 
     if already.is_some() then return already.unwrap()
 
-    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false))
+    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false, buf()))
 
     a.tables.struct_insts.put(key, made)
     made
@@ -1791,7 +1791,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     val made: &StructType = StructType(key, targs, buf(), d.packed,
                                        aligned_to(a, scope, span, written, d.alignment),
                                        exported_c_name(d), d.opaque, d.byte_order, d.guards,
-                                       d.union_layout)
+                                       d.union_layout, buf())
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -1802,10 +1802,21 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // refusal is the arguments', made where they were written (see `applied_bounds`).
     val outer = enter_fields(a, checked)
 
-    for f in d.fields
-        made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        c_bit_written(d, i) match
+            Some(b) ->
+                val storage = resolve_qualified(a, home, b.storage, subst)
+                val value = if b.zero then Unit else resolve_qualified(a, home, f.typ, subst)
+
+                made.fields.push((f.name, value))
+                made.c_bits.push(CBit(i, storage, if b.zero then 0 else c_bit_width(value)))
+            None -> made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
 
     leave_fields(a, outer)
+
+    if !made.c_bits.is_empty() then check_c_bits(a, scope, d, made)
 
     check_bitfields(a, scope, span, made)
     check_byte_order(a, scope, span, made)
@@ -1986,7 +1997,7 @@ end refuse_repeated_tags
 // field of its size. A struct one of whose fields did not resolve has been complained about already,
 // and is left alone.
 private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
-    if !s.packed then return
+    if !s.packed || !s.c_bits.is_empty() then return
 
     val stored = s.stored()
     var narrow = false

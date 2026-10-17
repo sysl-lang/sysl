@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **C bitfields, `name: T in S`** (`c_bitfields.sysl`; `docs/design/bitfields.md`): the parser and
+// the printer, the field rule's refusals each in its own words at its own line and column, what a
+// struct with C bitfields already does -- its size, its boundary, its other fields' offsets, reads
+// and writes -- and the uses of one that are refused until they are built. The layout itself is
+// checked against clang by `tests_cbl_c_bitfield_layout.sysl`.
+
+private cbf_ready() -> bool = std_root().is_ok() && clang_available()
+
+private cbf_run(text: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-cbf").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end cbf_run
+
+private cbf_prints(text: string, printed: string)
+    if !cbf_ready() then return
+
+    val (state, out, err) = cbf_run(text)
+
+    assert_eq(err, "")
+    assert_eq(out, printed)
+    assert(state == Status.Exited(0), s"stopped with $state")
+end cbf_prints
+
+private cbf_refused(text: string, message: string, line: int, col: int)
+    if !cbf_ready() then return
+
+    val (_, _, err) = cbf_run(text)
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end cbf_refused
+
+// -- the parser and the printer -------------------------------------------------------------------
+
+@test("'name: T in S' and '_: in S' parse, and print as written")
+cbf_parse_and_print()
+    assert_eq(pf("struct T\n    en: volatile u1 in u32\n    _: u4 in u32\n    _: in u32\n    n: u8\n"),
+              "(struct T (en:volatile u1 in u32 _:u4 in u32 _:in u32 n:u8))")
+    assert_eq(pf("union U\n    a: u3 in u32\n    b: u32\n"), "(union U (a:u3 in u32 b:u32))")
+
+@test("a zero-width bitfield has no name")
+cbf_named_zero_width_refused()
+    assert_eq(pf_err("struct T\n    z: in u32\n"),
+              "a zero-width bitfield holds nothing, so it has no name: write '_: in u32', C's 'u32 : 0'")
+    assert_eq(pf_at("struct T\n    z: in u32\n"), "2:5")
+
+// -- what is built --------------------------------------------------------------------------------
+
+@test("size, boundary and the other fields' offsets are C's, and those fields are read and written")
+cbf_layout_and_ordinary_fields()
+    cbf_prints(raw"""
+        struct Beside
+            a: u3 in u32
+            c: u8
+            b: u5 in u32
+
+        struct ZeroAlign
+            a: i8
+            _: in i32
+            b: i8
+
+        @packed
+        struct Packed2
+            c: u8
+            b: u20 in u32
+            d: u40 in u64
+
+        struct Holder
+            t: u8
+            s: Beside
+
+        union UB
+            a: u3 in u32
+            b: u8
+
+        @assert(sizeof(Beside) == 4 && alignof(Beside) == 4 && offsetof(Beside, c) == 1, "beside")
+        @assert(sizeof(ZeroAlign) == 5 && alignof(ZeroAlign) == 1 && offsetof(ZeroAlign, b) == 4, "zero")
+        @assert(sizeof(Packed2) == 9 && alignof(Packed2) == 1, "packed2")
+        @assert(sizeof(Holder) == 8 && offsetof(Holder, s) == 4, "a holder places it on its boundary")
+        @assert(sizeof(UB) == 4 && alignof(UB) == 4, "union")
+
+        main()
+            var h: Holder
+            var z: ZeroAlign
+            var hs: [2]Holder
+
+            z.b = 7
+            h.t = 3
+            h.s.c = 9
+            hs[1].s.c = 20
+            print(int(h.s.c) + int(h.t) + int(z.b) + int(z.a) + int(hs[1].s.c) + int(hs[0].s.c))
+        """, "39\n")
+
+// -- the field rule -------------------------------------------------------------------------------
+
+@test("the declared type is an integer of 8, 16, 32 or 64 bits, or 'bool'")
+cbf_storage_refused()
+    cbf_refused("struct S\n    a: u3 in f32\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is u3 in f32 — the type a bitfield is declared with is the unit C allocates it in: " +
+                "an integer of 8, 16, 32 or 64 bits, or 'bool'", 2, 5)
+    cbf_refused("struct S\n    a: u3 in u24\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is u3 in u24 — the type a bitfield is declared with is the unit C allocates it in: " +
+                "an integer of 8, 16, 32 or 64 bits, or 'bool'", 2, 5)
+
+@test("a bitfield holds an integer, a simple enum or 'bool'")
+cbf_value_refused()
+    cbf_refused("struct S\n    a: f32 in u32\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is f32 — a bitfield holds an integer, a simple enum or 'bool'", 2, 5)
+
+@test("a bitfield fits in its declared type")
+cbf_width_refused()
+    cbf_refused("struct S\n    x: u8\n    a: u9 in u8\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is u9 in u8 — 9 bits do not fit in u8's 8", 3, 5)
+
+@test("a bitfield's signedness is its declared type's")
+cbf_signedness_refused()
+    cbf_refused("struct S\n    a: i3 in u32\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is i3 in u32 — a bitfield is read with its declared type's signedness, so a signed " +
+                "field is declared in a signed type: 'a: i3 in i32'", 2, 5)
+    cbf_refused("struct S\n    a: u3 in i16\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is u3 in i16 — a bitfield is read with its declared type's signedness, so an unsigned " +
+                "field is declared in an unsigned type: 'a: u3 in u16'", 2, 5)
+
+@test("a field declared 'bool' holds a 'bool'")
+cbf_bool_storage_refused()
+    cbf_refused("struct S\n    a: u1 in bool\n\nmain()\n    print(sizeof(S))\n",
+                "'S.a' is u1 in bool — a field declared 'bool' (C's '_Bool') holds a 'bool': 'a: bool in bool'", 2, 5)
+
+@test("'@byte_order' is refused on a struct with C bitfields")
+cbf_byte_order_refused()
+    cbf_refused("@byte_order(big)\nstruct S\n    x: u8\n    a: u3 in u32\n\nmain()\n    print(sizeof(S))\n",
+                "'S' is '@byte_order(big)' and 'S.a' is a C bitfield — the order applies to whole integers, " +
+                "and C has no portable spelling for a bitfield stored the other way round", 4, 5)
+
+@test("a '@packed' struct does not mix C bitfields with today's narrow fields")
+cbf_mixed_models_refused()
+    cbf_refused("@packed\nstruct S\n    a: u3 in u32\n    b: u5\n\nmain()\n    print(sizeof(S))\n",
+                "'S.b' is u5, narrower than a byte, in a '@packed' struct with C bitfields — a '@packed' " +
+                "struct with such a field is one integer, and the two models do not mix in one struct: " +
+                "declare it as C does, 'b: u5 in <C type>'", 4, 5)
+
+@test("a struct with C bitfields holds nothing that carries a count")
+cbf_counted_refused()
+    cbf_refused("struct S\n    a: u3 in u32\n    s: string\n\nmain()\n    print(sizeof(S))\n",
+                "'S.s' is string, which carries a count, and 'S' has C bitfields — a struct with C bitfields " +
+                "is laid out as C lays its counterpart out, and C holds nothing that carries a count", 3, 5)
+
+@test("'offsetof' a C bitfield is refused: it has no byte offset")
+cbf_offsetof_refused()
+    cbf_refused("struct S\n    x: u8\n    a: u3 in u32\n\nmain()\n    print(offsetof(S, a))\n",
+                "'S.a' is a bitfield — it starts at bit 8 of the struct and is 3 bits wide, so it has no byte " +
+                "offset. 'offsetof' answers in bytes, and the byte it begins in is not where it is", 6, 11)
+
+// -- refused until they are built -----------------------------------------------------------------
+
+private cbf_unread(field: string) -> string =
+    s"'S.$field' is a C bitfield, and reading or writing one is not yet built — its struct is laid out " +
+    "as C lays it out, and the struct's other fields are reached as usual"
+
+@test("a read and a write of a C bitfield are refused until they are built")
+cbf_read_write_refused()
+    cbf_refused("struct S\n    a: u3 in u32\n    b: u8\n\nmain()\n    var s: S\n    print(s.a)\n",
+                cbf_unread("a"), 7, 13)
+    cbf_refused("struct S\n    a: u3 in u32\n    b: u8\n\nmain()\n    var s: S\n    s.a = 1\n    print(s.b)\n",
+                cbf_unread("a"), 7, 7)
+
+@test("building one field by field is refused until it is built")
+cbf_construction_refused()
+    cbf_refused("struct S\n    a: u3 in u32\n    b: u8\n\nmain()\n    val s = S(a = 1, b = 2)\n    print(s.b)\n",
+                "'S' has C bitfields, and building one field by field is not yet built for such a struct", 6, 13)
+
+@test("a pattern over one is refused until it is built")
+cbf_pattern_refused()
+    cbf_refused("struct S\n    a: u3 in u32\n    b: u8\n\nmain()\n    var s: S\n    val S(a, b) = s\n    print(b)\n",
+                "'S' has C bitfields, and binding its fields by a pattern is not yet built for such a struct", 7, 5)
+
+@test("a derived trait is refused until reads are built")
+cbf_derive_refused()
+    cbf_refused("struct S derives Eq\n    a: u3 in u32\n    b: u8\n\nmain()\n    var s: S\n    print(s.b)\n",
+                "a derived 'Eq' reads every field, and 'S' has C bitfields, whose reads are not yet built", 1, 18)
+
+@test("by value at a C boundary is refused until it is built")
+cbf_c_boundary_refused()
+    cbf_refused("struct S\n    a: u3 in u32\n\nextern take(s: S)\n\nmain()\n    var s: S\n    take(s)\n",
+                "'S' has C bitfields, and passing it by value to the 'extern' 'take' is not yet built for such " +
+                "a struct — pass its address, as a '*S'", 4, 1)
+    cbf_refused("struct S\n    a: u3 in u32\n\n@export(\"give\")\ngive() -> S\n    var s: S\n    s\n\n" +
+                "main()\n    print(sizeof(S))\n",
+                "'S' has C bitfields, and returning it by value from the exported 'give' is not yet built for " +
+                "such a struct — pass its address, as a '*S'", 4, 1)

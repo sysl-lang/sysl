@@ -51,6 +51,32 @@ enum Cpu
     Craft
 end Cpu
 
+// How a target's C compiler allocates bitfields (`c_bitfields.sysl`; `docs/design/bitfields.md` §3,
+// measured with clang on every triple). `BfItanium` is the generic rule: a field goes at the next
+// free bit unless its declared type's unit there cannot hold it, and only a named field raises the
+// struct's boundary. `BfAapcs` is the same but for that last point: an unnamed and a zero-width field
+// raise it too -- every Arm target but Apple's. `BfMsvc` is Windows' own algorithm: a unit per run
+// of fields whose declared types have one size, never straddled.
+enum BitfieldRule
+    BfItanium
+    BfAapcs
+    BfMsvc
+end BitfieldRule
+
+// The rule a target's C compiler lays bitfields out by. CRAFT has no C compiler to measure and
+// follows the generic rule; i386 follows it too, its difference being only the 4-byte boundary of an
+// 8-byte integer inside a struct (`TargetLayout.unit_align_cap`).
+bitfield_rule_of(os: Os, cpu: Cpu) -> BitfieldRule
+    if os == Windows then return BfMsvc
+    if cpu == Thumb || (cpu == Aarch64 && os != MacOS) then return BfAapcs
+
+    BfItanium
+end bitfield_rule_of
+
+// The boundary an integer's alignment inside a struct stops at, where the C ABI caps it below its
+// size: 4 on i386, which aligns `long long` to four bytes in a struct; 0 where nothing caps it.
+struct_int_align_cap(cpu: Cpu) -> usize = if cpu == X86 then 4 else 0
+
 // What an operating system is called where a *source file* names one.
 //
 // The same words a `__<os>__` directory selects on, because `#if linux` and `__linux__/` are one

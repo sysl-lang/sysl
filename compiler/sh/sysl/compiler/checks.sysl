@@ -839,6 +839,24 @@ private check_struct_export(a: &Analysis, key: string, at: Decl, d: StructDecl, 
 end check_struct_export
 
 // Refuses an export whose symbol C could not name, or whose function C could not call.
+// A struct with C bitfields by value across an export: how C passes one is not built yet.
+private check_export_c_bits(a: &Analysis, key: string, f: Func, e: ExportAttr)
+    val name = qualified_name(key)
+
+    for item in f.decl.params
+        val t = signature_type(a, f.decl.needs, f.scope, item.typ, no_bindings())
+
+        if has_c_bits(t)
+            a.fault(f.scope, e.span, c_bits_by_value(t, s"passing it by value to the exported '$name'"))
+            return
+        end if
+
+    val ret = declared_result_type(f.decl.ret_type.map(t -> signature_result(a, f.decl.needs, f.scope,
+                                                                             t, no_bindings())))
+
+    if has_c_bits(ret) then a.fault(f.scope, e.span, c_bits_by_value(ret, s"returning it by value from the exported '$name'"))
+end check_export_c_bits
+
 private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
     if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
         a.fault(f.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can call — an exported " +
@@ -881,6 +899,8 @@ private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
     // about a symbol. A private export keeps the name file-private and publishes the symbol hidden,
     // for the linker of the image it lands in -- module `asm` or a package's own C calling back in
     // (`emit_export.sysl`).
+
+    if f.decl.tparams.is_empty() then check_export_c_bits(a, key, f, e)
 
     if f.decl.ghost then
         a.fault(f.scope, e.span, s"'${qualified_name(key)}' is '@ghost', so it is erased before " +

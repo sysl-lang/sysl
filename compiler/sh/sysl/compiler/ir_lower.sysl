@@ -114,6 +114,7 @@ struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
     val word_bits = int(l.word_bits)
     var fields: Buf[LType] = buf()
 
+    if !d.c_bits.is_empty() then return c_bits_type_def(d, l)
     if d.union_layout then return Some(union_type_def(d, l))
 
     bitfield_ranges(d) match
@@ -174,6 +175,94 @@ private union_type_def(d: &StructType, l: TargetLayout) -> IrTypeDef
     IrTypeDef(name, fields, d.packed)
 end union_type_def
 
+// A struct with C bitfields, as packed bytes at the offsets C gives them (`c_bitfields.sysl`): each
+// ordinary field as itself, each run of bitfields between them as one element covering the bytes the
+// run's bits touch -- an `iN` where that is 1, 2, 4 or 8 bytes, bytes otherwise -- and every gap and
+// the tail written out, so LLVM's offsets and size are C's. Units of the declared types overlap one
+// another and the ordinary fields (`char a; int b:5` puts `b` in the `int` at byte 0), so a unit is
+// what a read loads, not what the type is built of. A union's fields all begin at byte 0, so its
+// definition is the bytes of its size. The boundary is stated where storage is made, and every
+// holder writes its gaps out (`TargetLayout.raises`).
+private c_bits_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
+    val name = s"%struct.${mangled(d.base, d.targs)}"
+    val total = l.size(Struct(d))
+
+    if d.union_layout
+        var bytes: Buf[LType] = buf()
+
+        bytes.push(gap_lty(total))
+        return Some(IrTypeDef(name, bytes, true))
+    end if
+
+    c_bits_elements(d, l) match
+        Some(parts) -> Some(IrTypeDef(name, parts.0, true))
+        None -> None
+end c_bits_type_def
+
+// The elements of a struct with C bitfields, and where each declared field landed among them: its
+// element's index, or -1 for a bitfield, which is reached through its unit rather than an element.
+c_bits_elements(d: &StructType, l: TargetLayout) -> Option[(Buf[LType], Buf[int])]
+    val c = c_bitfield_layout(l, d)
+    val word_bits = int(l.word_bits)
+    val total = l.size(Struct(d))
+    var out: Buf[LType] = buf()
+    var index: Buf[int] = buf()
+    var at: usize = 0
+    var run_from = -1
+    var run_to = 0
+
+    for i in 0..<d.fields.len()
+        val p = c.places.at(i)
+
+        if p.is_bit
+            if p.width > 0
+                if run_from < 0 then run_from = p.bit
+
+                if p.bit + p.width > run_to then run_to = p.bit + p.width
+            end if
+
+            index.push(-1)
+            continue
+        end if
+
+        if run_from >= 0
+            at = c_run_into(&out, at, run_from, run_to)
+            run_from = -1
+        end if
+
+        if p.unit_bytes == 0
+            index.push(-1)
+            continue
+        end if
+
+        if p.unit > at then out.push(gap_lty(p.unit - at))
+
+        index.push(int(out.len()))
+
+        type_lty(d.fields.at(i).1, word_bits) match
+            Some(t) -> out.push(t)
+            None -> return None
+
+        at = p.unit + p.unit_bytes
+
+    if run_from >= 0 then at = c_run_into(&out, at, run_from, run_to)
+    if total > at then out.push(gap_lty(total - at))
+
+    Some((out, index))
+end c_bits_elements
+
+// Writes the bytes bits `from` up to `to` touch, after any gap, and answers where they end.
+private c_run_into(out: *Buf[LType], at: usize, from: int, to: int) -> usize
+    val first = usize(from / 8)
+    val past = usize(to + 7) / 8
+    val n = past - first
+
+    if first > at then out.push(gap_lty(first - at))
+
+    out.push(if n == 1 || n == 2 || n == 4 || n == 8 then LInt(int(n) * 8) else gap_lty(n))
+    past
+end c_run_into
+
 // -- the gaps a raised boundary writes out -------------------------------------------------------
 //
 // A struct whose `@align(n)` asks for more than its fields give it is laid out by `TargetLayout` with
@@ -197,7 +286,7 @@ end Gaps
 // A struct's gaps, where it holds a raised boundary. A bitfield struct's one integer sits at zero
 // and takes what LLVM allocates for it.
 struct_gaps(l: TargetLayout, d: &StructType) -> Option[Gaps]
-    if d.union_layout || !l.struct_holds_raised(d) then return None
+    if d.union_layout || !d.c_bits.is_empty() || !l.struct_holds_raised(d) then return None
 
     var offsets: Buf[usize] = buf()
     var sizes: Buf[usize] = buf()
@@ -315,8 +404,37 @@ end gapped_values
 
 // The index of a struct's `k`th stored field.
 // Every field of a union is element 0, whose address is the union's own.
-struct_field_index(l: TargetLayout, d: &StructType, k: usize) -> int =
+struct_field_index(l: TargetLayout, d: &StructType, k: usize) -> int
+    if !d.c_bits.is_empty() then return c_bits_field_index(l, d, k)
+
     if d.union_layout then 0 else llvm_index(struct_gaps(l, d), k)
+end struct_field_index
+
+// The element an ordinary field of a struct with C bitfields is, from its stored position. -1 is a
+// bitfield, which has no element of its own.
+private c_bits_field_index(l: TargetLayout, d: &StructType, k: usize) -> int
+    if d.union_layout then return 0
+
+    val i = stored_to_declared(d.fields, k)
+
+    c_bits_elements(d, l) match
+        Some(parts) -> parts.1.at(i)
+        None -> -1
+end c_bits_field_index
+
+// Which declared field the `k`th stored one is: the stored ones skip what takes no room.
+private stored_to_declared(fields: Buf[(string, Type)], k: usize) -> usize
+    var n: usize = 0
+
+    for i in 0..<fields.len()
+        if !zero_sized(fields.at(i).1)
+            if n == k then return i
+
+            n += 1
+        end if
+
+    k
+end stored_to_declared
 
 // The index of a variant payload's `k`th stored field.
 variant_field_index(l: TargetLayout, v: EnumVariant, k: usize) -> int = llvm_index(variant_gaps(l, v), k)
