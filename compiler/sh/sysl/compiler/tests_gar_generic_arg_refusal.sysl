@@ -124,3 +124,48 @@ gar_correct_call_runs()
         Err(_) -> assert(false, "the program that was built could not be run")
         Ok(out) -> assert(out.text == "7\n3\n7\ns\n", s"expected '7\\n3\\n7\\ns\\n', got: ${out.text}")
 end gar_correct_call_runs
+
+// A generic body its own reading refused is reported there, once: an instantiation of it adds no
+// consequence of the same mistake in terms of the type it was made at. A body that reads fine and
+// is broken only by one particular type is still reported at that instantiation.
+
+private gar_field_message() -> string =
+    "'T' is a type parameter, so it has no fields to read — a field is layout, and no trait " +
+    "declares a property 'b' that a bound could promise instead"
+
+@test("a field read off a type parameter is refused at the body, not again at the call")
+gar_refused_body_field()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "pick[T](x: T) -> int = x.b\n\nmain()\n    print(pick(P(1)))\n",
+             gar_field_message(), "6:26")
+
+@test("and inside a generic call's argument in that body")
+gar_refused_body_field_in_call()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "pick[T](x: T) -> int = take(x.b, 1)\n\nmain()\n    print(pick(P(1)))\n",
+             gar_field_message(), "6:31")
+
+@test("a method called on a type parameter is refused at the body, not again at the call")
+gar_refused_body_method()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "pick[T](x: T) -> int = x.nope()\n\nmain()\n    print(pick(P(1)))\n",
+             "no trait declares a method 'nope', so no bound on 'T' could license this call", "6:26")
+
+@test("two instantiations at different types still leave one diagnostic")
+gar_refused_body_two_types()
+    if gar_skip() then return
+
+    gar_once(gar_struct() + "struct Q\n    b: int\n\npick[T](x: T) -> int = x.b\n\n" +
+             "main()\n    print(pick(P(1)))\n    print(pick(Q(2)))\n",
+             gar_field_message(), "9:26")
+
+@test("a body that reads fine is still refused at the one instantiation that breaks it")
+gar_instantiation_only()
+    if gar_skip() then return
+
+    gar_once("struct Node\n    r: &int\n\nfixed[K](witness: K) -> usize\n    var storage: [16]K\n" +
+             "    storage.len\n\nmain()\n    print(fixed(1))\n    print(fixed(Node(5)))\n",
+             "[16]Node has no zero value, so 'storage' needs an initial value", "5:5")
