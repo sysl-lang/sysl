@@ -506,6 +506,10 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bo
         Some(u) -> out.push(u)
         None -> ()
 
+    frame_pointer(t) match
+        Some(f) -> out.push(f)
+        None -> ()
+
     if !os_hosted(t.os) || libcalls then out.push("\"no-builtins\"")
 
     val sanitizers = sanitizer_attrs(flags)
@@ -535,6 +539,17 @@ unwind_table(t: Target) -> Option[string] = t.triple match
     "aarch64-linux-android24" -> Some("uwtable")
     "x86_64-unknown-none-elf" -> Some("uwtable")
     "i386-unknown-linux-gnu" -> Some("uwtable")
+    _ -> None
+
+// The frame pointer a hosted triple's C keeps, as clang's own attribute: a frame record on every
+// function that calls another, which is what a platform's ABI promises (Apple's and AArch64 Linux's)
+// and what a profiler, a crash report and a debugger walk the stack by. Without it a sampled sysl
+// program is a flat list of leaves. A bare-metal target is left as it was, its frame register its own.
+frame_pointer(t: Target) -> Option[string] = if !os_hosted(t.os) then None else t.triple match
+    "arm64-apple-macosx" -> Some("\"frame-pointer\"=\"non-leaf\"")
+    "x86_64-apple-macosx" -> Some("\"frame-pointer\"=\"all\"")
+    "aarch64-unknown-linux-gnu" -> Some("\"frame-pointer\"=\"non-leaf\"")
+    "aarch64-linux-android24" -> Some("\"frame-pointer\"=\"non-leaf\"")
     _ -> None
 
 // The text clang is handed for a module built for `t`: every definition marked with the function
