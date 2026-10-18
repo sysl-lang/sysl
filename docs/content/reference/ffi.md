@@ -871,7 +871,9 @@ fills it at all. Leaving the value off starts it at zero, which is constant data
 ```sysl
 module mylib
 
-counter() -> i32 = 7
+var seed: i32 = 7
+
+counter() -> i32 = seed
 
 @export
 var start: i32 = counter()
@@ -1146,11 +1148,11 @@ print(A.v)
 'A' cannot be initialized: its value needs 'B', whose value needs 'A' — computed module storage runs once before anything else does, so what it needs has to be settled first
 ```
 
-**A call is constant data only when it calls a
-[`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant
-arguments, which the compiler runs while compiling. Any other call is module storage whatever it is
-called with — `val start: i32 = counter()` below is storage even where `counter` is `= 7`, because
-nothing marked it as code the compiler may run.
+**A call is constant data when the compiler can run it while compiling**: its arguments are
+constant, and its body — and everything it calls — holds only what exists while compiling. No mark
+is needed; a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is
+one that promises it. A call that reaches storage filled at run time, I/O or the heap is module
+storage — `val start: i32 = counter()` below is storage because `counter` reads a `var`.
 
 **The value laid down is the value the same initializer computes at run time, and where the two
 could differ it is not laid down.** An integer operation whose result its type does not hold, a
@@ -1177,7 +1179,9 @@ walk is transitive:
 ```sysl build=c target=thumbv7em-freestanding
 module mylib
 
-counter() -> i32 = 7
+var seed: i32 = 7
+
+counter() -> i32 = seed
 
 val start: i32 = counter()
 

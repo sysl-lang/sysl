@@ -1752,30 +1752,18 @@ const n: Even = 4
 
 **A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
 arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
-a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** whose
-arguments are constant expressions. Integers, floats, `bool` and `char` fold, and a `string` constant
-is a **literal** or a `const` function's call — `const LABEL: string = label(3)` — which builds the
-string the same call builds when the program runs.
-
-**A call to any other function is refused:**
-
-```sysl
-size() -> int = 4
-
-const called: int = size()
-
-print(called)
-```
-
-```error
-the value of 'called' is not a constant expression — 'size' is not 'const', so it runs only when the program does; mark it 'const' to call it here
-```
-
-A `const` function is the one kind of code the compiler runs while it compiles, so marking it is
-all the call needs:
+a function whose body can run while compiling**, with arguments that are constant expressions. No
+mark is needed for that: a
+[`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is one that
+*promises* it, and any other function is run where its body turns out to hold only what exists
+while compiling. Integers, floats, `bool` and `char` fold, and a `string` constant is a **literal**
+or such a call — `const LABEL: string = label(3)` — which builds the string the same call builds
+when the program runs.
 
 ```sysl
-const size() -> int = 4
+import sysl.math.max
+
+size() -> int = max(3, 4)
 
 const called: int = size()
 
@@ -1786,6 +1774,23 @@ print(called)
 4
 ```
 
+**A call whose body reaches something that exists only when the program runs is refused**, and
+the refusal follows the calls down to it:
+
+```sysl
+size() -> int
+    print("asked")
+    4
+
+const called: int = size()
+
+print(called)
+```
+
+```error
+'called' cannot be computed while compiling: it calls 'size', which prints, which is outside the program — nothing outside the program exists while compiling
+```
+
 **The call is run, not guessed at.** The compiler runs the function's body over the arguments, at
 the target's widths — a `usize` wraps at 32 bits when the target's `usize` is 32 bits — with every
 integer operation wrapping as it does at run time and every `f32` operation rounded as it is at run
@@ -1794,7 +1799,7 @@ initialized by such a call is laid into the object file as data on every target,
 one included, rather than computed before the program's statements:
 
 ```sysl
-const fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
 
 static val V: int = fact(10)
 

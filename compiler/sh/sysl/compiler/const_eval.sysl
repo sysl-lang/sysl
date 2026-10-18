@@ -70,11 +70,19 @@ struct ConstEvaluation
     // That reason for each piece of module storage whose initializer stayed code because of it, by
     // symbol: what a freestanding artifact's refusal of the storage tells its reader.
     val_stops: Map[string, string]
+
+    // What each function nobody marked `const` was found to hold, by name: the reason it cannot run
+    // while compiling, or empty where it can (`const_check.sysl`'s `evaluable_refusal`).
+    unmarked: Map[string, string]
+
+    // How many folds are under way that only ask whether a value can be had -- a module `val` read
+    // from inside a run -- so a call that cannot run says nothing: the run asking is what reports.
+    asking: usize
 end ConstEvaluation
 
 // An evaluator that has evaluated nothing.
 const_evaluation() -> &ConstEvaluation =
-    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map())
+    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map(), map(), 0)
 
 // -- the seams ---------------------------------------------------------------------------------------
 
@@ -89,7 +97,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
 
     val written = callee_word(callee)
 
-    if written.is_none() || !names_const_fn(cx.an, written.unwrap()) then return None
+    if written.is_none() then return None
 
     val ev = cx.an.evaluation
 
@@ -108,6 +116,8 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
 
     val refused = ev.failed.get(key)
 
+    if refused.is_some() && ev.asking > 0 then return None
+
     if refused.is_some()
         cx.fault(e.span, refused.unwrap())
         cx.an.const_refusals += 1
@@ -119,7 +129,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TCall(name, _, _, _) -> if !cx.an.tables.const_fns.has(name) then return None
+        TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
         _ -> return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
@@ -133,6 +143,9 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             out
         EvFail(message, _) ->
             ev.failed.put(key, message)
+
+            if ev.asking > 0 then return None
+
             cx.fault(e.span, message)
             cx.an.const_refusals += 1
             None
@@ -267,8 +280,8 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
         _ -> Ok(None)
 end const_val_run
 
-// What a `const` initializer that calls a function owes its reader, where the function is not
-// `const`: the advice to mark it. Empty where the initializer is anything else.
+// What a `const` initializer that calls a function owes its reader, where that function cannot run
+// while compiling: what in its body stops it. Empty where the initializer is anything else.
 const_call_advice(cx: &Analyzer, e: Expr) -> string
     val callee = *e.kind match
         Call(c, _) -> c
@@ -284,10 +297,11 @@ const_call_advice(cx: &Analyzer, e: Expr) -> string
 
     *typed.unwrap().kind match
         TCall(name, _, _, _) ->
-            if cx.an.tables.funcs.has(name) && !cx.an.tables.const_fns.has(name) then
-                s" — '${written.unwrap()}' is not 'const', so it runs only when the program does; " +
-                "mark it 'const' to call it here"
-            else ""
+            if !cx.an.tables.funcs.has(name) then return ""
+
+            evaluable_refusal(cx.an, name) match
+                Some(why) -> s" — '${written.unwrap()}' ${if why.starts_with("it ") then why[3..] else why}"
+                None -> ""
         _ -> ""
 end const_call_advice
 
@@ -299,43 +313,17 @@ private callee_word(callee: Expr) -> Option[string] = *callee.kind match
     Field(_, n, _) -> Some(n)
     _ -> None
 
-// Whether some `const` function is spelled `word` -- the cheap question asked before anything is
-// typed, so a constant that calls nothing marked pays nothing.
-private names_const_fn(a: &Analysis, word: string) -> bool
-    for i in 0..<a.tables.const_fns.len()
-        if spelled_word(a.tables.const_fns.key_at(i)) == word then return true
+// Whether a call names a function the evaluator may try to run: one with a body, marked or not. An
+// `extern` has none here, and a constant that calls one is the fold's to refuse.
+private runs_while_compiling(a: &Analysis, name: string) -> bool =
+    a.tables.funcs.has(name) || a.tables.members.func_origin.has(name) ||
+        a.tables.members.eval_insts.has(name)
 
-    false
-end names_const_fn
-
-// The name a key was written as: the module and any owning type in front of it dropped, and an
-// overload's number after it.
-private spelled_word(key: string) -> string
-    var end_at = key.bytes.len
-    var start: usize = 0
-
-    // An overload's slot is a dot and digits on the end.
-    var i = key.bytes.len
-
-    while i > 0 && key.bytes[i - 1] >= u8('0') && key.bytes[i - 1] <= u8('9')
-        i -= 1
-
-    if i > 0 && i < key.bytes.len && key.bytes[i - 1] == u8('.') then end_at = i - 1
-
-    for j in 0..<end_at
-        val b = key.bytes[j]
-
-        if b == u8('$') || b == u8('.') then start = j + 1
-
-    key[start..<end_at]
-end spelled_word
-
-// Whether a written expression calls something spelled as a `const` function anywhere in it.
+// Whether a written expression calls anything anywhere in it -- the cheap question asked before
+// anything is typed, so a constant that calls nothing pays nothing.
 private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
     Call(c, args) ->
-        val w = callee_word(c)
-
-        if w.is_some() && names_const_fn(a, w.unwrap()) then return true
+        if callee_word(c).is_some() then return true
 
         for arg in args
             if mentions_const_call(a, arg) then return true
@@ -359,7 +347,7 @@ private calls_const_fn(a: &Analysis, t: TExpr) -> bool
     val sink = &found
 
     walk_texpr(t, expr_walk(true, x -> *x.kind match
-        TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        TCall(name, _, _, _) -> if runs_while_compiling(a, name) then sink.push(true)
         TGlobal(symbol, _, writable) -> if !writable && a.tables.vals.has(symbol) then sink.push(true)
         _ -> ()))
 
@@ -440,14 +428,14 @@ private trial_body(a: &Analysis, name: string) -> Option[TFunc]
     val covers = a.tables.body_covers.len()
     var typed: Option[TFunc] = None
     val f = a.tables.funcs.get(name)
-    val inst = a.tables.members.const_insts.get(name)
+    val inst = a.tables.members.eval_insts.get(name)
 
     if f.is_some()
         val d = f.unwrap()
 
         typed = Some(analyze_body(a, d.scope, d.span, with_call_bounds(d.decl), name))
     else if inst.is_some()
-        // An instantiation of a generic `const` function, read at the terms it was made at. Its
+        // An instantiation of a generic function, read at the terms it was made at. Its
         // signature is filed again for the reading, since the trial that asked for it took it back.
         val (job, sig) = inst.unwrap()
         val filed = a.tables.members.func_insts.has(name)
@@ -2029,7 +2017,11 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
             None -> refuse_form(r, at, s"'$shown' is filled when the program runs")
     end if
 
+    ev.asking += 1
+
     val folded = const_fold(analyzer_for(r.a, d.unwrap().scope), d.unwrap().init.unwrap())
+
+    ev.asking -= 1
 
     // **An initializer the untyped fold cannot settle is run**, as a whole value's is: `B + 1` over
     // another `val B` reads `B` through here in turn, where the fold knows only a `const`'s name.
@@ -2462,6 +2454,35 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
     run_call(r, at, name, vals)
 end call
 
+// The declaration an instantiation was made from, which is what a reader wrote.
+private callee_origin(a: &Analysis, name: string) -> string =
+    a.tables.members.func_origin.get(name).unwrap_or(name)
+
+// A function's body typed for the evaluation, once, and kept -- or `None` where it has none here, or
+// where typing it needs the value being worked out.
+evaluation_body(a: &Analysis, name: string) -> Option[&TFunc]
+    val ev = a.evaluation
+    val kept = ev.bodies.get(name)
+
+    if kept.is_some() then return kept
+
+    for item in ev.typing
+        if item == name then return None
+
+    ev.typing.push(name)
+
+    val typed = trial_body(a, name)
+
+    ev.typing.truncate(ev.typing.len() - 1)
+
+    if typed.is_none() then return None
+
+    val kept_now: &TFunc = typed.unwrap()
+
+    ev.bodies.put(name, kept_now)
+    Some(kept_now)
+end evaluation_body
+
 // The body a call names, typed for the evaluation once and kept.
 @noinline
 private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
@@ -2472,17 +2493,17 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
 
     val caller = if r.frames.len() > 1 then s"'${qualified_name(running(r).func)}'" else "it"
 
-    // A struct's `invariant` clauses are a function the compiler made from them, and run wherever a
-    // value of the struct is made -- so they run here too.
-    if !r.a.tables.const_fns.has(name) && !name.ends_with(s"${ModuleSep}inv")
-        refuse_form(r, at, s"$caller calls '${qualified_name(name)}', which is not 'const'")
-        return None
-    end if
+    // A function nobody marked runs where its body can. A struct's `invariant` clauses are a
+    // function the compiler made from them, and run wherever a value of the struct is made -- so they
+    // run here too.
+    if !name.ends_with(s"${ModuleSep}inv")
+        val why = evaluable_refusal(r.a, name)
 
-    if r.a.tables.members.func_origin.has(name) && !r.a.tables.members.const_insts.has(name)
-        refuse_form(r, at, s"'${qualified_name(name)}' is an instance of a generic 'const' function, and " +
-                    "those are not evaluated while compiling yet")
-        return None
+        if why.is_some()
+            refuse_form(r, at, s"$caller calls '${qualified_name(callee_origin(r.a, name))}', " +
+                        chained_reason(why.unwrap()))
+            return None
+        end if
     end if
 
     // The loop is found inside the reading of the body, which is a trial whose complaints are taken

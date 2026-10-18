@@ -244,25 +244,40 @@ cfn_const_is_pure()
 
 // -- what it may not do ----------------------------------------------------------------------------
 
-@test("a 'const' function may not call one that is not")
-cfn_refuses_a_call_to_an_unmarked_function()
+// The mark is a promise about the body, so a callee nobody marked is no reason to refuse: its own
+// body is held to the same rules, and the refusal follows the calls down to what stops them.
+@test("a 'const' function may call one that is not marked, where that one's body can run")
+cte_a_call_to_an_unmarked_function()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("noisy(x: int) -> int = x + 1\n\nconst f(x: int) -> int = noisy(x)\n\n" +
-                          "print(f(1))\n"),
-                cfn_f("it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this " +
-                      "at run time"), "3:26")
+    assert_eq(enm_ran("plain(x: int) -> int = x + 1\n\nconst f(x: int) -> int = plain(x)\n\n" +
+                      "print(f(1))\n"), "2\n")
 
-// The standard library is unmarked until the self-hosted compiler compiles it, so the advice cannot
-// be to mark the callee.
-@test("nor one of the standard library's, which marks nothing yet")
-cfn_refuses_a_library_call()
+@test("and a callee that cannot run is refused through the chain of calls down to what stops it")
+cte_a_chain_to_what_cannot_run()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("import sysl.math.max\n\nconst f(a: int, b: int) -> int = max(a, b)\n\n" +
-                          "print(f(1, 2))\n"),
-                cfn_f("it calls 'sysl.math.max', which is not — the standard library marks nothing " +
-                      "'const' yet, so compute this at run time"), "3:34")
+    cfn_refused(cfn_built("noisy(x: int) -> int\n    print(x)\n    x\n\nouter(x: int) -> int = noisy(x)\n\n" +
+                          "const f(x: int) -> int = outer(x)\n\nprint(f(1))\n"),
+                cfn_f("it calls 'outer', which calls 'noisy', which prints, which is outside the " +
+                      s"program — ${cfn_outside()}"), "7:26")
+
+@test("a call back into a body being asked about is answered by the walk already under way")
+cte_mutual_recursion_through_unmarked_functions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("even(n: int) -> bool = if n == 0 then true else odd(n - 1)\n\n" +
+                      "odd(n: int) -> bool = if n == 0 then false else even(n - 1)\n\n" +
+                      "const f(n: int) -> bool = even(n)\n\nconst E: bool = f(10)\n\nprint(E, f(3))\n"),
+              "true false\n")
+
+// The standard library marks nothing, and needs to: a generic of its own is instantiated and run.
+@test("one of the standard library's runs too, a generic instantiated for the call")
+cte_a_library_call()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.math.max\n\nconst f(a: int, b: int) -> int = max(a, b)\n\n" +
+                      "const M: int = f(1, 2)\n\nprint(M, f(4, 3))\n"), "2 4\n")
 
 @test("it may not print")
 cfn_refuses_printing()
@@ -368,9 +383,24 @@ cfn_refuses_a_module_var()
 cfn_refuses_a_computed_val()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("noisy() -> int = 3\n\nstatic val t: int = noisy()\n\nconst f() -> int = t\n\n" +
-                          "print(f())\n"),
-                cfn_f("it reaches 't' — 't' is filled when the program runs"), "5:20")
+    cfn_refused(cfn_built("static var seed: int = 3\n\nnoisy() -> int = seed\n\nstatic val t: int = noisy()\n\n" +
+                          "const f() -> int = t\n\nprint(f())\n"),
+                cfn_f("it reaches 't' — 't' is filled when the program runs"), "7:20")
+
+// A `val` over a call to a function nobody marked is laid down where the call can run, so a `const`
+// function may read it.
+@test("but a 'val' over an unmarked call that runs while compiling is a value it may read")
+cte_reads_a_val_over_an_unmarked_call()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("three() -> int = 3\n\nstatic val t: int = three()\n\nconst f() -> int = t + 1\n\n" +
+                      "const K: int = f()\n\nprint(K)\n"), "4\n")
+
+@test("an unmarked call may size an array")
+cte_an_unmarked_call_sizes_an_array()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("capacity() -> usize = 4\n\nvar b: [capacity()]u8 = [0; 4]\n\nprint(b.len)\n"), "4\n")
 
 @test("a string is evaluated, so a parameter of one is admitted")
 cfn_admits_a_string_parameter()
@@ -450,11 +480,12 @@ cfn_refuses_a_try_through_from()
     if !enm_ready() then return
 
     cfn_refused(cfn_built("struct Small\n    code: int\n\nstruct Big\n    code: int\n\n" +
-                          "impl From[Small] for Big\n    from(s: Small) -> Big = Big(s.code)\n\n" +
+                          "impl From[Small] for Big\n    from(s: Small) -> Big\n        print(s.code)\n" +
+                          "        Big(s.code)\n\n" +
                           "const lift(r: Result[int, Small]) -> Result[int, Big]\n    val v = r?\n" +
                           "    Ok(v + 1)\n\nprint(lift(Ok(1)).is_ok())\n"),
-                "'lift' is 'const', so it runs while compiling, and it calls 'Big.from', which is " +
-                "not — mark 'Big.from' 'const' too, or compute this at run time", "11:13")
+                "'lift' is 'const', so it runs while compiling, and it calls 'Big.from', which " +
+                s"prints, which is outside the program — ${cfn_outside()}", "13:13")
 
 // An operator a type supplied is a call to its implementation.
 @test("nor compare through an implementation that is not 'const'")
@@ -462,29 +493,32 @@ cfn_refuses_a_dispatched_comparison()
     if !enm_ready() then return
 
     cfn_refused(cfn_built("struct P\n    x: int\n\n" +
-                          "impl Eq for P\n    eq(self, rhs: P) -> bool = self.x == rhs.x\n\n" +
+                          "impl Eq for P\n    eq(self, rhs: P) -> bool\n        print(1)\n" +
+                          "        self.x == rhs.x\n\n" +
                           "const f(a: P, b: P) -> bool = a == b\n\nprint(f(P(1), P(1)))\n"),
-                cfn_f("it calls 'P.eq', which is not — mark 'P.eq' 'const' too, or compute this at " +
-                      "run time"), "7:31")
+                cfn_f(s"it calls 'P.eq', which prints, which is outside the program — ${cfn_outside()}"),
+                "9:31")
 
 @test("nor assign through an operator whose implementation is not 'const'")
 cfn_refuses_a_dispatched_compound_assignment()
     if !enm_ready() then return
 
     cfn_refused(cfn_built("struct V\n    x: int\n\n" +
-                          "impl Add for V\n    add(self, rhs: V) -> V = V(self.x + rhs.x)\n\n" +
+                          "impl Add for V\n    add(self, rhs: V) -> V\n        print(1)\n" +
+                          "        V(self.x + rhs.x)\n\n" +
                           "const f(a: V, b: V) -> int\n    var c = a\n    c += b\n    c.x\n\n" +
                           "print(f(V(1), V(2)))\n"),
-                cfn_f("it calls 'V.add', which is not — mark 'V.add' 'const' too, or compute this at " +
-                      "run time"), "9:5")
+                cfn_f(s"it calls 'V.add', which prints, which is outside the program — ${cfn_outside()}"),
+                "11:5")
 
 @test("a generic one is refused at its definition for what does not go through a type parameter")
 cfn_refuses_at_a_generic_definition()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("noisy() -> int = 1\n\nconst g[T](x: T) -> int = noisy()\n\nprint(g(5))\n"),
-                "'g' is 'const', so it runs while compiling, and it calls 'noisy', which is not — " +
-                "mark 'noisy' 'const' too, or compute this at run time", "3:27")
+    cfn_refused(cfn_built("noisy() -> int\n    print(1)\n    1\n\nconst g[T](x: T) -> int = noisy()\n\n" +
+                          "print(g(5))\n"),
+                "'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which " +
+                s"is outside the program — ${cfn_outside()}", "5:27")
 
 @test("and its signature is held to the same values, a slice of its parameter admitted")
 cfn_admits_a_generic_slice_parameter()

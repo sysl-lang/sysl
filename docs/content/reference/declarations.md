@@ -1591,8 +1591,9 @@ A bracketed list directly after the name declares type parameters, with optional
 
 ### A `const` function runs while compiling
 
-`const` in front of a function's name marks one the compiler may run while it compiles, so that a
-call to it can stand where a [constant](/reference/modules/) is required. Called anywhere else it is
+`const` in front of a function's name **promises** that the compiler can run it while it compiles,
+so that a call to it can stand where a [constant](/reference/modules/) is required. The promise is
+checked at the declaration, against the body and every function it calls. Called anywhere else it is
 an ordinary function, and an ordinary call:
 
 ```sysl
@@ -1606,6 +1607,12 @@ print(sq(n))
 ```output
 49
 ```
+
+**The mark is a promise, not a permission.** Any function whose body can run while compiling is run
+where a constant wants it, marked or not — [modules § const](/reference/modules/) shows one. What
+the mark adds is that the promise is held at the declaration: a later change to the body, or to
+something it calls, that would stop it running is refused there, rather than at a constant in some
+other package that relied on it.
 
 The word is the one sysl already uses for "settled while compiling" — a `const` declaration,
 `for const`, a `[const N: usize]` parameter — and a `const` function is a constant with parameters.
@@ -1815,32 +1822,38 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 
 | construct | refusal |
 |---|---|
-| a call to a function that is not `const` | `'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time` |
-| a call into the standard library | `… it calls 'sysl.math.max', which is not — the standard library marks nothing 'const' yet, so compute this at run time` |
+| a call to a function whose body cannot run | `'f' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling` — the calls are followed down to what stops them |
 | `print` | `… it prints, which is outside the program — nothing outside the program exists while compiling` |
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
 | a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
-| a value rendered through a `display` that is not `const` | `… it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time` |
+| a value rendered through a `display` whose body cannot run | `… it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling` |
 | a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
 | a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
 | atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
 | `f16`, `bf16` | `… its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while compiling yet` |
 
-One worked refusal for each of the commonest:
+One worked refusal for each of the commonest. A function that is not marked is no reason to refuse;
+what its body does is:
 
 ```sysl
-noisy(x: int) -> int = x + 1
+plain(x: int) -> int = x + 1
 
-const f(x: int) -> int = noisy(x)
+noisy(x: int) -> int
+    print(x)
+    plain(x)
 
-print(f(1))
+const f(x: int) -> int = plain(x)
+
+const g(x: int) -> int = noisy(x)
+
+print(f(1), g(1))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
 ```sysl
@@ -1899,7 +1912,9 @@ struct R
     n: int
 
 impl Display for R
-    display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.n), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec)
+        print("rendering")
+        display_int(long(self.n), out, fmt)
 
 const f(r: R) -> string = str(r)
 
@@ -1907,13 +1922,13 @@ print(f(R(1)))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time
+'f' is 'const', so it runs while compiling, and it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
 **Text is rendered while compiling as the program renders it.** A float goes through the library's
 own renderers — the shortest round trip for `str`, the exact digits under a specifier — so `-0`, a
-subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` is `const`
-runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
+subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` can run
+while compiling runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
 and the `display` of every type the library renders write into it, and a nested `display` is handed
 the same writer:
 
@@ -1955,7 +1970,9 @@ print(twice(21), twice(u8(2)))
 ```
 
 ```sysl
-noisy() -> int = 1
+noisy() -> int
+    print("asked")
+    1
 
 const g[T](x: T) -> int = noisy()
 
@@ -1963,7 +1980,7 @@ print(g(5))
 ```
 
 ```error
-'g' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
 ## Structs

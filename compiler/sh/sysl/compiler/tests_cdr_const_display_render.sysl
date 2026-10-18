@@ -134,7 +134,7 @@ cdr_a_generic_display()
     assert(enm_ir(prog).contains("c\"(4)(5)(2.5)(t)\\00\""), "G was not laid down")
 end cdr_a_generic_display
 
-@test("a display that is not 'const' is refused where the value is rendered")
+@test("a display that cannot run is refused where the value is rendered")
 cdr_a_display_not_const_is_refused()
     if !enm_ready() then return
 
@@ -143,22 +143,43 @@ cdr_a_display_not_const_is_refused()
             n: int
 
         impl Display for R
-            display(self, out: *Writer, fmt: FormatSpec) = display_pad("r".bytes, out, fmt)
+            display(self, out: *Writer, fmt: FormatSpec)
+                print("rendering")
+                display_pad("r".bytes, out, fmt)
 
         const f(r: R) -> string = str(r)
 
         print(f(R(1)))
         """).0
 
-    assert(said.contains("'f' is 'const', so it runs while compiling, and it calls 'R.display', which is not " +
-                         "— mark 'R.display' 'const' too, or compute this at run time"), said)
+    assert(said.contains("'f' is 'const', so it runs while compiling, and it calls 'R.display', which prints, " +
+                         "which is outside the program"), said)
 end cdr_a_display_not_const_is_refused
 
-@test("a const display reaching a library call that is not a renderer is refused at the display")
-cdr_a_display_calling_the_library_is_refused()
+@test("a display nobody marked runs while compiling where its body can")
+cte_an_unmarked_display_runs()
     if !enm_ready() then return
 
-    val said = enm_outcome(raw"""
+    assert_eq(enm_ran(raw"""
+        struct R
+            n: int
+
+        impl Display for R
+            display(self, out: *Writer, fmt: FormatSpec) = display_pad("r".bytes, out, fmt)
+
+        const f(r: R) -> string = str(r)
+
+        const S: string = f(R(1))
+
+        print(S)
+        """), "r\n")
+end cte_an_unmarked_display_runs
+
+@test("a const display reaching a library call that is not a renderer runs it")
+cdr_a_display_calling_the_library_runs_it()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
         import sysl.math.max
 
         struct R
@@ -169,11 +190,11 @@ cdr_a_display_calling_the_library_is_refused()
 
         const f(r: R) -> string = str(r)
 
-        print(f(R(1)))
-        """).0
+        const S: string = f(R(1))
 
-    assert(said.contains("'R.display' is 'const', so it runs while compiling, and it calls 'sysl.math.max'"), said)
-end cdr_a_display_calling_the_library_is_refused
+        print(S)
+        """), "2\n")
+end cdr_a_display_calling_the_library_runs_it
 
 @test("a float and a display rendered while compiling are laid down as text for a Cortex-M4")
 cdr_rendered_text_is_laid_down()
