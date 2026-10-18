@@ -46,8 +46,14 @@
 # same command, and that agreement is what makes it a row rather than a defect: a stop anywhere else
 # is still `FAILED`.
 #
-# The counts at the end are reconciled against the number of rows printed: a total that does not
-# equal the rows is a script that counted something twice, which is how a census comes to claim more
+# **Several repositories are asked at once** -- `SYSL_CENSUS_JOBS` of them, a third of the machine's
+# processors unless it is set -- since a row is mostly one compile, and a compile is mostly one core.
+# Each row works in a tree of its own, its path dependencies copied beside it, so no two rows share a
+# copy. A row is printed when it is answered, so they come in the order they finish.
+#
+# The counts at the end are reconciled against the repositories asked about: every row leaves its
+# verdict in a file of its own, and a count that does not equal the rows dispatched is a script that
+# counted something twice or lost a row, which is how a census comes to claim more or fewer
 # repositories than it has.
 
 set -e
@@ -192,18 +198,24 @@ run_row() {
     return $rr_rc
 }
 
+# A repository's files as git knows them, tracked or not yet added and never the ignored ones,
+# copied into `$2`.
+copy_tree() {
+    mkdir -p "$2"
+    ( cd "$1" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$2" && tar xf - )
+}
+
 # **A path dependency is a sibling checkout, so the copy gets its siblings.** The names are read off
-# the manifest's own `path = "../<name>"` lines, and each is copied beside the repository's copy
-# (`$work/<name>`), which is where `../<name>` resolves to.
+# the manifest's own `path = "../<name>"` lines, and each is copied into `$2` -- the directory the
+# repository's copy sits in, which is where `../<name>` resolves to.
 copy_path_deps() {
     cpd_dir=$1
     [ -f "$cpd_dir/package.hocon" ] || return 0
 
     for cpd_name in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$cpd_dir/package.hocon"); do
-        [ -d "$work/$cpd_name" ] && continue
+        [ -d "$2/$cpd_name" ] && continue
         [ -d "$org/$cpd_name" ] || continue
-        mkdir -p "$work/$cpd_name"
-        ( cd "$org/$cpd_name" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$work/$cpd_name" && tar xf - )
+        copy_tree "$org/$cpd_name" "$2/$cpd_name"
     done
 }
 
@@ -239,18 +251,97 @@ header_flags() {
     echo $hf_out
 }
 
-ok_test=0
-ok_build=0
-ok_build_c=0
-ok_board=0
-ok_typecheck=0
-failed=0
-both_refused=0
-no_sdk=0
-setup=0
-serverless=0
-needs_lib=0
-rows=0
+# **A row's verdict is a file**, `$work/rows/<name>`, holding the counter it adds to and the line it
+# printed: a row asked in the background cannot add to a variable here. `row <counter> <line>`.
+mkdir -p "$work/rows"
+
+row() {
+    printf '%s\n' "$1" > "$work/rows/$name"
+    echo "$2"
+}
+
+dispatched=0
+census_jobs=${SYSL_CENSUS_JOBS:-$(( $(sysctl -n hw.ncpu 2> /dev/null || nproc) / 3 ))}
+[ "$census_jobs" -ge 1 ] || census_jobs=1
+
+# One repository asked, in a tree of its own: every name the loop below settled is read here, in a
+# subshell started after they were.
+census_row() {
+    tree=$work/trees/$name
+    here=$tree/$name
+    copy_tree "$dir" "$here"
+    copy_path_deps "$dir" "$tree"
+
+    ours_ok=0
+
+    ( cd "$here" && run_row ours ) > "$work/$name.out" 2>&1 || ours_ok=1
+
+    if [ $ours_ok -eq 0 ]; then
+        case $label in
+            test|"test kernel; test arch/pmsa") counter=ok_test ;;
+            build) counter=ok_build ;;
+            build-lib) counter=ok_typecheck ;;
+            *)
+                if [ -n "$board" ] || [ -n "$kernel" ]; then
+                    counter=ok_board
+                else
+                    counter=ok_build_c
+                fi
+                ;;
+        esac
+
+        row $counter "ok ($shown)  $name"
+        return 0
+    fi
+
+    # A suite whose every failure is "no server at ..." is the package working as designed: its
+    # README says an absent server reddens the suite rather than skipping it, since a green run over
+    # nothing is the one result worth less than a red one.
+    if grep -q "no server at" "$work/$name.out"; then
+        row serverless "needs a server      $name -- $(grep -c 'no server at' "$work/$name.out") of its tests want one"
+        return 0
+    fi
+
+    # **Every failure is re-asked of the reference on the same files**, because a repository the
+    # reference also refuses is a fact about that repository rather than a defect here. A fresh copy,
+    # since the run above may have written a `sysl.sum`.
+    tree=$work/trees/$name.reference
+    theirs=$tree/$name
+    copy_tree "$dir" "$theirs"
+    copy_path_deps "$dir" "$tree"
+
+    theirs_ok=0
+
+    ( cd "$theirs" && run_row theirs ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+
+    # **A board row that stops where the reference stops is a PASS, and the row says so.** The
+    # header is one the SDK generates during a CMake configure, so neither compiler can reach it
+    # from a checkout -- and both run the whole analysis before a line of C, which is what the row
+    # is claiming. Both texts are required to name a missing header: a stop anywhere else, or a
+    # reference that got further, is still a failure.
+    if [ -n "$board" ] && [ $theirs_ok -ne 0 ] \
+       && grep -q "file not found" "$work/$name.out" \
+       && grep -q "file not found" "$work/$name.theirs"; then
+        row ok_typecheck "ok (type-check $board_target)  $name -- the analysis passed; $(grep -m1 -o "'[^']*' file not found" "$work/$name.out") is written by a CMake configure"
+        return 0
+    fi
+
+    # **A library nobody installed is the package working as designed, like a server nobody started.**
+    # Both compilers must say the same thing -- "needs the '<x>' headers and nothing supplied them" --
+    # so a failure of any other kind in either run is still a failure.
+    if [ $theirs_ok -ne 0 ] \
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.out" \
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.theirs"; then
+        row needs_lib "needs a library     $name -- $(grep -m1 -o "needs the '[^']*' headers" "$work/$name.out")"
+        return 0
+    fi
+
+    if [ $theirs_ok -ne 0 ]; then
+        row both_refused "refused by both     $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+    else
+        row failed "FAILED              $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+    fi
+}
 
 for dir in "$org"/*/; do
     name=$(basename "$dir")
@@ -299,9 +390,8 @@ for dir in "$org"/*/; do
         solder-pico2) board=1; board_target=thumb-freestanding-softfp ;;
         musicbox-pico) board=1; board_target=thumb-freestanding-softfp ;;
         zephyr|zephyr-demo)
-            rows=$((rows + 1))
-            setup=$((setup + 1))
-            echo "needs kernel tree   $name -- a west workspace, not on this machine"
+            dispatched=$((dispatched + 1))
+            row setup "needs kernel tree   $name -- a west workspace, not on this machine"
             continue
             ;;
     esac
@@ -368,9 +458,8 @@ for dir in "$org"/*/; do
     # asks for by name, which is what a named include is for.
     if [ -n "$board" ]; then
         if [ -z "$PICO_SDK_PATH" ]; then
-            rows=$((rows + 1))
-            no_sdk=$((no_sdk + 1))
-            echo "needs SDK           $name -- PICO_SDK_PATH names the SDK a board build reads"
+            dispatched=$((dispatched + 1))
+            row no_sdk "needs SDK           $name -- PICO_SDK_PATH names the SDK a board build reads"
             continue
         fi
 
@@ -389,9 +478,8 @@ for dir in "$org"/*/; do
     # run's own directory, so the census stays offline and writes nothing anybody owns.
     if [ "$name" = freertos ]; then
         if [ -z "$FREERTOS_KERNEL" ]; then
-            rows=$((rows + 1))
-            setup=$((setup + 1))
-            echo "needs kernel tree   freertos -- FREERTOS_KERNEL names a FreeRTOS-Kernel checkout"
+            dispatched=$((dispatched + 1))
+            row setup "needs kernel tree   freertos -- FREERTOS_KERNEL names a FreeRTOS-Kernel checkout"
             continue
         fi
 
@@ -407,9 +495,8 @@ for dir in "$org"/*/; do
                 "$FREERTOS_KERNEL"/stream_buffer.c "$FREERTOS_KERNEL"/portable/MemMang/heap_4.c \
                 "$fr_port"/port.c "$fr_port"/utils/wait_for_event.c \
               && ar rcs libfreertos.a ./*.o ) > "$work/freertos.kernel" 2>&1 || {
-                rows=$((rows + 1))
-                setup=$((setup + 1))
-                echo "needs kernel tree   freertos -- the kernel would not build: $(head -1 "$work/freertos.kernel")"
+                dispatched=$((dispatched + 1))
+                row setup "needs kernel tree   freertos -- the kernel would not build: $(head -1 "$work/freertos.kernel")"
                 continue
             }
         fi
@@ -444,90 +531,47 @@ test arch/pmsa"
         shown="$label $found_flags"
     fi
 
-    here=$work/$name
-    rm -rf "$here"
-    mkdir -p "$here"
-    ( cd "$dir" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$here" && tar xf - )
-    copy_path_deps "$dir"
+    # A free slot first: no more than `census_jobs` rows at once.
+    while [ "$(jobs -p | wc -l)" -ge "$census_jobs" ]; do
+        sleep 1
+    done
 
+    dispatched=$((dispatched + 1))
+    census_row &
+done
+
+wait
+
+ok_test=0
+ok_build=0
+ok_build_c=0
+ok_board=0
+ok_typecheck=0
+failed=0
+both_refused=0
+no_sdk=0
+setup=0
+serverless=0
+needs_lib=0
+rows=0
+
+for verdict in "$work"/rows/*; do
+    [ -f "$verdict" ] || continue
     rows=$((rows + 1))
-    ours_ok=0
 
-    ( cd "$here" && run_row ours ) > "$work/$name.out" 2>&1 || ours_ok=1
-
-    if [ $ours_ok -eq 0 ]; then
-        case $label in
-            test|"test kernel; test arch/pmsa") ok_test=$((ok_test + 1)) ;;
-            build) ok_build=$((ok_build + 1)) ;;
-            build-lib) ok_typecheck=$((ok_typecheck + 1)) ;;
-            *)
-                # Never `cond && (( a++ )) || (( b++ ))`: an arithmetic command reports its result
-                # as a status and `x++` yields the value before the increment, so the 0->1
-                # transition increments both counters.
-                if [ -n "$board" ] || [ -n "$kernel" ]; then
-                    ok_board=$((ok_board + 1))
-                else
-                    ok_build_c=$((ok_build_c + 1))
-                fi
-                ;;
-        esac
-
-        echo "ok ($shown)  $name"
-        continue
-    fi
-
-    # A suite whose every failure is "no server at ..." is the package working as designed: its
-    # README says an absent server reddens the suite rather than skipping it, since a green run over
-    # nothing is the one result worth less than a red one.
-    if grep -q "no server at" "$work/$name.out"; then
-        serverless=$((serverless + 1))
-        echo "needs a server      $name -- $(grep -c 'no server at' "$work/$name.out") of its tests want one"
-        continue
-    fi
-
-    # **Every failure is re-asked of the reference on the same copy**, because a repository the
-    # reference also refuses is a fact about that repository rather than a defect here. A fresh copy,
-    # since the run above may have written a `sysl.sum`.
-    theirs=$work/$name.reference
-    rm -rf "$theirs"
-    mkdir -p "$theirs"
-    ( cd "$dir" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$theirs" && tar xf - )
-
-    theirs_ok=0
-
-    ( cd "$theirs" && run_row theirs ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
-
-    # **A board row that stops where the reference stops is a PASS, and the row says so.** The
-    # header is one the SDK generates during a CMake configure, so neither compiler can reach it
-    # from a checkout -- and both run the whole analysis before a line of C, which is what the row
-    # is claiming. Both texts are required to name a missing header: a stop anywhere else, or a
-    # reference that got further, is still a failure.
-    if [ -n "$board" ] && [ $theirs_ok -ne 0 ] \
-       && grep -q "file not found" "$work/$name.out" \
-       && grep -q "file not found" "$work/$name.theirs"; then
-        ok_typecheck=$((ok_typecheck + 1))
-        echo "ok (type-check $board_target)  $name -- the analysis passed; $(grep -m1 -o "'[^']*' file not found" "$work/$name.out") is written by a CMake configure"
-        continue
-    fi
-
-    # **A library nobody installed is the package working as designed, like a server nobody started.**
-    # Both compilers must say the same thing -- "needs the '<x>' headers and nothing supplied them" --
-    # so a failure of any other kind in either run is still a failure.
-    if [ $theirs_ok -ne 0 ] \
-       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.out" \
-       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.theirs"; then
-        needs_lib=$((needs_lib + 1))
-        echo "needs a library     $name -- $(grep -m1 -o "needs the '[^']*' headers" "$work/$name.out")"
-        continue
-    fi
-
-    if [ $theirs_ok -ne 0 ]; then
-        both_refused=$((both_refused + 1))
-        echo "refused by both     $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
-    else
-        failed=$((failed + 1))
-        echo "FAILED              $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
-    fi
+    case $(cat "$verdict") in
+        ok_test) ok_test=$((ok_test + 1)) ;;
+        ok_build) ok_build=$((ok_build + 1)) ;;
+        ok_build_c) ok_build_c=$((ok_build_c + 1)) ;;
+        ok_board) ok_board=$((ok_board + 1)) ;;
+        ok_typecheck) ok_typecheck=$((ok_typecheck + 1)) ;;
+        failed) failed=$((failed + 1)) ;;
+        both_refused) both_refused=$((both_refused + 1)) ;;
+        no_sdk) no_sdk=$((no_sdk + 1)) ;;
+        setup) setup=$((setup + 1)) ;;
+        serverless) serverless=$((serverless + 1)) ;;
+        needs_lib) needs_lib=$((needs_lib + 1)) ;;
+    esac
 done
 
 total=$((ok_test + ok_build + ok_build_c + ok_board + ok_typecheck + failed + both_refused + no_sdk + setup + serverless + needs_lib))
@@ -536,8 +580,8 @@ echo
 echo "ok(test) $ok_test, ok(build) $ok_build, ok(build-c) $ok_build_c, ok(board) $ok_board,"
 echo "ok(type-check) $ok_typecheck, FAILED $failed, refused by both $both_refused,"
 echo "needs SDK $no_sdk, needs kernel tree $setup, needs a server $serverless, needs a library $needs_lib"
-echo "total $total over $rows rows"
+echo "total $total over $rows rows, $dispatched repositories asked"
 echo "output: $work"
 
-[ $total -eq $rows ] || { echo "the counts do not reconcile with the rows printed" >&2; exit 3; }
+[ $total -eq $rows ] && [ $rows -eq $dispatched ] || { echo "the counts do not reconcile with the rows printed" >&2; exit 3; }
 [ $failed -eq 0 ]

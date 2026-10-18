@@ -323,7 +323,7 @@ of its own, so running several at once shares nothing between them that running 
 another did not. What they can still share is whatever outlives a process — a file at a fixed path,
 a port — and a test that needs one of those to itself makes it its own, with a temporary directory or
 a port the system picks, or is named in its manifest's
-[`test.alone`](/reference/packages/#how-a-packages-suite-is-run), which runs it with nothing beside
+[`test.alone`](/reference/packages/#how-a-package-s-suite-is-run), which runs it with nothing beside
 it. The manifest's `test` block can also set the run's `jobs` and `timeout`, which the flags beat. A
 module's `@setup_all` is in before any of its tests starts, and its
 `@teardown_all` starts once every one of them is in.
