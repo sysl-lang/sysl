@@ -668,6 +668,12 @@ owner_of(a: &Analysis, name: string, scope: Scope) -> string =
 private check_generic_bodies(a: &Analysis, units: Buf[Program])
     for unit in units
         val scope = scope_of_unit(a, unit)
+
+        // **The library's generic bodies were read where the library was built** (`build-lib`,
+        // `test --std`), against the same bounds; they are the same text in every program, so a
+        // program does not pay to read them again. A library module being produced is read here.
+        if from_library(a, scope) then continue
+
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         for j in 0..<unit.body.len()
@@ -715,6 +721,9 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
 
         if !a.tables.members.default_origin.has(fd.name)
             val scope = a.tables.members.decl_scope.get(fd.name).unwrap_or(empty_scope())
+
+            if from_library(a, scope) then continue
+
             val said = a.kept.len()
 
             check_abstract_body(a, scope, fd)
@@ -742,7 +751,7 @@ private check_trait_default_bodies(a: &Analysis)
         val decl = types.at(i)
 
         decl.kind match
-            TraitOf(td) -> check_defaults_of(a, decl.scope, key, td)
+            TraitOf(td) -> if !from_library(a, decl.scope) then check_defaults_of(a, decl.scope, key, td)
             _ -> ()
 end check_trait_default_bodies
 

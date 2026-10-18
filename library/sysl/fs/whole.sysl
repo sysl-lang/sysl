@@ -3,6 +3,7 @@ module sysl.fs
 
 import sysl.buf.{Buf, buf}
 import sysl.io.Reader
+import sysl.slices.copy
 import sysl.fs.sys as fsys
 import sysl.text.from_utf8
 
@@ -28,9 +29,11 @@ import sysl.text.from_utf8
 
 /** Every byte of the file.
  *
- * It reads in chunks and grows rather than sizing the buffer from `size` first, which costs a little
- * copying and buys the case that matters: a file being written while this reads it, and anything
- * whose length is not a fact until the read ends. The loop stops on the first empty read, and asks
+ * **The file's size is the first guess, and only a guess.** The storage is sized to it plus one byte
+ * and read into directly, so a file that holds still is one read into its final home with nothing
+ * copied; the spare byte is what tells "read it all" apart from "it grew", and storage that fills is
+ * doubled, so a file being written while this reads it -- or anything whose length is not a fact
+ * until the read ends -- is still read whole. The loop stops on the first empty read, and asks
  * afterwards whether the reading *ended* badly -- the two are separate questions, which is the split
  * `Reader` was built around.
  */
@@ -39,20 +42,30 @@ read_bytes(path: string) -> Result[[]u8, IoError]
 
     defer f.close()
 
-    var out: Buf[u8] = buf()
-    var chunk: []u8  = [0; 8192]
+    val guess = metadata(path) match
+        Ok(m) -> if m.size > 0 then usize(m.size) else 0
+        Err(_) -> 0
+
+    var out: []u8 = [0; guess + 1]
+    var got: usize = 0
 
     loop
-        var got = f.read(chunk)
+        if got == out.len
+            var bigger: []u8 = [0; out.len * 2]
 
-        if got.len == 0
-            break
+            copy(bigger, out)
+            out = bigger
+        end if
 
-        for b in got do out.push(b)
+        val n = f.read(out[got..]).len
+
+        if n == 0 then break
+
+        got += n
 
     if f.failed() then return Err(f.failure())
 
-    Ok(out.view())
+    Ok(out[0..<got])
 end read_bytes
 
 /** The file as text, or `InvalidUtf8` carrying the offset of the first byte that is not.
