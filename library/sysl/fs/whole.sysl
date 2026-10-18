@@ -29,24 +29,20 @@ import sysl.text.from_utf8
 
 /** Every byte of the file.
  *
- * **The file's size is the first guess, and only a guess.** The storage is sized to it plus one byte
- * and read into directly, so a file that holds still is one read into its final home with nothing
- * copied; the spare byte is what tells "read it all" apart from "it grew", and storage that fills is
- * doubled, so a file being written while this reads it -- or anything whose length is not a fact
- * until the read ends -- is still read whole. The loop stops on the first empty read, and asks
- * afterwards whether the reading *ended* badly -- the two are separate questions, which is the split
- * `Reader` was built around.
+ * **The bytes are read straight into the storage that is handed back**, which doubles whenever it
+ * fills: a read as large as the file's own buffer goes to the descriptor directly, so a file is a few
+ * reads into its final home and a copy per doubling, never a byte at a time. It does not ask the file's
+ * size first -- that would reach a filesystem's `stat` for a program that only reads, and a size is
+ * not a fact for a file being written while this reads it, or for anything whose length is only known
+ * when the read ends. The loop stops on the first empty read, and asks afterwards whether the reading
+ * *ended* badly -- the two are separate questions, which is the split `Reader` was built around.
  */
 read_bytes(path: string) -> Result[[]u8, IoError]
     var f = open(path)?
 
     defer f.close()
 
-    val guess = metadata(path) match
-        Ok(m) -> if m.size > 0 then usize(m.size) else 0
-        Err(_) -> 0
-
-    var out: []u8 = [0; guess + 1]
+    var out: []u8 = [0; 8192]
     var got: usize = 0
 
     loop
