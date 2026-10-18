@@ -139,13 +139,33 @@ struct Manifest
     // register)`. Root project only, as the flags are.
     codegen_registers: Buf[(string, string)]
     target_codegen_registers: Buf[(string, string, string)]
+
+    // The `test` block: how this package's own suite is run where the command line does not say.
+    tests: TestSettings
 end Manifest
+
+// What a package's `test` block says about running its suite (`read_test_settings`). Each is a
+// default the command line overrides; nothing here is read by any build but `sysl test`.
+struct TestSettings
+    // How many tests may run at once (`--jobs`).
+    jobs: Option[usize]
+
+    // The seconds each test may run (`--timeout`), which a test's own `@test(timeout: n)` still beats.
+    timeout: Option[int]
+
+    // The tests that run with nothing else running beside them: each is a text a test's name or key
+    // holds, as `--filter` reads one.
+    alone: Buf[string]
+end TestSettings
+
+// A package that said nothing about its suite.
+no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf())
+             buf(), buf(), no_test_settings())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -531,6 +551,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val link = read_link(root)?
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
+    val tests = read_test_settings(root, &warnings)?
 
     val codegen_read = conf_at(root, "codegen") match
         None -> (buf(), buf(), None)
@@ -554,8 +575,64 @@ read_manifest(text: string) -> Result[Manifest, string]
                 target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
-                codegen_read.1, target_codegen_registers))
+                codegen_read.1, target_codegen_registers, tests))
 end read_manifest
+
+// The `test` block: `jobs`, `timeout` and `alone`, each what the command line would otherwise say.
+//
+// **`alone` is for the test that cannot share the machine** -- one that binds a fixed port, drives a
+// device there is one of, opens a database every test of the package opens, or measures time and is
+// thrown by a busy machine. Such a test runs with no other test of the run beside it, and the rest run
+// at once around it as `jobs` allows. It is a list of texts a test's name or key holds, as `--filter`
+// reads one, so a module's tests are made alone by naming the module.
+//
+// A key the block does not know is warned about and ignored, as a top-level one is: a manifest is
+// read by compilers older than the one it was written for.
+private read_test_settings(root: &Conf, warnings: *Buf[string]) -> Result[TestSettings, string]
+    val block = conf_at(root, "test") match
+        None -> return Ok(no_test_settings())
+        Some(b) -> b
+
+    if !conf_is_block(block)
+        return Err("'test' says how this package's suite is run, so it is a block — " +
+                   "test { jobs = 4, timeout = 60, alone = [\"port\"] }")
+
+    var settings = no_test_settings()
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        val key = keys.at(i)
+        val value = conf_at(block, key).unwrap()
+
+        if key == "jobs"
+            val given = *value match
+                Word(w) -> test_jobs(w)
+                _ -> None
+
+            if given.is_none()
+                return Err("'test.jobs' is how many tests may run at once, a whole number from 1 up")
+
+            settings.jobs = given
+        else if key == "timeout"
+            val given = *value match
+                Word(w) -> timeout_seconds(w)
+                _ -> None
+
+            if given.is_none()
+                return Err(s"'test.timeout' is the seconds each test may run, a whole number from 0 to " +
+                           s"$MostTestSeconds (0 is no limit)")
+
+            settings.timeout = given
+        else if key == "alone"
+            settings.alone = conf_list(value) match
+                Some(texts) -> texts
+                None -> return Err("'test.alone' is a list of texts a test's name holds — " +
+                                   "alone = [\"port\"], and not a single string")
+        else
+            warnings.push(unknown_key(s"test.$key"))
+
+    Ok(settings)
+end read_test_settings
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
 // `file:line:column` out of the image.
@@ -1670,4 +1747,4 @@ private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c"
+    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c" || key == "test"

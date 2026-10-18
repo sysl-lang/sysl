@@ -1021,6 +1021,7 @@ against a dev dependency the consumer never fetches, stops nothing but that pack
 sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --fail-fast
+sysl test <path> --jobs <n>
 sysl test <path> --timeout <seconds>
 ```
 
@@ -1035,7 +1036,10 @@ them, and its `@test` functions are not — a package's tests are run in the pac
 
 The process per test is not a cost being tolerated; **it is the mechanism.** A test that fails does
 so by ending its process, so a run that shared one would report the first failure and nothing after
-it. The compile is the slow half, and there is only ever one of it.
+it. It is also what lets the tests run **several at once** — as many as the machine has processors,
+or `--jobs <n>` — with nothing shared between them that a run of one at a time did not share; the
+report waits for each row's turn, so it reads the same either way
+([the CLI](/getting-started/cli/#test)).
 
 Exit status is 0 if and only if every test that ran passed. A tree with no tests, and a filter that
 matched none of the tests there are, both exit 0 and say which happened.

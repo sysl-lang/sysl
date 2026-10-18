@@ -1,10 +1,11 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.process.{start, Group, Status}
+import sysl.fs.IoError
+import sysl.process.{start, Child, Group, Output, Status}
 import sysl.signal.{send, KILL}
 import sysl.text.{from_utf8_unchecked, repeat, split, Search}
-import sysl.time.{monotonic, whole_millis}
+import sysl.time.{millis, monotonic, sleep, whole_millis, Duration}
 
 // `sysl test` -- the `@test` functions of a source tree, run, and what a reader is told about them.
 //
@@ -41,10 +42,14 @@ import sysl.time.{monotonic, whole_millis}
 // `filter` selects by substring against both the reported name and the key, so a module's tests can
 // be named by their module and one test by its own name. `fail_fast` stops at the first failure,
 // which is what someone iterating on one wants and the opposite of what someone reading a report
-// does -- hence a flag rather than a default either way.
+// does -- hence a flag rather than a default either way. `jobs` is how many test processes may run
+// at once (`run_selected`); one is a run of one at a time. `alone` are the texts naming the tests that
+// run with nothing beside them (a manifest's `test.alone`), each read as `filter` is.
 struct TestOptions
     filter: Option[string]
     fail_fast: bool
+    jobs: usize
+    alone: Buf[string]
 end TestOptions
 
 // One test, run. `detail` is absent exactly when the test passed; `output` is everything the run
@@ -79,18 +84,29 @@ struct Outcome
     not_run(self) -> bool = self.passed() && (self.ignored().is_some() || self.skipped.is_some())
 end Outcome
 
-// Every selected test, run in the order it was written -- which is the order it is reported in, so
-// that a reader following a failure down a file finds the tests where the file put them.
+// Every selected test, run -- up to `opts.jobs` of them at once -- and reported in the order it was
+// written, so that a reader following a failure down a file finds the tests where the file put them.
 //
-// `fail_fast` stops the loop rather than the report: what has run is still reported, and the tests
-// that never ran are simply absent. Reporting them as skipped would be a third verdict for something
-// that is not a verdict at all.
+// **Running several at once changes nothing a report says.** Each test is a process of its own
+// already, so one test reaches another's verdict only through what outlives a process -- a file, a
+// port, a directory both name -- which is the test's own business under any runner that starts more
+// than one, as it is under `cargo test`. A row is held back until every row above it is in, so the
+// report reads exactly as a run of one at a time would have written it, and `jobs` of one *is* that
+// run.
+//
+// A module's `@setup_all` is in before any of its tests starts, and its `@teardown_all` starts once
+// every one of them is in. Other modules' tests wait for neither. A test `opts.alone` names waits
+// until nothing is running, and nothing starts beside it.
+//
+// `fail_fast` stops the starting rather than the report: the tests already running finish and are
+// reported, what has run is still reported, and the tests that never started are simply absent.
+// Reporting them as skipped would be a third verdict for something that is not a verdict at all.
 //
 // **`emit` is called as the run goes, not once at the end** -- the header first, then a file's
-// heading before its first row, then each row the moment its test or hook finishes, then the summary
-// once every test has. A suite that takes half an hour is watched from a log file while it runs
-// rather than staying silent until it exits, and a run that is killed partway still has a report of
-// everything up to the kill.
+// heading before its first row, then each row as soon as it and every row above it are in, then the
+// summary once every test is. A suite that takes half an hour is watched from a log file while it
+// runs rather than staying silent until it exits, and a run that is killed partway still has a
+// report of everything up to the kill.
 //
 // `seconds` is the run's limit on each process it starts, zero for none; a test's own
 // `@test(timeout: n)` takes its place for that test, in either direction.
@@ -102,7 +118,6 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
              emit: string -> unit, seconds: int = DefaultTestSeconds,
              refused: Buf[Outcome] = buf()) -> Buf[Outcome]
     var done: Buf[Outcome] = buf()
-    var stop = false
     var shown = ""
     var any_shown = false
 
@@ -116,79 +131,326 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
 
     emit(tests_header(tests.len() + refused.len(), filtered))
 
-    val groups = by_module_order(tests)
+    var run = schedule_of(exe, by_module_order(tests), seconds, opts)
+    var reported: usize = 0
+    val most = if opts.jobs == 0 then 1 else opts.jobs
 
-    for item in groups
-        if stop then break
+    loop
+        run.start_up_to(most)
 
-        val group = item
-
-        // A module whose selected tests are all ignored runs nothing at all, its `_all` hooks
-        // included: they bracket the runs, and there are none to bracket.
-        val hooks = if all_ignored(group) then no_hooks() else group.at(0).hooks
-
-        // `@setup_all` is a run of its own, before anything else in the module. Where it does not
-        // come back it gets a row of its own and the module's tests do not run: there is no test to
-        // hang the failure on, and reporting tests that never started would be a third verdict for
-        // something that is not one.
-        var booted = true
-
-        hooks.setup_all match
-            Some(h) ->
-                val r = run_test_hook(exe, h, seconds)
-
-                if r.status != 0
-                    val outcome = hook_outcome(h, r)
-
+        while reported < run.rows.len() && run.settled.at(reported)
+            run.rows.at(reported) match
+                Some(outcome) ->
                     done.push(outcome)
                     show_outcome(outcome, width, &shown, &any_shown, emit)
-                    booted = false
+                None -> ()
 
-                    if opts.fail_fast then stop = true
-            None -> ()
+            reported += 1
 
-        if booted
-            for i in 0..<group.len()
-                if stop then break
+        if run.flights.is_empty() then break
 
-                // An ignored test starts no process — not the test's, and not its `@setup` or
-                // `@teardown` either, since those bracket a run and there is none.
-                val t = group.at(i)
-                val outcome = if t.ignored.is_some() then Outcome(t, None, "", 0, None)
-                else run_one_test(exe, t, seconds)
-
-                done.push(outcome)
-                show_outcome(outcome, width, &shown, &any_shown, emit)
-
-                if opts.fail_fast && !outcome.passed() then stop = true
-
-        // `@teardown_all` runs whatever became of the tests, and whatever became of `@setup_all`:
-        // what it is for is releasing what the module took, and a module that failed halfway has
-        // taken some of it.
-        hooks.teardown_all match
-            Some(h) ->
-                val r = run_test_hook(exe, h, seconds)
-
-                if r.status != 0
-                    val outcome = hook_outcome(h, r)
-
-                    done.push(outcome)
-                    show_outcome(outcome, width, &shown, &any_shown, emit)
-
-                    if opts.fail_fast then stop = true
-            None -> ()
+        run.land_any()
 
     for item in refused
-        if stop then break
+        if run.stopped then break
 
         done.push(item)
         show_outcome(item, width, &shown, &any_shown, emit)
 
-        if opts.fail_fast && !item.passed() then stop = true
+        if opts.fail_fast && !item.passed() then run.stopped = true
 
     emit(tests_summary(done))
     done
 end run_selected
+
+// A run in progress: the rows it owes, in the order they are reported, and the processes it has out.
+//
+// **A row is a slot, and a slot is settled exactly once** -- with an `Outcome` where it has a row to
+// show, and with nothing where it has none: a hook that came back, a test that never started.
+// `run_selected` reports the settled slots from the top down, stopping at the first that is not.
+private struct Schedule
+    exe: string
+    seconds: int
+    fail_fast: bool
+    alone: Buf[string]
+    groups: Buf[Buf[TTest]]
+    lanes: Buf[Lane]
+    rows: Buf[Option[Outcome]]
+    settled: Buf[bool]
+    flights: Buf[Flight]
+    stopped: bool
+
+    // The first lane not yet finished, so a long run does not walk the finished ones on every start.
+    live: usize
+
+    // Start whatever may start now, until `most` processes are out or nothing more may.
+    //
+    // The lanes are walked in order, so the tests are started in the order they were written and the
+    // rows near the top -- the ones holding back the report -- are the first to be in.
+    //
+    // **A test running alone holds everything**, hooks included, and one that is to run alone waits
+    // for the run to drain -- holding back what comes after it too, so the tests still start in the
+    // order they were written.
+    start_up_to(*self, most: usize)
+        for f in self.flights
+            if f.alone then return
+
+        var g = self.live
+        var held = false
+
+        while g < self.lanes.len()
+            var lane = self.lanes.at(g)
+
+            if lane.phase == Begun
+                // A module's `@setup_all` is a run of its own, before anything else in it, and
+                // nothing of a module starts once the run has stopped.
+                if self.stopped
+                    lane.phase = Over
+                    self.settle_from(lane.first, lane.first + lane.size(), None)
+                else
+                    lane.hooks.setup_all match
+                        Some(h) ->
+                            if self.flights.len() >= most then return
+
+                            self.launch(g, lane.first, SetupAll, h.func, self.seconds)
+                            lane.phase = SettingUp
+                        None -> lane.phase = Testing
+
+            if lane.phase == Testing
+                // Where `@setup_all` did not come back, the module's tests do not run: there is no
+                // test to hang the failure on, and reporting tests that never started would be a
+                // third verdict for something that is not one.
+                if !lane.booted || self.stopped
+                    self.settle_from(lane.first + lane.lead() + lane.next,
+                                     lane.first + lane.lead() + lane.count, None)
+                    lane.next = lane.count
+                end if
+
+                while lane.next < lane.count
+                    // An ignored test starts no process — not the test's, and not its `@setup` or
+                    // `@teardown` either, since those bracket a run and there is none.
+                    val t = self.groups.at(g).at(lane.next)
+                    val row = lane.first + lane.lead() + lane.next
+
+                    if t.ignored.is_some()
+                        self.settle(row, Some(Outcome(t, None, "", 0, None)))
+                    else
+                        if self.flights.len() >= most then break
+
+                        val alone = runs_alone(t, self.alone)
+
+                        if alone && !self.flights.is_empty()
+                            held = true
+                            break
+                        end if
+
+                        self.launch(g, row, OneTest, t.func, t.timeout.unwrap_or(self.seconds), alone)
+                        lane.out += 1
+
+                        if alone
+                            lane.next += 1
+                            held = true
+                            break
+                        end if
+                    end if
+
+                    lane.next += 1
+
+                // `@teardown_all` runs whatever became of the tests, and whatever became of
+                // `@setup_all`: what it is for is releasing what the module took, and a module that
+                // failed halfway has taken some of it.
+                if lane.next == lane.count && lane.out == 0
+                    lane.hooks.teardown_all match
+                        Some(h) ->
+                            if self.flights.len() < most
+                                self.launch(g, lane.first + lane.lead() + lane.count, TeardownAll,
+                                            h.func, self.seconds)
+                                lane.phase = TearingDown
+                        None -> lane.phase = Over
+            end if
+
+            self.lanes.set(g, lane)
+
+            if held then return
+
+            if lane.phase == Over && g == self.live then self.live += 1
+
+            g += 1
+    end start_up_to
+
+    // Wait until at least one process out has ended, and take in what each that has came to.
+    //
+    // **The wait is a poll**, since a process is waited for one at a time and any of them may be the
+    // next to end. A sweep that finds none ended sleeps a millisecond, which is nothing beside what one
+    // test costs. A process past its limit is waited for outright, which is what stops it
+    // (`Child.wait`).
+    land_any(*self)
+        loop
+            var still: Buf[Flight] = buf()
+            var landed: Buf[(Flight, BoundedRun)] = buf()
+
+            for f in self.flights
+                f.child match
+                    None -> landed.push((f, BoundedRun(NotStarted, "", false)))
+                    Some(child) ->
+                        val over = f.limit > 0 &&
+                            whole_millis(monotonic() - f.began) >= long(f.limit) * 1000
+                        val answer = if over then child.wait().map((o) -> Some(o)) else child.try_wait()
+
+                        answer match
+                            Ok(None) -> still.push(f)
+                            Ok(Some(o)) -> landed.push((f, bounded(child, Ok(o))))
+                            Err(e) -> landed.push((f, bounded(child, Err(e))))
+
+            self.flights = still
+
+            for item in landed
+                self.take(item.0, item.1)
+
+            if !landed.is_empty() then return
+
+            sleep(millis(1))
+    end land_any
+
+    // What one process that has ended came to, written into its slot and its lane.
+    private take(*self, f: Flight, ran: BoundedRun)
+        var lane = self.lanes.at(f.lane)
+        val took = whole_millis(monotonic() - f.began)
+
+        f.kind match
+            OneTest ->
+                val t = self.groups.at(f.lane).at(f.row - lane.first - lane.lead())
+                val outcome = test_landed(self.exe, t, ran, took, f.limit, self.seconds)
+
+                self.settle(f.row, Some(outcome))
+                lane.out -= 1
+
+                if self.fail_fast && !outcome.passed() then self.stopped = true
+            SetupAll ->
+                val h = lane.hooks.setup_all.unwrap()
+
+                self.settle(f.row, self.hook_row(h, ran, took))
+                lane.booted = ran.state == 0
+                lane.phase = Testing
+            TeardownAll ->
+                val h = lane.hooks.teardown_all.unwrap()
+
+                self.settle(f.row, self.hook_row(h, ran, took))
+                lane.phase = Over
+
+        self.lanes.set(f.lane, lane)
+    end take
+
+    // A module hook's slot: a row where it did not come back, and nothing where it did.
+    private hook_row(*self, h: THook, ran: BoundedRun, took: long) -> Option[Outcome]
+        if ran.state == 0 then return None
+
+        if self.fail_fast then self.stopped = true
+
+        Some(hook_outcome(h, HookRun(ran.state, unmarked_output(ran.raw), took,
+                                     ending_of(ran.state, ran.timed_out, self.seconds))))
+    end hook_row
+
+    // One entry point of the test binary, started for the slot `row`, in a **process group of its
+    // own** and bounded by `limit` seconds (none, for zero).
+    //
+    // One that cannot be started at all is out all the same, with no child: the next sweep takes it
+    // in as the run a binary that never started comes to, rather than this taking it in under the
+    // feet of the lane its caller is still holding.
+    private launch(*self, lane: usize, row: usize, kind: FlightKind, name: string, limit: int,
+                   alone: bool = false)
+        val began = monotonic()
+        val child = start(self.exe, [name], "", running_compiler_env().view(), true, limit * 1000,
+                          group = Group.New).ok()
+
+        self.flights.push(Flight(lane, row, kind, child, began, limit, alone))
+    end launch
+
+    private settle(*self, row: usize, outcome: Option[Outcome])
+        self.rows.set(row, outcome)
+        self.settled.set(row, true)
+
+    private settle_from(*self, from: usize, to: usize, outcome: Option[Outcome])
+        for row in from..<to
+            self.settle(row, outcome)
+end Schedule
+
+// The slots of every group laid out in report order -- a module's `@setup_all`, its tests, its
+// `@teardown_all` -- each unsettled.
+private schedule_of(exe: string, groups: Buf[Buf[TTest]], seconds: int, opts: TestOptions) -> Schedule
+    var lanes: Buf[Lane] = buf()
+    var rows: Buf[Option[Outcome]] = buf()
+    var settled: Buf[bool] = buf()
+
+    for group in groups
+        // A module whose selected tests are all ignored runs nothing at all, its `_all` hooks
+        // included: they bracket the runs, and there are none to bracket.
+        val hooks = if all_ignored(group) then no_hooks() else group.at(0).hooks
+        val lane = Lane(hooks, rows.len(), group.len(), Begun, 0, 0, true)
+
+        for _ in 0..<lane.size()
+            rows.push(None)
+            settled.push(false)
+
+        lanes.push(lane)
+
+    Schedule(exe, seconds, opts.fail_fast, opts.alone, groups, lanes, rows, settled, buf(), false, 0)
+end schedule_of
+
+// Whether a test is one of those `alone` names, each read as `--filter` reads its text.
+private runs_alone(t: TTest, alone: Buf[string]) -> bool
+    for item in alone
+        if test_matches(t, Some(item)) then return true
+
+    false
+end runs_alone
+
+// One module's part of a run: where its slots begin, how far its tests have got, and which of its
+// hooks has run.
+private struct Lane
+    hooks: THooks
+    first: usize
+    count: usize
+    phase: LanePhase
+    next: usize
+
+    // Tests started and not yet in.
+    out: usize
+
+    // Whether `@setup_all` came back, or there was none.
+    booted: bool
+
+    // Slots ahead of the first test: one for a `@setup_all`, none without.
+    lead(self) -> usize = if self.hooks.setup_all.is_some() then 1 else 0
+
+    size(self) -> usize =
+        self.lead() + self.count + (if self.hooks.teardown_all.is_some() then 1 else 0)
+end Lane
+
+private enum LanePhase
+    Begun
+    SettingUp
+    Testing
+    TearingDown
+    Over
+
+// A process the run has out: which slot it answers, and what it is.
+private struct Flight
+    lane: usize
+    row: usize
+    kind: FlightKind
+    child: Option[&Child]
+    began: Duration
+    limit: int
+
+    // A test running with nothing beside it.
+    alone: bool
+end Flight
+
+private enum FlightKind
+    SetupAll
+    OneTest
+    TeardownAll
 
 // One row, with its file's heading in front of it where this is the first row that file has had.
 private show_outcome(o: Outcome, width: usize, shown: *string, any_shown: *bool,
@@ -277,14 +539,14 @@ end index_of_module
 // honouring "teardown runs even when the test failed" any other way would mean not running it at all.
 // What a fresh process can release is what outlives a process, which is what the hook is documented
 // to be for.
-private run_one_test(exe: string, t: TTest, run_seconds: int) -> Outcome
-    val started = monotonic()
-    val limit = t.timeout.unwrap_or(run_seconds)
-    val ran = run_bounded(exe, t.func, limit)
+//
+// This is the test's process once it has ended, as `ran`, `took` milliseconds after it was started
+// with `limit` seconds to run in. The teardown it could not reach runs here, before the test's row is
+// in -- so the next test of a run of one at a time does not start until it is done.
+private test_landed(exe: string, t: TTest, ran: BoundedRun, took: long, limit: int,
+                    run_seconds: int) -> Outcome
     val raw = ran.raw
     val state = ran.state
-
-    val took = whole_millis(monotonic() - started)
     val output = unmarked_output(raw)
     val setup_ran = t.hooks.setup.is_none() || raw.has_byte(setup_byte())
     val entered_down = t.hooks.teardown.is_some() && raw.has_byte(test_byte())
@@ -323,7 +585,7 @@ private run_one_test(exe: string, t: TTest, run_seconds: int) -> Outcome
         if r.status != 0 && detail.is_none() then detail = Some(hook_ended(h, r.ending))
 
     Outcome(t, detail, output + trailing, took, skipped)
-end run_one_test
+end test_landed
 
 // What one hook's own process did. `ending` is how a report says it did not come back, where it did
 // not: an exit status, or the limit it outlasted.
@@ -360,30 +622,33 @@ end BoundedRun
 // test that returned is left alone: what it leaves running is its own business, and the runner's
 // part is only the limit it set. Output goes to files rather than pipes (`sysl.process`), so what a
 // stopped test printed before it was stopped is all still there to show.
-private run_bounded(exe: string, name: string, seconds: int) -> BoundedRun
+private run_bounded(exe: string, name: string, seconds: int) -> BoundedRun =
+    start(exe, [name], "", running_compiler_env().view(), true, seconds * 1000, group = Group.New) match
+        Err(_) -> BoundedRun(NotStarted, "", false)
+        Ok(child) -> bounded(child, child.wait())
+
+// What a child of the test binary came to, from what its wait answered -- and, where it was stopped
+// for outlasting its limit, the rest of its group stopped too. A wait that failed is a run with no
+// status, as a binary that never started is.
+private bounded(child: &Child, answer: Result[Output, IoError]) -> BoundedRun
     var state = NotStarted
     var raw = ""
     var timed_out = false
 
-    start(exe, [name], "", running_compiler_env().view(), true, seconds * 1000, group = Group.New) match
+    answer match
         Err(_) -> ()
-        Ok(child) ->
-            val gid = child.group()
+        Ok(o) ->
+            raw = o.text + o.err.unwrap_or("")
+            state = shell_status(o.status)
 
-            child.wait() match
-                Err(_) -> ()
-                Ok(o) ->
-                    raw = o.text + o.err.unwrap_or("")
-                    state = shell_status(o.status)
+            o.status match
+                TimedOut -> timed_out = true
+                _ -> ()
 
-                    o.status match
-                        TimedOut -> timed_out = true
-                        _ -> ()
-
-            if timed_out then send(-i64(gid), KILL)
+    if timed_out then send(-i64(child.group()), KILL)
 
     BoundedRun(state, raw, timed_out)
-end run_bounded
+end bounded
 
 // The run's limit where a run is not given one: long enough that no real test comes near it, short
 // enough that a test that will never end costs a run five minutes rather than the rest of the night.

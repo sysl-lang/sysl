@@ -237,6 +237,7 @@ sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --file <name>
 sysl test <path> --fail-fast
+sysl test <path> --jobs <n>
 sysl test <path> --timeout <seconds>
 sysl test <path> --std
 ```
@@ -315,9 +316,21 @@ same), or as much of its path as it takes to tell two files of one name apart (`
 questions, and given both a test has to answer yes to each. A refused program under `tests/refused/`
 is in a file of its own, so `--file` picks one of those out the same way.
 
-`--fail-fast` stops the loop rather than the report: what ran is still
-reported and what never ran is simply absent, because "skipped" would be a third verdict for
-something that is not a verdict.
+**The tests run several at once — as many as the machine has processors, or `--jobs <n>`** — and
+the report is the same report a run of one at a time writes: each row waits for every row above it,
+so the rows still come in source order, and `--jobs 1` is that run. Each test already has a process
+of its own, so running several at once shares nothing between them that running them one after
+another did not. What they can still share is whatever outlives a process — a file at a fixed path,
+a port — and a test that needs one of those to itself makes it its own, with a temporary directory or
+a port the system picks, or is named in its manifest's
+[`test.alone`](/reference/packages/#how-a-packages-suite-is-run), which runs it with nothing beside
+it. The manifest's `test` block can also set the run's `jobs` and `timeout`, which the flags beat. A
+module's `@setup_all` is in before any of its tests starts, and its
+`@teardown_all` starts once every one of them is in.
+
+`--fail-fast` stops the starting rather than the report: the tests already running finish and are
+reported, what ran is still reported, and what never started is simply absent, because "skipped"
+would be a third verdict for something that is not a verdict.
 
 **Every test has a time limit, so a test that never ends fails rather than hanging the run.**
 `--timeout <seconds>` sets it for each test the run starts — 300 seconds when it is not given, and

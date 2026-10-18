@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{split, Search}
 
@@ -72,12 +72,12 @@ private trn_outcomes_of(files: Buf[(string, string)], opts: TestOptions) -> Opti
     Some(ran)
 end trn_outcomes_of
 
-private trn_outcomes(text: string, opts: TestOptions = TestOptions(None, false)) -> Option[Buf[Outcome]] =
+private trn_outcomes(text: string, opts: TestOptions = TestOptions(None, false, 1, buf())) -> Option[Buf[Outcome]] =
     trn_outcomes_of(trn_one("main.sysl", text), opts)
 
 // The same for a file declaring `module m`.
 private trn_outcomes_m(text: string) -> Option[Buf[Outcome]] =
-    trn_outcomes_of(trn_one("m/m.sysl", text), TestOptions(None, false))
+    trn_outcomes_of(trn_one("m/m.sysl", text), TestOptions(None, false, 1, buf()))
 
 // Every test passed, and the message names each one that did not.
 private trn_all_passed(ran: Buf[Outcome])
@@ -298,7 +298,7 @@ trn_each_module_gets_its_own_hooks()
     files.push(("b/b.sysl", "module b\n\nvar ran: int = 0\n\n" +
                             "@test\ntheirs() =\n    assert(ran == 0, \"and nothing ran for b's\")\n"))
 
-    val ran = trn_outcomes_of(files, TestOptions(None, false)) match
+    val ran = trn_outcomes_of(files, TestOptions(None, false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -434,7 +434,7 @@ trn_a_computed_val_is_filled()
 
 @test("a filter selects by the name a report shows")
 trn_a_filter_selects_by_display()
-    trn_outcomes("@test\nalpha() = 0\n\n@test\nbeta() = 0\n", TestOptions(Some("alph"), false)) match
+    trn_outcomes("@test\nalpha() = 0\n\n@test\nbeta() = 0\n", TestOptions(Some("alph"), false, 1, buf())) match
         None -> ()
         Some(ran) -> assert_eq(trn_displays(ran), "alpha")
 
@@ -455,20 +455,20 @@ trn_a_filter_selects_by_module()
 @test("a display name is what the filter sees, not the function's own")
 trn_a_filter_sees_the_display_name()
     trn_outcomes("@test(\"the sum of an empty list is zero\")\nsum_empty() = 0\n",
-                 TestOptions(Some("empty list"), false)) match
+                 TestOptions(Some("empty list"), false, 1, buf())) match
         None -> ()
         Some(ran) -> assert_eq(trn_displays(ran), "the sum of an empty list is zero")
 
 @test("fail-fast stops at the first failure and reports what ran")
 trn_fail_fast_stops_at_the_first_failure()
     trn_outcomes("@test\nfirst() =\n    assert(false, \"down\")\n\n@test\nsecond() =\n    assert(true, \"up\")\n",
-                 TestOptions(None, true)) match
+                 TestOptions(None, true, 1, buf())) match
         None -> ()
         Some(ran) -> assert_eq(trn_displays(ran), "first")
 
 @test("fail-fast runs everything when nothing fails")
 trn_fail_fast_runs_everything_that_passes()
-    trn_outcomes("@test\nfirst() = 0\n\n@test\nsecond() = 0\n", TestOptions(None, true)) match
+    trn_outcomes("@test\nfirst() = 0\n\n@test\nsecond() = 0\n", TestOptions(None, true, 1, buf())) match
         None -> ()
         Some(ran) -> assert_eq(trn_displays(ran), "first,second")
 
@@ -807,3 +807,125 @@ trn_the_program_still_runs()
             assert(out.status.ok(), out.text)
             assert_eq(out.text, "42\n")
 end trn_the_program_still_runs
+
+// -- several tests at once ------------------------------------------------------------------------------
+
+// The source of a function that leaves the file `mine` and waits for `theirs`, failing where it does not
+// appear in twenty seconds: a test that passes calling it ran beside the test that left `theirs`.
+private trn_meeting(dir: string) -> string =
+    "import sysl.fs.{is_file, write_text}\nimport sysl.time.{millis, sleep}\n\n" +
+    s"meet(mine: string, theirs: string)\n    write_text(\"$dir/\" + mine, \"\").unwrap()\n\n" +
+    "    var waited = 0\n\n" +
+    s"    while !is_file(\"$dir/\" + theirs)\n" +
+    "        assert(waited < 20000, \"the other test never ran beside this one\")\n" +
+    "        sleep(millis(10))\n        waited += 10\n\n"
+
+@test("with '--jobs', tests run at the same time and are still reported in the order they were written")
+trn_jobs_run_at_once_and_report_in_order()
+    val dir = make_temp_dir("sysl-trn-jobs").unwrap()
+
+    // `first` cannot return until `third` has started, so `third` is in before it -- and is reported
+    // after it all the same.
+    val ran = trn_outcomes(trn_meeting(dir) +
+                           "@test\nfirst() =\n    meet(\"first\", \"third\")\n\n" +
+                           "@test\nsecond() = 0\n\n" +
+                           "@test\nthird() =\n    meet(\"third\", \"first\")\n",
+                           TestOptions(None, false, 3, buf())) match
+        None ->
+            remove_dir_all(dir).unwrap_or(())
+            return
+        Some(r) -> r
+
+    remove_dir_all(dir).unwrap_or(())
+    trn_all_passed(ran)
+    assert_eq(trn_displays(ran), "first,second,third")
+
+@test("with '--jobs', a module's '@setup_all' is in before its tests start and '@teardown_all' after")
+trn_jobs_keep_the_all_hooks_around_the_tests()
+    val dir = make_temp_dir("sysl-trn-jobs").unwrap()
+    val each = "import sysl.fs.{is_file, write_text}\n\n" +
+               s"@setup_all\nboot() =\n    write_text(\"$dir/up\", \"\").unwrap()\n\n" +
+               s"@teardown_all\nhalt() =\n    var all = is_file(\"$dir/up\")\n\n" +
+               "    for n in [\"a\", \"b\", \"c\", \"d\"]\n" +
+               s"        all = all && is_file(\"$dir/\" + n)\n\n" +
+               s"    if all then write_text(\"$dir/down\", \"\").unwrap()\n\n"
+
+    var tests = ""
+
+    for n in ["a", "b", "c", "d"]
+        tests = tests + s"@test\nt_$n() =\n    assert(is_file(\"$dir/up\"), \"the module came up first\")\n" +
+                s"    write_text(\"$dir/$n\", \"\").unwrap()\n\n"
+
+    val ran = trn_outcomes(each + tests, TestOptions(None, false, 4, buf())) match
+        None ->
+            remove_dir_all(dir).unwrap_or(())
+            return
+        Some(r) -> r
+
+    val down = is_file(s"$dir/down")
+
+    remove_dir_all(dir).unwrap_or(())
+    trn_all_passed(ran)
+    assert_eq(trn_displays(ran), "t_a,t_b,t_c,t_d")
+    assert(down, "'@teardown_all' ran once every test was in, and found each one's file")
+
+@test("with '--jobs' and '--fail-fast', a failure stops the starting and what was running is reported")
+trn_jobs_fail_fast_stops_the_starting()
+    var text = "import sysl.time.{millis, sleep}\n\n@test\none() =\n    assert(false, \"the first one fails\")\n\n"
+
+    for n in ["two", "three", "four", "five", "six"]
+        text = text + s"@test\n$n() =\n    sleep(millis(300))\n\n"
+
+    val ran = trn_outcomes(text, TestOptions(None, true, 2, buf())) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.at(0).test.display, "one")
+    assert(!ran.at(0).passed(), "the first one failed")
+    assert(ran.len() < 6, trn_displays(ran))
+    assert(!trn_displays(ran).contains("six"), trn_displays(ran))
+
+@test("'--jobs' takes a whole number from one up")
+trn_jobs_takes_a_whole_number_from_one()
+    assert_eq(test_jobs("1").unwrap(), 1)
+    assert_eq(test_jobs("16").unwrap(), 16)
+    assert_eq(test_jobs("9999").unwrap(), 9999)
+    assert(test_jobs("0").is_none())
+    assert(test_jobs("").is_none())
+    assert(test_jobs("-2").is_none())
+    assert(test_jobs("4x").is_none())
+    assert(test_jobs("10000").is_none())
+
+@test("a test the run names alone runs with nothing beside it, and the rest still run at once")
+trn_an_alone_test_runs_with_nothing_beside_it()
+    val dir = make_temp_dir("sysl-trn-alone").unwrap()
+
+    // Every test leaves a file while it runs and looks, a few times over, for anyone else's.
+    val busy = "import sysl.fs.{entries, is_file, remove_file, write_text}\nimport sysl.time.{millis, sleep}\n\n" +
+               s"busy(me: string, alone: bool)\n    write_text(\"$dir/\" + me, \"\").unwrap()\n\n" +
+               "    for _ in 0..<10\n" +
+               s"        val there = entries(\"$dir\").unwrap().len()\n\n" +
+               "        if alone then assert(there == 1, \"another test ran beside the one running alone\")\n" +
+               s"        else assert(!is_file(\"$dir/solo\"), \"a test ran beside the one running alone\")\n\n" +
+               "        sleep(millis(30))\n\n" +
+               s"    remove_file(\"$dir/\" + me).unwrap()\n\n"
+
+    var alone: Buf[string] = buf()
+
+    alone.push("solo")
+
+    val ran = trn_outcomes(busy +
+                           "@test\nfirst() =\n    busy(\"first\", false)\n\n" +
+                           "@test\nsecond() =\n    busy(\"second\", false)\n\n" +
+                           "@test\nsolo() =\n    busy(\"solo\", true)\n\n" +
+                           "@test\nfourth() =\n    busy(\"fourth\", false)\n\n" +
+                           "@test\nfifth() =\n    busy(\"fifth\", false)\n",
+                           TestOptions(None, false, 4, alone)) match
+        None ->
+            remove_dir_all(dir).unwrap_or(())
+            return
+        Some(r) -> r
+
+    remove_dir_all(dir).unwrap_or(())
+    trn_all_passed(ran)
+    assert_eq(trn_displays(ran), "first,second,solo,fourth,fifth")

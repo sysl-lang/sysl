@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.source
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
+import sysl.cpu_count
 import sysl.prints
 import sysl.text.{join, split, Search}
 
@@ -920,9 +921,10 @@ where_flags() -> string =
 private emit_typed_usage() -> string =
     "usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] " + where_flags() + " <path>"
 
-// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--target <name>]
-// [--cc <path>] [-O<level>] <path>` --
-// the `@test` functions of a tree, built into one binary and run one process each. `--file` keeps the
+// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>]
+// [--target <name>] [--cc <path>] [-O<level>] <path>` --
+// the `@test` functions of a tree, built into one binary and run one process each, `--jobs` of them at
+// once. `--file` keeps the
 // tests written in the one file it names (`file_named`), beside whatever `--filter` keeps.
 //
 // **The report is written as the run goes rather than at the end**, which is why it does not go
@@ -938,7 +940,8 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var within: Option[string] = None
     var fail_fast = false
     var std = false
-    var seconds = DefaultTestSeconds
+    var seconds: Option[int] = None
+    var jobs: Option[usize] = None
     var named_level: Option[string] = None
     var picked: Option[string] = None
     var file = ""
@@ -967,9 +970,22 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             i += 1
 
             timeout_seconds(args[i]) match
-                Some(n) -> seconds = n
+                Some(n) -> seconds = Some(n)
                 None ->
                     mistakes.push(bad_timeout(args[i]))
+                    break
+        else if args[i] == "--jobs"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+
+            test_jobs(args[i]) match
+                Some(n) -> jobs = Some(n)
+                None ->
+                    mistakes.push(bad_jobs(args[i]))
                     break
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file"
             if i + 1 >= args.len
@@ -1042,11 +1058,13 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             return Failed
         Ok(found) -> found
 
-    val opts = TestOptions(filter, fail_fast)
+    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
+    val opts = TestOptions(filter, fail_fast, 0, buf())
+    val asked = TestAsked(jobs, seconds)
 
     projects match
-        None -> test_project(file, named, cc, opts, seconds, std, named_level, note, report, within)
-        Some(members) -> test_members(members, named, cc, opts, seconds, std, named_level, say, note,
+        None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within)
+        Some(members) -> test_members(members, named, cc, opts, asked, std, named_level, say, note,
                                       report, within)
 end test_command
 
@@ -1066,6 +1084,41 @@ timeout_seconds(text: string) -> Option[int]
     if n > MostTestSeconds then None else Some(n)
 end timeout_seconds
 
+// `--jobs`'s value: how many tests may run at once, a whole number from one up. Without the flag it is
+// this machine's processor count (`cpu_count`), as `cargo test` takes it.
+test_jobs(text: string) -> Option[usize]
+    if text.bytes.len == 0 || text.bytes.len > 4 then return None
+
+    var n: usize = 0
+
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return None
+
+        n = n * 10 + usize(c - u8('0'))
+
+    if n == 0 then None else Some(n)
+end test_jobs
+
+// What the command line said about how to run, where it said anything: each is `None` where a
+// project's `test` block, and then the default, decides.
+private struct TestAsked
+    jobs: Option[usize]
+    seconds: Option[int]
+end TestAsked
+
+// The `test` block of the manifest beside `path` -- a project directory, or a file in one -- or none
+// where there is no readable manifest there; a manifest that cannot be read is said by the build.
+test_settings_of(path: string) -> TestSettings
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    manifest_at(root) match
+        Ok(m) -> m.tests
+        Err(_) -> no_test_settings()
+end test_settings_of
+
+private bad_jobs(text: string) -> string =
+    s"'--jobs' takes how many tests may run at once, a whole number from 1 up, and '$text' is not one"
+
 private bad_timeout(text: string) -> string =
     s"'--timeout' takes the seconds each test may run, a whole number from 0 to $MostTestSeconds " +
         s"(0 is no limit), and '$text' is not one"
@@ -1074,7 +1127,7 @@ private bad_timeout(text: string) -> string =
 // workspace came out. A failing member does not stop the others unless `--fail-fast` asked for that:
 // the point of testing a workspace at once is to hear about all of it.
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
-                     opts: TestOptions, seconds: int, std: bool, named_level: Option[string],
+                     opts: TestOptions, asked: TestAsked, std: bool, named_level: Option[string],
                      say: string -> unit, note: string -> unit, report: string -> unit,
                      within: Option[string]) -> int
     var failed: Buf[string] = buf()
@@ -1084,7 +1137,7 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, opts, seconds, std, named_level, note, report, within) != Fine
+        if test_project(mb.dir, named, cc, opts, asked, std, named_level, note, report, within) != Fine
             failed.push(mb.name)
 
             if opts.fail_fast then break
@@ -1100,9 +1153,15 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
 end test_members
 
 // One project's suite, once the command line has been read.
-private test_project(file: string, named: Option[string], cc: Option[string], opts: TestOptions,
-                     seconds: int, std: bool, named_level: Option[string], note: string -> unit,
+private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
+                     asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
                      report: string -> unit, within: Option[string]) -> int
+    // The package's own `test` block, under whatever the command line said.
+    val settings = test_settings_of(file)
+    val seconds = asked.seconds.unwrap_or(settings.timeout.unwrap_or(DefaultTestSeconds))
+    val opts = TestOptions(given.filter, given.fail_fast,
+                           asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
+
     val level = build_level(file, named_level) match
         Err(why) ->
             say_failure(why, note)
@@ -1223,7 +1282,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
     if failed == 0 then Fine else Failed
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     pipeline_usage() + " <path>"
 
@@ -1506,7 +1565,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | deps <path> | vendor <path> | tidy [--check] [<path>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +

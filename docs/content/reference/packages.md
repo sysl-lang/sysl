@@ -172,6 +172,52 @@ them and links nothing.
 tree's modules leave `tests/refused/` out, as they leave out `examples/`; the rest of `tests/` is an
 ordinary module directory.
 
+## How a package's suite is run
+
+**`sysl test` runs several tests at once**, as many as the machine has processors, and holds each
+test to 300 seconds ([the CLI](/getting-started/cli/#test)). A package whose suite needs something
+else says so in a `test` block, so that everyone who runs the suite — its author, a contributor, CI —
+gets it without a flag:
+
+```hocon
+package {
+  name    = "pg"
+  version = "0.4.0"
+}
+
+test {
+  jobs    = 4
+  timeout = 600
+  alone   = ["listen_", "sh.sysl.pg.server"]
+}
+```
+
+| key | what it says | the flag it is the default for |
+|---|---|---|
+| `jobs` | how many tests may run at once, a whole number from 1 up | `--jobs` |
+| `timeout` | the seconds each test may run, 0 for no limit | `--timeout` |
+| `alone` | the tests that run with no other test beside them | — |
+
+**`alone` is for the test that cannot share the machine**: one that binds a fixed port, drives a
+device there is one of, opens a database every test of the package opens, or measures time and is
+thrown by a busy machine. Each entry is a text a test's name **or module** holds, read as `--filter`
+reads one, so naming a module makes all of its tests alone. Such a test waits until nothing else is
+running, and nothing starts beside it until it is in; the rest of the suite still runs at once around
+it. A suite whose every test is like that says `jobs = 1` instead.
+
+**The flag beats the key, and the key beats the default**, as with
+[`optimization`](#the-optimization-level-a-project-is-built-at). A test's own
+[`@test(timeout: n)`](/reference/attributes/#a-test-may-be-given-a-limit) beats both limits. In a
+workspace, each member's suite is run by its own block.
+
+**The block is about this package's own suite**, so a dependency's is never read: its tests are not
+run by a consumer's `sysl test`. A value the block cannot mean is refused, and a key it does not know
+is [warned about and ignored](#a-key-this-compiler-does-not-know-is-reported-and-ignored):
+
+```
+package.hocon: 'test.jobs' is how many tests may run at once, a whole number from 1 up
+```
+
 ## A key this compiler does not know is reported and ignored
 
 A manifest is read by whatever compiler is in hand, which may be older than the manifest. So an
