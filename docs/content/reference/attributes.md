@@ -1248,11 +1248,14 @@ comparison has nothing to add, since the thing that came out `false` is its only
 
 **It is not `require`.** A `require` is a runtime precondition: it is compiled, it branches, and it
 traps when the program reaches it. This is settled while compiling and reaches the binary as nothing.
-A condition it cannot settle is refused rather than deferred — and a call is the line, since a call
-in a constant expression would be a request for compile-time evaluation of arbitrary code:
+A condition it cannot settle is refused rather than deferred — and a call that reaches run-time
+storage, a `var` for one, is the line, since only a function holding what exists while compiling can run
+then:
 
 ```sysl
-f() -> int = 3
+var seed: int = 3
+
+f() -> int = seed
 
 @assert(f() == 3)
 
@@ -3565,8 +3568,9 @@ address of other module storage, or an array or struct built from those — or l
 every thread at the type's zero. That is
 the one rule the attribute adds, and it follows from what a per-thread copy is: the copies are made
 from a single image in the object file, because a thread started halfway through a run never passes
-through the prologue an ordinary module `var` is filled by. A call as an initializer would fill exactly
-one copy and leave every other thread reading zeroes, so it is refused where it is written.
+through the prologue an ordinary module `var` is filled by. A call that has to run when the program does, because it prints
+or reads a `var` say, would fill exactly one copy and leave every other thread reading zeroes, so it is refused
+where it is written.
 
 It marks a `var` and nothing else. A `val` and a `const` never change, so the one copy each already has
 is every thread's.
@@ -3620,7 +3624,9 @@ for its count to be torn by, and reaching it is not crossing a concurrency domai
 ### What it may not take as an initializer
 
 ```sysl
-next() -> int = 42
+next() -> int
+    print("next")
+    42
 
 @thread_local static var n: int = next()
 
