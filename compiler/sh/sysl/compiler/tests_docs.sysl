@@ -587,20 +587,20 @@ end docs_first_twenty
 // several tests at once runs the site several pages at a time -- and no one process holds every
 // compilation of the site, which in one process came to sixteen gigabytes. A page is checked by
 // exactly one part (`docs_parts`). A complaint names its page, so which part found it does not matter.
-const DocsParts: int = 24
+const DocsParts: usize = 24
 
-// The part each page is checked by: the heaviest page first, by the sysl blocks it shows, each dealt
+// The part each page is checked by, `parts` standing for none yet: the heaviest page first, by the sysl blocks it shows, each dealt
 // to the part holding the fewest blocks so far -- ties to the lower part, and between pages of one
 // weight to the earlier name, so the dealing is the same on every machine. No part is lighter than
 // it could be except under a page too heavy to share.
-private docs_parts(root: string, pages: Buf[string], parts: int) -> Buf[int]
+private docs_parts(root: string, pages: Buf[string], parts: usize) -> Buf[usize]
     var weight: Buf[usize] = buf()
-    var part: Buf[int] = buf()
+    var part: Buf[usize] = buf()
     var load: Buf[usize] = buf()
 
     for page in pages
         weight.push(docs_blocks(docs_short(root, page), read_text(page).unwrap_or("")).len())
-        part.push(-1)
+        part.push(parts)
 
     for _ in 0..<parts
         load.push(0)
@@ -609,13 +609,13 @@ private docs_parts(root: string, pages: Buf[string], parts: int) -> Buf[int]
         var pick = pages.len()
 
         for i in 0..<pages.len()
-            if part.at(i) >= 0 then continue
+            if part.at(i) != parts then continue
 
             if pick == pages.len() || weight.at(i) > weight.at(pick) ||
                (weight.at(i) == weight.at(pick) && pages.at(i) < pages.at(pick))
                 pick = i
 
-        var lightest = 0
+        var lightest: usize = 0
 
         for k in 1..<parts
             if load.at(k) < load.at(lightest) then lightest = k
@@ -627,7 +627,7 @@ private docs_parts(root: string, pages: Buf[string], parts: int) -> Buf[int]
 end docs_parts
 
 // The pages part `part` checks, of the pages a run reads.
-private docs_pages_of_part(root: string, part: int) -> Buf[string]
+private docs_pages_of_part(root: string, part: usize) -> Buf[string]
     val pages = docs_pages(root)
     val dealt = docs_parts(root, pages, DocsParts)
     var out: Buf[string] = buf()
@@ -643,7 +643,7 @@ end docs_pages_of_part
 // The report is a line for each page and one for the part. **`SYSL_DOCS_SUMMARY` gathers every
 // part's report into one file**, each part appending its own as it finishes, so a run of the whole
 // site still leaves every complaint in one place.
-private docs_sweep_part(part: int)
+private docs_sweep_part(part: usize)
     if env_var("SYSL_DOCS").unwrap_or("") != "1"
         print("skipped: SYSL_DOCS is not set, so the site's pages were not run")
         return
@@ -814,7 +814,7 @@ the_sites_sweeps_are_owed_their_blocks()
     for p in 0..<pages.len()
         val blocks = docs_blocks(docs_short(root, pages.at(p)), read_text(pages.at(p)).unwrap_or(""))
 
-        assert(dealt.at(p) >= 0 && dealt.at(p) < DocsParts, s"${pages.at(p)} is in no part")
+        assert(dealt.at(p) < DocsParts, s"${pages.at(p)} is in no part")
         load.set(dealt.at(p), load.at(dealt.at(p)) + blocks.len())
 
         if blocks.len() > heaviest then heaviest = blocks.len()
@@ -836,7 +836,7 @@ the_sites_sweeps_are_owed_their_blocks()
         total += load.at(k)
 
     for k in 0..<DocsParts
-        assert(load.at(k) <= heaviest + total / usize(DocsParts),
+        assert(load.at(k) <= heaviest + total / DocsParts,
                s"part ${k + 1} carries ${load.at(k)} of $total blocks")
 end the_sites_sweeps_are_owed_their_blocks
 
@@ -900,7 +900,7 @@ private docs_live_at_exit(src: string, exe: string) -> Result[long, string]
 end docs_live_at_exit
 
 // Every runnable block on part `part`'s pages gives back every allocation it made.
-private docs_heap_part(part: int)
+private docs_heap_part(part: usize)
     val asked = env_var("SYSL_DOCS").unwrap_or("") == "1" ||
         env_var("SYSL_DOCS_LEAKS").unwrap_or("") == "1"
 
