@@ -124,6 +124,32 @@ if [ -n "$SYSL_CENSUS_PIN_ONLY" ]; then
     exit 0
 fi
 
+# **Both compilers must build a program before any row is read.** The reference is only consulted
+# when ours fails, so a reference that cannot run at all -- a bare binary copied without the library
+# installed beside it, an environment it cannot start in -- turns every failure into "refused by both"
+# and the census reports nothing wrong. A one-line program built by each is the whole check.
+mkdir -p "$work/preflight"
+printf 'print("ok")\n' > "$work/preflight/hello.sysl"
+
+if ! ( cd "$work/preflight" && PATH=$ours_path "$ours_bin" build hello.sysl -o ours ) > "$work/preflight/ours.out" 2>&1; then
+    echo "census refused: $ours_bin cannot build a one-line program:" >&2
+    head -5 "$work/preflight/ours.out" >&2
+    exit 3
+fi
+
+if ! ( cd "$work/preflight" && env $theirs_env PATH="$theirs_path" "$theirs_bin" build hello.sysl -o theirs ) > "$work/preflight/theirs.out" 2>&1; then
+    echo "census refused: the reference $theirs_bin cannot build a one-line program, so no row could be checked against it:" >&2
+    head -5 "$work/preflight/theirs.out" >&2
+    exit 3
+fi
+
+echo "preflight: both compilers build a program"
+
+# `SYSL_CENSUS_PREFLIGHT_ONLY=1` stops here, which is how the check is tested without a full run.
+if [ -n "$SYSL_CENSUS_PREFLIGHT_ONLY" ]; then
+    exit 0
+fi
+
 # **`keel` is a kernel, and its image is built the way its boot test builds it** (`scripts/boot-test.sh`,
 # with no QEMU): each user program first, into `scratch/user/`, because the kernel embeds their images
 # with `.incbin` paths the assembler resolves against the repository's root -- then the kernel, from
