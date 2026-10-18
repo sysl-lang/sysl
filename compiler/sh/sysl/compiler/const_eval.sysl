@@ -240,7 +240,7 @@ end const_quad_value
 
 // A module `val`'s initializer as the literal it comes to, where it calls a `const` function: such a
 // value is laid down on every target, the compiler having run the call -- a scalar, or a whole table
-// the function fills in a loop. A trap is refused at the initializer. Where the evaluation meets
+// the function fills in a loop. A trap in a `const` function is refused at the initializer. Where the evaluation meets
 // something it does not hold, or runs out of steps, the initializer stays code, computed before the
 // program's statements, and why is kept in `last_stop` for a target that cannot run that code.
 const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr] = const_val_run(cx, name, init) match
@@ -269,8 +269,11 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
             cx.an.evaluation.last_stop = s"'$name' came to a value holding an enum variant whose fields " +
                                          "have no fixed bit pattern, which is not laid down as constant data"
             Ok(None)
+        // A trap is refused where the initializer calls a `const` function, which promised to run
+        // while compiling. A call to one nobody marked keeps its meaning: it traps when the program
+        // starts, as written.
         EvFail(message, trapped) ->
-            if trapped
+            if trapped && calls_marked(cx.an, init)
                 cx.fault(init.span, message)
                 return Err(())
             end if
@@ -279,6 +282,18 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
             Ok(None)
         _ -> Ok(None)
 end const_val_run
+
+// Whether a typed tree calls a function marked `const`.
+private calls_marked(a: &Analysis, t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        _ -> ()))
+
+    !found.is_empty()
+end calls_marked
 
 // What a `const` initializer that calls a function owes its reader, where that function cannot run
 // while compiling: what in its body stops it. Empty where the initializer is anything else.
