@@ -101,6 +101,10 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
 
     val ev = cx.an.evaluation
 
+    // Before the declarations are read no body can be typed, so a call to a function nobody marked
+    // is left to the fold, which says the value has to be a constant.
+    if !ev.ready && !names_const_fn(cx.an, written.unwrap()) then return None
+
     if !ev.ready
         cx.fault(e.span, s"'${written.unwrap()}' is a 'const' function, but this value is read while " +
                  "declarations are, before any body can be run — a 'const' call is evaluated where a " +
@@ -327,6 +331,37 @@ private callee_word(callee: Expr) -> Option[string] = *callee.kind match
     Ident(n) -> Some(n)
     Field(_, n, _) -> Some(n)
     _ -> None
+
+// Whether some `const` function is spelled `word`: before the declarations are read, a call to one is
+// told it came too early, and any other call is the fold's to refuse.
+private names_const_fn(a: &Analysis, word: string) -> bool
+    for i in 0..<a.tables.const_fns.len()
+        if spelled_word(a.tables.const_fns.key_at(i)) == word then return true
+
+    false
+end names_const_fn
+
+// The name a key was written as: the module and any owning type in front of it dropped, and an
+// overload's number after it.
+private spelled_word(key: string) -> string
+    var end_at = key.bytes.len
+    var start: usize = 0
+
+    // An overload's slot is a dot and digits on the end.
+    var i = key.bytes.len
+
+    while i > 0 && key.bytes[i - 1] >= u8('0') && key.bytes[i - 1] <= u8('9')
+        i -= 1
+
+    if i > 0 && i < key.bytes.len && key.bytes[i - 1] == u8('.') then end_at = i - 1
+
+    for j in 0..<end_at
+        val b = key.bytes[j]
+
+        if b == u8('$') || b == u8('.') then start = j + 1
+
+    key[start..<end_at]
+end spelled_word
 
 // Whether a call names a function the evaluator may try to run: one with a body, marked or not. An
 // `extern` has none here, and a constant that calls one is the fold's to refuse.

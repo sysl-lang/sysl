@@ -3568,9 +3568,9 @@ address of other module storage, or an array or struct built from those — or l
 every thread at the type's zero. That is
 the one rule the attribute adds, and it follows from what a per-thread copy is: the copies are made
 from a single image in the object file, because a thread started halfway through a run never passes
-through the prologue an ordinary module `var` is filled by. A call that has to run when the program does, because it prints
-or reads a `var` say, would fill exactly one copy and leave every other thread reading zeroes, so it is refused
-where it is written.
+through the prologue an ordinary module `var` is filled by. A call that has to run when the program
+does — one that prints, or reads a `var` — would fill exactly one copy and leave every other thread
+reading zeroes, so it is refused where it is written.
 
 It marks a `var` and nothing else. A `val` and a `const` never change, so the one copy each already has
 is every thread's.
