@@ -644,10 +644,18 @@ emit_llvm_text(path: string, named_target: Option[string],
                against: Option[Buf[string]] = None,
                linking: bool = false, keep_tests: bool = false) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
+
+    phase_start()
+
     val program = packaged_compilation_of(path, t, keep_tests)?
+
+    phase_done("parse")
+
     val roots = if linking then roots_linked(program, path, level) else no_roots_linked()
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val done = analyze_bodies(program.units, program.target, also_auto_imported, image_entry_named(root, t))
+
+    phase_done("bodies")
 
     // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a
     // declaration nothing can reach is still one the program declared, and checking it is what makes
@@ -656,6 +664,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
+    phase_done("checks")
     explain_promotions(promotions, program, done.an)
 
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
@@ -695,6 +704,8 @@ emit_llvm_text(path: string, named_target: Option[string],
     // Nothing is precompiled, so the library's bodies are lowered into the text with the program's.
     // **`--no-std-lib` is the same answer asked for on purpose**: nothing is looked for, and the
     // library's bodies are lowered here while its C is compiled beside the program's.
+    phase_done("prune")
+
     var linked = StdArtifact(buf(), "")
 
     against match
@@ -711,6 +722,8 @@ emit_llvm_text(path: string, named_target: Option[string],
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level))
+
+    phase_done("codegen")
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -1140,6 +1153,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
                                    emitted.archives)
     val entry = settled_image_entry()
 
+    phase_done("link")
     settle_image("", "", "")
 
     linked match
