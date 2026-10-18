@@ -88,19 +88,14 @@ ordinary *does not implement* wording, naming the field.
 D is the closest, through user-defined attributes and `static foreach` over `.tupleof`. C++26 lands
 the same shape: reflection values, `template for` and annotations.
 
-## 5. Open questions — the user decides
+## 5. Decided (user, 2026-10-18)
 
-1. **Decision 6, user annotations.** Should a program be able to declare its own, so a serializer
-   can carry `@rename("id")`? The alternative is naming conventions only, as Zig does: a serializer
-   then cannot rename a field.
-2. **Decision 8b, rewriting the compiler-written `derives` and `Debug` as std code.** Doing it in
-   0.3.0 proves the machinery but makes 0.3.0 larger. The alternative keeps `deriving.sysl` and opens
-   the clause to library traits beside it.
-3. **Decision 7, private fields reachable by a derivation the type asked for.** The alternatives are
-   public fields only, which would break derived `Eq` on a struct with private fields, or every field
-   always (Zig).
-4. **The spelling `v.(f)`.** Alternatives are `v.[f]` or Zig's `field(v, f)`. `.(…)` reads as
-   "select by what is in the parentheses", and the parser has no other use for it.
+All four recommendations were taken, along with every row of §2 as recommended:
+
+1. **User annotations.** A program declares one as an `@annotation` struct, and reflection reads it as `f::Annotation[A]`.
+2. **The compiler-written derivations move to std in 0.3.0.** `Eq`, `Ord`, `Hash`, `Display` and `Debug` become std `derive` bodies with byte-identical output, and `deriving.sysl` is removed.
+3. **Private fields.** They are reachable in the type's own file and in a derivation the type asked for with `derives`.
+4. **The spelling `v.(f)`.**
 
 ## 6. Implementation plan
 
