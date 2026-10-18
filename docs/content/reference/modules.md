@@ -1494,6 +1494,20 @@ It is then hoisted, laid into the object file, visible to every file of the modu
 before any statement runs — which is also why its initializer may not call a helper that reads the
 body: at that moment there is no body yet.
 
+```sysl
+var seed: int = 7
+
+next() -> int = seed
+
+static val first: int = next()
+
+print(first)
+```
+
+```error
+'next' reads the entry file's body, so only the body can call it — this call is the module's, made before any statement runs, when there is no body yet. Make what 'next' reads 'static' too, or make the call part of the body
+```
+
 A **`static var`** is the same storage, written — assignment at every depth and `&`, which is what the
 word `var` already means, and which a `val` refuses because a `val` promises its storage is written
 once:
