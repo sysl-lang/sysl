@@ -685,6 +685,23 @@ end tag_of
 
 // What a declaration's own parameters mean at this instantiation, together with whatever `Self` and
 // a trait's arguments meant inside the member it was lowered from.
+// A value argument as the body reads it: at the type its parameter declared. An integer travels at
+// one width, so `rep[7]` and `rep[N]` are one instance whatever wrote them; inside the body the name
+// is the `int` (or `u8`, or `i64`) the declaration said.
+private at_declared(a: &Analysis, home: Scope, f: FuncDecl, tparam: string, targ: Type) -> Type
+    val written = binding_named(f.tvalues, tparam)
+
+    if written.is_none() then return targ
+
+    val declared = resolve_type(a, home, written.unwrap(), no_bindings())
+
+    targ match
+        ConstArg(v, ty, stood) -> underlying(declared) match
+            Integer(_, _, _) -> ConstArg(v, declared, stood)
+            _ -> targ
+        _ -> targ
+end at_declared
+
 private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Buf[Binding]
     var subst: Buf[Binding] = buf()
     val outer = a.tables.members.selves.get(f.name)
@@ -693,7 +710,8 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     var own: Buf[Binding] = buf()
 
     for i in 0..<f.tparams.len()
-        if i < targs.len() then own.push(Binding(f.tparams.at(i), targs.at(i)))
+        if i < targs.len() then own.push(Binding(f.tparams.at(i), at_declared(a, home, f, f.tparams.at(i),
+                                                                             targs.at(i))))
 
     // **A trait argument the block wrote at one of its own parameters is that parameter here**, at
     // this instantiation's argument: `impl[U] Get[U] for W[U]` binds the trait's `T` to the block's

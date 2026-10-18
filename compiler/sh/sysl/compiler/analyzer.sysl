@@ -348,8 +348,36 @@ struct Analyzer
     // (`consumes.sysl`).
     consume_calls: Buf[ConsumeCall]
 
+    // Every local `const` in scope or out of it, by unique name: the literal its value came to while
+    // compiling, which is what each use of the name is, and the scalar the fold reads it as.
+    local_consts: Buf[(string, TExpr, Option[Const])]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
+
+    // The literal a local `const` came to, where `unique` names one.
+    const_local(self, unique: string) -> Option[(TExpr, Option[Const])]
+        for item in self.local_consts
+            if item.0 == unique then return Some((item.1, item.2))
+
+        None
+    end const_local
+
+    // Takes the nearest value-argument binding of a local `const` out of the substitution.
+    private unbind_const(*self, name: string)
+        var out: Buf[Binding] = buf()
+        var gone = false
+
+        for b in self.subst
+            val bound = b.ty match
+                ConstArg(_, _, _) -> true
+                _ -> false
+
+            if !gone && bound && b.name == name then gone = true
+            else out.push(b)
+
+        self.subst = out
+    end unbind_const
 
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
@@ -382,6 +410,12 @@ struct Analyzer
                 self.an.ref_watches.set(i, RefWatch(w.func, w.name, w.types, w.start, Some(self.reach),
                                                     w.depth, w.view_of))
             end if
+
+        // A local `const` bound as a value argument goes with its scope.
+        for i in mark..<self.locals.len()
+            val local = self.locals.at(i)
+
+            if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
 
         self.locals.truncate(mark)
 
@@ -570,7 +604,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
-             false, buf())
+             false, buf(), buf())
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

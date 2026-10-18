@@ -1716,6 +1716,56 @@ loop and breaks out of itself as usual.
 `return` does work, and it is what `Eq` and `Ord` on a tuple are written with — an unrolled copy is
 straight-line code in the enclosing function, so a `return` in one is an ordinary return.
 
+### `if const` — the arm each instance takes
+
+**`if const cond` picks an arm while compiling, and only that arm is compiled.** The condition is a
+constant: a value parameter, a `const`, a call whose body can run, or the folded arithmetic over them.
+Each instance of a generic and each copy of a `for const` decides it again, so one body can hold an
+arm that makes sense only for some of them:
+
+```sysl
+describe[const N: usize]() -> string
+    if const N > 64
+        "big"
+    elif const N == 0
+        "empty"
+    else
+        "small"
+
+pick[T](x: T) -> int
+    if const sizeof(T) == 1
+        x.nothing_here()
+    else
+        7
+
+print(describe[100](), describe[0](), describe[3](), pick(5))
+```
+
+```output
+big empty small 7
+```
+
+`pick(5)` compiles: `x.nothing_here()` is never type-checked for an `int`, because the arm it
+stands in is not the one `int` takes. An ordinary `if` would check both arms for every instance.
+
+**A chain is decided in one place.** Every `elif` after an `if const` is an `elif const`, and a plain
+`else` is what is left; a test made while the program runs goes in a plain `if` inside that `else`.
+A condition that is not known while compiling is refused:
+
+```sysl
+main()
+    var n = 3
+    if const n > 2
+        print("x")
+```
+
+```error
+an 'if const' is decided while compiling, so its condition has to be known then
+```
+
+A generic body is read once before any instance as well, to check what does not depend on its
+parameters. There, neither arm of an `if const` is read; each instance reads the one it takes.
+
 ### What it is for: the catalog covers every tuple
 
 `impl[..A: Display] Display for (..A)` is one block covering every tuple there is, and `Eq`, `Ord`

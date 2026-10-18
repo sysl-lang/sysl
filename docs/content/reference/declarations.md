@@ -24,6 +24,52 @@ both directions. A `const` states an interface — its value is substituted wher
 that value *is* matters less than what it is a value **of**. A `val` has its type readable off the
 value it was given, and a `val` with no value is not a declaration of anything.
 
+### A `const` inside a body
+
+A `const` may be written inside a body too. Its value is computed **while compiling**, where it is
+written, and every use of the name is that value — so it stands wherever a constant is wanted: an
+array length, a value argument, a pattern, an `@assert`. It belongs to its block, as a `val` does,
+and may read a value parameter, another constant, and any function whose body can run:
+
+```sysl
+sq(x: int) -> int = x * x
+
+twice[const N: usize]() -> usize
+    const D: usize = N * 2
+    D + 1
+
+main()
+    const L: int = sq(6)
+    var a: [L]int
+
+    print(L, a.len, twice[4](), twice[L]())
+```
+
+```output
+36 36 9 73
+```
+
+That last call is the point of it: `twice[L]()` hands `L` to a value parameter, which a `val` could
+not be. A `val` over the same call is computed when the program runs, unless the optimiser folds it.
+
+**It reads nothing the body binds**, since a binding of the body holds a value only once the program
+runs:
+
+```sysl
+main()
+    var n = 3
+    const A: int = n + 1
+    print(A)
+```
+
+```error
+'A' is a constant, so its value is known while compiling, and it reads 'n', which the body binds and which holds a value only once the program runs. A name bound to such a value is a 'val'
+```
+
+Its type follows the rule for a module's `const` — [a scalar](/reference/modules/#const-a-value) —
+and a value its type does not admit is refused while compiling. It has no storage of its own, so
+nothing assigns to it and `&` does not reach it.
+
 ### The value may be an indented block
 
 A binding's `=` takes one expression, or an **indented block** whose trailing expression is the

@@ -1652,7 +1652,8 @@ reached from opposite sides: one asks what the *file* says, the other what is be
 ## `const` — a value
 
 A **`const` is a module member**: hoisted, order-free, visible to the whole module and beyond it under
-the ordinary rules, and never running at all.
+the ordinary rules, and never running at all. One written inside a body is that block's instead —
+[a `const` inside a body](/reference/declarations/#a-const-inside-a-body).
 
 ```sysl
 const capacity: usize = 512

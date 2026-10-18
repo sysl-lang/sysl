@@ -1266,6 +1266,30 @@ print(1)
 has to be a constant expression
 ```
 
+### In a body, per instance
+
+`@assert` may stand in a body as well, and there it is checked **for each instance** of a generic and
+in each unrolled copy of a `for const` — against the types and values that instance was given, which
+is the only moment `sizeof(T)` is a number. Inside an [`if const`](/reference/generics/) arm it is
+checked only where that arm is taken, which makes it a compile-time error that a generic raises on
+purpose:
+
+```sysl
+ring[T, const N: usize]() -> usize
+    if const N > 64
+        @assert(sizeof(T) * N <= 4096, "a ring this large belongs on the heap")
+    N
+
+print(ring[u8, 100](), ring[u64, 10]())
+print(ring[u64, 1000]())
+```
+
+```error
+assertion failed: a ring this large belongs on the heap — the left side is 8000 — where N = 1000
+```
+
+The first line compiles: `u8` times 100 is 100 bytes, and `ring[u64, 10]` never takes the arm.
+
 ### Checking a C struct's layout
 
 This is what it was built for. sysl lays a struct out in declaration order and is C-compatible by

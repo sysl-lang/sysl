@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.BigInt
+import sysl.math.bigint.{BigInt, from_int}
 
 // Statements, and the blocks they live in.
 //
@@ -532,13 +532,9 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     // body is this walk's to bind, and the scope it was written in gives it back at the dedent.
     ImportDecl(d) -> one(block_import(cx, stmt.span, d))
 
-    // A `const` written at the top of a file is folded into its uses before anything runs, so it
-    // never reaches the statement walk. One that reaches here was written **inside a body**, where
-    // there is nothing to hoist it into.
-    ConstDecl(_, _, _, _) ->
-        refuse(cx, stmt.span, "a constant is a module member and is declared at the top level — " +
-               "it is folded into its uses before the program runs, so there is no block for one " +
-               "written here to belong to. A name bound to a value inside a body is a 'val'")
+    // A `const` inside a body is folded where it is written: its value is run while compiling, and
+    // every use of the name is the literal it came to.
+    ConstDecl(name, typ, value, _) -> const_decl(cx, stmt.span, name, typ, value)
 
     CConstBlock(_) ->
         refuse(cx, stmt.span, "a 'c const' block is declared at the top level of a file — the C " +
@@ -696,6 +692,114 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
     note_view_binding(cx, span, name, unique, ti)
     one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))
 end val_decl
+
+// `const NAME: T = e` inside a body. The value is read in this block's terms and run while compiling,
+// and the name is bound to the literal it came to: nothing is kept for it at run time, and every use
+// is the value. It may read a value parameter, another constant and any function whose body can run
+// -- and nothing the body binds, which holds a value only once the program runs.
+//
+// **A generic body read before any instance** has no value for its value parameters, so there the
+// initializer is typed and kept as code; each instance runs it with its own arguments.
+private const_decl(cx: &Analyzer, span: Span, name: string, typ: TypeRef, value: Expr) -> Buf[TStmt]
+    val declared = resolve_type(cx.an, cx.scope, typ, cx.subst)
+    val ti = type_expr(cx, value, Some(declared))
+    val read = body_binding_read(cx, ti)
+
+    check_binding(cx, span, name, Some(declared), declared, ti)
+
+    val unique = cx.bind_read_only(name, declared, name_after_keyword(cx, span.start, name))
+
+    if cx.at_definition || declared == Unknown || texpr_type(ti) == Unknown then
+        return one(TVarDecl(unique, declared, ti, boundary(cx, name, None)))
+
+    // The same types a constant at the top of a file may have, refused in the same words.
+    val refused = local_const_type_refusal(declared, name)
+
+    if refused != ""
+        cx.fault(span, refused)
+        return buf()
+    end if
+
+    if read.is_some()
+        cx.fault(span, s"'$name' is a constant, so its value is known while compiling, and it reads " +
+                 s"'${read.unwrap()}', which the body binds and which holds a value only once the " +
+                 "program runs. A name bound to such a value is a 'val'")
+        return buf()
+    end if
+
+    const_local_image(cx, name, ti) match
+        Ok(image) ->
+            val folded = const_fold_typed(image, cx.an.tables.layout.little_endian)
+
+            cx.local_consts.push((unique, image, folded))
+
+            // **A number stands where a type is read too** -- an array length, a value argument --
+            // as a value parameter does, so it is bound the way one is, ahead of any of the name.
+            val arg = folded match
+                Some(ConstInt(n)) -> Some(n)
+                Some(ConstBool(b)) -> Some(from_int(if b then 1 else 0))
+                Some(ConstChar(c)) -> Some(from_int(long(u32(c))))
+                _ -> None
+
+            // A fresh substitution rather than a write into the one in hand, which an instance's
+            // record may share.
+            if arg.is_some()
+                var subst: Buf[Binding] = buf()
+
+                // An integer travels at the width every other value argument does, so the copy it
+                // names is the one a literal would.
+                val width = underlying(declared) match
+                    Integer(_, _, _) -> usize_type(word_bits(cx))
+                    _ -> declared
+
+                subst.push(Binding(name, ConstArg(arg.unwrap(), width, false)))
+
+                for b in cx.subst
+                    subst.push(b)
+
+                cx.subst = subst
+            end if
+        Err(why) -> if why != "" then cx.fault(span, why)
+
+    buf()
+end const_decl
+
+// Why a local `const` may not have the type it was declared with, or nothing: a constant is a
+// scalar, folded into its uses, and an aggregate is storage, which a `val` holds.
+private local_const_type_refusal(t: Type, name: string) -> string
+    if is_fixed(t)
+        return s"a constant is folded as an integer or a real, and ${type_show(t)} is fixed-point — " +
+            s"write '$name' as a 'val'"
+    end if
+
+    underlying(t) match
+        Integer(_, _, _) -> ""
+        Floating(_, _) -> ""
+        Bool -> ""
+        Char -> ""
+        Str -> ""
+        Array(_, _) -> local_const_storage(t, name)
+        Vector(_, _) -> local_const_storage(t, name)
+        Struct(_) -> local_const_storage(t, name)
+        _ -> s"a constant is a scalar, and ${type_show(t)} is not — '$name'"
+end local_const_type_refusal
+
+private local_const_storage(t: Type, name: string) -> string =
+    s"a constant is a scalar, and ${type_show(t)} is storage — write '$name' as a 'val'"
+
+// The first binding of the body around it that a typed value reads, by its written name.
+private body_binding_read(cx: &Analyzer, t: TExpr) -> Option[string]
+    var found: Buf[string] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TLoad(unique, _) ->
+            for local in cx.locals
+                if local.unique == unique then sink.push(local.name)
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found.at(0))
+end body_binding_read
 
 // The type a binding holds: the one it was declared with, and the value's where it was not.
 private settled_binding_type(declared: Option[Type], ti: TExpr) -> Type

@@ -107,11 +107,10 @@ cst_a_value_is_not_optional()
 cst_and_neither_is_a_type()
     assert_eq(pf_err("const n = 1"), "':' expected")
 
-// -- a constant belongs to a module, not to a block -----------------------------------------------
+// -- a constant written inside a body -------------------------------------------------------------
 
-// A constant is folded into its uses before the program runs, so there is nothing for one written
-// inside a body to be folded *in*. The use below it is told the name is undefined, never that it was
-// declared below this -- which would name a mistake the program had not made.
+// A constant inside a body is folded where it is written, as one at the top of a file is folded into
+// its uses: the value is computed while compiling and every use of the name is that value.
 private cst_in_a_body() -> string = raw"""
     f() -> int
         const k: int = 7
@@ -120,39 +119,36 @@ private cst_in_a_body() -> string = raw"""
     print(str(f()))
     """
 
-private cst_a_member() -> string =
-    "a constant is a module member and is declared at the top level — it is folded into its uses " +
-    "before the program runs, so there is no block for one written here to belong to. A name " +
-    "bound to a value inside a body is a 'val'"
-
-@test("so one written inside a function body is refused where it stands")
-cst_so_one_written_inside_a_function_body_is_refused()
+@test("so one written inside a function body is that body's, folded where it stands")
+cte_one_written_inside_a_function_body_is_folded()
     if !cst_ready() then return
 
-    cst_refuses(cst_ran(cst_in_a_body()), cst_a_member())
+    assert_eq(cst_ran(cst_in_a_body()), "8\n")
 
-@test("and the use below it is never told the name was declared below it")
-cst_and_the_use_below_it_is_never_told()
+@test("and its name ends with its block, as a 'val' does")
+cte_and_its_name_ends_with_its_block()
     if !cst_ready() then return
 
-    val said = cst_ran(cst_in_a_body())
+    cst_refuses(cst_ran(raw"""
+        f() -> int
+            if true
+                const k: int = 7
+            k + 1
 
-    cst_refuses(said, "undefined name 'k'")
-    assert(!cst_says(said, "declared below this"), said)
+        print(str(f()))
+        """), "undefined name 'k'")
 
 @test("the same inside a loop body, which is a block like any other")
-cst_the_same_inside_a_loop_body()
+cte_the_same_inside_a_loop_body()
     if !cst_ready() then return
 
-    val said = cst_ran(raw"""
+    assert_eq(cst_ran(raw"""
         var i = 0
         while i < 2
             const step: int = 1
             i += step
-        """)
-
-    cst_refuses(said, cst_a_member())
-    cst_refuses(said, "undefined name 'step'")
+        print(str(i))
+        """), "2\n")
 
 @test("while the one written at the top of the file is untouched")
 cst_while_the_one_written_at_the_top_is_untouched()

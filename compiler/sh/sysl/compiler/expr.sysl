@@ -179,6 +179,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     CFor(label, init, cond, step, body, else_body) ->
         c_for_expr(cx, e.span, label, init, cond, step, body, else_body, expected, false)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
+    ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, expected)
 
     Quantifier(universal, name, iter, pred) ->
         quantifier_expr(cx, e.span, universal, name, iter, pred)
@@ -452,6 +453,13 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         expected.unwrap() match
             Weak(_) -> return TExpr(span, TZero(expected.unwrap()))
             _ -> ()
+
+    // **A local `const` is its value**, as a module one is: every use is the literal it came to.
+    if local.is_some()
+        val konst = cx.const_local(local.unwrap().unique)
+
+        if konst.is_some() then return TExpr(span, konst.unwrap().0.kind)
+    end if
 
     if local.is_some()
         note_local_reference(cx, span, local.unwrap())
@@ -1416,6 +1424,16 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
+
+    // A local `const` is its value, and a value has no address.
+    val named = *operand.kind match
+        Ident(n) -> cx.lookup(n)
+        _ -> None
+
+    if named.is_some() && cx.const_local(named.unwrap().unique).is_some() then
+        return cx.err(span, s"'${named.unwrap().name}' is a constant, which is its value wherever it is " +
+                      "used and has no storage of its own — so '&' has nothing to reach. A name for " +
+                      "storage is a 'var'")
 
     if is_place(t) || named_place(operand) then
         if !is_place(t) then

@@ -554,6 +554,7 @@ private refuse_offsetof(p: *Parser)
 private parse_if_expr(p: *Parser, at: Span) -> Expr
     open_construct(p, "if", at)
 
+    val decided = p.accept_kw("const")
     val cond = parse_expr(p)
     val then_body = parse_body(p, "then")
     var conds: Buf[Expr] = buf()
@@ -564,6 +565,21 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         if !accept_on_next_line_kw(p, "elif") then break
 
         elifs.push(p.just_taken())
+
+        // **A chain is decided in one place or the other**: an `elif` after an `if const` picks an
+        // arm while compiling as the `if` did, and one after a plain `if` tests while running.
+        val also = p.accept_kw("const")
+
+        if decided && !also then
+            p.fault(elifs.at(elifs.len() - 1), "an 'if const' is decided while compiling, so each " +
+                    "'elif' after it is too — write 'elif const', or put a plain 'if' inside the " +
+                    "'else' for a test made while the program runs")
+
+        if also && !decided then
+            p.fault(elifs.at(elifs.len() - 1), "an 'elif const' follows an 'if const' — this chain's " +
+                    "'if' tests while the program runs. Start the chain with 'if const', or put the " +
+                    "'if const' inside the 'else'")
+
         conds.push(parse_expr(p))
         bodies.push(parse_body(p, "then"))
 
@@ -584,10 +600,14 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         i -= 1
 
         var wrapped: Buf[Stmt] = buf()
-        val inner = expr(elifs.at(i).to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body, true))
+        val shape = if decided then ConstIf(conds.at(i), bodies.at(i), else_body)
+                    else IfExpr(conds.at(i), bodies.at(i), else_body, true)
+        val inner = expr(elifs.at(i).to(p.just_taken()), shape)
 
         wrapped.push(stmt(inner.span, ExprStmt(inner)))
         else_body = Some(wrapped)
+
+    if decided then return expr(at.to(p.just_taken()), ConstIf(cond, then_body, else_body))
 
     expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body, false))
 end parse_if_expr

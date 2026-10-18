@@ -287,6 +287,29 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
         _ -> Ok(None)
 end const_val_run
 
+// A local `const`'s value, run while compiling and made the literal it came to -- or what stopped
+// it, empty where that was already reported.
+const_local_image(cx: &Analyzer, name: string, init: TExpr) -> Result[TExpr, string]
+    val subject = s"'$name'"
+
+    evaluate(cx.an, cx.scope, subject, init) match
+        EvValue(Some(v)) ->
+            if holds_view(v) then
+                return Err(s"$subject came to a slice, which views storage rather than holding a value, " +
+                           "and a constant is a value")
+
+            value_literal(init.span, v, texpr_type(init)) match
+                Some(image) -> Ok(image)
+                None -> Err(s"$subject came to a value with no form as a literal, so there is nothing " +
+                            "for a use of the name to be")
+        EvValue(None) -> Ok(TExpr(init.span, TZero(texpr_type(init))))
+        EvFail(message, _) -> Err(message)
+        EvBroken -> Err("")
+        EvQuiet -> Err(s"$subject is a constant, so its value is known while compiling — this one reads " +
+                       "something that holds a value only once the program runs. A name bound to such a " +
+                       "value is a 'val'")
+end const_local_image
+
 // Whether a typed tree calls a function marked `const`.
 private calls_marked(a: &Analysis, t: TExpr) -> bool
     var found: Buf[bool] = buf()
