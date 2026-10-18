@@ -216,6 +216,44 @@ quad_of_double(bits: u64) -> (u64, u64)
     else quad_of_ratio(negative, m, shl(from_int(1), usize(-e2)))
 end quad_of_double
 
+// `num / den`, both positive, as the nearest value of a sixteen-bit float -- `bf16` where `brain`,
+// `f16` otherwise -- rounded once, to nearest with ties to even, and given `negative`'s sign. It is
+// held as the `real` it is, which is exact: every value of either format is a `double`.
+half_of_ratio(negative: bool, num: BigInt, den: BigInt, brain: bool) -> real
+    val fraction = if brain then 7 else 10
+    val top = if brain then 127 else 15
+    val (biased, field) = binary_of_ratio(num, den, fraction, 1 - top, top)
+
+    var magnitude = infinity
+
+    if biased != 2 * top + 1
+        val hidden: long = if biased > 0 then long(1) << long(fraction) else 0
+        val significand = real(to_u64(field).unwrap_or(0)) + real(hidden)
+        // The weight of the significand's last bit, `2^(exponent - fraction)`, at most 2^120 and at
+        // least 2^-133 -- a normal `double` either way, so its pattern is written outright.
+        val weight = (if biased == 0 then 1 else biased) - top - fraction
+
+        magnitude = significand * real.from_bits(u64(weight + 1023) << 52)
+    end if
+
+    if negative then -magnitude else magnitude
+end half_of_ratio
+
+// A `double` as the nearest value of a sixteen-bit float, held as the `real` that value is. A NaN, an
+// infinity and a zero of either sign are already values of both formats.
+half_of_double(x: real, brain: bool) -> real
+    if x != x || x == 0.0 || x == infinity || x == -infinity then return x
+
+    val bits = x.bits()
+    val biased = int((bits >> 52) & 0x7FF)
+    val fraction = bits & 0x000FFFFFFFFFFFFF
+    val m = if biased == 0 then from_u64(fraction) else from_u64(fraction | 0x0010000000000000)
+    val e2 = if biased == 0 then -1074 else biased - 1075
+
+    if e2 >= 0 then half_of_ratio(x < 0.0, shl(m, usize(e2)), from_int(1), brain)
+    else half_of_ratio(x < 0.0, m, shl(from_int(1), usize(-e2)), brain)
+end half_of_double
+
 // `num / den`, both positive, rounded to nearest with ties to even and given `negative`'s sign.
 //
 // The value lies in `[2^e, 2^(e+1))`; the significand is the value scaled so that `2^e` lands on

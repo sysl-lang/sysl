@@ -1826,8 +1826,9 @@ print(V)
 ```
 
 **Every run is bounded**: 16,000,000 steps — one per expression and statement the run visits — and
-calls 512 deep. Running out of either is an error naming the constant, not a warning, and there is
-no setting that raises them:
+calls 512 deep. Running out of either is an error naming the constant, not a warning. A table
+generator that legitimately runs longer is given more with **`--const-steps <n>`**, which any command
+takes; the depth stays:
 
 ```sysl
 const spin() -> int
@@ -1844,7 +1845,8 @@ print(k)
 ```
 
 **What a body may hold while it runs is narrower than what it may hold**: integers of every width,
-`f32` and `real`, fixed-point formats, `bool`, `char` and `unit`, constrained types of them with their
+every float width — `f16` and `bf16` rounded to their format at every operation, as the program
+rounds them, and `f128` computed exactly and rounded once — fixed-point formats, `bool`, `char` and `unit`, constrained types of them with their
 checks run, and **fixed arrays, structs and enums** of any of these at any depth — an array built by a
 literal or a fill, read and written by element, walked by `for x in`; a struct built by its
 constructor, read and written by field, its `invariant` run; an enum value built by its variant,
@@ -1857,9 +1859,40 @@ the library's `display_*` routines and the `display` of every type it renders wr
 nested `display` is handed the same one), indexed by byte, sliced where characters start,
 compared by bytes and matched. **A slice** is held as a view of an array or a string the run holds,
 read, walked by `for x in`, sub-sliced and written through; a call handed one is run afresh rather
-than remembered. A pointer or a reference stops the run with *"a 'P' is not evaluated while
-compiling yet — integers, floats, fixed-point, 'bool', 'char', strings, and fixed arrays, structs,
-enums and slices of them are"*; the program's own run-time call is unaffected.
+than remembered. **A vector** is held as its lanes, and every operator is its lane's, lane by lane:
+built by a literal or a splat, read by lane, compared into a mask, chosen between by `select`,
+reduced by `min`, `max`, `any`, `all` and an integer `sum`, loaded from and stored into an array or a
+slice the run holds. **A float vector's `sum` is refused** — the program's reduction adds the lanes
+in whatever order the target's instructions take, so no one value is the program's. **A call
+through a function's address** runs the function the address was taken of. A reference stops the
+run with *"a 'P' is not evaluated while compiling yet — integers, floats, fixed-point, 'bool',
+'char', strings, and fixed arrays, vectors, structs, enums and slices of them are"*; the program's
+own run-time call is unaffected:
+
+```sysl
+const mix(seed: int) -> int
+    var xs: [8]int = [0; 8]
+
+    for i in 0..<8
+        xs[i] = seed * i
+
+    val v: <4>int = xs.load(2)
+    val w = (v > 10).select(v * 2, v)
+
+    xs.store(4, w)
+    w.sum() + xs[7]
+
+const half_step(x: f16) -> f16 = x / f16(3) + f16(0.1)
+
+const MIX: int = mix(3)
+const H: f16 = half_step(f16(1))
+
+print(MIX, H)
+```
+
+```output
+99 0.433
+```
 
 **A table is the reason arrays are evaluated.** A module `val` whose initializer calls a `const`
 function returning an array is laid into the object file as the elements the call came to — a sine
@@ -1926,7 +1959,7 @@ down; the value stays code, and a freestanding artifact's refusal says so. **A s
 the literal it came to**, its bytes constant data owned by nothing — a table of `(string, int)` tuples
 is `.rodata` on a bare board. **A slice is not laid down**: it views storage rather than holding a
 value, so a `val` over a call answering one stays code. Making an array costs a step per element and
-a string a step per byte, so the same 16,000,000 steps bound how large a table or a string may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
+a string a step per byte, so the same step limit bounds how large a table or a string may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
 call cannot be run — it reaches an `extern`, storage filled at run time, or more steps than the bound
 — the initializer stays code, filled before the program's statements; a freestanding artifact, which
 has nothing to fill it, refuses the storage and says what stopped the call: *"'T' did not finish

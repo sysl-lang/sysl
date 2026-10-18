@@ -429,21 +429,19 @@ cfn_admits_a_string_parameter()
     assert_eq(enm_ran("const f(s: string) -> int = int(s.len)\n\nconst k: int = f(\"abc\")\n\nprint(k, f(\"a\"))\n"),
               "3 1\n")
 
-@test("nor the two sixteen-bit floats")
-cfn_refuses_f16()
+@test("the two sixteen-bit floats are evaluated, so a parameter of one is admitted")
+cfn_admits_f16()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("const f(x: f16) -> int = 1\n\nprint(f(1.0))\n"),
-                cfn_f("its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while " +
-                      "compiling yet"), "1:12")
+    assert_eq(enm_ran("const f(x: f16) -> int = int(x * f16(2))\n\nconst K: int = f(1.5)\n\nprint(K, f(2.0))\n"),
+              "3 4\n")
 
-@test("nor a vector")
-cfn_refuses_a_vector()
+@test("a vector is evaluated, so a body may use one")
+cfn_admits_a_vector()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("const f() -> f32\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n    v[0]\n\n" +
-                          "print(f())\n"),
-                cfn_f("it uses a vector — vectors are not evaluated while compiling yet"), "2:21")
+    assert_eq(enm_ran("const f() -> f32\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n    v[3] * v[1]\n\n" +
+                      "const K: f32 = f()\n\nprint(K, f())\n"), "8 8\n")
 
 @test("nor perform an atomic operation")
 cfn_refuses_an_atomic()
@@ -485,14 +483,12 @@ cfn_answers_a_function_address()
     assert_eq(enm_ran("inc(x: int) -> int = x + 1\n\nconst f() -> *extern(int) -> int = &inc\n\n" +
                       "val g = f()\nprint(g(1))\n"), "2\n")
 
-@test("nor call through a function pointer")
-cfn_refuses_a_call_through_a_pointer()
+@test("and call through a function pointer, which runs the function the address was taken of")
+cfn_calls_through_a_pointer()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
-                          "    g(x)\n\nprint(f(1))\n"),
-                cfn_f("it calls through a value — which function that is is decided when the " +
-                      "program runs"), "5:5")
+    assert_eq(enm_ran("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
+                      "    g(x)\n\nconst K: int = f(1)\n\nprint(K, f(2))\n"), "2 3\n")
 
 // `?` widening the error calls the `From` conversion, which is a call like any other.
 @test("nor use '?' where it converts through a 'From' that is not 'const'")

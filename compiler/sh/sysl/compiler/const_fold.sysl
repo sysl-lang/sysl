@@ -1213,6 +1213,15 @@ run_float_binary(op: string, x: real, y: real, bits: int) -> Result[Const, strin
         None -> Err(s"'$op' on a float")
 end run_float_binary
 
+// A sixteen-bit float operator -- `bf16` where `brain`, `f16` otherwise -- computed as a `f32` and
+// rounded once more to the format, which is what the lowering does on a machine without the format's
+// own arithmetic. A machine with it gets the same answer: a `f32` holds more than twice either
+// format's significand, so rounding to it first never decides the second rounding.
+run_half_binary(op: string, x: real, y: real, brain: bool) -> Result[Const, string] =
+    run_float_binary(op, x, y, 32) match
+        Ok(ConstFloat(f)) -> Ok(ConstFloat(half_of_double(f, brain)))
+        other -> other
+
 // A float negated, which flips the sign of a zero as the machine's `fneg` does.
 run_float_negate(x: real) -> real = -x
 
@@ -1249,6 +1258,10 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
             val (hi, lo) = quad_of_int(n)
 
             Ok(ConstQuad(hi, lo))
+        (_, Floating(16, brain)) ->
+            if n.is_zero() then return Ok(ConstFloat(0.0))
+
+            Ok(ConstFloat(half_of_ratio(cmp(n, from_int(0)) < 0, big_abs(n), from_int(1), brain)))
         (_, Floating(bits, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
         (Char, Char) -> Ok(v)
         (_, Char) ->
@@ -1263,11 +1276,13 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
             val (hi, lo) = quad_of_double(f.bits())
 
             Ok(ConstQuad(hi, lo))
+        Floating(16, brain) -> Ok(ConstFloat(half_of_double(f, brain)))
         Floating(bits, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstQuad(hi, lo) -> to match
         Integer(bits, signed, _) -> Ok(ConstInt(quad_to_int((hi, lo), bits, signed)))
         Floating(128, _) -> Ok(v)
+        Floating(16, brain) -> Ok(ConstFloat(narrowed_half((hi, lo), brain)))
         Floating(bits, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstBool(_) -> if to == Bool then Ok(v) else Err(s"a conversion from bool to ${type_show(to)}")

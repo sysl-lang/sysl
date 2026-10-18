@@ -114,13 +114,18 @@ Each step lands with its tests (a `cte_` prefix) and its row in `scripts/fix_tes
    `const` keeps today's declaration-time check.
 2. **Heap and freezing (2, 2b).** Add evaluator values for a box, a `Buf`, a `Map` and a closure, and
    a freeze pass that lays a read-only answer into constant data with null owner words. The std's `Buf`,
-   `Map` and `Set` bodies must evaluate: their `extern` allocator calls get evaluator intrinsics.
+   `Map` and `Set` bodies must evaluate: their `extern` allocator calls get evaluator intrinsics. The
+   two holes of (9) that need an address of storage the evaluation owns land here, on the same
+   reference value: a closure's call (its `self` is `*` the closure; a `&Fn` is a box behind a
+   table) and an atomic on such storage.
 3. **Declaration-pass evaluation (3, 4).** The declaration pass calls the evaluator on demand, with
    cycle detection. The bracket parser reads an expression for a `const` parameter, and the
    `undefined name 'N'` cascade is fixed.
 4. **Local `const` (5), `if const` (6), `@assert` in a body (7)**: parser plus analyzer. `if const`
    reuses `for const`'s per-copy checking.
-5. **Evaluator holes (9) and `--const-steps` (10).**
+5. **Evaluator holes (9) and `--const-steps` (10).** `f16`/`bf16`, vectors and calls through a
+   function's address. A float vector's `sum` stays refused: the program's reduction reassociates,
+   and which lanes it adds first is the target's to choose.
 6. **Std marks its promises (1b)**, and the reference pages are updated: declarations.md § A `const`
    function, generics.md, attributes.md § `@assert`.
 

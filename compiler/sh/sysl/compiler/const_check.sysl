@@ -10,8 +10,8 @@ import sysl.text.{Search, from_utf8_unchecked}
 // **A `const` function is one the compiler may run while it compiles**, so its body is held to what
 // exists at that moment: values, and code the compiler can see. What is refused is everything that
 // only exists once the program runs -- an address, the heap, module storage that is filled at
-// startup, code outside the program, and a call whose target is chosen at run time -- plus the few
-// kinds of value the compiler does not evaluate yet (vectors, the two sixteen-bit floats). A call to a
+// startup, code outside the program, and a call whose target is chosen at run time -- plus the C
+// variadic arguments and atomics the compiler does not evaluate yet. A call to a
 // function that is not marked is held to the same by walking that function's body, so the refusal
 // names the chain of calls down to what cannot run. A string is
 // a value the compiler holds -- built, joined, sliced, rendered from an integer or a fixed-point value
@@ -118,8 +118,12 @@ private unmarked_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[s
     val at = cx.bodies.get(name)
     val body = if at.is_some() then Some(cx.funcs.at(at.unwrap())) else evaluation_body(a, name).map(f -> *f)
 
-    if body.is_none()
-        val why = "it has no body that can be read while compiling"
+    // An `extern` reached where nothing named it -- through a function's address -- is refused for
+    // what it is rather than for the body it lacks.
+    val outside = a.tables.externs.get(name).and_then(x -> extern_reason(extern_symbol(x)))
+
+    if body.is_none() || outside.is_some()
+        val why = outside.map(t -> s"it $t").unwrap_or("it has no body that can be read while compiling")
 
         cx.unmarked.put(name, why)
         return Some(why)
@@ -251,7 +255,9 @@ end const_expr
 // What a node does that the compiler cannot do while compiling, said the way a reader would say it.
 private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[string] = *e.kind match
     TCall(name, _, _, _) -> const_call_refusal(a, cx, name)
-    TCallPtr(_, _, _, _) -> Some(s"it calls through a value — ${const_dispatch()}")
+    // A call through a function's address is the call of the function the address was taken of,
+    // which the evaluation knows by then; it refuses one whose function cannot run.
+    TCallPtr(_, _, _, _) -> None
     // The one trait object a `const` function meets is the writer a rendering hands its `display`.
     TVCall(receiver, _, _, _, _) ->
         if writes_a_rendering(texpr_type(receiver)) then None
@@ -283,14 +289,10 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
     TVaArg(_, _) -> Some(variadic_walk())
     TVaCopy(_, _) -> Some(variadic_walk())
     TVaPass(_) -> Some(variadic_walk())
-    TVectorLit(_, _) -> Some(vector_use())
-    TSplat(_, _) -> Some(vector_use())
-    TLane(_, _, _) -> Some(vector_use())
-    TVecCompare(_, _, _, _) -> Some(vector_use())
-    TSelect(_, _, _, _) -> Some(vector_use())
-    TReduce(_, _, _) -> Some(vector_use())
-    TVecLoad(_, _, _) -> Some(vector_use())
-    TVecStore(_, _, _) -> Some(vector_use())
+    TReduce(op, _, _) ->
+        if op == "fadd" then Some("it sums a float vector, whose lanes are added in the order the target's " +
+                                  "instructions take — so the value is known only where the program runs")
+        else None
 
     // `?` widening the error through a conversion calls that conversion.
     TTry(_, _, _, _, _, _, convert) ->
@@ -314,8 +316,6 @@ private not_yet(what: string) -> string = s"$what not evaluated while compiling 
 
 private variadic_walk() -> string =
     s"it walks C variadic arguments — ${not_yet("C variadic arguments are")}"
-
-private vector_use() -> string = s"it uses a vector — ${not_yet("vectors are")}"
 
 // What is wrong with calling this from a `const` function, or nothing.
 private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[string]
@@ -358,7 +358,12 @@ end names_a_bound_member
 // An `extern` a `const` function calls: one of the LLVM operations whose result is exactly
 // specified, which the compiler can compute bit for bit; one of the C library's mathematical
 // functions, whose last bit is the library's own; or anything else outside the program.
-private extern_refusal(name: string, symbol: string) -> Option[string]
+private extern_refusal(name: string, symbol: string) -> Option[string] =
+    extern_reason(symbol).map(why -> s"it calls '${qualified_name(name)}', which $why")
+
+// What an `extern` is that keeps it from running while compiling, said after "which", or nothing
+// where it is an operation the compiler computes itself.
+private extern_reason(symbol: string) -> Option[string]
     val parts = dotted(symbol)
 
     if parts.len() >= 2 && parts.at(0) == "llvm"
@@ -366,15 +371,14 @@ private extern_refusal(name: string, symbol: string) -> Option[string]
     end if
 
     val base = if parts.len() >= 2 && parts.at(0) == "llvm" then parts.at(1) else symbol
-    val shown = qualified_name(name)
 
     if c_math(base)
-        return Some(s"it calls '$shown', which is the C library's '$base' — its last bit differs " +
-                    "between C libraries, and the board's would not agree with this compiler's")
+        return Some(s"is the C library's '$base' — its last bit differs between C libraries, and the " +
+                    "board's would not agree with this compiler's")
     end if
 
-    Some(s"it calls '$shown', which is outside the program — ${const_outside()}")
-end extern_refusal
+    Some(s"is outside the program — ${const_outside()}")
+end extern_reason
 
 // The LLVM operations a `const` function may reach: each has one exactly specified result.
 private exact_intrinsic(parts: Buf[string]) -> bool
@@ -465,11 +469,11 @@ private names_an_address(t: Type) -> bool = t match
 // the addresses the linker fills in and never read or called through. A type parameter stands for
 // whatever fills it, and is judged there.
 const_type_refusal(t: Type) -> Option[string] = t match
-    Floating(bits, _) ->
-        // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), so it is in.
-        if bits == 16 then Some(not_yet("'f16' and 'bf16' are")) else None
+    // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), and the two
+    // sixteen-bit formats as the `real`s their values are, rounded to the format at every operation.
+    Floating(_, _) -> None
     Slice(elem, _) -> const_type_refusal(*elem)
-    Vector(_, _) -> Some(not_yet("vectors are"))
+    Vector(_, elem) -> const_type_refusal(*elem)
     VaList -> Some(not_yet("C variadic arguments are"))
     Ref(inner, _) -> *inner match
         Trait(_, _, _) -> Some(trait_object())

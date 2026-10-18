@@ -1842,8 +1842,8 @@ true
 
 What such an address points at exists only when the program runs, so reading through one, or
 converting one to a number, is not evaluated — and neither is the address of a local, or of
-thread-local or per-core storage. A function pointer may be stored and answered; calling through it
-is refused like any other call through a value. On a bare machine, where storage must be constant
+thread-local or per-core storage. A function pointer may be stored and answered, and calling through
+it runs the function the address was taken of. On a bare machine, where storage must be constant
 data, the refusal says which:
 
 ```sysl build=c target=thumbv7em-freestanding
@@ -1876,10 +1876,10 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
 | a value rendered through a `display` whose body cannot run | `… it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling` |
 | a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
-| a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
+| a closure called, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
-| atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
-| `f16`, `bf16` | `… its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while compiling yet` |
+| atomics, fences, C variadic arguments | `… it performs an atomic operation — atomics are not evaluated while compiling yet` |
+| a float vector's `sum` | `… it sums a float vector, whose lanes are added in the order the target's instructions take — so the value is known only where the program runs` |
 
 One worked refusal for each of the commonest. A function that is not marked is no reason to refuse;
 what its body does is:

@@ -17,25 +17,47 @@ import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, 
 // operation does is not defined here either: `const_fold.sysl`'s run-time arithmetic is the one
 // definition (`run_int_binary`, `run_float_binary`, `run_convert`), read by the typed fold too.
 //
-// **What it holds is scalars**: every integer width, `f32` and `f64`, `bool`, `char` and `unit`,
-// constrained subtypes of them with their checks run. Locals, assignment, every loop, `break`,
-// `continue`, an early `return`, recursion and the contract clauses are evaluated. A form outside
-// that -- a struct, an array, a string, a call to a function that is not `const` -- stops the run
-// and says so; it never falls back to a guess.
+// **What it holds is values**: every integer width, every float width -- the two sixteen-bit ones
+// rounded to their format at every operation, `f128` computed exactly -- fixed point, `bool`, `char`
+// and `unit`, constrained subtypes of them with their checks run; strings; and arrays, vectors,
+// structs, enums and slices of all of these. Locals, assignment, every loop, `break`, `continue`, an
+// early `return`, recursion, the contract clauses and calls through a function's address are
+// evaluated. A form outside that -- a reference, the heap, a call outside the program -- stops the
+// run and says so; it never falls back to a guess.
 //
 // **A trap is a compile error.** Whatever would stop the program at run time -- a division by zero,
 // a quotient a width cannot hold, a value a `within` type does not admit, a failed `require` -- stops
 // the evaluation, and the constant is refused with what stopped it and the calls it was inside.
 //
-// **Every run is bounded**: 16,000,000 steps, one per expression and statement visited, and calls
-// 512 deep. Running out of either is an error naming the constant, not a warning.
+// **Every run is bounded**: 16,000,000 steps unless `--const-steps` says otherwise, one per expression
+// and statement visited, and calls 512 deep. Running out of either is an error naming the constant,
+// not a warning.
 //
 // **A callee's body is typed for the evaluation in a trial that is taken back** -- the reading
 // `opaque_body_type` makes of a `some` member's body -- so the main pass types it as it always would,
 // once, and nothing the trial registered survives into the program. The typed tree is kept here for
 // the rest of the compilation, since a body reads the same way every time it is asked.
 
-private const EvStepLimit: long = 16000000
+private const EvStepDefault: long = 16000000
+
+// How many steps one run may take: what `--const-steps` gave, or the default.
+private step_limit() -> long = const_steps_flag().unwrap_or(EvStepDefault)
+
+// The limit as a reader writes a large count, its digits grouped in threes.
+private step_limit_text() -> string
+    val digits = str(step_limit())
+    var out = ""
+
+    for i in 0..<digits.bytes.len
+        if i > 0 && (digits.bytes.len - i) % 3 == 0 then out = out + ","
+
+        out = out + digits[i..<i + 1]
+
+    out
+end step_limit_text
+
+// What a run stopped at its limit is told last: how to give it more.
+private step_advice() -> string = "; '--const-steps <n>' allows a longer run"
 
 private const EvDepthLimit: usize = 512
 
@@ -705,7 +727,7 @@ end not_constant
 private tick(r: &EvRun) -> bool
     r.steps += 1
 
-    if r.steps <= EvStepLimit then return true
+    if r.steps <= step_limit() then return true
 
     out_of_steps(r)
 
@@ -727,7 +749,8 @@ private out_of_steps(r: &EvRun)
 
             still = s"the loop at ${place_text(l.0, l.1)} was still running"
 
-        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $still"
+        r.message = s"${r.subject} did not finish within ${step_limit_text()} steps while compiling — $still" +
+                    step_advice()
     end if
 end out_of_steps
 
@@ -737,9 +760,7 @@ end out_of_steps
 private unheld(t: Type) -> Option[string] = t match
     Constrained(d) -> unheld(d.base)
     Integer(_, _, _) -> None
-    Floating(bits, brain) ->
-        if !brain && (bits == 32 || bits == 64 || bits == 128) then None
-        else Some("'f16' and 'bf16' are not evaluated while compiling yet")
+    Floating(_, _) -> None
     Fixed(_, _, _) -> None
     Array(_, elem) -> unheld(*elem)
     Struct(d) ->
@@ -758,6 +779,7 @@ private unheld(t: Type) -> Option[string] = t match
     Unknown -> None
     Str -> None
     Slice(elem, _) -> unheld(*elem)
+    Vector(_, elem) -> unheld(*elem)
     // The writer a rendering hands its `display` (`ConstWriter`), and an address the linker fills
     // in (`ConstLink`): held and handed on, never read through.
     Ptr(_) -> None
@@ -766,7 +788,8 @@ private unheld(t: Type) -> Option[string] = t match
 
 private unheld_other(t: Type) -> Option[string] =
     Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, " +
-              "fixed-point, 'bool', 'char', strings, and fixed arrays, structs, enums and slices of them are")
+              "fixed-point, 'bool', 'char', strings, and fixed arrays, vectors, structs, enums and slices " +
+              "of them are")
 
 // The first field whose type the evaluation does not hold, as `unheld` says it.
 private unheld_fields(fields: Buf[(string, Type)]) -> Option[string]
@@ -852,6 +875,7 @@ end array_text
 private element_type(t: Type) -> Type = underlying(t) match
     Array(_, elem) -> *elem
     Slice(elem, _) -> *elem
+    Vector(_, elem) -> *elem
     _ -> Unknown
 
 // A value a place takes, as a copy of its own: an array's elements are a buffer, and two places
@@ -938,7 +962,9 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
-    ConstArray(xs) -> array_literal(span, xs, t)
+    ConstArray(xs) -> underlying(t) match
+        Vector(_, _) -> vector_literal(span, xs, t)
+        _ -> array_literal(span, xs, t)
     ConstRecord(variant, fields) -> record_literal(span, variant, fields, t)
     // An address is laid down as the relocation it is: the folded place's address, or the function's.
     ConstLink(image) -> Some(image)
@@ -974,6 +1000,22 @@ private record_literal(span: Span, variant: int, fields: Buf[Const], t: Type) ->
         _ -> None
 end record_literal
 
+// A vector as the literal of its lanes it is laid down as.
+@noinline
+private vector_literal(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+    val lane = element_type(t)
+    var lits: Buf[TExpr] = buf()
+
+    for x in xs
+        val lit = value_literal(span, x, lane)
+
+        if lit.is_none() then return None
+
+        lits.push(lit.unwrap())
+
+    Some(TExpr(span, TVectorLit(lits, t)))
+end vector_literal
+
 // A table as the array literal it is laid down as, every element a literal at the element type.
 @noinline
 private array_literal(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
@@ -1003,6 +1045,7 @@ end float_pattern
 // The value a float literal of a width stands for.
 private float_at(f: real, t: Type) -> real = underlying(t) match
     Floating(32, _) -> real(f32(f))
+    Floating(16, brain) -> half_of_double(f, brain)
     _ -> f
 
 // What a step that has to produce a value produced, or the control it handed back.
@@ -1191,9 +1234,18 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TStructInvCheck(value, decl, inv_fn) -> invariant_check(r, e.span, value, decl, inv_fn)
         TRecheck(after, recv, decl, inv_fn) -> recheck(r, e.span, after, recv, decl, inv_fn)
         TIndex(receiver, index, _) -> element_read(r, receiver, index)
+        TVectorLit(lanes, _) -> vector_new(r, lanes)
+        TSplat(value, vec_ty) -> splat(r, value, vec_ty)
+        TLane(receiver, lane, _) -> lane_read(r, receiver, lane)
+        TVecCompare(op, l, r2, ty) -> vector_compare(r, e.span, op, l, r2, ty)
+        TSelect(mask, when_true, when_false, _) -> select_lanes(r, mask, when_true, when_false)
+        TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
+        TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
+        TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
         TAddrOf(place, ty) -> address_of(r, e.span, place, ty)
         TFuncAddr(_, _, _) -> EvGave(ConstLink(e))
+        TCallPtr(callee, args, _, _) -> call_through(r, e.span, callee, args)
         // `null` is the one address known before the linker runs, and is held the same way.
         TNullLit(_) -> EvGave(ConstLink(e))
         TDeref(operand, _) -> read_through(r, operand)
@@ -1204,6 +1256,21 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
             refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
+
+// A call through a function's address: the address is the function it was taken of, so the call is
+// that function's, run as a call by name is. Null is a trap, as it is where the program runs.
+@noinline
+private call_through(r: &EvRun, at: Span, callee: TExpr, args: Buf[TExpr]) -> Flow
+    val image = eval_value(r, callee) match
+        Ok(ConstLink(found)) -> found
+        Ok(_) -> return refuse_form(r, callee.span, "a call through something that is not a function's address")
+        Err(f) -> return f
+
+    *image.kind match
+        TFuncAddr(name, _, _) -> call(r, at, name, args, false)
+        TNullLit(_) -> trap(r, callee.span, "a call through a null function pointer")
+        _ -> refuse_form(r, callee.span, "a call through an address that is not a function's")
+end call_through
 
 // **The address of module storage is a value while compiling**, as it is in constant data: the
 // linker fills it in (`ConstLink`). So is the address of a field of it, or of an element at an index
@@ -1375,15 +1442,15 @@ private sized(r: &EvRun, at: Span, n: long) -> bool = charged(r, at, n, s"an arr
 // The same for any value made a step per element or byte: `what` names it.
 @noinline
 private charged(r: &EvRun, at: Span, n: long, what: string) -> bool
-    if r.steps + n <= EvStepLimit
+    if r.steps + n <= step_limit()
         r.steps += n
         return true
     end if
 
     if r.kind == EvRunning
         r.kind = EvLimit
-        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $what at " +
-                    s"${place_text(here(r), at)} is past the steps that were left"
+        r.message = s"${r.subject} did not finish within ${step_limit_text()} steps while compiling — $what at " +
+                    s"${place_text(here(r), at)} is past the steps that were left" + step_advice()
     end if
 
     false
@@ -1459,6 +1526,237 @@ private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
         Ok(i) -> EvGave(xs.at(lo + i))
         Err(f) -> f
 end element_read
+
+// -- vectors -------------------------------------------------------------------------------------------
+
+// **A vector is held as its lanes**, an array of them, and what an operator does to one is what the
+// lane's operator does to each lane, by the same definitions a scalar is run with (`operate`,
+// `fixed_operate`) at the lane type. No lane operation is checked, as the lowering checks none: an
+// integer lane wraps, and the two operators that would trap on one lane, integer `/` and `%`, are
+// refused on a vector before anything runs.
+
+// A vector's lanes; nothing for a value that is not one.
+private lanes_of(v: Const) -> Buf[Const] = v match
+    ConstArray(xs) -> xs
+    _ -> buf()
+
+// How many lanes a vector type has.
+private lane_count(t: Type) -> int = underlying(t) match
+    Vector(n, _) -> n
+    _ -> 0
+
+// `[a, b, c, d]` at a vector type: each lane computed in order.
+@noinline
+private vector_new(r: &EvRun, lanes: Buf[TExpr]) -> Flow
+    var out: Buf[Const] = buf()
+
+    for lane in lanes
+        eval_value(r, lane) match
+            Ok(v) -> out.push(v)
+            Err(f) -> return f
+
+    EvGave(ConstArray(out))
+end vector_new
+
+// One value in every lane.
+@noinline
+private splat(r: &EvRun, value: TExpr, vec_ty: Type) -> Flow = eval_value(r, value) match
+    Ok(v) -> EvGave(ConstArray(filled(v, lane_count(vec_ty))))
+    Err(f) -> f
+
+// `v[2]`: the analyzer has already checked the lane is one the vector has.
+@noinline
+private lane_read(r: &EvRun, receiver: TExpr, lane: int) -> Flow = eval_value(r, receiver) match
+    Ok(ConstArray(xs)) -> EvGave(xs.at(usize(lane)))
+    Ok(_) -> refuse_form(r, receiver.span, "a lane of something that is not a vector")
+    Err(f) -> f
+
+// An operator between two vectors, lane by lane. A shift's count may be one scalar for every lane.
+@noinline
+private lanewise(r: &EvRun, at: Span, op: string, lt: Type, rt: Type, ty: Type, x: Const, y: Const) -> Flow
+    val xs = lanes_of(x)
+    val ys = y match
+        ConstArray(found) -> found
+        _ -> filled(y, int(xs.len()))
+    val (ll, rl, tl) = (vector_lane_of(lt), vector_lane_of(rt), vector_lane_of(ty))
+    var out: Buf[Const] = buf()
+
+    for i in 0..<xs.len()
+        val lane = if fixed_arith_op(op, ll, rl, tl) then fixed_operate(r, at, op, ll, rl, tl, xs.at(i), ys.at(i))
+        else operate(r, at, op, ll, xs.at(i), ys.at(i), false)
+
+        lane match
+            EvGave(v) -> out.push(v)
+            other -> return other
+
+    EvGave(ConstArray(out))
+end lanewise
+
+// `a < b` between vectors: a mask, each lane the comparison of the two lanes.
+@noinline
+private vector_compare(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
+    val x = eval_value(r, l) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val y = eval_value(r, rt) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
+end vector_compare
+
+// `m.select(a, b)`: every operand computed, as the lowering computes them, and each lane taken from
+// `a` where the mask's lane is true and from `b` where it is not.
+@noinline
+private select_lanes(r: &EvRun, mask: TExpr, when_true: TExpr, when_false: TExpr) -> Flow
+    val m = eval_value(r, mask) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val a = eval_value(r, when_true) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val b = eval_value(r, when_false) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    var out: Buf[Const] = buf()
+
+    for i in 0..<m.len()
+        val chosen = m.at(i) match
+            ConstBool(true) -> a.at(i)
+            _ -> b.at(i)
+
+        out.push(chosen)
+
+    EvGave(ConstArray(out))
+end select_lanes
+
+// A vector's lanes folded into one value, by the reduction the analyzer chose (`vectors.sysl`).
+//
+// **A float sum is refused**: it is lowered as a sum the machine may reassociate, and which lanes it
+// adds first is the target's instructions' to choose -- an AArch64 core adds neighbouring pairs, the
+// generic expansion halves -- so no one value is the one the program computes. The minimum and
+// maximum of floats answer the other lane where one is a NaN, as `fmin` does; the integer and
+// fixed-point ones compare the values held, signed or not as the lane is. An integer sum wraps, and
+// wrapping addition gives one answer in any order.
+@noinline
+private reduce(r: &EvRun, at: Span, op: string, receiver: TExpr, ty: Type) -> Flow
+    if op == "fadd" then
+        return refuse_form(r, at, "a float vector's 'sum' adds its lanes in the order the target's " +
+                           "instructions take, so its value is known only where the program runs — add " +
+                           "the lanes in the order meant, 'v[0] + v[1] + …'")
+
+    val xs = eval_value(r, receiver) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    if xs.is_empty() then return refuse_form(r, at, "a vector with no lanes")
+
+    var acc = xs.at(0)
+
+    for i in 1..<xs.len()
+        val x = xs.at(i)
+
+        acc = (op, acc, x) match
+            ("add", _, _) -> operate(r, at, "+", ty, acc, x, false) match
+                EvGave(v) -> v
+                other -> return other
+            ("or", ConstBool(a), ConstBool(b)) -> ConstBool(a || b)
+            ("and", ConstBool(a), ConstBool(b)) -> ConstBool(a && b)
+            (_, ConstInt(a), ConstInt(b)) ->
+                val smaller = cmp(b, a) < 0
+
+                if (op.ends_with("min") && smaller) || (op.ends_with("max") && cmp(b, a) > 0) then x else acc
+            (_, ConstFloat(a), ConstFloat(b)) ->
+                if a != a then x
+                else if b != b then acc
+                else if (op == "fmin" && b < a) || (op == "fmax" && b > a) then x
+                else acc
+            _ -> return refuse_form(r, at, s"the reduction '$op' of ${type_show(texpr_type(receiver))}")
+    end for
+
+    EvGave(acc)
+end reduce
+
+// The run of elements a vector is loaded from or stored to, `n` of them from `index`: where they are
+// held, and the position of the first. A run that does not fit traps, as it does where the program
+// runs -- checked as a whole, so a run starting at an element that exists still traps if the last
+// does not.
+private lane_run(r: &EvRun, held: Const, receiver: TExpr, index: TExpr, n: int) -> Result[(Buf[Const], usize), Flow]
+    val (xs, lo, len) = held match
+        ConstArray(found) -> (found, usize(0), found.len())
+        ConstView(found, from, count, _) -> (found, from, count)
+        _ -> return Err(refuse_form(r, receiver.span, s"a vector of the elements of a " +
+                                    s"'${type_show(texpr_type(receiver))}' is not evaluated while compiling yet"))
+
+    val i = eval_value(r, index) match
+        Ok(ConstInt(v)) -> v
+        Ok(_) -> return Err(refuse_form(r, index.span, "an index that is not an integer"))
+        Err(f) -> return Err(f)
+
+    val count = from_int(long(n))
+
+    if cmp(from_int(long(len)), count) < 0 || cmp(i, from_int(0)) < 0 || cmp(add(i, count), from_int(long(len))) > 0 then
+        return Err(trap(r, index.span, s"$n elements from index ${to_string(i)} are out of bounds for a length of $len"))
+
+    Ok((xs, lo + usize(i.to_long().unwrap_or(0))))
+end lane_run
+
+// `xs.load(i)`: the lanes are copies of the elements, read where they are held.
+@noinline
+private vector_load(r: &EvRun, receiver: TExpr, index: TExpr, vec_ty: Type) -> Flow
+    val held = eval_value(r, receiver) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val n = lane_count(vec_ty)
+
+    lane_run(r, held, receiver, index, n) match
+        Ok((xs, first)) ->
+            var out: Buf[Const] = buf()
+
+            for k in 0..<usize(n)
+                out.push(copied(xs.at(first + k)))
+
+            EvGave(ConstArray(out))
+        Err(f) -> f
+end vector_load
+
+// `xs.store(i, v)`: the value first and the run second, the order an assignment takes, and each lane
+// written into the element where it is held -- an array a local holds, or the one a slice views.
+@noinline
+private vector_store(r: &EvRun, receiver: TExpr, index: TExpr, value: TExpr) -> Flow
+    val lanes = eval_value(r, value) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    // A place is read where it is held, so the writes land in it; a slice made on the spot views its
+    // array's own storage, and lands there.
+    val found = if is_place(receiver) then slot_of(r, receiver).and_then(s -> slot_value(r, receiver.span, s))
+    else eval_value(r, receiver)
+
+    val held = found match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    // An array that is not a place is a value of its own, and a write into it would land nowhere.
+    held match
+        ConstArray(_) -> if !is_place(receiver) then return no_place(r, receiver)
+        _ -> ()
+
+    lane_run(r, held, receiver, index, int(lanes.len())) match
+        Ok((xs, first)) ->
+            var target = xs
+
+            for k in 0..<lanes.len()
+                target.set(first + k, copied(lanes.at(k)))
+
+            EvNone
+        Err(f) -> f
+end vector_store
 
 // `for x in a` over a fixed array: the elements as they were when the loop began.
 @noinline
@@ -2162,6 +2460,21 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
         Ok(x) -> x
         Err(f) -> return f
 
+    underlying(ty) match
+        Vector(_, _) ->
+            var out: Buf[Const] = buf()
+
+            for x in lanes_of(v)
+                unary_value(r, at, op, x, vector_lane_of(ty)) match
+                    EvGave(y) -> out.push(y)
+                    other -> return other
+
+            EvGave(ConstArray(out))
+        _ -> unary_value(r, at, op, v, ty)
+end unary
+
+// A unary operator applied to a value of a scalar type.
+private unary_value(r: &EvRun, at: Span, op: string, v: Const, ty: Type) -> Flow
     v match
         ConstInt(n) -> underlying(ty) match
             Fixed(_, _, _) ->
@@ -2183,7 +2496,7 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
             else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
         ConstBool(b) -> if op == "!" then EvGave(ConstBool(!b)) else refuse_form(r, at, s"'$op' on bool")
         _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
-end unary
+end unary_value
 
 @noinline
 private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
@@ -2194,6 +2507,10 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
     val y = eval_value(r, rt) match
         Ok(v) -> v
         Err(f) -> return f
+
+    underlying(texpr_type(l)) match
+        Vector(_, _) -> return lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
+        _ -> ()
 
     if fixed_arith_op(op, texpr_type(l), texpr_type(rt), ty) then
         return fixed_operate(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
@@ -2241,6 +2558,7 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
             Fixed(bits, _, signed) -> run_int_binary(op, a, b, bits, signed, false)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstFloat(a), ConstFloat(b)) -> underlying(lt) match
+            Floating(16, brain) -> run_half_binary(op, a, b, brain)
             Floating(bits, _) -> run_float_binary(op, a, b, bits)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstQuad(ah, al), ConstQuad(bh, bl)) -> run_quad_binary(op, (ah, al), (bh, bl))

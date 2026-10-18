@@ -1,0 +1,259 @@
+module sh.sysl.compiler
+@tests
+
+// **The values a run while compiling holds beyond the scalars**: the two sixteen-bit floats, vectors,
+// and a call through a function's address -- each computed as the program computes it, and checked
+// against the same call made where the program runs -- and the limit on how long one run may take,
+// which `--const-steps` sets.
+
+@test("an 'f16' and a 'bf16' are computed while compiling as the program computes them")
+cte_half_floats_run_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        series(n: int) -> f16
+            var s = f16(0)
+
+            for i in 1..n
+                s = s + f16(1) / f16(i)
+
+            s
+
+        brain(n: int) -> bf16
+            var s = bf16(0)
+
+            for i in 1..n
+                s = s * bf16(1.01) + bf16(0.1)
+
+            s
+
+        tiny(x: real) -> f16 = f16(x * 1.0e-7)
+        third(x: real) -> bf16 = bf16(f128(x) / f128(3))
+        over(x: real) -> f16 = f16(x * 70000.0)
+
+        const S: f16 = series(300)
+        const B: bf16 = brain(200)
+        const T: f16 = tiny(1.0)
+        const H: bf16 = third(1.0)
+        const O: f16 = over(1.0)
+        const P: f16 = f16(65520)
+        const Q: bf16 = bf16(16777217)
+
+        var n = 300
+        var one = 1.0
+        var big = 16777217
+
+        print(real(S), real(B), real(T), real(H), real(O), real(P), real(Q))
+        print(S == series(n), B == brain(n - 100), T == tiny(one), H == third(one), O == over(one),
+              P == f16(65520 * int(one)), Q == bf16(big))
+        """), "6.2578125 43 0.00000011920928955078125 0.333984375 inf inf 16777216\ntrue true true true true true true\n")
+end cte_half_floats_run_while_compiling
+
+@test("a vector is computed while compiling lane by lane, loaded from and stored into an array")
+cte_a_vector_runs_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        dot(a: <4>f32, b: <4>f32) -> f32
+            val p = a * b
+
+            p[0] + p[1] + p[2] + p[3]
+
+        kernel(n: int) -> int
+            var xs: [8]int = [1, 2, 3, 4, 5, 6, 7, 8]
+            val v: <4>int = xs.load(2)
+
+            xs.store(4, v * 10 - 1)
+
+            var s = 0
+
+            for x in xs
+                s += x
+
+            s + n
+
+        lanes(k: int) -> int
+            val v: <4>int = [k, -k, k * 2, 7]
+            val m = v > 3
+            val w = m.select(v, 0)
+            val u = ~v + (v << 2) - (v >> 1)
+
+            w.sum() * 1000 + w.max() + u[0] + (if m.any() then 1 else 0) + (if m.all() then 10 else 0)
+
+        wraps(b: u8) -> u8
+            val v: <4>u8 = [b, 200, 100, 255]
+
+            (v + 100).sum()
+
+        floats(x: f32) -> f32
+            val v: <4>f32 = [x, 0.1, 1e8, -1e8]
+
+            (-v).min() + v.max() + (v / 3.0)[0]
+
+        const A: f32 = dot([1.0, 2.0, 3.0, 4.0], [0.5, 0.25, 2.0, 0.1])
+        const B: int = kernel(1)
+        const C: int = lanes(5)
+        const D: u8 = wraps(9)
+        const F: f32 = floats(0.3)
+
+        var one = 1
+
+        print(A, B, C, D, F)
+        print(A == dot([1.0, 2.0, 3.0, 4.0], [0.5, 0.25, 2.0, 0.1]), B == kernel(one), C == lanes(5 * one),
+              D == wraps(u8(9 * one)), F == floats(f32(0.3) * f32(one)))
+        """), "7.4 187 22023 196 0.1\ntrue true true true true\n")
+end cte_a_vector_runs_while_compiling
+
+@test("a 'static val' of a vector or a sixteen-bit float computed while compiling is laid down as data")
+cte_a_vector_val_is_laid_down()
+    if !enm_ready() then return
+
+    val prog = raw"""
+        mk(k: int) -> <4>int = [k, k + 1, k * k, -k]
+        mask(k: int) -> <4>bool = [k > 1, k > 5, true, false]
+        hs(x: f16) -> f16 = x / f16(3)
+        bs(x: bf16) -> bf16 = x * bf16(1.5)
+        fv(x: f32) -> <2>f32 = [x, x / 3.0]
+
+        static val V: <4>int = mk(3)
+        static val M: <4>bool = mask(3)
+        static val H: f16 = hs(f16(1))
+        static val B: bf16 = bs(bf16(3))
+        static val F: <2>f32 = fv(1.0)
+
+        print(V[2], V[3], M[0], M[1], H, B, F[1])
+        """
+
+    assert_eq(enm_ran(prog), "9 -3 true false 0.3333 4.5 0.33333334\n")
+
+    val ir = enm_ir(prog)
+
+    for laid in ["@V = private constant <4 x i32> <i32 3, i32 4, i32 9, i32 -3>",
+                 "@M = private constant <4 x i1> <i1 1, i1 0, i1 1, i1 0>",
+                 "@H = private constant half 0x3FD5540000000000",
+                 "@B = private constant bfloat 0x4012000000000000",
+                 "@F = private constant <2 x float> <float 0x3FF0000000000000, float 0x3FD5555560000000>"]
+        assert(ir.contains(laid), laid)
+end cte_a_vector_val_is_laid_down
+
+@test("a vector run past the end traps while compiling, and a float vector's sum is refused")
+cte_vector_refusals()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        past(i: int) -> int
+            val xs: [5]int = [1, 2, 3, 4, 5]
+            val v: <4>int = xs.load(i)
+
+            v.sum()
+
+        total(x: f32) -> f32
+            val v: <4>f32 = [x, 1.0, -x, 1.0]
+
+            v.sum()
+
+        const A: int = past(3)
+        const T: f32 = total(1.0e8)
+
+        print(A, T)
+        """).0
+
+    for part in ["'A' traps while it is being compiled: 4 elements from index 3 are out of bounds for a " +
+                 "length of 5 (main.sysl:3:29) — inside 'past(3)'",
+                 "'T' cannot be computed while compiling: it calls 'total', which sums a float vector, " +
+                 "whose lanes are added in the order the target's instructions take — so the value is " +
+                 "known only where the program runs"]
+        assert(said.contains(part), said)
+end cte_vector_refusals
+
+@test("a call through a function's address runs the function it was taken of")
+cte_a_call_through_a_function_address()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        inc(x: int) -> int = x + 1
+        dbl(x: int) -> int = x * 2
+
+        pick(which: bool) -> *extern(int) -> int = if which then &inc else &dbl
+
+        const run(x: int) -> int
+            val f = pick(x > 5)
+            val g = &dbl
+
+            g(f(x))
+
+        const A: int = run(7)
+        const B: int = run(2)
+
+        print(A, B)
+        """), "16 8\n")
+
+    assert(enm_outcome(raw"""
+        const run(x: int) -> int
+            val f: *extern(int) -> int = null
+
+            f(x)
+
+        const A: int = run(1)
+
+        print(A)
+        """).0.contains("'A' traps while it is being compiled: a call through a null function pointer"),
+           "a null function pointer was called")
+end cte_a_call_through_a_function_address
+
+private val cte_counting: string = raw"""
+    count(n: int) -> int
+        var i = 0
+
+        while i < n
+            i += 1
+
+        i
+
+    const K: int = count(100)
+
+    print(K)
+    """
+
+@test("--const-steps sets how many steps one run may take, and the message says it")
+cte_const_steps_sets_the_limit()
+    if !enm_ready() then return
+
+    var low: [2]string = ["--const-steps", "300"]
+
+    assert_eq(took_search_flag(low[..], 0), 2)
+
+    val said = enm_outcome(cte_counting).0
+
+    reset_search_paths()
+
+    assert(said.contains("'K' did not finish within 300 steps while compiling — the loop at main.sysl:4:5 " +
+                         "was still running; '--const-steps <n>' allows a longer run"), said)
+
+    var high: [2]string = ["--const-steps", "2_000"]
+
+    assert_eq(took_search_flag(high[..], 0), 2)
+
+    val ran = enm_ran(cte_counting)
+
+    reset_search_paths()
+    assert_eq(ran, "100\n")
+end cte_const_steps_sets_the_limit
+
+@test("--const-steps takes a whole number above zero, and refuses anything else by name")
+cte_const_steps_operand()
+    for bad in ["0", "x", "", "1e6", "-5"]
+        var args: [2]string = ["--const-steps", bad]
+
+        assert_eq(link_flag_refusal(args[..]),
+                  Some(s"'--const-steps' takes how many steps a compile-time evaluation may run, a whole " +
+                       s"number above zero, and '$bad' is not one"))
+
+    var ok: [2]string = ["--const-steps", "50,000,000"]
+
+    assert_eq(link_flag_refusal(ok[..]), None)
+    assert_eq(took_search_flag(ok[..], 0), 2)
+    assert_eq(const_steps_flag(), Some(long(50000000)))
+    reset_search_paths()
+    assert_eq(const_steps_flag(), None)
+end cte_const_steps_operand
