@@ -1094,17 +1094,11 @@ variant_homes(cx: &Analyzer, name: string) -> Buf[string]
 
     var own = false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
+    for key in enums_declaring(cx.an, name)
+        if reachable_key(cx.an, key, cx.scope) && variant_visible_here(cx, key, name) then
+            homes.push(key)
 
-        cx.an.tables.types.at(i).kind match
-            EnumOf(ed) ->
-                if declares_variant(ed, name) && reachable_key(cx.an, key, cx.scope) &&
-                        variant_visible_here(cx, key, name) then
-                    homes.push(key)
-
-                    if module_of(key) == cx.scope.module_name then own = true
-            _ -> ()
+            if module_of(key) == cx.scope.module_name then own = true
 
     if !own then return homes
 
@@ -1147,25 +1141,12 @@ private own_variant_name(cx: &Analyzer, name: string) -> bool
     if !overload_keys(cx.an, here).is_empty() || !overload_keys(cx.an, plain).is_empty() then
         return false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
-
-        cx.an.tables.types.at(i).kind match
-            EnumOf(ed) ->
-                if module_of(key) == cx.scope.module_name && declares_variant(ed, name) &&
-                        reachable_key(cx.an, key, cx.scope) then
-                    return true
-            _ -> ()
+    for key in enums_declaring(cx.an, name)
+        if module_of(key) == cx.scope.module_name && reachable_key(cx.an, key, cx.scope) then
+            return true
 
     false
 end own_variant_name
-
-private declares_variant(ed: EnumDecl, name: string) -> bool
-    for item in ed.variants
-        if item.name == name then return true
-
-    false
-end declares_variant
 
 // `'A'`, then `'A' and 'B'`, then `'A', 'B' and 'C'` -- a series a sentence can carry, with no comma
 // before the `and`.
@@ -1843,10 +1824,8 @@ private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool =
 private generic_variant_in_reach(cx: &Analyzer, name: string, carrying: bool) -> bool
     if !may_name_variant(cx, name) then return false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
-
-        cx.an.tables.types.at(i).kind match
+    for key in enums_declaring(cx.an, name)
+        cx.an.tables.types.get(key).unwrap().kind match
             EnumOf(d) ->
                 if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
                         variant_visible_here(cx, key, name)

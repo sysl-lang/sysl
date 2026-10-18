@@ -21,10 +21,14 @@ struct Table[V]
     order: Buf[string]
     by_key: Map[string, V]
 
+    // How many times the table has been written, so an index built over it can tell it is stale.
+    changes: usize
+
     put(*self, key: string, v: V)
         if !self.by_key.has(key) then self.order.push(key)
 
         self.by_key.put(key, v)
+        self.changes += 1
 
     get(self, key: string) -> Option[V] = self.by_key.get(key)
 
@@ -34,6 +38,7 @@ struct Table[V]
         if !self.by_key.has(key) then return
 
         self.by_key.remove(key)
+        self.changes += 1
 
         var kept: Buf[string] = buf()
 
@@ -53,7 +58,7 @@ struct Table[V]
 end Table
 
 // A table with nothing in it.
-table[V]() -> &Table[V] = Table(buf(), map())
+table[V]() -> &Table[V] = Table(buf(), map(), 0)
 
 // What one file's `import` clauses brought into scope.
 //
@@ -511,6 +516,20 @@ struct Tables
     // the subscript is lowered, so a function that merely has `index_place` in its name is not in it.
     place_calls: &Table[bool]
 
+    // The same names as `modules`, for asking whether one is among them.
+    module_names: Set[string]
+
+    // Where each capability reference sits in `capability_refs`, by the terms that make two of them
+    // one (`capability_ref_terms`) -- so recording a reference is a lookup, not a pass over every
+    // reference the compilation has made.
+    capability_ref_at: Map[string, usize]
+
+    // The enum declarations declaring each variant spelling, in declaration order
+    // (`enums_declaring`), and the `types` table's change count it was built at, plus one -- zero is
+    // never built.
+    variant_index: Map[string, Buf[string]]
+    variant_index_for: usize
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -518,12 +537,11 @@ struct Tables
     module_of_key(self, key: string) -> string = module_of(key)
 
     // Whether this compilation has files for a module.
-    has_module(self, name: string) -> bool
-        for item in self.modules
-            if item == name then return true
+    has_module(self, name: string) -> bool = self.module_names.has(name)
 
-        false
-    end has_module
+    // A module this compilation has files for, recorded once.
+    add_module(self, name: string)
+        if self.module_names.add(name) then self.modules.push(name)
 end Tables
 
 // Empty tables for one target.
@@ -547,7 +565,11 @@ tables_for(t: Target) -> &Tables =
            buf(),
            buf(),
            table(),
-           table())
+           table(),
+           set(),
+           map(),
+           map(),
+           0)
 
 // One `override impl` still to be held to there being something for it to override: the type as a
 // reader spelled it, the promise the block makes, the type it covers, and where to point.

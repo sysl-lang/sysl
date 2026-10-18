@@ -2,8 +2,9 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.math.bigint.from_int
-import sysl.text.Search
+import sysl.text.{Search, str_builder}
 
 // The declaration pass, from parsed files to the tables the later stages read.
 //
@@ -464,31 +465,40 @@ private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string
     val needs = a.tables.reaching_needs
     val scaffolding = a.tables.reaching_test || test_only_file(a, scope.src.name)
 
-    for i in 0..<a.tables.capability_refs.len()
-        val r = a.tables.capability_refs.at(i)
+    val terms = capability_ref_terms(from, to, needs, scaffolding, imported, named)
 
-        if r.from != from || r.to != to || r.scaffolding != scaffolding then continue
-        if r.imported != imported || r.named != named then continue
-        if !same_strings(r.needs, needs) then continue
-
-        if r.span.is_empty() && !span.is_empty() then
-            a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
-                                                          imported, named, false))
-
-        return
-
-    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding, imported,
-                                                named, false))
+    a.tables.capability_ref_at.get(terms) match
+        Some(i) ->
+            if a.tables.capability_refs.at(i).span.is_empty() && !span.is_empty() then
+                a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                              imported, named, false))
+        None ->
+            a.tables.capability_ref_at.put(terms, a.tables.capability_refs.len())
+            a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                        imported, named, false))
 end note_capability_ref
 
-private same_strings(xs: Buf[string], ys: Buf[string]) -> bool
-    if xs.len() != ys.len() then return false
+// What makes two capability references one: the edge, what the referring declaration needs, and the
+// three ways a reference is told apart. The fields are joined by a byte no name holds.
+private capability_ref_terms(from: string, to: string, needs: Buf[string], scaffolding: bool,
+                             imported: bool, named: string) -> string
+    var b = str_builder()
 
-    for i in 0..<xs.len()
-        if xs.at(i) != ys.at(i) then return false
+    b.push(from)
+    b.push_char('\u{1}')
+    b.push(to)
+    b.push_char('\u{1}')
+    b.push(named)
+    b.push_char('\u{1}')
+    b.push(if scaffolding then "s" else "-")
+    b.push(if imported then "i" else "-")
 
-    true
-end same_strings
+    for item in needs
+        b.push_char('\u{1}')
+        b.push(item)
+
+    b.finish()
+end capability_ref_terms
 
 // Fills in the position of an edge already recorded, where the first reference to make it had none.
 private position_edge(a: &Analysis, from: string, to: string, scope: Scope, span: Span)
@@ -615,21 +625,46 @@ private is_variant_name(a: &Analysis, key: string) -> bool = enum_of_variant(a, 
 // as well.
 enum_of_variant(a: &Analysis, key: string) -> Option[string]
     val here = module_of(key)
-    val name = module_bare(key)
 
-    for i in 0..<a.tables.types.len()
-        val decl = a.tables.types.at(i)
-
-        if module_of(a.tables.types.key_at(i)) == here then
-            decl.kind match
-                EnumOf(e) ->
-                    for item in e.variants
-                        if item.name == name then
-                            return Some(a.tables.types.key_at(i))
-                _ -> ()
+    for k in enums_declaring(a, module_bare(key))
+        if module_of(k) == here then return Some(k)
 
     None
 end enum_of_variant
+
+// The enum declarations that declare a variant of this spelling, in the order the types were declared.
+//
+// **A bare name is asked this on every lookup**, so it is an index rather than a pass over every type:
+// built once over the `types` table and rebuilt whenever the table has been written since, which
+// covers the declarations still being hoisted and a reading that is rewound.
+enums_declaring(a: &Analysis, name: string) -> Buf[string]
+    val types = a.tables.types
+
+    if a.tables.variant_index_for != types.changes + 1
+        var index: Map[string, Buf[string]] = map()
+
+        for i in 0..<types.len()
+            val key = types.key_at(i)
+
+            types.at(i).kind match
+                EnumOf(e) ->
+                    for item in e.variants
+                        index.get(item.name) match
+                            Some(keys) ->
+                                if keys.at(keys.len() - 1) != key then keys.push(key)
+                            None ->
+                                var keys: Buf[string] = buf()
+
+                                keys.push(key)
+                                index.put(item.name, keys)
+                _ -> ()
+
+        a.tables.variant_index = index
+        a.tables.variant_index_for = types.changes + 1
+    end if
+
+    a.tables.variant_index.get(name).unwrap_or(buf())
+end enums_declaring
 
 // A pinned underlying type says which one integer the discriminants are laid in. A generic enum has
 // an instantiation for every argument list rather than one, so there is no single storage for the

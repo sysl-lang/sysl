@@ -537,20 +537,34 @@ end domain_refs
 // The module storage an initializer reads, directly or through anything it calls -- which is what
 // settles the order computed storage is filled in. It is asked while the analysis is still running,
 // so there is no program yet, only the bodies typed so far and the tables built for them.
-vals_read_by(init: TExpr, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> Buf[string]
+//
+// **The functions are indexed once for every initializer asked about**, not once per initializer: a
+// program with many computed values would otherwise index every function it has for each of them.
+struct ValsReader
+    p: TProgram
+    index: FuncIndex
+
+    read(self, init: TExpr) -> Buf[string]
+        val root = no_reached()
+        val p = self.p
+
+        walk_texpr(init, expr_walk(false, e -> take_node_of(p, root, e)))
+        reached_from(p, self.index, root).vals
+    end read
+end ValsReader
+
+vals_reader(funcs: Buf[TFunc], vtables: Buf[TVtable]) -> ValsReader
     val p = TProgram(buf(), buf(), vtables, buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
                      buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
                      false, false, true)
-    val root = no_reached()
 
-    walk_texpr(init, expr_walk(false, e -> take_node_of(p, root, e)))
-    reached_from(p, func_index(p), root).vals
-end vals_read_by
+    ValsReader(p, func_index(p))
+end vals_reader
 
 // Where each function of a program is, by name: the first index holding a name, and from each index
 // the next one holding the same name, so a name held twice is visited at both places and in the
 // order the program lists them.
-private struct FuncIndex
+struct FuncIndex
     first: Map[string, usize]
     next: Buf[usize]
 
