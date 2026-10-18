@@ -81,6 +81,25 @@ case a cache cannot see, and the same one the standard module's cache has. No ot
 consults it: `build` writes a binary somebody named, and `build-c` and `build-lib` write artifacts
 for somebody else's toolchain.
 
+**`SYSL_TIMINGS=1`** says how long each phase of a compilation took, one line on standard error as
+each ends:
+
+```
+sysl: phase parse std 135ms
+sysl: phase parse program 0ms
+sysl: phase declarations 84ms
+sysl: phase bodies 153ms
+sysl: phase checks 4ms
+sysl: phase prune 0ms
+sysl: phase std 68ms
+sysl: phase codegen 2ms
+sysl: phase link 87ms
+```
+
+The phases add up to the compilation, nothing counted twice. `std` is finding the standard module's
+compiled artifact, or building it the first time, which is then one line rather than a compilation's
+worth. It is the instrument for a build that is slow and does not say why.
+
 **The kept binaries, and the C objects every build keeps beside them, are bounded.** Each directory
 — `~/Library/Caches/sysl/run/` and `~/Library/Caches/sysl/cobj/` on macOS, under `~/.cache/sysl/`
 on Linux — holds at most 4 GB: past that the oldest entries go, though never one written in the
