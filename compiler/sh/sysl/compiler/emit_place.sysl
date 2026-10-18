@@ -15,6 +15,22 @@ import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
 // keep for itself.
 access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlain
 
+// Whether a place is part of the copy a `with` works on (`expr_member.sysl`'s `with_expr`).
+//
+// **The copy is a value the form made for itself**, and nothing else reaches it. A `volatile` field of
+// it is therefore no register -- what a read of a register hands back is an ordinary value
+// (`reference/memory.md`) -- so the fields a `with` changes are folded in registers, and the device
+// sees the one load of the base and the one store of the result the source wrote.
+in_with_copy(x: TExpr) -> bool = *x.kind match
+    TLoad(name, _) -> with_copy_name(name)
+    TField(receiver, _, _) -> in_with_copy(receiver)
+    _ -> false
+
+private with_copy_name(name: string) -> bool = name.starts_with(s"${ModuleSep}with")
+
+// How a place is accessed: as its storage was declared, except within the copy a `with` works on.
+storage_access(x: TExpr) -> IrAccess = if in_with_copy(x) then AccPlain else access_of(place_ty(x))
+
 // The same asked of the node a place came from.
 //
 // **A `ref` name is the one node with no declaration to read a qualifier off**: the qualifier is on
@@ -23,7 +39,7 @@ access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlai
 // store, free to be reordered or dropped, where the path it stands for gets `store volatile`.
 place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
     TLoad(name, ty) -> ref_access(e, name, ty)
-    _ -> access_of(place_ty(x)) match
+    _ -> storage_access(x) match
         AccPlain -> buf_side(x)
         other -> other
 
@@ -71,6 +87,8 @@ private is_core_elems(x: TExpr) -> bool = *x.kind match
 // How storage reached through a local's name is accessed: as the place a `ref` stands on was
 // declared, and as the local's own type says everywhere else.
 ref_access(e: *Emit, written: string, ty: Type) -> IrAccess
+    if with_copy_name(written) then return AccPlain
+
     val name = local_name(e, written)
 
     for ref_place in e.ref_places
@@ -403,7 +421,7 @@ end container_at
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
     val t = fresh_reg(e)
 
-    emit(e, InLoad(t, container_lty(ranges), addr, access_of(place_ty(receiver)), None))
+    emit(e, InLoad(t, container_lty(ranges), addr, storage_access(receiver), None))
     reordered(e, container_reversal_of(texpr_type(receiver), e.target.little_endian()), t)
 end load_container
 
@@ -429,7 +447,7 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place
             store_over(e, b.0, p, inner, None)
             return
 
-        val acc = access_of(place_ty(b.0))
+        val acc = storage_access(b.0)
         val c = load_container(e, b.1, b.0, p)
         val back = container_reversal_of(texpr_type(b.0), e.target.little_endian())
 

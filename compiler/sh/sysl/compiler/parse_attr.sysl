@@ -370,6 +370,14 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     // **What stands in the parentheses is a name, never an expression** -- `@crossing(1)` is told
     // what the annotation names rather than that an identifier was expected, as the empty form is.
     loop
+        // The receiver is not a parameter these name: it is the one name a list could hold that is
+        // not a name, and it gets its own answer rather than the empty form's.
+        if p.at_kw("self")
+            p.fault(p.here(), receiver_refusal(word))
+            skip_line(p)
+            return out
+        end if
+
         p.peek() match
             Ident(n) ->
                 p.bump()
@@ -480,6 +488,19 @@ private quoted_list(names: Buf[string]) -> string
 
     out
 end quoted_list
+
+// `self` written in one of those lists. For `@disjoint` the answer is that naming the other
+// parameters already covers the receiver: what a named parameter reaches, nothing else the call can
+// reach does, `self` included.
+private receiver_refusal(word: string) -> string
+    if word == "disjoint"
+        return "'@disjoint' names parameters, and 'self' is the receiver — leave it out: a parameter " +
+               "'@disjoint' names is kept apart from every other pointer the body reaches, 'self' " +
+               "included, so '@disjoint(data)' already says it"
+    end if
+
+    s"'@$word' names parameters, and 'self' is the receiver, which it does not name"
+end receiver_refusal
 
 private named_list_refusal(word: string) -> string
     if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
