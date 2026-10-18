@@ -2279,6 +2279,48 @@ print(1)
 '@disjoint' marks 'fill', which is 'async'
 ```
 
+**A method names its other parameters, never `self`.** What a named parameter reaches, nothing else
+the body uses reaches — the receiver included — so naming the slice a method copies from already keeps
+it apart from the storage the method writes into:
+
+```sysl
+struct Ring
+    bytes: [8]u8
+
+impl Ring
+    @disjoint(data)
+    fill(*self, data: []const u8)
+        for i in 0..<data.len
+            self.bytes[i] = data[i]
+
+var r = Ring([0; 8])
+val src: [3]u8 = [7, 8, 9]
+
+r.fill(src[..])
+print(r.bytes[2])
+```
+
+```output
+9
+```
+
+Writing the receiver into the list is refused, and says so:
+
+```sysl
+struct Ring
+    bytes: [8]u8
+
+impl Ring
+    @disjoint(self, data)
+    fill(*self, data: []const u8) = ()
+
+print(1)
+```
+
+```error
+'@disjoint' names parameters, and 'self' is the receiver — leave it out
+```
+
 **It is not `@no_overlap`**: the `@no_` words are the capabilities a module or a definition gives up — `@no_alloc`,
 `@no_block` — and every `@no_<word>` is read as one, so a promise about two parameters takes a word of
 its own.
