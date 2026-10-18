@@ -15,7 +15,9 @@ the build rather than misleading you. Paste any of them into a file and run it w
 
 A `sysl` block with an `output` block under it is a whole program and that is what it prints. A
 `sysl` block with an `error` block under it is a program the compiler *refuses*, and that is what it
-says — the refusals are worth as much as the acceptances, so the tour shows them. A `sysl` block
+says — the refusals are worth as much as the acceptances, so the tour shows them. An `output trap`
+block is a program that prints that and then stops on a [trap](/reference/errors/) — the suite checks
+it ends that way, and a program under a plain `output` block that traps fails. A `sysl` block
 standing on its own is a fragment, quoted to make a point about shape rather than to be run.
 
 The order is deliberate. The three memory modes come early — around a third of the way in, well

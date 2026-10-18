@@ -11,7 +11,8 @@ import sysl.text.{replace_all, split, str_builder, Search}
 //
 // **A page on sysl.sh is not a picture of a program, it is the program**, and the reference's
 // `DocsTests` proves that by compiling every `sysl` block the site shows: one followed by an
-// `output` block is run and its stdout compared, one followed by an `error` block is required to
+// `output` block is run and its stdout compared (an `output trap` block also requires the run to end
+// on a trap, and a plain one that it does not), one followed by an `error` block is required to
 // fail with the diagnostic the page quotes, and one followed by neither is a fragment nobody
 // compiles. That is 1,220 executable blocks over 73 pages, and section 7 owes every one of them.
 //
@@ -49,6 +50,10 @@ struct DocsFence
 // `target` is the machine the block is *about*, from a `target=` on the fence, and is empty for the
 // ordinary case of a block about the language rather than about a processor. `archive` is `build=c`,
 // and says the block is about the artifact a C project links rather than about a program.
+//
+// `traps` is an `output trap` block underneath: the program prints `expected` and then stops on a
+// trap, which is the claim the page makes about it -- a run that comes back is as wrong as one that
+// prints something else.
 struct DocsBlock
     page: string
     nth: int
@@ -57,6 +62,7 @@ struct DocsBlock
     expected: string
     target: string
     archive: bool
+    traps: bool
 end DocsBlock
 
 // What one page, one section or the whole site came to.
@@ -71,6 +77,9 @@ struct DocsTally
     // counted so that a reader can see the number is not zero by accident.
     attributed: int
 end DocsTally
+
+// What a shell reports for a program stopped by `SIGTRAP`: 128 + 5 (`shell_status`).
+private val DocsTrapStatus: int = 133
 
 private docs_add(a: DocsTally, b: DocsTally) -> DocsTally =
     DocsTally(a.run_ok + b.run_ok, a.run_bad + b.run_bad, a.ref_ok + b.ref_ok, a.ref_bad + b.ref_bad,
@@ -142,20 +151,32 @@ end docs_fences
 // with a `bash` block in the middle. What the rule does refuse is an `output` block belonging to a
 // *later* program: the search stops at the next `sysl` block, so a claim can never attach to the
 // wrong one.
-private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, string)
+//
+// The third answer is whether the `output` block is written ```` ```output trap ````: the word
+// `trap` on its fence says the program traps once it has printed what the block holds.
+private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, string, bool)
     var i = from
 
     while i < fences.len()
         val f = fences.at(i)
 
         if f.lang == "sysl" then break
-        if f.lang == "output" then return (DocsClaim.PagePrints, f.body)
-        if f.lang == "error" then return (DocsClaim.PageRefuses, f.body)
+        if f.lang == "output" then return (DocsClaim.PagePrints, f.body, docs_has_word(f.info, "trap"))
+        if f.lang == "error" then return (DocsClaim.PageRefuses, f.body, false)
 
         i += 1
 
-    (DocsClaim.PageShows, "")
+    (DocsClaim.PageShows, "", false)
 end docs_claim_after
+
+// Whether `word` stands on its own among a fence's words.
+private docs_has_word(info: string, word: string) -> bool
+    for each in split(info, " ")
+        for part in split(each, "\t")
+            if part == word then return true
+
+    false
+end docs_has_word
 
 // Every `sysl` block of one page, each paired with what the page claims about it.
 //
@@ -175,7 +196,7 @@ private docs_blocks(page: string, text: string) -> Buf[DocsBlock]
             val said = docs_claim_after(fences, i + 1)
 
             out.push(DocsBlock(page, nth, f.body, said.0, said.1, docs_option(f.info, "target"),
-                               docs_option(f.info, "build") == "c"))
+                               docs_option(f.info, "build") == "c", said.2))
 
     out
 end docs_blocks
@@ -238,6 +259,12 @@ end docs_compile
 
 // A block the page says prints: built, linked, run, and its standard output held against the
 // `output` block underneath it.
+//
+// **How it ended is half the claim.** An `output` block says the program comes back, and an
+// `output trap` block says it stops on a trap (`SIGTRAP`, which a shell reports as 133) once it has
+// printed what the block holds -- so a trap under a plain `output` block fails, and so does a program
+// that comes back, or dies of anything else, under an `output trap` one. The trap's own message goes
+// to standard error, which is not compared.
 private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Option[string]
     build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
         Err(why) ->
@@ -247,8 +274,17 @@ private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Op
     capture(exe, [], "", [], true) match
         Err(_) -> return Some(s"$where: expected it to run, and the program could not be started")
         Ok(said) ->
-            if !said.status.ok()
-                return Some(s"$where: expected it to run, but it exited with ${shell_status(said.status)}")
+            val ended = shell_status(said.status)
+
+            if b.traps && ended != DocsTrapStatus
+                return Some(s"$where: the page says this traps, but it exited with $ended")
+
+            if !b.traps && ended == DocsTrapStatus
+                return Some(s"$where: expected it to run, but it trapped (exit status $ended) — a block " +
+                            "that traps says so with 'output trap'")
+
+            if !b.traps && !said.status.ok()
+                return Some(s"$where: expected it to run, but it exited with $ended")
 
             val printed = docs_paged(said.text, src)
 
@@ -279,6 +315,88 @@ docs_paged_names_the_page()
     assert_eq(docs_paged(s"$src:9:adds:PASS\n", src), "<page>:9:adds:PASS\n")
     assert_eq(docs_paged("/var/folders/x/T/sysl-docsAb12/main.sysl:4:x:FAIL\n", src), "<page>:4:x:FAIL\n")
     assert_eq(docs_paged("main.sysl:4\n", src), "main.sysl:4\n")
+
+// -- a block that traps ----------------------------------------------------------------------------
+
+// A page holding one program and the fence under it, read the way the sweep reads a page.
+private rgp_block(program: string, under: string) -> DocsBlock =
+    docs_blocks("p.md", "```sysl\n" + program + "```\n\n" + under).at(0)
+
+// That block checked the way the sweep checks it, in a directory of its own.
+private rgp_checked(program: string, under: string) -> Option[string]
+    val dir = make_temp_dir("sysl-rgp").unwrap()
+    val src = s"$dir/main.sysl"
+
+    write_text(src, program).unwrap()
+
+    val said = docs_check(src, s"$dir/program", s"$dir/program.a", rgp_block(program, under))
+
+    remove_dir_all(dir).unwrap_or(())
+    said
+end rgp_checked
+
+private rgp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// Three lines, then an index one past the end.
+private rgp_trapper() -> string =
+    "main()\n    val xs = [1, 2, 3]\n    var i = 0\n\n    loop\n        print(xs[i])\n        i += 1\n"
+
+private rgp_three() -> string = "1\n2\n3\n"
+
+@test("an 'output trap' fence marks its block as trapping, and only the word 'trap' does")
+rgp_the_fence_word_is_read()
+    val program = "main()\n    print(\"hi\")\n"
+
+    assert(rgp_block(program, "```output trap\nhi\n```\n").traps, "output trap")
+    assert(rgp_block(program, "```output\ttrap\nhi\n```\n").traps, "a tab separates words too")
+    assert(!rgp_block(program, "```output\nhi\n```\n").traps, "plain output")
+    assert(!rgp_block(program, "```output trapped\nhi\n```\n").traps, "a longer word is not the word")
+    assert_eq(rgp_block(program, "```output trap\nhi\n```\n").claim, DocsClaim.PagePrints)
+    assert_eq(rgp_block(program, "```output trap\nhi\n```\n").expected, "hi\n")
+
+@test("a block under 'output trap' that prints what the page says and then traps passes")
+rgp_a_trap_that_prints_the_page_passes()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output trap\n" + rgp_three() + "```\n")
+
+    assert(said.is_none(), said.unwrap_or(""))
+
+@test("a block under 'output trap' that traps after printing something else fails, showing both")
+rgp_a_trap_that_prints_otherwise_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output trap\n1\n9\n```\n").unwrap_or("")
+
+    assert(said.contains("p.md, sysl block 1: what it printed is not what the page says"), said)
+    assert(said.contains("9"), said)
+    assert(said.contains("3"), said)
+
+@test("a block under 'output trap' that comes back fails, naming its exit status")
+rgp_a_marked_block_that_returns_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked("main()\n    print(\"hi\")\n", "```output trap\nhi\n```\n").unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: the page says this traps, but it exited with 0")
+
+@test("a block under 'output trap' that panics instead fails: a panic is status 1, not a trap")
+rgp_a_marked_block_that_panics_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked("main()\n    print(\"hi\")\n    assert(false, \"no\")\n", "```output trap\nhi\n```\n")
+        .unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: the page says this traps, but it exited with 1")
+
+@test("a block under a plain 'output' that traps fails, and says how to mark one that should")
+rgp_an_unmarked_trap_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output\n" + rgp_three() + "```\n").unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: expected it to run, but it trapped (exit status 133) — a block " +
+                    "that traps says so with 'output trap'")
 
 // A block the page says is refused: compiled, required to fail, and the diagnostic required to
 // **contain** what the page quotes.
@@ -668,7 +786,8 @@ the_sites_programs_give_back_their_heap()
         for i in 0..<blocks.len()
             val b = blocks.at(i)
 
-            if b.claim != DocsClaim.PagePrints || b.archive || b.target != "" then continue
+            // A block that traps never reaches the exit where the count is reported.
+            if b.claim != DocsClaim.PagePrints || b.archive || b.target != "" || b.traps then continue
 
             val placed = docs_placed(dir, b.source)
             var at = src

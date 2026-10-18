@@ -920,9 +920,10 @@ where_flags() -> string =
 private emit_typed_usage() -> string =
     "usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] " + where_flags() + " <path>"
 
-// `sysl test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>]
-// [-O<level>] <path>` --
-// the `@test` functions of a tree, built into one binary and run one process each.
+// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--target <name>]
+// [--cc <path>] [-O<level>] <path>` --
+// the `@test` functions of a tree, built into one binary and run one process each. `--file` keeps the
+// tests written in the one file it names (`file_named`), beside whatever `--filter` keeps.
 //
 // **The report is written as the run goes rather than at the end**, which is why it does not go
 // through `say`: a suite that takes half an hour is watched from a log file while it runs, and a run
@@ -934,6 +935,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var named: Option[string] = None
     var cc: Option[string] = None
     var filter: Option[string] = None
+    var within: Option[string] = None
     var fail_fast = false
     var std = false
     var seconds = DefaultTestSeconds
@@ -969,7 +971,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
                 None ->
                     mistakes.push(bad_timeout(args[i]))
                     break
-        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
                 break
@@ -981,6 +983,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
 
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
+            else if flag == "--file" then within = Some(args[i])
             else filter = Some(args[i])
         else if args[i] == "--fail-fast"
             fail_fast = true
@@ -1042,9 +1045,9 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     val opts = TestOptions(filter, fail_fast)
 
     projects match
-        None -> test_project(file, named, cc, opts, seconds, std, named_level, note, report)
+        None -> test_project(file, named, cc, opts, seconds, std, named_level, note, report, within)
         Some(members) -> test_members(members, named, cc, opts, seconds, std, named_level, say, note,
-                                      report)
+                                      report, within)
 end test_command
 
 // `--timeout`'s value: a whole number of seconds, zero for no limit, up to the most a test's own
@@ -1072,7 +1075,8 @@ private bad_timeout(text: string) -> string =
 // the point of testing a workspace at once is to hear about all of it.
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
                      opts: TestOptions, seconds: int, std: bool, named_level: Option[string],
-                     say: string -> unit, note: string -> unit, report: string -> unit) -> int
+                     say: string -> unit, note: string -> unit, report: string -> unit,
+                     within: Option[string]) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
 
@@ -1080,7 +1084,7 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, opts, seconds, std, named_level, note, report) != Fine
+        if test_project(mb.dir, named, cc, opts, seconds, std, named_level, note, report, within) != Fine
             failed.push(mb.name)
 
             if opts.fail_fast then break
@@ -1098,7 +1102,7 @@ end test_members
 // One project's suite, once the command line has been read.
 private test_project(file: string, named: Option[string], cc: Option[string], opts: TestOptions,
                      seconds: int, std: bool, named_level: Option[string], note: string -> unit,
-                     report: string -> unit) -> int
+                     report: string -> unit, within: Option[string]) -> int
     val level = build_level(file, named_level) match
         Err(why) ->
             say_failure(why, note)
@@ -1117,7 +1121,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     val run = RefusedRun(if std then buf() else refused_files(file), named, level)
 
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within)
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
@@ -1135,13 +1139,13 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     end if
 
     // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
-    nothing_to_run(file, build.tests, run.files, opts.filter, note) match
+    nothing_to_run(file, build.tests, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
 
     // Refused programs and no `@test` function the filter keeps: there is no binary to link.
-    if selected_tests(build.tests, opts.filter).is_empty()
-        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report)
+    if selected_in(build.tests, opts.filter, within).is_empty()
+        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within)
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
@@ -1153,7 +1157,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], op
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report)
+    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report, within)
 end test_project
 
 // What a project's refused programs are compiled with: the files, and the run's own target and
@@ -1167,15 +1171,23 @@ end RefusedRun
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
 // the tests there are lead to the same empty report and are different mistakes, so each is named.
 // Neither is a failure: a program is allowed to have no tests. A refused program is a test here.
+// `--file` naming no file that has a test is the same mistake as a filter matching nothing, and is
+// said the same way, with the file named.
 private nothing_to_run(file: string, all: Buf[TTest], programs: Buf[string], filter: Option[string],
-                       note: string -> unit) -> Option[int]
+                       within: Option[string], note: string -> unit) -> Option[int]
     if all.is_empty() && programs.is_empty()
         note(s"no '@test' functions in $file")
         return Some(Fine)
     end if
 
-    if selected_tests(all, filter).is_empty() && selected_refused(programs, filter).is_empty()
-        note(s"no test matches '${filter.unwrap_or("")}' — ${all.len() + programs.len()} to choose from")
+    if selected_in(all, filter, within).is_empty() && selected_refused(programs, filter, within).is_empty()
+        val asked = within match
+            None -> s"'${filter.unwrap_or("")}'"
+            Some(named) -> filter match
+                None -> s"in file '$named'"
+                Some(f) -> s"'$f' in file '$named'"
+
+        note(s"no test matches $asked — ${all.len() + programs.len()} to choose from")
         return Some(Fine)
     end if
 
@@ -1185,13 +1197,14 @@ end nothing_to_run
 // The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
 // whole point of it being there. `exe` is empty where no `@test` function was chosen.
 private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
-                  discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit) -> int
-    nothing_to_run(file, all, run.files, opts.filter, note) match
+                  discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit,
+                  within: Option[string]) -> int
+    nothing_to_run(file, all, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
 
-    val chosen = selected_tests(all, opts.filter)
-    val picked = selected_refused(run.files, opts.filter)
+    val chosen = selected_in(all, opts.filter, within)
+    val picked = selected_refused(run.files, opts.filter, within)
     var judged: Buf[Outcome] = buf()
 
     for item in picked
@@ -1210,7 +1223,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
     if failed == 0 then Fine else Failed
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     pipeline_usage() + " <path>"
 
@@ -1493,7 +1506,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "test [--filter <text>] [--file <name>] [--fail-fast] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | deps <path> | vendor <path> | tidy [--check] [<path>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +

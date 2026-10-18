@@ -235,6 +235,7 @@ headers as a build step.
 ```bash
 sysl test <path>
 sysl test <path> --filter <text>
+sysl test <path> --file <name>
 sysl test <path> --fail-fast
 sysl test <path> --timeout <seconds>
 sysl test <path> --std
@@ -304,7 +305,17 @@ verdict, since the test has already returned or trapped by the time its teardown
 as a failing entry of its own, named after the hook, alongside whatever the test it followed reported.
 
 `--filter` keeps the tests whose name **or module** holds the text, and the header says how many of
-how many are running. `--fail-fast` stops the loop rather than the report: what ran is still
+how many are running.
+
+`--file <name>` keeps the tests written in one file — the file a report heads their rows with. The
+name is the file's base name, with or without `.sysl` (`--file clamp` and `--file clamp.sysl` are the
+same), or as much of its path as it takes to tell two files of one name apart (`--file geom/clamp`).
+**It matches whole path components, never a piece of one**, so `--file clamp` does not also run
+`clamps.sysl`, and a `--filter` keeps selecting exactly what it did: the two flags ask different
+questions, and given both a test has to answer yes to each. A refused program under `tests/refused/`
+is in a file of its own, so `--file` picks one of those out the same way.
+
+`--fail-fast` stops the loop rather than the report: what ran is still
 reported and what never ran is simply absent, because "skipped" would be a third verdict for
 something that is not a verdict.
 

@@ -509,12 +509,16 @@ main()
         i += 1
 ```
 
-```text
+```output trap
 element 0 is 1
 element 1 is 2
 element 2 is 3
-index 3 out of bounds for length 3 (main.sysl:6:35)
 ```
+
+All three lines reach standard output, and the trap follows them: the program exits with status 133,
+having written `index 3 out of bounds for length 3 (main.sysl:6:35)` to standard error on the way
+(below). The fence above says `output trap` rather than `output` because the site's test suite runs
+the program and holds it to both halves — what it printed, and that it ended on a trap.
 
 The flush happens once: a trap raised while it runs goes straight to the instruction, so a stream in
 a state that makes flushing fail cannot loop. **On a freestanding target there is nothing to flush**
