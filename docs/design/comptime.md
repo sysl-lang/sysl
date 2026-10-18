@@ -98,17 +98,12 @@ sysl takes D's model for the marker and the heap, and C++'s for the branch spell
 `Buf` into a view of a static array is D's behaviour, and the null owner word is sysl's existing
 mechanism for a literal.
 
-## 5. Open questions — the user decides
+## 5. Decided (user, 2026-10-18)
 
-1. **Decision 1, dropping the required marker.** The alternative keeps `const` required and marks std
-   instead (Rust's model). That is more std churn, and a user's ordinary helper still needs editing
-   before it can run at compile time.
-2. **Decision 2b, refusing a writable answer.** The alternative lets a `Buf` be answered whole and copies it on its first run-time write. That is more convenient but needs a copy-on-write path in `Buf` that every program pays for.
-3. **Decision 5, the local `const` spelling.** The alternative is a `const e` prefix expression, as
-   Zig's `comptime e`. That form is shorter, but its type comes only from inference.
-4. Whether **item 2's reflection note** should be written before any of this is built, so the two
-   land in one release cycle with one gate. Recommendation: yes. Build this first, behind its own
-   tests, and gate them together.
+1. **Decision 1: no required marker.** Any function whose body can run is evaluated at compile time. `const` is an optional promise, checked at the declaration.
+2. **Decision 2b: read-only answers only.** A whole `Buf` or `Map` answered is refused, and the refusal names `view()` or `freeze()`.
+3. **Decision 5: a local `const NAME: T = e`.** There is no prefix form.
+4. **Sequencing: the reflection note comes first.** Comptime is then built, then reflection, and both are gated and released together.
 
 ## 6. Implementation plan
 
