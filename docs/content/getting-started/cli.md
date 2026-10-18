@@ -85,20 +85,25 @@ for somebody else's toolchain.
 each ends:
 
 ```
-sysl: phase parse std 135ms
+sysl: phase parse std 130ms
 sysl: phase parse program 0ms
-sysl: phase declarations 84ms
-sysl: phase bodies 153ms
+sysl: phase declarations 52ms
+sysl: phase bodies 23ms
 sysl: phase checks 4ms
 sysl: phase prune 0ms
-sysl: phase std 68ms
+sysl: phase std 33ms
 sysl: phase codegen 2ms
-sysl: phase link 87ms
+sysl: phase link 90ms
 ```
 
 The phases add up to the compilation, nothing counted twice. `std` is finding the standard module's
 compiled artifact, or building it the first time, which is then one line rather than a compilation's
 worth. It is the instrument for a build that is slow and does not say why.
+
+**Where a phase is slow, a sampling profiler says which functions.** On a hosted target sysl keeps
+the frame pointer the platform's C keeps (Apple's, and AArch64 Linux's and Android's), so `sample`
+on macOS or `perf` on Linux walks a sysl program's stacks -- the compiler's own included -- and
+reports callers as well as the functions the time was spent in.
 
 **The kept binaries, and the C objects every build keeps beside them, are bounded.** Each directory
 — `~/Library/Caches/sysl/run/` and `~/Library/Caches/sysl/cobj/` on macOS, under `~/.cache/sysl/`
