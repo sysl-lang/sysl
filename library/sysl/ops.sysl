@@ -62,7 +62,8 @@ trait Eq
      * with a field in place of the position, and the only thing equality on a product can mean.
      * Two values of a data enum agree when they hold the same variant and every field of its
      * payload agrees. A simple enum is already `Eq` by rule, and the clause says so before this is
-     * ever read.
+     * ever read. A struct holding an anonymous `struct` or `union` block is refused at its
+     * `derives`: the block has no `Eq`.
      */
     derive[T] eq(self: T, rhs: T) -> bool
         if const T::Kind == Kind.DataEnum
@@ -83,6 +84,17 @@ trait Eq
 
             false
         else
+            // An anonymous `struct` or `union` block is no field, so `T::Fields` would pass over it
+            // and two values differing only inside it would compare equal.
+            for const m in T::Members
+                @assert(!m.anonymous || m::Type::Kind == Kind.Struct,
+                        s"'!=' is not defined for the anonymous union in '${T::Name}' — comparing its " +
+                        s"bytes is wrong for a float and for the bytes past a short field. Write " +
+                        s"'impl Eq for ${T::Name}' comparing the field you know is there")
+                @assert(!m.anonymous || m::Type::Kind == Kind.Union,
+                        s"'${T::Name}' cannot derive Eq: it holds an anonymous struct block, which has " +
+                        s"no Eq — write 'impl Eq for ${T::Name}'")
+
             for const f in T::Fields
                 if self.(f) != rhs.(f) then return false
 
@@ -96,7 +108,8 @@ trait Ord
      * position takes two comparisons, this one is less or it is greater or the two agree and the
      * next field decides, and all-tied ends `false`. A data enum orders by variant first, in
      * declaration order, and then field by field within the variant; a simple enum is its
-     * discriminant, so its order is the discriminants'.
+     * discriminant, so its order is the discriminants'. A struct holding an anonymous `struct` or
+     * `union` block is refused at its `derives`: the block has no `Ord`.
      */
     derive[T] lt(self: T, rhs: T) -> bool
         if const T::Kind == Kind.SimpleEnum
@@ -123,6 +136,17 @@ trait Ord
 
             false
         else
+            // As for `eq`: an anonymous block is no field, and passing over it would order two values
+            // as tied that differ inside it.
+            for const m in T::Members
+                @assert(!m.anonymous || m::Type::Kind == Kind.Struct,
+                        s"'<' is not defined for the anonymous union in '${T::Name}' — comparing its " +
+                        s"bytes is wrong for a float and for the bytes past a short field. Write " +
+                        s"'impl Ord for ${T::Name}' comparing the field you know is there")
+                @assert(!m.anonymous || m::Type::Kind == Kind.Union,
+                        s"'${T::Name}' cannot derive Ord: it holds an anonymous struct block, which has " +
+                        s"no Ord — write 'impl Ord for ${T::Name}'")
+
             for const f in T::Fields
                 if self.(f) < rhs.(f) then return true
                 if rhs.(f) < self.(f) then return false

@@ -242,6 +242,94 @@ acm_display_refuses_an_anonymous_struct()
         """), ["'Span' cannot derive Display: it holds an anonymous struct or union block"])
 end acm_display_refuses_an_anonymous_struct
 
+// ---- std's Eq, Ord and Hash derives over an anonymous member ----
+//
+// Each is refused at its `derives`, as the compiler's own derives refused it, whichever word opened
+// the block and whatever the block holds inside: it is the outer block that decides the message.
+
+/** `struct Packet derives <traits>` holding `block` between two named fields, with a function that
+ * uses each derived trait so its body is instantiated.
+ */
+acm_anon_packet(traits: string, block: string, body: string) -> [](string, string, string) =
+    azb_main("struct Packet derives " + traits + "\n    tag: u8\n" + block + "    len: u16\n\n" +
+             "check(a: Packet, b: Packet) -> bool = " + body + "\n\nprint(1)\n")
+
+acm_anon_union_block() -> string = "    union\n        word: u32\n        level: f32\n"
+acm_anon_struct_block() -> string = "    struct\n        x: u16\n        y: u16\n"
+acm_anon_struct_in_union() -> string =
+    "    union\n        word: u32\n        struct\n            lo: u16\n            hi: u16\n"
+acm_anon_union_in_struct() -> string =
+    "    struct\n        x: u16\n        union\n            word: u32\n            level: f32\n"
+
+/** The three derives over a struct whose outer anonymous block is a union. */
+acm_anon_refused_as_union(block: string)
+    azb_refused(acm_anon_packet("Eq", block, "a == b"),
+        ["assertion failed: '!=' is not defined for the anonymous union in 'Packet' — comparing its " +
+         "bytes is wrong for a float and for the bytes past a short field. Write 'impl Eq for Packet' " +
+         "comparing the field you know is there", "main.sysl:1:23"])
+    azb_refused(acm_anon_packet("Ord", block, "a < b"),
+        ["assertion failed: '<' is not defined for the anonymous union in 'Packet' — comparing its " +
+         "bytes is wrong for a float and for the bytes past a short field. Write 'impl Ord for Packet' " +
+         "comparing the field you know is there", "main.sysl:1:23"])
+    azb_refused(acm_anon_packet("Hash", block, "a.hash() == b.hash()"),
+        ["assertion failed: 'Packet' cannot derive Hash: it holds an anonymous union block, which has " +
+         "no Hash — hashing its bytes is wrong for a float and for the bytes past a short field. Write " +
+         "'impl Hash for Packet' hashing the field you know is there", "main.sysl:1:23"])
+end acm_anon_refused_as_union
+
+/** The three derives over a struct whose outer anonymous block is a struct. */
+acm_anon_refused_as_struct(block: string)
+    for t in ["Eq", "Ord", "Hash"]
+        val body = if t == "Eq" then "a == b" elif t == "Ord" then "a < b" else "a.hash() == b.hash()"
+
+        azb_refused(acm_anon_packet(t, block, body),
+            [s"assertion failed: 'Packet' cannot derive ${t}: it holds an anonymous struct block, which " +
+             s"has no ${t} — write 'impl ${t} for Packet'", "main.sysl:1:23"])
+end acm_anon_refused_as_struct
+
+@test("'derives Eq', 'Ord' and 'Hash' over an anonymous union are refused at the 'derives', naming the type")
+acm_eq_ord_hash_refuse_an_anonymous_union()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_union(acm_anon_union_block())
+end acm_eq_ord_hash_refuse_an_anonymous_union
+
+@test("'derives Eq', 'Ord' and 'Hash' over an anonymous struct block are refused too")
+acm_eq_ord_hash_refuse_an_anonymous_struct()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_struct(acm_anon_struct_block())
+end acm_eq_ord_hash_refuse_an_anonymous_struct
+
+@test("an anonymous union holding a struct block is refused as a union")
+acm_eq_ord_hash_refuse_a_struct_in_a_union()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_union(acm_anon_struct_in_union())
+end acm_eq_ord_hash_refuse_a_struct_in_a_union
+
+@test("an anonymous struct block holding a union is refused as a struct block")
+acm_eq_ord_hash_refuse_a_union_in_a_struct()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_struct(acm_anon_union_in_struct())
+end acm_eq_ord_hash_refuse_a_union_in_a_struct
+
+@test("'derives Eq, Ord, Hash' over named fields alone still compare and hash them")
+acm_eq_ord_hash_named_fields_work()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Packet derives Eq, Ord, Hash
+            tag: u8
+            len: u16
+
+        val a = Packet(tag = 1, len = 2)
+        val b = Packet(tag = 1, len = 3)
+        print(a == b, a < b, a.hash() == (u8(1), u16(2)).hash())
+        """), "false true true\n")
+end acm_eq_ord_hash_named_fields_work
+
 @test("'derives Display' over named fields alone still renders them")
 acm_display_named_fields_render()
     if !azb_ready() then return
