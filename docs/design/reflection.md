@@ -71,10 +71,20 @@ trait Json
         else
             @assert(false, s"Json cannot derive for ${T::Name}")
 
+impl Json for int
+    encode(self, w: *Writer) = w.write(s"$self".bytes)
+
+impl Json for string
+    encode(self, w: *Writer) = w.write(s"\"$self\"".bytes)
+
 struct User derives Json
     @rename("id") user_id: int
     name: string
 ```
+
+The example is checked: `tests_acm_assert_message.sysl` compiles and runs this program as written,
+and the `@assert`'s computed message names a type it is refused for (`enum Light derives Json` is
+refused at its `derives` with *assertion failed: Json cannot derive for Light*).
 
 `User` gets an `impl Json for User` whose body is two unrolled field writes. `self.(f).encode(w)`
 is checked for each field, so a field whose type is not `Json` is refused at the `derives` with the

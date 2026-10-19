@@ -688,15 +688,26 @@ end saturated
 // Inside a generic body the folding is done against the substitution the instantiation supplied,
 // which is the only moment `sizeof(T)` is a number -- and a condition that is still waiting for one
 // is not a mistake, since a later instantiation settles it.
-check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
+//
+// The message is worked out only once the condition has come out false (`assert_message`), so one
+// that could not be computed is never looked at while the condition holds.
+check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[Expr])
     val refusals = cx.an.const_refusals
 
     const_fold(cx, cond) match
         Some(ConstBool(true)) -> ()
         Some(ConstBool(false)) ->
-            val head = assertion_head(message)
+            if message.is_some()
+                val said = assert_message(cx, span, message.unwrap())
 
-            cx.fault(span, head + compared_note(cx, cond) + instantiation_note(cx))
+                if said.is_none() then return
+
+                cx.fault(span, s"assertion failed: ${said.unwrap()}" + compared_note(cx, cond) +
+                         instantiation_note(cx))
+                return
+            end if
+
+            cx.fault(span, "assertion failed" + compared_note(cx, cond) + instantiation_note(cx))
         Some(other) ->
             cx.fault(span, s"'@assert' takes a condition, and this is ${const_kind(other)} — an " +
                      "assertion is something that can be true or false")
@@ -708,12 +719,6 @@ check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
                          "'offsetof', a call whose body runs while compiling, or the arithmetic and " +
                          "comparisons over them — and nothing read out of storage filled at run time")
 end check_assert
-
-private assertion_head(message: Option[string]) -> string
-    if message.is_none() then return "assertion failed"
-
-    s"assertion failed: ${message.unwrap()}"
-end assertion_head
 
 // What a failed **comparison** adds: the value each side folded to, for a side the reader did not
 // write out as a literal. The compiler folded both to decide the comparison, so it is holding the

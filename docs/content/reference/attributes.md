@@ -1254,6 +1254,62 @@ The message is optional and is the reader's own, because they know what the numb
 struct matches its C counterpart, that a table is the size a protocol fixes — where the expression
 alone says only that two numbers differ.
 
+**The message is any `string` the compiler can work out while compiling**, not only a literal: an
+interpolation over constants, a call whose body runs while compiling, and — inside a generic or a
+[`derive`](/reference/traits/) body — what a type answers, `T::Name` or a field's `f.name`:
+
+```sysl
+const WIDTH: int = 3
+
+@assert(WIDTH % 2 == 0, s"a width of $WIDTH is not even")
+
+print(WIDTH)
+```
+
+```error
+assertion failed: a width of 3 is not even
+```
+
+It is worked out **only once the condition has come out false**, so a message that could not be
+computed costs nothing while the condition holds:
+
+```sysl
+const tenth(n: int) -> string = s"${10 / n}"
+
+@assert(1 == 1, tenth(0))
+
+print("the message was never worked out")
+```
+
+```output
+the message was never worked out
+```
+
+Where the condition is false and the message cannot be worked out — it traps, reads storage filled at
+run time, or is not a `string` — that is what is reported, in words that say the assertion failed:
+
+```sysl
+const tenth(n: int) -> string = s"${10 / n}"
+
+@assert(1 == 2, tenth(0))
+
+print(1)
+```
+
+```error
+the message of this failed '@assert' traps while it is being compiled: integer division by zero
+```
+
+```sysl
+@assert(1 == 2, 42)
+
+print(1)
+```
+
+```error
+the message of this failed '@assert' is of type 'int', and a message is a 'string'
+```
+
 **A failed comparison also says what each side came out as.** The compiler folded both in order to
 decide the condition, so it has the numbers at the moment it reports that one of them is wrong, and
 withholding them would leave you editing the literal and rebuilding to find out. A side you wrote as
@@ -1304,6 +1360,24 @@ assertion failed: a ring this large belongs on the heap — the left side is 800
 ```
 
 The first line compiles: `u8` times 100 is 100 bytes, and `ring[u64, 10]` never takes the arm.
+
+The message is worked out in the instance's terms too, so it can name the type that was given:
+
+```sysl
+struct Big
+    a: i64
+    b: i64
+
+fits[T]() -> int
+    @assert(sizeof(T) <= 8, s"'${T::Name}' is wider than a register")
+    1
+
+print(fits[i32]() + fits[Big]())
+```
+
+```error
+assertion failed: 'Big' is wider than a register — the left side is 16 — where T = Big
+```
 
 ### Checking a C struct's layout
 

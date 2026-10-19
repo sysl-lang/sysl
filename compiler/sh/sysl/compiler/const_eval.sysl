@@ -224,6 +224,59 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
         EvQuiet -> None
 end const_call
 
+// The message of an `@assert` whose condition came out false, worked out now -- and only now, so a
+// message that could not be computed costs nothing while the condition holds. It is any `string`
+// expression the compiler can compute: a literal, an interpolation over constants and what a type
+// answers (`T::Name`, `f.name`), a call whose body runs while compiling. It is typed and run whole in
+// the assertion's own terms, which inside a generic are the instance's.
+//
+// `None` where it could not be, having said why at the assertion, in words that say it failed:
+// the reader is told both that the condition is false and why its message could not be said.
+assert_message(cx: &Analyzer, span: Span, e: Expr) -> Option[string]
+    *e.kind match
+        StrLit(v) -> return Some(v)
+        _ -> ()
+
+    val head = "the message of this failed '@assert'"
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none()
+        // The trial took its complaint back; reading it again for real is what tells it.
+        val mark = cx.an.complaints()
+
+        type_expr(cx, e, None)
+
+        if cx.an.complaints() == mark then
+            cx.fault(span, unworkable_message(head))
+
+        return None
+    end if
+
+    val t = typed.unwrap()
+    val ty = texpr_type(t)
+
+    if ty != Str
+        cx.fault(span, s"$head is of type '${type_show(ty)}', and a message is a 'string' — " +
+                 "interpolate the value into one")
+        return None
+    end if
+
+    evaluate(cx.an, cx.scope, head, t) match
+        EvValue(Some(ConstStr(v))) -> Some(v)
+        EvFail(message, _) ->
+            cx.fault(span, message)
+            None
+        EvBroken -> None
+        _ ->
+            cx.fault(span, unworkable_message(head))
+            None
+end assert_message
+
+private unworkable_message(head: string) -> string =
+    s"$head cannot be computed while compiling — it has to be a 'string' made of constants, what a " +
+        "type answers and calls whose bodies run while compiling, and nothing read out of storage " +
+        "filled at run time"
+
 // `ADDR.to_be()` written straight into a `const`: one of `sysl.math.ByteOrder`'s members over a value
 // that folds. The call is typed in a trial -- the receiver's width is what the reversal is at, and
 // only the typed tree knows it -- and folded at the target's order.
