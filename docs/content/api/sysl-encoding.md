@@ -17,7 +17,7 @@ a field of anything. What the bytes *mean* belongs to whatever asked for them.
 
 ## Index
 
-[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`percent_decode`](#percent_decode) [`percent_decode_string`](#percent_decode_string) [`percent_decoded_len`](#percent_decoded_len) [`percent_encode`](#percent_encode) [`percent_string`](#percent_string) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Percent`](#percent) [`Uuid`](#uuid) [`Plain`](#plain) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
+[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`percent_decode`](#percent_decode) [`percent_decode_string`](#percent_decode_string) [`percent_decoded_len`](#percent_decoded_len) [`percent_encode`](#percent_encode) [`percent_string`](#percent_string) [`push_u16_be`](#push_u16_be) [`push_u16_le`](#push_u16_le) [`push_u32_be`](#push_u32_be) [`push_u32_le`](#push_u32_le) [`push_u64_be`](#push_u64_be) [`push_u64_le`](#push_u64_le) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Percent`](#percent) [`Uuid`](#uuid) [`Plain`](#plain) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
 
 ## Values
 
@@ -232,6 +232,42 @@ percent_string(bytes: []const u8, mode: Percent) -> string
 ```
 
 The same, gathered into a string. Every byte emitted is ASCII, so the result is valid UTF-8.
+
+### `push_u16_be`
+
+```sysl
+push_u16_be(out: Buf[u8], v: u16)
+```
+
+### `push_u16_le`
+
+```sysl
+push_u16_le(out: Buf[u8], v: u16)
+```
+
+### `push_u32_be`
+
+```sysl
+push_u32_be(out: Buf[u8], v: u32)
+```
+
+### `push_u32_le`
+
+```sysl
+push_u32_le(out: Buf[u8], v: u32)
+```
+
+### `push_u64_be`
+
+```sysl
+push_u64_be(out: Buf[u8], v: u64)
+```
+
+### `push_u64_le`
+
+```sysl
+push_u64_le(out: Buf[u8], v: u64)
+```
 
 ### `put_u16_be`
 

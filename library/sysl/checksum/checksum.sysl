@@ -1,0 +1,61 @@
+module sysl.checksum
+@no_alloc
+
+/** Checksums that detect accidental corruption and nothing else.
+ *
+ * **A CRC is not a hash in the sense `sysl.crypto` means.** Anyone can build a second input with
+ * the same CRC-32 on purpose, so it must never stand in for a digest where an attacker gains from a
+ * collision. It is what zip, gzip, PNG and Ethernet put on the wire, and for those it is exactly
+ * right.
+ */
+
+// The reflected form of the IEEE 802.3 polynomial 0x04C11DB7, which is the one zip, PNG, gzip and
+// Ethernet all use.
+const crc32_poly: u32 = 0xedb88320
+
+// Entry n is the remainder of the byte n divided by the polynomial, one bit at a time.
+const make_crc32_table() -> [256]u32
+    var t: [256]u32
+
+    for n in 0..<256
+        var c = u32(n)
+
+        for _ in 0..<8
+            c = if c & 1 == 1 then crc32_poly ^ c >> 1 else c >> 1
+
+        t[n] = c
+
+    t
+
+val crc32_table: [256]u32 = make_crc32_table()
+
+/** A CRC-32 in progress, for input that arrives in pieces.
+ *
+ * It is an ordinary struct, so copying one starts another from the same point. `update` may be
+ * called as often as you like and `finish` answers the checksum so far without ending anything.
+ */
+struct Crc32
+    private state: u32
+
+    update(*self, data: []const u8)
+        var c = self.state
+
+        for b in data
+            c = crc32_table[usize(u8(c) ^ b)] ^ c >> 8
+
+        self.state = c
+
+    finish(self) -> u32 = ~self.state
+
+/** A checksum ready for its first `update`. */
+new_crc32() -> Crc32 = Crc32(0xffffffff)
+
+/** The CRC-32 of one slice of bytes: initial value and final xor `0xffffffff`, polynomial
+ * `0xedb88320` reflected. `crc32("123456789".bytes)` is `0xcbf43926`, the standard check value, and
+ * the empty input is `0`.
+ */
+crc32(data: []const u8) -> u32
+    var c = new_crc32()
+
+    c.update(data)
+    c.finish()
