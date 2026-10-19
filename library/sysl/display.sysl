@@ -21,6 +21,73 @@ struct FormatSpec
 trait Display
     display(self, out: *Writer, fmt: FormatSpec)
 
+    /** What `derives Display` writes: `Size(3, 4)` -- the type's own name and its fields in order,
+     * which is the tuple's rendering with the name in front; a variant renders under its own name,
+     * `Circle(2)`, and a part-less shape as its name alone.
+     *
+     * Each part is handed the **neutral** specifier: the one that arrived describes the field the
+     * whole value occupies, so a width pads the whole rendering once (`display_padded`) rather than
+     * inside it.
+     */
+    derive[T] display(self: T, out: *Writer, fmt: FormatSpec)
+        if fmt.width > 0
+            display_padded(self, out, fmt)
+            return
+        end if
+
+        val parts = FormatSpec(0, -1, false)
+
+        if const T::Kind == Kind.SimpleEnum
+            for const c in T::Variants
+                if self is c then out.write(c.name.bytes)
+        elif const T::Kind == Kind.DataEnum
+            for const c in T::Variants
+                if self is c
+                    val p = self.(c)
+                    var n = 0
+
+                    out.write(c.name.bytes)
+
+                    for const f in c::Fields
+                        out.write((if n == 0 then "(" else ", ").bytes)
+                        p.(f).display(out, parts)
+                        n += 1
+
+                    if n > 0 then out.write(")".bytes)
+                end if
+        else
+            var n = 0
+
+            out.write(T::BaseName.bytes)
+
+            for const f in T::Fields
+                out.write((if n == 0 then "(" else ", ").bytes)
+                self.(f).display(out, parts)
+                n += 1
+
+            if n > 0 then out.write(")".bytes)
+    end display
+
+// `x`'s rendering in the field `fmt` describes, which is how a derived `Display` honours a width: the
+// value is rendered once into a counting sink with no width to learn how long it comes out, then
+// padded once around a second rendering. Nothing is gathered.
+private display_padded[T: Display](x: T, out: *Writer, fmt: FormatSpec)
+    val plain = FormatSpec(0, -1, false)
+    var count = Counting(0)
+    var sink: *Writer = &count
+
+    x.display(sink, plain)
+
+    var pad = fmt.width - int(count.n)
+
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+
+    x.display(out, plain)
+
+    if fmt.left then display_fill(out, 32, pad)
+end display_padded
+
 // The built-in types whose family is **closed**, each with an ordinary `impl` rather than a
 // membership the compiler hands out.
 //

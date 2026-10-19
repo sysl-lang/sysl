@@ -430,3 +430,101 @@ rfl_derive_member_refusals()
     for c in cases
         azb_refused(azb_main(s"trait Bad[U]\n    go(self) -> int\n\n    ${c.0}\n\nprint(1)\n"), [c.1])
 end rfl_derive_member_refusals
+
+// -- `Display` and `Debug`, from the library's `derive` bodies ---------------------------------------
+
+@test("'derives Display' renders through the library's derive body, a width padding the whole once")
+rfl_derive_display_from_std()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Point derives Display
+            x: int
+            y: string
+
+        struct Unit derives Display
+        end Unit
+
+        struct Box[T] derives Display
+            v: T
+
+        enum Shape derives Display
+            Circle(r: real)
+            Rect(w: int, h: int)
+            Empty
+
+        enum Tone derives Display
+            Low
+            High
+
+        print(Point(1, "q"), Unit(), Box(Box(Tone.High)), Shape.Rect(1, 2), Shape.Empty, Tone.Low)
+        print(f"[${Point(2, "z")}%14s][${Point(2, "z")}%-14s][${Unit()}%6s][${Shape.Rect(3, 4)}%12s]")
+        """),
+               "Point(1, q) Unit Box(Box(High)) Rect(1, 2) Empty Low\n" +
+               "[   Point(2, z)][Point(2, z)   ][  Unit][  Rect(3, 4)]\n")
+end rfl_derive_display_from_std
+
+@test("every type's Debug is the library's derive body: anonymous blocks by their word, '_' left out, depth cut")
+rfl_derive_debug_from_std()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Packet
+            tag: u8
+            union
+                word: u32
+                level: f32
+            len: u16
+            struct
+                lo: u8
+                hi: u8
+                union
+                    q: u16
+                    r: i16
+
+        struct Bits
+            a: u3 in u32
+            _: u5 in u32
+            b: u4 in u32
+
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        struct Odd
+            debug: int
+
+        enum Shape
+            Circle(r: real)
+            Empty
+
+        val pk = Packet(tag = 1, word = 0x3f800000, len = 2, lo = 3, hi = 4, q = 5)
+
+        print(debug(pk))
+        print(debug(Bits(1, 2)), debug(Odd(5)), debug(Shape.Circle(2.5)), debug(Shape.Empty))
+        print(f"[${Bits(1, 2)}%20?][${Shape.Empty}%-13?]")
+
+        var last: &Node = Node(0, None)
+
+        for i in 1..<40
+            last = Node(i, Some(last))
+
+        val shown = debug(*last)
+
+        print(shown[shown.bytes.len - 110..<shown.bytes.len])
+        """),
+               "Packet(tag: 1, union(00 00 80 3f), len: 2, struct(lo: 3, hi: 4, union(05 00)))\n" +
+               "Bits(a: 1, b: 2) Odd(debug: 5) Shape.Circle(r: 2.5) Shape.Empty\n" +
+               "[    Bits(a: 1, b: 2)][Shape.Empty  ]\n" +
+               "ode(v: 9, next: Some(Node(v: 8, next: Some(…))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))\n")
+end rfl_derive_debug_from_std
+
+@test("'derives Debug' is refused: every type has one already, and one of its own is an 'impl'")
+rfl_derive_debug_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("struct P derives Debug\n    x: int\n\nprint(debug(P(1)))\n"),
+                ["'Debug' is not a trait the compiler knows how to write, and it carries no 'derive' " +
+                 "member — 'derives' names Eq, Ord, Hash or Display, or a trait with a 'derive' body " +
+                 "for its members"])
+end rfl_derive_debug_refused

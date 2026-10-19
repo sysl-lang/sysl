@@ -1133,19 +1133,15 @@ ordinary `impl` block — the one a person would have typed — so a derived imp
 checked, dispatched and erased exactly as a written one is, and a field that cannot do the work says
 so in the ordinary words.
 
-**`Display` writes one more declaration than the block**, and it is the only one of the four that
-does: a file-private function beside the type, which writes the name and each part straight through
-to wherever the rendering is going. `display` points it at a
-[`Counting`](/library/core/#counting-the-width-without-the-bytes) sink first where a width was asked
-for, learns how wide the value came out, pads once and renders for real — so a derived rendering
+**Each of the four is written by the library**, as the trait's own [`derive` member](#a-trait-says-how-it-is-derived)
+— the same mechanism a trait of a program's own uses, so nothing about the four is special to the
+compiler except what the clause refuses up front. `Display`'s writes the name and each part straight
+through to wherever the rendering is going; where a width was asked for, it renders into a
+[`Counting`](/library/core/#counting-the-width-without-the-bytes) sink first, learns how wide the
+value came out, pads once and renders for real — so a derived rendering
 [builds no string](/library/core/#a-specifier-is-the-whole-value-s-field) and an ordinary `print` of
 one costs a single pass. A shape with no parts — a fieldless struct, an enum whose variants carry
-nothing — renders as one name and gets no renderer, there being nothing to measure.
-
-Its name is a [quoted identifier](/reference/lexical/#quoted-identifiers) with a space in it,
-`` `render Size` ``, so no ordinary name can collide with it: an unquoted identifier is letters,
-digits and `_`. It is not a name to call, and nothing but a stack trace or an object file will show
-it to you.
+nothing — renders as its name.
 
 The four are the ones the library already provides structurally for
 [every tuple](/reference/types/#what-the-library-gives-every-tuple), and a derived block walks a
