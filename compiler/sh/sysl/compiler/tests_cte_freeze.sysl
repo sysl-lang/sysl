@@ -1,0 +1,88 @@
+module sh.sysl.compiler
+@tests
+
+// **What a run while compiling makes on its heap is frozen into the object file** where it is answered
+// through a type that says nothing writes it -- a `[]const T`, or a frozen buffer -- and laid down as
+// constant data on every target, a board's included. Anything writable is refused, and stays code.
+
+private val cte_frozen_decls: string =
+    "import sysl.buf.{Buf, buf, Frozen}\n\n" +
+    "primes_below(n: int) -> []const int\n    var out = buf[int]()\n\n" +
+    "    for i in 2..<n\n        var p = true\n\n        for d in 2..<i\n" +
+    "            if i % d == 0 then p = false\n\n        if p then out.push(i)\n\n    out.view()\n\n" +
+    "squares(n: int) -> &sync Frozen[int]\n    var b = buf[int]()\n\n" +
+    "    for i in 0..<n\n        b.push(i * i)\n\n    b.freeze()\n\n" +
+    "words() -> []const string\n    var b = buf[string]()\n\n    b.push(\"alpha\")\n    b.push(\"beta\")\n" +
+    "    b.view()\n\n"
+
+@test("a '[]const T' and a frozen buffer answered while compiling run as the program's own")
+cte_frozen_answers_run()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cte_frozen_decls +
+                      "static val PRIMES: []const int = primes_below(100)\n" +
+                      "static val SQ: &sync Frozen[int] = squares(6)\n" +
+                      "static val NONE: &sync Frozen[int] = squares(0)\n" +
+                      "static val WORDS: []const string = words()\n\n" +
+                      "var t = 0\n\nfor x in SQ.view()\n    t += x\n\n" +
+                      "print(PRIMES.len, PRIMES[24], SQ.len(), SQ.at(5), t, NONE.len(), WORDS[1])\n"),
+              "25 97 6 25 55 0 beta\n")
+end cte_frozen_answers_run
+
+@test("they are constant data on a board: the elements an array of their own, the frozen box laid down whole")
+cte_frozen_answers_are_laid_down()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(cte_frozen_decls +
+                               "val PRIMES: []const int = primes_below(100)\nval SQ: &sync Frozen[int] = squares(6)" +
+                               ctb_main + "PRIMES[24] + SQ.at(5)\n")
+
+    ctb_laid_down(out, "@PRIMES = ")
+    assert(out.contains("@SQ = "), out)
+
+    // The elements are read-only arrays; the box is writable, its count one and its hook null.
+    assert(out.contains("constant [25 x i32] [i32 2, i32 3, i32 5"), out)
+    assert(out.contains("constant [6 x i32] [i32 0, i32 1, i32 4, i32 9, i32 16, i32 25]"), out)
+    assert(out.contains(" = private global %arc."), out)
+    assert(out.contains("{ i32 1, ptr null, i32 1, "), out)
+end cte_frozen_answers_are_laid_down
+
+@test("a whole 'Buf', a 'Map', a reference and a writable slice are refused, each naming what to answer")
+cte_writable_answers_are_refused()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding("import sysl.buf.{Buf, buf}\nimport sysl.container.{Map, map}\n\n" +
+                               "struct P\n    x: int\n\n" +
+                               "whole() -> Buf[int]\n    var b = buf[int]()\n\n    b.push(1)\n    b\n\n" +
+                               "table() -> Map[int, int]\n    var m: Map[int, int] = map()\n\n    m.put(1, 2)\n    m\n\n" +
+                               "boxed() -> &P = P(1)\n\n" +
+                               "writable() -> []int\n    var b = buf[int]()\n\n    b.push(1)\n    b.view()\n\n" +
+                               "val B: Buf[int] = whole()\nval M: Map[int, int] = table()\nval R: &P = boxed()\n" +
+                               "val W: []int = writable()" +
+                               ctb_main + "int(B.len()) + int(M.len()) + R.x + int(W.len)\n")
+
+    val laid = "and what a run while compiling makes is laid into the object file, where nothing may write it"
+
+    assert(out.contains(s"'B' holds a 'Buf', $laid — answer its 'view()' as a '[]const T', or its 'freeze()'"), out)
+end cte_writable_answers_are_refused
+
+@test("each writable answer stays code, and the board refusal for it says why")
+cte_each_writable_answer_says_why()
+    if ctb_skip() then return
+
+    val laid = "and what a run while compiling makes is laid into the object file, where nothing may write it"
+    val cases = [("import sysl.container.{Map, map}\n\ntable() -> Map[int, int]\n    var m: Map[int, int] = map()\n\n" +
+                  "    m.put(1, 2)\n    m\n\nval T: Map[int, int] = table()" + ctb_main + "int(T.len())\n",
+                  s"'T' holds a 'Map', $laid — answer what is read out of it"),
+                 ("struct P\n    x: int\n\nboxed() -> &P = P(1)\n\nval T: &P = boxed()" + ctb_main + "T.x\n",
+                  s"'T' holds a reference, $laid — answer the value itself, or a buffer's 'freeze()'"),
+                 ("import sysl.buf.{Buf, buf}\n\nwritable() -> []int\n    var b = buf[int]()\n\n    b.push(1)\n" +
+                  "    b.view()\n\nval T: []int = writable()" + ctb_main + "int(T.len)\n",
+                  s"'T' is a writable slice '[]int', $laid — answer it as a '[]const int'")]
+
+    for item in cases
+        val out = ctb_freestanding(item.0)
+
+        assert(out.contains(ctb_refusal), out)
+        assert(out.contains(item.1), out)
+end cte_each_writable_answer_says_why

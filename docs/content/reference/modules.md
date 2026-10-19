@@ -1864,10 +1864,10 @@ built by a literal or a splat, read by lane, compared into a mask, chosen betwee
 reduced by `min`, `max`, `any`, `all` and an integer `sum`, loaded from and stored into an array or a
 slice the run holds. **A float vector's `sum` is refused** — the program's reduction adds the lanes
 in whatever order the target's instructions take, so no one value is the program's. **A call
-through a function's address** runs the function the address was taken of. A reference stops the
-run with *"a 'P' is not evaluated while compiling yet — integers, floats, fixed-point, 'bool',
-'char', strings, and fixed arrays, vectors, structs, enums and slices of them are"*; the program's
-own run-time call is unaffected:
+through a function's address** runs the function the address was taken of. **A reference** — a box,
+or a pointer to a local, an element or a field — is held as the storage it names, and a `Buf`, a
+`Map` and a `Set` run by their own library bodies on a heap the run owns. A vector and a
+sixteen-bit float come to what the program's run does:
 
 ```sysl
 const mix(seed: int) -> int
@@ -1915,6 +1915,46 @@ print(SQUARES[3], SQUARES[7])
 
 ```output
 9 49
+```
+
+**A table the run builds on its heap is frozen into the object file**, where it is answered through a
+type that says nothing writes it: a `[]const T` is laid down as an array of its own with a view of
+it, and a frozen buffer (`b.freeze()`) as its box and its elements — both constant data on a board
+too. A whole `Buf` or `Map`, a reference, or a writable `[]T` answered this way stays code, computed
+when the program starts, and a board build says which of these it is and what to answer instead:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+primes_below(n: int) -> []const int
+    var out = buf[int]()
+
+    for i in 2..<n
+        var p = true
+
+        for d in 2..<i
+            if i % d == 0 then p = false
+
+        if p then out.push(i)
+
+    out.view()
+
+squares(n: int) -> &sync Frozen[int]
+    var b = buf[int]()
+
+    for i in 0..<n
+        b.push(i * i)
+
+    b.freeze()
+
+val PRIMES: []const int = primes_below(100)
+val SQ: &sync Frozen[int] = squares(6)
+
+print(PRIMES.len, PRIMES[24], SQ.at(5))
+```
+
+```output
+25 97 25
 ```
 
 **A table of records is laid down the same way**: a struct as the constructor over the literals its

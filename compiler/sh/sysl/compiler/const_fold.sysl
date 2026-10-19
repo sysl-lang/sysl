@@ -52,6 +52,16 @@ enum Const
     // `*T` and a `&sync T` alike, the evaluator keeping no counts. `owner` is the depth of the call
     // whose local the slot is, or -1 for the heap, as a slice's is. Made only by an evaluation.
     ConstPtr(cells: Buf[Const], at: usize, owner: int)
+    // A slot of storage `slot_storage` made that nothing has placed a value in yet: the bytes the
+    // program would find there are whatever the allocator left, so reading one is refused.
+    ConstUnset
+    // An address the run owns, converted to a pointer to another type: it may be compared and
+    // converted back to the type it was taken at, `as_was`, but what it points at is a value of that
+    // type, so reading or writing through it is refused.
+    ConstPun(addr: &Const, as_was: &Type)
+    // A trait object -- a closure's `&Fn` among them: the value behind it, `data` (a pointer to its
+    // box, or the pointer a `*Trait` was made of), and the table its calls go through, by name.
+    ConstErased(vtable: string, data: &Const)
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -268,6 +278,9 @@ private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) ->
         ConstWriter(_) -> None
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end const_binary
 
 // A comparison's verdict from the sign of the difference, where the operator is a comparison.
@@ -712,6 +725,9 @@ private const_text(v: Const) -> string = v match
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
     ConstPtr(_, _, _) -> "an address"
+    ConstUnset -> "a slot nothing was placed in"
+    ConstPun(_, _) -> "an address"
+    ConstErased(_, _) -> "a trait object"
 
 // A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
 // rather than as the `inf` and `nan` the C formatting underneath would print.
@@ -763,6 +779,9 @@ const_kind(v: Const) -> string = v match
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
     ConstPtr(_, _, _) -> "an address"
+    ConstUnset -> "a slot nothing was placed in"
+    ConstPun(_, _) -> "an address"
+    ConstErased(_, _) -> "a trait object"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
@@ -968,6 +987,9 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstWriter(_) -> None
     ConstLink(_) -> None
     ConstPtr(_, _, _) -> None
+    ConstUnset -> None
+    ConstPun(_, _) -> None
+    ConstErased(_, _) -> None
 
 // Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
 private scalar_value(n: BigInt) -> bool =
@@ -1022,6 +1044,9 @@ private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Con
         ConstWriter(_) -> None
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end typed_binary
 
 // The integer operators, answered only where run time answers the same: never a division by zero,
@@ -1106,6 +1131,9 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
         ConstWriter(_) -> None
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n

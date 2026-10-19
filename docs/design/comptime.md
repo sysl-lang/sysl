@@ -180,13 +180,27 @@ an evaluation is one thread.
 **Freezing an answer.**
 - A view owned by the heap, answered as `[]const T`, is laid down as the `TBufLit` of its elements. A
   module `val` over a slice literal is already a static array with a view whose owner is null.
-- A `&T` is laid down as a `TBox` of its value, and `emit_static` writes the box into the object
-  file. The box goes in **writable** data, unlike the rest: a `&T` points at its counted header, and
-  `arc.retain` writes the count. The count starts at one, which is the `val`'s own share and is never
-  given back, so nothing frees the box.
-- A frozen buffer is that box holding a `Frozen` whose `owner` is 0, which its `drop` already reads
-  as "never freed", and whose `data` points at a static array.
-- An answer through a writable type is refused, naming `view()` or `freeze()`.
+- A frozen buffer (`&sync Frozen[T]`) is laid down as a `TBox` of a `Frozen` whose `owner` is 0,
+  which its `drop` already reads as "never freed", and whose `data` points at a static array (the
+  address of a `TArrayLit`'s first element, which `emit_static` lays down on its own). The box goes
+  in **writable** data, unlike the rest: a reference points at its counted header, and `arc.retain`
+  writes the count. The count starts at one, which is the `val`'s own share and is never given back;
+  the hook is null.
+- **Any other answer through a writable type stays code**, computed at startup as before, and the
+  reason names what to answer: a whole `Buf` (`view()` as a `[]const T`, or `freeze()`), a `Map` or
+  `Set` (what is read out of it), a `[]T` (`[]const T`), a `&T` (the value itself). A `&T` is
+  writable through the reference, so decision 2b keeps it out; it could be laid down exactly as the
+  frozen box is, if that decision is revisited.
+
+**Found while building it:**
+- A library's panic is a function returning `never`. A call typed `never` is not followed by the
+  declaration check, and reaching one while compiling is a trap that names it.
+- A reference compared with null goes through a cast to `*byte` (`is_null`). A cast between pointer
+  types is the same address (`ConstPun`): it may be compared and cast back, but not read through.
+- `slot_storage`'s slots hold `ConstUnset` until something is placed in them, and reading one is
+  refused.
+- A variant must not hold a `Type` inline: it widened every `Const`, and a 500-deep evaluation
+  overflowed the compiler's stack. Variants hold large parts behind a reference.
 
 Step 2 lands in five parts, each with its tests:
 1. **2a**: references and locals as cells.

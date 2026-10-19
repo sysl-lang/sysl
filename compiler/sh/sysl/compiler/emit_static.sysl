@@ -197,6 +197,19 @@ private constant_address(e: *Emit, place: TExpr) -> Val = *place.kind match
 
         idx.push(ir_arg(word_lty(e), VInt(at)))
         VGep(lty(e, elem), constant_address(e, receiver), idx)
+    // An array a run while compiling made and froze: laid down as read-only storage of its own, which
+    // the frozen buffer's pointer to its first element names.
+    TArrayLit(_, array_ty) ->
+        e.table_id += 1
+
+        val name = s".frozen${e.table_id}"
+        val elem = nameless(array_ty) match
+            Array(_, el) -> *el
+            _ -> int_type()
+
+        e.globals.push(IrGlobal(name, true, lty(e, array_ty), Some(constant_value(e, place)), LinkPrivate,
+                                None, e.layout.storage_align(elem), false, false, false))
+        VGlobal(name)
     _ -> gap_at(e, "a constant address of something that is not module storage")
 
 // The section every `@per_cpu` binding's image is laid down in.
@@ -315,6 +328,12 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // A slice over literals: its elements laid down as an array of their own, and the view over them
     // with no owner -- the three words a string literal is, so nothing ever counts it.
     TBufLit(items, slice_ty) -> view_const(e, items, slice_ty)
+
+    // A box a run while compiling made: header and payload laid down whole, in **writable** data,
+    // since a reference names the header and taking a share writes the count there. The count starts
+    // at one -- the storage's own share, which is never given back -- so nothing frees the box, and
+    // the hook is null, so nothing destroys it either.
+    TBox(value, _) -> box_const(e, value)
 
     // A struct constant lists its fields in the order the type declares them, and skips the ones that
     // occupy nothing -- the initializer has to match the type this module emitted.
@@ -460,6 +479,30 @@ private all_constant(items: Buf[TExpr]) -> bool
 
     true
 end all_constant
+
+// A box laid down whole, as `TBox`'s arm says.
+private box_const(e: *Emit, value: TExpr) -> Val
+    val payload = texpr_type(value)
+    val bn = box_lty(e, payload)
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(word_lty(e), VInt(from_int(1))))
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(1))))
+
+    val pad = box_pad(e, payload)
+
+    if pad > 0 then fields.push(ir_arg(LArr(int(pad), LInt(8)), VZero))
+
+    fields.push(ir_arg(lty(e, payload), constant_value(e, value)))
+
+    e.table_id += 1
+
+    val name = s".box${e.table_id}"
+
+    e.globals.push(IrGlobal(name, false, bn, Some(VAgg(fields)), LinkPrivate, None, None, false, false, false))
+    VGlobal(name)
+end box_const
 
 // A string as a value: the owner nothing frees, the bytes, and how many there are.
 string_const(e: *Emit, s: string) -> Val

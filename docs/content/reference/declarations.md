@@ -1901,6 +1901,66 @@ print(T)
 11
 ```
 
+**The heap is the run's own**, so a `Buf`, a `Map`, a `Set` and a frozen buffer run while
+compiling by their own library bodies, as they do when the program runs. A library's panic — an
+index past the end — is a trap there, as it is here:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+const counts() -> int
+    var m: Map[string, int] = map()
+    var seen = buf[string]()
+
+    for w in ["to", "be", "or", "not", "to", "be"]
+        if !m.has(w) then seen.push(w)
+        m.put(w, m.get(w).unwrap_or(0) + 1)
+
+    int(seen.len()) * 10 + m.get("be").unwrap_or(0)
+
+const C: int = counts()
+
+print(C)
+```
+
+```output
+42
+```
+
+**A closure and a trait object are called while compiling** as the program calls them — a closure
+where it is written, handed on as a type argument or a `&Fn`, kept in a buffer, returned with state of
+its own; a call through a trait object goes to the function its table names. **An atomic operation** on
+storage the run owns is the plain one, since a run while compiling is one thread:
+
+```sysl
+import sysl.sync.{Atomic, SeqCst}
+
+counter() -> &Fn() -> int
+    var n = 0
+
+    () ->
+        n += 1
+        n
+
+const ticks() -> int
+    val c = counter()
+    var a = Atomic[int](0)
+
+    for _ in 0..<3
+        a.add(c(), SeqCst)
+
+    a.load(SeqCst)
+
+const T: int = ticks()
+
+print(T)
+```
+
+```output
+6
+```
+
 A box of a type with a `Drop` is refused, since its `drop` runs when the box's last share goes, and
 when that is, is decided by counts kept only when the program runs:
 
@@ -1935,13 +1995,11 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
-| a box, a buffer | `… it builds a buffer, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` |
 | a weak reference | `… it uses a 'weak P' — a weak reference answers whether its object is still alive, which is decided by counts kept only when the program runs` |
 | a value rendered through a `display` whose body cannot run | `… it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling` |
 | a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
-| a closure called, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
-| atomics, fences, C variadic arguments | `… it performs an atomic operation — atomics are not evaluated while compiling yet` |
+| C variadic arguments | `… it walks C variadic arguments — C variadic arguments are not evaluated while compiling yet` |
 | a float vector's `sum` | `… it sums a float vector, whose lanes are added in the order the target's instructions take — so the value is known only where the program runs` |
 
 One worked refusal for each of the commonest. A function that is not marked is no reason to refuse;

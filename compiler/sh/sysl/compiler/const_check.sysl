@@ -29,11 +29,8 @@ private const_opening(f: string) -> string =
     s"'${qualified_name(f)}' is 'const', so it runs while compiling, and"
 
 // Why each kind of refusal holds, said once.
-private const_heap() -> string =
-    "a heap made while compiling has nowhere to go: the object file holds values, not a heap"
 private const_address() -> string = "an address exists only when the program runs"
 private const_outside() -> string = "nothing outside the program exists while compiling"
-private const_dispatch() -> string = "which function that is is decided when the program runs"
 
 // Holds every `const` function to what the compiler can run: its signature where it is typed
 // (`check_const_signature`), and here its body and its clauses. An instantiation of a generic one is
@@ -254,36 +251,32 @@ end const_expr
 
 // What a node does that the compiler cannot do while compiling, said the way a reader would say it.
 private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[string] = *e.kind match
+    // A call that never returns ends the program -- a panic -- and is a trap where it is reached.
+    TCall(_, _, Never, _) -> None
     TCall(name, _, _, _) -> const_call_refusal(a, cx, name)
     // A call through a function's address is the call of the function the address was taken of,
     // which the evaluation knows by then; it refuses one whose function cannot run.
     TCallPtr(_, _, _, _) -> None
-    // The one trait object a `const` function meets is the writer a rendering hands its `display`.
-    TVCall(receiver, _, _, _, _) ->
-        if writes_a_rendering(texpr_type(receiver)) then None
-        else Some(s"it dispatches through a trait object — ${const_dispatch()}")
-    TErase(_, _, _) -> Some(s"it makes a trait object — ${const_dispatch()}")
+    // A call through a trait object -- a closure's among them -- is the call of the function its
+    // table names, which the evaluation knows by then; it refuses one whose function cannot run.
+    TVCall(_, _, _, _, _) -> None
+    TErase(_, _, _) -> None
 
-    TBufLit(_, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
-    TBufFill(_, _, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
     // A value a type renders through its own method runs that method, which is held to what any
     // other call is; through a trait object, which method that is is not known yet.
-    TRender(_, method, _, slot) ->
-        if slot.is_some() then Some(s"it renders a value through a trait object — ${const_dispatch()}")
-        else const_call_refusal(a, cx, method)
+    TRender(_, method, _, slot) -> if slot.is_some() then None else const_call_refusal(a, cx, method)
 
-    // A reference or pointer read as a pointer to the same type is the same address; any other
-    // conversion of one reads the layout of memory.
+    // A reference or pointer converted to another pointer type is the same address, which the
+    // evaluation refuses to read through as another type; converted to a number, it is where storage
+    // falls in memory.
     TCast(operand, ty) ->
         if !names_an_address(ty) && !names_an_address(texpr_type(operand)) then None
-        else if same_pointee(texpr_type(operand), ty) then None
+        else if both_point(texpr_type(operand), ty) then None
         else Some(s"it converts a pointer — ${const_address()}")
     TCStrLit(_) -> Some(s"it takes the address of a C string — ${const_address()}")
 
     TGlobal(symbol, _, writable) -> const_global_refusal(cx, symbol, writable)
 
-    TAtomic(_, _, _, _, _, _) -> Some(s"it performs an atomic operation — ${not_yet("atomics are")}")
-    TFence(_) -> Some(s"it orders memory with a fence — ${not_yet("fences are")}")
     TSysOp(op, _, _) -> Some(s"it runs '$op' — the processor it asks exists only when the program runs")
     TVaStart(_) -> Some(variadic_walk())
     TVaEnd(_) -> Some(variadic_walk())
@@ -324,7 +317,6 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
     // Through a type parameter's bound: settled by whichever type fills the parameter.
     if names_a_bound_member(a, name) then return None
 
-    if is_closure_symbol(name) then return Some(s"it calls through a closure — ${const_dispatch()}")
 
     val x = a.tables.externs.get(name)
 
@@ -341,7 +333,8 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
         return Some(s"it prints, which is outside the program — ${const_outside()}")
 
     // An `f"…"` specifier's renderers are run by the compiler itself (`const_eval.sysl`).
-    if const_renderer(shown) || writer_routine(shown) || float_bits_routine(name) then return None
+    if const_renderer(shown) || writer_routine(shown) || float_bits_routine(name) || frozen_routine(shown) then
+        return None
 
     // Any other function runs while compiling where its own body can.
     unmarked_refusal(a, cx, name).map(why -> s"it calls '$shown', ${chained_reason(why)}")
@@ -465,10 +458,8 @@ private names_an_address(t: Type) -> bool = t match
     CFn(_, _) -> true
     _ -> false
 
-// Whether two address types point at the same type.
-private same_pointee(a: Type, b: Type) -> bool = (pointee(a), pointee(b)) match
-    (Some(x), Some(y)) -> underlying(x) == underlying(y)
-    _ -> false
+// Whether both address types point at a type, which a function pointer does not.
+private both_point(a: Type, b: Type) -> bool = pointee(a).is_some() && pointee(b).is_some()
 
 // Why a value of this type cannot be held while compiling, or nothing where it can. The values a
 // `const` function works with are numbers, `bool`, `char` and `unit`, and structs, tuples, arrays and
@@ -484,9 +475,7 @@ const_type_refusal(t: Type) -> Option[string] = t match
     VaList -> Some(not_yet("C variadic arguments are"))
     // A reference is to a box the evaluation makes and holds; a weak one answers whether its object
     // is still alive, which counts kept only when the program runs decide.
-    Ref(inner, _) -> *inner match
-        Trait(_, _, _) -> Some(trait_object())
-        _ -> None
+    Ref(_, _) -> None
     Weak(_) -> Some("a weak reference answers whether its object is still alive, which is decided by " +
                     "counts kept only when the program runs")
     Trait(_, _, _) -> Some(trait_object())

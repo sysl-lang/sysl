@@ -1,0 +1,176 @@
+module sh.sysl.compiler
+@tests
+
+// **The heap while compiling**: a `Buf`, a `Map`, a `Set` and a frozen buffer, run by their own
+// library bodies over storage the run owns, and each checked against the same call made where the
+// program runs -- and what is refused or traps: a slot nothing was placed in, and a library's panic.
+
+@test("a 'Buf', a 'Map', a 'Set' and a frozen buffer run while compiling as the program runs them")
+cte_containers_run_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.container.{Map, map, Set, set}
+
+        primes(n: int) -> int
+            var out = buf[int]()
+
+            for i in 2..<n
+                var p = true
+
+                for d in 2..<i
+                    if i % d == 0 then p = false
+
+                if p then out.push(i)
+
+            var total = 0
+
+            for x in out
+                total += x
+
+            out.pop()
+            total * 1000 + int(out.len())
+
+        words() -> int
+            var m: Map[string, int] = map()
+
+            for w in ["a", "b", "a", "c", "a", "b"]
+                m.put(w, m.get(w).unwrap_or(0) + 1)
+
+            m.get("a").unwrap_or(0) * 100 + m.get("b").unwrap_or(0) * 10 + int(m.len())
+
+        distinct() -> int
+            var s: Set[int] = set()
+
+            for i in 0..<50
+                s.add(i % 7)
+
+            int(s.len())
+
+        frozen() -> int
+            var b = buf[int]()
+
+            for i in 0..<5
+                b.push(i * i)
+
+            val f = b.freeze()
+            var t = 0
+
+            for x in f.view()
+                t += x
+
+            t * 10 + int(f.len()) + int(f.at(2))
+
+        strings() -> int
+            var b: Buf[string] = buf()
+
+            b.push("x")
+            b.push("yz")
+            b.insert(0, "abc")
+            int(b.at(0).len) * 10 + int(b.len())
+
+        nothing() -> bool
+            var p: *int
+
+            p == null
+
+        const P: int = primes(30)
+        const W: int = words()
+        const D: int = distinct()
+        const F: int = frozen()
+        const S: int = strings()
+        const N: bool = nothing()
+
+        print(P, W, D, F, S, N)
+        print(P == primes(30), W == words(), D == distinct(), F == frozen(), S == strings())
+        """), "129009 323 7 309 33 true\ntrue true true true true\n")
+end cte_containers_run_while_compiling
+
+@test("a library's panic traps while compiling, and a slot nothing was placed in is refused")
+cte_heap_refusals()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        import sysl.buf.{Buf, buf}
+
+        past() -> int
+            var b = buf[int]()
+
+            b.push(1)
+            b.at(3)
+
+        unplaced() -> int
+            var xs: []int = slot_storage(3)
+
+            xs[1]
+
+        const A: int = past()
+        const U: int = unplaced()
+
+        print(A, U)
+        """).0
+
+    for part in ["'A' traps while it is being compiled: it reaches 'sysl.buf.past_end', which ends the program",
+                 "'U' cannot be computed while compiling: a slot of storage 'slot_storage' made is read before " +
+                 "anything was placed in it — its bytes are whatever the allocator left (main.sysl:12:8) — " +
+                 "inside 'unplaced()'"]
+        assert(said.contains(part), said)
+end cte_heap_refusals
+
+@test("an atomic operation on storage the run owns is the plain one, wrapping as the instruction does")
+cte_atomics_run_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.sync.{Atomic, SeqCst, Acquire, Release}
+
+        raw() -> int
+            var x: u8 = 250
+            val old = atomic_add(&x, 10, SeqCst)
+            val was = atomic_cas(&x, 4, 9, SeqCst)
+            val miss = atomic_cas(&x, 4, 1, SeqCst)
+
+            atomic_fence(SeqCst)
+            atomic_store(&x, atomic_load(&x, Acquire) + 1, Release)
+            int(old) * 10000 + int(was) * 100 + int(miss) * 10 + int(x) - 10
+
+        library() -> int
+            var a = Atomic[int](5)
+
+            a.add(3)
+            a.swap(a.load() * 2)
+            a.cas(16, 1)
+            a.load()
+
+        const R: int = raw()
+        const L: int = library()
+
+        print(R, L)
+        print(R == raw(), L == library())
+        """), "2500490 1\ntrue true\n")
+end cte_atomics_run_while_compiling
+
+@test("a spin lock is refused while compiling, for the processor hint it spins with")
+cte_a_spin_lock_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        import sysl.sync.SpinLock
+
+        locked() -> int
+            var l = SpinLock(0)
+
+            l.lock()
+            l.unlock()
+            1
+
+        const K: int = locked()
+
+        print(K)
+        """).0
+
+    assert(said.contains("'K' cannot be computed while compiling: it calls 'locked', which calls " +
+                         "'sysl.sync.SpinLock.lock', which calls 'sysl.sync.spin_hint', which holds an 'asm' " +
+                         "block, which is outside the program"), said)
+end cte_a_spin_lock_is_refused

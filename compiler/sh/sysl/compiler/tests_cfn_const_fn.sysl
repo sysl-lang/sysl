@@ -346,28 +346,21 @@ cfn_answers_a_pointer()
 
     assert_eq(enm_ran("const f(p: *int) -> *int = p\n\nvar x = 1\nval q = f(&x)\nprint(q == &x)\n"), "true\n")
 
-@test("it may not call through a closure")
-cfn_refuses_a_closure_call()
+@test("it may call through a closure, whose body the run knows")
+cfn_admits_a_closure_call()
     if !enm_ready() then return
 
-    val said = cfn_built("const f(x: int) -> int\n    val g = (y: int) -> y + 1\n    g(x)\n\nprint(f(1))\n")
+    assert_eq(enm_ran("const f(x: int) -> int\n    val g = (y: int) -> y + 1\n    g(x)\n\n" +
+                      "const K: int = f(1)\n\nprint(K, f(2))\n"), "2 3\n")
+end cfn_admits_a_closure_call
 
-    assert(said.contains("error: " + cfn_f("it calls through a closure — which function that is is " +
-                                            "decided when the program runs") + "\n"), said)
-    assert(said.contains("/main.sysl:3:5\n"), said)
-end cfn_refuses_a_closure_call
-
-@test("nor take a trait object")
-cfn_refuses_a_trait_object()
+@test("and take a trait object, called through its table")
+cfn_admits_a_trait_object()
     if !enm_ready() then return
 
-    val said = cfn_built("const f(d: &Display) -> int = 1\n\nprint(f(5))\n")
-
-    assert(said.contains("its parameter 'd' is a '&"), said)
-    assert(said.contains("' — which function a call through a trait object reaches is decided when " +
-                         "the program runs\n"), said)
-    assert(said.contains("/main.sysl:1:12\n"), said)
-end cfn_refuses_a_trait_object
+    assert_eq(enm_ran("const f(d: &Display) -> string = s\"<${d}>\"\n\nconst K: string = f(5)\n\nprint(K)\n"),
+              "<5>\n")
+end cfn_admits_a_trait_object
 
 @test("it may not reach a module 'var', which is filled when the program runs")
 cfn_refuses_a_module_var()
@@ -440,23 +433,20 @@ cfn_admits_a_vector()
     assert_eq(enm_ran("const f() -> f32\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n    v[3] * v[1]\n\n" +
                       "const K: f32 = f()\n\nprint(K, f())\n"), "8 8\n")
 
-@test("nor perform an atomic operation")
-cfn_refuses_an_atomic()
+@test("and perform an atomic operation, which is the plain one in a run of one thread")
+cfn_admits_an_atomic()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f(p: *i64) -> i64 = atomic_load(p, SeqCst)\n\n" +
-                          "var n: i64 = 1\nprint(f(&n))\n"),
-                cfn_f("it performs an atomic operation — atomics are not evaluated while compiling yet"),
-                "3:27")
+    assert_eq(enm_ran("import sysl.sync.*\n\nconst f(k: i64) -> i64\n    var n = k\n" +
+                      "    atomic_add(&n, 2, SeqCst)\n    atomic_load(&n, SeqCst)\n\n" +
+                      "const K: i64 = f(1)\n\nprint(K, f(5))\n"), "3 7\n")
 
-@test("nor order memory with a fence")
-cfn_refuses_a_fence()
+@test("and order memory with a fence, which orders nothing in a run of one thread")
+cfn_admits_a_fence()
     if !enm_ready() then return
 
-    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f() -> int\n    atomic_fence(SeqCst)\n    1\n\n" +
-                          "print(f())\n"),
-                cfn_f("it orders memory with a fence — fences are not evaluated while compiling yet"),
-                "4:5")
+    assert_eq(enm_ran("import sysl.sync.*\n\nconst f() -> int\n    atomic_fence(SeqCst)\n    1\n\n" +
+                      "const K: int = f()\n\nprint(K)\n"), "1\n")
 
 // A variadic signature is refused at the declaration, and walking the arguments in the body at the
 // form that walks them.
