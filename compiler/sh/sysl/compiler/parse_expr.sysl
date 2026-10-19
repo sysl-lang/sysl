@@ -313,6 +313,12 @@ end refuse_operand
 private nud(t: Spanned[Tok], p: *Parser) -> Expr
     val at = t.span
 
+    if p.deciding
+        val tested = trait_test_at(p, at)
+
+        if tested.is_some() then return tested.unwrap()
+    end if
+
     t.value match
         IntLit(digits, base, suffix) -> expr(at, IntLit(digits, base, suffix))
         FloatLit(text, suffix) -> expr(at, FloatLit(text, suffix))
@@ -555,7 +561,7 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
     open_construct(p, "if", at)
 
     val decided = p.accept_kw("const")
-    val cond = parse_expr(p)
+    val cond = parse_condition(p, decided)
     val then_body = parse_body(p, "then")
     var conds: Buf[Expr] = buf()
     var bodies: Buf[Buf[Stmt]] = buf()
@@ -580,7 +586,7 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
                     "'if' tests while the program runs. Start the chain with 'if const', or put the " +
                     "'if const' inside the 'else'")
 
-        conds.push(parse_expr(p))
+        conds.push(parse_condition(p, also))
         bodies.push(parse_body(p, "then"))
 
     var else_body: Option[Buf[Stmt]] = None
@@ -611,6 +617,51 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
 
     expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body, false))
 end parse_if_expr
+
+// An `if` or `elif` condition. One decided while compiling may test a type against a trait --
+// `T: Display`, written as a bound is -- wherever an operand stands in it.
+private parse_condition(p: *Parser, decided: bool) -> Expr
+    val outer = p.deciding
+
+    p.deciding = decided
+
+    val cond = parse_expr(p)
+
+    p.deciding = outer
+    cond
+end parse_condition
+
+// `T: Trait` -- tried where an operand of an `if const` condition begins, with the operand's first
+// token already taken. **It is a type, read without a complaint, followed by a single `:` and a
+// name**, which no other operand
+// is: `T::Kind` is one token pair the type reads whole, a trailing block's `:` ends its line, and a
+// named argument is written with `=`. Anything else is put back as it was found.
+private trait_test_at(p: *Parser, at: Span) -> Option[Expr]
+    val resume = p.mark()
+    val errors_at = p.errors_at()
+
+    p.rewind(resume - 1, errors_at)
+
+    if begins_type(p.peek())
+        val subject = parse_type(p)
+
+        // A type that would not read is no subject: `(T: Encode)` stops inside its parentheses.
+        if p.errors_at() == errors_at && p.at_kw(":") && is_ident(p.peek_at(1))
+            p.bump()
+
+            val bounds = parse_bounds(p)
+
+            return Some(expr(at.to(p.just_taken()), TraitTest(subject, bounds)))
+        end if
+    end if
+
+    p.rewind(resume, errors_at)
+    None
+end trait_test_at
+
+private is_ident(t: Tok) -> bool = t match
+    Ident(_) -> true
+    _ -> false
 
 // -- infix and postfix position -----------------------------------------------------------------
 

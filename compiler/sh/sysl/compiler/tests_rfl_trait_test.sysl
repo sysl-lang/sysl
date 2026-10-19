@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+@tests
+
+// **`if const T: Trait`** (`type_reflect.sysl`, `trait_test`): true while compiling where the type
+// implements the trait, asked as a bound asks it, so a generic body picks a type's own `impl` or
+// walks its make-up. Only the arm taken is read.
+
+private rfl_trait_types() -> string = raw"""
+    trait Encode
+        encode(self) -> string
+
+    trait Conv[U]
+        conv(self) -> U
+
+    struct Celsius
+        v: int
+
+    impl Encode for Celsius
+        encode(self) -> string = s"${self.v}C"
+
+    impl Conv[int] for Celsius
+        conv(self) -> int = self.v
+
+    struct Point
+        x: int
+        y: int
+
+    struct Shown derives Display
+        a: int
+
+    struct Hidden
+        a: int
+
+    """
+
+@test("'if const T: Trait' picks a type's own impl, and walks the fields of one without it")
+rfl_trait_own_impl_or_walk()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_trait_types() + raw"""
+        enc[T](v: T) -> string
+            if const T: Encode
+                return v.encode()
+            else
+                var out = ""
+
+                for const f in T::Fields
+                    out = out + s"${f.name}=${v.(f)};"
+
+                return out
+
+        print(enc(Celsius(21)))
+        print(enc(Point(1, 2)))
+        """), "21C\nx=1;y=2;\n")
+end rfl_trait_own_impl_or_walk
+
+@test("built-ins, a derived trait, a generic trait and a type parameter's bounds each answer")
+rfl_trait_answers()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_trait_types() + raw"""
+        shown[T]() -> string = if const T: Display then "y" else "n"
+        conv[T]() -> string = if const T: Conv[int] then "i" elif const T: Conv[string] then "s" else "-"
+        bounded[T: Encode]() -> string = if const T: Encode then "e" else "-"
+
+        print(shown[int](), shown[string](), shown[bool](), shown[Shown](), shown[Hidden]())
+        print(conv[Celsius](), conv[Point](), bounded[Celsius]())
+        print(if const Point: Encode then "p" else "-", if const Celsius: Encode + Conv[int] then "c" else "-")
+        """), "y y y y n\ni - e\n- c\n")
+end rfl_trait_answers
+
+@test("a trait test joins '&&', '||', '!' and ordinary constants, and leaves other conditions as they were")
+rfl_trait_combined()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_trait_types() + raw"""
+        const Wide: int = 3
+
+        which[T]() -> string
+            if const !(T: Encode) && T: Display
+                return "shown"
+            elif const T: Encode || Wide > 5
+                return "encoded"
+            else
+                return "neither"
+
+        plain[const N: int]() -> string = if const N > 2 && N < Wide + 5 then "mid" else "edge"
+
+        print(which[int](), which[Celsius](), which[Hidden](), plain[4](), plain[1]())
+        """), "shown encoded neither mid edge\n")
+end rfl_trait_combined
+
+@test("'f::Type: Display' asks each field's type, in each copy of a walk")
+rfl_trait_field_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_trait_types() + raw"""
+        struct Mixed
+            a: int
+            h: Hidden
+            s: string
+
+        show[T](v: T) -> string
+            var out = ""
+
+            for const f in T::Fields
+                if const f::Type: Display
+                    out = out + s"${f.name}=${v.(f)} "
+                else
+                    out = out + s"${f.name}=? "
+
+            out
+
+        print(show(Mixed(1, Hidden(2), "z")))
+        """), "a=1 h=? s=z \n")
+end rfl_trait_field_type
+
+@test("a trait test names a trait: an unknown name and a type after ':' are refused")
+rfl_trait_refusals()
+    if !enm_ready() then return
+
+    val unknown = enm_outcome(rfl_trait_types() + raw"""
+        f[T]() -> int = if const T: Nonesuch then 1 else 0
+
+        print(f[int]())
+        """)
+
+    assert(!unknown.1, unknown.0)
+    assert(unknown.0.contains("unknown trait 'Nonesuch'"), unknown.0)
+
+    val a_type = enm_outcome(rfl_trait_types() + raw"""
+        f[T]() -> int = if const T: Point then 1 else 0
+        g[T]() -> int = if const T: int then 1 else 0
+
+        print(f[int](), g[int]())
+        """)
+
+    assert(!a_type.1, a_type.0)
+    assert(a_type.0.contains("'Point' is a type and not a trait — the right of ':' in an 'if const' " +
+                             "names a trait, as a bound does"), a_type.0)
+    assert(a_type.0.contains("'int' is a type and not a trait"), a_type.0)
+
+    val subject = enm_outcome(rfl_trait_types() + raw"""
+        print(if const Nowhere: Display then 1 else 0)
+        """)
+
+    assert(!subject.1, subject.0)
+    assert(subject.0.contains("Nowhere"), subject.0)
+
+    val running = enm_outcome(rfl_trait_types() + raw"""
+        val n = 3
+
+        if n: Display
+            print(n)
+        """)
+
+    assert(!running.1, running.0)
+end rfl_trait_refusals

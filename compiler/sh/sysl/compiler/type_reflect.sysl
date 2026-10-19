@@ -391,8 +391,9 @@ private reflected_subject(cx: &Analyzer, span: Span, receiver: Expr) -> Option[T
 end reflected_subject
 
 // What one copy binds: the name at its descriptor and, for a field, `name::Type` at the field's
-// type -- which is how `f::Type` resolves wherever a type is written.
-descriptor_bindings(name: string, d: Type) -> Buf[Binding]
+// type, or for a variant, `name::Payload` at its payload's type -- which is how `f::Type` and
+// `c::Payload` resolve wherever a type is written.
+descriptor_bindings(cx: &Analyzer, name: string, d: Type) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
     out.push(Binding(name, d))
@@ -401,20 +402,45 @@ descriptor_bindings(name: string, d: Type) -> Buf[Binding]
 
     if ft.is_some() then out.push(Binding(s"$name::Type", ft.unwrap()))
 
+    d match
+        Descriptor(owner, v, f) ->
+            if f < 0 && v >= 0 then
+                out.push(Binding(s"$name::Payload", payload_type(cx, walked_fields(*owner, v))))
+        _ -> ()
+
     out
 end descriptor_bindings
 
-// `f::Type` written where a type is: the field's type, which the copy bound under that spelling.
-// `None` where the left side is not a descriptor's name.
-descriptor_projection(base: TypeRef, member: string, subst: Buf[Binding]) -> Option[Type]
+// `f::Type` and `c::Payload` written where a type is: the type the copy bound under that spelling.
+// `None` where the left side is not a descriptor's name; a member the descriptor does not answer is
+// refused here, naming what it does answer.
+descriptor_projection(a: &Analysis, scope: Scope, span: Span, base: TypeRef, member: string,
+                      subst: Buf[Binding]) -> Option[Type]
     val name = *base.kind match
         NamedType(n, args) -> if args.is_empty() then n else return None
         _ -> return None
 
-    if descriptor_bound(subst, name).is_none() then return None
+    val d = descriptor_bound(subst, name)
 
-    bound_type(subst, s"$name::$member")
+    if d.is_none() then return None
+
+    val held = bound_type(subst, s"$name::$member")
+
+    if held.is_some() then return held
+
+    a.fault(scope, span, descriptor_refusal(name, member, d.unwrap()))
+    Some(Unknown)
 end descriptor_projection
+
+// What a descriptor's name answers after `::`, said when it is asked something else.
+private descriptor_refusal(written: string, attr: string, d: Type) -> string = d match
+    Descriptor(owner, v, f) ->
+        val answers = if f >= 0 then "'::Type', the field's type"
+        else "'::Fields', its payload's fields, and '::Payload', its payload's type"
+
+        s"'$written' is the descriptor '${descriptor_text(*owner, v, f)}', which answers $answers, " +
+        s"and not '::$attr'"
+    _ -> ""
 
 // The part a copy stands at, as a refusal made in that copy names it.
 descriptor_label(d: Type) -> string = d match
@@ -531,13 +557,11 @@ descriptor_attr(cx: &Analyzer, span: Span, written: string, attr: string, d: Typ
     Descriptor(owner, v, f) ->
         if attr == "Fields" && v >= 0 && f < 0 then
             payload_fields_answer(cx, span, *owner, v)
-        else if attr == "Type" && f >= 0 then
-            cx.err(span, s"'$written::Type' is a type, so it stands where a type is written — " +
-                   s"'var x: $written::Type', 'sizeof($written::Type)', 'decode[$written::Type](r)'")
+        else if (attr == "Type" && f >= 0) || (attr == "Payload" && f < 0) then
+            cx.err(span, s"'$written::$attr' is a type, so it stands where a type is written — " +
+                   s"'var x: $written::$attr', 'sizeof($written::$attr)', 'decode[$written::$attr](r)'")
         else
-            cx.err(span, s"'$written' is the descriptor '${descriptor_text(*owner, v, f)}', which " +
-                   s"answers ${if f >= 0 then "'::Type', the field's type" else "'::Fields', its payload"}, " +
-                   s"and not '::$attr'")
+            cx.err(span, descriptor_refusal(written, attr, d))
     _ -> bad_expr(span)
 
 // `c::Fields` read as a value: the payload's fields, as `T::Fields` lists a struct's.
@@ -752,3 +776,36 @@ private built_variant(cx: &Analyzer, span: Span, en: Type, variant: EnumVariant,
 
     if stmts.is_empty() then made else TExpr(span, TBlockExpr(TBlock(stmts, Some(made), en)))
 end built_variant
+
+// -- asking what a type can do ---------------------------------------------------------------------
+
+// `T: Display + Hash` in an `if const` condition -- whether the type implements every trait named,
+// asked as a bound asks it (`satisfies`), so an own `impl`, a `derives`, a built-in's membership by
+// rule and a parameter's own bounds all answer yes. `None` where the subject or a trait is refused,
+// which the refusal has said.
+trait_test(cx: &Analyzer, span: Span, subject: TypeRef, bounds: Buf[BoundRef]) -> Option[Const]
+    val mark = cx.an.complaints()
+    val t = resolve_type(cx.an, cx.scope, subject, cx.subst)
+    var holds = true
+
+    for b in bounds
+        if lookup_trait_key(cx.an, cx.scope, b.name).is_none()
+            val a_type = lookup_type_key(cx.an, cx.scope, b.name).is_some() ||
+                         scalar_named(b.name, word_bits(cx)).is_some()
+
+            if a_type then
+                cx.fault(b.span, s"'${b.name}' is a type and not a trait — the right of ':' in an " +
+                         "'if const' names a trait, as a bound does")
+            else
+                cx.fault(b.span, s"unknown trait '${b.name}'")
+        else if !satisfies(cx.an, resolve_bound(cx.an, cx.scope, b.span, b, cx.subst), t)
+            holds = false
+        end if
+
+    if t == Unknown || cx.an.complaints() > mark
+        cx.an.const_refusals += 1
+        return None
+    end if
+
+    Some(ConstBool(holds))
+end trait_test

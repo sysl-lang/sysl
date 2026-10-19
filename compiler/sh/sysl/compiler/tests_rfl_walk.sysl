@@ -144,7 +144,7 @@ rfl_walk_field_type()
         """), "a:4:1 b:1:2 c:8:3 \n")
 end rfl_walk_field_type
 
-@test("a data enum round-trips through 'x is c', 'x.(c)', 'c::Fields' and 'T::Make'")
+@test("a data enum round-trips through 'x is c', 'x.(c)', 'c::Fields', 'c::Payload' and 'T::Make'")
 rfl_walk_enum_round_trip()
     if !enm_ready() then return
 
@@ -166,12 +166,12 @@ rfl_walk_enum_round_trip()
         decode[E](w: Wire) -> Option[E]
             for const c in E::Variants
                 if w.tag == c.index
-                    if const c::Fields.len == 0
-                        return Some(E::Make(c, ()))
-                    else if const c::Fields.len == 1
-                        return Some(E::Make(c, w.a))
-                    else
-                        return Some(E::Make(c, (w.a, w.b)))
+                    var p: c::Payload
+
+                    for const f in c::Fields
+                        if const f.index == 0 then p.(f) = w.a else p.(f) = w.b
+
+                    return Some(E::Make(c, p))
 
             None
 
@@ -337,7 +337,75 @@ rfl_walk_descriptor_misuse()
 
     assert(no_fields.0.contains("'int::Fields' lists the fields of a struct, a tuple or a union"),
            no_fields.0)
+
+    val field_payload = enm_outcome(rfl_walk_types() + raw"""
+        for const f in Q::Fields
+            var x: f::Payload
+        """)
+
+    assert(field_payload.0.contains("'f' is the descriptor 'Q.a', which answers '::Type', the " +
+                                    "field's type, and not '::Payload'"), field_payload.0)
+
+    val variant_type = enm_outcome(rfl_walk_types() + raw"""
+        for const c in Shape::Variants
+            var x: c::Type
+        """)
+
+    assert(variant_type.0.contains("'c' is the descriptor 'Shape.Circle', which answers '::Fields', " +
+                                   "its payload's fields, and '::Payload', its payload's type, and " +
+                                   "not '::Type'"), variant_type.0)
+
+    val payload_value = enm_outcome(rfl_walk_types() + raw"""
+        for const c in Shape::Variants
+            print(c::Payload)
+        """)
+
+    assert(payload_value.0.contains("'c::Payload' is a type, so it stands where a type is written"),
+           payload_value.0)
+
+    val outside = enm_outcome(rfl_walk_types() + raw"""
+        decode[T]() -> int
+            var p: T::Payload
+            0
+
+        print(decode[Shape]())
+        """)
+
+    assert(outside.0.contains("Payload"), outside.0)
+    assert(!outside.1, outside.0)
 end rfl_walk_descriptor_misuse
+
+@test("'c::Payload' is unit, the one field's type, or the tuple of the fields, and 'p.(f)' writes it")
+rfl_walk_payload_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        enum Mixed
+            Pair(a: u8, b: i64)
+            One(x: i16)
+            Nothing
+
+        sizes[E]() -> string
+            var out = ""
+
+            for const c in E::Variants
+                var p: c::Payload
+
+                for const f in c::Fields
+                    p.(f) = if const f.index == 0 then 1 else 2
+
+                out = out + s"${c.name}:${sizeof(c::Payload)}:${describe(E::Make(c, p))} "
+
+            out
+
+        describe(m: Mixed) -> string = m match
+            Pair(a, b) -> s"$a/$b"
+            One(x) -> s"$x"
+            Nothing -> "-"
+
+        print(sizes[Mixed]())
+        """), "Pair:16:1/2 One:2:1 Nothing:0:- \n")
+end rfl_walk_payload_type
 
 @test("a projection off a type parameter is a type argument, as it is a type anywhere else")
 rfl_walk_projection_type_argument()
