@@ -838,7 +838,8 @@ print(Split(lo = 1, hi = 2).all, p)
 ```
 
 A type holding an anonymous member is **built by naming its fields**: every field a struct holds,
-and exactly one of each anonymous union. A name may appear once across all the levels, as in C11.
+and exactly one of each anonymous union. A name may appear once across all the levels, as in C11. An unnamed bitfield (`_: u4 in u32`) is
+never named: it holds zero, here as in a struct with no anonymous member.
 
 ```sysl
 struct Packet
