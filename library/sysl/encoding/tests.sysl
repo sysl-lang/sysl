@@ -3,6 +3,7 @@ module sysl.encoding
 
 import sysl.text.from_utf8_unchecked
 import sysl.rand.rng
+import sysl.buf.buf
 import sysl.time.Instant
 
 // What `sysl.encoding` claims, asserted in sysl.
@@ -503,3 +504,42 @@ percent_decode_string_escape_errors()
 
     assert(trunc)
     assert(bad)
+
+// -- binary appends -------------------------------------------------------------------------------
+
+@test("push_ appends every width at both byte orders, after what is already there")
+binary_pushes_every_width()
+    val out = buf[u8]()
+
+    out.push(0xaa)
+    push_u16_le(out, 0x1122)
+    push_u16_be(out, 0x1122)
+    push_u32_le(out, 0x11223344)
+    push_u32_be(out, 0x11223344)
+    push_u64_le(out, 0x1122334455667788)
+    push_u64_be(out, 0x1122334455667788)
+
+    val want: []const u8 = [
+        0xaa,
+        0x22, 0x11,
+        0x11, 0x22,
+        0x44, 0x33, 0x22, 0x11,
+        0x11, 0x22, 0x33, 0x44,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    ]
+
+    assert_eq(out.len(), 1 + 2 + 2 + 4 + 4 + 8 + 8)
+
+    for i in 0..<want.len
+        assert_eq(out.at(i), want[i])
+
+    // And the `get_` family reads them back.
+    val v = out.view()
+
+    assert_eq(get_u16_le(v[1..]).unwrap(), 0x1122)
+    assert_eq(get_u16_be(v[3..]).unwrap(), 0x1122)
+    assert_eq(get_u32_le(v[5..]).unwrap(), 0x11223344)
+    assert_eq(get_u32_be(v[9..]).unwrap(), 0x11223344)
+    assert_eq(get_u64_le(v[13..]).unwrap(), 0x1122334455667788)
+    assert_eq(get_u64_be(v[21..]).unwrap(), 0x1122334455667788)

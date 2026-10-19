@@ -15,11 +15,12 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl`](sysl/) | The core: what every program has without importing anything. |
 | [`sysl.args`](sysl-args/) | How a program's arguments become a `[]string`, written here because every line of it is ordinary sysl. |
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
+| [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption and nothing else. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |
-| [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
+| [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order, read, written in place or appended. |
 | [`sysl.encoding.json`](sysl-encoding-json/) | JSON, read and written: a document parsed into a value tree that owns itself, and a value tree written back out compactly or for a person to read. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |

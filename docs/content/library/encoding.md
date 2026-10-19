@@ -224,6 +224,38 @@ struct with [`@byte_order`](/reference/attributes/), read and written whole with
 Unsigned only: the signed read of the same bytes is a cast at the call site, and doubling a
 twelve-function surface to spare one cast is not a trade worth making.
 
+### Appending to a growing buffer
+
+Where `put_` writes into storage that is already the right size, `push_` appends to a `Buf[u8]`, so
+there is no short slice to refuse. They are free functions taking the buffer by value: a `Buf` is a
+handle, and the caller's buffer grows through the copy.
+
+```sysl
+import sysl.buf.buf
+import sysl.encoding.{push_u16_be, push_u32_le, push_u64_be}
+
+val out = buf[u8]()
+
+out.push(0xaa)
+push_u16_be(out, 0x1122)
+push_u32_le(out, 0x11223344)
+push_u64_be(out, 0x1122334455667788)
+
+print(out.len())
+print(out.at(1), out.at(2))
+print(out.at(3), out.at(6))
+print(out.at(7), out.at(14))
+```
+
+```output
+15
+17 34
+68 17
+17 136
+```
+
+`push_u16`, `push_u32` and `push_u64` each come in `_le` and `_be`.
+
 ## Plain data — a record read out of bytes, and written back
 
 A superblock, an inode, a directory entry and a protocol header are all one thing: a struct whose
