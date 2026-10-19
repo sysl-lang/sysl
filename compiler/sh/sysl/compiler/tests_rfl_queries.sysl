@@ -1,0 +1,196 @@
+module sh.sysl.compiler
+@tests
+
+// **`T::Kind`, `T::Name`, `T::Fields` and `T::Variants`** -- what a type is made of, answered while
+// compiling (`type_reflect.sysl`). Each answer is a literal, so it folds in a `const`, an `@assert`
+// and an `if const`, lays down as a `static val`, and is answered per instantiation on a type
+// parameter.
+
+private rfl_types() -> string = raw"""
+    struct P
+        x: int
+        y: u8
+        private z: i64
+
+    enum Colour
+        Red
+        Green
+        Blue
+
+    enum Shape
+        Circle(r: real)
+        Square(s: real)
+
+    union U
+        a: int
+        b: real
+
+    struct Box[T]
+        item: T
+        count: int
+
+    type Pair = (int, u8)
+    type Small = int within 0..10
+
+    """
+
+@test("'T::Kind' answers the kind of every sort of type, and 'T::Name' its name")
+rfl_kind_and_name_of_every_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_types() + raw"""
+        kind[T]() -> string = Kind::Image(T::Kind)
+        name[T]() -> string = T::Name
+
+        print(Kind::Image(P::Kind), Kind::Image(Colour::Kind), Kind::Image(Shape::Kind),
+              Kind::Image(U::Kind), Kind::Image(Pair::Kind), Kind::Image(Small::Kind))
+        print(kind[int](), kind[real](), kind[bool](), kind[char](), kind[string](), kind[q15]())
+        print(kind[[4]int](), kind[[]int](), kind[*int](), kind[&P](), kind[Box[int]](), kind[unit]())
+        print(P::Name, Pair::Name, Box[int]::Name, name[Box[u8]](), name[int]())
+        """), "Struct SimpleEnum DataEnum Union Tuple Int\n" +
+              "Int Float Bool Char String Fixed\n" +
+              "Array Slice Pointer Ref Struct Unit\n" +
+              "P (int, byte) Box[int] Box[byte] int\n")
+end rfl_kind_and_name_of_every_type
+
+@test("'T::Fields' lists a struct's, a tuple's and a union's fields; 'T::Variants' an enum's variants")
+rfl_fields_and_variants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_types() + raw"""
+        hidden(public: bool) -> string = if public then "" else "!"
+
+        fields(fs: []const sysl.reflect.Field) -> string
+            var out = ""
+            for f in fs
+                out = out + s"${f.name}:${f.index}@${f.offset}${hidden(f.public)} "
+            out
+
+        names[T]() -> string
+            var out = ""
+            for v in T::Variants
+                out = out + s"${v.index}=${v.name} "
+            out
+
+        print(fields(P::Fields))
+        print(fields(Pair::Fields))
+        print(fields(U::Fields))
+        print(fields(Box[u8]::Fields), P::Fields.len)
+        print(names[Colour](), names[Shape](), names[Option[int]]())
+        """), "x:0@0 y:1@4 z:2@8! \n" +
+              "0:0@0 1:1@4 \n" +
+              "a:0@0 b:1@0 \n" +
+              "item:0@0 count:1@4  3\n" +
+              "0=Red 1=Green 2=Blue  0=Circle 1=Square  0=Some 1=None \n")
+end rfl_fields_and_variants
+
+@test("a type parameter's 'T::Fields' answers for the type each instantiation gave it")
+rfl_a_type_parameter_answers_per_instance()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_types() + raw"""
+        names[T]() -> string
+            var out = ""
+            for f in T::Fields
+                out = out + f.name + " "
+            out
+
+        print(names[P](), names[Box[real]](), names[Pair]())
+        """), "x y z  item count  0 1 \n")
+end rfl_a_type_parameter_answers_per_instance
+
+@test("the queries fold in a const, an @assert, an if const and a static val")
+rfl_queries_fold_while_compiling()
+    if !enm_ready() then return
+
+    val program = raw"""
+        struct P
+            x: int
+            y: int
+
+        const N: usize = P::Fields.len
+        @assert(P::Fields[1].name == "y", "the second field is y")
+        @assert(P::Kind == Kind.Struct)
+        @assert(P::Name == "P")
+
+        struct Q
+            xs: [N]int
+
+        static val NAMES: []const sysl.reflect.Field = P::Fields
+        static val K: Kind = P::Kind
+
+        describe[T]() -> string
+            if const T::Kind == Kind.Struct
+                return s"a struct of ${T::Fields.len} fields, the first '${T::Fields[0].name}'"
+            "something else"
+
+        """
+
+    assert_eq(enm_ran(program + raw"""
+        print(N, NAMES[0].name, NAMES.len, Kind::Image(K), sizeof(Q))
+        print(describe[P](), describe[int]())
+        """), "2 x 2 Struct 8\na struct of 2 fields, the first 'x' something else\n")
+
+    val wrong = enm_outcome(program + "@assert(P::Fields.len == 3, \"three fields\")\nprint(1)\n").0
+
+    assert(wrong.contains("assertion failed: three fields"), wrong)
+
+    val kind = enm_outcome(program + "@assert(P::Kind == Kind.Union, \"a union\")\nprint(1)\n").0
+
+    assert(kind.contains("assertion failed: a union"), kind)
+end rfl_queries_fold_while_compiling
+
+@test("a list of fields is constant data, so a module that never allocates may read one")
+rfl_fields_are_laid_down()
+    if !enm_ready() then return
+
+    val out = enm_outcome(raw"""
+        @no_alloc
+
+        struct P
+            x: int
+            y: int
+
+        width() -> usize = P::Fields.len + P::Fields[1].name.len
+
+        @export("rfl_width")
+        rfl_width() -> usize = width()
+        """)
+
+    assert(!out.0.contains("storage of its own"), out.0)
+end rfl_fields_are_laid_down
+
+@test("a query asked of a type that has no such part is refused, naming the type and what it is")
+rfl_queries_without_an_answer_are_refused()
+    if !enm_ready() then return
+
+    val ints = enm_outcome(rfl_types() + "print(int::Fields.len)\n")
+
+    assert(!ints.1, ints.0)
+    assert(ints.0.contains("'int::Fields' lists the fields of a struct, a tuple or a union, and " +
+                           "'int' is an integer"), ints.0)
+
+    val structs = enm_outcome(rfl_types() + "print(P::Variants.len)\n")
+
+    assert(structs.0.contains("'P::Variants' lists the variants of an enum, and 'P' is a struct"),
+           structs.0)
+
+    val bare = enm_outcome(rfl_types() + "print(Box::Fields.len)\n")
+
+    assert(bare.0.contains("is generic, so 'Box::Fields' has no single type to read"), bare.0)
+
+    val option = enm_outcome(rfl_types() + "print(Option::Variants.len)\n")
+
+    assert(option.0.contains("'sysl.Option' is generic, so 'sysl.Option::Variants' has no " +
+                                 "single enum to read"),
+           option.0)
+
+    val param = enm_outcome(rfl_types() + "count[T]() -> usize = T::Fields.len\n\nprint(count[real]())\n")
+
+    assert(param.0.contains("'T::Fields' lists the fields of a struct, a tuple or a union, and " +
+                            "'real' is a float"), param.0)
+
+    val args = enm_outcome(rfl_types() + "print(P::Fields(1).len)\n")
+
+    assert(args.0.contains("'P::Fields' takes no arguments"), args.0)
+end rfl_queries_without_an_answer_are_refused

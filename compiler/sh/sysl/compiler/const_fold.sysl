@@ -127,6 +127,9 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         if packed.is_some() then return packed
 
+        // `P::Fields.len`, `P::Fields[1].name`.
+        if reflects(receiver) then return reflected(cx, e)
+
         val dotted = dotted_name(cx, receiver, name).and_then(n -> const_of_name(cx, n))
 
         if dotted.is_some() then return dotted
@@ -144,11 +147,21 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
     Unary(op, operand) -> const_unary(cx, op, operand)
     Binary(op, l, r) -> const_binary(cx, e.span, op, l, r)
+    // A comparison that asks about a type's make-up -- `T::Kind == Kind.Struct`, where the enum value
+    // on the right is no constant the fold holds -- is typed and run whole.
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
-            const_binary(cx, e.span, ops.at(0), operands.at(0), operands.at(1))
+            if reflects(operands.at(0)) || reflects(operands.at(1)) then reflected(cx, e)
+            else const_binary(cx, e.span, ops.at(0), operands.at(0), operands.at(1))
         else
             None
+
+    // `T::Fields[1]` and `primes_below(10)[0]` -- an element of what a call or a type's make-up
+    // answers, run with it.
+    Index(receiver, _, _) ->
+        if reflects(receiver) then reflected(cx, e)
+        else if mentions_const_call(cx.an, receiver) then const_call(cx, e)
+        else None
 
     // A conversion is written, so what it does while compiling is what it does while running: a
     // narrowing wraps and a float-to-integer truncates toward zero.
@@ -174,9 +187,32 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
     // `T::Min` and `T::Max` on a built-in integer are constants for the reason `sizeof` is: the
     // answer is a property of the type and is known once the type is.
-    TypeAttr(receiver, attr, _, _) -> const_type_attr(cx, receiver, attr)
+    //
+    // `T::Kind`, `T::Name`, `T::Fields` and `T::Variants` are literals once typed, so they are typed
+    // and run as a call's answer is.
+    TypeAttr(receiver, attr, _, _) ->
+        if reflection_attr(attr) then reflected(cx, e) else const_type_attr(cx, receiver, attr)
 
     _ -> None
+
+// Whether an expression asks one of the four questions about a type's make-up anywhere in it.
+reflects(e: Expr) -> bool = *e.kind match
+    TypeAttr(_, attr, _, _) -> reflection_attr(attr)
+    Field(receiver, _, _) -> reflects(receiver)
+    Index(receiver, index, _) -> reflects(receiver) || reflects(index)
+    Unary(_, operand) -> reflects(operand)
+    Binary(_, l, r) -> reflects(l) || reflects(r)
+    Compare(operands, _) ->
+        for item in operands
+            if reflects(item) then return true
+
+        false
+    _ -> false
+
+// An expression asking about a type's make-up, typed and run -- once the type is known: a type
+// parameter standing for itself has no make-up yet, and every instantiation answers for its own.
+private reflected(cx: &Analyzer, e: Expr) -> Option[Const] =
+    if awaits_instantiation(cx, e) then None else const_call(cx, e)
 
 // How many types the pack `A` stands for, where `A.len` is what was written.
 private pack_length(subst: Buf[Binding], receiver: Expr, name: string) -> Option[Const]
@@ -795,6 +831,8 @@ private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     TypeArg(t) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
     Ident(n) -> binding_is_abstract(cx.subst, n)
     TypeAttr(receiver, _, _, _) -> awaits_instantiation(cx, receiver)
+    Field(receiver, _, _) -> awaits_instantiation(cx, receiver)
+    Index(receiver, index, _) -> awaits_instantiation(cx, receiver) || awaits_instantiation(cx, index)
     Unary(_, operand) -> awaits_instantiation(cx, operand)
     Binary(_, l, r) -> awaits_instantiation(cx, l) || awaits_instantiation(cx, r)
     Compare(operands, _) ->

@@ -1,0 +1,256 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// `T::Kind`, `T::Name`, `T::Fields` and `T::Variants` -- what a type is made of, answered while
+// compiling.
+//
+// **Every answer is a literal**, so it folds wherever a constant is wanted and costs nothing where
+// the program runs: the kind is a value of the library's `Kind`, the name is a string, and a list
+// of fields or variants is a `[]const` over literals of `sysl.reflect.Field` or `Variant`, laid down
+// as read-only data. On a type parameter each instantiation answers for the type it was given; the
+// walk that checks a generic body on its own terms gets a stand-in of the right type and folds
+// nothing, as `sizeof(T)` does there.
+
+// Whether an attribute is one of the four that describe a type's make-up.
+reflection_attr(attr: string) -> bool = attr match
+    "Kind" | "Name" | "Fields" | "Variants" -> true
+    _ -> false
+
+// The answer to one of the four for the type `written` stands for here.
+reflect_attr(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr], ty: Type) -> TExpr
+    if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
+
+    attr match
+        "Kind" -> kind_answer(cx, span, written, ty)
+        "Name" -> TExpr(span, TStrLit(type_show(ty)))
+        "Fields" -> fields_answer(cx, span, written, ty)
+        _ -> variants_answer(cx, span, written, ty)
+end reflect_attr
+
+// The key of the generic struct a written name declares, where it declares one and no type
+// parameter of the body being read stands in front of it: written bare, it names no single type.
+generic_struct_named(cx: &Analyzer, written: string) -> Option[string]
+    if bound_type(cx.subst, written).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if key.is_none() then return None
+
+    cx.an.tables.types.get(key.unwrap()).unwrap().kind match
+        StructOf(sd) -> if sd.tparams.is_empty() then None else key
+        _ -> None
+end generic_struct_named
+
+// `Box[int]::Fields` -- one of the four asked of a generic type at the arguments written on it.
+// `None` where the left side is not a generic type's name with brackets after it.
+reflect_on_written_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> Option[TExpr]
+    val found = written_on_generic_type(cx, receiver)
+
+    if found.is_none() then return None
+
+    val head = found.unwrap().0
+    val targs = written_type_args_for(cx, head.0, found.unwrap().1)
+
+    for t in targs
+        if t == Unknown then return Some(bad_expr(span))
+
+    val ty = reinstantiate_at(cx.an, cx.scope, span, head.0, targs)
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    Some(reflect_attr(cx, span, type_show(ty), attr, buf(), ty))
+end reflect_on_written_instance
+
+// A type of the library's that the answers are made of, by its full name.
+private library_type(cx: &Analyzer, span: Span, name: string) -> Type =
+    resolve_type(cx.an, cx.scope, named_type(span, name), no_bindings())
+
+// -- `T::Kind` -------------------------------------------------------------------------------------
+
+private kind_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
+    val kind_ty = library_type(cx, span, "sysl.Kind")
+
+    val d = underlying(kind_ty) match
+        Enum(e) -> e
+        _ -> return bad_expr(span)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TZero(kind_ty))
+        _ -> ()
+
+    val name = kind_name(ty)
+
+    if name.is_none() then
+        return cx.err(span, s"'$written' is ${type_show(ty)}, which is not a type a value can have, " +
+                      s"so '$written::Kind' has nothing to answer")
+
+    val v = d.variant(name.unwrap())
+
+    if v.is_none() then return bad_expr(span)
+
+    TExpr(span, TEnumNew(kind_ty, v.unwrap(), buf()))
+end kind_answer
+
+// Which of `Kind`'s variants a type is. A subtype is its base's kind and `volatile T` is `T`'s, which
+// `underlying` already sees through.
+kind_name(ty: Type) -> Option[string] = underlying(ty) match
+    Integer(_, _, _) -> Some("Int")
+    Floating(_, _) -> Some("Float")
+    Fixed(_, _, _) -> Some("Fixed")
+    Char -> Some("Char")
+    Bool -> Some("Bool")
+    Unit -> Some("Unit")
+    Str -> Some("String")
+    Ptr(_) -> Some("Pointer")
+    CFn(_, _) -> Some("Fn")
+    Ref(_, _) -> Some("Ref")
+    Weak(_) -> Some("Weak")
+    Array(_, _) -> Some("Array")
+    Vector(_, _) -> Some("Vector")
+    Slice(_, _) -> Some("Slice")
+    Trait(_, _, _) -> Some("Trait")
+    VaList -> Some("Opaque")
+    Results(_) -> Some("Tuple")
+    Struct(d) ->
+        if d.opaque then Some("Opaque")
+        else if d.union_layout then Some("Union")
+        else if is_tuple(d) then Some("Tuple")
+        else Some("Struct")
+    Enum(d) -> if carries_any(d) then Some("DataEnum") else Some("SimpleEnum")
+    _ -> None
+
+private carries_any(d: &EnumType) -> bool
+    for v in d.variants
+        if v.carries then return true
+
+    false
+end carries_any
+
+// What a type is, in words, for a refusal naming it.
+private kind_phrase(ty: Type) -> string = kind_name(ty).unwrap_or("") match
+    "Int" -> "an integer"
+    "Float" -> "a float"
+    "Fixed" -> "a fixed-point number"
+    "Char" -> "a char"
+    "Bool" -> "a bool"
+    "Unit" -> "the unit type"
+    "String" -> "a string"
+    "Pointer" -> "a pointer"
+    "Fn" -> "a function pointer"
+    "Ref" -> "a reference"
+    "Weak" -> "a weak reference"
+    "Array" -> "an array"
+    "Vector" -> "a vector"
+    "Slice" -> "a slice"
+    "Trait" -> "a trait object"
+    "Opaque" -> "an opaque type"
+    "Tuple" -> "a tuple"
+    "Union" -> "a union"
+    "Struct" -> "a struct"
+    "SimpleEnum" -> "an enum"
+    "DataEnum" -> "an enum"
+    _ -> "not a type a value can have"
+
+// -- `T::Fields` -----------------------------------------------------------------------------------
+
+private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
+    val field_ty = library_type(cx, span, "sysl.reflect.Field")
+
+    val fd = underlying(field_ty) match
+        Struct(f) -> f
+        _ -> return bad_expr(span)
+
+    val list_ty = Slice(field_ty, true)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TBufLit(buf(), list_ty))
+        _ -> ()
+
+    val d = underlying(ty) match
+        Struct(s) -> if s.opaque then None else Some(s)
+        Results(s) -> Some(s)
+        _ -> None
+
+    if d.is_none() then
+        return cx.err(span, s"'$written::Fields' lists the fields of a struct, a tuple or a union, and " +
+                      s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+
+    val s = d.unwrap()
+    val usize_ty = usize_type(word_bits(cx))
+    val measured = !mentions_abstract(ty)
+    var items: Buf[TExpr] = buf()
+
+    for i in 0..<s.fields.len()
+        val name = s.fields.at(i).0
+
+        // An anonymous member is storage the struct holds rather than a field a reader names; the
+        // fields it holds are reached through the struct, and are not listed one level up.
+        if is_anonymous_field(name) then continue
+
+        val at = if measured then cx.an.tables.layout.field_offset(s, name).unwrap_or(0) else 0
+        var parts: Buf[TExpr] = buf()
+
+        parts.push(TExpr(span, TStrLit(name)))
+        parts.push(TExpr(span, TIntLit(from_int(long(i)), usize_ty)))
+        parts.push(TExpr(span, TIntLit(from_int(long(at)), usize_ty)))
+        parts.push(TExpr(span, TBoolLit(field_public(cx, s, name))))
+        items.push(TExpr(span, TStructNew(fd, parts)))
+
+    TExpr(span, TBufLit(items, list_ty))
+end fields_answer
+
+// Whether code outside the declaring file may name a field: what the declaration wrote on it. A
+// tuple's parts, which no declaration writes, are public.
+private field_public(cx: &Analyzer, s: &StructType, name: string) -> bool
+    val decl = cx.an.tables.types.get(s.base)
+
+    if decl.is_none() then return true
+
+    decl.unwrap().kind match
+        StructOf(sd) ->
+            for f in sd.fields
+                if f.name == name
+                    f.vis match
+                        Public -> return true
+                        _ -> return false
+        _ -> ()
+
+    true
+end field_public
+
+// -- `T::Variants` ---------------------------------------------------------------------------------
+
+private variants_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
+    val variant_ty = library_type(cx, span, "sysl.reflect.Variant")
+
+    val vd = underlying(variant_ty) match
+        Struct(v) -> v
+        _ -> return bad_expr(span)
+
+    val list_ty = Slice(variant_ty, true)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TBufLit(buf(), list_ty))
+        _ -> ()
+
+    val d = underlying(ty) match
+        Enum(e) -> e
+        _ ->
+            return cx.err(span, s"'$written::Variants' lists the variants of an enum, and " +
+                          s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+
+    val usize_ty = usize_type(word_bits(cx))
+    var items: Buf[TExpr] = buf()
+
+    for i in 0..<d.variants.len()
+        var parts: Buf[TExpr] = buf()
+
+        parts.push(TExpr(span, TStrLit(d.variants.at(i).name)))
+        parts.push(TExpr(span, TIntLit(from_int(long(i)), usize_ty)))
+        items.push(TExpr(span, TStructNew(vd, parts)))
+
+    TExpr(span, TBufLit(items, list_ty))
+end variants_answer

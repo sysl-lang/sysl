@@ -153,6 +153,16 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             if !mentions_const_call(cx.an, receiver) then return None
 
             true
+        Index(receiver, _, _) ->
+            if !mentions_const_call(cx.an, receiver) then return None
+
+            true
+        // What a type's make-up answers is a literal once typed (`type_reflect.sysl`), and so is a
+        // comparison over it.
+        TypeAttr(_, _, _, _) | Compare(_, _) ->
+            if !reflects(e) then return None
+
+            true
         _ -> return None
 
     val ev = cx.an.evaluation
@@ -450,6 +460,8 @@ mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
 
         false
     Field(receiver, _, _) -> mentions_const_call(a, receiver)
+    Index(receiver, index, _) -> mentions_const_call(a, receiver) || mentions_const_call(a, index)
+    TypeAttr(_, attr, _, _) -> reflection_attr(attr)
     Unary(_, operand) -> mentions_const_call(a, operand)
     Binary(_, l, r) -> mentions_const_call(a, l) || mentions_const_call(a, r)
     Compare(operands, _) ->
@@ -478,7 +490,9 @@ end calls_const_fn
 // Where a call in a constant was written, with the type arguments it was read under -- the key its
 // answer is kept by.
 call_site_key(cx: &Analyzer, at: Span) -> string
-    var out = s"${cx.scope.src.name}:${at.start}"
+    // Both ends: a comparison run whole begins where its left operand does, and each has its own
+    // answer.
+    var out = s"${cx.scope.src.name}:${at.start}-${at.end}"
 
     for item in cx.subst
         out = out + s";${item.name}=${type_show(item.ty)}"

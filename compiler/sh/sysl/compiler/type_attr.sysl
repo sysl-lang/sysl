@@ -21,6 +21,14 @@ import sysl.math.decimal.{Decimal, rescale, Rounding}
 type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
     val name = attr_type_name(receiver)
 
+    // `Box[int]::Fields` -- the four that describe a type's make-up are asked of an instance written
+    // out in place, as a selection after `Box[int]` already is.
+    if name.is_none() && reflection_attr(attr)
+        val instance = reflect_on_written_instance(cx, span, receiver, attr)
+
+        if instance.is_some() then return instance.unwrap()
+    end if
+
     // **`::Id` on a value reads the identity an erased value carries**, and that is the case the
     // form exists for: an object has forgotten which type is inside it, and this is the one fact
     // about that type it still holds. Everywhere else the static type is known and `T::Id` is how
@@ -56,6 +64,15 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
         return cx.err(span, s"'$shown' is generic, so '$shown::$attr' has no single enum to read")
     end if
 
+    val generic_struct = if reflection_attr(attr) then generic_struct_named(cx, written) else None
+
+    if generic_struct.is_some() then
+        val shown = qualified_name(generic_struct.unwrap())
+
+        return cx.err(span, s"'$shown' is generic, so '$shown::$attr' has no single type to read — " +
+                      s"write the arguments, '$shown[…]::$attr'")
+    end if
+
     val subject = attr_subject(cx, span, written)
 
     if subject.is_none() then
@@ -73,6 +90,10 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
         return TExpr(span, TIntLit(type_identity(member_symbol(ty), word_bits(cx)),
                                    usize_type(word_bits(cx))))
     end if
+
+    // The four that describe a type's make-up are, like `Id`, asked of every type -- and of a type
+    // parameter per instantiation, since each one is a fact about the type it was given.
+    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
 
     // **A type parameter answers the same two attributes in every reading of the body**, the one
     // where it stands for itself and each instantiation alike -- so what it was bound to decides
