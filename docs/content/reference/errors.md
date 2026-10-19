@@ -533,7 +533,11 @@ index 5 out of bounds for length 3 (main.sysl:2:8)
 range 2..<9 out of bounds for length 3 (main.sysl:2:8)
 range start 3 is past its end 2 (main.sysl:2:8)
 range end 2 is not on a character boundary (main.sysl:2:8)
+variant 'Shape.Circle' was asked for, and the value is 'Shape.Dot' (main.sysl:9:18)
 ```
+
+The last is [`x.(c)`](/reference/reflection/) reading the payload of a variant the value does not
+hold; it goes through the same function, which is handed the two names as NUL-terminated texts.
 
 The location is the bracket's line and column, naming the file by its path inside what was built — a
 fetched package's file by its coordinate — so no build directory appears in it. The status is still

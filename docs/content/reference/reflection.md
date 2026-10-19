@@ -99,7 +99,7 @@ element is a `sysl.reflect.Field`, a plain value that exists while compiling:
 | member | is |
 |---|---|
 | `name: string` | the field's name; a tuple's parts are `"0"`, `"1"`, and so on |
-| `index: usize` | its position among the type's members, counting from `0` |
+| `index: usize` | its position in `T::Fields`, counting from `0` |
 | `offset: usize` | where it begins, in bytes from the start of the value |
 | `public: bool` | whether code outside the type's own file may name it |
 
@@ -161,15 +161,15 @@ for const f in Packet::Fields
 3 _ false
 4 hi false
 0 tag
-2 lo
-4 hi
+1 lo
+2 hi
 ```
 
 **`T::Fields` is the named fields alone**, so a derived `Eq` or `Hash` never reads an unnamed bitfield
 and an anonymous block is not a field of its own; `T::Members` is what `Debug` walks, since it shows the
-bytes a value holds. **A field's `index` is its position among the members**, which is why `lo` is `2`
-above and not `1`: the block before it counts. A walk that needs "the first field written" tests a
-counter of its own rather than `f.index > 0` when a type may open with a block.
+bytes a value holds. **Each list numbers its own elements**: a `Field`'s `index` is its position in
+`T::Fields` and a `Member`'s its position in `T::Members`, which is why `lo` is field `1` and member
+`2` above. So `f.index > 0` is "not the first field", whatever members come before it.
 
 A member that is an anonymous block is read and assigned as its own struct or union, and its `::Type`
 says which:
@@ -319,7 +319,9 @@ Rect Dot
 5 -1
 ```
 
-Reading a variant of a value that holds another stops the program:
+Reading a variant of a value that holds another stops the program, having written
+`variant 'Shape.Circle' was asked for, and the value is 'Shape.Dot' (main.sysl:9:18)` to standard error
+the way a failed [bounds check](/reference/errors/) does:
 
 ```sysl
 enum Shape
@@ -584,7 +586,8 @@ do the work is refused are on [traits](/reference/traits/#a-trait-says-how-it-is
 
 The program below is a complete serializer. `Json` is declared with an `encode` member and the
 reflection-written derivation of it; a struct is walked field by field, a simple enum is written as
-its variant's name, `@rename` changes a key, and a field's own `encode` is reached through
+its variant's name with `T::Image(self)` (in the enum's copy `T` is the enum, and answers what it
+does), `@rename` changes a key, and a field's own `encode` is reached through
 `self.(f).encode(w)`:
 
 ```sysl
@@ -609,8 +612,7 @@ trait Json
 
             w.write("}".bytes)
         elif const T::Kind == Kind.SimpleEnum
-            for const c in T::Variants
-                if self is c then w.write(s"\"${c.name}\"".bytes)
+            w.write(s"\"${T::Image(self)}\"".bytes)
         else
             @assert(false, s"Json cannot derive for ${T::Name}")
 

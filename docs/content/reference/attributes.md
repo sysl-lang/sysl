@@ -377,6 +377,11 @@ for any particular type. That walk has to hand back a typed value, and `Min` and
 `string`, so admitting those would mean restating each attribute's result type a second time, in a
 second place, where the two copies could drift apart.
 
+**A `derive` body's `T` is not such a parameter.** Its body is read once for each type that names the
+trait in its `derives`, with `T` that type and never standing for itself, so it answers every attribute
+the type does — `T::Image(self)` in an arm under `if const T::Kind == Kind.SimpleEnum`
+([reflection](/reference/reflection/#writing-a-derivation)).
+
 **Nothing is asked of `T` in the signature.** A parameter given a type with no extremes is reported
 at the instantiation that gave it one, and the message names both:
 

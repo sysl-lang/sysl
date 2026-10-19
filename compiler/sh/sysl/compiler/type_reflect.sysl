@@ -375,12 +375,13 @@ private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type, memb
     val s = d.unwrap()
     val measured = !mentions_abstract(ty)
     var items: Buf[TExpr] = buf()
+    val parts = listed_parts(s, members)
 
-    for i in listed_parts(s, members)
-        val name = s.fields.at(i).0
+    for k in 0..<parts.len()
+        val name = s.fields.at(parts.at(k)).0
         val at = if measured then cx.an.tables.layout.field_offset(s, name).unwrap_or(0) else 0
 
-        items.push(part_literal(cx, span, fd, name, i, at, field_public(cx, s, name), members))
+        items.push(part_literal(cx, span, fd, name, k, at, field_public(cx, s, name), members))
 
     TExpr(span, TBufLit(items, list_ty))
 end fields_answer
@@ -412,6 +413,18 @@ private listed_parts(s: &StructType, members: bool) -> Buf[usize]
 
     out
 end listed_parts
+
+// **A part's `index` is its position in the list that names it**, not its slot in the struct's
+// storage: the first field of a struct that opens with an anonymous block is field 0. A descriptor
+// keeps the storage slot, which is what `v.(f)` selects, and its `index` is asked here.
+private listed_position(s: &StructType, members: bool, slot: usize) -> usize
+    val parts = listed_parts(s, members)
+
+    for k in 0..<parts.len()
+        if parts.at(k) == slot then return k
+
+    slot
+end listed_position
 
 // One `sysl.reflect.Field`, or with `member` one `sysl.reflect.Member`, as a literal. An anonymous
 // member's name is `""`, since no reader wrote one; an unnamed bitfield's is the `_` it was written as.
@@ -773,7 +786,10 @@ private descriptor_field_literal(cx: &Analyzer, span: Span, fd: &StructType, own
 
     val at = if mentions_abstract(owner) then 0 else cx.an.tables.layout.field_offset(s, name).unwrap_or(0)
 
-    part_literal(cx, span, fd, name, usize(f), at, field_public(cx, s, name), v == MembersWalk)
+    val members = v == MembersWalk
+
+    part_literal(cx, span, fd, name, listed_position(s, members, usize(f)), at, field_public(cx, s, name),
+                 members)
 end descriptor_field_literal
 
 // A type attribute asked of a descriptor's name: `c::Fields` lists a variant's payload, and the
@@ -894,13 +910,33 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
         _ -> bad_expr(span)
 
     var hit: Buf[TPattern] = buf()
-    var rest: Buf[TPattern] = buf()
     var arms: Buf[TArm] = buf()
 
     hit.push(TVariantPattern(underlying(owner), variant, pats))
-    rest.push(TWildPattern(rt))
     arms.push(TArm(hit, None, TBlock(buf(), Some(value), pt)))
-    arms.push(TArm(rest, None, TBlock(buf(), Some(library_result_call_of(cx, span, "trap", buf())), Never)))
+
+    // Every other variant is an arm of its own, so the failure names the variant the value holds.
+    val asked = descriptor_text(owner, v, -1)
+    val variants = underlying(owner) match
+        Enum(d) -> d.variants
+        _ -> return bad_expr(span)
+
+    for i in 0..<variants.len()
+        if int(i) == v then continue
+
+        val other = variants.at(i)
+        var wild: Buf[TPattern] = buf()
+        var at: Buf[TPattern] = buf()
+
+        for item in other.fields
+            wild.push(TWildPattern(item.1))
+
+        at.push(TVariantPattern(underlying(owner), other, wild))
+
+        val fail = TExpr(span, TVariantFail(asked, descriptor_text(owner, int(i), -1)))
+
+        arms.push(TArm(at, None, TBlock(buf(), Some(fail), Never)))
+
     TExpr(span, TMatch(tr, arms, pt))
 end payload_of
 
