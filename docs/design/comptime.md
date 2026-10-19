@@ -208,3 +208,50 @@ Step 2 lands in five parts, each with its tests:
 3. **2c**: closures and trait objects.
 4. **2d**: atomics.
 5. **2e**: freezing answers into constant data.
+
+## 8. Step 3's design (2026-10-18)
+
+**Probed first.** On step 2's compiler, a call already sized a module `val`'s type, since that is read
+after the bodies are ready. Everything read during the declaration pass refused a call: a field's
+length, a parameter's type, an alias, a module `@assert`. A value argument written as a call or a
+`const` name was read as a type (G5), and its refusal cascaded into *undefined name 'N'*.
+
+**Why not lazy hoisting.** A method is not a member of its type until `hoist_all_members`, the last
+step of `read_decls`. That step comes after eager instantiation, and the order in which types become
+real is observable in what is laid out. Hoisting a type's members on demand would reorder that.
+
+**What was built** (`const_decl.sysl`):
+
+1. **In place first.** Before `ev.ready`, a call is run against the tables as they stand, with the
+   evaluator's caches swapped for fresh ones and every complaint taken back. Arithmetic and calls to
+   plain functions succeed here.
+2. **Otherwise it waits.** A call that cannot run in place is recorded as pending. Its value stands as
+   unknown, counted as a refused fold so nothing else is said about it. While anything waits, no
+   further call in that reading runs in place, because it could read a stand-in.
+3. **Read again.** `read_until_settled`, called from `analyze_produced`, sets `ready` once the reading
+   is complete and runs each pending call on the finished tables, watched. `lookup_type_key` and
+   `trial_body` record every declaration the run reaches, closed over the types each one's written
+   fields name. Then:
+   - a call that reached its own declaration (found by span) is a cycle, refused naming both;
+   - one that reached another pending declaration waits for the next reading;
+   - otherwise its value, or its refusal, is kept in `ev.answers`.
+
+   The declarations are then read again from nothing, at most 16 times. When no call can progress,
+   the declarations wait on each other, and each is refused naming the other.
+4. **The answer stands afterwards.** Once the declarations are read, `const_call` consults
+   `ev.answers` first, so a type read again while the bodies are comes to the same thing.
+5. **Value arguments.** `parse_type_arg` reads a name-led argument as a type only when a `,` or `]`
+   follows, and as an expression otherwise. `written_arg_for` reads every argument for a value
+   parameter as a value at the declared type, with integers at `usize`. `type_arg_read` sends calls,
+   arithmetic, comparisons and literals to a checked fold. An argument refused as `Unknown`
+   instantiates nothing, which ends the `N` cascade.
+
+**Findings fixed along the way:**
+- `f[n]()` with a run-time `n` used to instantiate at 0 silently. It is now refused.
+- A value argument's refusal used to bury its reason ("must be a constant"). It now says what
+  stopped the call.
+- The `@assert` refusal no longer says "never a call".
+
+**Cost.** A program with no waiting call reads its declarations once, as before. One with waiting
+calls reads them once more per link of the chain. The declarations of a small program take about
+50 ms.

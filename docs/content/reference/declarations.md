@@ -2135,6 +2135,103 @@ print(g(5))
 'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
+### Calls where a type is read
+
+**A call may stand wherever a type needs a value**: an array length in a field, a parameter or an
+alias, a value argument, and an `@assert` beside the declarations. It is run while the declarations
+are read. A body of arithmetic and plain calls runs where it stands. One that calls a type's members
+— `push` on a `Buf`, a method of the program's own — waits until every declaration has been read,
+and the declarations are then read again with its value in hand:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+sq(n: int) -> int = n * n
+
+primes_below(n: int) -> int
+    var out = buf[int]()
+
+    for i in 2..<n
+        var p = true
+        for d in 2..<i
+            if i % d == 0 then p = false
+        if p then out.push(i)
+
+    int(out.len())
+
+struct Table
+    primes: [primes_below(30)]int
+    cells: [sq(2)]u8
+
+type Quad = [sq(2)]u8
+
+@assert(primes_below(10) == 4, "four primes below ten")
+
+val t = Table([0; 10], [0; 4])
+val q: Quad = [1, 2, 3, 4]
+
+print(t.primes.len, t.cells.len, q.len)
+```
+
+```output
+10 4 4
+```
+
+**A value argument is an expression too**, in a call or in a type — a call, arithmetic over a
+`const`, a comparison for a `bool` parameter:
+
+```sysl
+cap(n: int) -> int = n * 2
+
+const L: int = 3
+
+struct Ring[T, const N: int]
+    items: [N]T
+
+f[const N: int]() -> int = N + 1
+
+val a: Ring[int, cap(4)] = Ring([0; 8])
+val b = Ring[int, L + 1]([0; 4])
+
+print(f[cap(3)](), a.items.len, b.items.len)
+```
+
+```output
+7 8 4
+```
+
+**A declaration whose value needs that declaration itself is refused, naming both** — reading it
+waits for the value, and the value is worked out by reading it:
+
+```sysl
+struct S
+    items: [f()]int
+
+f() -> int = int(sizeof(S))
+
+print(f())
+```
+
+```error
+'S' cannot be read while compiling: it needs the value of a call to 'f', and running 'f' reads 'S' itself — a declaration cannot wait on a value worked out from it
+```
+
+Two declarations that each wait on the other are refused the same way, each naming the other. A
+value argument that is not a constant is refused where it is written, and the generic is not read
+with it:
+
+```sysl
+f[const N: int]() -> int = N + 1
+
+var n = 3
+
+print(f[n]())
+```
+
+```error
+a value argument must be a constant — a literal, or a 'const' naming one
+```
+
 ## Structs
 
 A named product type. Fields are declared one per line; methods, properties and an `invariant` may

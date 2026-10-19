@@ -415,10 +415,7 @@ end written_call
 private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string,
                           targ_exprs: Buf[Expr], args: Buf[Expr], expected: Option[Type]) -> TExpr
     val key = renamed_generic(cx, lookup_type_key(cx.an, cx.scope, name).unwrap())
-    var targs: Buf[Type] = buf()
-
-    for targ_expr in targ_exprs
-        targs.push(written_type_arg(cx, targ_expr))
+    val targs = written_type_args_for(cx, key, targ_exprs)
 
     cx.an.tables.types.get(key).unwrap().kind match
         StructOf(_) -> struct_call(cx, span, key, name, args, expected, targs)
@@ -510,14 +507,10 @@ private applied_associated_call(cx: &Analyzer, span: Span, head: (string, string
 
     if variant then return None
 
-    var targs: Buf[Type] = buf()
+    val targs = written_type_args_for(cx, head.0, targ_exprs)
 
-    for targ_expr in targ_exprs
-        val t = written_type_arg(cx, targ_expr)
-
+    for t in targs
         if t == Unknown then return Some(bad_expr(span))
-
-        targs.push(t)
 
     val ty = reinstantiate_at(cx.an, cx.scope, span, head.0, targs)
 
@@ -546,14 +539,10 @@ type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_e
                       s"from it; write the type on what receives the result — 'var x: ${head.1}[…] " +
                       s"= …' — and select '$sel' from the plain name")
 
-    var targs: Buf[Type] = buf()
+    val targs = written_type_args_for(cx, head.0, targ_exprs)
 
-    for targ_expr in targ_exprs
-        val t = written_type_arg(cx, targ_expr)
-
+    for t in targs
         if t == Unknown then return bad_expr(span)
-
-        targs.push(t)
 
     reinstantiate_at(cx.an, cx.scope, span, head.0, targs) match
         Enum(d) ->
@@ -2477,15 +2466,11 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
             if ed.tparams.len() != targ_exprs.len() then return VsNone
             if variant_decl_named(ed, member).is_none() then return VsNone
 
-            var targs: Buf[Type] = buf()
+            val targs = written_type_args_for(cx, key.unwrap(), targ_exprs)
 
-            for targ_expr in targ_exprs
-                val t = written_type_arg(cx, targ_expr)
-
-                // A type argument that names nothing has said so already.
+            // A type argument that names nothing has said so already.
+            for t in targs
                 if mentions_unknown(t) then return VsSaid
-
-                targs.push(t)
 
             reinstantiate_at(cx.an, cx.scope, anchor_of(receiver), key.unwrap(), targs) match
                 Enum(d) -> d.variant(member) match

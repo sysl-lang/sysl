@@ -1,0 +1,326 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// A call run while the declarations are read: `[cap(4)]int` in a field, a value argument
+// `Ring[int, cap(8)]` in a signature, `@assert(sq(3) == 9)` beside them.
+//
+// **A body cannot always be typed in the middle of the declarations**: a method is not a member of
+// its type until the members are hoisted, which is the last thing the pass does. So such a call is
+// first run where it stands, which is enough for a body of arithmetic and calls to plain functions.
+// One that cannot be run there **waits**: its value stands as unknown for the rest of the reading,
+// and once every declaration has been read it is run against the finished tables. The declarations
+// are then read again from the start with that answer in hand, which the second reading finds where
+// the call is written. A chain -- a length whose function reads a type whose own length waits too --
+// takes one reading per link.
+//
+// **A run is watched for the declarations it reaches**, through every name it resolves and every body
+// it types, and through the types those declarations name in turn. An answer that reached a
+// declaration whose own value was still waiting may have read it at the stand-in, so it is not kept:
+// it is asked again in the next reading, when that value is in. **One that reached the very
+// declaration its call is written in is a cycle** -- that declaration cannot be read without the value,
+// and the value cannot be had without reading it -- and it is refused naming both.
+
+// A call a declaration is read in terms of: where it was written, the terms it was written in, and the
+// declaration it stands in.
+struct DeclSite
+    key: string
+    scope: Scope
+    subst: Buf[Binding]
+    call: Expr
+    owner: string
+end DeclSite
+
+// What the readings of one compilation settled about those calls, by where each was written: a value,
+// or what to say at the call.
+struct DeclAnswers
+    values: Map[string, Option[Const]]
+    refused: Map[string, string]
+end DeclAnswers
+
+decl_answers() -> &DeclAnswers = DeclAnswers(map(), map())
+
+// How many times the declarations are read at most: one per link of a chain of waiting calls.
+private const DeclReadings: usize = 16
+
+// The value a declaration needs of a call, before every declaration has been read: a settled answer,
+// the call run where it stands, or `None` while it waits -- counted as a refused fold, so the length
+// or argument it stands in says nothing of its own.
+declared_value(cx: &Analyzer, e: Expr) -> Option[Const]
+    val ev = cx.an.evaluation
+    val key = call_site_key(cx, e.span)
+    val answer = ev.answers.values.get(key)
+
+    if answer.is_some() then return answer.unwrap()
+
+    val refused = ev.answers.refused.get(key)
+
+    // A refusal with nothing of its own to say leaves the saying to the position the call stands in.
+    if refused.is_some()
+        if refused.unwrap() == "" then return None
+
+        cx.fault(e.span, refused.unwrap())
+        cx.an.const_refusals += 1
+        return None
+    end if
+
+    val known = ev.done.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    // **Run where it stands only while nothing in this reading waits**: a waiting call's value stands
+    // as unknown, and a run that read it would answer in terms of the stand-in.
+    if ev.pending.is_empty()
+        val here = run_aside(cx.an, cx.scope, cx.subst, e, false)
+
+        if here.0.is_some()
+            ev.done.put(key, here.0)
+            return here.0
+        end if
+    end if
+
+    // A reading that is not read again -- only the declarations asked for -- has nothing to wait for.
+    if !ev.declaring then return None
+
+    var waiting = false
+
+    for item in ev.pending
+        if item.key == key then waiting = true
+
+    if !waiting then
+        ev.pending.push(DeclSite(key, cx.scope, cx.subst, e, owner_of(ev.units, cx.scope, e.span)))
+
+    cx.an.const_refusals += 1
+    None
+end declared_value
+
+// What the reading of the declarations settled about a call, asked again once they are read: its
+// value, `Some(None)` where it was refused -- said again here, which a place already told does not
+// repeat -- and `None` where the reading never needed it.
+settled_value(cx: &Analyzer, key: string, at: Span) -> Option[Option[Const]]
+    val answers = cx.an.evaluation.answers
+    val answer = answers.values.get(key)
+
+    if answer.is_some() then return answer
+
+    val refused = answers.refused.get(key)
+
+    if refused.is_none() then return None
+    if refused.unwrap() == "" then return Some(None)
+
+    cx.fault(at, refused.unwrap())
+    cx.an.const_refusals += 1
+    Some(None)
+end settled_value
+
+// One call run against the tables as they stand, with the evaluator's memory set aside so nothing a
+// run made there outlives it, and everything it said taken back: what it came to, what it said where
+// it did not come to a value, and -- `watched` -- the declarations it reached.
+private run_aside(a: &Analysis, scope: Scope, subst: Buf[Binding], e: Expr,
+                  watched: bool) -> (Option[Const], string, Buf[string])
+    val kept = a.evaluation
+    val fresh = const_evaluation()
+
+    fresh.ready = true
+    fresh.answers = kept.answers
+    fresh.units = kept.units
+    fresh.watching = watched
+    a.evaluation = fresh
+
+    val cx = analyzer_for(a, scope)
+
+    cx.subst = subst
+
+    val mark = a.complaints()
+    val refusals = a.const_refusals
+    val out = const_call(cx, e)
+    var why = ""
+
+    if out.is_none() && a.found.len() > mark then why = a.found.at(mark).diag.message
+
+    a.restore_complaints(mark)
+    a.const_refusals = refusals
+    a.evaluation = kept
+    (out, why, fresh.touched)
+end run_aside
+
+// The declaration a call is written in, as the key a lookup answers with: the one whose text holds it.
+private owner_of(units: Buf[Program], scope: Scope, at: Span) -> string
+    for unit in units
+        if unit.src.name != scope.src.name then continue
+
+        for s in unit.body
+            if at.start >= s.span.start && at.start < s.span.end
+                val name = declared_by(s)
+
+                return if name == "" then "" else module_qualify(scope.module_name, name)
+            end if
+
+    ""
+end owner_of
+
+private declared_by(s: Stmt) -> string = *s.kind match
+    StructDecl(d) -> d.name
+    EnumDecl(d) -> d.name
+    TypeDecl(d) -> d.name
+    TraitDecl(d) -> d.name
+    FuncDecl(d) -> d.name
+    ConstDecl(name, _, _, _) -> name
+    StaticDecl(inner) -> declared_by(inner)
+    _ -> ""
+
+// The declarations a run reached, and every one their own written types name, as readable names.
+private reached_decls(a: &Analysis, touched: Buf[string]) -> Buf[string]
+    var keys: Buf[string] = buf()
+    var out: Buf[string] = buf()
+
+    for item in touched
+        if !holds_string(keys, item) then keys.push(item)
+
+    var i: usize = 0
+
+    while i < keys.len()
+        val key = keys.at(i)
+
+        i += 1
+        out.push(qualified_name(key))
+
+        val decl = a.tables.types.get(key)
+
+        if decl.is_none() then continue
+
+        var named: Buf[(string, Span)] = buf()
+
+        decl.unwrap().kind match
+            StructOf(d) ->
+                for f in d.fields
+                    names_in(&named, f.typ, d.tparams)
+            EnumOf(d) ->
+                for v in d.variants
+                    for f in v.fields
+                        names_in(&named, f.typ, d.tparams)
+            TypeOf(d) -> names_in(&named, d.base, d.tp.names)
+            _ -> ()
+
+        for n in named
+            val found = type_key_of_quietly(a, decl.unwrap().scope, n.0)
+
+            if found.is_some() && !holds_string(keys, found.unwrap()) then keys.push(found.unwrap())
+
+    out
+end reached_decls
+
+// Which declaration a written name reaches, asked without recording that it was asked.
+private type_key_of_quietly(a: &Analysis, scope: Scope, name: string) -> Option[string]
+    val watching = a.evaluation.watching
+
+    a.evaluation.watching = false
+
+    val found = lookup_type_key(a, scope, name)
+
+    a.evaluation.watching = watching
+    found
+end type_key_of_quietly
+
+// Every call the reading just finished left waiting, run against its finished tables: an answer that
+// read nothing still waiting is kept for the next reading, a run that reached its own declaration is
+// refused as the cycle it is, and one that stopped is refused for what stopped it. `false` where no
+// call could be settled -- each waits on another, round a loop -- and every one of them was refused.
+private settle_waiting(a: &Analysis) -> bool
+    val ev = a.evaluation
+    val answers = ev.answers
+    var owners: Buf[string] = buf()
+
+    for p in ev.pending
+        if p.owner != "" then owners.push(qualified_name(p.owner))
+
+    ev.ready = true
+
+    var progress = false
+    var stuck: Buf[(DeclSite, string)] = buf()
+
+    for p in ev.pending
+        val run = run_aside(a, p.scope, p.subst, p.call, true)
+        val reached = reached_decls(a, run.2)
+        val own = if p.owner == "" then "" else qualified_name(p.owner)
+
+        if own != "" && holds_string(reached, own)
+            answers.refused.put(p.key, cycle_text(p, own))
+            progress = true
+            continue
+        end if
+
+        var waits = ""
+
+        for o in owners
+            if waits == "" && o != own && holds_string(reached, o) then waits = o
+
+        if waits != ""
+            stuck.push((p, waits))
+            continue
+        end if
+
+        if run.0.is_some()
+            answers.values.put(p.key, run.0)
+        else
+            // A run that stopped without a reason of its own -- it read storage filled while the
+            // program runs, or its body did not read cleanly, which the body's own reading reports --
+            // is refused by the position it stands in, in that position's words.
+            answers.refused.put(p.key, run.1)
+        end if
+
+        progress = true
+
+    if progress then return true
+
+    for item in stuck
+        val p = item.0
+        val own = if p.owner == "" then "this declaration" else s"'${qualified_name(p.owner)}'"
+
+        answers.refused.put(p.key, s"$own cannot be read while compiling: it needs the value of a call to " +
+                            s"${called_text(p)}, which reads '${item.1}', and '${item.1}' waits on a value " +
+                            "of its own that needs this one — the declarations wait on each other")
+
+    false
+end settle_waiting
+
+private called_text(p: DeclSite) -> string = *p.call.kind match
+    Call(c, _) -> callee_word(c).map(w -> s"'$w'").unwrap_or("the call")
+    _ -> "the call"
+
+private cycle_text(p: DeclSite, owner: string) -> string =
+    s"'$owner' cannot be read while compiling: it needs the value of a call to ${called_text(p)}, and " +
+    s"running ${called_text(p)} reads '$owner' itself — a declaration cannot wait on a value worked out " +
+    "from it"
+
+// The declarations of a compilation that goes on to its bodies, read as many times as the calls they
+// are written in terms of need: once where none waits, and once more for each link of a chain that
+// does. Answers with the analysis whose reading needed nothing further, and the files as it read them.
+read_until_settled(make: () -> &Analysis, written: Buf[Program], has_entry_point: bool) -> (&Analysis, Buf[Program])
+    val answers = decl_answers()
+    var a = make()
+    var units: Buf[Program] = buf()
+
+    for round in 0..<DeclReadings
+        if round > 0 then a = make()
+
+        a.evaluation.answers = answers
+        a.evaluation.declaring = true
+        a.evaluation.units = written
+
+        units = read_decls(a, written, has_entry_point)
+
+        if a.evaluation.pending.is_empty() || c_probe_refused() then return (a, units)
+
+        settle_waiting(a)
+
+    // A chain longer than the readings allowed: what still waits is told so where it is written.
+    for p in a.evaluation.pending
+        a.fault(p.scope, p.call.span, s"this value cannot be computed while declarations are read: " +
+                s"${called_text(p)} waits on a chain of more than $DeclReadings declarations, each " +
+                "needing a value computed from the next")
+
+    (a, units)
+end read_until_settled

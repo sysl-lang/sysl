@@ -1222,8 +1222,23 @@ print(capacity)
 
 The condition is a [constant expression](/reference/modules/), folded by the machinery
 a `const` initializer already goes through — so it may name constants, `sizeof`, `alignof`,
-`offsetof`, and the arithmetic and comparisons over them, including a constant declared *below* it. A true one emits
-nothing at all. A false one stops the compilation, quoting the message:
+`offsetof`, and the arithmetic and comparisons over them, including a constant declared *below* it,
+and call any function whose body can run while compiling
+([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)):
+
+```sysl
+sq(n: int) -> int = n * n
+
+@assert(sq(3) == 9, "the square of three")
+
+print(sq(3))
+```
+
+```output
+9
+```
+
+A true one emits nothing at all. A false one stops the compilation, quoting the message:
 
 ```sysl
 @assert(1 == 2, "arithmetic broke")
@@ -1249,8 +1264,8 @@ comparison has nothing to add, since the thing that came out `false` is its only
 **It is not `require`.** A `require` is a runtime precondition: it is compiled, it branches, and it
 traps when the program reaches it. This is settled while compiling and reaches the binary as nothing.
 A condition it cannot settle is refused rather than deferred — and a call that reaches run-time
-storage, a `var` for one, is the line, since only a function holding what exists while compiling can run
-then:
+storage, a `var` for one, is the line, since only a function holding what exists while compiling can
+run then:
 
 ```sysl
 var seed: int = 3

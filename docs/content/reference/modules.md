@@ -2003,9 +2003,14 @@ a string a step per byte, so the same step limit bounds how large a table or a s
 call cannot be run — it reaches an `extern`, storage filled at run time, or more steps than the bound
 — the initializer stays code, filled before the program's statements; a freestanding artifact, which
 has nothing to fill it, refuses the storage and says what stopped the call: *"'T' did not finish
-within 16,000,000 steps while compiling — the loop at main.sysl:5:5 was still running"*. A `const` call where a **type** is read — an array bound, a `within` —
-is not evaluated yet either, and is refused with *"'four' is a 'const' function, but this value is
-read while declarations are, before any body can be run"*.
+within 16,000,000 steps while compiling — the loop at main.sysl:5:5 was still running"*.
+
+**A call where a type is read is run while the declarations are**: an array bound in a field, a
+parameter or an alias, a value argument, an `@assert` beside the declarations. A body of arithmetic
+runs where it stands; one that calls a type's members waits until every declaration is read, and the
+declarations are then read again with its value in hand
+([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)).
+A declaration whose value needs that declaration itself is refused naming both.
 
 **"A `const`" above means the declaration, not a spelling of it.** A constant reached by its full path
 is the same constant as one reached by an import, and the two fold alike in every position below —

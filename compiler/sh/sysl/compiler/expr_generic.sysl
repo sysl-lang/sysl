@@ -67,6 +67,9 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         for i in 0..<authored.len()
             known.push(Binding(authored.at(i), written_arg_for(cx, f, authored.at(i), targ_exprs.at(i))))
 
+        for b in known
+            if b.ty == Unknown then return bad_expr(span)
+
         return generic_call_with(cx, span, written, key, f, args, expected, true, known)
     end if
 
@@ -74,6 +77,11 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
 
     for i in 0..<targ_exprs.len()
         targs.push(written_arg_for(cx, f, authored.at(i), targ_exprs.at(i)))
+
+    // **An argument already refused instantiates nothing**: the body read with that parameter bound
+    // to nothing would report every use of it as a name nobody declared.
+    for t in targs
+        if t == Unknown then return bad_expr(span)
 
     // **A BOUND IS RESOLVED WHERE IT WAS WRITTEN, WHICH IS THE DECLARATION'S SCOPE AND NOT THE
     // CALLER'S.** `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that
@@ -135,13 +143,59 @@ private written_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type
     if declared.is_some()
         val ty = nameless(resolve_type(cx.an, f.scope, declared.unwrap(), no_bindings()))
 
-        ty match
-            Enum(_) -> return enum_value_arg(cx.an, cx.scope, anchor_of(e), e, ty, cx.subst)
-            _ -> ()
+        // **Anything else written for a value parameter is a value**: a `const` it names, or an
+        // expression run while compiling, `f[sq(3)]()` -- never a type, whatever its spelling.
+        return value_written(cx, e, ty)
     end if
 
     written_type_arg(cx, e)
 end written_arg_for
+
+// One argument written for a value parameter of type `ty`: a value whatever its spelling. A number
+// travels at the width a length does, as one written as a literal does.
+private value_written(cx: &Analyzer, e: Expr, ty: Type) -> Type
+    val got = enum_value_arg(cx.an, cx.scope, anchor_of(e), e, ty, cx.subst)
+
+    ty match
+        Integer(_, _, _) -> got match
+            ConstArg(v, _, stood) -> ConstArg(v, usize_type(word_bits(cx)), stood)
+            other -> other
+        _ -> got
+end value_written
+
+// The arguments written for a generic **type**, `Ring[int, cap(8)](…)`, each read against the
+// parameter it fills: a value where the declaration wrote `const`, a type everywhere else.
+written_type_args_for(cx: &Analyzer, key: string, targ_exprs: Buf[Expr]) -> Buf[Type]
+    val decl = cx.an.tables.types.get(key)
+    var params: Buf[string] = buf()
+    var values: Buf[TypeBinding] = buf()
+
+    if decl.is_some()
+        decl.unwrap().kind match
+            StructOf(d) ->
+                params = d.tparams
+                values = d.tvalues
+            EnumOf(d) ->
+                params = d.tparams
+                values = d.tvalues
+            _ -> ()
+    end if
+
+    var out: Buf[Type] = buf()
+
+    for i in 0..<targ_exprs.len()
+        val declared = if i < params.len() then binding_named(values, params.at(i)) else None
+
+        if declared.is_some()
+            val ty = nameless(resolve_type(cx.an, decl.unwrap().scope, declared.unwrap(), no_bindings()))
+
+            out.push(value_written(cx, targ_exprs.at(i), ty))
+        else
+            out.push(written_type_arg(cx, targ_exprs.at(i)))
+        end if
+
+    out
+end written_type_args_for
 
 // The same at an address, `&f[T]`, whose refusal advises writing the type on the binding instead,
 // there being no call to infer anything from.

@@ -1382,6 +1382,27 @@ print(buf.data.len, on.v)
 
 `Buf[2]` and `Buf[4]` are two types with two layouts, and neither stands where the other is wanted.
 
+**An argument may be any constant expression** — a `const`, arithmetic over one, or a call run while
+compiling — in a type and in a call alike
+([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)):
+
+```sysl
+struct Ring[const N: usize]
+    data: [N]byte
+
+double(n: usize) -> usize = n * 2
+
+const Base: usize = 2
+
+var r: Ring[double(Base) + 1] = Ring([0; 5])
+
+print(r.data.len)
+```
+
+```output
+5
+```
+
 A **member** reads the parameter as an ordinary value of its declared type, and the two lengths are
 two bodies rather than one compiled at whichever came first:
 

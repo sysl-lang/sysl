@@ -1194,6 +1194,7 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     end if
 
     val e = written.unwrap()
+    val refusals = a.const_refusals
     val folded = const_arg_value(a, scope, e, subst)
 
     if folded.is_some()
@@ -1247,6 +1248,16 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
                 return None
             end if
         _ -> ()
+
+    // **A fold that refused has its own reason** -- a call that prints, a trap -- so it is made once
+    // more keeping what it says, the one above having put its complaints back.
+    if const_refused_since(a, refusals)
+        val inner = analyzer_for(a, scope)
+
+        inner.subst = subst
+        const_fold(inner, e)
+        return None
+    end if
 
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
@@ -1487,6 +1498,9 @@ lookup_type_key(a: &Analysis, scope: Scope, name: string) -> Option[string]
     // of its code and costs the writer nothing unless a value of it can die there and its destructor
     // is gated (`check_gated_modules`).
     if found.is_some() then depends_on_named(a, scope, found.unwrap(), span_zero())
+
+    // A run watched for what it reads (`const_decl.sysl`) is told every declaration a name reached.
+    if found.is_some() && a.evaluation.watching then a.evaluation.touched.push(found.unwrap())
 
     found
 end lookup_type_key
