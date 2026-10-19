@@ -607,7 +607,8 @@ private struct EvFrame
     call: Span
     caller: Scope
     home: Scope
-    locals: Map[string, Const]
+    // Each local's cell: a buffer of one value, so a pointer to the local is a pointer into it.
+    locals: Map[string, Buf[Const]]
     olds: Buf[Const]
     result: Option[Const]
     slots: Map[string, Const]
@@ -784,6 +785,11 @@ private unheld(t: Type) -> Option[string] = t match
     // in (`ConstLink`): held and handed on, never read through.
     Ptr(_) -> None
     CFn(_, _) -> None
+    // A reference to storage the evaluation owns (`ConstPtr`). A reference to a trait object is
+    // the table's to answer, which is when the program runs.
+    Ref(inner, _) -> *inner match
+        Trait(_, _, _) -> unheld_other(t)
+        _ -> None
     _ -> unheld_other(t)
 
 private unheld_other(t: Type) -> Option[string] =
@@ -818,6 +824,7 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstLink(image) -> *image.kind match
         TNullLit(_) -> "null"
         _ -> s"&${link_key(image)}"
+    ConstPtr(xs, at, _) -> s"&${value_text(xs.at(at), pointee(t).unwrap_or(Unknown))}"
 
 // The elements a slice sees, as a buffer of their own.
 private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
@@ -905,6 +912,7 @@ private copied_all(xs: Buf[Const]) -> Buf[Const]
 // through, so that it is never remembered either.
 private holds_view(v: Const) -> bool = v match
     ConstView(_, _, _, _) -> true
+    ConstPtr(_, _, _) -> true
     ConstWriter(_) -> true
     ConstArray(xs) -> any_view(xs)
     ConstRecord(_, fields) -> any_view(fields)
@@ -920,6 +928,7 @@ private any_view(xs: Buf[Const]) -> bool
 // outlive the storage it views, once that call returns.
 private dangles(v: Const, depth: int) -> bool = v match
     ConstView(_, _, _, owner) -> owner >= depth
+    ConstPtr(_, _, owner) -> owner >= depth
     ConstArray(xs) -> any_dangles(xs, depth)
     ConstRecord(_, fields) -> any_dangles(fields, depth)
     _ -> false
@@ -1244,6 +1253,8 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
         TAddrOf(place, ty) -> address_of(r, e.span, place, ty)
+        TBox(value, _) -> boxed(r, e.span, value)
+        TTempAddr(value, _) -> temp_address(r, value)
         TFuncAddr(_, _, _) -> EvGave(ConstLink(e))
         TCallPtr(callee, args, _, _) -> call_through(r, e.span, callee, args)
         // `null` is the one address known before the linker runs, and is held the same way.
@@ -1274,16 +1285,33 @@ end call_through
 
 // **The address of module storage is a value while compiling**, as it is in constant data: the
 // linker fills it in (`ConstLink`). So is the address of a field of it, or of an element at an index
-// that comes to a number the array has. Any other address -- of a local, of thread-local or
-// per-core storage, through a view or a pointer -- exists only when the program runs.
+// that comes to a number the array has. The address of storage the evaluation owns -- a local, an
+// element or field of one, what a pointer or a slice reaches -- is the slot it names (`ConstPtr`).
+// Thread-local and per-core storage's exists only when the program runs.
 @noinline
-private address_of(r: &EvRun, at: Span, place: TExpr, ty: Type) -> Flow =
-    linked_place(r, place) match
-        Ok(Some(p)) -> EvGave(ConstLink(TExpr(at, TAddrOf(p, ty))))
-        Ok(None) -> refuse_form(r, at, "the address of anything but module storage is not evaluated while " +
-                                "compiling — a local's, or a thread's or a core's own storage's, exists " +
-                                "only when the program runs")
+private address_of(r: &EvRun, at: Span, place: TExpr, ty: Type) -> Flow
+    if rooted_in_module(place)
+        return linked_place(r, place) match
+            Ok(Some(p)) -> EvGave(ConstLink(TExpr(at, TAddrOf(p, ty))))
+            Ok(None) -> refuse_form(r, at, "the address of a thread's or a core's own storage is not evaluated " +
+                                    "while compiling — it exists only when the program runs")
+            Err(f) -> f
+    end if
+
+    slot_of(r, place) match
+        Ok(SlotElem(xs, i, owner)) -> EvGave(ConstPtr(xs, i, owner))
+        Ok(SlotLocal(name)) -> refuse_form(r, at, s"'$name' is read before anything was written to it")
+        Ok(SlotUnion(_, _, _, _, _)) ->
+            refuse_form(r, at, "the address of a union's field is not evaluated while compiling yet")
         Err(f) -> f
+end address_of
+
+// Whether a place is module storage or inside it, reached without a pointer.
+private rooted_in_module(place: TExpr) -> bool = *place.kind match
+    TGlobal(_, _, _) -> true
+    TField(receiver, _, _) -> rooted_in_module(receiver)
+    TIndex(receiver, _, _) -> rooted_in_module(receiver)
+    _ -> false
 
 // A place inside module storage, its indices run to the numbers they come to, or `None` where the
 // place is not one; an index the array does not have traps, as taking its address would.
@@ -1322,11 +1350,43 @@ private linked_place(r: &EvRun, place: TExpr) -> Result[Option[TExpr], Flow] = *
         Ok(Some(TExpr(place.span, TIndex(inside, folded, ty))))
     _ -> Ok(None)
 
-// `*p`, where `p` came to an address: what is there exists only when the program runs.
+// `*p`: the value in the slot the pointer names, where the evaluation owns it. Through an address the
+// linker fills in, what is there exists only when the program runs.
 @noinline
 private read_through(r: &EvRun, operand: TExpr) -> Flow = eval_value(r, operand) match
-    Ok(_) -> refuse_form(r, operand.span, link_reason())
+    Ok(ConstPtr(xs, at, _)) -> EvGave(xs.at(at))
+    Ok(v) -> through_unowned(r, operand.span, v)
     Err(f) -> f
+
+// A value put on the heap: a box of its own, which nothing frees while the evaluation runs.
+@noinline
+private boxed(r: &EvRun, at: Span, value: TExpr) -> Flow
+    val why = dropped_box(r.a, texpr_type(value))
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    eval_value(r, value) match
+        Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, -1))
+        Err(f) -> f
+end boxed
+
+// `&value` over a value with no place of its own: a slot made for it in the running call, as the
+// program makes one in its frame.
+@noinline
+private temp_address(r: &EvRun, value: TExpr) -> Flow = eval_value(r, value) match
+    Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, int(r.frames.len()) - 1))
+    Err(f) -> f
+
+// Why a box of this type is not made while compiling: **a type with a `Drop` runs it when its box's
+// last share goes**, and when that is, is decided by counts the evaluator does not keep.
+private dropped_box(a: &Analysis, t: Type) -> Option[string] = underlying(t) match
+    Struct(_) -> if holds_string(drops_declared(a), owner_key(underlying(t))) then Some(dropped_text(t)) else None
+    Enum(_) -> if holds_string(drops_declared(a), owner_key(underlying(t))) then Some(dropped_text(t)) else None
+    _ -> None
+
+private dropped_text(t: Type) -> string =
+    s"a box of a '${type_show(t)}', which has a 'Drop', is not made while compiling — its 'drop' runs when " +
+    "the last share of the box goes, and when that is, is decided by counts kept only when the program runs"
 
 private link_reason() -> string =
     "reading through an address is not evaluated while compiling — the linker fills an address in, " +
@@ -1516,7 +1576,9 @@ private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
         Ok(ConstStr(s)) -> return element_index(r, index, s.bytes.len) match
             Ok(i) -> EvGave(ConstInt(from_int(long(s.bytes[i]))))
             Err(f) -> f
-        Ok(ConstLink(_)) -> return refuse_form(r, receiver.span, link_reason())
+        // A pointer's subscript counts from the slot it points at.
+        Ok(ConstPtr(found, at, _)) -> (found, at, found.len() - at)
+        Ok(ConstLink(image)) -> return through_unowned(r, receiver.span, ConstLink(image))
         Ok(_) -> return refuse_form(r, receiver.span, s"an element of a '${type_show(texpr_type(receiver))}' " +
                                     "is not evaluated while compiling yet — a fixed array's, a slice's and a " +
                                     "string's are")
@@ -2344,9 +2406,9 @@ end fixed_bits
 
 @noinline
 private load(r: &EvRun, at: Span, name: string, ty: Type) -> Flow
-    val v = running(r).locals.get(name)
+    val cell = running(r).locals.get(name)
 
-    if v.is_some() then return EvGave(v.unwrap())
+    if cell.is_some() then return EvGave(cell.unwrap().at(0))
 
     if underlying(ty) == Unit then return EvNone
 
@@ -2577,6 +2639,8 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
                 else Err(s"'$op' on ${type_show(lt)}")
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstStr(a), ConstStr(b)) -> return str_operate(r, at, op, a, b)
+        (ConstPtr(_, _, _), _) -> same_address(op, x, y, lt)
+        (ConstLink(_), _) -> same_address(op, x, y, lt)
         _ -> Err(s"'$op' on ${type_show(lt)}")
 
     out match
@@ -2587,6 +2651,20 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
             if is_trap_text(why) then trap(r, at, why)
             else refuse_form(r, at, s"$why is not evaluated while compiling yet")
 end operate
+
+// Two addresses compared, which only `==` and `!=` do while compiling: the same slot of the same
+// storage, or the same storage the linker fills in. A slot the evaluation owns is never at an address
+// the linker fills in, nor at null; where two such addresses fall in memory is the linker's to say.
+private same_address(op: string, x: Const, y: Const, lt: Type) -> Result[Const, string]
+    if op != "==" && op != "!=" then return Err(s"'$op' on ${type_show(lt)}")
+
+    val same = (x, y) match
+        (ConstPtr(xs, i, _), ConstPtr(ys, j, _)) -> usize(&xs.elems[i]) == usize(&ys.elems[j])
+        (ConstLink(a), ConstLink(b)) -> link_key(a) == link_key(b)
+        _ -> false
+
+    Ok(ConstBool(if op == "==" then same else !same))
+end same_address
 
 // Whether what the arithmetic answered is a trap rather than an operator it does not have.
 private is_trap_text(why: string) -> bool =
@@ -2654,6 +2732,17 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
                 _ -> refuse_form(r, at, "an address converted to a number is not evaluated while compiling — " +
                                  "the linker fills an address in, so its value exists only when the " +
                                  "program runs")
+        // A slot stays the slot it is under a reference or pointer to the same type. Read as another
+        // type, or as a number, it is a layout in memory, which the evaluator does not hold values as.
+        ConstPtr(_, _, _) ->
+            return (pointee(texpr_type(operand)), pointee(ty)) match
+                (Some(from), Some(to)) ->
+                    if underlying(from) == underlying(to) then EvGave(v)
+                    else refuse_form(r, at, s"a '${type_show(texpr_type(operand))}' read as a " +
+                                     s"'${type_show(ty)}' is not evaluated while compiling — " +
+                                     "the evaluator holds values, not the bytes they are laid out in")
+                _ -> refuse_form(r, at, "an address converted to a number is not evaluated while compiling — " +
+                                 "where storage falls in memory is decided when the program runs")
         _ -> ()
 
     // A bare enum converts as the integer its variant's tag is, at the enum's underlying type.
@@ -2960,23 +3049,26 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
 
     r.frames.truncate(r.frames.len() - 1)
 
-    // A slice of the call's own storage would outlive it: the program's run keeps that storage alive
-    // on the heap, and a run while compiling has no heap to keep it on.
+    // A slice of the call's own storage would outlive it: the program's run moves that storage to
+    // the heap where the slice escapes, which the evaluation does not follow. A pointer to it would
+    // name storage that is gone, as it does when the program runs.
     val dangling = out match
         EvGave(v) -> dangles(v, depth)
         _ -> false
 
     if dangling then
-        return refuse_form(r, at, s"'${qualified_name(name)}' answers a slice of storage local to its call, " +
-                           "which ends when the call returns — a slice answered while compiling may view " +
-                           "only what its caller handed in, or module storage")
+        return refuse_form(r, at, s"'${qualified_name(name)}' answers a slice of, or a pointer to, storage " +
+                           "local to its call, which ends when the call returns — what is answered while " +
+                           "compiling may reach only what its caller handed in, the heap, or module storage")
 
     // A call handed a slice is not remembered: what it reads is wherever the slice points, which a
     // later call with an equal-looking slice need not find the same.
     if key == "" then return out
 
+    // Nor is one that answered storage -- a box, or a slice of fresh elements: each call makes its
+    // own, and two callers handed one would see each other's writes.
     out match
-        EvGave(v) -> r.a.evaluation.memo.put(key, Some(v))
+        EvGave(v) -> if !holds_view(v) then r.a.evaluation.memo.put(key, Some(v))
         EvNone -> r.a.evaluation.memo.put(key, None)
         _ -> ()
 
@@ -3016,7 +3108,7 @@ private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
     val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
 
     for i in 0..<f.params.len()
-        frame.locals.put(f.params.at(i).0, copied(vals.at(i)))
+        frame.locals.put(f.params.at(i).0, cell_of(copied(vals.at(i))))
 
     Ok(frame)
 end entered
@@ -3138,6 +3230,8 @@ private key_part(v: Const) -> string = v match
     ConstWriter(_) -> "w"
     // An address is the storage or function it names: two calls handed the same one answer alike.
     ConstLink(image) -> s"&${link_key(image)};"
+    // Never part of a key: a call handed a pointer reads, and may write, wherever it points.
+    ConstPtr(_, _, _) -> "p"
 
 // A float's own pattern, a NaN's included, so that two arguments differing in a bit are two runs.
 private float_pattern_exact(f: real) -> u64 = f.bits()
@@ -3305,13 +3399,14 @@ private variant_check(r: &EvRun, slot: string, e: TExpr) -> Flow
     EvNone
 end variant_check
 
-// Where a write lands: a local, or one element of an array or field of a struct a local holds, at any
-// depth -- an element and a field are both a position in a buffer of values. A union's field is a
-// slot of its own: a write into it changes which field the union was last written through, which is
-// part of the union's value and so lands in the slot that holds the union.
+// Where a write lands: a position in a buffer of values -- a local's cell, an element of an array or
+// a slice, a field of a struct, a box's value -- at any depth, with the depth of the call whose
+// storage it is (-1 for the heap); or a local not written yet. A union's field is a slot of its own:
+// a write into it changes which field the union was last written through, which is part of the
+// union's value and so lands in the slot that holds the union.
 private enum EvSlot
     SlotLocal(name: string)
-    SlotElem(elems: Buf[Const], at: usize)
+    SlotElem(elems: Buf[Const], at: usize, owner: int)
     SlotUnion(holder: &EvSlot, fields: Buf[Const], written: int, at: usize, ty: Type)
 end EvSlot
 
@@ -3321,20 +3416,36 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
     if r.frames.is_empty() then return Err(no_place(r, place))
 
     *place.kind match
-        TLoad(name, _) -> Ok(SlotLocal(name))
+        TLoad(name, _) ->
+            val cell = running(r).locals.get(name)
+
+            if cell.is_some() then Ok(SlotElem(cell.unwrap(), 0, int(r.frames.len()) - 1))
+            else Ok(SlotLocal(name))
         TIndex(receiver, index, _) ->
-            val held = slot_of(r, receiver) match
-                Ok(s) -> slot_value(r, receiver.span, s)
+            // An index through a pointer counts from the slot it points at, in the buffer that slot
+            // is in: `p[i]` is the element `i` past `*p`.
+            nameless(texpr_type(receiver)) match
+                Ptr(_) ->
+                    return eval_value(r, receiver) match
+                        Ok(ConstPtr(xs, at, owner)) ->
+                            element_index(r, index, xs.len() - at).map(i -> SlotElem(xs, at + i, owner))
+                        Ok(v) -> Err(through_unowned(r, receiver.span, v))
+                        Err(f) -> Err(f)
+                _ -> ()
+
+            val outer = slot_of(r, receiver) match
+                Ok(s) -> s
                 Err(f) -> return Err(f)
 
-            // A slice's element is a place in the array it views.
-            val (xs, lo, n) = held match
-                Ok(ConstArray(found)) -> (found, usize(0), found.len())
-                Ok(ConstView(found, from, count, _)) -> (found, from, count)
+            // A slice's element is a place in the array it views, and the slice's owner is the
+            // element's.
+            val (xs, lo, n, owner) = slot_value(r, receiver.span, outer) match
+                Ok(ConstArray(found)) -> (found, usize(0), found.len(), slot_owner(outer))
+                Ok(ConstView(found, from, count, whose)) -> (found, from, count, whose)
                 Ok(_) -> return Err(no_place(r, place))
                 Err(f) -> return Err(f)
 
-            element_index(r, index, n).map(i -> SlotElem(xs, lo + i))
+            element_index(r, index, n).map(i -> SlotElem(xs, lo + i, owner))
         // A field is a slot in the struct's own fields, so a write into it lands where it is held.
         TField(receiver, index, _) ->
             val outer = slot_of(r, receiver) match
@@ -3342,22 +3453,37 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
                 Err(f) -> return Err(f)
 
             slot_value(r, receiver.span, outer) match
-                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index)))
+                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index), slot_owner(outer)))
                 Ok(ConstRecord(v, fields)) if v <= -2 ->
                     Ok(SlotUnion(outer, fields, union_written(v), usize(index), texpr_type(receiver)))
                 Ok(_) -> Err(no_place(r, place))
                 Err(f) -> Err(f)
+        // What a pointer points at is the slot it names.
+        TDeref(operand, _) -> eval_value(r, operand) match
+            Ok(ConstPtr(xs, at, owner)) -> Ok(SlotElem(xs, at, owner))
+            Ok(v) -> Err(through_unowned(r, operand.span, v))
+            Err(f) -> Err(f)
         _ -> Err(no_place(r, place))
 end slot_of
 
+// Whose storage a slot is: the depth of the call that holds it, or -1 for the heap.
+private slot_owner(s: EvSlot) -> int = s match
+    SlotElem(_, _, owner) -> owner
+    SlotUnion(holder, _, _, _, _) -> slot_owner(*holder)
+    SlotLocal(_) -> -1
+
+// A read or write through a pointer the evaluation does not own: null is a trap, as it is where the
+// program runs; an address the linker fills in names storage that exists only then.
+private through_unowned(r: &EvRun, at: Span, v: Const) -> Flow = v match
+    ConstLink(image) -> *image.kind match
+        TNullLit(_) -> trap(r, at, "a read or write through a null pointer")
+        _ -> refuse_form(r, at, link_reason())
+    _ -> refuse_form(r, at, link_reason())
+
 // What a slot holds now.
 private slot_value(r: &EvRun, at: Span, s: EvSlot) -> Result[Const, Flow] = s match
-    SlotLocal(name) ->
-        val v = running(r).locals.get(name)
-
-        if v.is_some() then Ok(v.unwrap())
-        else Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
-    SlotElem(xs, i) -> Ok(xs.at(i))
+    SlotLocal(name) -> Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
+    SlotElem(xs, i, _) -> Ok(xs.at(i))
     SlotUnion(_, xs, written, i, ty) ->
         if written == int(i) then Ok(xs.at(i))
         else Err(refuse_form(r, at, union_cross_read(ty, written, int(i))))
@@ -3366,10 +3492,7 @@ private slot_value(r: &EvRun, at: Span, s: EvSlot) -> Result[Const, Flow] = s ma
 // built with that field.
 private slot_write(r: &EvRun, s: EvSlot, v: Const) = s match
     SlotLocal(name) -> assign(r, name, v)
-    SlotElem(xs, i) ->
-        var held = xs
-
-        held.set(i, copied(v))
+    SlotElem(xs, i, _) -> written_over(xs, i, v)
     SlotUnion(holder, xs, _, i, _) ->
         var held = xs
 
@@ -3378,12 +3501,29 @@ private slot_write(r: &EvRun, s: EvSlot, v: Const) = s match
 
 private assign(r: &EvRun, name: string, v: Const)
     val frame = r.frames.at(r.frames.len() - 1)
-    val old = frame.locals.get(name)
+    val cell = frame.locals.get(name)
 
-    if old.is_some() && overwrite(old.unwrap(), v) then return
-
-    frame.locals.put(name, copied(v))
+    if cell.is_some() then written_over(cell.unwrap(), 0, v) else frame.locals.put(name, cell_of(copied(v)))
 end assign
+
+// A value written into slot `i` of a buffer of values: in the storage already there where the two
+// have the same shape, so a slice or a pointer taken into the old value sees the new one, as the
+// program's would; as a copy of its own where they do not.
+private written_over(xs: Buf[Const], i: usize, v: Const)
+    if overwrite(xs.at(i), v) then return
+
+    var held = xs
+
+    held.set(i, copied(v))
+end written_over
+
+// A local's cell, holding its first value.
+private cell_of(v: Const) -> Buf[Const]
+    var out: Buf[Const] = buf()
+
+    out.push(v)
+    out
+end cell_of
 
 private no_place(r: &EvRun, place: TExpr) -> Flow =
     refuse_form(r, place.span, "a write into anything but a local, an element or a field is not evaluated " +

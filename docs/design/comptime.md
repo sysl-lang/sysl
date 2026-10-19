@@ -130,3 +130,67 @@ Each step lands with its tests (a `cte_` prefix) and its row in `scripts/fix_tes
    function, generics.md, attributes.md § `@assert`.
 
 Steps 1, 4 and 5 are independent. Steps 2 and 3 are the large ones.
+
+## 7. Step 2's design (2026-10-18)
+
+**One value for every address the evaluation owns.** `ConstPtr(cells, at, owner)` is slot `at` of a
+shared buffer of values. It stands for a `&T`, a `*T` and a `&sync T` alike, since the evaluator keeps
+no counts. The buffer may be:
+- a box (`TBox`, a buffer of one);
+- an array's elements, or a slice's;
+- a struct's fields;
+- a local's cell.
+
+`owner` is the frame depth whose storage it is, or -1 for the heap, as a view's is. A pointer to a
+local never outlives its call, and is refused where a result would carry it out. Null stays
+`ConstLink(null)`, and an address of module storage stays a `ConstLink`. Identity (`==`) is the slot's
+own address.
+
+**Locals become cells** (`Map[string, Buf[Const]]`), so `&x` is a pointer to the cell, and `*self`
+methods run on locals.
+
+**The heap is the evaluator's own.** Nothing is ever freed:
+- `TBufLit`, `TBufFill` and `slot_storage` make a view of fresh cells owned by the heap;
+- `slot_place` writes a cell, and `slot_vacate` does nothing.
+
+Two things depend on counts the evaluator does not keep, so both are refused:
+- **a box of a type with a `Drop`**: when it runs is decided by those counts;
+- **`weak T`**: whether an upgrade succeeds is decided by those counts.
+
+A `ptr_cast` that reinterprets words is refused, as reading through `ConstLink` is. `Buf`, `Map` and
+`Set` need no allocator intrinsics: their storage is `slot_storage` and buffer literals. `Frozen` is
+built by reinterpreting words, so `freeze_buf` and `Frozen.view` are evaluator intrinsics. A frozen
+buffer is a `Frozen` record whose `owner` is 0 and whose `data` points at heap cells, which is exactly
+what a never-freed `Frozen` is when the program runs.
+
+**Closures and trait objects.**
+- `TErase` makes `ConstErased(vtable, data)`.
+- `TVCall` finds the slot's target in that table and passes the receiver by its `RecvMode`:
+  - by value: the payload, copied;
+  - by pointer, or `&self`: the pointer.
+- `TTypeId` is the table's `type_id`.
+
+The closure bodies and the tables a trial made are kept in the evaluation (`bodies`, `vtables`)
+before the trial is rewound. Their names stay unique because the evaluator's trials never rewind the
+closure counter, and a discarded trial rewinds it no lower than the last name the evaluation kept.
+
+**Atomics** on a `ConstPtr` are plain loads, stores and read-modify-writes, and a fence is nothing:
+an evaluation is one thread.
+
+**Freezing an answer.**
+- A view owned by the heap, answered as `[]const T`, is laid down as the `TBufLit` of its elements. A
+  module `val` over a slice literal is already a static array with a view whose owner is null.
+- A `&T` is laid down as a `TBox` of its value, and `emit_static` writes the box into the object
+  file. The box goes in **writable** data, unlike the rest: a `&T` points at its counted header, and
+  `arc.retain` writes the count. The count starts at one, which is the `val`'s own share and is never
+  given back, so nothing frees the box.
+- A frozen buffer is that box holding a `Frozen` whose `owner` is 0, which its `drop` already reads
+  as "never freed", and whose `data` points at a static array.
+- An answer through a writable type is refused, naming `view()` or `freeze()`.
+
+Step 2 lands in five parts, each with its tests:
+1. **2a**: references and locals as cells.
+2. **2b**: heap storage, with `Buf`, `Map` and `Set` running.
+3. **2c**: closures and trait objects.
+4. **2d**: atomics.
+5. **2e**: freezing answers into constant data.

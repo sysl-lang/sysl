@@ -46,6 +46,12 @@ enum Const
     // converts it to a number or calls it while compiling, since what it points at exists only when
     // the program runs. Made only by a `const` function's evaluation.
     ConstLink(image: TExpr)
+    // An address of storage the evaluation owns: slot `at` of a buffer of values -- a box's one
+    // value, an array's or a slice's elements, a struct's fields, or a local's cell -- shared with
+    // whatever else holds that buffer, so a write through it is seen there. It stands for a `&T`, a
+    // `*T` and a `&sync T` alike, the evaluator keeping no counts. `owner` is the depth of the call
+    // whose local the slot is, or -1 for the heap, as a slice's is. Made only by an evaluation.
+    ConstPtr(cells: Buf[Const], at: usize, owner: int)
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -261,6 +267,7 @@ private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) ->
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
 end const_binary
 
 // A comparison's verdict from the sign of the difference, where the operator is a comparison.
@@ -704,6 +711,7 @@ private const_text(v: Const) -> string = v match
     ConstView(_, _, n, _) -> s"a slice of $n elements"
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
+    ConstPtr(_, _, _) -> "an address"
 
 // A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
 // rather than as the `inf` and `nan` the C formatting underneath would print.
@@ -754,6 +762,7 @@ const_kind(v: Const) -> string = v match
     ConstView(_, _, _, _) -> "a slice"
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
+    ConstPtr(_, _, _) -> "an address"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
@@ -958,6 +967,7 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstView(_, _, _, _) -> None
     ConstWriter(_) -> None
     ConstLink(_) -> None
+    ConstPtr(_, _, _) -> None
 
 // Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
 private scalar_value(n: BigInt) -> bool =
@@ -1011,6 +1021,7 @@ private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Con
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
 end typed_binary
 
 // The integer operators, answered only where run time answers the same: never a division by zero,
@@ -1094,6 +1105,7 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n

@@ -1794,7 +1794,7 @@ const K: int = head()
 ```
 
 ```error
-'local' answers a slice of storage local to its call, which ends when the call returns
+'local' answers a slice of, or a pointer to, storage local to its call, which ends when the call returns
 ```
 
 **A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere:
@@ -1841,8 +1841,8 @@ true
 ```
 
 What such an address points at exists only when the program runs, so reading through one, or
-converting one to a number, is not evaluated — and neither is the address of a local, or of
-thread-local or per-core storage. A function pointer may be stored and answered, and calling through
+converting one to a number, is not evaluated — and neither is the address of thread-local or
+per-core storage. A function pointer may be stored and answered, and calling through
 it runs the function the address was taken of. On a bare machine, where storage must be constant
 data, the refusal says which:
 
@@ -1863,6 +1863,68 @@ begin() -> i32 = seen
 reading through an address is not evaluated while compiling — the linker fills an address in, and what it points at exists only when the program runs
 ```
 
+**A reference, and a pointer to storage the run owns, are values while compiling.** A box made with
+`&T`, a local, an element or a field reached through `&` or `*` is held by the run itself, and a
+write through one is seen wherever else the storage is held, as it is when the program runs. A
+pointer may not outlive its call, nor be converted to a number or read as another type:
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+bump(p: *int)
+    *p += 1
+
+const total(k: int) -> int
+    var head: Option[&Node] = None
+
+    for i in 0..<k
+        head = Some(Node(i, head))
+
+    var sum = 0
+    var cur = head
+
+    while cur is Some(n)
+        sum += n.v
+        cur = n.next
+
+    bump(&sum)
+    sum
+
+const T: int = total(5)
+
+print(T)
+```
+
+```output
+11
+```
+
+A box of a type with a `Drop` is refused, since its `drop` runs when the box's last share goes, and
+when that is, is decided by counts kept only when the program runs:
+
+```sysl
+struct Lamp
+    on: bool
+
+impl Drop for Lamp
+    drop(self)
+        print("off")
+
+lit() -> bool
+    val l: &Lamp = Lamp(true)
+    l.on
+
+const ON: bool = lit()
+
+print(ON)
+```
+
+```error
+a box of a 'Lamp', which has a 'Drop', is not made while compiling — its 'drop' runs when the last share of the box goes, and when that is, is decided by counts kept only when the program runs
+```
+
 **What it may not hold** is everything that exists only once the program runs, and the few kinds of
 value the compiler does not evaluate yet. Each is refused where it was written:
 
@@ -1873,7 +1935,8 @@ value the compiler does not evaluate yet. Each is refused where it was written:
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
-| a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
+| a box, a buffer | `… it builds a buffer, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` |
+| a weak reference | `… it uses a 'weak P' — a weak reference answers whether its object is still alive, which is decided by counts kept only when the program runs` |
 | a value rendered through a `display` whose body cannot run | `… it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling` |
 | a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
 | a closure called, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
@@ -1924,21 +1987,6 @@ print(f(1.0))
 
 ```error
 'f' is 'const', so it runs while compiling, and it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's
-```
-
-```sysl
-struct Cell
-    v: int
-
-const f() -> int
-    val b: &Cell = Cell(1)
-    b.v
-
-print(f())
-```
-
-```error
-'f' is 'const', so it runs while compiling, and it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap
 ```
 
 ```sysl
