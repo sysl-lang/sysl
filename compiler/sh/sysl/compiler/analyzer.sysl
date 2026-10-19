@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.text.Search
 
 // The context an expression is typed in: the declaration tables the whole compilation shares, the
@@ -352,6 +353,15 @@ struct Analyzer
     // compiling, which is what each use of the name is, and the scalar the fold reads it as.
     local_consts: Buf[(string, TExpr, Option[Const])]
 
+    // Where each name in `used` stands, so asking whether one is taken is one lookup; an entry is
+    // believed only while `used` still holds that name there, which lets a rewind truncate `used`
+    // alone. And for each base `fresh_name` numbered, the last suffix it gave and where that name
+    // stands: while it is still there, every smaller suffix is too, so the search starts above it.
+    // Without these, the copies of a walk over a few hundred variants, each binding the same names,
+    // asked every name before them about every suffix.
+    used_at: Map[string, usize]
+    suffixes: Map[string, (int, usize)]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -531,28 +541,36 @@ struct Analyzer
         val safe = if base.starts_with("$") then base else guarded(base)
 
         if !self.holds(safe)
-            self.used.push(safe)
+            self.take(safe)
 
             return safe
         end if
 
         var k = 1
 
+        self.suffixes.get(safe) match
+            Some((last, at)) -> if self.held_at(s"$safe.$last", at) then k = last + 1
+            None -> ()
+
         while self.holds(s"$safe.$k")
             k = k + 1
 
         val n = s"$safe.$k"
 
-        self.used.push(n)
+        self.suffixes.put(safe, (k, self.used.len()))
+        self.take(n)
         n
     end fresh_name
 
-    private holds(self, name: string) -> bool
-        for item in self.used
-            if item == name then return true
+    private take(*self, name: string)
+        self.used_at.put(name, self.used.len())
+        self.used.push(name)
 
-        false
-    end holds
+    private holds(self, name: string) -> bool = self.used_at.get(name) match
+        Some(at) -> self.held_at(name, at)
+        None -> false
+
+    private held_at(self, name: string, at: usize) -> bool = at < self.used.len() && self.used[at] == name
 
     // The innermost binding of a name, or none.
     lookup(self, name: string) -> Option[Local]
@@ -604,7 +622,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
-             false, buf(), buf())
+             false, buf(), buf(), map(), map())
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

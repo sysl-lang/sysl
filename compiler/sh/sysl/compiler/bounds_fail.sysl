@@ -163,7 +163,61 @@ end bounds_unless
 // **`x.(c)` reached with a value holding another variant** reports through the same function, the
 // two variants' names handed over as the addresses of NUL-terminated texts laid down with the
 // locations, and stops the program.
-variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val
+variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val =
+    variant_fail_at(e, asked, c_text_of(e, holds), site)
+
+// The same, the held variant's name read while the program runs: the value's tag indexes a table of
+// the enum's variant names (the analyzer chooses this form only where the tags are the positions).
+variant_fail_held(e: *Emit, asked: string, held: TExpr, site: Span) -> Val
+    val ty = texpr_type(held)
+    val d = enum_decl(ty).unwrap()
+    val v = gen_expr(e, held)
+    val w = word_lty(e)
+    val tag = fresh_reg(e)
+
+    emit(e, InExtract(tag, enum_lty(d), v, index_list(0)))
+
+    var at = tag
+
+    if e.word_bits > 32
+        at = fresh_reg(e)
+        emit(e, InCast(at, CastZExt, LInt(32), tag, w))
+    end if
+
+    val n = int(d.variants.len())
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(w, VInt(from_int(0))))
+    idx.push(ir_arg(w, at))
+
+    val slot = fresh_reg(e)
+    val name = fresh_reg(e)
+
+    emit(e, InGep(slot, LArr(n, LPtr), VGlobal(variant_name_table(e, ty, d)), idx))
+    emit(e, InLoad(name, LPtr, slot, AccPlain, None))
+    variant_fail_at(e, asked, name, site)
+end variant_fail_held
+
+// An enum's variant names in tag order, laid down once per module.
+private variant_name_table(e: *Emit, ty: Type, d: &EnumType) -> string
+    val key = l_render(enum_lty(d))
+    val known = e.variant_names.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    var names: Buf[IrArg] = buf()
+
+    for i in 0..<d.variants.len()
+        names.push(ir_arg(LPtr, c_text_of(e, descriptor_text(ty, int(i), -1))))
+
+    val name = s".variants${e.variant_names.len()}"
+
+    e.globals.push(ir_global(name, true, LArr(int(names.len()), LPtr), VArray(names)))
+    e.variant_names.put(key, name)
+    name
+end variant_name_table
+
+private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val
     e.traps = true
     e.bounds_fails = true
 
@@ -172,7 +226,7 @@ variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val
     val b = fresh_reg(e)
 
     emit(e, InCast(a, CastPtrToInt, LPtr, c_text_of(e, asked), w))
-    emit(e, InCast(b, CastPtrToInt, LPtr, c_text_of(e, holds), w))
+    emit(e, InCast(b, CastPtrToInt, LPtr, holds, w))
 
     var args: Buf[IrArg] = buf()
 
@@ -185,7 +239,7 @@ variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val
     emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
     VNothing
-end variant_fail
+end variant_fail_at
 
 // What the default prints for it, which is also what an evaluation while compiling says.
 variant_fail_text(asked: string, holds: string) -> string =
@@ -313,9 +367,11 @@ end location_of
 // A NUL-terminated constant holding `text`, laid down with the locations and numbered among them, so
 // one text asked for twice is one constant.
 c_text_of(e: *Emit, text: string) -> Val
-    for i in 0..<e.locs.len()
-        if e.locs.at(i) == text then return VGlobal(bounds_location_name(i))
+    val known = e.locs_at.get(text)
 
+    if known.is_some() then return VGlobal(bounds_location_name(known.unwrap()))
+
+    e.locs_at.put(text, e.locs.len())
     e.locs.push(text)
     VGlobal(bounds_location_name(e.locs.len() - 1))
 end c_text_of

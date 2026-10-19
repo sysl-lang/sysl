@@ -1519,6 +1519,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         // An evaluation is one thread, so there is nothing for a fence to order.
         TFence(_) -> EvNone
         TVariantFail(asked, holds) -> trap(r, e.span, variant_fail_text(asked, holds))
+        TVariantFailHeld(asked, held) -> held_variant_fail(r, e.span, asked, held)
         TLen(receiver, _) -> length(r, receiver)
         TBytes(receiver) -> bytes_of(r, receiver)
         TSlice(base, lo, hi, inclusive, _) -> sliced(r, e.span, base, lo, hi, inclusive)
@@ -2291,6 +2292,16 @@ private length(r: &EvRun, receiver: TExpr) -> Flow = eval_value(r, receiver) mat
     Ok(_) -> refuse_form(r, receiver.span, s"the length of a '${type_show(texpr_type(receiver))}' is not " +
                          "evaluated while compiling")
     Err(f) -> f
+
+// `x.(c)` on a value holding another variant, named from the value itself.
+@noinline
+private held_variant_fail(r: &EvRun, at: Span, asked: string, held: TExpr) -> Flow =
+    eval_value(r, held) match
+        Ok(ConstRecord(v, _)) ->
+            trap(r, at, variant_fail_text(asked, descriptor_text(texpr_type(held), v, -1)))
+        Ok(_) -> refuse_form(r, held.span, s"a '${type_show(texpr_type(held))}' is not evaluated " +
+                             "while compiling")
+        Err(f) -> f
 
 // `s.bytes`: a read-only view of a string's bytes, which outlive every call.
 @noinline

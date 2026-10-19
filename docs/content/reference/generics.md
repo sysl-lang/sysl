@@ -1722,6 +1722,10 @@ compile-time descriptors, `v.(f)` is that field of a value in each copy, `f::Typ
 as a tuple's `t.i` is, so one body serves fields of every type. The descriptors, and what a derivation
 written with them looks like, are on [reflection](/reference/reflection/).
 
+**A walk of a type's own parts unrolls to however many it has**, with no limit: the type's declaration
+is the bound, a reader can see it, and a derivation over a hundred-variant enum emits what a hundred
+hand-written arms would. The limit below is for a range.
+
 ### What a `for const` will not do
 
 A range computed at run time cannot be unrolled, and the ordinary `for` is what walks one:
@@ -1736,6 +1740,22 @@ f(3)
 
 ```error
 must be known at compile time
+```
+
+A range is unrolled to at most 65 copies (its two ends at most 64 apart). `for const i in 0..<100000`
+is one line and a hundred thousand copies of its body, and nothing on the page says so; a loop that
+long is a run-time `for`, which costs one copy whatever it counts to:
+
+```sysl
+f()
+    for const i in 0..<100
+        print(i)
+
+f()
+```
+
+```error
+a 'for const' over 100 values would emit that many copies of its body, and 64 is the most one is unrolled to
 ```
 
 `break` and `continue` are refused as well. There is no loop at run time for either to act on: the

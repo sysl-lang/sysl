@@ -1342,17 +1342,14 @@ end quantifier_expr
 // have different types, so one written line type-checks differently at each position.
 const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[Stmt]) -> TExpr
     // `for const f in T::Fields` -- one copy per part of a type, the name standing at that part's
-    // descriptor (`type_reflect.sysl`).
+    // descriptor (`type_reflect.sysl`). No cap applies: the type's own declaration is the bound, so a
+    // derivation over a hundred variants emits what a hundred hand-written arms would.
     val walked = reflected_walk(cx, span, iter)
 
     if walked.is_some()
         val parts = walked.unwrap() match
             Ok(ds) -> ds
             Err(refusal) -> return refusal
-
-        if parts.len() > usize(MaxUnrolledCopies) then
-            return cx.err(span, s"a 'for const' over ${parts.len()} parts would emit that many " +
-                          s"copies of its body, and $MaxUnrolledCopies is the most one is unrolled to")
 
         var each: Buf[Buf[Binding]] = buf()
         var labels: Buf[string] = buf()
@@ -1483,10 +1480,11 @@ const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_
         None -> TExpr(span, TBlockExpr(TBlock(buf(), None, Unit)))
 end const_if_expr
 
-// The most copies a `for const` is unrolled to -- a bound rather than no bound, because the cost is
-// in the emitted program and not in a number a reader can see: `for const i in 0..<100000` is one
-// line and a hundred thousand copies. The comparison above is the reference's own, which lets a
-// range one longer than this through.
+// The most copies a `for const` over a range is unrolled to -- a bound rather than no bound, because
+// the cost is in the emitted program and not in a number a reader can see: `for const i in 0..<100000`
+// is one line and a hundred thousand copies. The comparison above is the reference's own, which lets
+// a range one longer than this through. A walk of `T::Fields`, `T::Members` or `T::Variants` is not
+// bounded by it: its length is the type's declaration, which a reader can see.
 const MaxUnrolledCopies: long = 64
 
 private const_int_of(cx: &Analyzer, e: Expr) -> Option[long]

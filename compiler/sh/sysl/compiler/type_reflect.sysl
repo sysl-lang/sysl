@@ -915,12 +915,33 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
     hit.push(TVariantPattern(underlying(owner), variant, pats))
     arms.push(TArm(hit, None, TBlock(buf(), Some(value), pt)))
 
-    // Every other variant is an arm of its own, so the failure names the variant the value holds.
     val asked = descriptor_text(owner, v, -1)
-    val variants = underlying(owner) match
-        Enum(d) -> d.variants
+    val en = underlying(owner) match
+        Enum(d) -> d
         _ -> return bad_expr(span)
+    val variants = en.variants
 
+    // Every other variant is one arm, which names the variant the value holds from a table indexed
+    // by its tag -- one test per `x.(c)`, so the copies of a walk over a few hundred variants stay
+    // a few hundred tests and not the square of it. The table needs tags that are the positions.
+    if !en.simple && positional_tags(variants)
+        cx.enter()
+
+        val u = cx.bind_pattern(s"${ModuleSep}held", owner)
+
+        cx.leave()
+
+        var rest: Buf[TPattern] = buf()
+
+        rest.push(TBindPattern(u, owner))
+
+        val fail = TExpr(span, TVariantFailHeld(asked, TExpr(span, TLoad(u, owner))))
+
+        arms.push(TArm(rest, None, TBlock(buf(), Some(fail), Never)))
+        return TExpr(span, TMatch(tr, arms, pt))
+    end if
+
+    // Otherwise every other variant is an arm of its own, the variant it holds named in its failure.
     for i in 0..<variants.len()
         if int(i) == v then continue
 
@@ -939,6 +960,13 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
 
     TExpr(span, TMatch(tr, arms, pt))
 end payload_of
+
+// Whether each variant's tag is its position, so a tag indexes a table of the variants' names.
+private positional_tags(variants: Buf[EnumVariant]) -> bool
+    for i in 0..<variants.len()
+        if variants.at(i).tag != from_int(long(i)) then return false
+
+    true
 
 // `x is c`, and a `c` arm of a `match` -- the variant a descriptor stands for, every field let go.
 descriptor_pattern(cx: &Analyzer, span: Span, name: string, d: Type, ty: Type) -> TPattern = d match

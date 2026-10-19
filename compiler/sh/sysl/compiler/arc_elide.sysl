@@ -46,8 +46,13 @@ elide_arc_pairs(blocks: Buf[IrBlock], inert: Set[string]) -> Buf[IrBlock]
     for b in blocks
         out.push(IrBlock(b.label, elide_in_block(b.instrs, clean), b.terminator))
 
+    // Who branches where is read once: the hoisting moves instructions and never a terminator, so
+    // the edges stay as they are, and asking every block about every join is a cost that grows with
+    // the square of the function -- a derivation over a few hundred variants is thousands of blocks.
+    val edges = join_edges(out)
+
     for j in 1..<out.len()
-        hoist_join_releases(out, j, clean)
+        hoist_join_releases(out, j, clean, edges)
 
     // What is left is a count a covering slot may make needless however far away it is given back
     // (`arc_cover.sysl`). A view of a view is given back inside its parent's window, so the parent's
@@ -325,27 +330,51 @@ end close_window
 private key_of(canon: Map[string, string], v: Val) -> string =
     canon.get(v_render(v)).unwrap_or(v_render(v))
 
-// Copies the releases block `j` opens with to the end of each of its predecessors, where that lets a
-// predecessor cancel one (see `elide_arc_pairs`). The releases moved are those of a value loaded from
-// a clean slot, reached through nothing but clean-slot loads, field reads and other such releases.
-private hoist_join_releases(bs: Buf[IrBlock], j: usize, clean: Set[string])
-    val join = bs[j]
-    var preds: Buf[usize] = buf()
+// The edges `hoist_join_releases` reads, in order of the blocks they leave: `preds` holds, for each
+// label, the blocks that reach it by an unconditional branch, and `shut` the labels a join cannot be --
+// those a conditional branch or a switch reaches, and a block that branches to itself.
+private struct JoinEdges
+    preds: Map[string, Buf[usize]]
+    shut: Set[string]
+
+private join_edges(bs: Buf[IrBlock]) -> JoinEdges
+    var preds: Map[string, Buf[usize]] = map()
+    var shut: Set[string] = set()
 
     for k in 0..<bs.len()
         bs[k].terminator match
             Some(InBr(l)) ->
-                if l == join.label
-                    if k == j then return
+                if l == bs[k].label then shut.add(l)
 
-                    preds.push(k)
-            Some(InCondBr(_, a, b)) -> if a == join.label || b == join.label then return
+                preds.get(l) match
+                    Some(ks) -> ks.push(k)
+                    None ->
+                        var ks: Buf[usize] = buf()
+
+                        ks.push(k)
+                        preds.put(l, ks)
+            Some(InCondBr(_, a, b)) ->
+                shut.add(a)
+                shut.add(b)
             Some(InSwitch(_, _, d, cases)) ->
-                if d == join.label then return
+                shut.add(d)
 
                 for c in cases
-                    if c.1 == join.label then return
+                    shut.add(c.1)
             _ -> ()
+
+    JoinEdges(preds, shut)
+end join_edges
+
+// Copies the releases block `j` opens with to the end of each of its predecessors, where that lets a
+// predecessor cancel one (see `elide_arc_pairs`). The releases moved are those of a value loaded from
+// a clean slot, reached through nothing but clean-slot loads, field reads and other such releases.
+private hoist_join_releases(bs: Buf[IrBlock], j: usize, clean: Set[string], edges: JoinEdges)
+    val join = bs[j]
+
+    if edges.shut.has(join.label) then return
+
+    val preds = edges.preds.get(join.label).unwrap_or(buf())
 
     if preds.len() == 0 || preds.len() > 4 then return
 

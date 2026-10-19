@@ -74,6 +74,11 @@ struct Emit
     // the block can be reached at all.
     reached: Buf[string]
 
+    // Where each label stands in `reached`, so asking costs one lookup rather than a walk of every
+    // label the function has named. An entry is believed only while `reached` still holds that label
+    // at that position, which is what lets a rewind truncate `reached` alone.
+    reached_at: Map[string, usize]
+
     // The enclosing loops, innermost last, so a `break`/`continue` knows where to jump and what
     // result slot to store into.
     loops: Buf[GenLoop]
@@ -240,6 +245,11 @@ struct Emit
     src: Option[Source]
     bounds_fails: bool
     locs: Buf[string]
+    locs_at: Map[string, usize]
+
+    // The table of an enum's variant names a failed `x.(c)` reads the held one from, by the enum's
+    // LLVM type: one per enum in the module, however many sites read it (`bounds_fail.sysl`).
+    variant_names: Map[string, string]
 
     // The boundary each named LLVM type holding a raised `@align(n)` is stored on, by its name: a
     // stack slot is created from an LLVM type, and this is how it states the boundary
@@ -434,13 +444,13 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
 
     Emit(t, memo_layout_for(t), int(t.pointer_bits()), globals, 0, 0, sat_decls, false, false, false,
          false, false, false, false, 0,
-         prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
+         prologue, blocks, current, None, "entry", 0, 0, false, reached, map(), loops, scratch, symbols,
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, set(), relaid, set(), promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
-         None, false, buf(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
+         None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf())
 end emitter_for
 
@@ -477,6 +487,7 @@ start_function(e: *Emit)
     e.label = 0
     e.terminated = false
     e.reached.clear()
+    e.reached_at.clear()
     e.loops.clear()
     e.scratch.clear()
     e.ensures.clear()
@@ -664,18 +675,14 @@ emit_term(e: *Emit, i: Inst)
 end emit_term
 
 private mark_reached(e: *Emit, l: string)
-    for item in e.reached
-        if item == l then return
+    if is_reached(e, l) then return
 
+    e.reached_at.put(l, e.reached.len())
     e.reached.push(l)
-end mark_reached
 
-private is_reached(e: *Emit, l: string) -> bool
-    for item in e.reached
-        if item == l then return true
-
-    false
-end is_reached
+private is_reached(e: *Emit, l: string) -> bool = e.reached_at.get(l) match
+    Some(i) -> i < e.reached.len() && e.reached[i] == l
+    None -> false
 
 // Opens a block under `l`.
 //
