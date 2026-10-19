@@ -3,20 +3,25 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
-// `derives Eq, Ord, Hash, Display` -- the four implementations the compiler writes over a type's own
-// parts -- and `derives Json`, any trait that carries `derive` members of its own.
+// `derives Eq, Ord, Hash, Display` -- the four implementations every tuple already has -- and
+// `derives Json`, any trait that carries `derive` members of its own.
 //
-// These four are the ones the library already provides structurally for every tuple, which is the
-// same claim in the same words -- a composite has them exactly when its parts do. Any other name is
-// written as an empty block marked `derived`, which `hoist_impl` fills from the trait's `derive`
-// bodies (`derive_members.sysl`) or refuses where the trait has none.
+// Every name but `Display` is written as an empty block marked `derived`, which `hoist_impl` fills
+// from the trait's `derive` bodies (`derive_members.sysl`) or refuses where the trait has none --
+// `Eq`, `Ord` and `Hash` carry theirs in the library. `Display` is still written here, as a block
+// and the renderer beside it.
+//
+// The four are the clause's own business in one respect: what is wrong with naming one of them for
+// an opaque struct, a union or a simple enum is said here, at the word in the clause, before any
+// body is read.
 //
 // **What is built is source**, and that is the whole design: a clause becomes the `impl` block a
 // reader could have written, hoisted and analyzed by the ordinary machinery, so nothing downstream
 // learns anything about deriving. A derived body that cannot be typed is reported against the block
 // it stands in, which is positioned at the word in the clause that asked for it.
 
-// The traits a clause may name, in the order a diagnostic lists them.
+// The four the clause answers for itself where the declaration cannot have them
+// (`derives_problem`), in the order a diagnostic lists them.
 private derivable() -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -26,12 +31,6 @@ private derivable() -> Buf[string]
     out.push("Display")
     out
 end derivable
-
-// FNV-1a's offset basis and prime, which is what the tuple's `Hash` mixes with and therefore what a
-// struct's must. The prime is what makes position matter -- a plain XOR would make `Size(1, 2)` and
-// `Size(2, 1)` one key.
-private fnv_basis() -> string = "cbf29ce484222325"
-private fnv_prime() -> string = "100000001b3"
 
 // Every unit with the blocks its `derives` clauses ask for written out after the declarations that
 // asked, which is what the rest of the compiler reads.
@@ -209,28 +208,21 @@ private one_derivation(entry: BoundRef, simple: string, s: Stmt) -> Buf[Stmt]
 
     val subject = TypeRef(at, NamedType(name, targs))
 
-    // **A trait of the program's or a library's is derived by its own `derive` bodies**: the block
-    // is written empty and marked, and `hoist_impl` supplies its members from the trait -- read in
-    // the trait's file, with the trait's `T` standing for this type.
-    if !holds_string(derivable(), simple)
+    // **Every trait but `Display` is derived by its own `derive` bodies** -- `Eq`, `Ord` and `Hash`
+    // by the library's, a trait of the program's by the program's: the block is written empty and
+    // marked, and `hoist_impl` supplies its members from the trait -- read in the trait's file, with
+    // the trait's `T` standing for this type.
+    if simple != "Display"
         out.push(stmt(at, ImplDecl(ImplDecl(entry.name, subject, buf(), tparams, bounds, buf(), buf(),
                                             false, tvalues, buf(), buf(), true))))
         return out
     end if
 
-    var method = eq_method(at, s)
+    // `Display` needs a declaration of its own beside the block: the parts are written straight
+    // through a renderer rather than gathered into a string, and a renderer is a function.
+    if has_parts(s) then out.push(renderer_decl(at, name, tparams, bounds, tvalues, s))
 
-    if simple == "Ord" then method = ord_method(at, s)
-    else if simple == "Hash" then method = hash_method(at, s)
-    else if simple == "Display"
-        // `Display` is the one that needs a declaration of its own beside the block: the parts are
-        // written straight through a renderer rather than gathered into a string, and a renderer is
-        // a function.
-        if has_parts(s)
-            out.push(renderer_decl(at, name, tparams, bounds, tvalues, s))
-            method = display_method(at, name)
-        else method = display_literal_method(at, name, s)
-
+    val method = if has_parts(s) then display_method(at, name) else display_literal_method(at, name, s)
     var methods: Buf[MethodDecl] = buf()
 
     methods.push(method)
@@ -285,7 +277,6 @@ private is_sum(s: Stmt) -> bool = *s.kind match
 private ident(at: Span, name: string) -> Expr = expr(at, Ident(name))
 private field_of(at: Span, e: Expr, name: string) -> Expr = expr(at, Field(e, name, at))
 private self_field(at: Span, name: string) -> Expr = field_of(at, ident(at, "self"), name)
-private rhs_field(at: Span, name: string) -> Expr = field_of(at, ident(at, "rhs"), name)
 
 private compare(at: Span, op: string, l: Expr, r: Expr) -> Expr
     var operands: Buf[Expr] = buf()
@@ -314,12 +305,6 @@ private one_stmt_of(s: Stmt) -> Buf[Stmt]
     out.push(s)
     out
 end one_stmt_of
-
-// `if <cond> then return <v>` -- the one statement shape three of the four bodies are built from.
-private guard_stmt(at: Span, cond: Expr, v: bool) -> Stmt =
-    stmt(at, ExprStmt(expr(at, IfExpr(cond,
-                                      one_stmt_of(stmt(at, Return(Some(expr(at, BoolLit(v)))))),
-                                      None, false))))
 
 // The binders one side of a two-sided match introduces: `l0`, `l1` for the left operand's fields
 // and `r0`, `r1` for the right's. Positional, because a variant's fields are matched positionally.
@@ -356,54 +341,7 @@ private arm_of(at: Span, p: Pattern, body: Buf[Stmt]) -> MatchArm
     MatchArm(at, ps, None, body)
 end arm_of
 
-// Which variant a value is, as an `int` -- one `match` whose arms are the declaration positions.
-//
-// A data enum's discriminant is not something a program can read, and it does not need to be: every
-// arm knows its own position at the moment this is built, so the literal is the tag.
-private tag_of(at: Span, scrutinee: Expr, vs: Buf[EnumVariantDecl]) -> Expr
-    var arms: Buf[MatchArm] = buf()
-
-    for i in 0..<vs.len()
-        arms.push(arm_of(at, any_of(at, vs.at(i)),
-                         one_stmt_of(stmt(at, ExprStmt(int_of(at, s"$i"))))))
-
-    expr(at, MatchExpr(scrutinee, arms))
-end tag_of
-
 private int_of(at: Span, digits: string) -> Expr = expr(at, IntLit(digits, 10, ""))
-private u64_of(at: Span, digits: string) -> Expr = expr(at, IntLit(digits, 16, "u64"))
-
-// The arms of a match over **both** operands: one per variant, pairing that variant with itself, and
-// a catch-all for every pair that disagrees.
-private both_arms(at: Span, vs: Buf[EnumVariantDecl], same_eq: bool) -> Buf[MatchArm]
-    var arms: Buf[MatchArm] = buf()
-
-    for item in vs
-        var pair: Buf[Pattern] = buf()
-
-        pair.push(variant_pattern(at, item, "l"))
-        pair.push(variant_pattern(at, item, "r"))
-
-        val body = if same_eq then same_variant_eq(at, item) else same_variant_ord(at, item)
-
-        arms.push(arm_of(at, pattern_of(at, TuplePattern(pair)), body))
-
-    // A tag comparison is only needed where there is more than one variant to tell apart, and a
-    // catch-all arm is only *reachable* then -- a one-variant sum's tuple match covers every pair.
-    if vs.len() > 1 then
-        arms.push(arm_of(at, pattern_of(at, WildcardPattern),
-                         one_stmt_of(stmt(at, ExprStmt(expr(at, BoolLit(false)))))))
-
-    arms
-end both_arms
-
-private pair_match(at: Span, vs: Buf[EnumVariantDecl], same_eq: bool) -> Stmt
-    var parts: Buf[Expr] = buf()
-
-    parts.push(ident(at, "self"))
-    parts.push(ident(at, "rhs"))
-    stmt(at, ExprStmt(expr(at, MatchExpr(expr(at, Tuple(parts)), both_arms(at, vs, same_eq)))))
-end pair_match
 
 private method_of(at: Span, name: string, params: Buf[Param], ret: Option[TypeRef],
                   body: Buf[Stmt]) -> MethodDecl =
@@ -412,166 +350,6 @@ private method_of(at: Span, name: string, params: Buf[Param], ret: Option[TypeRe
 
 private param_of(at: Span, name: string, typ: TypeRef) -> Param =
     Param(at, name, typ, Public, None, false, false)
-
-private self_param(at: Span) -> Buf[Param]
-    var out: Buf[Param] = buf()
-
-    out.push(param_of(at, "rhs", TypeRef(at, NamedType("Self", buf()))))
-    out
-end self_param
-
-private bool_ref(at: Span) -> Option[TypeRef] = Some(TypeRef(at, NamedType("bool", buf())))
-
-// -- Eq --------------------------------------------------------------------------------------------
-
-// Field by field, first disagreement decides -- which is the tuple's body with a name in place of
-// the position, and is the only thing equality on a product can mean.
-private eq_method(at: Span, s: Stmt) -> MethodDecl
-    var body: Buf[Stmt] = buf()
-
-    if is_sum(s) then
-        // Two variants agree when they are the same variant and every field of it agrees, which is
-        // one match over the pair rather than a tag comparison and a second match inside it.
-        body.push(pair_match(at, variants_of(s), true))
-    else
-        val fields = fields_of(s)
-
-        for item in fields
-            body.push(guard_stmt(at, compare(at, "!=", self_field(at, item),
-                                             rhs_field(at, item)), false))
-
-        body.push(stmt(at, ExprStmt(expr(at, BoolLit(true)))))
-
-    method_of(at, "eq", self_param(at), bool_ref(at), body)
-end eq_method
-
-private same_variant_eq(at: Span, v: EnumVariantDecl) -> Buf[Stmt]
-    var body: Buf[Stmt] = buf()
-
-    for i in 0..<v.fields.len()
-        body.push(guard_stmt(at, compare(at, "!=", ident(at, binder("l", i)),
-                                         ident(at, binder("r", i))), false))
-
-    body.push(stmt(at, ExprStmt(expr(at, BoolLit(true)))))
-    body
-end same_variant_eq
-
-// -- Ord -------------------------------------------------------------------------------------------
-
-// Lexicographic, first field first, written as a ladder rather than as `<` on each field in turn:
-// deciding a position takes *two* comparisons -- this one is less, or it is greater, or the two
-// agree and the next field decides. All-tied ends `false`, since a value is not less than one it
-// agrees with everywhere.
-private ord_method(at: Span, s: Stmt) -> MethodDecl
-    var body: Buf[Stmt] = buf()
-
-    if !is_sum(s)
-        val fields = fields_of(s)
-
-        for item in fields
-            body.push(guard_stmt(at, compare(at, "<", self_field(at, item),
-                                             rhs_field(at, item)), true))
-            body.push(guard_stmt(at, compare(at, "<", rhs_field(at, item),
-                                             self_field(at, item)), false))
-
-        body.push(stmt(at, ExprStmt(expr(at, BoolLit(false)))))
-    else if simple_sum(variants_of(s))
-        // A simple sum is its discriminant, so its order is the discriminants' and there is nothing
-        // to walk.
-        body.push(stmt(at, ExprStmt(compare(at, "<",
-                                            call_of(at, ident(at, "int"),
-                                                    one_arg(ident(at, "self"))),
-                                            call_of(at, ident(at, "int"),
-                                                    one_arg(ident(at, "rhs")))))))
-    else
-        // **Variants first, then fields.** A `Circle` is less than a `Rect` because it is declared
-        // first, and two `Rect`s are decided by their fields -- so the tag is compared before
-        // anything is taken apart, and the pair-match below only ever runs where the tags agree.
-        val vs = variants_of(s)
-
-        body.push(stmt(at, ValDecl("l", None, tag_of(at, ident(at, "self"), vs), Public, None, None, OneCopy,
-                                   None)))
-        body.push(stmt(at, ValDecl("r", None, tag_of(at, ident(at, "rhs"), vs), Public, None, None,
-                                   OneCopy, None)))
-        body.push(stmt(at, ExprStmt(expr(at, IfExpr(
-            compare(at, "!=", ident(at, "l"), ident(at, "r")),
-            one_stmt_of(stmt(at, Return(Some(compare(at, "<", ident(at, "l"),
-                                                     ident(at, "r")))))),
-            None, false)))))
-        body.push(pair_match(at, vs, false))
-
-    method_of(at, "lt", self_param(at), bool_ref(at), body)
-end ord_method
-
-private same_variant_ord(at: Span, v: EnumVariantDecl) -> Buf[Stmt]
-    var body: Buf[Stmt] = buf()
-
-    for i in 0..<v.fields.len()
-        body.push(guard_stmt(at, compare(at, "<", ident(at, binder("l", i)),
-                                         ident(at, binder("r", i))), true))
-        body.push(guard_stmt(at, compare(at, "<", ident(at, binder("r", i)),
-                                         ident(at, binder("l", i))), false))
-
-    body.push(stmt(at, ExprStmt(expr(at, BoolLit(false)))))
-    body
-end same_variant_ord
-
-// -- Hash ------------------------------------------------------------------------------------------
-
-// The fields mixed in order with FNV's prime, seeded from the offset basis rather than from the
-// first field's hash -- which is what lets the empty struct and the one-field struct take the same
-// shape rather than needing a case each.
-private hash_method(at: Span, s: Stmt) -> MethodDecl
-    var body: Buf[Stmt] = buf()
-
-    body.push(stmt(at, VarDecl("h", None, Some(u64_of(at, fnv_basis())), Public, None, None, OneCopy,
-                                 None)))
-
-    if !is_sum(s)
-        val fields = fields_of(s)
-
-        for item in fields
-            body.push(mix_in(at, call_of(at, field_of(at, self_field(at, item), "hash"),
-                                         no_args())))
-    else
-        // The **tag is mixed first**, so two variants carrying equal payloads are different keys --
-        // `Some(0)` and a one-field `Other(0)` have to be, or a table holding both collides on
-        // every insert. Then each variant's own fields, which is the product case one level down.
-        val vs = variants_of(s)
-
-        body.push(mix_in(at, call_of(at, ident(at, "hash_u64"),
-                                     one_arg(call_of(at, ident(at, "u64"),
-                                                     one_arg(tag_of(at, ident(at, "self"), vs)))))))
-
-        if !simple_sum(vs)
-            var arms: Buf[MatchArm] = buf()
-
-            for v in vs
-                var inner: Buf[Stmt] = buf()
-
-                if v.fields.is_empty() then inner.push(stmt(at, ExprStmt(expr(at, UnitLit))))
-                else
-                    for j in 0..<v.fields.len()
-                        inner.push(mix_in(at, call_of(at, field_of(at, ident(at, binder("l", j)),
-                                                                   "hash"), no_args())))
-
-                arms.push(arm_of(at, variant_pattern(at, v, "l"), inner))
-
-            body.push(stmt(at, ExprStmt(expr(at, MatchExpr(ident(at, "self"), arms)))))
-
-    body.push(stmt(at, ExprStmt(call_of(at, ident(at, "hash_u64"), one_arg(ident(at, "h"))))))
-    method_of(at, "hash", buf(), Some(TypeRef(at, NamedType("u64", buf()))), body)
-end hash_method
-
-// `h = h * prime ^ <part>` -- one step of the FNV fold. The multiply is what carries the position,
-// so that a value's parts in a different order are a different key; a plain XOR would make them the
-// same one.
-private mix_in(at: Span, part: Expr) -> Stmt =
-    stmt(at, ExprStmt(expr(at, Assign("=", ident(at, "h"),
-                                      expr(at, Binary("^",
-                                                      expr(at, Binary("*", ident(at, "h"),
-                                                                      u64_of(at, fnv_prime()))),
-                                                      part))))))
 
 // -- Display ---------------------------------------------------------------------------------------
 

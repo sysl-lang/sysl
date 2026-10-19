@@ -58,8 +58,77 @@ trait Not
 trait Eq
     eq(self, rhs: Self) -> bool
 
+    /** What `derives Eq` writes: field by field, the first disagreement deciding -- the tuple's body
+     * with a field in place of the position, and the only thing equality on a product can mean.
+     * Two values of a data enum agree when they hold the same variant and every field of its
+     * payload agrees. A simple enum is already `Eq` by rule, and the clause says so before this is
+     * ever read.
+     */
+    derive[T] eq(self: T, rhs: T) -> bool
+        if const T::Kind == Kind.DataEnum
+            for const c in T::Variants
+                if self is c
+                    if rhs is c
+                        val l = self.(c)
+                        val r = rhs.(c)
+
+                        for const f in c::Fields
+                            if l.(f) != r.(f) then return false
+
+                        return true
+                    end if
+
+                    return false
+                end if
+
+            false
+        else
+            for const f in T::Fields
+                if self.(f) != rhs.(f) then return false
+
+            true
+    end eq
+
 trait Ord
     lt(self, rhs: Self) -> bool
+
+    /** What `derives Ord` writes: lexicographic, first field first, as a ladder -- deciding a
+     * position takes two comparisons, this one is less or it is greater or the two agree and the
+     * next field decides, and all-tied ends `false`. A data enum orders by variant first, in
+     * declaration order, and then field by field within the variant; a simple enum is its
+     * discriminant, so its order is the discriminants'.
+     */
+    derive[T] lt(self: T, rhs: T) -> bool
+        if const T::Kind == Kind.SimpleEnum
+            int(self) < int(rhs)
+        elif const T::Kind == Kind.DataEnum
+            var l: usize = 0
+            var r: usize = 0
+
+            for const c in T::Variants
+                if self is c then l = c.index
+                if rhs is c then r = c.index
+
+            if l != r then return l < r
+
+            for const c in T::Variants
+                if self is c
+                    val a = self.(c)
+                    val b = rhs.(c)
+
+                    for const f in c::Fields
+                        if a.(f) < b.(f) then return true
+                        if b.(f) < a.(f) then return false
+                end if
+
+            false
+        else
+            for const f in T::Fields
+                if self.(f) < rhs.(f) then return true
+                if rhs.(f) < self.(f) then return false
+
+            false
+    end lt
 
 // A tuple is comparable, hashable and printable exactly when its parts are, which is what these
 // rows say: the membership is *structural*, so nothing has to be written per tuple type.

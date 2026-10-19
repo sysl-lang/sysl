@@ -231,6 +231,105 @@ rfl_derive_same_named_member_of_another_trait()
         """), "{\"level\":4}\n")
 end rfl_derive_same_named_member_of_another_trait
 
+// A trait the derived one requires, its members reached in the body as a bound `T: Tagged` would
+// reach them -- and another trait's member of the same name is not the one meant.
+private rfl_derive_tagged() -> string = raw"""
+    trait Named
+        name(self) -> string
+
+    trait Loud
+        name(self) -> string
+
+    trait Tagged: Named
+        tag(self) -> string
+
+        derive[T] tag(self: T) -> string
+            var out = ""
+
+            for const f in T::Fields
+                out = out + self.(f).name()
+
+            out
+
+    impl Named for int
+        name(self) -> string = "int"
+
+    impl Loud for bool
+        name(self) -> string = "LOUD"
+
+    """
+
+@test("a member of a trait the derived one requires is reached through that trait in the copy")
+rfl_derive_supertrait_member()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_tagged() + raw"""
+        struct P derives Tagged
+            a: int
+            b: int
+
+        impl Named for P
+            name(self) -> string = "P"
+
+        print(P(1, 2).tag())
+        """), "intint\n")
+end rfl_derive_supertrait_member
+
+@test("a supertrait's member in a derivation is never another trait's member of the same name")
+rfl_derive_supertrait_member_not_another_traits()
+    if !azb_ready() then return
+
+    val said = azb_refusal(azb_main(rfl_derive_tagged() + raw"""
+        struct Q derives Tagged
+            level: int
+            on: bool
+
+        impl Named for Q
+            name(self) -> string = "Q"
+
+        print(Q(1, true).tag())
+        """))
+
+    assert(said.contains("'bool' does not implement 'Named': method 'name' is missing (in the copy " +
+                         "for field 'Q.on')"), said)
+    assert(!said.contains("LOUD"), said)
+end rfl_derive_supertrait_member_not_another_traits
+
+// The library's `Eq`, `Ord` and `Hash` are `derive` bodies in the standard module, and an enum's are
+// written with `c.index` -- which reads a `sysl.reflect.Variant`, so it must make no edge from `sysl`
+// to `sysl.reflect` (which depends on `sysl`) for the standard module to build at all.
+@test("the library's Eq, Ord and Hash derive a data enum through 'c.index'")
+rfl_derive_std_data_enum()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        enum D derives Eq, Ord, Hash
+            P(a: int, b: string)
+            Q
+            R(c: int)
+
+        print(P(1, "a") == P(1, "a"), P(1, "a") == Q, Q == Q, R(2) < P(9, ""), P(1, "b") < P(1, "c"))
+        print(Q < R(0), R(0) < Q, Q.hash() == Q.hash(), P(1, "a").hash() == P(1, "b").hash())
+        """), "true false true false true\ntrue false true false\n")
+end rfl_derive_std_data_enum
+
+// An opaque struct that declares its fields withholds its layout outside its module, and a
+// derivation it asked for is its author opting in -- so the library's bodies walk the fields, read in
+// the standard module's file, exactly as they walk a private one.
+@test("an opaque struct that declares its fields derives Eq, Ord and Hash")
+rfl_derive_opaque_with_fields()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        opaque struct H derives Eq, Ord, Hash
+            x: int
+            y: string
+
+        print(H(1, "a") == H(1, "a"), H(1, "a") == H(1, "b"), H(1, "a") < H(1, "b"), H(2, "") < H(1, "z"))
+        print(H(1, "a").hash() == H(1, "a").hash(), H(1, "a").hash() == H(1, "b").hash())
+        """), "true false true false\ntrue false\n")
+end rfl_derive_opaque_with_fields
+
 @test("a trait with no 'derive' member is refused at the 'derives' that names it")
 rfl_derive_trait_without_derive_members()
     if !azb_ready() then return

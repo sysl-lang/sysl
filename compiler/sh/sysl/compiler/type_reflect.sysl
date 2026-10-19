@@ -76,8 +76,17 @@ private written_instance(cx: &Analyzer, span: Span, receiver: Expr) -> Option[Ty
 end written_instance
 
 // A type of the library's that the answers are made of, by its full name.
-private library_type(cx: &Analyzer, span: Span, name: string) -> Type =
-    resolve_type(cx.an, cx.scope, named_type(span, name), no_bindings())
+//
+// **Read in the declaring module's own terms**, so it makes no edge in the module graph: the
+// compiler names the type, not the code being read -- and that code may be the standard module's
+// own, where a `derive` body reading `c.index` would otherwise make `sysl` depend on
+// `sysl.reflect`, which depends on `sysl`.
+private library_type(cx: &Analyzer, span: Span, name: string) -> Type
+    val home = Scope(name[0..<last_dot_in(name).unwrap_or(0)], no_imports(), source_of("", ""),
+                     no_packaging())
+
+    resolve_type(cx.an, home, named_type(span, name), no_bindings())
+end library_type
 
 // -- `x::Annotation[A]` ----------------------------------------------------------------------------
 //
@@ -494,8 +503,13 @@ reflected_walk(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[Buf[Type]
 
     val fields = walked_fields(t, -1)
 
+    // An `opaque struct` that declares its fields has them where its layout is known -- its own
+    // module -- and in a derivation it asked for, which is the type's author opting in exactly as
+    // for a private field. One with no body has none anywhere.
     val listed = underlying(t) match
-        Struct(s) -> !s.opaque
+        Struct(s) ->
+            !s.opaque || (!s.fields.is_empty() &&
+                          (!layout_hidden(cx.an, cx.scope, s.base) || in_own_derivation(cx, s.base)))
         Results(_) -> true
         _ -> false
 
