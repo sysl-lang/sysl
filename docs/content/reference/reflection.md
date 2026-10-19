@@ -24,7 +24,7 @@ It is built from forms that are described elsewhere, and this page is where they
 | `@annotation`, `f::Annotation[A]` | a program's own marks on a field, variant or type | [annotations](#annotations) |
 
 The other `::` attributes — `Color::First`, `Int::Max`, `T::Min` — are on
-[attributes](/reference/attributes/#-what-a-types-own-name-answers). `for const` and `if const` are on
+[attributes](/reference/attributes/#what-a-type-s-own-name-answers). `for const` and `if const` are on
 [generics](/reference/generics/).
 
 ## What a type is, and what it is called
