@@ -20,6 +20,12 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val span = im.span
     val key = lookup_trait_key(a, scope, im.decl.trait_name)
 
+    if key.is_none() && im.decl.derived
+        a.fault(scope, span, s"unknown trait '${im.decl.trait_name}' — 'derives' names Eq, Ord, Hash " +
+                "or Display, or a trait in scope with a 'derive' body for its members")
+        return im
+    end if
+
     if key.is_none()
         a.fault(scope, span, s"unknown trait '${im.decl.trait_name}'")
         return im
@@ -27,6 +33,18 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
     val tr = trait_decl_at(a, key.unwrap()).unwrap()
     var block = im.decl
+
+    // A `derives` clause may name any trait that says how to write it -- which is what its `derive`
+    // members are. One without any is implemented by hand.
+    if block.derived && tr.derives.is_empty()
+        val simple = im.decl.trait_name
+
+        a.fault(scope, span, s"'$simple' is not a trait the compiler knows how to write, and it " +
+                "carries no 'derive' member — 'derives' names Eq, Ord, Hash or Display, or a trait " +
+                "with a 'derive' body for its members. A trait without one is implemented with an " +
+                "'impl' block")
+        return im
+    end if
 
     // `Self` is what a block is *for*, so it cannot be what the block names; it ends here, told
     // once, since reading on would resolve `Self` again and complain about the same word.
@@ -437,6 +455,17 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         a.tables.members.default_origin.put(
             s"${home.symbol}.${item.name}${home.alt}",
             s"${key.unwrap()}.${item.name}")
+
+    // A member a `derives` clause wrote from a `derive` body is an inherited default with three
+    // differences (`derive_members.sysl`), recorded under the name the copy lowers to.
+    if block.derived
+        for item in inherited
+            val made = derive_for(tr, item.name)
+
+            if made.is_some() then
+                a.tables.members.derived.put(s"${home.symbol}.${item.name}${home.alt}",
+                                             DerivedCopy(made.unwrap().param, home.key, key.unwrap(),
+                                                         scope, span))
 
     // A member the trait does not declare is not one the type gains: the block was told it may not
     // define it, and a member filed anyway would have its body read and answer a call by its name.

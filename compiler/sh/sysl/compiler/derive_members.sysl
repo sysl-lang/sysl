@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A trait's `derive` members (`docs/design/reflection.md` § 2, row 8): `derive[T] encode(self: T, …)`
+// is the body the trait writes for `encode` over any type whose `derives` clause names it.
+//
+// The clause becomes an empty `impl` block marked `derived` (`deriving.sysl`), and `hoist_impl`
+// supplies each member from the trait's `derive` body exactly as it supplies an inherited default --
+// read in the trait's file, under the trait's imports. Three things set the copy apart, and they are
+// what this file answers:
+//
+// - **`T` is the deriving type**: it is bound wherever `Self` is, so `T::Fields`, `f::Type` and
+//   `self.(f)` are read at that type's own make-up.
+// - **A refusal in the copy is told at the `derives`**: the trait's body is a template, so a field it
+//   cannot handle is the deriving type's problem, said where the type asked for it.
+// - **The copy may reach the type's private fields** (row 7): the type's author opted in by naming
+//   the trait.
+
+// The bindings a member's body or signature is read under, with the `derive` body's own name for the
+// deriving type added where the member was written from one -- standing for whatever `Self` does.
+with_derive_param(a: &Analysis, name: string, subst: Buf[Binding]) -> Buf[Binding]
+    val copy = a.tables.members.derived.get(name)
+
+    if copy.is_none() then return subst
+
+    val self_ty = bound_type(subst, "Self")
+
+    if self_ty.is_none() then return subst
+
+    val param = copy.unwrap().param
+
+    // Already bound by an outer reading of the same member.
+    for item in subst
+        if item.name == param && type_eq(item.ty, self_ty.unwrap()) then return subst
+
+    // **In FRONT**, since a substitution answers with the first binding of a name: the body is the
+    // trait's, and a generic type's own parameter of the same spelling (`struct Box[T] derives Json`)
+    // means nothing there.
+    var out: Buf[Binding] = buf()
+
+    out.push(Binding(param, self_ty.unwrap()))
+
+    for item in subst
+        out.push(item)
+
+    out
+end with_derive_param
+
+// Every refusal said since `before`, while the body of a member written from a `derive` body was
+// read, is moved to the word in the `derives` clause that asked for the member. The message is kept
+// -- a refusal made in one copy of a field walk already names the field.
+told_at_derives(a: &Analysis, name: string, before: usize)
+    val copy = a.tables.members.derived.get(name)
+
+    if copy.is_none() then return
+
+    val site = copy.unwrap()
+    val found = a.found
+
+    for i in before..<found.len()
+        val p = found.at(i)
+        val d = p.diag
+
+        found.set(i, Placed(site.scope.src, Diagnostic(d.severity, site.span, d.message, d.label, d.note),
+                            p.at_place))
+end told_at_derives
+
+// The scope of the `derives` clause a member was written for, or nothing for any other member.
+derived_home(a: &Analysis, name: string) -> Option[Scope] =
+    a.tables.members.derived.get(name).map(c -> c.scope)
+
+// Whether the body being read is a derivation the type `base` asked for, which may reach its private
+// fields through `v.(f)`.
+in_own_derivation(cx: &Analyzer, base: string) -> bool
+    val copy = cx.an.tables.members.derived.get(cx.decl_name)
+
+    copy.is_some() && copy.unwrap().subject == base
+end in_own_derivation
+
+// The trait being derived, as a message names it, where the body being read is a derivation and that
+// trait declares a member `name`.
+derived_trait_declaring(cx: &Analyzer, name: string) -> Option[string]
+    val copy = cx.an.tables.members.derived.get(cx.decl_name)
+
+    if copy.is_none() then return None
+
+    val tr = trait_decl_at(cx.an, copy.unwrap().trait_key)
+
+    if tr.is_none() then return None
+
+    for tm in tr.unwrap().methods
+        if tm.name == name then return Some(qualified_name(copy.unwrap().trait_key))
+
+    None
+end derived_trait_declaring
+
+// The `derive` body a trait carries for one of its members.
+derive_for(tr: TraitDecl, name: string) -> Option[DeriveDecl]
+    for item in tr.derives
+        if item.member.name == name then return Some(item)
+
+    None
+end derive_for

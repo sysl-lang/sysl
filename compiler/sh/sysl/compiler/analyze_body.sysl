@@ -237,7 +237,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
         // A `Debug` the compiler supplied is held on the same terms: it cannot be wrong, and every
         // struct and enum has one.
-        if from_library(a, home) || supplied_debug(m.params) then
+        // A member written from a `derive` body belongs to the type that asked for it, wherever the
+        // trait was written, so it is held only where that type is the library's.
+        if from_library(a, derived_home(a, m.name).unwrap_or(home)) || supplied_debug(m.params) then
             held.hold(m.name, HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
 
@@ -863,6 +865,8 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     if written.is_some() then subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(),
                                                                       subst)))
 
+    subst = with_derive_param(a, d.name, subst)
+
     val cx = analyzer_for(a, scope)
 
     cx.subst = subst
@@ -980,6 +984,8 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
 
     if written.is_some() then subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(),
                                                                       subst)))
+
+    subst = with_derive_param(a, d.name, subst)
 
     val cx = analyzer_for(a, scope)
 
@@ -1104,8 +1110,11 @@ end analyze_instance
 // The same, on an analyzer whose terms a caller has already set.
 analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> TFunc
     val reaching = enter_reaching(a, d)
+    val said = a.complaints()
 
     defer leave_reaching(a, reaching)
+    // A member a `derives` clause wrote from a trait's template is refused at the clause.
+    defer told_at_derives(a, d.name, said)
 
     val sig = a.tables.members.func_insts.get(name)
 

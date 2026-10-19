@@ -4,12 +4,12 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
 // `derives Eq, Ord, Hash, Display` -- the four implementations the compiler writes over a type's own
-// parts.
+// parts -- and `derives Json`, any trait that carries `derive` members of its own.
 //
-// The list is **closed**, and deliberately: an open one would be an extension point, and the
-// extension point would be the field loop this feature exists instead of. These four are the ones
-// the library already provides structurally for every tuple, which is the same claim in the same
-// words -- a composite has them exactly when its parts do.
+// These four are the ones the library already provides structurally for every tuple, which is the
+// same claim in the same words -- a composite has them exactly when its parts do. Any other name is
+// written as an empty block marked `derived`, which `hoist_impl` fills from the trait's `derive`
+// bodies (`derive_members.sysl`) or refuses where the trait has none.
 //
 // **What is built is source**, and that is the whole design: a clause becomes the `impl` block a
 // reader could have written, hoisted and analyzed by the ordinary machinery, so nothing downstream
@@ -104,6 +104,16 @@ private derives_clause(s: Stmt) -> Buf[BoundRef] = *s.kind match
 // reported on and only the sound ones become blocks -- and because a refusal here is about the
 // **clause**, where every other refusal a derived block can raise is about the body it wrote.
 private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[string]
+    if !entry.args.is_empty() then
+        return Some(s"'${entry.name}' writes trait arguments, and a derived implementation takes " +
+                    "none — a derivation is written over a type's own fields, and there is nothing " +
+                    "for an argument to vary")
+
+    // **A trait of the program's or a library's is the trait's own business**: whether it carries a
+    // `derive` body, and what that body makes of an opaque struct or a union, is asked where the
+    // trait is known (`hoist_impl.sysl`) and in the body (`T::Kind`).
+    if !holds_string(derivable(), simple) then return None
+
     // An **opaque** struct with no fields is C's incomplete type: the storage belongs to whoever
     // allocated it and nothing here knows its shape. Derived over no fields at all, `Eq` answers
     // true for every pair and `Display` renders every value the same -- a wrong answer with nothing
@@ -138,17 +148,6 @@ private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[stri
                                 "comparison. Remove 'Eq' from the 'derives' clause; the other " +
                                 "three are still worth deriving")
             _ -> ()
-
-    if !entry.args.is_empty() then
-        return Some(s"'${entry.name}' writes trait arguments, and a derived implementation takes " +
-                    "none — the compiler writes Eq, Ord, Hash, Display over a type's own fields, " +
-                    "and there is nothing for an argument to vary")
-
-    if !holds_string(derivable(), simple) then
-        return Some(s"'$simple' is not a trait the compiler knows how to write — 'derives' names " +
-                    "Eq, Ord, Hash or Display, which are the four the library provides " +
-                    "structurally for every tuple. A trait of your own is implemented with an " +
-                    "'impl' block")
 
     None
 end derives_problem
@@ -209,6 +208,16 @@ private one_derivation(entry: BoundRef, simple: string, s: Stmt) -> Buf[Stmt]
         targs.push(TypeRef(at, NamedType(tparam, buf())))
 
     val subject = TypeRef(at, NamedType(name, targs))
+
+    // **A trait of the program's or a library's is derived by its own `derive` bodies**: the block
+    // is written empty and marked, and `hoist_impl` supplies its members from the trait -- read in
+    // the trait's file, with the trait's `T` standing for this type.
+    if !holds_string(derivable(), simple)
+        out.push(stmt(at, ImplDecl(ImplDecl(entry.name, subject, buf(), tparams, bounds, buf(), buf(),
+                                            false, tvalues, buf(), buf(), true))))
+        return out
+    end if
+
     var method = eq_method(at, s)
 
     if simple == "Ord" then method = ord_method(at, s)
@@ -226,7 +235,7 @@ private one_derivation(entry: BoundRef, simple: string, s: Stmt) -> Buf[Stmt]
 
     methods.push(method)
     out.push(stmt(at, ImplDecl(ImplDecl(entry.name, subject, methods, tparams, bounds, buf(), buf(),
-                                        false, tvalues, buf(), buf()))))
+                                        false, tvalues, buf(), buf(), false))))
     out
 end one_derivation
 
@@ -915,7 +924,7 @@ private debug_blocks(s: Stmt, shown: Option[string] = None) -> Buf[Stmt]
 
     methods.push(method)
     out.push(stmt(at, ImplDecl(ImplDecl("sysl.Debug", subject, methods, tparams, bounds, buf(), buf(),
-                                        false, tvalues, buf(), buf()))))
+                                        false, tvalues, buf(), buf(), false))))
     out
 end debug_blocks
 

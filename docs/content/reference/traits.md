@@ -1147,11 +1147,102 @@ Its name is a [quoted identifier](/reference/lexical/#quoted-identifiers) with a
 digits and `_`. It is not a name to call, and nothing but a stack trace or an object file will show
 it to you.
 
-**The four are the whole list**, and it is closed: `Eq`, `Ord`, `Hash`, `Display`. They are the four
-the library already provides structurally for [every tuple](/reference/types/#what-the-library-gives-every-tuple),
-and a derived block walks a named product by the same rules a tuple's is walked by — so a `Size` and
-a `(int, int)` compare and order alike, and render alike but for the name in front. A trait of your own is implemented with an
-`impl` block; there is no way to teach the clause a fifth name.
+The four are the ones the library already provides structurally for
+[every tuple](/reference/types/#what-the-library-gives-every-tuple), and a derived block walks a
+named product by the same rules a tuple's is walked by — so a `Size` and a `(int, int)` compare and
+order alike, and render alike but for the name in front. Any other trait is derived by **its own
+`derive` members**, below.
+
+### A trait says how it is derived
+
+A trait may carry a **`derive` member**: `derive[T] name(self: T, …)`, with a body written over `T`'s
+make-up using [reflection](/reference/generics/) — `T::Kind`, `for const f in T::Fields`, `self.(f)`.
+A `derives` clause naming the trait instantiates each `derive` member with `T` standing for the type,
+as the `impl` block a person would have written:
+
+```sysl
+@annotation
+struct rename
+    name: string
+
+trait Json
+    encode(self, w: *Writer)
+
+    derive[T] encode(self: T, w: *Writer)
+        if const T::Kind == Kind.Struct
+            w.write("{".bytes)
+
+            for const f in T::Fields
+                if f.index > 0 then w.write(",".bytes)
+
+                val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                w.write(s"\"$key\":".bytes)
+                self.(f).encode(w)
+
+            w.write("}".bytes)
+        else
+            @assert(false, "Json derives for a struct")
+
+impl Json for int
+    encode(self, w: *Writer) = w.write(s"$self".bytes)
+
+impl Json for string
+    encode(self, w: *Writer) = w.write(s"\"$self\"".bytes)
+
+struct User derives Json
+    @rename("id") user_id: int
+    name: string
+
+User(7, "ann").encode(stdout())
+print("")
+```
+
+```output
+{"id":7,"name":"ann"}
+```
+
+`User` gets an `impl Json for User` whose body is two unrolled field writes. The body is read in the
+trait's file, under the trait's imports, and it is a **template rather than a default**: a block
+written by hand inherits nothing from it. A generic type derives at each instance (`struct Box[T]
+derives Json` asks `T: Json` of each), and a data enum is walked with `for const c in T::Variants`.
+
+**The copy is checked once per field, and refused at the `derives`**: a field whose type cannot do
+what the body asks is the deriving type's problem, said where the type asked, naming the field.
+
+```sysl
+trait Json
+    to_json(self) -> string
+
+    derive[T] to_json(self: T) -> string
+        var out = ""
+
+        for const f in T::Fields
+            out = out + self.(f).to_json()
+
+        out
+
+impl Json for int
+    to_json(self) -> string = s"$self"
+
+struct Pin
+    on: bool
+
+struct Lamp derives Json
+    level: int
+    pin: Pin
+
+print(Lamp(1, Pin(true)).to_json())
+```
+
+```error
+'Pin' does not implement 'Json': method 'to_json' is missing (in the copy for field 'Lamp.pin')
+```
+
+**A derivation reaches the type's private fields.** `self.(f)` on a private field is otherwise
+refused outside the type's own file; naming the trait in `derives` is the type's author opting in.
+
+A trait with no `derive` member cannot be derived, and is implemented with an `impl` block:
 
 ```sysl
 trait Show
@@ -1162,7 +1253,7 @@ struct P derives Show
 ```
 
 ```error
-is not a trait the compiler knows how to write
+'Show' is not a trait the compiler knows how to write, and it carries no 'derive' member
 ```
 
 ### Order is declaration order
