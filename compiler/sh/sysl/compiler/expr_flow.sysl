@@ -1341,6 +1341,29 @@ end quantifier_expr
 // feature**, and it is why this cannot be a desugaring into an ordinary `for`: the parts of a tuple
 // have different types, so one written line type-checks differently at each position.
 const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[Stmt]) -> TExpr
+    // `for const f in T::Fields` -- one copy per part of a type, the name standing at that part's
+    // descriptor (`type_reflect.sysl`).
+    val walked = reflected_walk(cx, span, iter)
+
+    if walked.is_some()
+        val parts = walked.unwrap() match
+            Ok(ds) -> ds
+            Err(refusal) -> return refusal
+
+        if parts.len() > usize(MaxUnrolledCopies) then
+            return cx.err(span, s"a 'for const' over ${parts.len()} parts would emit that many " +
+                          s"copies of its body, and $MaxUnrolledCopies is the most one is unrolled to")
+
+        var each: Buf[Buf[Binding]] = buf()
+        var labels: Buf[string] = buf()
+
+        for d in parts
+            each.push(descriptor_bindings(name, d))
+            labels.push(descriptor_label(d))
+
+        return unrolled(cx, span, name, each, labels, body)
+    end if
+
     val bounds = range_bounds(iter)
 
     if bounds.is_none() then
@@ -1365,11 +1388,33 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
                       "to — a loop this long is a run-time 'for', which costs one copy whatever " +
                       "it counts to")
 
+    var each: Buf[Buf[Binding]] = buf()
+    var v = first
+
+    while v <= last
+        var one: Buf[Binding] = buf()
+
+        one.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
+        each.push(one)
+        v = v + 1
+
+    unrolled(cx, span, name, each, buf(), body)
+end const_for_expr
+
+// The copies of a `for const` body, each read under its own bindings for the loop's name -- and,
+// for a walk over a type's make-up, `name::Type` beside it -- in place of whatever outer ones the
+// name had.
+//
+// **A refusal in a copy over a type's parts names the part**, from `labels`: one line is checked
+// once per field, and the line alone does not say which field it failed for.
+private unrolled(cx: &Analyzer, span: Span, name: string, each: Buf[Buf[Binding]],
+                 labels: Buf[string], body: Buf[Stmt]) -> TExpr
     // The enclosing loops are **hidden** while the copies are read, which is what stops an
     // unlabelled `break` in one of them from silently leaving a loop the `for const` sits inside.
     val saved_loops = cx.loops
     val saved_flag = cx.in_const_for
     val saved_subst = cx.subst
+    val typed = s"$name::Type"
 
     cx.loops = buf()
     cx.in_const_for = true
@@ -1381,25 +1426,32 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
     if saved_outer.is_some() then cx.defer_outer = Some(0)
 
     var copies: Buf[TExpr] = buf()
-    var v = first
 
-    while v <= last
+    for k in 0..<each.len()
         var subst: Buf[Binding] = buf()
 
         for i in 0..<saved_subst.len()
-            if saved_subst.at(i).name != name then subst.push(saved_subst.at(i))
+            val held = saved_subst.at(i).name
 
-        subst.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
+            if held != name && held != typed then subst.push(saved_subst.at(i))
+
+        for b in each.at(k)
+            subst.push(b)
+
         cx.subst = subst
+
+        val before = cx.an.complaints()
+
         copies.push(TExpr(span, TBlockExpr(type_value_block(cx, body, None, true))))
-        v = v + 1
+
+        if k < labels.len() then name_the_part(cx, before, labels.at(k))
 
     cx.subst = saved_subst
     cx.loops = saved_loops
     cx.in_const_for = saved_flag
     cx.defer_outer = saved_outer
     TExpr(span, TSeq(copies))
-end const_for_expr
+end unrolled
 
 // `if const cond` -- the branch decided **while compiling**. The condition is folded, and only the arm
 // it picks is read: the other is never type-checked, which is what lets one generic body hold an arm

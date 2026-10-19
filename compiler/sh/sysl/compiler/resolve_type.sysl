@@ -107,8 +107,14 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
     // anything else the moment the subject is known: the subject is resolved first, and a parameter
     // standing in for itself answers off the bounds it carries.
+    //
+    // `f::Type` is the type of the field a `for const` over `T::Fields` stands at in this copy, which
+    // the copy binds under that very spelling.
     AssocType(base, member) ->
-        assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
+        val projected = descriptor_projection(base, member, subst)
+
+        if projected.is_some() then projected.unwrap()
+        else assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
     ValueArgType(e) -> const_argument(a, scope, t.span, e, subst)
 
@@ -946,6 +952,12 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         // A parameter used here stands where the declaration wrote it, and what it stands for is
         // held exactly as the parameter is -- so this is where the argument position's deferral is
         // paid for.
+        if stood_for.is_some() && descriptor_bound(subst, name).is_some()
+            a.fault(scope, span, s"'$name' is a descriptor a 'for const' binds, not a type — the type " +
+                    s"of the field it stands at is '$name::Type'")
+            return Unknown
+        end if
+
         if stood_for.is_some() then return substituted(a, scope, span, stood_for.unwrap())
 
     if name == "never"

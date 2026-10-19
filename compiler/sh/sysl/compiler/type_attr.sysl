@@ -53,6 +53,11 @@ end type_attr_expr
 
 // `T::Attr(x)` -- the attributes that carry an operand, and the ones that do not, refused by name.
 type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr]) -> TExpr
+    // The name a `for const` over a type's make-up binds answers for the part it stands at.
+    val descriptor = descriptor_bound(cx.subst, written)
+
+    if descriptor.is_some() then return descriptor_attr(cx, span, written, attr, descriptor.unwrap())
+
     // **A generic enum written bare names no type at all** -- resolving `Option` with no arguments
     // is refused for the arguments, which says nothing about the attribute -- so it is told here,
     // before the name is resolved, that there is no single enum for the attribute to read.
@@ -95,6 +100,9 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
     // parameter per instantiation, since each one is a fact about the type it was given.
     if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
 
+    // `T::Make(c, payload)` builds the variant a walk over `T::Variants` stands at.
+    if attr == "Make" then return make_variant(cx, span, written, args, ty)
+
     // **A type parameter answers the same two attributes in every reading of the body**, the one
     // where it stands for itself and each instantiation alike -- so what it was bound to decides
     // the value and never which attributes may be asked.
@@ -128,7 +136,7 @@ attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
 
 // The key of the generic enum a written name declares, where it declares one and no type parameter
 // of the body being read stands in front of it.
-private generic_enum_named(cx: &Analyzer, written: string) -> Option[string]
+generic_enum_named(cx: &Analyzer, written: string) -> Option[string]
     if bound_type(cx.subst, written).is_some() then return None
 
     val key = lookup_type_key(cx.an, cx.scope, written)
@@ -146,7 +154,7 @@ end generic_enum_named
 
 // The type a written name stands for here, in the order a reader's own terms are consulted: a type
 // parameter of the body being read, then a declared type, then a built-in integer.
-private attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
+attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
     val stood = bound_type(cx.subst, written)
 
     if stood.is_some() then return stood
