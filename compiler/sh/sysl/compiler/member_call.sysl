@@ -887,13 +887,32 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
                       targs: Buf[Expr] = no_written_members()) -> TExpr
     val found = member_key(cx.an, rty, name)
 
+    // Inside a derivation, a member the derived trait declares is reached through that trait alone,
+    // as a bound would have it: the trait narrows the candidates, and a member of the name that some
+    // other trait gave the type -- or the compiler supplies for it -- is not the one the body meant.
+    val deriving = derived_trait_key(cx, name)
+
+    if deriving.is_some() && !offered_by(cx, found.0, name, deriving.unwrap()) then
+        return not_derived_there(cx, span, found.0, name, deriving.unwrap())
+
     if !has_member_at(cx.an, found.0, name) &&
        !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
         return no_such_method(cx, span, receiver, rty, found.0, name, args)
 
+    var through = via
+
+    if deriving.is_some()
+        through = buf()
+
+        for item in via
+            through.push(item)
+
+        through.push(deriving.unwrap())
+    end if
+
     val declaring = core_declaring(name)
-    val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty)
-    val chosen = chosen_member(cx, rty, found.0, name, span, args, via, provided)
+    val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty) && deriving.is_none()
+    val chosen = chosen_member(cx, rty, found.0, name, span, args, through, provided)
 
     if chosen.is_none() then return bad_expr(span)
 
@@ -2096,13 +2115,31 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
     // Inside a derivation, a member of the trait being derived asked of a part is the trait asked of
     // that part's type -- which the reader fixes by implementing or deriving it there.
-    val deriving = derived_trait_declaring(cx, name)
+    val deriving = derived_trait_key(cx, name)
 
-    if deriving.is_some() then
-        return cx.err(span, s"'$base' does not implement '${deriving.unwrap()}': method '$name' is missing")
+    if deriving.is_some() then return not_derived_there(cx, span, base, name, deriving.unwrap())
 
     cx.err(span, s"type '$base' has no method '$name'")
 end no_such_method
+
+// A part of the deriving type whose own type does not implement the trait being derived, asked for
+// that trait's member: the refusal a bound would have made at the call.
+private not_derived_there(cx: &Analyzer, span: Span, base: string, name: string, key: string) -> TExpr =
+    cx.err(span, s"'$base' does not implement '${qualified_name(key)}': method '$name' is missing")
+
+// Whether the type filed under `base` holds a member `name` that the trait `key` gave it -- the one
+// member, or one of several the name is filed under.
+private offered_by(cx: &Analyzer, base: string, name: string, key: string) -> bool
+    val from = cx.an.tables.members.from_trait
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, name))
+
+    if alts.is_none() then return from.get(member_key_of(base, name)).unwrap_or("") == key
+
+    for item in alts.unwrap()
+        if from.get(member_key_of(base, item)).unwrap_or("") == key then return true
+
+    false
+end offered_by
 
 // An integer or fixed-point type with no negative values.
 private is_unsigned_number(t: Type) -> bool = t match

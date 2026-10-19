@@ -1208,7 +1208,10 @@ written by hand inherits nothing from it. A generic type derives at each instanc
 derives Json` asks `T: Json` of each), and a data enum is walked with `for const c in T::Variants`.
 
 **The copy is checked once per field, and refused at the `derives`**: a field whose type cannot do
-what the body asks is the deriving type's problem, said where the type asked, naming the field.
+what the body asks is the deriving type's problem, said where the type asked, naming the field. A
+call in the body of a member the trait declares means **that trait's** member, as a bound `T: Json`
+would make it: a field whose type has a member of the same name from some other trait is still
+refused as not implementing `Json`, and is never handed to the other trait's member.
 
 ```sysl
 trait Json
