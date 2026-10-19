@@ -68,21 +68,27 @@ primes_below(n: int) -> []const int
 
     out.view()
 
-static val PRIMES = primes_below(100)
-@assert(PRIMES.len == 25, "there are 25 primes below 100")
+const COUNT: usize = primes_below(100).len
+@assert(COUNT == 25, "there are 25 primes below 100")
+
+static val PRIMES: []const int = primes_below(100)
 
 ring_for[T, const N: usize]() -> usize
     if const N > 64
         @assert(sizeof(T) * N <= 4096, "a ring this large belongs on the heap")
     N
 
-main()
-    const SMALL: int = primes_below(10).len
-    print(SMALL, PRIMES[24])
+const SMALL: usize = primes_below(10).len
+
+print(SMALL, PRIMES[24], ring_for[u8, 128]())
 ```
 
 `PRIMES` is laid into the object file as 25 integers, viewed with a null owner word. `SMALL` is folded to 4.
-The `@assert` inside `if const` is checked only for instances where `N > 64`.
+The `@assert` inside `if const` is checked only for instances where `N > 64`. The program prints
+`4 97 128`; `ring_for[u64, 1024]()` is refused by the assertion. A `val` is storage, so the count an
+`@assert` reads is a `const`. (The example as first written asserted on `PRIMES.len`, gave `SMALL` the
+wrong type, and wrote `static` in a file it could not stand in. It is the test
+`cte_the_design_example_runs`.)
 
 ## 4. What the analogy checks say
 
@@ -255,3 +261,32 @@ real is observable in what is laid out. Hoisting a type's members on demand woul
 **Cost.** A program with no waiting call reads its declarations once, as before. One with waiting
 calls reads them once more per link of the chain. The declarations of a small program take about
 50 ms.
+
+## 9. Step 6 (2026-10-19)
+
+**Std marks its promises.** The `const` mark is on:
+- `sysl.math`: `pow`, `gcd`, `lcm`, `divmod`, `div_floor`, `mod_floor`, `is_power_of_two`,
+  `next_power_of_two`, `min`, `max`, `clamp`, `approx_eq`, `approx_eq_rel`, the checked and
+  overflowing arithmetic, and `magnitude`;
+- `Buf`'s constructors and members, and `Frozen`'s readers and walk;
+- `Map` and `Set`, their constructors and their set operations;
+- `sysl.slices`' searches, comparisons and sorts;
+- `StrBuilder`.
+
+`build-lib --std` holds every mark at its declaration. `slices.copy` and `copy_exact` stay unmarked,
+because they compare addresses to choose a direction for overlapping slices. The C library's
+floating-point maths stays unmarked as well, as decision 9 says.
+
+**What marking found.** Two forms passed the static check but were not held by the evaluator, so a
+promised function failed when run. Both are fixed:
+- the `Bits` and `Signed` operations (`count_ones`, the leading and trailing counts, `reverse_bits`,
+  the rotations, `abs`, `signum`), now `int_op_value` in `const_fold.sysl`, checked against the
+  machine across widths;
+- `for` over a type that walks itself (`TIterate`).
+
+A routine the evaluator runs itself (`Frozen.view`, `freeze_buf`, the renderers) is not walked at
+its declaration, since it keeps its promise in `const_eval.sysl`.
+
+**§3's example did not compile as written.** A field read off a call's answer
+(`primes_below(10).len`) was not folded, because only a call was. It is now run as the whole
+expression, as a method on the answer already was. The example is corrected, and it is a test.

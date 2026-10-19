@@ -131,6 +131,9 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         if dotted.is_some() then return dotted
 
+        // A field of what a call answers is run with the call (`const_eval.sysl`).
+        if mentions_const_call(cx.an, receiver) then return const_call(cx, e)
+
         // `real.infinity`, `f32.nan` -- read off the float type they are of, exactly as the
         // analyzer reads them (`bare_type_member`).
         if builtin_float(name).is_none() then return None
@@ -954,6 +957,101 @@ swapped_bytes(n: BigInt, bits: int, signed: bool) -> BigInt
 
     wrap(out, bits, signed)
 end swapped_bytes
+
+// An operation of the `Bits` and `Signed` traits on `n`, held at a width of `bits`: the answer the
+// machine's own instructions give. A count of zeros or ones from either end of zero is the width, as
+// the trait documents; a rotation is by its amount modulo the width, as a funnel shift of the value
+// with itself is; `abs` of the most negative value wraps to itself. `None` for an operation it does
+// not name.
+int_op_value(op: string, n: BigInt, bits: int, signed: bool, amount: Option[BigInt]) -> Option[BigInt]
+    val zero = from_int(0)
+
+    if op == "abs" then return Some(if cmp(n, zero) < 0 then wrap(negate(n), bits, signed) else n)
+    if op == "signum" then return Some(from_int(if cmp(n, zero) < 0 then -1 else if cmp(n, zero) > 0 then 1 else 0))
+
+    // The bits, lowest first.
+    var low_first: Buf[bool] = buf()
+    var raw = wrap(n, bits, false)
+
+    for _ in 0..<bits
+        val q = div_rem(raw, from_int(2))
+
+        low_first.push(cmp(q.1, zero) != 0)
+        raw = q.0
+
+    op match
+        "count_ones" -> Some(from_int(long(count_of(low_first, true))))
+        "count_zeros" -> Some(from_int(long(count_of(low_first, false))))
+        "leading_zeros" -> Some(from_int(long(run_of(low_first, false, true))))
+        "trailing_zeros" -> Some(from_int(long(run_of(low_first, false, false))))
+        "leading_ones" -> Some(from_int(long(run_of(low_first, true, true))))
+        "trailing_ones" -> Some(from_int(long(run_of(low_first, true, false))))
+        "reverse_bits" ->
+            var reversed: Buf[bool] = buf()
+
+            for i in 0..<low_first.len()
+                reversed.push(low_first.at(low_first.len() - 1 - i))
+
+            Some(bits_value(reversed, signed))
+        "rotate_left" -> Some(bits_value(rotated(low_first, amount.unwrap_or(zero), true), signed))
+        "rotate_right" -> Some(bits_value(rotated(low_first, amount.unwrap_or(zero), false), signed))
+        _ -> None
+end int_op_value
+
+private count_of(low_first: Buf[bool], want: bool) -> usize
+    var n: usize = 0
+
+    for b in low_first
+        if b == want then n += 1
+
+    n
+end count_of
+
+// How many bits equal to `want` run from one end before the first that is not -- the high end where
+// `from_top`, the low end otherwise.
+private run_of(low_first: Buf[bool], want: bool, from_top: bool) -> usize
+    val w = low_first.len()
+    var n: usize = 0
+
+    while n < w
+        val b = if from_top then low_first.at(w - 1 - n) else low_first.at(n)
+
+        if b != want then break
+
+        n += 1
+
+    n
+end run_of
+
+// The bits moved `by` places toward the high end (`left`) or the low end, those leaving one end
+// arriving at the other.
+private rotated(low_first: Buf[bool], by: BigInt, left: bool) -> Buf[bool]
+    val w = low_first.len()
+    var out: Buf[bool] = buf()
+
+    if w == 0 then return out
+
+    val k = usize(to_u64(div_rem(by, from_int(long(w))).1).unwrap_or(0))
+
+    for i in 0..<w
+        // The bit landing at `i` came from `k` places below it when moving left, above it otherwise.
+        val from = if left then (i + w - k) % w else (i + k) % w
+
+        out.push(low_first.at(from))
+
+    out
+end rotated
+
+// The value bits stand for, lowest first, read at the width's signedness.
+private bits_value(low_first: Buf[bool], signed: bool) -> BigInt
+    var out = from_int(0)
+    val w = low_first.len()
+
+    for i in 0..<w
+        out = add(mul(out, from_int(2)), from_int(if low_first.at(w - 1 - i) then 1 else 0))
+
+    wrap(out, int(w), signed)
+end bits_value
 
 // The scalar a typed node is, where it is one this fold answers for: an integer, a `f32` or `f64`,
 // a `bool`, a `char` or a `string`, or a name for one that checks nothing. A subtype with a range or

@@ -1660,6 +1660,40 @@ the mark adds is that the promise is held at the declaration: a later change to 
 something it calls, that would stop it running is refused there, rather than at a constant in some
 other package that relied on it.
 
+**The standard library marks what it promises.** That covers:
+- `sysl.math`'s integer helpers and comparisons: `min`, `max`, `clamp`, `pow`, `gcd`, `lcm`, the
+  flooring division, the checked and overflowing arithmetic, the powers of two and `magnitude`;
+- `Buf`'s constructors and members, `Frozen`'s readers, and `Map` and `Set` with their operations;
+- `sysl.slices`' searches, comparisons and sorts;
+- `StrBuilder`.
+
+What it leaves unmarked still runs where its body can. Two things are left out on purpose: the C
+library's floating-point mathematics, and `slices.copy`, which compares addresses to handle
+overlapping slices.
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.math.gcd
+import sysl.slices.sort
+
+const sorted_gcds(xs: []const int) -> Buf[int]
+    var out = buf[int]()
+
+    for i in 1..<xs.len
+        out.push(gcd(xs[i - 1], xs[i]))
+
+    sort(out.view())
+    out
+
+const LEAST: int = sorted_gcds([12, 18, 27, 36][..]).at(0)
+
+print(LEAST)
+```
+
+```output
+6
+```
+
 The word is the one sysl already uses for "settled while compiling" — a `const` declaration,
 `for const`, a `[const N: usize]` parameter — and a `const` function is a constant with parameters.
 `const`, then a name, then `(` or `[` is a function; `const`, a name and `:` is a constant. It sits

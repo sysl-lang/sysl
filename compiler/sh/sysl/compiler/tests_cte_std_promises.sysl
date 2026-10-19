@@ -1,0 +1,147 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **What the standard library promises to run while compiling** -- the functions it marks `const`:
+// the integer helpers and comparisons, `Buf`, `Frozen`, `Map`, `Set`, the slice searches and sorts,
+// and string building. Each is run here where a constant is wanted, and the answer laid down is the
+// one the program computes. A function the library does not mark still runs where its body can; the
+// mark is the promise that it always will.
+
+@test("the library's promised functions run while compiling, and agree with the program")
+cte_the_library_promises_run()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf, buf_filled}
+        import sysl.container.{Map, map, Set, set_of, union}
+        import sysl.math.{clamp, gcd, lcm, max, min, pow, checked_add, next_power_of_two}
+        import sysl.slices.{index_of, contains, reverse, sort, binary_search, equal}
+        import sysl.text.{StrBuilder, str_builder}
+
+        const numbers() -> int
+            val c = checked_add(i8(100), i8(100))
+
+            pow(3, 4) + gcd(84, 36) + lcm(4, 6) + max(2, 9) + min(2, 9) + clamp(15, 0, 10) +
+                int(next_power_of_two(u32(37)).unwrap_or(0)) + (if c.is_none() then 1000 else 0)
+
+        const containers() -> int
+            var b = buf_filled(3, 7)
+            b.push(1)
+            b.insert(0, 5)
+
+            val m: Map[string, int] = map()
+            m.put("a", 1)
+            m.put("b", 2)
+
+            val s = union(set_of([1, 2, 3]), set_of([3, 4]))
+            val f = b.copy().freeze()
+
+            int(b.len()) * 1000 + m.get_or("b", 0) * 100 + int(s.len()) * 10 + f.at(0)
+
+        const slices() -> int
+            var xs: [6]int = [5, 3, 9, 1, 7, 3]
+
+            sort(xs[..])
+
+            val found = binary_search(xs[..], 7)
+            var ys: [3]int = [1, 2, 3]
+
+            reverse(ys[..])
+
+            int(found.1) * 100 + int(index_of(xs[..], 9).unwrap_or(0)) * 10 +
+                (if contains(xs[..], 4) then 1 else 0) + (if equal(ys[..], [3, 2, 1][..]) then 5 else 0)
+
+        const text() -> string
+            var sb = str_builder()
+            sb.push("n=")
+            sb.push_int(-42)
+            sb.push_char(' ')
+            sb.push_bool(true)
+            sb.push_char(' ')
+            sb.push_real(2.5)
+            sb.finish()
+
+        const N: int = numbers()
+        const C: int = containers()
+        const S: int = slices()
+        static val T: string = text()
+
+        print(N, C, S, T)
+        print(N == numbers(), C == containers(), S == slices(), T == text())
+        """), "1190 5245 455 n=-42 true 2.5\ntrue true true true\n")
+end cte_the_library_promises_run
+
+// The design note's worked example (`docs/design/comptime.md § 3`), whole: an unmarked function
+// building a heap buffer, a field read off its answer folding into a `const` and an `@assert`, the
+// answer laid down as a `static val`, and an assertion inside `if const` checked for one instance.
+@test("a field read off a call's answer folds, and the design's example runs as written")
+cte_the_design_example_runs()
+    if !enm_ready() then return
+
+    val program = raw"""
+        import sysl.buf.{Buf, buf}
+
+        primes_below(n: int) -> []const int
+            var out = buf[int]()
+
+            for i in 2..<n
+                var p = true
+                for d in 2..<i
+                    if i % d == 0 then p = false
+                if p then out.push(i)
+
+            out.view()
+
+        const COUNT: usize = primes_below(100).len
+        @assert(COUNT == 25, "there are 25 primes below 100")
+
+        static val PRIMES: []const int = primes_below(100)
+
+        ring_for[T, const N: usize]() -> usize
+            if const N > 64
+                @assert(sizeof(T) * N <= 4096, "a ring this large belongs on the heap")
+            N
+
+        const SMALL: usize = primes_below(10).len
+
+        """
+
+    assert_eq(enm_ran(program + "print(SMALL, PRIMES[24], ring_for[u8, 128]())\n"), "4 97 128\n")
+
+    val big = enm_outcome(program + "print(ring_for[u64, 1024]())\n").0
+
+    assert(big.contains("assertion failed: a ring this large belongs on the heap"), big)
+end cte_the_design_example_runs
+
+@test("every bit operation and 'abs' and 'signum' answer while compiling as the machine does")
+cte_bit_operations_agree_with_the_machine()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        bits8(x: i8) -> string =
+            s"${x.count_ones()} ${x.count_zeros()} ${x.leading_zeros()} ${x.trailing_zeros()} " +
+            s"${x.leading_ones()} ${x.trailing_ones()} ${x.reverse_bits()} ${x.rotate_left(3)} " +
+            s"${x.rotate_right(10)} ${x.abs()} ${x.signum()}"
+
+        bits32(x: u32) -> string =
+            s"${x.count_ones()} ${x.leading_zeros()} ${x.trailing_zeros()} ${x.leading_ones()} " +
+            s"${x.reverse_bits()} ${x.rotate_left(36)} ${x.rotate_right(1)}"
+
+        bits64(x: i64) -> string = s"${x.count_ones()} ${x.leading_zeros()} ${x.abs()} ${x.signum()}"
+
+        all() -> string =
+            bits8(0) + "|" + bits8(-128) + "|" + bits8(-1) + "|" + bits8(37) + "|" +
+            bits32(0) + "|" + bits32(0x80000001) + "|" + bits32(0xFFFFFFFF) + "|" +
+            bits64(-9223372036854775807 - 1) + "|" + bits64(12345)
+
+        static val AT_COMPILE: string = all()
+
+        print(AT_COMPILE == all())
+        print(AT_COMPILE)
+        """), "true\n" +
+              "0 8 8 8 0 0 0 0 0 0 0|1 7 0 7 1 0 1 4 32 -128 -1|8 0 0 0 8 8 -1 -1 -1 1 -1|" +
+              "3 5 2 0 0 1 -92 41 73 37 1|0 32 32 0 0 0 0|2 0 0 1 2147483649 24 3221225472|" +
+              "32 0 0 32 4294967295 4294967295 4294967295|1 0 -9223372036854775808 -1|6 50 12345 1\n")
+end cte_bit_operations_agree_with_the_machine

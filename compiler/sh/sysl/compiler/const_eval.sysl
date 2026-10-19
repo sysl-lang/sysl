@@ -140,14 +140,20 @@ const_evaluation() -> &ConstEvaluation =
 // `const_fold` asks of a `Call` that is not a conversion. `None` where the call is not one this
 // answers for, or where it stopped -- having said why, and counted the refusal, where it was a
 // mistake.
+//
+// **A field read off what a call answers is run the same way**, `primes_below(10).len`: the whole
+// expression typed and evaluated, as a method called on the answer already is.
 const_call(cx: &Analyzer, e: Expr) -> Option[Const]
-    val callee = *e.kind match
-        Call(c, _) -> c
+    val off_a_call = *e.kind match
+        Call(c, _) ->
+            if callee_word(c).is_none() then return None
+
+            false
+        Field(receiver, _, _) ->
+            if !mentions_const_call(cx.an, receiver) then return None
+
+            true
         _ -> return None
-
-    val written = callee_word(callee)
-
-    if written.is_none() then return None
 
     val ev = cx.an.evaluation
 
@@ -182,7 +188,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
 
     *typed.unwrap().kind match
         TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
-        _ -> return None
+        _ -> if !off_a_call then return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
         // An array is storage, not a constant's value: it is laid down only as a `val`'s data.
@@ -435,7 +441,7 @@ private runs_while_compiling(a: &Analysis, name: string) -> bool =
 
 // Whether a written expression calls anything anywhere in it -- the cheap question asked before
 // anything is typed, so a constant that calls nothing pays nothing.
-private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
+mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
     Call(c, args) ->
         if callee_word(c).is_some() then return true
 
@@ -443,6 +449,7 @@ private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
             if mentions_const_call(a, arg) then return true
 
         false
+    Field(receiver, _, _) -> mentions_const_call(a, receiver)
     Unary(_, operand) -> mentions_const_call(a, operand)
     Binary(_, l, r) -> mentions_const_call(a, l) || mentions_const_call(a, r)
     Compare(operands, _) ->
@@ -1255,6 +1262,7 @@ private eval(r: &EvRun, e: TExpr) -> Flow
         TLoop(_, _) -> loop_node(r, e)
         TWhile(_, _, _, _) -> while_node(r, e)
         TDoWhile(_, _, _, _) -> do_while_node(r, e)
+        TIterate(_, _, _, _, _, _, _, _) -> do_while_node(r, e)
         TFor(_, _, _, _, _, _, _, _) -> for_node(r, e)
         TCFor(_, _, _, _, _, _) -> c_for_node(r, e)
         TStore(_, _, _) -> store_node(r, e)
@@ -1338,6 +1346,8 @@ private while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
 @noinline
 private do_while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
     TDoWhile(body, cond, else_block, _) -> ev_do_while(r, e.span, body, cond, else_block)
+    TIterate(cursor, _, init, next, bind, body, else_block, _) ->
+        ev_iterate(r, e.span, cursor, init, next, bind, body, else_block)
     _ -> EvStop
 
 @noinline
@@ -1438,11 +1448,9 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         // `null` is the one address known before the linker runs, and is held the same way.
         TNullLit(_) -> EvGave(ConstLink(e))
         TDeref(operand, _) -> read_through(r, operand)
-        TIntOp(op, operand, None, width, ty) ->
+        TIntOp(op, operand, amount, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
-            else byte_order(r, e.span, op, operand, width)
-        TIntOp(op, _, _, _, _) ->
-            refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
+            else bit_operation(r, e.span, op, operand, amount, width)
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
 
@@ -3049,6 +3057,37 @@ private punned(r: &EvRun, at: Span, addr: Const, from: Type, ty: Type) -> Flow =
 // family of compiler-provided members a constant is computed with. The direction is the target's,
 // read off the layout every constant is folded against.
 @noinline
+// An operation of the `Bits` or `Signed` trait on an integer -- a count, a reversal, a rotation, `abs`
+// or `signum` -- answered as the program's instructions answer it (`int_op_value`).
+private bit_operation(r: &EvRun, at: Span, op: string, operand: TExpr, amount: Option[TExpr],
+                      width: Type) -> Flow
+    if amount.is_none() && byte_order_op(op) then return byte_order(r, at, op, operand, width)
+
+    val v = eval_value(r, operand) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    var by: Option[BigInt] = None
+
+    if amount.is_some()
+        eval_value(r, amount.unwrap()) match
+            Ok(ConstInt(k)) -> by = Some(k)
+            Ok(_) -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            Err(f) -> return f
+    end if
+
+    v match
+        ConstInt(n) -> width match
+            Integer(bits, signed, _) -> int_op_value(op, n, bits, signed, by) match
+                Some(out) -> EvGave(ConstInt(out))
+                None -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+        _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+end bit_operation
+
+private byte_order_op(op: string) -> bool =
+    op == "swap_bytes" || op == "to_be" || op == "from_be" || op == "to_le" || op == "from_le"
+
 private byte_order(r: &EvRun, at: Span, op: string, operand: TExpr, width: Type) -> Flow
     val little = r.a.tables.layout.little_endian
     val swaps = op match
@@ -4354,6 +4393,37 @@ private ev_while(r: &EvRun, at: Span, cond: Buf[TCondTerm], body: Buf[TStmt],
             TurnDone(v) -> return left(r, gave(v))
             TurnOut(f) -> return left(r, f)
 end ev_while
+
+// `for x in c` over a type that walks itself: the cursor `walk` answered kept in a local of its own,
+// and each turn the element its `next` gives, bound by the pattern -- the loop ending where `next`
+// answers what the pattern does not take.
+@noinline
+private ev_iterate(r: &EvRun, at: Span, cursor: string, init: TExpr, next: TExpr, bind: TPattern,
+                   body: Buf[TStmt], else_block: Option[TBlock]) -> Flow
+    val start = eval_value(r, init) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    r.frames.at(r.frames.len() - 1).locals.put(cursor, cell_of(copied(start)))
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        val item = eval_value(r, next) match
+            Ok(x) -> x
+            Err(f) -> return left(r, f)
+
+        matches(r, bind, item) match
+            Ok(true) -> ()
+            Ok(false) -> return ran_out(r, else_block)
+            Err(f) -> return left(r, f)
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+end ev_iterate
 
 @noinline
 private ev_do_while(r: &EvRun, at: Span, body: Buf[TStmt], cond: TExpr,
