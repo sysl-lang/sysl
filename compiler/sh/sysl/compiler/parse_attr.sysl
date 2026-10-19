@@ -253,12 +253,13 @@ annotations_then(p: *Parser, below: *Parser -> bool) -> bool
     found
 end annotations_then
 
-// Whether a type declaration a program's annotation may stand above follows: a struct, a union or
-// an enum, after its visibility.
+// Whether a type declaration a program's annotation may stand above follows: a struct, a union, an
+// enum or a `type`, after its visibility.
 private at_annotated_type(p: *Parser) -> bool
     parse_visibility(p)
 
-    p.at_kw("struct") || p.at_kw("enum") || at_union_head(p, 0) || p.at_word("opaque")
+    p.at_kw("struct") || p.at_kw("enum") || at_union_head(p, 0) || p.at_word("opaque") ||
+        p.at_kw("type")
 end at_annotated_type
 
 // `@rename("id")` or `@marker` -- one use of an annotation the program declared, about `target`.
@@ -1046,10 +1047,12 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
-    // of a declaration with no fields -- so it takes `@export` alone and nothing that lays out.
-    if p.at_kw("type") && all_are(attrs, "export")
+    // of a declaration with no fields -- so it takes `@export` and nothing that lays out. A type of its
+    // own takes the annotations a program declares too.
+    if p.at_kw("type") && (all_are(attrs, "export") || any_user(attrs))
+        refuse_unless(p, at, attrs, "type")
         refuse_weak_export(p, attrs, "a type's '@export' names it in a generated header, which is no definition the link could replace")
-        return from_first(start, exported_type(parse_type_decl(p, at, vis), attrs))
+        return from_first(start, exported_type(p, parse_type_decl(p, at, vis), attrs))
 
     // At the end of the file there is no declaration below for the annotations to be about, so
     // nothing an annotation's own sentence says is true of it: the grammar refuses it, at the word
@@ -1110,6 +1113,7 @@ private may_carry(form: string, a: Attr) -> bool
     end if
 
     if form == "enum" then return is_user(a)
+    if form == "type" then return is_user(a) || attr_word(a) == "export"
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
@@ -1591,15 +1595,24 @@ private file_private(v: Visibility) -> bool = v match
     File -> true
     _ -> false
 
-// The C name `@export` gives a `type` in a generated header.
-private exported_type(s: Stmt, attrs: Buf[Attr]) -> Stmt
+// The C name `@export` gives a `type` in a generated header, and the program's annotations a type of
+// its own carries.
+//
+// **A plain alias carries none**: `type Id = int` is a second name for `int`, the one type, so an
+// annotation on it would be one `int` had under one of its names and not under the other.
+private exported_type(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     *s.kind match
         TypeDecl(d) ->
             var decl = d
+            val alias = !d.derived && d.range.is_none() && d.pred.is_none() && d.wrapping.is_none()
 
             for attr in attrs
                 attr match
                     Export(e) -> decl.cname = Some(e)
+                    User(u) ->
+                        if alias
+                            p.fault(u.span, s"'@${annot_written(u)}' is about a type of its own, and 'type ${d.name} = ${type_text(d.base)}' declares none — it is a second name for '${type_text(d.base)}', the same type, so an annotation is written above a 'new' type, a range, a 'where' or the declaration of '${type_text(d.base)}'")
+                        else decl.annots.push(u)
                     _ -> ()
 
             stmt(s.span, TypeDecl(decl))

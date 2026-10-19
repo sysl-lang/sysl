@@ -62,7 +62,7 @@ end reflect_on_written_instance
 // The type `Box[int]` names, where the left side of a `::` is a generic type's name with brackets
 // after it; `Unknown` where the arguments were refused, and `None` where it is no such thing.
 private written_instance(cx: &Analyzer, span: Span, receiver: Expr) -> Option[Type]
-    val found = written_on_generic_type(cx, receiver)
+    val found = written_on_generic_type(cx, receiver, true)
 
     if found.is_none() then return None
 
@@ -83,8 +83,9 @@ private library_type(cx: &Analyzer, span: Span, name: string) -> Type =
 //
 // **What a program's annotation said, read back as an `Option[A]` constant**: `Some` of the literal
 // its use came to (`annotations.sysl`), or `None` where nothing carries it. `x` is a type, or a name a
-// `for const` copy binds to a field or a variant. A field of a variant's payload, a tuple's part and
-// a type no struct or enum declares carry none, so they answer `None`; a type parameter read in its
+// `for const` copy binds to a field, a variant or a field of a variant's payload. A tuple's part and
+// a type no struct, enum, `new`, range or `where` declaration makes carry none, so they answer `None`
+// (a plain alias is its base, and answers the base's); a type parameter read in its
 // own terms has no declaration yet and answers `None` as a stand-in, as `T::Fields` answers empty.
 
 // `x::Annotation` with no brackets: the annotation it reads is not named.
@@ -133,6 +134,9 @@ annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
                 else if v >= 0 && f < 0
                     owner = declared_key(*o)
                     target = variant_name(*o, v)
+                else if v >= 0 && f >= 0
+                    owner = declared_key(*o)
+                    target = variant_name(*o, v) + "." + walked_fields(*o, v).at(usize(f)).0
             _ -> ()
     else
         val ty = if name.is_some() then attr_subject(cx, span, name.unwrap())
@@ -144,7 +148,7 @@ annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
 
         if ty.unwrap() == Unknown then return bad_expr(span)
 
-        owner = declared_key(ty.unwrap())
+        owner = own_key(ty.unwrap())
     end if
 
     if owner == "" then return absent_annotation(span, opt)
@@ -176,6 +180,13 @@ private declared_key(t: Type) -> string = underlying(t) match
     Struct(s) -> s.base
     Enum(e) -> e.base
     _ -> ""
+
+// The key of the declaration that made this type itself: a `new` type, a range or a `where` is a
+// declaration of its own and answers its own annotations, not those of the type it is made over.
+private own_key(t: Type) -> string = t match
+    Constrained(c) -> if c.generic != "" then c.generic else c.name
+    Volatile(inner) -> own_key(*inner)
+    _ -> declared_key(t)
 
 private one_type(t: Type) -> Buf[Type]
     var out: Buf[Type] = buf()

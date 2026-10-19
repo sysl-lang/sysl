@@ -422,7 +422,7 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
             val annots = parse_part_annotations(p, "a variant")
 
             if at_enum_variant(p)
-                val variant = parse_enum_variant(p)
+                val variant = parse_enum_variant(p, &decl.annots)
 
                 about(annots, variant.name, &decl.annots)
                 decl.variants.push(variant)
@@ -431,7 +431,7 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
                     p.want("dedent")
             end if
         elif at_enum_variant(p)
-            decl.variants.push(parse_enum_variant(p))
+            decl.variants.push(parse_enum_variant(p, &decl.annots))
 
             // A variant is the whole of its line, so anything after it is where the body ended:
             // `B x` is not a second variant on the same line but a missing dedent at the `x`.
@@ -581,8 +581,10 @@ private at_enum_variant(p: *Parser) -> bool
             !(p.peek_at(3) == Newline && p.peek_at(4) == Indent)
     end if
 
-    if !names_a_field(p.peek_at(2)) then return false
-    if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
+    // An annotation before the first field is a payload's: a parameter carries none.
+    if !p.kw_at(2, "@")
+        if !names_a_field(p.peek_at(2)) then return false
+        if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
 
     // **A variant's named payload and an ASSOCIATED FUNCTION's parameter list are spelled the same
     // as far as the closing bracket**, so what settles it is what comes after one: a result type, an
@@ -620,7 +622,7 @@ end past_parameters
 // one nothing in any corpus writes, and a bound is what keeps the lookahead from walking a file.
 private const ParameterLookahead: usize = 256
 
-private parse_enum_variant(p: *Parser) -> EnumVariantDecl
+private parse_enum_variant(p: *Parser, into: *Buf[AnnotUse]) -> EnumVariantDecl
     val start = p.here()
     val name = parse_bound_name(p)
 
@@ -645,12 +647,18 @@ private parse_enum_variant(p: *Parser) -> EnumVariantDecl
 
     if !p.at_kw(")")
         loop
-            fields.push(parse_field_param(p))
+            // A payload's field carries the program's annotations as a struct's does, written before
+            // it -- on its own line where the payload spans several. They are about `Variant.field`.
+            val annots = parse_part_annotations(p, "a payload's field")
+            val field = parse_field_param(p)
+
+            about(annots, s"$name.${field.name}", into)
+            fields.push(field)
 
             if !p.accept_kw(",") then break
             // A comma may trail the last field, so what follows one is a field only where it could
             // name one; anything else is where the bracket should have closed.
-            if !names_a_field(p.peek()) then break
+            if !names_a_field(p.peek()) && !p.at_kw("@") then break
 
     p.expect_kw(")")
     EnumVariantDecl(start.to(p.just_taken()), name, None, fields)

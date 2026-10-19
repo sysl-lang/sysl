@@ -204,7 +204,145 @@ rfl_annotation_from_a_library_root()
     remove_dir_all(lib).unwrap_or(())
 end rfl_annotation_from_a_library_root
 
+@test("a payload's fields carry annotations, written inline or on lines of their own")
+rfl_annotation_payload_fields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        enum Event
+            @rename("click") Click(@rename("px") x: int, @skip y: int)
+            Key(
+                @doc("the code", 3)
+                code: int,
+                shift: bool,
+            )
+
+        fields[T]() -> string
+            var out = ""
+
+            for const c in T::Variants
+                for const f in c::Fields
+                    out = out + c.name + "." + f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                    if const f::Annotation[skip].is_some()
+                        out = out + "!"
+
+                    val d = f::Annotation[doc]
+
+                    if d.is_some() then out = out + s"(${d.unwrap().text})"
+
+                    out = out + " "
+
+            out
+
+        print(fields[Event]())
+        print(Event::Annotation[rename].is_none())
+        """), "Click.px Click.y! Key.code(the code) Key.shift \ntrue\n")
+end rfl_annotation_payload_fields
+
+@test("a type of its own carries annotations, read off its name or a type parameter")
+rfl_annotation_distinct_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        @doc("metres", 1)
+        type Meters = new real
+
+        @rename("pct")
+        type Percent = int within 0..100
+
+        @doc("even", 2)
+        @skip
+        type Even = int where value % 2 == 0
+
+        @doc("handle", 5)
+        type Handle[T] = new u64
+
+        about[T]() -> string = T::Annotation[doc].map(d -> d.text).unwrap_or("none")
+
+        print(Meters::Annotation[doc].unwrap().text, Percent::Annotation[rename].unwrap().name)
+        print(about[Meters](), about[Even](), about[Handle[u8]](), about[Percent](), about[real]())
+        print(about[User](), Handle[int]::Annotation[doc].unwrap().level)
+        print(Even::Annotation[skip].is_some(), Meters::Annotation[skip].is_none())
+        """), "metres pct\nmetres even handle none none\na user 5\ntrue true\n")
+end rfl_annotation_distinct_types
+
+@test("a generic 'new' type written with its arguments answers the reflection queries")
+rfl_annotation_generic_new_type_queries()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        type Handle[T] = new u64
+
+        print(Handle[int]::Name, Kind::Image(Handle[u8]::Kind))
+        """), "Handle[int] Int\n")
+end rfl_annotation_generic_new_type_queries
+
+@test("the design note's encoder runs as a plain generic function over a writer")
+rfl_annotation_design_encoder()
+    if !enm_ready() then return
+
+    val program = rfl_annotation_decls() + raw"""
+        encode[T](v: T, w: *Writer)
+            if const T::Kind == Kind.Struct
+                w.write("{".bytes)
+
+                for const f in T::Fields
+                    if f.index > 0 then w.write(",".bytes)
+
+                    val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                    w.write(s"\"$key\":${v.(f)}".bytes)
+
+                w.write("}\n".bytes)
+            else
+                @assert(false, "encode writes a struct")
+
+        struct Account
+            @rename("id") user_id: int
+            name: string
+
+        """
+
+    assert_eq(enm_ran(program + "encode(Account(7, \"ann\"), stdout())\n"), "{\"id\":7,\"name\":ann}\n")
+
+    val said = enm_err(program + "encode(3, stdout())\n")
+
+    assert(said.contains("encode writes a struct"), said)
+end rfl_annotation_design_encoder
+
 // -- what is refused -------------------------------------------------------------------------------
+
+@test("a plain alias carries no annotation, being no type of its own")
+rfl_annotation_on_alias()
+    if !enm_ready() then return
+
+    val said = enm_err(rfl_annotation_decls() + "@doc(\"x\", 1)\ntype Id = int\n\nprint(1)\n")
+
+    assert(said.contains("error: '@doc' is about a type of its own, and 'type Id = int' declares none " +
+                         "— it is a second name for 'int', the same type, so an annotation is written " +
+                         "above a 'new' type, a range, a 'where' or the declaration of 'int'"), said)
+
+    val twice = enm_err(rfl_annotation_decls() + "@skip\n@skip\ntype M = new int\n\nprint(1)\n")
+
+    assert(twice.contains("error: '@skip' is written twice above one declaration, and it says nothing " +
+                          "the once does not"), twice)
+end rfl_annotation_on_alias
+
+@test("a payload's field takes one annotation once, and none of the language's own")
+rfl_annotation_payload_refused()
+    if !enm_ready() then return
+
+    val twice = enm_err(rfl_annotation_decls() + "enum E\n    A(@skip @skip x: int)\n\nprint(1)\n")
+
+    assert(twice.contains("error: '@skip' is written twice above 'A.x', and it says nothing the once " +
+                          "does not"), twice)
+
+    val builtin = enm_err(rfl_annotation_decls() + "enum E\n    A(@inline x: int)\n\nprint(1)\n")
+
+    assert(builtin.contains("error: '@inline' is not about a payload's field — what a payload's field " +
+                            "carries is an annotation the program declares"), builtin)
+end rfl_annotation_payload_refused
 
 @test("an annotation nothing declares is refused at its use")
 rfl_annotation_unknown()

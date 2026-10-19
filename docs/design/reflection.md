@@ -53,17 +53,17 @@ trait Json
 
     derive[T] encode(self: T, w: *Writer)
         if const T::Kind == Kind.Struct
-            w.put("{")
+            w.write("{".bytes)
 
             for const f in T::Fields
-                if f.index > 0 then w.put(",")
+                if f.index > 0 then w.write(",".bytes)
 
-                val key = f::Annotation[rename].map(|r| r.name) or f.name
+                val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
 
-                w.put(f"\"$key\":")
+                w.write(s"\"$key\":".bytes)
                 self.(f).encode(w)
 
-            w.put("}")
+            w.write("}".bytes)
         else
             @assert(false, s"Json cannot derive for ${T::Name}")
 
