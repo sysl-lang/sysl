@@ -4,32 +4,59 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.from_int
 
-// `T::Kind`, `T::Name`, `T::Fields` and `T::Variants` -- what a type is made of, answered while
-// compiling.
+// `T::Kind`, `T::Name`, `T::BaseName`, `T::Fields`, `T::Members` and `T::Variants` -- what a type is
+// made of, answered while compiling.
 //
 // **Every answer is a literal**, so it folds wherever a constant is wanted and costs nothing where
-// the program runs: the kind is a value of the library's `Kind`, the name is a string, and a list
-// of fields or variants is a `[]const` over literals of `sysl.reflect.Field` or `Variant`, laid down
-// as read-only data. On a type parameter each instantiation answers for the type it was given; the
-// walk that checks a generic body on its own terms gets a stand-in of the right type and folds
-// nothing, as `sizeof(T)` does there.
+// the program runs: the kind is a value of the library's `Kind`, a name is a string, and a list of
+// fields, members or variants is a `[]const` over literals of `sysl.reflect.Field`, `Member` or
+// `Variant`, laid down as read-only data. On a type parameter each instantiation answers for the type
+// it was given; the walk that checks a generic body on its own terms gets a stand-in of the right
+// type and folds nothing, as `sizeof(T)` does there.
+//
+// **`T::Fields` lists what a reader names, and `T::Members` everything the type stores**: the named
+// fields alone, against those plus each anonymous `struct`/`union` block and each unnamed `_`
+// bitfield, in declaration order. A zero-width `_` stores nothing and is in neither.
 
-// Whether an attribute is one of the four that describe a type's make-up.
+// Whether an attribute is one of those that describe a type's make-up.
 reflection_attr(attr: string) -> bool = attr match
-    "Kind" | "Name" | "Fields" | "Variants" | "Annotation" -> true
+    "Kind" | "Name" | "BaseName" | "Fields" | "Members" | "Variants" | "Annotation" -> true
     _ -> false
 
-// The answer to one of the four for the type `written` stands for here.
+// The answer to one of them for the type `written` stands for here.
 reflect_attr(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr], ty: Type) -> TExpr
     if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
 
     attr match
         "Kind" -> kind_answer(cx, span, written, ty)
         "Name" -> TExpr(span, TStrLit(type_show(ty)))
-        "Fields" -> fields_answer(cx, span, written, ty)
+        "BaseName" -> TExpr(span, TStrLit(base_name(ty)))
+        "Fields" -> fields_answer(cx, span, written, ty, false)
+        "Members" -> fields_answer(cx, span, written, ty, true)
         "Annotation" -> annotation_unnamed(cx, span, written)
         _ -> variants_answer(cx, span, written, ty)
 end reflect_attr
+
+// The name a type was declared under, with no module before it and no arguments after it: `Box` for
+// `Box[int]`, `Q` for `demo.Q`. A type no declaration names -- `int`, `[4]u8`, a tuple -- is shown
+// as `T::Name` shows it.
+private base_name(ty: Type) -> string = ty match
+    Struct(d) -> if is_tuple(d) || is_closure_literal(ty) then type_show(ty)
+                 else if d.base == TaskBase then "Task"
+                 else last_segment(d.base)
+    Enum(d) -> last_segment(d.base)
+    Constrained(d) -> last_segment(if d.targs.is_empty() then d.name else d.generic)
+    Volatile(inner) -> base_name(*inner)
+    _ -> type_show(ty)
+
+// What follows the last dot of a declaration's key, as a reader is shown it.
+private last_segment(key: string) -> string
+    val shown = module_show(key)
+
+    last_dot_in(shown) match
+        Some(i) -> shown[i + 1..<shown.bytes.len]
+        None -> shown
+end last_segment
 
 // The key of the generic struct a written name declares, where it declares one and no type
 // parameter of the body being read stands in front of it: written bare, it names no single type.
@@ -232,7 +259,12 @@ private kind_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TEx
         Abstract(_, _) -> return TExpr(span, TZero(kind_ty))
         _ -> ()
 
-    val name = kind_name(ty)
+    // An opaque struct is a struct where its fields are listed (`opaque_shut`).
+    val name = underlying(ty) match
+        Struct(s) ->
+            if s.opaque && !opaque_shut(cx, s) then Some(if s.union_layout then "Union" else "Struct")
+            else kind_name(ty)
+        _ -> kind_name(ty)
 
     if name.is_none() then
         return cx.err(span, s"'$written' is ${type_show(ty)}, which is not a type a value can have, " +
@@ -305,60 +337,101 @@ private kind_phrase(ty: Type) -> string = kind_name(ty).unwrap_or("") match
     "DataEnum" -> "an enum"
     _ -> "not a type a value can have"
 
-// -- `T::Fields` -----------------------------------------------------------------------------------
+// -- `T::Fields` and `T::Members` ------------------------------------------------------------------
 
-private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
-    val field_ty = library_type(cx, span, "sysl.reflect.Field")
+// The `variant` a walk over `T::Members` gives its descriptors, which tells them from a walk over
+// `T::Fields` (-1): both stand at a part of the type itself, and each copy reads as a `Member` rather
+// than a `Field`.
+val MembersWalk: int = -2
 
-    val fd = underlying(field_ty) match
+// `T::Fields`, or with `members` `T::Members`.
+private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type, members: bool) -> TExpr
+    val item_ty = library_type(cx, span, if members then "sysl.reflect.Member" else "sysl.reflect.Field")
+
+    val fd = underlying(item_ty) match
         Struct(f) -> f
         _ -> return bad_expr(span)
 
-    val list_ty = Slice(field_ty, true)
+    val list_ty = Slice(item_ty, true)
 
     ty match
         Abstract(_, _) -> return TExpr(span, TBufLit(buf(), list_ty))
         _ -> ()
 
     val d = underlying(ty) match
-        Struct(s) -> if s.opaque then None else Some(s)
+        Struct(s) -> if opaque_shut(cx, s) then None else Some(s)
         Results(s) -> Some(s)
         _ -> None
 
     if d.is_none() then
-        return cx.err(span, s"'$written::Fields' lists the fields of a struct, a tuple or a union, and " +
+        val what = if members then "Members' lists the members" else "Fields' lists the fields"
+
+        return cx.err(span, s"'$written::$what of a struct, a tuple or a union, and " +
                       s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+    end if
 
     val s = d.unwrap()
     val measured = !mentions_abstract(ty)
     var items: Buf[TExpr] = buf()
 
-    for i in 0..<s.fields.len()
+    for i in listed_parts(s, members)
         val name = s.fields.at(i).0
-
-        // An anonymous member is storage the struct holds rather than a field a reader names; the
-        // fields it holds are reached through the struct, and are not listed one level up.
-        if is_anonymous_field(name) then continue
-
         val at = if measured then cx.an.tables.layout.field_offset(s, name).unwrap_or(0) else 0
 
-        items.push(field_literal(cx, span, fd, name, i, at, field_public(cx, s, name)))
+        items.push(part_literal(cx, span, fd, name, i, at, field_public(cx, s, name), members))
 
     TExpr(span, TBufLit(items, list_ty))
 end fields_answer
 
-// One `sysl.reflect.Field`, as a literal.
-private field_literal(cx: &Analyzer, span: Span, fd: &StructType, name: string, index: usize,
-                      at: usize, public: bool) -> TExpr
+// **Whether an `opaque struct` keeps its parts to itself here.** One that declares its fields has
+// them where its layout is known -- its own module -- and in a derivation it asked for, which is the
+// type's author opting in exactly as for a private field; there it is a struct like any other. One
+// with no body has none anywhere. Every other struct is open.
+private opaque_shut(cx: &Analyzer, s: &StructType) -> bool =
+    s.opaque && (s.fields.is_empty() ||
+                 (layout_hidden(cx.an, cx.scope, s.base) && !in_own_derivation(cx, s.base)))
+
+// The positions among a struct's declared parts that `T::Members` lists, or `T::Fields`.
+//
+// An anonymous member is storage the struct holds rather than a field a reader names -- the fields
+// it holds are reached through the struct -- and an unnamed `_` bitfield only moves the fields after
+// it, so `T::Fields` lists neither. A zero-width `_` stores nothing, so neither lists it.
+private listed_parts(s: &StructType, members: bool) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for i in 0..<s.fields.len()
+        val name = s.fields.at(i).0
+        val unnamed_bit = name == "_" && s.c_bit(i).is_some()
+
+        if unnamed_bit && s.c_bit(i).unwrap().width == 0 then continue
+        if !members && (unnamed_bit || is_anonymous_field(name)) then continue
+
+        out.push(i)
+
+    out
+end listed_parts
+
+// One `sysl.reflect.Field`, or with `member` one `sysl.reflect.Member`, as a literal. An anonymous
+// member's name is `""`, since no reader wrote one; an unnamed bitfield's is the `_` it was written as.
+private part_literal(cx: &Analyzer, span: Span, fd: &StructType, name: string, index: usize,
+                     at: usize, public: bool, member: bool) -> TExpr
     val usize_ty = usize_type(word_bits(cx))
+    val anonymous = is_anonymous_field(name)
     var parts: Buf[TExpr] = buf()
 
-    parts.push(TExpr(span, TStrLit(name)))
+    parts.push(TExpr(span, TStrLit(if anonymous then "" else name)))
     parts.push(TExpr(span, TIntLit(from_int(long(index)), usize_ty)))
     parts.push(TExpr(span, TIntLit(from_int(long(at)), usize_ty)))
     parts.push(TExpr(span, TBoolLit(public)))
+
+    if member then parts.push(TExpr(span, TBoolLit(anonymous)))
+
     TExpr(span, TStructNew(fd, parts))
-end field_literal
+end part_literal
+
+private field_literal(cx: &Analyzer, span: Span, fd: &StructType, name: string, index: usize,
+                      at: usize, public: bool) -> TExpr =
+    part_literal(cx, span, fd, name, index, at, public, false)
 
 // One `sysl.reflect.Variant`, as a literal.
 private variant_literal(cx: &Analyzer, span: Span, vd: &StructType, name: string, index: usize) -> TExpr
@@ -454,7 +527,8 @@ names_descriptor(subst: Buf[Binding], e: Expr) -> bool = *e.kind match
 // terms has none yet, so it is walked zero times, and every instantiation walks its own.
 reflected_walk(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[Buf[Type], TExpr]]
     val asked: Option[(Expr, string)] = *iter.kind match
-        TypeAttr(r, a, _, _) -> if a == "Fields" || a == "Variants" then Some((r, a)) else None
+        TypeAttr(r, a, _, _) ->
+            if a == "Fields" || a == "Members" || a == "Variants" then Some((r, a)) else None
         _ -> None
 
     if asked.is_none() then return None
@@ -501,23 +575,18 @@ reflected_walk(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[Buf[Type]
         return Some(Ok(out))
     end if
 
-    val fields = walked_fields(t, -1)
+    val members = attr == "Members"
 
-    // An `opaque struct` that declares its fields has them where its layout is known -- its own
-    // module -- and in a derivation it asked for, which is the type's author opting in exactly as
-    // for a private field. One with no body has none anywhere.
-    val listed = underlying(t) match
-        Struct(s) ->
-            !s.opaque || (!s.fields.is_empty() &&
-                          (!layout_hidden(cx.an, cx.scope, s.base) || in_own_derivation(cx, s.base)))
-        Results(_) -> true
-        _ -> false
+    val s = underlying(t) match
+        Struct(s) -> if opaque_shut(cx, s) then None else Some(s)
+        Results(s) -> Some(s)
+        _ -> None
 
-    if !listed then return Some(Err(fields_answer(cx, span, type_show(t), t)))
+    if s.is_none() then return Some(Err(fields_answer(cx, span, type_show(t), t, members)))
 
-    // An anonymous member is storage rather than a field, as `T::Fields` lists them.
-    for i in 0..<fields.len()
-        if !is_anonymous_field(fields.at(i).0) then out.push(Descriptor(t, -1, int(i)))
+    // The parts the attribute lists, as `T::Fields` and `T::Members` list them.
+    for i in listed_parts(s.unwrap(), members)
+        out.push(Descriptor(t, if members then MembersWalk else -1, int(i)))
 
     Some(Ok(out))
 end reflected_walk
@@ -591,7 +660,8 @@ private descriptor_refusal(written: string, attr: string, d: Type) -> string = d
 // The part a copy stands at, as a refusal made in that copy names it.
 descriptor_label(d: Type) -> string = d match
     Descriptor(owner, v, f) ->
-        s"${if f >= 0 then "field" else "variant"} '${descriptor_text(*owner, v, f)}'"
+        s"${if v == MembersWalk then "member" else if f >= 0 then "field" else "variant"} " +
+        s"'${descriptor_text(*owner, v, f)}'"
     _ -> ""
 
 // Every refusal said since `before` -- in one copy of a walk over a type's parts -- says which part
@@ -653,13 +723,18 @@ descriptor_text(owner: Type, v: int, f: int) -> string
     var out = type_show(owner)
 
     if v >= 0 then out = out + "." + variant_name(owner, v)
-    if f >= 0 then out = out + "." + walked_fields(owner, v).at(usize(f)).0
+    if f >= 0
+        val name = walked_fields(owner, v).at(usize(f)).0
+
+        // An anonymous member has no name a reader wrote; it is shown as what it is.
+        out = out + "." + (if is_anonymous_field(name) then s"(anonymous member $f)" else name)
+    end if
 
     out
 end descriptor_text
 
-// A descriptor's name read as a value: the `sysl.reflect.Field` or `Variant` it stands for, the
-// literal `T::Fields` or `T::Variants` lists it as.
+// A descriptor's name read as a value: the `sysl.reflect.Field`, `Member` or `Variant` it stands
+// for, the literal `T::Fields`, `T::Members` or `T::Variants` lists it as.
 descriptor_value(cx: &Analyzer, span: Span, d: Type) -> TExpr = d match
     Descriptor(owner, v, f) ->
         if f < 0 then
@@ -667,13 +742,15 @@ descriptor_value(cx: &Analyzer, span: Span, d: Type) -> TExpr = d match
                 Struct(vd) -> variant_literal(cx, span, vd, variant_name(*owner, v), usize(v))
                 _ -> bad_expr(span)
         else
-            underlying(library_type(cx, span, "sysl.reflect.Field")) match
+            underlying(library_type(cx, span, if v == MembersWalk then "sysl.reflect.Member"
+                                              else "sysl.reflect.Field")) match
                 Struct(fd) -> descriptor_field_literal(cx, span, fd, *owner, v, f)
                 _ -> bad_expr(span)
     _ -> bad_expr(span)
 
-// The `sysl.reflect.Field` a field descriptor stands for. A payload's fields are public, as every
-// variant's are, and each sits where the payload's tuple places it.
+// The `sysl.reflect.Field` a field descriptor stands for, or the `Member` one of a walk over
+// `T::Members` does. A payload's fields are public, as every variant's are, and each sits where the
+// payload's tuple places it.
 private descriptor_field_literal(cx: &Analyzer, span: Span, fd: &StructType, owner: Type, v: int,
                                  f: int) -> TExpr
     val fields = walked_fields(owner, v)
@@ -694,7 +771,7 @@ private descriptor_field_literal(cx: &Analyzer, span: Span, fd: &StructType, own
 
     val at = if mentions_abstract(owner) then 0 else cx.an.tables.layout.field_offset(s, name).unwrap_or(0)
 
-    field_literal(cx, span, fd, name, usize(f), at, field_public(cx, s, name))
+    part_literal(cx, span, fd, name, usize(f), at, field_public(cx, s, name), v == MembersWalk)
 end descriptor_field_literal
 
 // A type attribute asked of a descriptor's name: `c::Fields` lists a variant's payload, and the

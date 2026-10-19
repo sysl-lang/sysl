@@ -132,6 +132,11 @@ end type_attr_call
 // The written name a type attribute is asked of, where the left side is one.
 attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
     Ident(n) -> Some(n)
+    // `f::Type::Kind`, `c::Payload::Fields` -- a descriptor's projection is a type a copy bound under
+    // that spelling (`descriptor_bindings`), so it is asked as the name it was bound to.
+    TypeAttr(inner, a, _, _) -> *inner.kind match
+        Ident(n) -> if a == "Type" || a == "Payload" then Some(s"$n::$a") else None
+        _ -> None
     _ -> None
 
 // The key of the generic enum a written name declares, where it declares one and no type parameter
@@ -160,6 +165,16 @@ attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
     if stood.is_some() then return stood
 
     val key = lookup_type_key(cx.an, cx.scope, written)
+
+    // **An `opaque struct` is asked about outside its module as `*Name` names it**: a `::` question
+    // needs no layout, so `H::Kind` answers `Opaque` there and `H::Fields` is refused for having none.
+    if key.is_some() && layout_hidden(cx.an, cx.scope, key.unwrap())
+        val behind = type_ref(span, PtrType(named_type(span, written)))
+
+        return resolve_type(cx.an, cx.scope, behind, cx.subst) match
+            Ptr(inner) -> Some(*inner)
+            other -> Some(other)
+    end if
 
     if key.is_some() then
         return Some(resolve_type(cx.an, cx.scope, named_type(span, written), cx.subst))
