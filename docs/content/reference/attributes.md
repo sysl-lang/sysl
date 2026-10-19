@@ -457,11 +457,29 @@ print(Color::Nonesuch)
 'Color' has no attribute 'Nonesuch'
 ```
 
+### Reflection queries answer on every type
+
+**The sets above belong to one kind of type each. A second family answers on any type**, because it asks
+what the type is made of rather than what a value of it may do, and it is answered while compiling:
+
+| written | answers |
+|---|---|
+| `T::Kind` | a `Kind` variant — `Struct`, `DataEnum`, `Int`, `Opaque`… |
+| `T::Name`, `T::BaseName` | the type as written, with its arguments / the declared name alone |
+| `T::Fields`, `T::Members` | the named fields / every stored member of a struct, tuple or union |
+| `T::Variants` | the variants of an enum, simple or data |
+| `T::Make(c, p)` | the variant `c` of a data enum, built from a payload |
+| `T::Annotation[A]`, `f::Annotation[A]` | an `Option` of the program's own `@annotation` on a type or field |
+
+A data enum, which has no `First` or `Pos`, is walked through `T::Variants` instead. The descriptors,
+`for const f in T::Fields`, `v.(f)`, `f::Type` and the rest are on [reflection](/reference/reflection/).
+
 ## `@test` — a function with a caller nothing else has
 
 A word after `@` that is neither `test` nor `tailrec` is answered by name rather than as grammar. The
 set is closed, which is what makes a misspelling an error instead of a marker that quietly does
-nothing — annotations are deliberately *not* a general mechanism yet.
+nothing — the built-in annotations are a closed list. A program's own are declared with `@annotation`
+and read by [reflection](/reference/reflection/#annotations).
 
 The annotation goes on its own line above an ordinary function declaration, which may still be
 `private`:

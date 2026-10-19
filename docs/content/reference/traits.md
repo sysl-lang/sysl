@@ -1152,7 +1152,7 @@ order alike, and render alike but for the name in front. Any other trait is deri
 ### A trait says how it is derived
 
 A trait may carry a **`derive` member**: `derive[T] name(self: T, …)`, with a body written over `T`'s
-make-up using [reflection](/reference/generics/) — `T::Kind`, `for const f in T::Fields`, `self.(f)`.
+make-up using [reflection](/reference/reflection/) — `T::Kind`, `for const f in T::Fields`, `self.(f)`.
 A `derives` clause naming the trait instantiates each `derive` member with `T` standing for the type,
 as the `impl` block a person would have written:
 
