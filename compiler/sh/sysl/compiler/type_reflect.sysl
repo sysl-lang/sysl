@@ -16,7 +16,7 @@ import sysl.math.bigint.from_int
 
 // Whether an attribute is one of the four that describe a type's make-up.
 reflection_attr(attr: string) -> bool = attr match
-    "Kind" | "Name" | "Fields" | "Variants" -> true
+    "Kind" | "Name" | "Fields" | "Variants" | "Annotation" -> true
     _ -> false
 
 // The answer to one of the four for the type `written` stands for here.
@@ -27,6 +27,7 @@ reflect_attr(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf
         "Kind" -> kind_answer(cx, span, written, ty)
         "Name" -> TExpr(span, TStrLit(type_show(ty)))
         "Fields" -> fields_answer(cx, span, written, ty)
+        "Annotation" -> annotation_unnamed(cx, span, written)
         _ -> variants_answer(cx, span, written, ty)
 end reflect_attr
 
@@ -77,6 +78,126 @@ end written_instance
 // A type of the library's that the answers are made of, by its full name.
 private library_type(cx: &Analyzer, span: Span, name: string) -> Type =
     resolve_type(cx.an, cx.scope, named_type(span, name), no_bindings())
+
+// -- `x::Annotation[A]` ----------------------------------------------------------------------------
+//
+// **What a program's annotation said, read back as an `Option[A]` constant**: `Some` of the literal
+// its use came to (`annotations.sysl`), or `None` where nothing carries it. `x` is a type, or a name a
+// `for const` copy binds to a field or a variant. A field of a variant's payload, a tuple's part and
+// a type no struct or enum declares carry none, so they answer `None`; a type parameter read in its
+// own terms has no declaration yet and answers `None` as a stand-in, as `T::Fields` answers empty.
+
+// `x::Annotation` with no brackets: the annotation it reads is not named.
+annotation_unnamed(cx: &Analyzer, span: Span, written: string) -> TExpr =
+    cx.err(span, s"'$written::Annotation' reads one annotation, named in brackets — " +
+           s"'$written::Annotation[rename]'")
+
+annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
+    val asked = written_type_arg(cx, item)
+
+    if asked == Unknown then return bad_expr(span)
+
+    val shown = type_show(asked)
+
+    val akey = underlying(asked) match
+        Struct(s) -> s.base
+        _ -> ""
+
+    var is_annotation = false
+
+    cx.an.tables.types.get(akey) match
+        Some(decl) ->
+            decl.kind match
+                StructOf(sd) -> is_annotation = sd.annotation
+                _ -> ()
+        None -> ()
+
+    if !is_annotation then
+        return cx.err(span, s"'$shown' is ${kind_phrase(asked)}, not an annotation — an annotation is a " +
+                      s"struct marked '@annotation', which is what lets '::Annotation[$shown]' read it")
+
+    val opt = reinstantiate(cx.an, library_key("Option"), one_type(asked))
+    val name = attr_type_name(subject)
+    val d = if name.is_some() then descriptor_bound(cx.subst, name.unwrap()) else None
+
+    // Whose annotations, and which of them: the declaration's key and the part's name.
+    var owner = ""
+    var target = ""
+
+    if d.is_some()
+        d.unwrap() match
+            Descriptor(o, v, f) ->
+                if v < 0 && f >= 0
+                    owner = declared_key(*o)
+                    target = walked_fields(*o, v).at(usize(f)).0
+                else if v >= 0 && f < 0
+                    owner = declared_key(*o)
+                    target = variant_name(*o, v)
+            _ -> ()
+    else
+        val ty = if name.is_some() then attr_subject(cx, span, name.unwrap())
+                 else written_instance(cx, span, subject)
+
+        if ty.is_none() then
+            return cx.err(span, "'::Annotation[…]' is asked of a type, or of a field or a variant a " +
+                          "'for const' walk stands at, and its left side is none of them")
+
+        if ty.unwrap() == Unknown then return bad_expr(span)
+
+        owner = declared_key(ty.unwrap())
+    end if
+
+    if owner == "" then return absent_annotation(span, opt)
+
+    val held = annotations_of(cx.an, owner)
+
+    if held.is_none() then return absent_annotation(span, opt)
+
+    val found = annotation_on(cx.an, held.unwrap().1, held.unwrap().0, target, akey)
+
+    if found.is_none() then return absent_annotation(span, opt)
+
+    val value = annotation_value(cx.an, held.unwrap().1, found.unwrap().0, found.unwrap().1, asked)
+
+    if value.is_none() then return bad_expr(span)
+
+    val some = option_variant(opt, "Some")
+
+    if some.is_none() then return bad_expr(span)
+
+    var payload: Buf[TExpr] = buf()
+
+    payload.push(value.unwrap())
+    TExpr(span, TEnumNew(opt, some.unwrap(), payload))
+end annotation_query
+
+// The key of the struct or enum declaration a type is made from; empty for every other type.
+private declared_key(t: Type) -> string = underlying(t) match
+    Struct(s) -> s.base
+    Enum(e) -> e.base
+    _ -> ""
+
+private one_type(t: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(t)
+    out
+end one_type
+
+// `None` of an annotation's `Option`.
+private absent_annotation(span: Span, opt: Type) -> TExpr = option_variant(opt, "None") match
+    Some(v) -> TExpr(span, TEnumNew(opt, v, buf()))
+    None -> bad_expr(span)
+
+private option_variant(opt: Type, name: string) -> Option[EnumVariant]
+    underlying(opt) match
+        Enum(e) ->
+            for v in e.variants
+                if v.name == name then return Some(v)
+        _ -> ()
+
+    None
+end option_variant
 
 // -- `T::Kind` -------------------------------------------------------------------------------------
 
@@ -555,7 +676,8 @@ end descriptor_field_literal
 // rest are refused with what the descriptor does answer.
 descriptor_attr(cx: &Analyzer, span: Span, written: string, attr: string, d: Type) -> TExpr = d match
     Descriptor(owner, v, f) ->
-        if attr == "Fields" && v >= 0 && f < 0 then
+        if attr == "Annotation" then annotation_unnamed(cx, span, written)
+        else if attr == "Fields" && v >= 0 && f < 0 then
             payload_fields_answer(cx, span, *owner, v)
         else if (attr == "Type" && f >= 0) || (attr == "Payload" && f < 0) then
             cx.err(span, s"'$written::$attr' is a type, so it stands where a type is written — " +

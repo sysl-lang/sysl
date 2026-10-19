@@ -491,7 +491,35 @@ enum Attr
     // `@disjoint(a, b)` above a function or a member: no memory reached through one named parameter
     // is reached any other way while the call runs.
     Disjoint(names: Buf[string])
+    // `@annotation` above a struct: the struct is an annotation a program writes as `@Name(...)`.
+    AnnotationMark
+    // `@rename("id")` above a type: an annotation the program declared, not one of the language's.
+    User(use: AnnotUse)
 end Attr
+
+// One use of an annotation a program declared -- `@rename("id")` or `@marker` -- on a field, a variant
+// or a type. `call` is the construction it stands for, `rename("id")`, and a bare `@marker` is the
+// construction with no arguments; `parens` says whether parentheses were written. `target` is the
+// field's or the variant's name, or empty for the type declaration itself.
+struct AnnotUse
+    span: Span
+    target: string
+    call: Expr
+    parens: bool
+end AnnotUse
+
+// The name an annotation's use was written with, dotted where it was qualified.
+annot_written(u: AnnotUse) -> string = *u.call.kind match
+    Call(callee, _) -> annot_path(callee)
+    _ -> ""
+
+private annot_path(e: Expr) -> string = *e.kind match
+    Ident(n) -> n
+    Field(receiver, n, _) ->
+        val head = annot_path(receiver)
+
+        if head == "" then "" else s"$head.$n"
+    _ -> ""
 
 // The word an attribute is written as, which is what a complaint about it names.
 attr_word(a: Attr) -> string = a match
@@ -528,6 +556,8 @@ attr_word(a: Attr) -> string = a match
     Views(_) -> "views"
     Consumes -> "consumes"
     Disjoint(_) -> "disjoint"
+    AnnotationMark -> "annotation"
+    User(u) -> annot_written(u)
 
 // A foreign function's declaration.
 struct ExternDecl
@@ -578,6 +608,13 @@ struct StructDecl
     // The fields written `name: T in S`: C bitfields, each allocated in a unit of its declared type
     // `S` by the target's C rule (`c_bitfields.sysl`).
     bits: Buf[BitInDecl]
+
+    // `@annotation` above it: the struct is an annotation, written `@Name(...)` on a field, a
+    // variant or a type (`annotations.sysl`).
+    annotation: bool
+
+    // The annotations the program declared that are written on it and on its fields.
+    annots: Buf[AnnotUse]
 end StructDecl
 
 // What `in S` adds to the field at `field` (its position in `fields`): the type C declares it with,
@@ -610,6 +647,9 @@ struct EnumDecl
     tdefaults: Buf[TypeBinding]
     tvalues: Buf[TypeBinding]
     deriving: Buf[BoundRef]
+
+    // The annotations the program declared that are written on it and on its variants.
+    annots: Buf[AnnotUse]
 end EnumDecl
 
 // `new 1..100` on a constrained type -- the range its values must lie in.

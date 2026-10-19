@@ -179,6 +179,9 @@ end member_attr_word
 // An annotation written twice above one declaration says nothing the once does not.
 private refuse_duplicates(p: *Parser, attrs: Buf[Attr], what: string)
     for i in 0..<attrs.len()
+        // Which struct a program's annotation names is the analysis's to say, and so is a repeat.
+        if is_user(attrs.at(i)) then continue
+
         for j in 0..<i
             if attr_word(attrs.at(i)) == attr_word(attrs.at(j))
                 p.fault(p.here(), s"'@${attr_word(attrs.at(i))}' is written twice above one ${what}, and it says nothing the once does not")
@@ -200,6 +203,116 @@ private refuse_hash_attr(p: *Parser, at: Span)
     skip_line(p)
 end refuse_hash_attr
 
+// -- the annotations a program declares -------------------------------------------------------------
+//
+// **A word the language does not own is an annotation the program declared** (`@annotation struct
+// rename`) where what the annotations stand above can carry one: a type declaration, a field or a
+// variant. Which struct the word names is the analysis's question (`annotations.sysl`); the parser
+// reads the use as the construction it stands for. Above anything else the word is refused as the
+// language's own closed list refuses it.
+
+// Whether a word after `@` is one the language owns -- an annotation, a header clause or `@assert`.
+// A struct declared `@annotation` may not take one of these names.
+builtin_attr_word(w: string) -> bool
+    if header_attr_word(w) || fn_forgo_word(w) then return true
+
+    for word in ["assert", "annotation", "ignore", "test", "setup", "teardown", "setup_all", "teardown_all",
+                 "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
+                 "section", "crossing", "domain", "borrows", "lends", "disjoint", "guards", "needs",
+                 "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks"]
+        if word == w then return true
+
+    false
+end builtin_attr_word
+
+// Whether the `@` here opens an annotation the program declared: a word the language does not own.
+at_user_annotation(p: *Parser) -> bool
+    if !p.at_kw("@") then return false
+
+    val word = attr_name(p)
+
+    word != "" && !builtin_attr_word(word)
+end at_user_annotation
+
+// Every annotation from here on read past, in a reading taken back, and whether what follows them
+// is what `below` asks for -- the declaration they stand above decides whether a word the language
+// does not own is an annotation the program declared.
+annotations_then(p: *Parser, below: *Parser -> bool) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    while p.at_kw("@")
+        p.bump()
+        parse_expr_bp(p, PrefixPower)
+        p.skip_newlines()
+
+    val found = below(p)
+
+    p.rewind(tokens_at, errors_at)
+    found
+end annotations_then
+
+// Whether a type declaration a program's annotation may stand above follows: a struct, a union or
+// an enum, after its visibility.
+private at_annotated_type(p: *Parser) -> bool
+    parse_visibility(p)
+
+    p.at_kw("struct") || p.at_kw("enum") || at_union_head(p, 0) || p.at_word("opaque")
+end at_annotated_type
+
+// `@rename("id")` or `@marker` -- one use of an annotation the program declared, about `target`.
+parse_user_annotation(p: *Parser, target: string) -> Option[AnnotUse]
+    val at = p.here()
+
+    p.bump()
+
+    val written = parse_expr_bp(p, PrefixPower)
+    val span = at.to(p.just_taken())
+
+    if annot_name_shaped(written) then
+        return Some(AnnotUse(span, target, expr(written.span, Call(written, buf())), false))
+
+    *written.kind match
+        Call(callee, _) -> if annot_name_shaped(callee) then return Some(AnnotUse(span, target, written, true))
+        _ -> ()
+
+    p.fault(at, "an annotation is written '@name' or '@name(arguments)' — the name of a struct declared '@annotation', and the values of its fields in the parentheses as a construction of it takes them")
+    skip_line(p)
+    None
+end parse_user_annotation
+
+// A name or a dotted path to one: what an annotation's use names its struct with.
+private annot_name_shaped(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    Field(receiver, _, _) -> annot_name_shaped(receiver)
+    _ -> false
+
+// The annotations above a field or a variant, every one of them a program's own.
+parse_part_annotations(p: *Parser, what: string) -> Buf[AnnotUse]
+    var out: Buf[AnnotUse] = buf()
+
+    while p.at_kw("@")
+        if !at_user_annotation(p)
+            p.fault(p.here(), s"'@${attr_name(p)}' is not about ${what} — what ${what} carries is an annotation the program declares, a struct marked '@annotation'")
+            skip_line(p)
+            return out
+        end if
+
+        parse_user_annotation(p, "") match
+            Some(u) -> out.push(u)
+            None -> return out
+
+        p.skip_newlines()
+
+    out
+end parse_part_annotations
+
+// The annotations read above one field or variant, made about it now that its name is known.
+about(annots: Buf[AnnotUse], target: string, into: *Buf[AnnotUse])
+    for u in annots
+        into.push(AnnotUse(u.span, target, u.call, u.parens))
+
 // One annotation.
 parse_attribute(p: *Parser) -> Option[Attr]
     val at = p.here()
@@ -208,6 +321,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
         refuse_hash_attr(p, at)
         return None
     end if
+
+    if at_user_annotation(p) && annotations_then(p, at_annotated_type) then
+        return parse_user_annotation(p, "").map(u -> User(u))
 
     p.bump()
 
@@ -270,6 +386,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "views" then return Some(parse_views_attr(p))
     if word == "consumes" then return no_inlining_args(p, Consumes, "what a call takes is everything its receiver holds")
     if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
+    if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -280,7 +397,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header. An annotation a program declares, a struct marked '@annotation', stands above a type declaration, a field or a variant")
     skip_line(p)
     None
 end parse_attribute
@@ -877,6 +994,13 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false, a_union), attrs))
     end if
 
+    // An enum takes the annotations a program declares and nothing else: its layout is the
+    // compiler's, and it names no symbol.
+    if p.at_kw("enum") && any_user(attrs)
+        refuse_unless(p, at, attrs, "enum")
+        return from_first(start, annotated_enum(parse_enum_decl(p, at, vis), attrs))
+    end if
+
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
     // and a function lays nothing out. A binding takes `@align(n)` beside it, and the rest of the
     // pair is refused below with the binding's own rule.
@@ -982,20 +1106,34 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct"
         return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" ||
-            attr_word(a) == "pinned"
+            attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
     end if
+
+    if form == "enum" then return is_user(a)
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
     !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" &&
-        attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes"
+        attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
+        !is_user(a) && !is_annotation_mark(a)
 end may_carry
+
+private is_user(a: Attr) -> bool = a match
+    User(_) -> true
+    _ -> false
+
+private is_annotation_mark(a: Attr) -> bool = a match
+    AnnotationMark -> true
+    _ -> false
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
+
+    if any_is(attrs, "annotation")
+        return "'@annotation' makes a struct an annotation, whose fields are what a use of it writes in its parentheses — so it marks a struct, and this declares none"
 
     if all_are(attrs, "blocks")
         return "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them"
@@ -1229,7 +1367,8 @@ end refuse_impossible_pairs
 // `@pinned` marks a struct as readily as a function, so it settles neither reading.
 private marks_a_function(attrs: Buf[Attr]) -> bool
     for attr in attrs
-        if !is_layout(attr) && attr_word(attr) != "section" && attr_word(attr) != "pinned" then
+        if !is_layout(attr) && attr_word(attr) != "section" && attr_word(attr) != "pinned" &&
+                !is_user(attr) && !is_annotation_mark(attr) then
             return true
 
     false
@@ -1379,11 +1518,49 @@ private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
                     Export(e) -> decl.cname = Some(e)
                     Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
                     Pinned -> decl.pinned = true
+                    AnnotationMark -> decl.annotation = true
+                    User(u) -> decl.annots.push(u)
                     _ -> ()
+
+            if decl.annotation then refuse_annotation_shape(p, at, decl)
 
             stmt(s.span, StructDecl(decl))
         _ -> s
 end laid_out
+
+// An annotation's struct is named by every use of it, and its fields are what a use writes, so a
+// name the language's own annotations take and a type parameter no use could supply are refused.
+private refuse_annotation_shape(p: *Parser, at: Span, d: StructDecl)
+    if builtin_attr_word(d.name)
+        p.fault(at, s"'@${d.name}' is one of the language's own annotations, so an annotation a program declares may not take the name — a use of it would read as the built-in one")
+        return
+    end if
+
+    if !d.tparams.is_empty() then
+        p.fault(at, s"an annotation takes no type parameters — what a use of '@${d.name}' says is the values written in its parentheses, and reflection asks for it by one name, '::Annotation[${d.name}]'")
+end refuse_annotation_shape
+
+private any_user(attrs: Buf[Attr]) -> bool
+    for a in attrs
+        if is_user(a) then return true
+
+    false
+end any_user
+
+// The program's annotations written above an enum, kept on its declaration.
+private annotated_enum(s: Stmt, attrs: Buf[Attr]) -> Stmt
+    *s.kind match
+        EnumDecl(d) ->
+            var decl = d
+
+            for attr in attrs
+                attr match
+                    User(u) -> decl.annots.push(u)
+                    _ -> ()
+
+            stmt(s.span, EnumDecl(decl))
+        _ -> s
+end annotated_enum
 
 // The fields `@guards(...)` names, each held to being one the struct declares and keeps `private`.
 //

@@ -377,6 +377,44 @@ const_local_image(cx: &Analyzer, name: string, init: TExpr) -> Result[TExpr, str
                        "value is a 'val'")
 end const_local_image
 
+// What one use of a program's annotation comes to -- `@rename("id")` read as the construction
+// `rename("id")` in the terms of the file that wrote it, run while compiling, and made the literal it
+// came to. `None` where it was refused, which has been said at the use.
+//
+// **The construction is typed in a trial taken back**, as a constant's call is: nothing a use of
+// an annotation reaches is reached by the program. Where the trial complained, the construction is
+// typed again for real so that the complaint is told -- the arguments a struct's construction would
+// refuse are the ones an annotation refuses, in the same words.
+annotation_image(cx: &Analyzer, written: string, call: Expr, ty: Type) -> Option[TExpr]
+    val typed = typed_call(cx, call, Some(ty))
+
+    if typed.is_none()
+        type_expr(cx, call, Some(ty))
+        return None
+    end if
+
+    val init = typed.unwrap()
+    val stopped = s"what an annotation says is settled while compiling, so '@$written' takes constants — " +
+                  "this reads something that holds a value only once the program runs"
+
+    evaluate(cx.an, cx.scope, s"'@$written'", init) match
+        EvValue(Some(v)) ->
+            val image = if answer_refusal(v, texpr_type(init)).is_some() then None
+                        else value_literal(call.span, v, texpr_type(init))
+
+            if image.is_none() then cx.fault(call.span, stopped)
+
+            image
+        EvValue(None) -> Some(TExpr(call.span, TZero(ty)))
+        EvFail(message, _) ->
+            cx.fault(call.span, message)
+            None
+        EvBroken -> None
+        EvQuiet ->
+            cx.fault(call.span, stopped)
+            None
+end annotation_image
+
 // Whether a typed tree calls a function marked `const`.
 private calls_marked(a: &Analysis, t: TExpr) -> bool
     var found: Buf[bool] = buf()

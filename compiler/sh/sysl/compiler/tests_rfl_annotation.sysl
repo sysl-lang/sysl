@@ -1,0 +1,328 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+
+// **Annotations a program declares** (`annotations.sysl`, `type_reflect.sysl § x::Annotation[A]`): a
+// struct marked `@annotation` is written `@Name(...)` above a type declaration, a field or a variant,
+// and `x::Annotation[Name]` reads it back as an `Option[Name]` constant.
+
+private rfl_annotation_decls() -> string = raw"""
+    @annotation
+    struct rename
+        name: string
+
+    @annotation
+    struct skip
+    end skip
+
+    @annotation
+    struct doc
+        text: string
+        level: int
+
+    @doc("a user", 2)
+    struct User
+        @rename("id") user_id: int
+        @skip
+        @doc("the name", 1)
+        name: string
+        age: int
+
+    @doc("a shape", 0)
+    enum Shape
+        @rename("circle") Circle(r: int)
+        @skip
+        Square(s: int)
+        Empty
+
+    """
+
+@test("a field walk renames the keys an annotation names and keeps the rest")
+rfl_annotation_renames_keys()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        encode[T](v: T) -> string
+            var out = "{"
+
+            for const f in T::Fields
+                if f.index > 0 then out = out + ","
+
+                val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                out = out + s"\"$key\":${v.(f)}"
+
+            out + "}"
+
+        print(encode(User(7, "ann", 30)))
+        """), "{\"id\":7,\"name\":ann,\"age\":30}\n")
+end rfl_annotation_renames_keys
+
+@test("a marker annotation decides an 'if const', and one field carries several annotations")
+rfl_annotation_marker_and_several()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        shown[T]() -> string
+            var out = ""
+
+            for const f in T::Fields
+                if const f::Annotation[skip].is_some()
+                    out = out + "-" + f.name
+                else
+                    out = out + "+" + f.name
+
+                val d = f::Annotation[doc]
+
+                if d.is_some() then out = out + s"(${d.unwrap().text}/${d.unwrap().level})"
+
+            out
+
+        print(shown[User]())
+        """), "+user_id-name(the name/1)+age\n")
+end rfl_annotation_marker_and_several
+
+@test("a variant walk reads a variant's annotations, and a type's own are read off its name")
+rfl_annotation_variants_and_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        names[T]() -> string
+            var out = ""
+
+            for const c in T::Variants
+                out = out + c::Annotation[rename].map(r -> r.name).unwrap_or(c.name)
+
+                if const c::Annotation[skip].is_some()
+                    out = out + "!"
+
+                out = out + " "
+
+            out
+
+        about[T]() -> string = T::Annotation[doc].map(d -> d.text).unwrap_or("none")
+
+        print(names[Shape]())
+        print(User::Annotation[doc].unwrap().text, Shape::Annotation[doc].unwrap().level)
+        print(about[User](), about[Shape](), about[int](), about[(int, bool)]())
+        print(User::Annotation[rename].is_none(), Shape::Annotation[skip].is_none())
+        """), "circle Square! Empty \na user 0\na user a shape none none\ntrue true\n")
+end rfl_annotation_variants_and_types
+
+@test("an annotation's arguments may be named, and may be any constant: a 'const' or a call that runs")
+rfl_annotation_constant_arguments()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_annotation_decls() + raw"""
+        const PREFIX: string = "x_"
+
+        twice(n: int) -> int = n * 2
+
+        struct Row
+            @rename(name = PREFIX + "a") @doc(level = twice(4), text = "a") a: int
+
+        for const f in Row::Fields
+            print(f::Annotation[rename].unwrap().name, f::Annotation[doc].unwrap().level)
+        """), "x_a 8\n")
+end rfl_annotation_constant_arguments
+
+@test("an annotation from another module is named through its import, qualified or not")
+rfl_annotation_from_another_module()
+    if !azb_ready() then return
+
+    val json = raw"""
+        module json
+
+        @annotation
+        struct rename
+            name: string
+
+        key_of[T]() -> string
+            var out = ""
+
+            for const f in T::Fields
+                out = out + f::Annotation[rename].map(r -> r.name).unwrap_or(f.name) + " "
+
+            out
+        """
+
+    val model = raw"""
+        module model
+
+        import json.rename
+
+        struct Point
+            @rename("X") x: int
+            y: int
+
+        val point_x: Option[rename] = Point::Annotation[rename]
+        """
+
+    azb_prints([("json", "json.sysl", json), ("model", "model.sysl", model),
+                ("", "main.sysl", raw"""
+                    import json
+                    import model.{Point, point_x}
+
+                    struct Q
+                        @json.rename("first") a: int
+                        b: int
+
+                    print(json.key_of[Point](), json.key_of[Q](), point_x.is_none())
+                    """)],
+               "X y  first b  true\n")
+end rfl_annotation_from_another_module
+
+@test("a library root's annotations are read by the program that uses its types")
+rfl_annotation_from_a_library_root()
+    if !azb_ready() then return
+
+    val lib = azb_tree([("codec", "codec.sysl", raw"""
+        module codec
+
+        @annotation
+        struct tag
+            n: int
+
+        @tag(9)
+        struct Packet
+            @tag(1) head: int
+            body: int
+        """)])
+
+    azb_prints_with([("", "main.sysl", raw"""
+        import codec.*
+
+        var out = ""
+
+        for const f in Packet::Fields
+            out = out + s"${f.name}=${f::Annotation[tag].map(t -> t.n).unwrap_or(0)} "
+
+        print(out, Packet::Annotation[tag].unwrap().n)
+        """)], [lib], "head=1 body=0  9\n")
+
+    remove_dir_all(lib).unwrap_or(())
+end rfl_annotation_from_a_library_root
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("an annotation nothing declares is refused at its use")
+rfl_annotation_unknown()
+    if !enm_ready() then return
+
+    val said = enm_err("struct A\n    @nothing(\"x\") x: int\n\nprint(1)\n")
+
+    assert(said.contains("error: '@nothing' names no annotation — nothing called 'nothing' is in reach " +
+                         "here, and an annotation is a struct declared with '@annotation' above it"), said)
+end rfl_annotation_unknown
+
+@test("a struct not marked '@annotation' is refused as one, at a use and in brackets")
+rfl_annotation_not_marked()
+    if !enm_ready() then return
+
+    val used = enm_err("struct plain\n    s: string\n\nstruct A\n    @plain(\"x\") x: int\n\nprint(1)\n")
+
+    assert(used.contains("error: 'plain' is a struct, not an annotation — an annotation is a struct " +
+                         "marked '@annotation', which is what lets it be written '@plain'"), used)
+
+    val read = enm_err("struct plain\n    s: string\n\nstruct A\n    x: int\n\nprint(A::Annotation[plain])\n")
+
+    assert(read.contains("error: 'plain' is a struct, not an annotation — an annotation is a struct " +
+                         "marked '@annotation', which is what lets '::Annotation[plain]' read it"), read)
+
+    val unnamed = enm_err("struct A\n    x: int\n\nprint(A::Annotation)\n")
+
+    assert(unnamed.contains("error: 'A::Annotation' reads one annotation, named in brackets — " +
+                            "'A::Annotation[rename]'"), unnamed)
+end rfl_annotation_not_marked
+
+@test("an annotation may not take a built-in attribute's name, nor type parameters")
+rfl_annotation_reserved_name()
+    if !enm_ready() then return
+
+    val said = enm_err("@annotation\nstruct inline\n    n: int\n\nprint(1)\n")
+
+    assert(said.contains("error: '@inline' is one of the language's own annotations, so an annotation " +
+                         "a program declares may not take the name — a use of it would read as the " +
+                         "built-in one"), said)
+
+    val generic = enm_err("@annotation\nstruct tagged[T]\n    v: T\n\nprint(1)\n")
+
+    assert(generic.contains("error: an annotation takes no type parameters — what a use of '@tagged' " +
+                            "says is the values written in its parentheses, and reflection asks for " +
+                            "it by one name, '::Annotation[tagged]'"), generic)
+end rfl_annotation_reserved_name
+
+@test("one annotation written twice above one part is refused, and two different ones are not")
+rfl_annotation_duplicate()
+    if !enm_ready() then return
+
+    val said = enm_err(rfl_annotation_decls() + "struct B\n    @rename(\"a\")\n    @rename(\"b\") x: int\n\nprint(1)\n")
+
+    assert(said.contains("error: '@rename' is written twice above 'x', and it says nothing the once " +
+                         "does not"), said)
+
+    val whole = enm_err(rfl_annotation_decls() + "@skip\n@skip\nstruct C\n    x: int\n\nprint(1)\n")
+
+    assert(whole.contains("error: '@skip' is written twice above one declaration, and it says nothing " +
+                          "the once does not"), whole)
+end rfl_annotation_duplicate
+
+@test("an annotation's arguments are constants, and are what a construction of its struct takes")
+rfl_annotation_arguments_refused()
+    if !azb_ready() then return
+
+    azb_refused([("m", "m.sysl", raw"""
+        module m
+
+        @annotation
+        struct level
+            n: int
+
+        var counter: int = 3
+
+        struct A
+            @level(counter) x: int
+        """), ("", "main.sysl", "import m.A\n\nprint(1)\n")],
+        ["'@level' cannot be computed while compiling: 'm.counter' is filled when the program runs"])
+
+    if !enm_ready() then return
+
+    val said = enm_err(rfl_annotation_decls() + raw"""
+        struct B
+            @rename("a", "b") x: int
+            @rename(3) y: int
+            @rename z: int
+            @skip() w: int
+
+        print(1)
+        """)
+
+    assert(said.contains("error: struct 'rename' has 1 field, but 2 values were given"), said)
+    assert(said.contains("error: 'name' of 'rename' is string, but int was given"), said)
+    assert(said.contains("error: struct 'rename' has 1 field, but 0 values were given"), said)
+    assert(said.contains("error: 'skip' has no fields, so '@skip' takes no arguments — it is written " +
+                         "with no parentheses"), said)
+end rfl_annotation_arguments_refused
+
+@test("an annotation stands above a type, a field or a variant and nothing else")
+rfl_annotation_misplaced()
+    if !enm_ready() then return
+
+    val above_fn = enm_err(rfl_annotation_decls() + "@rename(\"f\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(above_fn.contains("error: 'rename' is not an annotation a declaration takes — "), above_fn)
+    assert(above_fn.contains("An annotation a program declares, a struct marked '@annotation', stands " +
+                             "above a type declaration, a field or a variant"), above_fn)
+
+    val mark = enm_err("@annotation\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(mark.contains("error: '@annotation' makes a struct an annotation, whose fields are what a " +
+                         "use of it writes in its parentheses — so it marks a struct, and this " +
+                         "declares none"), mark)
+
+    val mixed = enm_err(rfl_annotation_decls() + "struct B\n    @rename(\"a\")\n    @inline x: int\n\nprint(1)\n")
+
+    assert(mixed.contains("error: '@inline' is not about a field — what a field carries is an " +
+                          "annotation the program declares, a struct marked '@annotation'"), mixed)
+end rfl_annotation_misplaced

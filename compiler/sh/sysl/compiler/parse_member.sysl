@@ -127,23 +127,18 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
             decl.invariants.push(parse_expr(p))
         elif at_anonymous_member(p)
             parse_anonymous_member(p, decl)
+        elif at_user_annotation(p) && annotations_then(p, at_field)
+            val annots = parse_part_annotations(p, "a field")
+
+            if at_field(p)
+                val count = decl.fields.len()
+
+                parse_field_line(p, decl)
+
+                if decl.fields.len() > count then about(annots, decl.fields.at(count).name, &decl.annots)
+            end if
         elif at_field(p)
-            val vis = parse_visibility(p)
-
-            if p.kw_at(1, ":") && p.kw_at(2, "in")
-                parse_zero_width(p, decl, vis)
-            else
-                var field = parse_field_param(p)
-
-                field.vis = vis
-
-                if p.accept_kw("in")
-                    val storage = parse_type(p)
-
-                    decl.bits.push(BitInDecl(field.span.to(p.just_taken()), decl.fields.len(), storage, false))
-                end if
-
-                decl.fields.push(field)
+            parse_field_line(p, decl)
         else
             parse_member_line(p, &decl.members, InType)
 
@@ -155,6 +150,28 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
 
     if !p.accept(Dedent) then p.want("dedent")
 end parse_struct_body
+
+// One field of a struct's body, with the `in S` a C bitfield adds.
+private parse_field_line(p: *Parser, decl: *StructDecl)
+    val vis = parse_visibility(p)
+
+    if p.kw_at(1, ":") && p.kw_at(2, "in")
+        parse_zero_width(p, decl, vis)
+        return
+    end if
+
+    var field = parse_field_param(p)
+
+    field.vis = vis
+
+    if p.accept_kw("in")
+        val storage = parse_type(p)
+
+        decl.bits.push(BitInDecl(field.span.to(p.just_taken()), decl.fields.len(), storage, false))
+    end if
+
+    decl.fields.push(field)
+end parse_field_line
 
 // `_: in S`: C's zero-width bitfield `S : 0`, which holds nothing and moves the next field onto a
 // boundary of `S`. It has no width to write, so its field's type is its declared type, and the
@@ -401,6 +418,18 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         if refuse_stray_member(p, first, InType) then ()
         elif refuse_reserved_variant(p) then ()
         elif refuse_positional_payload(p) then ()
+        elif at_user_annotation(p) && annotations_then(p, at_enum_variant)
+            val annots = parse_part_annotations(p, "a variant")
+
+            if at_enum_variant(p)
+                val variant = parse_enum_variant(p)
+
+                about(annots, variant.name, &decl.annots)
+                decl.variants.push(variant)
+
+                if p.report.len() == before && !(p.at(Newline) || p.at(Dedent) || p.at(Eof))
+                    p.want("dedent")
+            end if
         elif at_enum_variant(p)
             decl.variants.push(parse_enum_variant(p))
 
