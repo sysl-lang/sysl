@@ -377,6 +377,11 @@ for any particular type. That walk has to hand back a typed value, and `Min` and
 `string`, so admitting those would mean restating each attribute's result type a second time, in a
 second place, where the two copies could drift apart.
 
+**A `derive` body's `T` is not such a parameter.** Its body is read once for each type that names the
+trait in its `derives`, with `T` that type and never standing for itself, so it answers every attribute
+the type does — `T::Image(self)` in an arm under `if const T::Kind == Kind.SimpleEnum`
+([reflection](/reference/reflection/#writing-a-derivation)).
+
 **Nothing is asked of `T` in the signature.** A parameter given a type with no extremes is reported
 at the instantiation that gave it one, and the message names both:
 
@@ -457,11 +462,29 @@ print(Color::Nonesuch)
 'Color' has no attribute 'Nonesuch'
 ```
 
+### Reflection queries answer on every type
+
+**The sets above belong to one kind of type each. A second family answers on any type**, because it asks
+what the type is made of rather than what a value of it may do, and it is answered while compiling:
+
+| written | answers |
+|---|---|
+| `T::Kind` | a `Kind` variant — `Struct`, `DataEnum`, `Int`, `Opaque`… |
+| `T::Name`, `T::BaseName` | the type as written, with its arguments / the declared name alone |
+| `T::Fields`, `T::Members` | the named fields / every stored member of a struct, tuple or union |
+| `T::Variants` | the variants of an enum, simple or data |
+| `T::Make(c, p)` | the variant `c` of a data enum, built from a payload |
+| `T::Annotation[A]`, `f::Annotation[A]` | an `Option` of the program's own `@annotation` on a type or field |
+
+A data enum, which has no `First` or `Pos`, is walked through `T::Variants` instead. The descriptors,
+`for const f in T::Fields`, `v.(f)`, `f::Type` and the rest are on [reflection](/reference/reflection/).
+
 ## `@test` — a function with a caller nothing else has
 
 A word after `@` that is neither `test` nor `tailrec` is answered by name rather than as grammar. The
 set is closed, which is what makes a misspelling an error instead of a marker that quietly does
-nothing — annotations are deliberately *not* a general mechanism yet.
+nothing — the built-in annotations are a closed list. A program's own are declared with `@annotation`
+and read by [reflection](/reference/reflection/#annotations).
 
 The annotation goes on its own line above an ordinary function declaration, which may still be
 `private`:

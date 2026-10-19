@@ -1713,6 +1713,15 @@ covers all of them.
 constant rather than as a literal. It reaches the parts of a tuple and nothing else — a struct's
 fields have names, and a number does not address one.
 
+### A `for const` over a type's own make-up
+
+**The subject may also be a descriptor list**: `for const f in T::Fields` unrolls once per field of a
+struct, tuple or union, and `for const c in T::Variants` once per variant of an enum. `f` and `c` are
+compile-time descriptors, `v.(f)` is that field of a value in each copy, `f::Type` its type, and
+`c::Fields` the payload's own list, which a nested `for const` walks. Each copy is checked on its own,
+as a tuple's `t.i` is, so one body serves fields of every type. The descriptors, and what a derivation
+written with them looks like, are on [reflection](/reference/reflection/).
+
 ### What a `for const` will not do
 
 A range computed at run time cannot be unrolled, and the ordinary `for` is what walks one:

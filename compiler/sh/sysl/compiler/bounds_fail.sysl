@@ -57,6 +57,7 @@ const BoundsTooWide: int = 8
 const BoundsRun: int = 9
 const BoundsCountTooWide: int = 10
 const BoundsNoVariant: int = 11
+const BoundsWrongVariant: int = 12
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -64,7 +65,8 @@ const BoundsASigned: int = 256
 const BoundsBSigned: int = 512
 
 // What each form says, in order: the text with a `%s` for each value, and which values fill them --
-// `a`, `b` or `n` (the length). The location, where there is one, follows as ` (file:line:col)`.
+// `a`, `b` or `n` (the length), or `A` or `B` where that value is the address of a NUL-terminated
+// text rather than a number. The location, where there is one, follows as ` (file:line:col)`.
 private val BoundsForms: []const (string, string) = [
     ("index %s out of bounds for length %s", "an"),
     ("range %s..<%s out of bounds for length %s", "abn"),
@@ -77,7 +79,8 @@ private val BoundsForms: []const (string, string) = [
     ("index does not fit in usize", ""),
     ("%s elements from index %s out of bounds for length %s", "ban"),
     ("count does not fit in usize", ""),
-    ("value %s is not one of the enum's variants", "a")]
+    ("value %s is not one of the enum's variants", "a"),
+    ("variant '%s' was asked for, and the value is '%s'", "AB")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -156,6 +159,37 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
 end bounds_unless
+
+// **`x.(c)` reached with a value holding another variant** reports through the same function, the
+// two variants' names handed over as the addresses of NUL-terminated texts laid down with the
+// locations, and stops the program.
+variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val
+    e.traps = true
+    e.bounds_fails = true
+
+    val w = word_lty(e)
+    val a = fresh_reg(e)
+    val b = fresh_reg(e)
+
+    emit(e, InCast(a, CastPtrToInt, LPtr, c_text_of(e, asked), w))
+    emit(e, InCast(b, CastPtrToInt, LPtr, c_text_of(e, holds), w))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), VInt(from_int(long(BoundsWrongVariant)))))
+    args.push(ir_arg(w, a))
+    args.push(ir_arg(w, b))
+    args.push(ir_arg(w, bounds_none()))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
+    emit_term(e, InUnreachable)
+    VNothing
+end variant_fail
+
+// What the default prints for it, which is also what an evaluation while compiling says.
+variant_fail_text(asked: string, holds: string) -> string =
+    s"variant '$asked' was asked for, and the value is '$holds'"
 
 // A value a form does not use.
 bounds_none() -> Val = VInt(from_int(0))
@@ -363,10 +397,17 @@ bounds_runtime(t: Target) -> string
 
             if j < fills.bytes.len
                 val which = fills[j..<j + 1]
-                val sign = if which == "a" then "%asg" else if which == "b" then "%bsg" else "false"
 
-                text = text + s"  %k${k}.v${j} = call ptr @sysl.bounds.num(ptr $at, $word %${which}, " +
-                    s"i1 $sign, ptr %lim)\n"
+                if which == "A" || which == "B"
+                    text = text + s"  %k${k}.t${j} = inttoptr $word %${if which == "A" then "a" else "b"} to ptr\n" +
+                        s"  %k${k}.v${j} = call ptr @sysl.bounds.put(ptr $at, ptr %k${k}.t${j}, ptr %lim)\n"
+                else
+                    val sign = if which == "a" then "%asg" else if which == "b" then "%bsg" else "false"
+
+                    text = text + s"  %k${k}.v${j} = call ptr @sysl.bounds.num(ptr $at, $word %${which}, " +
+                        s"i1 $sign, ptr %lim)\n"
+                end if
+
                 at = s"%k${k}.v${j}"
 
         text = text + "  br label %tail\n"
