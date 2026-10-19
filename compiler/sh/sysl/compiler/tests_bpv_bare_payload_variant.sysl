@@ -1,0 +1,296 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A variant that carries something, named through its enum without its values. Where the position
+// expects the enum, the expected type settles WHICH enum is meant, and nothing about what the variant
+// carries: `Big.V2` there is refused exactly as it is where nothing is expected, rather than built as
+// a value whose payload was never written (which read as zero, or compiled to a lone trap). The
+// reference (`reference/types.md § Enums`) gives a bare payload variant no meaning of its own -- it is
+// constructed, as `V2(1, "a")`, and is not a function value.
+
+private var bpv_library_cache: Buf[Program] = buf()
+private var bpv_library_read: bool = false
+
+private bpv_library() -> Buf[Program]
+    if bpv_library_read then return bpv_library_cache
+
+    bpv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bpv_library_cache = units
+
+    bpv_library_cache
+end bpv_library
+
+private bpv_ready() -> bool
+    if bpv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bpv_ready
+
+private bpv_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The report a source earns, taken through the lowering.
+private bpv_err(text: string) -> string
+    val root = make_temp_dir("sysl-bpv").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bpv_err
+
+// What a program prints.
+private bpv_ran(text: string) -> string
+    val root = make_temp_dir("sysl-bpv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bpv_ran
+
+// The one diagnostic a source earns: its message, and where it points.
+private bpv_one(text: string, message: string, at: string)
+    val said = bpv_err(text)
+
+    assert(bpv_says(said, s"error: $message\n"), said)
+    assert(bpv_says(said, s"main.sysl:$at\n"), said)
+end bpv_one
+
+private val bpv_v2: string ="variant 'V2' carries data — construct it with 'V2(…)'"
+
+@test("a payload variant named through its enum is refused as an expression statement")
+bpv_statement()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        main()
+            Big.V2
+        """, bpv_v2, "6:9")
+
+@test("and as an annotated binding's value, which is where the expected type settles the enum")
+bpv_val()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        main()
+            val b: Big = Big.V2
+            print(b == Big.V1)
+        """, bpv_v2, "6:22")
+
+@test("and as an element of an array literal, beside a unit variant")
+bpv_array()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        main()
+            val xs: []Big = [Big.V1, Big.V2]
+            print(xs.len)
+        """, bpv_v2, "6:34")
+
+@test("and as a call's argument")
+bpv_argument()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        take(b: Big) -> int = 1
+
+        main()
+            print(take(Big.V2))
+        """, bpv_v2, "8:20")
+
+@test("and as a function's result, written as its body or after 'return'")
+bpv_return()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        make() -> Big = Big.V2
+
+        main()
+            print(make() == Big.V1)
+        """, bpv_v2, "5:21")
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        make() -> Big
+            return Big.V2
+
+        main()
+            print(make() == Big.V1)
+        """, bpv_v2, "6:16")
+
+@test("and as a match arm's body")
+bpv_match_arm()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        pick(k: int) -> Big = k match
+            0 -> Big.V1
+            _ -> Big.V2
+
+        main()
+            print(pick(1) == Big.V1)
+        """, bpv_v2, "7:14")
+
+@test("and as a struct field's value")
+bpv_field()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        struct Holder
+            b: Big
+
+        main()
+            val h = Holder(Big.V2)
+            print(h.b == Big.V1)
+        """, bpv_v2, "9:24")
+
+@test("and with the enum's name left off, or bare")
+bpv_implicit_and_bare()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        main()
+            val b: Big = .V2
+            print(b == Big.V1)
+        """, bpv_v2, "6:18")
+
+    bpv_one(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        main()
+            val xs: []Big = [V1, V2]
+            print(xs.len)
+        """, bpv_v2, "6:26")
+
+@test("a generic enum's payload variant is refused where the position names the instantiation")
+bpv_generic()
+    if !bpv_ready() then return
+
+    bpv_one(raw"""
+        enum G[T]
+            A(x: T)
+            B
+
+        main()
+            val g: G[int] = G.A
+            print(1)
+        """, "variant 'A' carries data — construct it with 'A(…)'", "6:23")
+
+@test("while a unit variant and a constructed payload variant are accepted in every one of those places")
+bpv_accepted()
+    if !bpv_ready() then return
+
+    assert_eq(bpv_ran(raw"""
+        enum Big
+            V1
+            V2(n: int, s: string)
+
+        enum G[T]
+            A(x: T)
+            B
+
+        struct Holder
+            b: Big
+
+        take(b: Big) -> int = b match
+            V1 -> 1
+            V2(n, _) -> n
+
+        make() -> Big = Big.V2(4, "ab")
+
+        made() -> Big
+            return Big.V1
+
+        pick(k: int) -> Big = k match
+            0 -> Big.V1
+            _ -> Big.V2(k, "")
+
+        main()
+            val xs: []Big = [Big.V1, Big.V2(2, "abc"), .V2(3, "c"), V2(5, "e"), .V1, V1]
+            val h = Holder(Big.V2(7, ""))
+            val u = Holder(Big.V1)
+            val g: G[int] = G.A(6)
+            val n: G[int] = G.B
+            print(take(xs[0]), take(xs[1]), take(xs[2]), take(xs[3]), take(xs[4]), take(xs[5]))
+            print(take(make()), take(made()), take(pick(0)), take(pick(9)), take(h.b), take(u.b))
+            print(take(Big.V2(8, "")), take(Big.V1))
+            print(g match
+                A(x) -> x
+                B -> 0, n match
+                A(x) -> x
+                B -> 0)
+        """), "1 2 3 5 1 1\n4 1 1 9 7 1\n8 1\n6 0\n")

@@ -1155,6 +1155,24 @@ print(int(Green), area(Circle(1.0)), area(Rect(2.0, 3.0)))
 `Option[T]` and `Result[T, E]` are ordinary data enums declared in the standard library, with no
 compiler privileges — which is why you can write your own and have it work identically.
 
+**A variant that carries something is constructed, never named on its own.** Written without its
+values it is neither a value of the enum nor a function that makes one — and a position that expects
+the enum changes nothing, since what it settles is which enum is meant, not what the variant holds:
+
+```sysl
+enum Shape
+    Circle(r: real)
+    Dot
+
+val shapes: []Shape = [Shape.Dot, Shape.Circle]
+
+print(shapes.len)
+```
+
+```error
+variant 'Circle' carries data — construct it with 'Circle(…)'
+```
+
 ### A variant belongs to its enum
 
 Two enums in one module may each name a variant `Failed`, and neither has to be renamed. **What a
