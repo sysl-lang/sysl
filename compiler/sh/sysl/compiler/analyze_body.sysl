@@ -1742,8 +1742,11 @@ private module_storage(a: &Analysis) -> Buf[TVal]
         for i in 0..<a.tables.vals.len()
             val key = a.tables.vals.key_at(i)
             val writable = holds_string(a.tables.writable, key)
+            // The value a `var` binding takes apart is read with that binding's names, ahead of
+            // them, as a `val` binding's is read ahead of its own.
+            val first = writable || held_whole_keyword(a.tables.vals.at(i).name) == "var"
 
-            if (pass == 0) == writable
+            if (pass == 0) == first
                 val d = a.tables.vals.at(i)
                 val cx = analyzer_for(a, d.scope)
                 // `stored` is what the storage is declared at, qualifier and all; `ty` is what a read
@@ -1774,8 +1777,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     // the declaration is the mistake.
                     val got = texpr_type(init.unwrap())
 
+                    // The value a module binding takes apart is named by the binding, in the words
+                    // the same binding in a body is refused with.
+                    val what = if is_held_whole(d.name) then "the parts of this binding" else s"'${d.name}'"
+
                     if disagree(got, ty) then
-                        cx.fault(d.span, s"cannot initialize '${d.name}': declared ${type_show(ty)} but " +
+                        cx.fault(d.span, s"cannot initialize $what: declared ${type_show(ty)} but " +
                                  s"the value is ${type_show(got)}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())
@@ -1868,7 +1875,7 @@ private inferred_storage(cx: &Analyzer, key: string, d: ValueDecl, got: Type) ->
     // and its type is written for the whole binding.
     if holds_string(cx.an.val_cycles, key) && is_held_whole(d.name)
         cx.fault(d.span, "this binding takes its parts' types from its value, and the value reaches " +
-                 "what it binds again — write the type of the whole value, 'val (…): T = …'")
+                 s"what it binds again — write the type of the whole value, '${held_whole_keyword(d.name)} (…): T = …'")
 
         return Unknown
     end if

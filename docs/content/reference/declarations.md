@@ -374,10 +374,12 @@ binding with nothing to take apart names nothing. The right side is produced bef
 bound, so a value there still means whatever the enclosing scope calls it — the binding does not
 shadow itself half way through its own right-hand side.
 
-**A module takes it too**, since a module `val` takes its type as a local does: each name is a module
-`val` of its part's type, read from the module's functions, its other files and the modules that
-import it like any other. A list of values is shared out one each, so a part over a constant is
-constant data; one value taken apart is computed once, however many names it gives.
+**A module takes it too**, since module storage takes its type as a local does: each name is a module
+`val` — or, written with `var`, module storage — of its part's type, read from the module's
+functions, its other files and the modules that import it like any other. A list of values is shared
+out one each, so a part over a constant is constant data; one value taken apart is computed once,
+however many names it gives. Each name a `var` binds is storage of its own, written without touching
+the others.
 
 ```sysl
 static val width, height = 640, 480
@@ -500,19 +502,22 @@ show()
 cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
 ```
 
-Like the comma form, it **is a module `val` per name** at the top of a file, and a type written for
-the whole value governs there as it does here:
+Like the comma form, it **is a module `val` per name** at the top of a file — module storage per name,
+written with `var` — and a type written for the whole value governs there as it does here:
 
 ```sysl
 static val (lo, hi): (u8, u16) = (1, 300)
+static var (count, limit): (u8, u16) = (0, 2)
 
 span() -> u16 = hi - u16(lo)
 
-print(lo, hi, span())
+count += 1
+limit *= 100
+print(lo, hi, span(), count, limit)
 ```
 
 ```output
-1 300 299
+1 300 299 1 200
 ```
 
 The same pattern stands in a
