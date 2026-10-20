@@ -98,8 +98,10 @@ print(total)
 ```
 
 The bare literals are read at that type, not as an `int` first, so one that does not fit it is refused
-where it stands. Two elements that each have a type still have to agree, and an integer literal
-beside a real is not made a real:
+where it stands. Two elements that each have a type meet at the wider where one holds every value of
+the other, as two operands do — `[b, n]` over a `byte` and an `int` is a `[2]int` — and otherwise have
+to agree, so `[u, n]` over a `u32` and an `int` is refused. An integer literal beside a real is not
+made a real:
 
 ```sysl
 var bytes = [1u8, 300]

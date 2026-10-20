@@ -106,6 +106,21 @@ print(n + i)
 '+' needs matching types, got uint and int
 ```
 
+**A `char` operand never widens.** A character beside a number is far more often a mistake than
+arithmetic, so `c + n` says which is meant — `int(c) + n` — even though a `char` widens to an `int`
+everywhere a position asks for one (`val k: int = c`). Two `char`s compare as they always did.
+
+```sysl
+var c = 'a'
+var n: int = 1
+
+print(c + n)
+```
+
+```error
+'+' needs matching types, got char and int
+```
+
 ### A shift takes a count
 
 **A shift is the one exception, and its right operand may be any integer type.** `a + b` combines two
@@ -365,14 +380,16 @@ anything with a cursor rather than a second kind of loop. The cursor moves, but 
 `0..3` reaching the same total says the inclusive form counts one more.
 
 **Its bounds are read by the same two rules a `for` header's are** — they must agree, and they must
-be integers — so the value and the loop cannot come to disagree about what a range is. Note that a
+be integers — so the value and the loop cannot come to disagree about what a range is. Two bounds of
+different types agree where one holds every value of the other, as two operands do: `a..<b` over an
+`int` and a `u8` is an `int` range, and over an `int` and a `u32` it is refused. Note that a
 bound written as a literal takes its type from the other end, so `0..<3u8` is a `u8` range rather
 than a disagreement; it takes two names to write one. A range of literals standing where a
 `Range[T]` is wanted takes `T` the same way, so `total(0..<4)` passes a `Range[usize]` to a
 `total(r: Range[usize])`, and `val r: Range[u8] = 0..<3` is a `u8` range.
 
 ```sysl
-f(a: int, b: u8) -> int
+f(a: int, b: u32) -> int
     val r = a..<b
     0
 
@@ -1155,7 +1172,10 @@ a `[]int` and a `byte` is not an `Option[int]`.
 declared type, an assignment (a compound one converts the right side to the left's type, never the
 reverse), an argument (an `extern`'s too), a returned value, each element of a literal whose element
 type the context gives, and the branches of an `if` or a `match` used as a value, which meet at the
-wider of their types as two operands do.
+wider of their types as two operands do. **The bounds of a range and the elements of an unannotated
+array literal meet the same way**: `i..<n` over an `int` and a `long` is a `long` range, and `[a, b]`
+over an `int` and a `long` is a `[2]long`. A pair neither of whose types holds the other — a `u32` and
+an `int` — is refused as before.
 
 ```sysl
 struct Sample
@@ -1188,6 +1208,27 @@ print(n, total, widen(b), peak(wide[..]), one.at, one.level, if n > 0 then b els
 
 ```output
 200 199 200 200 200 200 200
+```
+
+```sysl
+var i: int = 2147483646
+var n: long = 2147483648
+var b: byte = 7
+
+for k in i..<n
+    print(k)
+
+val ints = [b, i, b]
+val longs = [i, n]
+val wide: [2]long = longs
+
+print(ints[0] + ints[2], ints[1], wide[1] - wide[0])
+```
+
+```output
+2147483646
+2147483647
+14 2147483646 2
 ```
 
 **A type parameter is never decided by a conversion.** A call solves it from the arguments' own types,
