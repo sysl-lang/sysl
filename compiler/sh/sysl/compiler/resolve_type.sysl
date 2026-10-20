@@ -1272,9 +1272,67 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
         return None
     end if
 
+    // **An argument that does not read at the declared type says so**, at the part that does not:
+    // `Ring[double(Base)]` over an `int` `Base` and a `usize` parameter is a constant expression, and
+    // what is wrong with it is the parameter it is handed to. Only an argument whose every name is a
+    // constant is read so: one naming storage is not a constant, and that is what is wrong with it.
+    val reader = analyzer_for(a, scope)
+
+    reader.subst = subst
+
+    if names_only_constants(reader, e)
+        val trial = begin_trial(reader)
+
+        type_expr(reader, e, Some(ty))
+
+        val said = if a.complaints() > trial.said then Some(a.found.at(trial.said)) else None
+
+        discard_trial(reader, trial)
+
+        if said.is_some()
+            a.fault_again(said.unwrap())
+            return None
+        end if
+    end if
+
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
 end value_arg
+
+// Whether every name a value argument reads as a value is a constant: a `const`, a value parameter,
+// a variant. A callee is not read as a value, and neither is the name a member is called on.
+private names_only_constants(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    Ident(_) ->
+        val mark = cx.an.complaints()
+        val refusals = cx.an.const_refusals
+        val folded = const_fold(cx, e)
+
+        cx.an.restore_complaints(mark)
+        cx.an.const_refusals = refusals
+        folded.is_some()
+    Unary(_, operand) -> names_only_constants(cx, operand)
+    Binary(_, l, r) -> names_only_constants(cx, l) && names_only_constants(cx, r)
+    Compare(operands, _) ->
+        var all = true
+
+        for item in operands
+            if !names_only_constants(cx, item) then all = false
+
+        all
+    Call(callee, args) ->
+        var all = *callee.kind match
+            Field(receiver, _, _) -> *receiver.kind match
+                Ident(_) -> true
+                _ -> names_only_constants(cx, receiver)
+            _ -> true
+
+        for item in args
+            if !names_only_constants(cx, item) then all = false
+
+        all
+    NamedArg(_, value) -> names_only_constants(cx, value)
+    Index(receiver, index, _) -> names_only_constants(cx, receiver) && names_only_constants(cx, index)
+    _ -> true
 
 // A value argument written as an expression -- `f[High]()` on a generic function -- at the simple
 // enum its parameter was declared as.
