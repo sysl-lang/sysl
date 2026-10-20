@@ -674,6 +674,12 @@ be reviewed as a diff in a commit, which generated HTML cannot.
 
 **The unit is a module**, not a type, because a module is what you import.
 
+**A page lists every public declaration of its module**, each group under its own heading:
+constants, values (`val`), variables (`var` and `static var`), functions, externs, types, aliases,
+traits and implementations. A declaration's signature is shown as it was written, and its doc
+comment beneath it. A variable is listed because storage a caller may write is as much a part of a
+module's API as storage it may only read.
+
 | Flag | Means |
 |---|---|
 | `-o`, `--out <dir>` | where the Markdown goes (default `docs/api`) |

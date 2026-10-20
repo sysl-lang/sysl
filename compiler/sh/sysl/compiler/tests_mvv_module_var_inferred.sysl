@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// Module storage written with `var` takes its type as a module `val` does (`reference/declarations.md
+// § A module member takes its type as a local does`): left off, it is the initializer's; written, it
+// governs. Every spelling of it -- a module's `var`, the entry file's `static var`, a `private` one, a
+// `@thread_local` one -- is read the same way, and only storage with no initializer states its type.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mvv_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of a `main.sysl` beginning and the files of one module beside it.
+private mvv_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-mvv").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end mvv_root
+
+// What the program prints, or the report it was refused with.
+private mvv_ran(files: []const (string, string)) -> string
+    val root = mvv_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mvv_ran
+
+// The emitted module, or the report the program was refused with.
+private mvv_ir(files: []const (string, string)) -> string
+    val root = mvv_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mvv_ir
+
+private mvv_prints(module_text: string, main_text: string, want: string)
+    if !mvv_ready() then return
+
+    assert_eq(mvv_ran([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)]), want)
+
+// Refused with `message`, at `at` (`line:col` of `file`).
+private mvv_refused_in(files: []const (string, string), file: string, message: string, at: string)
+    if !mvv_ready() then return
+
+    val said = mvv_ir(files)
+    val place = s"error: $message\n --> $file:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+end mvv_refused_in
+
+private mvv_refused(module_text: string, main_text: string, message: string, at: string) =
+    mvv_refused_in([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)], "cfg/cfg.sysl", message, at)
+
+private mvv_states_its_type(name: string) -> string =
+    s"'$name' is module storage, and module storage states its type — write '$name: T'"
+
+// -- the type the value gives ---------------------------------------------------------------------
+
+@test("a module var with no type is an int, a string, a call's result, an array and a real sum, each written")
+mvv_inferred_types() =
+    mvv_prints("module cfg\n\nvar limit = 10\nvar name = \"cfg\"\nvar area = sq(6)\nvar table = [1, 2, 3]\n" +
+               "var half = 1 + 0.5\n\nsq(n: int) -> int = n * n\n",
+               "import cfg\n\ncfg.limit += 2\ncfg.name = \"two\"\ncfg.area -= 1\ncfg.table[2] = 30\n" +
+               "cfg.half *= 2\nprint(cfg.limit / 3, cfg.name, cfg.area, cfg.table[2], cfg.half)\n",
+               "4 two 35 30 3\n")
+
+@test("an inferred module var is read and written before its declaration, by a generic body and from another file")
+mvv_read_anywhere()
+    if !mvv_ready() then return
+
+    val a = "module cfg\n\nval doubled = limit * 2\n\npick[T](x: T) -> int = limit + 1\n\n" +
+            "bump() = count += limit\n"
+    val b = "module cfg\n\nval limit = 10\nvar count = sq(2)\n\nsq(n: int) -> int = n * n\n"
+    val main = "import cfg\n\ncfg.bump()\nprint(cfg.doubled, cfg.pick(\"x\"), cfg.count)\n"
+
+    assert_eq(mvv_ran([("cfg/a.sysl", a), ("cfg/b.sysl", b), ("main.sysl", main)]), "20 11 14\n")
+end mvv_read_anywhere
+
+@test("a var's type is its value's whichever of the two is declared first")
+mvv_either_order()
+    mvv_prints("module cfg\n\nvar a = b + 1\nvar b = 2\n", "import cfg\n\ncfg.a += 1\nprint(cfg.a, cfg.b)\n", "4 2\n")
+    mvv_prints("module cfg\n\nvar b = 2\nvar a = b + 1\n", "import cfg\n\ncfg.a += 1\nprint(cfg.a, cfg.b)\n", "4 2\n")
+end mvv_either_order
+
+@test("a written type still governs a module var, and the value is held to it")
+mvv_written_type_governs()
+    mvv_prints("module cfg\n\nvar ratio: real = 3\nvar small: u8 = 200\nvar wide: long = 1 << 40\n",
+               "import cfg\n\ncfg.small += 55\nprint(cfg.ratio / 2, cfg.small, cfg.wide)\n", "1.5 255 1099511627776\n")
+    mvv_refused("module cfg\n\nvar bad: int = \"no\"\n", "import cfg\n\nprint(cfg.bad)\n",
+                "cannot initialize 'bad': declared int but the value is string", "3:1")
+end mvv_written_type_governs
+
+@test("a write of the wrong type to an inferred module var is refused against the inferred type")
+mvv_write_held_to_type()
+    if !mvv_ready() then return
+
+    val said = mvv_ir([("cfg/cfg.sysl", "module cfg\n\nvar count = 0\n"), ("main.sysl", "import cfg\n\ncfg.count = \"no\"\n")])
+
+    assert(said.contains("error: "), said)
+    assert(said.contains("string"), said)
+    assert(said.contains("int"), said)
+end mvv_write_held_to_type
+
+// -- every spelling of module storage -------------------------------------------------------------
+
+@test("the entry file's static var, a private one and a thread-local one each take their value's type")
+mvv_every_spelling()
+    if !mvv_ready() then return
+
+    val main = "static var ticks = 0\nprivate static var name = \"none\"\n@thread_local static var per = 7\n\n" +
+               "tick() = ticks += 1\n\ntick()\ntick()\nname = \"two\"\nper += 1\nprint(ticks, name, per)\n"
+
+    assert_eq(mvv_ran([("main.sysl", main)]), "2 two 8\n")
+    mvv_prints("module cfg\n\nprivate var hidden = 4\n@thread_local var per = 7\n\npeek() -> int = hidden + per\n",
+               "import cfg\n\ncfg.per += 1\nprint(cfg.peek())\n", "12\n")
+end mvv_every_spelling
+
+@test("a var beside a main is the module's, and takes its value's type")
+mvv_beside_main()
+    if !mvv_ready() then return
+
+    assert_eq(mvv_ran([("main.sysl", "var counter = 0\n\nbump() =\n    counter += 1\n\nmain()\n    bump()\n" +
+                                      "    bump()\n    print(counter)\n")]), "2\n")
+
+// -- where the storage is -------------------------------------------------------------------------
+
+@test("an inferred module var over a constant is data in the object file, and one over a call that builds is filled")
+mvv_static_data()
+    if !mvv_ready() then return
+
+    val ir = mvv_ir([("cfg/cfg.sysl",
+                      "module cfg\n\nimport sysl.buf.{Buf, buf}\n\nvar limit = 10\nvar table = [1, 2, 3]\n" +
+                      "var half = 1 + 0.5\nvar area = sq(6)\nvar held = holder()\n@thread_local var per = 7\n\n" +
+                      "sq(n: int) -> int = n * n\n\n" +
+                      "holder() -> Buf[int]\n    var b: Buf[int] = buf()\n\n    b.push(limit)\n    b\n"),
+                     ("main.sysl", "import cfg\n\ncfg.limit += 1\ncfg.per += 1\n" +
+                      "print(cfg.limit, cfg.table[0], cfg.half, cfg.area, cfg.held.len(), cfg.per)\n")])
+
+    assert(ir.contains("@cfg$limit = private global i32 10\n"), ir)
+    assert(ir.contains("@cfg$table = private global [3 x i32] [i32 1, i32 2, i32 3]\n"), ir)
+    assert(ir.contains("@cfg$half = private global double 0x3FF8000000000000\n"), ir)
+    assert(ir.contains("@cfg$area = private global i32 36\n"), ir)
+    assert(ir.contains("@cfg$per = private thread_local global i32 7\n"), ir)
+    assert(ir.contains("@cfg$held = private global %struct.sysl.buf$Buf.int zeroinitializer\n"), ir)
+end mvv_static_data
+
+// -- what has no type to take ---------------------------------------------------------------------
+
+@test("a module var whose value reaches itself, or is a bare closure, or is wrong, is refused at the declaration")
+mvv_refusals()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvv_refused("module cfg\n\nvar a = b + 1\nvar b = a + 1\n\nuses() -> int = a\n", main,
+                "'cfg.a' takes its type from its value, and the value reaches 'cfg.a' again — write its type, " +
+                "'var a: T = …'", "3:1")
+    mvv_refused("module cfg\n\nvar a = a + 1\n\nuses() -> int = a\n", main,
+                "'cfg.a' takes its type from its value, and the value reaches 'cfg.a' again — write its type, " +
+                "'var a: T = …'", "3:1")
+    mvv_refused("module cfg\n\nvar f = (x: int) -> x * 2\n\nuses() -> int = f(2)\n", main,
+                "'cfg.f' would hold a closure, whose type has no name for module storage to be declared at — " +
+                "declare it as a function instead", "3:1")
+    mvv_refused("module cfg\n\nvar bad = missing + 1\n\nuses() -> int = bad\n", main,
+                "undefined name 'cfg.missing'", "3:11")
+end mvv_refusals
+
+@test("a var and a val reaching each other are refused each in its own word")
+mvv_cycle_through_a_val() =
+    mvv_refused("module cfg\n\nvar a = b + 1\nval b = a + 1\n\nuses() -> int = a\n", "import cfg\n\nprint(cfg.uses())\n",
+                "'cfg.a' takes its type from its value, and the value reaches 'cfg.a' again — write its type, " +
+                "'var a: T = …'", "3:1")
+
+@test("storage with no initializer still states its type, in every spelling, and is refused for that alone")
+mvv_no_initializer_states_its_type()
+    if !mvv_ready() then return
+
+    mvv_refused("module cfg\n\nvar slot\n\nuses() -> int = 1\n", "import cfg\n\nprint(cfg.uses())\n",
+                mvv_states_its_type("slot"), "3:1")
+    mvv_refused("module cfg\n\n@thread_local var per\n\nuses() -> int = 1\n", "import cfg\n\nprint(cfg.uses())\n",
+                mvv_states_its_type("per"), "3:1")
+    mvv_refused_in([("main.sysl", "static var slot\n\nprint(slot)\n")], "main.sysl", mvv_states_its_type("slot"),
+                   "1:8")
+
+    val said = mvv_ir([("main.sysl", "private static var slot\n\nprint(slot)\n")])
+
+    assert(said.contains(mvv_states_its_type("slot")), said)
+    assert(!said.contains("undefined"), said)
+end mvv_no_initializer_states_its_type
+
+@test("storage with a written type and no initializer starts at its zero")
+mvv_written_type_no_initializer() =
+    mvv_prints("module cfg\n\nvar slot: int\nvar name: string\n", "import cfg\n\ncfg.slot += 3\nprint(cfg.slot, cfg.name.len)\n",
+               "3 0\n")
+
+// -- the exposure rule ----------------------------------------------------------------------------
+
+private mvv_exposure_module(decls: string) -> string =
+    s"module cfg\n\nprivate struct P\n    x: int\n\n$decls\n\nprivate mk() -> P = P(1)\n\nuses() -> int = 1\n"
+
+@test("a public var whose inferred type is private is refused as one written is, and a private one is fine")
+mvv_exposure_inferred()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+    val exposed = "'p' is public, but its type names 'cfg.P', which is private to 'cfg/cfg.sysl', the file " +
+                  "that declares it — a declaration may not be more visible than the types it names"
+
+    mvv_refused(mvv_exposure_module("var p = mk()"), main, exposed, "6:1")
+    mvv_refused(mvv_exposure_module("var p: P = mk()"), main, exposed, "6:8")
+    mvv_prints(mvv_exposure_module("private var p = mk()\n\nread() -> int = p.x"),
+               "import cfg\n\nprint(cfg.uses(), cfg.read())\n", "1 1\n")
+end mvv_exposure_inferred
+
+// -- a library's export, sysl doc, an editor ------------------------------------------------------
+
+// What `sysl doc` makes of a module's storage, one signature per line.
+private mvv_doc_lines(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    assert(r.ok(), "the module did not parse")
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+    out
+end mvv_doc_lines
+
+@test("sysl doc shows a module var as written, inferred or typed, as it shows a val")
+mvv_doc_signature()
+    assert_eq(mvv_doc_lines("module m\n\nvar Count = 3\nval Limit = 3\n"), "var Count = 3\nval Limit = 3\n")
+    assert_eq(mvv_doc_lines("module m\n\nvar Count: int = 3\nval Limit: int = 3\n"),
+              "var Count: int = 3\nval Limit: int = 3\n")
+
+@test("a library exports an inferred module var, which build-lib checks and a program writes at its type")
+mvv_library_export()
+    if !mvv_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-mvv-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-mvv-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nvar Count = 3\nvar Label = \"demo\"\nvar Area = square(4)\n\n" +
+               "square(n: int) -> int = n * n\n\ntwice() -> int = Count * 2\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\ndemo.Count += 1\ndemo.Label = \"lib\"\nprint(demo.Count, demo.Label, demo.Area, demo.twice())\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "4 lib 16 8\n")
+end mvv_library_export
+
+@test("an editor's hover shows an inferred module var at its type")
+mvv_hover_inferred_type()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-mvv-hover").unwrap()
+
+    write_text(s"$root/t.sysl", "static var ticks = 10\nstatic var label = \"s\"\n\nf() -> int = ticks\n\n" +
+               "print(f(), label)\n").unwrap()
+
+    val ix = indexed_file(s"$root/t.sysl").unwrap()
+    var out = ""
+
+    for item in ix.references
+        if item.at_file.ends_with("/t.sysl") && item.detail != "" && !out.contains(s"${item.detail};") then
+            out = s"$out${item.detail};"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains("ticks: int;"), out)
+    assert(out.contains("label: string;"), out)
+end mvv_hover_inferred_type
