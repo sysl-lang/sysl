@@ -376,3 +376,53 @@ wid_overloads_ambiguous() =
     wid_refused("f(x: int, y: long) -> string = \"a\"\nf(x: long, y: int) -> string = \"b\"\n\n" +
                 "var b: byte = 1\nprint(f(b, b))\n",
                 "'f' is ambiguous here — 2 of its declarations take these arguments:", "5:7")
+
+// -- a literal that does not fit beside a typed operand -------------------------------------------
+
+@test("a float literal beside an int takes real, and the int widens to it, in either order")
+wid_float_literal_beside_int() =
+    wid_prints("var k = 4\nval a: real = 1.0 / k\nval b: real = k / 2.0\nprint(a, b, 2.0 * k, k * 2.5)\n",
+               "0.25 2 8 10\n")
+
+@test("an int compared with a float literal compares as real, in either order")
+wid_float_literal_compared() =
+    wid_prints("var k = 4\nprint(k < 1.5, 1.5 < k, k == 4.0, 4.5 > k, k >= 4.5)\n",
+               "false true true true false\n")
+
+@test("an integer literal a byte cannot hold makes the sum an int, in either order")
+wid_int_literal_beside_byte() =
+    wid_prints("var b: u8 = 2\nval s: int = b + 300\nval t: int = 300 + b\nprint(s, t, b * 1000, 1000 * b, b / 300, b < 256)\n",
+               "302 302 2000 2000 0 true\n")
+
+@test("a range over an int is unchanged, and a byte bound beside a literal past it widens to int")
+wid_literal_range_bounds() =
+    wid_prints("var k = 4\nvar i: u8 = 250\nvar s = 0\nfor j in 0..<k\n    s += j\n\nvar t = 0\n" +
+               "for j in i..<300\n    t += j\n\nprint(s, t)\n", "6 13725\n")
+
+@test("an unannotated array of a byte and a literal past it is an array of int")
+wid_literal_array() =
+    wid_prints("var b: u8 = 2\nval a = [b, 300]\nval c: [2]int = a\nprint(c[0], c[1])\n", "2 300\n")
+
+@test("if and match arms meet a float literal and an int at real")
+wid_literal_arms() =
+    wid_prints("var k = 4\nval a: real = if k > 1 then k else 0.5\nval b: real = k match\n" +
+               "    4 -> 1.5\n    _ -> k\n\nprint(a, b)\n", "4 1.5\n")
+
+@test("a literal that fits the typed operand is still read at its type: f32, long and byte stay")
+wid_literal_fits_stays() =
+    wid_prints("var h: f32 = 1.5\nval x: f32 = h * 0.5\nval y: f32 = 0.5 * h\nvar b: u8 = 2\n" +
+               "val z: u8 = b + 3\nval w: u8 = b * 3\nprint(x, y, z, w)\n", "0.75 0.75 5 6\n")
+    wid_refused("var q: long = 3\nval r: int = q + 1\n", "cannot initialize 'r': declared int but the value is long",
+                "2:1")
+
+@test("a typed operand that does not widen to the literal's default keeps today's refusal")
+wid_literal_no_widen_refused()
+    wid_refused("var q: long = 3\nprint(q / 2.0)\n", "'/' needs matching types, got long and real", "2:11")
+    wid_refused("var q: long = 3\nprint(2.0 / q)\n", "'/' needs matching types, got real and long", "2:13")
+    wid_refused("var b: u8 = 2\nprint(b + 1_000_000_000_000)\n",
+                "the literal 1000000000000 does not fit byte", "2:11")
+    wid_refused("var b: u8 = 2\nprint(1_000_000_000_000 + b)\n",
+                "the literal 1000000000000 does not fit byte", "2:7")
+    wid_refused("var c = 'a'\nprint(c + 1.5)\n", "'+' needs matching types, got char and real", "2:11")
+    wid_refused("var c = 'a'\nprint(c + 300)\n", "'+' needs matching types, got char and int", "2:11")
+end wid_literal_no_widen_refused

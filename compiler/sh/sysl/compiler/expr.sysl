@@ -1598,7 +1598,10 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
 
-        return Some((tl, operand_rhs(cx, op, tl, r, type_expr(cx, r, Some(repr(texpr_type(tl)))))))
+        val at = scale_literal_type(cx, op, texpr_type(tl), r)
+        val wl = widened(tl, Some(at))
+
+        return Some((wl, operand_rhs(cx, op, wl, r, type_expr(cx, r, Some(at)))))
     end if
 
     if op == "*" && bare_int_literal(l) && !is_literal(r)
@@ -1610,11 +1613,25 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
 
-        return Some((type_expr(cx, l, Some(repr(texpr_type(tr)))), tr))
+        val at = scale_literal_type(cx, op, texpr_type(tr), l)
+
+        return Some((type_expr(cx, l, Some(at)), widened(tr, Some(at))))
     end if
 
     None
 end scale_operands
+
+// The type an integer literal beside a scalar operand of `*` or `/` is read at: the operand's own
+// where the literal fits it, and otherwise `int`, where the operand widens to it -- the operand
+// rule of `literal_widened`, for the pairs read here rather than there. A shift's count is never
+// widened into.
+private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr) -> Type
+    val own = repr(t)
+
+    if op != "*" && op != "/" || own == Char || own == Unknown || literal_fits(cx, lit, own) then return own
+
+    if literal_fits(cx, lit, int_type()) && implicitly_widens(own, int_type()) then int_type() else own
+end scale_literal_type
 
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
 // scalars does, sharing each middle operand between the two comparisons that use it.
@@ -1709,7 +1726,8 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         else if is_literal(e) then told.push(None)
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
-    val ty = firmest(operands, told, widen, rescales).or_else(() -> expected)
+    val ty = literal_widened(cx, operands, told, firmest(operands, told, widen, rescales).or_else(() -> expected),
+                             widen, rescales)
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
@@ -1726,6 +1744,53 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
     out
 end analyze_operands
+
+// **A literal is read at the typed operand's type where it fits there, and otherwise at its own
+// default**, to which the typed operands then widen: `h * 0.5` over an `f32` stays `f32` and `b + 3`
+// over a `byte` stays a byte, but `1.0 / k` over an `int` is a `real` quotient and `b + 300` an `int`
+// sum. Where a typed operand does not widen losslessly to the literal's default (a `long` beside
+// `2.0`), or the literal does not fit its default either (a `byte` beside a literal no `int` holds),
+// the type settled on stands, and the literal is told it does not fit, as it always was.
+private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]],
+                        settled: Option[Type], widen: bool, rescales: bool) -> Option[Type]
+    if !widen || settled.is_none() || !any_typed(operands, told) then return settled
+
+    var ty = settled.unwrap()
+
+    for i in 0..<operands.len()
+        val e = operands.at(i)
+
+        if told.at(i).is_none() && is_literal(e)
+            val own = literal_default(e)
+
+            if own.is_some() && !type_eq(own.unwrap(), ty) && !literal_fits(cx, e, ty) &&
+                    literal_fits(cx, e, own.unwrap()) &&
+                    holds_every_operand(operands, told, own.unwrap(), rescales) then
+                ty = own.unwrap()
+
+    Some(ty)
+end literal_widened
+
+// Whether any operand has a type of its own -- with none, there is nothing to widen, and the literals
+// are read at what the position asked for.
+private any_typed(operands: Buf[Expr], told: Buf[Option[TExpr]]) -> bool
+    for i in 0..<operands.len()
+        told.at(i) match
+            Some(t) -> if !adaptable(operands.at(i), t) then return true
+            None -> ()
+
+    false
+end any_typed
+
+// Whether a literal reads at a type without a complaint and as that type.
+private literal_fits(cx: &Analyzer, e: Expr, ty: Type) -> bool
+    val tried = begin_trial(cx)
+    val t = type_expr(cx, e, Some(ty))
+    val refused = refused_since(cx, tried)
+
+    discard_trial(cx, tried)
+    !refused && texpr_type(t) != Unknown && !disagree(texpr_type(t), ty)
+end literal_fits
 
 // One reading of an operand for the TOP TIER, answering nothing where the reading failed.
 //

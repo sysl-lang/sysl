@@ -1231,6 +1231,39 @@ print(ints[0] + ints[2], ints[1], wide[1] - wide[0])
 14 2147483646 2
 ```
 
+**A bare literal beside a typed operand is read at that operand's type where it fits there** — `h *
+0.5` over an `f32` is an `f32` product, `b + 3` over a `byte` a byte sum. **Where it does not fit, it
+takes its own default, `int` or `real`, and the typed operand widens to that** wherever the table
+above allows it, so `1.0 / k` over an `int` is a `real` quotient, `k < 1.5` compares as reals and
+`b + 300` over a `byte` is an `int` sum, in either order. The same holds for comparisons, range
+bounds, the elements of an unannotated array literal and the arms of an `if` or a `match`. Where the
+operand does not widen to the literal's default — a `long` beside `2.0`, a `char` beside anything —
+or the literal does not fit even that, the pair is refused as before.
+
+```sysl
+var k = 4
+var b: byte = 2
+var h: f32 = 1.5
+
+val x: f32 = h * 0.5
+
+print(1.0 / k, k / 2.0, k < 1.5, b + 300, x)
+```
+
+```output
+0.25 2 false 302 0.75
+```
+
+```sysl
+var q: long = 3
+
+print(q / 2.0)
+```
+
+```error
+'/' needs matching types, got long and real
+```
+
 **A type parameter is never decided by a conversion.** A call solves it from the arguments' own types,
 exactly, and only a parameter it has already fixed is widened to — so `max(a, b)` over an `int` and a
 `long` is refused in either order, and `max[long](a, b)` is how to say which.
