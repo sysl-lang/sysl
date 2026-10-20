@@ -284,12 +284,49 @@ wid_fixed_product_unchanged()
                 "the product of u16q16 and u8q8 has no format of its own — it is exactly a u24q24; " +
                 "give it a type", "4:13")
 
-@test("the bounds of a range and the elements of an unannotated array still need one type")
-wid_ranges_and_bare_arrays_unchanged()
-    wid_refused("var a: int = 1\nvar b: byte = 5\nfor i in a..<b\n    print(i)\n",
-                "a 'for' range needs matching bounds, got int and byte", "3:1")
-    wid_refused("var a: real = 1.0\nvar b: int = 5\nval xs = [a, b]\n",
-                "an array literal needs one element type, got real and int", "3:10")
+@test("a char operand never widens: char + int and int + char are refused, in either order")
+wid_char_operand_refused()
+    wid_refused("var c = 'a'\nvar n: int = 1\nprint(c + n)\n", "'+' needs matching types, got char and int",
+                "3:11")
+    wid_refused("var c = 'a'\nvar n: int = 1\nprint(n + c)\n", "'+' needs matching types, got int and char",
+                "3:11")
+    wid_refused("var c = 'a'\nvar n: int = 97\nprint(n == c)\n", "cannot compare int with char", "3:7")
+
+@test("two chars still compare, and a char still widens where a position asks for an integer")
+wid_char_operands_of_one_type() =
+    wid_prints("var c = 'a'\nvar d = 'a'\nvar n: int = 1\nval k: int = c\nprint(c == d, c < 'b', k + n)\n",
+               "true true 98\n")
+
+// -- ranges and unannotated array literals ---------------------------------------------------------
+
+@test("the bounds of a range meet at the wider type, in either order, in a for and as a value")
+wid_range_bounds_meet() =
+    wid_prints("var i: int = 2147483646\nvar n: long = 2147483649\nfor k in i..<n\n    print(k)\n" +
+               "var j: long = 1\nvar m: int = 2\nfor k in j..m\n    print(k)\n" +
+               "val r = i..<n\nfor k in r\n    print(k)\n",
+               "2147483646\n2147483647\n2147483648\n1\n2\n2147483646\n2147483647\n2147483648\n")
+
+@test("range bounds with no common widening are refused: u32 and int, in a for and as a value")
+wid_range_bounds_refused()
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nfor i in a..<b\n    print(i)\n",
+                "a 'for' range needs matching bounds, got uint and int", "3:1")
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nval r = a..<b\n",
+                "a range needs matching bounds, got uint and int", "3:9")
+
+@test("an unannotated array literal's elements meet at the widest: [int, long], [byte, int, byte], [real, int]")
+wid_bare_array_meets() =
+    wid_prints("var a: int = 1\nvar b: long = 2\nvar p: byte = 3\nvar r: real = 0.5\n" +
+               "val xs = [a, b]\nval lx: [long; 2] = xs\n" +
+               "val ys = [p, a, p]\nval iy: [int; 3] = ys\n" +
+               "val zs = [r, a]\nval rz: [real; 2] = zs\n" +
+               "val ws = [b, 1]\nval lw: [long; 2] = ws\n" +
+               "print(lx[0] + lx[1], iy[0] + iy[1] + iy[2], rz[0] + rz[1], lw[1])\n",
+               "3 7 1.5 1\n")
+
+@test("array elements with no common widening are refused: u32 and int")
+wid_bare_array_refused()
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nval xs = [a, b]\n",
+                "an array literal needs one element type, got uint and int", "3:10")
 
 @test("a branch read at its sibling's type is not widened to it, so tuple branches meet as before")
 wid_sibling_branches_exact() =

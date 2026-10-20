@@ -282,7 +282,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
 
     // The same two questions the `for` header asks of its bounds, in the same order and the same
     // words: a range value and a counted loop must not come to disagree about what a range is.
-    val ts = analyze_operands(cx, ends, range_element(expected))
+    val ts = analyze_operands(cx, ends, range_element(expected), true)
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -1672,9 +1672,9 @@ end compare_expr
 // is available to the ones that do not.
 //
 // **`widen` is the operand rule of an arithmetic or a comparison operator**: an operand converts to
-// the other's type where that holds every value of its own. A shift's count, the bounds of a range
-// and the elements of an unannotated array literal are read without it, each still asking for one
-// type written.
+// the other's type where that holds every value of its own. The bounds of a range and the elements
+// of an unannotated array literal meet the same way; a shift's count is read without it, since the
+// count's width says nothing about the value shifted.
 //
 // **`rescales` marks a `*` or a `/`**, under which two fixed-point formats keep their own rule -- the
 // product of two formats takes the format of where it is written (`reference/fixed-point.md § Two
@@ -1718,7 +1718,9 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                 if ty.is_some()
                     val keeps = rescales && is_fixed(ty.unwrap()) && is_fixed(repr(texpr_type(t)))
 
-                    out.push(reread(cx, t, operands.at(i), ty.unwrap(), widen && !keeps))
+                    val widens = widen && !keeps && repr(texpr_type(t)) != Char
+
+                    out.push(reread(cx, t, operands.at(i), ty.unwrap(), widens))
                 else out.push(t)
             None -> out.push(type_expr(cx, operands.at(i), ty))
 
@@ -1825,6 +1827,10 @@ end firmest
 // it is not the one first chosen -- `b + n` over a `byte` and an `int` is an `int` sum as `n + b`
 // is. Where no operand's type holds all the others, the first choice stands and the mismatch is
 // reported as it always was.
+//
+// **A `char` operand never widens**: `c + n` is a character used as a number, which is a mistake far
+// more often than it is arithmetic, so it is written `int(c) + n`. A character still widens to an
+// integer everywhere a position asks for one -- an initializer, an argument, a return.
 private widest_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Type,
                        rescales: bool) -> Type
     for i in 0..<operands.len()
@@ -1849,7 +1855,7 @@ private holds_every_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], ty: T
                 if other == Unknown then return false
                 if rescales && is_fixed(other) && is_fixed(ty) && !type_eq(other, ty) then return false
                 if !adaptable(operands.at(i), t) && !type_eq(other, ty) &&
-                        !implicitly_widens(other, ty) then return false
+                        (other == Char || !implicitly_widens(other, ty)) then return false
             None -> ()
 
     true

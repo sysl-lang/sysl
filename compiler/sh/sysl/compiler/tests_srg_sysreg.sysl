@@ -488,16 +488,30 @@ srg_wrong_target()
     srg_refuses("x86_64-linux", "isb()\n", "'isb' is an AArch64 instruction")
 end srg_wrong_target
 
-@test("write_sysreg takes a u64, and a narrower value is refused with the conversion to write")
+@test("write_sysreg takes a narrower unsigned value, zero-extended, as every u64 position does")
+srg_write_widens_an_unsigned_value()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        set(x: u32)
+            write_sysreg("vbar_el1", x)
+        set(1)
+        """)
+
+    srg_says(ir, "zext i32 %")
+    srg_says(ir, "call void @llvm.write_register.i64(metadata !{!\"vbar_el1\"}, i64 %")
+end srg_write_widens_an_unsigned_value
+
+@test("write_sysreg takes a u64, and a value that does not widen to one is refused with the conversion to write")
 srg_wrong_value_type()
     if !srg_ready() then return
 
     srg_refused(srg_build(raw"""
-        set(x: u32)
+        set(x: int)
             write_sysreg("vbar_el1", x)
         set(1)
         """, srg_arm).0,
-                "'write_sysreg' writes a u64, and this value is a uint — convert it with u64(...)", 2, 30)
+                "'write_sysreg' writes a u64, and this value is a int — convert it with u64(...)", 2, 30)
     srg_refuses(srg_arm, "write_sysreg(\"vbar_el1\", true)\n", "'write_sysreg' writes a u64")
 end srg_wrong_value_type
 
@@ -720,15 +734,29 @@ srg_maintenance_operand_type()
     if !srg_ready() then return
 
     srg_refused(srg_build(raw"""
-        flush(x: u32)
+        flush(x: int)
             tlbi(vae1, x)
         flush(1)
         """, srg_arm).0,
-                "'tlbi(vae1)' takes a u64, and this value is a uint — convert it with u64(...)", 2, 16)
+                "'tlbi(vae1)' takes a u64, and this value is a int — convert it with u64(...)", 2, 16)
     srg_refuses(srg_arm, "flush(p: *u8)\n    tlbi(vae1, p)\nflush(null)\n", "'tlbi(vae1)' takes a u64")
     srg_refuses(srg_arm, "dc(civac, true)\n",
                 "'dc(civac)' takes an address, a u64 or a raw pointer, and this value is a bool")
 end srg_maintenance_operand_type
+
+@test("a maintenance operand of a narrower unsigned type is zero-extended to the u64")
+srg_maintenance_widens_an_unsigned_operand()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        flush(x: u32)
+            tlbi(vae1, x)
+        flush(1)
+        """)
+
+    srg_says(ir, "zext i32 %")
+    srg_says(ir, "call void asm sideeffect \"tlbi vae1, $0\", \"r,~{memory}\"(i64 ")
+end srg_maintenance_widens_an_unsigned_operand
 
 @test("the maintenance forms yield to a declaration of their name")
 srg_maintenance_yields()
