@@ -1748,14 +1748,25 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 val cx = analyzer_for(a, d.scope)
                 // `stored` is what the storage is declared at, qualifier and all; `ty` is what a read
                 // of it hands back, which is what the initializer is held to.
-                val stored = if d.typ.is_none() then Unknown
+                //
+                // **A `val` written with no type takes its initializer's** (`storage_type`), read here
+                // with nothing expected, as a local `val`'s is.
+                val inferred = d.typ.is_none() && d.init.is_some()
+                var stored = if d.typ.is_none() then Unknown
                 else resolve_storage(a, d.scope, d.typ.unwrap(), d.name, writable)
-                val ty = unqualified(stored)
 
                 var init: Option[TExpr] = None
 
+                if inferred
+                    a.vals_in_progress.push(key)
+                    init = Some(type_expr(cx, d.init.unwrap(), None))
+                    a.vals_in_progress.truncate(a.vals_in_progress.len() - 1)
+                    stored = inferred_storage(cx, key, d, texpr_type(init.unwrap()))
+
+                val ty = unqualified(stored)
+
                 if d.init.is_some()
-                    init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
+                    if !inferred then init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
 
                     // The rule a local binding is held to: the value is fine as an expression, and
                     // the declaration is the mistake.
@@ -1844,6 +1855,37 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
     out
 end module_storage
+
+// The type a `val` written with none is stored at, which is its initializer's -- refused where the
+// initializer reaches the `val` itself, so there is no type for it to take, and where it is a bare
+// closure, whose type has no name: storage holding one would be the read-only image of a closure that
+// may write what it captured, which no module storage could be before a type could be left off.
+private inferred_storage(cx: &Analyzer, key: string, d: ValueDecl, got: Type) -> Type
+    val shown = if d.scope.module_name == "" then d.name else s"${d.scope.module_name}.${d.name}"
+
+    if holds_string(cx.an.val_cycles, key)
+        cx.fault(d.span, s"'$shown' takes its type from its value, and the value reaches '$shown' " +
+                 s"again — write its type, 'val ${d.name}: T = …'")
+
+        return Unknown
+    end if
+
+    if is_closure_literal(got)
+        cx.fault(d.span, s"'$shown' would hold a closure, whose type has no name for module storage to " +
+                 "be declared at — declare it as a function instead")
+
+        return Unknown
+    end if
+
+    var known = false
+
+    for item in cx.an.val_types
+        if item.0 == key then known = true
+
+    if !known then cx.an.val_types.push((key, got))
+
+    got
+end inferred_storage
 
 // `&` in front of a value writes it into a hidden local of the scope the `&` stands in, and a module
 // initializer runs in a prologue whose frame is gone by the program's first statement -- so the slot

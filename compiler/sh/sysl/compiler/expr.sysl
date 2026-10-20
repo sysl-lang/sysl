@@ -886,6 +886,41 @@ private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
     ConstChar(c) -> Some(TExpr(span, TIntLit(from_int(long(u32(c))), ty)))
     _ -> None
 
+// The type module storage is declared at: the one written, qualifier and all, or else -- a `val`
+// written with none -- its initializer's own, exactly as a local `val`'s is.
+//
+// **The type is known wherever a written one was**: a read of the name in a body analyzed before the
+// storage is, or in another `val`'s initializer, reads the initializer for its type then. That
+// reading is a trial thrown away whole -- the reading the program gets is `module_storage`'s -- so
+// it registers nothing twice, and only its answer is kept. A `val` whose value reaches itself has no
+// type to take, which `module_storage` reports at its declaration.
+storage_type(a: &Analysis, key: string, d: ValueDecl, writable: bool) -> Type
+    if d.typ.is_some() then return resolve_storage(a, d.scope, d.typ.unwrap(), d.name, writable)
+    if d.init.is_none() then return Unknown
+
+    for item in a.val_types
+        if item.0 == key then return item.1
+
+    if holds_string(a.vals_in_progress, key)
+        if !holds_string(a.val_cycles, key) then a.val_cycles.push(key)
+
+        return Unknown
+    end if
+
+    a.vals_in_progress.push(key)
+
+    val cx = analyzer_for(a, d.scope)
+    val tried = begin_trial(cx)
+    val ty = texpr_type(type_expr(cx, d.init.unwrap(), None))
+
+    discard_trial(cx, tried)
+    a.vals_in_progress.truncate(a.vals_in_progress.len() - 1)
+
+    if !holds_string(a.val_cycles, key) then a.val_types.push((key, ty))
+
+    ty
+end storage_type
+
 // Whether a name that stands for module storage is one a program may write to.
 is_writable_key(cx: &Analyzer, key: string) -> bool
     for item in cx.an.tables.writable
@@ -903,10 +938,7 @@ private global_expr(cx: &Analyzer, span: Span, key: string, from: &Table[ValueDe
     // The node carries the type the storage is DECLARED at, a `volatile` included, as a field's
     // declaration does: what a read of it hands back is the plain value (`texpr_type`), and what an
     // access to it is, or what `&` of it points at, is asked of the declaration (`place_type`).
-    val stored = if d.typ.is_none() then Unknown
-    else resolve_storage(cx.an, d.scope, d.typ.unwrap(), d.name, writable)
-
-    TExpr(span, TGlobal(key, stored, writable))
+    TExpr(span, TGlobal(key, storage_type(cx.an, key, d, writable), writable))
 end global_expr
 
 // A bare name that stands for a variant of an enum, which is the one name form the *expected* type

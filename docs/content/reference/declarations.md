@@ -167,28 +167,23 @@ print(Limit)
 'Limit' is a 'const', so its value is folded into every use of it
 ```
 
-### A module member states its type
+### A module member takes its type as a local does
 
-Where a binding is a **member of a module** rather than a local, the annotation stops being optional
-even on a `val`. That is a rule about *where* the binding was written, so the grammar accepts either
-form and the analyzer applies the rule.
+A **member of a module** may leave its type off exactly as a local may: `val limit = 10` is an `int`
+wherever it is declared, `val name = "sysl"` a `string`, and `val area = square(6)` whatever `square`
+returns. Where the type is written it governs, and the value is read against it — `val ratio: real =
+3` is a `real` three. A `const` follows the same rule. Module storage written with `var` still states
+its type, since it may have no initializer to read one off.
 
-It is worth reading as one rule rather than two, because it is one: **anything visible outside its
-file states its types**, and a module member always could be, while a local states nothing to anyone
-and so infers exactly as a `var` does. Most of it the syntax already enforced — a parameter type and
-a field type are mandatory, and an absent return type *means* `unit` rather than being inferred — so
-a module-level binding is simply the last declaration the rule had left to reach.
-
-**The payoff is that interface extraction is parse-only.** A file's exported surface can be read off
-its syntax tree without resolving a name, checking a body, or having compiled anything the file
-imports, which is what lets the collect pass depend on nothing but parsing — and that is what a fast,
-parallel, eventually incremental build rests on. Scala infers types for public members and pays for
-it with a far heavier extraction step; this is a deliberate divergence, and a cheap one here because
-sysl's signatures were already explicit for other reasons.
+The type is the initializer's wherever the name is read — in a body, in another `val`'s initializer
+above or below it, in another file of the module, or in a program built against a library that exports
+it — and `sysl doc` shows the declaration as it was written. What the value is decides, as it always
+did, whether the storage is laid into the object file or filled before the first statement.
 
 ```sysl
-const Limit: int = 3
-static val Scale: int = 2
+const Limit = 3
+static val Scale = 2
+static val Ratio: real = 3
 
 show()
     var count = 0
@@ -197,19 +192,32 @@ show()
 
     count += 1
 
-    print(count, doubled, name, Limit)
+    print(count, doubled, name, Ratio / 2)
 
 show()
 ```
 
 ```output
-1 6 sysl 3
+1 6 sysl 1.5
 ```
 
-The two `val`s in that program are one keyword doing one thing: the module member says `: int`
-because it is visible outside its file, and the one inside `show` is visible to nobody and does not
-have to. The `static` is what asks for the member — this is the file the program starts in, so a plain
-`val` there would be a local of its body, and a local infers exactly as a `var` does.
+The `static` is what asks for the member — this is the file the program starts in, so a plain `val`
+there would be a local of its body.
+
+**Two values give a module `val` no type to take.** One whose initializer reaches the `val` itself has
+nothing to read the type from first, and one whose value is a bare closure has a type with no name for
+storage to be declared at — a function is the declaration for that:
+
+```sysl
+static val a = b + 1
+static val b = a + 1
+
+print(a)
+```
+
+```error
+'a' takes its type from its value, and the value reaches 'a' again — write its type, 'val a: T = …'
+```
 
 **A module-level `val` may hold a counted value, and never releases it.** Storage that exists for the
 whole run is never let go of, so the one release with nowhere to go is the one at exit — and not
@@ -2775,7 +2783,7 @@ parameter list is an associated function already, reached the same way and calle
 `static` in front of one is refused rather than being a second spelling of what already exists.
 
 `static` is not a new word: it is the same one that makes a binding in an entry file belong to the
-module rather than to that file's body ([bindings](#a-module-member-states-its-type)). The two are
+module rather than to that file's body ([bindings](#a-module-member-takes-its-type-as-a-local-does)). The two are
 told apart by what follows it.
 
 ### `invariant`

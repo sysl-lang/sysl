@@ -274,21 +274,15 @@ something a reader can rely on, and it is additive in the safe direction: forbid
 nothing a later rule would have had to keep allowing, while allowing it and tightening later would
 break programs.
 
-### Anything visible outside its file states its types
+### What a declaration visible outside its file writes
 
-**A declaration visible beyond the file that declares it carries explicit types.** Inference is
-available only at the bare-`private` level — the one level that provably never crosses a file boundary
-— which is why the two rules are really one.
-
-Most of it the syntax already enforces: parameter and field types are mandatory, and a return type is
-written or its absence *means* `unit`. What the rule genuinely binds is the two declarations that are
-a name and a type — a `const` and a module-level `val`, both below.
-
-**Why: it makes interface extraction parse-only.** A file's exported surface can be read off its
-syntax tree without resolving a name, checking a body, or having compiled anything the file imports.
-That is what a fast, parallel, and eventually incremental build rests on. Scala infers types for
-public members and pays for it with a far heavier extraction step; this is a deliberate divergence,
-and it is cheap here precisely because sysl's signatures were already explicit for other reasons.
+**A signature is written in full**: parameter and field types are mandatory, and a return type is
+written or its absence *means* `unit`. The two declarations that are a name and a value — a `const`
+and a module-level `val`, both below — may leave the type to the value, exactly as a local may
+([Bindings](/reference/declarations/#a-module-member-takes-its-type-as-a-local-does)): the type is
+then the initializer's, and another file or a program built against the library reads it as it would
+a written one. Module storage written with `var` states its type, since it may have no value to read
+one off.
 
 ## Imports
 
@@ -2169,7 +2163,7 @@ at the limit other
 ```
 
 The rest of what a module-level `val` may hold — read-only at every depth, and the `[]const T` a
-slice of one yields — is on [declarations](/reference/declarations/#a-module-member-states-its-type).
+slice of one yields — is on [declarations](/reference/declarations/#a-module-member-takes-its-type-as-a-local-does).
 
 ## Separate compilation
 

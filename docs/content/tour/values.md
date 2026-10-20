@@ -26,11 +26,9 @@ cannot change, but a value the compiler substitutes wherever the name appears, s
 read at run time. A `const` must give a value, and its type, where it is left off, is the value's
 own: `const steps = 3` is an `int`.
 
-`limit` states its type because these statements are at **module level**, which is the first place
-the top of a file behaves differently from the inside of a function. A module-level `val` is part of
-the module's public surface, visible to other files, so its type is written down rather than inferred
-from the expression on the right. The same `val limit = 10` inside a function infers its type, because
-a local is visible only there.
+`limit` states its type, which a `val` may do anywhere and need not: `val limit = 10` is an `int`
+whether it is a local inside a function or a member of a module, visible to other files. Where the
+type is written it governs, and the value is read against it.
 
 A module-level `val` **may** hold a value the program builds at run time: a reference, a slice, a
 string assembled while running. Its storage lasts for the whole run, as a static does. The value

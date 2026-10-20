@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A module-level `val` takes its type as a local one does (`reference/declarations.md § A module
+// member takes its type as a local does`): left off, it is the initializer's; written, it governs.
+// The type is known wherever a written one was -- in a body analyzed before the storage, in another
+// `val`'s initializer above or below, in another file of the module, through a library -- and the
+// storage is laid down as data or computed exactly as a written one's would be.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mvi_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of a `main.sysl` beginning and the files of one module beside it.
+private mvi_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-mvi").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end mvi_root
+
+// What the program prints, or the report it was refused with.
+private mvi_ran(files: []const (string, string)) -> string
+    val root = mvi_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mvi_ran
+
+// The emitted module, or the report the program was refused with.
+private mvi_ir(files: []const (string, string)) -> string
+    val root = mvi_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mvi_ir
+
+private mvi_prints(module_text: string, main_text: string, want: string)
+    if !mvi_ready() then return
+
+    assert_eq(mvi_ran([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)]), want)
+
+// Refused with `message`, at `at` (`line:col` of the module's file).
+private mvi_refused(module_text: string, main_text: string, message: string, at: string)
+    if !mvi_ready() then return
+
+    val said = mvi_ir([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)])
+    val place = s"error: $message\n --> cfg/cfg.sysl:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+end mvi_refused
+
+// -- the type the value gives ---------------------------------------------------------------------
+
+@test("a module val with no type is an int, a string, a call's result, an array and a real sum")
+mvi_inferred_types() =
+    mvi_prints("module cfg\n\nval limit = 10\nval name = \"cfg\"\nval area = sq(6)\nval table = [1, 2, 3]\n" +
+               "val half = 1 + 0.5\n\nsq(n: int) -> int = n * n\n",
+               "import cfg\n\nprint(cfg.limit / 3, cfg.name, cfg.area, cfg.table[2], cfg.half * 2)\n",
+               "3 cfg 36 3 3\n")
+
+@test("an inferred module val is read before its declaration, by a generic body and from another file")
+mvi_read_anywhere()
+    if !mvi_ready() then return
+
+    val a = "module cfg\n\nval doubled = limit * 2\n\npick[T](x: T) -> int = limit + 1\n\nuses() -> int = limit + area\n"
+    val b = "module cfg\n\nval limit = 10\nval area = sq(6)\n\nsq(n: int) -> int = n * n\n"
+    val main = "import cfg\n\nprint(cfg.doubled, cfg.pick(\"x\"), cfg.uses(), cfg.limit)\n"
+
+    assert_eq(mvi_ran([("cfg/a.sysl", a), ("cfg/b.sysl", b), ("main.sysl", main)]), "20 11 46 10\n")
+end mvi_read_anywhere
+
+@test("a written type still governs a module val, and the value is held to it")
+mvi_written_type_governs()
+    mvi_prints("module cfg\n\nval ratio: real = 3\nval small: u8 = 200\nval wide: long = 1 << 40\n",
+               "import cfg\n\nprint(cfg.ratio / 2, cfg.small + 55, cfg.wide)\n", "1.5 255 1099511627776\n")
+    mvi_refused("module cfg\n\nval bad: int = \"no\"\n", "import cfg\n\nprint(cfg.bad)\n",
+                "cannot initialize 'bad': declared int but the value is string", "3:1")
+end mvi_written_type_governs
+
+// -- where the storage is -------------------------------------------------------------------------
+
+@test("an inferred module val over a constant is data in the object file, and one over a call that builds is filled")
+mvi_static_data()
+    if !mvi_ready() then return
+
+    val ir = mvi_ir([("cfg/cfg.sysl",
+                      "module cfg\n\nimport sysl.buf.{Buf, buf}\n\nval limit = 10\nval table = [1, 2, 3]\n" +
+                      "val half = 1 + 0.5\nval area = sq(6)\nval held = holder()\n\nsq(n: int) -> int = n * n\n\n" +
+                      "holder() -> Buf[int]\n    var b: Buf[int] = buf()\n\n    b.push(limit)\n    b\n"),
+                     ("main.sysl", "import cfg\n\nprint(cfg.limit, cfg.table[0], cfg.half, cfg.area, cfg.held.len())\n")])
+
+    assert(ir.contains("@cfg$limit = private constant i32 10\n"), ir)
+    assert(ir.contains("@cfg$table = private constant [3 x i32] [i32 1, i32 2, i32 3]\n"), ir)
+    assert(ir.contains("@cfg$half = private constant double 0x3FF8000000000000\n"), ir)
+    assert(ir.contains("@cfg$area = private constant i32 36\n"), ir)
+    assert(ir.contains("@cfg$held = private global %struct.sysl.buf$Buf.int zeroinitializer\n"), ir)
+end mvi_static_data
+
+// -- what has no type to take ---------------------------------------------------------------------
+
+@test("a module val whose value reaches itself, or is a bare closure, or is wrong, is refused at the declaration")
+mvi_refusals()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvi_refused("module cfg\n\nval a = b + 1\nval b = a + 1\n\nuses() -> int = a\n", main,
+                "'cfg.a' takes its type from its value, and the value reaches 'cfg.a' again — write its type, " +
+                "'val a: T = …'", "3:1")
+    mvi_refused("module cfg\n\nval f = (x: int) -> x * 2\n\nuses() -> int = f(2)\n", main,
+                "'cfg.f' would hold a closure, whose type has no name for module storage to be declared at — " +
+                "declare it as a function instead", "3:1")
+    mvi_refused("module cfg\n\nval bad = missing + 1\n\nuses() -> int = bad\n", main,
+                "undefined name 'cfg.missing'", "3:11")
+end mvi_refusals
+
+// -- a library's export ---------------------------------------------------------------------------
+
+@test("sysl doc shows an inferred module val as it was written, and a written type with it")
+mvi_doc_signature()
+    val r = parse(source_of("t.sysl", "module m\n\nval Limit = 3\nval Scale: real = 2\n"))
+
+    assert(r.ok(), r.first().message)
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+    assert_eq(out, "val Limit = 3\nval Scale: real = 2\n")
+end mvi_doc_signature
+
+@test("a library exports an inferred module val, which build-lib checks and a program reads at its type")
+mvi_library_export()
+    if !mvi_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-mvi-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-mvi-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nval Limit = 3\nval Label = \"demo\"\nval Area = square(4)\nval Scale: real = 2\n\n" +
+               "square(n: int) -> int = n * n\n\ntwice() -> int = Limit * 2\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\nprint(demo.Limit * 2, demo.Label, demo.Area, demo.Scale / 4, demo.twice())\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "6 demo 16 0.5 6\n")
+end mvi_library_export
