@@ -274,7 +274,38 @@ wid_operands_refused()
 
 @test("a shift count is still any integer, and an integer still scales a fixed-point value")
 wid_shift_and_scale_unchanged() =
-    wid_prints("var n: int = 3\nvar q: q15 = 0.25\nvar k: int = 2\nprint(n << 2u8, q * k)\n", "12 0.5\n")
+    wid_prints("var n: int = 3\nvar q: q15 = 0.25\nvar k: int = 2\nvar b: u8 = 0x81\nvar wide: u64 = 1\n" +
+               "print(n << 2u8, q * k, b << wide)\n", "12 0.5 2\n")
+
+@test("a product of two fixed-point formats still takes the format of where it is written")
+wid_fixed_product_unchanged()
+    wid_prints("var a: u16q16 = 0.5\nvar x: u8q8 = 0.25\nval p: u24q24 = a * x\nprint(p)\n", "0.125\n")
+    wid_refused("val a: u16q16 = 0.5\nval x: u8q8 = 0.25\nval y = a * x\n",
+                "the product of u16q16 and u8q8 has no format of its own — it is exactly a u24q24; " +
+                "give it a type", "3:9")
+
+@test("the bounds of a range and the elements of an unannotated array still need one type")
+wid_ranges_and_bare_arrays_unchanged()
+    wid_refused("var a: int = 1\nvar b: byte = 5\nfor i in a..<b\n    print(i)\n",
+                "a range needs matching bounds, got int and byte", "3:10")
+    wid_refused("var a: real = 1.0\nvar b: int = 5\nval xs = [a, b]\n",
+                "an array literal needs one element type, got real and int", "3:10")
+
+@test("a branch read at its sibling's type is not widened to it, so tuple branches meet as before")
+wid_sibling_branches_exact() =
+    wid_prints("joined(n: u8, m: u16) -> u16\n    val t = if n < 3 then (n, 1) else (0, m)\n\n" +
+               "    u16(t.0) + t.1\n\nprint(joined(1, 5), joined(7, 5))\n", "2 5\n")
+
+@test("a new type's own From for a value's type still comes before the base's conversion")
+wid_from_before_widening() =
+    wid_prints("type Phase = new real\n\nimpl From[int] for Phase\n    from(n: int) -> Phase = Phase(n) * 2.0\n\n" +
+               "val i = 3\nprint(f64(Phase(i)))\n", "6\n")
+
+@test("a bitfield struct's Bits still takes exactly the integer it is stored as")
+wid_bits_unchanged() =
+    wid_refused("@packed\nstruct Esr\n    iss: u25\n    il: u1\n    ec: u6\n    iss2: u5\n    res0: u27\n\n" +
+                "val low: u32 = 0x3c\nprint(Esr::Bits(low).ec)\n",
+                "'Esr::Bits' takes the ulong 'Esr' is stored as, not uint", "10:16")
 
 // -- generics and overloads ------------------------------------------------------------------------
 
