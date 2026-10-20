@@ -495,6 +495,11 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     MultiDecl(names, mutable, values, _) -> multi_decl(cx, stmt.span, names, mutable, values)
     PatternDecl(pat, mutable, value, typ, _) ->
         pattern_decl(cx, stmt.span, pat, mutable, value, typ)
+    // Copies per thread or per core are module storage's; the binding is still read, so what it
+    // binds is there for the rest of the block.
+    CopiedDecl(copies, inner) ->
+        no_thread_local(cx, stmt.span, first_bound(inner), copies)
+        type_stmt(cx, inner)
 
     VarDecl(name, typ, init, _, align, section, copies, export) ->
         var_decl(cx, stmt.span, name, typ, init, align, section, copies, export)
@@ -889,6 +894,18 @@ private no_export(cx: &Analyzer, span: Span, name: string) =
 // tell module storage from a local, and this is the first place that can. A local already belongs
 // to one thread -- its storage is the frame of whichever call is running, and a frame is one
 // thread's stack -- so the attribute asks for something the declaration already has.
+// The first name a binding naming several things gives, which a refusal of the whole binding names.
+private first_bound(s: Stmt) -> string
+    var names: Buf[string] = buf()
+
+    *s.kind match
+        MultiDecl(ns, _, _, _) -> return if ns.is_empty() then "_" else ns.at(0)
+        PatternDecl(pat, _, _, _, _) -> pattern_names(&names, pat)
+        _ -> ()
+
+    if names.is_empty() then "_" else names.at(0)
+end first_bound
+
 private no_thread_local(cx: &Analyzer, span: Span, name: string, copies: Copies)
     if copies == OneCopy then return
 
@@ -957,8 +974,10 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
 
     val want = cx.ret_ty.unwrap_or(Unit)
 
+    // A result not known -- one being read off the body, or one that could not be -- agrees with a
+    // bare `return` as it agrees with every value.
     if value.is_none()
-        if want != Unit then
+        if want != Unit && want != Unknown then
             cx.fault(span, s"this function must return a ${type_show(want)} value")
 
         return one(TReturn(None))
@@ -1154,6 +1173,7 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
         VarDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         ValDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         MultiDecl(_, _, _, _) -> Some(deferred_declaration())
+        CopiedDecl(_, _) -> Some(deferred_declaration())
         ConstDecl(_, _, _, _) -> Some(deferred_declaration())
         _ -> None
 

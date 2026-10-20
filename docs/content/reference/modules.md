@@ -1568,6 +1568,33 @@ print(slot)
 'slot' is module storage, and module storage states its type — write 'slot: T'
 ```
 
+**A `var` naming several things is module storage per name**, as the same `val` is a module `val`
+per name: a comma list shares its values out one each, and a single value taken apart — by a comma
+list or a [pattern](/reference/declarations/#by-pattern-when-the-shape-matters) — is computed once,
+each name filled from its part as the storage is. From then on each name is storage of its own, so a
+write to one leaves the others as they were. `@thread_local` above one gives every name it binds a copy
+per thread:
+
+```sysl
+static var lo, hi = 0, 10
+static var (hits, label) = (0, "none")
+@thread_local static var (seen, limit) = (0, 3)
+
+record(s: string)
+    hits += 1
+    seen += 1
+    label = s
+
+record("a")
+record("b")
+lo = 5
+print(lo, hi, hits, label, seen, limit)
+```
+
+```output
+5 10 2 b 2 3
+```
+
 **It holds a counted value, and the last one it holds is never released.** A `string`, a slice, a
 `&T`, a `weak T` and anything built out of them are all module storage; every assignment during the
 run gives back the count it replaces, and the only release with nowhere to go is the one at exit —

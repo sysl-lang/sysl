@@ -246,6 +246,7 @@ private entry_binding(s: Stmt) -> bool = *s.kind match
     VarDecl(_, _, _, _, _, _, _, _) -> true
     MultiDecl(_, _, _, _) -> true
     PatternDecl(_, _, _, _, _) -> true
+    CopiedDecl(_, _) -> true
     _ -> false
 
 // What a trait's members may not carry a body for.
@@ -364,21 +365,21 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // registered exactly as another file's declaration of it would be -- which is the whole of
         // what the modifier does, in the one file where an ordinary `var` is a local instead.
         StaticDecl(inner) -> hoist_stmt(a, scope, inner)
-        // **A `val` naming several things is one module `val` per name**, each of its part's type,
-        // exactly as the same binding in a body gives it.
+        // **A binding naming several things is one piece of module storage per name**, each of its
+        // part's type, exactly as the same binding in a body gives it -- a `val` per name, or a `var`
+        // per name, each writable on its own.
         MultiDecl(names, mutable, values, vis) ->
-            if !mutable then hoist_several(a, scope, s.span, names, values, vis)
+            hoist_several(a, scope, s.span, names, values, vis, mutable, OneCopy)
         PatternDecl(pat, mutable, value, typ, vis) ->
-            if !mutable
-                var names: Buf[string] = buf()
-
-                pattern_names(&names, pat)
-
-                val held = held_once(a, scope, s.span, value, typ)
-                val binding = PatternDecl(pat, false, held.at(0), None, File)
-
-                hoist_parts(a, scope, s.span, names, vis, binding)
-            end if
+            hoist_pattern(a, scope, s.span, pat, value, typ, vis, mutable, OneCopy)
+        // `@thread_local` or `@per_cpu` above such a binding gives every name it binds those copies.
+        CopiedDecl(copies, inner) ->
+            *inner.kind match
+                MultiDecl(names, mutable, values, vis) ->
+                    hoist_several(a, scope, s.span, names, values, vis, mutable, copies)
+                PatternDecl(pat, mutable, value, typ, vis) ->
+                    hoist_pattern(a, scope, s.span, pat, value, typ, vis, mutable, copies)
+                _ -> ()
         _ -> ()
 
 // `val a, b = …` at module level. **A list of values is shared out one each**, so each name's
@@ -386,20 +387,43 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
 // value taken apart -- and a count that does not match, which the body's reading refuses -- goes
 // through `hoist_parts`.
 private hoist_several(a: &Analysis, scope: Scope, span: Span, names: Buf[string], values: Buf[Expr],
-                      vis: Visibility)
+                      vis: Visibility, mutable: bool, copies: Copies)
     if values.len() == names.len() && !names_repeated(names)
         for i in 0..<names.len()
             if names.at(i) != "_" then
-                hoist_value(a, scope, span, names.at(i), None, vis, a.tables.vals, "'val'",
-                            Some(values.at(i)))
+                hoist_named(a, scope, span, names.at(i), vis, values.at(i), mutable, copies)
 
         return
     end if
 
-    val from = if values.len() == 1 then held_once(a, scope, span, values.at(0), None) else values
+    val from = if values.len() == 1 then held_once(a, scope, span, values.at(0), None, mutable) else values
 
-    hoist_parts(a, scope, span, names, vis, MultiDecl(names, false, from, File))
+    hoist_parts(a, scope, span, names, vis, MultiDecl(names, false, from, File), mutable, copies)
 end hoist_several
+
+// `val Point(x, y) = p` or `var (a, b) = …` at module level: the value is held once and each name
+// reads its part of it.
+private hoist_pattern(a: &Analysis, scope: Scope, span: Span, pat: Pattern, value: Expr,
+                      typ: Option[TypeRef], vis: Visibility, mutable: bool, copies: Copies)
+    var names: Buf[string] = buf()
+
+    pattern_names(&names, pat)
+
+    val held = held_once(a, scope, span, value, typ, mutable)
+
+    hoist_parts(a, scope, span, names, vis, PatternDecl(pat, false, held.at(0), None, File), mutable,
+                copies)
+end hoist_pattern
+
+// One name of a module binding naming several: a module `val`, or module storage written with `var`
+// -- which may be written to, and is filed as the single `var` form is (`hoist_storage`).
+private hoist_named(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility, init: Expr,
+                    mutable: bool, copies: Copies)
+    if mutable
+        hoist_storage(a, scope, span, name, None, vis, Some(init), None, None, copies, None)
+    else
+        hoist_value(a, scope, span, name, None, vis, a.tables.vals, "'val'", Some(init))
+end hoist_named
 
 // One module `val` per name a binding gives, each initialized by **the binding itself, read as a
 // body reads it, and then the name** -- so a part has the type, and meets the refusals, that the
@@ -412,8 +436,11 @@ end hoist_several
 // is quiet instead, as a body's later use of a name its refused binding gave is left to the refusal.
 //
 // A name written twice is refused here, since the binding each part reads no longer spells it twice.
+//
+// **A `var`'s part is a copy taken once, while the storage is filled**: what each name holds after
+// that is its own, so writing one changes neither the value held for the binding nor another name.
 private hoist_parts(a: &Analysis, scope: Scope, span: Span, names: Buf[string], vis: Visibility,
-                    binding: StmtKind)
+                    binding: StmtKind, mutable: bool, copies: Copies)
     val first = first_namings(names)
 
     for i in 0..<names.len()
@@ -428,8 +455,7 @@ private hoist_parts(a: &Analysis, scope: Scope, span: Span, names: Buf[string], 
 
         body.push(stmt(span, part_binding(binding, names.at(i))))
         body.push(stmt(span, ExprStmt(expr(span, Ident(PART_LOCAL)))))
-        hoist_value(a, scope, span, names.at(i), None, vis, a.tables.vals, "'val'",
-                    Some(expr(span, Block(body))))
+        hoist_named(a, scope, span, names.at(i), vis, expr(span, Block(body)), mutable, copies)
     end for
 end hoist_parts
 
@@ -481,12 +507,17 @@ private renamed_ident(p: Pattern, done: *bool) -> Pattern
 const PART_LOCAL: string = "$part"
 
 // How the `val` holding the value a module binding takes apart is named (`held_once`), followed by
-// where the value was written.
+// where the value was written -- and, for a `var` binding, by `HELD_FOR_VAR` first.
 private const HELD_WHOLE: string = "$parts@"
+private const HELD_FOR_VAR: string = "var@"
 
 // Whether a module `val` is the value a binding takes apart, which a diagnostic names by the binding
 // rather than by a name the reader never wrote.
 is_held_whole(name: string) -> bool = name.starts_with(HELD_WHOLE)
+
+// The keyword of the binding a held value is taken apart for, which a diagnostic about it quotes.
+held_whole_keyword(name: string) -> string =
+    if name.starts_with(HELD_WHOLE + HELD_FOR_VAR) then "var" else "val"
 
 private renamed_patterns(ps: Buf[Pattern], name: string, done: *bool) -> Buf[Pattern]
     var out: Buf[Pattern] = buf()
@@ -499,10 +530,11 @@ end renamed_patterns
 
 // The value a module binding takes apart, held once in a `val` of its file under a name no program
 // can write, so it is computed once however many names read it -- and a read of that `val`, standing
-// where the value was written. A type written for the whole value is that `val`'s.
-private held_once(a: &Analysis, scope: Scope, span: Span, value: Expr,
-                  typ: Option[TypeRef]) -> Buf[Expr]
-    val name = HELD_WHOLE + s"${value.span.start}"
+// where the value was written. A type written for the whole value is that `val`'s. It is a `val`
+// for a `var` binding too: nothing writes it, and each name's storage is filled from it once.
+private held_once(a: &Analysis, scope: Scope, span: Span, value: Expr, typ: Option[TypeRef],
+                  mutable: bool) -> Buf[Expr]
+    val name = HELD_WHOLE + (if mutable then HELD_FOR_VAR else "") + s"${value.span.start}"
     var out: Buf[Expr] = buf()
 
     hoist_value(a, scope, span, name, typ, File, a.tables.vals, "'val'", Some(value))
@@ -1436,19 +1468,17 @@ private note_wider(a: &Analysis, scope: Scope, s: Stmt)
         ConstDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
         ValDecl(name, _, _, vis, _, _, _, _) -> note_wider_name(a, scope, name, vis)
         VarDecl(name, _, _, vis, _, _, _, _) -> note_wider_name(a, scope, name, vis)
-        MultiDecl(names, mutable, _, vis) ->
-            if !mutable
-                for item in names
-                    note_wider_name(a, scope, item, vis)
-        PatternDecl(pat, mutable, _, _, vis) ->
-            if !mutable
-                var names: Buf[string] = buf()
+        MultiDecl(names, _, _, vis) ->
+            for item in names
+                note_wider_name(a, scope, item, vis)
+        PatternDecl(pat, _, _, _, vis) ->
+            var names: Buf[string] = buf()
 
-                pattern_names(&names, pat)
+            pattern_names(&names, pat)
 
-                for item in names
-                    note_wider_name(a, scope, item, vis)
-            end if
+            for item in names
+                note_wider_name(a, scope, item, vis)
+        CopiedDecl(_, inner) -> note_wider(a, scope, inner)
         ExternVarDecl(name, _, _, vis, _) -> note_wider_name(a, scope, name, vis)
         ExternDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         FuncDecl(d) -> note_wider_name(a, scope, d.name, d.vis)

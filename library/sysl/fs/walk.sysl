@@ -72,6 +72,12 @@ private struct Frame
  * read is one `Err` and the walk carries on with what is left. That is the axis `remove_dir_all` and
  * a best-effort cleanup disagree about, and neither answer is now the library's: `?` in the loop
  * body makes the first `Err` fatal, and ignoring it makes the walk best effort.
+ *
+ * **An entry that disappears while the walk is under way is absent, not a failure.** A directory is
+ * listed once and its names are read one at a time afterwards, so another process may remove one
+ * in between -- a lock directory, a temporary file. Such a name is skipped, and a directory removed
+ * after it was reported is walked as an empty one. A root that does not exist when the walk starts
+ * is still an `Err`, since that is a path the caller named rather than one the walk found.
  */
 struct Walk
     private stack: Buf[Frame]
@@ -182,6 +188,7 @@ impl Iterate for Walk
                 return Some(Ok(here))
 
             self.open(self.root, 0, m) match
+                Err(NotFound) -> return None
                 Err(e) -> return Some(Err(e))
                 Ok(_) -> ()
 
@@ -199,6 +206,7 @@ impl Iterate for Walk
 
                     if !self.pruned
                         self.open(at, down, m) match
+                            Err(NotFound) -> ()
                             Err(err) -> return Some(Err(err))
                             Ok(_) -> ()
 
@@ -224,6 +232,7 @@ impl Iterate for Walk
             self.stack.set(top, f)
 
             val m = link_metadata(child) match
+                Err(NotFound) -> continue
                 Err(e) -> return Some(Err(e))
                 Ok(m) -> m
 
@@ -236,6 +245,7 @@ impl Iterate for Walk
                 return Some(Ok(e))
 
             self.open(child, e.depth, m) match
+                Err(NotFound) -> ()
                 Err(err) -> return Some(Err(err))
                 Ok(_) -> ()
     end next

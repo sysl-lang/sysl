@@ -856,6 +856,12 @@ read is one `Err` and the walk carries on with what is left. That is the axis `r
 a best-effort cleanup disagree about, and neither answer is now the library's: `?` in the loop
 body makes the first `Err` fatal, and ignoring it makes the walk best effort.
 
+**An entry that disappears while the walk is under way is absent, not a failure.** A directory is
+listed once and its names are read one at a time afterwards, so another process may remove one
+in between -- a lock directory, a temporary file. Such a name is skipped, and a directory removed
+after it was reported is walked as an empty one. A root that does not exist when the walk starts
+is still an `Err`, since that is a path the caller named rather than one the walk found.
+
 | Member | Signature | Description |
 |---|---|---|
 | `bottom_up` | `bottom_up(self) -> Walk` | The same walk, reporting a directory *after* everything under it. |

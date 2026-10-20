@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.{Source, source}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{current_dir, entries, is_file, metadata, read_bytes}
+import sysl.fs.{current_dir, entries, is_file, link_metadata, metadata, read_bytes}
 import sysl.text.{split, Search}
 
 // Which files one invocation compiles, and which module each of them is in.
@@ -38,6 +38,11 @@ val ExamplesDir: string = "examples"
 
 // Where a project keeps the packages it vendored, which the walk is not to read as modules.
 val VendorDir: string = "vendor"
+
+// The project's own working directory: what the toolchain derives and keeps beside the tree (the
+// standard module's artifact on a machine with no cache directory), and the scratch a project's
+// tests write. Nothing in it is source, and another process may be writing it while a build walks.
+val LocalDir: string = ".sysl"
 
 // `tests/refused/` under the root: the programs a package's `sysl test` requires the compiler to
 // refuse, which no build reads as a module. Two names, because the walk meets them one level apart.
@@ -364,16 +369,17 @@ end walk_stray_c
 private walked_into(dir: Buf[string], sub: string) -> bool =
     !skipped_at_root(dir, sub) && !is_file(join_path(sub, ManifestName))
 
-// The root's `examples/` and `vendor/` are left out, and the `dir.is_empty()` test is what makes it
-// the *root's* one: everywhere else the name is ordinary. So is the root's `tests/refused/`, whose
-// files are programs `sysl test` requires to be refused, each compiled on its own (`refused_files`).
+// The root's `examples/`, `vendor/` and `.sysl/` are left out, and the `dir.is_empty()` test is what
+// makes it the *root's* one: everywhere else the name is ordinary. So is the root's `tests/refused/`,
+// whose files are programs `sysl test` requires to be refused, each compiled on its own
+// (`refused_files`).
 private skipped_at_root(dir: Buf[string], sub: string) -> bool
     val name = basename(sub)
 
     if dir.len() == 1 && dir.at(0) == RefusedParent then return name == RefusedLeaf
     if !dir.is_empty() then return false
 
-    name == ExamplesDir || name == VendorDir
+    name == ExamplesDir || name == VendorDir || name == LocalDir
 end skipped_at_root
 
 // One directory's contents with per-OS selection already folded in: the files that belong to it,
@@ -389,9 +395,16 @@ end Contents
 //
 // **A directory that cannot be listed is refused, naming it**: left out, the modules below it would
 // vanish from the build with nothing said.
+//
+// **One that is no longer there is not**, below the root: its parent listed it, so another process
+// removed it while the walk was under way -- a test's lock directory, a temporary tree -- and what
+// is gone holds no modules. A name removed between the listing and the look at what it is goes the
+// same way, unless it is an editor's unsaved file, which was never on disk to begin with, or a link
+// whose target is missing, which is still there to be reported by whatever reads it.
 private contents(root: string, path: string, os: Option[Os], within: Option[string]) -> Result[Contents, Selection]
     val names = entries(path) match
         Ok(found) -> found
+        Err(NotFound) if path != absolute_path(root) -> return Ok(Contents(buf(), buf()))
         Err(e) -> return Err(Selection(s"cannot read $root: ${io_refusal(path, e)}"))
     var sorted = sort_names(with_unsaved(path, names))
 
@@ -402,7 +415,13 @@ private contents(root: string, path: string, os: Option[Os], within: Option[stri
     for item in sorted
         val full = join_path(path, item)
 
-        if !is_directory(full)
+        val dir = metadata(full) match
+            Ok(m) -> m.is_dir()
+            // A link whose target is missing is still an entry, so it is asked of the name itself.
+            Err(NotFound) -> if link_metadata(full).is_err() && editor_text(full).is_none() then continue else false
+            Err(_) -> false
+
+        if !dir
             files.push(full)
         else if marked(item)
             selectors.push(full)

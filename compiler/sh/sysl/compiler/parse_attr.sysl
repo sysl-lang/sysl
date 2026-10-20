@@ -1665,10 +1665,29 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr], written: Visibility) -> St
         // **Both annotations are about one object**, so a binding that names several has nothing for
         // them to be about. The refusal names the annotation rather than the binding, since the
         // annotation is the half that has to go.
-        MultiDecl(_, _, _, _) -> refuse_several(p, s, attrs)
-        PatternDecl(_, _, _, _, _) -> refuse_several(p, s, attrs)
+        //
+        // **A copy per thread or per core is not about one object**: it says how many copies each
+        // name's storage has, which a `var` naming several things says of each name.
+        MultiDecl(names, mutable, values, vis) ->
+            several_placed(p, s, attrs, copies, MultiDecl(names, mutable, values, either_vis(written, vis)))
+        PatternDecl(pat, mutable, value, typ, vis) ->
+            several_placed(p, s, attrs, copies, PatternDecl(pat, mutable, value, typ, either_vis(written, vis)))
         _ -> s
 end placed
+
+// A binding naming several things under annotations: refused for the ones about one object, and
+// otherwise given the copies the annotations ask each name for.
+private several_placed(p: *Parser, s: Stmt, attrs: Buf[Attr], copies: Copies, kind: StmtKind) -> Stmt
+    var about_one: Buf[Attr] = buf()
+
+    for attr in attrs
+        if attr_word(attr) != "thread_local" && attr_word(attr) != "per_cpu" then about_one.push(attr)
+
+    if !about_one.is_empty() then return refuse_several(p, s, about_one)
+    if copies == OneCopy then return s
+
+    stmt(s.span, CopiedDecl(copies, stmt(s.span, kind)))
+end several_placed
 
 // The visibility written in front of the annotations' declaration, where one was, and the binding's
 // own reading otherwise.
@@ -1711,8 +1730,7 @@ private refuse_several(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
 end refuse_several
 
 // Whether a binding is a `var` -- the one keyword `@thread_local` marks -- reaching through the
-// `static` wrapper. A comma list and a pattern are `var`s too, refused a line later for naming
-// several.
+// `static` wrapper. A comma list and a pattern are `var`s too.
 private holds_a_var(s: Stmt) -> bool = *s.kind match
     VarDecl(_, _, _, _, _, _, _, _) -> true
     MultiDecl(_, mutable, _, _) -> mutable

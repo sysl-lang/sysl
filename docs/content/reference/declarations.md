@@ -374,10 +374,12 @@ binding with nothing to take apart names nothing. The right side is produced bef
 bound, so a value there still means whatever the enclosing scope calls it — the binding does not
 shadow itself half way through its own right-hand side.
 
-**A module takes it too**, since a module `val` takes its type as a local does: each name is a module
-`val` of its part's type, read from the module's functions, its other files and the modules that
-import it like any other. A list of values is shared out one each, so a part over a constant is
-constant data; one value taken apart is computed once, however many names it gives.
+**A module takes it too**, since module storage takes its type as a local does: each name is a module
+`val` — or, written with `var`, module storage — of its part's type, read from the module's
+functions, its other files and the modules that import it like any other. A list of values is shared
+out one each, so a part over a constant is constant data; one value taken apart is computed once,
+however many names it gives. Each name a `var` binds is storage of its own, written without touching
+the others.
 
 ```sysl
 static val width, height = 640, 480
@@ -500,19 +502,22 @@ show()
 cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
 ```
 
-Like the comma form, it **is a module `val` per name** at the top of a file, and a type written for
-the whole value governs there as it does here:
+Like the comma form, it **is a module `val` per name** at the top of a file — module storage per name,
+written with `var` — and a type written for the whole value governs there as it does here:
 
 ```sysl
 static val (lo, hi): (u8, u16) = (1, 300)
+static var (count, limit): (u8, u16) = (0, 2)
 
 span() -> u16 = hi - u16(lo)
 
-print(lo, hi, span())
+count += 1
+limit *= 100
+print(lo, hi, span(), count, limit)
 ```
 
 ```output
-1 300 299
+1 300 299 1 200
 ```
 
 The same pattern stands in a
@@ -522,13 +527,13 @@ apart as the loop hands it over.
 ## Functions
 
 A name, a parameter list, an optional `-> result`, and a body. There is no keyword: the shape is what
-identifies it. An absent result type means `unit`.
+identifies it.
 
 The body is either `= expr` — whose value is the result — or an indented block, whose **trailing
 expression** is the result.
 
 ```sysl
-double(n: int) -> int = n * 2
+double(n: int) = n * 2
 
 sum(a: int, b: int) -> int
     var t = a + b
@@ -549,6 +554,88 @@ hi you
 
 `= ` may also open an indented block, so a body does not have to change shape when it outgrows a
 line.
+
+### The result type
+
+**A body written `= value` with no `-> T` takes the value's type**, exactly as a `val` written with
+no type takes its initializer's. A body that is an indented block with no `=` and no `-> T` hands back
+nothing: its result is `unit`, and the value its last line comes to is discarded.
+
+```sysl
+twice(x: int) = x * 2
+name() = "sysl"
+pair[T](x: T) = (x, x)
+area(w: int, h: int) =
+    val inner = w * h
+
+    inner + 1
+
+shout(word: string) = print(word + "!")
+
+tally()
+    42
+
+print(twice(21) + 1, name(), pair(2.5).1, area(3, 4))
+shout("hey")
+print(tally() == ())
+```
+
+```output
+43 sysl 2.5 13
+hey!
+true
+```
+
+A generic function's result is the body's type in terms of its parameters, so `pair` above is
+`(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
+initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
+
+**The result is known wherever a written one would be.** A call above the declaration, in another
+file of the module, in another module, or through a library reads it, in any order; `sysl doc` shows
+the declaration as written, `= value` and all, and an editor's hover shows it at the type it was read
+as.
+
+**A body that reaches its own function before the result is known has no type to take**, directly or
+through another function that does the same, and is refused at the declaration. Writing the result on
+any one function of the loop settles it:
+
+```sysl
+fact(n: int) = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```error
+'fact' takes its result type from its body, and the body reaches 'fact' again — write its result type, 'fact(…) -> T'
+```
+
+```sysl
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```output
+120
+```
+
+The rest of what a result read off the body is held to:
+
+- **It is the signature's**, so it obeys the
+  [visibility rule](/reference/modules/#a-declaration-may-not-be-more-visible-than-the-types-it-names)
+  exactly as a written one does: a public function whose body yields a type private to its file is
+  refused at the declaration.
+- **A member of an `impl` block for a trait takes the trait's result.** The block is held to the
+  trait's signature, so `size(self) = 255` supplying a trait's `size(self) -> u8` is a `u8`, and its
+  body is read against it. A trait's own member states its result, since every implementation is held
+  to it: a default written `= value` with no `-> T` is `unit`.
+- **A `@test` function and a hook return nothing** whatever their `= value` comes to.
+- **C reads what an `@export` or `@convention` function hands back**, so one whose body yields a value
+  writes its result type; one whose body is `unit` need not.
+- **A body that hands back a bare closure is refused**: its type has no name for a signature to state,
+  so the function writes `-> &Fn(…) -> R`.
+- An `async` function's task is of its body's type, and a `const` function's value folds as a written
+  one's does.
 
 ### Tail calls
 

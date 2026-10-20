@@ -108,6 +108,29 @@ that walked upward would make a build depend on directories above the one it was
 **The exclusion is at the root and nowhere else.** `sh/sysl/mypkg/examples/` is an ordinary module
 named `sh.sysl.mypkg.examples`, so a package that wants the word still has it.
 
+## The root's `.sysl/` is a working directory, not source
+
+**`.sysl/` at a project root is left out of the tree** on the same terms as `examples/`: out of the
+library build, out of the C the package carries, out of `sysl test .`'s walk, and out of what the
+run cache keys a build on. It is where the toolchain keeps what it derives beside a project (the
+standard module's artifact, on a machine with no cache directory) and where a package's tests keep
+their scratch files, so it belongs in `.gitignore` and nothing in it is compiled. A test that writes
+there while another test's build is running changes nothing that build reads.
+
+```
+mypkg/sh/sysl/mypkg/mypkg.sysl     the library
+mypkg/.sysl/c-tests/case.c         a test's scratch, not part of it
+```
+
+As with `examples/`, the exclusion is at the root only; a `.sysl/` further down is an ordinary
+directory.
+
+**A tree that changes while it is walked is read as it stands.** A file or directory that another
+process removes between the walk listing a directory and looking at the entry — a lock directory, a
+temporary file — is absent, and the build goes on with what is there. A directory that is present
+and cannot be read is still refused, naming it, since the modules below it would otherwise drop out
+of the build unannounced.
+
 ## A package may test what it refuses
 
 **`tests/refused/` at a project root holds programs that `sysl test` requires the compiler to

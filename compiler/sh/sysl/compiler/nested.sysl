@@ -138,7 +138,9 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
             params.push((d.params.at(j).name,
                          resolve_type(cx.an, cx.scope, d.params.at(j).typ, cx.subst)))
 
+        // A result read off the body waits for the frame the body is read in, below.
         val ret = if d.ret_type.is_none() then Unit
+        else if is_inferred_result(d.ret_type) then Unknown
         else resolve_result(cx.an, cx.scope, d.ret_type.unwrap(), cx.subst)
 
         cx.an.tables.members.func_insts.put(fname, FuncSig(params, ret))
@@ -166,6 +168,23 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
         if !d.tparams.is_empty()
             cx.an.tables.nested_generics.put(lowered.at(i),
                                              NestedGeneric(d, unshadowed(cx.subst, d.tparams), frame))
+
+    // **A result read off a body is read before any body is typed**, so a sibling's call above the
+    // declaration finds it -- each read in the frame just taken, a generic one with its own parameters
+    // standing for themselves -- and a body that reaches its own function first is told here.
+    for i in 0..<group.len()
+        val d = group.at(i)
+        val outer = if d.tparams.is_empty() then cx.subst else unshadowed(cx.subst, d.tparams)
+
+        note_result_site(cx.an, lowered.at(i), d.name, cx.scope, decl_anchor(d), d, false, None,
+                         Some(frame), outer)
+
+    for i in 0..<group.len()
+        settled_result_of(cx.an, lowered.at(i))
+
+        cx.an.results.sites.get(lowered.at(i)) match
+            Some(s) -> told_of_result(cx.an, s)
+            None -> ()
 
     for i in 0..<group.len()
         val d = group.at(i)
@@ -262,6 +281,7 @@ block_binds(s: Stmt, out: *Buf[string])
             for item in ns
                 out.push(item)
         PatternDecl(p, _, _, _, _) -> pattern_names(out, p)
+        CopiedDecl(_, inner) -> block_binds(inner, out)
         _ -> ()
 
 // A name a block binds: where its statement starts, and whether the block's nested functions had
@@ -396,8 +416,11 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
 
     inner.carried_declares = inner.block_declares.len()
 
-    val written = d.ret_type.map(w -> resolve_result(a, f.scope, w, subst))
-    val ret = body_result(d, declared_result_type(written))
+    // **The reading that is finding out what the body produces expects nothing of it**: that is the
+    // question being asked (`nested_result_type`).
+    val own = is_inferred_result(d.ret_type) && a.results.for_body == fname
+    val written = if own then None else d.ret_type.map(w -> resolve_result(a, f.scope, w, subst))
+    val ret = if own then Unknown else body_result(d, declared_result_type(written))
 
     inner.ret_ty = Some(ret)
     inner.await_site = await_site_of(d)
@@ -405,7 +428,7 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
     val split = contract_length(d.body)
     val contract = analyze_contract(inner, decl_anchor(d), d.body, split, ret, false)
     val rest = statements_from(d.body, split)
-    val block = body_block(inner, rest, ret)
+    val block = if own then own_result_block(inner, rest) else typed_body(inner, d, rest, ret)
 
     // A nested function is a closure over its frame, and is told so in a closure's words -- at the
     // line that declared it, as a top-level function's disagreement is.
@@ -513,6 +536,48 @@ private check_nested_definition(a: &Analysis, g: &NestedGeneric, fname: string)
     a.closure_funcs.truncate(made)
 end check_nested_definition
 
+// What a nested function's body produces, read in its frame with nothing expected and taken back
+// whole -- the reading `inferred_results.sysl` asks for where the declaration leaves its result to
+// its body. A generic one is read as at its definition, its own parameters standing for themselves.
+nested_result_type(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl,
+                   outer: Buf[Binding]) -> Type
+    if d.body.is_empty() then return Unknown
+
+    val generic = !d.tparams.is_empty()
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val lowered = a.closure_count
+    val made = a.closure_funcs.len()
+    val subst = if generic then abstract_subst(a, f.scope, d.tparams, d.bounds, d.tvalues, d.tpacks, outer)
+    else outer
+    val settled_before = a.settled
+    val reading_before = a.results.for_body
+
+    if generic then a.settled = joined_bindings(subst, buf())
+
+    a.results.for_body = fname
+
+    val read = nested_body_in(a, f, fname, d, subst, generic)
+
+    a.results.for_body = reading_before
+    a.settled = settled_before
+
+    val clean = a.complaints() == mark
+
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_count = closure_rewind(a, lowered)
+    a.closure_funcs.truncate(made)
+
+    if clean then read.body.ty else Unknown
+end nested_result_type
+
 // What a frame's type parameters stand for, less the ones a nested declaration names again: its own
 // parameter of the spelling is the nearer binding.
 private unshadowed(subst: Buf[Binding], tparams: Buf[string]) -> Buf[Binding]
@@ -588,6 +653,10 @@ call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Ex
 
     if generic.is_some() then
         return generic_nested_call(cx, span, n, generic.unwrap(), written, args, expected, buf())
+
+    // A sibling's result read off its body is read now if it has not been: a call above it in the
+    // group is the reading that first needs it.
+    settled_result_of(cx.an, n.fname)
 
     val sig = cx.an.tables.members.func_insts.get(n.fname)
 

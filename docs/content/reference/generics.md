@@ -1387,6 +1387,29 @@ print(r.data.len)
 5
 ```
 
+An integer constant is read at the parameter's type wherever it is handed to the parameter itself,
+and refused only where its value does not fit, so `const Base = 2`, an `int`, still makes `Ring[Base]`
+and `Ring[Base + 1]`. Inside the expression the ordinary rules hold: a function's parameter takes
+what any call to it takes, and an `int` is not converted to a `usize` implicitly. That argument is
+refused at the part that does not read, as the same call would be anywhere else:
+
+```sysl
+struct Ring[const N: usize]
+    data: [N]byte
+
+double(n: usize) -> usize = n * 2
+
+const Base = 2
+
+var r: Ring[double(Base) + 1] = Ring([0; 5])
+
+print(r.data.len)
+```
+
+```error
+'n' of 'double' is usize, but int was given
+```
+
 A **member** reads the parameter as an ordinary value of its declared type, and each length gets its
 own body:
 

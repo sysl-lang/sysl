@@ -118,7 +118,13 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // **Every `some` result is settled first** -- the one pass that reads a body to learn a type. It
     // waits for every declaration, since such a body may name anything the program declares, and
     // runs before every other body, any of which may ask what an associated type is.
+    //
+    // **A result left to a body is readable from the same point and for the same reason**, so it is
+    // opened first -- a `some` body may call a function whose result is read off its own -- and the
+    // program's own are all read straight after, before any body is typed.
+    open_inferred_results(a)
     settle_opaque_results(a)
+    settle_inferred_results(a)
 
     check_generic_bodies(a, units)
 
@@ -611,8 +617,9 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
         params.push((unique, ty))
 
     // **A function that declares no result hands nothing back**, so its body is read with nothing
-    // expected and the value it comes to is discarded -- which is why `probe() = 42` is a `unit`
-    // function rather than an `int` one.
+    // expected and the value it comes to is discarded. A body written `= value` with no result
+    // declares the value's type (`inferred_results.sysl`), so `probe() = 42` is an `int` function and
+    // `probe()` followed by an indented `42` a `unit` one.
     val written = d.ret_type.map(w -> resolve_result(a, scope, w, no_bindings()))
     val ret = body_result(d, declared_result_type(written))
 
@@ -630,7 +637,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
-    val body = body_block(cx, rest, ret)
+    val body = typed_body(cx, d, rest, ret)
 
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
     // the mistake is the signature and the body disagreeing, and the signature is where it is read.
@@ -1158,7 +1165,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val split = contract_length(d.body)
     val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
     val rest = statements_from(d.body, split)
-    val body = body_block(cx, rest, ret)
+    val body = typed_body(cx, d, rest, ret)
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
@@ -1253,6 +1260,12 @@ body_block(cx: &Analyzer, rest: Buf[Stmt], ret: Type) -> TBlock
 
     block
 end body_block
+
+// A declaration's body, read against its result -- or, where the result was to be read off the body
+// and could not be, read as that reading read it, so what stopped it is what the reader is told.
+typed_body(cx: &Analyzer, d: FuncDecl, rest: Buf[Stmt], ret: Type) -> TBlock =
+    if ret == Unknown && is_inferred_result(d.ret_type) then own_result_block(cx, rest)
+    else body_block(cx, rest, ret)
 
 // What a function hands back: the tuple a result list lays out as, and `unit` where none was
 // written.
@@ -1742,8 +1755,11 @@ private module_storage(a: &Analysis) -> Buf[TVal]
         for i in 0..<a.tables.vals.len()
             val key = a.tables.vals.key_at(i)
             val writable = holds_string(a.tables.writable, key)
+            // The value a `var` binding takes apart is read with that binding's names, ahead of
+            // them, as a `val` binding's is read ahead of its own.
+            val first = writable || held_whole_keyword(a.tables.vals.at(i).name) == "var"
 
-            if (pass == 0) == writable
+            if (pass == 0) == first
                 val d = a.tables.vals.at(i)
                 val cx = analyzer_for(a, d.scope)
                 // `stored` is what the storage is declared at, qualifier and all; `ty` is what a read
@@ -1774,8 +1790,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     // the declaration is the mistake.
                     val got = texpr_type(init.unwrap())
 
+                    // The value a module binding takes apart is named by the binding, in the words
+                    // the same binding in a body is refused with.
+                    val what = if is_held_whole(d.name) then "the parts of this binding" else s"'${d.name}'"
+
                     if disagree(got, ty) then
-                        cx.fault(d.span, s"cannot initialize '${d.name}': declared ${type_show(ty)} but " +
+                        cx.fault(d.span, s"cannot initialize $what: declared ${type_show(ty)} but " +
                                  s"the value is ${type_show(got)}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())
@@ -1868,7 +1888,7 @@ private inferred_storage(cx: &Analyzer, key: string, d: ValueDecl, got: Type) ->
     // and its type is written for the whole binding.
     if holds_string(cx.an.val_cycles, key) && is_held_whole(d.name)
         cx.fault(d.span, "this binding takes its parts' types from its value, and the value reaches " +
-                 "what it binds again — write the type of the whole value, 'val (…): T = …'")
+                 s"what it binds again — write the type of the whole value, '${held_whole_keyword(d.name)} (…): T = …'")
 
         return Unknown
     end if
