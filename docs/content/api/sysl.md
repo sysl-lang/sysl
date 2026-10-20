@@ -40,13 +40,13 @@ only a cycle or a very long chain reaches it.
 ### `esink`
 
 ```sysl
-val esink: *Stderr = ptr_cast(0usize)
+val esink: *Stderr = ptr_cast(0)
 ```
 
 ### `sink`
 
 ```sysl
-val sink: *Stdout = ptr_cast(0usize)
+val sink: *Stdout = ptr_cast(0)
 ```
 
 ## Functions
