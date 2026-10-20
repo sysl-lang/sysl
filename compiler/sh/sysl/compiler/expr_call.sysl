@@ -906,7 +906,7 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
     if args.len() != 1 then
         return cx.err(span, "'ptr_cast' takes exactly one value, the address to read as a pointer")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = address_operand(cx, args.at(0))
 
     if expected.is_none() then
         return cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and nothing " +
@@ -919,6 +919,19 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
 
     TExpr(span, TCast(t, to))
 end ptr_cast_call
+
+// The address `ptr_cast` is handed, analyzed. **A bare integer literal is a `usize`**, as a literal is
+// whatever integer type its position names: `ptr_cast(0x4000_0000)` reads the address as the target's
+// address width, and one too large for that width -- or a negative one -- is refused as the literal
+// that does not fit. Anything with a type of its own keeps it, so an `int` value is still refused.
+private address_operand(cx: &Analyzer, e: Expr) -> TExpr =
+    if is_int_literal(e) then type_expr(cx, e, Some(usize_type(word_bits(cx))))
+    else type_expr_bare(cx, e)
+
+private is_int_literal(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, suffix) -> suffix == ""
+    Unary(op, operand) -> op == "-" && is_int_literal(operand)
+    _ -> false
 
 // What a reinterpreted address may NOT be read as, named by what the type promises that an address
 // cannot supply. A function pointer is an address like any other.

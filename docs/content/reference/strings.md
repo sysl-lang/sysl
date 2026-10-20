@@ -13,38 +13,37 @@ A `string` is a **three-word owning view of validated UTF-8 bytes** — the same
 | `ptr` | the first byte of *this* string — an interior pointer into the owner's bytes |
 | `len` | the length in **bytes**, not characters |
 
-Added: the bytes are guaranteed well-formed UTF-8. Taken away: nothing may write through it. Every
-rule on the [arrays page](/reference/arrays/) about indexing, slicing, length and ownership is
-therefore true here too, and this page is the two differences and what follows from them.
+Added: the bytes are guaranteed to be well-formed UTF-8. Taken away: nothing may write through it.
+Every rule on the [arrays page](/reference/arrays/) about indexing, slicing, length and ownership
+therefore applies here too, and this page covers the two differences and what follows from them.
 
 **`ptr` is separate from `owner` because a substring must name a range inside its parent's buffer
-while still keeping that parent alive.** Two words cannot do both jobs: with only `{ptr, len}`,
-release has no way back to the buffer header, so either substrings copy or lifetime goes unchecked.
-The third word buys O(1) substring sharing for eight bytes.
+while keeping that parent alive.** Two words cannot do both: with only `{ptr, len}`, releasing the
+string has no way back to the buffer header, so either every substring copies or its lifetime goes
+unchecked. The third word gives O(1) substring sharing for eight bytes.
 
-That is the trade against the three languages this came from. Go's two words work because a garbage
-collector owns the bytes and can find the object from an interior pointer; sysl has no collector, so
-those two words leave lifetime unanswered. Swift's packed sixteen hide three representations behind a
-discriminator, require an allocator unconditionally, and carry a grapheme-cluster element type whose
-break tables cannot be in a kernel. Rust's split — a `&str` view against an owning `String` — is the
-honest two-word answer, and the price is that every signature and every programmer chooses between
-two types. One type at three words is the trade this language prefers.
+Other languages make different choices. Go's two words work because a garbage collector owns the
+bytes and can find the object from an interior pointer; sysl has no collector, so two words would
+leave lifetime unanswered. Swift's packed sixteen bytes hide three representations behind a
+discriminator, always require an allocator, and use a grapheme-cluster element type whose break
+tables do not belong in a kernel. Rust splits the job between a `&str` view and an owning `String`,
+which costs every signature a choice between two types. sysl uses one type of three words.
 
 ## Validity
 
-**Every `string` is well-formed UTF-8.** This follows `char`, which already enforces that its value
-is a Unicode scalar value: a `string` that could hold arbitrary bytes would make decoding partial
-again, and would hand a decoder a way to produce a `char` that cannot exist.
+**Every `string` is well-formed UTF-8.** This matches `char`, which already guarantees that its
+value is a Unicode scalar value: a `string` that could hold arbitrary bytes would make decoding
+partial, and would give a decoder a way to produce a `char` that cannot exist.
 
-This is Swift's guarantee rather than Go's. Go strings are arbitrary bytes that are UTF-8 by
-convention, so its decoder must substitute U+FFFD and advance one byte on malformed input. Here there
-is no repair path, because there is nothing to repair.
+The guarantee is Swift's rather than Go's. Go strings are arbitrary bytes that are UTF-8 by
+convention, so its decoder must substitute U+FFFD and advance one byte on malformed input. A sysl
+decoder has no repair path, because there is never anything to repair.
 
 | from | spelling | behaviour |
 |---|---|---|
 | a literal | `"héllo"` | validated while compiling |
 | bytes | `from_utf8(b: []const u8)` | validates; the error names the byte offset |
-| bytes, trusted | `from_utf8_unchecked(b)` | **unsafe** — the long name is the point: it stays greppable |
+| bytes, trusted | `from_utf8_unchecked(b)` | **unsafe** — the long name keeps every use easy to find |
 | bytes, trusted and shared | `str_view(b: []u8)` | **unsafe** — no copy: the string sees later writes to `b` |
 | a `char` | `string(c)` | encodes one scalar value |
 
@@ -69,31 +68,29 @@ bad at 0 truncated: false
 ```
 
 **`Utf8Error` carries one thing besides the offset: whether the input merely *ended* in the middle of
-a sequence.** That is the only distinction a caller can act on differently — more bytes would fix an
-unfinished sequence and could never fix a wrong one — which is why it is a field rather than a
-taxonomy of fault names nobody would match on. The pair above is the difference: `C3 28` is a lead
-byte followed by something that is not a continuation, so no amount of further input rescues it.
+a sequence.** That is the only distinction a caller can act on differently — more bytes can complete
+an unfinished sequence but can never fix a wrong one — so it is a field rather than a list of fault
+names. The pair above shows the difference: `C3 28` is a lead byte followed by something that is not
+a continuation, so no further input can make it valid.
 
-**The validator is Unicode's well-formedness table, not a decode-then-range-check**, and the
-difference is not stylistic. In the table the *lead* byte fixes the legal range of the byte after it
-— `E0` demands `A0..BF`, `ED` only `80..9F`, `F0` demands `90..BF`, `F4` only `80..8F` — so an
-overlong encoding, a surrogate, and a value past `10FFFF` are all rejected at the second byte, by the
-same test, before any codepoint is assembled. Written the other way each needs its own check and each
-is its own chance to be forgotten.
+**The validator follows Unicode's well-formedness table rather than decoding and then range-checking.**
+In the table the *lead* byte fixes the legal range of the byte after it — `E0` requires `A0..BF`, `ED`
+only `80..9F`, `F0` requires `90..BF`, `F4` only `80..8F` — so an overlong encoding, a surrogate and a
+value past `10FFFF` are all rejected at the second byte, by the same test, before any code point is
+assembled. Decoding first would need a separate check for each case.
 
-**`from_utf8` copies rather than views.** A `string` could in principle share a `[]u8`'s owner, which
-would make the conversion O(1) — but a slice is writable and a string is not, so a later write
-through the slice would change a value that had already been checked. Copying is what makes
-validation mean anything afterwards, and it is why that entry requires an allocator.
+**`from_utf8` copies rather than views.** A `string` could share a `[]u8`'s owner, which would make
+the conversion O(1), but a slice is writable and a string is not, so a later write through the slice
+would change a value that had already been checked. Copying keeps the validation true afterwards,
+which is why `from_utf8` requires an allocator.
 
-**The division of labour is the reason `from_utf8` is not built in.** The compiler supplies exactly
-one primitive — `str_cast`, which is a `[]u8` taken as a `string` with nothing looked at — and
-everything on top of it is ordinary sysl in [`sysl.text`](/library/text/), `from_utf8_unchecked`
-included. What no sysl body could do is that last line, because every safe route to a `string`
-already carries the guarantee.
+**`from_utf8` is library code, not a compiler built-in.** The compiler supplies exactly one
+primitive — `str_cast`, which takes a `[]u8` as a `string` without examining it — and everything on
+top of it is ordinary sysl in [`sysl.text`](/library/text/), `from_utf8_unchecked` included. That
+primitive is the one step no sysl body could write, because every safe route to a `string` already
+carries the guarantee.
 
-**So the unchecked conversion is imported like any other function**, as of 0.0.82. It was a compiler
-form in scope everywhere before that, which is why older code calls it with nothing imported.
+**The unchecked conversion is imported like any other function:**
 
 ```sysl
 import sysl.text.from_utf8_unchecked
@@ -107,8 +104,8 @@ print(from_utf8_unchecked(bytes))
 hi!
 ```
 
-What sits underneath it is a compiler primitive, deliberately in the same category as a raw pointer,
-because breaking the UTF-8 invariant breaks `char`'s invariant downstream.
+The primitive underneath it is deliberately in the same category as a raw pointer, because breaking
+the UTF-8 invariant breaks `char`'s invariant downstream.
 
 ### A string that shares a buffer
 
@@ -121,8 +118,8 @@ operation.
 
 **It is in the unsafe tier, and the caller owes two guarantees rather than one.** The bytes are valid
 UTF-8, as for `from_utf8_unchecked`; and **nothing writes the bytes the string covers while the
-string is alive**, because every other part of the language takes a `string` to be immutable. The
-program below breaks the second promise on purpose, to show what the promise is about:
+string is alive**, because the rest of the language treats a `string` as immutable. The program below
+breaks the second guarantee deliberately, to show what it protects:
 
 ```sysl
 import sysl.text.{from_utf8_unchecked, str_view}
@@ -154,7 +151,7 @@ region has no owner to share, and is the programmer's problem exactly as every `
 ## Immortal bytes
 
 A string literal is bytes in read-only data with **no owner at all** — the owner word is null, and
-retain and release both test for that and do nothing. Three consequences:
+retain and release both test for that and do nothing. As a result:
 
 - A literal costs no allocation and no refcount traffic. It is a *constant*, so it needs no
   instruction to build either.
@@ -163,25 +160,25 @@ retain and release both test for that and do nothing. Three consequences:
 - A module-level `val` holds one with no code running first. Module storage may hold a built string
   too, and never releases it; a literal is the case that needs no prologue at all.
 
-A sentinel refcount in a header would say the same thing. The null owner is better because it is not
-string-specific: it is already how a slice of static storage says "nothing to keep alive", so
-immortality needs no mechanism of its own.
+A sentinel refcount in a header could express the same thing. The null owner is preferred because it
+is not specific to strings: it is already how a slice of static storage says "nothing to keep alive",
+so immortality needs no mechanism of its own.
 
 ## Granularity: bytes and scalar values
 
 A string is indexed and measured in **bytes**, and decoded into **`char`** — Unicode scalar values.
 Grapheme clusters are a library built over the scalar view, not the element type.
 
-The reason is where the Unicode data would have to live. Grapheme breaking needs tables that must not
-be in a kernel, and making the default element type the one that requires them would put a length at
-O(n) and force an opaque index type on every program that just wants a byte offset. Go's choice is
-right for a systems language; Swift's is right for an application language.
+The reason is where the Unicode data would have to live. Grapheme breaking needs tables that do not
+belong in a kernel, and making the element type one that requires them would make a length O(n) and
+force an opaque index type on every program that only needs a byte offset. Go's choice suits a
+systems language; Swift's suits an application language.
 
-**The tables are in the standard library, and that does not change the element type.**
+**The tables are in the standard library, and they do not change the element type.**
 [`sysl.unicode`](/library/unicode/#what-a-character-is) carries the whole Unicode Character Database and answers grapheme
-breaking, case mapping, folding and normalization over a byte view — which is the library built over
-the scalar view this section describes, and is why a `char` is still a scalar value and `s.len` is
-still bytes. A program links none of it unless it calls into it.
+breaking, case mapping, folding and normalization over a byte view. It is the library built over the
+scalar view this section describes, so a `char` remains a scalar value and `s.len` remains a count of
+bytes. A program links none of it unless it calls into it.
 
 | operation | spelling | cost |
 |---|---|---|
@@ -212,8 +209,8 @@ print(count, s.bytes.len)
 5 6
 ```
 
-Six bytes, five characters, and the `é` is the two bytes `195 169` sitting where one index used to be
-enough. That gap between the two counts is the whole of what this section is about.
+The string is six bytes and five characters: the `é` occupies the two bytes `195 169`, at indexes 1
+and 2.
 
 ### Indexing gives a byte, and there is no way to write one
 
@@ -227,7 +224,7 @@ s[0] = 65
 a string is immutable, so its bytes have no address to write through
 ```
 
-`s.bytes` does not open a way round it, and gets a diagnostic of its own that says why:
+Writing through `s.bytes` is refused too, with a diagnostic that says why:
 
 ```sysl
 var s = "hello"
@@ -239,8 +236,8 @@ s.bytes[0] = 65
 'bytes' views the string's own storage rather than a copy of it — so writing through one is writing the string
 ```
 
-The bytes are a `[]const u8`, which is the type that records exactly this, and the way out is the one
-that type always names: copy them into a `[]u8` of your own first.
+The bytes are a `[]const u8`, the type that records exactly this. To modify them, copy them into a
+`[]u8` of your own first.
 
 ### Slicing is boundary-checked
 
@@ -265,17 +262,16 @@ print(s[0..<2])
 
 Byte 2 is the second half of the `é`, so that program stops there — no message, no unwinding.
 
-Go permits the mid-character slice and lets you build an invalid string with it. That option is
-closed here by the validity guarantee, and it is closed for a string that arrived through `from_utf8`
-exactly as it is for a literal: validating at the door is worth nothing if something downstream may
-undo it.
+Go permits the mid-character slice and so lets a program build an invalid string. The validity
+guarantee rules that out here, for a string that arrived through `from_utf8` exactly as for a
+literal: validating input is only useful if nothing downstream can undo it.
 
 ### Walking the characters
 
-`s.chars` is a **cursor** — a value implementing `Iterate` with `char` for its `Item` — and it is the one row of the table
-above that could not be a value or a view. Every other row yields a value; this one yields a
-*sequence*, and the decoding is what makes the scalar values, so something has to carry a position
-and answer "the next one".
+`s.chars` is a **cursor** — a value implementing `Iterate` with `char` for its `Item` — and it is the
+one row of the table above that is not a value or a view. Every other row yields a value; this one
+yields a *sequence*, produced by decoding, so something has to carry a position and answer "the next
+one".
 
 The cursor validates nothing. A `string` is well-formed by construction, so the decoding reads the
 length off the lead byte and takes the continuation bytes as given — which is why the cost is O(1)
@@ -301,13 +297,13 @@ print(cur.offset, cur.peek().unwrap())
 1 é
 ```
 
-That shape is a lexer's, and it was underserved before those existed: a reader with only "the next
-one" indexes bytes by hand and decodes a second time to find out where it is.
+This is the shape a lexer needs: a reader with only "the next one" would have to index bytes by hand
+and decode a second time to find out where it is.
 
-**`char_indices` is the paired walk**, yielding each character with the offset of its **first** byte
-— Rust's name, for Rust's reason. That the offset is the first byte is what makes it directly usable:
-a slice built from two reported offsets lands on boundaries by construction, and since `s[a..b]`
-traps on a mid-character bound, that is a guarantee rather than a convention.
+**`char_indices` is the paired walk**, yielding each character with the offset of its **first** byte,
+under the name Rust uses for the same operation. Reporting the first byte makes the offset directly
+usable: a slice built from two reported offsets lands on boundaries by construction, and since
+`s[a..b]` traps on a mid-character bound, that is a guarantee rather than a convention.
 
 ```sysl
 import sysl.text.char_indices
@@ -327,13 +323,13 @@ for pair in char_indices(s.bytes)
 5 o
 ```
 
-The offsets go `0 1 3` rather than `0 1 2`, which is the two-byte `é` visible from the other side. It
-wraps a `Chars` rather than decoding for itself, so there is one decoder and the two cursors cannot
-come to disagree about a width.
+The offsets go `0 1 3` rather than `0 1 2` because the `é` is two bytes. `char_indices` wraps a
+`Chars` rather than decoding for itself, so there is one decoder and the two cursors cannot disagree
+about a width.
 
-**`is_char_boundary` is the same question about a single byte** — one mask and one comparison, since
-the continuation byte is the only one matching `10xxxxxx`. It is what a program walking backwards, or
-snapping an arbitrary offset onto a boundary, would otherwise write inline:
+**`is_char_boundary` asks the same question about a single byte** — one mask and one comparison,
+since a continuation byte is the only kind matching `10xxxxxx`. It serves a program walking
+backwards, or snapping an arbitrary offset onto a boundary:
 
 ```sysl
 import sysl.text.is_char_boundary
@@ -350,8 +346,8 @@ true false true
 
 ## Comparison is by bytes
 
-`==`, `<` and the rest compare the byte sequences. For well-formed UTF-8 that is also codepoint order,
-so the ordering is the useful one. A literal is also a pattern, matched by the same comparison:
+`==`, `<` and the rest compare the byte sequences. For well-formed UTF-8 that is also code point
+order. A literal is also a pattern, matched by the same comparison:
 
 ```sysl
 var s = "héllo"
@@ -372,7 +368,7 @@ true true true
 ```
 
 **Normalization is not applied.** Swift's `==` compares by canonical equivalence, so a composed `"é"`
-equals a decomposed one — correct for user-facing text, surprising and expensive in systems code,
+equals a decomposed one. That suits user-facing text but is surprising and expensive in systems code,
 where a string is usually a path, a device name, or a protocol token that must compare as the bytes
 it is. Normalization and collation are library operations, applied where they are wanted and visible
 when they cost something.
@@ -381,8 +377,8 @@ when they cost something.
 
 `a + b` joins two strings and `s += t` appends onto a slot. Both allocate: the result is a fresh
 buffer — an ordinary counted heap object — so it owns a count of its own and frees itself like any
-other reference. UTF-8 is closed under concatenation, so the validity invariant is preserved for free
-and nothing is re-checked. The operands are copied out rather than aliased, so an operand that was
+other reference. UTF-8 is closed under concatenation, so the result is valid without being
+re-checked. The operands are copied out rather than aliased, so an operand that was
 itself a substring keeps no hold on the result.
 
 ```sysl
@@ -410,11 +406,10 @@ print("n=" + n)
 '+' needs matching types, got string and int
 ```
 
-That is the same no-implicit-coercion stance the numeric operators take, where a mixed-width sum is
-an error asking for a conversion. The way to build a string out of values of other types is
-interpolation, where the conversion is written where it happens; making `+` polymorphic over
-"anything with a string form" would reintroduce exactly the invisible conversion the rest of the
-language refuses.
+Turning a number into text is not a lossless conversion, and the language inserts only lossless ones
+(§ [Which conversions are implicit](/reference/expressions/#which-conversions-are-implicit)). A
+string built from values of other types is written with interpolation, where the conversion is
+visible at the point it happens; a `+` that accepted "anything with a string form" would hide it.
 
 `+` is the only arithmetic operator a string defines. The rest are rejected as they are for any type
 that does not define them.
@@ -440,8 +435,8 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 | float | the rendering `print` gives it — the fewest digits that read back at its own width, positionally, as Rust's `{}` writes them |
 | `string` | itself, unchanged |
 
-Every case but a `string` allocates a fresh buffer; a `string` is returned as it is, and a `bool`
-renders to one of two immortal literals and allocates nothing. Every number is rendered without the
+A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
+allocates; every other case allocates a fresh buffer. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
 most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
 library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling at the float's width),
@@ -555,10 +550,10 @@ struct Square
 impl Area for Square
     area(self) -> int = self.side * self.side
 
-val z: *int = ptr_cast(usize(0))
-val p: *int = ptr_cast(usize(0x1000))
+val z: *int = ptr_cast(0)
+val p: *int = ptr_cast(0x1000)
 val a: *Area = &Square(3)
-val f: &Fn(int) -> int = (x: int) -> x + 1
+val f: &Fn(int) -> int = x -> x + 1
 
 print(z, p, a, f)
 ```
@@ -583,15 +578,15 @@ n is 7, 14 doubled, $5
 ```
 
 Each spliced value is rendered by `str`, so the same rules apply: a primitive renders, a type with a
-`Display` renders through it, and every other value through its `Debug`. The whole thing desugars to the machinery already
-built — `s"a${e}b"` is exactly `"a" + str(e) + "b"` — so an interpolation is not a new kind of value,
-just a concise way to write a concatenation. A hole holds a full expression, which may itself
+`Display` renders through it, and every other value through its `Debug`. The whole form desugars to
+operations already described — `s"a${e}b"` is exactly `"a" + str(e) + "b"` — so an interpolation is
+not a new kind of value, only a concise way to write a concatenation. A hole holds a full expression, which may itself
 interpolate, and an empty literal segment beside a hole is dropped, since it is the identity under
 `+`.
 
-This follows Scala's interpolators, and deliberately not a `printf`-style format string in the
-default form: the value and the text around it stay where they are read, and the conversion is `str`
-applied at the splice rather than a directive parsed out of a separate string.
+The form is like Scala's interpolators rather than a `printf`-style format string: the value and the
+text around it stay together where they are read, and the conversion is `str` applied at the splice
+rather than a directive parsed out of a separate string.
 
 ### Format specifiers
 
@@ -610,8 +605,8 @@ print(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")
 
 A hole with no specifier renders through `str` exactly as in an `s"…"` string. A specifier binds only
 to the `%` written immediately after a hole, so a bare `%` elsewhere in the text — `f"${n}%d done,
-100% sure"` — is ordinary text. Keeping the specifier beside its value is the point of putting it
-after the hole rather than in a separate format string.
+100% sure"` — is ordinary text. Writing the specifier after the hole keeps it beside the value it
+formats.
 
 **The conversion is checked against the value's type while compiling:**
 
@@ -726,8 +721,8 @@ print(debug(p), debug('c'), debug(Some("x")))
 Point(x: 1, y: 2) 'c' Some("x")
 ```
 
-`debug` yields to a function or a local of that name, as `embed` does, since it is an ordinary
-enough word to be somebody's own.
+`debug` yields to a function or a local of that name, as `embed` does, since it is a common word for
+a program to use for its own purposes.
 
 `s`, `raw` and `f` are only prefixes when written directly against the opening quote. Used as
 ordinary names they are unaffected, so `s + raw` and `f + 1` are ordinary expressions.
@@ -751,8 +746,8 @@ Where a `[N]u8` is expected, a literal of exactly `N` UTF-8 bytes is that array 
 ### Text blocks
 
 A literal that spans lines is written `"""` … `"""`. The content begins on the line **after** the
-opening delimiter, which is what gives the indentation rule an anchor: the opening delimiter's own
-column then means nothing, so the form reads the same at any depth of nesting.
+opening delimiter, so the opening delimiter's own column plays no part in the indentation rule and
+the form reads the same at any depth of nesting.
 
 ```sysl
 run() -> string
@@ -779,9 +774,9 @@ Three things happen to a line inside a block that do not happen inside `"…"`.
 **Its incidental indentation is dropped.** The strip is the least indented line that carries content,
 together with the line the closing delimiter sits on when it sits alone on one — so the closing
 delimiter is the control, and there is no margin character to remember. Move it left and the value
-keeps more; right and it keeps less. This matters more here than in a free-form language: a block
-written inside an indented body would otherwise carry that body's indentation in its value, and the
-depth a piece of code sits at is not something its data should record.
+keeps more indentation; move it right and it keeps less. This matters in an indentation-based
+language: a block written inside an indented body would otherwise carry that body's indentation in
+its value, and the depth at which code sits should not change its data.
 
 **Its trailing blanks are dropped**, because whitespace at the end of a line is invisible in a source
 file and would otherwise enter the value unseen. One that is *meant* is written `\u{20}`, which
@@ -789,8 +784,8 @@ survives because escapes are read after the trimming rather than before it. A ca
 with the rest of a line's trailing whitespace, so a block means the same thing in a file with either
 line ending.
 
-**A `\` at the end of a line joins it to the next**, which is the form's reason for existing:
-embedded data wants no line breaks in its value at all.
+**A `\` at the end of a line joins it to the next**, for embedded data that must have no line breaks
+in its value at all.
 
 ```sysl
 digest() -> string
@@ -812,8 +807,8 @@ with `+` allocates and copies once per piece.
 
 Whether the value ends with a newline needs no rule of its own: a closing delimiter alone on its line
 is reached *after* the last content line's break has been taken, and one that follows content is
-reached before any break at all. A lone `"` inside a block is ordinary text, which is the other thing
-the form buys; a block cannot end with one, and `\"` writes it.
+reached before any break at all. A lone `"` inside a block is ordinary text; a block cannot end with
+one, and `\"` writes it there.
 
 **The prefixes are orthogonal to the quote form.** `c"""`, `s"""`, `f"""` and `raw"""` all compose,
 since a prefix says how a literal is *read* and the quote form says how it was *written*. A `raw`
@@ -823,11 +818,10 @@ block does no escape decoding, so nothing joins its lines.
 
 Four operations produce a string that is not a substring of one already there.
 
-**`s.copy()`** stops a substring holding its parent alive. Slicing is O(1) and shares the buffer,
-which carries Go's hazard with it: a small substring keeps the *whole* parent buffer alive. Swift
-addresses that with a distinct `Substring` type you must explicitly copy out of; sysl does not add a
-type for it — the operation that copies out is named, and the hazard is documented rather than
-encoded.
+**`s.copy()`** stops a substring holding its parent alive. Slicing is O(1) and shares the buffer, so
+a small substring keeps the *whole* parent buffer alive, as in Go. Swift addresses that with a
+distinct `Substring` type that must be copied out of explicitly; sysl keeps one type and names the
+operation that copies out.
 
 ```sysl
 var big = "the quick brown fox"
@@ -873,16 +867,14 @@ n=42!
 
 **Every way in carries the guarantee.** A `push` takes a `string`, a `push_char` takes a `char`, and
 the four renderers take a number or a `bool` — UTF-8 is closed under appending any of them, so
-`finish` hands back a plain `string` rather than something a caller has to validate. That is why a
-builder is **not** a `Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with a
-longer name and none of its greppability.
+`finish` hands back a plain `string` rather than something a caller has to validate. For the same
+reason a builder is **not** a `Writer`: a public `write` taking a `[]u8` would be an unchecked
+conversion without the unsafe name that marks one.
 
-`push_int`, `push_uint`, `push_real` and `push_bool` exist so that gathering a number costs no
-allocation — `push(str(n))` builds a whole counted string, copies its bytes out, and drops it, for a
-value whose text is a couple of dozen bytes and is wanted only inside this buffer. They agree with
-`str` to the byte, which is the property that makes the cheap path a substitute rather than a second
-rendering: a program that builds half a line with a builder and half with an interpolation must not
-be able to tell which half a number came through.
+`push_int`, `push_uint`, `push_real` and `push_bool` let a number be appended with no allocation —
+`push(str(n))` builds a whole counted string, copies its bytes out and drops it, for text of a few
+dozen bytes that is needed only inside this buffer. They agree with `str` to the byte, so a line
+built partly with a builder and partly with an interpolation renders each number identically.
 
 `finish` **copies rather than lending**, so a builder may go on being appended to and the string
 already taken out of it does not change. The alternative — handing over the storage and leaving the
@@ -913,10 +905,10 @@ print(cs.len, strlen(cs.ptr))
 3 1
 ```
 
-**That disagreement is the whole reason the conversion is written rather than inferred.** For
-`cstring("a\u{0}b")`, `cs.len` is 3 and C's `strlen` is 1. Both are right, and neither can be made to
-be the other. The pointer carries a raw pointer's rule: valid while the `CString` is held, and
-keeping it past that is the ordinary raw-pointer mistake rather than a new one. Passing
+**That disagreement is why the conversion is written rather than inferred.** For
+`cstring("a\u{0}b")`, `cs.len` is 3 and C's `strlen` is 1. Both are correct, and neither can be made
+to equal the other. The pointer follows a raw pointer's rule: it is valid while the `CString` is
+held, and keeping it past that is the ordinary raw-pointer mistake. Passing
 `cstring(s).ptr` straight into a call is safe, since the temporary lives for the statement; storing
 that pointer and using it later is not.
 
@@ -935,10 +927,10 @@ print(strlen(c"hello"))
 5
 ```
 
-It is a distinct literal form rather than an inferred optimization, and deliberately: whether an
-expression is *literally a literal* is not something a reader should have to work out, and a rule
-that silently allocates for `s` but not for `"…"` hides a cost the language promises to show. It is
-Rust's `c"…"` and Zig's null-terminated literal, for the reason both added it.
+It is a distinct literal form rather than an inferred optimization: a reader should not have to work
+out whether an expression is a literal, and a rule that silently allocates for `s` but not for `"…"`
+would hide a cost the language otherwise shows. Rust's `c"…"` and Zig's null-terminated literals
+exist for the same reason.
 
 A `c"…"` containing an interior NUL is a compile error rather than a truncation:
 
@@ -952,9 +944,8 @@ print(strlen(c"a\u{0}b"))
 a C string ends at its first NUL, so it cannot contain one
 ```
 
-An ordinary `"a\u{0}b"` is unaffected — it has three bytes and prints as three, because carrying a
-length is the whole point — and only the free ride to C is lost, which is exactly where the
-diagnostic belongs.
+An ordinary `"a\u{0}b"` is unaffected — it carries its length, so it has three bytes and prints all
+three. Only the allocation-free route to C is refused, and the diagnostic is reported there.
 
 ## The allocator-free subset
 
@@ -980,15 +971,14 @@ print(tail, name.len, name[0], count, tail == "console", name < "/dev/null")
 console 12 47 12 true true
 ```
 
-**A module-level `val` may hold one, which is where a table of messages lives** — and here the point
-is not that it may but that it costs nothing: a literal allocates nothing, so the table is complete
-before the program starts and a module with `@no_alloc` may carry it
-([declarations](/reference/declarations/)):
+**A module-level `val` may hold one, which is where a table of messages lives**, and it costs
+nothing: a literal allocates nothing, so the table is complete before the program starts and a module
+with `@no_alloc` may carry it ([declarations](/reference/declarations/)):
 
 ```sysl
 @no_alloc
 
-val messages: [3]string = ["out of range", "not permitted", "no such device"]
+val messages = ["out of range", "not permitted", "no such device"]
 
 var i = 2
 
@@ -999,8 +989,8 @@ print(messages[i], messages[i].len, messages[0][0..<3])
 no such device 14 out
 ```
 
-A `const` could not have served that: a constant is folded into its uses and has no address, so
-there is nothing to index at `i`.
+A `const` would not serve here: a constant is folded into its uses and has no address, so there is
+nothing to index at `i`.
 
 Requiring an allocator: `from_utf8`, `copy()`, concatenation, `string(c)`, `str_builder()` and
 `cstring` — every operation that produces new bytes.
@@ -1018,8 +1008,8 @@ print(full)
 the string two strings join into needs an allocator, and this module declared '@no_alloc'
 ```
 
-The diagnostic finishes with the rule that makes the subset usable: such a module **may hold and
-release storage made elsewhere, and may make none of its own.** So a module that only ever uses
+The rule that makes the subset usable is that such a module **may hold and release storage made
+elsewhere, and may make none of its own.** So a module that only ever uses
 literals sees only immortal strings and its retain and release compile away entirely; one that is
 handed a heap-backed string pays ordinary refcount traffic and still links no allocator.
 
@@ -1033,9 +1023,9 @@ because the compiler names it by key rather than by resolving the word.
 Named at the call site, and so imported: `from_utf8`, `char_from_u32`, `str_builder`, `cstring`,
 `char_indices`, `is_char_boundary`, the `parse_*` family, the text operations `split`, `fields`,
 `join`, `repeat`, `replace_all`, `to_upper` and `to_lower`, the `Search` and `Ascii` traits, and the
-types `Utf8Error`, `ParseError`, `Chars`, `CharIndices`, `StrBuilder` and `CString`. The split is the
-one the [modules page](/reference/modules/) describes: what a program cannot avoid needing arrives
-free, and what it has to ask for it asks for.
+types `Utf8Error`, `ParseError`, `Chars`, `CharIndices`, `StrBuilder` and `CString`. This is the
+division the [modules page](/reference/modules/) describes: what every program needs is available
+without an import, and everything else is imported by name.
 
 ## Relationship to slices
 
