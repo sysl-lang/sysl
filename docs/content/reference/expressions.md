@@ -72,18 +72,38 @@ Both of those need parentheses in C, Rust and Zig. The payoff in systems code is
 
 ## Operands
 
-**Both operands of a binary operator have the same type.** There is no implicit promotion anywhere,
-so a mixed-width expression is a diagnostic asking for the conversion rather than a silent widening.
+**Both operands of a binary operator have the same type, and an operand converts only to the other
+operand's type.** Where one operand's type holds every value of the other's — `long` holds every
+`int`, `real` every `int` — the narrower one is widened to it, in either order, exactly as `long(a)`
+would have done (§ [Which conversions are implicit](#which-conversions-are-implicit)). Nothing is
+promoted to a third type: two `int`s add as `int` wherever the sum goes, so `val x: long = a + a`
+overflows at `int`'s width before the sum is widened.
 
 ```sysl
 var a: int = 1
 var b: long = 2
+var r: real = 0.5
 
-print(a + b)
+print(a + b, b - a, a + r)
+```
+
+```output
+3 1 1.5
+```
+
+**Where neither type holds the other, the expression is a diagnostic asking for the conversion.** A
+`u32` and an `int` are both 32 bits: neither holds every value of the other, so the program says which
+side it means.
+
+```sysl
+var n: u32 = 1
+var i: int = 2
+
+print(n + i)
 ```
 
 ```error
-'+' needs matching types, got int and long
+'+' needs matching types, got uint and int
 ```
 
 ### A shift takes a count
@@ -1018,8 +1038,10 @@ enum 'Colour' has no variant 'Rd'
 
 ## Conversions are calls
 
-Every conversion is written, with call syntax, and none is inferred — the visible-cost rule the
-memory model rests on applies to representation changes too.
+A conversion that can lose or change a value is written, with call syntax — the visible-cost rule the
+memory model rests on applies to representation changes too. One that cannot, where every value of
+the source type is exactly a value of the target, a position performs by itself (§ [Which
+conversions are implicit](#which-conversions-are-implicit)); writing it as a call is still allowed.
 
 | from → to | written | behaviour |
 |---|---|---|
@@ -1105,6 +1127,115 @@ table because it is where the language's guarantees stop.
 
 Because these are calls, they parse as postfix at level 13 rather than as an operator of their own.
 The name in front may be a **type parameter**, and then the row is chosen at the instantiation.
+
+### Which conversions are implicit
+
+**A value of type `S` converts to `T` without being written exactly when every value of `S` is
+exactly a value of `T`.** Nothing is rounded, truncated, saturated or reinterpreted, so there is no
+cost to make visible: the conversion is the one `T(x)` performs, done by the position.
+
+| from → to | implicit when | so |
+|---|---|---|
+| `uM` → `uN`, `iM` → `iN` | `N ≥ M` | `u8` → `u16`, `int` → `long` |
+| `uM` → `iN` | `N > M` | `u8` → `i16`, never `u32` → `int` |
+| `iM` → `uN` | never | a negative value has no unsigned twin |
+| `usize`, `isize` | as `uN`/`iN` at the target's address width | `u32` → `usize` on a 64- and a 32-bit target, not on Craft's 16; `usize` ↔ `isize` never |
+| `char` → integer | the integer holds `0x10FFFF` (`u21`+, `i22`+) | `char` → `u32`, `int`, `long`; integer → `char` is always written |
+| float → float | wider format | `f16`, `bf16` → `f32`, `f64`, `f128`; `f32` → `f64`; `f16` ↔ `bf16` never |
+| `uM` → float, `iM` → float | `M ≤ p` unsigned, `M ≤ p + 1` signed, `p` the significand (`f16` 11, `bf16` 8, `f32` 24, `f64` 53, `f128` 113) | `int` → `real`, `i16` → `f32`; `int` → `f32` never |
+| fixed → fixed, integer → fixed | no fraction bit and no integer bit is lost (an integer has no fraction; unsigned → signed needs one more integer bit; signed → unsigned never) | `q15` → `i32q16`, `i8` → `i16q8` |
+| fixed → float | the significand holds every bit and the format reaches `2^-F` | `q15` → `f32`, `q31` → `real`; `q31` → `f32` never |
+| float → integer or fixed, fixed → integer | never | each rounds |
+
+**Nothing converts through anything else**: `bool`, a pointer (`usize(p)` stays written), a slice, a
+reference, an `Option`, a tuple or a function type converts as itself or not at all, so a `[]u8` is not
+a `[]int` and a `byte` is not an `Option[int]`.
+
+**The positions that convert** are the ones that know the type they want: a `val` or `var` with a
+declared type, an assignment (a compound one converts the right side to the left's type, never the
+reverse), an argument (an `extern`'s too), a returned value, each element of a literal whose element
+type the context gives, and the branches of an `if` or a `match` used as a value, which meet at the
+wider of their types as two operands do.
+
+```sysl
+struct Sample
+    at: long
+    level: real
+
+peak(xs: []const long) -> long
+    var best: long = 0
+
+    for x in xs
+        if x > best then best = x
+
+    best
+end peak
+
+widen(b: byte) -> int = b
+
+var b: byte = 200
+var s: i8 = -1
+var n: int = b
+var total: long = s
+
+total += n
+
+val wide: [3]long = [n, b, s]
+val one = Sample(n, n)
+
+print(n, total, widen(b), peak(wide[..]), one.at, one.level, if n > 0 then b else n)
+```
+
+```output
+200 199 200 200 200 200 200
+```
+
+**A type parameter is never decided by a conversion.** A call solves it from the arguments' own types,
+exactly, and only a parameter it has already fixed is widened to — so `max(a, b)` over an `int` and a
+`long` is refused in either order, and `max[long](a, b)` is how to say which.
+
+```sysl
+import sysl.math.max
+
+var a: int = 1
+var b: long = 2
+
+print(max(a, b))
+```
+
+```error
+'b' of 'sysl.math.max' is int, but long was given
+```
+
+**Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
+the candidate each of whose parameters converts to the other's. Where neither is narrower at every
+position, the call is ambiguous.
+
+```sysl
+f(x: int) -> string = "int"
+f(x: long) -> string = "long"
+
+var b: byte = 1
+var l: long = 1
+
+print(f(b), f(l))
+```
+
+```output
+int long
+```
+
+**What can lose a value is still a diagnostic**, with the same message as before: a narrowing, a sign
+change, a float read as an integer.
+
+```sysl
+var l: long = 5
+var n: int = l
+```
+
+```error
+cannot initialize 'n': declared int but the value is long
+```
 
 ## `sizeof`, `alignof` and `offsetof`
 

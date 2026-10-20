@@ -113,7 +113,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         wants.push(want)
 
         slots.at(i) match
-            Some(e) -> ts.push(argument_at(cx, decl, i, e, want))
+            Some(e) -> ts.push(argument_at(cx, decl, i, e, want, buf()))
             None ->
                 val inner = default_reader(cx, span, f.scope, name, decl.bounds)
 
@@ -481,7 +481,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     t = prov.kept.at(i).unwrap()
 
                     if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
-                else t = argument_at(cx, decl, i, e, want)
+                else t = argument_at(cx, decl, i, e, want, not_bound(decl.tparams, known))
 
                 ts.push(t)
             // A default that was read while the solve was settling is the node the program gets:
@@ -572,10 +572,18 @@ end not_bound
 // convert -- it *is* the type its position gives it. So it is read against the parameter it turned
 // out to have. A written-out array standing where a slice was asked for is the other: by the time
 // there is an array to coerce, the storage has been made as one.
-private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type) -> TExpr
+//
+// **A conversion never decides a type parameter**: an argument at a parameter that names one the
+// solve worked out (`solved`) is held to the type it was solved at exactly, so `max(n, l)` over an
+// `int` and a `long` is refused in either order. One whose parameters were all written out, or that
+// names none, widens as any argument does.
+private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type,
+                    solved: Buf[string]) -> TExpr
+    val widen = i >= decl.params.len() || !ref_mentions(decl.params.at(i).typ, solved)
+
     if i >= decl.params.len() || !ref_mentions(decl.params.at(i).typ, decl.tparams) ||
             is_literal(e) then
-        return type_expr(cx, e, Some(want))
+        return typed_widening(cx, e, want, widen)
 
     // **The bare reading is a probe, so what it could not answer is not a complaint.** A form with
     // no type of its own -- a nullary variant of a generic enum, `None` standing at a `T` the solve
@@ -587,7 +595,7 @@ private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type
 
     if refused_since(cx, tried)
         discard_trial(cx, tried)
-        return type_expr(cx, e, Some(want))
+        return typed_widening(cx, e, want, widen)
 
     keep_trial(cx)
 
@@ -599,10 +607,13 @@ private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type
 
     // What the position could not repair is read again against the parameter, and kept only where
     // that answers -- otherwise the first reading is what the complaint should name.
-    val again = type_expr(cx, e, Some(want))
+    val again = typed_widening(cx, e, want, widen)
 
     if disagree(texpr_type(again), want) then fitted else again
 end argument_at
+
+private typed_widening(cx: &Analyzer, e: Expr, want: Type, widen: bool) -> TExpr =
+    if widen then type_expr(cx, e, Some(want)) else type_expr_unwidened(cx, e, Some(want))
 
 // **An argument the solve could not read is read once more, for real, so that what it could not
 // answer is said.** The provisional reading is sandboxed, so a `null` or a `None` at a parameter
