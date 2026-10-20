@@ -17,12 +17,38 @@ where it lives.
 |---|---|---|---|
 | `var name = v` | yes | optional — a `var` may be declared and assigned later | optional |
 | `val name = v` | no, written once | **required** | optional |
-| `const Name: T = v` | no, and known while compiling | required | **required** |
+| `const Name = v` | no, and known while compiling | required | optional |
 
-The type is mandatory on a `const` and optional on a `val`, and that arrangement is deliberate in
-both directions. A `const` states an interface — its value is substituted where it is used, so what
-that value *is* matters less than what it is a value **of**. A `val` has its type readable off the
-value it was given, and a `val` with no value is not a declaration of anything.
+**A `const` takes its type exactly as a `val` does**: left off, the type is the value's own —
+`const Step = 2` is an `int`, `const Greeting = "hello"` a `string`, `const Area = sq(3)` whatever
+`sq` answers. Written, `const Name: T = v`, the type governs: the value is read at `T`, and refused
+where `T` does not hold it. A `val` or a `const` with no value is not a declaration of anything.
+
+```sysl
+const Step = 2
+const Greeting = "hello"
+const Half: real = 1
+
+sq(x: int) -> int = x * x
+
+const Area = sq(Step + 1)
+
+var cells: [Area]u8
+
+print(Step * 10, Greeting, Half / 4, Area, cells.len)
+```
+
+```output
+20 hello 0.25 9 9
+```
+
+```sysl
+const Limit: u8 = 300
+```
+
+```error
+'Limit' does not fit byte: 300
+```
 
 ### A `const` inside a body
 
@@ -39,7 +65,7 @@ twice[const N: usize]() -> usize
     D + 1
 
 main()
-    const L: int = sq(6)
+    const L = sq(6)
     var a: [L]int
 
     print(L, a.len, twice[4](), twice[L]())

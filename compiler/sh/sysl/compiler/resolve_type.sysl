@@ -2656,9 +2656,17 @@ check_const_admits(a: &Analysis)
         val v = a.tables.consts.at(i)
         val key = a.tables.consts.key_at(i)
 
-        if v.typ.is_none() || v.init.is_none() then continue
+        if v.init.is_none() then continue
 
-        val t = resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+        // A type left off is the value's own, read as a use of the constant reads it.
+        val t = if v.typ.is_some() then resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+        else
+            a.consts_in_progress.push(key)
+
+            val own = const_type(analyzer_for(a, v.scope), v)
+
+            a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+            own
 
         if const_type_refused(a, v, t) then continue
 
@@ -2702,9 +2710,11 @@ end check_const_admits
 // Whether a constant's declared type is one it may not be, said where it is. A struct, an enum and a
 // `where` predicate are told at the declaration by `check_const_named`, and are only passed over here.
 private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
-    val named = *v.typ.unwrap().kind match
-        NamedType(_, _) -> true
-        _ -> false
+    val named = v.typ match
+        Some(w) -> *w.kind match
+            NamedType(_, _) -> true
+            _ -> false
+        None -> false
 
     val scalar = t match
         Integer(_, _, _) -> true
@@ -2756,6 +2766,7 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
     val kind_fits = value match
         ConstInt(_) -> t match
             Integer(_, _, _) -> true
+            Floating(_, _) -> true
             _ -> false
         ConstFloat(_) -> t match
             Floating(_, _) -> true
@@ -2791,6 +2802,12 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
             Integer(bits, signed, _) ->
                 if !fits(n, bits, signed)
                     a.fault(v.scope, at, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
+                    return false
+                end if
+            // A whole number is a float constant's value where the float holds it exactly.
+            Floating(_, _) ->
+                if !exactly_float(n, t)
+                    a.fault(v.scope, at, s"'${v.name}' is not exactly ${float_named(t)}: ${to_string(n)}")
                     return false
                 end if
             _ -> ()

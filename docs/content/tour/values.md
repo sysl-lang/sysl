@@ -23,8 +23,8 @@ count: 5 of 10
 
 `var` and `val` are the pair most languages have. `const` is different: it is not a variable that
 cannot change, but a value the compiler substitutes wherever the name appears, so there is nothing to
-read at run time. For that reason a `const` must state its type and give a value; the compiler does
-not infer either.
+read at run time. A `const` must give a value, and its type, where it is left off, is the value's
+own: `const steps = 3` is an `int`.
 
 `limit` states its type because these statements are at **module level**, which is the first place
 the top of a file behaves differently from the inside of a function. A module-level `val` is part of

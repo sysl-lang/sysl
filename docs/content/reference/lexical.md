@@ -694,6 +694,36 @@ An unsuffixed literal adopts the type its context expects, provided the value fi
 makes `42` a `u8`, and `var x: u8 = 300` is a compile error. This is not a conversion: the literal
 *is* that type.
 
+**A float type is such a context too.** Where a position expects `f16`, `bf16`, `f32`, `real` or
+`f128` — an initializer, an assignment, an argument, a return, an element, or the other side of an
+operator from a float operand — an unsuffixed integer literal is that float, provided the float holds
+its value exactly:
+
+```sysl
+val r: real = 2
+val h: f32 = 0.75
+
+print(r / 4, 3 * h, h + 1, r < 3)
+```
+
+```output
+0.5 2.25 1.75 true
+```
+
+A value the format would round is refused, as a value too wide for an integer type is, since the
+number written is what the program means:
+
+```sysl
+val r: real = 9007199254740993
+```
+
+```error
+the literal 9007199254740993 is not exactly a real
+```
+
+A suffixed literal has said what it is: `2i32` is an `i32`, which a `real` takes by the ordinary
+widening rule, and `2i64` is a `long`, which it does not.
+
 ### Floating point
 
 A literal containing a `.` with a digit on each side, or an exponent, is floating point. Its default
@@ -713,6 +743,20 @@ print(f1, f2, f3)
 
 A float prints in the shortest form that round-trips, so `2.5e3` prints as `2500`, without a `.0`.
 Binary and octal have no floating-point form.
+
+A float written as a whole number needs no `.0` where its type is known: [an integer literal is the
+float its position expects](#integers), at any width that holds it exactly.
+
+```sysl
+val one: f16 = 1
+val big: f32 = 16777216
+
+print(one / 4, big)
+```
+
+```output
+0.25 16777216
+```
 
 **A hexadecimal float follows C99**: a hex significand, an optional `.` and hex fraction, and a `p`
 exponent — a power of **two**, written in decimal. The `p` is required (hex digits include letters, so

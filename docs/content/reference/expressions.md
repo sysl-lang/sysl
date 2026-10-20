@@ -1265,6 +1265,37 @@ print(q / 2.0)
 '/' needs matching types, got long and real
 ```
 
+**An integer literal is the float a position or a float operand asks for**, where the float holds its
+value exactly ([Literals § Integers](/reference/lexical/#integers)): the literal is that float, so nothing is
+converted. `r / 2` over a `real` divides by two reals, `h + 1` over an `f32` stays an `f32`, and
+`half(7)` passes a `real` seven. A literal the float would round — `h + 16777217` over an `f32` — is
+refused, and a suffixed literal is an integer value that converts only as the table says.
+
+```sysl
+half(x: real) -> real = x / 2
+
+var r: real = 3
+var h: f32 = 1.5
+
+r = 2 * r
+
+print(r, half(7), h + 1, h < 2)
+```
+
+```output
+6 3.5 2.5 true
+```
+
+```sysl
+var h: f32 = 1.5
+
+print(h + 16777217)
+```
+
+```error
+the literal 16777217 is not exactly an f32
+```
+
 **A type parameter is never decided by a conversion.** A call solves it from the arguments' own types,
 exactly, and only a parameter it has already fixed is widened to — so `max(a, b)` over an `int` and a
 `long` is refused in either order, and `max[long](a, b)` is how to say which.

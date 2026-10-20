@@ -965,17 +965,17 @@ print(u32(i))
 the literal 4294967296 does not fit uint
 ```
 
-A literal the base would not take is no more the `new` type's than the base's: `3` is not a `real`,
-so it is not a `Phase` over one either.
+A literal the base would not take is no more the `new` type's than the base's: `2^53 + 1` is not
+exactly a `real`, so it is not a `Phase` over one either.
 
 ```sysl
 type Phase = new real
 
-val p: Phase = 3
+val p: Phase = 9007199254740993
 ```
 
 ```error
-cannot initialize 'p': declared Phase but the value is int
+the literal 9007199254740993 is not exactly a real
 ```
 
 #### A `new` type's name converts from whatever its base's name converts from

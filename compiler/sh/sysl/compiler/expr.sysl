@@ -819,9 +819,15 @@ private loop_from(round: Buf[string], start: usize) -> string
     s"$out \u{2192} ${module_show(round.at(start))}"
 end loop_from
 
+// The type a constant is: the one it was written at, or else its value's own, read in the
+// declaration's terms -- `const step = 2` is an `int` exactly as `val step = 2` is.
+const_type(cx: &Analyzer, d: ValueDecl) -> Type =
+    if d.typ.is_some() || d.init.is_none() then value_type(cx, d)
+    else texpr_type(type_expr(analyzer_for(cx.an, d.scope), d.init.unwrap(), None))
+
 private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     val d = a_consts(cx).get(key).unwrap()
-    val ty = value_type(cx, d)
+    val ty = const_type(cx, d)
 
     if d.init.is_none() then return TExpr(span, TZero(ty))
 
@@ -869,9 +875,12 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     TExpr(span, *folded.kind)
 end const_value_expr
 
-// A settled value as the literal a use of the name reads, where there is a literal form for it.
+// A settled value as the literal a use of the name reads, where there is a literal form for it. An
+// integer folded for a float constant has none: its initializer read at the float is the value.
 private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
-    ConstInt(n) -> Some(TExpr(span, TIntLit(n, ty)))
+    ConstInt(n) -> underlying(ty) match
+        Floating(_, _) -> None
+        _ -> Some(TExpr(span, TIntLit(n, ty)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstChar(c) -> Some(TExpr(span, TIntLit(from_int(long(u32(c))), ty)))

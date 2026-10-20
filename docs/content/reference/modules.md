@@ -1657,7 +1657,7 @@ the ordinary rules, and never running at all. One written inside a body is that 
 
 ```sysl
 const capacity: usize = 512
-const window: int = 1 << 15
+const window = 1 << 15
 
 type Slot = usize within 0..<capacity
 
@@ -1674,10 +1674,9 @@ print(table.len, window, capacity)
 bound is a compile-time constant and a call is not. Without `const`, a program carries `[512]u8` next
 to a `capacity()` function and a comment asking the reader to keep the two in step.
 
-**The type is always written** — not because it could not be inferred from the initializer, but
-because the rule that anything visible outside its file states its types is what keeps interface
-extraction parse-only. Writing it is also what fixes the literal's type, so `const capacity: usize =
-512` needs no suffix on the `512`.
+**The type may be left to the value**, as a [binding's](/reference/declarations/#bindings) may:
+`const window = 1 << 15` is an `int`. Written, it fixes the literal's type, so `const capacity: usize
+= 512` needs no suffix on the `512`.
 
 **And the type is a scalar, or a transparent subtype of one.** The first half is the shape of what a
 constant expression can produce rather than a restriction anybody chose — there is no aggregate

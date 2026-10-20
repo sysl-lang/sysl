@@ -1062,21 +1062,25 @@ at `int` is `0` and `pow(2u8, 9)` is `0`, both arrived at honestly — the doubl
 The implementation is repeated squaring, so the exponent costs a logarithmic number of multiplies
 rather than a linear one.
 
-**This one is the integers'.** Its bound admits a `real`, and the body does not:
+**Its bound admits a float, and so does its body**: the `1` it starts from is read at the float, as
+an integer literal is wherever a float is wanted, so a float raised to a whole power is the same
+repeated squaring:
 
 ```sysl
 import sysl.math.pow
 
 print(pow(2.0, 10u32))
+print(pow(1.5f32, 2u32))
 ```
 
-```error
-cannot initialize 'acc': declared real but the value is int
+```output
+1024
+2.25
 ```
 
-A float raises through [`Float`](#float)'s own member — `2.0.pow(10.0)` — which takes its exponent as
-a `Self` rather than a count, because a float exponent is a meaningful thing to have and an integer
-one is not the same operation.
+A float exponent goes through [`Float`](#float)'s own member — `2.0.pow(10.0)` — which takes it as a
+`Self` rather than a count, because a float exponent is a meaningful thing to have and a count is not
+the same operation.
 
 ### Checked and overflowing arithmetic
 
