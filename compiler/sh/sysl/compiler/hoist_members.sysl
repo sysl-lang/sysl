@@ -506,6 +506,12 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
         // Declared here, though: the copy is this block's member, whichever module wrote its body.
         a.tables.members.decl_owner.put(fd.name, home.scope.module_name)
         a.tables.members.decl_spans.put(fd.name, method_anchor(m))
+
+        // A result left to the body is filed before anything asks for it -- the trait's, where the
+        // member supplies one (`conformance.sysl`), and otherwise read off the body once every
+        // declaration is in.
+        note_result_site(a, fd.name, s"${home.label}.$written", written_in, method_anchor(m), fd, true,
+                         held_trait_result(a, member_key_of(home.key, m.name)))
         lowered.push(fd)
         check_pack_spellings(a, written_in, m.span, fd.tparams, fd.tpacks, fd.tvalues, fd.params,
                              fd.ret_type)
@@ -552,7 +558,8 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
             // finds it and says nothing more, the signature's complaint being the one there is, and
             // a body read against a result nobody could name would only add a second complaint
             // about the same mistake.
-            var resolved = !mentions_unknown(ret)
+            // A result read off the body is not known yet, and is filed in once it is.
+            var resolved = !mentions_unknown(ret) || is_inferred_result(fd.ret_type)
 
             for j in 0..<params.len()
                 if mentions_unknown(params.at(j).1) then resolved = false

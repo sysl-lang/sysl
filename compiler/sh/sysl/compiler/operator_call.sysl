@@ -49,8 +49,11 @@ private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, 
                        recv: TExpr, written: Option[Expr]) -> Option[TExpr]
     val tr_name = library_key(spelling)
     val recv_ty = texpr_type(recv)
-    val rhs = if operand.is_some() then Some(widened_operand(cx.an, op, recv_ty, operand.unwrap(), written))
+    val rhs = if operand.is_some() then Some(widened_operand(cx, span, op, recv_ty, operand.unwrap(), written))
     else None
+
+    if rhs.is_some() && operand_refused(operand.unwrap(), rhs.unwrap()) then return Some(bad_expr(span))
+
     var rhs_ty: Option[Type] = None
 
     if rhs.is_some() then rhs_ty = Some(texpr_type(rhs.unwrap()))
@@ -459,19 +462,23 @@ end agreed_operand
 // The right-hand operand of a dispatched operator, converted to the right-hand type of the
 // implementation it reaches by widening (`reference/expressions.md § Operator dispatch`).
 //
-// `a * b` is `Mul::mul(a, b)`, so the operand is an argument and selects the way an argument does: an
-// implementation written at its own type is meant where there is one, and otherwise the one whose
-// right-hand type is the narrowest the operand widens to. Where none is reached, or two are and
-// neither is the narrower, the operand is handed back as it came, for the dispatch to diagnose. A
-// scalar's own operator is not dispatched, and its operand keeps the scalar rule: it widens only to
-// the other operand's type.
+// `a * b` is `Mul::mul(a, b)`, so the operand is an argument and selects the way an argument does,
+// by the one rule a method call's argument is chosen by (`expr_call.sysl`'s `narrowed_at`): an
+// implementation written at its own type is meant where there is one; otherwise, among those it
+// reaches by widening, a bare integer literal prefers the narrowest signed integer at least as wide as
+// `int`, a typed operand the narrowest right-hand type, and a literal failing both the implementation
+// at its default type (`literal_default_at`). Where none is reached the operand is handed back as it
+// came, for the dispatch to diagnose. **Where several are reached and the rule leaves more than one,
+// the operator is refused as `x.mul(n)` is** -- `isize` and `i64` each widen to the other on a 64-bit
+// target, so an `int` reaching both says nothing about which is meant -- and the answer is an
+// `Unknown` operand, which the caller reads as already diagnosed. A scalar's own operator is not
+// dispatched, and its operand keeps the scalar rule: it widens only to the other operand's type.
 //
-// `written` is the operand as the source wrote it, where there is one. **A bare literal reached by
-// two widenings neither narrower than the other settles as an argument does** (`expr_call.sysl`'s
-// `narrowed_at`), so `x * 2` means what `x.mul(2)` means: an integer literal prefers the narrowest
-// signed integer at least as wide as `int`, and failing that the implementation at the literal's
-// default type (`literal_default_at`) is meant.
-widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr, written: Option[Expr]) -> TExpr
+// `written` is the operand as the source wrote it, where there is one; an operand read out of a
+// carrier has none, and is not a literal.
+widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
+                written: Option[Expr]) -> TExpr
+    val a = cx.an
     val spelling = core_infix(op)
 
     if spelling.is_none() || core_builtin(spelling.unwrap(), subject) then return t
@@ -499,56 +506,45 @@ widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr, written: Opti
             if !seen then reached.push(h)
         end if
 
-    for h in reached
-        var narrowest = true
+    if reached.is_empty() then return t
+    if reached.len() == 1 then return widened(t, Some(reached.at(0)))
 
-        for o in reached
-            if !type_eq(h, o) && !implicitly_widens(h, o) then narrowest = false
-
-        if narrowest then return widened(t, Some(h))
-
-    if written.is_none() || literal_default(written.unwrap()).is_none() then return t
-
-    val signed = narrowest_signed_head(reached, got)
-
-    if signed.is_some() then return widened(t, signed)
-
-    var defaulted: Buf[Type] = buf()
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
 
     for h in reached
-        if type_eq(h, literal_default_at(written.unwrap(), h)) then defaulted.push(h)
+        var one: Buf[Type] = buf()
 
-    if defaulted.len() == 1 then widened(t, Some(defaulted.at(0))) else t
+        one.push(h)
+        declared.push(1)
+        generic.push(false)
+        fitted.push(one)
+
+    var args: Buf[Expr] = buf()
+    var natural: Buf[Option[Type]] = buf()
+
+    args.push(written.unwrap_or(expr(t.span, Ident(""))))
+    natural.push(Some(got))
+
+    val chosen = narrowed_at(declared, generic, fitted, args, natural)
+
+    if chosen.len() == 1 then return widened(t, Some(reached.at(chosen.at(0))))
+
+    var shown: Buf[string] = buf()
+
+    for h in reached
+        shown.push(s"'${show_bound(a, op_bound(a, cx.scope, tr_name, subject, Some(h)), subject)}'")
+
+    cx.fault(span, s"'$op' between ${type_show(subject)} and ${type_show(got)} comes from " +
+             s"${quantity(reached.len(), "implementation")} of one trait on ${type_show(subject)}, " +
+             s"and the operands do not say which was meant — it implements ${conjoin(shown)}")
+    bad_expr(t.span)
 end widened_operand
 
-// Among the right-hand types an integer literal's operand reaches, the narrowest signed integer at
-// least as wide as `int`, where exactly one is narrowest -- the literal's preference for the signed
-// widening that a call's arguments have too.
-private narrowest_signed_head(reached: Buf[Type], got: Type) -> Option[Type]
-    if signed_width(got) == 0 then return None
-
-    var least: Option[Type] = None
-    var count = 0
-
-    for h in reached
-        val bits = signed_width(h)
-
-        if bits < 32 then continue
-
-        if least.is_none() || bits < signed_width(least.unwrap())
-            least = Some(h)
-            count = 1
-        else if bits == signed_width(least.unwrap())
-            count += 1
-        end if
-
-    if count == 1 then least else None
-end narrowest_signed_head
-
-// The width of a signed integer type, and 0 for anything else.
-private signed_width(t: Type) -> int = t match
-    Integer(bits, true, _) -> bits
-    _ -> 0
+// Whether `widened_operand` refused the operand it was handed, which leaves nothing to dispatch.
+operand_refused(given: TExpr, answered: TExpr) -> bool =
+    texpr_type(answered) == Unknown && texpr_type(given) != Unknown
 
 // The right-hand operand of a binary operator, re-read where the left operand's own implementation
 // names a right-hand type the literal did not take.

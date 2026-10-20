@@ -1838,12 +1838,12 @@ from* — never the rule:
 written at `b`'s own type is meant where there is one; otherwise `b` takes an
 [implicit conversion](#which-conversions-are-implicit) to the narrowest right-hand type among the
 implementations it widens to, so `c * n` over `impl Mul[real] for Complex` takes an `int` `n` exactly
-as `c.mul(n)` does, and `c *= n` does the same. Two it widens to, neither of which holds the other,
-leave the operator refused — unless `b` is a bare literal, which settles as a literal argument does
+as `c.mul(n)` does, and `c *= n` does the same. A bare literal settles as a literal argument does
 ([Overloading](/reference/declarations/#overloading)): an integer literal prefers the narrowest signed
 integer at least as wide as `int`, and otherwise the implementation at the literal's default type is
-meant. A built-in scalar's operator has nothing to choose among, and its
-operands keep their own rule: an operand widens only to the other operand's type.
+meant. Where that leaves more than one, the operator is refused exactly as `a.m(b)` is. A built-in
+scalar's operator has nothing to choose among, and its operands keep their own rule: an operand
+widens only to the other operand's type.
 
 ```sysl
 struct Complex
@@ -1863,6 +1863,30 @@ print(c.re, c.im)
 
 ```output
 13.5 -18
+```
+
+Two implementations neither of which is the narrower leave the operand saying nothing about which is
+meant. On a 64-bit target `isize` and `i64` each widen to the other, so an `int` reaches both
+equally, and `s * n`, `s *= n` and `s.mul(n)` are all refused; an operand at either type exactly
+still means that one:
+
+```sysl
+struct Scale
+    k: int
+
+impl Mul[isize, string] for Scale
+    mul(self, n: isize) -> string = "isize"
+
+impl Mul[i64, string] for Scale
+    mul(self, n: i64) -> string = "i64"
+
+val n = 2
+
+print(Scale(1) * n)
+```
+
+```error
+'*' between Scale and int comes from 2 implementations of one trait on Scale, and the operands do not say which was meant
 ```
 
 | trait | method | operator |
