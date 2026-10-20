@@ -1,0 +1,290 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **String `==` asks whether the bytes are the same, not how they order** (`str_runtime.sysl`'s
+// `str_eq_text`): different lengths answer at once, one pointer and length answers at once, and the
+// rest is compared a word at a time with an overlapping last word. Every branch of that -- under four
+// bytes, four to seven, a whole word, a word and a remainder, many words -- is run here against a
+// difference at every position, on the host and on every QEMU board, where the micro:bit's Cortex-M0
+// has no unaligned access at all.
+
+private seq_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end seq_ready
+
+// What a program PRINTS.
+private seq_ran(text: string) -> string
+    val root = make_temp_dir("sysl-seq").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end seq_ran
+
+// The LLVM text a program lowers to.
+private seq_ir(text: string) -> string
+    val root = make_temp_dir("sysl-seq-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end seq_ir
+
+// The two comparisons as calls the optimizer keeps, so every answer below is the runtime's own.
+private val SeqCalls: string = raw"""
+@noinline
+same(a: string, b: string) -> bool = a == b
+
+@noinline
+differ(a: string, b: string) -> bool = a != b
+
+"""
+
+// Every length to forty, each against an equal string in its own buffer, itself, a string with one
+// byte changed at every position, its prefix one shorter and itself one longer. `bad` counts answers
+// that are wrong; `asked` counts the questions, so a loop that ran nothing cannot pass.
+private val SeqSweep: string = raw"""
+digits(n: int) -> string
+    var s = ""
+
+    for i in 0..<n do s = s + str(i % 10)
+
+    s
+
+var bad = 0
+var asked = 0
+
+for n in 0..<41
+    val a = digits(n)
+    val twin = digits(n)
+
+    asked += 3
+    if !same(a, twin) || differ(a, twin) then bad += 1
+    if !same(a, a) || differ(a, a) then bad += 1
+    if same(a, a + "z") || !differ(a + "z", a) then bad += 1
+
+    if n > 0
+        asked += 1
+        if same(a[0..<(n - 1)], a) || !differ(a, a[0..<(n - 1)]) then bad += 1
+    end if
+
+    for k in 0..<n
+        val changed = a[0..<k] + "#" + a[(k + 1)..<n]
+
+        asked += 1
+        if same(a, changed) || !differ(changed, a) then bad += 1
+    end for
+end for
+"""
+
+// The same questions with no allocation, for a board whose arena is two kilobytes and never given
+// back: every string is a window onto one of two literals. `T` is the alphabet twice, so a window and
+// the one 26 bytes on hold the same bytes from different addresses -- at every alignment, since the
+// start moves a byte at a time; `U` is `T` with byte 13 changed, so a window over it differs from
+// `T`'s exactly when it covers 13. Every length to 26 at every start, each against its twin, against
+// `U`, and against one byte more.
+private val SeqWindows: string = raw"""
+val T = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+val U = "abcdefghijklm#opqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+
+var wrong = 0
+var windows = 0
+
+for n in 0..<27
+    for s in 0..<(27 - n)
+        val a = T[(s + 26)..<(s + 26 + n)]
+        val b = T[s..<(s + n)]
+        val c = U[s..<(s + n)]
+        val covers = s <= 13 && 13 < s + n
+
+        windows += 1
+        if !same(a, b) || differ(b, a) then wrong += 1
+        if same(a, c) != !covers || differ(c, a) != covers then wrong += 1
+        if same(b, T[s..<(s + n + 1)]) || !differ(T[s..<(s + n + 1)], b) then wrong += 1
+    end for
+end for
+"""
+
+@test("equal, one byte changed at every position, a prefix and a longer string, at every length to forty")
+seq_every_length_and_every_position()
+    if !seq_ready() then return
+
+    val said = seq_ran(SeqCalls + SeqSweep + SeqWindows + "print(bad, asked, wrong, windows)\n")
+
+    // 41 lengths x 3, 40 prefixes, and 0 + 1 + ... + 40 changed positions; then 27 + 26 + ... + 1
+    // windows.
+    assert(said == "0 983 0 378\n", said)
+end seq_every_length_and_every_position
+
+@test("the named cases: a slice against a literal, empties, NUL bytes and bytes past 0x7f")
+seq_the_named_cases()
+    if !seq_ready() then return
+
+    val said = seq_ran(SeqCalls + raw"""
+print(same("abcdef"[0..<3], "abc"), same("abcdef"[3..<6], "def"), same("abcdef"[0..<3], "abd"))
+print(same("", ""), same("", "a"), same("a", ""), differ("", ""), differ("", "a"))
+print(same("a\u{0}b", "a\u{0}b"), same("a\u{0}b", "a\u{0}c"), same("\u{0}", ""), differ("a\u{0}", "a"))
+print(same("ÿé", "ÿé"), same("ÿé", "ÿè"), same("日本語のテキスト", "日本語のテキスト"), differ("é", "e"))
+print(same("abcdefgh", "abcdefgh"), same("abcdefgh", "abcdefgX"), same("Xbcdefgh", "abcdefgh"))
+""")
+
+    assert(said == "true true false\n" +
+                   "true false false false true\n" +
+                   "true false false true\n" +
+                   "true false true true\n" +
+                   "true false false\n", said)
+end seq_the_named_cases
+
+@test("a string match, a derived Eq over a string field and a map keyed by strings answer by the bytes")
+seq_match_derived_eq_and_map()
+    if !seq_ready() then return
+
+    val said = seq_ran(raw"""
+import sysl.container.{Map, map}
+
+struct Named derives Eq
+    name: string
+    n: int
+
+kind(s: string) -> int = s match
+    "alpha" -> 1
+    "alphabet" -> 2
+    "" -> 3
+    "\u{0}" -> 4
+    else 0
+
+val built = "alp" + "ha"
+
+print(kind(built), kind(built + "bet"), kind(""), kind("\u{0}"), kind("alph"), kind("alphA"))
+print(Named(built, 1) == Named("alpha", 1), Named(built, 1) == Named("alphb", 1), Named(built, 1) != Named("alpha", 2))
+
+var m: Map[string, int] = map()
+
+m.put("an identifier that runs past a word", 1)
+m.put("an identifier that runs past a wore", 2)
+m.put(built, 3)
+
+print(m.get("an identifier that runs past a " + "word").unwrap_or(-1), m.get("an identifier that runs past a wore").unwrap_or(-1),
+      m.get("alpha").unwrap_or(-1), m.get("alphb").unwrap_or(-1), m.get("").unwrap_or(-1))
+""")
+
+    assert(said == "1 2 3 4 0 0\ntrue false true\n1 2 3 -1 -1\n", said)
+end seq_match_derived_eq_and_map
+
+@test("equality is one call answering yes or no, and only an ordering asks for -1 / 0 / 1")
+seq_equality_is_its_own_call()
+    if !seq_ready() then return
+
+    val eq = seq_ir(SeqCalls + "print(same(\"a\", \"b\"), differ(\"a\", \"b\"))\n")
+
+    assert(eq.contains("define private i1 @sysl.str.eq(ptr %a, i64 %an, ptr %b, i64 %bn)"), eq)
+    assert(eq.contains("load i64, ptr %wa, align 1"), eq)
+    assert(!eq.contains("@sysl.str.cmp"), eq)
+    assert(!eq.contains("memcmp") && !eq.contains("bcmp"), eq)
+
+    val lt = seq_ir("@noinline\nbefore(a: string, b: string) -> bool = a < b\nprint(before(\"a\", \"b\"))\n")
+
+    assert(lt.contains("@sysl.str.cmp("), lt)
+    assert(!lt.contains("@sysl.str.eq("), lt)
+end seq_equality_is_its_own_call
+
+// -- on the boards --------------------------------------------------------------------------------------
+
+private seq_program(b: QemuBoard, body: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", "import board.*\n\nval w = console()\n\n" + body))
+    files.push(("board/board.sysl", qemu_board_module(b)))
+    files
+end seq_program
+
+// The window sweep on every QEMU board, where the word is 32 bits: no board's support files define
+// `memcmp` or `bcmp`, so an image that links proves the comparison is the program's own, and the
+// micro:bit's Cortex-M0 takes every unaligned word as bytes. The answer and both counts are printed,
+// so a board that disagrees says by how much.
+@test("the window sweep runs on every board, the M0 with no unaligned access among them")
+seq_the_sweep_runs_on_every_board()
+    val body = SeqCalls + SeqWindows + raw"""
+w.write((if wrong == 0 && windows == 378 then "equal-ok " else "equal-BAD ").bytes)
+wrong.display(w, FormatSpec(0, -1, false))
+w.write(" ".bytes)
+windows.display(w, FormatSpec(0, -1, false))
+"""
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        ran += 1
+
+        qemu_boot(b, seq_program(b, body)) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("equal-ok") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end seq_the_sweep_runs_on_every_board
+
+// The Pico 2's target, which no QEMU board runs: the module lowers to the same comparison with a
+// 32-bit word, and names neither of C's.
+@test("thumb-freestanding-softfp lowers string equality to the module's own word loop")
+seq_softfp_lowers_to_its_own_loop()
+    if !seq_ready() then return
+
+    val dir = make_temp_dir("sysl-seq-thumb").unwrap()
+
+    write_text(s"$dir/main.sysl", SeqCalls + raw"""
+@export("probe")
+probe(n: int) -> int = if same(str(n), "12345678") then 1 else if differ(str(n), "1") then 2 else 3
+""").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert(text.contains("define private i1 @sysl.str.eq(ptr %a, i32 %an, ptr %b, i32 %bn)"), text)
+    assert(text.contains("load i32, ptr %wa, align 1"), text)
+    assert(!text.contains("memcmp") && !text.contains("bcmp"), text)
+end seq_softfp_lowers_to_its_own_loop
