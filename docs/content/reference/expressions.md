@@ -1889,6 +1889,53 @@ print(Scale(1) * n)
 '*' between Scale and int comes from 2 implementations of one trait on Scale, and the operands do not say which was meant
 ```
 
+**A scalar on the left is chosen by the same rule, read from the other side.** Where the right
+operand's type has no machine instruction, the candidates are the scalars with an implementation at
+that type — `impl Mul[Point, Point] for real` makes `real` one. A bare literal on the left is read at
+whichever of them it fits, exactly for a float, and settles as a literal argument does: the
+implementation at its default type, `int` or `real`, where there is one; then an integer literal's
+signed widening; then the narrowest. A typed scalar on the left widens to the narrowest of them it
+reaches without loss, as a right operand does. A literal or a type that reaches none keeps the
+matching-types refusal, and two that the rule cannot choose between are refused as ambiguous:
+
+```sysl
+struct Point
+    x: real
+    y: real
+
+impl Mul[Point, Point] for real
+    mul(self, p: Point) -> Point = Point(self * p.x, self * p.y)
+
+val p = Point(1, 2)
+val k = 3
+
+print(2 * p, -0.5 * p, k * p)
+```
+
+```output
+Point(x: 2, y: 4) Point(x: -0.5, y: -1) Point(x: 3, y: 6)
+```
+
+A `long` holds values a `real` cannot represent exactly, so it does not widen to one, and `n * p`
+names no implementation:
+
+```sysl
+struct Point
+    x: real
+    y: real
+
+impl Mul[Point, Point] for real
+    mul(self, p: Point) -> Point = Point(self * p.x, self * p.y)
+
+val n: long = 2
+
+print(n * Point(1, 2))
+```
+
+```error
+'*' needs matching types, got long and Point
+```
+
 | trait | method | operator |
 |---|---|---|
 | `Add[Rhs = Self, Out = Self]` | `add(self, rhs: Rhs) -> Out` | `+` |

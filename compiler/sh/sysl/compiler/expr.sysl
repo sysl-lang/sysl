@@ -1587,10 +1587,15 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
         return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
     val numeric = numeric_expectation(expected)
-    val scaled = scale_operands(cx, op, l, r, numeric)
-    val (tl, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
+    val literal_left = literal_subject_operands(cx, span, op, l, r, numeric)
+    val scaled = if literal_left.is_some() then literal_left else scale_operands(cx, op, l, r, numeric)
+    val (read_l, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
 
-    if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
+    if texpr_type(read_l) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
+
+    val tl = if is_literal(l) then read_l else scalar_subject_widened(cx, span, op, l, read_l, tr)
+
+    if texpr_type(tl) == Unknown then return bad_expr(span)
 
     val dispatched = operator_call(cx, span, op, tl, tr, r)
 
@@ -1605,6 +1610,78 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
 
     produced(TExpr(span, TBinary(op, tl, tr, ty)))
 end binary_expr
+
+// `2 * p` over `impl Mul[Point, Point] for real`: an unsuffixed literal on the LEFT of an operator
+// whose right operand is a type with no instruction of its own is the receiver of the trait's
+// method, so it is read at the scalar whose implementation takes that right operand
+// (`operator_call.sysl`'s `scalar_impls_at`), where the literal fits it -- exactly, for a float.
+// Among several, `chosen_scalar` decides. Answers nothing where the shape does not apply or no
+// implementation takes the literal, which leaves the pair to the readings below and their
+// diagnostics; a literal the right operand's own type takes is that reading too.
+//
+// The right operand is read alone first, in a sandbox, since a literal contributes nothing to what
+// its neighbour is read at.
+private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
+                                 numeric: Option[Type]) -> Option[(TExpr, TExpr)]
+    val own = literal_default(l)
+
+    if own.is_none() || is_literal(r) || !selects_by_operand(cx.an, op) then return None
+
+    val read = sandboxed_reading(cx, r)
+    val rty = texpr_type(read.0)
+
+    if read.1 || rty == Unknown || literal_fits(cx, l, rty) then return None
+
+    var reached: Buf[Type] = buf()
+
+    for s in scalar_impls_at(cx.an, op, rty)
+        if literal_fits(cx, l, s) then reached.push(s)
+
+    val at = chosen_scalar(cx, span, op, l, own.unwrap(), rty, reached)
+
+    if at.is_none() then return None
+
+    var one: Buf[Expr] = buf()
+
+    one.push(r)
+
+    val tr = analyze_operands(cx, one, numeric).at(0)
+
+    if at.unwrap() == Unknown then return Some((bad_expr(l.span), tr))
+
+    Some((type_expr(cx, l, Some(at.unwrap())), tr))
+end literal_subject_operands
+
+// `k * p` with `k: int` over `impl Mul[Point, Point] for real`: a typed scalar on the left whose own
+// type implements nothing at the right operand widens to a scalar that does, losslessly, as a right
+// operand widens to an implementation's right-hand type (`operator_call.sysl`'s `widened_operand`).
+// The operand comes back as it was where its own type is one of them or none is reached, and as an
+// `Unknown` where several are and the rule leaves more than one.
+private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, tl: TExpr,
+                               tr: TExpr) -> TExpr
+    val got = texpr_type(tl)
+    val scalar = got match
+        Integer(_, _, _) -> true
+        Floating(_, _) -> true
+        Fixed(_, _, _) -> true
+        _ -> false
+
+    if !scalar then return tl
+
+    val found = scalar_impls_at(cx.an, op, texpr_type(tr))
+    var reached: Buf[Type] = buf()
+
+    for s in found
+        if type_eq(s, got) then return tl
+        if implicitly_widens(got, s) then reached.push(s)
+
+    val at = chosen_scalar(cx, span, op, expr(l.span, Ident("")), got, texpr_type(tr), reached)
+
+    if at.is_none() then return tl
+    if at.unwrap() == Unknown then return bad_expr(tl.span)
+
+    widened(tl, at)
+end scalar_subject_widened
 
 // The two operands of a binary operator, read as a pair that shares one type.
 private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,

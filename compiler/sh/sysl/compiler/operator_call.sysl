@@ -542,6 +542,134 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     bad_expr(t.span)
 end widened_operand
 
+// Whether an operator's trait takes the right-hand type as an argument, so that the right operand
+// selects among implementations -- the arithmetic traits, and not `Eq`, `Ord` or the prefix ones.
+selects_by_operand(a: &Analysis, op: string) -> bool
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return false
+
+    val d = trait_decl_at(a, library_key(spelling.unwrap()))
+
+    d.is_some() && !d.unwrap().tparams.is_empty()
+end selects_by_operand
+
+// The scalars with an implementation of an operator's trait at a right-hand type the machine has no
+// instruction for: `real` for `impl Mul[Point, Point] for real`, which is the block that puts a
+// scalar on the LEFT of `*`. Empty where the right-hand type is a scalar, a type parameter, or the
+// trait takes no right-hand type at all.
+//
+// The left operand is the receiver, so nothing about it can be looked up the way a right operand's
+// implementations are: a bare literal has no type yet, and a typed one may only reach the
+// implementation by widening. So the question is asked the other way round -- which scalar subjects
+// name this right-hand type -- over every scalar an implementation of the trait was filed for, plus
+// the named scalars, which is what finds a blanket block over them.
+scalar_impls_at(a: &Analysis, op: string, rhs: Type) -> Buf[Type]
+    var found: Buf[Type] = buf()
+
+    if !selects_by_operand(a, op) then return found
+
+    val spelling = core_infix(op).unwrap()
+
+    if rhs == Unknown || core_builtin(spelling, rhs) then return found
+
+    rhs match
+        Abstract(_, _) -> return found
+        _ -> ()
+
+    val tr_name = library_key(spelling)
+    val d = trait_decl_at(a, tr_name).unwrap()
+
+    var names: Buf[string] = buf()
+
+    for n in ["int", "short", "long", "byte", "ushort", "uint", "ulong", "usize", "isize", "i8",
+              "i128", "u128", "real", "f16", "bf16", "f32", "f128"]
+        names.push(n)
+
+    val prefix = impl_key_of(tr_name, "")
+
+    for i in 0..<a.tables.members.impls.len()
+        val key = a.tables.members.impls.key_at(i)
+
+        if key.starts_with(prefix) then names.push(key[prefix.len..<key.len])
+
+    for name in names
+        val s = scalar_named(name, int(a.tables.layout.word_bits))
+            .or_else(() -> width_type(a, empty_scope(), span_zero(), name))
+
+        if s.is_none() then continue
+
+        val subject = s.unwrap()
+        val scalar = subject match
+            Integer(_, _, _) -> true
+            Floating(_, _) -> true
+            Fixed(_, _, _) -> true
+            _ -> false
+
+        if !scalar || type_show(subject) != name then continue
+
+        var seen = false
+
+        for f in found
+            if type_eq(f, subject) then seen = true
+
+        if seen then continue
+
+        for h in impl_heads(a, tr_name, subject, d)
+            if type_eq(h, rhs)
+                found.push(subject)
+                break
+    end for
+
+    found
+end scalar_impls_at
+
+// Which of the scalar subjects a left operand reaches is the one meant, by the rule a method call's
+// argument is chosen by (`expr_call.sysl`'s `narrowed_at`), each subject standing as a candidate
+// taking the left operand: the operand's own type first, then a bare integer literal's signed
+// widening, then the narrowest widening, then a literal's default (`int` at an integer subject,
+// `real` at a float one). `written` is the operand as the source wrote it and `natural` its own type
+// -- a literal's default where it is one. Nothing where `reached` is empty, and `Unknown` where the
+// rule leaves more than one, after saying so.
+chosen_scalar(cx: &Analyzer, span: Span, op: string, written: Expr, natural: Type, rhs: Type,
+              reached: Buf[Type]) -> Option[Type]
+    if reached.is_empty() then return None
+    if reached.len() == 1 then return Some(reached.at(0))
+
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
+
+    for h in reached
+        var one: Buf[Type] = buf()
+
+        one.push(h)
+        declared.push(1)
+        generic.push(false)
+        fitted.push(one)
+
+    var args: Buf[Expr] = buf()
+    var own: Buf[Option[Type]] = buf()
+
+    args.push(written)
+    own.push(Some(natural))
+
+    val chosen = narrowed_at(declared, generic, fitted, args, own)
+
+    if chosen.len() == 1 then return Some(reached.at(chosen.at(0)))
+
+    val tr_name = library_key(core_infix(op).unwrap())
+    var shown: Buf[string] = buf()
+
+    for h in reached
+        shown.push(s"'${type_show(h)}: ${show_bound(cx.an, op_bound(cx.an, cx.scope, tr_name, h, Some(rhs)), h)}'")
+
+    cx.fault(span, s"'$op' between ${type_show(natural)} and ${type_show(rhs)} comes from " +
+             s"${quantity(reached.len(), "implementation")} of one trait on different scalars, and " +
+             s"the operands do not say which was meant — they are ${conjoin(shown)}")
+    Some(Unknown)
+end chosen_scalar
+
 // Whether `widened_operand` refused the operand it was handed, which leaves nothing to dispatch.
 operand_refused(given: TExpr, answered: TExpr) -> bool =
     texpr_type(answered) == Unknown && texpr_type(given) != Unknown
