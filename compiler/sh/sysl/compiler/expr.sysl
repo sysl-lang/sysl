@@ -1598,7 +1598,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
 
-        val at = scale_literal_type(cx, op, texpr_type(tl), r)
+        val at = scale_literal_type(cx, op, texpr_type(tl), r, numeric)
         val wl = widened(tl, Some(at))
 
         return Some((wl, operand_rhs(cx, op, wl, r, type_expr(cx, r, Some(at)))))
@@ -1613,7 +1613,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
 
-        val at = scale_literal_type(cx, op, texpr_type(tr), l)
+        val at = scale_literal_type(cx, op, texpr_type(tr), l, numeric)
 
         return Some((type_expr(cx, l, Some(at)), widened(tr, Some(at))))
     end if
@@ -1625,12 +1625,14 @@ end scale_operands
 // where the literal fits it, and otherwise `int`, where the operand widens to it -- the operand
 // rule of `literal_widened`, for the pairs read here rather than there. A shift's count is never
 // widened into.
-private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr) -> Type
+private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr, numeric: Option[Type]) -> Type
     val own = repr(t)
 
     if op != "*" && op != "/" || own == Char || own == Unknown || literal_fits(cx, lit, own) then return own
 
-    if literal_fits(cx, lit, int_type()) && implicitly_widens(own, int_type()) then int_type() else own
+    if reaches_position(int_type(), numeric) && literal_fits(cx, lit, int_type()) &&
+            implicitly_widens(own, int_type()) then int_type()
+    else own
 end scale_literal_type
 
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
@@ -1727,7 +1729,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
     val ty = literal_widened(cx, operands, told, firmest(operands, told, widen, rescales).or_else(() -> expected),
-                             widen, rescales)
+                             expected, widen, rescales)
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
@@ -1751,8 +1753,12 @@ end analyze_operands
 // sum. Where a typed operand does not widen losslessly to the literal's default (a `long` beside
 // `2.0`), or the literal does not fit its default either (a `byte` beside a literal no `int` holds),
 // the type settled on stands, and the literal is told it does not fit, as it always was.
+//
+// **So does a position whose type the default would not reach**: `val z: u8 = b + 300` is told the
+// literal does not fit a byte, which is the mistake, rather than that an `int` sum is no byte.
 private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]],
-                        settled: Option[Type], widen: bool, rescales: bool) -> Option[Type]
+                        settled: Option[Type], expected: Option[Type], widen: bool,
+                        rescales: bool) -> Option[Type]
     if !widen || settled.is_none() || !any_typed(operands, told) then return settled
 
     var ty = settled.unwrap()
@@ -1763,13 +1769,17 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TEx
         if told.at(i).is_none() && is_literal(e)
             val own = literal_default(e)
 
-            if own.is_some() && !type_eq(own.unwrap(), ty) && !literal_fits(cx, e, ty) &&
-                    literal_fits(cx, e, own.unwrap()) &&
+            if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
+                    !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
                     holds_every_operand(operands, told, own.unwrap(), rescales) then
                 ty = own.unwrap()
 
     Some(ty)
 end literal_widened
+
+// Whether a literal's default type is one the position the pair stands in takes.
+private reaches_position(own: Type, expected: Option[Type]) -> bool =
+    expected.is_none() || type_eq(own, repr(expected.unwrap())) || implicitly_widens(own, repr(expected.unwrap()))
 
 // Whether any operand has a type of its own -- with none, there is nothing to widen, and the literals
 // are read at what the position asked for.

@@ -1238,7 +1238,8 @@ above allows it, so `1.0 / k` over an `int` is a `real` quotient, `k < 1.5` comp
 `b + 300` over a `byte` is an `int` sum, in either order. The same holds for comparisons, range
 bounds, the elements of an unannotated array literal and the arms of an `if` or a `match`. Where the
 operand does not widen to the literal's default — a `long` beside `2.0`, a `char` beside anything —
-or the literal does not fit even that, the pair is refused as before.
+or the literal does not fit even that, or the position the pair stands in does not take the default
+(`val z: u8 = b + 300` is told the literal does not fit a byte) — the pair is refused as before.
 
 ```sysl
 var k = 4
