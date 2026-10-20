@@ -4,27 +4,25 @@ summary: Two channels — a failure you handle is a value, and a bug stops the p
 weight: 90
 ---
 
-Failure travels on two separate channels in sysl, and choosing between them is a real decision at
-every API rather than a coin toss:
+sysl reports failure through two separate channels, and every API chooses one deliberately:
 
-- **A recoverable failure is a value.** `Result[T, E]` or `Option[T]` in the return type, propagated
-  with `?`. The caller has to engage with it, because it is part of the signature.
-- **A bug is a trap.** An index past the end, an invalid cast, a broken contract. Not a value, not
-  catchable, and it stops the program.
+- **A recoverable failure is a value.** It is a `Result[T, E]` or `Option[T]` in the return type,
+  propagated with `?`. The caller must deal with it, because it is part of the signature.
+- **A bug is a trap.** An index past the end, an invalid conversion, a broken contract. A trap is not
+  a value, cannot be caught, and stops the program.
 
-Keeping them apart is what makes a signature honest. A function returning `Result[T, E]` is telling
-you it can fail in a way you handle; one returning plain `T` is telling you the only way it "fails"
-is if the program is already wrong.
+Keeping them apart makes a signature accurate. A function returning `Result[T, E]` tells you it can
+fail in a way you are expected to handle; one returning plain `T` tells you it fails only if the
+program already has a bug.
 
-The line between them is one question: **could correct calling code ever hit this?** If yes — the
-input came from a file, a socket, or a person, or the operation legitimately may not succeed — it is
-a `Result`. If only a bug reaches it, it traps.
+One question decides between them: **could correct calling code ever reach this failure?** If so,
+because the input came from a file, a socket or a person, or because the operation may legitimately
+not succeed, it is a `Result`. If only a bug can reach it, it traps.
 
 ## `Result` and `Option`
 
-Both are ordinary generic enums from the library, exactly as the [previous
-chapter](/tour/enums/) described. `Option[T]` is **absence with no reason attached**; `Result[T, E]`
-is **failure with a reason**:
+Both are ordinary generic enums from the library, as the [previous chapter](/tour/enums/) described.
+`Option[T]` is **absence with no reason attached**; `Result[T, E]` is **failure with a reason**:
 
 ```sysl
 half(n: int) -> Result[int, string]
@@ -45,15 +43,15 @@ half: 5
 refused: odd
 ```
 
-`E` is whatever carries the reason — a string here, but usually an enum, so a caller can match on
-what went wrong instead of reading it.
+`E` is whatever type describes the reason: a string here, but usually an enum, so a caller can match
+on what went wrong instead of parsing a message.
 
-Type arguments come from inference, including the cases with nothing to infer from at the call: a
-bare `None` takes its `T` from context, and `Ok(n)` inside a `Result[int, string]`-returning function
+Type arguments are inferred, including where the call itself gives nothing to infer from: a bare
+`None` takes its `T` from context, and `Ok(n)` inside a function returning `Result[int, string]`
 takes its `E` from the return type.
 
-Matching every call gets old fast, and `?` is sugar for the match you would have written: **unwrap
-the success, or early-return the failure.**
+Matching every call quickly becomes repetitive, and `?` is shorthand for that match: **unwrap the
+success, or return the failure early.**
 
 ```sysl
 half(n: int) -> Result[int, string]
@@ -72,8 +70,8 @@ print(quarter(20).unwrap_or(-1), quarter(10).unwrap_or(-1), quarter(7).unwrap_or
 5 -1 -1
 ```
 
-On a `Result`, `Ok(v)` becomes `v` and `Err(e)` returns `Err(e)` from the enclosing function
-immediately. On an `Option`, `Some(v)` becomes `v` and `None` returns `None`:
+On a `Result`, `Ok(v)` becomes `v` and `Err(e)` immediately returns `Err(e)` from the enclosing
+function. On an `Option`, `Some(v)` becomes `v` and `None` returns `None`:
 
 ```sysl
 struct Node
@@ -97,12 +95,12 @@ b
 (none)
 ```
 
-`?` is an expression, not a statement, so its unwrapped value flows straight into whatever surrounds
-it.
+`?` is an expression, not a statement, so the unwrapped value can be used directly in the
+surrounding expression.
 
-**The two channels do not cross.** An `Option`'s `?` cannot early-return from a `Result`-returning
-function, and the enclosing function's return type has to be able to carry the failure at all — the
-early return needs somewhere to go:
+**The two kinds do not mix.** An `Option`'s `?` cannot return early from a function that returns a
+`Result`, and the enclosing function's return type must be able to carry the failure, since the early
+return needs somewhere to go:
 
 ```sysl
 half(n: int) -> Result[int, string]
@@ -117,19 +115,51 @@ count(n: int) -> int
 '?' may only be used in a function returning sysl.Result, not int
 ```
 
-The error types must match **exactly** — there is no implicit widening, so a function whose own error
-type differs from a callee's converts at the call site. That is a real ergonomic cost and it is the
-shipping behaviour rather than the end state; [the reference](/reference/errors/) has where it is
-going.
+Where the callee's error type differs from the caller's, `?` converts it through `From`. A function
+with its own error type writes `impl From[Theirs] for Mine` once, and every `?` that crosses between
+the two types uses it:
 
-The conveniences on both types are **ordinary members in the library**, not compiler knowledge:
-`is_some`, `is_none` and `unwrap_or` on an `Option`, `is_ok`, `is_err` and `unwrap_err` on a
-`Result`, and the forcing `unwrap()` and `expect(msg)` that hand over the payload and stop the
-program when there is none. [`library/core`](/library/core/) lists them.
+```sysl
+enum ReadError
+    Missing
 
-That these are written in sysl rather than built in is the part worth pausing on, because it is what
-keeps "a bug stops the program" from meaning "the compiler has to know the name of every way to
-stop":
+enum ConfigError
+    Unreadable(cause: ReadError)
+    Invalid(key: string)
+
+impl From[ReadError] for ConfigError
+    from(value: ReadError) -> ConfigError = Unreadable(value)
+
+read_setting(present: bool) -> Result[int, ReadError]
+    if present then Ok(8080) else Err(Missing)
+
+load_port(present: bool) -> Result[int, ConfigError]
+    val port = read_setting(present)?
+
+    if port > 65535 then Err(Invalid("port")) else Ok(port)
+
+print(load_port(true).unwrap_or(-1))
+
+load_port(false) match
+    Ok(p) -> print("port", p)
+    Err(Unreadable(_)) -> print("config file unreadable")
+    Err(Invalid(k)) -> print("invalid", k)
+```
+
+```output
+8080
+config file unreadable
+```
+
+Without such a block the `?` is rejected, and the diagnostic names the `impl` to write;
+[the reference](/reference/errors/#a-converts-through-from) has the details.
+
+The conveniences on both types are **ordinary members in the library**, not built into the compiler:
+`is_some`, `is_none` and `unwrap_or` on an `Option`; `is_ok`, `is_err` and `unwrap_err` on a
+`Result`; and `unwrap()` and `expect(msg)`, which return the payload or stop the program when there
+is none. [`library/core`](/library/core/) lists them.
+
+Because they are written in sysl, the compiler does not need to know every way a program can stop:
 
 ```sysl
 unwrap(self) -> T = self match
@@ -139,20 +169,20 @@ unwrap(self) -> T = self match
         exit(1)
 ```
 
-Two things make that ordinary code. A diverging arm has a type — `never` — so `exit(1)` sits beside
-`Some(v) -> v` and the `match` still has the payload's type rather than a conflict. And the departure
-itself is an `extern`: the library declares `exit(code: int) -> never`, so stopping is a call.
+Two features make this ordinary code. A diverging arm has the type `never`, so `exit(1)` can sit
+beside `Some(v) -> v` and the `match` still has the payload's type. And stopping is a plain call: the
+library declares `exit(code: int) -> never` as an `extern`.
 
-## `defer` — releasing what ARC does not
+## `defer`: releasing what reference counting does not
 
-`?` has a consequence worth facing directly: it makes leaving early the **normal** way out of a
-function. That is fine for everything ARC owns — a `&T`, a string, a slice's backing all go back on
-their own — and it is a problem for everything else. A file descriptor from `open`, a block from
-`malloc`, a lock taken from a mutex: those are released by hand, and a function with four exits has
-four places to remember.
+`?` makes an early return the **normal** way out of a function. That is fine for everything
+reference counting manages, since a `&T`, a string and a slice's storage are all released
+automatically. It is a problem for everything else. A file descriptor from `open`, a block from
+`malloc` and a held mutex lock must be released by hand, and a function with four exits has four
+places to do it.
 
-`defer <statement>` runs that statement on the way out of the block containing it, so the release is
-written **beside the call that took the resource**, once:
+`defer <statement>` runs that statement when control leaves the enclosing block, so the release is
+written once, **next to the call that acquired the resource**:
 
 ```sysl
 acquire(n: int) -> Result[int, string]
@@ -186,17 +216,17 @@ released 3
 false
 ```
 
-Both exits ran it. `run(4)` fell off the end and `run(3)` left through the `?` in the middle, and
-neither one had to say so — which is the entire point, because the second exit is the one a program
-forgets.
+Both exits ran the `defer`. `run(4)` reached the end of the function and `run(3)` left through the
+`?` in the middle, and neither needed its own release code. The second kind of exit is the one most
+easily forgotten.
 
-Two rules make it predictable. **Several in one block run last-registered-first**, so they undo in
-the reverse of the order they were set up. And **a `defer` runs only if control reached it**: it is a
-statement, not a declaration, so one below an early return never registered at all. In the program
-above, a failure from `acquire` returns before the `defer` line, and nothing is released — correctly,
-since nothing was acquired.
+Two rules make `defer` predictable. **Several in one block run in reverse order of registration**,
+so they undo the setup in reverse. And **a `defer` runs only if control reached it**: it is a
+statement, not a declaration, so one after an early return was never registered. Above, a failure
+from `acquire` returns before the `defer` line, and nothing is released, which is correct because
+nothing was acquired.
 
-The scope is the **block**, not the function, and a loop is where that shows:
+The scope is the **block**, not the function, which matters in a loop:
 
 ```sysl
 for i in 0..<2
@@ -215,19 +245,18 @@ close 1
 done
 ```
 
-Go runs its `defer` at function exit, so the same loop would hold two resources to the end and
-release both at once — which is how a loop over ten thousand files runs out of descriptors. Here each
-iteration is a block and each closes its own.
+Go runs `defer` at function exit, so the same loop would hold both resources until the end and
+release them together; a loop over ten thousand files can run out of descriptors that way. In sysl
+each iteration is a block and releases its own resources.
 
-One thing `defer` is not: a `finally`. **A trap runs nothing.** A broken invariant means the
-program's model of itself is already wrong, and cleanup run against that state is how a corrupt
-program writes its corruption out. `defer` releases a resource; it does not rescue a bug — which is
-the subject of the rest of this page.
+`defer` is not a `finally`: **a trap runs nothing.** A broken invariant means the program's state is
+already wrong, and cleanup code run against that state can write the corruption out. `defer`
+releases resources; it does not recover from bugs, which are the subject of the rest of this page.
 
 ## Traps
 
-The other channel. A trap is the runtime response to a broken invariant, and what it does is settled:
-**it aborts.** No unwinding, no stack cleanup, no `catch`, no exceptions.
+A trap is the run-time response to a broken invariant, and its behaviour is fixed: **it aborts.**
+There is no unwinding, no stack cleanup, no `catch`, and no exceptions.
 
 ```sysl
 var xs = [1, 2, 3]
@@ -235,31 +264,28 @@ var xs = [1, 2, 3]
 print(xs[5])
 ```
 
-That program compiles and then stops when it runs, because the bounds check fails. There is no
-handler that could have caught it and no `defer` that runs on the way down — `defer` is a scope-exit
-form, and a trap is not an exit. It is the program stopping because its model of itself is already
-wrong, and cleanup code run against that state is how a corrupt program writes its corruption out.
+That program compiles, then stops when it runs, because the bounds check fails. No handler can catch
+it and no `defer` runs: `defer` handles scope exits, and a trap is not an exit.
 
-The trap sources are the runtime safety checks the safe subset rests on: an out-of-bounds index, an
-inverted or out-of-range slice range, a checked cast that fails, an integer divide by zero, and a
-violated `require`/`ensure` contract.
+Traps come from the run-time safety checks the safe subset relies on: an out-of-bounds index, an
+inverted or out-of-range slice, a failed checked conversion, integer division by zero, and a violated
+`require` or `ensure` contract.
 
-**Integer overflow is not one of them**, which is worth saying because Rust traps on it in a debug
-build. Arithmetic wraps at the declared width, as [values](/tour/values/) showed — that is defined
-behaviour rather than a broken invariant, so there is nothing for a trap to report.
+**Integer overflow does not trap**, unlike a Rust debug build. Arithmetic wraps at the declared
+width, as [values](/tour/values/) showed; that is defined behaviour, not a broken invariant.
 
-Two reasons abort is the only defensible choice here. A kernel and an embedded target have **no
-unwinding runtime** — landing pads, a personality routine and per-frame cleanup tables are exactly
-what a freestanding target does not have. And an abort is one code path, where unwinding is a second,
-invisible control-flow graph that every function in the program would have to be correct under.
+Aborting is the only option for two reasons. A kernel or embedded target has **no unwinding
+runtime**: landing pads, a personality routine and per-frame cleanup tables are exactly what a
+freestanding target lacks. And an abort is a single code path, whereas unwinding is a second,
+invisible control-flow graph that every function would have to handle correctly.
 
-What a trap *does* is an environment fact rather than a language one. A hosted program prints a
-diagnostic and exits non-zero; a kernel installs its own panic handler and enters that. The decision
-to stop is the language's; the action on stopping is the environment's.
+What happens on a trap depends on the environment, not the language. A hosted program prints a
+diagnostic and exits with a non-zero status; a kernel installs its own panic handler. The language
+decides to stop; the environment decides what stopping does.
 
-There is no `panic` you can recover from, so a program that wants to survive bad input must **not do
-the trapping thing** — check the bound, validate before dividing, and use the fallible constructor
-rather than the checked cast. That is the move to make wherever untrusted input enters:
+No panic can be recovered from, so a program that must survive bad input has to **avoid the
+operation that traps**: check the bound, validate before dividing, and use the fallible conversion
+rather than the checked one. Do this wherever untrusted input enters the program:
 
 ```sysl
 enum Color: u8
@@ -286,28 +312,29 @@ read: Green
 byte 9 is not a Color
 ```
 
-`Color(9)` would have trapped. `Color.try(9)` hands back a `None` that this function turns into a
-reason, and the byte off the wire stops being a bug in the program and starts being a value it
-handles — which is the whole of the policy in one function.
+`Color(9)` would trap. `Color.try(9)` returns `None`, which this function turns into an error with a
+reason, so an invalid byte from the wire becomes a value the program handles rather than a bug.
 
-- **No exceptions.** Recoverable failure is a returned value and a bug is an abort. There is no
+In summary:
+
+- **No exceptions.** A recoverable failure is a returned value and a bug is an abort. There is no
   third, invisible control-flow channel.
-- **No error return codes by convention.** The failure is in the type and it is checked, not an
-  `int` a caller might forget to inspect.
-- **No panic that unwinds.** A trap is terminal.
+- **No error codes by convention.** The failure is in the type and is checked, not an `int` a caller
+  might forget to inspect.
+- **No unwinding panic.** A trap is terminal.
 
-`?` obeys ARC with no special rule, which matters most here because it is the operator most likely to
-carry a heap payload across a function boundary.
+`?` follows the ordinary reference-counting rules, which matters because it is the operator most
+likely to carry a heap payload across a function boundary.
 
-Unwrapping a `&T` success payload retains it past the wrapper, so the reference outlives the `Result`
-it came out of and is released exactly once. Propagating a `&T` error payload moves it through the
-early return with its count intact.
+Unwrapping a `&T` success payload retains it, so the reference outlives the `Result` it came from
+and is released exactly once. Propagating a `&T` error payload moves it through the early return
+with its count intact.
 
-Neither is a rule about `?`. Both fall out of retain-on-alias and release-at-scope-end — and they are
-worth naming because a hand-rolled C error return leaks or double-frees at exactly these two
-boundaries.
+Neither needs a special rule for `?`; both follow from retaining on aliasing and releasing at the end
+of a scope. They are worth stating because hand-written C error returns tend to leak or double-free
+at exactly these two points.
 
 ---
 
-Next: [traits and generics](/tour/traits/) — one implementation over many types, and what a bound is
-really promising.
+Next: [traits and generics](/tour/traits/): one implementation over many types, and what a bound
+guarantees.
