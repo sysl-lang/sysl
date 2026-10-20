@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_opendir`](#supply_opendir) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_stat`](#supply_stat) [`supply_symlink`](#supply_symlink) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_write`](#supply_write)
+[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_opendir`](#supply_opendir) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_symlink`](#supply_symlink) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_write`](#supply_write)
 
 ## Functions
 
@@ -131,6 +131,12 @@ supply_rmdir(path: *u8, len: usize) -> int
 
 ```sysl
 supply_seek(fd: int, offset: long, whence: int, at: *long) -> int
+```
+
+### `supply_set_modified`
+
+```sysl
+supply_set_modified(path: *u8, len: usize, micros: long) -> int
 ```
 
 ### `supply_stat`

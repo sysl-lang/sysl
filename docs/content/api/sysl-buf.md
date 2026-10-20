@@ -22,13 +22,13 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 ### `buf`
 
 ```sysl
-buf[T]() -> Buf[T]
+const buf[T]() -> Buf[T]
 ```
 
 ### `buf_filled`
 
 ```sysl
-buf_filled[T](n: usize, value: T) -> Buf[T]
+const buf_filled[T](n: usize, value: T) -> Buf[T]
 ```
 
 A buffer of `n` elements, every one of them `value` -- what a RAM disk, a frame buffer or a table
@@ -41,7 +41,7 @@ and a counted one is shared -- `n` elements naming one object, holding `n` count
 ### `buf_with_capacity`
 
 ```sysl
-buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
+const buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
 ```
 
 A buffer that has already been given room for `n` elements, for a caller that knows roughly how
@@ -119,23 +119,23 @@ asks on purpose.
 |---|---|---|
 | `elems` | `elems -> []T` | The storage, spare capacity included -- for a reader that wants the address of an element, as `&b.elems[i]` is. |
 | `count` | `count -> usize` | How many elements there are -- `len()` under the name the field had. |
-| `len` | `len(self) -> usize` |  |
-| `cap` | `cap(self) -> usize` |  |
-| `is_empty` | `is_empty(self) -> bool` |  |
-| `at` | `at(self, i: usize) -> T` |  |
-| `set` | `set(self, i: usize, v: T)` |  |
-| `push` | `push(self, v: T)` |  |
-| `extend` | `extend(self, xs: []const T)` |  |
-| `pop` | `pop(self) -> Option[T]` |  |
-| `truncate` | `truncate(self, n: usize)` |  |
-| `clear` | `clear(self)` |  |
-| `insert` | `insert(self, i: usize, v: T)` |  |
-| `reserve` | `reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
-| `remove` | `remove(self, i: usize) -> T` |  |
-| `copy` | `copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
-| `freeze` | `freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
-| `view` | `view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
-| `release` | `release(*self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
+| `len` | `const len(self) -> usize` |  |
+| `cap` | `const cap(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `at` | `const at(self, i: usize) -> T` |  |
+| `set` | `const set(self, i: usize, v: T) = self.reading().set(i, v)` |  |
+| `push` | `const push(self, v: T)` |  |
+| `extend` | `const extend(self, xs: []const T)` |  |
+| `pop` | `const pop(self) -> Option[T]` |  |
+| `truncate` | `const truncate(self, n: usize)` |  |
+| `clear` | `const clear(self)` |  |
+| `insert` | `const insert(self, i: usize, v: T)` |  |
+| `reserve` | `const reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
+| `remove` | `const remove(self, i: usize) -> T` |  |
+| `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
+| `freeze` | `const freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
+| `view` | `const view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
+| `release` | `release(*self) = forget(self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
 
 ### `ByteSink`
 
@@ -187,10 +187,10 @@ destructor touches that count, once, run by whichever thread lets go of the box'
 
 | Member | Signature | Description |
 |---|---|---|
-| `len` | `len(self) -> usize` |  |
-| `is_empty` | `is_empty(self) -> bool` |  |
-| `at` | `at(self, i: usize) -> T` | The element at `i`, checked against the length. |
-| `view` | `view(&sync self) -> []const T` | The elements as a read-only slice. |
+| `len` | `const len(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `at` | `const at(self, i: usize) -> T` | The element at `i`, checked against the length. |
+| `view` | `const view(&sync self) -> []const T` | The elements as a read-only slice. |
 
 ### `FrozenWalk`
 

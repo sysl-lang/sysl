@@ -20,7 +20,7 @@ them exactly as much as a hosted one that shares it with a thread.
 
 ## Index
 
-[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Guarded`](#guarded) [`Ordering`](#ordering) [`SpinLock`](#spinlock) [`Lock`](#lock) [Lock for SpinLock](#lock-for-spinlock)
+[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Guarded`](#guarded) [`IrqLock`](#irqlock) [`Ordering`](#ordering) [`SpinLock`](#spinlock) [`Lock`](#lock) [Lock for IrqLock](#lock-for-irqlock) [Lock for SpinLock](#lock-for-spinlock)
 
 ## Functions
 
@@ -130,7 +130,36 @@ one to write.
 | `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock can be taken without waiting: `Some` of what `body` answered, or `None`. |
 | `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting however `L` waits, and answers the address of the record. |
 | `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it can without waiting, and answers the record's address where it did. |
-| `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through the address to whoever takes it next. |
+| `unlock_raw` | `unlock_raw(*self) = self.lock.release()` | Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through the address to whoever takes it next. |
+
+### `IrqLock`
+
+```sysl
+struct IrqLock
+    saved: u32
+```
+
+Mutual exclusion on one Cortex-M core, held by masking interrupts rather than by spinning.
+
+**This is the lock an Armv6-M core has.** It has no exclusive pair, so it cannot take a
+`SpinLock`'s flag; what it can do is stop being interrupted. `lock` saves PRIMASK and runs
+`cpsid i`, `unlock` puts PRIMASK back as it was, so holds nest: an inner hold taken with interrupts
+already masked leaves them masked when it lets go. Nothing waits, so `try_lock` always succeeds.
+
+**It excludes interrupt handlers, not other cores.** Code on a second core runs straight through
+it, so it is right only where everything that touches the data runs on the core taking the lock --
+the main loop and that core's handlers. A dual-core part (an RP2040) needs its hardware lock,
+through `Guarded[L, T]`.
+
+It exists on every Cortex-M target sysl builds for (Armv6-M, Armv7-M, Armv8-M); a program reaching
+it for any other machine is refused.
+
+| Member | Signature | Description |
+|---|---|---|
+| `lock` | `lock(*self)` | Masks interrupts, remembering whether they already were. |
+| `try_lock` | `try_lock(*self) -> bool` | Takes the lock, which never has to wait, and answers `true`. |
+| `with` | `with[R](*self, body: () -> R) -> R` | Takes the lock, runs `body`, releases it, and answers what `body` answered. |
+| `unlock` | `unlock(*self)` | Puts PRIMASK back as `lock` found it. |
 
 ### `Ordering`
 
@@ -232,6 +261,12 @@ that never waits -- one that masks interrupts on a single processor -- answers `
 | `release` | `release(*self)` |  |
 
 ## Implementations
+
+### Lock for IrqLock
+
+```sysl
+impl Lock for IrqLock
+```
 
 ### Lock for SpinLock
 

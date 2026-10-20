@@ -1,0 +1,59 @@
+---
+title: sysl.reflect
+layout: api-module
+headingShift: 0
+slugStyle: github
+module: sysl.reflect
+---
+
+## Index
+
+[`Field`](#field) [`Member`](#member) [`Variant`](#variant)
+
+## Types
+
+### `Field`
+
+```sysl
+struct Field
+    name: string
+    index: usize
+    offset: usize
+    public: bool
+```
+
+One field of a struct, a tuple or a union, as `T::Fields` lists it while compiling.
+
+`index` is the field's position in `T::Fields` -- `0` for the first field, whatever members come
+before it -- and `offset` is where it begins, in bytes from the start of the value. A tuple's parts are named `"0"`, `"1"`, and so on.
+`public` says whether code outside the type's own file may name the field. An anonymous `struct`
+or `union` block and an unnamed `_` bitfield are not fields, and `T::Members` is what lists them.
+
+### `Member`
+
+```sysl
+struct Member
+    name: string
+    index: usize
+    offset: usize
+    public: bool
+    anonymous: bool
+```
+
+One stored member of a struct, a tuple or a union, as `T::Members` lists it while compiling.
+
+It answers what a `Field` answers, for every member the type holds: its named fields, an
+anonymous `struct` or `union` block, and an unnamed `_` bitfield. `anonymous` is true for the
+block, whose `name` is `""`; an unnamed bitfield's `name` is `"_"`. Its `index` is its position in
+`T::Members`.
+
+### `Variant`
+
+```sysl
+struct Variant
+    name: string
+    index: usize
+```
+
+One variant of an enum, as `T::Variants` lists it while compiling: its name, and its position
+among the enum's variants.
