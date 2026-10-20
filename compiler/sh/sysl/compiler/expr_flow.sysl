@@ -129,8 +129,22 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             settled_else = sibling
     end if
 
-    val t_else = else_branch(cx, else_body, early, settled_else, then_block, expected,
+    var t_else = else_branch(cx, else_body, early, settled_else, then_block, expected,
                              else_guesses, then_guesses, else_leans, discarded)
+
+    if t_else.is_some()
+        var tys: Buf[Type] = buf()
+
+        tys.push(then_block.ty)
+        tys.push(t_else.unwrap().ty)
+
+        val to = widest_branch(tys)
+
+        if to.is_some()
+            then_block = widened_block(then_block, to.unwrap())
+            t_else = Some(widened_block(t_else.unwrap(), to.unwrap()))
+    end if
+
     val ty = if_type(cx, span, then_block, t_else)
 
     TExpr(span, TIf(tc, then_block, t_else, ty))
@@ -404,8 +418,61 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
     // A refusal of the whole `match` -- arms that disagree, a gap in its coverage -- anchors at its
     // SCRUTINEE, as the reference's does: `Colour.Red match` is refused under `Red`, a selection's
     // own anchor being its member.
-    TExpr(span, TMatch(ts, tarms, match_result_type(cx, ts.span, texpr_type(ts), tarms)))
+    val met = arms_widened(tarms)
+
+    TExpr(span, TMatch(ts, met, match_result_type(cx, ts.span, texpr_type(ts), met)))
 end match_expr
+
+// **Branches meet at the widest of their types where it holds every value of the others** -- the
+// operand rule, so `if c then n else b` over an `int` and a `byte` is an `int`, and two branches
+// neither of which holds the other still disagree. A branch that is converted has its value widened
+// where the value is made, as a position widens one.
+private widest_branch(tys: Buf[Type]) -> Option[Type]
+    for candidate in tys
+        if !plain_value(candidate) then continue
+
+        var holds = true
+        var other = false
+
+        for ty in tys
+            if !plain_value(ty) then continue
+
+            if !type_eq(repr(ty), repr(candidate))
+                other = true
+
+                if !implicitly_widens(ty, candidate) then holds = false
+
+        if holds && other then return Some(candidate)
+
+    None
+end widest_branch
+
+// A branch type that takes part in meeting: one that finishes, was worked out, and is a value.
+private plain_value(ty: Type) -> bool = ty != Never && ty != Unknown && ty != Unit
+
+private widened_block(b: TBlock, to: Type) -> TBlock
+    if !plain_value(b.ty) || type_eq(repr(b.ty), repr(to)) || b.result.is_none() then return b
+
+    TBlock(b.stmts, Some(TExpr(b.result.unwrap().span, TCast(b.result.unwrap(), to))), to)
+end widened_block
+
+private arms_widened(arms: Buf[TArm]) -> Buf[TArm]
+    var tys: Buf[Type] = buf()
+
+    for arm in arms
+        tys.push(arm.body.ty)
+
+    val to = widest_branch(tys)
+
+    if to.is_none() then return arms
+
+    var out: Buf[TArm] = buf()
+
+    for arm in arms
+        out.push(TArm(arm.patterns, arm.guard, widened_block(arm.body, to.unwrap())))
+
+    out
+end arms_widened
 
 // A match's arms, with the ones that have **no type of their own** told what the rest settled --
 // the `if` rule above, over as many alternatives as the form has.

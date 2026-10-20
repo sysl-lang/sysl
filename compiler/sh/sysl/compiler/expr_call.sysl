@@ -2974,6 +2974,10 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val preferred = signed_literal_preference(fitted, ranked, args)
 
         if preferred.len() == 1 then return preferred
+
+        val narrowest = narrowest_widening(fitted, ranked, args)
+
+        if narrowest.len() == 1 then return narrowest
     end if
 
     var pool: Buf[usize] = buf()
@@ -3053,6 +3057,42 @@ private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
 
     narrowest
 end signed_literal_preference
+
+// **Among candidates every argument reached by widening, the one with the narrowest parameters is
+// meant**: a candidate beats another where each of its parameters is the other's or widens to it, so
+// `f(b)` over `f(x: int)` and `f(x: long)` at a `byte` is the `int` one. A literal has no type to be
+// widened from, so a position holding one decides nothing here -- what it means is the literal's
+// own rule above. Empty where no candidate beats every other.
+private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
+    var winners: Buf[usize] = buf()
+
+    if ranked.len() < 2 then return winners
+
+    for a in 0..<ranked.len()
+        var beats_all = true
+
+        for b in 0..<ranked.len()
+            if a != b && !params_narrower(fitted.at(ranked.at(a)), fitted.at(ranked.at(b)), args)
+                beats_all = false
+
+        if beats_all then winners.push(ranked.at(a))
+
+    winners
+end narrowest_widening
+
+private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> bool
+    if mine.len() != theirs.len() || mine.len() != args.len() then return false
+
+    var strictly = false
+
+    for j in 0..<mine.len()
+        if type_eq(mine.at(j), theirs.at(j)) then continue
+        if is_literal(args.at(j)) || !implicitly_widens(mine.at(j), theirs.at(j)) then return false
+
+        strictly = true
+
+    strictly
+end params_narrower
 
 // An integer literal written with no suffix, which is what has no type until a position gives one.
 private bare_int_literal(e: Expr) -> bool = *e.kind match

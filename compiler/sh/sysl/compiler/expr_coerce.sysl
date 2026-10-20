@@ -12,8 +12,94 @@ import sysl.buf.{Buf, buf}
 // word the reader writes.
 
 // Analyzes an expression at the type its position wants, performing whatever that position does to
-// what comes back.
-analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+// what comes back -- a lossless widening among them (`widened`).
+analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr =
+    widened(analyze_unwidened(cx, e, expected), expected)
+
+// A value put where a wider scalar was asked for, converted to it, as the explicit conversion would
+// have been. Anything else is handed back as it came, for the position to diagnose.
+widened(t: TExpr, expected: Option[Type]) -> TExpr
+    if expected.is_none() then return t
+
+    val got = texpr_type(t)
+    val want = expected.unwrap()
+
+    if !disagree(got, want) || !plain_scalar(want) || !implicitly_widens(got, want) then return t
+
+    TExpr(t.span, TCast(t, want))
+end widened
+
+// A type a widened value may be converted to directly. A subtype with a range or a predicate is
+// reached through its own check (`analyze_unwidened`), never by a conversion that would skip it.
+private plain_scalar(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    Constrained(d) -> name_only(d) && plain_scalar(d.base)
+    _ -> false
+
+// **Whether every value of one type is exactly a value of another**, which is the whole condition
+// for a position taking it without a conversion being written (`reference/expressions.md § Which
+// conversions are implicit`). It is asked of scalars only: nothing converts through a container, a
+// reference, a pointer or an aggregate, and a `bool` converts to nothing.
+//
+// An address-width integer is its target's width here, because the type already is: `usize` on a
+// 32-bit target is `Integer(32, …)`, so `u32` reaches it there and on a 64-bit target, and on a
+// 16-bit one it does not.
+implicitly_widens(from: Type, to: Type) -> bool = repr(from) match
+    Integer(m, sm, _) -> repr(to) match
+        Integer(n, sn, _) -> integer_fits(m, sm, n, sn)
+        Floating(b, brain) -> m <= (if sm then significand_bits(b, brain) + 1 else significand_bits(b, brain))
+        Fixed(w, f, s) -> fixed_fits(m, 0, sm, w, f, s)
+        _ -> false
+    // The largest scalar value is 0x10FFFF, twenty-one bits.
+    Char -> repr(to) match
+        Integer(n, sn, _) -> integer_fits(21, false, n, sn)
+        _ -> false
+    // `f16` and `bf16` are both sixteen bits and neither holds the other's values.
+    Floating(a, _) -> repr(to) match
+        Floating(b, _) -> b > a
+        _ -> false
+    Fixed(w, f, s) -> repr(to) match
+        Fixed(w2, f2, s2) -> fixed_fits(w, f, s, w2, f2, s2)
+        Floating(b, brain) ->
+            (if s then w - 1 else w) <= significand_bits(b, brain) && f <= subnormal_scale(b, brain)
+        _ -> false
+    _ -> false
+
+// An `M`-bit integer inside an `N`-bit one: a signed value never fits an unsigned type, and an
+// unsigned one fits a signed type only with a bit to spare for the sign.
+private integer_fits(m: int, sm: bool, n: int, sn: bool) -> bool =
+    if sm == sn then n >= m else if sn then n > m else false
+
+// A fixed-point value inside another, an integer being one with no fraction bits: the fraction has
+// to keep every bit it had, and the integer part (the sign among its bits) every one of its own.
+private fixed_fits(w: int, f: int, s: bool, w2: int, f2: int, s2: bool) -> bool
+    if s && !s2 then return false
+
+    val need = if s2 && !s then w - f + 1 else w - f
+
+    f2 >= f && w2 - f2 >= need
+end fixed_fits
+
+// The significand of a binary format, its hidden bit counted.
+private significand_bits(bits: int, brain: bool) -> int = bits match
+    16 -> if brain then 8 else 11
+    32 -> 24
+    64 -> 53
+    _ -> 113
+
+// The power of two the smallest subnormal of a format is the negative of.
+private subnormal_scale(bits: int, brain: bool) -> int = bits match
+    16 -> if brain then 133 else 24
+    32 -> 149
+    64 -> 1074
+    _ -> 16494
+
+// Analyzes an expression at the type its position wants, performing every conversion that position
+// does except widening a scalar. An operand is read this way: it converts to the other operand's
+// type and never to the one around it.
+analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     if expected.is_none() then return analyze_value(cx, e, None)
 
     val want = expected.unwrap()
@@ -74,7 +160,7 @@ analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
         _ -> ()
 
     analyze_value(cx, e, expected)
-end analyze_expected
+end analyze_unwidened
 
 // The conversions a **position** performs, which are the ones a branch has to perform for itself.
 private converts(want: Type) -> bool

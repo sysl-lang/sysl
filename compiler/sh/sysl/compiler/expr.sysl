@@ -17,7 +17,14 @@ import sysl.math.bigint.{BigInt, from_int, negate}
 // **Whether a result list may stand here is taken before anything below runs**, which is what
 // confines the permission to one expression: every subexpression is analyzed through this same
 // funnel and finds the flag already spent.
-type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = typed_at(cx, e, expected, true)
+
+// The same, except that a scalar is not widened to what is expected -- the reading of an operand,
+// which converts to its sibling's type rather than to its position's.
+type_expr_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr =
+    typed_at(cx, e, expected, false)
+
+private typed_at(cx: &Analyzer, e: Expr, expected: Option[Type], widen: bool) -> TExpr
     val allowed = cx.multi_ok
     val outer = cx.result_chain
 
@@ -25,11 +32,11 @@ type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     cx.result_chain = cx.result_next
     cx.result_next = false
 
-    val raw = analyze_expected(cx, e, expected)
+    val raw = if widen then analyze_expected(cx, e, expected) else analyze_unwidened(cx, e, expected)
 
     cx.result_chain = outer
     unwrap_results(cx, e, raw, allowed)
-end type_expr
+end typed_at
 
 // The same, with nothing expected.
 type_expr_bare(cx: &Analyzer, e: Expr) -> TExpr = type_expr(cx, e, None)
@@ -1689,7 +1696,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
 
         if own.at(i).is_some() then told.push(own.at(i))
         else if is_literal(e) then told.push(None)
-        else told.push(Some(type_expr(cx, e, settled)))
+        else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
     val ty = firmest(operands, told).or_else(() -> expected)
     var out: Buf[TExpr] = buf()
@@ -1719,7 +1726,7 @@ private attempt_operand(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Optio
 
     // An operand is never a place a result list may stand, so one is refused here as `type_expr`
     // refuses it -- and the refusal sends the operand back to be read for real.
-    val t = unwrap_results(cx, e, analyze_expected(cx, e, expected), false)
+    val t = unwrap_results(cx, e, analyze_unwidened(cx, e, expected), false)
 
     if refused_since(cx, tried)
         discard_trial(cx, tried)
@@ -1790,8 +1797,40 @@ private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]]) -> Option[Type]
 
     if chosen.is_none() then return None
 
-    Some(meet_views(chosen.unwrap(), read))
+    Some(meet_views(widest_operand(operands, read, chosen.unwrap()), read))
 end firmest
+
+// **An operand converts to the other operand's type, never to a third**: of the types the operands
+// that stand on their own were read at, the one every other of them widens to losslessly, wherever
+// it is not the one first chosen -- `b + n` over a `byte` and an `int` is an `int` sum as `n + b`
+// is. Where no operand's type holds all the others, the first choice stands and the mismatch is
+// reported as it always was.
+private widest_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Type) -> Type
+    for i in 0..<operands.len()
+        read.at(i) match
+            Some(t) ->
+                val ty = repr(texpr_type(t))
+
+                if !adaptable(operands.at(i), t) && !type_eq(ty, chosen) &&
+                        holds_every_operand(operands, read, ty) then return ty
+            None -> ()
+
+    chosen
+end widest_operand
+
+private holds_every_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], ty: Type) -> bool
+    for i in 0..<operands.len()
+        read.at(i) match
+            Some(t) ->
+                val other = repr(texpr_type(t))
+
+                if other == Unknown then return false
+                if !adaptable(operands.at(i), t) && !type_eq(other, ty) &&
+                        !implicitly_widens(other, ty) then return false
+            None -> ()
+
+    true
+end holds_every_operand
 
 // The two views of one slice, met at the read-only one -- the only place a pair of operands has a
 // type to settle on that neither of them wrote.
