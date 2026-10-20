@@ -32,11 +32,31 @@ import sysl.buf.{forget, unassigned, Unassigned}
  *
  * **An empty map has no table**, which is the fourth piece and the only one that is about what a map
  * costs when nothing is in it. `map()` allocates only the small cell every name for the map shares;
- * the first `put` makes the table. A program
+ * the first `put` makes its storage. A program
  * that builds a map per loop iteration, or holds one in a struct that is usually empty, or makes one
  * on a branch that turns out not to be taken, pays nothing for any of them -- and none of those
  * callers could see that they were paying before, which is why the fix belongs here rather than at
  * each of them.
+ *
+ * **A small map is a list, not a table**, which is the fifth piece. Up to `list_room` entries --
+ * eight -- live packed at the front of the same run of slots, in the order they were put, and a key
+ * is found by comparing it with each of them in turn. No hash is computed. Hashing a key and then
+ * comparing it anyway costs more than comparing it with a handful of others. Building a map of n
+ * entries and asking it 4n questions, at four entries the list is faster than the table by a sixth
+ * for `int` keys, a fifth for short strings and two-word structs, and three fifths for a forty-byte
+ * string, whose hash reads every byte while an unequal compare mostly stops at the length. At eight
+ * `int` keys and short strings come out level, while structs still gain a quarter and long strings
+ * half. Past eight the table wins for `int` keys and short strings and keeps winning; long strings
+ * would gain from a longer list still, but one line serves every key, and eight is the longest that
+ * costs none of them anything. Most maps in a real program never get past it.
+ *
+ * The ninth distinct key builds the table, once, from the list: every key hashed for the first
+ * time, every entry placed, the table sized so that it does not grow again until it is three times
+ * as full. A table never goes back to being a list, however much is removed from it -- a map that
+ * was big once is likely to be big again, and flipping between the two around the line would pay
+ * for a rebuild each way. `clear` does go back, since it lets the storage go entirely. Which of the
+ * two a map is in is read off the length of its storage: a list is `list_room` slots and a table
+ * is never fewer than `initial_slots`, which is more.
  *
  * ## What this replaced, and what that exercise found
  *
@@ -97,10 +117,16 @@ import sysl.buf.{forget, unassigned, Unassigned}
  * is updated by putting it back rather than by being mutated where it lies.
  */
 
-/** How many slots a fresh map has. A power of two, so an index is a mask rather than a division, and
- * doubling keeps every later count a power of two as well.
+/** How many entries a map holds as a list before it builds a table -- and so how many slots the list
+ * is given, all at once, by the first `put`. See the account at the top of this file for why eight.
  */
-private const initial_slots: usize = 8
+private const list_room: usize = 8
+
+/** The fewest slots a table has. A power of two, so an index is a mask rather than a division, and
+ * doubling keeps every later count a power of two as well. It is bigger than `list_room`, which is
+ * what lets the length of the storage say which of the two a map is.
+ */
+private const initial_slots: usize = 16
 
 /** The table is grown when three quarters of its slots are spoken for -- live entries and tombstones
  * alike, since a probe has to walk both. Written as a numerator over a denominator because there
@@ -120,7 +146,8 @@ private const load_den: usize = 4
  * is looking for was inserted, so the chain it belongs to may continue past it.
  *
  * `Live` carries the hash beside the key so that a probe can reject a slot on an integer comparison
- * and `rehash` can re-place an entry without asking the key to mix itself down again.
+ * and `rehash` can re-place an entry without asking the key to mix itself down again. While the map
+ * is still a list nothing has been hashed, and the field holds zero.
  */
 enum Slot[K, V]
     Empty
@@ -183,11 +210,15 @@ struct Map[K: Hash + Eq, V]
 
     const is_empty(self) -> bool = self.len() == 0
 
-    /** How many slots the table has, which is what the load factor is measured against. It is not a
-     * promise about how many entries fit -- the map rehashes at three quarters of this.
+    /** How many slots the map's storage has. For a table that is what the load factor is measured
+     * against, and not a promise about how many entries fit -- the map rehashes at three quarters
+     * of it.
      *
-     * **A map that has never been put into answers zero**, because it has no table: one is made by
-     * the first insert. That is the one number here a caller might be surprised by, and it is the
+     * **A map still small enough to be a list answers `list_room`**, eight: that many entries fit
+     * before the table is built, and it is the size of the storage the list lives in.
+     *
+     * **A map that has never been put into answers zero**, because it has no storage at all: the first
+     * insert makes it. That is the one number here a caller might be surprised by, and it is the
      * whole of what "an empty map holds no table" looks like from outside.
      */
     const capacity(self) -> usize = if !is_null(self.core) then self.core.cell.len else 0
@@ -242,7 +273,9 @@ impl[K: Hash + Eq, V] Walk for Map[K, V]
     type Walker = Cursor[K, V]
 
     /** A cursor over the entries, in no particular order -- the order is the table's, which changes
-     * when it rehashes and is not something a program may rely on.
+     * when it rehashes and is not something a program may rely on. (A map small enough to be a list
+     * happens to yield in the order its keys were first put, and that is not promised either: the
+     * ninth key ends it.)
      *
      * **Do not modify the map while a cursor over it is live.** Doing so is memory-safe and nothing
      * more: the cursor holds the table as a view, so it keeps that storage alive and can never read
@@ -265,18 +298,32 @@ private[container] struct MapCore[K: Hash + Eq, V]
     count: usize
     dead: usize
 
+    /** Whether the entries are in a table rather than a list. A list is `list_room` slots and a table
+     * at least `initial_slots`, so the length answers it; a map with no storage is a list of nothing.
+     */
+    hashed(self) -> bool = self.cell.len > list_room
+
     /** The index a key's entry sits at, or `None`.
      *
-     * The walk stops at `Empty` and steps over `Dead`, which is the rule the two variants exist to
-     * express. It terminates because the load factor keeps at least one slot in four empty, so the
-     * `Empty` case is always reachable from anywhere in the table.
+     * **In a list, every entry is compared**, front to back, and nothing is hashed: the `count` of them
+     * are packed at the front, so the scan stops there.
      *
-     * **A map with no table at all is answered before the probe starts.** A table is made by the
-     * first `put`, so `cell` is empty until then, and `cell.len - 1` on an empty run is not a mask
-     * of no bits -- it is every bit, and the index it makes is off the end.
+     * In a table, the walk stops at `Empty` and steps over `Dead`, which is the rule the two variants
+     * exist to express. It terminates because the load factor keeps at least one slot in four empty,
+     * so the `Empty` case is always reachable from anywhere in the table.
+     *
+     * **A map with no storage at all is a list of nothing**, so it is answered by the scan, and never
+     * reaches the probe -- where `cell.len - 1` on an empty run would not be a mask of no bits but
+     * every bit, and the index it made off the end.
      */
     find(self, k: K) -> Option[usize]
-        if self.cell.len == 0 then return None
+        if !self.hashed()
+            for i in 0..<self.count
+                self.cell[i] match
+                    Slot.Live(_, sk, _) -> if sk == k then return Some(i)
+                    _ -> ()
+
+            return None
 
         val h = k.hash()
         val mask = self.cell.len - 1
@@ -291,7 +338,19 @@ private[container] struct MapCore[K: Hash + Eq, V]
             i = (i + 1) & mask
     end find
 
+    /** The value a key names. A list answers it from the scan itself, value and all, rather than
+     * finding an index and reading the slot a second time -- the lookup is the list's whole reason to
+     * exist, so it is the one path written out twice.
+     */
     get(self, k: K) -> Option[V]
+        if !self.hashed()
+            for i in 0..<self.count
+                self.cell[i] match
+                    Slot.Live(_, sk, v) -> if sk == k then return Some(v)
+                    _ -> ()
+
+            return None
+
         self.find(k) match
             None -> None
             Some(i) -> self.cell[i].value()
@@ -303,9 +362,29 @@ private[container] struct MapCore[K: Hash + Eq, V]
      * is the entry about to be added: the test is whether the table would be over its load *after*
      * this insert, since discovering it afterwards would leave it over for the whole of the next
      * lookup.
+     *
+     * **A list takes the key at its end**, after a scan has shown it is not already there; the first
+     * `put` into a map with no storage has `rehash` make the list's eight slots. A list with no room
+     * left is turned into a table by `rehash` too, and the key is then put into that like any other.
      */
     put(*self, k: K, v: V)
-        if (self.count + self.dead + 1) * load_den > self.cell.len * load_num then self.rehash()
+        if !self.hashed()
+            self.find(k) match
+                Some(i) ->
+                    self.cell[i] = Slot.Live(0, k, v)
+                    return
+                None -> ()
+
+            if self.cell.len == 0 then self.rehash()
+
+            if self.count < list_room
+                self.cell[self.count] = Slot.Live(0, k, v)
+                self.count += 1
+                return
+
+            self.rehash()
+        else if (self.count + self.dead + 1) * load_den > self.cell.len * load_num
+            self.rehash()
 
         val h = k.hash()
         val mask = self.cell.len - 1
@@ -340,10 +419,20 @@ private[container] struct MapCore[K: Hash + Eq, V]
      * The slot becomes a tombstone rather than empty, because a key that probed past it on the way
      * to its own slot must still be able to. The tombstone is counted, which is what eventually
      * triggers the rehash that clears it.
+     *
+     * **A list closes the gap instead**: the entries after the removed one move down a slot, so the
+     * list stays packed at the front, in the order its keys were put, and leaves no tombstone.
      */
     remove(*self, k: K) -> bool
         self.find(k) match
             None -> false
+            Some(i) if !self.hashed() ->
+                for j in i..<self.count - 1
+                    self.cell[j] = self.cell[j + 1]
+
+                self.cell[self.count - 1] = Slot.Empty
+                self.count -= 1
+                true
             Some(i) ->
                 self.cell[i] = Slot.Dead
                 self.count -= 1
@@ -353,7 +442,7 @@ private[container] struct MapCore[K: Hash + Eq, V]
 
     /** Every entry dropped and the table let go entirely, so that a map used as scratch across a
      * loop does not keep the largest table any pass through it needed -- and a map that is cleared
-     * and never used again costs nothing at all. The next `put` makes a fresh table, exactly as it
+     * and never used again costs nothing at all. The next `put` starts a fresh list, exactly as it
      * would for a map that had never held anything.
      */
     clear(*self)
@@ -369,23 +458,35 @@ private[container] struct MapCore[K: Hash + Eq, V]
      * it already was, with every tombstone gone. A map that is genuinely growing doubles, because
      * its live count is what put it over the line.
      *
-     * Nothing is hashed here. Every entry carries the `u64` it mixed down to, and a table's index is
-     * that number masked, so re-placing an entry is a mask and a walk.
+     * Nothing is hashed when a table is rebuilt. Every entry carries the `u64` it mixed down to, and a
+     * table's index is that number masked, so re-placing an entry is a mask and a walk.
+     *
+     * **This is also where a full list becomes a table**, and there every key is hashed, once, since
+     * a list never hashed any. The `+ 1` is the entry whose arrival prompted it, so the table built
+     * for the ninth key is sized for nine and does not grow again for a while.
+     *
+     * And it is where a map with no storage gets its list, so that every slot a map ever holds is
+     * made in this one place, whichever form it is for.
      */
     private rehash(*self)
+        if !self.hashed() && self.count < list_room
+            self.cell = [Slot.Empty; list_room]
+            return
+
         var want = initial_slots
 
         while want < (self.count + 1) * 2
             want *= 2
 
         val old = self.cell
+        val listed = !self.hashed()
 
         self.cell = [Slot.Empty; want]
         self.dead = 0
 
         for i in 0..<old.len
             old[i] match
-                Slot.Live(h, k, v) -> self.place(h, k, v)
+                Slot.Live(h, k, v) -> self.place(if listed then k.hash() else h, k, v)
                 _ -> ()
     end rehash
 
@@ -410,13 +511,11 @@ end MapCore
  * map built inside a loop, held in a struct that is usually empty, or made and dropped on a branch
  * that turns out not to be taken would otherwise pay for a table of slots every time, and no caller
  * can see that it is paying. The cell is the `MapCore` every name for the map shares -- three words,
- * whatever the key and value. The first `put` finds the table over its load -- nothing is over
- * nothing -- and rehashes to `initial_slots` before it places anything, which is the path `put`
- * already took for a table that had filled up. So there is no separate "grow from empty" case to get
- * wrong.
+ * whatever the key and value. The first `put` makes the `list_room` slots a small map lives in, and
+ * the ninth distinct key turns them into a table.
  *
  * Reach for `map_with_capacity` where entries are known to be coming: a caller who names a size is
- * saying so, and gets its table immediately.
+ * saying so, and gets its storage immediately.
  *
  * **The annotation on `core` is required and is not noise.** `MapCore`'s parameters would have to
  * come from the constructor's arguments while the empty table waits to hear what it is a table of,
@@ -427,11 +526,17 @@ const map[K: Hash + Eq, V]() -> Map[K, V]
 
     Map(core)
 
-/** A map whose table is already big enough for `n` entries without rehashing, for a caller that knows
- * roughly how many are coming. The table is sized to twice `n` because the map rehashes at three
- * quarters full, so a table of exactly `n` slots would grow before the `n`th entry arrived.
+/** A map whose storage is already big enough for `n` entries without rehashing, for a caller that
+ * knows roughly how many are coming. Up to `list_room` entries that is the list's slots, since so few
+ * would be a list anyway. Past it the map starts as a table, sized to twice `n` because it rehashes
+ * at three quarters full, so a table of exactly `n` slots would grow before the `n`th entry arrived.
  */
 const map_with_capacity[K: Hash + Eq, V](n: usize) -> Map[K, V]
+    if n <= list_room
+        val small: &MapCore[K, V] = MapCore([Slot.Empty; list_room], 0, 0)
+
+        return Map(small)
+
     var want = initial_slots
 
     while want < n * 2
