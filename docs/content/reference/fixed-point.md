@@ -21,13 +21,13 @@ print(gain, ratio, phase)
 0.6 3.25 0.5
 ```
 
-The storage width is in the name because on a microcontroller it **is** the cost: an `i32q31` add is
-one `QADD` on a Cortex-M4 and a 64-bit multiply is a library call on a Cortex-M0+. A fixed-point value
-is laid out, passed and stored exactly as the `iW`/`uW` of its width, and a C header spells it as
-that integer (`int32_t` for a `q31`, which is CMSIS's `q31_t`).
+The storage width is part of the name because on a microcontroller it determines the cost: an
+`i32q31` add is one `QADD` on a Cortex-M4, while a 64-bit multiply is a library call on a Cortex-M0+.
+A fixed-point value is laid out, passed and stored exactly as the `iW`/`uW` of its width, and a C
+header spells it as that integer (`int32_t` for a `q31`, which is CMSIS's `q31_t`).
 
-The fraction is 1 to the width. No fraction is the integer itself, and more fraction than storage has
-no bits to put it in:
+The fraction is from 1 bit up to the storage width. A format with no fraction would be the integer
+type itself, and a fraction wider than the storage has no bits to occupy:
 
 ```sysl
 var x: i32q0 = 0
@@ -64,9 +64,9 @@ print(a.bits, b.bits, c.bits)
 1288490189 461168601842738790 196608
 ```
 
-A literal outside the range is a compile error, exactly as `var x: u8 = 300` is — and the message
-names the range and the attribute for the end, since the commonest way to write one out of range is
-to reach for the end itself:
+A literal outside the range is a compile error, as `var x: u8 = 300` is. The message names the range
+and the attribute for its end, since the most common out-of-range literal is an attempt to write the
+end itself:
 
 ```sysl
 val x: q31 = 1.0
@@ -79,8 +79,8 @@ the literal 1.0 does not fit q31, whose range is -1 to 0.9999999995; the largest
 A suffix names the format where nothing else does: `0.6i32q31`, `1i32q16`.
 
 **The converted value is constant data.** A module `val`, an array or a struct built from fixed-point
-literals is laid into the object file with no initializer at all, which is what lets it live on a
-board with no loader:
+literals is laid into the object file with no initializer at all, so it works on a board with no
+loader:
 
 ```sysl build=c target=thumbv6m-freestanding
 module tone
@@ -100,7 +100,7 @@ same way, rounded and saturated exactly as the run-time conversion would:
 ```sysl build=c target=thumbv6m-freestanding
 module ramp
 
-const step(i: int) -> real = real(i) / 4.0 - 0.5
+const step(i: int) -> real = real(i) / 4 - 0.5
 
 val RAMP: [4]q15 = [q15(step(0)), q15(step(1)), q15(step(2)), q15(step(3))]
 
@@ -115,7 +115,7 @@ element by element and return it, and a module `val` over the call is laid into 
 ```sysl build=c target=thumbv7em-freestanding
 module osc
 
-const pi: real = 3.141592653589793
+const pi = 3.141592653589793
 
 // sin(x) on [-pi, pi], by its series to x^15.
 const sine(x: real) -> real
@@ -129,10 +129,10 @@ const sine(x: real) -> real
     sum
 
 const sine_table() -> [256]q15
-    var t: [256]q15 = [q15(0.0); 256]
+    var t: [256]q15 = [0; 256]
 
     for i in 0..<256
-        t[i] = q15(sine(2.0 * pi * real(i) / 256.0 - pi))
+        t[i] = q15(sine(2 * pi * real(i) / 256 - pi))
 
     t
 
@@ -152,11 +152,11 @@ does at a width wide enough to hold them; the same call made at run time gives t
 
 ```sysl
 const halves() -> [4]q15
-    var t: [4]q15 = [q15(0.0); 4]
+    var t: [4]q15 = [0; 4]
     val step: q15 = 0.25
 
     for i in 0..<4
-        t[i] = step * i - q15(0.5)
+        t[i] = step * i - 0.5
 
     t
 
@@ -260,11 +260,11 @@ divisor of zero traps.
 
 ```sysl
 val x: q15 = 0.25
-val n: int = -4
-val a: q15 = x * 3
-val b: q15 = x * 5
-val c: q15 = x * n
-val d: q15 = x / 3
+val n = -4
+val a = x * 3
+val b = x * 5
+val c = x * n
+val d = x / 3
 
 print(a, b, c, real(d))
 ```
@@ -278,7 +278,7 @@ is two types:
 
 ```sysl
 val x: q15 = 0.5
-val n: int = 2
+val n = 2
 val y = n / x
 ```
 
@@ -311,13 +311,13 @@ changes what the operators do, so it makes a type of its own and is written with
 ```sysl
 type Acc = new i8q4 wrapping
 
-var w: Acc = Acc(7.0)
-w += Acc(2.0)
-w -= Acc(3.0)
+var w = Acc(7)
+w += Acc(2)
+w -= Acc(3)
 
-var s: i8q4 = 7.0
-s += 2.0
-s -= 3.0
+var s: i8q4 = 7
+s += 2
+s -= 3
 
 print(real(w), real(s))
 ```
@@ -476,7 +476,7 @@ type Acc = new i64q43 wrapping
 val raw: i64 = 8796093022208
 val a = Acc::Bits(raw)
 
-print(real(a), a.bits, real(Acc::Max) > 1000000.0)
+print(real(a), a.bits, real(Acc::Max) > 1000000)
 ```
 
 ```output
@@ -651,7 +651,7 @@ import sysl.math.Signed
 magnitude[T: Signed](x: T) -> T = x.abs()
 
 val a: q15 = -0.25
-val z: q15 = 0.0
+val z: q15 = 0
 print(magnitude(a), q15::Min.abs(), z.abs())
 print(a.signum(), (-a).signum(), z.signum())
 val b: i32q16 = -3.5
@@ -684,9 +684,9 @@ A fixed-point type is a scalar, so `within` narrows it like any other — the en
 exactly, and a value is checked against them at the raw value:
 
 ```sysl
-type Gain = i32q27 within 0.0..8.0
+type Gain = i32q27 within 0..8
 
-val g: Gain = 4.0
+val g: Gain = 4
 print(g)
 ```
 
@@ -727,7 +727,7 @@ products, added. With a `wrapping` accumulator that is a dot product of pairs:
 type Acc = new i32q30 wrapping
 
 dot(xs: [4]q15, ys: [4]q15) -> Acc
-    var acc = Acc(0.0)
+    var acc = Acc(0)
 
     for i in 0..<2
         val x: <2>q15 = [xs[2 * i], xs[2 * i + 1]]
@@ -738,24 +738,24 @@ dot(xs: [4]q15, ys: [4]q15) -> Acc
     acc
 end dot
 
-val xs: [4]q15 = [0.5, 0.25, -1.0, 0.75]
-val ys: [4]q15 = [0.5, -0.5, -1.0, 0.5]
+val xs: [4]q15 = [0.5, 0.25, -1, 0.75]
+val ys: [4]q15 = [0.5, -0.5, -1, 0.5]
 
-print(dot(xs, ys), real(Acc(1.5) + Acc(1.0)))
+print(dot(xs, ys), real(Acc(1.5) + Acc(1)))
 ```
 
 ```output
 1.5 -1.5
 ```
 
-The accumulator wraps rather than saturating, as `wrapping` says: `Acc(1.5) + Acc(1.0)` is 2.5, past
+The accumulator wraps rather than saturating, as `wrapping` says: `Acc(1.5) + Acc(1)` is 2.5, past
 an `i32q30`'s largest value, and comes back as -1.5. So does a single pair — `-1 × -1` twice is 2,
 which an `i32q30` holds as -2:
 
 ```sysl
 type Acc = new i32q30 wrapping
 
-val m: <2>q15 = [-1.0, -1.0]
+val m: <2>q15 = [-1, -1]
 val s: Acc = (m * m).sum()
 
 print(s)
