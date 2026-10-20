@@ -550,8 +550,8 @@ struct Square
 impl Area for Square
     area(self) -> int = self.side * self.side
 
-val z: *int = ptr_cast(usize(0))
-val p: *int = ptr_cast(usize(0x1000))
+val z: *int = ptr_cast(0)
+val p: *int = ptr_cast(0x1000)
 val a: *Area = &Square(3)
 val f: &Fn(int) -> int = x -> x + 1
 
