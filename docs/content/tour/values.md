@@ -120,31 +120,35 @@ Storage rounds up to whole bytes and an alignment the machine has — a `u12` oc
 narrow width buys correct arithmetic rather than tight packing. The
 [reference](/reference/types/) has the ceiling and the two costs at extreme widths.
 
-Ask for a wider type and the compiler will not do it silently:
+Ask for a wider type and you get it, because nothing can be lost: every `byte` is an `int`. Ask for a
+narrower one and the compiler will not do it silently:
 
 ```sysl
 var small: byte = 200
 var wide: int = small
-print(wide)
+var count: int = 300
+var back: byte = count
 ```
 
 ```error
-cannot initialize 'wide': declared int but the value is byte
+cannot initialize 'back': declared byte but the value is int
 ```
 
-The fix is to say so, and every conversion is written with call syntax:
+The fix is to say so, and every conversion that can lose or change a value is written with call
+syntax:
 
 ```sysl
 var small: byte = 200
+var wide: int = small
 
-print("widened:", int(small))
+print("widened:", wide, "narrowed:", byte(300))
 print("truncated:", int(3.9))
 print("divided:", f32(7) / f32(2))
 print("code point:", u32('A'))
 ```
 
 ```output
-widened: 200
+widened: 200 narrowed: 44
 truncated: 3
 divided: 3.5
 code point: 65

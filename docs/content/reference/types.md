@@ -9,9 +9,12 @@ the **aggregates** you build (arrays, slices, structs, enums, tuples), and the *
 where a value lives (`T`, `&T`, `*T`). This page covers the first three. The modes have a
 [page of their own](/reference/memory/), because they are about storage rather than shape.
 
-There is no implicit conversion anywhere in the language. Every width change, signedness change, and
-float/integer crossing is written as a cast, and a cast that could lose information is written and
-seen.
+**A conversion is implicit exactly when it cannot lose anything**: where every value of one numeric
+type is exactly a value of another — a `byte` into an `int`, an `int` into a `long` or a `real`, an
+`f32` into an `f64` — a position that wants the wider type takes the narrower one as it stands. Every
+other width change, signedness change, and float/integer crossing is written as a conversion call, so
+a conversion that could lose information is written and seen. The table is in [Which conversions are
+implicit](/reference/expressions/#which-conversions-are-implicit).
 
 ## Integers are an open family
 
