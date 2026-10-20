@@ -1527,22 +1527,81 @@ private check_exposed_name(a: &Analysis, scope: Scope, label: string, vis: Visib
 
     val key = lookup_type_key(a, scope, name)
 
-    if key.is_none() then return
+    if key.is_some() then check_exposed_key(a, scope, label, vis, what, key.unwrap(), span)
+end check_exposed_name
 
+private check_exposed_key(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
+                          key: string, span: Span)
     // **A name the declaration cannot reach at all is one mistake, not two** -- it is refused where
     // it is written, and saying a second time that the signature is too visible for it would be a
     // second complaint about the same word.
-    if !reachable_key(a, key.unwrap(), scope) then return
+    if !reachable_key(a, key, scope) then return
 
-    val acc = a.tables.access.get(key.unwrap())
+    val acc = a.tables.access.get(key)
 
     if acc.is_none() || reaches_as_far(vis, scope.module_name, acc.unwrap()) then return
 
     a.fault(scope, span,
-            s"'$label' is ${reach_phrase(vis)}, but $what names '${qualified_name(key.unwrap())}', " +
+            s"'$label' is ${reach_phrase(vis)}, but $what names '${qualified_name(key)}', " +
             s"which is ${no_further_than(acc.unwrap())} — a declaration may not be more visible " +
             "than the types it names")
-end check_exposed_name
+end check_exposed_key
+
+// **A type left off is held to the rule a written one is**: the value's type is what a reader of
+// the declaration gets, so a private type in it is exposed exactly as one written would be. Said at
+// the declaration, there being no written name to point at; asked once the type has been read, by
+// whatever reads the declaration (`module_storage`, `check_const_admits`).
+check_exposed_inferred(a: &Analysis, v: ValueDecl, t: Type)
+    if is_private_reach(v.vis) then return
+
+    var keys: Buf[string] = buf()
+
+    type_keys(&keys, t)
+
+    for key in keys
+        check_exposed_key(a, v.scope, v.name, v.vis, "its type", key, v.span)
+end check_exposed_inferred
+
+// Every declared type a type is made of -- what a written type would have had to name -- outermost
+// first, each once. A struct's fields are its own declaration's business and are not followed.
+private type_keys(out: *Buf[string], t: Type)
+    t match
+        Struct(d) ->
+            push_key(out, d.base)
+            each_type_key(out, d.targs)
+        Enum(d) ->
+            push_key(out, d.base)
+            each_type_key(out, d.targs)
+        Results(parts) ->
+            for item in parts.fields
+                type_keys(out, item.1)
+        Trait(name, args, assocs) ->
+            push_key(out, name)
+            each_type_key(out, args)
+
+            for item in assocs
+                type_keys(out, item.1)
+        Constrained(d) -> push_key(out, d.name)
+        Ptr(inner) -> type_keys(out, *inner)
+        Volatile(inner) -> type_keys(out, *inner)
+        Ref(inner, _) -> type_keys(out, *inner)
+        Weak(inner) -> type_keys(out, *inner)
+        Array(_, elem) -> type_keys(out, *elem)
+        Vector(_, elem) -> type_keys(out, *elem)
+        Slice(elem, _) -> type_keys(out, *elem)
+        CFn(params, ret) ->
+            each_type_key(out, params)
+            type_keys(out, *ret)
+        Pack(elems) -> each_type_key(out, elems)
+        _ -> ()
+end type_keys
+
+private each_type_key(out: *Buf[string], ts: Buf[Type])
+    for item in ts
+        type_keys(out, item)
+
+private push_key(out: *Buf[string], key: string)
+    if !holds_string(*out, key) then out.push(key)
 
 // Whether every reader of a declaration at this reach is also a reader of a type at that one. The
 // file level is not asked: a file-private declaration is read in one file, and every type it names

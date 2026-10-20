@@ -1209,8 +1209,8 @@ It answers a [result list](/reference/declarations/) and not a tuple, because th
 callee to caller and nothing afterwards needs to hold the two together. A caller that *does* need to
 hold them writes the tuple itself.
 
-A binding naming several things is a **local** form — its parts have nowhere to write a type — so the
-top of a program, which is a body, takes one exactly as a function does:
+A binding naming several things gives each name the type of its part, so the top of a program, which
+is a body, takes one exactly as a function does:
 
 ```sysl
 import sysl.math.divmod
@@ -1224,18 +1224,23 @@ print(q, r)
 3 2
 ```
 
-Asking for the module's storage instead is what has nowhere to put the types, and is refused:
+and so does the module, asked for with `static`: each name is then a module `val` of its part's type,
+read by the module's functions as well as by the body, and the call is made once.
 
 ```sysl
 import sysl.math.divmod
 
 static val q, r = divmod(17, 5)
 
+show() = print(q * 5 + r)
+
 print(q, r)
+show()
 ```
 
-```error
-a module-level 'val' states its type, and a binding that names several things has nowhere to write one — declare 'q' and 'r' separately
+```output
+3 2
+17
 ```
 
 ### `div_floor` and `mod_floor`

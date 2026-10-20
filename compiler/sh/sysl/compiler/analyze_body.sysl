@@ -1762,6 +1762,8 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     init = Some(type_expr(cx, d.init.unwrap(), None))
                     a.vals_in_progress.truncate(a.vals_in_progress.len() - 1)
                     stored = inferred_storage(cx, key, d, texpr_type(init.unwrap()))
+                    check_exposed_inferred(a, d, stored)
+                end if
 
                 val ty = unqualified(stored)
 
@@ -1862,6 +1864,15 @@ end module_storage
 // may write what it captured, which no module storage could be before a type could be left off.
 private inferred_storage(cx: &Analyzer, key: string, d: ValueDecl, got: Type) -> Type
     val shown = if d.scope.module_name == "" then d.name else s"${d.scope.module_name}.${d.name}"
+
+    // The value a module binding takes apart (`hoist.sysl`'s `held_once`) is no name of the reader's,
+    // and its type is written for the whole binding.
+    if holds_string(cx.an.val_cycles, key) && is_held_whole(d.name)
+        cx.fault(d.span, "this binding takes its parts' types from its value, and the value reaches " +
+                 "what it binds again — write the type of the whole value, 'val (…): T = …'")
+
+        return Unknown
+    end if
 
     if holds_string(cx.an.val_cycles, key)
         cx.fault(d.span, s"'$shown' takes its type from its value, and the value reaches '$shown' " +

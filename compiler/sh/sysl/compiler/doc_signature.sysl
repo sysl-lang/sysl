@@ -467,4 +467,72 @@ doc_signature(s: Stmt) -> Option[string] = *s.kind match
     ExternDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_extern(d)}")
     ExternVarDecl(name, typ, _, vis, _) -> Some(s"${doc_vis_word(vis)}extern ${name}: ${doc_type_text(typ)}")
     ValDecl(name, typ, value, vis, _, _, _, _) -> Some(s"${doc_vis_word(vis)}${doc_val(name, typ, value)}")
+    MultiDecl(names, mutable, values, vis) ->
+        if mutable then None
+        else Some(s"${doc_vis_word(vis)}val ${doc_names(names)} = ${doc_exprs_text(values)}")
+    PatternDecl(pat, mutable, value, typ, vis) ->
+        if mutable then None else Some(s"${doc_vis_word(vis)}${doc_pattern_val(pat, typ, value)}")
     _ -> None
+
+// The names a binding gives, as it lists them: `q, r`.
+doc_names(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + ", "
+
+        out = out + names.at(i)
+
+    out
+end doc_names
+
+private doc_exprs_text(es: Buf[Expr]) -> string
+    var out = ""
+
+    for i in 0..<es.len()
+        if i > 0 then out = out + ", "
+
+        out = out + doc_expr_text(es.at(i))
+
+    out
+end doc_exprs_text
+
+private doc_pattern_val(pat: Pattern, typ: Option[TypeRef], value: Expr) -> string = typ match
+    Some(t) -> s"val ${doc_pattern_text(pat)}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
+    None -> s"val ${doc_pattern_text(pat)} = ${doc_expr_text(value)}"
+
+// A pattern as it is written: `(a, b)`, `Point(x, y)`, `Point { x, y: b }`, `n @ (a, _)`.
+doc_pattern_text(p: Pattern) -> string = *p.kind match
+    LitPattern(v) -> doc_expr_text(v)
+    RangePattern(lo, hi, inclusive) ->
+        s"${doc_expr_text(lo)}${if inclusive then ".." else "..<"}${doc_expr_text(hi)}"
+    WildcardPattern -> "_"
+    IdentPattern(n) -> n
+    EqPattern(n) -> s"`$n`"
+    VariantPattern(n, args) -> s"$n(${doc_patterns_text(args)})"
+    StructPattern(n, fields) ->
+        var out = s"$n { "
+
+        for i in 0..<fields.len()
+            if i > 0 then out = out + ", "
+
+            val f = fields.at(i)
+
+            *f.pat.kind match
+                IdentPattern(b) if b == f.name -> out = out + b
+                _ -> out = out + s"${f.name}: ${doc_pattern_text(f.pat)}"
+
+        out + " }"
+    TuplePattern(args) -> s"(${doc_patterns_text(args)})"
+    BindPattern(n, inner) -> s"$n @ ${doc_pattern_text(inner)}"
+
+private doc_patterns_text(ps: Buf[Pattern]) -> string
+    var out = ""
+
+    for i in 0..<ps.len()
+        if i > 0 then out = out + ", "
+
+        out = out + doc_pattern_text(ps.at(i))
+
+    out
+end doc_patterns_text

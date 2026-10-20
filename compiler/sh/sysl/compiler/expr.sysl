@@ -569,7 +569,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
         val d = a_extern_vars(cx).get(ek.unwrap()).unwrap()
 
-        note_storage_reference(cx, span, d)
+        note_storage_reference(cx, span, d, value_type(cx, d))
 
         return TExpr(span, TGlobal(extern_var_symbol(d), value_type(cx, d), true))
     end if
@@ -932,13 +932,14 @@ end is_writable_key
 private global_expr(cx: &Analyzer, span: Span, key: string, from: &Table[ValueDecl],
                     writable: bool) -> TExpr
     val d = from.get(key).unwrap()
+    val stored = storage_type(cx.an, key, d, writable)
 
-    note_storage_reference(cx, span, d)
+    note_storage_reference(cx, span, d, stored)
 
     // The node carries the type the storage is DECLARED at, a `volatile` included, as a field's
     // declaration does: what a read of it hands back is the plain value (`texpr_type`), and what an
     // access to it is, or what `&` of it points at, is asked of the declaration (`place_type`).
-    TExpr(span, TGlobal(key, storage_type(cx.an, key, d, writable), writable))
+    TExpr(span, TGlobal(key, stored, writable))
 end global_expr
 
 // A bare name that stands for a variant of an enum, which is the one name form the *expected* type
@@ -956,7 +957,9 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
     val found = variant_of(cx, name, expected)
 
-    if found.is_none() && refused_is_name(cx, name) then return bad_expr(span)
+    // The part a module binding reads back is unbound only where the binding was refused, which said
+    // why (`hoist_parts`).
+    if found.is_none() && (refused_is_name(cx, name) || name == PART_LOCAL) then return bad_expr(span)
 
     if found.is_none() then
         // A generic enum nothing has instantiated yet still declares the name, and a variant of it

@@ -244,6 +244,8 @@ end hoist_units
 private entry_binding(s: Stmt) -> bool = *s.kind match
     ValDecl(_, _, _, _, _, _, _, _) -> true
     VarDecl(_, _, _, _, _, _, _, _) -> true
+    MultiDecl(_, _, _, _) -> true
+    PatternDecl(_, _, _, _, _) -> true
     _ -> false
 
 // What a trait's members may not carry a body for.
@@ -362,28 +364,176 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // registered exactly as another file's declaration of it would be -- which is the whole of
         // what the modifier does, in the one file where an ordinary `var` is a local instead.
         StaticDecl(inner) -> hoist_stmt(a, scope, inner)
-        // The rule a module `val` meets, and a form that cannot satisfy it: a binding naming several
-        // things, or written as a pattern, has nowhere to write a type for any of its parts, so it
-        // can only ever be a local. Saying so here is what stops one asking for the module from
-        // quietly becoming a local of the entry point.
-        MultiDecl(names, mutable, _) ->
+        // **A `val` naming several things is one module `val` per name**, each of its part's type,
+        // exactly as the same binding in a body gives it.
+        MultiDecl(names, mutable, values, vis) ->
+            if !mutable then hoist_several(a, scope, s.span, names, values, vis)
+        PatternDecl(pat, mutable, value, typ, vis) ->
             if !mutable
-                var named = ""
+                var names: Buf[string] = buf()
 
-                for i in 0..<names.len()
-                    if i > 0 then named = named + " and "
+                pattern_names(&names, pat)
 
-                    named = named + s"'${names.at(i)}'"
+                val held = held_once(a, scope, s.span, value, typ)
+                val binding = PatternDecl(pat, false, held.at(0), None, File)
 
-                a.fault(scope, s.span, "a module-level 'val' states its type, and a binding that " +
-                        s"names several things has nowhere to write one — declare $named separately")
+                hoist_parts(a, scope, s.span, names, vis, binding)
             end if
-        PatternDecl(_, mutable, _, _) ->
-            if !mutable then
-                a.fault(scope, s.span, "a module-level 'val' states its type, and a binding written " +
-                        "as a pattern has nowhere to write one — take the value apart inside a " +
-                        "function, or declare the parts separately")
         _ -> ()
+
+// `val a, b = …` at module level. **A list of values is shared out one each**, so each name's
+// initializer is the value written beside it, and is data wherever that value alone would be. One
+// value taken apart -- and a count that does not match, which the body's reading refuses -- goes
+// through `hoist_parts`.
+private hoist_several(a: &Analysis, scope: Scope, span: Span, names: Buf[string], values: Buf[Expr],
+                      vis: Visibility)
+    if values.len() == names.len() && !names_repeated(names)
+        for i in 0..<names.len()
+            if names.at(i) != "_" then
+                hoist_value(a, scope, span, names.at(i), None, vis, a.tables.vals, "'val'",
+                            Some(values.at(i)))
+
+        return
+    end if
+
+    val from = if values.len() == 1 then held_once(a, scope, span, values.at(0), None) else values
+
+    hoist_parts(a, scope, span, names, vis, MultiDecl(names, false, from, File))
+end hoist_several
+
+// One module `val` per name a binding gives, each initialized by **the binding itself, read as a
+// body reads it, and then the name** -- so a part has the type, and meets the refusals, that the
+// form inside a function gives it. A refusal of the form is the same message at the same place for
+// every name, and is said once.
+//
+// **The part is bound under a name no program can write** (`PART_LOCAL`) and that is what is read:
+// a binding refused for its shape binds nothing, and a read of the name as written would then find
+// the module `val` itself -- a value reaching itself, said on top of the refusal. The local's read
+// is quiet instead, as a body's later use of a name its refused binding gave is left to the refusal.
+//
+// A name written twice is refused here, since the binding each part reads no longer spells it twice.
+private hoist_parts(a: &Analysis, scope: Scope, span: Span, names: Buf[string], vis: Visibility,
+                    binding: StmtKind)
+    val first = first_namings(names)
+
+    for i in 0..<names.len()
+        if first.at(i) || names.at(i) == "_" then continue
+
+        a.fault(scope, span, s"'${names.at(i)}' is named twice in one binding")
+
+    for i in 0..<names.len()
+        if !first.at(i) then continue
+
+        var body: Buf[Stmt] = buf()
+
+        body.push(stmt(span, part_binding(binding, names.at(i))))
+        body.push(stmt(span, ExprStmt(expr(span, Ident(PART_LOCAL)))))
+        hoist_value(a, scope, span, names.at(i), None, vis, a.tables.vals, "'val'",
+                    Some(expr(span, Block(body))))
+    end for
+end hoist_parts
+
+// The binding with the first place it binds `name` binding `PART_LOCAL` instead.
+private part_binding(binding: StmtKind, name: string) -> StmtKind
+    var done = false
+
+    binding match
+        MultiDecl(names, _, values, _) ->
+            var renamed: Buf[string] = buf()
+
+            for item in names
+                if !done && item == name
+                    renamed.push(PART_LOCAL)
+                    done = true
+                else
+                    renamed.push(item)
+
+            MultiDecl(renamed, false, values, File)
+        PatternDecl(pat, _, value, typ, _) ->
+            PatternDecl(renamed_pattern(pat, name, &done), false, value, typ, File)
+        other -> other
+end part_binding
+
+private renamed_pattern(p: Pattern, name: string, done: *bool) -> Pattern = *p.kind match
+    IdentPattern(n) -> if *done || n != name then p else renamed_ident(p, done)
+    BindPattern(n, inner) ->
+        val mine = !*done && n == name
+
+        if mine then *done = true
+
+        Pattern(p.span, BindPattern(if mine then PART_LOCAL else n, renamed_pattern(inner, name, done)))
+    TuplePattern(args) -> Pattern(p.span, TuplePattern(renamed_patterns(args, name, done)))
+    VariantPattern(v, args) -> Pattern(p.span, VariantPattern(v, renamed_patterns(args, name, done)))
+    StructPattern(s, fields) ->
+        var out: Buf[FieldPattern] = buf()
+
+        for item in fields
+            out.push(FieldPattern(item.name, renamed_pattern(item.pat, name, done)))
+
+        Pattern(p.span, StructPattern(s, out))
+    _ -> p
+
+private renamed_ident(p: Pattern, done: *bool) -> Pattern
+    *done = true
+    Pattern(p.span, IdentPattern(PART_LOCAL))
+
+// The local a module binding's part is bound to while its `val` is read (`hoist_parts`).
+const PART_LOCAL: string = "$part"
+
+// How the `val` holding the value a module binding takes apart is named (`held_once`), followed by
+// where the value was written.
+private const HELD_WHOLE: string = "$parts@"
+
+// Whether a module `val` is the value a binding takes apart, which a diagnostic names by the binding
+// rather than by a name the reader never wrote.
+is_held_whole(name: string) -> bool = name.starts_with(HELD_WHOLE)
+
+private renamed_patterns(ps: Buf[Pattern], name: string, done: *bool) -> Buf[Pattern]
+    var out: Buf[Pattern] = buf()
+
+    for item in ps
+        out.push(renamed_pattern(item, name, done))
+
+    out
+end renamed_patterns
+
+// The value a module binding takes apart, held once in a `val` of its file under a name no program
+// can write, so it is computed once however many names read it -- and a read of that `val`, standing
+// where the value was written. A type written for the whole value is that `val`'s.
+private held_once(a: &Analysis, scope: Scope, span: Span, value: Expr,
+                  typ: Option[TypeRef]) -> Buf[Expr]
+    val name = HELD_WHOLE + s"${value.span.start}"
+    var out: Buf[Expr] = buf()
+
+    hoist_value(a, scope, span, name, typ, File, a.tables.vals, "'val'", Some(value))
+    out.push(expr(value.span, Ident(name)))
+    out
+end held_once
+
+// Whether each name of a binding is the first time it is written there. A name written twice is
+// refused by the binding's own reading, and given one `val` rather than reported again as a second
+// declaration.
+private first_namings(names: Buf[string]) -> Buf[bool]
+    var out: Buf[bool] = buf()
+
+    for i in 0..<names.len()
+        var first = names.at(i) != "_"
+
+        for j in 0..<i
+            if names.at(j) == names.at(i) then first = false
+
+        out.push(first)
+
+    out
+end first_namings
+
+private names_repeated(names: Buf[string]) -> bool
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(j) == names.at(i) then return true
+
+    false
+end names_repeated
 
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
@@ -1286,6 +1436,19 @@ private note_wider(a: &Analysis, scope: Scope, s: Stmt)
         ConstDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
         ValDecl(name, _, _, vis, _, _, _, _) -> note_wider_name(a, scope, name, vis)
         VarDecl(name, _, _, vis, _, _, _, _) -> note_wider_name(a, scope, name, vis)
+        MultiDecl(names, mutable, _, vis) ->
+            if !mutable
+                for item in names
+                    note_wider_name(a, scope, item, vis)
+        PatternDecl(pat, mutable, _, _, vis) ->
+            if !mutable
+                var names: Buf[string] = buf()
+
+                pattern_names(&names, pat)
+
+                for item in names
+                    note_wider_name(a, scope, item, vis)
+            end if
         ExternVarDecl(name, _, _, vis, _) -> note_wider_name(a, scope, name, vis)
         ExternDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         FuncDecl(d) -> note_wider_name(a, scope, d.name, d.vis)

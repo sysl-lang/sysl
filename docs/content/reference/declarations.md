@@ -369,9 +369,25 @@ binding with nothing to take apart names nothing. The right side is produced bef
 bound, so a value there still means whatever the enclosing scope calls it — the binding does not
 shadow itself half way through its own right-hand side.
 
-**It is a local form.** The parts carry no type annotation and there is nowhere to write one, so a
-multiple `val` at the top of a file collides with the rule above and is refused rather than becoming
-a quiet local of the entry point. A module member that wants the form declares its names separately.
+**A module takes it too**, since a module `val` takes its type as a local does: each name is a module
+`val` of its part's type, read from the module's functions, its other files and the modules that
+import it like any other. A list of values is shared out one each, so a part over a constant is
+constant data; one value taken apart is computed once, however many names it gives.
+
+```sysl
+static val width, height = 640, 480
+static val q, r = halves(17)
+
+halves(n: int) -> (int, int) = (n / 2, n % 2)
+
+area() -> int = width * height
+
+print(area(), q, r)
+```
+
+```output
+307200 8 1
+```
 
 The same spelling also takes a **result list** and a **tuple** apart, which is why a function with
 several results needs no special form at the call.
@@ -479,8 +495,20 @@ show()
 cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
 ```
 
-Like the comma form, this is **a local form**, so one at the top of a file is refused rather than
-becoming a quiet local of the entry point.
+Like the comma form, it **is a module `val` per name** at the top of a file, and a type written for
+the whole value governs there as it does here:
+
+```sysl
+static val (lo, hi): (u8, u16) = (1, 300)
+
+span() -> u16 = hi - u16(lo)
+
+print(lo, hi, span())
+```
+
+```output
+1 300 299
+```
 
 The same pattern stands in a
 [`for` header](/reference/statements/#the-loop-variable-may-be-a-pattern), where it takes the element
