@@ -75,7 +75,8 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
     var shared: Option[Type] = None
 
     if then_leans && else_leans && expected.is_none() && !discarded then
-        shared = shared_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
+        shared = offering(cx, () -> shared_branch_type(cx, span, cond, then_body, else_body.unwrap(),
+                                                        discarded))
 
     val early_type = early.and_then(b -> settles(b)).or_else(() -> shared)
     val offered = if then_leans && expected.is_none() then early_type else None
@@ -92,13 +93,15 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 
     // A leaning *then* is offered the `else`'s type rather than told it, and read as a branch with
     // nothing to go on where it does not take it.
-    val took = offered.and_then(t -> attempt_then(cx, span, cond, then_body, Some(t), discarded))
+    val took = offered.and_then(t -> offering(cx, () -> attempt_then(cx, span, cond, then_body, Some(t),
+                                                                     discarded)))
 
     if took.is_some()
         tc = took.unwrap().0
         then_block = took.unwrap().1
     elif then_wants.is_some() || else_body.is_none()
-        val side = then_side(cx, span, cond, then_body, then_wants, discarded)
+        val side = if expected.is_some() then then_side(cx, span, cond, then_body, then_wants, discarded)
+                   else offering(cx, () -> then_side(cx, span, cond, then_body, then_wants, discarded))
 
         tc = side.0
         then_block = side.1
@@ -122,7 +125,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             if sibling.is_none() then
                 want = merged_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
 
-            val side = then_side(cx, span, cond, then_body, want, discarded)
+            val side = offering(cx, () -> then_side(cx, span, cond, then_body, want, discarded))
 
             tc = side.0
             then_block = side.1
@@ -215,12 +218,13 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
     val want = expected.or_else(() -> if else_guesses && !then_guesses then settles(then_block)
                                       else None)
 
-    if want.is_some() then return Some(type_value_block(cx, b, want, discarded))
+    if want.is_some() && expected.is_some() then return Some(type_value_block(cx, b, want, discarded))
+    if want.is_some() then return Some(offering(cx, () -> type_value_block(cx, b, want, discarded)))
 
     // A leaning `else` is offered what the *then* settled, and read on its own where it does not
     // take it.
     val offered = if else_leans then settles(then_block) else None
-    val took = offered.and_then(t -> attempt_block(cx, b, Some(t), discarded))
+    val took = offered.and_then(t -> offering(cx, () -> attempt_block(cx, b, Some(t), discarded)))
 
     if took.is_some() then return took
 
@@ -230,8 +234,19 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
 
     if tried.is_some() then return tried
 
-    Some(type_value_block(cx, b, settles(then_block), discarded))
+    Some(offering(cx, () -> type_value_block(cx, b, settles(then_block), discarded)))
 end else_branch
+
+// A reading of a branch at the type its sibling settled, which widens nothing to that type
+// (`Analyzer.sibling_offers`).
+private offering[T](cx: &Analyzer, read: () -> T) -> T
+    cx.sibling_offers += 1
+
+    val t = read()
+
+    cx.sibling_offers -= 1
+    t
+end offering
 
 // The branches meet at one type, and a branch that does not finish takes the other's. A branch used
 // only for its effect is a different thing: one `unit` branch makes the whole `if` a statement,

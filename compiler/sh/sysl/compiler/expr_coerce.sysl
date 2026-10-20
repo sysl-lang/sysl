@@ -20,7 +20,7 @@ import sysl.buf.{Buf, buf}
 analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     val t = analyze_unwidened(cx, e, expected)
 
-    if is_literal(e) then t else widened(t, expected)
+    if is_literal(e) || cx.sibling_offers > 0 then t else widened(t, expected)
 end analyze_expected
 
 // A value put where a wider scalar was asked for, converted to it, as the explicit conversion would
@@ -36,13 +36,12 @@ widened(t: TExpr, expected: Option[Type]) -> TExpr
     TExpr(t.span, TCast(t, want))
 end widened
 
-// A type a widened value may be converted to directly. A subtype with a range or a predicate is
-// reached through its own check (`analyze_unwidened`), never by a conversion that would skip it.
+// A type a widened value may be converted to directly. A named type over a scalar -- a subtype, a
+// `c type` -- is a type of its own, and nothing widens into it.
 private plain_scalar(t: Type) -> bool = t match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Fixed(_, _, _) -> true
-    Constrained(d) -> name_only(d) && plain_scalar(d.base)
     _ -> false
 
 // **Whether every value of one type is exactly a value of another**, which is the whole condition
@@ -53,21 +52,24 @@ private plain_scalar(t: Type) -> bool = t match
 // An address-width integer is its target's width here, because the type already is: `usize` on a
 // 32-bit target is `Integer(32, …)`, so `u32` reaches it there and on a 64-bit target, and on a
 // 16-bit one it does not.
-implicitly_widens(from: Type, to: Type) -> bool = repr(from) match
-    Integer(m, sm, _) -> repr(to) match
+//
+// **Both sides are the scalars themselves**: a named type over one (a subtype, a `c type`) is a type
+// of its own and converts as written, here as anywhere.
+implicitly_widens(from: Type, to: Type) -> bool = from match
+    Integer(m, sm, _) -> to match
         Integer(n, sn, _) -> integer_fits(m, sm, n, sn)
         Floating(b, brain) -> m <= (if sm then significand_bits(b, brain) + 1 else significand_bits(b, brain))
         Fixed(w, f, s) -> fixed_fits(m, 0, sm, w, f, s)
         _ -> false
     // The largest scalar value is 0x10FFFF, twenty-one bits.
-    Char -> repr(to) match
+    Char -> to match
         Integer(n, sn, _) -> integer_fits(21, false, n, sn)
         _ -> false
     // `f16` and `bf16` are both sixteen bits and neither holds the other's values.
-    Floating(a, _) -> repr(to) match
+    Floating(a, _) -> to match
         Floating(b, _) -> b > a
         _ -> false
-    Fixed(w, f, s) -> repr(to) match
+    Fixed(w, f, s) -> to match
         Fixed(w2, f2, s2) -> fixed_fits(w, f, s, w2, f2, s2)
         Floating(b, brain) ->
             (if s then w - 1 else w) <= significand_bits(b, brain) && f <= subnormal_scale(b, brain)
