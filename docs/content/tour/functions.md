@@ -6,8 +6,8 @@ weight: 30
 
 ## Two bodies
 
-A function is a name, a parameter list, a return type, and a body. When the body is one expression
-it goes after `=`:
+A function is a name, a parameter list, a return type, and a body. When the body is a single
+expression, it follows `=`:
 
 ```sysl
 add(a: int, b: int) -> int = a + b
@@ -19,44 +19,43 @@ print("3 + 4 =", add(3, 4))
 3 + 4 = 7
 ```
 
-When it is more than that, indent it under the header and drop the `=`. The trailing expression is
-what the function yields — there is no `return` to write, though `return` exists for leaving early:
+A longer body is indented under the header, without the `=`. The last expression is the function's
+result, so no `return` is needed; `return` exists for leaving early:
 
 ```sysl
-classify(n: int) -> string
-    var doubled = n * 2
+frame_kind(payload: int) -> string
+    var total = payload + 18
 
-    if doubled > 100 then "big"
-    else "small"
+    if total > 1518 then "jumbo"
+    else "standard"
 
-print(classify(60), classify(3))
+print(frame_kind(9000), frame_kind(46))
 ```
 
 ```output
-big small
+jumbo standard
 ```
 
-An optional `end` marker closes a long declaration and names it — worth writing when the closing
-indentation is off the screen. A function that returns nothing simply says no return type.
+An optional `end` marker closes a long declaration and names it, which helps when the start of the
+block is off the screen. A function that returns nothing omits the return type.
 
-A parameter may carry a default, and defaults fill from the right — so what a call writes decides
-how many are taken:
+A parameter may have a default. Defaults are filled from the right, so the number of arguments a call
+passes decides how many defaults it uses:
 
 ```sysl
 tag(text: string, open: string = "[", close: string = "]") -> string = open + text + close
 
-print(tag("all"), tag("half", "<"), tag("none", "{", "}"))
+print(tag("info"), tag("warn", "<"), tag("error", "{", "}"))
 ```
 
 ```output
-[all] <half] {none}
+[info] <warn] {error}
 ```
 
-The default is an expression evaluated at each call, not one value computed once and shared. That
-matters as soon as a default allocates: every call gets its own.
+A default is an expression evaluated at each call, not a single value computed once and shared. This
+matters when a default allocates: every call gets its own object.
 
-An argument may also be given by name, which is what rescues a call site that would otherwise be a
-row of anonymous literals:
+An argument may also be passed by name, which keeps a call with several literal arguments readable:
 
 ```sysl
 window(x: int = 0, y: int = 0, width: int = 80, height: int = 24) -> string
@@ -69,10 +68,11 @@ print(window(width = 132, y = 10))
 132x24 at 0,10
 ```
 
-A positional argument may not follow a named one — once a call starts naming, it names.
+A positional argument may not follow a named one: once a call starts naming arguments, the rest must
+be named too.
 
-A name may be declared more than once. Which declaration a call means is decided by the arguments it
-passes — how many, and what type each is:
+A name may be declared more than once. The arguments of a call, their number and their types,
+decide which declaration it uses:
 
 ```sysl
 show(x: int) -> string = s"int $x"
@@ -87,15 +87,15 @@ int 1
 str a
 ```
 
-Never by what they return, though: two declarations differing only in the result have no call that
-tells them apart, and the second is refused where it is written. The
-[reference](/reference/declarations/#overloading) has the rest, including what happens when a call
-fits two of them.
+The return type does not take part. Two declarations that differ only in their result could not be
+told apart by any call, so the second is rejected where it is declared. The
+[reference](/reference/declarations/#overloading) has the full rules, including what happens when a
+call matches two declarations.
 
 ## Closures
 
-A function that takes a function writes the parameter's type with an arrow. One parameter needs no
-parentheses; two or more, or none, take them:
+A parameter that takes a function has an arrow type. A single parameter type needs no parentheses;
+zero or several need them:
 
 ```sysl
 apply(f: int -> int, x: int) -> int = f(x)
@@ -108,8 +108,8 @@ print(apply(x -> x + 1, 5), combine((a, b) -> a * b, 6, 7))
 6 42
 ```
 
-A closure body sees the names around it, which is what makes it worth having rather than passing a
-plain function pointer. Naming one captures it, and there is no capture list to write:
+A closure body can use the names around it, which is what distinguishes it from a plain function
+pointer. Using a name captures it; there is no capture list to write:
 
 ```sysl
 apply(f: int -> int, x: int) -> int = f(x)
@@ -123,9 +123,8 @@ print(apply(x -> x * factor, 5))
 50
 ```
 
-This is the one place closures will surprise you if you arrive from Kotlin, Swift or JavaScript, so
-it is worth meeting now rather than in a debugger. **Capturing a value copies it in.** The closure
-gets its own, and writing to it does not touch the original:
+If you come from Kotlin, Swift or JavaScript, one rule differs from what you expect. **Capturing a
+value copies it.** The closure has its own copy, and writing to it does not change the original:
 
 ```sysl
 each3(f: int -> unit)
@@ -141,13 +140,13 @@ print("the outer total is still", total)
 the outer total is still 0
 ```
 
-Nothing went wrong there. `total` is an `int` — a value — and capturing a value copies it, so the
-closure incremented a copy that went away when it did. This is not a special rule for closures; it
-is the same copy discipline a by-value parameter or a struct field follows, applied at the moment
-the closure is formed.
+`total` is an `int`, which is a value, so the closure received a copy and incremented that. This is
+not a rule specific to closures. It is the same copy behaviour a by-value parameter or a struct field
+has, applied when the closure is created.
 
-To accumulate, capture something that *is* shared. A `&T` is a counted reference, so capturing one
-retains it rather than copying what it points at, and everybody sees the same object:
+To accumulate across calls, capture something that *is* shared. A `&T` is a counted reference, so
+capturing one retains the reference instead of copying the object, and every holder sees the same
+object:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -165,14 +164,14 @@ print("collected:", seen.len())
 collected: 3
 ```
 
-Which of the two you get is decided by the captured variable's *type*, not by anything written at
-the capture site — so it is the same question the [memory chapter](/tour/memory/) is about, and
-knowing that chapter is knowing this rule.
+Which behaviour you get depends on the *type* of the captured variable, not on anything written where
+it is captured. It is the same question the [memory chapter](/tour/memory/) answers, and that chapter
+explains this rule in full.
 
-The compiler also works out how long a closure needs to live. One that does not outlive its frame
-is inlined and costs nothing; one that escapes — stored in a field, returned — is heap-boxed and
-counted. You do not choose between them, and you cannot get it wrong.
+The compiler also determines how long a closure must live. A closure that does not outlive its frame
+is inlined and needs no allocation. One that escapes, by being stored in a field or returned, is
+placed in a counted heap box. The compiler makes this choice for you.
 
 ---
 
-Next: [structs and methods](/tour/structs/) — giving a type some data, and then some behaviour.
+Next: [structs and methods](/tour/structs/), which give a type data and behaviour.
