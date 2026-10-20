@@ -791,7 +791,7 @@ division: *"a constant divided by zero"*.
 ### A float range may end at an infinity
 
 Over a float base an end may be `infinity` or `-infinity` — the
-[constants no literal spells](/reference/types/#the-two-values-no-literal-spells) — which is how a
+[constants no literal spells](/reference/types/#infinity-and-nan) — which is how a
 range open at one end is written. **An infinite end is still a check**: every comparison with a NaN
 is false, so even `-infinity..infinity` refuses exactly one thing, and `0.0..<infinity` refuses
 `infinity` itself.
