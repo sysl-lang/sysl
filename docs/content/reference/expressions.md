@@ -5,9 +5,9 @@ weight: 30
 ---
 
 Almost everything in sysl is an expression. Assignment yields the value assigned, `++` yields a
-value, and `if`, `match` and the loops all yield the branch they took. What is *not* an expression is
-a short list — a declaration, a multiple assignment, and `defer` — and each is named where it comes
-up rather than left to be discovered.
+value, and `if`, `match` and the loops all yield the branch they took. Only a short list of forms
+are *not* expressions — a declaration, a multiple assignment, and `defer` — and each is pointed out
+where it comes up.
 
 This page is about how expressions are built and what each operator means. Where an expression is a
 control-flow form, [statements and control flow](/reference/statements/) has the details of the form
@@ -36,7 +36,7 @@ operator symbols, and no facility to add one.
 | — | `await` | run a task: prefix, taking the postfix chain up to its first `?` | right |
 
 `*` and `&` appear at two levels each — prefix at 12 (dereference, address-of) and binary at 11 and 9
-(multiply, bitwise and). Position tells them apart, and nothing else has to.
+(multiply, bitwise and). Their position tells them apart.
 
 **`await` sits between the two postfix kinds** rather than on a level of its own: it takes the calls,
 member selections and indexes after it, so `await d.read(n)` awaits the call, and stops at the first
@@ -45,14 +45,14 @@ member selections and indexes after it, so `await d.read(n)` awaits the call, an
 
 ### Two deliberate corrections to C
 
-Every level above matches C except two, and both are cases C is now widely held to have gotten wrong.
+Every level above matches C except two, and both are widely regarded as mistakes in C.
 
-**Bitwise binds tighter than comparison.** `x & mask == 0` means `(x & mask) == 0`, which is what it
-looks like. In C it means `x & (mask == 0)`, the single most-cited precedence bug in the language.
+**Bitwise binds tighter than comparison.** `x & mask == 0` means `(x & mask) == 0`, as it reads. In C
+it means `x & (mask == 0)`, the most frequently cited precedence bug in the language.
 
 **Shift binds like multiplication**, at level 11 alongside `* / %`, rather than looser than addition.
-A shift *is* a multiply or divide by a power of two, so it belongs with them. This is Go's fix, and a
-deliberate divergence from Rust and Zig toward it.
+A shift *is* a multiply or divide by a power of two, so it belongs with them. Go makes the same
+choice; Rust and Zig follow C.
 
 ```sysl
 var x = 0b1100
@@ -67,7 +67,7 @@ true
 17
 ```
 
-Both of those need parentheses in C, Rust and Zig. The payoff in systems code is that
+Both of those need parentheses in C, Rust and Zig. In systems code this means
 `base + index << shift` and `a << 8 + b` group the way they read.
 
 ## Operands
@@ -80,9 +80,9 @@ promoted to a third type: two `int`s add as `int` wherever the sum goes, so `val
 overflows at `int`'s width before the sum is widened.
 
 ```sysl
-var a: int = 1
+var a = 1
 var b: long = 2
-var r: real = 0.5
+var r = 0.5
 
 print(a + b, b - a, a + r)
 ```
@@ -97,7 +97,7 @@ side it means.
 
 ```sysl
 var n: u32 = 1
-var i: int = 2
+var i = 2
 
 print(n + i)
 ```
@@ -108,11 +108,11 @@ print(n + i)
 
 **A `char` operand never widens.** A character beside a number is far more often a mistake than
 arithmetic, so `c + n` says which is meant — `int(c) + n` — even though a `char` widens to an `int`
-everywhere a position asks for one (`val k: int = c`). Two `char`s compare as they always did.
+everywhere a position asks for one (`val k: int = c`). Two `char`s compare with each other as usual.
 
 ```sysl
 var c = 'a'
-var n: int = 1
+var n = 1
 
 print(c + n)
 ```
@@ -125,9 +125,9 @@ print(c + n)
 
 **A shift is the one exception, and its right operand may be any integer type.** `a + b` combines two
 values that have to agree on what they are; `x << n` asks for `x` shifted `n` places, and `n`'s width
-has nothing to do with `x`'s. That is C's reading, Rust's, Java's, Go's and Scala's, and the cast a
-program used to write for the compiler's benefit was noise in exactly the code — a hash, a bitset, a
-decoder — where widths are already being juggled.
+has nothing to do with `x`'s. C, Rust, Java, Go and Scala read a shift the same way, and it keeps
+casts out of exactly the code — a hash, a bitset, a decoder — where several widths are already in
+play.
 
 **The result is the shifted value's own type**, never the count's, so a byte shifted by a 64-bit
 count is still a byte and wraps as one.
@@ -160,9 +160,9 @@ print(x << 1.5)
 '<<' shifts by a count, and real is not an integer
 ```
 
-**A count wider than the value is clamped before it is narrowed**, which is what keeps the
-over-shift rule below meaning what it says: 256 places on a byte is a full shift, not — as
-truncating first would have it — a shift by nothing.
+**A count wider than the value is clamped before it is narrowed**, so the over-shift rule below
+holds: 256 places on a byte is a full shift, not the shift by nothing that truncating first would
+give.
 
 ```sysl
 var x: u8 = 1
@@ -175,15 +175,15 @@ print(x << n)
 0
 ```
 
-A **vector** is untouched: its count is lane-wise and is already the same register type, so the two
-sides of `v << w` still have to agree.
+A **vector** is different: its count is lane-wise and is already the same register type, so the two
+sides of `v << w` have to agree.
 
 ### What has arithmetic
 
 Arithmetic is defined on the numeric types and nowhere else. `char` has equality and ordering and no
 arithmetic at all; `bool` has equality, no ordering, and no arithmetic.
 
-Unary `-` needs a type with a sign, so it is the signed integers and the floats — negating an
+Unary `-` needs a type with a sign, so it applies to the signed integers and the floats; negating an
 unsigned value is written as the subtraction it actually is. Unary `~` is defined on every integer
 type, signed or not.
 
@@ -192,18 +192,18 @@ by zero traps.
 
 ### Shifting by the width or more
 
-**A shift amount at or past the operand's width is defined**, and answers what shifting all the way
-answers: zero for `<<` and for an unsigned `>>`, and the **sign** for a signed `>>`, since an
-arithmetic right shift fills from the top. That is Go's rule and Swift's.
+**A shift amount at or past the operand's width is defined**, and gives the result of shifting all
+the way: zero for `<<` and for an unsigned `>>`, and the **sign** for a signed `>>`, since an
+arithmetic right shift fills from the top. Go and Swift use the same rule.
 
-The width is the **operand's own** rather than the machine's, so a `u8` reaches this case at 8 —
-where the bare instruction masks the amount to five or six bits and would shift by something else
+The width is the **operand's own** rather than the machine's, so a `u8` reaches this case at 8,
+where the bare instruction would mask the amount to five or six bits and shift by something else
 entirely.
 
 ```sysl
 var u: usize = 11
-var neg: int = -8
-var pos: int = 8
+var neg = -8
+var pos = 8
 var b: u8 = 0b1011
 
 print(u >> 64, u << 64, u >> 65)
@@ -217,14 +217,14 @@ print(b >> 8, b << 8, b >> 200)
 0 0 0
 ```
 
-It follows from the decision that makes integer arithmetic wrap rather than trap: plain arithmetic is
-total, and `within` is where checking is opted into, so a plain over-width shift has to be *defined*
-— trapping would put a trap on a type whose whole contract is that it has none. **A `within`-typed
+This follows from integer arithmetic wrapping rather than trapping: plain arithmetic is total, and
+`within` is where checking is opted into, so a plain over-width shift has to be *defined* — a trap
+would break the contract of a type that promises none. **A `within`-typed
 left shift is the exception and does trap**, on its own terms and not the shift operator's; see
 [errors](/reference/errors/#the-operations-are-the-base-s-their-overflow-is-not).
 
-**Masking** the amount — C's rule, Java's, and what the instruction does unaided — is what this is
-not. It makes `x >> 64` be `x`, which is never what anybody means.
+The amount is **not masked**, as it is in C, in Java, and by the bare instruction. Masking makes
+`x >> 64` equal `x`, which is almost never what a program intends.
 
 ### Equality reaches further than ordering
 
@@ -269,9 +269,8 @@ first comparison that fails, so the `bump(6)` on its right never runs at all.
 
 Comparing two [vectors](/reference/vectors/) yields a mask rather than a `bool`, and a chain of them
 is **refused**. The reason is the short-circuiting above: `a < b < c` joins its links with `&&`, and
-there is no such thing as short-circuiting one lane of a register and not another. Reading the chain
-as a lane-wise `&` would give the same spelling a different meaning, so the reader is asked to write
-the `&` and see it.
+one lane of a register cannot short-circuit while another does not. Reading the chain as a lane-wise
+`&` would give the same spelling a different meaning, so the `&` is written explicitly.
 
 ```sysl
 val a: <4>int = [1, 2, 3, 4]
@@ -295,7 +294,7 @@ var zero = 0.0
 var nan = zero / zero
 
 print(nan == nan, nan != nan)
-print(nan < 1.0, nan >= 1.0)
+print(nan < 1, nan >= 1)
 ```
 
 ```output
@@ -316,8 +315,8 @@ there is no integer-as-condition rule and no `if (p)` idiom — write `p != null
 `a..b` is inclusive, `a..<b` is half-open. Either end may be omitted: `a..`, `..b`, `..<b`, and a
 bare `..` meaning the whole thing.
 
-Ranges are **non-associative** and sit below arithmetic and above comparison, which is Swift's
-placement — so `0..<n + 1` is `0..<(n + 1)` and needs no parentheses.
+Ranges are **non-associative** and sit below arithmetic and above comparison, as in Swift, so
+`0..<n + 1` is `0..<(n + 1)` and needs no parentheses.
 
 ```sysl
 var lo = 1
@@ -332,9 +331,9 @@ for i in lo..lo + 2
 3
 ```
 
-The spelling deviates from Swift's `...` toward Kotlin's `..` / `..<`, because the two forms are
-visually parallel and read as "through" and "up to, less than". It lexes unambiguously: a float
-literal needs digits after the `.`, so `1..2` is three tokens and not two.
+The spelling is Kotlin's `..` / `..<` rather than Swift's `...`, because the two forms are visually
+parallel and read as "through" and "up to, less than". It lexes unambiguously: a float literal needs
+digits after the `.`, so `1..2` is three tokens and not two.
 
 **`..=` is not a spelling sysl has**, and is refused by name wherever a range may be written — it is
 Rust's inclusive range, and inclusive here is the bare `..`:
@@ -352,8 +351,8 @@ for i in a..=3
 
 **A range with both ends written is a form in four places and a value everywhere else.** In a `for`
 header, a slice index, a `match` pattern and a quantifier the compiler reads the two bounds directly
-and no range object exists in what it emits — that is what keeps the most ordinary loop in the
-language a counter and a comparison, with no struct, no `Option` a step and no call. Anywhere else it
+and no range object exists in what it emits, so the most common loop in the language compiles to a
+counter and a comparison, with no struct, no `Option` per step and no call. Anywhere else it
 builds a `sysl.Range[T]`: three fields, the two bounds and whether the upper one is included.
 
 ```sysl
@@ -376,15 +375,15 @@ print(total(r), total(r), total(0..3))
 
 A `Range` is walked by [`Iterate`](/library/core/), so a `for` over one is the ordinary `for` over
 anything with a cursor rather than a second kind of loop. The cursor moves, but a `for` walks a
-**copy** — which is why `r` above answers the same both times rather than coming back spent, and why
-`0..3` reaching the same total says the inclusive form counts one more.
+**copy**, so `r` above gives the same total both times rather than being used up, and `0..3` gives
+the same total because the inclusive form counts one more.
 
-**Its bounds are read by the same two rules a `for` header's are** — they must agree, and they must
-be integers — so the value and the loop cannot come to disagree about what a range is. Two bounds of
+**Its bounds follow the same two rules as a `for` header's** — they must agree, and they must be
+integers — so the value and the loop always agree about what a range is. Two bounds of
 different types agree where one holds every value of the other, as two operands do: `a..<b` over an
-`int` and a `u8` is an `int` range, and over an `int` and a `u32` it is refused. Note that a
-bound written as a literal takes its type from the other end, so `0..<3u8` is a `u8` range rather
-than a disagreement; it takes two names to write one. A range of literals standing where a
+`int` and a `u8` is an `int` range, and over an `int` and a `u32` it is refused. A bound written as a
+literal takes its type from the other end, so `0..<3u8` is a `u8` range rather than a disagreement;
+only two typed bounds can disagree. A range of literals standing where a
 `Range[T]` is wanted takes `T` the same way, so `total(0..<4)` passes a `Range[usize]` to a
 `total(r: Range[usize])`, and `val r: Range[u8] = 0..<3` is a `u8` range.
 
@@ -432,22 +431,22 @@ print(r)
 a range with an open end is only allowed in a slice index
 ```
 
-Because a range is a value, it implements [`Sequence`](/library/seq/), which is what makes
-`(0..<n).map(f)` the spelling it looks like it should be. Nothing is materialized to answer a
-question about one, so `(0..<1_000_000).any(p)` costs the predicate and no storage.
+Because a range is a value, it implements [`Sequence`](/library/seq/), so `(0..<n).map(f)` works as
+written. Nothing is materialized to answer a question about one, so `(0..<1_000_000).any(p)` costs
+the predicate calls and no storage.
 
 ## `is` — a pattern where a condition is wanted
 
 `x is Pat` tests a value against a pattern and yields a `bool`; `x is not Pat` negates it. The right
 side is a full pattern, alternatives (`|`) included — the same grammar a `match` arm's left side
-uses, so it is not a second thing to learn.
+uses.
 
 ```sysl
 enum Shape
     Circle(r: real)
     Rect(w: real, h: real)
 
-var s = Rect(2.0, 3.0)
+var s = Rect(2, 3)
 
 if s is Rect(_, _) && s is not Circle(_)
     print("rectangular")
@@ -457,13 +456,13 @@ if s is Rect(_, _) && s is not Circle(_)
 rectangular
 ```
 
-Its level — between `&&` and the comparisons — is what makes `a is P && b > 0` a chain of two terms
+Its level — between `&&` and the comparisons — makes `a is P && b > 0` a conjunction of two terms
 rather than an `is` against a conjunction.
 
-**Under `||` a test stands so long as it binds nothing.** A name bound by `is` is live from its own
-`is` rightward and through the branch, and under `||` the branch runs when either side held — so a
-name bound on one side would hold nothing when the other side was the one that did. A test that binds
-nothing has no such question to answer:
+**Under `||` a test is allowed as long as it binds nothing.** A name bound by `is` is live from its
+own `is` rightward and through the branch, and under `||` the branch runs when either side held, so
+a name bound on one side would hold nothing when only the other side matched. A test that binds
+nothing has no such problem:
 
 ```sysl
 enum Push
@@ -493,9 +492,8 @@ if o is Some(n) || false
 a pattern under '||' cannot bind a name
 ```
 
-Both `is` and `not` are **soft** words: neither is
-reserved, so both remain usable as ordinary names, and this is the only place either reads as a
-keyword.
+Both `is` and `not` are **soft** words: neither is reserved, so both remain usable as ordinary
+names, and this is the only place either reads as a keyword.
 
 ## Assignment
 
@@ -516,10 +514,10 @@ print(a, b, c)
 7 7 7
 ```
 
-That is what makes the capture idioms available — `while (c = next()) != 0`,
-`if (p = find(k)) != null`. C's classic `if (x = 0)` bug is not caused by this; it is caused by C
-additionally letting any integer serve as a truth value. sysl has a distinct `bool` with no such
-coercion, so the mistake is already a type error and needs no grammar ban:
+That makes the capture idioms available — `while (c = next()) != 0`, `if (p = find(k)) != null`.
+C's classic `if (x = 0)` bug comes not from this but from C also letting any integer serve as a
+truth value. sysl has a distinct `bool` with no such coercion, so the mistake is a type error and
+needs no special rule in the grammar:
 
 ```sysl
 var x = 1
@@ -539,8 +537,8 @@ traits**: `a += b` is defined as `a = a + b` and requires exactly what `+` requi
 ### Statement position discards a block's value
 
 A block's value is its trailing expression — but where the block's own value is unused, the block has
-**none**, and its type is `unit` whatever the last line yields. Without that rule an `if` whose
-branches merely each did something would be forced to make those somethings agree:
+**none**, and its type is `unit` whatever the last line yields. Without that rule, an `if` whose
+branches each perform an action would need those actions' values to agree:
 
 ```
 if c
@@ -553,15 +551,14 @@ The rule is about the **position**, not the operator: it propagates into the bra
 arms of a `match`, and a loop's `else`. Statement position starts at a statement, at a loop body, and
 at the body of a function that returns nothing.
 
-A block that does not *arrive* keeps `never` rather than collapsing to `unit` — that is
-reachability, not a value, and the code around it is entitled to know.
+A block that never completes keeps the type `never` rather than becoming `unit`: that describes
+reachability, not a value, and the surrounding code relies on it.
 
 ### Several places at once
 
 A comma-separated list of places takes a comma-separated list of values. **The right side is
-evaluated in full, into temporaries, before any assignment happens** — which is the entire content of
-the feature, and what makes the first line below a swap rather than two statements that leave both
-variables holding `b`.
+evaluated in full, into temporaries, before any assignment happens**, so the first line below is a
+swap rather than two statements that leave both variables holding `b`.
 
 ```sysl
 var a = 1
@@ -580,8 +577,7 @@ print(a, b, xs[0], xs[2])
 2 1 30 10
 ```
 
-Compound forms multi-assign too, and need no rule of their own — only the one above, read carefully.
-Every place is located, then every place a compound form touches is **read**, then the whole right
+Compound forms multi-assign too, under the same rule. Every place is located, then every place a compound form touches is **read**, then the whole right
 side is produced, and only then does anything land:
 
 ```sysl
@@ -597,20 +593,20 @@ print(a, b)
 3 3
 ```
 
-Both arms saw the values the statement started with. Written as two statements it would not work:
-`a += b` followed by `b += a` folds the new `a` into `b`, and nothing on the page says so.
+Both sides saw the values the statement started with. Two separate statements would differ:
+`a += b` followed by `b += a` folds the new `a` into `b`.
 
 A place's own subexpressions are evaluated **exactly once**, before the assignments — so in
 `xs[f()], xs[g()] = xs[g()], xs[f()]` each of `f` and `g` runs once.
 
-**A multiple assignment is a statement, not an expression**, and that is what keeps it small. A
-single assignment yields the value assigned; a multiple one would have to yield several, and the only
-thing that could be is a tuple — allocating a product type for a form whose whole point is that
-several places change at once. So it does not nest, does not appear in a condition, and has no value
-to discard. A binding takes the same list: `val a, b = 1, 2`.
+**A multiple assignment is a statement, not an expression**, which keeps it simple. A single
+assignment yields the value assigned; a multiple one would have to yield several, which could only
+be a tuple — a product value built for a form whose purpose is to change several places at once. So
+it does not nest, does not appear in a condition, and has no value to discard. A binding takes the
+same list: `val a, b = 1, 2`.
 
-A place that is really a **call** is the one thing the accepted set is *smaller* than a single `=`'s,
-and there are two of them: an element reached through a user type's `Index`, where `b[i] = v` calls
+A multiple assignment accepts fewer places than a single `=` does: it refuses a place that is really
+a **call**, of which there are two kinds — an element reached through a user type's `Index`, where `b[i] = v` calls
 `index_set`, and a [settable property](/reference/declarations/), where `p.count = v` calls the
 setter. Neither has an address for the locating phase to find, and the call both reads and writes, so
 there is nothing to split into the two halves the ordering rule is about.
@@ -620,8 +616,8 @@ yields what the call yields, which for both of these is `unit`.
 
 ## `++` and `--`
 
-Expressions, both prefix and postfix. Prefix yields the new value; postfix yields the old one. This
-is what the pointer-walking idioms need — `*p++` only works if `++` is an expression.
+Both are expressions, prefix and postfix. Prefix yields the new value; postfix yields the old one.
+The pointer-walking idioms depend on this: `*p++` only works if `++` is an expression.
 
 ```sysl
 var i = 5
@@ -634,10 +630,10 @@ print(i++, i, ++i, i)
 ```
 
 C's `i = i++ + ++i` is undefined because C leaves evaluation order unspecified while allowing
-unsequenced mutation of one object. sysl fixes the root cause rather than banning the operator:
+unsequenced mutation of one object. sysl addresses the cause rather than banning the operator:
 **evaluation order is strictly left to right**, everywhere — operands of a binary operator, function
 arguments, index expressions. With an order defined, the expression above has one meaning. It is
-merely hard to read, which makes it a lint candidate and not a footgun.
+merely hard to read, which is a matter of style rather than of correctness.
 
 Postfix binds tighter than prefix, so `*p++` is `*(p++)` and `-a.b` is `-(a.b)`, exactly as in C.
 The one prefix that reaches past a postfix is [`await`](/reference/async/#where-await-binds), which
@@ -660,13 +656,13 @@ Eight things attach to an expression on the right, and they compose left to righ
 | `e?` | try — unwrap or propagate |
 | `e++`, `e--` | post-increment, post-decrement |
 
-A tuple index is a `Field` selection because it *is* one: a tuple's fields are named for their
-positions. Note that `t.0.1` does not work, because the lexer reads `0.1` as a float before it is two
-indices — write `(t.0).1`, which is what the diagnostic says.
+A tuple index is a field selection: a tuple's fields are named for their positions. `t.0.1` does not
+work, because the lexer reads `0.1` as a float before it can be two indexes; write `(t.0).1`, as the
+diagnostic suggests.
 
 A dot with **nothing to its left** is a different form — the member of whatever type the context
-expects, [below](#a-leading-dot-the-qualifier-the-context-already-knows) — and it is told from a tail
-by there being no expression in front of it to select from.
+expects, [below](#a-leading-dot-the-qualifier-the-context-already-knows) — and it is distinguished
+from a tail by having no expression in front of it to select from.
 
 ### `?`
 
@@ -703,8 +699,9 @@ err odd
 Two rules make it well defined. **The enclosing function's return type must carry the failure** — a
 `?` on a `Result` is legal only inside a function returning `Result`, and on an `Option` only inside
 one returning `Option`. The early return has to have somewhere to go, and the two channels do not
-cross. And **the error types must match exactly**; there is no implicit widening, so a function with
-its own error type converts a callee's explicitly.
+cross. And **the error types must match, or be joined by a `From`**: a function with an error type
+of its own writes `impl From[Theirs] for Mine` once, and every `?` across that boundary converts
+through it ([errors](/reference/errors/#a-converts-through-from)).
 
 `?` is an expression and composes as one, so its unwrapped value flows into whatever surrounds it.
 
@@ -755,9 +752,9 @@ print(hot.fg, hot.bg, hot.pad)
 1 9 8
 ```
 
-### It is the two statements you would otherwise write
+### It is a copy followed by assignments
 
-The whole of the rule is one desugaring. `base with { bg = 9 }` means:
+The rule is one desugaring. `base with { bg = 9 }` means:
 
 ```
 var tmp = base
@@ -766,7 +763,7 @@ tmp
 ```
 
 so the base is copied first, the fields are assigned to **in the order written**, and the copy is the
-value. Nothing else is defined anywhere: a struct's `invariant` is re-checked because a field
+value. Everything else follows from that: a struct's `invariant` is re-checked because a field
 assignment re-checks it, a field another module keeps `private` is refused because an assignment
 refuses it, a literal needs no width suffix because it is read against the field's type, and a
 [settable property](/reference/declarations/) runs its setter because `p.count = v` is a call.
@@ -789,11 +786,11 @@ print((c with { count = 4 }).v)
 40
 ```
 
-### What it buys is that it composes
+### It composes
 
-The two statements are perfectly good and are still there. What they cannot do is stand inside a
-larger expression — so a value could not be layered at the point it is used, which is what a theme
-overridden for one state and overridden again for the next actually is:
+The statements it stands for remain available, but they cannot stand inside a larger expression.
+`with` can, so a value can be layered at the point it is used — a theme overridden for one state and
+overridden again for the next:
 
 ```sysl
 struct Style
@@ -821,9 +818,9 @@ The base is evaluated **once**, however many fields change, so a base that is a 
 
 ### The base has to be a struct
 
-A counted reference or a pointer is refused, and it is the one case where refusing matters rather
-than merely being tidy: `var tmp = p` on a `&Style` binds a second reference to the *same* object, so
-the writes would reach every other holder and the form would quietly mean the opposite of a copy.
+A counted reference or a pointer is refused, because the desugaring would change meaning: `var tmp =
+p` on a `&Style` binds a second reference to the *same* object, so the writes would reach every
+other holder and the form would silently mean the opposite of a copy.
 
 ```sysl
 struct Style
@@ -839,8 +836,8 @@ print(hot.bg)
 'with' copies a struct, and this is a counted reference to one
 ```
 
-The refusal names the spelling that does copy, and the parentheses in it are load-bearing: the clause
-is a postfix tail, so `*p with { … }` is `*(p with { … })`.
+The refusal names the spelling that does copy, and its parentheses are required: the clause is a
+postfix tail, so `*p with { … }` is `*(p with { … })`.
 
 ```sysl
 struct Style
@@ -858,8 +855,7 @@ print(base.bg, hot.bg, hot.pad)
 2 9 3
 ```
 
-A field named twice in one clause is refused too, since the first change is one the value cannot
-carry:
+A field named twice in one clause is refused too, since the first change could never take effect:
 
 ```sysl
 struct Style
@@ -920,7 +916,7 @@ var c: Colour = .Red
 
 c = .Green
 
-val pens: [2]Pen = [Pen(.Red), Pen(.Blue)]
+val pens = [Pen(.Red), Pen(.Blue)]
 
 print(code(.Green), code(c), code(pick()), code(pens[1].tip))
 print(c == .Green, .Green == c)
@@ -931,8 +927,8 @@ print(c == .Green, .Green == c)
 true true
 ```
 
-**Every position that already pushes an expected type down supplies one**, which is why the list is
-long and needs no rule of its own: an argument, an argument written by name, a parameter's default, an
+**Every position that already pushes an expected type down supplies one**, so the list is long but
+needs no rule of its own: an argument, an argument written by name, a parameter's default, an
 annotated binding and the assignment after it, a return and an expression body, a struct's field, an
 element of an array or a slice, a part of a tuple, a variant's payload, each branch of an `if` or
 a `match` used as a value, and the operand of a prefix `-` or `~`.
@@ -989,11 +985,10 @@ exactly as `null` is, so the argument that settles the type parameter settles th
 **It reaches whatever the qualified form reaches**, and fails where that fails in the same words: a
 variant, a variant carrying data, an associated function of an enum, of a struct, or of a
 [constrained subtype](/reference/errors/). Visibility is untouched — what the dot leaves off is the
-*spelling*, not the check, so a private associated function is as private as it ever was.
+*spelling*, not the check, so a private associated function stays private.
 
-**The type it resolves against need not be nameable where the dot is written**, which is most of the
-point. A variant of another module's enum needs no import and no path: the parameter already says
-which type it is.
+**The type it resolves against need not be nameable where the dot is written.** A variant of another
+module's enum needs no import and no path: the parameter already says which type it is.
 
 **The expected type is read as it was written**, and this is the one place a transparent
 constrained subtype is *not* interchangeable with its base: the base is not where the subtype's
@@ -1089,7 +1084,7 @@ below `i32::Min` is `i32::Min`, and a negative value read as an unsigned type is
 has no integer value at all, comes to `0`** — for a signed and an unsigned target alike. An infinity
 is past either end, so it is that end. The rule is the same at both float widths, for every integer
 width and signedness, and for a constant as for a value computed at run time. Nothing traps and
-nothing wraps, which is what makes `i32(x * 2147483648.0)` a correct clamp of a sample in
+nothing wraps, so `i32(x * 2147483648.0)` is a correct clamp of a sample in
 `-1.0 ..= 1.0` into q31.
 
 ```sysl
@@ -1135,12 +1130,12 @@ Everything else is rejected. There is **no conversion to or from `bool`** — `i
 and so is `bool(0)` — and **no number converts to or from a `string`**: `str(x)` renders one and the
 `strconv` surface parses one, neither of them spelled as a conversion. The `char` → `string` row is
 the one exception, and a narrow one: a `char` is a single scalar value, so encoding it is total and
-has nothing to say about failure.
+cannot fail.
 
 The pointer row goes only one way. An address *is* a number of `usize`'s width, so reading it as one
 loses nothing and produces a value that cannot be dereferenced. The inverse is not a conversion at
-all — making a pointer out of an integer is `ptr_cast`, in the raw tier, spelled apart from this
-table because it is where the language's guarantees stop.
+all: making a pointer out of an integer is `ptr_cast`, in the raw tier, kept apart from this table
+because it is where the language's guarantees stop.
 
 Because these are calls, they parse as postfix at level 13 rather than as an operator of their own.
 The name in front may be a **type parameter**, and then the row is chosen at the instantiation.
@@ -1175,7 +1170,7 @@ type the context gives, and the branches of an `if` or a `match` used as a value
 wider of their types as two operands do. **The bounds of a range and the elements of an unannotated
 array literal meet the same way**: `i..<n` over an `int` and a `long` is a `long` range, and `[a, b]`
 over an `int` and a `long` is a `[2]long`. A pair neither of whose types holds the other — a `u32` and
-an `int` — is refused as before.
+an `int` — is refused.
 
 ```sysl
 struct Sample
@@ -1239,7 +1234,7 @@ above allows it, so `1.0 / k` over an `int` is a `real` quotient, `k < 1.5` comp
 bounds, the elements of an unannotated array literal and the arms of an `if` or a `match`. Where the
 operand does not widen to the literal's default — a `long` beside `2.0`, a `char` beside anything —
 or the literal does not fit even that, or the position the pair stands in does not take the default
-(`val z: u8 = b + 300` is told the literal does not fit a byte) — the pair is refused as before.
+(`val z: u8 = b + 300` is told the literal does not fit a byte) — the pair is refused.
 
 ```sysl
 var k = 4
@@ -1358,7 +1353,7 @@ print(f(b), f(l))
 int long
 ```
 
-**What can lose a value is still a diagnostic**, with the same message as before: a narrowing, a sign
+**A conversion that can lose a value is a diagnostic** unless it is written: a narrowing, a sign
 change, a float read as an integer.
 
 ```sysl
@@ -1387,9 +1382,9 @@ print(sizeof(int), alignof(int), sizeof(Pair), alignof(Pair))
 4 4 8 4
 ```
 
-They are read as their own grammar rather than left to look like calls, because a call's arguments
-are expressions and `sizeof(*Node)` would otherwise parse as a dereference. There is no form that
-takes a value — a value's type is what would be measured anyway.
+They have their own grammar rather than being parsed as calls, because a call's arguments are
+expressions and `sizeof(*Node)` would otherwise parse as a dereference. There is no form that takes a
+value, since it is the value's type that would be measured.
 
 `offsetof` takes a type and then a **field name**, and answers where that field starts in bytes. The
 name is a name and not an expression, for the same reason the type is not one: there is no value here
@@ -1421,9 +1416,8 @@ answer is in bytes, and a field starting at bit twelve is not at byte one.
 as far to the right as an expression can: that is a closure over the sum, not a closure over `x`
 added to `1`.
 
-Parameters are one bare name, or a parenthesized list — including the empty list, which is the one
-arity with nowhere else to be written. A type annotation goes inside the parentheses and nowhere
-else, so there is no second spelling to disagree with the first.
+Parameters are one bare name, or a parenthesized list — including the empty list `()`. A type
+annotation goes inside the parentheses and nowhere else, so there is only one way to write it.
 
 ```sysl
 apply(f: () -> int) -> int = f() + f()
@@ -1444,13 +1438,12 @@ which carry types and not names, so there would be nothing at the call to fill o
 
 ### A closure that only reads what it captured may be a `val`
 
-A closure captures **by value**, so it carries its own copy of what it closed over and calling one
+A closure captures **by value**, so it carries its own copy of what it closed over, and calling one
 that writes a capture writes through the closure itself. That is why `Fn::call` takes `*self` — and a
 `val` is written once, so binding such a closure to one and calling it is refused.
 
-**A closure that only reads is not that closure**, and it is the common one. It writes nothing, so
-nothing about the call needs the name to be mutable, and `val` is what a program that is not going to
-reassign it should be able to write.
+**A closure that only reads its captures is the common case**, and it may be a `val`. It writes
+nothing, so nothing about the call needs the name to be mutable.
 
 ```sysl
 val inc = (x: int) -> x + 1
@@ -1463,8 +1456,7 @@ print(inc(41), double(21))
 42 42
 ```
 
-The refusal stands exactly where it was, which is the point of the distinction rather than an
-exception to it — a closure that writes a capture is a value the call mutates:
+A closure that writes a capture is a value the call mutates, so a `val` holding one is refused:
 
 ```sysl
 var n = 0
@@ -1479,9 +1471,9 @@ print(bump(), bump())
 'call' takes '*self', so it writes through what it is called on, and a 'val' is written once — write 'var bump' if it is meant to change
 ```
 
-`&Fn(int) -> int` is still the way to hold one behind a reference, and is what a program without an
-allocator cannot use — a `&T` is a box. That was the whole of the argument for admitting the reading
-case: on a freestanding target there had been no way to bind a closure to an immutable name at all.
+`&Fn(int) -> int` holds a closure behind a reference, which a program without an allocator cannot
+use, since a `&T` is a box. A reading closure in a `val` is how freestanding code binds a closure to
+an immutable name.
 
 ### `_` — a parameter with the name left out
 
@@ -1498,9 +1490,9 @@ print(apply(_ + 1, 41), apply(_ * 2, 21))
 42 42
 ```
 
-The group is what a program reaches for when the other two boundaries fall in the wrong place. But
-it cuts both ways, and this is the one thing to know about the form: **the closure closes at the
-group, so anything outside the group applies to the closure itself**, not to what it computes.
+A group is the way to place the boundary when the other two fall in the wrong place. It also limits
+the closure: **the closure closes at the group, so anything outside the group applies to the closure
+itself**, not to what it computes.
 
 ```sysl
 apply(f: int -> int, x: int) -> int = f(x)
@@ -1513,8 +1505,8 @@ this '_' has no type here
 ```
 
 `(_ + 1) * 2` multiplies a *closure* by two rather than closing over the doubled sum — so nothing is
-left to say what the placeholder's parameter is, and the diagnostic points at the `_`. When the
-boundary is not where you want it, write the arrow form: `x -> (x + 1) * 2`.
+left to say what the placeholder's parameter is, and the diagnostic points at the `_`. Where the
+boundary falls in the wrong place, write the arrow form: `x -> (x + 1) * 2`.
 
 An interpolation hole is a boundary too, so a placeholder cannot reach out of a string to close over
 the whole of one.
@@ -1697,10 +1689,10 @@ print(n)
 A parameter's default does not count as having filled it, so a block still reaches a parameter that
 has one — the block was written and the default was not.
 
-### Blocks nest, which is what the form is for
+### Blocks nest
 
-A call is an expression, so a call carrying a block is a line of the block above it. That is how a
-tree gets written as indentation rather than as a nest of brackets.
+A call is an expression, so a call carrying a block can be a line of the block above it. This is the
+main use of the form: a tree written as indentation rather than as nested brackets.
 
 ```sysl
 node(name: string, kids: []string) -> string
@@ -1728,9 +1720,9 @@ a(b(c d) e)
 
 ### There is no result builder
 
-Swift has one because a Swift block holds *statements*, so something has to assemble arms of
+Swift needs one because a Swift block holds *statements*, so something has to assemble arms of
 differing shape into a single value. A sysl block holds **expressions**, and `if` is already an
-expression whose arms must agree in type — so a branch is an ordinary line and needs no machinery:
+expression whose arms must agree in type, so a branch is an ordinary line:
 
 ```sysl
 pick(xs: []int) -> int = xs[0] + xs[1]
@@ -1748,10 +1740,9 @@ print(n)
 101
 ```
 
-**What that costs is loops, and it is the one limit worth knowing before you reach it.** A loop in
-sysl *is* an expression, so one written as a line of a collection's block would contribute the
-single `unit` it evaluates to rather than an element per iteration. It is refused by name rather
-than read that way:
+**The limit is loops.** A loop in sysl *is* an expression, so one written as a line of a
+collection's block would contribute the single `unit` it evaluates to rather than an element per
+iteration. It is refused by name rather than read that way:
 
 ```sysl
 total(xs: []int) -> int = 0
@@ -1784,8 +1775,8 @@ print(n)
 this one declares a name instead
 ```
 
-Neither restriction applies to the callable reading, where the block is a body and every statement
-form is at home in it.
+Neither restriction applies to the callable reading, where the block is a body and may hold any
+statement.
 
 ### A trailing block cannot be written inside brackets
 
@@ -1795,8 +1786,8 @@ than a call with a block in it — bind the value first and print the name.
 
 The two forms that *do* open a block inside brackets are `match` and `->`, and
 [the layout rules](/reference/lexical/) say why they are the two: each is a token that can only ever
-open a block, so a reader is never left wondering whether the line ended. `:` is not, and a trailing
-block written as an argument has a name-it-first form that reads better anyway.
+open a block, so a reader always knows whether the line has ended. `:` is not such a token, and a
+value built with a trailing block reads more clearly bound to a name first.
 
 ## String interpolation
 
@@ -1818,9 +1809,9 @@ hello world, 42
 [   7]
 ```
 
-The embedded source is parsed as an ordinary expression — so a hole may itself interpolate — and it
-is parsed as its own little source, so a diagnostic inside a hole points into the hole rather than at
-an unrelated column of the line the string sits on.
+The embedded source is parsed as an ordinary expression — so a hole may itself interpolate — and as
+a source of its own, so a diagnostic inside a hole points into the hole rather than at an unrelated
+column of the line the string sits on.
 
 ## Operator dispatch
 
@@ -1831,12 +1822,12 @@ exactly when `a`'s type satisfies `Op` **at `b`'s type**.
 What differs between a scalar, a user type and a bounded type parameter is only *where the impl comes
 from* — never the rule:
 
-- **A built-in scalar** satisfies the operator traits by a compiler-provided impl, and codegen keeps
-  emitting the native machine instruction. No call, no vtable. The membership exists so the type
-  system agrees a scalar satisfies `Add`, which is what lets one be passed where `[T: Add]` is wanted.
-  That membership is at **one** argument list — `real` is `Mul[real, real]` — so a block written for
-  a scalar at another one is reached without disturbing it, which is what puts a scalar on the
-  [left of an operator](/reference/traits/#where-an-impl-may-live).
+- **A built-in scalar** satisfies the operator traits by a compiler-provided impl, and codegen emits
+  the native machine instruction, with no call and no vtable. The membership exists so the type
+  system agrees a scalar satisfies `Add`, which lets one be passed where `[T: Add]` is wanted. That
+  membership is at **one** argument list — `real` is `Mul[real, real]` — so a block written for a
+  scalar at another argument list is reached without disturbing it, which is how a scalar can stand
+  on the [left of an operator](/reference/traits/#where-an-impl-may-live).
 - **A user type with `impl Op for S`** lowers to the member the impl produced. Overloading an
   operator *is* implementing its trait; there is no separate operator-method syntax.
 - **A bounded parameter `[T: Op]`** resolves abstractly at the definition, and monomorphization binds
@@ -1859,7 +1850,7 @@ impl Mul[real] for Complex
     mul(self, k: real) -> Complex = Complex(self.re * k, self.im * k)
 
 val n = 3
-var c = Complex(1.5, -2.0) * n
+var c = Complex(1.5, -2) * n
 
 c *= n
 
@@ -1890,19 +1881,18 @@ print(c.re, c.im)
 | `IndexSet` | `index_set` | `e[i] = v` |
 
 The two prefix rows take no result parameter: negation and complement are closed operations on the
-type they are written for. `Eq` and `Ord` stay homogeneous for a different reason — what a comparison
-across two types would promise about reflexivity and transitivity is a question nothing has asked.
+type they are written for. `Eq` and `Ord` stay homogeneous for a different reason: a comparison
+across two types would have no defined promise about reflexivity and transitivity.
 
 **Two more traits sit beside these and have no operator**: [`Zero`](/library/math/) and `One`, each
 declaring a single member with no receiver — `zero() -> Self` and `one() -> Self`. They are here
 rather than in `sysl.math` because they are the identities *of these operators*, and because a trait
 outside the standard module is reachable only where a file names it: a generic body writing
-`T.zero()` should owe no import, and a `real` that answers `real.zero()` should not stop doing so
-because the caller did not think to ask for a trait. What a bound gains by them is the one thing an
-operator cannot supply — a **value** — so `[T: Add + Zero]` can start an accumulation where
-`[T: Add]` has to be handed one.
+`T.zero()` should need no import, and `real.zero()` should work whether or not the caller imported a
+trait. What a bound gains from them is the one thing an operator cannot supply — a **value** — so
+`[T: Add + Zero]` can start an accumulation where `[T: Add]` has to be handed one.
 
-**Every integer type is a member of both, and no block anywhere says so.** `sysl.ops` writes an
+**Every integer type is a member of both, with no `impl` block written for it.** `sysl.ops` writes an
 `impl` for `real` and one for `f32`, and it cannot write one for the integers: `iN` and `uN` are an
 [open family](/reference/types/), so a program may name a `u256` no library file ever listed. That
 membership is the compiler's, exactly as `Signed`'s and `Bits`' are — and unlike those, the member
@@ -1919,18 +1909,18 @@ sum[T: Add + Zero](xs: []const T) -> T
 
 var none: []int = []
 
-print(sum([1, 2, 3]), sum(none), sum([1.5, 2.5]) == 4.0)
+print(sum([1, 2, 3]), sum(none), sum([1.5, 2.5]) == 4)
 ```
 
 ```output
 6 0 true
 ```
 
-**A constrained subtype is deliberately not a member, and it is the one place a value parts company
-with an operation.** [A derivation](/reference/errors/) gives a subtype every operation its base has,
-because narrowing which values a type holds does not narrow what can be done with them. An identity
-is not an operation: a range written to exclude zero has not got one, so the membership stops at the
-integer types themselves. A **vector** is left out for a related reason — `<4>i32` has four lanes and
+**A constrained subtype is deliberately not a member, the one place where a value and an operation
+are treated differently.** [A derivation](/reference/errors/) gives a subtype every operation its
+base has, because narrowing which values a type holds does not narrow what can be done with them. An
+identity is a value, not an operation: a range written to exclude zero does not contain one, so the
+membership stops at the integer types themselves. A **vector** is left out for a related reason — `<4>i32` has four lanes and
 `zero()` names none of them, where every operator above is the lane's operation happening four times
 at once.
 
@@ -1969,8 +1959,8 @@ print(v.x, v.y)
 
 Both parameters default to `Self`, so the homogeneous reading is what every arithmetic trait means
 where nothing says otherwise: `impl Mul for Point` is `impl Mul[Point, Point] for Point`, and
-`[T: Mul]` asks for `Mul[T, T]`. **Writing an argument is what asks for something else**, and four
-readings fall out of one trait:
+`[T: Mul]` asks for `Mul[T, T]`. **Writing an argument asks for something else**, and one trait
+covers four readings:
 
 | written | means | what it says |
 |---|---|---|
@@ -1979,14 +1969,14 @@ readings fall out of one trait:
 | `impl Mul[V, real] for V` | as written | a dot product — `V * V -> real` |
 | `impl Mul[V, V] for M` | as written | a transform — `M * V -> V` |
 
-**No associated type is involved, and that is a choice rather than an absence.** sysl has
-[associated types](/reference/traits/#a-trait-may-declare-an-associated-type), and the catalog
-deliberately does not use one: an associated type is **one per type**, so `Out` as an associated type
-would let a `Vec2` have exactly one multiplication. Rust's `Add` carries an associated `Output` and
-pays for it with a separate trait per operand type; here the result is an ordinary trait argument
-defaulting to `Self`, so one trait covers all four readings below — which is the mechanism
-[`Index`](#the-postfix-tail) already uses to carry the element type of what it reads. A vector space needs three of the four readings at once, and they are three ordinary
-blocks:
+**No associated type is involved, by design.** sysl has
+[associated types](/reference/traits/#a-trait-may-declare-an-associated-type), and the operator
+traits deliberately do not use one: an associated type is **one per type**, so `Out` as an associated
+type would let a `Vec2` have exactly one multiplication. Rust's `Add` carries an associated `Output`
+and needs a separate implementation per operand type; here the result is an ordinary trait argument
+defaulting to `Self`, so one trait covers all four readings above — the same mechanism
+[`Index`](#the-postfix-tail) uses to carry the element type of what it reads. A vector space needs
+three of the four readings at once, and they are three ordinary blocks:
 
 ```sysl
 struct Vec2
@@ -2008,9 +1998,9 @@ impl Mul[real] for Vec2
 impl Mul[Vec2, Vec2] for Mat2
     mul(self, v: Vec2) -> Vec2 = Vec2(self.a * v.x + self.b * v.y, self.c * v.x + self.d * v.y)
 
-var v = Vec2(1.0, 2.0)
-var scaled = v * 3.0
-var turned = Mat2(0.0, -1.0, 1.0, 0.0) * v
+var v = Vec2(1, 2)
+var scaled = v * 3
+var turned = Mat2(0, -1, 1, 0) * v
 
 print(v * v, scaled.x, turned.x, turned.y)
 ```
@@ -2041,8 +2031,8 @@ print(1)
 differs only in what it gives back
 ```
 
-**A compound assignment stays homogeneous**, and this is where a result that is not the left
-operand's type is felt: `a op= b` is `a = a op b`, so there is nothing to assign back.
+**A compound assignment stays homogeneous**, so a result that is not the left operand's type cannot
+be used there: `a op= b` is `a = a op b`, and the result could not be assigned back.
 
 ```sysl
 struct V
@@ -2051,9 +2041,9 @@ struct V
 impl Mul[V, real] for V
     mul(self, o: V) -> real = self.x * o.x
 
-var v = V(3.0)
+var v = V(3)
 
-v *= V(4.0)
+v *= V(4)
 
 print(v.x)
 ```
@@ -2062,7 +2052,7 @@ print(v.x)
 '*=' updates V in place, but '*' between V and V gives real
 ```
 
-One thing the result being an argument opens: an operator trait at **written** arguments has no
+Making the result an argument has one further effect: an operator trait at **written** arguments has no
 `Self` left in its signature — `Mul[real, real]` declares `mul(self, rhs: real) -> real` — so it is
 object-safe, and `&Mul[real, real]` is a formable [trait object](/reference/traits/#trait-objects)
 over types with quite different multiplications. Written bare it is `Mul[Self, Self]` and still is
@@ -2119,7 +2109,7 @@ print(1)
 whose arguments default names the type it is written for
 ```
 
-A genuine duplicate on a generic subject is caught by the rules above, unchanged: a second block at
+A genuine duplicate on a generic subject is caught by the rules above: a second block at
 the same operands by [one implementation per argument
 list](/reference/traits/#one-implementation-per-argument-list), and one differing only in its result
 by the rule that a result is not a selector.
@@ -2129,22 +2119,22 @@ implementing **one**, `eq` — the compiler derives the rest: `a != b` is `!eq(a
 `lt(b, a)`, `a <= b` is `!lt(b, a)`, `a >= b` is `!lt(a, b)`.
 
 Two of those **swap their operands**, and the swap is of the two *values*, applied at the call — so
-`a > b` still evaluates `a` before `b`, and the derivation is invisible in evaluation order as well
-as in the answer.
+`a > b` still evaluates `a` before `b`, and the derivation affects neither evaluation order nor the
+answer.
 
-`Eq` and `Ord` are **independent** traits, not a hierarchy. That is the scalar law lifted intact:
-`bool` and the pointer modes have `==` and no `<`. There is no four-way `PartialEq`/`Eq`/`PartialOrd`
+`Eq` and `Ord` are **independent** traits, not a hierarchy, matching the scalars: `bool` and the
+pointer modes have `==` and no `<`. There is no four-way `PartialEq`/`Eq`/`PartialOrd`
 /`Ord` tower.
 
 The scalars do not go through those derivations — the compiler-provided impls supply all six
-comparisons directly at IEEE semantics, which is what keeps `NaN <= 1.0` and `NaN >= 1.0` both false
-where negating `lt` would have made one true.
+comparisons directly at IEEE semantics, which keeps `NaN <= 1.0` and `NaN >= 1.0` both false where
+negating `lt` would make one of them true.
 
 ### A simple enum is `Eq`, and nothing else
 
 An enum whose variants all carry nothing is a **simple** enum, and its value *is* its discriminant.
-There is exactly one thing equality on it could mean, so the compiler supplies it — the same rule
-that makes every width of integer `Eq` without a block being written per width:
+Equality on it can mean only one thing, so the compiler supplies it — the same rule that makes every
+width of integer `Eq` without a block written per width:
 
 ```sysl
 enum Colorspace
@@ -2165,10 +2155,10 @@ true
 The membership satisfies an `Eq` **bound**, as the second line shows, and not merely the `==` token —
 so a simple enum goes into anything written over `[T: Eq]`.
 
-It is **not** `Ord`. Declaration order is an order and it is not a *meaning*: `Srgb < Linear` says
-nothing anybody wants a language to assert on their behalf, so an enum whose order means something
-writes the `impl` that says so. It is not `Hash` either, for the same reason — that is a promise
-about a distribution, and a program makes it deliberately.
+It is **not** `Ord`. Declaration order is an order but not a *meaning*: `Srgb < Linear` asserts
+nothing a program should rely on by default, so an enum whose order means something writes the
+`impl` that says so. It is not `Hash` either, for a similar reason: a hash is a promise about a
+distribution, and a program makes it deliberately.
 
 An enum that **carries data** is not a member. Comparing two of those means comparing their payloads,
 which needs every payload type to be `Eq` itself; that is an `impl` a program writes, and
@@ -2194,11 +2184,12 @@ print(Srgb == Srgb)
 
 ### Why the token set is closed
 
-Overloading the fixed set is the bare-metal consensus: Rust, C++, D and Ada all allow it, Zig and C
-allow no overloading at all, and **none** permits a new operator token. Low-level code is read while
-reasoning about hardware, and a mystery operator that is secretly a user function fights that — the
-same visible-cost value the memory model rests on. A closed set also lexes by longest match against a
-fixed list, with no operator "muncher" and no parser-vocabulary registration to keep in step.
+Overloading a fixed set is common ground among systems languages: Rust, C++, D and Ada all allow it,
+Zig and C allow no overloading at all, and **none** permits a new operator token. Low-level code is
+read while reasoning about hardware, and an unfamiliar operator that is really a user function
+works against that — the same visible-cost principle the memory model rests on. A closed set also
+lexes by longest match against a fixed list, with no operator registration for the parser to keep
+in step.
 
 ---
 
