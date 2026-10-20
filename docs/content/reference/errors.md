@@ -4,35 +4,34 @@ summary: Two channels for failure — a value you handle and a stop you cannot �
 weight: 110
 ---
 
-Failure travels on **two separate channels**, and which one a given failure uses is a design decision
-at every API rather than a coin toss:
+Failure travels on **two separate channels**, and choosing which one a given failure uses is a
+deliberate design decision for every API:
 
-- **A recoverable failure is a value.** `Result[T, E]` or `Option[T]` in the return type, propagated
-  with [`?`](/reference/expressions/). It is part of the signature, so the caller has to engage
-  with it.
-- **A bug is a trap.** An index past the end, an invalid cast, a broken contract. Not a value, not
-  catchable, and the program stops.
+- **A recoverable failure is a value.** It is a `Result[T, E]` or `Option[T]` in the return type,
+  propagated with [`?`](/reference/expressions/). It is part of the signature, so the caller has to
+  handle it.
+- **A bug is a trap.** An index past the end, an invalid cast, a broken contract. A trap is not a
+  value and cannot be caught; the program stops.
 
-Keeping them apart is what makes a signature honest. A function returning `Result[T, E]` is telling
-you it can fail in a way you handle; one returning plain `T` is telling you the only way it "fails"
-is if the program is already wrong.
+Keeping the two apart keeps signatures accurate. A function returning `Result[T, E]` tells you it can
+fail in a way you handle; one returning plain `T` tells you it can only fail if the program is
+already wrong.
 
-This page covers both channels and then the three features that *create* the second one —
-constrained types, struct invariants, and function contracts — because a `within` range and a
-`require` clause are only interesting once you know what happens when they are false.
+This page covers both channels and then the three features that *produce* the second one:
+constrained types, struct invariants, and function contracts. A `within` range or a `require` clause
+is easiest to understand once you know what happens when it is false.
 
 ## Which channel — the policy
 
-One question decides it: **could correct calling code ever hit this?**
+One question decides it: **could correct calling code ever reach this?**
 
 | | answer | why |
 |---|---|---|
 | **Yes** — an expected outcome of valid use | `Result` / `Option` | The input came from outside the program — a file, a socket, a person — or the operation legitimately may not succeed. A correct caller still meets this case, so the type must force it to be handled. |
 | **No** — only a bug reaches it | a trap | Indexing past the end, converting an out-of-range integer to a `char`, dividing by zero, violating a `require`. A correct program never does these; reaching one means the program is already wrong. |
 
-The payoff of the split is that signatures stay clean — no `Result` smeared across functions that
-cannot meaningfully fail — while the failures that *are* real are impossible to ignore, because they
-are in the type.
+With this split, signatures stay clean, with no `Result` on functions that cannot meaningfully fail,
+while the failures that *can* happen are impossible to ignore, because they are in the type.
 
 ## `Option[T]` and `Result[T, E]`
 
@@ -44,16 +43,16 @@ enum Option[T]                 enum Result[T, E]
     None                           Err(error: E)
 ```
 
-- **`Option[T]` is absence** — a value that may or may not be there, with no reason attached: a
-  missing key, the `next` of a list tail, the result of a search. It is also what a
-  [`weak` reference](/reference/memory/) degrades to, and what a fallible constructor like
-  `char.try` answers with.
-- **`Result[T, E]` is failure with a reason** — parsing, I/O, validation. `E` is whatever carries the
-  reason: a string, an error enum, a `&Fail`.
+- **`Option[T]` represents absence**: a value that may or may not be there, with no reason attached,
+  such as a missing key, the `next` of a list's last node, or the result of a search. It is also what
+  a [`weak` reference](/reference/memory/) yields when read, and what a fallible constructor like
+  `char.try` returns.
+- **`Result[T, E]` represents failure with a reason**: parsing, I/O, validation. `E` is whatever
+  carries the reason: a string, an error enum, a `&Fail`.
 
-They are constructed and taken apart like any enum, and their type arguments come from inference —
-including the two cases with nothing to infer from at the call. A bare `None` takes its `T` from
-context, and an `Ok(n)` inside a `Result[int, string]`-returning function takes its `E` from the
+They are constructed and taken apart like any enum, and their type arguments are inferred, including
+in the two cases where the call itself gives nothing to infer from. A bare `None` takes its `T` from
+context, and an `Ok(n)` inside a function returning `Result[int, string]` takes its `E` from the
 return type:
 
 ```sysl
@@ -87,11 +86,11 @@ refused: odd
 ```
 
 `E` is usually an enum rather than a string, so a caller can match on *what* went wrong instead of
-reading a sentence about it.
+parsing a message.
 
 ### The members
 
-The **total** ones ask a question or supply a fallback. None of them can stop the program:
+The **total** members ask a question or supply a fallback. None of them can stop the program:
 
 | on `Option[T]` | on `Result[T, E]` | is |
 |---|---|---|
@@ -99,7 +98,7 @@ The **total** ones ask a question or supply a fallback. None of them can stop th
 | `is_none()` | `is_err()` | `true` when it is not |
 | `unwrap_or(default)` | `unwrap_or(default)` | the payload, or `default` |
 
-The **forcing** ones hand over the payload and stop the program when there is none:
+The **forcing** members return the payload and stop the program when there is none:
 
 | on `Option[T]` | on `Result[T, E]` | stops when |
 |---|---|---|
@@ -109,10 +108,10 @@ The **forcing** ones hand over the payload and stop the program when there is no
 | — | `expect_err(msg)` | `Ok` |
 
 ```sysl
-var got: Option[int] = Some(7)
+var got = Some(7)
 var bad: Result[int, string] = Err("no")
 
-print(got.is_some(), got.unwrap_or(0), got.expect("put here two lines ago"))
+print(got.is_some(), got.unwrap_or(0), got.expect("set above"))
 print(bad.is_err(), bad.unwrap_or(-1), bad.unwrap_err())
 ```
 
@@ -121,10 +120,10 @@ true 7 7
 true -1 no
 ```
 
-`unwrap_err` is `Result`'s alone because `Option`'s empty case carries nothing to hand back.
+Only `Result` has `unwrap_err`, because `Option`'s empty case carries nothing to return.
 
-The **transforming** ones build a new value out of the old one, and carry the other case through
-untouched:
+The **transforming** members build a new value from the old one, and pass the other case through
+unchanged:
 
 | on `Option[T]` | on `Result[T, E]` | is |
 |---|---|---|
@@ -143,9 +142,9 @@ halve(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
 width(e: string) -> int = int(e.len)
 
 main()
-    val some: Option[int] = Some(21)
+    val some = Some(21)
     val none: Option[int] = None
-    val four: Option[int] = Some(4)
+    val four = Some(4)
     val bad: Result[int, string] = Err("abc")
 
     print(some.map(double), none.map(double))
@@ -161,25 +160,24 @@ Ok(21) Err(missing)
 Err(3) None Some(abc)
 ```
 
-`and_then` is the one worth reading twice. `map` of a function that itself answers an `Option` gives
-an `Option[Option[U]]`; `and_then` gives an `Option[U]`, which is what a chain of fallible steps
-wants. On a `Result` it is `?` written as an expression, for the places `?` cannot go — a chain
-being built as an argument, or a body that is one expression.
+`and_then` deserves a closer look. `map` with a function that itself returns an `Option` gives an
+`Option[Option[U]]`; `and_then` gives an `Option[U]`, which is what a chain of fallible steps needs.
+On a `Result` it is `?` written as an expression, for places `?` cannot go, such as a chain built as
+an argument, or a body that is a single expression.
 
-`ok_or` and `ok`/`err` are the crossings between the two, and they are as much the point as the
-mapping is: `ok_or` is what makes a lookup usable in a body that propagates with `?`, and `ok` goes
-back the other way when the reason has stopped mattering.
+`ok_or` and `ok`/`err` convert between the two types: `ok_or` makes a lookup usable in a body that
+propagates with `?`, and `ok` converts the other way when the reason no longer matters.
 
-`unwrap_or_else` is the companion of `unwrap_or` rather than a replacement: `unwrap_or` evaluates its
-argument whether or not it is wanted, which is right for a constant and wrong for anything that
-reads a file or builds a string.
+`unwrap_or_else` complements `unwrap_or` rather than replacing it: `unwrap_or` evaluates its argument
+whether or not it is needed, which is right for a constant and wrong for anything that reads a file
+or builds a string.
 
 **`?` converts between error types through [`From`](#a-converts-through-from)**, so `map_err` is for
-a transformation the type system does not know about — a message reworded, a code renumbered — rather
-than for joining two layers of a program. `step().map_err(to_mine)?` is still what to write where the
-two are not related by a `From` block.
+a transformation the type system does not know about, such as rewording a message or renumbering a
+code, rather than for joining two layers of a program. Where the two error types are not related by
+a `From` block, write `step().map_err(to_mine)?`.
 
-### They are written in sysl, and that is the point
+### They are written in sysl
 
 The forcing members stop the program without any compiler support of their own:
 
@@ -191,18 +189,18 @@ unwrap(self) -> T = self match
         exit(1)
 ```
 
-That is what keeps "a bug stops the program" from meaning "the compiler must know the name of every
-way to stop". Two ordinary features make it work. A diverging arm has a type — [`never`](/reference/types/)
-— so `exit(1)` sits beside `Some(v) -> v` and the `match` still has the payload's type rather than a
-conflict between `T` and nothing. And the departure itself is an `extern`: the library declares
-`exit(code: int) -> never`, so stopping is a call.
+So "a bug stops the program" does not require the compiler to know every way of stopping. Two
+ordinary features make it work. A diverging arm has a type, [`never`](/reference/types/), so
+`exit(1)` can sit beside `Some(v) -> v` and the `match` still has the payload's type. And stopping is
+an `extern` call: the library declares `exit(code: int) -> never`.
 
-Nothing here costs a program that does not use it. The enums are generic, so a member exists only
-where a call asks for one, and an `extern` nothing reaches is never declared in the output.
+None of this costs a program that does not use it. The enums are generic, so a member exists only
+where a call uses it, and an `extern` that nothing reaches is never declared in the output.
 
 ### They compare, and they render
 
-Both carry `Eq` and `Display`, and the bounds are on the **payloads** rather than on the whole:
+Both implement `Eq` and `Display`, with the bounds on the **payloads** rather than on the whole
+type:
 
 ```sysl
 impl[T: Eq] Eq for Option[T]
@@ -212,19 +210,19 @@ impl[T: Display] Display for Option[T]
 impl[T: Display, E: Display] Display for Result[T, E]
 ```
 
-Two of them are equal when they took the same road and agree at the end of it. `Some` is never equal
-to `None`, and **`Ok` is never equal to `Err`** however the two payloads compare — the pair below
-carries a 3 on both sides. A rendering is the source spelling, and a width describes the field the
-whole value occupies rather than its payload:
+Two values are equal when they hold the same variant and their payloads are equal. `Some` is never
+equal to `None`, and **`Ok` is never equal to `Err`** however the two payloads compare; the pair
+below holds a 3 on both sides. A value renders as its source spelling, and a width applies to the
+field the whole value occupies rather than to its payload:
 
 ```sysl
-val a: Option[usize] = Some(166)
-val n: Option[usize] = None
+val a = Some(166)
+val n: Option[int] = None
 
 print(a == Some(166), a == n, n == None)
 
-val ok: Result[usize, usize] = Ok(3)
-val bad: Result[usize, usize] = Err(3)
+val ok: Result[int, int] = Ok(3)
+val bad: Result[int, int] = Err(3)
 
 print(ok == bad)
 print(str(a), str(n), str(ok), str(bad))
@@ -238,20 +236,20 @@ Some(166) None Ok(3) Err(3)
    Some(166)|
 ```
 
-**A `Result[T, E]` compares exactly when both halves do**, and the two bounds are written
-separately because they are two questions: the payload being comparable says nothing about the error
-type, and a `Result` is only as comparable as the less comparable of them.
+**A `Result[T, E]` can be compared exactly when both of its type arguments can**, and the two bounds
+are written separately because they are independent: a comparable payload says nothing about the
+error type.
 
-The bound is reported where the comparison is written rather than where the type was declared, and
-it names the half that is missing:
+A missing bound is reported where the comparison is written rather than where the type was declared,
+and the diagnostic names the type argument that lacks it:
 
 ```sysl
 struct Opaque
     n: int
 
 main()
-    val a: Option[Opaque] = Some(Opaque(1))
-    val b: Option[Opaque] = Some(Opaque(2))
+    val a = Some(Opaque(1))
+    val b = Some(Opaque(2))
 
     print(a == b)
 ```
@@ -260,20 +258,20 @@ main()
 error: '==' between sysl.Option[Opaque] needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of Opaque, which does not implement it
 ```
 
-Both blocks are what makes [`assert_eq`](/library/core/) usable on one: it is bounded over
-`Eq + Display`, so either alone would still refuse — and the refusal would name the trait that is
-missing rather than the one a reader was thinking about.
+Both implementations are needed for [`assert_eq`](/library/core/) to accept these types: it is
+bounded by `Eq + Display`, so either one alone would still be refused, and the diagnostic names the
+trait that is missing.
 
 ## `?`
 
-The [expressions page](/reference/expressions/) gives `?` its place in the grammar — postfix, at
-the tightest level, alongside `.` and `()`. Its rules in full:
+The [expressions page](/reference/expressions/) gives `?` its place in the grammar: postfix, at the
+tightest level, alongside `.` and `()`. Its rules in full:
 
 **On a `Result`,** `Ok(v)` evaluates to `v` and `Err(e)` returns `Err(e)` from the enclosing function
 immediately. **On an `Option`,** `Some(v)` evaluates to `v` and `None` returns `None` immediately.
 
-**The enclosing function's return type must be able to carry the failure.** The early return has to
-have somewhere to go:
+**The enclosing function's return type must be able to carry the failure**, since the early return
+needs somewhere to go:
 
 ```sysl
 half(n: int) -> Result[int, string]
@@ -308,8 +306,8 @@ cross(n: int) -> Result[int, string]
 
 **Where the two error types differ, `?` converts through [`From`](/library/core/).** A function with
 an error type of its own writes `impl From[Theirs] for Mine` once, and every `?` across that boundary
-finds it — so the two layers are joined in the block that says how rather than at each call that
-crosses between them.
+uses it, so the two layers are joined in one block rather than at every call that crosses between
+them.
 
 ```sysl
 enum Io
@@ -341,12 +339,12 @@ print(describe(read(true)), describe(read(false)))
 ok 14 disk
 ```
 
-**The parameter is the source and `Self` is the destination**, which is the direction that lets a type
-accept conversions from types it does not own: the block is written where `Fault` is, and `Io` need
-never have heard of it. A type may implement `From` several times over — `From[int]` and `From[real]`
-for one type are two blocks — so an error type may accept every layer it sits above.
+**The parameter is the source and `Self` is the destination**, which lets a type accept conversions
+from types it does not own: the block is written beside `Fault`, and `Io` does not need to know about
+it. A type may implement `From` several times (`From[int]` and `From[real]` for one type are two
+blocks), so an error type may accept errors from every layer beneath it.
 
-Where there is **no** such block the `?` is refused, and the refusal names the one to write:
+Where there is **no** such block, the `?` is refused, and the diagnostic names the block to write:
 
 ```sysl
 half(n: int) -> Result[int, string]
@@ -362,23 +360,21 @@ other(n: int) -> Result[int, bool]
 a '?' converts through 'sysl.From', so 'impl From[string] for bool' is what joins the two layers
 ```
 
-An `Option`'s `?` has nothing to convert: `None` carries nothing, so the two enums still have to be
-the same one and the rule above about the channels not crossing is unchanged.
+An `Option`'s `?` has nothing to convert: `None` carries nothing, so the two enums must still be the
+same, and the rule above that the channels do not cross still applies.
 
-The conversion is a **widening**: every exact-match `?` written before it means what it always meant,
-and a `?` whose error types agree makes no call at all.
+A `?` whose error types already agree makes no conversion call at all.
 
-**`?` is an expression**, so its unwrapped value flows straight into whatever surrounds it — `Ok(mk()?)`
-is ordinary, and a chain of hops is written as a sequence of `?`-bound locals.
+**`?` is an expression**, so its unwrapped value flows directly into the surrounding expression:
+`Ok(mk()?)` is ordinary, and a chain of steps is written as a sequence of `?`-bound locals.
 
 ### `?` and the memory model
 
-`?` obeys [ARC](/reference/memory/) with no special rule, and this is where that
-discipline is load-bearing, because `?` is the operator most likely to carry a heap payload across a
-function boundary.
+`?` follows [ARC](/reference/memory/) with no special rule. This matters here, because `?` is the
+operator most likely to carry a heap payload across a function boundary.
 
-**Unwrapping a `&T` success payload retains it past the wrapper**, so the reference outlives the
-`Result` it came out of and is released exactly once:
+**Unwrapping a `&T` success payload retains it beyond the wrapper**, so the reference outlives the
+`Result` it came from and is released exactly once:
 
 ```sysl
 struct Point
@@ -400,35 +396,34 @@ print(use(true).unwrap_or(-1), use(false).unwrap_or(-1))
 3 -1
 ```
 
-**Propagating a `&T` error payload moves it through the early return** with its count intact, freed
-exactly once on whichever path consumes it.
+**Propagating a `&T` error payload moves it through the early return** with its reference count
+intact, and it is freed exactly once on whichever path consumes it.
 
-Neither is a rule about `?`. Both fall out of retain-on-alias and release-at-scope-end, and they are
-named here because a hand-rolled C error return leaks or double-frees at exactly these two
-boundaries.
+Neither is a special rule for `?`. Both follow from retain-on-alias and release-at-scope-end, and
+they are spelled out here because a hand-written C error return typically leaks or double-frees at
+exactly these two boundaries.
 
 ## Traps
 
-The other channel. A trap is the runtime response to a **broken invariant**, and its semantics are
-settled:
+A trap is the other channel: the runtime response to a **broken invariant**. Its semantics are
+fixed:
 
-**A trap aborts.** There is no unwinding, no stack cleanup, no `catch`, no exceptions. When a check
-fails the program stops; it does not run destructors up the stack, and it cannot be intercepted and
-resumed.
+**A trap aborts.** There is no unwinding, no stack cleanup, no `catch`, and no exceptions. When a
+check fails, the program stops; it does not run destructors up the stack, and it cannot be
+intercepted and resumed.
 
-Two reasons this is the only defensible choice for the language's targets. **A kernel and an embedded
-target have no unwinding runtime** — landing pads, a personality routine and per-frame cleanup tables
-are exactly the machinery a freestanding `no alloc` target does not have and does not want, and an
-abort needs none of it. And **determinism**: an abort is one code path, where unwinding is a second,
-invisible control-flow graph that every function in the program would have to be correct under.
-Removing it removes the whole "is this exception-safe?" class of reasoning, which is the same
+There are two reasons this is the right choice for the language's targets. **Kernels and embedded
+targets have no unwinding runtime**: landing pads, a personality routine and per-frame cleanup tables
+are machinery that a freestanding `no alloc` target does not have and does not want, and an abort
+needs none of it. The second is **determinism**: an abort is one code path, whereas unwinding is a
+second, invisible control-flow graph under which every function in the program would have to be
+correct. Removing it removes the whole "is this exception-safe?" class of reasoning, the same
 simplification the memory model makes by having no move semantics.
 
-**Nor does a trap run a deferred statement.** [`defer`](/reference/statements/#defer) is the
-language's scope-exit form, and a trap is not an exit — it is the program stopping because its model
-of itself is already wrong. Cleanup code run against that state is how a corrupt program writes its
-corruption out on the way down. So `defer` is for releasing a resource, not for restoring an
-invariant.
+**A trap does not run deferred statements either.** [`defer`](/reference/statements/#defer) is the
+language's scope-exit form, and a trap is not an exit: it is the program stopping because its own
+state is already wrong. Running cleanup code against that state risks writing the corruption out
+before the program stops. So `defer` is for releasing a resource, not for restoring an invariant.
 
 ### What traps
 
@@ -454,18 +449,18 @@ than to arithmetic.
 `NDEBUG`. A check that is in the language is in every build, because a switch that removed one would
 make a program's meaning depend on how it was compiled.
 
-**A trap while a constant is being worked out is a compile error.** A
+**A trap while a constant is being evaluated is a compile error.** A
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) called where a
-constant is wanted is run by the compiler, and every source in the table above stops that run as it
-would stop the program — so the constant is refused, at the call written in it, with the trap's own
-words, where it happened, and every call the run was inside:
+constant is expected is run by the compiler, and every source in the table above stops that run as
+it would stop the program. The constant is refused at the call, with the trap's message, where it
+happened, and every call the evaluation was inside:
 
 ```sysl
 const per(n: int, k: int) -> int = n / k
 
 const buckets(n: int, k: int) -> int = per(n, k) + 1
 
-const steps: int = buckets(1024, 0)
+const steps = buckets(1024, 0)
 
 print(steps)
 ```
@@ -474,17 +469,18 @@ print(steps)
 'steps' traps while it is being compiled: integer division by zero
 ```
 
-The program never runs, so it prints nothing at all; the full message names the division, then each call the run was inside — `inside 'per(1024, 0)'`,
-`inside 'buckets(1024, 0)'` — with where each was called.
+The program never runs, so it prints nothing. The full message names the division, then each call
+the evaluation was inside (`inside 'per(1024, 0)'`, `inside 'buckets(1024, 0)'`), with the location
+of each call.
 
 ### What stopping looks like
 
-The *decision* to stop is the language's; the *action* on stopping is the environment's. Under the
-`os` capability a hosted program stops the process and exits non-zero; a kernel installs its own
-panic handler and enters that.
+The *decision* to stop belongs to the language; the *action* taken on stopping belongs to the
+environment. Under the `os` capability a hosted program stops the process and exits non-zero; a
+kernel installs its own panic handler and enters that.
 
-On a hosted target there are three observably different shapes, and the difference is worth knowing
-before you debug one:
+On a hosted target there are three observably different outcomes, and it helps to know them before
+you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
@@ -492,12 +488,12 @@ before you debug one:
 | any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message>` on stdout, after everything the program printed before it | 1 |
 
-**A trap flushes standard output before it stops the program.** Standard output is buffered — fully,
-when it goes to a file or a pipe rather than a terminal — so what a program printed may still be in
-the buffer when a check fails. Every trap, the compiler's checks and the library's `trap()` alike,
-goes through one runtime point that flushes every open output stream and then executes the trap
-instruction, so the status is the trap's and a program that printed diagnostics right up to the
-failing line shows all of them:
+**A trap flushes standard output before it stops the program.** Standard output is buffered (fully
+buffered when it goes to a file or a pipe rather than a terminal), so what a program printed may
+still be in the buffer when a check fails. Every trap, from the compiler's checks and the library's
+`trap()` alike, goes through one runtime function that flushes every open output stream and then
+executes the trap instruction. The exit status is the trap's, and a program that printed diagnostics
+up to the failing line shows all of them:
 
 ```sysl
 main()
@@ -516,17 +512,18 @@ element 2 is 3
 ```
 
 All three lines reach standard output, and the trap follows them: the program exits with status 133,
-having written `index 3 out of bounds for length 3 (main.sysl:6:35)` to standard error on the way
-(below). The fence above says `output trap` rather than `output` because the site's test suite runs
-the program and holds it to both halves — what it printed, and that it ended on a trap.
+after writing `index 3 out of bounds for length 3 (main.sysl:6:35)` to standard error (see below).
+The block above is marked `output trap` rather than `output` because the site's test suite runs the
+program and checks both what it printed and that it ended with a trap.
 
-The flush happens once: a trap raised while it runs goes straight to the instruction, so a stream in
-a state that makes flushing fail cannot loop. **On a freestanding target there is nothing to flush**
-— its `putchar` is whatever the board supplies, buffering nothing a trap could lose — so a trap
-there is the instruction alone, and a program that never prints links no C stream function at all.
+The flush happens once: a trap raised during the flush goes straight to the instruction, so a stream
+in a state that makes flushing fail cannot cause a loop. **On a freestanding target there is nothing
+to flush**: its `putchar` is whatever the board supplies and buffers nothing a trap could lose, so a
+trap there is the instruction alone, and a program that never prints links no C stream function at
+all.
 
-**A bounds check says what failed before it traps**, written straight to standard error so that it
-survives the trap:
+**A bounds check reports what failed before it traps**, writing directly to standard error so that
+the message survives the trap:
 
 ```text
 index 5 out of bounds for length 3 (main.sysl:2:8)
@@ -537,28 +534,28 @@ variant 'Shape.Circle' was asked for, and the value is 'Shape.Dot' (main.sysl:9:
 ```
 
 The last is [`x.(c)`](/reference/reflection/) reading the payload of a variant the value does not
-hold; it goes through the same function, which is handed the two names as NUL-terminated texts.
+hold; it goes through the same function, which receives the two names as NUL-terminated strings.
 
-The location is the bracket's line and column, naming the file by its path inside what was built — a
-fetched package's file by its coordinate — so no build directory appears in it. The status is still
-the trap's, so a [`should_trap`](/reference/attributes/#a-test-passes-by-returning) test reads it as
-it always did, and can now ask for the words. Every failure goes through one weak function,
-`sysl_bounds_fail`, which a program may replace with an `@export` of its own — a board writing the
-report to a UART — and the trap still follows whatever it does. On a freestanding target the default
-writes nothing and returns, so the trap is what stops it. The locations cost a string per check in
-the image; `bounds_locations = false` in the manifest, or `--no-bounds-locations` on the command line,
-leaves them out and keeps the values:
+The location is the bracket's line and column, with the file named by its path inside the build (a
+fetched package's file by its coordinate), so no build directory appears in it. The exit status is
+still the trap's, so a [`should_trap`](/reference/attributes/#a-test-passes-by-returning) test
+recognises it, and can also check the message. Every failure goes through one weak function,
+`sysl_bounds_fail`, which a program may replace with an `@export` of its own, for example on a board
+that writes the report to a UART; the trap still follows whatever it does. On a freestanding target
+the default writes nothing and returns, so the trap is what stops the program. The locations cost
+one string per check in the image; `bounds_locations = false` in the manifest, or
+`--no-bounds-locations` on the command line, leaves them out and keeps the values:
 
 ```text
 index 5 out of bounds for length 3
 ```
 
-Making every other check say why it stopped is an open question in the design.
+Whether every other check should also report why it stopped is an open design question.
 
 ### Running out of stack, which is the third shape
 
-**A hosted program installs a handler for the fault an exhausted stack raises**, and says which of the
-two things happened rather than dying silently:
+**A hosted program installs a handler for the fault an exhausted stack raises**, and reports which of
+two things happened rather than stopping silently:
 
 ```
 sysl: this program has overflowed its stack -- a recursion with no base case, or a walk over a
@@ -569,26 +566,25 @@ structure that contains itself
 sysl: this program faulted on an address it does not own
 ```
 
-Which of the two is decided by **where the faulting address lies** — just below the stack, or
-anywhere else — which is what Rust, Go and Java each do. Getting it wrong in the safe direction is
-the second message, so the first is worth trusting.
+The choice is made by **where the faulting address lies**: just below the stack, or anywhere else,
+as Rust, Go and Java also do. When the classification errs, it errs toward the second message, so
+the first can be trusted.
 
-**What the program had already printed comes out with it.** The handler flushes standard output
-before it stops, which recovers exactly the evidence a reader needs and which was lost before: the
-process died with the buffer in it, so a program that had printed twenty lines appeared to have
-printed none. The flush is attempted **after** the message, because it is not async-signal-safe — a
-fault raised inside the output machinery itself would deadlock, and the diagnostic is already out by
-then.
+**Output the program had already printed is preserved.** The handler flushes standard output before
+it stops, so a program that printed twenty lines before overflowing shows all twenty, rather than
+losing them with the buffer. The flush is attempted **after** the message, because flushing is not
+async-signal-safe: a fault raised inside the output machinery itself would deadlock, and by then the
+diagnostic has already been written.
 
 **A freestanding target installs nothing**, having no signals to catch. Neither does an archive built
-with `sysl build-c`: what a C project links its own entry point to is that project's business.
+with `sysl build-c`: how a C project sets up its own entry point is up to that project.
 
 ## Turning a trap back into a value
 
-There is no `panic` you can recover from, so a program that must survive bad input has to **not do
-the trapping thing**: check the bound, validate before dividing, and use the fallible constructor
-rather than the checked cast. That is the move to make wherever untrusted input enters, and it is
-where a bug turns back into a value:
+There is no recoverable `panic`, so a program that must survive bad input has to **avoid the
+operation that traps**: check the bound, validate before dividing, and use the fallible constructor
+rather than the checked cast. Do this wherever untrusted input enters the program; it is where a
+potential bug becomes a value instead:
 
 ```sysl
 enum Color: u8
@@ -615,12 +611,12 @@ read: Green
 byte 9 is not a Color
 ```
 
-`Color(9)` would have trapped. `Color.try(9)` hands back a `None` this function turns into a reason,
-and the byte off the wire stops being a bug in the program and starts being a value it handles.
+`Color(9)` would have trapped. `Color.try(9)` returns a `None` that this function turns into a
+reason, so a byte read from the wire is a value the program handles rather than a bug.
 
-**The same form reads a bitfield's enum field fallibly.** Reading the field is the checked cast and
-traps on bits no variant has; handed to `try` as it is, the field's bits are read unchecked and
-answered for:
+**The same form reads a bitfield's enum field fallibly.** Reading the field is a checked cast and
+traps on bits that match no variant; passed directly to `try`, the field's bits are read unchecked
+and validated:
 
 ```sysl
 enum Ec: u6
@@ -633,7 +629,7 @@ struct Esr
     ec: Ec
     high: u32
 
-var raw: u64 = u64(0x2a) << 26
+var raw: u64 = 0x2a << 26
 val e: *Esr = ptr_cast(&raw)
 
 print(Ec.try(e.ec).is_none())
@@ -644,8 +640,8 @@ true
 ```
 
 [`attributes.md`](/reference/attributes/#bitfields-an-in-field-in-exactly-n-bits) has the field
-rule. A value of the enum read anywhere else is already one of its variants, so `try` takes an
-integer or such a field and nothing else.
+rule. A value of the enum obtained any other way is already one of its variants, so `try` accepts
+only an integer or such a field.
 
 For a constrained type the equivalent is `T::Valid`, below.
 
@@ -657,7 +653,7 @@ One declaration form with three independent parts:
 type Name = [new] Base [within lo..hi] [where predicate]
 ```
 
-`new`, `within` and `where` are **contextual keywords** — ordinary identifiers everywhere else, so a
+`new`, `within` and `where` are **contextual keywords** and ordinary identifiers everywhere else, so a
 field, a function or a variable may still be called `where`:
 
 ```sysl
@@ -676,7 +672,7 @@ print(c.where, c.invariant, where(5))
 3 4 10
 ```
 
-Each of the three parts may be left out, and leaving out all three is a form of its own:
+Each of the three parts is optional, and leaving out all three is a form of its own:
 
 | written | means |
 |---|---|
@@ -686,10 +682,9 @@ Each of the three parts may be left out, and leaving out all three is a form of 
 | `type Slot = new u8 within 0..<200` | distinct **and** constrained |
 | `type Alias = int` | a [type alias](/reference/declarations/#type-declarations) — no new type at all |
 
-The last row is different in kind from the four above it. Adding nothing to the base declares no
-type: it is a second spelling for one that already exists, and a value crosses between the two names
-with nothing emitted and nothing checked, because there are not two things for anything to be
-emitted between.
+The last row differs in kind from the four above it. Adding nothing to the base declares no new type:
+it is a second name for an existing one, and a value passes between the two names with nothing
+emitted and nothing checked, because there is only one type.
 
 ```sysl
 type Alias = int
@@ -703,12 +698,11 @@ print(n + 1)
 2
 ```
 
-Everything in the rest of this section is about the other four rows, and the first thing it says is
-the clearest way to tell them apart: an alias's base may be **any** type, and a constrained
-subtype's may not.
+The rest of this section is about the other four rows, starting with the clearest difference: an
+alias's base may be **any** type, and a constrained subtype's may not.
 
-**A constrained subtype's base must be a scalar** — an integer, a float, a `char`, or a
-[fixed-point type](/reference/fixed-point/#a-range), whose `within` ends are decimals:
+**A constrained subtype's base must be a scalar**: an integer, a float, a `char`, or a
+[fixed-point type](/reference/fixed-point/#a-range), whose `within` bounds are decimals:
 
 ```sysl
 struct Point
@@ -732,12 +726,12 @@ invariant below and, for an enum, having fewer variants.
 ### Ranges
 
 `..` includes the upper bound and `..<` excludes it, matching the
-[range expressions](/reference/expressions/#ranges). A bound is a **constant expression** — a
-literal, a `const`, or arithmetic over them, folded through the same path an array length and an enum
-discriminant go through, so the three positions accept the same expressions and cannot drift apart:
+[range expressions](/reference/expressions/#ranges). A bound is a **constant expression**: a
+literal, a `const`, or arithmetic over them, folded by the same code that folds an array length and
+an enum discriminant, so all three positions accept the same expressions:
 
 ```sysl
-const max_tasks: int = 4
+const max_tasks = 4
 
 type Task = int within 0..<max_tasks
 type Trimmed = int within 0..max_tasks - 2
@@ -752,11 +746,11 @@ print(t, u)
 3 2
 ```
 
-That is one fact written once: `within 0..<max_tasks` beside `[max_tasks]Task`. What a bound may not
-be is **non-constant** — a module-level `val` is read-only storage with an address rather than a
-constant, and is refused here.
+This lets one constant define both `within 0..<max_tasks` and `[max_tasks]Task`. A bound may not be
+**non-constant**: a module-level `val` is read-only storage with an address rather than a constant,
+and is refused here.
 
-Two shapes are rejected at the declaration. A bound outside the base's own range:
+Two forms are rejected at the declaration. A bound outside the base's own range:
 
 ```sysl
 type Big = byte within 0..300
@@ -785,34 +779,33 @@ the lower bound of 'Inverted' is above its upper bound
 ```
 
 A bound that folds to a float is ordered like a literal one, so `f64 within 2.0..(0.5 * 2.0)` is an
-inverted range. A bound whose fold itself refuses — `1/0` — is refused in the fold's words, at the
-division: *"a constant divided by zero"*.
+inverted range. A bound whose folding itself fails, such as `1/0`, is refused with the folder's
+message, at the division: *"a constant divided by zero"*.
 
 ### A float range may end at an infinity
 
-Over a float base an end may be `infinity` or `-infinity` — the
-[constants no literal spells](/reference/types/#infinity-and-nan) — which is how a
-range open at one end is written. **An infinite end is still a check**: every comparison with a NaN
-is false, so even `-infinity..infinity` refuses exactly one thing, and `0.0..<infinity` refuses
-`infinity` itself.
+Over a float base, a bound may be `infinity` or `-infinity`, the
+[constants no literal spells](/reference/types/#infinity-and-nan), which is how a range open at one
+end is written. **An infinite bound is still a check**: every comparison with a NaN is false, so even
+`-infinity..infinity` refuses exactly one value, and `0..<infinity` refuses `infinity` itself.
 
 ```sysl
-type Distance = real within 0.0..infinity
+type Distance = real within 0..infinity
 type Finite = real within -infinity..<infinity
 
 var far: Distance = infinity
 var d: Finite = -1.0e300
 
-print(f64(far) > 1.0e308, f64(d) < 0.0)
+print(far > 1.0e308, d < 0)
 ```
 
 ```output
 true true
 ```
 
-A NaN arriving at either is refused where it is produced, as any out-of-range value is — the program
-traps there. **A NaN bound is refused at the declaration**, a range ending at one admitting no value
-at all:
+A NaN assigned to either type is refused where it is produced, like any out-of-range value: the
+program traps there. **A NaN bound is refused at the declaration**, since a range ending at a NaN
+admits no value at all:
 
 ```sysl
 type Broken = real within 0.0..nan
@@ -824,9 +817,9 @@ print(1)
 a 'within' bound may not be NaN — every comparison with one is false, so a range ending at a NaN admits no value
 ```
 
-An integer or `char` range has no infinity to end at; `int within 0..infinity` is refused as *"an
-integer subtype needs integer bounds, not a floating-point literal"*. A constant declared at such a
-type is held to it while compiling, and the end is spelled the way it was written:
+An integer or `char` range has no infinity to end at; `int within 0..infinity` is refused with *"an
+integer subtype needs integer bounds, not a floating-point literal"*. A constant declared with such a
+type is checked against it at compile time, and the diagnostic spells the bound as it was written:
 
 ```sysl
 type Distance = real within 0.0..infinity
@@ -847,10 +840,10 @@ bound only inside the predicate:
 
 ```sysl
 type Even = int within 0..100 where value % 2 == 0
-type HexDigit = char where value >= '0' && value <= '9'
+type Digit = char where value >= '0' && value <= '9'
 
 var e: Even = 8
-var h: HexDigit = '7'
+var h: Digit = '7'
 
 print(e, h)
 ```
@@ -859,12 +852,12 @@ print(e, h)
 8 7
 ```
 
-A predicate may read module constants, which is what lets a range and a table's size be stated once.
+A predicate may read module constants, so a range and a table's size can share one definition.
 Where both a range and a predicate are written, **the range is checked first**, so a value the range
 rejects never reaches the predicate.
 
-A non-boolean predicate is reported against the type, without leaking the name of the function the
-compiler synthesised to hold it:
+A non-boolean predicate is reported against the type, without exposing the name of the function the
+compiler generates to hold it:
 
 ```sysl
 type Odd = int where value + 1
@@ -881,7 +874,7 @@ a 'where' predicate must be a 'bool', but this one is int
 ### `new` is what makes it a type
 
 Without `new`, a constrained type **is** its base with a checked range. `Age` and `int` are the same
-type, values flow between them in both directions with no cast, and what the declaration buys is the
+type, values flow between them in both directions with no cast, and what the declaration adds is the
 check:
 
 ```sysl
@@ -898,8 +891,8 @@ print(n)
 42
 ```
 
-With `new` it is a **distinct nominal type**, and that is the whole of the difference. Two derived
-types over one base do not mix:
+With `new` it is a **distinct nominal type**, and that is the only difference. Two derived types over
+one base do not mix:
 
 ```sysl
 type Meters = new f64
@@ -912,8 +905,8 @@ print(f64(Meters(1.0) + Feet(1.0)))
 '+' needs matching types, got Meters and Feet
 ```
 
-A derived type does not mix with its **base** either, and no position excuses it — an initializer, an
-argument and a returned value each refuse a value that already *has* the base type:
+A derived type does not mix with its **base** either, in any position: an initializer, an argument
+and a returned value each refuse a value that already *has* the base type:
 
 ```sysl
 type Meters = new f64
@@ -928,30 +921,30 @@ print(f64(q))
 cannot initialize 'q': declared Meters but the value is real
 ```
 
-Going in either direction is a **written conversion**: `Meters(x)` wraps, `f64(m)` unwraps, and the
-wrap is where the constraint is checked.
+Converting in either direction is **written explicitly**: `Meters(x)` wraps, `f64(m)` unwraps, and
+the wrap is where the constraint is checked.
 
-**A bare literal is the exception, because it has no type of its own to defend.** It takes its type
-from where it sits — `x + 1` reads the 1 at `x`'s width — and a `new` type's position is no different,
-so the literal is that type's value, read at the base and checked as `Meters(3.0)` would be:
+**A bare literal is the exception, because it has no type of its own.** It takes its type from its
+position (`x + 1` reads the 1 at `x`'s width), and a `new` type's position is no different, so the
+literal becomes a value of that type, read at the base and checked as `Meters(3)` would be:
 
 ```sysl
 type Meters = new f64
 type PhysAddr = new u64
 
-var q: Meters = 3.0
+var q: Meters = 3
 val p = PhysAddr(0x4000_0000)
 
-print(f64(q * 2.0), u64(p + 4096), p < 0x8000_0000)
+print(f64(q * 2), u64(p + 4096), p < 0x8000_0000)
 ```
 
 ```output
 6 1073745920 true
 ```
 
-What stays a written conversion is a value that already has a type: `p + n` over an `n: u64` is still
-refused, since a `u64` is not an address — which is the mistake the type exists to catch. A literal
-that does not fit the base is refused at the base:
+A value that already has a type still needs an explicit conversion: `p + n` with an `n: u64` is
+refused, since a `u64` is not an address, which is exactly the mistake the type exists to catch. A
+literal that does not fit the base is refused at the base:
 
 ```sysl
 type Ip = new u32
@@ -965,8 +958,8 @@ print(u32(i))
 the literal 4294967296 does not fit uint
 ```
 
-A literal the base would not take is no more the `new` type's than the base's: `2^53 + 1` is not
-exactly a `real`, so it is not a `Phase` over one either.
+A literal the base does not accept is not accepted by the `new` type either: `2^53 + 1` is not
+exactly representable as a `real`, so it is not a valid `Phase` over one.
 
 ```sysl
 type Phase = new real
@@ -981,12 +974,13 @@ the literal 9007199254740993 is not exactly a real
 #### A `new` type's name converts from whatever its base's name converts from
 
 **`N(x)` is `N(B(x))`**, accepted exactly where `B(x)` is: `Phase(3)` over `real` is
-`Phase(real(3))`, a variable of any type `real(…)` takes converts the same way, and a value already
-at the base is wrapped as before. The base's conversion is the one that runs, with its own rules —
-a float into an integer base is truncated, a value into a fixed-point base is rounded and saturated
-as `q15(x)` is and takes a rounding mode where that conversion takes one — and then the `new`
-type's own `within` or `where` is checked on the result. A chain of `new` types converts through to
-the scalar at the bottom, so over `type A = new B` and `type B = new real`, `A(3)` is `A(B(real(3)))`:
+`Phase(real(3))`, a variable of any type that `real(…)` accepts converts the same way, and a value
+already of the base type is wrapped directly. The base's conversion is the one that runs, with its
+own rules (a float into an integer base is truncated; a value into a fixed-point base is rounded and
+saturated as `q15(x)` is, and takes a rounding mode where that conversion takes one), and then the
+`new` type's own `within` or `where` is checked on the result. A chain of `new` types converts
+through to the scalar at the bottom, so with `type A = new B` and `type B = new real`, `A(3)` is
+`A(B(real(3)))`:
 
 ```sysl
 type Phase = new real
@@ -997,14 +991,15 @@ type Turn = new Phase
 val n = 3
 val f = 2.9
 
-print(f64(Phase(3)) / 2.0, u8(Slot(f)), i32q16(Gain(n)), i32q16(Gain(0.1, Floor)), f64(Turn(n)))
+print(f64(Phase(3)) / 2, u8(Slot(f)), i32q16(Gain(n)), i32q16(Gain(0.1, Floor)), f64(Turn(n)))
 ```
 
 ```output
 1.5 2 3 0.09999 3
 ```
 
-What the conversion refuses, the `new` type's name refuses, told about the type the line names:
+What the base conversion refuses, the `new` type's name refuses too, and the diagnostic names the
+type written on the line:
 
 ```sysl
 type Phase = new real
@@ -1016,20 +1011,21 @@ print(f64(Phase(true)))
 cannot make Phase from bool
 ```
 
-What is **not** inherited is the silence: only the written `Phase(…)` converts. A value that already
-has a type is still refused wherever a `Phase` is wanted, as above, and converting out — `f64(p)`,
-`int(p)` — is the base's own conversion out of the value it holds, as it always was.
+What is **not** inherited is implicit conversion: only the written `Phase(…)` converts. A value that
+already has a type is still refused wherever a `Phase` is expected, as shown above, and converting
+out (`f64(p)`, `int(p)`) is the base's own conversion applied to the value it holds.
 
-**A `new` type's own `From` comes first.** Where the type implements `From[X]` and the value is an
-`X`, `N(x)` is that `from`, whatever the base would have made of it; a value of any other type still
-takes the base's conversion. Inside that very `from`, `N(x)` is the base's conversion, so the
-impl may be written in terms of it. A constant made through a `from` is a call, not a constant:
+**A `new` type's own `From` takes precedence.** Where the type implements `From[X]` and the value is
+an `X`, `N(x)` calls that `from`, whatever the base conversion would have produced; a value of any
+other type still takes the base's conversion. Inside that `from` itself, `N(x)` is the base's
+conversion, so the impl may be written in terms of it. A value made through a `from` is a call, not
+a constant:
 
 ```sysl
 type Phase = new real
 
 impl From[int] for Phase
-    from(n: int) -> Phase = Phase(n) * 2.0
+    from(n: int) -> Phase = Phase(n) * 2
 
 val i = 3
 
@@ -1041,24 +1037,24 @@ print(f64(Phase(i)), f64(Phase(i8(3))), f64(Phase(1.5)))
 ```
 
 The payoff is a specific bug. A table-driven program has several small integers that index different
-things — a task number, a lock number, a priority level — and the mistake such a program actually
-makes is passing one where another was wanted. Three `new u8`s with three ranges make that a compile
-error rather than a plausible-looking wrong answer. **It is an argument about types, not about
-checking.**
+things (a task number, a lock number, a priority level), and the typical mistake in such a program is
+passing one where another was expected. Three `new u8`s with three ranges make that a compile error
+rather than a plausible-looking wrong answer. **The benefit comes from the types, not from the
+checks.**
 
 ### A derivation inherits its base's behaviour and may replace none of it
 
-A `new` type over a scalar arrives with **everything the scalar could do** — the arithmetic
-operators, the remainder, the bitwise operators and the shifts, unary `-` and `~`, the comparisons,
-the compound assignments, `++` and `--`, and `str` — working at itself and producing itself.
+A `new` type over a scalar comes with **everything the scalar supports**: the arithmetic operators,
+the remainder, the bitwise operators and the shifts, unary `-` and `~`, the comparisons, the compound
+assignments, `++` and `--`, and `str`, each operating on the new type and producing it.
 
-And no `impl` may **replace** any of it:
+No `impl` may **replace** any of it:
 
 ```sysl
 type Stamp = new i64
 
 impl Add for Stamp
-    add(self, other: Stamp) -> Stamp = Stamp(0i64)
+    add(self, other: Stamp) -> Stamp = Stamp(0)
 ```
 
 ```error
@@ -1076,15 +1072,15 @@ impl Display for Span
 'Span' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block written over the family, and a subtype has its base's memberships
 ```
 
-The two refusals arrive by different routes, which the messages say. `Add` is a membership the
-**compiler** provides, so a block writing no arguments is asking for the one that is already there.
-`Display` is an ordinary `impl` the **library** writes — one blanket block covering every integer —
-and a derivation has its base's memberships, so the block covers `Span` too.
+The two refusals come from different sources, as the messages say. `Add` is an implementation the
+**compiler** provides, so a block with no type arguments asks for the one that already exists.
+`Display` is an ordinary `impl` the **library** writes, one blanket block covering every integer,
+and a derivation inherits its base's implementations, so that block covers `Span` too.
 
-**Extending it at an argument list the base does not have is a different thing, and it is allowed.**
-A trait that takes arguments is a family of promises, and the base is a member of exactly one of
-them: the compiler provides `Stamp + Stamp` and has nothing to say about `Stamp + Span`. So the
-timeline a struct can describe is one a derivation can describe too:
+**Extending a trait at an argument list the base does not have is different, and it is allowed.** A
+trait that takes arguments is a family of separate implementations, and the base has exactly one of
+them: the compiler provides `Stamp + Stamp` and says nothing about `Stamp + Span`. So a derivation
+can model a timeline just as a struct can:
 
 ```sysl
 type Stamp = new i64
@@ -1093,32 +1089,33 @@ type Span = new i64
 impl Add[Span] for Stamp
     add(self, other: Span) -> Stamp = Stamp(i64(self) + i64(other))
 
-print(i64(Stamp(100i64) + Span(7i64)), i64(Stamp(100i64) + Stamp(5i64)))
+print(i64(Stamp(100) + Span(7)), i64(Stamp(100) + Stamp(5)))
 ```
 
 ```output
 107 105
 ```
 
-The second number is the point: the base's own addition is untouched, and only the argument list
-tells the two apart.
+The second number shows that the base's own addition is untouched; only the argument type
+distinguishes the two.
 
-Both halves are deliberate. **Inheriting is right** because a derivation does not change what the
-values *are*: a `Slot` is some of the `u8`s, not a different set of things that happens to be stored
-in a byte. A derivation that started with nothing would make every `new u8` cost a dozen `impl`
-blocks, and nobody would use it.
+Both rules are deliberate. **Inheriting is right** because a derivation does not change what the
+values *are*: a `Slot` is a subset of the `u8`s, not a different kind of value that happens to be
+stored in a byte. If a derivation started with nothing, every `new u8` would need a dozen `impl`
+blocks before it was usable.
 
-**Refusing to replace is the harder call, and it is a ruling.** If `Stamp` could redefine `<`, then
-`Stamp` would be a set of `i64`s that do not order the way `i64`s order, and every fact the base
-guarantees would hold only until somebody looked. A derivation is a *narrowing*, and a narrowing that
-alters behaviour is not a narrowing.
+**Refusing replacement is the stricter decision, and it is intentional.** If `Stamp` could redefine
+`<`, it would be a set of `i64`s that do not order the way `i64`s order, and none of the guarantees
+the base makes could be relied on. A derivation is a *narrowing*, and a narrowing that alters
+behaviour is not a narrowing.
 
-So the answer to "I want my own `+`" is that you do not want a derivation, you want a **struct**.
+So if you want your own `+`, you want a **struct**, not a derivation.
 
-### Except rendering, which a derivation may take back
+### Except rendering, which a derivation may replace
 
-The second refusal above is the *unmarked* one, and that is the whole of what it refuses. Say
-[`override`](/reference/traits/#override-when-the-overlap-is-deliberate) and the block is yours:
+The second refusal above applies only to an *unmarked* block. Write
+[`override`](/reference/traits/#override-when-the-overlap-is-deliberate) and the block replaces the
+inherited one:
 
 ```sysl
 type Stamp = new int
@@ -1126,7 +1123,7 @@ type Stamp = new int
 override impl Display for Stamp
     display(self, out: *Writer, fmt: FormatSpec) = display_str("#" + str(int(self)), out, fmt)
 
-var s: Stamp = Stamp(7)
+var s = Stamp(7)
 
 print(s)
 print(7)
@@ -1137,28 +1134,28 @@ print(7)
 7
 ```
 
-**The line is what the base guarantees about its values.** Ordering is such a guarantee — that is the
-`<` argument above, and it still stands. How a value *renders* is not: a `Stamp` printing as `#7` is
-the same `i64` it always was, and nothing downstream reasons about it differently. So rendering is
-the one row a derivation may replace, and the operators are not.
+**The line is drawn at what the base guarantees about its values.** Ordering is such a guarantee, as
+the `<` argument above explains. How a value *renders* is not: a `Stamp` printing as `#7` holds the
+same integer as before, and nothing downstream reasons about it differently. So rendering is the one
+behaviour a derivation may replace, and the operators are not.
 
 | | a `new` derivation | a one-field struct |
 |---|---|---|
 | distinct type | yes | yes |
 | the base's catalogue | free; only `Display` is replaceable | nothing, write it all |
 | an operation the base does not have | a member, or an `impl` at another argument list | ordinary |
-| an operation the base has that is now nonsense | present anyway | absent |
+| an operation the base has that makes no sense for the new type | present anyway | absent |
 | rendering as something other than the base | `override impl Display` | ordinary |
 
-**Use a derivation for an identity** — a slot number, a handle, a unit-tagged measurement, anything
+**Use a derivation for an identity**: a slot number, a handle, a unit-tagged measurement, anything
 whose operations are its representation's operations. **Use a struct for a quantity with an algebra
-of its own**: an instant plus a duration is an instant, an instant plus an instant is nonsense, and
-no derived scalar can be told the difference. The cost is real and was measured — a date-and-time
+of its own**: an instant plus a duration is an instant, an instant plus an instant is meaningless,
+and a derived scalar cannot express the difference. The struct approach has a cost: a date-and-time
 library written this way needs one-field structs and five `impl` blocks per type.
 
-The case in the middle — a type that wants most of its base's catalogue and a few rows of its own —
-is a derivation with **members**, and an `impl` at an argument list the base does not have, as
-`Stamp + Span` above is.
+The case in between, a type that wants most of its base's operations plus a few of its own, is a
+derivation with **members**, plus an `impl` at an argument list the base does not have, like
+`Stamp + Span` above.
 
 ### A `new` type may declare members
 
@@ -1188,7 +1185,7 @@ struct Frame
     pc: u64
 
 type UserPtr[T] = new u64
-    next(self) -> UserPtr[T] = self + UserPtr[T](u64(sizeof(T)))
+    next(self) -> UserPtr[T] = self + UserPtr[T](sizeof(T))
 
 val f = UserPtr[Frame](4096)
 
@@ -1199,8 +1196,7 @@ print(u64(f.next()), u64(UserPtr[u8](4096).next()))
 4112 4097
 ```
 
-The body holds **members and nothing else** — the value is the base, so there is no field for it to
-hold:
+The body holds **only members**: the value is the base, so there is no field for it to hold:
 
 ```sysl
 type PhysAddr = new u64
@@ -1223,8 +1219,8 @@ type Age = int within 0..150
 'Age' is not a 'new' type, so its values are int's and a member written here would be a member of every int — 'new' after the '=' makes it a type of its own, which may have members
 ```
 
-A member may add to the catalogue and may not replace it, by the rule above: one named for an
-operator's method is refused as the `impl` would be.
+By the rule above, a member may add to the inherited operations but not replace them: a member named
+after an operator's method is refused, as the `impl` would be.
 
 ```sysl
 type Stamp = new i64
@@ -1235,8 +1231,8 @@ type Stamp = new i64
 'add' is how 'Add' is implemented for Stamp, and the compiler provides that — a member of this name would hide it
 ```
 
-**A subtype narrows which values a type has, never which operations it has** — so what the base does
-not have, the subtype does not either, and the diagnostic names the subtype rather than the base:
+**A subtype narrows which values a type has, never which operations it has**, so an operation the
+base lacks, the subtype lacks too, and the diagnostic names the subtype rather than the base:
 
 ```sysl
 type Slot = new u8 within 0..<8
@@ -1260,22 +1256,22 @@ unary '~' is not defined for Ratio
 
 ### The operations are the base's; their overflow is not
 
-Raw integer arithmetic wraps, and a wrapped result reaching a produce site is a wrong answer the
-range check can pass without noticing. On a `Slot = u8 within 0..<200`, `Slot(150) + Slot(150)` is
-300, which wraps to 44 — which is in range.
+Raw integer arithmetic wraps, and a wrapped result that reaches a produce site is a wrong answer the
+range check may not catch. On a `Slot = u8 within 0..<200`, `Slot(150) + Slot(150)` is 300, which
+wraps to 44, and 44 is in range.
 
 So **where an operand came through a `within` type and the operands' declared ranges permit a result
-the base width cannot hold, `+`, `-` and `*` are overflow-detecting and trap.** A range narrow enough
-that its results always fit stays on the plain instruction, so a counter, an index and an `x + 1`
-cost exactly what they did before. A left shift is checked on its own terms — it has no overflow
-intrinsic, so a bit pushed out of the top is caught by shifting back, and a shift amount at or past
-the width traps. **That trap is this section's and not the shift operator's** — a plain shift by the
-width or more is *defined*, and answers zero or the sign; see
+the base width cannot hold, `+`, `-` and `*` detect overflow and trap.** A range narrow enough that
+its results always fit keeps the plain instruction, so a counter, an index and an `x + 1` cost
+nothing extra. A left shift is checked separately: it has no overflow intrinsic, so a bit pushed out
+of the top is detected by shifting back, and a shift amount at or beyond the width traps. **That trap
+belongs to this rule, not to the shift operator**: a plain shift by the width or more is *defined*,
+and yields zero or the sign; see
 [expressions](/reference/expressions/#shifting-by-the-width-or-more). Arithmetic on a type with
 **no** range still wraps.
 
-For a **transparent** subtype the arithmetic happens at the base and yields a base value, so a
-literal beside one is an ordinary base value and what has to be in range is only what is stored:
+For a **transparent** subtype, the arithmetic happens at the base and yields a base value, so a
+literal beside one is an ordinary base value, and only what is stored has to be in range:
 
 ```sysl
 type Small = int within 0..10
@@ -1289,16 +1285,15 @@ print(s * 100)
 200
 ```
 
-The multiplier is not a `Small` and does not have to be. A **derived** subtype is its own
-representation, so it mixes with the base only through the cast above, and its results are its own
-and are checked where they are produced.
+The multiplier is not a `Small` and does not need to be. A **derived** subtype is a type of its own,
+so it mixes with the base only through the explicit conversion above, and its results are of its
+own type and are checked where they are produced.
 
 ### Where a constraint is checked
 
-**At every point a value of the constrained type is produced, and nowhere else.** That is not a list
-of syntactic forms to memorize: a value comes to have the type wherever it **flows into a slot the
-type is written on**, plus wherever an operation of the type's own **yields one**. The slots are
-enumerable:
+**At every point where a value of the constrained type is produced, and nowhere else.** There is no
+list of syntactic forms to memorize: a value acquires the type wherever it **flows into a slot the
+type is written on**, and wherever one of the type's own operations **yields one**. The slots are:
 
 - a variable's initializer, and every later assignment to it — including one arm of a
   multi-assignment, and **a write through a pointer**
@@ -1329,16 +1324,16 @@ print(a, slot.unwrap_or(0))
 41 8
 ```
 
-And the two sites that are the type's own doing rather than a slot's:
+The two sites that come from the type itself rather than from a slot are:
 
-- **an operation on a derived subtype**, which gets the base's catalogue *producing itself* — so
+- **an operation on a derived subtype**, whose inherited operations *produce the subtype*, so
   `Slot(199) + Slot(1)` is a produce site and traps. A **transparent** subtype has no such site: its
-  arithmetic happens at its base and yields a base value, checked by the store that gives it the
-  subtype again.
+  arithmetic happens at its base and yields a base value, which is checked by the store that gives
+  it the subtype again.
 - **a compound assignment and an increment**, which compute and store in one step and so are checked
-  between the two. `a += e` produces exactly what `a = a + e` produces: what the operator is applied
-  to is a base value either way, so `t += 120` on a `Temp = int within -100..100` holding `-50` is
-  `70`, and not a complaint that 120 is no temperature.
+  between the two. `a += e` produces exactly what `a = a + e` produces: the operator is applied to a
+  base value either way, so `t += 120` on a `Temp = int within -100..100` holding `-50` gives `70`,
+  rather than an error because 120 is out of range.
 
 A value that **already has** the type is not re-checked when it is merely read, passed along, or
 copied — it could not have got there unchecked. Passing one to a *different* subtype over the same
@@ -1347,7 +1342,7 @@ narrower one.
 
 ### A constrained type has no zero value
 
-The one site that is closed by not existing:
+One possible produce site, the implicit zero value, is closed by not existing:
 
 ```sysl
 type Age = int within 0..150
@@ -1361,13 +1356,14 @@ print(a)
 Age has no zero value, so 'a' needs an initial value
 ```
 
-That holds whether or not the range contains zero. Making it the **type's** rule rather than the
-range's means widening a range never silently changes whether a declaration compiles somewhere else.
+This holds whether or not the range contains zero. Making it a rule of the **type** rather than of
+the range means that widening a range never silently changes whether a declaration elsewhere
+compiles.
 
-**A `new` type that checks nothing is not constrained in that sense**, and has its base's zero. With
-no range and no predicate every value of the base is one of its own, zero included, so the rule would
-protect nothing — and an address type that could not sit in zero-filled storage could not be the type
-of an address in a table:
+**A `new` type that checks nothing is not constrained in this sense**, and has its base's zero. With
+no range and no predicate, every value of the base is a valid value, zero included, so the rule would
+protect nothing, and an address type that could not live in zero-filled storage could not be used
+for an address field in a table:
 
 ```sysl
 type Ip = new u32
@@ -1386,7 +1382,7 @@ print(u32(table[2].ip), u32(none))
 0 0
 ```
 
-A `new` type with a range is a checking type, and the rule above is its rule:
+A `new` type with a range is a checking type, and the rule above applies:
 
 ```sysl
 type Slot = new u8 within 0..<8
@@ -1402,15 +1398,15 @@ Slot has no zero value, so 's' needs an initial value
 
 ### A constant may have a constrained type
 
-A constant's value is folded while compiling, so a range is settled there, once, against the folded
-number; and a constant of a `new` type is the base's constant written through the conversion — or a
-bare literal, which takes the type as anywhere else:
+A constant's value is folded at compile time, so its range is checked once, against the folded
+number. A constant of a `new` type is the base's constant written through the conversion, or a bare
+literal, which takes the type as it does anywhere else:
 
 ```sysl
 type Ip = new u32
 type Slot = new u8 within 0..<8
 
-const OUR_IP: Ip = Ip(0x0a00_020f)
+const OUR_IP = Ip(0x0a00_020f)
 const GATEWAY: Ip = 0x0a00_0202
 const LAST: Slot = 7
 
@@ -1433,15 +1429,15 @@ const T: Slot = 9
 'T' is 9, which Slot does not admit — it holds 0 to under 8
 ```
 
-A `where` predicate is refused: it is a function run where a value is made, and a constant is folded
-into its uses rather than made anywhere.
+A type with a `where` predicate is refused for a constant: the predicate is a function run where a
+value is produced, and a constant is folded into its uses rather than produced at run time.
 
 ### A violated check traps, and there is no `try`
 
-It is not an error value and it is not catchable. A constrained type states something its values
-*are*, so a value that is not one of them is a bug in the code that made it rather than a condition
-to handle — which means the fallible constructor an enum has is deliberately absent here, and the
-diagnostic says so by name:
+A violation is not an error value and cannot be caught. A constrained type states something its
+values *are*, so a value outside it is a bug in the code that produced it rather than a condition to
+handle. The fallible constructor an enum has is therefore deliberately absent, and the diagnostic
+says so:
 
 ```sysl
 type Age = int within 0..150
@@ -1455,12 +1451,12 @@ print(Age.try(5))
 
 ## What the type's own name offers: `::` attributes
 
-A constrained type's name is a type and not a value, so nothing is *read* from it. What it answers
-are **attributes**, written with `::` rather than `.` so they stay out of the member namespace:
+A constrained type's name is a type, not a value, so nothing is *read* from it. What it provides are
+**attributes**, written with `::` rather than `.` so they stay out of the member namespace:
 `Age::First` cannot be confused with a field, a property or an associated function, and no `impl` can
 shadow one by declaring a member of that name.
 
-The set is small and closed, and every member of it is a question about **integer bounds**:
+The set is small and closed, and every attribute in it concerns **integer bounds**:
 
 | written | is | notes |
 |---|---|---|
@@ -1472,14 +1468,14 @@ The set is small and closed, and every member of it is a question about **intege
 | `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive, the variable a `T` |
 | `T::Min` / `T::Max` | the same two numbers | the *magnitude* question, which agrees with the ordinal one here — see below |
 
-**`Min`/`Max` are not aliases of `First`/`Last`, and the reason matters where the two come apart.**
-`First` and `Last` name the ends of a *declared sequence*; `Min` and `Max` the extremes a type can
-hold. A `within` range is written in order, so both questions have the same answer here and both are
-offered — refusing `Min` on the one kind of type whose whole purpose is bounds would be the odd
-outcome, and a reader who met `Min` on `u32` should not find it renamed on a subtype of `u32`. A
-**simple enum answers only `First`/`Last`**, because that is where they diverge: discriminants may be
-explicit and non-contiguous, so the first-declared variant need not carry the smallest one. An
-**integer type answers only `Min`/`Max`**, on the [attributes](/reference/attributes/) page.
+**`Min`/`Max` are not aliases of `First`/`Last`; they answer different questions that can have
+different answers.** `First` and `Last` name the ends of a *declared sequence*; `Min` and `Max` name
+the extremes a type can hold. A `within` range is written in order, so both questions have the same
+answer here, and both are offered: a type whose purpose is its bounds should support `Min`, and a
+reader who knows `Min` on `u32` should find it on a subtype of `u32` too. A **simple enum answers
+only `First`/`Last`**, because there the answers differ: discriminants may be explicit and
+non-contiguous, so the first-declared variant need not carry the smallest one. An **integer type
+answers only `Min`/`Max`**, as described on the [attributes](/reference/attributes/) page.
 
 ```sysl
 type Slot = new u8 within 0..<8
@@ -1489,7 +1485,7 @@ print(u8(Slot::Succ(Slot(3))), u8(Slot::Pred(Slot(3))))
 
 var total = 0
 
-for k in Slot::Range do total += int(u8(k))
+for k in Slot::Range do total += u8(k)
 
 print("sum of every slot:", total)
 ```
@@ -1500,16 +1496,16 @@ print("sum of every slot:", total)
 sum of every slot: 28
 ```
 
-**Every attribute but `Valid` speaks the subtype.** A bound of `T` is a value of `T`, the step from
-one `T` is another, and the values `Range` walks are `T`s. That is invisible on a transparent
-subtype, where `T` and its base agree anyway — it is what makes the set usable on a **derived** one,
-which would otherwise be the only kind of type whose own attributes had to be cast back into it. A
-`new` subtype exists to stay out of its base's traffic, and an attribute surface that handed back the
-base would make its own declaration the thing you had to undo to use it.
+**Every attribute except `Valid` works in terms of the subtype.** A bound of `T` is a value of `T`,
+the step from one `T` is another, and the values `Range` walks are `T`s. On a transparent subtype
+this is invisible, since `T` and its base are the same type; it is what makes the set usable on a
+**derived** subtype, which would otherwise have to cast its own attributes back into itself. A `new`
+subtype exists to keep its values separate from its base's, and attributes that returned the base
+would undo that separation.
 
-**`Valid` is the exception, and the asymmetry is its job.** It takes the base, because asking whether
-a value is a `T` is only a question about something that is not one yet. Handed a `T` it is refused,
-since the answer could only be yes:
+**`Valid` is the deliberate exception.** It takes the base, because asking whether a value is a `T`
+only makes sense for a value that is not one yet. Given a `T` it is refused, since the answer could
+only be yes:
 
 ```sysl
 type Slot = new u8 within 0..<8
@@ -1521,20 +1517,19 @@ print(Slot::Valid(Slot(3)))
 'Slot::Valid' takes a byte, not Slot
 ```
 
-The numbers it can be asked about are therefore the ones the **base** can hold, so a subtype over a
-`u8` cannot be asked about `-1`. That is not a narrowing of the question; it is the base's range being
-what a base is.
+The values it can be asked about are therefore the ones the **base** can hold, so a subtype over a
+`u8` cannot be asked about `-1`; that is simply the base's own range.
 
-`Valid` is the answer to "how do I ask instead of trapping". A produce site traps because a value
-outside the range is a mistake and not a condition; `Valid` is how a program holding a number it has
-not vetted puts the question, and a cast after a `Valid` that answered true is the ordinary way in.
+`Valid` is how to check instead of trapping. A produce site traps because a value outside the range
+is a mistake, not a condition; a program holding a number it has not validated asks `Valid`, and a
+cast after `Valid` returns true is the ordinary way to obtain a value of the type.
 
-`Succ` and `Pred` **trap** rather than saturating or wrapping, on the same argument: a step past the
-end is not a value of the type, so making one is the mistake, and no single answer would be right for
-every caller.
+`Succ` and `Pred` **trap** rather than saturating or wrapping, for the same reason: a step past the
+end is not a value of the type, so producing one is the mistake, and no single alternative result
+would suit every caller.
 
-Two shapes are refused. `Range` is meaningful only where an iterable is — it names nothing a program
-can hold, because a range is not yet a type a program can name:
+Two forms are refused. `Range` is meaningful only as an iterable; it names nothing a program can
+hold, because a range is not a type a program can name:
 
 ```sysl
 type Slot = new u8 within 0..<8
@@ -1549,11 +1544,11 @@ print(r)
 ```
 
 And a subtype over a **float** or a `char`, or one written with **no range**, has no attributes at
-all — each of these is a question about integer bounds, and there are none to ask about. The
-diagnostic names the part that would have to change:
+all, since each attribute concerns integer bounds and there are none. The diagnostic names the part
+that would have to change:
 
 ```sysl
-type Ratio = new f64 within 0.0..1.0
+type Ratio = new f64 within 0..1
 
 print(f64(Ratio::First))
 ```
@@ -1575,8 +1570,8 @@ print(Plain::Last)
 ## Struct invariants
 
 A struct body may carry `invariant <bool>` clauses among its fields. The clause is an expression over
-the struct's own fields, in scope by name, and several clauses all have to hold — each checked
-independently, so the diagnostic names the one that failed:
+the struct's own fields, which are in scope by name, and when there are several clauses all must
+hold. Each is checked independently, so the diagnostic names the one that failed:
 
 ```sysl
 struct Window
@@ -1597,15 +1592,14 @@ print(w.lo, w.hi, w.hi - w.lo)
 ```
 
 An invariant may read a module constant. `invariant` is contextual here too, and the grammar
-disambiguates by shape: a **member** declaration has a parameter list or a `->`, an **invariant
-clause** is the word followed by an expression, and anything else is a **field** — so a field may
+distinguishes by shape: a **member** declaration has a parameter list or a `->`, an **invariant
+clause** is the word followed by an expression, and anything else is a **field**. So a field may
 still be named `invariant`, as the `Cfg` example above showed, since `invariant: int` matches neither
 of the first two.
 
 ### Checked at every write, not only at construction
 
-That is the part worth stating, because the cheap implementation checks the constructor and calls it
-done. The obligation covers:
+An invariant is checked far more often than at construction alone. The check covers:
 
 - constructing the struct, including one built directly as an argument or as a returned value
 - assigning a whole struct over an existing one
@@ -1613,29 +1607,30 @@ done. The obligation covers:
   (`w.hi++`)
 - a field written through a pointer
 - a field written into an array element
-- a field written **inside** one of these — `o.a.n = 9`, or `g.items[0].n = 9`
-- **the zero** a declaration with no initializer starts at — `var w: Window`, a `[4]Window`, a struct
-  with a `Window` field, and module storage declared the same way
+- a field written **inside** one of these: `o.a.n = 9`, or `g.items[0].n = 9`
+- **the zero value** a declaration with no initializer starts at: `var w: Window`, a `[4]Window`, a
+  struct with a `Window` field, and module storage declared the same way
 
-That penultimate one is owed for a reason a narrow reading misses. A clause may read *through* a
-field: `invariant a.n <= b` is legal, and `a.n` is then not a field of the struct at all, so the write
-that breaks it is a write the struct never sees. The obligation is therefore on **every struct a place
-is written inside**, not only on the one whose field is named last, and the checks nest
-innermost-first — so the smallest struct the write broke is the one that stops it. An index into an
-array locates a place rather than owning one, so it contributes no check and is walked through. An
-index into a **view** reaches its far side, which no clause may read (see below), so writing a view's
-element owes the struct holding the view nothing at all.
+The second-to-last case is needed for a reason that is easy to miss. A clause may read *through* a
+field: `invariant a.n <= b` is legal, and `a.n` is then not a field of the struct itself, so the
+write that breaks it is a write the struct never sees directly. The check therefore applies to
+**every struct a written place is inside**, not only to the one whose field is named last, and the
+checks run innermost first, so the smallest struct the write broke is the one that traps. An index
+into an array locates a place rather than owning one, so it contributes no check and is passed
+through. An index into a **view** reaches storage outside the struct, which no clause may read (see
+below), so writing a view's element requires no check on the struct holding the view.
 
-The zero is a construction nobody spelled. `Window`'s zero has `lo` and `hi` both `0`, which breaks
-`lo <= hi` nowhere and `lo < hi` at once — and a struct that began its life broken is a value no write
-ever checked. The check is of a constant, so where the zero satisfies the clause it costs nothing.
+The zero value is an implicit construction. `Window`'s zero has `lo` and `hi` both `0`, which
+satisfies `lo <= hi` but would immediately break `lo < hi`, and a struct that started out invalid
+would be a value no write had ever checked. The check is on a constant, so where the zero value
+satisfies the clause it costs nothing.
 
-The consequence is the intended one: **a sequence of writes that ends in a valid state but passes
-through an invalid one traps at the step that broke it.** There is no "I am mid-update" mode.
+As a result, **a sequence of writes that ends in a valid state but passes through an invalid one
+traps at the step that broke the invariant.** There is no "mid-update" mode.
 
-The [multiple assignment](/reference/expressions/#assignment) is the exception that proves it — it
-lands both writes before either invariant is consulted, so a pair that ends legal is legal even where
-each half alone would not be:
+The [multiple assignment](/reference/expressions/#assignment) is the one exception: it completes both
+writes before either invariant is checked, so a pair that ends valid is accepted even where each half
+alone would not be:
 
 ```sysl
 struct Window
@@ -1654,45 +1649,44 @@ print(w.lo, w.hi)
 6 8
 ```
 
-The pair that needs it is the one that crosses: `w.lo = 12` followed by `w.hi = 14` traps at the
-first write, because 12 is briefly above the 10 still in `hi`. `w.lo, w.hi = 12, 14` does not, and
-the two writes land on a struct that was legal before and is legal after.
+This matters when the two writes cross: `w.lo = 12` followed by `w.hi = 14` traps at the first
+write, because 12 is briefly above the 10 still in `hi`. `w.lo, w.hi = 12, 14` does not, and the
+two writes take a struct that was valid before to one that is valid after.
 
 ### When a struct cannot be updated one field at a time
 
-Three answers, and the order matters, because the last one is the expensive one and it is the one
-reached for first:
+There are three approaches. Their order matters, because the last one is the most expensive and the
+one most often tried first:
 
-1. **Look for an order in which no intermediate state is illegal**, and often there is one. A
+1. **Look for an order in which no intermediate state is invalid**; there often is one. A
    `count <= high` watermark is updated by raising the ceiling before the floor, and needs nothing
-   else; the same two writes in the other order are refused. That the same clause accepts one order
-   and refuses the other is the whole of the answer here.
-2. **Ask whether the clause is pointing at a redundant field.** An invariant relating two fields is a
-   claim about the *representation*, and the trap is often the compiler observing that the struct
-   carries one fact twice. A ring buffer keeping `head`, `tail` and `count` cannot move any two of
-   them one at a time; one keeping `head` and `count` and computing the end has no clause to break,
-   because nothing is left to disagree. Two of the three fields is the honest design either way.
-3. **Otherwise assign the whole struct**, which is what whole-struct assignment is for — and know the
-   price. `*self = Ring(self.buf, …)` restates the *whole* value to move two bytes, so an invariant
-   across two fields makes a container's own update cost the size of the container. For a buffer,
-   that is its entire storage, per element.
+   else; the same two writes in the other order are refused.
+2. **Ask whether the clause points at a redundant field.** An invariant relating two fields is a
+   claim about the *representation*, and the trap often means the struct stores one fact twice. A
+   ring buffer keeping `head`, `tail` and `count` cannot update any two of them one at a time; one
+   keeping `head` and `count` and computing the end has no clause to break, because nothing is left
+   to disagree. Storing two of the three fields is the better design either way.
+3. **Otherwise assign the whole struct**, which is what whole-struct assignment is for, but be aware
+   of the cost. `*self = Ring(self.buf, …)` restates the *whole* value to change two bytes, so an
+   invariant across two fields makes a container's own update cost the size of the container. For a
+   buffer, that is its entire storage, per element.
 
 ### What may be aliased
 
-Everything above is discharged by walking outward through the **place** being written, so the whole
-obligation rests on the place still naming the struct. A pointer is where that runs out — inside a
-function taking a `*Inner`, there is no `Outer` to re-read and no way to learn there ever was one.
+Every check above works by walking outward through the **place** being written, so it depends on the
+place still naming the struct. A pointer is where that stops working: inside a function taking a
+`*Inner`, there is no `Outer` to re-read and no way to know there ever was one.
 
-It is therefore a rule about **what may be aliased**, and it restricts alias *creation*, which is
-local and a question about types, rather than alias *use*, which would need the borrow checker sysl
-does not have. Four parts, and **none of them applies to a program that declares no invariants** —
-each is a question asked about a clause, and there is no clause to ask about.
+The rule is therefore about **what may be aliased**, and it restricts alias *creation*, which is
+local and decided by types, rather than alias *use*, which would need a borrow checker, which sysl
+does not have. It has four parts, and **none of them applies to a program that declares no
+invariants**, since each concerns a clause.
 
-That is a different question from whether two parameters may overlap at all, which is what a
+This is a separate question from whether two parameters may overlap at all, which is what a
 function's [`@disjoint(...)`](/reference/attributes/#disjoint-parameters-whose-memory-nothing-else-reaches)
-promises the optimizer; neither rule reads the other.
+promises the optimizer; the two rules are independent.
 
-**A pointer that would be typed below a clause is refused where it is made:**
+**A pointer whose target is constrained by a clause it cannot see is refused where it is created:**
 
 ```sysl
 struct Inner
@@ -1712,7 +1706,7 @@ print(bad.n)
 '&' here makes a '*Inner' pointing inside Outer, whose invariant reads 'a.n' — and a '*Inner' names no Outer, so a write through it would break the clause with nothing left to re-check it against. Take the address of the Outer itself, which keeps the invariant in its type, or make the change through a method
 ```
 
-**A writable view is the same licence to write by another spelling**, and is refused the same way:
+**A writable view grants the same ability to write**, and is refused the same way:
 
 ```sysl
 struct Inner
@@ -1732,9 +1726,8 @@ print(view.len)
 this view may be written, and it views storage inside Group, whose invariant reads 'items.n' — a '[]Inner' names no Group, so a write through it would break the clause with nothing left to re-check it against. Take it as a '[]const Inner', which may not write, or make the change through a method
 ```
 
-A `[]const T` is ordinary, since giving up the write is exactly what makes a view carry no promise it
-could break — which is the first of the two spellings the diagnostic names, and the whole of the
-difference between the two programs:
+A `[]const T` is allowed, since a view that cannot write cannot break the invariant. It is the first
+of the two alternatives the diagnostic names, and the only difference between the two programs:
 
 ```sysl
 struct Inner
@@ -1754,9 +1747,8 @@ print(view.len, view[0].n)
 2 0
 ```
 
-So is `&o` itself, whose `*Outer` names the struct and is checked by the ordinary walk.
-And so is a pointer to a field **no clause mentions** — the refusal is about the clause, not about
-the struct:
+So is `&o` itself, whose `*Outer` names the struct and is checked by the ordinary walk, and so is a
+pointer to a field **no clause mentions**, because the refusal concerns the clause, not the struct:
 
 ```sysl
 struct Inner
@@ -1780,8 +1772,8 @@ print(o.a.n, o.c)
 ```
 
 **A mutating method call on such a field is allowed, and re-checks the clause when it returns.**
-`o.a.set(4)` hands `set` the same severed `*Inner` — and it is allowed because the *call site* still
-knows the whole place: `o` is right there, so the clause is re-run the moment the call returns:
+`o.a.set(4)` passes `set` the same detached `*Inner`, and it is allowed because the *call site* still
+knows the whole place: `o` is visible there, so the clause is re-run as soon as the call returns:
 
 ```sysl
 struct Inner
@@ -1805,13 +1797,13 @@ print(o.a.n)
 4
 ```
 
-Since there are no parameter modes, a receiver is the only way a callee is handed somewhere to write
-without an `&` in the caller's own source — which is why this one channel is worth keeping open, and
-why keeping it open costs a mutating method nothing.
+Since there are no parameter modes, a receiver is the only way a callee is given somewhere to write
+without an `&` in the caller's own source, which is why this one channel is kept open, at no cost to
+a mutating method.
 
-**A `*self` method may not let a pointer into its receiver outlive the call.** That is what makes the
-paragraph above sound: a `set` that returned `&self.n` would hand out the severed alias by a route no
-`&` in the caller spells:
+**A `*self` method may not let a pointer into its receiver outlive the call.** This is what makes
+the rule above sound: a `set` that returned `&self.n` would hand out the detached alias by a route
+that no `&` in the caller shows:
 
 ```sysl
 struct Cell
@@ -1828,12 +1820,12 @@ struct Holder
 a '*self' method may not let a pointer into the receiver's own storage outlive the call, and this one is returned — the receiver may be a field of a struct whose invariant reads it, and a pointer that gets out is somewhere to write that names no such struct. Hand back a copy of the value, or an index into it, and let the caller reach the storage through the receiver it already has
 ```
 
-The check is local to the body, and it is asked only of methods whose struct can *be* a field of one
-carrying clauses — a struct that lies inside nothing can never have a severed receiver, so its
-methods are left alone. Storage on the far side of a reference or a view is not the receiver's to
-lose either, so `&self.bytes[0]` where `bytes` is a `[]u8` field is ordinary.
+The check is local to the body, and it applies only to methods of a struct that can *be* a field of
+a struct with clauses; a struct that is never contained in one can never have a detached receiver,
+so its methods are not checked. Storage on the far side of a reference or a view does not belong to
+the receiver either, so `&self.bytes[0]` where `bytes` is a `[]u8` field is ordinary.
 
-**A clause may only read storage the struct owns.** All of the above is a rule about aliases of the
+**A clause may only read storage the struct owns.** Everything above concerns aliases of the
 struct's own bytes, so a clause reading through a pointer, a reference, or a view's *elements* is
 refused where it is written:
 
@@ -1850,11 +1842,10 @@ struct Ptr
 an invariant may only read storage the struct owns, and 'n' is read through *Inner — what is on the far side has an identity of its own, so another alias of it could break the clause with nothing left to re-check it against. Hold the value in a field of the struct, and state the invariant over that
 ```
 
-A view's `len` is on the near side — the three words are stored in the struct — and may be read.
-Its elements are on the far side, and that cuts the other way too: since no clause can read one,
-**an alias of a view's element carries no promise to sever**. A pointer to one, and a writable view
-sliced out of one, are ordinary — and writing through either changes nothing a clause over the
-length can see:
+A view's `len` is stored in the struct, as part of the view itself, and may be read. Its elements
+are stored elsewhere, and that has a useful consequence: since no clause can read them, **an alias of
+a view's element cannot break an invariant**. A pointer to one, and a writable view sliced from the
+view, are ordinary, and writing through either changes nothing a clause over the length can see:
 
 ```sysl
 struct Seq
@@ -1877,18 +1868,17 @@ print(s.elems[0], s.elems[1], s.elems[2])
 4 5 9
 ```
 
-What none of this does is make a `*T` safe, and it does not try to. A pointer handed to a *third*
-function that stores it is out of reach of a local check, exactly as the
-[memory model](/reference/memory/) says every guarantee about a raw pointer is. What the
-rule buys is that the **silent** severing — the one that looks like ordinary code, reads like
-ordinary code, and leaves a clause quietly false — is refused.
+None of this makes a `*T` safe, and it is not intended to. A pointer passed to a *third* function
+that stores it is out of reach of a local check, as the [memory model](/reference/memory/) says of
+every guarantee about a raw pointer. What the rule provides is that the **silent** case, an alias
+that looks like ordinary code and leaves a clause quietly false, is refused.
 
 ### Generic structs
 
-A generic struct carries clauses exactly as any other does, and they are checked at every place the
-list above names. A clause is a generic body over the struct's own parameters, so what it may do with
-a `T` is what the struct's bounds say — a comparison needs `Ord`, and is checked once, where the struct
-is declared, rather than once for every type it is made at:
+A generic struct carries clauses like any other struct, and they are checked at every place the list
+above names. A clause is a generic body over the struct's own parameters, so what it may do with a
+`T` is what the struct's bounds allow: a comparison needs `Ord`, and is checked once, where the
+struct is declared, rather than once for every type it is instantiated at:
 
 ```sysl
 struct Span[T: Ord]
@@ -1908,21 +1898,19 @@ print(a.lo, a.hi, b.hi)
 1 9 2.5
 ```
 
-Each instantiation checks with the clause made real at its own type, so `Span[float]` compares floats.
-Whether a clause reads storage the struct owns is asked of each instantiation too, since it depends on
-what the parameters turn out to be — a `T` that is `int` is the struct's own bytes, and one that is a
-pointer is not.
+Each instantiation checks the clause at its own type, so `Span[real]` compares floats. Whether a
+clause reads storage the struct owns is also decided per instantiation, since it depends on the
+type arguments: a `T` that is `int` is the struct's own bytes, and one that is a pointer is not.
 
-The standard library's `Buf[T]` is the reason this exists. It says `invariant count <= elems.len`,
-and every member is then [told so on entry](/reference/verification/#what-the-optimizer-is-told) —
-which is what lets `at` compare the index with `count` once and have the slice's own test fold into
-that compare.
+The standard library's `Buf[T]` relies on this. It declares `invariant count <= elems.len`, and every
+member is then [told so on entry](/reference/verification/#what-the-optimizer-is-told), which lets
+`at` compare the index with `count` once and fold the slice's own bounds test into that comparison.
 
 ## Contracts on a function
 
 ```sysl
 half(x: int) -> int
-    require x >= 0, "a half of a negative is not what this means"
+    require x >= 0, "x must not be negative"
     ensure result >= 0
 
     x / 2
@@ -1935,12 +1923,12 @@ print(half(10), half(7))
 ```
 
 `require` is checked **on entry**. `ensure` is checked **before every return**, including early
-ones — an early `return` that violates the postcondition traps exactly as the fall-through path
+ones: an early `return` that violates the postcondition traps exactly as the fall-through path
 would. Both take an optional message after a comma.
 
 **Both kinds form one block at the top of the body.** A clause of either kind after an ordinary
-statement is rejected — a precondition that runs after some of the work is not a precondition, and a
-postcondition is *written* with them because that is where a reader looks for what the function
+statement is rejected: a precondition that runs after some of the work is not a precondition, and a
+postcondition is *written* there because that is where a reader looks for what the function
 promises, not because that is when it runs. Clauses may not be nested inside an inner block either:
 
 ```sysl
@@ -1960,8 +1948,8 @@ f(x: int) -> int
 
 Two names exist only inside a contract.
 
-**`result`** is the value being returned, available in an `ensure` only. It is rejected in a
-`require` — there is no value yet — in an ordinary statement, and in the `ensure` of a function that
+**`result`** is the value being returned, available only in an `ensure`. It is rejected in a
+`require` (there is no value yet), in an ordinary statement, and in the `ensure` of a function that
 returns nothing:
 
 ```sysl
@@ -1975,8 +1963,7 @@ h(x: int) -> int
 'result' is only meaningful inside an 'ensure' of a value-returning function
 ```
 
-A local actually named `result` shadows it, which is the ordinary scoping rule rather than a special
-case:
+A local named `result` shadows it, by the ordinary scoping rule rather than a special case:
 
 ```sysl
 triple(n: int) -> int
@@ -1993,10 +1980,9 @@ print(triple(4))
 12
 ```
 
-**`old(expr)`** is `expr` evaluated **on entry**, available in an `ensure` only. It takes exactly one
-argument, and several `old` snapshots in one function are independent of each other. This is what
-lets a postcondition talk about what a mutating function *changed* rather than only about what it
-left behind:
+**`old(expr)`** is `expr` evaluated **on entry**, available only in an `ensure`. It takes exactly one
+argument, and several `old` snapshots in one function are independent of each other. It lets a
+postcondition describe what a mutating function *changed*, not only the state it left behind:
 
 ```sysl
 struct Counter
@@ -2021,19 +2007,18 @@ print(c.n, c.m)
 2 4
 ```
 
-Contracts work the same on a **method**, including one with a `*self` receiver, where they are at
-their most useful: `ensure result > old(self.n)` on a mutating method says the thing the method is
-*for*.
+Contracts work the same way on a **method**, including one with a `*self` receiver, where they are
+most useful: `ensure result > old(self.n)` on a mutating method states what the method is *for*.
 
 Like a constraint, a violated contract **traps**, and contracts are checked in **every** build. There
-is no release mode that drops them, and adding one would make a program's meaning depend on how it
-was compiled.
+is no release mode that drops them, since one would make a program's meaning depend on how it was
+compiled.
 
 ## The third shape: a latch
 
-`Result` and a trap are the two channels for an *operation* that failed. A **stream** is the case
-neither fits well, and the library answers it with a third shape — a trait whose one member reports
-whether the stream has gone wrong:
+`Result` and a trap are the two channels for an *operation* that failed. A **stream** fits neither
+well, and the library handles it with a third shape: a trait whose single member reports whether the
+stream has failed:
 
 ```sysl
 struct Meter
@@ -2063,18 +2048,18 @@ false 3
 true 3
 ```
 
-`Fallible` is required by both `Writer` and `Reader`, which is what lets one open file be both — two
-traits each declaring a `failed` for one type could not be told apart at a call, because `failed`
-takes no arguments and so nothing about the call could say which was meant.
+`Fallible` is required by both `Writer` and `Reader`, which lets one open file be both. Two traits
+each declaring a `failed` for the same type could not be told apart at a call, because `failed` takes
+no arguments, so nothing about the call could say which was meant.
 
-**It latches rather than returning**, and that is the shape everything above it is built on: an
-implementation stays straight-line, `print(x)` stays a statement, and a caller asks once after a run
-of operations rather than after each. Whether a stream *ended* is a separate question from whether it
-ended badly, which is why reading answers the first with an empty result and leaves this to answer
-the second.
+**It latches rather than returning a result**, and the streams built on it rely on that: an
+implementation stays straight-line, `print(x)` stays a statement, and a caller checks once after a
+series of operations rather than after each one. Whether a stream *ended* is a separate question from
+whether it failed, which is why reading reports the first with an empty result and leaves `failed`
+to report the second.
 
-The default is `false` — most streams cannot fail, and one that cannot should not have to write down
-that it cannot, so an `impl` with an empty body is a complete one.
+The default is `false`: most streams cannot fail, and one that cannot should not have to say so, so
+an `impl` with an empty body is complete.
 
 ## What is deliberately absent
 
@@ -2087,16 +2072,17 @@ that it cannot, so an `impl` with an empty body is a complete one.
 | a build flag that strips checks | every check is in every build |
 | a contract discharged instead of checked | it is a branch and a trap wherever the value is produced, whether or not a prover has been over it |
 
-Nothing on this page is proved while compiling: a `require` is a branch and a trap, an invariant is a
-call to a synthesised predicate, a `within` is two comparisons. What that buys is that **the failure
-lands where the mistake is** — plus, for `new` types, a compile-time guarantee that has nothing to do
-with the checking at all.
+Nothing on this page is proved at compile time: a `require` is a branch and a trap, an invariant is a
+call to a generated predicate, and a `within` is two comparisons. The benefit is that **the failure
+is reported where the mistake is**, plus, for `new` types, a compile-time guarantee that is
+independent of the checks.
 
-**Proving is a separate tool and it removes nothing.** [Verification](/reference/verification/) adds
-the specification vocabulary — quantifiers, loop invariants, termination measures, `@pure` and
-`@ghost` — and `sysl prove`, which discharges the obligations with Why3. A clause proved redundant is
+**Proving is a separate tool, and it removes nothing.** [Verification](/reference/verification/) adds
+the specification vocabulary (quantifiers, loop invariants, termination measures, `@pure` and
+`@ghost`) and `sysl prove`, which discharges the obligations with Why3. A clause proved redundant is
 still compiled, because a program whose emitted code depended on whether a prover had been available
-is one nobody could reason about. That is why the row above says *instead of*: the two are additive.
+would be impossible to reason about. That is why the row above says *instead of*: the two are
+additive.
 
 ---
 

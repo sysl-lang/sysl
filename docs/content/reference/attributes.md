@@ -2902,7 +2902,7 @@ struct Ctrl
     a: u3
     b: u5
 
-var p: *volatile Ctrl = ptr_cast(4096usize)
+var p: *volatile Ctrl = ptr_cast(4096)
 
 print(p.a)
 ```

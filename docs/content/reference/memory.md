@@ -1227,7 +1227,7 @@ end Kernel
 
 var k = Kernel([Task(0, 7); 4])
 
-k.advance(2usize)
+k.advance(2)
 
 print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].prio)
 ```
@@ -2346,6 +2346,47 @@ print(n.value, sizeof(Node), usize(n) == usize(&arena[0]))
 pointer's width, and the number that comes out cannot be dereferenced any more than the one above
 can. It is what a binding reaches for when a C library wants a callback registered through something
 that takes a number, and it is the same row of the table rather than a special case.
+
+**A number becomes a pointer only from an address-width integer**, `usize` or `isize`. A fixed width
+is not an address's width on every target, and reading a narrower one would invent the address's top
+bits. **The operand of `ptr_cast` is an address-width position**, as the initializer of a
+`val a: usize` is: a bare integer literal, or an expression made of nothing but bare integer
+literals, is a `usize` at the target's width. So the address a datasheet gives is written as it is
+printed there, and so is a base plus an offset or a bit shifted into place:
+
+```sysl
+struct Uart
+    data: u32
+    status: u32
+
+val uart: *Uart = ptr_cast(0x4000_4000)
+val status: *u32 = ptr_cast(0x4000_4000 + 4)
+val bit: *u8 = ptr_cast(1 << 20)
+val none: *Uart = ptr_cast(0)
+
+print(usize(uart), usize(status), usize(bit), usize(none))
+```
+
+```output
+1073758208 1073758212 1048576 0
+```
+
+Each literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
+machine, above `0xFFFF_FFFF` on a 32-bit one — or a negative one is refused as any literal that does
+not fit its type is, and the arithmetic over them wraps at that width as integer arithmetic does. A
+value that already has a type keeps it, so an `int`, a suffixed literal such as `16u32`, or an
+expression with either inside it is still refused, and is converted where it is meant as an address:
+
+```sysl
+var base = 0x4000_4000
+val uart: *u32 = ptr_cast(base)
+
+print(usize(uart))
+```
+
+```error
+'ptr_cast' reads an address, and int is not address-width — convert it first, as 'ptr_cast(usize(n))'
+```
 
 **The target type comes from whatever receives the result** — the same way `va_arg`, a bare `None`,
 and a bare `null` all take theirs. Where that is not where a reader wants to say it, it may be

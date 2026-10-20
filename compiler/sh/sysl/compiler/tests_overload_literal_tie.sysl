@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Candidates tied only by bare literals (`reference/declarations.md § Overloading`): where every
+// position the candidates differ at holds a numeric literal with no suffix, the candidate whose
+// parameters there are the literals' default types wins -- `real` for a float literal, and for an
+// integer literal `int` at an integer parameter and `real` at a float one. A typed argument in the
+// tie, no candidate at the defaults, or two at them stays ambiguous. An operator choosing between
+// user implementations settles its right operand the same way (`operator_call.sysl`'s
+// `widened_operand`), after the integer literal's preference for the signed widening, so `x * 2`
+// means what `x.mul(2)` means.
+
+private olt_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end olt_ready
+
+// What a program prints, built and run.
+private olt_ran(text: string) -> string
+    val root = make_temp_dir("sysl-olt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end olt_ran
+
+// Everything a source has to say for itself.
+private olt_err(text: string) -> string
+    val root = make_temp_dir("sysl-olt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end olt_err
+
+private olt_floats() -> string = raw"""
+    k(x: f32, y: f32) -> string = "f32"
+    k(x: real, y: real) -> string = "real"
+    """
+
+@test("a library function tied only by literals takes them at their defaults")
+olt_nextafter_takes_the_real_overload()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(raw"""
+        import sysl.math.nextafter
+        val up = nextafter(1.0, 2)
+        print(up > 1, nextafter(up, 0) == 1, nextafter(0.0, 1) > 0)
+        """), "true true true\n")
+
+@test("an integer literal at float parameters defaults to real, in either position")
+olt_integer_literal_at_floats_is_real()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(olt_floats() + raw"""
+        print(k(1, 2), k(1.5, 2), k(2, 1.5), k(-1, -2))
+        f(x: f32) -> string = "f32"
+        f(x: real) -> string = "real"
+        print(f(2), f(-2))
+        """), "real real real real\nreal real\n")
+
+@test("a literal that fits every candidate leaves the exact and suffixed choices alone")
+olt_exact_and_suffixed_choices_are_unchanged()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(olt_floats() + raw"""
+        print(k(1.5f32, 2f32), k(1.5, 2.5), k(1f32, 2f32))
+        h(x: i64) -> string = "i64"
+        h(x: int) -> string = "int"
+        print(h(2), h(2i64))
+        """), "f32 real f32\nint i64\n")
+
+@test("the signed preference still comes first: long over real at an integer literal")
+olt_signed_preference_precedes_the_default()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(raw"""
+        g(x: long) -> string = "long"
+        g(x: real) -> string = "real"
+        print(g(2))
+        """), "long\n")
+
+@test("a typed argument in the tie keeps the call ambiguous")
+olt_typed_argument_stays_ambiguous()
+    if !olt_ready() then return
+
+    val e = olt_err(olt_floats() + raw"""
+        val s: i16 = 1
+        print(k(s, 2))
+        print(k(2, s))
+        print(k(1.5f32, 2))
+        """)
+
+    assert(e.contains("'k' is ambiguous here — 2 of its declarations take these arguments:"), e)
+    assert(e.contains("main.sysl:4:"), e)
+    assert(e.contains("main.sysl:5:"), e)
+    assert(e.contains("main.sysl:6:"), e)
+
+@test("no candidate at the defaults stays ambiguous")
+olt_no_candidate_at_the_defaults_stays_ambiguous()
+    if !olt_ready() then return
+
+    val e = olt_err(raw"""
+        w(x: f32) -> string = "f32"
+        w(x: f128) -> string = "f128"
+        print(w(2))
+        print(w(2.5))
+        p(x: isize) -> string = "isize"
+        p(x: i64) -> string = "i64"
+        print(p(2))
+        """)
+
+    assert(e.contains("'w' is ambiguous here — 2 of its declarations take these arguments:"), e)
+    assert(e.contains("main.sysl:3:"), e)
+    assert(e.contains("main.sysl:4:"), e)
+    assert(e.contains("'p' is ambiguous here — 2 of its declarations take these arguments:"), e)
+
+@test("two candidates both at the defaults stay ambiguous")
+olt_two_at_the_defaults_stay_ambiguous()
+    if !olt_ready() then return
+
+    val e = olt_err(raw"""
+        m(x: int, y: real) -> string = "ir"
+        m(x: real, y: int) -> string = "ri"
+        print(m(2, 2))
+        """)
+
+    assert(e.contains("'m' is ambiguous here — 2 of its declarations take these arguments:"), e)
+
+private olt_tag() -> string = raw"""
+    struct Tag
+        v: int
+    impl Mul[long, string] for Tag
+        mul(self, k: long) -> string = "long"
+    impl Mul[real, string] for Tag
+        mul(self, k: real) -> string = "real"
+    """
+
+@test("an operator's literal operand settles as the method call's argument does")
+olt_operator_literal_matches_the_method_call()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(olt_tag() + raw"""
+        print(Tag(1) * 2, Tag(1).mul(2), Tag(1) * -2, Tag(1).mul(-2), Tag(1) * 2.5)
+        struct Wide
+            v: int
+        impl Mul[i128, string] for Wide
+            mul(self, k: i128) -> string = "i128"
+        impl Mul[f128, string] for Wide
+            mul(self, k: f128) -> string = "f128"
+        print(Wide(1) * 2)
+        """), "long long long long real\ni128\n")
+
+@test("a compound assignment's literal operand settles the same way")
+olt_compound_assignment_literal_settles()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(raw"""
+        struct V
+            n: int
+        impl Mul[long, V] for V
+            mul(self, k: long) -> V = V(1)
+        impl Mul[real, V] for V
+            mul(self, k: real) -> V = V(2)
+        var v = V(0)
+        v *= 2
+        print(v.n)
+        v = V(0)
+        v *= 2.5
+        print(v.n)
+        """), "1\n2\n")
+
+@test("a typed or suffixed operand still leaves the operator refused")
+olt_typed_operand_stays_refused()
+    if !olt_ready() then return
+
+    val e = olt_err(olt_tag() + raw"""
+        val n = 2
+        print(Tag(1) * n)
+        print(Tag(1) * 2i32)
+        """)
+
+    assert(e.contains("'*' between Tag and int comes from 2 implementations of one trait on Tag, and the " +
+                      "operands do not say which was meant — it implements 'sysl.Mul[long, string]' and " +
+                      "'sysl.Mul[real, string]'"), e)
+    assert(e.contains("main.sysl:8:"), e)
+    assert(e.contains("main.sysl:9:"), e)

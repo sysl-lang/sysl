@@ -23,12 +23,15 @@ import sysl.buf.{Buf, buf}
 // -- that is what keeps a float comparison on IEEE semantics rather than routing it through a
 // negated `lt`. Nothing, too, for an operand type with no membership either way, so the diagnostic
 // stays the one the scalar path already gives.
-operator_call(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr) -> Option[TExpr]
+//
+// `written` is the right operand as the source wrote it, which is what says whether it is a bare
+// literal (`widened_operand`).
+operator_call(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr, written: Expr) -> Option[TExpr]
     val spelling = core_infix(op)
 
     if spelling.is_none() then return None
 
-    trait_operator(cx, span, spelling.unwrap(), op, Some(r), l)
+    trait_operator(cx, span, spelling.unwrap(), op, Some(r), l, Some(written))
 end operator_call
 
 // `-a`, `~a` -- the same, for the two prefix operators.
@@ -37,17 +40,20 @@ prefix_call(cx: &Analyzer, span: Span, op: string, t: TExpr) -> Option[TExpr]
 
     if spelling.is_none() then return None
 
-    trait_operator(cx, span, spelling.unwrap(), op, None, t)
+    trait_operator(cx, span, spelling.unwrap(), op, None, t, None)
 end prefix_call
 
 // `spelling` is the trait as the catalog names it, which is what a program writes; the key the
 // tables hold it under is the library's for that spelling.
 private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, operand: Option[TExpr],
-                       recv: TExpr) -> Option[TExpr]
+                       recv: TExpr, written: Option[Expr]) -> Option[TExpr]
     val tr_name = library_key(spelling)
     val recv_ty = texpr_type(recv)
-    val rhs = if operand.is_some() then Some(widened_operand(cx.an, op, recv_ty, operand.unwrap()))
+    val rhs = if operand.is_some() then Some(widened_operand(cx, span, op, recv_ty, operand.unwrap(), written))
     else None
+
+    if rhs.is_some() && operand_refused(operand.unwrap(), rhs.unwrap()) then return Some(bad_expr(span))
+
     var rhs_ty: Option[Type] = None
 
     if rhs.is_some() then rhs_ty = Some(texpr_type(rhs.unwrap()))
@@ -456,13 +462,23 @@ end agreed_operand
 // The right-hand operand of a dispatched operator, converted to the right-hand type of the
 // implementation it reaches by widening (`reference/expressions.md § Operator dispatch`).
 //
-// `a * b` is `Mul::mul(a, b)`, so the operand is an argument and selects the way an argument does: an
-// implementation written at its own type is meant where there is one, and otherwise the one whose
-// right-hand type is the narrowest the operand widens to. Where none is reached, or two are and
-// neither is the narrower, the operand is handed back as it came, for the dispatch to diagnose. A
-// scalar's own operator is not dispatched, and its operand keeps the scalar rule: it widens only to
-// the other operand's type.
-widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr) -> TExpr
+// `a * b` is `Mul::mul(a, b)`, so the operand is an argument and selects the way an argument does,
+// by the one rule a method call's argument is chosen by (`expr_call.sysl`'s `narrowed_at`): an
+// implementation written at its own type is meant where there is one; otherwise, among those it
+// reaches by widening, a bare integer literal prefers the narrowest signed integer at least as wide as
+// `int`, a typed operand the narrowest right-hand type, and a literal failing both the implementation
+// at its default type (`literal_default_at`). Where none is reached the operand is handed back as it
+// came, for the dispatch to diagnose. **Where several are reached and the rule leaves more than one,
+// the operator is refused as `x.mul(n)` is** -- `isize` and `i64` each widen to the other on a 64-bit
+// target, so an `int` reaching both says nothing about which is meant -- and the answer is an
+// `Unknown` operand, which the caller reads as already diagnosed. A scalar's own operator is not
+// dispatched, and its operand keeps the scalar rule: it widens only to the other operand's type.
+//
+// `written` is the operand as the source wrote it, where there is one; an operand read out of a
+// carrier has none, and is not a literal.
+widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
+                written: Option[Expr]) -> TExpr
+    val a = cx.an
     val spelling = core_infix(op)
 
     if spelling.is_none() || core_builtin(spelling.unwrap(), subject) then return t
@@ -490,16 +506,45 @@ widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr) -> TExpr
             if !seen then reached.push(h)
         end if
 
+    if reached.is_empty() then return t
+    if reached.len() == 1 then return widened(t, Some(reached.at(0)))
+
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
+
     for h in reached
-        var narrowest = true
+        var one: Buf[Type] = buf()
 
-        for o in reached
-            if !type_eq(h, o) && !implicitly_widens(h, o) then narrowest = false
+        one.push(h)
+        declared.push(1)
+        generic.push(false)
+        fitted.push(one)
 
-        if narrowest then return widened(t, Some(h))
+    var args: Buf[Expr] = buf()
+    var natural: Buf[Option[Type]] = buf()
 
-    t
+    args.push(written.unwrap_or(expr(t.span, Ident(""))))
+    natural.push(Some(got))
+
+    val chosen = narrowed_at(declared, generic, fitted, args, natural)
+
+    if chosen.len() == 1 then return widened(t, Some(reached.at(chosen.at(0))))
+
+    var shown: Buf[string] = buf()
+
+    for h in reached
+        shown.push(s"'${show_bound(a, op_bound(a, cx.scope, tr_name, subject, Some(h)), subject)}'")
+
+    cx.fault(span, s"'$op' between ${type_show(subject)} and ${type_show(got)} comes from " +
+             s"${quantity(reached.len(), "implementation")} of one trait on ${type_show(subject)}, " +
+             s"and the operands do not say which was meant — it implements ${conjoin(shown)}")
+    bad_expr(t.span)
 end widened_operand
+
+// Whether `widened_operand` refused the operand it was handed, which leaves nothing to dispatch.
+operand_refused(given: TExpr, answered: TExpr) -> bool =
+    texpr_type(answered) == Unknown && texpr_type(given) != Unknown
 
 // The right-hand operand of a binary operator, re-read where the left operand's own implementation
 // names a right-hand type the literal did not take.
