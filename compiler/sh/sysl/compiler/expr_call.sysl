@@ -920,18 +920,26 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
     TExpr(span, TCast(t, to))
 end ptr_cast_call
 
-// The address `ptr_cast` is handed, analyzed. **A bare integer literal is a `usize`**, as a literal is
-// whatever integer type its position names: `ptr_cast(0x4000_0000)` reads the address as the target's
-// address width, and one too large for that width -- or a negative one -- is refused as the literal
-// that does not fit. Anything with a type of its own keeps it, so an `int` value is still refused.
+// The address `ptr_cast` is handed, analyzed. **The operand is an address-width position**, as the
+// initializer of a `val a: usize` is: a bare integer literal, or an expression made of nothing but
+// bare integer literals (`0x4000 + 16`, `1 << 20`), is read at the target's `usize`, and one too large
+// for that width -- or a negative one -- is refused as the value that does not fit. Anything with a
+// type of its own keeps it, so an `int` value, a suffixed literal of another type, or an expression
+// with either inside it is still refused.
 private address_operand(cx: &Analyzer, e: Expr) -> TExpr =
-    if is_int_literal(e) then type_expr(cx, e, Some(usize_type(word_bits(cx))))
+    if int_literal_only(e) then type_expr(cx, e, Some(usize_type(word_bits(cx))))
     else type_expr_bare(cx, e)
 
-private is_int_literal(e: Expr) -> bool = *e.kind match
+// An unsuffixed integer literal, or integer arithmetic over nothing else.
+private int_literal_only(e: Expr) -> bool = *e.kind match
     IntLit(_, _, suffix) -> suffix == ""
-    Unary(op, operand) -> op == "-" && is_int_literal(operand)
+    Unary(op, operand) -> (op == "-" || op == "~") && int_literal_only(operand)
+    Binary(op, l, r) -> integer_operator(op) && int_literal_only(l) && int_literal_only(r)
     _ -> false
+
+private integer_operator(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" ||
+        op == "^" || op == "<<" || op == ">>"
 
 // What a reinterpreted address may NOT be read as, named by what the type promises that an address
 // cannot supply. A function pointer is an address like any other.
@@ -3175,9 +3183,11 @@ private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> 
     strictly
 end params_narrower
 
-// An integer literal written with no suffix, which is what has no type until a position gives one.
+// An integer literal written with no suffix, which is what has no type until a position gives one --
+// negated or not, so `f(-3)` prefers the signed widening as `f(3)` does.
 private bare_int_literal(e: Expr) -> bool = *e.kind match
     IntLit(_, _, suffix) -> suffix == ""
+    Unary(op, operand) -> op == "-" && bare_int_literal(operand)
     _ -> false
 
 // The width of a signed integer parameter at a position, and 0 for anything else.

@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// `a ⊕ b` is `Op::m(a, b)` (`reference/expressions.md § Operator dispatch`), so the operator and the
+// method call choose an implementation by one rule and reach one verdict. On a 64-bit target `isize`
+// and `i64` each widen to the other, so an `int` reaching `Mul[isize]` and `Mul[i64]` says nothing
+// about which is meant: `e.mul(n)` is refused as ambiguous, and so are `e * n` and `e *= n`. An
+// operand at either type exactly still means that one, in both forms. On a 32-bit target `isize` is
+// 32 bits and widens to `i64` but not back, so the `isize` implementation is the narrower and both
+// forms take it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private occ_ready() -> bool = std_root().is_ok() && clang_available()
+
+private occ_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-occ").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end occ_root
+
+// What a one-file program prints on this machine, or the report it was refused with.
+private occ_ran(text: string) -> string
+    val root = occ_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end occ_ran
+
+// The report a program is refused with on a machine (this one where none is named), or its LLVM
+// text where it is accepted, prefixed `accepted:`.
+private occ_report(machine: Option[string], text: string) -> string
+    val root = occ_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then s"accepted:\n${made.text}" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end occ_report
+
+// `E` multiplies by an `isize` and by an `i64`, and says which ran.
+private occ_e() -> string = raw"""
+    struct E
+        v: int
+    impl Mul[isize, string] for E
+        mul(self, k: isize) -> string = "isize"
+    impl Mul[i64, string] for E
+        mul(self, k: i64) -> string = "i64"
+    """
+
+private occ_operator_refusal(subject: string, operand: string) -> string =
+    s"'*' between $subject and $operand comes from 2 implementations of one trait on $subject, and " +
+    "the operands do not say which was meant — it implements 'sysl.Mul[isize, string]' and " +
+    "'sysl.Mul[long, string]'"
+
+private occ_method_refusal() -> string =
+    "'mul' comes from 2 implementations of one trait on E, and the arguments do not say which was meant"
+
+// -- no exact match: ambiguous in both forms ------------------------------------------------------
+
+@test("an int reaching isize and i64 is ambiguous to the operator as to the method call")
+occ_a_typed_int_is_ambiguous_in_both_forms()
+    if !occ_ready() then return
+
+    val op = occ_report(None, occ_e() + "val n: i32 = 2\nprint(E(1) * n)\n")
+
+    assert(op.starts_with(s"error: ${occ_operator_refusal("E", "int")}") && op.contains("--> main.sysl:8:7\n"), op)
+
+    val call = occ_report(None, occ_e() + "val n: i32 = 2\nprint(E(1).mul(n))\n")
+
+    assert(call.starts_with(s"error: ${occ_method_refusal()}"), call)
+
+@test("and so is a bare literal, which prefers neither 64-bit signed type")
+occ_a_literal_is_ambiguous_in_both_forms()
+    if !occ_ready() then return
+
+    val op = occ_report(None, occ_e() + "print(E(1) * 2)\n")
+
+    assert(op.starts_with(s"error: ${occ_operator_refusal("E", "int")}"), op)
+
+    val call = occ_report(None, occ_e() + "print(E(1).mul(2))\n")
+
+    assert(call.starts_with(s"error: ${occ_method_refusal()}"), call)
+
+@test("the refusal is the only complaint, not followed by a missing-trait one")
+occ_the_refusal_stands_alone()
+    if !occ_ready() then return
+
+    val op = occ_report(None, occ_e() + "val n: i32 = 2\nprint(E(1) * n)\n")
+
+    assert(!op.contains("needs 'sysl.Mul"), op)
+    assert(op.starts_with("error:") && !op.contains("\nerror:"), op)
+
+// -- an exact match wins in both forms ------------------------------------------------------------
+
+@test("an operand at isize or at i64 exactly means that implementation, in both forms")
+occ_an_exact_operand_wins_in_both_forms()
+    if !occ_ready() then return
+
+    assert_eq(occ_ran(occ_e() + raw"""
+        val a: isize = 2
+        val b: i64 = 2
+        print(E(1) * a)
+        print(E(1) * b)
+        print(E(1).mul(a))
+        print(E(1).mul(b))
+        """), "isize\ni64\nisize\ni64\n")
+
+// A negated literal is a bare integer literal too, so it prefers the signed widening in every form.
+@test("a negative literal prefers the signed widening at a free call, a method and an operator")
+occ_a_negative_literal_prefers_the_signed_widening()
+    if !occ_ready() then return
+
+    assert_eq(occ_ran(raw"""
+        pick(x: long) -> string = "long"
+        pick(x: real) -> string = "real"
+        struct Tag
+            v: int
+        impl Mul[long, string] for Tag
+            mul(self, k: long) -> string = "long"
+        impl Mul[real, string] for Tag
+            mul(self, k: real) -> string = "real"
+        print(pick(-2), Tag(1).mul(-2), Tag(1) * -2, pick(-2.5))
+        """), "long long long real\n")
+
+// -- compound assignment follows ------------------------------------------------------------------
+
+private occ_scale() -> string = raw"""
+    struct E
+        v: int
+    impl Mul[isize, E] for E
+        mul(self, k: isize) -> E = E(self.v + 1)
+    impl Mul[i64, E] for E
+        mul(self, k: i64) -> E = E(self.v + 10)
+    """
+
+@test("a compound assignment is refused where the operator is")
+occ_a_compound_assignment_is_ambiguous()
+    if !occ_ready() then return
+
+    val e = occ_report(None, occ_scale() + "val n: i32 = 2\nvar e = E(0)\ne *= n\nprint(e.v)\n")
+
+    assert(e.starts_with("error: '*' between E and int comes from 2 implementations of one trait on E, " +
+                         "and the operands do not say which was meant — it implements 'sysl.Mul[isize]' " +
+                         "and 'sysl.Mul[long]'") && e.contains("--> main.sysl:9:1\n"), e)
+
+@test("and so is one arm of a multiple compound assignment")
+occ_a_multiple_compound_assignment_is_ambiguous()
+    if !occ_ready() then return
+
+    val e = occ_report(None, occ_scale() + "val n: i32 = 2\nvar e = E(0)\nvar f = E(0)\ne, f *= n, n\n")
+
+    assert(e.starts_with("error: '*' between E and int comes from 2 implementations of one trait on E"), e)
+
+@test("while an exact operand updates through its own implementation")
+occ_a_compound_assignment_takes_the_exact_one()
+    if !occ_ready() then return
+
+    assert_eq(occ_ran(occ_scale() + raw"""
+        val a: isize = 2
+        val b: i64 = 2
+        var e = E(0)
+        e *= a
+        e *= b
+        print(e.v)
+        """), "11\n")
+
+// -- a bounded body is the same rule --------------------------------------------------------------
+
+@test("a body bounded by both implementations is refused at the operator as at the call")
+occ_a_bounded_body_is_ambiguous()
+    if !occ_ready() then return
+
+    val op = occ_report(None, occ_scale() + "twice[T: Mul[isize, T] + Mul[i64, T]](x: T, k: int) -> T = x * k\n" +
+                        "print(twice(E(0), 2).v)\n")
+
+    assert(op.starts_with("error: '*' between E and int comes from 2 implementations of one trait on E"), op)
+
+// -- on a 32-bit target isize is the narrower -----------------------------------------------------
+
+private occ_probe() -> string = raw"""
+    struct E
+        v: int
+    impl Mul[isize, int] for E
+        mul(self, k: isize) -> int = 1
+    impl Mul[i64, int] for E
+        mul(self, k: i64) -> int = 2
+    @export("occ_probe")
+    probe(n: int) -> int = E(0) * n + E(0).mul(n)
+    """
+
+@test("on a 32-bit target both forms take the isize implementation")
+occ_on_a_32_bit_target_isize_is_narrower()
+    if !occ_ready() then return
+
+    val ir = occ_report(Some("thumbv7em-freestanding"), occ_probe())
+
+    assert(ir.starts_with("accepted:"), ir)
+    assert(ir.contains("call i32 @E.mul(") && !ir.contains("call i32 @E.mul.2("), ir)
+
+    val here = occ_report(None, occ_probe())
+
+    assert(here.starts_with("error: '*' between E and int comes from 2 implementations of one trait on E"),
+           here)
+
+    val call = occ_report(None, replace_all(occ_probe(), "E(0) * n + ", ""))
+
+    assert(call.starts_with(s"error: ${occ_method_refusal()}"), call)
+end occ_on_a_32_bit_target_isize_is_narrower

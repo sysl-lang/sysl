@@ -4,27 +4,26 @@ summary: Machine instructions, in an arm per architecture — where operands are
 weight: 125
 ---
 
-**Inline assembly is EXPERIMENTAL, and outside the [0.1.0 promise](/getting-started/stability/).**
-Everything below is shipped, documented and checked against the compiler like every other page here.
-What it does not have is a settled surface: a read-modify-write operand, a floating register class,
-and the two spellings that hand memory and the flags back are all unbuilt, and each would add to the
-notation rather than only to what it can reach. Build on it where it earns its place — but do not
-expect it to hold unchanged across releases, and prefer a construct from the promised part of the
-language where one will do.
+**Inline assembly is experimental, and outside the [stability promise](/getting-started/stability/).**
+Everything below works and is checked against the compiler like every other page here. What it does
+not have yet is a settled surface: a read-modify-write operand, a floating-point register class, and
+the two forms that hand memory and the flags back to the compiler are not built, and each would add
+to the notation. Use it where it is needed, expect it to change between releases, and prefer a
+construct from the stable part of the language where one will do.
 
-`asm` reaches the instructions no library can wrap: the privileged ones, the ones that talk to a bus
-rather than to memory, and the handful that change the machine the library is running on. It is the
-one construct that steps outside the language, and it is shaped so that stepping outside costs as
-little as possible — you supply instructions, and nothing else.
+`asm` reaches the instructions no library can wrap: privileged instructions, instructions that talk
+to a bus rather than to memory, and the few that reconfigure the machine the program is running on.
+It is the one construct that steps outside the language, and it is designed so that doing so costs
+as little as possible: you supply the instructions, and nothing else.
 
-**What you do not supply is the interesting part.** Which register an operand lands in, how the
-value gets there, what the block destroys, how a label avoids colliding with its own second
-expansion, how an operand is spelled in the emitted template: each is something the compiler knows,
-and each is something that, written by hand, is a comment nothing checks.
+**The compiler supplies the rest.** Which register an operand lands in, how the value gets there,
+what the block destroys, how a label avoids colliding with a second expansion of the same block, and
+how an operand is spelled in the emitted template are all things the compiler knows. Written by
+hand, each would be a comment that nothing checks.
 
-sysl does **not** ship named functions for "disable interrupts" or "flush the TLB" that expand to
-each machine's instruction. Assembly is the primitive; the architecture layer above it is ordinary
-sysl that you write. What the language contributes is that the layer can be *checked*.
+sysl does **not** ship named functions such as "disable interrupts" or "flush the TLB" that expand
+to each machine's instruction. Assembly is the primitive; the architecture layer above it is ordinary
+sysl that you write, and the language makes that layer *checkable*.
 
 ## One arm per architecture
 
@@ -48,34 +47,32 @@ arch_cli()
 ```
 
 An arm names one processor or several, spelled as [`#if`](/reference/attributes/) spells them:
-`aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft`. A name outside that
-set is an error rather than a machine nobody has heard of.
+`aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft`. Any other name is an
+error.
 
-**An arm is a processor, and what differs between the cores of one is `#if`'s.** Every Arm target is
-`thumb`, from a Cortex-M0+ with no floating-point registers to a Cortex-M7 with double-precision
-ones; the arm stays `[thumb]` and the lines that touch those registers sit behind
+**An arm selects a processor; differences between cores of one processor are handled with `#if`.**
+Every Arm target is `thumb`, from a Cortex-M0+ with no floating-point registers to a Cortex-M7 with
+double-precision ones. The arm stays `[thumb]`, and the lines that touch those registers sit behind
 [`#if fpu`](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)
-inside it, gated before the statement is parsed.
+inside it, resolved before the statement is parsed.
 
-**`wasm32` is the one that is not a processor**, and it will not carry instructions at all: a wasm
-module has no registers to name and no assembler behind it. Its arm is therefore always empty or
-`unavailable` — both forms are below — which makes it the standing reminder that these arms are
-about *targets* rather than about chips.
+**`wasm32` is not a processor**, and its arm never carries instructions: a wasm module has no
+registers to name and no assembler behind it. Its arm is always empty or `unavailable` (both forms
+are shown below), which is a reminder that the arms select *targets* rather than chips.
 
-**`craft` is 16-bit, and its arms are the ones worth reading twice.** It has three-operand
-arithmetic and eight registers, so `mv` and `add` are spelled as RISC-V spells them — but it has no
-logical immediate and no bit-clear on a control register, so clearing one bit of `status` is a
-read-modify-write through two scratch registers rather than the one instruction every other machine
-here writes. That is what a deliberately small instruction set costs, stated where somebody can see
-it.
+**`craft` is a 16-bit processor with a deliberately small instruction set.** It has three-operand
+arithmetic and eight registers, so `mv` and `add` are spelled as on RISC-V. It has no logical
+immediate and no bit-clear on a control register, so clearing one bit of `status` takes a
+read-modify-write through two scratch registers rather than the single instruction the other
+machines use.
 
-**`riscv32` and `thumb` are one board's two halves**, which is why they are usually written together
-in what follows. The RP2350 boots either a pair of Cortex-M33s or a pair of RV32IMAC cores, and a
-microcontroller is what inline assembly is mostly for. `thumb` rather than `arm` names the Arm one
-because a Cortex-M executes Thumb only — an arm written for A32 would assemble for a machine that
-cannot run it, and the name is what says so.
+**`riscv32` and `thumb` are the two halves of one board**, which is why they usually appear
+together below. The RP2350 boots either a pair of Cortex-M33 cores or a pair of RV32IMAC cores, and
+microcontrollers are where inline assembly is used most. The Arm arm is named `thumb` rather than
+`arm` because a Cortex-M executes only Thumb code; an arm written for A32 would assemble for a
+machine that cannot run it.
 
-Here is a whole program. `yield`, `pause` and `nop` are each their machine's hint that a spin loop is
+Here is a complete program. `yield`, `pause` and `nop` are each their machine's hint that a loop is
 spinning, which is about as small as a real use of this construct gets:
 
 ```sysl
@@ -98,15 +95,15 @@ hinted
 A program wanting the hint itself calls [`sysl.sync.spin_hint()`](/library/sync/#spin-hint), which is
 this function with RISC-V's real `pause` in place of the `nop`.
 
-**Square brackets rather than a `match` arm's `->`.** Brackets are already what sysl writes around
-things resolved at compile time — a type parameter list, `Option[T]` — and the arrow is what it
-writes between a runtime pattern and its body. An architecture is not a value being tested: the arms
-not chosen do not exist in the output at all.
+**Arms use square brackets rather than a `match` arm's `->`.** sysl writes brackets around things
+resolved at compile time, such as a type parameter list or `Option[T]`, and writes the arrow between
+a runtime pattern and its body. An architecture is not a value being tested: the arms not chosen do
+not appear in the output at all.
 
 ## Every architecture needs an answer
 
-The arms must cover every processor a target can be built for, not merely the one you are building
-for now. A missing arm is an error on **every** build:
+The arms must cover every processor a target can be built for, not only the one the current build
+targets. A missing arm is an error on **every** build:
 
 ```sysl
 halt()
@@ -120,16 +117,16 @@ halt()
 this assembly has no arm for 'aarch64', 'riscv64', 'riscv32', 'thumb', 'wasm32' or 'craft'
 ```
 
-This is the rule `#if` follows one level up, where every condition is checked in the branches being
-skipped as well as the one being taken. Here it reaches past whether a branch *parses* to whether one
-*exists* — so a forgotten processor is found by whoever forgot it, rather than by whoever first
-builds for the machine that was left out.
+`#if` follows the same principle: every condition is checked in the skipped branches as well as the
+taken one. Here the check goes beyond whether a branch *parses* to whether one *exists*, so a
+forgotten processor is reported to the author who forgot it, not to whoever first builds for the
+machine that was left out.
 
 ### When there is genuinely no answer
 
-Some assembly is unportable in principle rather than by omission. `outb` and `inb` are x86's; every
-other processor here reaches devices through memory and has no equivalent at all. Such an
-architecture says so, and says why:
+Some assembly is unportable in principle rather than by omission. `outb` and `inb` exist only on
+x86; every other processor here reaches devices through memory and has no equivalent. Such an arm
+says so, and says why:
 
 ```sysl
 port_out(port: u16, value: u8)
@@ -141,9 +138,8 @@ port_out(port: u16, value: u8)
         [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "port I/O is x86-only; devices are reached through memory"
 ```
 
-The x86-64 build compiles that. A build for a processor the arm covers is refused, and the reason
-travels into the diagnostic — which is the whole of what this form buys over leaving the arm out,
-since leaving it out fails *every* build instead:
+An x86-64 build compiles that. A build for a processor the `unavailable` arm covers is refused, and
+the reason appears in the diagnostic. Leaving the arm out instead would fail *every* build:
 
 ```sysl target=aarch64-macos
 port_out()
@@ -160,9 +156,9 @@ port I/O is x86-only; devices are reached through memory
 
 ### When the answer is no instruction
 
-An arm written with nothing under it is an answer too: this processor needs no instruction. A memory
-barrier is free on a machine that never reordered the accesses in question, and `unavailable` would
-be false there — the operation is available, it simply costs nothing.
+An arm with nothing under it is also an answer: this processor needs no instruction. A memory
+barrier is free on a machine that never reorders the accesses in question, and `unavailable` would
+be wrong there, because the operation is available and simply costs nothing.
 
 ```sysl
 barrier()
@@ -175,8 +171,8 @@ barrier()
         [wasm32]
 ```
 
-An empty arm cannot be confused with a forgotten one, because a forgotten arm is not empty — it is
-absent, and absent is the error above.
+An empty arm cannot be confused with a forgotten one: a forgotten arm is absent, and an absent arm
+is the error above.
 
 ## Operands are values, not registers
 
@@ -185,7 +181,7 @@ the machine register it must occupy. The template refers to it by that same name
 
 ```sysl
 copy(n: int) -> int
-    var v: int = 0
+    var v = 0
     asm
         [x86_64]
             "movl {n}, {v}"
@@ -209,9 +205,9 @@ print(copy(7))
 7
 ```
 
-`reg` means *any general-purpose register the allocator likes*, and it is the only class there is.
-Where an instruction demands a particular register, name it — quoted, because it is the assembler's
-name and not sysl's:
+`reg` means *any general-purpose register the allocator chooses*, and it is the only class. Where an
+instruction requires a particular register, name it, in quotes, because it is the assembler's name
+and not sysl's:
 
 ```sysl
 out_byte(port: u16, value: u8)
@@ -223,30 +219,30 @@ out_byte(port: u16, value: u8)
         [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "port I/O is x86-only"
 ```
 
-**A bare word is sysl's and a quoted word is the assembler's.** That rule decides every case in the
-construct: `reg` is a class this language names, `"dx"` is a register only the assembler knows, and
-instruction text is quoted because sysl does not read it.
+**A bare word belongs to sysl and a quoted word belongs to the assembler.** That rule settles every
+case in the construct: `reg` is a class the language names, `"dx"` is a register only the assembler
+knows, and instruction text is quoted because sysl does not read it.
 
 The class slot is required even though `reg` is currently the only class. Writing it keeps every
-operand line one shape, so a second class arrives as a peer rather than as the exception to an
-invisible default.
+operand line the same shape, so a second class can be added alongside `reg` rather than as an
+exception to a hidden default.
 
 **The `:` here is not a type annotation.** An operand names a variable that already has a type, so
-there is nothing left to declare — the slot holds a class or a register.
+there is nothing to declare; the slot holds a class or a register.
 
 ### What an operand may be
 
-An operand must be a plain variable, and its type must fit a general-purpose register: the integers,
-the pointers, `bool`. A float needs a floating class, which does not exist yet.
+An operand must be a plain variable whose type fits a general-purpose register: an integer, a
+pointer or `bool`. A float would need a floating-point register class, which does not exist yet.
 
-**A name bound by `ref` is not an operand.** It names a place somewhere else rather than a variable
+**A name bound by `ref` is not an operand.** It names storage somewhere else rather than a variable
 of its own, so there is no slot for the register to be loaded from or stored back to:
 
 ```sysl
 f()
-    var xs: [3]int = [1, 2, 3]
+    var xs = [1, 2, 3]
     ref r = xs[1]
-    var v: int = 0
+    var v = 0
     asm
         [x86_64]
             "movl {r}, {v}"
@@ -269,15 +265,15 @@ f()
 'r' is bound by 'ref', so it names storage somewhere else rather than a variable of its own, and there is nothing here for an operand to be. Copy it into a 'var' first, and write that back afterwards if the instructions set it
 ```
 
-Copy it into a `var` and hand the instructions that, writing the result back through the `ref` if
+Copy it into a `var`, give the instructions that, and write the result back through the `ref` if
 they set it:
 
 ```sysl
 f()
-    var xs: [3]int = [1, 2, 3]
+    var xs = [1, 2, 3]
     ref r = xs[1]
-    var n: int = r
-    var v: int = 0
+    var n = r
+    var v = 0
     asm
         [x86_64]
             "movl {n}, {v}"
@@ -302,12 +298,12 @@ f()
 1 42 3
 ```
 
-Reading and writing the same variable is refused, because it is two operands and so possibly two
-registers — the instructions would read one and write another:
+Reading and writing the same variable is refused, because that is two operands and possibly two
+registers; the instructions would read one and write the other:
 
 ```sysl
 f()
-    var n: int = 1
+    var n = 1
     asm
         [x86_64]
             "addl {n}, {n}"
@@ -326,9 +322,8 @@ f()
 both read and written here
 ```
 
-Only the **selected** arm's operands are checked, since the others describe machines this build is
-not for. So a mistake in an arm is reported by a build for that arm's processor — which is the same
-bargain exhaustiveness makes, one level down.
+Only the **selected** arm's operands are checked, since the others describe machines this build does
+not target. A mistake in an arm is therefore reported by a build for that arm's processor.
 
 ## What the block destroys
 
@@ -343,42 +338,40 @@ f()
         [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "x86 only here"
 ```
 
-**Memory and the condition flags are assumed clobbered, always**, and cannot currently be given
-back. That is the conservative direction on purpose: assuming them costs optimization quality across
-a handful of instructions, and not assuming them costs a value kept in a register the block
-overwrote — a wrong answer with nothing to point at.
+**Memory and the condition flags are always assumed clobbered**, and there is not yet a way to state
+otherwise. This is deliberately conservative: assuming them clobbered costs some optimization across
+a few instructions, while wrongly assuming them preserved leaves a stale value in a register the
+block overwrote, which is a wrong answer that is very hard to trace.
 
-Registers cannot be treated the same way. "Everything is clobbered" is a legal assumption and a
-useless one, so the registers an arm destroys are the one part of its effect you have to state.
+Registers cannot be handled the same way. "Everything is clobbered" is a legal assumption but a
+useless one, so the registers an arm destroys are the one part of its effect you must state.
 
 ## What the compiler owns
 
-**Operand substitution and its escaping.** `$` is LLVM's own operand marker, so a `$` you write — an
-x86 immediate, `movq $1, %rsi` — is doubled by the compiler rather than by you. A doubled brace is a
-literal one, which is not a nicety: ARM writes register lists as `{r0-r3}`, so `push {{lr}}` is how
-you spell `push {lr}`.
+**Operand substitution and its escaping.** `$` is LLVM's operand marker, so a `$` you write, such as
+an x86 immediate in `movq $1, %rsi`, is doubled by the compiler. A doubled brace is a literal brace,
+which matters on ARM, where register lists are written `{r0-r3}`: `push {{lr}}` emits `push {lr}`.
 
 **Label uniqueness.** A label in an arm is local to that arm's expansion, and a block emitted twice
-gets two distinct labels. A label in inline assembly is otherwise a global symbol, and the second
-definition is a duplicate the assembler rejects for reasons you cannot do anything about from where
-you are standing.
+gets two distinct labels. In plain inline assembly a label is a global symbol, and a second copy of
+the block is a duplicate definition that the assembler rejects.
 
-**Line joining.** Instructions are separate strings on separate lines, each able to carry a comment.
-This is the difference between an assembly routine that can be read and a six-instruction spinlock
-written on one line with `\n` between the instructions.
+**Line joining.** Instructions are separate strings on separate lines, and each line can carry a
+comment. A routine of several instructions stays readable instead of being written on one line with
+`\n` between the instructions.
 
-**The constraint string**, which you never write, because a constraint that disagrees with the
-instruction text is not detectable by reading either one.
+**The constraint string**, which you never write. A constraint that disagrees with the instruction
+text cannot be detected by reading either one.
 
 **Every output gets a register of its own.** The compiler does not read the instructions, so it
-cannot know whether they finish reading the inputs before they write an output — and an output
-sharing an input's register is a wrong answer exactly when they do not. So no output is ever given
-the register an input arrives in (LLVM's *early-clobber*, `=&r`), and an arm may write its output
-first and read an input after:
+cannot know whether they finish reading the inputs before they write an output, and an output that
+shares an input's register gives a wrong answer exactly when they do not. No output is ever given
+the register an input arrives in (LLVM's *early-clobber*, `=&r`), so an arm may write its output
+first and read an input afterwards:
 
 ```sysl
 seven_plus(level: int) -> int
-    var old: int = 0
+    var old = 0
     asm
         [aarch64]
             "mov {old}, #7"
@@ -405,14 +398,14 @@ print(seven_plus(1))
 8
 ```
 
-The one exception is an output named to the same machine register as an input — `in n : "eax"`
-and `out v : "eax"` — which says the two share it, and they do.
+The one exception is an output bound to the same machine register as an input, as in
+`in n : "eax"` and `out v : "eax"`, which states that the two share it.
 
-## The words this construct spends
+## The words this construct uses
 
 None of them is reserved. `asm`, `unavailable`, `out`, `reg` and `clobbers` are contextual: each is
-recognized in exactly one position and is an ordinary identifier everywhere else — including inside
-an assembly block, in any other position.
+recognized in exactly one position and is an ordinary identifier everywhere else, including in any
+other position inside an assembly block.
 
 ```sysl
 f() -> int
@@ -429,19 +422,19 @@ print(f())
 10
 ```
 
-`in` is a reserved word already, for `for x in xs`, and is reused here rather than added to.
+`in` is already a reserved word, used in `for x in xs`, and is reused here.
 
 ## Where assembly may not go
 
-**Not in a `require` or `ensure` condition** — and there is no check that says so, because there is
-no way to write it: a contract's condition is an expression and assembly is a statement. A contract
-is a claim the compiler reasons about and an assembly block is precisely what it cannot reason
-about, so the two never meeting is a property to rely on.
+**Not in a `require` or `ensure` condition.** No check is needed, because there is no way to write
+it: a contract's condition is an expression and assembly is a statement. A contract is a claim the
+compiler reasons about, and an assembly block is exactly what it cannot reason about, so you can
+rely on the two never meeting.
 
-**Nothing about a block's contents is understood, including whether control comes back.** The
-compiler does not read the instructions, so it cannot know that a jump to a reset vector never
-returns — and it does not try. A function declared `-> never` with an assembly body is taken at its
-word, exactly as anything else declared not to return is:
+**The compiler does not interpret a block's contents, including whether control returns.** It does
+not read the instructions, so it cannot know that a jump to a reset vector never returns, and it
+does not try. A function declared `-> never` with an assembly body is taken at its word, like any
+other function declared not to return:
 
 ```sysl
 arch_reset() -> never
@@ -472,15 +465,16 @@ arch_reset() -> never
         [wasm32] unavailable "a wasm module cannot halt its host"
 ```
 
-The promise is yours to keep here, which is true of the instructions themselves anyway.
+Keeping that promise is the author's responsibility, as is the correctness of the instructions
+themselves.
 
 ## Assembly at the top of a file
 
 Some code has to run before there is a function to run it in. The first instructions a processor
-executes after reset have no stack yet, and a function — even one whose body is a single `asm`
-block — may save a register on the stack before its first instruction. An exception vector table is
-not a function at all: it is sixteen 128-byte slots on a 2 KiB boundary. Both are written as an
-`asm` block at the **top of a file**, outside every function:
+executes after reset have no stack yet, and a function, even one whose body is a single `asm` block,
+may save a register on the stack before its first instruction. An exception vector table is not a
+function at all: it is sixteen 128-byte slots on a 2 KiB boundary. Both are written as an `asm`
+block at the **top of a file**, outside every function:
 
 ```sysl build=c target=aarch64-freestanding
 @section(".text.boot")
@@ -512,36 +506,36 @@ extern "vectors" vectors()
 kmain() -> int = 0
 ```
 
-The block has the same arms as one inside a function, chosen the same way, and every processor still
-needs an answer. What changes is that **nothing surrounds it**: the assembler lays the instructions
-down by themselves, once, in the order the files were read.
+The block has the same arms as one inside a function, selected the same way, and every processor
+still needs an answer. The difference is that **nothing surrounds it**: the assembler emits the
+instructions on their own, once, in the order the files were read.
 
-- **A label is a symbol, as written.** A block at the top of a file is emitted exactly once, so its
-  labels are not renamed — which is the point: `_start` and `vectors` above are the names a linker
-  script, the processor and sysl code reach. sysl reaches one through an `extern`.
-- **`$` is an ordinary character** — there are no operands for it to mark — and **a doubled brace
-  is still a literal one**, so `push {{lr}}` means the same thing at the top of a file as inside a
-  function. A single brace pair is a constant, below.
-- **It is never left out.** Nothing in the program names a block, so reachability has nothing to
-  ask of one: every block in every file of the build is laid down, including in a `build-c` archive.
-  A block in a [`@tests` file](/reference/attributes/) is scaffolding, and only a test build carries
-  it.
+- **A label is a symbol, exactly as written.** A block at the top of a file is emitted exactly once,
+  so its labels are not renamed. `_start` and `vectors` above are the names that a linker script,
+  the processor and sysl code refer to; sysl code reaches one through an `extern`.
+- **`$` is an ordinary character**, since there are no operands for it to mark, and **a doubled
+  brace is still a literal brace**, so `push {{lr}}` means the same at the top of a file as inside a
+  function. A single brace pair names a constant, described below.
+- **It is never omitted.** Nothing in the program refers to a block, so reachability does not apply:
+  every block in every file of the build is emitted, including in a `build-c` archive. A block in a
+  [`@tests` file](/reference/attributes/) is test scaffolding, and only a test build carries it.
 - **It belongs to the module even in the file a program starts in**, so a file holding nothing but a
-  block and declarations does not become that file.
+  block and declarations does not become the program's entry file.
 
 `@section("...")` places the instructions: they are bracketed by `.pushsection` and `.popsection`,
-so whatever follows is back where it was. As everywhere else the name is the target's spelling, and
-the assembler gives the section its flags from that name — `.text.boot` is code — so a section of
-code is named under `.text`. `@align(n)` begins the block on an `n`-byte boundary, inside the section
-when there is one; `n` is a constant power of two. Those two are the only annotations a block takes.
+so whatever follows returns to the previous section. As elsewhere, the name is spelled as the target
+spells it, and the assembler derives the section's flags from the name (`.text.boot` is code), so a
+code section is named under `.text`. `@align(n)` starts the block on an `n`-byte boundary, inside the
+section when there is one; `n` is a constant power of two. These are the only two annotations a block
+accepts.
 
 ### A constant is written into the text
 
 There are no operands at the top of a file, but there are constants: **`{NAME}` names a `const` in
-scope, and the compiler writes its value into the instructions as a decimal number.** That is how a
-layout the assembly shares with a struct is stated once. The entry code of an exception reserves a
-frame and saves registers at its offsets; written with `sizeof` and `offsetof`, a field added to
-`Frame` moves the assembly with it:
+scope, and the compiler writes its value into the instructions as a decimal number.** This lets a
+layout shared between the assembly and a struct be stated once. The entry code of an exception
+handler reserves a frame and saves registers at fixed offsets; written with `sizeof` and `offsetof`,
+the assembly follows any field added to `Frame`:
 
 ```sysl build=c target=aarch64-freestanding
 struct Frame
@@ -549,8 +543,8 @@ struct Frame
     elr: u64
     spsr: u64
 
-const FRAME: usize = sizeof(Frame)
-const ELR: usize = offsetof(Frame, elr)
+const FRAME = sizeof(Frame)
+const ELR = offsetof(Frame, elr)
 
 @section(".text.vectors")
 asm
@@ -571,9 +565,9 @@ kmain() -> int = 0
 ```
 
 The assembler reads `sub sp, sp, #256` and `str x0, [sp, #240]`. **Only an integer constant is
-written** — a literal, a `const`, `sizeof`, `alignof`, `offsetof`, or the arithmetic over them,
-anything a `const` may be — and a name that is anything else is refused, in every arm. Storage has a
-value only while the program runs:
+written**: a literal, a `const`, `sizeof`, `alignof`, `offsetof`, or arithmetic over them, which is
+anything a `const` may be. A name that is anything else is refused, in every arm. Storage has a value
+only while the program runs:
 
 ```sysl target=aarch64-freestanding
 static var depth: u64 = 0
@@ -589,9 +583,9 @@ print(depth)
 '{depth}' is not a constant: it names storage, whose value exists only while the program runs
 ```
 
-A string, a `bool`, a `char` or a float is not a number the instructions can take, and a name that
-reaches nothing is most likely a brace meant for the assembler, so the refusal offers the doubled
-one:
+A string, a `bool`, a `char` or a float is not a number the instructions can take. A name that
+refers to nothing is most likely a brace meant for the assembler, so the diagnostic suggests the
+doubled form:
 
 ```sysl target=aarch64-freestanding
 asm
@@ -604,14 +598,14 @@ asm
 '{lr}' names no constant: an 'asm' block at the top of a file writes a 'const' in scope as '{NAME}', and nothing here is called that. Write '{{' and '}}' for a brace the assembler is to see
 ```
 
-**A symbol needs no placeholder.** A function or storage is reached by the name the linker knows —
+**A symbol needs no placeholder.** A function or storage is reached by the name the linker knows:
 `b kmain` above, through `@export("kmain")`, or a label the block defines and sysl declares
-`extern` — so `{NAME}` naming one is refused with that advice rather than read as its address.
+`extern`. A `{NAME}` that names one is refused with that advice rather than read as its address.
 
-**A function only the block calls may stay `private`.** `private` is a promise about the sysl *name*
-and `@export` one about a *symbol*, so together they are a function no other file can name whose
-symbol the block still reaches. The symbol is published **hidden**: every object of the image being
-linked resolves it, and a shared library built from it does not offer it to a loader
+**A function that only the block calls may stay `private`.** `private` concerns the sysl *name* and
+`@export` concerns the *symbol*, so together they give a function no other file can name but whose
+symbol the block can still reach. The symbol is published **hidden**: every object in the image
+being linked resolves it, and a shared library built from it does not offer it to a loader
 ([a private export](/reference/ffi/#a-private-export)).
 
 ```sysl build=c target=aarch64-freestanding
@@ -628,8 +622,9 @@ asm
 private thread_entry(arg: u64) -> u64 = arg + 1
 ```
 
-**What only a block inside a function can mean is refused**, on every arm and not only on the one
-being built, since the mistake does not depend on the machine. An operand has no variable to be:
+**Anything that only makes sense inside a function is refused**, on every arm and not only on the
+one being built, since the mistake does not depend on the machine. An operand has no variable to
+bind to:
 
 ```sysl target=aarch64-freestanding
 var ticks: u64 = 0
@@ -647,7 +642,8 @@ print(ticks)
 'ticks' cannot be an operand here: an 'asm' block at the top of a file is outside every function
 ```
 
-A `clobbers` line tells surrounding code what the block destroys, and there is no surrounding code:
+A `clobbers` line tells the surrounding code what the block destroys, and here there is no
+surrounding code:
 
 ```sysl target=aarch64-freestanding
 asm
@@ -661,8 +657,8 @@ asm
 'clobbers' tells the code around an 'asm' block which registers it destroys, and a block at the top of a file has no code around it
 ```
 
-And a block inside a function is that function's code, so it cannot be placed apart from it — place
-the function, or move the block to the top of the file:
+A block inside a function is part of that function's code, so it cannot be placed in a section of
+its own. Place the function instead, or move the block to the top of the file:
 
 ```sysl target=aarch64-freestanding
 halt()
@@ -679,10 +675,10 @@ an 'asm' block inside a function is part of that function's code
 ### A file's bytes in the instructions
 
 **`.incbin "file"` reads its file from the directory of the source the block is written in**, as
-[`embed`](/reference/arrays/) does, and never from the directory the build was started in — the
+[`embed`](/reference/arrays/) does, and never from the directory the build was started in. The
 compiler writes the absolute path into the instructions, so the same tree assembles from anywhere.
-Where the data needs labels of its own or a section a linker script gathers, this is the form; where
-it needs only to be read, `embed("file")` is shorter. This block carries its own source:
+Use this form when the data needs labels of its own or a section a linker script collects; when it
+only needs to be read, `embed("file")` is shorter. This block includes its own source file:
 
 ```sysl build=c target=aarch64-freestanding
 @section(".rodata.blobs")
@@ -701,9 +697,10 @@ extern blob_end: u8
 kmain() -> int = int(usize(&blob_end) - usize(&blob_start))
 ```
 
-The file's bytes are in the build's keys as an embedded file's are, so an edit to it reassembles the
-block. Only the arm being built reads its file — another machine's arm may name one this build never
-made — and a file that is not there is refused while compiling, naming the path that was tried:
+The file's bytes are part of the build's cache key, as an embedded file's are, so editing the file
+reassembles the block. Only the arm being built reads its file, since another machine's arm may name
+one this build never produced. A missing file is refused at compile time, with the path that was
+tried:
 
 ```sysl target=aarch64-freestanding
 asm
@@ -717,10 +714,10 @@ cannot include 'user/hello.elf' with '.incbin': there is no file at '
 
 ## System registers and barriers
 
-On AArch64 most of a kernel's conversation with the processor is one instruction long: `mrs` to read
-a system register, `msr` to write one, and a barrier. Each would be a function of its own wrapped
-around an `asm` block with an `unavailable` arm for every other processor, since the register's name
-is part of the instruction text. Five built-in forms say it directly instead:
+On AArch64 most of a kernel's interaction with the processor is a single instruction: `mrs` to read
+a system register, `msr` to write one, and a barrier. Written with `asm`, each would need its own
+function around a block with an `unavailable` arm for every other processor, since the register's
+name is part of the instruction text. Five built-in forms express them directly instead:
 
 ```sysl build=c target=aarch64-freestanding
 @export("kmain")
@@ -734,22 +731,23 @@ kmain(vectors: u64) -> u64
 ```
 
 - **`read_sysreg(name) -> u64`** is `mrs`, and **`write_sysreg(name, value)`** is `msr`. The value is
-  a `u64`; a narrower one is converted with `u64(...)`.
+  a `u64`; a narrower unsigned value converts to it implicitly.
 - **`dsb(option)`, `dmb(option)` and `isb()`** are the barriers. The option is one of the
-  architecture's twelve words — `sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`, `nshst`, `nshld`,
-  `osh`, `oshst`, `oshld` — and `isb` has only `sy`, so it takes none.
+  architecture's twelve words (`sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`, `nshst`, `nshld`,
+  `osh`, `oshst`, `oshld`); `isb` has only `sy`, so it takes none.
 
-They are not assembly: each becomes the LLVM intrinsic for the instruction
+These are not assembly: each becomes the LLVM intrinsic for the instruction
 (`llvm.read_volatile_register`, `llvm.write_register`, `llvm.aarch64.dsb`/`dmb`/`isb`), so the
 optimizer knows what each one does. **A read is never merged with another read or moved past a
-store**: reading `icc_iar1_el1` acknowledges an interrupt, and two reads have to be two `mrs`.
+store**: reading `icc_iar1_el1` acknowledges an interrupt, so two reads must remain two `mrs`
+instructions.
 
-**The name is spelled into the instruction, so it is known while compiling** — a string literal or a
-`const` string. It is the Arm architecture's name in any case (`CurrentEL`, `cntv_ctl_el0`), or the
-generic `s<op0>_<op1>_c<n>_c<m>_<op2>` (`s3_3_c14_c0_0`). The compiler asks the back end that will
-build the program whether it has that register **in the direction it is used** — `CurrentEL` can be
-read and not written, `icc_eoir1_el1` written and not read — so a name it does not know is refused
-here rather than by LLVM:
+**The name is part of the instruction, so it must be known at compile time**: a string literal or a
+`const` string. It is the Arm architecture's name in any letter case (`CurrentEL`, `cntv_ctl_el0`),
+or the generic `s<op0>_<op1>_c<n>_c<m>_<op2>` (`s3_3_c14_c0_0`). The compiler asks the back end that
+will build the program whether it supports that register **in the direction it is used**
+(`CurrentEL` can be read but not written, `icc_eoir1_el1` written but not read), so an unknown name
+is refused by sysl rather than by LLVM:
 
 ```sysl target=aarch64-freestanding
 print(read_sysreg("esr_el9"))
@@ -769,8 +767,8 @@ print(read_sysreg(which))
 ```
 
 **A PSTATE field takes a constant.** `daifset`, `daifclr`, `spsel`, `pan`, `uao`, `dit`, `ssbs` and
-`tco` are written by `msr` from an immediate inside the instruction, so the value is a constant from 0
-to 15 (`allint` and `pm` take 0 or 1):
+`tco` are written by `msr` from an immediate inside the instruction, so the value must be a constant
+from 0 to 15 (`allint` and `pm` take 0 or 1):
 
 ```sysl target=aarch64-freestanding
 mask(bits: u64)
@@ -795,7 +793,7 @@ dsb(full)
 
 ### Cache, TLB and translation maintenance
 
-Changing a translation table, or writing code into memory, takes the maintenance instructions as
+Changing a translation table, or writing code into memory, needs the maintenance instructions as
 well as the barriers. Four more forms issue them:
 
 ```sysl build=c target=aarch64-freestanding
@@ -818,19 +816,19 @@ remap(entry: *u64, page: u64, va: u64) -> u64
   zeroes a block.
 - **`ic(op)` and `ic(op, addr)`** are the instruction cache: `iallu` and `ialluis` invalidate it
   whole, `ivau` by address.
-- **`at(op, va) -> u64`** asks the MMU to translate `va` — `s1e1r`, `s1e1w`, `s1e0r` or `s1e0w`, a
-  stage-1 translation as EL1 or EL0 would read or write — and answers PAR_EL1, with bit 0 set where
-  the translation faulted. It is `at`, then `isb()`, then `read_sysreg("par_el1")`, issued together
-  so the barrier the read needs cannot be left out.
+- **`at(op, va) -> u64`** asks the MMU to translate `va` (`s1e1r`, `s1e1w`, `s1e0r` or `s1e0w`: a
+  stage-1 translation as an EL1 or EL0 read or write) and returns PAR_EL1, with bit 0 set when the
+  translation faulted. It issues `at`, then `isb()`, then `read_sysreg("par_el1")` together, so the
+  barrier the read needs cannot be left out.
 
 An address may be a `u64` or a raw pointer; `tlbi`'s operand is not an address, so it is a `u64`
 only. Each form is one block of inline assembly (LLVM has intrinsics for almost none of them), and it
 clobbers memory: **it is never moved past a load or store, and two identical ones are never merged
 into one**.
 
-The operation is a word of the instruction, written at the call as a barrier's option is, and
-whether it reads a register is the operation's. Leaving the operand off one that reads it, or adding
-one to an operation that takes none, is refused:
+The operation is a word of the instruction, written at the call like a barrier's option, and the
+operation determines whether a register operand is read. Leaving the operand off an operation that
+reads one, or adding one to an operation that takes none, is refused:
 
 ```sysl target=aarch64-freestanding
 tlbi(vae1is)
@@ -852,16 +850,16 @@ dc(cisw, 0)
 
 **The compiler keeps program order around every one of these forms.** No load or store written
 before a `read_sysreg`, a `write_sysreg`, a barrier or a maintenance form is moved after it, none
-written after is moved before it, and a store is not dropped as dead because a second one to the same
-word follows — each is treated as touching all of memory. That is the whole of what the compiler can
-promise, because it is the whole of what the compiler controls.
+written after is moved before it, and a store is not dropped as dead because a second store to the
+same word follows: each form is treated as touching all of memory. That is everything the compiler
+can promise, because it is everything the compiler controls.
 
-**The processor is another matter.** An `msr` is not a memory access, so no
-[`Ordering`](/library/sync/#ordering) — `Release`, `SeqCst`, a fence — orders a store before it: the
-C11 orderings relate memory accesses to memory accesses, and an AArch64 core may let the write to
-`icc_sgi1r_el1` raise its interrupt on another core before that core can see the store the interrupt
-is about. What orders memory against a register, or against the MMU, is a `dsb`, and its option says
-what has to be complete and where:
+**The processor is a separate matter.** An `msr` is not a memory access, so no
+[`Ordering`](/library/sync/#ordering) (`Release`, `SeqCst`, a fence) orders a store before it. The
+C11 orderings relate memory accesses to other memory accesses, and an AArch64 core may let the write
+to `icc_sgi1r_el1` raise its interrupt on another core before that core can see the store the
+interrupt refers to. What orders memory against a register, or against the MMU, is a `dsb`, and its
+option says what must be complete and where:
 
 ```sysl build=c target=aarch64-freestanding
 import sysl.sync.*
@@ -884,17 +882,17 @@ hand_over(job: u64, target: u64)
 | Normal memory a device must see before a write to the device | `dmb(osh)`, or `dsb(osh)` where the write is to a register | a device sits in the outer shareable domain, which `ish` does not reach |
 | a write that changes the context — `vbar_el1`, `ttbr0_el1`, `sctlr_el1` | `isb()` after it | the instructions already fetched were fetched under the old context |
 
-**So the orderings and the barriers are not two tiers of one tool.** An `Ordering` is the portable
-answer between two threads touching memory; a barrier is the answer wherever one side is not a memory
-access, and only AArch64 spells it, which is why these forms are refused on every other processor.
-The forms take no `Ordering` argument for the same reason: the instruction that does the ordering is
-the barrier, and which barrier depends on what the register's effect observes, which no ordering
-names.
+**The orderings and the barriers are therefore not two levels of one tool.** An `Ordering` is the
+portable answer between two threads accessing memory; a barrier is the answer wherever one side is
+not a memory access. Only AArch64 has these forms, which is why they are refused on every other
+processor. For the same reason the forms take no `Ordering` argument: the barrier is the instruction
+that does the ordering, and which barrier is right depends on what the register's effect observes,
+which no ordering expresses.
 
 ### On other processors
 
 **Every other processor refuses all nine forms**, naming the target, so a module that uses them on
-AArch64 and is also built elsewhere puts those lines behind `#if aarch64`:
+AArch64 and is also built for other processors puts those lines behind `#if aarch64`:
 
 ```sysl target=riscv64-freestanding
 print(read_sysreg("cntfrq_el0"))
@@ -904,14 +902,14 @@ print(read_sysreg("cntfrq_el0"))
 'read_sysreg' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64 — put the code that uses it behind '#if aarch64'
 ```
 
-The nine names are taken only where nothing else claims them: a function or a local called `isb` or
-`at` is what `isb()` or `at(...)` calls.
+The nine names apply only where nothing else claims them: if a function or a local is called `isb`
+or `at`, then `isb()` or `at(...)` calls it.
 
 ## What is not here yet
 
-- **`inout`** — a read-modify-write operand. The instructions wanting one are the exchange and
+- **`inout`**, a read-modify-write operand. The instructions that need one are the exchange and
   compare-exchange family, which [`sysl.sync`](/library/) already covers.
-- **Giving memory and the flags back**, which is an optimization over an answer that is currently
-  always correct.
-- **A floating register class.** It cannot be a single one: bare-metal RISC-V has no floating
-  registers to name.
+- **Declaring that memory and the flags are preserved**, which would be an optimization over the
+  current behaviour, which is always correct.
+- **A floating-point register class.** It cannot be a single class: bare-metal RISC-V has no
+  floating-point registers to name.
