@@ -4,10 +4,10 @@ summary: Async functions, the Task they hand back, await, the executor contract,
 weight: 115
 ---
 
-**`async` written on a function makes calling it hand back a `Task[T]` instead of running it**, and
-**`await t`** runs that task to the `T` it ends with. An async function may await another, so a chain
-of them reads as straight-line code while every `await` is a place the whole chain can stop and be
-picked up again later.
+**Calling a function marked `async` returns a `Task[T]` instead of running the function**, and
+**`await t`** runs that task until it produces its `T`. An async function may await another, so a
+chain of them reads as straight-line code, while every `await` is a point where the whole chain can
+suspend and later resume.
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -24,11 +24,11 @@ print(block_on(average(1, 3)))
 217
 ```
 
-**The language supplies the words and the contract, and nothing that schedules.** `block_on` above
-runs one task to its end on the calling thread; anything that interleaves tasks — an event loop, a
-run queue, a timer wheel — is an ordinary program written against four builtins
-([the executor contract](#the-executor-contract-step-park-and-yield-now)). No executor lives in the
-language or the standard library ([where the executors live](#where-the-executors-live)).
+**The language supplies the keywords and the contract, but no scheduler.** `block_on` above runs one
+task to completion on the calling thread. Anything that interleaves tasks, such as an event loop, a
+run queue or a timer wheel, is an ordinary program written against four builtins
+([the executor contract](#the-executor-contract-step-park-and-yield-now)). Neither the language nor
+the standard library contains an executor ([where the executors live](#where-the-executors-live)).
 
 ## Calling an async function makes a task, and runs nothing
 
@@ -52,8 +52,9 @@ reading channel 2
 217
 ```
 
-**`Task[T]` is a type a program may write**, and a task held in a binding is awaited whenever the
-body gets to it. An async function with no result is a `Task[unit]`, and its `await` is a statement:
+**`Task[T]` is a type a program may write**, and a task held in a binding is awaited wherever the
+body reaches the `await`. An async function with no result returns a `Task[unit]`, and awaiting it
+is a statement:
 
 ```sysl
 async sample() -> int = 21
@@ -84,8 +85,8 @@ tick
 
 ### `Task` takes one type argument
 
-The argument is the type the task ends with, and there is no second one for an error: a task that
-can fail ends with a `Result`.
+The argument is the type the task produces, and there is no second argument for an error: a task
+that can fail produces a `Result`.
 
 ```sysl
 async check(t: Task[int, string]) -> int = 0
@@ -97,9 +98,9 @@ async check(t: Task[int, string]) -> int = 0
 
 ### A program's own `Task` is the nearer name
 
-`Task` is a name the compiler supplies, not a reserved word, so a program that declares a type called
-`Task` gets its own wherever it writes the word — and an async function's call still hands back the
-compiler's task, which the program then awaits as usual:
+`Task` is a name the compiler supplies, not a reserved word, so a program that declares its own type
+called `Task` gets that type wherever it writes the name. A call to an async function still returns
+the compiler's task, which the program awaits as usual:
 
 ```sysl
 struct Task
@@ -120,14 +121,14 @@ print(block_on(schedule(Task(2, 5))))
 ## `await` runs a task to its result
 
 `await` is a prefix on an expression whose value is a task. Inside an async function it runs that
-task until it ends and is the value it ended with; each time the awaited task stops partway, the
-awaiting one stops with it, so a stop anywhere in a chain travels out to whatever is driving the
-outermost task.
+task to completion, and its value is the task's result. Each time the awaited task suspends, the
+awaiting task suspends with it, so a suspension anywhere in a chain propagates out to whatever is
+driving the outermost task.
 
 ### Where `await` binds
 
-**`await` takes the operand's calls, member selections and indexes, and stops at the first `?`** — so
-the `?` applies to what was awaited, which is the order a fallible async call wants:
+**`await` takes in the operand's calls, member selections and indexes, and stops at the first `?`**,
+so the `?` applies to the awaited result, which is the order a fallible async call needs:
 
 | written | read as |
 |---|---|
@@ -138,8 +139,7 @@ the `?` applies to what was awaited, which is the order a fallible async call wa
 | `1 + await f()` | `1 + (await f())` |
 | `-await f()` | `-(await f())` |
 
-Nothing written without `await` reads differently for it: `-a?` is still `-(a?)` and `a.b?.c` is
-still `(a.b?).c`.
+Expressions without `await` are unaffected: `-a?` is `-(a?)` and `a.b?.c` is `(a.b?).c`.
 
 ```sysl
 struct Dma
@@ -170,8 +170,8 @@ refused: 4096 bytes is more than one transfer
 
 ### A task where its value was wanted
 
-**Leaving out `await` is the mistake the type system sees first**, and where the position wanted the
-very type the task ends with, the refusal says what was left out:
+**A missing `await` is caught by the type checker**, and where the position expects exactly the type
+the task produces, the diagnostic says what was left out:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -187,7 +187,7 @@ print(block_on(run()))
 cannot initialize 'raw': declared int but the value is Task[int] — calling an 'async' function hands back its task rather than running it, so write 'await' in front to run it and take the int it ends with
 ```
 
-The same sentence is added at an argument, at a `return`, and at a body's last expression:
+The same hint is added at an argument, at a `return`, and at a body's last expression:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -204,7 +204,7 @@ print(block_on(run()))
 'raw' of 'celsius' is int, but Task[int] was given — calling an 'async' function hands back its task rather than running it, so write 'await' in front to run it and take the int it ends with
 ```
 
-The repair is the one the message names, at the binding or in the argument itself:
+The fix is the one the message names, at the binding or in the argument itself:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -212,7 +212,7 @@ async read_sensor(channel: int) -> int = channel * 100 + 17
 celsius(raw: int) -> int = raw / 10
 
 async run() -> int
-    val raw: int = await read_sensor(1)
+    val raw = await read_sensor(1)
     celsius(raw) + celsius(await read_sensor(2))
 
 print(block_on(run()))
@@ -222,8 +222,8 @@ print(block_on(run()))
 32
 ```
 
-**The hint is given only where `await` would actually fix it.** A task where some other type was
-wanted is an ordinary mismatch, and says nothing about `await`:
+**The hint is given only where `await` would actually fix the error.** A task where some other type
+is expected is an ordinary mismatch, and the diagnostic does not mention `await`:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -241,8 +241,8 @@ cannot initialize 'label': declared string but the value is Task[int]
 
 ## Where `await` may be written
 
-**Only in the body of an async function.** A stop has to have somewhere to stop *to*, and an ordinary
-function has no task of its own to suspend:
+**Only in the body of an async function.** Suspending requires a task to suspend, and an ordinary
+function has no task of its own:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -257,7 +257,7 @@ print(scaled(1))
 'await' may only be written in the body of an 'async' function, and the function it stands in is not one — write 'async' in front of its name to make it one
 ```
 
-**Not in the entry file's statements**, which are the program's `main` — C calls it, and C has no
+**Not in the entry file's statements**, which form the program's `main`: C calls it, and C has no
 way to drive a task. That is what `block_on` is for, as in every program on this page:
 
 ```sysl
@@ -270,8 +270,8 @@ print(await read_sensor(1))
 'await' may only be written in the body of an 'async' function, and this is the entry file's body — the program's 'main', which C calls directly and cannot drive a task through. Move the work into an 'async' function
 ```
 
-**Not in a closure, even one written inside an async function.** A closure is a function of its own
-and is never async, so there is no task for it to wait in:
+**Not in a closure, even one written inside an async function.** A closure is a function in its own
+right and is never async, so it has no task to wait in:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -287,7 +287,7 @@ print(block_on(sweep()))
 'await' cannot be written in a closure: a closure is not itself async, even inside an 'async' function, so there is no task of its own for it to wait in. Await in the enclosing function's body and hand the closure the value
 ```
 
-Awaiting in the body and handing the closure what it needs:
+Await in the function's body and pass the closure the values it needs:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -319,13 +319,13 @@ print(block_on(report("adc")))
 'await' needs a Task, which is what calling an 'async' function hands back, but this value is string
 ```
 
-`await` stands wherever a value of the async function's body may — a binding, an argument, an `if`'s
-branch, a `match`'s arm.
+`await` may appear wherever a value may appear in the async function's body: a binding, an
+argument, a branch of an `if`, an arm of a `match`.
 
 ## What may be `async`
 
-A function, a generic function, and a method. A generic async function runs at each type its calls
-solved, as any generic does:
+A function, a generic function, and a method. A generic async function is instantiated at each type
+its calls infer, like any generic:
 
 ```sysl
 async latest[T](readings: []T) -> T
@@ -344,8 +344,8 @@ print(block_on(report()))
 sampling at 3.2 V
 ```
 
-**Nothing that something other than sysl calls directly may be async**, because the caller would
-receive a task and have no way to drive it. An `@export`ed function is the first of those:
+**A function called directly by anything other than sysl cannot be async**, because the caller would
+receive a task and have no way to drive it. An `@export`ed function is the first case:
 
 ```sysl
 async sample() -> int = 7
@@ -359,7 +359,7 @@ print(block_on(sample()))
 an '@export'ed function cannot be 'async': C calls it directly, and calling an async function only makes its task, which C has no way to drive. Export a plain function and keep the 'async' one behind it
 ```
 
-The shape the message names — a plain export that drives the async function:
+The structure the message describes is a plain export that drives the async function:
 
 ```sysl
 async read_sensor(channel: int) -> int = channel * 100 + 17
@@ -393,8 +393,8 @@ async interrupt timer()
 an interrupt handler cannot be 'async': the hardware calls it directly, and calling an async function only makes its task, which nothing there can drive
 ```
 
-**`async` marks a declaration, so it cannot stand in front of a statement** — the entry file's
-statements are `main`, for the same reason `await` cannot stand among them:
+**`async` marks a declaration, so it cannot precede a statement.** The entry file's statements are
+`main`, which is also why `await` cannot appear among them:
 
 ```sysl
 print("booting")
@@ -405,8 +405,8 @@ async print("sampling")
 'async' marks a function declaration, and what follows it here is a statement. The statements of a body run where they stand — the entry file's are the program's 'main', which C calls directly and cannot drive a task through — so put the work in an 'async' function instead
 ```
 
-**A property cannot be async**: it is read like a field, and a field read has no call to hand a task
-back from.
+**A property cannot be async**: it is read like a field, and reading a field involves no call that
+could return a task.
 
 ```sysl
 struct Adc
@@ -419,7 +419,7 @@ struct Adc
 a property cannot be 'async': it is read like a field, with no call to hand a task back from — make it a method, written with '()'
 ```
 
-As a method it is an ordinary async member, called and awaited through the receiver:
+Written as a method, it is an ordinary async member, called and awaited through the receiver:
 
 ```sysl
 struct Adc
@@ -437,8 +437,8 @@ print(block_on(Adc(3).reading()))
 ## `async` and `await` are contextual
 
 Neither word is [reserved](/reference/lexical/#reserved-words). `async` is a keyword only where a
-declaration follows it, and `await` only where an operand does, so both stay available as names —
-including in a program that also uses them as keywords:
+declaration follows it, and `await` only where an operand follows it, so both remain available as
+names, even in a program that also uses them as keywords:
 
 ```sysl
 var async = 1
@@ -455,12 +455,12 @@ print(async + await)
 
 ### `block_on`
 
-**`block_on(t)` runs `t` on the calling thread until it ends, and is its result.** It is the one
-driver the compiler supplies, and it is an ordinary call: it may stand in the entry file, in a plain
-function, and behind an `@export`.
+**`block_on(t)` runs `t` on the calling thread until it ends, and its value is the task's result.**
+It is the one driver the compiler supplies, and it is an ordinary call: it may appear in the entry
+file, in a plain function, and behind an `@export`.
 
-`block_on` is the only thing that could ever wake the task it drives — there is no other thread
-running it — so **a task that parks and is never woken traps** rather than spinning for ever:
+Nothing but `block_on` can wake the task it drives, since no other thread is running it, so **a
+task that parks and is never woken traps** rather than spinning forever:
 
 ```sysl
 async settle()
@@ -469,12 +469,12 @@ async settle()
 block_on(settle())
 ```
 
-That program builds and stops with a trap. (A block on this page can only claim a program that runs
-to the end or one the compiler refuses, so this one is shown without a claim.)
+```output trap
+```
 
 ### The executor contract: `step`, `park` and `yield_now`
 
-Four builtins are the whole interface between a task and whatever schedules it:
+Four builtins form the entire interface between a task and whatever schedules it:
 
 | builtin | what it does |
 |---|---|
@@ -483,13 +483,13 @@ Four builtins are the whole interface between a task and whatever schedules it:
 | `await park(register: &Fn(&Fn() -> unit) -> unit)` | hands `register` a **waker** and suspends until the waker is called |
 | `await yield_now()` | wakes the task being stepped and suspends once |
 
-**A waker is a `&Fn() -> unit`.** An executor hands `step` the one it wants called when the task can
-run again; a task's `park` hands its registrar a waker of its own, which the registrar keeps wherever
-the event it waits for will find it — a timer, an interrupt, a completion queue. Calling that waker
-calls the executor's.
+**A waker is a `&Fn() -> unit`.** An executor passes `step` the waker it wants called when the task
+can run again. A task's `park` passes its registrar a waker of its own, which the registrar stores
+wherever the awaited event will find it: a timer, an interrupt, a completion queue. Calling that
+waker calls the executor's.
 
-So an executor is a run queue and a loop over `step`. Here is a whole one, with a timer as the event
-source:
+An executor is therefore a run queue and a loop over `step`. Here is a complete one, with a timer as
+the event source:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -503,7 +503,7 @@ spawn(id: usize, t: Task[unit])
     ready.push(id)
 
 run()
-    var i: usize = 0
+    var i = 0
 
     while i < ready.len()
         val id = ready[i]
@@ -560,19 +560,19 @@ sampler read the adc
 `sample` each round. `sample` parks with nothing to wake it, so the first `run` ends with it off the
 queue; the timer's waker puts it back.
 
-**Stepping a finished task resumes nothing and answers `true` again**, so an executor that steps a
-task one time too many has done nothing wrong.
+**Stepping a finished task resumes nothing and returns `true` again**, so an executor that steps a
+task one time too many is still correct.
 
 ### A waker fires at most once
 
-**However many times a waker is called, the executor hears of it once** — and a waker whose park is
-over is a no-op, so a stale one held by an event source cannot wake the task out of a *later* park:
+**However many times a waker is called, the executor is notified once**, and a waker whose park has
+ended is a no-op, so a stale waker held by an event source cannot wake the task from a *later* park:
 
 ```sysl
 import sysl.buf.{Buf, buf}
 
 static var kept: Buf[&Fn() -> unit] = buf()
-static var heard: int = 0
+static var heard = 0
 
 keep(wake: &Fn() -> unit)
     kept.push(wake)
@@ -608,15 +608,15 @@ false 1
 true 2
 ```
 
-A waker called *during* its own registration — an event that has already happened — still costs the
-task one suspension and is heard once. A task dropped while it is parked disarms its waker on the
-way out, so an event source that calls it afterwards wakes nothing.
+A waker called *during* its own registration, for an event that has already happened, still costs
+the task one suspension and is delivered once. A task dropped while it is parked disarms its waker as
+it is freed, so an event source that calls the waker afterwards wakes nothing.
 
 ### A park at any depth wakes the outermost task
 
 An executor steps the task it holds, and that task may be awaiting a task that awaits another. **A
-park three awaits down calls the waker of the step in progress**, which is the outermost task's — the
-only one the executor knows about. A step nobody asked for, while the park is still unwoken, is
+park three awaits down calls the waker of the step in progress**, which belongs to the outermost task,
+the only one the executor knows about. A step that arrives while the park has not been woken is
 absorbed by the park rather than seen by the task.
 
 ```sysl
@@ -668,7 +668,7 @@ async wait_for_dma() -> int
 'park(…)' is a task that waits on the waker it hands its registrar, and it can only be awaited — write 'await park(…)' in the body of an 'async' function
 ```
 
-`step` takes the task and the waker, both:
+`step` takes both the task and the waker:
 
 ```sysl
 async blink()
@@ -693,10 +693,10 @@ poll(t: Task[unit]) -> bool = step(t, 1)
 ```
 
 `block_on`, `step`, `park` and `yield_now` are names the compiler supplies, not reserved words, so a
-program's own declaration of one is the nearer name and is called as written. **That includes an
-import**: `sysl.threads` declares a `yield_now` of its own — the thread's — so a file that
-imports that module whole is handed the thread's, and awaiting it is awaiting a `bool`. The refusal
-says whose `yield_now` the call became:
+program's own declaration of one of these names takes precedence and is called as written. **That
+includes an import**: `sysl.threads` declares its own `yield_now`, which yields the thread, so a file
+that imports the whole module gets that one, and awaiting it means awaiting a `bool`. The diagnostic
+says which `yield_now` the call resolved to:
 
 ```sysl
 import sysl.threads.*
@@ -711,14 +711,14 @@ block_on(blink())
 'await' needs a Task, which is what calling an 'async' function hands back, but this value is bool — the 'yield_now' called here resolved to 'sysl.threads.yield_now', declared in 'sysl.threads', and a declaration of that name stands in front of the task form 'yield_now(…)', so the task form is shadowed
 ```
 
-A local of the same name shadows the task form the same way, and is named as a local binding.
-Import what the file uses by name — `import sysl.threads.spawn` — and the task's `yield_now` is
-the one in scope.
+A local of the same name shadows the task form in the same way, and the diagnostic names it as a
+local binding. Import what the file uses by name, as in `import sysl.threads.spawn`, and the task's
+`yield_now` remains in scope.
 
 ## A task's frame is on the heap
 
-**A task's frame — its parameters, its result, and whatever is alive across an `await` — is
-allocated when the async function is called and freed when the last share of the task goes.** The
+**A task's frame (its parameters, its result, and whatever is live across an `await`) is allocated
+when the async function is called and freed when the last reference to the task is dropped.** The
 storage comes from one pair of functions:
 
 ```
@@ -727,15 +727,15 @@ sysl_task_free(p: *u8)
 ```
 
 The compiler defines both over the program's allocator, **weakly**, so a program that defines either
-with [`@export`](/reference/ffi/) replaces the default, and every frame — and every waker a `park`
-makes — comes from its own. Counting them shows each frame given back:
+with [`@export`](/reference/ffi/) replaces the default, and every frame, and every waker a `park`
+creates, comes from the program's own allocator. Counting the calls shows each frame being returned:
 
 ```sysl
 extern "malloc" c_malloc(n: usize) -> *u8
 extern "free" c_free(p: *u8)
 
-static var frames: int = 0
-static var freed: int = 0
+static var frames = 0
+static var freed = 0
 
 @export("sysl_task_alloc")
 task_alloc(size: usize) -> *u8
@@ -762,9 +762,9 @@ print(frames > 0, frames == freed)
 true true
 ```
 
-**On a microcontroller the pair is how frames come from a static pool** instead of a heap. The object
-a board build produces holds no coroutine intrinsic — the compiler has lowered every one — and
-reaches no `malloc`: its frames come from whatever the program's two definitions call.
+**On a microcontroller, this pair lets frames come from a static pool** instead of a heap. The object
+a board build produces contains no coroutine intrinsics, because the compiler has lowered all of them,
+and it does not reference `malloc`: its frames come from whatever the program's two definitions call.
 
 ```sysl build=c target=thumbv7em-freestanding
 // Frames come from a fixed pool the firmware owns, not from a heap.
@@ -787,18 +787,18 @@ async average(a: int, b: int) -> int = (await read_sensor(a) + await read_sensor
 sensor_average(a: int, b: int) -> int = block_on(average(a, b))
 ```
 
-**A task is a counted value**: a binding, a field or an `Option` holding one keeps a share, and the
-frame goes when the last share does — once, whether the task finished, stopped partway, or never
-started.
+**A task is a reference-counted value**: a binding, a field or an `Option` holding one keeps a
+reference, and the frame is freed when the last reference is dropped. That happens exactly once,
+whether the task finished, was suspended partway, or never started.
 
 ### A frame never moves, so a borrow may cross an `await`
 
 **A task's frame is allocated once, by the call, and stays at that address until it is freed.** A
-task value is the address of the frame, not the frame: handing a task to `step`, to another task that
-awaits it, to a join, or into a buffer or an `Option` copies that address, and every resumption
-reaches the body's locals through it. Nothing a program can write copies a frame — so, unlike Rust,
-sysl needs no `Pin`: a body may lend out a view of its own array, or the address of its own local,
-and hold the loan across an `await`.
+task value is the address of the frame, not the frame itself: passing a task to `step`, to another
+task that awaits it, to a join, or into a buffer or an `Option` copies that address, and every
+resumption reaches the body's locals through it. No sysl code can copy a frame, so, unlike Rust, sysl
+needs no `Pin`: a body may lend out a view of its own array, or the address of its own local, and
+hold the loan across an `await`.
 
 ```sysl
 static var staged: [16]u8 = [0; 16]
@@ -838,14 +838,14 @@ true 23
 ```
 
 `buf` lives in `handle`'s frame, `head` views it, and `read_into`'s frame holds `head` while both
-tasks are parked; the bytes are written through it after the resumption and read back from `buf`.
-A view handed to something that keeps it beyond the call — a device's static, say — is instead the
-case [`--explain-escapes`](/reference/memory/) reports: the array is promoted to the heap, and the
-loan is just as safe.
+tasks are parked; the bytes are written through it after the task resumes and are read back from
+`buf`. A view passed to something that keeps it beyond the call, such as a device's static, is the
+case [`--explain-escapes`](/reference/memory/) reports instead: the array is promoted to the heap,
+and the loan is equally safe.
 
-**A local lent across an `await` keeps its `@align(n)` too.** Whatever boundary it asks — of the
-binding, or of a type declared `@align(n)` — its storage in the frame begins on it, at every
-optimization level:
+**A local lent across an `await` also keeps its `@align(n)`.** Whatever alignment it requests,
+whether on the binding or through a type declared `@align(n)`, its storage in the frame starts on
+that boundary at every optimization level:
 
 ```sysl
 @align(64)
@@ -875,11 +875,11 @@ print(block_on(fill()))
 
 ## Dropping a task cancels it
 
-**There is no cancel operation: a task is cancelled by letting go of it.** A task dropped while it is
-suspended gives back exactly what a `return` written at that suspension would — its pending `defer`s
-run, then its locals and parameters are released, in the same order a `return` releases them — and a
-task that awaits another gives back the awaited task first. A task dropped before it ever started
-gives back its parameters and nothing else, since none of its body ran.
+**There is no cancel operation: a task is cancelled by dropping it.** A task dropped while it is
+suspended releases exactly what a `return` at that suspension point would: its pending `defer`s run,
+then its locals and parameters are released, in the same order a `return` releases them. A task that
+is awaiting another releases the awaited task first. A task dropped before it started releases only
+its parameters, since none of its body ran.
 
 ```sysl
 struct DmaBuffer
@@ -921,14 +921,13 @@ transfer 2 made, never stepped
 done
 ```
 
-`transfer 1 finished` never prints: the task was let go of at its `await`, and everything after it is
-code that does not run. Transfer 2 never reached its first statement, so it made no buffer to give
-back.
+`transfer 1 finished` never prints: the task was dropped at its `await`, and the code after it never
+runs. Transfer 2 never reached its first statement, so it created no buffer to release.
 
-**A task handed to an async function as a temporary belongs to the task it was handed to.** A
-temporary argument of an async call [moves into the callee's frame](/reference/memory/), so when
-the callee returns without finishing what it was given, that task is dropped — and cancelled — right
-there, before the caller does anything with the answer:
+**A task passed to an async function as a temporary belongs to the task it was passed to.** A
+temporary argument of an async call [moves into the callee's frame](/reference/memory/), so when the
+callee returns without finishing the task it was given, that task is dropped, and so cancelled,
+immediately, before the caller does anything with the result:
 
 ```sysl
 async parked()
@@ -954,30 +953,30 @@ gave up
 after
 ```
 
-A timeout written this way — `(await timeout(d, conn.read())) match …` — lets go of the abandoned read
-the moment the timeout drops it. A task held in a named local is the caller's as well as the callee's,
-and lives until the local's block ends.
+A timeout written this way, `(await timeout(d, conn.read())) match …`, releases the abandoned read as
+soon as the timeout drops it. A task held in a named local belongs to the caller as well as the
+callee, and lives until the local's block ends.
 
 ## A task crossing a concurrency domain
 
-**A task may be handed to another thread — or anywhere a [`@crossing`](/library/threads/) parameter
-reaches — only if everything its frame can hold is safe to share.** The compiler asks, of each thing
-the frame holds, the question it asks of what a closure captures when that closure is shared into a
-`&sync Fn`:
+**A task may be passed to another thread, or anywhere a [`@crossing`](/library/threads/) parameter
+reaches, only if everything its frame can hold is safe to share.** For each thing the frame holds,
+the compiler applies the same check it applies to a closure's captures when that closure is shared
+as a `&sync Fn`:
 
 - its **parameters**;
 - its **result**;
-- every **binding alive across an `await`** — a counted local lives to the end of its block, so one
-  read only before the `await` is still held if its block outlasts it;
-- every **value computed before an `await` in the same statement** — an argument to the left of an
-  awaited one, the left operand of an operator whose right one awaits, a receiver whose call awaits
-  in an argument, the elements of an array or tuple and the text of an interpolation built before an
-  awaited part. A temporary used up in an earlier statement is gone before the `await`, and a scalar
-  one crosses;
-- every **task it awaits**, followed down the chain — and a task handed in as a parameter is
-  answered by the argument its call was given.
+- every **binding live across an `await`**: a reference-counted local lives to the end of its block,
+  so one read only before the `await` is still held if its block extends past it;
+- every **value computed before an `await` in the same statement**: an argument to the left of an
+  awaited one, the left operand of an operator whose right operand awaits, a receiver whose call
+  awaits in an argument, and the elements of an array or tuple or the text of an interpolation built
+  before an awaited part. A temporary consumed in an earlier statement is gone before the `await`,
+  and a scalar temporary is always safe;
+- every **task it awaits**, followed down the chain; for a task passed in as a parameter, the check
+  applies to the argument given at the call.
 
-A task of scalars crosses, and runs on the other thread while this one runs its own:
+A task holding only scalars crosses, and runs on the other thread while this thread runs its own:
 
 ```sysl
 import sysl.threads.spawn
@@ -1011,8 +1010,8 @@ print(job.out, mine)
 499500 1999000
 ```
 
-The same hand-over is refused once the frame holds a `string`, whose bytes are owned through a count
-that is not atomic. The refusal names the function and the parameter:
+The same hand-over is refused once the frame holds a `string`, whose bytes are owned through a
+reference count that is not atomic. The diagnostic names the function and the parameter:
 
 ```sysl
 import sysl.threads.spawn
@@ -1065,8 +1064,8 @@ hand_off(filtered(1023))
 't' of 'hand_off' reaches another concurrency domain, so every count inside it has to be atomic — but it is a task of 'filtered', whose frame holds its local 'r', a '&Reading', whose count is not. Hold it as a '&sync Reading'
 ```
 
-Held as the message says, the task crosses — and so does one whose `&T` is let go of before its first
-`await`, because then the frame never holds it:
+Held as the message suggests, the task crosses. So does a task whose `&T` is released before its
+first `await`, because then the frame never holds it:
 
 ```sysl
 struct Reading
@@ -1101,7 +1100,7 @@ print(hand_off(filtered(1023)), hand_off(scaled(100)))
 ```
 
 A value a statement has already computed when it reaches an `await` waits in the frame until the
-statement finishes, so it is asked about too — here the label, built before the awaited reading:
+statement finishes, so it is checked too; here it is the label, built before the awaited reading:
 
 ```sysl
 @crossing(t)
@@ -1123,20 +1122,20 @@ hand_off(report(3))
 but it is a task of 'report', whose frame holds a value computed before an 'await' in the same statement, a 'string', which owns its bytes through a count that is not atomic
 ```
 
-Computed into a local of its own in an earlier statement and used up there, or kept as a scalar, it
-is not in the frame at the `await`.
+If the value is computed into a local in an earlier statement and consumed there, or is a scalar,
+it is not in the frame at the `await`.
 
-**The question is answered where the call that makes the task can be seen.** A task that arrives as
-a plain parameter could have been made by any async function, so handing it on is refused unless that
-parameter is itself marked `@crossing` — which moves the question to the callers. A task held in a
-`&sync` structure is asked about where the structure is boxed, and one captured by a closure shared
-into a `&sync Fn` is asked about at the closure. Everything refused here is accepted where the task
-stays in its own domain.
+**The check is made where the call that creates the task is visible.** A task that arrives as a
+plain parameter could have been created by any async function, so passing it on is refused unless
+that parameter is itself marked `@crossing`, which moves the check to the callers. A task held in a
+`&sync` structure is checked where the structure is boxed, and one captured by a closure shared as a
+`&sync Fn` is checked at the closure. Everything refused here is accepted when the task stays in its
+own domain.
 
 ### A task that parks stays in its domain
 
 **A task that awaits `park` is never allowed to cross.** Its waker is a `&Fn() -> unit` belonging to
-the domain whose executor steps it, so the task belongs to that domain too:
+the domain whose executor steps it, so the task belongs to that domain as well:
 
 ```sysl
 @crossing(t)
@@ -1153,9 +1152,10 @@ hand_off(wait_for_dma())
 but it is a task of 'wait_for_dma', whose frame holds the 'park' it awaits — a task that parks is handed a waker, and a waker is a '&Fn() -> unit' belonging to the domain whose executor steps the task, so a task that parks stays in that domain
 ```
 
-The same rule keeps a waker at home from the other side: a registrar may not capture the waker it is
-handed into a closure shared into a `&sync Fn`, and `step` will not take a `&sync Fn() -> unit` as its
-waker. No spelling makes a waker atomic, so the refusal says where it belongs instead:
+The same rule keeps a waker in its domain from the other direction: a registrar may not capture the
+waker it receives in a closure shared as a `&sync Fn`, and `step` does not accept a
+`&sync Fn() -> unit` as its waker. No form makes a waker atomic, so the diagnostic says where it
+belongs instead:
 
 ```sysl
 @crossing(f)
@@ -1172,10 +1172,10 @@ print(block_on(waits()))
 a closure shared between two domains may be called from either, so every count it captures has to be atomic — but the 'w' it captures is the waker 'park' handed its registrar, a '&Fn() -> unit' belonging to the domain whose executor steps the task, and no spelling makes it atomic. Keep the waker in that domain: let the other domain — an interrupt, another thread — signal the executor, and have the executor call the waker
 ```
 
-**The interrupt that completes the request is the other domain a kernel meets**, and the shape it
-writes first is a waker parked in module storage and called from the handler. Marked
+**In a kernel, the other domain is usually the interrupt that completes a request**, and the obvious
+first design is a waker stored in module storage and called from the handler. Marked
 [`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running),
-the handler is held to what it reaches, and the waker is what it reaches:
+the handler is checked against everything it reaches, and the waker is what it reaches:
 
 ```sysl build=c target=aarch64-freestanding
 var on_complete: Option[&Fn() -> unit] = None
@@ -1199,26 +1199,27 @@ async read_sector(n: u64) -> u64
 'disk_irq' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'on_complete' it reaches holds a '&Fn() -> unit' in its 'Some(value)', whose count is not. If it holds a waker 'park' handed its registrar, no spelling makes that atomic: keep the waker in the executor's domain — have this one signal the executor, and the executor call the waker. A callback of the program's own is held as a '&sync Fn() -> unit' ('06')
 ```
 
-What the handler may do is what an `Atomic` word or a `&sync` object allows: set a flag the executor
-reads, or push the request's number onto a ring the executor drains — and the executor, back in its
-own domain, calls the waker.
+The handler may do what an `Atomic` word or a `&sync` object allows: set a flag the executor reads,
+or push the request's number onto a ring the executor drains. The executor, in its own domain, then
+calls the waker.
 
-`yield_now` makes no waker, so a task that only yields crosses — `checksum` above is one.
+`yield_now` creates no waker, so a task that only yields can cross; `checksum` above is one.
 
 ## Where the executors live
 
 **Not in the language and not in the standard library.** The compiler supplies `block_on` and the
-contract above; an executor is a package, written against the contract in ordinary sysl, exactly as
-the run queue on this page is.
+contract above; an executor is a package written against the contract in ordinary sysl, exactly like
+the run queue on this page.
 
-- **[`kairos`](https://github.com/sysl-lang/kairos)** is an event loop written for a microcontroller
-  first — numbered sources an interrupt raises, timers on one clock. It is also an executor: tasks
-  spawned on the loop sleep on its timers and wait on its sources, with the wakers kept where the
-  timers and sources fire them. A board and a host use the same loop; only the driver value differs.
+- **[`kairos`](https://github.com/sysl-lang/kairos)** is an event loop designed for microcontrollers
+  first, with numbered sources raised by interrupts and timers on one clock. It is also an executor:
+  tasks spawned on the loop sleep on its timers and wait on its sources, with the wakers stored where
+  the timers and sources fire them. A board and a host use the same loop; only the driver value
+  differs.
 - With its **`uv` feature** (`features = [uv]`), kairos runs the same loop over
-  **[`libuv`](https://github.com/sysl-lang/libuv)** for a host: sockets and whole-file reads and
-  writes are tasks awaited beside `sleep` and `timeout`. With the feature off nothing of libuv is
-  fetched or linked.
+  **[`libuv`](https://github.com/sysl-lang/libuv)** on a host: sockets and whole-file reads and
+  writes are tasks awaited alongside `sleep` and `timeout`. With the feature off, nothing from libuv
+  is fetched or linked.
 
 ---
 
