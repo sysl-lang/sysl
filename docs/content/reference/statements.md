@@ -5,12 +5,12 @@ weight: 40
 ---
 
 `if`, `match`, `while`, `loop` and `for` are **expressions**. Each yields a value, so each can
-initialize a binding, be a function's body, or feed a branch of another. In statement position the
-value is simply unused and the same forms read as ordinary control flow.
+initialize a binding, be a function's body, or be a branch of another. In statement position the
+value is unused and the same forms act as ordinary control flow.
 
-That removes the statement/expression split that forces C's temporary-and-reassign dance
-(`int label; if (…) label = …; else label = …;`), and it makes one rule — *the last expression is
-the value* — uniform across functions, branches, arms and loops.
+This removes the need for C's declare-then-assign pattern (`int label; if (…) label = …; else label
+= …;`), and one rule — *the last expression is the value* — applies uniformly to functions,
+branches, arms and loops.
 
 ## Blocks
 
@@ -20,9 +20,8 @@ block. See [lexical structure](/reference/lexical/) for the layout rules and how
 continued across lines.
 
 Where a block's own value is unused, the block has **none** — its type is `unit` whatever the last
-line yields — and that propagates inward, into the branches of an `if`, the arms of a `match`, and
-the `else` of a loop. This is what lets branches merely do things without being made to agree on a
-value nobody asked for:
+line yields — and this propagates inward, into the branches of an `if`, the arms of a `match`, and
+the `else` of a loop. Branches that only perform actions therefore do not have to agree on a type:
 
 ```sysl
 var full = false
@@ -41,14 +40,14 @@ print(full, len)
 true 0
 ```
 
-Without that rule, `full = true` (a `bool`) and `len += 1` (an `int`) would be two branches with
-nothing to meet at. Statement position starts at a statement, at a loop body, and at the body of a
+Without this rule, `full = true` (a `bool`) and `len += 1` (an `int`) would be branches of
+incompatible types. Statement position begins at a statement, at a loop body, and at the body of a
 function that returns nothing.
 
-**A block stands wherever a construct puts one, and a binding's `=` is one of those places** — see
+**A block may appear wherever a construct accepts one, including after a binding's `=`** — see
 [the value may be an indented block](/reference/declarations/#the-value-may-be-an-indented-block).
-The rules there are the ones above, unchanged: the trailing expression is the value, and what the
-block binds goes out of scope with it.
+The same rules apply: the trailing expression is the value, and what the block binds goes out of
+scope with it.
 
 ### The statement forms
 
@@ -89,14 +88,14 @@ print(label(4), label(7), grade(95), grade(85), grade(70))
 even odd A B C
 ```
 
-`elif` is sugar: each one nests into the `else` branch of the one before, so no separate node exists
-and no rule about it has to be learned.
+`elif` is shorthand: each one nests into the `else` branch of the one before, so it follows the
+same rules as `if`.
 
-**An `if` used for a value needs an `else`.** A missing one leaves the open branch at `unit`, which
-is a diagnostic wherever a value was wanted. In statement position a missing `else` is ordinary.
+**An `if` used for a value needs an `else`.** Without one the missing branch is `unit`, which is a
+diagnostic wherever a value is expected. In statement position a missing `else` is ordinary.
 
-An `if` may be closed with `end if`, which is optional everywhere and reads well when the block is
-long enough that its extent has stopped being obvious:
+An `if` may be closed with `end if`. The marker is always optional and is useful when a block is long
+enough that its extent is no longer obvious:
 
 ```sysl
 var n = 3
@@ -110,12 +109,13 @@ end if
 positive
 ```
 
-`end` is a **soft** word — an ordinary identifier everywhere except immediately before a construct
-keyword — so `end` remains usable as a name. The same marker closes `while`, `for`, `loop` and
-`match` here, and a struct, an enum and a block-bodied `val` or `var` on
+`end` is a **contextual** word — an ordinary identifier everywhere except immediately before a
+construct keyword — so `end` remains usable as a name. The same marker closes `while`, `for`, `loop`
+and `match` here, and a struct, an enum and a block-bodied `val` or `var` on
 [declarations](/reference/declarations/).
 
-**A marker is checked where it is written, so one naming another construct is refused, naming both:**
+**A marker is checked, so one naming a different construct is refused, and the diagnostic names
+both:**
 
 ```sysl
 var n = 3
@@ -129,9 +129,9 @@ end for
 'end for' cannot close the 'while' above it — its marker is 'end while'
 ```
 
-**A marker closes an indented block, so one after a one-line form is refused** — a one-liner has no
-block for it to close, and the marker would only be clutter. A construct whose *last* part is written
-on one line ends on a one-line form too, whatever came before it:
+**A marker closes an indented block, so one after a one-line form is refused**, since there is no
+block to close. A construct whose *last* part is written on one line also ends on a one-line form,
+whatever came before it:
 
 ```sysl
 var n = 3
@@ -144,9 +144,8 @@ end if
 'end if' has no block to close — the 'if' above it ends on a one-line form, which takes no marker
 ```
 
-**Where two constructs open on one line, their blocks close together, and the marker is the outer
-one's to write** — the `match` below ends the `if`'s body as well as its own arms, so `end if` closes
-both:
+**Where two constructs open on one line, their blocks close together, and the marker names the outer
+one.** The `match` below ends the `if`'s body as well as its own arms, so `end if` closes both:
 
 ```sysl
 report(wide: bool, n: int)
@@ -186,8 +185,7 @@ silver
 ## `match`
 
 `value match`, then an indented list of `pattern -> body` arms. The keyword goes **after** the value,
-as in Scala and for Scala's reason: a match is a transformation of the thing to its left, so writing
-it there is what lets one feed another.
+as in Scala: a match transforms the value to its left, so matches can be chained.
 
 ```sysl
 enum Tier
@@ -208,16 +206,16 @@ print(fee(Bronze), fee(Silver), fee(Gold))
 0 10 25
 ```
 
-A match used **for a value must be exhaustive**; one written for effect need not be, which follows
-the same rule the block-value discard does. Everything about the left side of an arm — the pattern
-grammar, guards, alternatives, bindings — is on [patterns and matching](/reference/patterns/).
+A match used **for a value must be exhaustive**; one written for effect need not be, following the
+same rule as an unused block value. The left side of an arm — the pattern grammar, guards,
+alternatives, bindings — is covered on [patterns and matching](/reference/patterns/).
 
 ## A branch with no type of its own takes its sibling's
 
 The branches of an `if` and the arms of a `match` must agree on one type; there is no subtyping among
-concrete types for them to widen towards. A **bare literal** is the exception, because it has no type
-of its own to be overridden. It takes the type of the branch beside it, exactly as it takes the type
-of the operand beside it in `n + 1` and of the other end in `0..<xs.len`.
+concrete types for them to widen to. A **bare literal** is the exception, because it has no type of
+its own. It takes the type of the branch beside it, just as it takes the type of the other operand
+in `n + 1` and of the other bound in `0..<xs.len`.
 
 ```sysl
 width(n: usize) -> usize = n
@@ -232,14 +230,13 @@ print(at_least_one(0), gap(9, 2), gap(2, 9))
 1 7 0
 ```
 
-`width` is what makes those three real: it takes a `usize`, so an `if` that had come out as `int`
-would not compile at all. Without the rule the `1` and the `0` fall to `int`, each pair is refused
-for a difference nobody wrote, and the fix is an annotation on the declaration restating a width the
-other branch already gives.
+`width` takes a `usize`, so an `if` whose type came out as `int` would not compile. Without the rule
+the `1` and the `0` would default to `int`, each pair would be refused, and the fix would be an
+annotation restating the width the other branch already gives.
 
-A `match` is the same rule over as many alternatives as the form has. The arms that know what they
-are settle the type and the bare literals take it, wherever they are written — the arm that knows
-may be the last one.
+A `match` applies the same rule across all its arms. The arms with a type of their own determine the
+type, and the bare literals take it, wherever they are written; the arm that determines it may be
+the last one.
 
 ```sysl
 width(n: usize) -> usize = n
@@ -259,11 +256,11 @@ print(step(0), step(1), step(8))
 1 2 8
 ```
 
-An arm or a branch that does not finish settles nothing, which is the same standing-aside `never`
-already does when the type of the whole form is worked out. It does not stop its sibling taking a
-type either: `if c then 0 else continue` is a `0` of whatever the position wants, exactly as it
-would be with a `1` in place of the `continue`. A branch ending in `return`, `break`, `continue` or a
-call of a function declared `-> never` (`panic`, or one of the program's own) stands aside like this.
+An arm or a branch that does not finish has type `never` and does not affect the type of the whole
+form. Nor does it stop a sibling literal from taking a type: `if c then 0 else continue` is a `0` of
+whatever type the position expects, exactly as it would be with a `1` in place of the `continue`. A
+branch ending in `return`, `break`, `continue` or a call of a function declared `-> never` (`panic`,
+or one of the program's own) is treated this way.
 
 ```sysl
 first_even(xs: []usize) -> usize
@@ -283,8 +280,7 @@ print(first_even([3, 5, 8]), first_even([7, 101]), first_even([1]))
 8 0 1
 ```
 
-**Two branches that each know what they are still have to agree.** That is the half the rule
-protects: neither is silently decided by the other, because both arrived with an opinion.
+**Two branches that each have a type must still agree.** Neither is converted to match the other:
 
 ```sysl
 f(a: int, b: usize)
@@ -299,11 +295,11 @@ f(0, 1)
 if branches have different types: int and usize
 ```
 
-**The rule reaches inside a construction, part by part.** A tuple or an array literal written out
-of literals has no type of its own either, so `(0, 0)` beside a `(u64, u64)` is a pair of `u64`s,
-however deeply the tuples nest. A construction that knows only some of its parts — `(n, 0)`,
-`Some(0)` — is *offered* the type its sibling settled, and two such branches that each know a
-different part meet at the type that has both:
+**The rule applies inside a construction, part by part.** A tuple or array literal made only of
+literals has no type of its own either, so `(0, 0)` beside a `(u64, u64)` is a pair of `u64`s,
+however deeply the tuples nest. A construction with a type for only some of its parts — `(n, 0)`,
+`Some(0)` — takes the rest from its sibling, and two such branches that each determine a different
+part combine into the type that has both:
 
 ```sysl
 pair(ok: bool) -> Result[(u64, u64), int] = if ok then Ok((3, 4)) else Err(1)
@@ -327,8 +323,8 @@ print(ends(true), ends(false), joined(1, 5), joined(7, 5))
 7 0 2 5
 ```
 
-The branches of an `elif` chain are siblings, so they meet at one type all together rather than two
-at a time — the four branches below are four pairs of `usize`:
+The branches of an `elif` chain are all siblings, so they are resolved to one type together rather
+than two at a time; the four branches below are four pairs of `usize`:
 
 ```sysl
 split(n: usize) -> usize
@@ -343,8 +339,8 @@ print(split(3), split(4), split(5), split(7))
 30 4 51 72
 ```
 
-A part that cannot be what the sibling says keeps its own type, and the branches are refused as
-two that disagree:
+A part that cannot take the sibling's type keeps its own, and the branches are refused as
+disagreeing:
 
 ```sysl
 f(n: u64)
@@ -361,10 +357,10 @@ f(1)
 match arms have different types: (ulong, ulong) and (ulong, string)
 ```
 
-**A branch with nothing to go on is tried, not refused.** A nullary generic call has no argument to
-fix its type parameter from, so a branch like `empty()` cannot be read on its own — it is held over
-until its sibling has settled something, in either order and through an `elif` chain or a `match`'s
-arms:
+**A branch that cannot be typed on its own is deferred, not refused.** A nullary generic call has no
+argument from which to infer its type parameter, so a branch like `empty()` cannot be typed alone;
+it is deferred until a sibling has determined the type, in either order, through an `elif` chain or
+a `match`'s arms:
 
 ```sysl
 empty[T]() -> Option[T] = None
@@ -382,11 +378,11 @@ Some(1)
 None
 ```
 
-Where neither branch can be read alone, the refusal above is unchanged.
+Where no branch can be typed alone, the expression is refused as above.
 
-**Branches that each settle a different part of one generic enum's type meet at the whole of it.**
-`Err(E.Bad)` says what a `Result` fails with and nothing about what it succeeds with; `Ok(n)` says
-the opposite. Neither stands alone, and together they are one `Result[int, E]`, in either order,
+**Branches that each determine a different part of one generic enum's type combine into the whole
+type.** `Err(E.Bad)` gives a `Result`'s error type and nothing about its success type; `Ok(n)` gives
+the opposite. Neither is complete alone, and together they are one `Result[int, E]`, in either order,
 across a `match`'s arms or an `elif` chain:
 
 ```sysl
@@ -411,8 +407,9 @@ print(pick(0).is_err(), pick(4).unwrap(), check(-3).unwrap(), check(0).is_err())
 true 4 3 true
 ```
 
-Each parameter takes the first branch that settles it, and a later branch settling it differently is
-refused at its own value. A parameter no branch settles is still a question nobody answered:
+Each type parameter is taken from the first branch that determines it, and a later branch that
+determines it differently is refused at its own value. A type parameter that no branch determines is
+an error:
 
 ```sysl
 enum E
@@ -432,7 +429,7 @@ cannot infer the type argument 'T' of 'Err' here — annotate the expected type
 
 ## Loops
 
-Five forms, and each is an expression.
+There are five loop forms, and each is an expression.
 
 | form | when |
 |---|---|
@@ -442,18 +439,17 @@ Five forms, and each is an expression.
 | `for x in seq` | walk a range, an array, a slice, an `Iterate`, or a container through its `Walk` |
 | `for init; cond; step` | a stride, a descent, a compound test, several variables |
 
-**A fourth thing may follow `for`, and it is not a loop.** `for const i in 0..<A.len` is *unrolled*
-while the program is compiled — the compiler emits one copy of the body per value and there is no
-loop left at run time, which is why it takes no label, no `break` and no `else`. It exists to walk a
-[type pack](/reference/generics/#a-parameter-may-stand-for-a-list-of-types), where each iteration has
-a different type and so genuinely has to be a different copy. Everything on this page is about the
-five forms above; `for const` is documented with generics, where its range rule and its restrictions
-are.
+**`for const` is not a loop.** `for const i in 0..<A.len` is *unrolled* at compile time: the
+compiler emits one copy of the body per value and no loop remains at run time, so it takes no label,
+no `break` and no `else`. It is for walking a
+[type pack](/reference/generics/#a-parameter-may-stand-for-a-list-of-types), where each iteration
+has a different type and so must be a separate copy. This page covers the five forms above;
+`for const` is documented with generics, together with its range rule and restrictions.
 
 ### `for x in`
 
-The ordinary walk, and preferred wherever it fits: it names one thing instead of three and cannot
-get any of them wrong.
+The ordinary iteration, and the preferred form wherever it fits: it names one thing instead of the
+three a counted loop needs.
 
 ```sysl
 var xs = [4, 5, 6]
@@ -475,10 +471,10 @@ for i in 0..<2
 
 **A container is walked through `Walk`.** Where `seq`'s type implements the library's
 [`Walk`](/library/core/) and is not itself a cursor, the loop is `for x in seq.walk()`: `walk` is
-called once, before the first turn, and what it answers is walked by the rules above — so a `Buf`,
-whose `walk` answers its view, is walked by index as a slice is, and a `Map` through its cursor, a
-`(key, value)` pair apiece. A type implementing `Iterate` is walked by `next` even if it implements
-`Walk` too.
+called once, before the first iteration, and its result is walked by the rules above. A `Buf`, whose
+`walk` returns its view, is therefore walked by index as a slice is, and a `Map` through its cursor,
+one `(key, value)` pair per iteration. A type implementing `Iterate` is walked by `next` even if it
+implements `Walk` too.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -501,8 +497,8 @@ for x in b
 
 A `for` binds what a [binding](/reference/declarations/#by-pattern-when-the-shape-matters) binds, so
 an element that is a tuple or a struct may be taken apart in the header instead of inside the body.
-The pattern grammar is the same one, whole: nested as deep as the value goes, a part skipped with
-`_`, a struct named by its fields, and the element kept beside its parts with `n @`.
+The full pattern grammar applies: nesting to any depth, a part skipped with `_`, a struct named by
+its fields, and the whole element kept beside its parts with `n @`.
 
 ```sysl
 struct Point
@@ -530,13 +526,13 @@ b 2
 5 6
 ```
 
-The parts are bound the way the loop variable itself is, so a part may be assigned to. What the
-pattern may **not** be is a choice among an enum's variants: a loop has no other arm to take when
-the element turns out to have a different shape, which is the same rule a binding follows.
+The parts are bound the way the loop variable itself is, so a part may be assigned to. The pattern
+may **not** choose among an enum's variants, because a loop has no other arm to take when the
+element has a different shape; a binding follows the same rule.
 
-The parts go in parentheses, and the comma spelling is not a second way to write it — `for a, b` is
-already the beginning of a three-clause header whose first clause assigns to two names, and the two
-would not tell themselves apart until the `in`:
+The parts go in parentheses. The comma form is not accepted, because `for a, b` already begins a
+three-clause header whose first clause assigns to two names, and the two forms could not be told
+apart until the `in`:
 
 ```sysl
 for k, v in [(1, 2)]
@@ -573,10 +569,9 @@ print(found, none)
 4 -1
 ```
 
-That turns the most common reason to leave a loop early — *find the first element satisfying a
-predicate* — into one expression whose type states, through the mandatory `else`, what happens when
-nothing is found. It is the same discipline that gives references no null and errors a `Result`: the
-loop cannot fall through to an undefined value.
+This makes the most common early exit — *find the first element satisfying a predicate* — a single
+expression, and the required `else` states what happens when nothing is found. The loop cannot fall
+through to an undefined value.
 
 With no `else`, normal completion yields `unit` — so a value-carrying `break` without one is refused:
 
@@ -598,8 +593,8 @@ with no `else` is the ordinary statement loop, of type `unit`.
 
 ### `do … while`
 
-The test goes at the foot, so the body runs before anything is asked. The body is an indented block
-with the `while` on the line that closes it, or a single statement on one line.
+The test comes at the end, so the body runs at least once. The body is an indented block with the
+`while` on the line that closes it, or a single statement on one line.
 
 ```sysl
 digits(n: int) -> string
@@ -624,11 +619,11 @@ print(digits(0), digits(4071), i)
 0 4071 4
 ```
 
-Written as a `while`, `digits` prints nothing for `0`. The value rules are `while`'s: a `break`
-carries the loop's value, and an `else` runs when the test at the foot finally fails.
+Written as a `while`, `digits` would print nothing for `0`. The value rules are `while`'s: a `break`
+carries the loop's value, and an `else` runs when the test at the end fails.
 
-**`continue` runs the test**, and that is what the form is for. The shape written instead is `loop`
-with the test inverted at the bottom:
+**`continue` runs the test.** This distinguishes the form from the common substitute, a `loop` with
+the inverted test at the bottom:
 
 ```
 loop
@@ -636,12 +631,12 @@ loop
     if !cond then break        // NOT the same loop
 ```
 
-That has no test for a `continue` to reach, so the first `continue` added to it jumps over the exit
-and the loop never leaves — the same trap the three-clause `for` exists to avoid, where a `continue`
-skips the step.
+That loop has no test for a `continue` to reach, so a `continue` skips the exit and the loop never
+ends — the same problem the three-clause `for` avoids, where a `continue` would otherwise skip the
+step.
 
-The test takes no `is` binding, and cannot read what the body declared: it guards nothing, because
-the body it belongs to has already run.
+The test takes no `is` binding, and cannot read names the body declared; since the body has already
+run, a binding in the test would guard nothing.
 
 ```sysl
 do
@@ -653,14 +648,13 @@ while k < 2
 undefined name 'k'
 ```
 
-`do` is never ambiguous with the `do` that introduces a one-line body. That one only ever follows a
-loop header on the same line, so it is never a statement's first token; a `do` that starts a line
-opens this form and nothing else.
+This `do` is never ambiguous with the `do` that introduces a one-line body. That one always follows
+a loop header on the same line, so it is never a statement's first token; a `do` that starts a line
+always opens this form.
 
 ### `loop`
 
-A loop with nothing to test. It runs until something leaves it, which is what `while true` was always
-being used to say.
+A loop with no test. It runs until something leaves it, and it replaces `while true`.
 
 ```sysl
 var n = 0
@@ -677,12 +671,13 @@ print(stop, n)
 40 4
 ```
 
-Two things follow from the condition being *gone* rather than merely constant. It takes **no
-`else`** — an `else` runs on normal completion, and this loop has none — so a value-carrying `break`
-needs nothing beside it, which is why the program above compiles where the `for` above it did not.
+Because a `loop` has no condition at all, rather than a constant one, two things follow. It takes
+**no `else`** — an `else` runs on normal completion, and this loop never completes normally — so a
+value-carrying `break` needs nothing beside it; that is why the program above compiles where the
+earlier `for` did not.
 
-And a `loop` **nothing breaks out of has type `never`**, so it may stand as the last thing a function
-owing a value does, with nothing after it to supply one:
+And a `loop` **that nothing breaks out of has type `never`**, so it may be the last expression of a
+function that returns a value, with nothing after it:
 
 ```sysl
 serve(handle: () -> unit) -> int
@@ -690,15 +685,13 @@ serve(handle: () -> unit) -> int
         handle()
 ```
 
-That is the fact `while true` cannot state. A condition is an expression the analyzer does not
-evaluate, so a loop written that way looks like one that might finish, and the code after it looks
-reachable.
+`while true` cannot express this: the analyzer does not evaluate a condition, so such a loop appears
+able to finish, and the code after it appears reachable.
 
 ### The three-clause `for`
 
-C's counted loop without the parentheses, as Go writes it — every other header in the language is
-parenthesis-free, and parentheses here would be structure rather than grouping. Each of the three
-clauses may be left out.
+C's counted loop without the parentheses, as in Go; no header in the language is parenthesized. Each
+of the three clauses may be omitted.
 
 ```sysl
 var total = 0
@@ -720,16 +713,14 @@ print(total, down)
 25 321
 ```
 
-**The step is why the form exists, and it is not sugar for a `while`.** `continue` runs the step
-before testing again, so the skipped iterations above still advance — which is the whole reason that
-loop terminates. Written as a `while` the increment sits at the foot of the body, where the first
-`continue` anybody adds later walks straight past it: a bug the shape of the code invites and nothing
-about it warns of.
+**The form is not shorthand for a `while`.** `continue` runs the step before testing again, so the
+skipped iterations above still advance and the loop terminates. Written as a `while`, the increment
+sits at the end of the body, where a `continue` added later skips it.
 
-The second loop is the other reason: a descent is not something a range says.
+The second loop shows the other use: a descent, which a range cannot express.
 
-An absent condition never turns false, so such a loop ends only through a `break` and takes no
-`else` — exactly as `loop` does, and `loop` says it better.
+An omitted condition never becomes false, so such a loop ends only through a `break` and takes no
+`else`, exactly as `loop` does; write `loop` instead.
 
 ### Labels
 
@@ -752,16 +743,15 @@ print(hit)
 3
 ```
 
-A labeled `break` carries a value exactly as a bare one does, meeting that loop's other breaks and
-its `else` at one type. `continue` takes a label but never a value.
+A labeled `break` carries a value exactly as a bare one does, sharing one type with that loop's other
+breaks and its `else`. `continue` takes a label but never a value.
 
-The sigil is a leading apostrophe, as in Rust, and deliberately not the `:`-suffix some languages
-use: a bare `break outer` would be ambiguous with `break expr` carrying a value that happens to be
-named `outer`, and the apostrophe keeps a label and a value textually distinct. It does not collide
-with a character literal — `'a'` closes its quote and is a character, `'a` does not and is a label.
+The sigil is a leading apostrophe, as in Rust, because a plain `break outer` would be ambiguous with
+`break expr` carrying a value named `outer`. It does not collide with a character literal: `'a'`
+closes its quote and is a character; `'a` does not and is a label.
 
 A label is in scope only inside its own loop's body. Naming a loop that does not enclose the
-`break`, or reusing a label already in scope, is an error rather than a silent miss.
+`break`, or reusing a label already in scope, is an error.
 
 ## `return`
 
@@ -784,20 +774,20 @@ print(q, r, z, w)
 3 2 0 0
 ```
 
-**`become f(…)` is `return f(…)` with the jump guaranteed**, which is a different statement rather
-than a faster one: a chain of tail calls between functions is a loop only if every one of them is
-eliminated, so an ordinary `return` of a call is a frame and `become` is not. It is written up under
-[declarations](/reference/declarations/), beside the tail call it generalises.
+**`become f(…)` is `return f(…)` with the tail call guaranteed.** It differs in meaning, not only in
+speed: a chain of tail calls between functions runs in constant stack only if every call is
+eliminated, so an ordinary `return` of a call may use a frame and `become` never does. It is
+described under [declarations](/reference/declarations/), beside the tail call it generalizes.
 
 ## `defer`
 
-ARC gives back a `&T`, a `string` and a slice's backing without being asked. It knows nothing about
-the rest: a descriptor from `open`, a `FILE*` from `fopen`, a block from `malloc`, a lock taken from
-a mutex. Until those are released by hand, a correct program is one that never takes an early exit —
-which `?` makes the *normal* way to leave a function.
+Reference counting releases a `&T`, a `string` and a slice's backing storage automatically. It does
+not manage other resources: a descriptor from `open`, a `FILE*` from `fopen`, a block from `malloc`,
+a lock taken from a mutex. Releasing those by hand at every exit is error-prone, especially since
+`?` makes an early exit the normal way to leave a function on failure.
 
-**`defer <statement>` runs that statement on the way out of the block containing it.** The resource
-is released beside the call that took it, once, rather than at every exit.
+**`defer <statement>` runs that statement on the way out of the block containing it.** The release
+is written once, beside the call that acquired the resource, rather than at every exit.
 
 ```sysl
 work()
@@ -823,9 +813,8 @@ itself — and runs when control leaves that block by any ordinary route: fallin
 
 **A deferred statement may not contain a jump that leaves it** — a `return`, or a `break` or
 `continue` of a loop outside it — at any depth, since it runs while its block is already being left
-and there is no second exit to take. A loop written inside the statement is its own, so a jump of
-that loop stays inside and is fine, and so is a jump inside a closure or a nested function written
-there:
+and there is no second exit to take. A loop written inside the statement is separate, so a jump
+within that loop is allowed, as is a jump inside a closure or a nested function written there:
 
 ```sysl
 first(c: bool) -> int
@@ -857,14 +846,15 @@ body
 1
 ```
 
-**Several in one block run last-registered-first**, as above, so they undo in the reverse of the
-order they were set up — the order that lets a later one depend on an earlier one's resource.
+**Several in one block run in reverse order of registration**, as above, so resources are released
+in the reverse of the order they were acquired, and a later one may depend on an earlier one's
+resource.
 
 **A `defer` runs only if control reached it.** It is a statement, not a declaration: one after an
-early `return` never registered, and one in a branch never taken did not either.
+early `return` is never registered, and neither is one in a branch not taken.
 
-**The whole statement runs at the exit, so everything in it is read there** — not where the `defer`
-stands:
+**The whole statement runs at the exit, so every name in it is read there**, not where the `defer`
+is written:
 
 ```sysl
 show()
@@ -881,25 +871,24 @@ show()
 2
 ```
 
-Go differs here: it evaluates a deferred call's *arguments* where the `defer` stands and runs the
-call later, which needs somewhere to keep each captured argument until then — a slot per deferred
-statement, sized and laid out per call. Reading everything at the exit needs nothing kept. This is
-Zig's rule, and it changes nothing for the form's purpose: `defer fclose(f)` releases the handle
-bound above it, and a program that rebinds `f` in between has changed which file is open, so closing
-the one that is actually open is the behaviour wanted.
+This differs from Go, which evaluates a deferred call's *arguments* where the `defer` is written and
+runs the call later, keeping each argument in a slot until then. sysl follows Zig: reading
+everything at the exit needs no storage. `defer fclose(f)` releases the handle bound above it; if a
+program rebinds `f` in between, it has changed which file is open, and closing that file is the
+intended behaviour.
 
-**A trap runs nothing.** A trap aborts without stack cleanup, and `defer` does not qualify that: a
-broken invariant means the program's model of itself is already wrong, and running cleanup against
-that state is how a corrupt program writes its corruption to disk on the way down. `defer` releases a
-resource; it does not restore an invariant. A call that leaves its frame for good while the program
-goes on — a thread ending — is the opposite case, and a function declared
-[`@abandons`](/reference/declarations/) runs its caller's deferred statements before the call.
+**A trap runs nothing.** A trap aborts without stack cleanup, including deferred statements: a broken
+invariant means the program's state is already wrong, and running cleanup against that state risks
+writing corrupt data on the way down. `defer` releases a resource; it does not restore an invariant.
+A call that leaves its frame permanently while the program continues — a thread ending — is the
+opposite case: a function declared [`@abandons`](/reference/declarations/) runs its caller's
+deferred statements before the call.
 
 ### Why the block and not the function
 
-Go's `defer` runs at **function** exit. The difference is invisible for the common case — a resource
-taken at the top of a body and released when the body ends, where the function *is* the block — and
-shows up in a loop:
+Go's `defer` runs at **function** exit. The two are the same in the common case — a resource taken
+at the top of a body and released when the body ends, where the function *is* the block — and differ
+in a loop:
 
 ```sysl
 for i in 0..<2
@@ -915,35 +904,33 @@ open 1
 close 1
 ```
 
-Block scope closes each iteration's resource at the end of that iteration, so the program holds one
-at a time. Function scope would hold all of them until the function returned — and, the part that
-decides it, would need somewhere to record a number of pending statements that no compiler can bound.
-That is a per-frame list whose length is discovered while running, which is precisely the machinery
-that a freestanding target under `no alloc` has nowhere to put. Block scope needs no runtime state at
-all: the statement is emitted at each edge that leaves the block, exactly as ARC's own releases
-already are.
+Block scope releases each iteration's resource at the end of that iteration, so the program holds
+one at a time. Function scope would hold all of them until the function returned, and would need a
+per-frame list of pending statements whose length is known only at run time — storage a
+freestanding target under `no alloc` has nowhere to put. Block scope needs no run-time state: the
+statement is emitted at each edge that leaves the block, as reference-count releases are.
 
-Go has two reasons for its choice and sysl has neither. `recover` only works inside a deferred call
-and a panic unwinds one frame at a time, so the frame has to be the unit; and mutating a named result
-is how Go wraps an error on the way out. sysl has no unwinding and no named results. The languages
-that came later without `recover` — Zig, Swift — both put `defer` at the block.
+Go's choice follows from features sysl does not have: `recover` works only inside a deferred call
+and a panic unwinds one frame at a time, and Go wraps errors by mutating named results on the way
+out. sysl has no unwinding and no named results. Zig and Swift, which also have no `recover`, both
+scope `defer` to the block.
 
 ### Where it sits against the rest of the model
 
-**A deferred statement runs before the block's ARC releases**, so every local it names is still alive
-when it runs, including the one holding the resource being closed. Leaving from the middle unwinds
-outward: the innermost block runs its deferred statements and then gives up its counts, then the
-block outside it does the same, up to the function's own.
+**A deferred statement runs before the block's reference-count releases**, so every local it names is
+still alive when it runs, including the one holding the resource being closed. Leaving from the
+middle unwinds outward: the innermost block runs its deferred statements and then releases its
+references, then the enclosing block does the same, up to the function's own.
 
-**It owns nothing and allocates nothing.** `defer` takes no count, makes no box, and adds no word to
-any value; a program that does not use it emits nothing for it. That is what keeps it available under
-`no alloc`, where the resources it releases are the only ones there are.
+**It owns nothing and allocates nothing.** `defer` takes no reference count, creates no box, and adds
+no word to any value; a program that does not use it emits nothing for it. It is therefore available
+under `no alloc`, where the resources it releases are the only kind there are.
 
-**What it is not is a [destructor](/reference/memory/).** A destructor belongs to a *type* and runs
-wherever a value of that type dies; `defer` belongs to one place in one body and runs for the
-resource that body took. Both exist and neither replaces the other: `defer` covers every site a
-program can name, and a destructor covers the deaths it cannot — a resource inside a container, or
-inside a struct inside a container, dies at a point with no expression in the source.
+**It is not a [destructor](/reference/memory/).** A destructor belongs to a *type* and runs wherever
+a value of that type dies; `defer` belongs to one place in one body and runs for the resource that
+body acquired. Each covers what the other cannot: `defer` covers every site a program can name, and
+a destructor covers the deaths it cannot — a resource inside a container, or inside a struct inside
+a container, dies at a point with no expression in the source.
 
 ---
 
