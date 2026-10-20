@@ -43,7 +43,7 @@ gen_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     push_temps(e)
     push_owned(e)
     gen_stack_guard(e)
-    gen_computed_vals(e, p.vals)
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
 
     // The storage's initializers were written in whichever files declared them; the statements
@@ -170,7 +170,7 @@ private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig, guard: bool) -> Opt
 
     if guard then gen_stack_guard(e)
 
-    gen_computed_vals(e, p.vals)
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
     release_all(e)
     emit_term(e, InRet(None, None))
@@ -202,9 +202,20 @@ private module_init_priority() -> long = 65535
 // region and the storage left addressing freed bytes. The release is *absent* because there is
 // nothing to release: the storage has never held anything, and a `&T`'s zero is not a reference --
 // loading it and letting go of it would be a decrement through null.
-private gen_computed_vals(e: *Emit, vals: Buf[TVal])
+//
+// **Storage an artifact lays down is never filled here** (`emit_static.sysl`'s `gen_vals` declares
+// it): a library `val` the artifact carries as data is declared `constant`, and a store into it is a
+// write to read-only memory. The decision is the library's, made once (`const_eval.sysl`'s
+// `step_limit`), so meeting one here is a compiler fault, and it is said as one rather than emitted.
+private gen_computed_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string])
     for i in 0..<vals.len()
         val v = vals.at(i)
+
+        if v.computed && v.init.is_some() && holds_string(precompiled, v.symbol)
+            panic(s"internal error: '${v.symbol}' is storage a linked artifact lays down, and this " +
+                  "program was about to fill it at startup — the program and the artifact disagree on " +
+                  "whether its initializer is constant data")
+        end if
 
         if v.computed && v.init.is_some()
             push_temps(e)
@@ -268,7 +279,7 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     push_temps(e)
     push_owned(e)
     gen_parent_watch(e)
-    gen_computed_vals(e, p.vals)
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
 
     val named = fresh_label(e, "test.named")

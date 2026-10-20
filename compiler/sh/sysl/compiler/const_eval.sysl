@@ -33,6 +33,14 @@ import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, 
 // and statement visited, and calls 512 deep. Running out of either is an error naming the constant,
 // not a warning.
 //
+// **The standard module's own constants and storage run under the default whatever the program
+// asked for.** Whether a library `val` is laid down as data is the library's answer, made once when
+// its artifact is built and kept for every program after -- so a program re-reading the same
+// initializer under its own `--const-steps` could only disagree with it, and a disagreement is a
+// global the artifact defines as constant that the program then writes at startup. What decides is
+// the file the constant was written in, not the files its calls reach: a program's constant calling a
+// library function runs under the program's limit.
+//
 // **A callee's body is typed for the evaluation in a trial that is taken back** -- the reading
 // `opaque_body_type` makes of a `some` member's body -- so the main pass types it as it always would,
 // once, and nothing the trial registered survives into the program. The typed tree is kept here for
@@ -40,12 +48,15 @@ import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, 
 
 private const EvStepDefault: long = 16000000
 
-// How many steps one run may take: what `--const-steps` gave, or the default.
-private step_limit() -> long = const_steps_flag().unwrap_or(EvStepDefault)
+// How many steps one run of a constant written in `base` may take: the default for the standard
+// module's own, and otherwise what `--const-steps` gave, or the default.
+private step_limit(base: Scope) -> long =
+    if base.src.name.starts_with(s"$StdPrefix/") then EvStepDefault
+    else const_steps_flag().unwrap_or(EvStepDefault)
 
 // The limit as a reader writes a large count, its digits grouped in threes.
-private step_limit_text() -> string
-    val digits = str(step_limit())
+private step_limit_text(limit: long) -> string
+    val digits = str(limit)
     var out = ""
 
     for i in 0..<digits.bytes.len
@@ -782,6 +793,8 @@ private struct EvRun
     subject: string
     base: Scope
     steps: long
+    // How many steps this run may take (`step_limit`).
+    limit: long
     frames: Buf[&EvFrame]
     loops: Buf[(Scope, Span)]
     kind: EvStopKind
@@ -793,7 +806,7 @@ end EvRun
 // Runs one typed expression standing in a constant: `subject` is what a refusal names, `base` the
 // file it was written in.
 private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr) -> EvOutcome
-    val r: &EvRun = EvRun(a, subject, base, 0, buf(), buf(), EvRunning, "", buf())
+    val r: &EvRun = EvRun(a, subject, base, 0, step_limit(base), buf(), buf(), EvRunning, "", buf())
 
     // The expression itself is read in a frame of its own, which names no call: what it binds -- a
     // pattern in a `match` -- lands there.
@@ -890,7 +903,7 @@ end not_constant
 private tick(r: &EvRun) -> bool
     r.steps += 1
 
-    if r.steps <= step_limit() then return true
+    if r.steps <= r.limit then return true
 
     out_of_steps(r)
 
@@ -912,7 +925,7 @@ private out_of_steps(r: &EvRun)
 
             still = s"the loop at ${place_text(l.0, l.1)} was still running"
 
-        r.message = s"${r.subject} did not finish within ${step_limit_text()} steps while compiling — $still" +
+        r.message = s"${r.subject} did not finish within ${step_limit_text(r.limit)} steps while compiling — $still" +
                     step_advice()
     end if
 end out_of_steps
@@ -1798,14 +1811,14 @@ private sized(r: &EvRun, at: Span, n: long) -> bool = charged(r, at, n, s"an arr
 // The same for any value made a step per element or byte: `what` names it.
 @noinline
 private charged(r: &EvRun, at: Span, n: long, what: string) -> bool
-    if r.steps + n <= step_limit()
+    if r.steps + n <= r.limit
         r.steps += n
         return true
     end if
 
     if r.kind == EvRunning
         r.kind = EvLimit
-        r.message = s"${r.subject} did not finish within ${step_limit_text()} steps while compiling — $what at " +
+        r.message = s"${r.subject} did not finish within ${step_limit_text(r.limit)} steps while compiling — $what at " +
                     s"${place_text(here(r), at)} is past the steps that were left" + step_advice()
     end if
 
