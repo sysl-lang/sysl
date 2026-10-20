@@ -4,10 +4,10 @@ summary: What the compiler reads before it parses anything — tokens, literals,
 weight: 10
 ---
 
-sysl is read in two passes that are worth keeping separate in your head. A **lexer** turns characters
-into tokens and, because the language is indentation-sensitive, also inserts the tokens that open and
-close blocks. Only then does a parser see anything. Most of the surprises in a layout-sensitive
-language happen in the first pass, which is why it gets its own page.
+sysl source is read in two passes. A **lexer** turns characters into tokens and, because the
+language is indentation-sensitive, also inserts the tokens that open and close blocks. The parser
+then reads those tokens. Most of what is surprising about a layout-sensitive language happens in the
+first pass, so this page describes it on its own.
 
 ## Source text
 
@@ -19,18 +19,18 @@ Line endings may be LF or CRLF. A file need not end in a newline.
 ## Literate source
 
 **A file named `.lsysl` is a Markdown document, and the part of it indented four columns is the
-program.** Everything else is prose and is not compiled. Which of the two a file is, its **name**
-decides and nothing else: a `.sysl` file is never read this way whatever its indentation happens to
-look like, and a `.lsysl` file with no prose in it is a `.sysl` file with four spaces down the left.
+program.** Everything else is prose and is not compiled. The file's **name** alone decides which
+kind of file it is: a `.sysl` file is never read this way, whatever its indentation, and a `.lsysl`
+file with no prose in it is a `.sysl` file indented four spaces.
 
-There is no other marker — no name on a block, no directive opening one, no way to say that a block
-ends.
+There is no other marker: no name on a block, no directive that opens one, and no way to say that a
+block ends.
 
 ````text
 # Halving
 
-The interesting part of this program is that it explains itself. Everything at the
-margin is prose, and the compiler never sees it.
+This program explains itself. Everything at the margin is prose, and the compiler
+never sees it.
 
     half(n: int) -> int = n / 2
 
@@ -60,12 +60,12 @@ print(half(9))
 4
 ```
 
-This is Knuth's *WEB* with its most famous half deliberately left out. WEB let an author write the
-program in the order that explains it and had a *tangler* put it back into the order the compiler
-needs, which is the feature that made a `.web` file unreadable without its tools. Here the code
-appears in the order it runs and the tangler only removes prose, so the file is legible as it sits —
-by a reader, by a Markdown renderer, and by `grep`. What is kept is the part that pays: room for an
-argument between two functions, in a place a comment cannot hold it.
+This is a form of Knuth's *WEB* without reordering. WEB let an author write the program in the order
+that explains it and had a *tangler* rearrange it into the order the compiler needs, which made a
+`.web` file hard to read without its tools. In a `.lsysl` file the code appears in the order it runs
+and the tangler only removes prose, so the file reads correctly as it is — to a person, to a Markdown
+renderer, and to `grep`. What it adds over comments is room for a full explanation between two
+functions.
 
 ### The four rules
 
@@ -74,49 +74,46 @@ is exactly what the compiler reads.
 
 **Consecutive indented blocks are one block.** A paragraph between two of them ends nothing, so a
 function body may be explained a step at a time: the prose dedents to column zero and the code
-resumes at the indentation it left off at. Without this the format would only be good for examples,
-which is the length at which it is not needed.
+resumes at the indentation it left off at.
 
-**A fenced block is an illustration.** Both ` ``` ` and `~~~` mark code that is to be *looked at*
-rather than run — the wrong version beside the right one, a shell transcript, a fragment of C — and
-none of it is compiled however it is indented. Code that runs is indented; code that is shown is
+**A fenced block is an illustration.** Both ` ``` ` and `~~~` mark code that is to be read rather
+than run — a wrong version beside the right one, a shell transcript, a fragment of C — and none of
+it is compiled, however it is indented. Code that runs is indented; code that is only shown is
 fenced.
 
 **What is under a bullet is prose.** An indented block inside a list item belongs to that item, so a
 list may hold examples without any of them entering the program. An executable block therefore never
-sits directly under a list; a line of prose between them is what separates the two.
+sits directly under a list; a line of prose separates the two.
 
-### Positions survive
+### Source positions are preserved
 
 **Prose is blanked, not removed.** The text handed to the lexer has exactly as many lines as the
-file, and each line of program text is on the line it was written on — so every position the lexer
-records is already a position in the `.lsysl` file. There is no mapping table, and no pass below the
-parser knows that any of this happened.
+file, and each line of program text stays on the line it was written on, so every position the
+lexer records is already a position in the `.lsysl` file. No mapping table is needed, and no later
+pass treats a literate file differently.
 
-The one coordinate that does move is the **column**, by the four that made the line code, and it is
-added back where a position is *reported*. A diagnostic therefore names the line and column of the
-file the reader has open.
+The one coordinate that moves is the **column**, by the four columns of indentation that made the
+line code. They are added back when a position is reported, so a diagnostic names the line and
+column of the file the reader has open.
 
-### Two things Markdown would accept are refused
+### Two forms Markdown accepts are refused
 
-Both are the same failure — a program silently missing a piece of itself — and neither could be
-diagnosed later, because what reaches the compiler afterwards is a program that is merely smaller
-than the author's.
+Both would silently drop part of the program, and neither could be diagnosed later, because what
+reaches the compiler is simply a smaller program than the author wrote.
 
-**A tab in the indentation.** A tab is as wide as whatever is displaying it, so a tab-indented line
-is program text in one editor and prose in another. It is refused *before* the four-column test
-rather than failing it, since failing it is the silent outcome — the line becomes prose, and a
-function quietly loses a statement.
+**A tab in the indentation.** A tab is as wide as whatever displays it, so a tab-indented line could
+be program text in one editor and prose in another. It is refused *before* the four-column test,
+because failing that test would silently turn the line into prose and drop a statement from a
+function.
 
 ```text
 error: a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another
 ```
 
-**A fence that is never closed.** Markdown runs an unclosed fence to the end of the document, which
-for a document is harmless. Here it turns every declaration below it into an illustration, and the
-diagnostic the author would otherwise get is about something incomplete much further down — their
-missing half never enters the story. It is refused at the line that opened it, which is the line to
-go and look at.
+**A fence that is never closed.** Markdown runs an unclosed fence to the end of the document. In a
+literate file that would turn every declaration below it into an illustration, and the resulting
+diagnostic would point somewhere far below the cause. The fence is refused at the line that opened
+it.
 
 ```text
 error: this fence is never closed, so everything below it is an illustration and none of it is compiled — close it, or indent the lines that are meant to run
@@ -124,28 +121,25 @@ error: this fence is never closed, so everything below it is an illustration and
 
 ### `tangle` and `weave`
 
-The two halves of a literate system are named for what they do to the source, and a build has been
-tangling all along — that is how a `.lsysl` file compiles at all. What the commands add is a way to
-ask for each half by name:
+The two halves of a literate system are named for what they do to the source. Every build of a
+`.lsysl` file tangles it; the commands let you run each half on its own:
 
-- **`sysl tangle`** prints the program with the prose stripped. It answers the question a misbehaving
-  literate file always raises — *what did the compiler actually read* — which a block indented that
-  should not have been, or a fence that swallowed a function, otherwise leaves unanswerable.
-- **`sysl weave`** renders the document as HTML. A `.lsysl` file is already Markdown, so the one
-  thing a renderer would otherwise lose is the highlighting: an indented block carries no language,
-  so nothing can colour it and nothing scanning for the code can find it. `weave` tells the renderer
-  that an indented block is sysl and passes the source through verbatim.
+- **`sysl tangle`** prints the program with the prose stripped. It shows exactly what the compiler
+  read, which is the first thing to check when a literate file misbehaves — a block indented that
+  should not have been, or a fence that swallowed a function.
+- **`sysl weave`** renders the document as HTML. A `.lsysl` file is already Markdown, but an
+  indented block carries no language, so a plain renderer cannot highlight it. `weave` marks each
+  indented block as sysl and passes the source through verbatim.
 
 **`tangle` reads the file the way a build does**, so a file the compiler refuses — a tab in an
-indent, a fence that is never closed — is refused by it with the same diagnostic, and the program it
+indent, a fence that is never closed — is refused with the same diagnostic, and the program it
 prints is the program a build compiles.
 
-*`weave` is not in this compiler yet — it answers "is not a command this compiler can carry out
-yet".*
+*`weave` is not implemented in this compiler; it reports "is not a command this compiler can carry
+out yet".*
 
-Both are covered under the [CLI](/getting-started/cli/). Weaving asks for no target, no standard
-module and no library, which is what makes a package's prose worth reading on a machine that could
-not build it.
+Both are covered under the [CLI](/getting-started/cli/). Weaving needs no target, no standard module
+and no library, so a package's documentation can be rendered on a machine that cannot build it.
 
 ## Comments
 
@@ -166,9 +160,8 @@ print(x)
 
 ### A block comment **nests**
 
-`/*` inside a block comment opens another one, and it takes a matching `*/` to close. That is what
-lets a block of code with comments in it be commented out, which is the reason most modern languages
-do it and C does not:
+`/*` inside a block comment opens another one, which needs its own matching `*/`. This lets you
+comment out a block of code that already contains comments, which C does not allow:
 
 ```sysl
 /* commented out, /* including this */ and on to here */
@@ -179,10 +172,10 @@ print(1)
 1
 ```
 
-**What it costs is that `/*` and `*/` mean something inside a comment, and backticks do not protect
-them.** The lexer has no idea it is reading Markdown. So a comment about anything whose text contains
-those two characters — a glob pattern above all — is a comment that does not end where it looks like
-it does, and neither diagnostic mentions comments:
+**As a consequence, `/*` and `*/` are significant inside a comment, and backticks do not protect
+them**: the lexer does not read Markdown. A comment whose text contains either sequence — a glob
+pattern is the common case — does not end where it appears to, and neither resulting diagnostic
+mentions comments:
 
 ```sysl
 /* a glob pattern: src/** */
@@ -193,8 +186,8 @@ print(1)
 unclosed comment
 ```
 
-That one opened a second comment at `c/*` and closed only that, so the outer ran to the end of the
-file. The other direction is worse, because the caret lands on prose:
+That comment opened a second comment at `c/*` and closed only the inner one, so the outer comment
+ran to the end of the file. The opposite case is harder to read, because the caret lands on prose:
 
 ```sysl
 /** matches "**/*.sysl" at any depth */
@@ -207,8 +200,8 @@ print(f())
 unterminated string literal
 ```
 
-There the `*/` inside `**/` closed the comment early, and everything after it was read as code — so
-the complaint is about a quote in what the writer believed was a sentence.
+There the `*/` inside `**/` closed the comment early and everything after it was read as code, so
+the diagnostic is about a quote in what was meant to be a sentence.
 
 **Write such a comment with `//`**, where neither sequence means anything:
 
@@ -223,9 +216,9 @@ print(f())
 1
 ```
 
-That is a real constraint on a doc comment rather than a curiosity: `/** … */` is the only form
-`sysl doc` reads, so a module whose subject is globs documents its grammar in `//` lines above the
-declarations rather than in the doc comments on them.
+This constrains doc comments too: `/** … */` is the only form `sysl doc` reads, so a module about
+globs documents its pattern syntax in `//` lines above the declarations rather than in their doc
+comments.
 
 ## Documentation comments
 
@@ -249,21 +242,20 @@ print(first([7, 8, 9]))
 7
 ```
 
-**The delimiter is the whole of what makes one.** An implementation note above a declaration stays an
-implementation note by being written `//`, so nothing has to guess at intent — and a `/* … */` block
-comment is not a doc comment either. `/**/` is an empty block comment rather than a doc comment
-opening.
+**Only the delimiter makes a doc comment.** An implementation note above a declaration is written
+with `//` and stays out of the documentation; a `/* … */` block comment is not a doc comment either.
+`/**/` is an empty block comment, not the opening of a doc comment.
 
 A `*` down the left margin is optional; where it is written, it and one following space are removed,
 so a fenced block inside a doc comment keeps its own indentation.
 
-**A doc comment is trivia and cannot change what a program means.** Nothing in the analyzer reads
-one, no lowering sees one, and a program compiles identically with every doc comment in it deleted.
+**A doc comment cannot change what a program means.** The analyzer and code generation ignore it, and
+a program compiles identically with every doc comment deleted.
 
 ### What a doc comment attaches to
 
-The declaration below it. **Annotations and `//` lines may sit between** — which is the ordinary
-shape, since `@test` and `@export` are written directly above what they annotate:
+The declaration below it. **Annotations and `//` lines may sit between them**, which is the usual
+layout, since `@test` and `@export` are written directly above what they annotate:
 
 ```sysl
 /** Answers twice its argument. */
@@ -278,8 +270,8 @@ print(twice(21))
 42
 ```
 
-**A blank line ends the association.** That is what lets a file open with prose belonging to the
-module rather than to whatever happens to be declared first:
+**A blank line ends the association**, so a file can open with a comment that documents the module
+rather than its first declaration:
 
 ```sysl
 module demo.text
@@ -295,9 +287,9 @@ byte_length(s: []const u8) -> usize = s.len
 
 ### Tags
 
-A tag is `@name` **at the start of a line**, and nowhere else — so an `@` inside a sentence opens
-nothing. Its text runs to the next tag or the end of the comment, and a blank line does not end it,
-because a tag's text is prose and prose has paragraphs.
+A tag is `@name` **at the start of a line**, and nowhere else, so an `@` inside a sentence is plain
+text. A tag's text runs to the next tag or the end of the comment; a blank line does not end it, so
+the text may have several paragraphs.
 
 | Tag | Takes | Means |
 |---|---|---|
@@ -310,15 +302,13 @@ because a tag's text is prose and prose has paragraphs.
 | `@since` | — | the version it appeared in |
 | `@deprecated` | — | what to use instead |
 
-**There is no `@throws`**, and its absence is not an oversight: sysl has no exceptions, and what a
-fallible function answers with is the `E` of its `Result[T, E]` — which `@return` describes, because
-it is part of the return type rather than a second channel out of the function.
+**There is no `@throws`.** sysl has no exceptions: a fallible function's error is the `E` of its
+`Result[T, E]`, which is part of the return type and is described under `@return`.
 
-### A tag naming the signature is checked; one that does not is prose
+### Tags that name the signature are checked
 
-`@param` and `@tparam` are the two that can go stale, because a rename leaves the paragraph
-describing something that is no longer there. So one naming a parameter the declaration does not have
-is refused:
+`@param` and `@tparam` can go stale when a parameter is renamed, so one naming a parameter the
+declaration does not have is refused:
 
 ```sysl
 /** Adds two numbers.
@@ -335,32 +325,29 @@ print(add(1, 2))
 error: 'c' is not a parameter of this declaration — it has a, b
 ```
 
-**The check runs in one direction only, and that is deliberate.** A parameter with **no** `@param` is
-not an error and must never become one: documentation is optional, a partial doc comment is better
-than none, and a rule requiring the full set is what makes people write `@param n the n` to silence
-it. Check what is written, never require what is absent — which is also what lets a library be
-converted a file at a time.
+**The check runs in one direction only.** A parameter with **no** `@param` is not an error:
+documentation is optional, and a partial doc comment is better than none. The compiler checks what
+is written and never requires what is absent.
 
-A bare `@param` with no name after it is its own mistake and is named as one.
+A bare `@param` with no name after it is reported as its own error.
 
-**`@param self` is admitted on a member.** The receiver is not an entry in the parameter list as far
-as the analyzer is concerned, but it is spelled in the declaration, and refusing the one tag a reader
-is most likely to reach for on a method would be pedantry about a real part of the signature. It is
-admitted rather than required, like every other parameter.
+**`@param self` is accepted on a member.** The receiver is not part of the analyzer's parameter
+list, but it is written in the declaration, so it may be documented. Like every other parameter, it
+is accepted rather than required.
 
-### An unrecognised `@name` is prose
+### An unrecognized `@name` is prose
 
-`@` is sysl's annotation sigil — `@test`, `@requires`, `@export`, `@no_alloc` — so a doc comment
-discussing one is discussing the language rather than tagging itself. The vocabulary above is closed
-and anything outside it is body text.
+`@` is also sysl's annotation sigil — `@test`, `@requires`, `@export`, `@no_alloc` — so a doc
+comment may mention one in its text. The tag vocabulary above is closed, and anything outside it is
+body text.
 
-What that costs is that a typo is silent: `@parm` is a paragraph beginning with a word, not a tag the
-compiler will complain about.
+As a result, a misspelled tag is silent: `@parm` begins a paragraph rather than producing a
+diagnostic.
 
 ### The first sentence is the summary
 
-The prose before the first tag is the **body**, and its first sentence is the **summary** — which is
-what an index with one column to spend shows.
+The prose before the first tag is the **body**, and its first sentence is the **summary**, which is
+what an index shows.
 
 A sentence ends at `.`, `!` or `?` **followed by a space or the end of the text**, so a dotted module
 name mid-sentence does not end one: *"Reads a `sysl.text` value and answers it."* is a single
@@ -384,30 +371,26 @@ print(año, área(3.0, 4.0), Círculo(2.0).radio)
 2026 12 2
 ```
 
-This is a rule about *reading* rather than about internationalization. A language whose identifiers
-are ASCII asks everybody who does not think in English to transliterate their own vocabulary, and the
-words that suffer are the domain ones — the names a reader most needs to recognize. Go, Java, Scala
-and C# all draw the line here.
+This lets domain vocabulary be written in the programmer's own language rather than transliterated.
+Go, Java, Scala and C# follow the same rule.
 
 A **digit** is whatever Unicode calls one too, but only *inside* a name: `caf٣` is an identifier and
-`٣` is not, because a name may not begin with a digit in any script. The number *literal* grammar is
-deliberately unmoved — a literal is a value the arithmetic has to read, and `٣` is not one.
+`٣` is not, because a name may not begin with a digit in any script. Number *literals* accept only
+ASCII digits, so `٣` is not a number literal either.
 
-A **combining mark** — an accent, a vowel sign, anything Unicode files under category M — continues
-a name the way a letter does, so a name typed on a keyboard that composes `é` as an `e` and a
-combining acute is one identifier rather than an illegal character. It cannot *begin* a name, having
-nothing to combine with, and one written there is refused as exactly that.
+A **combining mark** — an accent, a vowel sign, anything in Unicode category M — continues a name the
+way a letter does, so a name typed on a keyboard that composes `é` as an `e` plus a combining acute
+is one identifier. A combining mark cannot *begin* a name, and one written there is refused.
 
-**Two spellings that look identical are two names**, and this is the one edge worth stating outright:
-`café` written with a precomposed `é` and `café` written with an `e` and a combining acute are
-different identifiers — both legal, and a program may declare the two side by side without a
-collision. sysl applies no normalization, which is a deliberate refusal of UAX #31's
-rule — a declaration is what a caller has to spell, and folding them would make a name that looks
-right refuse to resolve for a reason nothing on the screen shows.
+**Two spellings that look identical are two names.** `café` written with a precomposed `é` and
+`café` written with an `e` and a combining acute are different identifiers; both are legal, and a
+program may declare both without a collision. sysl applies no Unicode normalization (unlike UAX
+#31's recommendation), so a name resolves only when it is spelled with the same code points as its
+declaration.
 
-**A letter above the Basic Multilingual Plane is refused**, which is the other edge and is not
-predictable from the rule above. Every living script's letters are inside the BMP, CJK Unified
-Ideographs included; what is outside is the historic scripts and the CJK extension planes.
+**A letter above the Basic Multilingual Plane is refused.** This is not predictable from the rule
+above. The letters of every living script are inside the BMP, CJK Unified Ideographs included; what
+lies outside it is historic scripts and the CJK extension planes.
 
 ```sysl
 val 𠮷 = 1
@@ -417,19 +400,17 @@ print(𠮷)
 illegal character
 ```
 
-An **operator-shaped** character is not a letter and never was: `×` and `÷` are refused the same way.
+An **operator-shaped** character is not a letter: `×` and `÷` are refused the same way.
 
-Case is significant. Capitalization is not enforced anywhere, but the convention the standard library
-and this documentation follow is `PascalCase` for types and traits, `snake_case` for everything else —
-and the syntax highlighting treats a capitalized name as a type, so following it makes code read
-correctly on a page.
+Case is significant. Capitalization is not enforced, but the standard library and this documentation
+use `PascalCase` for types and traits and `snake_case` for everything else, and syntax highlighting
+treats a capitalized name as a type.
 
 ### Quoted identifiers
 
 **A name written between backticks may be anything the rule above refuses** — a reserved word, or a
-name carrying spaces and punctuation. That set is narrower than it looks: since a letter is Unicode's
-letter, `café` and `名前` need no backticks, and what is left for the quoted form is punctuation,
-spaces, and the words the grammar has taken for itself.
+name containing spaces and punctuation. Since a letter is any Unicode letter, `café` and `名前` need
+no backticks; the quoted form is for punctuation, spaces and reserved words.
 
 ```sysl
 var `item count` = 3
@@ -452,11 +433,10 @@ print(1)
 'match' is a reserved word, so it cannot stand as a function's name — write it '`match`'
 ```
 
-It is a name and nothing more: `` `match` `` *is* the identifier `match`. A contextual word written
-this way is an ordinary name rather than the word — `` `end` `` names something, and does not close a
-block.
+The backticks are not part of the name: `` `match` `` *is* the identifier `match`. A contextual word
+written this way is an ordinary name — `` `end` `` names something and does not close a block.
 
-That holds for a name the ordinary grammar can also write, so the two spellings are one name:
+The same holds for a name the ordinary grammar can also write, so the two spellings are one name:
 
 ```sysl
 var café = 3
@@ -467,16 +447,16 @@ print(café)
 4
 ```
 
-Two characters may not appear inside, and a newline ends the search rather than the name, so an
-unclosed backtick is reported on the line that opened it. A **backtick** cannot appear at all, since
-there are no escapes inside. A **`.`** cannot either: a qualified name is carried as a dotted string,
-so a dot inside one part could not be told from the separator between two.
+Two characters may not appear inside the backticks. A **backtick** cannot, since there are no
+escapes. A **`.`** cannot either, because a qualified name is stored as a dotted string and a dot
+inside one part could not be told from the separator between two. A newline ends the search rather
+than the name, so an unclosed backtick is reported on the line that opened it.
 
-A **module path** is written with plain names only, for the same reason — `module my.mod`, never
-``module `my mod` ``. A module names a directory, and its parts are what the file system holds.
+A **module path** is written with plain names only — `module my.mod`, never ``module `my mod` `` —
+because a module names a directory and its parts must be directory names.
 
-The form does a second job in a `match` arm, where a backticked name **references** a variable
-already declared rather than binding a new one.
+In a `match` arm the form has a second use: a backticked name **refers to** a variable already
+declared rather than binding a new one.
 
 ## Reserved words
 
@@ -495,14 +475,12 @@ Forty words are reserved and may not be used as identifiers:
 
 **`alloc`, `no` and `requires` are *not* among them**, though they read like keywords where they
 appear. A capability is written as an [attribute](/reference/attributes/) — `@no_alloc`,
-`@requires(os)` — and an attribute's words are matched as ordinary identifiers, which is the point of
-spelling capabilities that way: no word is spent, so an allocator may still call its function
-`alloc`.
+`@requires(os)` — and an attribute's words are matched as ordinary identifiers, so no word is
+reserved and an allocator may still name its function `alloc`.
 
-**Type names are deliberately not among them.** `int`, `usize`, `f32`, `bool`, `string` and the rest
-are *predeclared identifiers* that the analyzer resolves, exactly as in Go and Swift. That is what
-lets the `iN` / `uN` / `fN` families stay open: `u12` and `i5` are types you may write without the
-lexer having heard of them, and no list of widths has to be maintained anywhere.
+**Type names are not reserved either.** `int`, `usize`, `f32`, `bool`, `string` and the rest are
+*predeclared identifiers* that the analyzer resolves, as in Go and Swift. This keeps the `iN` / `uN`
+/ `fN` families open: `u12` and `i5` are valid types without the lexer knowing a list of widths.
 
 A few words are **contextual** — special only where the grammar expects one, and ordinary identifiers
 everywhere else: `is`, `not`, `end`, `become`, `opaque`, `derives`, `invariant`, `new`, `set`, `some`,
@@ -510,15 +488,14 @@ everywhere else: `is`, `not`, `end`, `become`, `opaque`, `derives`, `invariant`,
 and the `c` of a [`c const` or `c type`](/reference/ffi/) block. You may name a variable `where`; you
 may not name one `while`.
 
-**A word is contextual rather than reserved when it can be**, and the trade is the same every time: a
-reserved word is spent out of every program's namespace for the sake of one line apiece.
-[`become`](/reference/declarations/) needs no reservation at all, because two identifiers in a row
-are not otherwise a statement — so a `become` of a function called `become` reads as exactly what it
-is. `async` is the same case, being a keyword only where a declaration follows it, and `await` only
-where an operand does.
+**A word is contextual rather than reserved wherever the grammar allows it**, because a reserved word
+is removed from every program's namespace. [`become`](/reference/declarations/) needs no reservation,
+because two identifiers in a row are not otherwise a statement, so a `become` of a function named
+`become` parses unambiguously. Likewise `async` is a keyword only where a declaration follows it,
+and `await` only where an operand does.
 
-`set` is read only where a member declaration begins, which is what keeps the word available for
-everything else it is wanted for — a container, a local, a method:
+`set` is special only where a member declaration begins, so the word remains available as the name
+of a container, a local or a method:
 
 ```sysl
 struct Cell
@@ -534,10 +511,9 @@ print(set.get)
 3
 ```
 
-The last of those is the clearest case for why the language spends so few words. `c` is the most
-common one-letter name in code that handles characters, and what keeps it available is the keyword
-that follows it: nothing else in sysl puts one after a name, so each pair can only be the one thing,
-and the word costs nobody anything.
+`c` is a common name in code that handles characters. It stays available because it is special only
+when followed by `const` or `type`; nothing else in sysl puts a keyword after a name, so the pair is
+unambiguous.
 
 ## Reserved identifiers
 
@@ -554,16 +530,15 @@ __file__        not reserved — the middle is not capitals
 __FILE_         not reserved — one underscore short, and so an ordinary name
 ```
 
-The shape is reserved rather than the names in it, which is what makes every future addition
-non-breaking: a release that adds a new built-in cannot collide with a name you already declared,
-because the shape was never yours to declare. C reserves the same territory and diagnoses nothing in
-it; here taking it is refused where it is written.
+The shape is reserved rather than particular names, so a new built-in can never collide with a name
+a program has declared. C reserves the same names but does not diagnose their use; sysl refuses the
+declaration where it is written.
 
 These are **predeclared identifiers**, like the type names above — not reserved words, and absent from
 the table.
 
-The restriction is on sysl names only. The string an `extern` links to is untouched, which matters
-because a C library's own symbols live in exactly this space:
+The restriction applies to sysl names only. The symbol an `extern` links to is unaffected, since a C
+library's own symbols often have this shape:
 
 ```sysl
 private extern "__errno_location" errno_location() -> *i32
@@ -586,7 +561,7 @@ private extern "__errno_location" errno_location() -> *i32
 for and is range-checked with it.
 
 **A built-in written as a default argument reports the caller.** A default is evaluated at the call,
-standing where the argument would have been written, so this needs no special mechanism:
+in the place where the argument would have been written:
 
 ```sysl
 where(line: int = __LINE__) -> int = line
@@ -600,20 +575,19 @@ print(where())
 4
 ```
 
-That is how the standard library's `assert` names the line it failed on, and why its message is
-optional. Where a default fills another default, the outermost call is the one reported.
+This is how the standard library's `assert` reports the line that failed, which is why its message
+is optional. Where a default fills another default, the outermost call is the one reported.
 
-`__DATE__` and `__TIME__` make a build non-reproducible, in the way C's do. They are worth having for
-a firmware build stamp and worth not reaching for otherwise.
+`__DATE__` and `__TIME__` make a build non-reproducible, as C's do. They suit a firmware build stamp
+and are best avoided otherwise.
 
 ### `__VERSION__` is the package's version
 
 **`__VERSION__` is the `version` the [manifest](/reference/packages/#what-a-project-is-called)
-states, so `package.hocon` is the one place a program's version is written.** A `--version` flag or an
-About screen reads it rather than keeping a `const VERSION = "…"` of its own that has to be
-remembered at every release. In a package whose manifest says `version = "1.4.0"`, this prints
-`mytool 1.4.0` — and a block on this page is a lone file with no manifest beside it, so here it is
-refused, for the reason the last paragraph of this section gives:
+states, so `package.hocon` is the one place a program's version is written.** A `--version` flag or
+an About screen reads it instead of keeping its own `const VERSION = "…"`. In a package whose
+manifest says `version = "1.4.0"`, this prints `mytool 1.4.0`. A block on this page is a lone file
+with no manifest, so here it is refused, as described at the end of this section:
 
 ```sysl
 print("mytool ", __VERSION__)
@@ -629,12 +603,11 @@ It is a string literal like `__FILE__`, folded where it is written, so a `const`
 **It belongs to the package whose file it is written in.** A library's `__VERSION__` is the library's
 own version wherever it is called from, never its consumer's.
 
-**Except as a default argument, where it reports the caller — exactly as `__FILE__` and `__LINE__`
-do.** A default stands where the argument would have been written, so a library's
-`stamp(v: string = __VERSION__)` answers the version of whichever package the call to `stamp()` sits
-in: the program's when the program calls it, a second library's when that library does, and the
-library's own only when it calls itself. That is what lets a library offer a `--version` helper that
-reports the program using it rather than itself.
+**As a default argument it reports the caller, as `__FILE__` and `__LINE__` do.** A library's
+`stamp(v: string = __VERSION__)` answers the version of whichever package contains the call to
+`stamp()`: the program's when the program calls it, another library's when that library does, and
+the library's own only when it calls itself. A library can therefore offer a `--version` helper that
+reports the program using it.
 
 **A file that belongs to no package has no version to read**, so `__VERSION__` is refused there — a
 lone `sysl run tool.sysl` with no `package.hocon` beside it, or a manifest with no `version` key. The
@@ -644,13 +617,12 @@ package"*, or *"… and …/package.hocon declares none"*.
 ### `__NAME__` is the package's name
 
 **`__NAME__` is the `name` the [manifest](/reference/packages/#what-a-project-is-called) states, so a
-program can name itself without writing its name a second time.** It is `__VERSION__`'s twin: the
-same manifest, read the same way, with the same rules. The motivating use is a log tag: a logging
-function that defaults its tag to `__NAME__` tags every message with the name of the package that
-called it, because a default reports the caller. In a package whose manifest says
-`name = "skitter-app"`, this prints `[ skitter-app ] started` — and a block on this page is a lone
-file with no manifest beside it, so here it is refused, for the reason the last paragraph of this
-section gives:
+program can name itself without writing its name a second time.** It follows the same rules as
+`__VERSION__`. A typical use is a log tag: a logging function that defaults its tag to `__NAME__`
+tags every message with the name of the calling package, because a default reports the caller. In a
+package whose manifest says `name = "skitter-app"`, this prints `[ skitter-app ] started`. A block
+on this page is a lone file with no manifest, so here it is refused, as described at the end of this
+section:
 
 ```sysl
 logcat(msg: string, tag: string = __NAME__)
@@ -668,8 +640,8 @@ initialized with it.
 
 **It belongs to the package whose file it is written in, except as a default argument.** A library's
 `__NAME__` is the library's own name wherever it is called from; written as a default, it is the name
-of whichever package the call sits in — the program's when the program calls it, a second library's
-when that library does. That is the rule `__VERSION__` and `__FILE__` follow, for the same reason.
+of whichever package contains the call — the program's when the program calls it, another library's
+when that library does. `__VERSION__` and `__FILE__` follow the same rule.
 
 **A file that belongs to no package has no name to read**, so `__NAME__` is refused there — a lone
 `sysl run tool.sysl` with no `package.hocon` beside it, or a manifest with no `name` key. The refusal
@@ -697,7 +669,7 @@ A manifest may state either field without the other: one with a `name` and no `v
 Decimal, hexadecimal (`0x`), binary (`0b`), and octal (`0o`). The prefix letter may be written in
 either case, so `0XFF`, `0B1010` and `0O755` are the same literals as `0xFF`, `0b1010` and `0o755`;
 the hexadecimal digits are case-insensitive too. An underscore may appear between digits and is
-ignored, so long groupings stay readable. A canonical type name may be written as a **suffix**;
+ignored, so long numbers can be grouped. A canonical type name may be written as a **suffix**;
 without one the literal takes its type from context.
 
 ```sysl
@@ -714,13 +686,13 @@ print(dec, hex, bin, oct, suffixed)
 1000000 255 170 493 42
 ```
 
-The scan is greedy and validated afterwards rather than stopping at the first character that does not
-fit. That is why `42abc` is *one bad literal* and a clear diagnostic, rather than `42` followed by an
-identifier and a confusing parse error further along.
+The scan is greedy and validated afterwards, rather than stopping at the first character that does
+not fit, so `42abc` is reported as one malformed literal rather than as `42` followed by an
+identifier and a parse error further along.
 
 An unsuffixed literal adopts the type its context expects, provided the value fits — `var x: u8 = 42`
-makes `42` a `u8`, and `var x: u8 = 300` is a compile error. This is not implicit promotion: the
-literal simply *is* that type.
+makes `42` a `u8`, and `var x: u8 = 300` is a compile error. This is not a conversion: the literal
+*is* that type.
 
 ### Floating point
 
@@ -739,13 +711,14 @@ print(f1, f2, f3)
 3.14 2500 0.001
 ```
 
-Note the rendering: a float prints in the shortest form that round-trips, so `2.5e3` shows as `2500`
-and carries no `.0`. Binary and octal have no floating-point form.
+A float prints in the shortest form that round-trips, so `2.5e3` prints as `2500`, without a `.0`.
+Binary and octal have no floating-point form.
 
-**A hexadecimal float is C99's**: a hex significand, an optional `.` and hex fraction, and a `p`
+**A hexadecimal float follows C99**: a hex significand, an optional `.` and hex fraction, and a `p`
 exponent — a power of **two**, written in decimal. The `p` is required (hex digits include letters, so
 `0x1.b` is an integer and a field read), either case is accepted, and a suffix goes after the
-exponent. It infers as a decimal float does: `real` unless the suffix or the context says otherwise.
+exponent. Its type is inferred as for a decimal float: `real` unless the suffix or the context says
+otherwise.
 
 ```sysl
 val ln2_hi = 0x1.62e42fefa39efp-1
@@ -759,10 +732,11 @@ print(0x1.8p3, 0x1p-2, pi, ln2_hi.bits() == 0x3fe62e42fefa39ef, third.bits() == 
 12 0.25 3.141592653589793 true true
 ```
 
-**A hex float is exact, or it is refused.** The digits *are* the bits — that is the whole reason a
-libm is written in them — so a literal whose type cannot hold its value exactly is an error naming
-the type, never a quiet rounding: too many significant bits, a power past the type's largest finite
-value, or a bit below its smallest subnormal. The same digits are fine at a type wide enough for them.
+**A hex float is exact, or it is refused.** Hex float digits specify the bits directly, which is why
+math libraries use them, so a literal whose type cannot hold its value exactly is an error naming the
+type rather than a silent rounding: too many significant bits, a power past the type's largest
+finite value, or a bit below its smallest subnormal. The same digits are accepted at a type wide
+enough to hold them.
 
 ```sysl
 val x: f32 = 0x1.000001p0
@@ -783,10 +757,10 @@ the hex float '0x1p-1075' is not exactly a 'real': its lowest bit is 2^-1075, an
 At a [fixed-point](/reference/fixed-point/) type a hex float is exact when its lowest bit is no finer
 than the type's step: `0x1p-15` is the smallest `q15`, and `0x1p-16` is refused.
 
-A float's encoding is also reachable the other way, through `FloatBits`: `real.from_bits(b)`,
-`f32.from_bits(b)` and `x.bits()` reinterpret rather than convert, and **they fold while compiling**,
-so a table of constants written as bit patterns is constant data exactly as one written in hex floats
-is — in a `const`, in a module `val` laid into `.rodata`, and inside a `const` function.
+A float's encoding can also be written as an integer, through `FloatBits`: `real.from_bits(b)`,
+`f32.from_bits(b)` and `x.bits()` reinterpret rather than convert, and **they fold at compile
+time**, so a table of constants written as bit patterns is constant data just as one written in hex
+floats is — in a `const`, in a module `val` placed in `.rodata`, and inside a `const` function.
 
 ```sysl
 const LN2_HI: real = real.from_bits(0x3fe62e42fefa39ef)
@@ -838,10 +812,9 @@ print(int(ch), int(nl), int(bs), int(uni))
 65 10 8 128512
 ```
 
-The named set is C's, and is deliberately no larger: the escape a programmer reaches for should be
-the one every language they might arrive from has. The notable absence is **`\e`** for the escape
-character, U+001B, which some shells and Perl accept — it is a GNU extension rather than standard C,
-and Rust and Go both refuse it. Terminal code writes `'\u{1b}'` and gives it a name.
+The named set is C's, with no additions. The notable absence is **`\e`** for the escape character,
+U+001B, which some shells and Perl accept; it is a GNU extension rather than standard C, and Rust and
+Go both refuse it. Terminal code writes `'\u{1b}'` and gives it a name.
 
 ```sysl
 var esc = '\e'
@@ -853,9 +826,8 @@ print(int(esc))
 unknown escape sequence '\e'
 ```
 
-`\u{...}` is braced rather than a fixed four hex digits because a scalar value may need up to six —
-the fixed-width form is what forces surrogate pairs into source text, and sysl's `char` is a scalar
-value rather than a UTF-16 code unit, so there is nothing to pair.
+`\u{...}` is braced rather than a fixed four hex digits because a scalar value may need up to six.
+sysl's `char` is a scalar value rather than a UTF-16 code unit, so there are no surrogate pairs.
 
 ### Byte literals
 
@@ -863,13 +835,13 @@ A character literal is a `char` — except **where a `u8` is wanted**, where an 
 point below 128) is that byte. It takes its type from its position exactly as an integer literal
 does: a binding's annotation, an argument, a return, an array element, a pattern or a range in a
 pattern against a `u8`, and an operand of an operator whose other operand is a `u8`, on either
-side. Byte-oriented code reads the way it means, with no `u8(...)` around each character.
+side. Byte-oriented code therefore needs no `u8(...)` around each character.
 
 ```sysl
 import sysl.buf.{Buf, buf}
 
 digit(b: u8) -> int = b match
-    '0'..'9' -> int(b - '0')
+    '0'..'9' -> b - '0'
     _ -> -1
 
 val sep: u8 = ','
@@ -888,12 +860,12 @@ print(sep, fields, digit('7'), digit('x'), out.len(), out.at(1))
 44 3 7 -1 2 10
 ```
 
-Escapes are the bytes they encode — `'\n'` is 10, `'\0'` is 0, `'\u{7f}'` is 127. Where no `u8` is
-wanted, nothing changes: `val c = 'a'` is a `char`, and so is each side of `'a' == 'b'`.
+An escape is the byte it encodes — `'\n'` is 10, `'\0'` is 0, `'\u{7f}'` is 127. Where no `u8` is
+expected, a character literal is a `char`: `val c = 'a'` is a `char`, and so is each side of
+`'a' == 'b'`.
 
-A code point from 128 up is **more than one byte** of UTF-8, so it is not a byte, and is refused
-rather than cut down to one. A string is the way to write its bytes, and `u8(0x..)` the way to write
-one byte by number:
+A code point of 128 or above is **more than one byte** of UTF-8, so it is refused as a byte rather
+than truncated. Write a string for its bytes, or `u8(0x..)` for one byte by number:
 
 ```sysl
 val b: u8 = 'é'
@@ -921,8 +893,8 @@ print(x)
 cannot initialize 'x': declared i8 but the value is char
 ```
 
-The rule is about the **literal**, whose value is known as it is written. A `char` held in a
-variable may be any code point, so it still needs the conversion, which keeps its low eight bits:
+The rule applies to the **literal**, whose value is known where it is written. A `char` held in a
+variable may be any code point, so it needs an explicit conversion, which keeps its low eight bits:
 
 ```sysl
 val c = 'a'
@@ -950,17 +922,14 @@ There are several other quote forms, each marked by a prefix on the opening quot
 | `raw"…"` | left exactly alone — no escapes decoded and no `${…}` read |
 
 Any of them may also be written **tripled** as a text block, which spans lines and strips the common
-leading indentation so the text lines up with the code around it rather than against the left margin.
+leading indentation, so the text can be indented with the surrounding code.
 
-The forms are told apart at the token, so nothing downstream has to remember which quote produced a
-given value.
+The forms are distinguished by the lexer, so later passes see only the resulting value.
 
-**`raw` means raw, which is one rule rather than two thirds of one.** Scala's `raw` is an
-interpolator that happens to leave backslashes alone, and copying that left the one combination
-nobody could write: a plain string reads no `${…}` and *does* decode escapes, and Scala's `raw` does
-the opposite, so *leave all of it alone* had no spelling at all. That is the only thing a literal
-carrying another language's source can use — and `${` is not exotic, since shell, Make, Kotlin,
-Groovy and JavaScript template literals all spell interpolation with it.
+**`raw` leaves everything alone**: it decodes no escapes and reads no `${…}` holes. A plain string
+reads no holes but decodes escapes; `raw` is the form for text that must pass through untouched,
+such as source code in another language. (`${` is common in such text: shell, Make, Kotlin, Groovy
+and JavaScript template literals all use it for interpolation.)
 
 ```sysl
 val program = raw"""
@@ -981,14 +950,15 @@ fn main() {
 
 ```
 
-Byte for byte what was written, with the block's indentation still stripped so it sits at the margin
-of the code around it. **On one line a `raw"…"` cannot hold a `"`** — the first one ends it, because
-there is no escape left to write one with — which is what the tripled form is for.
+The output is byte for byte what was written, with the block's common indentation stripped. **A
+single-line `raw"…"` cannot contain a `"`**, since the first one ends it and there is no escape;
+use the tripled form instead.
 
 ### Loop labels
 
-A label is `'name` — an apostrophe and an identifier, the form Rust uses. It is told from a character
-literal by the **absence of a closing quote**: `'a'` is the character `a`, and `'a` is the label `a`.
+A label is `'name` — an apostrophe and an identifier, as in Rust. It is distinguished from a
+character literal by the **absence of a closing quote**: `'a'` is the character `a`, and `'a` is the
+label `a`.
 
 ### `true`, `false`, `null`
 
@@ -1013,17 +983,16 @@ Operators are tokenized by longest match, so `..<` wins over `..`, and `<<=` ove
 #  ;
 ```
 
-Two of these are worth a note. `.*` is lexed as **one token** — the tail of a wildcard import — which
-is possible because a `.` is otherwise only ever followed by a name. And `;` is *only* a separator
-inside a three-clause `for` header: it is deliberately not a statement terminator, because a line
-already ends a statement and a token that could also end one would give the language two answers to
-the same question.
+Two of these need a note. `.*` is lexed as **one token** — the tail of a wildcard import — which is
+possible because a `.` is otherwise always followed by a name. And `;` is a separator *only* inside a
+three-clause `for` header. It is not a statement terminator, because the end of a line already ends
+a statement.
 
-`@` opens an annotation and `#` opens a directive, and between them they are a declaration's only
-prefixes that are not words. Nothing in the expression grammar spells either, so neither needs
-lookahead to recognize. The two are told apart by the sigil and not by the margin, though a directive
-is taken by a pass that runs before the lexer and reads only column 1 — so an *indented* `#` reaches
-the grammar like any other token, and [attributes](/reference/attributes/) says what it is told there.
+`@` opens an annotation and `#` opens a directive; they are the only non-word prefixes a declaration
+can have. The expression grammar uses neither, so neither needs lookahead to recognize. A directive
+is handled by a pass that runs before the lexer and reads only column 1, so an *indented* `#`
+reaches the grammar like any other token; [attributes](/reference/attributes/) describes how it is
+read there.
 
 ## Layout
 
@@ -1048,10 +1017,10 @@ print(count(4))
 
 ### A dedent goes back to a margin that is still open
 
-**A line less indented than the one above it has to line up with a block that is still open**, and it
-closes every block indented deeper than it. A line that lines up with none of them — a body pulled back
-to a column between two open margins, usually after moving code — is refused, naming the two margins it
-fell between:
+**A line less indented than the one above it must line up with a block that is still open**, and it
+closes every block indented deeper than it. A line that lines up with none of them — usually a line
+left between two open margins after code was moved — is refused, and the diagnostic names the two
+margins:
 
 ```sysl
 check(n: int)
@@ -1064,14 +1033,13 @@ check(n: int)
 a line indented 6 columns lines up with no open block: it sits between the block indented 8 and the one indented 4 — indent it to one of the two
 ```
 
-It is refused rather than read at the nearer margin because the layout cannot know which of the two was
-meant, and the two readings are different programs: at column 8 the second `print` runs only for a
-positive `n`, at column 4 it runs for every one. An `end` marker is a line like any other and is held to
-the same rule. A tab counts as one column.
+It is refused rather than read at the nearer margin because the two readings are different programs:
+at column 8 the second `print` runs only for a positive `n`, and at column 4 it runs for every `n`.
+An `end` marker is a line like any other and follows the same rule. A tab counts as one column.
 
-**One ragged line is not refused: an `else` or `elif` lined up exactly under the `if` it continues.**
-An `if` written to the right of a `=` sits at a column no block opened, and the branch lined up under it
-is the layout everyone reaches for:
+**One exception: an `else` or `elif` lined up exactly under the `if` it continues.** An `if` written
+to the right of a `=` sits at a column no block opened, and lining its branches up under it is the
+natural layout:
 
 ```sysl
 sign(n: int) -> string
@@ -1090,10 +1058,10 @@ print(sign(-3), sign(0), sign(5))
 negative zero positive
 ```
 
-It is read exactly as the same branch written at the statement's margin, and it holds for an `else if`,
-for an `if` nested in another's branch, and for a statement `if` after an arm's `->`. The `if` has to be
-the one the line continues — in the same statement — and the column has to be the `if` word's own; an
-`else` anywhere else that no block opened is refused as above:
+It is read exactly as the same branch written at the statement's margin. This holds for an
+`else if`, for an `if` nested in another's branch, and for a statement `if` after an arm's `->`. The
+`if` must be the one the line continues, in the same statement, and the column must be that of the
+`if` keyword itself; an `else` at any other column that no block opened is refused as above:
 
 ```sysl
 sign(n: int) -> string
@@ -1108,9 +1076,9 @@ sign(n: int) -> string
 a line indented 17 columns lines up with no open block: it sits between the block indented 19 and the one indented 4 — indent it to one of the two
 ```
 
-The branch lined up under its `if` may also sit **deeper** than the line it continues, which is where it
-lands when the `then` branch stays on the `if`'s own line. Such a line opens no block; it goes on the
-statement above, after a `=` or after an arm's `->` alike:
+The branch lined up under its `if` may also sit **deeper** than the line it continues, as happens when
+the `then` branch stays on the `if`'s own line. Such a line opens no block; it continues the
+statement above, whether after a `=` or after an arm's `->`:
 
 ```sysl
 digits(o: Option[int], wide: bool) -> int
@@ -1134,16 +1102,15 @@ print(digits(None, true), digits(None, false), digits(Some(3), false))
 ### Brackets suspend the rule
 
 Inside `(`, `[` or `{`, layout stops applying until the bracket closes — so an argument list, an array
-literal, or a parenthesized expression may be broken across lines however you like, and the
-indentation of the continuation lines means nothing.
+literal, or a parenthesized expression may be broken across lines freely, and the indentation of the
+continuation lines is ignored.
 
 ### Except where a block opens inside them
 
 **A token that opens an indented block opens one wherever it is written, brackets included.** There
-are two of them — `match`, which opens its arms, and `->`, which opens a closure's body or an arm's
-— and inside a bracket pair the layout the bracket suspended is put back for the block's extent and
-taken away again at its dedent. Without that a block's own margin, which is the only thing saying
-where it ends, would have meant nothing.
+are two such tokens — `match`, which opens its arms, and `->`, which opens a closure's body or an
+arm's. Inside a bracket pair, layout is restored for the extent of the block and suspended again at
+its dedent, since a block's margin is what marks where it ends.
 
 ```sysl
 name(n: int)
@@ -1163,7 +1130,7 @@ one
 many
 ```
 
-The same for an arrow, which is what a multi-statement closure passed as an argument needs:
+The same applies to an arrow, so a multi-statement closure can be passed as an argument:
 
 ```sysl
 apply(f: int -> int, n: int) -> int = f(n)
@@ -1179,11 +1146,11 @@ print(apply((x) ->
 ```
 
 The bracket rule resumes at the dedent, so an argument written after the block is read at the outer
-level and its own margin means nothing again.
+level, and its indentation is again ignored.
 
-**A comma on the block's own level ends the block — unless the line is a multi-assignment.** A line
+**A comma at the block's own level ends the block, unless the line is a multi-assignment.** A line
 that is a list of places followed by an assignment operator is a statement of the block, and every
-comma on it, the values' included, is the statement's:
+comma on it, including those between the values, belongs to that statement:
 
 ```sysl
 call(f: () -> unit) = f()
@@ -1200,14 +1167,14 @@ call(() ->
 11
 ```
 
-**`then`, `else` and `do` are not among the two, and neither is the trailing block's `:`.** An `if`
-written across lines puts its `else` back at the *outer* margin, which is a dedent belonging to the
-bracket rather than to the block — a different mechanism rather than more of this one. A branch used
-as an argument has its one-line form, which is what an argument wants anyway.
+**`then`, `else` and `do` do not open blocks inside brackets, and neither does the trailing block's
+`:`.** An `if` written across lines puts its `else` back at the *outer* margin, which is a dedent
+belonging to the bracket rather than to the block. A branch used as an argument is written in its
+one-line form.
 
-**What the rule costs is one layout, and it is the whole of it:** a function *type* written inside
-brackets may not be broken immediately after its arrow, since that line now opens a block instead of
-joining. Break it before the arrow, or at a comma, and it joins as it always did.
+**This rule rules out one layout:** a function *type* written inside brackets may not be broken
+immediately after its arrow, because that line would open a block. Break it before the arrow, or at
+a comma:
 
 ```sysl
 apply(f: int
@@ -1222,9 +1189,8 @@ print(apply((x) -> x + 1, 5))
 
 ### An unbracketed line continues after an operator
 
-The rule is the narrowest one that works: **an operator that cannot finish an expression continues the
-line.** After `+`, `&&`, `==`, `<<` or a prefix `!` something must follow, so a newline there cannot
-have been the end of a statement and there is nothing ambiguous to resolve.
+**An operator that cannot finish an expression continues the line.** After `+`, `&&`, `==`, `<<` or
+a prefix `!` an operand must follow, so a newline there cannot end a statement.
 
 ```sysl
 var total = 1 +
@@ -1241,24 +1207,23 @@ print(total, ok)
 6 true
 ```
 
-What is *excluded* follows from the same rule rather than from taste:
+The exclusions follow from the same rule:
 
 - **`=` and `->`** are binary but already open an indented block — a function body, a match arm, a
   [binding's value](/reference/declarations/#the-value-may-be-an-indented-block) — and one token cannot mean
-  both "the block starts here" and "the line goes on". A value too long for its line therefore goes
+  both "a block starts here" and "the line continues". A value too long for its line therefore goes
   *under* the `=` as a block rather than after it as a continuation.
 - **`++`, `--` and `?`** are postfix, so a line ending in one is already complete.
 - **`..`, `..<` and `...`** can be complete too: `s[..]` is the whole range, and `int...` is a
   variadic tail.
-- **`.`** would work, but the continuation style worth having for a call chain puts the dot at the
-  *start* of the next line — which is the opposite mechanism, and is the next section.
+- **`.`** is not a trailing continuation, because a call chain is broken with the dot at the
+  *start* of the next line, described in the next section.
 
 ### An unbracketed line continues before a dot
 
-A chain is the one expression people habitually break across lines, and the break goes *before* the
-dot rather than after it. There is no operator at the end of `text(label)` for the rule above to see,
-so this one looks at how the next line **begins**: a line starting with a `.` followed by a name
-continues the line above it.
+A method chain is commonly broken across lines with the break *before* each dot. There is no
+operator at the end of the line for the rule above to see, so this rule looks at how the next line
+**begins**: a line starting with a `.` followed by a name continues the line above it.
 
 ```sysl
 import sysl.text.Search
@@ -1274,19 +1239,19 @@ print(trimmed)
 26
 ```
 
-As with a trailing operator, the continuation line's own indentation means nothing, so a chain may be
-laid out however reads best.
+As with a trailing operator, the continuation line's indentation is ignored, so a chain may be laid
+out however reads best.
 
-**A name after the dot is required, and it is what makes the rule safe.** A continued line's margin is
-discarded, so a rule that fired on anything which could also *begin* a statement would pull that line
-into the block above and move where the block ends. Requiring a letter or `_` excludes everything else
-a line could start with a dot for — `..` and `..<` are ranges, `...` is a variadic tail, `.0` is a
-tuple index, and `.*` is an import wildcard.
+**A name after the dot is required.** A continued line's margin is discarded, so a rule that fired on
+a line that could also *begin* a statement would pull that line into the block above and move where
+the block ends. Requiring a letter or `_` excludes every other reason a line could start with a dot
+— `..` and `..<` are ranges, `...` is a variadic tail, `.0` is a tuple index, and `.*` is an import
+wildcard.
 
-**And the line above has to be one a chain could continue.** This is the exact dual of the rule
-before it: a trailing operator carries the line because it *cannot* finish an expression, and a
-leading dot continues one only where the line above *could* have. A **reserved word** could not —
-there is nothing to call a method on — so a block opened by one keeps its body:
+**The line above must be one a chain could continue.** A trailing operator continues the line
+because it *cannot* finish an expression; a leading dot continues one only where the line above
+*could* have finished one. A line ending in a **reserved word** has nothing to call a method on, so a
+block opened by one keeps its body:
 
 ```sysl
 enum Colour
@@ -1304,9 +1269,9 @@ print(n)
 1
 ```
 
-Without that half, the first arm of the `match` would read as a chain hanging off the header. The
-four reserved words that *are* values — `self`, `true`, `false` and `null` — are the exception, so
-`self` on its own line with `.field` under it is an ordinary chain.
+Otherwise the first arm of the `match` would be read as a chain continuing the header. The four
+reserved words that *are* values — `self`, `true`, `false` and `null` — are the exception, so `self`
+on its own line with `.field` under it is an ordinary chain.
 
 A **trailing** dot is not a continuation, and is an error:
 
@@ -1321,16 +1286,15 @@ print(n)
 tuple index expected
 ```
 
-Two ways of writing one chain is a style argument in every file that has one, so the language admits
-exactly the one.
+The language accepts only the leading-dot form, so every chain is written one way.
 
-### The one hazard
+### A dedented continuation line
 
-A continuation line that is **dedented** has its dedent swallowed along with the newline, so a
-trailing operator can hold a block open further than it looks. Every language that joins lines has
-this, including on brackets. A chain written at the outer margin is the same hazard from the other
-end: it is still inside the block above it, and that block ends one line later than it appears to.
+A continuation line that is **dedented** has its dedent absorbed along with the newline, so a
+trailing operator can hold a block open further than it appears to. Every language that joins lines
+has this property, including across brackets. A chain written at the outer margin is the same case
+from the other direction: it is still inside the block above it, and that block ends one line later
+than it appears to.
 
-It is documented rather than guarded against, and the reason is worth knowing: guarding would mean
-the indentation of a continuation line carried meaning, and the entire point of continuing a line is
-that it does not.
+The compiler does not diagnose this, because doing so would give the indentation of a continuation
+line a meaning, and a continuation line's indentation is defined to have none.
