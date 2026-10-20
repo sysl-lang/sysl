@@ -2709,9 +2709,9 @@ print((e with { iss = 7 }).bits)
 
 **The integer is the struct's own: unsigned, and as wide as its container** — the fields' widths
 added and rounded up to whole bytes, so `Esr` is a `u64` and a struct of 3 and 21 bits a `u24`. A
-literal takes that type from where it sits; a value of any other width or signedness is refused
-rather than widened, narrowed or reinterpreted, since that would be a second conversion hidden inside
-the first:
+literal takes that type from where it sits, and a narrower unsigned value
+[widens](/reference/expressions/#which-conversions-are-implicit) to it as any argument does, so a
+32-bit register read decodes into `Esr` directly:
 
 ```sysl
 @packed
@@ -2722,13 +2722,34 @@ struct Esr
     iss2: u5
     res0: u27
 
-val low: u32 = 0x3c
+val low: u32 = 0xF2000000
 
 print(Esr::Bits(low).ec)
 ```
 
+```output
+60
+```
+
+A value that would have to be narrowed, or change its sign, is refused, and the conversion is
+written:
+
+```sysl
+@packed
+struct Esr
+    iss: u25
+    il: u1
+    ec: u6
+    iss2: u5
+    res0: u27
+
+val word: i32 = 0x3c
+
+print(Esr::Bits(word).ec)
+```
+
 ```error
-'Esr::Bits' takes the ulong 'Esr' is stored as, not uint
+'Esr::Bits' takes the ulong 'Esr' is stored as, not int
 ```
 
 `Esr(raw)` is not the spelling because it is already the constructor, which takes one value per
