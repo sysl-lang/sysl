@@ -503,7 +503,7 @@ spawn(id: usize, t: Task[unit])
     ready.push(id)
 
 run()
-    var i = 0
+    var i: usize = 0
 
     while i < ready.len()
         val id = ready[i]
@@ -572,7 +572,7 @@ ended is a no-op, so a stale waker held by an event source cannot wake the task 
 import sysl.buf.{Buf, buf}
 
 static var kept: Buf[&Fn() -> unit] = buf()
-static var heard = 0
+static var heard: int = 0
 
 keep(wake: &Fn() -> unit)
     kept.push(wake)
@@ -734,8 +734,8 @@ creates, comes from the program's own allocator. Counting the calls shows each f
 extern "malloc" c_malloc(n: usize) -> *u8
 extern "free" c_free(p: *u8)
 
-static var frames = 0
-static var freed = 0
+static var frames: int = 0
+static var freed: int = 0
 
 @export("sysl_task_alloc")
 task_alloc(size: usize) -> *u8

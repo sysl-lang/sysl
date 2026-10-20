@@ -570,7 +570,7 @@ anything a `const` may be. A name that is anything else is refused, in every arm
 only while the program runs:
 
 ```sysl target=aarch64-freestanding
-static var depth = 0
+static var depth: u64 = 0
 
 asm
     [aarch64] "mov x0, #{depth}"
@@ -627,7 +627,7 @@ one being built, since the mistake does not depend on the machine. An operand ha
 bind to:
 
 ```sysl target=aarch64-freestanding
-var ticks = 0
+var ticks: u64 = 0
 
 asm
     [aarch64]
