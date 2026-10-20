@@ -204,7 +204,7 @@ catch-all is still required.
 It cannot appear in a binding, where there is no other arm to take when the value differs:
 
 ```sysl
-val limit: int = 10
+val limit = 10
 val (`limit`, b) = (3, 4)
 
 print(b)
@@ -578,7 +578,7 @@ enum Cell
     Empty
     Full(v: int)
 
-var d: Cell = Full(1)
+var d = Full(1)
 
 d match
     Full(n) -> n = 99
@@ -596,7 +596,7 @@ enum Cell
     Empty
     Full(v: int)
 
-var d: Cell = Full(1)
+var d = Full(1)
 
 d match
     Full(n) ->
@@ -634,7 +634,7 @@ enum Slot
     Empty
     Filled(e: &Entry)
 
-var s: Slot = Filled(Entry(1))
+var s = Filled(Entry(1))
 
 s match
     Filled(e) -> e.value = 99
@@ -813,7 +813,7 @@ var s: &Slot = Full(Reading(1, 10))
     Full(r) -> print("through a reference:", r.value)
     Empty -> print("empty")
 
-var v: Slot = Full(Reading(1, 10))
+var v = Full(Reading(1, 10))
 
 v match
     Full(r) ->

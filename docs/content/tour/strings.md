@@ -129,7 +129,7 @@ To avoid writing `str` at every join, a literal may carry a prefix:
 ```sysl
 var n = 42
 var word = "left"
-var ratio = 2.0 / 3.0
+var ratio = 2.0 / 3
 
 print(s"n is $n, and twice that is ${n * 2}")
 print(f"[${n}%6d] [${word}%-6s] ${ratio}%.3f")

@@ -61,7 +61,7 @@ impl Show for int
 impl Show for bool
     show(self) -> string = if self then "yes" else "no"
 
-var n: int = 5
+var n = 5
 
 print(n.show(), true.show())
 ```
@@ -121,7 +121,7 @@ impl Show for int
 
 describe[T: Show](x: T) -> string = "<" + x.show() + ">"
 
-var n: int = 7
+var n = 7
 
 print(describe(n))
 ```

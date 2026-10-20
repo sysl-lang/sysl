@@ -23,7 +23,7 @@ var two = 2.0
 var u = 0b1011u8
 
 print(two.sqrt(), pi, min(3, 7))
-print(u.count_ones(), u.rotate_left(1u32))
+print(u.count_ones(), u.rotate_left(1))
 ```
 
 ```output
@@ -158,8 +158,8 @@ something the widening introduced.
 ```sysl
 import sysl.math.Float
 
-var h: f16 = 9.0
-var b: bf16 = 9.0
+var h: f16 = 9
+var b: bf16 = 9
 
 print(h.sqrt(), b.sqrt())
 print(real(f16.max_value()), real(bf16.epsilon()))
@@ -183,12 +183,12 @@ var three = 3.0
 var eight = 8.0
 var hundred = 100.0
 var eightyone = 81.0
-var quarter = tau / 4.0
+var quarter = tau / 4
 
 print(two.sqrt(), eight.cbrt())
 print(e.ln(), two.exp2())
 print(hundred.log10(), eight.log2(), eightyone.log(three))
-print(two.pow(10.0), three.hypot(4.0))
+print(two.pow(10), three.hypot(4))
 print(quarter.sin(), quarter.cos())
 ```
 
@@ -231,8 +231,8 @@ var ten = 10.0
 var one = 1.0
 
 print(half.floor(), half.ceil(), half.round(), neg.trunc())
-print(neg.abs(), three.copysign(-1.0))
-print(seven.fmod(2.0))
+print(neg.abs(), three.copysign(-1))
+print(seven.fmod(2))
 print(four.recip(), three.square(), zero.lerp(ten, 0.25))
 print(one.atan2(one).to_degrees())
 print(neg.signum(), zero.signum())
@@ -308,7 +308,7 @@ meets.
 ```sysl
 import sysl.math.Float
 
-var f: f32 = 2.0f32
+var f: f32 = 2
 
 print(real.epsilon(), real.max_value())
 print(f.sqrt(), f32.pi(), f32.epsilon())
@@ -430,8 +430,8 @@ against a written-down number needs a tolerance rather than an equality:
 import sysl.math.{approx_eq, approx_eq_rel, nan, infinity, Float}
 
 print(approx_eq(0.1 + 0.2, 0.3, 1e-12), approx_eq(1.0, 1.5, 0.1))
-print(approx_eq(infinity(), infinity(), 0.0), approx_eq(nan(), nan(), 1.0))
-print(approx_eq_rel(1e18, 1e18 + 1000.0, 1e-6), approx_eq_rel(1.0, 1.5, 1e-6))
+print(approx_eq(infinity(), infinity(), 0), approx_eq(nan(), nan(), 1))
+print(approx_eq_rel(1e18, 1e18 + 1000, 1e-6), approx_eq_rel(1.0, 1.5, 1e-6))
 ```
 
 ```output
@@ -499,10 +499,10 @@ they answer the same on a freestanding target as on a hosted one.
 import sysl.math.{nextafter, ulp, infinity, nan, Float}
 
 val up = nextafter(1.0, 2.0)
-print(up > 1.0, up - 1.0 == ulp(1.0), nextafter(up, 0.0) == 1.0)
-print(nextafter(0.0, 1.0) > 0.0, nextafter(2.0, 2.0) == 2.0)
+print(up > 1, up - 1 == ulp(1.0), nextafter(up, 0) == 1)
+print(nextafter(0.0, 1.0) > 0, nextafter(2.0, 2.0) == 2)
 print(nextafter(1.7976931348623157e308, infinity()) == infinity(), ulp(infinity()) == infinity())
-print(nextafter(nan(), 1.0).is_nan(), ulp(nan()).is_nan())
+print(nextafter(nan(), 1).is_nan(), ulp(nan()).is_nan())
 ```
 
 ```output
@@ -594,7 +594,7 @@ import sysl.math.Signed
 
 var n = -42
 var z = 0
-var m: i32 = -2147483647 - 1
+var m = -2147483647 - 1
 var big: i128 = -170141183460469231731687303715884105727
 
 print(n.abs(), n.signum(), z.signum())
@@ -624,15 +624,15 @@ import sysl.math.Bits
 var u = 0b1011u8
 var zero8 = 0u8
 var all8 = 255u8
-var wide: u32 = 1u32
+var wide: u32 = 1
 
 print(u.count_ones(), u.count_zeros())
 print(u.leading_zeros(), u.trailing_zeros())
 print(u.leading_ones(), u.trailing_ones())
-print(u.reverse_bits(), u.rotate_left(1u32), u.rotate_right(1u32))
+print(u.reverse_bits(), u.rotate_left(1), u.rotate_right(1))
 print(zero8.leading_zeros(), zero8.trailing_zeros())
 print(all8.leading_ones(), all8.count_zeros())
-print(wide.leading_zeros(), wide.rotate_right(1u32))
+print(wide.leading_zeros(), wide.rotate_right(1))
 print(u8.width(), u32.width(), i64.width())
 ```
 
@@ -768,7 +768,7 @@ down as data — which a board with no loader needs:
 ```sysl
 import sysl.math.ByteOrder
 
-const PORT: u16 = 0x0035u16.to_be()
+const PORT = 0x0035u16.to_be()
 
 print(PORT)
 ```
@@ -853,7 +853,7 @@ import sysl.math.complex.Complex
 
 size(x: &Magnitude[real]) -> real = x.magnitude()
 
-var scalar: real = -7.5
+var scalar = -7.5
 
 print(size(scalar), size(Complex(3.0, 4.0)))
 ```
@@ -957,7 +957,7 @@ div_floor(a, b)              mod_floor(a, b)
 
 import sysl.math.{pow, gcd, lcm, is_power_of_two, next_power_of_two}
 
-print(pow(2, 10), pow(3, 0u32))
+print(pow(2, 10), pow(3, 0))
 print(gcd(12, 18), lcm(4, 6), lcm(21, 6))
 print(is_power_of_two(8), is_power_of_two(0))
 print(next_power_of_two(17).unwrap_or(-1))
@@ -1031,8 +1031,8 @@ undefined function 'gcd'
 
 import sysl.math.pow
 
-print(pow(2, 10), pow(-3, 3u32))
-print(pow(2, 64u32), pow(2u8, 9u32))
+print(pow(2, 10), pow(-3, 3))
+print(pow(2, 64), pow(2u8, 9))
 ```
 
 ```output
@@ -1069,8 +1069,8 @@ repeated squaring:
 ```sysl
 import sysl.math.pow
 
-print(pow(2.0, 10u32))
-print(pow(1.5f32, 2u32))
+print(pow(2.0, 10))
+print(pow(1.5f32, 2))
 ```
 
 ```output

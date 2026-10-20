@@ -73,7 +73,7 @@ so the conversion cannot bypass the constraint:
 type Age = int within 0..150
 
 var n: usize = 42
-var f: f64 = 7.9
+var f = 7.9
 
 print(Age(n), Age(f))
 ```
@@ -92,8 +92,8 @@ With `new`, the result is a **distinct nominal type**. Two such types over the s
 type Meters = new f64
 type Feet = new f64
 
-var m = Meters(3.0)
-var f = Feet(3.0)
+var m = Meters(3)
+var f = Feet(3)
 
 print(f64(m + f))
 ```
@@ -103,9 +103,10 @@ print(f64(m + f))
 ```
 
 A `new` type does not mix with its **base** either, and each direction is a written conversion:
-`Meters(x)` wraps and `f64(m)` unwraps, and the constraint is checked when wrapping. The wrap takes a
-value already of the base type, `Meters(3.0)` rather than `Meters(3)`. This is the one place the two
-kinds differ at a call, and it follows from `new` making the type distinct.
+`Meters(x)` wraps and `f64(m)` unwraps, and the constraint is checked when wrapping. The wrap
+converts from whatever the base's name converts from, so `Meters(3)` is `Meters(f64(3))`; only the
+written name does it, and a value that already has a type, such as an `f64`, is still not a
+`Meters` where one is wanted.
 
 This prevents a specific kind of bug. A table-driven program has several small integers that index
 different things, such as a task number, a lock number and a priority level, and a common mistake is

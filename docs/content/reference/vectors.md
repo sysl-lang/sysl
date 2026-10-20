@@ -8,8 +8,8 @@ weight: 77
 difference: its operators work on every lane at once.
 
 ```sysl
-val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]
-val b: <4>f32 = [10.0, 20.0, 30.0, 40.0]
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <4>f32 = [10, 20, 30, 40]
 
 val c = a + b
 
@@ -47,8 +47,8 @@ print(v[0], v[3], v.len)
 is expected — at a binding, an operator, a return — is copied into every lane:
 
 ```sysl
-val zero: <4>f32 = 0.0
-val ones: <4>f32 = [1.0; 4]
+val zero: <4>f32 = 0
+val ones: <4>f32 = [1; 4]
 
 half(v: <4>f32) -> <4>f32 = v * 0.5
 
@@ -66,7 +66,7 @@ time: a vector has no address, and an out-of-range lane read has no defined resu
 level. The index must therefore be a literal or a `const`, and it is checked at compile time:
 
 ```sysl
-val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+val v: <4>f32 = [1, 2, 3, 4]
 
 print(v[4])
 ```
@@ -109,8 +109,8 @@ Operators do not convert between vector types. Two different widths, or two diff
 are two different types:
 
 ```sysl
-val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]
-val b: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
 
 f() -> unit
     val c = a + b
@@ -126,9 +126,9 @@ A comparison between vectors yields a **mask** — a `<N>bool`. It is an ordinar
 it, reduce it.
 
 ```sysl
-val a: <4>f32 = [1.0, 5.0, 3.0, 7.0]
+val a: <4>f32 = [1, 5, 3, 7]
 
-val small = a < 4.0
+val small = a < 4
 
 print(small.any(), small.all())
 ```
@@ -142,11 +142,11 @@ or the other, and a register cannot take one branch in some lanes and the other 
 sides are computed, and the mask picks between the results lane by lane:
 
 ```sysl
-val a: <4>f32 = [1.0, 5.0, 3.0, 7.0]
-val b: <4>f32 = [4.0, 2.0, 6.0, 0.0]
+val a: <4>f32 = [1, 5, 3, 7]
+val b: <4>f32 = [4, 2, 6, 0]
 
 val lo = (a < b).select(a, b)
-val clamped = (a > 4.0).select(4.0, a)
+val clamped = (a > 4).select(4, a)
 
 print(lo[0], lo[1], clamped[1], clamped[3])
 ```
@@ -195,8 +195,8 @@ and `all` to a mask.
 ```sysl
 dot(a: <4>f32, b: <4>f32) -> f32 = (a * b).sum()
 
-val v: <4>f32 = [3.0, 1.0, 4.0, 1.5]
-val w: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+val v: <4>f32 = [3, 1, 4, 1.5]
+val w: <4>f32 = [1, 2, 3, 4]
 
 print(v.sum(), v.min(), v.max(), dot(v, w))
 ```
@@ -216,12 +216,12 @@ program's data. Two methods move a run of elements between them. They belong to 
 rather than to the vector, because the move needs an address and a length, and a vector has neither.
 
 ```sysl
-var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+var xs: [8]f32 = [1, 2, 3, 4, 5, 6, 7, 8]
 var out: [8]f32
 
 val v: <4>f32 = xs.load(2)
 
-out.store(0, v * 10.0)
+out.store(0, v * 10)
 
 print(v[0], v[3], out[0], out[3])
 ```
@@ -249,7 +249,7 @@ first(v: <4>f32) -> f32 = v[0]
 
 grab[const W: usize](xs: []const f32) -> <W>f32 = xs.load(0)
 
-var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+var xs: [8]f32 = [1, 2, 3, 4, 5, 6, 7, 8]
 
 val annotated: <4>f32 = xs.load(4)
 val declared: <2>f32 = grab(xs[..])
@@ -267,11 +267,11 @@ of its own is resolved first, a load takes the width that operand gives, and a b
 the type the other two determined.
 
 ```sysl
-var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
-val by: <4>f32 = 10.0
+var xs: [4]f32 = [1, 2, 3, 4]
+val by: <4>f32 = 10
 var out: [4]f32
 
-out.store(0, xs.load(0) * by + 1.0)
+out.store(0, xs.load(0) * by + 1)
 
 print(out[0], out[3])
 ```
@@ -334,11 +334,11 @@ array's length is, and one generic kernel serves every width.
 ```sysl
 scale[const W: usize](v: <W>f32, by: f32) -> <W>f32 = v * by
 
-val four: <4>f32 = [1.0, 2.0, 3.0, 4.0]
-val eight: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+val four: <4>f32 = [1, 2, 3, 4]
+val eight: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
 
-val a = scale(four, 2.0)
-val b = scale(eight, 3.0)
+val a = scale(four, 2)
+val b = scale(eight, 3)
 
 print(a[3], b[7], a.len, b.len)
 ```
@@ -354,10 +354,10 @@ wide and eight. A mask inside a generic kernel has the same width, so a comparis
 ```sysl
 clamp_low[const W: usize](v: <W>f32, lo: f32) -> <W>f32 = (v < lo).select(lo, v)
 
-val four: <4>f32 = [1.0, -2.0, 3.0, -4.0]
-val two: <2>f32 = [-1.0, 5.0]
+val four: <4>f32 = [1, -2, 3, -4]
+val two: <2>f32 = [-1, 5]
 
-print(clamp_low(four, 0.0)[1], clamp_low(two, 0.0)[0])
+print(clamp_low(four, 0)[1], clamp_low(two, 0)[0])
 ```
 
 ```output
@@ -387,13 +387,13 @@ scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)
         out[i] = xs[i] * by[0]
         i += 1
 
-val src: [10]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+val src: [10]f32 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 var four: [10]f32
 var eight: [10]f32
 
-val by4: <4>f32 = 3.0
-val by8: <8>f32 = 3.0
+val by4: <4>f32 = 3
+val by8: <8>f32 = 3
 
 scale(src[..], four[..], by4)
 scale(src[..], eight[..], by8)

@@ -314,7 +314,7 @@ ends(ok: bool) -> u64
 joined(n: u8, m: u16) -> u16
     val t = if n < 3 then (n, 1) else (0, m)
 
-    u16(t.0) + t.1
+    t.0 + t.1
 
 print(ends(true), ends(false), joined(1, 5), joined(7, 5))
 ```

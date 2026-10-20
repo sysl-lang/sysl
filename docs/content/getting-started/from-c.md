@@ -180,7 +180,7 @@ area(s: Shape) -> real = s match
     Circle(r)  -> r * r
     Square(a)  -> a * a
 
-print(area(Circle(2.0)), area(Square(3.0)))
+print(area(Circle(2)), area(Square(3)))
 ```
 
 ```output
