@@ -99,6 +99,96 @@ str_cmp_text(word: string) -> string
     }
     """
 
+// Whether two strings hold the same bytes -- what `==` and `!=` ask, and so a string literal pattern,
+// a derived `Eq` that reaches a string field and a map keyed by strings. It is not `str_cmp` read
+// against zero, because equality needs no order: strings of different lengths are unequal without a
+// byte being read, a string compared with itself (one pointer, one length) is equal the same way, and
+// the rest is compared a machine word at a time.
+//
+// **The words are read unaligned, and the last one overlaps.** A string's bytes start wherever the
+// view starts, so every load is `align 1`; a length that is not a multiple of the word ends with one
+// more whole word read from `n - W`, which re-reads some bytes already found equal rather than
+// stepping through the remainder a byte at a time. Under a word, two overlapping 4-byte reads cover 4
+// to 7 bytes and a byte loop covers the rest.
+//
+// **It is the module's own loop, never C's `memcmp`/`bcmp`.** A freestanding image owes no `memcmp`
+// -- the boards that supply one may supply a stub -- and a `declare` beside a package's own
+// `@export("memcmp")` is `invalid redefinition of function`; a loop the module carries reaches
+// nothing and runs the same on every target. A target without unaligned loads has them split into
+// byte loads by LLVM, which is the old loop's cost and no worse.
+str_eq_text(word: string) -> string
+    val wbytes = if word == "i64" then "8" else "4"
+
+    s"""
+    define private i1 @sysl.str.eq(ptr %a, $word %an, ptr %b, $word %bn) {
+    entry:
+      %samelen = icmp eq $word %an, %bn
+      br i1 %samelen, label %check, label %no
+    check:
+      %samep = icmp eq ptr %a, %b
+      br i1 %samep, label %yes, label %size
+    size:
+      %wide = icmp uge $word %an, $wbytes
+      br i1 %wide, label %words, label %small
+    words:
+      %i = phi $word [ 0, %size ], [ %inext, %wstep ]
+      %wa = getelementptr i8, ptr %a, $word %i
+      %wb = getelementptr i8, ptr %b, $word %i
+      %xa = load $word, ptr %wa, align 1
+      %xb = load $word, ptr %wb, align 1
+      %wsame = icmp eq $word %xa, %xb
+      br i1 %wsame, label %wstep, label %no
+    wstep:
+      %inext = add $word %i, $wbytes
+      %reach = add $word %inext, $wbytes
+      %wmore = icmp ule $word %reach, %an
+      br i1 %wmore, label %words, label %last
+    last:
+      %lo = sub $word %an, $wbytes
+      %la = getelementptr i8, ptr %a, $word %lo
+      %lb = getelementptr i8, ptr %b, $word %lo
+      %ya = load $word, ptr %la, align 1
+      %yb = load $word, ptr %lb, align 1
+      %lsame = icmp eq $word %ya, %yb
+      br i1 %lsame, label %yes, label %no
+    small:
+      %half = icmp uge $word %an, 4
+      br i1 %half, label %four, label %bytes
+    four:
+      %ha = load i32, ptr %a, align 1
+      %hb = load i32, ptr %b, align 1
+      %fo = sub $word %an, 4
+      %fa = getelementptr i8, ptr %a, $word %fo
+      %fb = getelementptr i8, ptr %b, $word %fo
+      %ta = load i32, ptr %fa, align 1
+      %tb = load i32, ptr %fb, align 1
+      %hx = xor i32 %ha, %hb
+      %tx = xor i32 %ta, %tb
+      %fx = or i32 %hx, %tx
+      %fsame = icmp eq i32 %fx, 0
+      br i1 %fsame, label %yes, label %no
+    bytes:
+      %j = phi $word [ 0, %small ], [ %jnext, %bstep ]
+      %bmore = icmp ult $word %j, %an
+      br i1 %bmore, label %bbody, label %yes
+    bbody:
+      %pa = getelementptr i8, ptr %a, $word %j
+      %pb = getelementptr i8, ptr %b, $word %j
+      %ba = load i8, ptr %pa
+      %bb = load i8, ptr %pb
+      %bsame = icmp eq i8 %ba, %bb
+      br i1 %bsame, label %bstep, label %no
+    bstep:
+      %jnext = add $word %j, 1
+      br label %bytes
+    yes:
+      ret i1 true
+    no:
+      ret i1 false
+    }
+    """
+end str_eq_text
+
 // Where a string sits in a sorted table of strings: the position of the entry holding the same bytes,
 // or the table's length where none does. The table is an array of strings in the order `str_cmp`
 // gives them, so a binary search over it asks the very comparison the chain of `==`s would have
