@@ -1661,9 +1661,10 @@ whose types are the arguments.
 **The resolution is exact, not ranked.** A call is answered by the one implementation whose
 parameters are the types of the arguments, and a call matching none of them, or more than one, is
 reported rather than resolved. So `c.mul(2)`, where the candidates take a `Complex` and a `real`,
-calls the `real` one, because an integer literal can be read as a `real` and cannot be a `Complex`;
-where the candidates take an `f32` and a `real`, the literal fits both and the call is refused.
-Picking the nearest candidate would be a specialization rule, which the language does not have.
+calls the `real` one, because an integer literal can be read as a `real` and cannot be a `Complex`.
+Where the candidates take an `f32` and a `real`, a bare literal fits both and takes its default float
+type, `real`. Beyond that nothing ranks candidates: picking the nearest one would be a specialization
+rule, which the language does not have.
 
 Two limits follow from distinguishing several implementations inside one namespace:
 
