@@ -2349,9 +2349,10 @@ that takes a number, and it is the same row of the table rather than a special c
 
 **A number becomes a pointer only from an address-width integer**, `usize` or `isize`. A fixed width
 is not an address's width on every target, and reading a narrower one would invent the address's top
-bits. **A bare integer literal is an address-width integer**: it is a `usize` at the target's width,
-just as a literal is whatever integer type any other position names, so the address a datasheet
-gives is written as it is printed there:
+bits. **The operand of `ptr_cast` is an address-width position**, as the initializer of a
+`val a: usize` is: a bare integer literal, or an expression made of nothing but bare integer
+literals, is a `usize` at the target's width. So the address a datasheet gives is written as it is
+printed there, and so is a base plus an offset or a bit shifted into place:
 
 ```sysl
 struct Uart
@@ -2359,19 +2360,22 @@ struct Uart
     status: u32
 
 val uart: *Uart = ptr_cast(0x4000_4000)
+val status: *u32 = ptr_cast(0x4000_4000 + 4)
+val bit: *u8 = ptr_cast(1 << 20)
 val none: *Uart = ptr_cast(0)
 
-print(usize(uart), usize(none))
+print(usize(uart), usize(status), usize(bit), usize(none))
 ```
 
 ```output
-1073758208 0
+1073758208 1073758212 1048576 0
 ```
 
-The literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
+Each literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
 machine, above `0xFFFF_FFFF` on a 32-bit one — or a negative one is refused as any literal that does
-not fit its type is. A value that already has a type keeps it, so an `int` is still refused, and is
-converted where it is meant as an address:
+not fit its type is, and the arithmetic over them wraps at that width as integer arithmetic does. A
+value that already has a type keeps it, so an `int`, a suffixed literal such as `16u32`, or an
+expression with either inside it is still refused, and is converted where it is meant as an address:
 
 ```sysl
 var base = 0x4000_4000

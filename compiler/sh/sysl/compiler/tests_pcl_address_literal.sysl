@@ -5,11 +5,11 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.replace_all
 
-// A bare integer literal handed to `ptr_cast` is the address-width integer the form reads
-// (`reference/memory.md § Reinterpreting storage`): it is a `usize` at the target's width, as a
-// literal is whatever integer type its position names. One that does not fit that width, or a
-// negative one, is refused as a literal that does not fit; a value that already has a type keeps it,
-// so an `int` or a suffixed literal is still refused as before.
+// A bare integer literal handed to `ptr_cast`, or an expression made only of them, is the
+// address-width integer the form reads (`reference/memory.md § Reinterpreting storage`): it is a
+// `usize` at the target's width, as a `val a: usize` initializer is. A literal that does not fit that
+// width, or a negative one, is refused as a literal that does not fit; a value that already has a
+// type keeps it, so an `int` or a suffixed literal, alone or inside the expression, is still refused.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -123,6 +123,32 @@ pcl_a_suffixed_literal_is_still_refused() =
                    "'ptr_cast' reads an address, and uint is not address-width — convert it first, as " +
                    "'ptr_cast(usize(n))'", "1:15")
 
+// -- an expression made only of literals is read at usize too --------------------------------------
+
+@test("a sum, a shift and a parenthesised expression of literals are addresses")
+pcl_literal_expressions_are_addresses() =
+    pcl_prints("val p: *u8 = ptr_cast(0x4000 + 16)\nval q: *u8 = ptr_cast(1 << 20)\n" +
+               "val r: *u8 = ptr_cast((0x10 + 2) * 4)\n" +
+               "print(usize(p), usize(q), usize(r))\n",
+               "16400 1048576 72\n")
+
+@test("an expression of literals reads as a val usize initializer does, above four gigabytes here")
+pcl_literal_expression_above_four_gigabytes() =
+    pcl_prints("val p: *u8 = ptr_cast(1 << 33)\nval a: usize = 1 << 33\nprint(usize(p), a)\n",
+               "8589934592 8589934592\n")
+
+@test("a typed int inside the expression keeps it int, and refused")
+pcl_a_typed_operand_inside_is_still_refused() =
+    pcl_refused_on(None, "val k = 16\nval p: *u8 = ptr_cast(0x4000 + k)\nprint(usize(p))\n",
+                   "'ptr_cast' reads an address, and int is not address-width — convert it first, as " +
+                   "'ptr_cast(usize(n))'", "2:14")
+
+@test("and so does a suffixed literal inside it")
+pcl_a_suffixed_literal_inside_is_still_refused() =
+    pcl_refused_on(None, "val p: *u8 = ptr_cast(0x4000 + 16u32)\nprint(usize(p))\n",
+                   "'ptr_cast' reads an address, and uint is not address-width — convert it first, as " +
+                   "'ptr_cast(usize(n))'", "1:14")
+
 // -- the width is the target's --------------------------------------------------------------------
 
 @test("on a 32-bit target the top address fits and one past it does not")
@@ -131,6 +157,18 @@ pcl_on_a_32_bit_target()
     pcl_refused_on(Some("thumbv7em-freestanding"), pcl_probe("0x1_0000_0000"),
                    "the literal 4294967296 does not fit usize", "3:27")
 end pcl_on_a_32_bit_target
+
+// Each literal is held to the target's address width, as in a `val a: usize` initializer; the
+// arithmetic over them wraps at that width, as integer arithmetic does.
+@test("on a 32-bit target a literal in the expression too wide for the address is refused")
+pcl_literal_expression_on_a_32_bit_target()
+    pcl_accepted_on("thumbv7em-freestanding", pcl_probe("0xFFFF_0000 + 0xFFFF"))
+    pcl_accepted_on("thumbv7em-freestanding", pcl_probe("1 << 31"))
+    pcl_refused_on(Some("thumbv7em-freestanding"), pcl_probe("0x1_0000_0000 + 16"),
+                   "the literal 4294967296 does not fit usize", "3:27")
+    pcl_refused_on(Some("thumbv7em-freestanding"), pcl_probe("16 + (0x1_0000_0000 << 1)"),
+                   "the literal 4294967296 does not fit usize", "3:33")
+end pcl_literal_expression_on_a_32_bit_target
 
 @test("on Craft's 16-bit target the top address fits and one past it does not")
 pcl_on_craft()

@@ -645,7 +645,8 @@ import sysl.sync.*
 var counts: Guarded[IrqLock, int] = Guarded.new(IrqLock(0), 0)
 
 @export("on_tick")
-on_tick() = counts.with((n) -> *n = *n + 1)
+on_tick()
+    counts.with((n) -> *n = *n + 1)
 ```
 
 **It excludes interrupt handlers, not other cores.** A second core runs straight through it, so it is

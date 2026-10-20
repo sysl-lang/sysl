@@ -7,17 +7,24 @@ weight: 30
 ## Two bodies
 
 A function is a name, a parameter list, a return type, and a body. When the body is a single
-expression, it follows `=`:
+expression, it follows `=`, and the return type may be left off: the function returns whatever type
+the expression has, just as a `val` takes the type of its value:
 
 ```sysl
-add(a: int, b: int) -> int = a + b
+add(a: int, b: int) = a + b
+greeting(name: string) = "hello, " + name
 
 print("3 + 4 =", add(3, 4))
+print(greeting("sysl"))
 ```
 
 ```output
 3 + 4 = 7
+hello, sysl
 ```
+
+A function that calls itself writes its return type, since its result cannot be read off a body
+that needs the answer first.
 
 A longer body is indented under the header, without the `=`. The last expression is the function's
 result, so no `return` is needed; `return` exists for leaving early:
@@ -37,13 +44,25 @@ jumbo standard
 ```
 
 An optional `end` marker closes a long declaration and names it, which helps when the start of the
-block is off the screen. A function that returns nothing omits the return type.
+block is off the screen. A block body with no `=` and no return type returns nothing: its last line
+is run for its effect.
+
+```sysl
+greet(name: string)
+    print("hi", name)
+
+greet("you")
+```
+
+```output
+hi you
+```
 
 A parameter may have a default. Defaults are filled from the right, so the number of arguments a call
 passes decides how many defaults it uses:
 
 ```sysl
-tag(text: string, open: string = "[", close: string = "]") -> string = open + text + close
+tag(text: string, open: string = "[", close: string = "]") = open + text + close
 
 print(tag("info"), tag("warn", "<"), tag("error", "{", "}"))
 ```
@@ -75,8 +94,8 @@ A name may be declared more than once. The arguments of a call, their number and
 decide which declaration it uses:
 
 ```sysl
-show(x: int) -> string = s"int $x"
-show(x: string) -> string = s"str $x"
+show(x: int) = s"int $x"
+show(x: string) = s"str $x"
 
 print(show(1))
 print(show("a"))
@@ -98,8 +117,8 @@ A parameter that takes a function has an arrow type. A single parameter type nee
 zero or several need them:
 
 ```sysl
-apply(f: int -> int, x: int) -> int = f(x)
-combine(f: (int, int) -> int, a: int, b: int) -> int = f(a, b)
+apply(f: int -> int, x: int) = f(x)
+combine(f: (int, int) -> int, a: int, b: int) = f(a, b)
 
 print(apply(x -> x + 1, 5), combine((a, b) -> a * b, 6, 7))
 ```
@@ -112,7 +131,7 @@ A closure body can use the names around it, which is what distinguishes it from 
 pointer. Using a name captures it; there is no capture list to write:
 
 ```sysl
-apply(f: int -> int, x: int) -> int = f(x)
+apply(f: int -> int, x: int) = f(x)
 
 var factor = 10
 

@@ -60,6 +60,8 @@ doc_type_text(t: TypeRef) -> string = *t.kind match
     AssocType(base, member) -> s"${doc_type_text(base)}::${member}"
     AssocArgType(name, typ) -> s"${name} = ${doc_type_text(typ)}"
     SomeType(bounds) -> s"some ${doc_bound_list(bounds, " + ")}"
+    // Nothing is written for a result read off the body, and a declaration is shown as written.
+    InferredResult(_) -> ""
 end doc_type_text
 
 private doc_type_list(ts: Buf[TypeRef]) -> string
@@ -286,9 +288,21 @@ private doc_param_list(ps: Buf[Param]) -> Buf[string]
 
 // The result clause, absent rather than `-> ()` where nothing is returned: sysl writes a procedure
 // with no arrow at all.
-private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
+private doc_ret_text(ret: Option[TypeRef]) -> string = as_written(ret) match
     Some(r) -> s" -> ${doc_type_text(r)}"
     None -> ""
+
+// What a function hands back as it was written: its `-> T`, or -- a result read off the body -- the
+// `= value` it is read from, as an inferred module `val` shows its initializer. A value too long to
+// show is `…`.
+private doc_result_text(ret: Option[TypeRef], body: Buf[Stmt]) -> string
+    if ret.is_none() || !is_inferred_result(ret) then return doc_ret_text(ret)
+    if body.len() != 1 then return " = \u{2026}"
+
+    *body.at(0).kind match
+        ExprStmt(e) -> s" = ${doc_expr_text(e)}"
+        _ -> " = \u{2026}"
+end doc_result_text
 
 // -- declarations ---------------------------------------------------------------------------------
 
@@ -296,7 +310,7 @@ private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
 doc_func(f: FuncDecl) -> string
     val tps = doc_tparams_text(f.tparams, f.bounds, f.tvalues, f.tpacks, f.tdefaults)
 
-    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_ret_text(f.ret_type)}"
+    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_result_text(f.ret_type, f.body)}"
 
 // `const ` in front of a function the compiler may run -- part of its interface, so the page says it.
 private const_word(marked: bool) -> string = if marked then "const " else ""
@@ -330,7 +344,7 @@ private doc_method_bare(m: MethodDecl) -> string
     for item in ps
         all.push(item)
 
-    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_ret_text(m.ret_type)}"
+    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_result_text(m.ret_type, m.body)}"
 end doc_method_bare
 
 private doc_receiver_text(mode: RecvMode) -> string = mode match
@@ -451,6 +465,20 @@ doc_val(name: string, typ: Option[TypeRef], value: Expr) -> string = typ match
     Some(t) -> s"val ${name}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
     None -> s"val ${name} = ${doc_expr_text(value)}"
 
+// A module `var`, as written: `var count = 0`, `var limit: int = 8`, `var slots: [64]u8`.
+doc_var(name: string, typ: Option[TypeRef], init: Option[Expr]) -> string
+    val head = typ match
+        Some(t) -> s"var ${name}: ${doc_type_text(t)}"
+        None -> s"var ${name}"
+
+    init match
+        Some(v) -> s"$head = ${doc_expr_text(v)}"
+        None -> head
+end doc_var
+
+// The keyword a binding was written with.
+private doc_binder(mutable: bool) -> string = if mutable then "var" else "val"
+
 // The signature of a declaration a reference page can list, or `None` for a statement that is not
 // one. Which of these a page actually lists -- and which visibilities -- is the model's decision; a
 // declaration that is not public carries its mark in front (`private helper(n: int) -> int`,
@@ -467,12 +495,28 @@ doc_signature(s: Stmt) -> Option[string] = *s.kind match
     ExternDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_extern(d)}")
     ExternVarDecl(name, typ, _, vis, _) -> Some(s"${doc_vis_word(vis)}extern ${name}: ${doc_type_text(typ)}")
     ValDecl(name, typ, value, vis, _, _, _, _) -> Some(s"${doc_vis_word(vis)}${doc_val(name, typ, value)}")
+    VarDecl(name, typ, init, vis, _, _, _, _) -> Some(s"${doc_vis_word(vis)}${doc_var(name, typ, init)}")
     MultiDecl(names, mutable, values, vis) ->
-        if mutable then None
-        else Some(s"${doc_vis_word(vis)}val ${doc_names(names)} = ${doc_exprs_text(values)}")
-    PatternDecl(pat, mutable, value, typ, vis) ->
-        if mutable then None else Some(s"${doc_vis_word(vis)}${doc_pattern_val(pat, typ, value)}")
+        Some(s"${doc_vis_word(vis)}${doc_binder(mutable)} ${doc_names(names)} = ${doc_exprs_text(values)}")
+    PatternDecl(pat, mutable, value, typ, vis) -> Some(s"${doc_vis_word(vis)}${doc_pattern_val(pat, mutable, typ, value)}")
+    // `static` belongs to the module's binding it marks, so it leads that binding's own signature,
+    // after the visibility mark: `private static var hits = 0`.
+    StaticDecl(inner) -> doc_signature(inner) match
+        Some(sig) -> Some(doc_after_vis(sig, "static "))
+        None -> None
     _ -> None
+
+// `word` put after the visibility mark that opens `sig`, or in front where it has none.
+private doc_after_vis(sig: string, word: string) -> string
+    if sig.starts_with("private")
+        val b = sig.bytes
+
+        for i in 0..<b.len
+            if b[i] == u8(' ') then return s"${sig[0..i]}$word${sig[i + 1..]}"
+    end if
+
+    s"$word$sig"
+end doc_after_vis
 
 // The names a binding gives, as it lists them: `q, r`.
 doc_names(names: Buf[string]) -> string
@@ -497,9 +541,9 @@ private doc_exprs_text(es: Buf[Expr]) -> string
     out
 end doc_exprs_text
 
-private doc_pattern_val(pat: Pattern, typ: Option[TypeRef], value: Expr) -> string = typ match
-    Some(t) -> s"val ${doc_pattern_text(pat)}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
-    None -> s"val ${doc_pattern_text(pat)} = ${doc_expr_text(value)}"
+private doc_pattern_val(pat: Pattern, mutable: bool, typ: Option[TypeRef], value: Expr) -> string = typ match
+    Some(t) -> s"${doc_binder(mutable)} ${doc_pattern_text(pat)}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
+    None -> s"${doc_binder(mutable)} ${doc_pattern_text(pat)} = ${doc_expr_text(value)}"
 
 // A pattern as it is written: `(a, b)`, `Point(x, y)`, `Point { x, y: b }`, `n @ (a, _)`.
 doc_pattern_text(p: Pattern) -> string = *p.kind match

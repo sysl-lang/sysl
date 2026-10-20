@@ -23,7 +23,21 @@ after it are usually the same failure seen again through worse state.
 
 ## Index
 
-[`attach`](#attach) [`check`](#check) [`check_eq`](#check_eq) [`check_slice_eq`](#check_slice_eq) [`failures`](#failures) [`finish`](#finish) [`reset`](#reset) [`run`](#run) [`skip`](#skip) [`skipped`](#skipped) [`tests_run`](#tests_run)
+[`quiet`](#quiet) [`attach`](#attach) [`check`](#check) [`check_eq`](#check_eq) [`check_slice_eq`](#check_slice_eq) [`failures`](#failures) [`finish`](#finish) [`reset`](#reset) [`run`](#run) [`skip`](#skip) [`skipped`](#skipped) [`tests_run`](#tests_run)
+
+## Variables
+
+### `quiet`
+
+```sysl
+var quiet: bool = false
+```
+
+Silence the per-test lines, leaving the counters and `finish`'s verdict untouched.
+
+It is public because this module's own tests need it -- they call `check` with a false condition on
+purpose, and a suite whose expected output includes its own failures is unreadable. A board that
+signals its verdict through something other than a console wants it for the same reason.
 
 ## Functions
 
@@ -56,7 +70,7 @@ one mistake this shape of API invites (`sysl/check.sysl` says the same thing abo
 ### `check_eq`
 
 ```sysl
-check_eq[T: Eq + Display](got: T, want: T, file: string = __FILE__, line: long = __LINE__)
+check_eq[T: Eq + Debug](got: T, want: T, file: string = __FILE__, line: long = __LINE__)
 ```
 
 Two values that have to be equal, reported with both of them when they are not.
@@ -66,8 +80,8 @@ can: `TEST_ASSERT_EQUAL_*` covers a fixed list of C's own types and falls back t
 bytes for anything a program defined, while a bound reaches any type at all that can say whether
 two of it are equal and write itself down.
 
-Rendering costs no allocation: a `Display` writes into a sink rather than returning a fresh string
-(`sysl/display.sysl`).
+Each side is shown through its `Debug`, which every type has, and costs no allocation: it writes
+into a sink rather than returning a fresh string (`sysl/debug.sysl`).
 
 **`got` and `want`, in that order** -- the computed value first, which is `assert_eq`'s order in
 the module next door and the order a failure is read in. The package this came from took
@@ -77,7 +91,7 @@ than that sentence was.
 ### `check_slice_eq`
 
 ```sysl
-check_slice_eq[T: Eq + Display](got: []const T, want: []const T, file: string = __FILE__, line: long = __LINE__)
+check_slice_eq[T: Eq + Debug](got: []const T, want: []const T, file: string = __FILE__, line: long = __LINE__)
 ```
 
 The same for a slice, which needs more than `==` to be useful.
