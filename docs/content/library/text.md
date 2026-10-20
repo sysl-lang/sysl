@@ -777,25 +777,28 @@ interpolation must not be able to tell which half a number came through. `push_r
 
 They take `long` and `ulong` rather than one member per width — the bargain the `print` family
 makes. [Overloading](/reference/declarations/) would give a set of members one *name*; it would not
-give them one *body*, which is what the widening buys. The difference is that `print` has the
-compiler widening its arguments and a member cannot:
+give them one *body*, which is what the widening buys. A narrower integer reaches them as it stands,
+since every `int` is a `long` ([implicit conversions](/reference/expressions/#which-conversions-are-implicit));
+one that is not — a `ulong` at `push_int` — is refused rather than reinterpreted:
 
 ```sysl
 import sysl.text.str_builder
 
 var b = str_builder()
 var k: int = 42
+var big: ulong = 7
 
 b.push_int(k)
+b.push_int(big)
 ```
 
 ```error
-'n' of 'sysl.text.StrBuilder.push_int' is long, but int was given
+'n' of 'sysl.text.StrBuilder.push_int' is long, but ulong was given
 ```
 
-So a narrower value is written `b.push_int(long(k))` — and a caller who would rather not is
-describing `push(str(k))`, which still works, still costs the allocation, and still saves the
-quadratic copying that made a builder worth having. A value of any other type is pushed that way too.
+So an unsigned value goes to `push_uint`, and one that is no integer at all is described by
+`push(str(x))`, which still works, still costs the allocation, and still saves the quadratic copying
+that made a builder worth having.
 
 `str_builder_with_capacity(n)` starts one with room, skipping the reallocate-and-copy at each
 doubling on the way up to `n`. It is a guess and nothing depends on it: too small and the buffer

@@ -68,9 +68,11 @@ private wid_refused_on(machine: Option[string], text: string, message: string, a
     if !wid_ready() then return
 
     val said = wid_report(machine, text)
-    val head = s"error: $message\n  --> main.sysl:$at\n"
+    val head = s"error: $message"
+    val place = s"\n --> main.sysl:$at\n"
 
-    assert(said.starts_with(head), s"expected a report starting\n$head\ngot\n$said")
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
 end wid_refused_on
 
 private wid_refused(text: string, message: string, at: string) = wid_refused_on(None, text, message, at)
@@ -159,7 +161,7 @@ wid_integer_to_float_refused()
 @test("a fixed-point value widens where no fraction bit and no integer bit is lost, and is rescaled")
 wid_fixed() =
     wid_prints("var q: q15 = -0.5\nvar u: u8q4 = 1.5\nvar n: i8 = -3\nval a: i32q16 = q\n" +
-               "val b: i9q4 = u\nval c: i16q8 = n\nval d: f32 = q\nval e: real = 0.25q31\n" +
+               "var w: q31 = 0.25\nval b: i9q4 = u\nval c: i16q8 = n\nval d: f32 = q\nval e: real = w\n" +
                "print(a, b, c, d, e, a.bits)\n",
                "-0.5 1.5 -3 -0.5 0.25 -32768\n")
 
@@ -205,12 +207,12 @@ wid_usize_on_thumb()
                     "@export(\"wid_probe\")\nprobe(a: u32) -> u32\n    val b: usize = a\n    b\nend probe\n")
     wid_refused_on(Some("thumbv7em-freestanding"),
                    "@export(\"wid_probe\")\nprobe(a: u64) -> usize = a\n",
-                   "cannot return u64 from a function declared to return usize", "2:27")
+                   "function 'probe' should return usize, but its body yields ulong", "1:1")
 
 @test("on Craft's 16-bit target u32 does not reach usize")
 wid_usize_on_craft() =
     wid_refused_on(Some("craft-freestanding"), "@export(\"wid_probe\")\nprobe(a: u32) -> usize = a\n",
-                   "cannot return uint from a function declared to return usize", "2:27")
+                   "function 'probe' should return usize, but its body yields uint", "1:1")
 
 // -- the positions that convert -------------------------------------------------------------------
 
@@ -222,7 +224,7 @@ wid_bindings_and_assignments() =
 @test("a compound assignment converts its right side to the left's type, never the reverse")
 wid_compound_never_narrows() =
     wid_refused("var b: byte = 1\nvar n: int = 5\nb += n\n", "'+' needs matching types, got byte and int",
-                "3:1")
+                "3:6")
 
 @test("an argument widens to its parameter, an extern's among them, and a result to the declared one")
 wid_arguments_and_results() =
@@ -265,9 +267,9 @@ wid_no_third_type() =
 @test("an operand never converts to a third type: byte + i8, int + f32 and u32 < int are refused")
 wid_operands_refused()
     wid_refused("var a: byte = 1\nvar b: i8 = 2\nprint(a + b)\n", "'+' needs matching types, got byte and i8",
-                "3:9")
+                "3:11")
     wid_refused("var a: int = 1\nvar b: f32 = 2.0\nprint(a + b)\n",
-                "'+' needs matching types, got int and f32", "3:9")
+                "'+' needs matching types, got int and f32", "3:11")
     wid_refused("var a: u32 = 1\nvar b: int = 2\nprint(a < b)\n", "cannot compare uint with int", "3:7")
 
 @test("a shift count is still any integer, and an integer still scales a fixed-point value")

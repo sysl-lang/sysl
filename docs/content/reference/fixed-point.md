@@ -194,16 +194,21 @@ print(a + b, -a - b, a * b, b / a)
 ```
 
 Comparisons are on the value. `%` and the bit operators are not defined — the bits are `.bits`. A
-fixed-point value and a float do not mix without a conversion:
+fixed-point value and a float mix only where the float holds every value of the fixed-point type
+exactly (§ [Conversions](#conversions)): a `real` holds every `q31`, so `a + f` is a `real` sum, while
+an `f32`'s 24-bit significand cannot hold a `q31`'s 31 bits and the pair needs a conversion written:
 
 ```sysl
 var a: q31 = 0.5
-var f = 0.5
+var f = 0.25
+var g: f32 = 0.25
+
 print(a + f)
+print(a + g)
 ```
 
 ```error
-'+' needs matching types, got q31 and real
+'+' needs matching types, got q31 and f32
 ```
 
 ### Two formats: the result's format comes from where it goes
@@ -371,7 +376,29 @@ a `q15` product is a 32-bit multiply rather than a 64-bit library call.
 
 ## Conversions
 
-Every conversion is a call, as for every other number:
+A conversion that can round or saturate is a call, as for every other number. **One that cannot is
+made by the position**, as a `byte` becomes an `int`: a fixed-point value reaches another format that
+keeps every fraction bit and every integer bit it has (`q15` → `i32q16`; unsigned → signed needs one
+integer bit more, and signed → unsigned never), an integer reaches a format whose integer part holds
+it (`i8` → `i16q8`), and a fixed-point value reaches a float whose significand holds all its bits and
+whose range reaches its smallest step (`q15` → `f32`, `q31` → `real`, never `q31` → `f32`). Nothing
+converts implicitly from a float, or from a fixed-point value to an integer — each of those rounds.
+
+```sysl
+var q: q15 = -0.5
+var n: i8 = -3
+val wide: i32q16 = q
+val scaled: i16q8 = n
+val f: f32 = q
+
+print(wide, wide.bits, scaled, f)
+```
+
+```output
+-0.5 -32768 -3 -0.5
+```
+
+The written conversions:
 
 | from → to | written | what it does |
 |---|---|---|
