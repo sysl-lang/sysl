@@ -1738,7 +1738,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
     val ty = literal_widened(cx, operands, told, firmest(operands, told, widen, rescales).or_else(() -> expected),
-                             expected, widen, rescales)
+                             expected, widen, rescales).or_else(() -> if widen then float_among(operands) else None)
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
@@ -1785,6 +1785,17 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TEx
 
     Some(ty)
 end literal_widened
+
+// **Where only literals meet and one of them is a float, the pair is that float**: `1 + 2.0` is a
+// `real` sum and `[1.5, 2]` a `[2]real`, the integer literal being read as the float where it holds
+// it exactly -- as it is beside a float operand. With nothing settled the literals would each fall
+// to their own default and disagree over a difference the reader never wrote.
+private float_among(operands: Buf[Expr]) -> Option[Type]
+    for e in operands
+        if is_literal(e) && literal_default(e).unwrap_or(Unknown) == real_type() then return Some(real_type())
+
+    None
+end float_among
 
 // Whether a literal's default type is one the position the pair stands in takes.
 private reaches_position(own: Type, expected: Option[Type]) -> bool =

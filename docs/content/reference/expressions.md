@@ -1296,6 +1296,33 @@ print(h + 16777217)
 the literal 16777217 is not exactly an f32
 ```
 
+**Where two literals meet and one is a float, the integer literal is that float too** — under the
+same operand rule, so in arithmetic, a comparison, the bounds of a range, the elements of an
+unannotated array literal and the arms of an `if` or a `match`. `1 + 2.0` is a `real` three,
+`[1.5, 2]` a `[2]real`, and `if c then 1 else 2.5` a `real`. A position's type still comes first
+(`val h: f32 = 1 + 2.0` is an `f32`); a suffixed integer literal is a typed operand and widens only
+as the table says, so `1i64 + 2.0` is refused as `long` beside `real` is; and an integer the float
+would round is refused as above.
+
+```sysl
+val rs = [1.5, 2]
+val h: f32 = 1 + 2.0
+
+print(1 + 2.0, rs[1], 1 < 2.5, h)
+```
+
+```output
+3 2 true 3
+```
+
+```sysl
+print(0.5 + 9007199254740993)
+```
+
+```error
+the literal 9007199254740993 is not exactly a real
+```
+
 **A type parameter is never decided by a conversion.** A call solves it from the arguments' own types,
 exactly, and only a parameter it has already fixed is widened to — so `max(a, b)` over an `int` and a
 `long` is refused in either order, and `max[long](a, b)` is how to say which.
