@@ -172,8 +172,9 @@ print(Limit)
 A **member of a module** may leave its type off exactly as a local may: `val limit = 10` is an `int`
 wherever it is declared, `val name = "sysl"` a `string`, and `val area = square(6)` whatever `square`
 returns. Where the type is written it governs, and the value is read against it — `val ratio: real =
-3` is a `real` three. A `const` follows the same rule. Module storage written with `var` still states
-its type, since it may have no initializer to read one off.
+3` is a `real` three. A `const` follows the same rule, and so does module storage written with `var`
+— `static var ticks = 0` is an `int` the program may write. Only a `var` with **no initializer**
+states its type, since there is no value to read one off and it starts at its type's zero.
 
 The type is the initializer's wherever the name is read — in a body, in another `val`'s initializer
 above or below it, in another file of the module, or in a program built against a library that exports
@@ -184,6 +185,7 @@ did, whether the storage is laid into the object file or filled before the first
 const Limit = 3
 static val Scale = 2
 static val Ratio: real = 3
+static var calls = 0
 
 show()
     var count = 0
@@ -191,22 +193,25 @@ show()
     val name = "sysl"
 
     count += 1
+    calls += 1
 
-    print(count, doubled, name, Ratio / 2)
+    print(count, doubled, name, Ratio / 2, calls)
 
+show()
 show()
 ```
 
 ```output
-1 6 sysl 1.5
+1 6 sysl 1.5 1
+1 6 sysl 1.5 2
 ```
 
 The `static` is what asks for the member — this is the file the program starts in, so a plain `val`
 there would be a local of its body.
 
-**Two values give a module `val` no type to take.** One whose initializer reaches the `val` itself has
-nothing to read the type from first, and one whose value is a bare closure has a type with no name for
-storage to be declared at — a function is the declaration for that:
+**Two values give a module `val` or `var` no type to take.** One whose initializer reaches the
+storage itself has nothing to read the type from first, and one whose value is a bare closure has a
+type with no name for storage to be declared at — a function is the declaration for that:
 
 ```sysl
 static val a = b + 1
@@ -1484,6 +1489,47 @@ long
 u64
 ```
 
+**Candidates tied only by bare literals take each literal at its default type.** Where every
+position the candidates differ at holds a numeric literal with no suffix, and no rule above has
+chosen, the candidate whose parameter at each of those positions is the literal's default wins. A
+float literal's default is `real`. An integer literal's default is `int` at an integer parameter and
+`real` at a float one, since an integer literal is read as the float its position expects. So
+`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one:
+
+```sysl
+import sysl.math.nextafter
+
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+print(scale(1.5, 2), scale(1, 2), scale(1.5f32, 2f32))
+print(nextafter(1.0, 2) > 1)
+```
+
+```output
+real real f32
+true
+```
+
+The call stays ambiguous where an argument with a type of its own is part of the tie, where no
+candidate takes the literals at their defaults (`f32` beside `f128` at `2`), and where two do
+(`(int, real)` beside `(real, int)` at `(2, 2)`):
+
+```sysl
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+val s: i16 = 3
+print(scale(s, 2))
+```
+
+```error
+'scale' is ambiguous here — 2 of its declarations take these arguments:
+```
+
+An operator choosing between implementations of its trait settles a literal operand the same way,
+so `x * 2` means what `x.mul(2)` means.
+
 **Exactness is asked of the types a candidate was fitted at, which for a generic one is what the call
 solved it to.** `g[T]` below takes the `[]int` at `T = []int`, as it was written; the other takes it
 only by giving up the ability to write. So the generic declaration is the exact one:
@@ -2144,7 +2190,7 @@ print(f(1.0))
 ```
 
 ```sysl
-static var counter: int = 0
+static var counter = 0
 
 const f() -> int = counter
 
