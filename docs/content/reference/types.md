@@ -124,7 +124,7 @@ var wide: u256 = 1
 var i = 0
 
 while i < 200 do
-    wide = wide * 2u256
+    wide = wide * 2
     i = i + 1
 
 print(wide)
@@ -166,7 +166,7 @@ to C, C++, Rust and Java programmers.
 var a: f32 = 1.5
 var b: real = 2.25
 
-print(a + 1.0, b / 2.0)
+print(a + 1, b / 2)
 ```
 
 ```output
@@ -187,10 +187,10 @@ initializer or a `within` bound may use one.
 as for any other value:
 
 ```sysl
-const top: real = infinity
-val low: f32 = -f32.infinity
+const top = infinity
+val low = -f32.infinity
 
-print(top > 1.0e308, low < f32(-3.0e38), nan != nan, -infinity < 0.0)
+print(top > 1.0e308, low < -3.0e38, nan != nan, -infinity < 0)
 ```
 
 ```output
@@ -218,9 +218,9 @@ Where a declared **function** has the name, reading it bare as a value is refuse
 message gives the spelling no declaration can hide:
 
 ```sysl
-infinity() -> real = 2.0
+infinity() -> real = 2
 
-val x: real = infinity
+val x = infinity
 
 print(x)
 ```
@@ -258,10 +258,10 @@ var b: bf16 = 0.1
 print(h, b)
 print(real(h), real(b))
 
-var big: f16 = 65504.0
+var big: f16 = 65504
 var wide: bf16 = 65504.0
 
-print(big * 2.0, real(wide * 2.0))
+print(big * 2, real(wide * 2))
 ```
 
 ```output
@@ -273,8 +273,10 @@ inf 131072
 Both print `0.1`, because `print` writes the fewest digits that read back as the value **at its own
 width**, and `0.1` reads back as each format's nearest value to a tenth. Neither holds a tenth
 exactly, and the two nearest values differ: widened to a `real`, which represents every value of
-both formats exactly, each shows all of its digits. (`wide * 2.0` is widened for the same reason: at
-`bf16`'s width the shortest reading of 131072 is `131000`.)
+both formats exactly, each shows all of its digits. (`wide * 2` is widened for the same reason: at
+`bf16`'s width the shortest reading of 131072 is `131000`.) The `bf16` initializer is written
+`65504.0` because the value rounds there: an integer literal is accepted at a float type only where
+the format holds it exactly, and `bf16`'s nearest value is 65536.
 
 `f16` and `bf16` are also the one pair where **neither conversion is a widening or a narrowing**. It
 is still written as an ordinary conversion:
@@ -313,7 +315,7 @@ than a double's tenth widened:
 
 ```sysl
 val tenth: f128 = 0.1
-val third: f128 = 1.0 / 3.0
+val third: f128 = 1 / 3
 
 print(third.bits() == 0x3FFD5555555555555555555555555555)
 print(real(tenth) == 0.1, tenth + 0.2 > 0.3, f128(0.1) == tenth)
@@ -370,7 +372,7 @@ so it needs no C library and works on bare metal:
 
 ```sysl
 val tenth: f128 = 0.1
-val third: f128 = 1.0 / 3.0
+val third: f128 = 1 / 3
 
 print(tenth, third, -0.0f128, f128.infinity)
 print(str(third).bytes.len, s"$tenth", f"${third}%.40f", f"${tenth}%.3e")
@@ -388,7 +390,7 @@ as it accepts a `real`.
 ```sysl
 import sysl.text.parse_f128
 
-val x: f128 = 2.0 / 7.0
+val x: f128 = 2 / 7
 
 print(parse_f128(str(x)).unwrap().bits() == x.bits())
 ```
@@ -402,19 +404,19 @@ rounded once to binary128, as the run-time routines would round it, and the resu
 stored, so `third` below is binary128's third, not a widened `double`'s:
 
 ```sysl
-const third(x: f128) -> f128 = x / 3.0
+const third(x: f128) -> f128 = x / 3
 
 const harmonic(n: int) -> f128
-    var sum: f128 = 0.0
+    var sum: f128 = 0
 
     for k in 1..n
-        sum = sum + 1.0 / f128(k)
+        sum = sum + 1 / f128(k)
 
     sum
 end harmonic
 
-const T: f128 = third(1.0)
-const H: f128 = harmonic(20)
+const T = third(1)
+const H = harmonic(20)
 
 print(T.bits() == 0x3FFD5555555555555555555555555555, H)
 ```
@@ -526,7 +528,7 @@ var b = a
 
 b[0] = 99
 
-var v: []int = a[..]
+var v = a[..]
 v[1] = 88
 
 print(a[0], a[1], b[0])
@@ -555,10 +557,10 @@ It holds the same values an `[N]T` holds, in the same order; the two type constr
 their brackets because a vector is an array whose operators work lane-wise:
 
 ```sysl
-val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]
-val b: <4>f32 = [10.0, 20.0, 30.0, 40.0]
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <4>f32 = [10, 20, 30, 40]
 
-print((a + b)[3], (a * 2.0)[0], (a * b).sum())
+print((a + b)[3], (a * 2)[0], (a * b).sum())
 ```
 
 ```output
@@ -773,7 +775,7 @@ union Word
     whole: u32
     f: f32
 
-print(Word(f = 1.0))
+print(Word(f = 1))
 ```
 
 ```output
@@ -840,7 +842,7 @@ struct Packet
         word: u32
         level: f32
 
-val p = Packet(tag = 1, word = 7, level = 2.0)
+val p = Packet(tag = 1, word = 7, level = 2)
 ```
 
 ```error
@@ -898,17 +900,17 @@ union Reg
 
 const make(n: u32) -> Reg = Reg(bits = n)
 const bits_of(r: Reg) -> u32 = r.bits
-const K: u32 = bits_of(make(7))
+const K = bits_of(make(7))
 
 const rewritten(n: u32) -> u32
-    var r = Reg(level = 1.0)
+    var r = Reg(level = 1)
 
     r.bits = n
     r.bits
 
-const W: u32 = rewritten(5)
+const W = rewritten(5)
 
-val table: [2]Reg = [Reg(level = 1.0), make(9)]
+val table = [Reg(level = 1), make(9)]
 
 print(K, W, table[0].bits, table[1].bits)
 ```
@@ -923,7 +925,7 @@ union Reg
     level: f32
 
 const level_of(r: Reg) -> f32 = r.level
-const K: f32 = level_of(Reg(bits = 7))
+const K = level_of(Reg(bits = 7))
 ```
 
 ```error
@@ -1048,7 +1050,7 @@ with no parts, has the same four ([`unit` and `never`](#unit-and-never)).
 val pair = (1, "one")
 val trip = (1, 2.5, 'x')
 
-val o: Option[(string, int)] = Some(("k", 7))
+val o = Some(("k", 7))
 
 o match
     Some((k, v)) -> print(k, v)
@@ -1131,7 +1133,7 @@ area(s: Shape) -> real = s match
     Circle(r)  -> 3.14159 * r * r
     Rect(w, h) -> w * h
 
-print(int(Green), area(Circle(1.0)), area(Rect(2.0, 3.0)))
+print(int(Green), area(Circle(1)), area(Rect(2, 3)))
 ```
 
 ```output

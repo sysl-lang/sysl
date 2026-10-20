@@ -10,8 +10,8 @@ There are three keywords, and they differ in what may happen to the value afterw
 
 ```sysl
 var count = 3            // storage that may change
-val limit: int = 10      // storage that may not
-const step: int = 2      // not storage at all — a value known while compiling
+val limit = 10           // storage that may not
+const step = 2           // not storage at all — a value known while compiling
 
 count = count + step
 print("count:", count, "of", limit)
@@ -23,12 +23,12 @@ count: 5 of 10
 
 `var` and `val` are the pair most languages have. `const` is different: it is not a variable that
 cannot change, but a value the compiler substitutes wherever the name appears, so there is nothing to
-read at run time. A `const` must give a value, and its type, where it is left off, is the value's
-own: `const steps = 3` is an `int`.
+read at run time. A `const` must give a value.
 
-`limit` states its type, which a `val` may do anywhere and need not: `val limit = 10` is an `int`
-whether it is a local inside a function or a member of a module, visible to other files. Where the
-type is written it governs, and the value is read against it.
+None of the three needs a type: each takes the type of its value, so `step` and `limit` are `int`
+values, whether they are locals inside a function or members of a module, visible to other files. A
+type may be written on any of them (`val limit: long = 10`); where it is written it governs, and the
+value is read against it.
 
 A module-level `val` **may** hold a value the program builds at run time: a reference, a slice, a
 string assembled while running. Its storage lasts for the whole run, as a static does. The value
@@ -90,12 +90,12 @@ struct Pixel
     green: u6
     blue:  u5
 
-var p = Pixel(31u5, 40u6, 17u5)
+var p = Pixel(31, 40, 17)
 
 var counter: u12 = 4000
 
-print("wraps at 4096:", counter + 100u12)
-print("and divides:", counter / 7u12)
+print("wraps at 4096:", counter + 100)
+print("and divides:", counter / 7)
 print("packed:", p.red, p.green, p.blue)
 ```
 
@@ -119,7 +119,7 @@ Converting to a wider type is implicit, because no value can be lost: every `byt
 ```sysl
 var small: byte = 200
 var wide: int = small
-var count: int = 300
+var count = 300
 var back: byte = count
 ```
 
@@ -135,7 +135,7 @@ var wide: int = small
 
 print("widened:", wide, "narrowed:", byte(300))
 print("truncated:", int(3.9))
-print("divided:", f32(7) / f32(2))
+print("divided:", f32(7) / 2)
 print("code point:", u32('A'))
 ```
 
@@ -146,8 +146,9 @@ divided: 3.5
 code point: 65
 ```
 
-`int(3.9)` truncates rather than rounds. `f32(7) / f32(2)` is floating-point division because both
-operands are floats; `7 / 2` would be integer division and give 3. The types decide which operation
+`int(3.9)` truncates rather than rounds. `f32(7) / 2` is floating-point division because its left
+operand is a float, and the literal `2` takes the float type it meets; `7 / 2` would be integer
+division and give 3. The types decide which operation
 runs, and the types are visible in the code.
 
 ## Characters are not small integers

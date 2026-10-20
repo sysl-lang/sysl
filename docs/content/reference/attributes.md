@@ -2743,7 +2743,7 @@ struct Esr
     iss2: u5
     res0: u27
 
-val word: i32 = 0x3c
+val word = 0x3c
 
 print(Esr::Bits(word).ec)
 ```
@@ -2877,7 +2877,7 @@ struct Reg
     mode: volatile u3
     prescale: volatile u4
 
-var block: [4]u8 = [0u8; 4]
+var block: [4]u8 = [0; 4]
 var r: *Reg = ptr_cast(&block[0])
 
 r.enable = 1
@@ -2956,12 +2956,12 @@ describe(class: Option[Ec]) -> string = class match
     Some(c) -> Ec::Image(c)
     None -> "a class this kernel does not know"
 
-var raw: u64 = u64(0x2a) << 26
+var raw: u64 = 0x2a << 26
 val e: *Esr = ptr_cast(&raw)
 
 print(describe(Ec.try(e.ec)))
 
-raw = u64(0x3c) << 26
+raw = 0x3c << 26
 print(describe(Ec.try(e.ec)))
 ```
 

@@ -365,7 +365,7 @@ val año = 2026
 struct Círculo
     radio: real
 
-print(año, área(3.0, 4.0), Círculo(2.0).radio)
+print(año, área(3, 4), Círculo(2).radio)
 ```
 ```output
 2026 12 2
@@ -648,7 +648,7 @@ when that library does. `__VERSION__` and `__FILE__` follow the same rule.
 lands where `__NAME__` is read, so a `const` initialized with it is refused at the `const`:
 
 ```sysl
-const TAG: string = __NAME__
+const TAG = __NAME__
 print(TAG)
 ```
 
@@ -807,12 +807,12 @@ time**, so a table of constants written as bit patterns is constant data just as
 floats is — in a `const`, in a module `val` placed in `.rodata`, and inside a `const` function.
 
 ```sysl
-const LN2_HI: real = real.from_bits(0x3fe62e42fefa39ef)
-const ONE_BITS: u32 = f32(1.0).bits()
+const LN2_HI = real.from_bits(0x3fe62e42fefa39ef)
+const ONE_BITS = f32(1).bits()
 const next_up(x: real) -> real = real.from_bits(x.bits() + 1)
-const AFTER_ONE: real = next_up(1.0)
+const AFTER_ONE = next_up(1)
 
-val TABLE: [2]real = [0x1.62e42fefa39efp-1, real.from_bits(0x3c7abc9e3b39803f)]
+val TABLE = [0x1.62e42fefa39efp-1, real.from_bits(0x3c7abc9e3b39803f)]
 
 print(LN2_HI == TABLE[0], ONE_BITS == 0x3f800000, AFTER_ONE.bits() == 0x3ff0000000000001)
 ```

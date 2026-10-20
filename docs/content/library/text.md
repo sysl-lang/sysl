@@ -409,7 +409,7 @@ var s = "  hello, world  "
 print(s.trim())
 print(s.contains("world"), s.index_of("world").unwrap())
 print("aaa".count_of("aa"), "--x--".trim_matches("-"))
-print("path/to/file.txt".last_index_of_byte(u8('/')).unwrap())
+print("path/to/file.txt".last_index_of_byte('/').unwrap())
 print("// comment".starts_with("//"), "file.txt".ends_with(".txt"))
 ```
 
@@ -425,8 +425,8 @@ true true
 same rule `replace_all` substitutes by — so the number `count_of` reports and the number of
 replacements made always agree.
 
-`index_of` answers with an `Option` rather than the older sysl's `-1`, because a sentinel is a value
-the type calls ordinary and every caller has to remember to check.
+`index_of` answers with an `Option` rather than a sentinel such as `-1`, because a sentinel is a
+value the type calls ordinary and every caller has to remember to check.
 
 ### `from` names a place to start, and the answer is an offset in the whole receiver
 
@@ -452,7 +452,7 @@ while at.is_some()
     at = s.index_of_from("abc", k + 1)
 
 print(s.last_index_of_from("abc", 4).unwrap())
-print(s.index_of_byte_from(u8('c'), 3).unwrap(), s.last_index_of_byte_from(u8('c'), 3).unwrap())
+print(s.index_of_byte_from('c', 3).unwrap(), s.last_index_of_byte_from('c', 3).unwrap())
 print(s.index_of_from("abc", 999).is_none())
 ```
 
@@ -515,7 +515,7 @@ var raw: [3]u8 = [104, 105, 33]
 var needle: [2]u8 = [105, 33]
 
 print(raw[..].contains(needle), raw[..].index_of(needle).unwrap())
-print(raw[..].starts_with([104u8]), raw[..].is_empty())
+print(raw[..].starts_with([104]), raw[..].is_empty())
 print("  hello  ".bytes.trim().len)
 ```
 
@@ -785,7 +785,7 @@ one that is not — a `ulong` at `push_int` — is refused rather than reinterpr
 import sysl.text.str_builder
 
 var b = str_builder()
-var k: int = 42
+var k = 42
 var big: ulong = 7
 
 b.push_int(k)
