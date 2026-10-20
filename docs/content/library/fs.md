@@ -916,6 +916,12 @@ remove_dir_all(dir).unwrap()
 first unreadable directory fatal, and ignoring it makes the walk best effort. A directory that cannot
 be read is one `Err` and the walk carries on with what is left.
 
+**An entry another process removes while the walk is under way is absent, not an error.** A
+directory is listed once and its entries are looked at afterwards, so a lock directory or a temporary
+file may be gone by the time the walk reaches it. Such an entry is skipped, and a directory removed
+after it was reported is walked as an empty one. A root that is not there when the walk starts is
+still an `Err`.
+
 **A symbolic link is reported and never followed.** `is_dir` follows a link, so a walk that classified
 with it would descend into a link to a directory without ever deciding to — and a link pointing at one
 of its own ancestors would make the walk unbounded. Each entry carries a

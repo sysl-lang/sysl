@@ -1,0 +1,145 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.{spawn, ToPath}
+import sysl.text.join
+import sysl.time.monotonic
+
+// The project walk against a tree something else is writing. Two halves: the root's `.sysl/` --
+// the toolchain's and the tests' own working directory -- is not part of the tree, so neither the
+// files a build finds nor the run cache's key read it; and an entry another process removes while
+// the walk is under way is absent rather than a refusal of the whole build.
+
+private const VwkMain: string = "print(\"hi\")\n"
+
+// A project holding `main.sysl` and whatever else the case asks for.
+private vwk_project(files: []string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("main.sysl")
+    all.push(VwkMain)
+
+    for i in 0..<files.len
+        all.push(files[i])
+
+    pkc_tree("sysl-vwk", all.view())
+end vwk_project
+
+// Every file `collect` found, by its path below the root.
+private vwk_found(root: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    collect(root, Some(host_target().os)) match
+        Err(e) -> out.push(s"refused: ${e.message}")
+        Ok(found) ->
+            for item in found
+                out.push(relative_to(absolute_path(root), item.src.name))
+
+    out
+end vwk_found
+
+private vwk_key(root: string) -> Option[string] =
+    run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+// -- the root's `.sysl/` is not part of the tree --------------------------------------------------
+
+@test("a '.sysl' file under the root's '.sysl/' is not a file of the project")
+vwk_local_dir_is_not_walked()
+    val root = vwk_project([".sysl/stray.sysl", "module stray\n", ".sysl/c-tests/t.c", "int t;\n"])
+    val found = vwk_found(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(found.len(), 1, join(found.view(), ", "))
+    assert_eq(found.at(0), "main.sysl")
+end vwk_local_dir_is_not_walked
+
+@test("and a '.sysl/' below the root is an ordinary directory")
+vwk_local_dir_below_the_root_is_walked()
+    val root = vwk_project(["lib/lib.sysl", "module lib\n", "lib/.sysl/inner.sysl", "module inner\n"])
+    val found = vwk_found(root)
+
+    remove_dir_all(root).unwrap_or(())
+    var seen = false
+
+    for item in found
+        if item == "lib/.sysl/inner.sysl" then seen = true
+
+    assert(seen, join(found.view(), ", "))
+end vwk_local_dir_below_the_root_is_walked
+
+@test("what the root's '.sysl/' holds does not move the run cache's key")
+vwk_local_dir_is_not_in_the_key()
+    if !compiler_build_known() then return
+
+    val root = vwk_project([])
+    val before = vwk_key(root)
+
+    make_dir_all(s"$root/.sysl/c-tests/oracle-lock-1").unwrap()
+    write_text(s"$root/.sysl/c-tests/oracle-lock-1/held", "1").unwrap()
+    write_text(s"$root/.sysl/c-tests/case.c", "int x;\n").unwrap()
+    write_text(s"$root/.sysl/stray.sysl", "print(1)\n").unwrap()
+
+    val after = vwk_key(root)
+
+    // The control: the same write anywhere else in the tree is a different program.
+    write_text(s"$root/extra.sysl", "print(1)\n").unwrap()
+
+    val moved = vwk_key(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(before.is_some(), "the tree did not key at all")
+    assert_eq(after, before)
+    assert(moved != before, "a file of the tree did not move the key, so the case shows nothing")
+end vwk_local_dir_is_not_in_the_key
+
+// -- an entry removed while the walk is under way -------------------------------------------------
+
+// The walk lists a directory and then looks at each name, so the case needs another process making
+// and removing a directory inside the tree for as long as the walk is asked to run. Nothing here
+// can place the removal between those two steps, so the case is a bounded stress run rather than a
+// single deterministic one: two seconds of walks against a tree that never stops changing.
+@test("a directory another process keeps making and removing never refuses the walk")
+vwk_vanishing_entry_is_absent()
+    val root = vwk_project(["scratch/keep.sysl", "module scratch\n"])
+    val script = s"while :; do mkdir $root/scratch/lock; : > $root/scratch/lock/held; " +
+                 s"rm -rf $root/scratch/lock; done"
+    var churn = spawn("/bin/sh", ["-c", script], stdout = ToPath("/dev/null"),
+                      stderr = ToPath("/dev/null")).unwrap()
+
+    val deadline = monotonic().us + 2000000
+    var refused = ""
+    var walks = 0
+
+    while refused == "" && monotonic().us < deadline
+        collect(root, Some(host_target().os)) match
+            Err(e) -> refused = e.message
+            Ok(_) -> ()
+
+        c_sources(root, Some(host_target().os)) match
+            Err(e) -> refused = e.message
+            Ok(_) -> ()
+
+        walks += 1
+
+    churn.kill().unwrap_or(())
+    assert(churn.wait().is_ok(), "the churning process could not be reaped")
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(refused, "")
+    assert(walks > 0, "the walk never ran")
+end vwk_vanishing_entry_is_absent
+
+@test("a root that is not there is still refused")
+vwk_missing_root_is_refused()
+    val root = vwk_project([])
+
+    remove_dir_all(root).unwrap_or(())
+
+    val got = collect(root, Some(host_target().os)) match
+        Err(e) -> e.message
+        Ok(_) -> ""
+
+    assert_eq(got, s"cannot read $root: '$root' does not exist")
+end vwk_missing_root_is_refused
