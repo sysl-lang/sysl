@@ -20,7 +20,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Reader for File](#reader-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Reader for File](#reader-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -426,11 +426,13 @@ read_bytes(path: string) -> Result[[]u8, IoError]
 
 Every byte of the file.
 
-It reads in chunks and grows rather than sizing the buffer from `size` first, which costs a little
-copying and buys the case that matters: a file being written while this reads it, and anything
-whose length is not a fact until the read ends. The loop stops on the first empty read, and asks
-afterwards whether the reading *ended* badly -- the two are separate questions, which is the split
-`Reader` was built around.
+**The bytes are read straight into the storage that is handed back**, which doubles whenever it
+fills: a read as large as the file's own buffer goes to the descriptor directly, so a file is a few
+reads into its final home and a copy per doubling, never a byte at a time. It does not ask the file's
+size first -- that would reach a filesystem's `stat` for a program that only reads, and a size is
+not a fact for a file being written while this reads it, or for anything whose length is only known
+when the read ends. The loop stops on the first empty read, and asks afterwards whether the reading
+*ended* badly -- the two are separate questions, which is the split `Reader` was built around.
 
 ### `read_link`
 
@@ -528,6 +530,20 @@ in the program, and puts it back only if it remembers to.
 
 Prefer building an absolute path. This exists because a program that drives a build, or that is
 the shell-like thing at the top, genuinely needs it.
+
+### `set_modified`
+
+```sysl
+set_modified(path: string, when: Instant) -> Result[unit, IoError]
+```
+
+The modification time of what `path` names -- a file or a directory -- set to `when`, and its
+access time with it, following a symbolic link. It is what makes "last used" a thing a program can
+record without writing to the file: a cache that evicts the least recently used entry touches what
+it hands out. A path that is not there reports `NotFound`; a target whose filesystem cannot be told
+a time reports `unsupported()`.
+
+Times are kept to the resolution of the filesystem, so reading back with `metadata` may round `when`.
 
 ### `set_owner`
 
@@ -865,7 +881,7 @@ is still an `Err`, since that is a path the caller named rather than one the wal
 | Member | Signature | Description |
 |---|---|---|
 | `bottom_up` | `bottom_up(self) -> Walk` | The same walk, reporting a directory *after* everything under it. |
-| `skip_dir` | `skip_dir(*self)` | Do not descend into the directory just reported. |
+| `skip_dir` | `skip_dir(*self) = …` | Do not descend into the directory just reported. |
 | `matching` | `matching(self, pattern: string) -> Matching` | The same walk, reporting only the entries whose path matches a glob. |
 
 ## Implementations

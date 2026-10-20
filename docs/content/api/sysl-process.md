@@ -58,7 +58,7 @@ the vector as it is given, so a path is a path whatever is in it.
 
 ## Index
 
-[`capture`](#capture) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`hostname`](#hostname) [`new_session`](#new_session) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`user`](#user) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
+[`capture`](#capture) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`hostname`](#hostname) [`new_session`](#new_session) [`pid`](#pid) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`user`](#user) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
 
 ## Functions
 
@@ -175,6 +175,19 @@ new session's id -- its own process id, and the new group's number.
 does in the child it starts a shell in, so that the terminal the shell then opens becomes that
 session's. A program that already leads a process group -- a job a shell started with `Group.New`,
 or one that called `set_process_group()` -- is `NotPermitted`, and stays where it was.
+
+### `pid`
+
+```sysl
+pid() -> u32
+```
+
+This program's process id: the number no other program running beside it has, which is what
+names a file, a directory or a cache entry this run alone owns. It is POSIX's `getpid`, and what a
+`Child`'s `pid` is to the program that started it.
+
+**A target that keeps no processes answers 0**, as it answers 0 for a user: there is one program, and
+nothing beside it to be told apart from. So does a supplier that does not know the question.
 
 ### `pipe`
 

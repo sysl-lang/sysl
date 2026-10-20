@@ -78,7 +78,7 @@ of two has to be carried around to remember it.
 ### `approx_eq`
 
 ```sysl
-approx_eq[F: Float](a: F, b: F, tol: F) -> bool
+const approx_eq[F: Float](a: F, b: F, tol: F) -> bool
 ```
 
 Whether two floats are within `tol` of each other -- an **absolute** tolerance, which is what a
@@ -100,7 +100,7 @@ is that test.
 ### `approx_eq_rel`
 
 ```sysl
-approx_eq_rel[F: Float](a: F, b: F, tol: F) -> bool
+const approx_eq_rel[F: Float](a: F, b: F, tol: F) -> bool
 ```
 
 Whether two floats agree to within `tol` **relative to the larger of them**, which is the test to
@@ -117,7 +117,7 @@ combined form always knew they did.
 ### `assert_approx_eq`
 
 ```sysl
-assert_approx_eq[F: Float + Display](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_approx_eq[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
 ```
 
 The two above, written as assertions -- the float half of `sysl.assert_eq`, which floats cannot
@@ -130,21 +130,20 @@ an edge back the other way, and `reference/modules.md § The module graph is acy
 module graph to being acyclic. Anyone writing float assertions has this module in scope already,
 since it is where the float functions are. They report the pair and the tolerance for the reason
 `assert_eq` reports the pair: a float that missed by one part in `1e9` and one that came back NaN
-are the same failed check until the report says which. `Display` joins the bound because `Float`
-does not imply it -- the two floats have `impl Display` blocks of their own (`display.sysl`)
-rather than a membership the compiler hands out, so asking for it costs a caller nothing and lets
-the report exist.
+are the same failed check until the report says which. `Debug` joins the bound because `Float`
+does not imply it -- every float has an `impl Debug` of its own (`debug.sysl`), so asking for it
+costs a caller nothing and lets the report exist.
 
 ### `assert_approx_eq_rel`
 
 ```sysl
-assert_approx_eq_rel[F: Float + Display](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_approx_eq_rel[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
 ```
 
 ### `checked_add`
 
 ```sysl
-checked_add[T: Signed + Add + BitXor + BitAnd + Ord](a: T, b: T) -> Option[T]
+const checked_add[T: Signed + Add + BitXor + BitAnd + Ord](a: T, b: T) -> Option[T]
 ```
 
 `a + b`, or `none` where the sum does not fit.
@@ -156,7 +155,7 @@ cannot use without looking.
 ### `checked_mul`
 
 ```sysl
-checked_mul[T: Signed + Bits + Mul + Div + Sub + Shl + Eq + Ord](a: T, b: T) -> Option[T]
+const checked_mul[T: Signed + Bits + Mul + Div + Sub + Shl + Eq + Ord](a: T, b: T) -> Option[T]
 ```
 
 `a * b`, or `none` where the product does not fit.
@@ -164,7 +163,7 @@ checked_mul[T: Signed + Bits + Mul + Div + Sub + Shl + Eq + Ord](a: T, b: T) -> 
 ### `checked_sub`
 
 ```sysl
-checked_sub[T: Signed + Sub + BitXor + BitAnd + Ord](a: T, b: T) -> Option[T]
+const checked_sub[T: Signed + Sub + BitXor + BitAnd + Ord](a: T, b: T) -> Option[T]
 ```
 
 `a - b`, or `none` where the difference does not fit.
@@ -172,7 +171,7 @@ checked_sub[T: Signed + Sub + BitXor + BitAnd + Ord](a: T, b: T) -> Option[T]
 ### `clamp`
 
 ```sysl
-clamp[T: Ord](x: T, low: T, high: T) -> T
+const clamp[T: Ord](x: T, low: T, high: T) -> T
 ```
 
 The receiver held to a range, inclusive at both ends.
@@ -185,7 +184,7 @@ tool for saying so where it is not.
 ### `div_floor`
 
 ```sysl
-div_floor[T: Div + Rem + Eq + Ord + Sub](a: T, b: T) -> T
+const div_floor[T: Div + Rem + Eq + Ord + Sub](a: T, b: T) -> T
 ```
 
 `a` divided by `b`, rounded toward negative infinity: `div_floor(-7, 2)` is `-4` where `-7 / 2`
@@ -203,7 +202,7 @@ divisor, and the one signed overflow `MIN / -1`, trap here exactly as `/` does.
 ### `divmod`
 
 ```sysl
-divmod[T: Div + Rem](a: T, b: T) -> (T, T)
+const divmod[T: Div + Rem](a: T, b: T) -> (T, T)
 ```
 
 The quotient and the remainder together, as a result list (`reference/declarations.md § Several
@@ -221,7 +220,7 @@ two operands feed both.
 ### `gcd`
 
 ```sysl
-gcd[T: Rem + Eq + Ord + Sub](a: T, b: T) -> T
+const gcd[T: Rem + Eq + Ord + Sub](a: T, b: T) -> T
 ```
 
 The largest value dividing both, and never a negative one.
@@ -252,7 +251,7 @@ exactly one place either way.
 ### `is_power_of_two`
 
 ```sysl
-is_power_of_two[T: Bits + Ord](x: T) -> bool
+const is_power_of_two[T: Bits + Ord](x: T) -> bool
 ```
 
 Whether the value is a power of two -- which is to say, whether exactly one bit is set.
@@ -265,7 +264,7 @@ zero costs nothing and is the whole of the difference.
 ### `lcm`
 
 ```sysl
-lcm[T: Rem + Eq + Ord + Sub + Div + Mul](a: T, b: T) -> T
+const lcm[T: Rem + Eq + Ord + Sub + Div + Mul](a: T, b: T) -> T
 ```
 
 The smallest value both divide, and never a negative one.
@@ -281,7 +280,7 @@ else also divides, and reaching `gcd(0, 0)`, which is zero, would otherwise be a
 ### `max`
 
 ```sysl
-max[T: Ord](a: T, b: T) -> T
+const max[T: Ord](a: T, b: T) -> T
 ```
 
 The larger of two values, and again the first when they tie.
@@ -289,7 +288,7 @@ The larger of two values, and again the first when they tie.
 ### `min`
 
 ```sysl
-min[T: Ord](a: T, b: T) -> T
+const min[T: Ord](a: T, b: T) -> T
 ```
 
 The smaller of two values, and the receiver-side one when they compare equal.
@@ -302,7 +301,7 @@ the first is the answer that makes a fold over a sequence stable.
 ### `mod_floor`
 
 ```sysl
-mod_floor[T: Rem + Add + Eq + Ord](a: T, b: T) -> T
+const mod_floor[T: Rem + Add + Eq + Ord](a: T, b: T) -> T
 ```
 
 `a` modulo `b`, taking the **divisor's** sign: `mod_floor(-7, 2)` is `1` where `-7 % 2` is `-1`.
@@ -324,7 +323,7 @@ look for it.
 ### `next_power_of_two`
 
 ```sysl
-next_power_of_two[T: Bits + Ord + Shl + Sub](x: T) -> Option[T]
+const next_power_of_two[T: Bits + Ord + Shl + Sub](x: T) -> Option[T]
 ```
 
 The smallest power of two at or above the value, or `none` when that power does not fit in `T`.
@@ -367,7 +366,7 @@ The `f32` after `x` in the direction of `y`; see the `real` form for the edges.
 ### `overflowing_add`
 
 ```sysl
-overflowing_add[T: Signed + Add + BitXor + BitAnd + Ord](a: T, b: T) -> (T, bool)
+const overflowing_add[T: Signed + Add + BitXor + BitAnd + Ord](a: T, b: T) -> (T, bool)
 ```
 
 `a + b`, and whether it overflowed. The value is the wrapped sum either way.
@@ -382,7 +381,7 @@ than by a branch.
 ### `overflowing_mul`
 
 ```sysl
-overflowing_mul[T: Signed + Bits + Mul + Div + Sub + Shl + Eq + Ord](a: T, b: T) -> (T, bool)
+const overflowing_mul[T: Signed + Bits + Mul + Div + Sub + Shl + Eq + Ord](a: T, b: T) -> (T, bool)
 ```
 
 `a * b`, and whether it overflowed. The value is the wrapped product either way.
@@ -403,7 +402,7 @@ the sum can never clear the bar.
 ### `overflowing_sub`
 
 ```sysl
-overflowing_sub[T: Signed + Sub + BitXor + BitAnd + Ord](a: T, b: T) -> (T, bool)
+const overflowing_sub[T: Signed + Sub + BitXor + BitAnd + Ord](a: T, b: T) -> (T, bool)
 ```
 
 `a - b`, and whether it overflowed. The value is the wrapped difference either way.
@@ -419,7 +418,7 @@ negative value of the width: negating that wraps to itself, so `a - min` would b
 ### `pow`
 
 ```sysl
-pow[T: Mul + Ord](base: T, exponent: u32) -> T
+const pow[T: Mul + Ord](base: T, exponent: u32) -> T
 ```
 
 A value raised to a whole power, by repeated squaring: `pow(2, 10)` is `1024`.
