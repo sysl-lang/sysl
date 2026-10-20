@@ -3384,7 +3384,7 @@ end call_key
 // there, so a second bad argument, and a result the call never had, are consequences.
 refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                  slots: Buf[Option[Expr]], ts: Buf[TExpr], wants: Buf[Type],
-                 before: usize, report: bool = true) -> Option[TExpr]
+                 before: usize, report: bool = true, unread: Buf[usize] = buf()) -> Option[TExpr]
     // Every caller quotes the declaration it reached, which for an overload or a second
     // implementation is the slot it was filed under and not the name anybody wrote.
     val shown = unslotted_quote(quoted)
@@ -3423,11 +3423,13 @@ refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
             // declaration that type is only known here: `step: T = 1` cannot be checked where it is
             // written, `T` standing for itself there, and at `T = real` the literal is an `int`
             // handed to a `real` -- which lowered as the integer's bits read as a float. It is
-            // refused at the default, in the reference's words.
+            // refused at the default, in the reference's words -- and so is one whose reading at
+            // that type was refused outright (`default_at`), which is the same mistake.
             None ->
                 val d = params.at(i).default
 
-                if i < ts.len() && d.is_some() && disagree(texpr_type(ts.at(i)), wants.at(i))
+                if i < ts.len() && d.is_some() &&
+                   (holds_index(unread, i) || disagree(texpr_type(ts.at(i)), wants.at(i)))
                     if !report then return Some(cx.err(d.unwrap().span, "argument disagrees"))
 
                     return Some(cx.err(d.unwrap().span, s"'${params.at(i).name}' of $shown was left " +
@@ -3438,6 +3440,12 @@ refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
 
     None
 end refused_argument
+
+private holds_index(items: Buf[usize], i: usize) -> bool
+    for item in items
+        if item == i then return true
+
+    false
 
 // **A by-value `va_list` parameter takes the address of the walk**, at a sysl callee as at an
 // `extern`: that is what sysl has to give and what every target's answer is formed from, so the

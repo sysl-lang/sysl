@@ -1842,6 +1842,34 @@ from* — never the rule:
 - **A bounded parameter `[T: Op]`** resolves abstractly at the definition, and monomorphization binds
   it per instantiation.
 
+**The right-hand operand selects the implementation as an argument selects an overload.** One
+written at `b`'s own type is meant where there is one; otherwise `b` takes an
+[implicit conversion](#which-conversions-are-implicit) to the narrowest right-hand type among the
+implementations it widens to, so `c * n` over `impl Mul[real] for Complex` takes an `int` `n` exactly
+as `c.mul(n)` does, and `c *= n` does the same. Two it widens to, neither of which holds the other,
+leave the operator refused. A built-in scalar's operator has nothing to choose among, and its
+operands keep their own rule: an operand widens only to the other operand's type.
+
+```sysl
+struct Complex
+    re: real
+    im: real
+
+impl Mul[real] for Complex
+    mul(self, k: real) -> Complex = Complex(self.re * k, self.im * k)
+
+val n = 3
+var c = Complex(1.5, -2.0) * n
+
+c *= n
+
+print(c.re, c.im)
+```
+
+```output
+13.5 -18
+```
+
 | trait | method | operator |
 |---|---|---|
 | `Add[Rhs = Self, Out = Self]` | `add(self, rhs: Rhs) -> Out` | `+` |

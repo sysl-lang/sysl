@@ -104,6 +104,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
     val slots = bound.unwrap()
 
     for i in 0..<slots.len()
@@ -116,10 +117,14 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
             Some(e) -> ts.push(argument_at(cx, decl, i, e, want, buf()))
             None ->
                 val inner = default_reader(cx, span, f.scope, name, decl.bounds)
+                val read = default_at(inner, decl.params.at(i).default.unwrap(), want)
 
-                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                if read.is_none() then unread.push(i)
 
-    val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before)
+                ts.push(read.unwrap_or(bad_expr(span)))
+
+    val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before,
+                                   true, unread)
 
     if refused.is_some() then return refused.unwrap()
 
@@ -458,6 +463,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
 
     for i in 0..<slots.len()
         val want = walk_wanted(decl.params.at(i), if i < written_params.len()
@@ -494,11 +500,14 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     else ts.push(kept)
                 else
                     val inner = default_reader(cx, span, f.scope, name, decl.bounds)
+                    val read = default_at(inner, decl.params.at(i).default.unwrap(), want)
 
-                    ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                    if read.is_none() then unread.push(i)
+
+                    ts.push(read.unwrap_or(bad_expr(span)))
 
     val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before,
-                                   report)
+                                   report, unread)
 
     if refused.is_some() then return refused.unwrap()
 

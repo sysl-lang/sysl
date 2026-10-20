@@ -253,6 +253,7 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
 
     for i in 0..<slots.unwrap().len()
         val want = walk_wanted(decl.params.at(i), if i < sig.unwrap().params.len()
@@ -265,11 +266,14 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
             None ->
                 val inner = default_reader(cx, span, member_default_scope(cx, fname), fname,
                                            decl.bounds)
+                val read = default_at(inner, decl.params.at(i).default.unwrap(), want)
 
-                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                if read.is_none() then unread.push(i)
+
+                ts.push(read.unwrap_or(bad_expr(span)))
 
     val refused = refused_argument(cx, span, s"'${qualified_name(found.0)}.$picked'", decl.params,
-                                   slots.unwrap(), ts, wants, before)
+                                   slots.unwrap(), ts, wants, before, true, unread)
 
     if refused.is_some() then return refused
 
@@ -1124,6 +1128,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     val before = cx.an.complaints()
     var given: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
 
     for i in 0..<slots.unwrap().len()
         val want = walk_wanted(m.params.at(i), if i + off < params.len() then params.at(i + off).1
@@ -1149,10 +1154,14 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
                 given.push(t)
             None ->
                 val inner = default_reader(cx, span, member_default_scope(cx, name), name, m.bounds)
+                val read = default_at(inner, m.params.at(i).default.unwrap(), want)
 
-                given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+                if read.is_none() then unread.push(i)
 
-    val refused = refused_argument(cx, span, subject, m.params, slots.unwrap(), given, wants, before)
+                given.push(read.unwrap_or(bad_expr(span)))
+
+    val refused = refused_argument(cx, span, subject, m.params, slots.unwrap(), given, wants, before,
+                                   true, unread)
 
     if refused.is_some() then return refused.unwrap()
 
@@ -1236,6 +1245,7 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     val before = cx.an.complaints()
     var given: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
 
     for i in 0..<slots.unwrap().len()
         val want = walk_wanted(m.params.at(i), if i + 1 < params.len() then params.at(i + 1).1
@@ -1247,11 +1257,14 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
             Some(e) -> given.push(type_expr(cx, e, Some(want)))
             None ->
                 val inner = default_reader(cx, span, member_default_scope(cx, fname), fname, m.bounds)
+                val read = default_at(inner, m.params.at(i).default.unwrap(), want)
 
-                given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+                if read.is_none() then unread.push(i)
+
+                given.push(read.unwrap_or(bad_expr(span)))
 
     val refused = refused_argument(cx, span, s"'$fname'", m.params, slots.unwrap(), given, wants,
-                                   before)
+                                   before, true, unread)
 
     if refused.is_some() then return refused.unwrap()
 

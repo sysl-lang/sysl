@@ -100,7 +100,7 @@ print(total)
 The bare literals are read at that type, not as an `int` first, wherever they fit it. One that does
 not takes its own default, `int` or `real`, and the typed elements widen to that where every value of
 theirs is one of its — `[1u8, 300]` is a `[2]int` — as a literal beside a typed operand does (§
-[Which conversions are implicit](expressions.md#which-conversions-are-implicit)). Two elements that
+[Which conversions are implicit](/reference/expressions/#which-conversions-are-implicit)). Two elements that
 each have a type meet at the wider where one holds every value of the other, as two operands do —
 `[b, n]` over a `byte` and an `int` is a `[2]int` — and otherwise have to agree, so `[u, n]` over a
 `u32` and an `int` is refused. An integer literal beside a real is not made a real. A literal that
