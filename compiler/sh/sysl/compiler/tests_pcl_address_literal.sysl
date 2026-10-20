@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A bare integer literal handed to `ptr_cast` is the address-width integer the form reads
+// (`reference/memory.md § Reinterpreting storage`): it is a `usize` at the target's width, as a
+// literal is whatever integer type its position names. One that does not fit that width, or a
+// negative one, is refused as a literal that does not fit; a value that already has a type keeps it,
+// so an `int` or a suffixed literal is still refused as before.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private pcl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private pcl_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-pcl").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end pcl_root
+
+// What a one-file program prints on this machine, or the report it was refused with.
+private pcl_ran(text: string) -> string
+    val root = pcl_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pcl_ran
+
+// The report a one-file program is refused with on a machine (this one where none is named), its
+// locations relative to the program's directory, or nothing where it is accepted.
+private pcl_report(machine: Option[string], text: string) -> string
+    val root = pcl_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end pcl_report
+
+private pcl_prints(text: string, want: string)
+    if !pcl_ready() then return
+
+    assert_eq(pcl_ran(text), want)
+end pcl_prints
+
+// Refused on `machine` with exactly `message`, first, at `at` (`line:col`).
+private pcl_refused_on(machine: Option[string], text: string, message: string, at: string)
+    if !pcl_ready() then return
+
+    val said = pcl_report(machine, text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end pcl_refused_on
+
+private pcl_accepted_on(machine: string, text: string)
+    if !pcl_ready() then return
+
+    assert_eq(pcl_report(Some(machine), text), "")
+end pcl_accepted_on
+
+// A probe for a bare target: one exported function that reads `literal` as an address.
+private pcl_probe(literal: string) -> string =
+    s"@export(\"pcl_probe\")\nprobe() -> usize\n    val p: *u8 = ptr_cast($literal)\n    usize(p)\nend probe\n"
+
+// -- the literal is the address -------------------------------------------------------------------
+
+@test("a bare literal is the address, in decimal, in hex, and as zero")
+pcl_a_bare_literal_is_the_address() =
+    pcl_prints("val p: *u32 = ptr_cast(4096)\nval q: *u8 = ptr_cast(0x4000_0000)\nval z: *u8 = ptr_cast(0)\n" +
+               "print(usize(p), usize(q), usize(z))\n",
+               "4096 1073741824 0\n")
+
+@test("the written type-argument form and an argument position read it the same way")
+pcl_type_argument_and_argument_position() =
+    pcl_prints("addr(p: *u16) -> usize = usize(p)\nval p = ptr_cast[*u8](0x100)\n" +
+               "print(usize(p), addr(ptr_cast(0x200)))\n",
+               "256 512\n")
+
+@test("a 64-bit target takes an address above four gigabytes")
+pcl_above_four_gigabytes_here() =
+    pcl_prints("val p: *u8 = ptr_cast(0x1_0000_0000)\nprint(usize(p))\n", "4294967296\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("a negative literal does not fit an address")
+pcl_a_negative_literal_is_refused() =
+    pcl_refused_on(None, "val p: *u32 = ptr_cast(-1)\nprint(usize(p))\n",
+                   "the literal -1 does not fit usize", "1:24")
+
+@test("a typed int is not address-width, and only a literal changes")
+pcl_a_typed_int_is_still_refused() =
+    pcl_refused_on(None, "var n = 4096\nval p: *u32 = ptr_cast(n)\nprint(usize(p))\n",
+                   "'ptr_cast' reads an address, and int is not address-width — convert it first, as " +
+                   "'ptr_cast(usize(n))'", "2:15")
+
+@test("a suffixed literal has said what it is, and a u32 is not address-width")
+pcl_a_suffixed_literal_is_still_refused() =
+    pcl_refused_on(None, "val p: *u32 = ptr_cast(4096u32)\nprint(usize(p))\n",
+                   "'ptr_cast' reads an address, and uint is not address-width — convert it first, as " +
+                   "'ptr_cast(usize(n))'", "1:15")
+
+// -- the width is the target's --------------------------------------------------------------------
+
+@test("on a 32-bit target the top address fits and one past it does not")
+pcl_on_a_32_bit_target()
+    pcl_accepted_on("thumbv7em-freestanding", pcl_probe("0xFFFF_FFFF"))
+    pcl_refused_on(Some("thumbv7em-freestanding"), pcl_probe("0x1_0000_0000"),
+                   "the literal 4294967296 does not fit usize", "3:27")
+end pcl_on_a_32_bit_target
+
+@test("on Craft's 16-bit target the top address fits and one past it does not")
+pcl_on_craft()
+    pcl_accepted_on("craft-freestanding", pcl_probe("0xFFFF"))
+    pcl_refused_on(Some("craft-freestanding"), pcl_probe("0x1_0000"),
+                   "the literal 65536 does not fit usize", "3:27")
+end pcl_on_craft

@@ -1227,7 +1227,7 @@ end Kernel
 
 var k = Kernel([Task(0, 7); 4])
 
-k.advance(2usize)
+k.advance(2)
 
 print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].prio)
 ```
@@ -2346,6 +2346,43 @@ print(n.value, sizeof(Node), usize(n) == usize(&arena[0]))
 pointer's width, and the number that comes out cannot be dereferenced any more than the one above
 can. It is what a binding reaches for when a C library wants a callback registered through something
 that takes a number, and it is the same row of the table rather than a special case.
+
+**A number becomes a pointer only from an address-width integer**, `usize` or `isize`. A fixed width
+is not an address's width on every target, and reading a narrower one would invent the address's top
+bits. **A bare integer literal is an address-width integer**: it is a `usize` at the target's width,
+just as a literal is whatever integer type any other position names, so the address a datasheet
+gives is written as it is printed there:
+
+```sysl
+struct Uart
+    data: u32
+    status: u32
+
+val uart: *Uart = ptr_cast(0x4000_4000)
+val none: *Uart = ptr_cast(0)
+
+print(usize(uart), usize(none))
+```
+
+```output
+1073758208 0
+```
+
+The literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
+machine, above `0xFFFF_FFFF` on a 32-bit one — or a negative one is refused as any literal that does
+not fit its type is. A value that already has a type keeps it, so an `int` is still refused, and is
+converted where it is meant as an address:
+
+```sysl
+var base = 0x4000_4000
+val uart: *u32 = ptr_cast(base)
+
+print(usize(uart))
+```
+
+```error
+'ptr_cast' reads an address, and int is not address-width — convert it first, as 'ptr_cast(usize(n))'
+```
 
 **The target type comes from whatever receives the result** — the same way `va_arg`, a bare `None`,
 and a bare `null` all take theirs. Where that is not where a reader wants to say it, it may be

@@ -53,7 +53,7 @@ the answer cannot change under a running program in any way that matters:
 ### `tty_sink`
 
 ```sysl
-val tty_sink: *TtyWriter = ptr_cast(0usize)
+val tty_sink: *TtyWriter = ptr_cast(0)
 ```
 
 ## Functions
