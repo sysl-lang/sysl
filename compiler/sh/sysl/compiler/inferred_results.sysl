@@ -1,0 +1,338 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A function's result read off its body: `twice(x: int) = x * 2` hands back an `int` exactly as
+// `val y = x * 2` holds one.
+//
+// **The result is a signature's, so it has to be known wherever a written one would be** -- by a call
+// above the declaration, in another file, through another module. It is read where it is first asked
+// for: the body is read once with nothing expected, the way a `val`'s initializer is read for its
+// type, everything that reading registered is taken back, and only the type is kept. The reading the
+// program gets is the ordinary one, against that type, wherever the body is typed.
+//
+// **A body that reaches its own function before the type is known has no type to take**, which is
+// refused at the declaration, as a module `val` whose value reaches itself is.
+//
+// Every declaration that leaves its result to its body is filed here before anything asks, under the
+// name of the function it lowers to, and its slot (`ast_types.sysl`'s `ResultSlot`) names that entry,
+// so every copy of the declaration -- the one a call reads, the one the hoist resolved -- reaches the
+// one answer. A generic declaration's answer is in terms of its own parameters, standing for
+// themselves, and each reading puts its own types in for them.
+
+// One declaration whose result is read off its body.
+struct ResultSite
+    key: string
+    // The name a refusal shows for it, qualified as a reader would write it.
+    label: string
+    scope: Scope
+    // Where the declaration is written: what a refusal points at.
+    span: Span
+    decl: FuncDecl
+    vis: Visibility
+    // A nested function's frame, and what the frame's own type parameters stand for there.
+    frame: Option[&NestedFrame]
+    outer: Buf[Binding]
+    // Waiting, being read, settled.
+    state: int
+    ty: Type
+    // The body reached this declaration while it was being read for its type; `told` once refused.
+    looped: bool
+    told: bool
+    // A loop was closed while this declaration's body was being read, so what it read is built on a
+    // type nobody had.
+    tainted: bool
+    // The declarations a loop through this one ran through, as a refusal names them.
+    through: Buf[string]
+    // The body hands back a closure, whose type has no name for a signature to state.
+    closure: bool
+    library: bool
+    member: bool
+end ResultSite
+
+// Every result read off a body, and the reading under way.
+struct ResultSites
+    // A body can be read once every declaration is in and every member hoisted; before then a result
+    // asked for is not known yet, and an asker gets `Unknown`.
+    open: bool
+    sites: &Table[&ResultSite]
+    // The declarations whose bodies are being read for their results now, outermost first.
+    reading: Buf[string]
+    // The result an `impl` member takes from the trait it supplies, by member key.
+    held: &Table[Type]
+    // The nested function whose body `nested_body_in` is reading for that function's own result.
+    for_body: string
+end ResultSites
+
+result_sites() -> &ResultSites = ResultSites(false, table(), buf(), table(), "")
+
+// A declaration filed: its slot is pointed at it, and it waits to be asked -- or, where the result is
+// settled already (`held`), it is that.
+note_result_site(a: &Analysis, key: string, label: string, scope: Scope, span: Span, d: FuncDecl,
+                 member: bool, held: Option[Type] = None, frame: Option[&NestedFrame] = None,
+                 outer: Buf[Binding] = buf())
+    val slot = result_slot_of(d.ret_type)
+
+    if slot.is_none() then return
+
+    slot.unwrap().site = key
+
+    val state = if held.is_some() then 2 else 0
+    val site = ResultSite(key, label, scope, span, d, d.vis, frame, outer, state,
+                          held.unwrap_or(Unknown), false, false, false, buf(), false,
+                          from_library(a, scope), member)
+
+    a.results.sites.put(key, site)
+end note_result_site
+
+// The result an `impl` member supplying a trait's member takes, filed under the member's key while
+// the block is checked against the trait (`conformance.sysl`).
+held_trait_result(a: &Analysis, member_key: string) -> Option[Type] = a.results.held.get(member_key)
+
+// A member of an `impl` block, which supplies a trait's member: its result is the one the trait
+// declared, which is what the block is held to, so its body is read against that rather than for a
+// type of its own -- `write(*self, b: []const u8) = putbytes(b)` supplies the trait's `write`
+// whatever `putbytes` hands back.
+hold_trait_result(a: &Analysis, member_key: string, ty: Type)
+    a.results.held.put(member_key, ty)
+
+// What a result left to the body comes to, in the terms of the reading that asks.
+inferred_result(a: &Analysis, slot: &ResultSlot, subst: Buf[Binding]) -> Type
+    val found = a.results.sites.get(slot.site)
+
+    if found.is_none() then return Unknown
+
+    val s = found.unwrap()
+
+    if s.state != 2 && !a.results.open then return Unknown
+
+    settle_result(a, s)
+    subst_params(a, s.ty, subst)
+end inferred_result
+
+// The result of the function filed under `key`, settled if it has not been yet -- for a reader that
+// holds the function's name rather than its declaration.
+settled_result_of(a: &Analysis, key: string) -> Option[Type]
+    val found = a.results.sites.get(key)
+
+    if found.is_none() || !a.results.open then return None
+
+    settle_result(a, found.unwrap())
+    Some(found.unwrap().ty)
+end settled_result_of
+
+// Reads one declaration's body for its type, once.
+//
+// **A body reaching the declaration while it is being read is the loop the reader has to break**:
+// the declaration it reached is refused, and every one the reading passed through on the way takes
+// `Unknown` with it, since none of them has a type either until one of the loop states its own.
+settle_result(a: &Analysis, s: &ResultSite)
+    if s.state == 2 then return
+
+    if s.state == 1
+        var on_loop = false
+
+        for item in a.results.reading
+            if on_loop then
+                a.results.sites.get(item) match
+                    Some(other) ->
+                        other.tainted = true
+
+                        if !s.looped then s.through.push(other.label)
+                    None -> ()
+
+            if item == s.key then on_loop = true
+
+        s.looped = true
+        return
+    end if
+
+    s.state = 1
+    a.results.reading.push(s.key)
+
+    val got = read_result(a, s)
+
+    a.results.reading.truncate(a.results.reading.len() - 1)
+    s.state = 2
+    s.ty = if s.looped || s.tainted then Unknown else got
+
+    // A concrete member's signature was filed at the hoist, before a body could be read, and a nested
+    // function's where its group was, so each is corrected here: a call reads the result from there.
+    if s.member || s.frame.is_some()
+        val sig = a.tables.members.func_insts.get(s.key)
+
+        // Read back through the declaration, so an `async` one's call hands back the task of it.
+        if sig.is_some()
+            val terms = if s.member then a.tables.members.selves.get(s.key).unwrap_or(buf()) else s.outer
+            val ret = declared_result_type(Some(resolve_result(a, s.scope, s.decl.ret_type.unwrap(), terms)))
+
+            a.tables.members.func_insts.put(s.key, FuncSig(sig.unwrap().params, ret))
+        end if
+    end if
+end settle_result
+
+private read_result(a: &Analysis, s: &ResultSite) -> Type
+    val got = if s.frame.is_some() then nested_result_type(a, s.frame.unwrap(), s.key, s.decl, s.outer)
+    else body_result_type(a, s.scope, s.decl)
+
+    if is_closure_literal(got)
+        s.closure = true
+        return Unknown
+    end if
+
+    got
+end read_result
+
+// What a body produces, read with nothing expected and taken back.
+//
+// The setup is the one a generic body gets at its definition, so a generic declaration's answer is in
+// terms of its own parameters and a member's in terms of its type's: each type parameter stands for
+// itself, and a reading that fixes them puts its own types in. **Everything the reading said is
+// rewound**: the body is read again, for real, wherever it is typed, and a mistake inside it would
+// otherwise be reported twice. A body that did not read cleanly answers `Unknown`, which nothing
+// downstream complains about a second time.
+private body_result_type(a: &Analysis, scope: Scope, written: FuncDecl) -> Type
+    val d = with_call_bounds(written)
+
+    if d.body.is_empty() then return Unknown
+
+    val reaching = enter_reaching(a, d)
+
+    defer leave_reaching(a, reaching)
+
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
+    val counted = a.closure_count
+    val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
+    var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
+                                                      d.tpacks, outer))
+    val written_self = a.tables.members.generic_self.get(d.name)
+
+    if written_self.is_some() then
+        subst.push(Binding("Self", resolve_type(a, scope, written_self.unwrap(), subst)))
+
+    subst = with_derive_param(a, d.name, subst)
+
+    val cx = analyzer_for(a, scope)
+
+    cx.subst = subst
+    cx.owner = owner_of(a, d.name, scope)
+    cx.in_variadic = d.variadic
+    remember_bounds(cx, d)
+
+    for p in d.params
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+
+        if p.by_name then cx.by_name.push(unique)
+
+    cx.func_name = d.name
+    cx.decl_name = d.name
+    cx.views_self = d.marks.views
+    cx.ret_ty = Some(Unknown)
+    cx.await_site = await_site_of(d)
+    cx.ret_is_list = false
+
+    val split = contract_length(d.body)
+
+    analyze_contract(cx, decl_anchor(d), d.body, split, Unknown)
+
+    val body = own_result_block(cx, statements_from(d.body, split))
+    val clean = a.complaints() == mark
+
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_funcs.truncate(closures)
+    a.closure_count = closure_rewind(a, counted)
+
+    if clean then body.ty else Unknown
+end body_result_type
+
+// A body read for the type it produces: its trailing expression with nothing expected, as a `val`'s
+// initializer is read. A body that gave up comes to `Unknown`.
+own_result_block(cx: &Analyzer, rest: Buf[Stmt]) -> TBlock
+    val outer = cx.an.open_region()
+    val block = type_value_block(cx, rest, None, false)
+    val gave_up = cx.an.poison.is_some()
+
+    cx.an.close_region(outer)
+
+    if gave_up then TBlock(block.stmts, block.result, Unknown) else block
+end own_result_block
+
+// Every function that leaves its result to its body filed -- a member was filed as it was hoisted --
+// and bodies from here on readable: every declaration is in.
+open_inferred_results(a: &Analysis)
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+        val shown = if f.scope.module_name == "" then f.decl.name
+        else s"${f.scope.module_name}.${f.decl.name}"
+
+        note_result_site(a, a.tables.funcs.key_at(i), shown, f.scope, decl_anchor(f.decl), f.decl, false)
+
+    a.results.open = true
+end open_inferred_results
+
+// Every result a program's own declarations leave to their bodies, read once every declaration is in
+// -- so that a loop among them is refused and a type one exposes is told, whether or not anything
+// calls them -- and every member's, since a call reads a member's result from the table the hoist
+// filled. A library function's is read when something first asks for it.
+settle_inferred_results(a: &Analysis)
+    for i in 0..<a.results.sites.len()
+        val s = a.results.sites.at(i)
+
+        if s.frame.is_some() || (s.library && !s.member) then continue
+
+        settle_result(a, s)
+
+    for i in 0..<a.results.sites.len()
+        val s = a.results.sites.at(i)
+
+        if s.frame.is_none() && !s.library then told_of_result(a, s)
+end settle_inferred_results
+
+// What a declaration whose result was read is told: that its body reaches it, that its result
+// exposes a type it may not, or that C reads it.
+told_of_result(a: &Analysis, s: &ResultSite)
+    if s.state != 2 || s.told then return
+
+    s.told = true
+
+    if s.looped
+        var via = ""
+
+        for i in 0..<s.through.len()
+            via = via + (if i == 0 then " through " else ", ") + s"'${s.through.at(i)}'"
+
+        a.fault(s.scope, s.span, s"'${s.label}' takes its result type from its body, and the body " +
+                s"reaches '${s.label}' again$via — write its result type, '${s.decl.name}(…) -> T'")
+        return
+    end if
+
+    if s.closure
+        a.fault(s.scope, s.span, s"'${s.label}' would hand back a closure, whose type has no name for " +
+                s"a signature to state — write its result type, '${s.decl.name}(…) -> &Fn(…) -> R'")
+        return
+    end if
+
+    if mentions_unknown(s.ty) then return
+
+    // **C reads what an exported function hands back**, and what it reads is the declaration as
+    // written, so a value it would be handed is one the declaration has to state.
+    if s.ty != Unit && (s.decl.exported.is_some() || s.decl.conv.is_some())
+        val shown = if s.decl.exported.is_some() then "'@export'" else "'@convention'"
+
+        a.fault(s.scope, s.span, s"'${s.label}' is $shown, so C reads what it hands back, and its " +
+                s"body yields ${type_show(s.ty)} — write its result type, '${s.decl.name}(…) -> T'")
+        return
+    end if
+
+    if !s.member then check_exposed_result(a, s.scope, s.label, s.vis, s.ty, s.span)
+end told_of_result

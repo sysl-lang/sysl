@@ -146,10 +146,11 @@ is a body, the module member is asked for with `static val` / `static var`.
 
 **A function is a name, a parameter list, an optional `-> result`, and a body** — no keyword. The
 body is `= expr` or an indented block whose **trailing expression** is the result; `=` may also open
-a block. An absent result type means `unit`.
+a block. **With no `-> result`, a `= value` body takes the value's type** as a `val` does, and a block
+body with no `=` hands back `unit`.
 
 ```sysl
-double(n: int) -> int = n * 2
+double(n: int) = n * 2
 
 sum(a: int, b: int) -> int
     val t = a + b

@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A value argument that is a constant but does not read at its parameter's type is refused for
+// that**, at the part that does not read (`reference/generics.md § Which values`): `const Base = 2`
+// is an `int`, so `double(Base)` over a `usize` parameter is a mismatch, not a non-constant. An
+// argument naming storage keeps "must be a constant", and an `int` constant handed straight to a
+// `usize` value parameter is read at it, fit-checked.
+
+private vam_ring() -> string = raw"""
+    struct Ring[const N: usize]
+        data: [N]byte
+
+    double(n: usize) -> usize = n * 2
+
+    const Base = 2
+    """
+
+@test("an int const through a usize function in a type's value argument is a mismatch at the const")
+vam_through_a_function_in_a_type()
+    if !enm_ready() then return
+
+    val said = enm_outcome(vam_ring() + raw"""
+
+        var r: Ring[double(Base)] = Ring([0; 4])
+
+        print(r.data.len)
+        """).0
+
+    assert(said.contains("'n' of 'double' is usize, but int was given"), said)
+    assert(said.contains("main.sysl:8:20"), said)
+    assert(!said.contains("must be a constant"), said)
+end vam_through_a_function_in_a_type
+
+@test("the mismatch is found under arithmetic, in a type and in a call, at module level and in a body")
+vam_through_arithmetic()
+    if !enm_ready() then return
+
+    val module_level = enm_outcome(vam_ring() + raw"""
+
+        var r: Ring[double(Base) + 1] = Ring([0; 5])
+
+        print(r.data.len)
+        """).0
+
+    assert(module_level.contains("'n' of 'double' is usize, but int was given"), module_level)
+    assert(module_level.contains("main.sysl:8:20"), module_level)
+    assert(!module_level.contains("must be a constant"), module_level)
+
+    val in_body = enm_outcome(vam_ring() + raw"""
+
+        main()
+            val r: Ring[1 + double(Base)] = Ring([0; 5])
+            print(r.data.len)
+        """).0
+
+    assert(in_body.contains("'n' of 'double' is usize, but int was given"), in_body)
+    assert(in_body.contains("main.sysl:9:28"), in_body)
+    assert(!in_body.contains("must be a constant"), in_body)
+
+    val in_call = enm_outcome(raw"""
+        twice[const N: usize]() -> usize = N * 2
+
+        double(n: usize) -> usize = n * 2
+
+        const Base = 2
+
+        print(twice[double(Base) * 2]())
+        """).0
+
+    assert(in_call.contains("'n' of 'double' is usize, but int was given"), in_call)
+    assert(in_call.contains("main.sysl:7:20"), in_call)
+    assert(!in_call.contains("must be a constant"), in_call)
+end vam_through_arithmetic
+
+@test("a member called in a value argument reports its parameter's mismatch too")
+vam_through_a_member()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct Ring[const N: usize]
+            data: [N]byte
+
+        struct K
+            v: int
+
+            twice(self, n: usize) -> usize = n * 2
+
+        const Base = 2
+
+        var r: Ring[K(1).twice(Base)] = Ring([0; 4])
+
+        print(r.data.len)
+        """).0
+
+    assert(said.contains("'n' of 'K.twice' is usize, but int was given"), said)
+    assert(!said.contains("must be a constant"), said)
+end vam_through_a_member
+
+@test("an int const handed straight to a usize value parameter is read at it, and so is arithmetic")
+vam_direct_int_const_is_read_at_the_parameter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(vam_ring() + raw"""
+
+        half(n: int) -> int = n / 2
+
+        twice[const N: usize]() -> usize = N * 2
+
+        var a: Ring[Base] = Ring([0; 2])
+        var b: Ring[Base + 1] = Ring([0; 3])
+        var c: Ring[half(8)] = Ring([0; 4])
+
+        print(a.data.len, b.data.len, c.data.len, twice[Base]())
+        """), "2 3 4 4\n")
+end vam_direct_int_const_is_read_at_the_parameter
+
+@test("the typed const goes through the usize function, as the reference's example does")
+vam_typed_const_works()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Ring[const N: usize]
+            data: [N]byte
+
+        double(n: usize) -> usize = n * 2
+
+        const Base: usize = 2
+
+        var r: Ring[double(Base) + 1] = Ring([0; 5])
+
+        print(r.data.len)
+        """), "5\n")
+end vam_typed_const_works
+
+@test("an int const that does not fit the parameter is refused as not fitting")
+vam_direct_int_const_must_fit()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct Ring[const N: u8]
+            v: int
+
+        const Big = 300
+
+        var r: Ring[Big] = Ring(1)
+
+        print(r.v)
+        """).0
+
+    assert(said.contains("this argument does not fit byte: 300"), said)
+end vam_direct_int_const_must_fit
+
+@test("an argument naming storage is still refused as not a constant, in a type and in a call")
+vam_storage_is_not_a_constant()
+    if !enm_ready() then return
+
+    val module_var = enm_outcome(raw"""
+        struct Ring[const N: usize]
+            data: [N]byte
+
+        var n = 3
+
+        var r: Ring[n] = Ring([0; 3])
+
+        print(r.data.len)
+        """).0
+
+    assert(module_var.contains("a value argument must be a constant — a literal, or a 'const' naming one"),
+           module_var)
+    assert(!module_var.contains("undefined name"), module_var)
+
+    val local = enm_outcome(raw"""
+        struct Ring[const N: usize]
+            data: [N]byte
+
+        main()
+            var n = 3
+            val r: Ring[n + 1] = Ring([0; 4])
+            print(r.data.len)
+        """).0
+
+    assert(local.contains("a value argument must be a constant — a literal, or a 'const' naming one"), local)
+    assert(!local.contains("undefined name"), local)
+
+    val in_call = enm_outcome(raw"""
+        twice[const N: usize]() -> usize = N * 2
+
+        double(n: usize) -> usize = n * 2
+
+        main()
+            var k: usize = 1
+            print(twice[double(k)]())
+        """).0
+
+    assert(in_call.contains("a value argument must be a constant — a literal, or a 'const' naming one"),
+           in_call)
+end vam_storage_is_not_a_constant
