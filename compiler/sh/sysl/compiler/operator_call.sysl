@@ -23,12 +23,15 @@ import sysl.buf.{Buf, buf}
 // -- that is what keeps a float comparison on IEEE semantics rather than routing it through a
 // negated `lt`. Nothing, too, for an operand type with no membership either way, so the diagnostic
 // stays the one the scalar path already gives.
-operator_call(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr) -> Option[TExpr]
+//
+// `written` is the right operand as the source wrote it, which is what says whether it is a bare
+// literal (`widened_operand`).
+operator_call(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr, written: Expr) -> Option[TExpr]
     val spelling = core_infix(op)
 
     if spelling.is_none() then return None
 
-    trait_operator(cx, span, spelling.unwrap(), op, Some(r), l)
+    trait_operator(cx, span, spelling.unwrap(), op, Some(r), l, Some(written))
 end operator_call
 
 // `-a`, `~a` -- the same, for the two prefix operators.
@@ -37,16 +40,16 @@ prefix_call(cx: &Analyzer, span: Span, op: string, t: TExpr) -> Option[TExpr]
 
     if spelling.is_none() then return None
 
-    trait_operator(cx, span, spelling.unwrap(), op, None, t)
+    trait_operator(cx, span, spelling.unwrap(), op, None, t, None)
 end prefix_call
 
 // `spelling` is the trait as the catalog names it, which is what a program writes; the key the
 // tables hold it under is the library's for that spelling.
 private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, operand: Option[TExpr],
-                       recv: TExpr) -> Option[TExpr]
+                       recv: TExpr, written: Option[Expr]) -> Option[TExpr]
     val tr_name = library_key(spelling)
     val recv_ty = texpr_type(recv)
-    val rhs = if operand.is_some() then Some(widened_operand(cx.an, op, recv_ty, operand.unwrap()))
+    val rhs = if operand.is_some() then Some(widened_operand(cx.an, op, recv_ty, operand.unwrap(), written))
     else None
     var rhs_ty: Option[Type] = None
 
@@ -462,7 +465,13 @@ end agreed_operand
 // neither is the narrower, the operand is handed back as it came, for the dispatch to diagnose. A
 // scalar's own operator is not dispatched, and its operand keeps the scalar rule: it widens only to
 // the other operand's type.
-widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr) -> TExpr
+//
+// `written` is the operand as the source wrote it, where there is one. **A bare literal reached by
+// two widenings neither narrower than the other settles as an argument does** (`expr_call.sysl`'s
+// `narrowed_at`), so `x * 2` means what `x.mul(2)` means: an integer literal prefers the narrowest
+// signed integer at least as wide as `int`, and failing that the implementation at the literal's
+// default type (`literal_default_at`) is meant.
+widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr, written: Option[Expr]) -> TExpr
     val spelling = core_infix(op)
 
     if spelling.is_none() || core_builtin(spelling.unwrap(), subject) then return t
@@ -498,8 +507,48 @@ widened_operand(a: &Analysis, op: string, subject: Type, t: TExpr) -> TExpr
 
         if narrowest then return widened(t, Some(h))
 
-    t
+    if written.is_none() || literal_default(written.unwrap()).is_none() then return t
+
+    val signed = narrowest_signed_head(reached, got)
+
+    if signed.is_some() then return widened(t, signed)
+
+    var defaulted: Buf[Type] = buf()
+
+    for h in reached
+        if type_eq(h, literal_default_at(written.unwrap(), h)) then defaulted.push(h)
+
+    if defaulted.len() == 1 then widened(t, Some(defaulted.at(0))) else t
 end widened_operand
+
+// Among the right-hand types an integer literal's operand reaches, the narrowest signed integer at
+// least as wide as `int`, where exactly one is narrowest -- the literal's preference for the signed
+// widening that a call's arguments have too.
+private narrowest_signed_head(reached: Buf[Type], got: Type) -> Option[Type]
+    if signed_width(got) == 0 then return None
+
+    var least: Option[Type] = None
+    var count = 0
+
+    for h in reached
+        val bits = signed_width(h)
+
+        if bits < 32 then continue
+
+        if least.is_none() || bits < signed_width(least.unwrap())
+            least = Some(h)
+            count = 1
+        else if bits == signed_width(least.unwrap())
+            count += 1
+        end if
+
+    if count == 1 then least else None
+end narrowest_signed_head
+
+// The width of a signed integer type, and 0 for anything else.
+private signed_width(t: Type) -> int = t match
+    Integer(bits, true, _) -> bits
+    _ -> 0
 
 // The right-hand operand of a binary operator, re-read where the left operand's own implementation
 // names a right-hand type the literal did not take.

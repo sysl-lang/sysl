@@ -498,9 +498,9 @@ they answer the same on a freestanding target as on a hosted one.
 ```sysl
 import sysl.math.{nextafter, ulp, infinity, nan, Float}
 
-val up = nextafter(1.0, 2.0)
+val up = nextafter(1.0, 2)
 print(up > 1, up - 1 == ulp(1.0), nextafter(up, 0) == 1)
-print(nextafter(0.0, 1.0) > 0, nextafter(2.0, 2.0) == 2)
+print(nextafter(0.0, 1) > 0, nextafter(2.0, 2) == 2)
 print(nextafter(1.7976931348623157e308, infinity()) == infinity(), ulp(infinity()) == infinity())
 print(nextafter(nan(), 1).is_nan(), ulp(nan()).is_nan())
 ```

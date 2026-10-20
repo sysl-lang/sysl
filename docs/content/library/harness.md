@@ -202,7 +202,7 @@ impl Writer for Console
     write(*self, bytes: []const u8)
         for b in bytes do putc(b)
 
-val uart: *Console = ptr_cast(0usize)
+val uart: *Console = ptr_cast(0)
 
 console() -> *Writer = uart
 ```
@@ -215,7 +215,7 @@ default `failed`, which answers false. A UART that cannot fail has nothing to ad
 
 **`Console` has no fields, so its receiver is a null pointer.** A trait object is two words, a method
 table and a datum, and `write` here never looks at the datum — everything it needs is the module's
-own `regs`. Given nothing to point at, `ptr_cast(0usize)` is the honest spelling; the alternative
+own `regs`. Given nothing to point at, `ptr_cast(0)` is the honest spelling; the alternative
 would be to take the address of a temporary, which is a dangling pointer with better manners.
 
 **And it has to be a module of its own rather than the file your statements are in.** An `impl`
