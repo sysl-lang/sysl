@@ -75,8 +75,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
     var shared: Option[Type] = None
 
     if then_leans && else_leans && expected.is_none() && !discarded then
-        shared = offering(cx, () -> shared_branch_type(cx, span, cond, then_body, else_body.unwrap(),
-                                                        discarded))
+        shared = shared_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
 
     val early_type = early.and_then(b -> settles(b)).or_else(() -> shared)
     val offered = if then_leans && expected.is_none() then early_type else None
@@ -93,7 +92,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 
     // A leaning *then* is offered the `else`'s type rather than told it, and read as a branch with
     // nothing to go on where it does not take it.
-    val took = offered.and_then(t -> offering(cx, () -> attempt_then(cx, span, cond, then_body, Some(t),
+    val took = offered.and_then(t -> offering(cx, Some(t), () -> attempt_then(cx, span, cond, then_body, Some(t),
                                                                      discarded)))
 
     if took.is_some()
@@ -101,7 +100,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
         then_block = took.unwrap().1
     elif then_wants.is_some() || else_body.is_none()
         val side = if expected.is_some() then then_side(cx, span, cond, then_body, then_wants, discarded)
-                   else offering(cx, () -> then_side(cx, span, cond, then_body, then_wants, discarded))
+                   else offering(cx, then_wants, () -> then_side(cx, span, cond, then_body, then_wants, discarded))
 
         tc = side.0
         then_block = side.1
@@ -125,7 +124,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             if sibling.is_none() then
                 want = merged_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
 
-            val side = offering(cx, () -> then_side(cx, span, cond, then_body, want, discarded))
+            val side = offering(cx, want, () -> then_side(cx, span, cond, then_body, want, discarded))
 
             tc = side.0
             then_block = side.1
@@ -161,8 +160,8 @@ private shared_branch_type(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf
     if !shaped_value(then_body) || !shaped_value(else_body) then return None
 
     common_offer(chain_branches(else_body),
-                 (i, want) -> trial(cx, () -> branch_reading(cx, span, cond, then_body, else_body,
-                                                             i, want, discarded)))
+                 (i, want) -> offering(cx, want, () -> trial(cx, () -> branch_reading(cx, span, cond,
+                                                             then_body, else_body, i, want, discarded))))
 end shared_branch_type
 
 // Branch `i` of an `if` chain: the *then* branch, read in the condition's scope, for `i` 0, an
@@ -219,12 +218,12 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
                                       else None)
 
     if want.is_some() && expected.is_some() then return Some(type_value_block(cx, b, want, discarded))
-    if want.is_some() then return Some(offering(cx, () -> type_value_block(cx, b, want, discarded)))
+    if want.is_some() then return Some(offering(cx, want, () -> type_value_block(cx, b, want, discarded)))
 
     // A leaning `else` is offered what the *then* settled, and read on its own where it does not
     // take it.
     val offered = if else_leans then settles(then_block) else None
-    val took = offered.and_then(t -> offering(cx, () -> attempt_block(cx, b, Some(t), discarded)))
+    val took = offered.and_then(t -> offering(cx, Some(t), () -> attempt_block(cx, b, Some(t), discarded)))
 
     if took.is_some() then return took
 
@@ -234,17 +233,21 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
 
     if tried.is_some() then return tried
 
-    Some(offering(cx, () -> type_value_block(cx, b, settles(then_block), discarded)))
+    Some(offering(cx, settles(then_block), () -> type_value_block(cx, b, settles(then_block), discarded)))
 end else_branch
 
-// A reading of a branch at the type its sibling settled, which widens nothing to that type
-// (`Analyzer.sibling_offers`).
-private offering[T](cx: &Analyzer, read: () -> T) -> T
-    cx.sibling_offers += 1
+// A reading of a branch at the type its sibling settled, which widens nothing to that type or to a
+// part of it (`Analyzer.sibling_offers`).
+private offering[T](cx: &Analyzer, offer: Option[Type], read: () -> T) -> T
+    if offer.is_none() then return read()
+
+    val depth = cx.sibling_offers.len()
+
+    cx.sibling_offers.push(offer.unwrap())
 
     val t = read()
 
-    cx.sibling_offers -= 1
+    cx.sibling_offers.truncate(depth)
     t
 end offering
 
@@ -529,7 +532,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
 
     for i in 0..<arms.len()
         if leaning(cx, arms.at(i).body)
-            read.push(offered_arm(cx, scrut, arms.at(i), want, discarded))
+            read.push(offering(cx, want, () -> offered_arm(cx, scrut, arms.at(i), want, discarded)))
         else
             read.push(own.at(i))
 
@@ -542,7 +545,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     for i in 0..<arms.len()
         read.at(i) match
             Some(t) -> out.push(t)
-            None -> out.push(analyze_arm(cx, scrut, arms.at(i), want, discarded))
+            None -> out.push(offering(cx, want, () -> analyze_arm(cx, scrut, arms.at(i), want, discarded)))
 
     out
 end analyze_arms
@@ -557,8 +560,8 @@ private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
 
     if shaped.len() < 2 then return None
 
-    common_offer(shaped.len(), (i, want) -> trial(cx, () -> analyze_arm(cx, scrut, shaped.at(i), want,
-                                                                         discarded).body))
+    common_offer(shaped.len(), (i, want) -> offering(cx, want, () -> trial(cx, () ->
+                     analyze_arm(cx, scrut, shaped.at(i), want, discarded).body)))
 end shared_arm_type
 
 private any_unread(arms: Buf[Option[TArm]]) -> bool

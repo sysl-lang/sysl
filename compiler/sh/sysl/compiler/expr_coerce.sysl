@@ -20,8 +20,35 @@ import sysl.buf.{Buf, buf}
 analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     val t = analyze_unwidened(cx, e, expected)
 
-    if is_literal(e) || cx.sibling_offers > 0 then t else widened(t, expected)
+    if is_literal(e) || offered_here(cx, expected) then t else widened(t, expected)
 end analyze_expected
+
+// Whether a type is one a sibling branch offered, or a part of one (`Analyzer.sibling_offers`).
+private offered_here(cx: &Analyzer, expected: Option[Type]) -> bool
+    if expected.is_none() then return false
+
+    for offer in cx.sibling_offers
+        if part_of(offer, expected.unwrap()) then return true
+
+    false
+end offered_here
+
+private part_of(whole: Type, t: Type) -> bool
+    if type_eq(whole, t) then return true
+
+    whole match
+        Struct(d) -> any_part(d.targs, t)
+        Enum(d) -> any_part(d.targs, t)
+        Array(_, e) -> part_of(*e, t)
+        _ -> false
+end part_of
+
+private any_part(parts: Buf[Type], t: Type) -> bool
+    for p in parts
+        if part_of(p, t) then return true
+
+    false
+end any_part
 
 // A value put where a wider scalar was asked for, converted to it, as the explicit conversion would
 // have been. Anything else is handed back as it came, for the position to diagnose.
