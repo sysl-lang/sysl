@@ -2985,6 +2985,10 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val narrowest = narrowest_widening(fitted, ranked, args)
 
         if narrowest.len() == 1 then return narrowest
+
+        val defaulted = literal_default_preference(fitted, ranked, args)
+
+        if defaulted.len() == 1 then return defaulted
     end if
 
     var pool: Buf[usize] = buf()
@@ -3086,6 +3090,63 @@ private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf
 
     winners
 end narrowest_widening
+
+// **Candidates tied only by bare literals take the literals at their default types.** Where every
+// position the candidates still standing differ at holds a numeric literal with no suffix, the one
+// candidate whose parameter at each such position is that literal's default beats the rest. The
+// default is `real` for a float literal; for an integer literal it is `int` at an integer parameter
+// and `real` at a float one, since an integer literal is the float a float position expects. So
+// `nextafter(1.0, 2)` over `(real, real)` and `(f32, f32)` is the `real` one, while `(f32, f32)`
+// beside `(f128, f128)` offers no default and stays ambiguous, as do two candidates both at the
+// defaults (`(int, real)` beside `(real, int)` at `(2, 2)`). Empty where the rule does not apply.
+private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
+    var none: Buf[usize] = buf()
+
+    if ranked.len() < 2 then return none
+
+    var differ: Buf[usize] = buf()
+
+    for j in 0..<args.len()
+        val first = fitted.at(ranked.at(0))
+        var differs = false
+
+        for r in 0..<ranked.len()
+            val here = fitted.at(ranked.at(r))
+
+            if j >= here.len() || j >= first.len() || !type_eq(here.at(j), first.at(j))
+                differs = true
+
+        if differs
+            if literal_default(args.at(j)).is_none() then return none
+
+            differ.push(j)
+        end if
+
+    if differ.is_empty() then return none
+
+    var winners: Buf[usize] = buf()
+
+    for r in 0..<ranked.len()
+        val here = fitted.at(ranked.at(r))
+        var all = true
+
+        for d in differ
+            if !type_eq(here.at(d), literal_default_at(args.at(d), here.at(d))) then all = false
+
+        if all then winners.push(ranked.at(r))
+
+    winners
+end literal_default_preference
+
+// The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
+// an integer literal `real` at a float parameter and `int` anywhere else.
+literal_default_at(e: Expr, param: Type) -> Type
+    val own = literal_default(e).unwrap()
+    val float_param = param match
+        Floating(_, _) -> true
+        _ -> false
+
+    if float_param then real_type() else own
 
 private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> bool
     if mine.len() != theirs.len() || mine.len() != args.len() then return false

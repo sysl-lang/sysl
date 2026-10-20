@@ -1342,7 +1342,8 @@ print(max(a, b))
 
 **Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
 the candidate each of whose parameters converts to the other's. Where neither is narrower at every
-position, the call is ambiguous.
+position, the call is ambiguous — except where the candidates are tied only by bare literals, which
+then take their default types ([Overloading](/reference/declarations/#overloading)).
 
 ```sysl
 f(x: int) -> string = "int"
@@ -1847,7 +1848,10 @@ written at `b`'s own type is meant where there is one; otherwise `b` takes an
 [implicit conversion](#which-conversions-are-implicit) to the narrowest right-hand type among the
 implementations it widens to, so `c * n` over `impl Mul[real] for Complex` takes an `int` `n` exactly
 as `c.mul(n)` does, and `c *= n` does the same. Two it widens to, neither of which holds the other,
-leave the operator refused. A built-in scalar's operator has nothing to choose among, and its
+leave the operator refused — unless `b` is a bare literal, which settles as a literal argument does
+([Overloading](/reference/declarations/#overloading)): an integer literal prefers the narrowest signed
+integer at least as wide as `int`, and otherwise the implementation at the literal's default type is
+meant. A built-in scalar's operator has nothing to choose among, and its
 operands keep their own rule: an operand widens only to the other operand's type.
 
 ```sysl

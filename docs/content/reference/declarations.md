@@ -1484,6 +1484,47 @@ long
 u64
 ```
 
+**Candidates tied only by bare literals take each literal at its default type.** Where every
+position the candidates differ at holds a numeric literal with no suffix, and no rule above has
+chosen, the candidate whose parameter at each of those positions is the literal's default wins. A
+float literal's default is `real`. An integer literal's default is `int` at an integer parameter and
+`real` at a float one, since an integer literal is read as the float its position expects. So
+`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one:
+
+```sysl
+import sysl.math.nextafter
+
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+print(scale(1.5, 2), scale(1, 2), scale(1.5f32, 2f32))
+print(nextafter(1.0, 2) > 1)
+```
+
+```output
+real real f32
+true
+```
+
+The call stays ambiguous where an argument with a type of its own is part of the tie, where no
+candidate takes the literals at their defaults (`f32` beside `f128` at `2`), and where two do
+(`(int, real)` beside `(real, int)` at `(2, 2)`):
+
+```sysl
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+val s: i16 = 3
+print(scale(s, 2))
+```
+
+```error
+'scale' is ambiguous here — 2 of its declarations take these arguments:
+```
+
+An operator choosing between implementations of its trait settles a literal operand the same way,
+so `x * 2` means what `x.mul(2)` means.
+
 **Exactness is asked of the types a candidate was fitted at, which for a generic one is what the call
 solved it to.** `g[T]` below takes the `[]int` at `T = []int`, as it was written; the other takes it
 only by giving up the ability to write. So the generic declaration is the exact one:
