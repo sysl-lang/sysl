@@ -1,8 +1,8 @@
 ---
 title: sysl
-heroTitle: A systems language you can
-heroHighlight: actually learn
-summary: Ref-counted rather than borrow-checked. Four ways to name storage, no garbage collector, and every check the compiler makes explainable in a sentence.
+heroTitle: A memory-safe systems language
+heroHighlight: without a borrow checker
+summary: Reference-counted rather than borrow-checked. Four ways to name storage, no garbage collector, and every check the compiler makes explainable in a sentence.
 ---
 
 ## Why sysl
