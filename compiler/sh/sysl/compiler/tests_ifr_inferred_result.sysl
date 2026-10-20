@@ -1,0 +1,341 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A function whose body is `= value` and that writes no result type takes the value's type, as a
+// `val` written with no type takes its initializer's (`reference/declarations.md § The result
+// type`). A block body with no `=` still hands back nothing. The type is known wherever a written one
+// would be -- a call above the declaration, another file, another module, a library, `sysl doc`, an
+// editor's hover -- and a body that reaches its own function before the type is known is refused.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ifr_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of the files given, `main.sysl` among them.
+private ifr_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-ifr").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end ifr_root
+
+// What the program prints, or the report it was refused with.
+private ifr_ran(files: []const (string, string)) -> string
+    val root = ifr_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ifr_ran
+
+// The report a program was refused with, empty where it was not.
+private ifr_report(files: []const (string, string)) -> string
+    val root = ifr_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ifr_report
+
+private ifr_prints(text: string, want: string)
+    if !ifr_ready() then return
+
+    assert_eq(ifr_ran([("main.sysl", text)]), want)
+
+// Refused with exactly `message`, first, at `at` (`file:line:col`).
+private ifr_refused_in(files: []const (string, string), message: string, at: string)
+    if !ifr_ready() then return
+
+    val said = ifr_report(files)
+    val head = s"error: $message"
+    val place = s"--> $at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at $place\ngot\n$said")
+end ifr_refused_in
+
+private ifr_refused(text: string, message: string, at: string) =
+    ifr_refused_in([("main.sysl", text)], message, s"main.sysl:$at")
+
+// -- the type the body gives ----------------------------------------------------------------------
+
+@test("an '= value' body with no result type hands back the value's type: an int, a string, a real, a tuple, a call's result")
+ifr_value_types() =
+    ifr_prints("twice(x: int) = x * 2\nname() = \"sysl\"\nhalf(x: real) = x / 2\npair(x: int) = (x, x + 1)\n" +
+               "quad(x: int) = twice(twice(x))\n\n" +
+               "print(twice(21) + 1, name() + \"!\", half(3), pair(4).1, quad(2) * 10)\n",
+               "43 sysl! 1.5 5 80\n")
+
+@test("a literal body takes the literal's own type, as a val's initializer does")
+ifr_literal_default() =
+    ifr_prints("byte() = 255\nratio() = 0.25\nyes() = true\n\nprint(byte() + 1000, ratio() * 4, !yes())\n",
+               "1255 1 false\n")
+
+@test("a body whose value is unit is a unit function, and a block body with no '=' is one whatever it ends with")
+ifr_unit_stays_unit() =
+    ifr_prints("greet(name: string) = print(\"hi\", name)\n\nnoisy()\n    3\n\n" +
+               "check(x: int) =\n    if x > 0 then print(\"pos\")\n\n" +
+               "greet(\"you\")\ncheck(1)\nval u = noisy()\nval v = greet(\"me\")\nprint(u == (), v == ())\n",
+               "hi you\npos\nhi me\ntrue true\n")
+
+@test("'=' opening an indented block takes the block's trailing value, and a bare 'return' leaves a unit one")
+ifr_equals_block() =
+    ifr_prints("area(w: int, h: int) =\n    val a = w * h\n\n    a + 1\n\n" +
+               "show(x: int) =\n    if x < 0 then return\n\n    print(x)\n\n" +
+               "print(area(3, 4))\nshow(5)\nshow(-1)\n",
+               "13\n5\n")
+
+@test("a generic function's result is its body's type in terms of its parameters, fixed per call")
+ifr_generic() =
+    ifr_prints("id[T](x: T) = x\nboth[T](x: T) = (x, x)\napply(f: int -> int, x: int) = f(x)\n\n" +
+               "print(id(5) + 1, id(\"s\"), both(2.5).1, apply(x -> x * 3, 4))\n",
+               "6 s 2.5 12\n")
+
+@test("an async function's task is of its body's type, and a const function's value folds")
+ifr_async_and_const() =
+    ifr_prints("async sample() = 21\nasync tick() = print(\"tick\")\n\nasync run() -> int\n" +
+               "    await tick()\n    await sample() * 2\n\nconst triple(x: int) = x * 3\nconst N: int = triple(4)\n\n" +
+               "print(block_on(run()), N, triple(2))\n",
+               "tick\n42 12 6\n")
+
+// -- known wherever a written one is --------------------------------------------------------------
+
+@test("a call above the declaration reads the result, in either order of two that call each other's results")
+ifr_any_order() =
+    ifr_prints("print(later(), early(), twice(3))\n\nlater() = early() * 10\nearly() = twice(1) + 1\n" +
+               "twice(x: int) = x * 2\n", "30 3 6\n")
+
+@test("a nested function's result is read before any body of its group, so a sibling above it reads it")
+ifr_nested() =
+    ifr_prints("var base = 4\n\nfirst(n: int) = second(n) + base\nsecond(n: int) = n * base\n" +
+               "grow[T](x: T) = (x, base)\n\nprint(first(2), second(1), grow(\"g\").1)\n",
+               "12 4 4\n")
+
+@test("a member's result is read off its body, on a concrete type and a generic one")
+ifr_members() =
+    ifr_prints("struct P\n    x: int\n    doubled(self) = self.x * 2\n    label(self) = \"p\"\n\n" +
+               "struct Box[T]\n    v: T\n    get(self) = self.v\n    pair(self) = (self.v, self.x())\n" +
+               "    x(self) = 7\n\nprint(P(4).doubled() + 1, P(1).label(), Box(3).get() + 1, Box(\"s\").get(), " +
+               "Box(2).pair().1)\n",
+               "9 p 4 s 7\n")
+
+@test("an impl member supplying a trait's member hands back the trait's result, its body read against it")
+ifr_impl_member_takes_the_trait() =
+    ifr_prints("trait Sized\n    size(self) -> u8\n    note(self)\n\nstruct M\n    v: int\n\n" +
+               "impl Sized for M\n    size(self) = 255\n    note(self) = self.v + 1\n\n" +
+               "print(M(1).size() + u8(0), M(2).note() == ())\n",
+               "255 true\n")
+
+@test("a trait's own member writes its result, so a default written '= value' with no result is unit")
+ifr_trait_member_writes_it() =
+    ifr_prints("trait Hi\n    hello(self) = 3\n\nstruct X\n    n: int\n\nimpl Hi for X\n\n" +
+               "print(X(1).hello() == ())\n",
+               "true\n")
+
+@test("a result read off the body is read across files of a module and from another module")
+ifr_across_modules() =
+    if !ifr_ready() then return
+
+    val a = "module cfg\n\nuses() = limit() + area(3)\nlater() = early() * 3\n"
+    val b = "module cfg\n\nlimit() = 10\narea(n: int) = n * n\nearly() = 2\n"
+    val main = "import cfg\n\nprint(cfg.uses(), cfg.later(), cfg.limit() / 3)\n"
+
+    assert_eq(ifr_ran([("cfg/a.sysl", a), ("cfg/b.sysl", b), ("main.sysl", main)]), "19 6 3\n")
+
+@test("a library's function, generic and member results are read off their bodies through build-lib and --lib")
+ifr_library_export()
+    if !ifr_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-ifr-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-ifr-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nsquare(n: int) = n * n\nlabel() = \"demo\"\nid[T](x: T) = x\n\n" +
+               "struct W\n    v: int\n    twice(self) = self.v * 2\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\nprint(demo.square(4) + 1, demo.label(), demo.id(2.5), demo.W(3).twice() + 1)\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "17 demo 2.5 7\n")
+end ifr_library_export
+
+@test("sysl doc shows a result read off the body as the '= value' it was written with")
+ifr_doc_signature()
+    val r = parse(source_of("t.sysl", "module m\n\ntwice(x: int) = x * 2\nlong(x: int) =\n    val y = x\n\n" +
+                                      "    y\n\nwritten(x: int) -> int = x\n\nstruct W\n    v: int\n    " +
+                                      "twice(self) = self.v * 2\n"))
+
+    assert(r.ok(), "the module did not parse")
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+        *item.kind match
+            StructDecl(d) ->
+                for m in d.members
+                    out = out + doc_method(m) + "\n"
+            _ -> ()
+
+    assert(out.contains("twice(x: int) = x * 2\n"), out)
+    assert(out.contains("long(x: int) = \u{2026}\n"), out)
+    assert(out.contains("written(x: int) -> int\n"), out)
+    assert(out.contains("twice(self) = self.v * 2"), out)
+end ifr_doc_signature
+
+@test("an editor's hover shows a function whose result is read off its body at that result")
+ifr_hover()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ifr-hover").unwrap()
+
+    write_text(s"$root/t.sysl", "twice(x: int) = x * 2\nid[T](x: T) = x\n\nprint(twice(2), id(\"s\"))\n").unwrap()
+
+    val ix = indexed_file(s"$root/t.sysl").unwrap()
+    var out = ""
+
+    for item in ix.references
+        if item.at_file.ends_with("/t.sysl") && item.detail != "" then out = s"$out${item.detail};"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains("twice(x: int) -> int;"), out)
+    assert(out.contains("id[T](x: T) -> T;"), out)
+end ifr_hover
+
+@test("a test and a hook return nothing whatever their '= value' is, and the parser reads the rest as inferred")
+ifr_tests_return_nothing()
+    val r = parse(source_of("t.sysl", "@test\nt() = 3\nf() = 3\ng() -> int = 3\nh()\n    3\n"))
+
+    assert(r.ok(), "the file did not parse")
+
+    var shapes = ""
+
+    for item in r.program.body
+        *item.kind match
+            FuncDecl(d) ->
+                val shape = if is_inferred_result(d.ret_type) then "inferred"
+                else if d.ret_type.is_some() then "written" else "none"
+
+                shapes = shapes + s"${d.name}:$shape "
+            _ -> ()
+
+    assert_eq(shapes, "t:none f:inferred g:written h:none ")
+end ifr_tests_return_nothing
+
+// -- what has no type to take ---------------------------------------------------------------------
+
+@test("a body that reaches its own function before its result is known is refused at the declaration")
+ifr_recursion_refused() =
+    ifr_refused("fact(n: int) = if n <= 1 then 1 else n * fact(n - 1)\n\nprint(fact(5))\n",
+                "'fact' takes its result type from its body, and the body reaches 'fact' again — write its " +
+                "result type, 'fact(…) -> T'", "1:1")
+
+@test("two that reach each other are refused, naming the one the loop runs through, in either order")
+ifr_mutual_recursion_refused()
+    val message = "takes its result type from its body, and the body reaches"
+
+    ifr_refused("even(n: int) = if n == 0 then true else odd(n - 1)\n" +
+                "odd(n: int) = if n == 0 then false else even(n - 1)\n\nprint(even(4))\n",
+                "'even' takes its result type from its body, and the body reaches 'even' again through " +
+                "'odd' — write its result type, 'even(…) -> T'", "1:1")
+
+    if !ifr_ready() then return
+
+    val other = ifr_report([("main.sysl", "odd(n: int) = if n == 0 then false else even(n - 1)\n" +
+                                          "even(n: int) = if n == 0 then true else odd(n - 1)\n\nprint(even(4))\n")])
+
+    assert(other.starts_with(s"error: 'odd' $message 'odd' again through 'even'"), other)
+end ifr_mutual_recursion_refused
+
+@test("a recursive function that writes its result, and a nested one that reaches itself, are told apart")
+ifr_written_recursion_fine()
+    ifr_prints("fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\nprint(fact(5))\n", "120\n")
+    ifr_refused("var seed = 1\nwalk(n: int) = if n == 0 then seed else walk(n - 1)\n\nprint(walk(3))\n",
+                "'walk' takes its result type from its body, and the body reaches 'walk' again — write its " +
+                "result type, 'walk(…) -> T'", "2:1")
+end ifr_written_recursion_fine
+
+@test("an '@export' function C reads a value from has to write its result, and a unit one need not")
+ifr_export_refused()
+    ifr_refused("@export(\"probe_add\")\nadd(a: int, b: int) = a + b\n\nprint(add(1, 2))\n",
+                "'add' is '@export', so C reads what it hands back, and its body yields int — write its " +
+                "result type, 'add(…) -> T'", "2:1")
+    ifr_prints("@export(\"probe_tick\")\ntick() = print(\"t\")\n\ntick()\n", "t\n")
+end ifr_export_refused
+
+@test("a body that hands back a closure is refused, its type having no name for a signature to state")
+ifr_closure_refused() =
+    ifr_refused("make() = (x: int) -> x + 1\n\nprint(1)\n",
+                "'make' would hand back a closure, whose type has no name for a signature to state — write " +
+                "its result type, 'make(…) -> &Fn(…) -> R'", "1:1")
+
+@test("a body that does not read is told its own mistake, not a disagreement with a result it never had")
+ifr_body_mistake_told() =
+    ifr_refused("f(x: int) =\n    if x > 0 then return\n\n    missing + 1\n\nf(1)\n",
+                "undefined name 'missing'", "4:5")
+
+@test("branches that disagree are refused as a val's initializer's are")
+ifr_branches_disagree() =
+    ifr_refused("pick(c: bool) = if c then 1 else \"s\"\n\nprint(pick(true))\n",
+                "if branches have different types: int and string", "1:17")
+
+@test("a public function whose result is a private type is refused as one written is, at the declaration")
+ifr_exposure()
+    val head = "module cfg\n\nprivate struct P\n    x: int\n\nprivate mk() -> P = P(1)\n\n"
+    val main = "import cfg\n\nprint(cfg.fine())\n"
+
+    ifr_refused_in([("cfg/cfg.sysl", head + "leak() = mk()\nfine() = 1\n"), ("main.sysl", main)],
+                   "'cfg.leak' is public, but its result names 'cfg.P', which is private to 'cfg/cfg.sysl', " +
+                   "the file that declares it — a declaration may not be more visible than the types it names",
+                   "cfg/cfg.sysl:8:1")
+
+    if !ifr_ready() then return
+
+    assert_eq(ifr_ran([("cfg/cfg.sysl", head + "private hidden() = mk()\nfine() = hidden().x + 1\n"),
+                       ("main.sysl", main)]), "2\n")
+end ifr_exposure

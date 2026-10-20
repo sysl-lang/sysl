@@ -60,6 +60,8 @@ doc_type_text(t: TypeRef) -> string = *t.kind match
     AssocType(base, member) -> s"${doc_type_text(base)}::${member}"
     AssocArgType(name, typ) -> s"${name} = ${doc_type_text(typ)}"
     SomeType(bounds) -> s"some ${doc_bound_list(bounds, " + ")}"
+    // Nothing is written for a result read off the body, and a declaration is shown as written.
+    InferredResult(_) -> ""
 end doc_type_text
 
 private doc_type_list(ts: Buf[TypeRef]) -> string
@@ -286,9 +288,21 @@ private doc_param_list(ps: Buf[Param]) -> Buf[string]
 
 // The result clause, absent rather than `-> ()` where nothing is returned: sysl writes a procedure
 // with no arrow at all.
-private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
+private doc_ret_text(ret: Option[TypeRef]) -> string = as_written(ret) match
     Some(r) -> s" -> ${doc_type_text(r)}"
     None -> ""
+
+// What a function hands back as it was written: its `-> T`, or -- a result read off the body -- the
+// `= value` it is read from, as an inferred module `val` shows its initializer. A value too long to
+// show is `…`.
+private doc_result_text(ret: Option[TypeRef], body: Buf[Stmt]) -> string
+    if ret.is_none() || !is_inferred_result(ret) then return doc_ret_text(ret)
+    if body.len() != 1 then return " = \u{2026}"
+
+    *body.at(0).kind match
+        ExprStmt(e) -> s" = ${doc_expr_text(e)}"
+        _ -> " = \u{2026}"
+end doc_result_text
 
 // -- declarations ---------------------------------------------------------------------------------
 
@@ -296,7 +310,7 @@ private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
 doc_func(f: FuncDecl) -> string
     val tps = doc_tparams_text(f.tparams, f.bounds, f.tvalues, f.tpacks, f.tdefaults)
 
-    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_ret_text(f.ret_type)}"
+    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_result_text(f.ret_type, f.body)}"
 
 // `const ` in front of a function the compiler may run -- part of its interface, so the page says it.
 private const_word(marked: bool) -> string = if marked then "const " else ""
@@ -330,7 +344,7 @@ private doc_method_bare(m: MethodDecl) -> string
     for item in ps
         all.push(item)
 
-    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_ret_text(m.ret_type)}"
+    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_result_text(m.ret_type, m.body)}"
 end doc_method_bare
 
 private doc_receiver_text(mode: RecvMode) -> string = mode match
