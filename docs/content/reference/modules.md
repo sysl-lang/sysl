@@ -277,11 +277,12 @@ break programs.
 ### What a declaration visible outside its file writes
 
 **A signature is written in full**: parameter and field types are mandatory, and a return type is
-written or its absence *means* `unit`. The two declarations that are a name and a value — a `const`
-and a module-level `val`, both below — may leave the type to the value, exactly as a local may
+written or its absence *means* `unit`. The declarations that are a name and a value — a `const`, a
+module-level `val` and module storage written with `var`, all below — may leave the type to the
+value, exactly as a local may
 ([Bindings](/reference/declarations/#a-module-member-takes-its-type-as-a-local-does)): the type is
 then the initializer's, and another file or a program built against the library reads it as it would
-a written one. Module storage written with `var` states its type, since it may have no value to read
+a written one. A `var` written with no initializer states its type, since there is no value to read
 one off.
 
 ## Imports
@@ -1349,7 +1350,7 @@ What it cannot be is addressed, passed as a value, or reached from another file.
 ordinary module function again:
 
 ```sysl
-static var failures: int = 0
+static var failures = 0
 
 failed[T](r: Result[T, int])
     if !r.is_ok() then failures += 1
@@ -1431,7 +1432,7 @@ is, and what a `var` in a file with a `module` line always is. A program shaped 
 a counter, the functions that bump it, and a `main` calling them — is therefore just that:
 
 ```sysl
-var counter: int = 0
+var counter = 0
 
 bump() =
     counter += 1
@@ -1446,12 +1447,13 @@ main()
 2
 ```
 
-Being the module's, it is held to what module storage is held to, and the first of those is a
-stated type. That is the one line reported, on the `var` itself — every use of the name below it
-still resolves:
+Being the module's, it is held to what module storage is held to. Its type is its value's, as a
+module `val`'s is; with no value it starts at its type's zero, so that type is written. Left off
+there, it is the one line reported, on the `var` itself — every use of the name below it still
+resolves:
 
 ```sysl
-var counter = 0
+var counter
 
 bump() =
     counter += 1
@@ -1507,7 +1509,7 @@ word `var` already means, and which a `val` refuses because a `val` promises its
 once:
 
 ```sysl
-static var ticks: int = 0
+static var ticks = 0
 
 tick() = ticks += 1
 
@@ -1520,8 +1522,51 @@ print(ticks)
 2
 ```
 
+**Its type is its initializer's**, read exactly as a module `val`'s is: a literal takes its default,
+a call its result, and a written type governs the value where one is given. The type is known to
+every reader of the storage, wherever it is written, and storage over a constant is still laid down
+as data. A value that reaches the storage itself has no type to give it, and is refused at the
+declaration:
+
+```sysl
+static var scale = 1.5
+static var names = ["a", "b"]
+static var small: u8 = 200
+
+names[1] = "z"
+scale *= 2
+small += 55
+print(scale, names[1], small)
+```
+
+```output
+3 z 255
+```
+
+```sysl
+static var a = b + 1
+static var b = a + 1
+
+print(a)
+```
+
+```error
+'a' takes its type from its value, and the value reaches 'a' again — write its type, 'var a: T = …'
+```
+
 Its initializer may be **absent**, which a `val`'s may not — the type's zero is what it starts at, and
-that is the cheapest form and the one an arena wants.
+that is the cheapest form and the one an arena wants. With no value to read one off, that form states
+its type:
+
+```sysl
+static var slot
+
+print(slot)
+```
+
+```error
+'slot' is module storage, and module storage states its type — write 'slot: T'
+```
 
 **It holds a counted value, and the last one it holds is never released.** A `string`, a slice, a
 `&T`, a `weak T` and anything built out of them are all module storage; every assignment during the
@@ -1529,7 +1574,7 @@ run gives back the count it replaces, and the only release with nowhere to go is
 which is the release a static is *defined* by not taking.
 
 ```sysl
-static var current: string = ""
+static var current = ""
 
 set(s: string) = current = "[" + s + "]"
 
@@ -1599,7 +1644,7 @@ exactly as above:
 ```sysl
 module counter
 
-var count: int = 0
+var count = 0
 
 bump() = count += 1
 ```
@@ -1614,7 +1659,7 @@ functions that maintain the storage are public and the storage itself is nobody'
 ```sysl
 module counter
 
-private var count: int = 0
+private var count = 0
 
 bump() = count += 1
 peek() -> int = count
