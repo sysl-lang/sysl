@@ -102,12 +102,14 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             written_call(cx, span, head, open, targs, args, expected)
         // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
         // and is re-read here where the name is one a generic declares -- and only where nothing
-        // nearer holds the name: a local shadowing the function is what is indexed.
+        // nearer holds the name: a local shadowing the function is what is indexed. A function the
+        // entry file's body keeps is one too, out of reach from here, and told so.
         Index(head, one, open) ->
             val name = written_name_of(cx, head)
 
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
-               (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some())
+               (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some() ||
+                holds_string(cx.an.tables.entry_captures, name.unwrap()))
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
@@ -2796,6 +2798,18 @@ private first_dot_in(name: string) -> Option[usize]
     None
 end first_dot_in
 
+// A function of the entry file that reads the body's bindings is part of the body, and a call made
+// from outside it -- a `static` initializer or a `const`, settled before any statement runs -- has no
+// body to reach it through (`entry.sysl`'s `capturing`). `None` where the name is not one of those.
+// Asked by a call written with type arguments too (`f[int]()`), which names the same function.
+body_only_call(cx: &Analyzer, span: Span, written: string) -> Option[TExpr]
+    if !holds_string(cx.an.tables.entry_captures, written) then return None
+
+    Some(cx.err(span, s"'$written' reads the entry file's body, so only the body can call it — " +
+                "this call is the module's, made before any statement runs, when there is no body " +
+                s"yet. Make what '$written' reads 'static' too, or make the call part of the body"))
+end body_only_call
+
 // A call of a function this compilation knows by key.
 //
 // **Which declaration a call means is decided by its arguments**, so a name with more than one
@@ -2832,13 +2846,9 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
         if rivals.len() > 1 then return cx.err(span, ambiguous_offer(written, rivals))
 
-        // A function of the entry file that reads the body's bindings is part of the body, and a call
-        // made from outside it -- a `static` initializer, run before any statement -- has no body to
-        // reach it through (`entry.sysl`'s `capturing`).
-        if holds_string(cx.an.tables.entry_captures, written) then
-            return cx.err(span, s"'$written' reads the entry file's body, so only the body can call it — " +
-                          "this call is the module's, made before any statement runs, when there is no body " +
-                          s"yet. Make what '$written' reads 'static' too, or make the call part of the body")
+        val captured = body_only_call(cx, span, written)
+
+        if captured.is_some() then return captured.unwrap()
 
         return cx.err(span, s"undefined function '$written'")
 

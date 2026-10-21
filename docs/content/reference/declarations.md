@@ -2542,6 +2542,41 @@ print(f[cap(3)](), a.items.len, b.items.len)
 7 8 4
 ```
 
+**A call may name its type arguments outright**, and stands in all of these positions just as the
+same call with them inferred does. A function with no value parameter to infer from is called this
+way — here a fingerprint of a struct's layout, settled while compiling and checked in an `@assert`:
+
+```sysl
+struct Header
+    tag: u8
+    length: u32
+    flags: u16
+
+const fingerprint[T]() -> u32
+    var h: u32 = 2166136261
+
+    for const f in T::Fields
+        h = (h ^ u32(f.offset)) * 16777619
+
+    (h ^ u32(sizeof(T))) * 16777619
+
+const width[T]() -> int = int(sizeof(T))
+
+const Layout = fingerprint[Header]()
+
+struct Frame
+    header: Header
+    pad: [width[u64]()]u8
+
+@assert(fingerprint[Header]() == 2081354981, "the header's layout moved")
+
+print(Layout, sizeof(Frame))
+```
+
+```output
+2081354981 20
+```
+
 **A declaration whose value needs that declaration itself is refused, naming both** — reading it
 waits for the value, and the value is worked out by reading it:
 
