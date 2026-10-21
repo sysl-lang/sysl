@@ -28,6 +28,8 @@ enum PayloadUnit
     UnitTable(symbol: string)
     // A function's address, named by the entry `&f` names.
     UnitFn(entry: string)
+    // The address of a box laid down whole, its payload `value`.
+    UnitBox(value: TExpr)
 
 // The units of a carrying variant's payload region, in order, each at the region's unit width.
 payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[PayloadUnit]]
@@ -88,6 +90,7 @@ payloads_laid(l: TargetLayout, t: TExpr) -> bool = *t.kind match
     TArrayLit(items, _) -> all_payloads_laid(l, items)
     TArrayFill(value, _) -> payloads_laid(l, value)
     TStructNew(_, args) -> all_payloads_laid(l, args)
+    TBox(value, _) -> payloads_laid(l, value)
     TEnumNew(en, v, args) ->
         if !v.carries then true
         else underlying(en) match
@@ -184,6 +187,13 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[
             refs.push((at + l.pointer_bytes(), UnitAddr(place)))
             true
         _ -> false
+    // A box a run while compiling made: laid down on its own (`emit_static.sysl`'s `box_const`), and
+    // its address a word the linker fills in.
+    TBox(value, _) ->
+        if l.size(ty) != l.pointer_bytes() || !payloads_laid(l, value) then return false
+
+        refs.push((at, UnitBox(value)))
+        true
     // A null pointer, thin or fat, is all zero bits, which the region already is.
     TNullLit(_) -> true
     _ -> false

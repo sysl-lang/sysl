@@ -1863,9 +1863,16 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                         Ok(None) -> static_image(cx, d.name, init.unwrap())
                         Err(_) -> None
 
-                    if image.is_some() && !(writable && builds_view(image.unwrap()))
+                    val boxes = image.is_some() && writable && builds_box(image.unwrap())
+
+                    if image.is_some() && !(writable && builds_view(image.unwrap())) && !boxes
                         init = image
                         imaged = true
+                    else if boxes
+                        cx.an.evaluation.val_stops.put(key, s"'${d.name}' holds a reference, and a 'var' " +
+                                                       "gives its share back when it is assigned, so its box " +
+                                                       "is made when the program starts — a module 'val' " +
+                                                       "holds one laid down")
                     else if cx.an.evaluation.last_stop != ""
                         // Why a `const` call in it was not run: what a target that cannot run the
                         // initializer either tells its reader (`emit_checks.sysl`).
@@ -2309,6 +2316,28 @@ private any_builds_view(xs: Buf[TExpr]) -> bool
     false
 end any_builds_view
 
+// Whether an image holds a box a run while compiling made, other than a frozen buffer's. **Only a `val`
+// holds one laid down**: its box keeps its count above zero for good, so a box with no hook behaves as
+// the one the program would have made. A `var` gives its share back when it is assigned, and the box
+// it held then has to be destroyed as the program's own would be, so it keeps building its box at
+// startup. A storage holding one shares a count that is not atomic (`sharing.sysl`).
+builds_box(t: TExpr) -> bool = *t.kind match
+    TBox(value, ref_ty) -> !frozen_box_type(ref_ty) || builds_box(value)
+    TBufLit(elems, _) -> any_builds_box(elems)
+    TArrayLit(elems, _) -> any_builds_box(elems)
+    TArrayFill(value, _) -> builds_box(value)
+    TStructNew(_, args) -> any_builds_box(args)
+    TEnumNew(_, _, args) -> any_builds_box(args)
+    TConstrainedCheck(value, _) -> builds_box(value)
+    _ -> false
+
+private any_builds_box(xs: Buf[TExpr]) -> bool
+    for item in xs
+        if builds_box(item) then return true
+
+    false
+end any_builds_box
+
 // **Constant data**: an initializer whose every scalar is a constant expression -- what a `const`
 // may be written as, `reference/modules.md § const — a value` -- and the arrays, structs and variants
 // carrying nothing that are built from them, written back as the literals they come to so the
@@ -2334,6 +2363,8 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TStructNew(decl, args) ->
         if decl.union_layout then written_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
         else static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
+    // A box written out is laid down as one, as a box a `const` call answers is (`builds_box`).
+    TBox(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TBox(x, ty)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
     TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
     TAddrOf(place, ty) ->

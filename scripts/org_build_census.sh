@@ -514,11 +514,17 @@ for dir in "$org"/*/; do
     commands=$command
 
     case $name in
-        # skiff is gated per directory (its CLAUDE.md, "Gate"): `sysl test .` is not what it runs.
+        # skiff has no package at its root: its kernel's host tests, then `tools/portable`, which
+        # instantiates every kernel generic, built for each target the kernel runs on. Its
+        # `arch/armv7m`, `chips/*` and `boards/*` are cross-only and checked by skiff's own QEMU gate
+        # (`scripts/gate.sh`), not here, as picokit's board build is not.
         skiff)
             commands="test kernel
-test arch/pmsa"
-            label="test kernel; test arch/pmsa"
+build-c tools/portable --target thumbv6m-freestanding
+build-c tools/portable --target thumbv7em-freestanding
+build-c tools/portable --target thumb-freestanding
+build-c tools/portable --target riscv32-freestanding"
+            label="test kernel; build-c tools/portable x4 targets"
             ;;
     esac
 
