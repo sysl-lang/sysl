@@ -167,11 +167,78 @@ print(Limit)
 'Limit' is a 'const', so its value is folded into every use of it
 ```
 
+### A literal binding takes its type from its first use
+
+A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
+its type from its **first use that fixes one**: a comparison with an operand that has a type of its
+own, an assignment of such a value or into a typed place, an argument, an index, a `return` or the
+body's result. A counter compared with a length is a `usize`, and an index read with it needs no
+conversion:
+
+```sysl
+val xs = [10, 20, 30]
+val first = 0
+var i = 0
+
+while i < xs.len
+    print(xs[i])
+    i += 1
+
+print(first < xs.len, i)
+```
+
+```output
+10
+20
+30
+true 3
+```
+
+**Arithmetic fixes nothing.** In `sum + b` the binding keeps its default and the typed operand widens
+to it, exactly as though the default had been written. Nor does a conversion: `u8(n)` converts `n`
+from what it is rather than deciding it. A binding no use fixes has the literal's
+default: `int`, or `real` for a float literal. A use whose type cannot hold the literal — `300` handed
+to a `u8` — fixes nothing either, and is refused as it would be with `int` written. An integer
+literal is fixed at a float type where it holds the value exactly. A use inside a closure or a nested
+function is a use like any other.
+
+```sysl
+half(x: f32) -> f32 = x / 2
+
+var sum = 250
+val b: u8 = 10
+var h = 3
+
+print(sum + b, half(h), h / 2)
+```
+
+```output
+260 1.5 1.5
+```
+
+**The first such use decides**, and a later use that disagrees is told exactly as it would be had the
+type been written on the declaration:
+
+```sysl
+wide(n: usize) -> usize = n
+narrow(n: u8) -> u8 = n
+
+var i = 0
+
+print(wide(i))
+print(narrow(i))
+```
+
+```error
+'n' of 'narrow' is byte, but usize was given
+```
+
 ### A module member takes its type as a local does
 
-A **member of a module** may leave its type off exactly as a local may: `val limit = 10` is an `int`
+A **member of a module** may leave its type off as a local may: `val limit = 10` is an `int`
 wherever it is declared, `val name = "sysl"` a `string`, and `val area = square(6)` whatever `square`
-returns. Where the type is written it governs, and the value is read against it — `val ratio: real =
+returns. A module member's literal is its default, `int` or `real`: its uses are spread across the
+module, so no one of them is first. Where the type is written it governs, and the value is read against it — `val ratio: real =
 3` is a `real` three. A `const` follows the same rule, and so does module storage written with `var`
 — `static var ticks = 0` is an `int` the program may write. Only a `var` with **no initializer**
 states its type, since there is no value to read one off and it starts at its type's zero.

@@ -369,6 +369,15 @@ struct Analyzer
     // argument -- still widens.
     sibling_offers: Buf[Type]
 
+    // A local `var` or `val` whose initial value is a bare literal takes its type from its first use
+    // that fixes one (`var_first_use.sysl`). The bindings still open in the reading under way; the
+    // fixes that reading found, which a thrown-away trial takes back; the fixes a block is being
+    // read again with; and where a name is read as an operand, a place no use fixes a type from.
+    open_vars: Buf[OpenVar]
+    var_fix_log: Buf[VarFix]
+    var_fixes: Buf[KnownFix]
+    not_fixing: Buf[usize]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -453,6 +462,27 @@ struct Analyzer
 
             self.scope.imports.levels.truncate(self.scope.imports.levels.len() - 1)
     end leave
+
+    // Where the innermost scope's bindings and imports stand now, for a reading that may be read
+    // again (`var_first_use.sysl`).
+    scope_mark(self) -> ScopeMark =
+        ScopeMark(self.locals.len(), self.scope.imports.names.len(), self.scope.imports.modules.len(),
+                  self.scope.imports.wildcards.len(), self.scope.imports.levels.len())
+
+    // Takes back every binding and import made since `at`, leaving the scope they were made in open:
+    // a block read again binds its names afresh, and the first reading's must not answer a lookup.
+    rewind_scope(*self, at: ScopeMark)
+        for i in at.locals..<self.locals.len()
+            val local = self.locals.at(i)
+
+            if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
+
+        self.locals.truncate(at.locals)
+        self.scope.imports.names.truncate(at.names)
+        self.scope.imports.modules.truncate(at.modules)
+        self.scope.imports.wildcards.truncate(at.wildcards)
+        self.scope.imports.levels.truncate(at.levels)
+    end rewind_scope
 
     // Makes the innermost block's imports a level of their own, where it is about to take its first:
     // a name is asked of that block's imports before an outer block's or the file's.
@@ -629,7 +659,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
-             false, buf(), buf(), map(), map(), buf())
+             false, buf(), buf(), map(), map(), buf(), buf(), buf(), buf(), buf())
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()
