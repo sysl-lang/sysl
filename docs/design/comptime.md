@@ -39,7 +39,7 @@ instance.
 | 1 | must a function be marked to run while compiling? | **No. Any function may be called where a constant is wanted, and it is evaluated if its body can be.** The refusal names the first thing in the call chain that cannot run (*'K' calls 'plain', which calls 'print' …*). `const f(...)` stays, as a **promise checked at the declaration**: the body must be evaluable, as `const_check` holds it today, so a library can commit to it | D's CTFE and Zig need no marker; Rust and C++ do. Their reason is semver, and the checked promise keeps that. Pleasantness decides it (G1, and G2 disappears with it) |
 | 1b | does std then mark its functions? | **Std marks `const` only on functions it promises**: math, `Buf`, `Map`, `Set`, string building and slices. Nothing else needs a mark to be callable | the mark is an API promise; under (1) callability needs none |
 | 2 | heap while evaluating | **Allowed.** `&T`, `Buf`, `Map`, `Set` and closures work during evaluation as at run time. **What the evaluation answers is frozen into constant data**: a `[]const T` viewing a `Buf` becomes a static array plus a view of it with a null owner word, the way a string literal is laid down; a `&sync Frozen[T]` (`b.freeze()`) becomes the same array behind static storage; a `&T` to a struct becomes static storage with a null owner word | D lays `new` results into static data; C++20 allows only transient allocation. A null owner word already means "never freed" for literals, so nothing new is needed at run time (G3) |
-| 2b | answering something writable | **Refused where it is written**: an evaluation answers heap data only through a read-only type (`[]const T`, `string`, `&sync Frozen[T]`, a `&T` to a struct with no `var` path). A `Buf[T]` or `Map` answered whole gets *answer `b.view()` or `b.freeze()` — what is made while compiling is laid into the object file, and nothing writes it there* | the types already say "nobody writes this", so there is no copy-on-write path and no run-time trap |
+| 2b | answering something writable | **Refused where it is written**: an evaluation answers heap data only through a read-only type (`[]const T`, `string`, `&sync Frozen[T]`), or as a `&T` a module `val` holds, laid down as writable static data like the frozen box (revisited 2026-10-19). A `Buf[T]` or `Map` answered whole gets *answer `b.view()` or `b.freeze()` — what is made while compiling is laid into the object file, and nothing writes it there* | the types already say "nobody writes this", so there is no copy-on-write path and no run-time trap |
 | 3 | evaluation where a type is read | **The declaration pass evaluates on demand.** A call in an array length, a value argument, `@assert` or a default parameter is evaluated when that declaration is resolved, after the callee's body is checked. A cycle (*`K`'s length needs `f`, whose body needs `K`*) is reported naming both | Zig and D evaluate lazily, in dependency order. Without it, reflection cannot compute a type (G4, G5) |
 | 4 | an expression as a value argument | **`f[sq(3)]()`, `Ring[int, cap(8)]`**: the bracket reads an expression when the parameter is `const` | needed by (3). The parser already reads brackets out of the expression grammar |
 | 5 | forcing evaluation inside a body | **A local `const NAME: T = e`** (the type is required, as at module level). It is folded like a module `const`, scoped to its block. `val` stays as it is: a `val` over a call is evaluated at run time unless the optimiser folds it | reuses a spelling sysl already has. Zig writes `comptime e`, D writes `enum x = e`. No new word (G6) |
@@ -192,11 +192,17 @@ an evaluation is one thread.
   in **writable** data, unlike the rest: a reference points at its counted header, and `arc.retain`
   writes the count. The count starts at one, which is the `val`'s own share and is never given back;
   the hook is null.
+- **A `&T` a module `val` holds is laid down exactly as the frozen box is** (decision 2b revisited,
+  2026-10-19): a `TBox` in writable data, count one, hook null, so the one object is written
+  through by every use and nothing frees it. A box written out (`val R: &P = P(1)`) is laid down the
+  same way, and a box inside an enum payload is a word the linker fills (`UnitBox`). It stays code
+  where laying it down would change what the program means: a `var` gives its share back when
+  assigned, and the box it held must then be destroyed as the program's own would be; an answer
+  reaching one box from two places would become two objects; and a box of a type with a `Drop` is
+  not made while compiling at all.
 - **Any other answer through a writable type stays code**, computed at startup as before, and the
   reason names what to answer: a whole `Buf` (`view()` as a `[]const T`, or `freeze()`), a `Map` or
-  `Set` (what is read out of it), a `[]T` (`[]const T`), a `&T` (the value itself). A `&T` is
-  writable through the reference, so decision 2b keeps it out; it could be laid down exactly as the
-  frozen box is, if that decision is revisited.
+  `Set` (what is read out of it), a `[]T` (`[]const T`).
 
 **Found while building it:**
 - A library's panic is a function returning `never`. A call typed `never` is not followed by the

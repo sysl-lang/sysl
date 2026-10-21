@@ -1,0 +1,271 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A module `val` holding a `&T` that is known while compiling is a box laid into the object file**:
+// a `const` call's answer, or a box written out. The box is writable data, its count one -- the
+// storage's own share, never given back -- and its hook null, so nothing frees it. Every use reads and
+// writes that one object, on a board as on a host, and no allocator is needed for it. What stays code:
+// a `var` (its share is given back when it is assigned), an answer reaching one object from two
+// places, and a box of a type with a `Drop`. The box's count is not atomic and the program writes
+// through it, so a `&sync` closure may not reach it and a `const` function may not read it.
+
+private struct RsdRun
+    ok: bool
+    out: string
+    err: string
+
+private rsd_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rsd_ready
+
+// A program built with the heap counted, and what it said on each stream.
+private rsd_run(text: string) -> RsdRun
+    val root = make_temp_dir("sysl-rsd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RsdRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RsdRun(false, "could not be started", "")
+        Ok(o) -> RsdRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end rsd_run
+
+private rsd_clean(run: RsdRun, expected: string)
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end rsd_clean
+
+private rsd_decls() -> string = raw"""
+    struct P
+        x: int
+        name: string
+
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    struct Holder
+        p: &P
+        k: int
+
+    boxed() -> &P = P(1, "one")
+
+    chain() -> &Node = Node(1, Some(Node(2, None)))
+
+    held() -> Holder = Holder(P(8, "eight"), 9)
+
+    """
+
+@test("a '&T' a 'const' call answers is one object: written through, read back, the same at every read")
+rsd_boxes_run()
+    if !rsd_ready() then return
+
+    rsd_clean(rsd_run(rsd_decls() + raw"""
+        static val R: &P = boxed()
+        static val C: &Node = chain()
+        static val H: Holder = held()
+        static val W: &P = P(4, "four")
+
+        bump()
+            R.x += 1
+
+        read_h() -> int = H.p.x
+
+        R.x += 10
+        bump()
+        print(R.x, R.name)
+
+        C.next.unwrap().v = 7
+        print(C.v, C.next.unwrap().v)
+
+        H.p.x += 1
+        W.x *= 10
+        print(read_h(), H.k, W.x, W.name)
+
+        val a = R
+        val b = R
+
+        print(a == b, a == W)
+        """), "12 one\n1 7\n9 9 40 four\ntrue false\n")
+end rsd_boxes_run
+
+@test("shares taken and given back on a laid-down box leave the heap where it started")
+rsd_shares_come_back()
+    if !rsd_ready() then return
+
+    rsd_clean(rsd_run("import sysl.buf.{Buf, buf}\n\n" + rsd_decls() + raw"""
+        static val R: &P = boxed()
+
+        keep(p: &P) -> &P = p
+
+        var held: Buf[&P] = buf()
+
+        for i in 0..<100
+            held.push(keep(R))
+
+        held.clear()
+
+        for i in 0..<100
+            val r = R
+            r.x += 1
+
+        print(R.x)
+        """), "101\n")
+end rsd_shares_come_back
+
+@test("on a board the boxes are constant data: writable, count one, hook null, nothing run at startup")
+rsd_boxes_are_laid_down_on_a_board()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(rsd_decls() +
+                               "val R: &P = boxed()\nval C: &Node = chain()\nval H: Holder = held()\n" +
+                               "val W: &P = P(4, \"four\")" +
+                               ctb_main + "R.x + C.next.unwrap().v + H.p.x + W.x\n")
+
+    ctb_laid_down(out, "@R = ")
+    assert(out.contains("@R = private constant ptr @.box"), out)
+    assert(out.contains("@C = private constant ptr @.box"), out)
+    assert(out.contains("@H = private constant %struct.Holder { ptr @.box"), out)
+    assert(out.contains("@W = private constant ptr @.box"), out)
+
+    // Each box: writable, its count one, its hook null; the inner node's address fills a payload word.
+    assert(out.contains(" = private global %arc.P { i32 1, ptr null, i32 1, %struct.P { i32 1, "), out)
+    assert(out.contains(" = private global %arc.Node { i32 1, ptr null, i32 1, %struct.Node { i32 2, "), out)
+    assert(out.contains("ptrtoint (ptr @.box"), out)
+end rsd_boxes_are_laid_down_on_a_board
+
+@test("a 'var', an answer reaching one object twice, and a box with a 'Drop' stay code, each saying why")
+rsd_what_stays_code()
+    if ctb_skip() then return
+
+    val cases = [(raw"""
+                      struct P
+                          x: int
+
+                      boxed() -> &P = P(1)
+
+                      var T: &P = boxed()
+                      """ + ctb_main + "T.x\n",
+                  "'T' holds a reference, and a 'var' gives its share back when it is assigned, so its box " +
+                  "is made when the program starts — a module 'val' holds one laid down"),
+                 (raw"""
+                      struct P
+                          x: int
+
+                      struct Two
+                          a: &P
+                          b: &P
+
+                      shared() -> Two
+                          val p: &P = P(5)
+                          Two(p, p)
+
+                      val T: Two = shared()
+                      """ + ctb_main + "T.a.x\n",
+                  "'T' reaches one object the run made from two places, and each place laid down would hold " +
+                  "an object of its own — keep one reference to it"),
+                 (raw"""
+                      struct D
+                          n: int
+
+                      impl Drop for D
+                          drop(self) = ()
+
+                      dropped() -> &D = D(3)
+
+                      val T: &D = dropped()
+                      """ + ctb_main + "T.n\n",
+                  "a box of a 'D', which has a 'Drop', is not made while compiling")]
+
+    for item in cases
+        val out = ctb_freestanding(item.0)
+
+        assert(out.contains(ctb_refusal), out)
+        assert(out.contains(item.1), out)
+end rsd_what_stays_code
+
+@test("a 'var' holding a reference keeps building its box, and assigning it gives the old one back")
+rsd_var_runs()
+    if !rsd_ready() then return
+
+    rsd_clean(rsd_run(rsd_decls() + raw"""
+        static var V: &P = boxed()
+
+        V.x = 2
+        print(V.x)
+        V = P(3, "three")
+        print(V.x, V.name)
+        """), "2\n3 three\n")
+end rsd_var_runs
+
+@test("a laid-down box is counted as the program's own are: a '&sync' closure may not reach it")
+rsd_a_sync_closure_may_not_reach_it()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding(rsd_decls() + raw"""
+        val R: &P = boxed()
+
+        run() -> int
+            val job: &sync Fn() -> unit = () -> R.x += 1
+            job()
+            R.x
+        """ + ctb_main + "run()\n")
+
+    assert(out.contains("but the module storage 'R' it reaches"), out)
+end rsd_a_sync_closure_may_not_reach_it
+
+@test("a 'const' function reading a laid-down box is not run while compiling")
+rsd_a_const_read_is_refused()
+    if !rsd_ready() then return
+
+    val run = rsd_run(rsd_decls() + raw"""
+        static val R: &P = boxed()
+
+        const get() -> int = R.x
+
+        const K: int = get()
+
+        print(K)
+        """)
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains("'R' holds a reference, and what the program writes through it is known only " +
+                            "when the program runs"), run.out)
+end rsd_a_const_read_is_refused
+
+@test("a 'const' is a scalar, so a reference is still refused there")
+rsd_const_reference_is_refused()
+    if !rsd_ready() then return
+
+    val run = rsd_run(rsd_decls() + "const K: &P = boxed()\n\nprint(K.x)\n")
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains("a constant is a scalar, and &P is not — 'K'"), run.out)
+end rsd_const_reference_is_refused

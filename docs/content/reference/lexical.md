@@ -460,18 +460,19 @@ declared rather than binding a new one.
 
 ## Reserved words
 
-Forty words are reserved and may not be used as identifiers:
+Forty-one words are reserved and may not be used as identifiers:
 
 | | | | | |
 |---|---|---|---|---|
 | `alignof` | `as` | `break` | `const` | `continue` |
 | `defer` | `do` | `elif` | `else` | `ensure` |
-| `enum` | `extern` | `false` | `for` | `if` |
-| `impl` | `import` | `in` | `loop` | `match` |
-| `module` | `null` | `offsetof` | `override` | `private` |
-| `ref` | `require` | `return` | `self` | `sizeof` |
-| `static` | `struct` | `then` | `trait` | `true` |
-| `type` | `val` | `var` | `weak` | `while` |
+| `enum` | `errdefer` | `extern` | `false` | `for` |
+| `if` | `impl` | `import` | `in` | `loop` |
+| `match` | `module` | `null` | `offsetof` | `override` |
+| `private` | `ref` | `require` | `return` | `self` |
+| `sizeof` | `static` | `struct` | `then` | `trait` |
+| `true` | `type` | `val` | `var` | `weak` |
+| `while` | | | | |
 
 **`alloc`, `no` and `requires` are *not* among them**, though they read like keywords where they
 appear. A capability is written as an [attribute](/reference/attributes/) — `@no_alloc`,

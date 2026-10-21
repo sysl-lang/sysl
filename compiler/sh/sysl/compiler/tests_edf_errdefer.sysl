@@ -1,0 +1,650 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `errdefer` -- a deferred statement that runs only when the function fails
+// (`reference/statements.md § errdefer`, `docs/design/errdefer.md`).
+//
+// Almost everything here builds a program and runs it, because which exits run the statement, and in
+// what order beside a `defer`, is the whole content of the form. What is pinned is what the design
+// decided: it runs when the function returns its failure variant -- a `?` taking its failure arm, an
+// `Err(…)` or `None` returned or left as the body's value, a computed result holding one -- and on no
+// other way out; it shares `defer`'s stack and its block scope; `errdefer e -> …` sees the failure
+// in the function's own error type; and each refusal says why.
+
+// What a program does: what it printed (standard error after standard output) and the status it
+// exited with. A failure to build is its message and `-1`, which no program exits with.
+private edf_outcome(text: string, counted: bool) -> (string, int)
+    val root = make_temp_dir("sysl-edf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end edf_outcome
+
+// The program prints exactly this and leaves with this status. Returns at once without the library.
+private edf_leaves(text: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val out = edf_outcome(text, false)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+end edf_leaves
+
+// The program runs to the end and prints exactly this.
+private edf_prints(text: string, want: string) = edf_leaves(text, want, 0)
+
+// The build is refused with this message and no other, anchored at this `line:column`.
+private edf_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = edf_outcome(text, false)
+    val said = out.0
+
+    assert_eq(out.1, -1)
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+    val first = said.index_of("error: ").unwrap_or(0)
+
+    assert(!said[first + 7..<said.len].contains("error: "), said)
+end edf_refused
+
+// The whole lowered module of a one-file program, or nothing without the library.
+private edf_ir(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-edf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            Some(emitted.text)
+end edf_ir
+
+// One function's body out of a lowered module, from its `define` to its closing brace.
+private edf_body(ir: string, name: string) -> string
+    val at = ir.index_of(s"@$name(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end edf_body
+
+// The probe the design note opens with: a step that fails after an earlier one succeeded.
+private val edf_build: string = raw"""
+    step(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("step")
+
+    build(ok: bool) -> Result[int, string]
+        val f = step(true)?
+        errdefer print("undo", f)
+
+        step(ok)?
+        Ok(f)
+
+    """
+
+// -- the exits it runs on ---------------------------------------------------------------------------
+
+@test("runs on a '?' that takes its failure arm, and not on success")
+edf_runs_on_a_failing_try()
+    edf_prints(edf_build + "print(build(true))\nprint(build(false))\n", "Ok(1)\nundo 1\nErr(step)\n")
+
+@test("runs on a 'return Err(…)'")
+edf_runs_on_a_return_of_err()
+    edf_prints(raw"""
+        f(n: int) -> Result[int, string]
+            errdefer print("undo")
+            if n < 0 then return Err("negative")
+            Ok(n)
+
+        print(f(1))
+        print(f(-1))
+        """, "Ok(1)\nundo\nErr(negative)\n")
+
+@test("runs on an 'Err(…)' that is the body's value")
+edf_runs_on_a_tail_err()
+    edf_prints(raw"""
+        f() -> Result[int, string]
+            errdefer print("undo")
+            Err("tail")
+
+        g() -> Result[int, string]
+            errdefer print("never")
+            Ok(2)
+
+        print(f())
+        print(g())
+        """, "undo\nErr(tail)\nOk(2)\n")
+
+@test("runs on a computed result holding the failure, returned or left as the value")
+edf_runs_on_a_computed_failure()
+    edf_prints(raw"""
+        returned(ok: bool) -> Result[int, string]
+            errdefer print("returned undo")
+            val r: Result[int, string] = if ok then Ok(1) else Err("r")
+            return r
+
+        tail(ok: bool) -> Result[int, string]
+            errdefer print("tail undo")
+            if ok then Ok(2) else Err("t")
+
+        print(returned(true))
+        print(returned(false))
+        print(tail(true))
+        print(tail(false))
+        """, "Ok(1)\nreturned undo\nErr(r)\nOk(2)\ntail undo\nErr(t)\n")
+
+@test("runs on 'None' in an Option function, and not on 'Some'")
+edf_runs_on_none()
+    edf_prints(raw"""
+        pick(n: int) -> Option[int]
+            errdefer print("rolled back")
+            if n == 0 then return None
+            Some(n)
+
+        print(pick(1))
+        print(pick(0))
+        """, "Some(1)\nrolled back\nNone\n")
+
+@test("runs on an Option '?' that takes its 'None' arm")
+edf_runs_on_an_option_try()
+    edf_prints(raw"""
+        half(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+
+        quarter(n: int) -> Option[int]
+            errdefer print("undo", n)
+            val h = half(n)?
+            half(h)
+
+        print(quarter(8))
+        print(quarter(6))
+        print(quarter(3))
+        """, "Some(2)\nundo 6\nNone\nundo 3\nNone\n")
+
+@test("an 'errdefer' control never reached is not run")
+edf_not_reached_not_run()
+    edf_prints(edf_build + raw"""
+        early() -> Result[int, string]
+            step(false)?
+            errdefer print("never")
+            Ok(1)
+
+        print(early())
+        """, "Err(step)\n")
+
+// A trap runs no deferred statement of either kind: the program leaves with the trap's status, and
+// an `errdefer` that ran would have exited zero.
+@test("a trap runs nothing")
+edf_a_trap_runs_nothing()
+    edf_leaves(raw"""
+        f() -> Result[int, string]
+            var xs = [1, 2, 3]
+            var i = 5
+            errdefer exit(0)
+            print(xs[i])
+            Err("never")
+
+        print(f())
+        """, "index 5 out of bounds for length 3 (main.sysl:5:13)\n", 133)
+
+// -- order, beside 'defer' --------------------------------------------------------------------------
+
+@test("shares 'defer''s stack: the last written runs first, whichever kind")
+edf_shares_the_defer_stack()
+    edf_prints(edf_build + raw"""
+        f(ok: bool) -> Result[int, string]
+            defer print("defer 1")
+            errdefer print("errdefer 2")
+            defer print("defer 3")
+            errdefer print("errdefer 4")
+            step(ok)?
+            Ok(0)
+
+        print(f(true))
+        print(f(false))
+        """, "defer 3\ndefer 1\nOk(0)\nerrdefer 4\ndefer 3\nerrdefer 2\ndefer 1\nErr(step)\n")
+
+// The design's `transfer`: the undo of the later step runs before the release of the earlier one.
+@test("an 'errdefer' written after a 'defer' runs before it")
+edf_after_a_defer_runs_before_it()
+    edf_prints(edf_build + raw"""
+        transfer(debit: bool, credit: bool) -> Result[unit, string]
+            print("lock")
+            defer print("unlock")
+
+            step(debit)?
+            errdefer e ->
+                print("credit back")
+                print(s"rolled back: $e")
+
+            step(credit)?
+            Ok(())
+
+        print(transfer(true, true))
+        print(transfer(true, false))
+        print(transfer(false, true))
+        """, "lock\nunlock\nOk(())\nlock\ncredit back\nrolled back: step\nunlock\nErr(step)\n" +
+             "lock\nunlock\nErr(step)\n")
+
+@test("a computed result tests its tag once for a run of 'errdefer's, in order")
+edf_a_run_under_one_test()
+    edf_prints(raw"""
+        f(ok: bool) -> Result[int, string]
+            errdefer print("a")
+            errdefer print("b")
+            defer print("c")
+            errdefer print("d")
+            val r: Result[int, string] = if ok then Ok(1) else Err("x")
+            r
+
+        print(f(true))
+        print(f(false))
+        """, "c\nOk(1)\nd\nc\nb\na\nErr(x)\n")
+
+// -- block scope ------------------------------------------------------------------------------------
+
+@test("an inner block's 'errdefer' runs before the outer block's, on a failure inside it")
+edf_nested_blocks_inner_first()
+    edf_prints(edf_build + raw"""
+        f(ok: bool) -> Result[int, string]
+            errdefer print("outer")
+
+            if true
+                errdefer print("inner")
+                step(ok)?
+
+            Ok(1)
+
+        print(f(false))
+        """, "inner\nouter\nErr(step)\n")
+
+@test("a block left normally discards its 'errdefer', so a later failure runs only the outer one")
+edf_block_end_discards()
+    edf_prints(edf_build + raw"""
+        f() -> Result[int, string]
+            errdefer print("outer")
+
+            if true
+                errdefer print("inner")
+                step(true)?
+
+            step(false)?
+            Ok(1)
+
+        print(f())
+        """, "outer\nErr(step)\n")
+
+@test("a loop body's 'errdefer' is discarded by 'continue', 'break' and its end")
+edf_loop_body_discards()
+    edf_prints(raw"""
+        f(fail_at: int) -> Result[int, string]
+            errdefer print("outer")
+
+            for i in 0..<4
+                errdefer print("undo", i)
+                if i == 1 then continue
+                if i == fail_at then return Err(s"at $i")
+                if i == 3 then break
+
+            Ok(0)
+
+        print(f(9))
+        print(f(2))
+        """, "Ok(0)\nundo 2\nouter\nErr(at 2)\n")
+
+// -- seeing the failure -----------------------------------------------------------------------------
+
+@test("'errdefer e ->' binds the error being returned")
+edf_binder_sees_the_error()
+    edf_prints(raw"""
+        f(n: int) -> Result[int, string]
+            errdefer e -> print("failed with", e)
+            if n < 0 then return Err(s"bad $n")
+            Ok(n)
+
+        print(f(2))
+        print(f(-3))
+        """, "Ok(2)\nfailed with bad -3\nErr(bad -3)\n")
+
+@test("the binder sees the error after a '?' converted it through 'From'")
+edf_binder_after_from()
+    edf_prints(raw"""
+        struct Wide
+            code: usize
+
+        impl From[string] for Wide
+            from(s: string) -> Wide = Wide(s.len)
+
+        inner(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("four")
+
+        outer(ok: bool) -> Result[int, Wide]
+            errdefer w -> print("converted", w.code)
+            val x = inner(ok)?
+            Ok(x)
+
+        print(outer(true).is_ok())
+        print(outer(false).is_ok())
+        """, "true\nconverted 4\nfalse\n")
+
+@test("the binder's body may be a block under it")
+edf_binder_block_body()
+    edf_prints(raw"""
+        f() -> Result[int, string]
+            errdefer e ->
+                val n = e.len
+                print("first", e)
+                print("then", n)
+            Err("oops")
+
+        print(f())
+        """, "first oops\nthen 4\nErr(oops)\n")
+
+// A result too large for registers leaves through the caller's storage; the tag and the payload are
+// read back out of it.
+@test("a large result returned through the caller's storage is told apart by its tag")
+edf_large_result()
+    edf_prints(raw"""
+        big(n: int) -> Result[(int, int, int, int, int, int), string]
+            errdefer e -> print("undo", e)
+            val r: Result[(int, int, int, int, int, int), string] =
+                if n > 5 then Err(s"too big $n") else Ok((n, n, n, n, n, n))
+            r
+
+        print(big(1).is_ok())
+        print(big(9).is_ok())
+        """, "true\nundo too big 9\nfalse\n")
+
+// The binder reads the payload the leaving value already holds a count of, and takes none of its own.
+@test("the binder takes no count: a counted run ends with nothing live")
+edf_binder_takes_no_count()
+    if xvr_no_library() then return
+
+    val out = edf_outcome(raw"""
+        import sysl.buf.{Buf, buf}
+
+        step(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err(s"bad $n")
+
+        held(n: int) -> Result[Buf[int], string]
+            var b: Buf[int] = buf()
+            b.push(n)
+            errdefer e ->
+                val kept = e
+                print("undo", kept, b.len())
+            step(n)?
+            Ok(b)
+
+        print(held(1).is_ok())
+        print(held(-2).is_ok())
+        """, true)
+
+    assert_eq(out.0, "true\nundo bad -2 1\nfalse\n")
+    assert_eq(out.1, 0)
+end edf_binder_takes_no_count
+
+// -- the innermost body decides ---------------------------------------------------------------------
+
+@test("a closure's 'errdefer' runs when the closure fails, not the function around it")
+edf_closure_decides()
+    edf_prints(raw"""
+        run(f: &Fn(int) -> Result[int, string], n: int) -> Result[int, string] = f(n)
+
+        outer() -> Result[int, string]
+            errdefer print("outer undo")
+            val f: &Fn(int) -> Result[int, string] = k ->
+                errdefer e -> print("closure undo", e)
+                if k > 0 then Ok(k) else Err("closure")
+            print(run(f, 0))
+            run(f, 2)
+
+        print(outer())
+        """, "closure undo closure\nErr(closure)\nOk(2)\n")
+
+@test("a nested function's 'errdefer' runs when it fails")
+edf_nested_function_decides()
+    edf_prints(raw"""
+        host(n: int) -> int
+            helper(k: int) -> Result[int, string]
+                errdefer e -> print("helper failed:", e)
+                if k > 1 then Err("big") else Ok(k)
+
+            helper(n).unwrap_or(-1)
+
+        print(host(1))
+        print(host(5))
+        """, "1\nhelper failed: big\n-1\n")
+
+@test("an async body's 'errdefer' runs when its task ends in failure")
+edf_async_task_failure()
+    edf_prints(raw"""
+        step(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err(s"bad $n")
+
+        async task(n: int) -> Result[int, string]
+            errdefer e -> print("task undo", e)
+            val x = step(n)?
+            Ok(x)
+
+        print(block_on(task(1)))
+        print(block_on(task(0)))
+        """, "Ok(1)\ntask undo bad 0\nErr(bad 0)\n")
+
+@test("in a 'main' that returns a Result, it runs before the report, with the 'defer's")
+edf_in_main()
+    edf_leaves(raw"""
+        main() -> Result[unit, string]
+            defer print("main: defer")
+            errdefer e -> print("main: errdefer", e)
+            Err("main failed")
+        """, "main: errdefer main failed\nmain: defer\nerror: main failed\n", 1)
+
+// -- what it costs -----------------------------------------------------------------------------------
+
+// A computed result is tested where an `errdefer` waits and nowhere else; a variant written out and
+// a `?`'s failure arm are settled while compiling.
+@test("a tag test is laid only where a computed result leaves past an 'errdefer'")
+edf_tag_test_only_where_needed()
+    val ir = edf_ir(raw"""
+        computed(ok: bool) -> Result[int, string]
+            errdefer print("undo")
+            val r: Result[int, string] = if ok then Ok(1) else Err("x")
+            r
+
+        written(ok: bool) -> Result[int, string]
+            errdefer print("undo")
+            if !ok then return Err("x")
+            Ok(1)
+
+        plain(ok: bool) -> Result[int, string]
+            defer print("done")
+            val r: Result[int, string] = if ok then Ok(1) else Err("x")
+            r
+
+        print(computed(true), written(true), plain(true))
+        """)
+
+    ir match
+        None -> ()
+        Some(text) ->
+            assert(edf_body(text, "computed").contains("errdefer.run"), edf_body(text, "computed"))
+            assert(!edf_body(text, "written").contains("errdefer.run"), edf_body(text, "written"))
+            assert(!edf_body(text, "plain").contains("errdefer.run"), edf_body(text, "plain"))
+end edf_tag_test_only_where_needed
+
+// The binder and the test allocate nothing, so a `no alloc` module on a bare board may use both.
+@test("a 'no alloc' module on a bare board may use it, binder and all")
+edf_no_alloc_bare_board()
+    if cfv_skip() then return
+
+    val out = cfv_built(raw"""
+        @no_alloc
+
+        pick(n: i32) -> Result[i32, i32]
+            errdefer e -> undo(e)
+            val r: Result[i32, i32] = if n > 0 then Ok(n) else Err(n)
+            r
+
+        undo(e: i32) = ()
+
+        @export("main")
+        main_entry() -> int = int(pick(3).unwrap_or(0))
+        """)
+
+    assert(out.contains("errdefer.run"), out)
+end edf_no_alloc_bare_board
+
+// -- what it is refused for ---------------------------------------------------------------------------
+
+@test("refused in a function that cannot fail")
+edf_refused_where_nothing_fails()
+    edf_refused(raw"""
+        count(n: int) -> int
+            errdefer print("never")
+            n
+
+        print(count(1))
+        """, "'errdefer' runs when 'count' fails, and 'count' returns int, which cannot fail — use " +
+                 "'defer'", "2:5")
+
+@test("refused in a function with no result")
+edf_refused_in_a_unit_function()
+    edf_refused(raw"""
+        tidy()
+            errdefer print("never")
+
+        tidy()
+        """, "'errdefer' runs when 'tidy' fails, and 'tidy' returns unit, which cannot fail — use " +
+                 "'defer'", "2:5")
+
+@test("a binder is refused in an Option function, whose 'None' carries nothing")
+edf_refused_binder_in_option()
+    edf_refused(raw"""
+        pick(n: int) -> Option[int]
+            errdefer e -> print(e)
+            Some(n)
+
+        print(pick(1))
+        """, "'errdefer' binds the error 'pick' fails with, and 'pick' returns sysl.Option[int], " +
+                 "whose 'None' carries none — leave the binder out", "2:5")
+
+@test("refused in a closure whose result its context did not fix")
+edf_refused_in_an_unfixed_closure()
+    edf_refused(raw"""
+        val f = (k: int) ->
+            errdefer print("x")
+            k
+        print(f(1))
+        """, "'errdefer' runs when this closure fails, and what this closure returns is not known " +
+                 "where the 'errdefer' is read — state its result type", "2:5")
+
+@test("a 'return' inside is refused, as in a 'defer'")
+edf_refused_return()
+    edf_refused(raw"""
+        f() -> Result[int, string]
+            errdefer return Err("x")
+            Ok(1)
+
+        print(f())
+        """, "a deferred statement runs while its block is being left, so it cannot 'return' — " +
+                 "there is no exit left to take. Compute what the function returns before the block " +
+                 "ends", "2:5")
+
+@test("a '?' inside is refused, as in a 'defer'")
+edf_refused_try()
+    edf_refused(raw"""
+        parse() -> Result[int, string] = Ok(1)
+
+        f() -> Result[int, string]
+            errdefer e -> print(parse()?)
+            Ok(2)
+
+        print(f())
+        """, "a deferred statement runs while its block is being left, so a '?' in it has nowhere " +
+                 "to return to. Check the result and handle the failure in the deferred statement itself",
+                "4:5")
+
+@test("a 'break' inside is refused, as in a 'defer'")
+edf_refused_break()
+    edf_refused(raw"""
+        f() -> Result[int, string]
+            for i in 0..<3
+                errdefer break
+            Ok(1)
+
+        print(f())
+        """, "a deferred statement runs while its block is being left, so it cannot 'break' or " +
+                 "'continue' — the loop edge it would take is the one already being taken", "3:9")
+
+@test("a deferred statement inside is refused")
+edf_refused_nested_defer()
+    edf_refused(raw"""
+        f() -> Result[int, string]
+            errdefer defer print("x")
+            Ok(1)
+
+        print(f())
+        """, "'errdefer' schedules a statement, and scheduling a scheduling has nothing to run: " +
+                 "write the statement itself after this 'errdefer'", "2:5")
+
+@test("a declaration alone is refused")
+edf_refused_declaration()
+    edf_refused(raw"""
+        f() -> Result[int, string]
+            errdefer val x = 1
+            Ok(1)
+
+        print(f())
+        """, "a deferred declaration binds a name that dies the moment the statement finishes, so " +
+                 "nothing could read it — defer what uses the value instead of what declares it", "2:5")
+
+@test("the binder is read-only")
+edf_refused_binder_write()
+    edf_refused(raw"""
+        f() -> Result[int, string]
+            errdefer e -> e = "other"
+            Err("x")
+
+        print(f())
+        """, "a 'val' is written once, so assignment has nothing to write through", "2:19")
+
+@test("'errdefer' is a reserved word")
+edf_refused_as_a_name()
+    edf_refused(raw"""
+        var errdefer = 3
+        """, "'errdefer' is a reserved word, so it cannot stand as the name a 'var' binds — write it " +
+                 "'`errdefer`' if that is the name you want, which is what the backticks are for: a " +
+                 "quoted word is an ordinary name wherever one may be written", "1:5")

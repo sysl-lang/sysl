@@ -549,7 +549,7 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     Become(call) -> become_stmt(cx, stmt.span, call)
     Break(label, value) -> break_stmt(cx, stmt.span, label, value)
     Continue(label) -> continue_stmt(cx, stmt.span, label)
-    Defer(inner) -> defer_stmt(cx, stmt.span, inner)
+    Defer(inner, when) -> defer_stmt(cx, stmt.span, inner, when)
 
     AsmStmt(arms) -> one(type_asm(cx, stmt.span, arms))
 
@@ -1199,14 +1199,33 @@ end not_in_an_unrolled_loop
 // which it is one, and the lowering never comes back. The refusal is the whole answer: nothing of
 // the statement is read past it, so it is one diagnostic and the block is left as if the line were
 // not there.
-private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
+//
+// **An `errdefer` is the same statement with one more question asked first**: whether the function
+// it is written in can fail at all, and -- where it binds the failure -- what the failure carries.
+private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt, when: DeferWhen) -> Buf[TStmt]
+    var word = "defer"
+    var typed_when = TEveryExit
+    var binder: Option[(string, Type)] = None
+
+    when match
+        EveryExit -> ()
+        FailureExit(named) ->
+            word = "errdefer"
+            typed_when = TFailureExit(None)
+
+            failure_exit(cx, named.is_some()) match
+                Ok(carries) -> if named.is_some() then binder = Some((named.unwrap(), carries))
+                Err(why) ->
+                    cx.fault(span, why)
+                    return buf()
+
     val refusal: Option[string] = *inner.kind match
         Return(_) -> Some(deferred_return())
         Break(_, _) -> Some(deferred_jump())
         Continue(_) -> Some(deferred_jump())
-        Defer(_) ->
-            Some("'defer' schedules a statement, and scheduling a scheduling has " +
-                 "nothing to run: write the statement itself after this 'defer'")
+        Defer(_, _) ->
+            Some(s"'$word' schedules a statement, and scheduling a scheduling has " +
+                 s"nothing to run: write the statement itself after this '$word'")
         VarDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         ValDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         MultiDecl(_, _, _, _) -> Some(deferred_declaration())
@@ -1231,7 +1250,17 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
     cx.defer_outer = Some(cx.loops.len())
     cx.defer_jump = None
 
+    // An `errdefer`'s binder is in scope for its statement and nowhere else, read-only: it names the
+    // failure on its way out, which nothing here may replace.
+    if binder.is_some()
+        cx.enter()
+        typed_when = TFailureExit(Some((cx.bind_read_only(binder.unwrap().0, binder.unwrap().1, None),
+                                        binder.unwrap().1)))
+
     val t = type_stmts(cx, body)
+
+    if binder.is_some() then cx.leave()
+
     val jump = cx.defer_jump
 
     cx.defer_outer = around.0
@@ -1254,8 +1283,44 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
                  "deferred statement itself")
         return buf()
 
-    one(TDefer(t))
+    one(TDefer(t, typed_when))
 end defer_stmt
+
+// Whether the function an `errdefer` is written in can fail, and what its failure carries -- the
+// type a binder takes, which is the function's own error type, whatever a `?` converted from.
+//
+// **The innermost body decides**: a closure's or a nested function's own result, not the result of
+// the function it was written in. A closure whose result its context did not fix has none to ask
+// yet, and is told to state it, as a `?` in one is.
+private failure_exit(cx: &Analyzer, binds: bool) -> Result[Type, string]
+    val who = cx.body_called match
+        Some(n) -> if n == "" then "this closure" else s"'$n'"
+        None -> s"'${cx.decl_name}'"
+
+    val ret = cx.ret_ty.unwrap_or(Unit)
+
+    if ret == Unknown
+        return Err(s"'errdefer' runs when $who fails, and what $who returns is not known where " +
+                   "the 'errdefer' is read — state its result type")
+
+    val parts = fallible_parts(ret)
+
+    if parts.is_none()
+        return Err(s"'errdefer' runs when $who fails, and $who returns ${type_show(ret)}, which " +
+                   "cannot fail — use 'defer'")
+
+    val fail = parts.unwrap().1
+
+    if fail.fields.is_empty()
+        if binds
+            return Err(s"'errdefer' binds the error $who fails with, and $who returns " +
+                       s"${type_show(ret)}, whose '${fail.name}' carries none — leave the binder " +
+                       "out")
+
+        return Ok(Unit)
+
+    Ok(fail.fields.at(0).1)
+end failure_exit
 
 private deferred_return() -> string =
     "a deferred statement runs while its block is being left, so it cannot 'return' — there is " +

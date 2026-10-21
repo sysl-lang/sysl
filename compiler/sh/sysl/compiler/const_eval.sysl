@@ -389,8 +389,9 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
     evaluate(cx.an, cx.scope, s"'$name'", init) match
         EvValue(Some(v)) ->
             // What the run made on its heap is frozen into the object file only through a type that
-            // says nothing writes it; anything else stays code, computed when the program starts.
-            val refused = answer_refusal(v, texpr_type(init))
+            // says nothing writes it, or as a box the storage holds; anything else stays code,
+            // computed when the program starts.
+            val refused = boxed_answer_refusal(v, texpr_type(init))
 
             if refused.is_some()
                 cx.an.evaluation.last_stop = s"'$name' ${refused.unwrap()}"
@@ -1202,19 +1203,51 @@ end frozen_view
 // run made on its heap is frozen there, and the object file's copy is read by every use, so it may be
 // answered only through a type that says nothing writes it: a `[]const T`, a string, or a frozen
 // buffer. Said after the subject's name.
-answer_refusal(v: Const, t: Type) -> Option[string] = answer_refusal_in(v, t, false)
+//
+// **A module `val` or `var` may answer a `&T` too** (`boxed_answer_refusal`): the box is laid down in
+// writable data, as a frozen buffer's is, and the storage is the one object every use reads and writes.
+answer_refusal(v: Const, t: Type) -> Option[string]
+    var laying = Laying(false, buf())
 
-private answer_refusal_in(v: Const, t: Type, in_frozen: bool) -> Option[string] = v match
+    answer_refusal_in(v, t, false, &laying)
+end answer_refusal
+
+boxed_answer_refusal(v: Const, t: Type) -> Option[string]
+    var laying = Laying(true, buf())
+
+    answer_refusal_in(v, t, false, &laying)
+end boxed_answer_refusal
+
+// What an answer may hold while it is checked: whether a box the run made may be laid down as a box of
+// its own, and the boxes reached so far -- each is laid down once for each place that reaches it, so
+// one reached twice would become two objects where the run had one.
+private struct Laying
+    boxes: bool
+    seen: Buf[usize]
+
+private answer_refusal_in(v: Const, t: Type, in_frozen: bool, laying: *Laying) -> Option[string] = v match
     ConstView(xs, lo, n, _) -> underlying(t) match
         Slice(elem, read_only) ->
             if !read_only then Some(s"is a writable slice '${type_show(t)}', ${laid_text()} — answer it as a " +
                                     s"'[]const ${type_show(*elem)}'")
-            else elements_refusal(viewed(xs, lo, n), *elem, in_frozen)
+            else elements_refusal(viewed(xs, lo, n), *elem, in_frozen, laying)
         _ -> None
     ConstPtr(cells, at, _) -> underlying(t) match
         Ref(inner, _) ->
-            if container_named(*inner) == "sysl.buf.Frozen" then answer_refusal_in(cells.at(at), *inner, true)
-            else Some(s"holds a reference, ${laid_text()} — answer the value itself, or a buffer's 'freeze()'")
+            if container_named(*inner) == "sysl.buf.Frozen" then answer_refusal_in(cells.at(at), *inner, true, laying)
+            else if !laying.boxes then Some(s"holds a reference, ${laid_text()} — answer the value itself, or a " +
+                                            "buffer's 'freeze()'")
+            else
+                val address = usize(&cells.elems[at])
+
+                for seen in laying.seen
+                    if seen == address
+                        return Some("reaches one object the run made from two places, and each place laid " +
+                                    "down would hold an object of its own — keep one reference to it")
+                    end if
+
+                laying.seen.push(address)
+                answer_refusal_in(cells.at(at), *inner, in_frozen, laying)
         Ptr(inner) ->
             if !in_frozen then Some(s"holds a pointer to storage the run made, ${laid_text()} — answer the value " +
                                     "itself")
@@ -1224,9 +1257,9 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool) -> Option[string] 
                 for i in at..<cells.len()
                     rest.push(cells.at(i))
 
-                elements_refusal(rest, *inner, true)
+                elements_refusal(rest, *inner, true, laying)
         _ -> Some(s"holds an address of storage the run made, ${laid_text()}")
-    ConstArray(xs) -> elements_refusal(xs, element_type(t), in_frozen)
+    ConstArray(xs) -> elements_refusal(xs, element_type(t), in_frozen, laying)
     ConstRecord(variant, fields) ->
         val named = container_named(t)
 
@@ -1240,7 +1273,7 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool) -> Option[string] 
 
         for i in 0..<fields.len()
             if i < types.len()
-                val why = answer_refusal_in(fields.at(i), types.at(i).1, in_frozen)
+                val why = answer_refusal_in(fields.at(i), types.at(i).1, in_frozen, laying)
 
                 if why.is_some() then return why
         None
@@ -1250,9 +1283,9 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool) -> Option[string] 
     ConstWriter(_) -> Some("holds a writer, which exists only while a value renders")
     _ -> None
 
-private elements_refusal(xs: Buf[Const], elem: Type, in_frozen: bool) -> Option[string]
+private elements_refusal(xs: Buf[Const], elem: Type, in_frozen: bool, laying: *Laying) -> Option[string]
     for x in xs
-        val why = answer_refusal_in(x, elem, in_frozen)
+        val why = answer_refusal_in(x, elem, in_frozen, laying)
 
         if why.is_some() then return why
 
@@ -1261,6 +1294,11 @@ end elements_refusal
 
 private laid_text() -> string =
     "and what a run while compiling makes is laid into the object file, where nothing may write it"
+
+// Whether a reference type is a frozen buffer's, `&sync Frozen[T]`.
+frozen_box_type(t: Type) -> bool = underlying(t) match
+    Ref(inner, _) -> container_named(*inner) == "sysl.buf.Frozen"
+    _ -> false
 
 // The library container a type is, by its generic's qualified name, or empty for anything else.
 private container_named(t: Type) -> string = underlying(t) match
@@ -4041,7 +4079,7 @@ private stmt_rest(r: &EvRun, s: TStmt) -> Flow
                 _ -> f
         TRefDecl(name, _, place) ->
             refuse_form(r, place.span, s"'ref $name' is not evaluated while compiling yet")
-        TDefer(_) -> refuse_form(r, span_zero(), "a 'defer' is not evaluated while compiling yet")
+        TDefer(_, _) -> refuse_form(r, span_zero(), "a 'defer' is not evaluated while compiling yet")
         TAsm(_, _, _, span) -> refuse_form(r, span, "an 'asm' block is outside the program")
         _ -> EvStop
 end stmt_rest

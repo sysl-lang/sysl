@@ -340,7 +340,7 @@ end can_begin_stmt
 private begins_stmt_word(w: string) -> bool
     for word in ["var", "val", "ref", "const", "static", "struct", "enum", "trait", "impl",
                  "override", "extern", "import", "private", "type", "return", "break", "continue",
-                 "defer", "require", "ensure", "@", "#"]
+                 "defer", "errdefer", "require", "ensure", "@", "#"]
         if word == w then return true
 
     false
@@ -422,6 +422,7 @@ private parse_decl_or_stmt(p: *Parser, start: Span, vis: Visibility, marked: boo
     if p.at_kw("break") then return parse_break(p, start)
     if p.at_kw("continue") then return parse_continue(p, start)
     if p.at_kw("defer") then return parse_defer(p, start)
+    if p.at_kw("errdefer") then return parse_errdefer(p, start)
     if p.at_kw("require") then return parse_contract(p, start, "require")
     if p.at_kw("ensure") then return parse_contract(p, start, "ensure")
 
@@ -733,8 +734,41 @@ private parse_defer(p: *Parser, start: Span) -> Stmt
     // being the keyword alone.
     val deferred = parse_stmt_at(p, true)
 
-    stmt(start.to(p.just_taken()), Defer(deferred))
+    stmt(start.to(p.just_taken()), Defer(deferred, EveryExit))
 end parse_defer
+
+// `errdefer stmt` and `errdefer e -> stmt` -- what to run on the way out of this block only when
+// the function is failing, the second seeing the failure it fails with.
+//
+// The plain form is one line, as `defer` is. The binder's form takes what follows its arrow as a
+// match arm takes it -- one line, or a block under it -- since logging the error and undoing a step
+// are two statements more often than one. A block of several is read as one block expression, so
+// the declarations in it are the block's own.
+private parse_errdefer(p: *Parser, start: Span) -> Stmt
+    p.bump()
+
+    var binder: Option[string] = None
+
+    p.peek() match
+        Ident(name) ->
+            if p.kw_at(1, "->")
+                binder = Some(name)
+                p.bump()
+                p.bump()
+        _ -> ()
+
+    if binder.is_none()
+        val deferred = parse_stmt_at(p, true)
+
+        return stmt(start.to(p.just_taken()), Defer(deferred, FailureExit(None)))
+    end if
+
+    val body = if p.block_ahead() then parse_suite(p) else parse_inline_body(p)
+    val deferred = if body.len() == 1 then body.at(0) else
+        stmt(start.to(p.just_taken()), ExprStmt(expr(start.to(p.just_taken()), Block(body))))
+
+    stmt(start.to(p.just_taken()), Defer(deferred, FailureExit(binder)))
+end parse_errdefer
 
 // `become f(x)` -- a call that replaces this frame rather than adding to it.
 //

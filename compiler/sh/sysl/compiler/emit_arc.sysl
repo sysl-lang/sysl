@@ -893,11 +893,16 @@ end own_box
 
 // Hands a statement to the scope being emitted. Nothing is emitted here -- the `defer` itself costs
 // no instruction, and the statement is laid down at each edge that leaves the block.
-defer_stmts(e: *Emit, stmts: Buf[TStmt])
+//
+// An `errdefer` is held whole, so that the way out laying it down can tell it from a `defer`.
+defer_stmts(e: *Emit, stmts: Buf[TStmt], when: TDeferWhen)
     if e.defer_marks.is_empty() then return
 
-    for stmt in stmts
-        e.defers.push(stmt)
+    when match
+        TEveryExit ->
+            for stmt in stmts
+                e.defers.push(stmt)
+        TFailureExit(_) -> e.defers.push(TDefer(stmts, when))
 end defer_stmts
 
 // Emits the releases for the innermost scope without popping it -- the guard-failure path out of a
@@ -966,17 +971,146 @@ end pop_owned
 // They go **before** that scope's releases, so every local the statement names is still alive while
 // it runs -- including the one holding the resource it is closing, which is the whole point of the
 // form. Registration order is written order, so the walk backwards is the LIFO a `defer` promises.
+//
+// **An `errdefer` takes its place in the same stack**, so the two kinds interleave in written order.
+// What it adds is a question about the way out (`ExitMode`): every run of them back to back is laid
+// down whole on a failing exit, left out on any other, and laid under one test of the returned
+// value's tag where only the value can say.
 private run_deferrals(e: *Emit, k: usize)
     val ds = scope_defers(e, k)
 
     // Laid down at an exit, out of the order a guard was proved in (`nowrap.sysl`).
     nowrap_suspend(e)
 
-    for i in 0..<ds.len()
-        gen_stmt(e, ds.at(ds.len() - 1 - i))
+    // A deferred statement is read as a block of its own while it runs, so a scope it opens and
+    // closes is an ordinary way out -- the exit being taken is the one asked here, once.
+    val exit = e.exit
 
+    e.exit = Leaving
+
+    var i = ds.len()
+
+    while i > 0
+        i -= 1
+
+        if !on_failure(ds.at(i))
+            gen_stmt(e, ds.at(i))
+            continue
+
+        var run: Buf[TStmt] = buf()
+
+        run.push(ds.at(i))
+
+        while i > 0 && on_failure(ds.at(i - 1))
+            i -= 1
+            run.push(ds.at(i))
+
+        failure_run(e, exit, run)
+
+    e.exit = exit
     nowrap_resume(e)
 end run_deferrals
+
+// Whether a scheduled statement is an `errdefer`, which a scope holds whole -- with its binder --
+// rather than as the statements it schedules.
+private on_failure(s: TStmt) -> bool = s match
+    TDefer(_, TFailureExit(_)) -> true
+    _ -> false
+
+// One run of `errdefer`s, last written first, on the way out this is.
+private failure_run(e: *Emit, exit: ExitMode, run: Buf[TStmt])
+    exit match
+        Leaving -> ()
+        Failing(v, ty) -> lay_failure_run(e, run, v, ty)
+        Returning(v, ty) ->
+            val parts = fallible_parts(ty)
+            val d = enum_decl(ty)
+
+            if parts.is_none() || d.is_none() then return
+
+            val tag = fresh_reg(e)
+            val failed = fresh_reg(e)
+            val run_l = fresh_label(e, "errdefer.run")
+            val past_l = fresh_label(e, "errdefer.past")
+
+            emit(e, InExtract(tag, enum_lty(d.unwrap()), v, index_list(0)))
+            emit(e, InIntCmp(failed, IEq, l_i32(), tag, VInt(parts.unwrap().1.tag)))
+            emit_term(e, InCondBr(failed, run_l, past_l))
+            emit_label(e, run_l)
+            lay_failure_run(e, run, v, ty)
+
+            if !e.terminated then emit_term(e, InBr(past_l))
+
+            emit_label(e, past_l)
+end failure_run
+
+// Lays a run down on a path where the value leaving is the failure: each binder is written with the
+// failure's payload, read out of that value, and then its statements run.
+//
+// **The binder takes no count.** The value leaving already holds the one it leaves with, and the
+// binder is read while it does -- so it is a slot written and read, never owned.
+private lay_failure_run(e: *Emit, run: Buf[TStmt], v: Val, ty: Type)
+    for s in run
+        s match
+            TDefer(stmts, TFailureExit(binder)) ->
+                if binder.is_some() && !zero_sized(binder.unwrap().1)
+                    val (name, bty) = binder.unwrap()
+                    val d = enum_decl(ty).unwrap()
+                    val fail = fallible_parts(ty).unwrap().1
+                    val payload = payload_values(e, d, fail, v)
+                    val slot = named_alloca(e, s"$name.addr", lty(e, bty), None)
+
+                    emit(e, InStore(lty(e, bty), payload.at(0), slot, AccPlain, None))
+                end if
+
+                for stmt in stmts
+                    gen_stmt(e, stmt)
+            _ -> ()
+end lay_failure_run
+
+// How a way out leaves the function, for the `errdefer`s it lays down. A block's end, a `break`, a
+// `continue`, a task destroyed while it waits and an `@abandons` call are `Leaving`, which is no
+// failure. A `return`, a `?` and a body's last value say which they are: `Failing` where the value
+// is known to be the failure variant, `Returning` where only its tag can tell -- each with the value
+// and the function's result type.
+enum ExitMode
+    Leaving
+    Failing(value: Val, ty: Type)
+    Returning(value: Val, ty: Type)
+
+// Lets go of everything the function holds on a way out that leaves it as `exit` says.
+release_all_as(e: *Emit, exit: ExitMode)
+    e.exit = exit
+    release_all(e)
+    e.exit = Leaving
+end release_all_as
+
+// How a `return` of `v`, written as `r`, leaves a function whose result is `ty` -- asked only where an
+// `errdefer` is waiting, so a function with none pays nothing. A variant written out is settled here;
+// anything else is told apart at the edge by its tag.
+exit_returning(e: *Emit, r: Option[TExpr], v: Val, ty: Type) -> ExitMode
+    if !errdefer_pending(e) then return Leaving
+
+    val parts = fallible_parts(ty)
+
+    if parts.is_none() then return Leaving
+
+    if r.is_some()
+        *r.unwrap().kind match
+            TEnumNew(_, variant, _) ->
+                return if variant.name == parts.unwrap().1.name then Failing(v, ty) else Leaving
+            _ -> ()
+
+    Returning(v, ty)
+end exit_returning
+
+// Whether any scope being left has an `errdefer` scheduled.
+errdefer_pending(e: *Emit) -> bool
+    for s in e.defers
+        if on_failure(s) then return true
+
+    false
+end errdefer_pending
 
 // Lets go of everything the function holds, for a `return` that leaves from the middle of it.
 // Nothing is popped: the block is terminated straight afterwards, so the scopes that follow this one
