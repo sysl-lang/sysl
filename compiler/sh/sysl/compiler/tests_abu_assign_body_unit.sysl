@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A function whose `= value` body is an assignment, plain or compound, and that writes no result
+// type, is a `unit` function: the store is what it is written for (`reference/declarations.md § The
+// result type`). The value an assignment yields stays the expression's own -- `a = b = 0` still
+// stores twice, and a written result still takes it -- and a caller that uses the call as a value is
+// told it is `unit`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private abu_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of the files given, `main.sysl` among them.
+private abu_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-abu").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end abu_root
+
+// What the program prints, or the report it was refused with.
+private abu_ran(text: string) -> string
+    val root = abu_root([("main.sysl", text)])
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end abu_ran
+
+private abu_prints(text: string, want: string)
+    if !abu_ready() then return
+
+    assert_eq(abu_ran(text), want)
+
+// Refused with exactly `message`, first and alone, at `main.sysl:<at>`.
+private abu_refused(text: string, message: string, at: string)
+    if !abu_ready() then return
+
+    val root = abu_root([("main.sysl", text)])
+
+    val said = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = replace_all(said, s"$root/", "")
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(out.starts_with(head) && out.contains(place) &&
+           !out[head.bytes.len..<out.bytes.len].contains("error: "),
+           s"expected one report starting\n$head\nlocated at $place\ngot\n$out")
+end abu_refused
+
+// Every signature `sysl doc` writes for a one-file module `demo`, members indented under their type.
+private abu_documented(src: string) -> string
+    val root = abu_root([("demo/demo.sysl", s"module demo\n\n$src")])
+    val modules = read_doc_tree(root, true, (_) -> ())
+
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for m in modules.unwrap()
+        for sym in m.symbols
+            out = s"$out${sym.signature}\n"
+
+            for member in sym.members
+                out = s"$out  ${member.signature}\n"
+
+    out
+end abu_documented
+
+// -- every place an assignment stores to ----------------------------------------------------------
+
+@test("a body that is a plain assignment to module storage is a unit function")
+abu_plain() =
+    abu_prints("var n = 0\n\nput() = n = 5\n\nval u = put()\nprint(n, u == ())\n", "5 true\n")
+
+@test("a body that is a compound assignment is a unit function, not one of the place's type")
+abu_compound() =
+    abu_prints("var n = 0\nvar s = \"a\"\n\nbump() = n += 1\ngrow() = s += \"b\"\n\n" +
+               "bump()\nval u = bump()\nval v = grow()\nprint(n, s, u == (), v == ())\n",
+               "2 ab true true\n")
+
+@test("a method whose body stores to a field through *self is a unit method")
+abu_field() =
+    abu_prints("struct Flag\n    v: bool\n    hits: int\n\nimpl Flag\n    set(*self) = self.v = true\n" +
+               "    hit(*self) = self.hits += 1\n\nvar f = Flag(false, 0)\nval u = f.set()\nval w = f.hit()\n" +
+               "print(f.v, f.hits, u == (), w == ())\n",
+               "true 1 true true\n")
+
+@test("a body that stores to an element, of an array and through IndexSet, is a unit function")
+abu_index() =
+    abu_prints("var a = [0, 0, 0]\n\nstore(i: usize) = a[i] = 7\nadd(i: usize) = a[i] += 2\n\n" +
+               "struct Row\n    x: int\n\nimpl Index[usize, int] for Row\n    index(self, i: usize) -> int = self.x\n\n" +
+               "impl IndexSet[usize, int] for Row\n    index_set(*self, i: usize, v: int) = self.x = v\n\n" +
+               "var r = Row(0)\n\nput(i: usize) = r[i] = 9\n\n" +
+               "val u = store(1)\nadd(1)\nval w = put(0)\nprint(a[1], r[0], u == (), w == ())\n",
+               "9 9 true true\n")
+
+@test("a nested function whose body is an assignment is unit, plain and compound")
+abu_nested() =
+    abu_prints("outer() -> int\n    var n = 1\n\n    grow() = n = n * 2\n    bump() = n += 1\n\n" +
+               "    grow()\n    val u = bump()\n\n    if u == () then n else 0\nend outer\n\nprint(outer())\n",
+               "3\n")
+
+@test("an assignment keeps its value inside the body: a chain stores every place, and a written result takes it")
+abu_value_kept() =
+    abu_prints("var a = 0\nvar b = 0\n\nboth() = a = b = 4\nset_to(v: int) -> int = a = v\n" +
+               "check() = if (b = 6) == 6 then print(\"six\")\n\n" +
+               "val u = both()\nprint(a, b, u == ())\nprint(set_to(8), a)\ncheck()\n",
+               "4 4 true\n8 8\nsix\n")
+
+// -- using the call as a value --------------------------------------------------------------------
+
+@test("a call to an assignment body held to a written type is refused: its value is unit")
+abu_refused_typed() =
+    abu_refused("var n = 0\n\nbump() = n += 1\n\nmain()\n    val y: int = bump()\n\n    print(y)\n",
+                "cannot initialize 'y': declared int but the value is unit", "6:5")
+
+@test("a call to an assignment body used as an operand is refused: its value is unit")
+abu_refused_operand() =
+    abu_refused("var n = 0\n\nbump() = n += 1\n\nmain()\n    print(bump() + 1)\n",
+                "'+' needs matching types, got unit and int", "6:20")
+
+@test("a method storing through *self cannot stand for the value it stored")
+abu_refused_method() =
+    abu_refused("struct Flag\n    v: bool\n\nimpl Flag\n    set(*self) = self.v = true\n\n" +
+                "main()\n    var f = Flag(false)\n    val on: bool = f.set()\n\n    print(on)\n",
+                "cannot initialize 'on': declared bool but the value is unit", "9:5")
+
+@test("a function written to return what it stores is refused a body that is a unit call")
+abu_refused_written() =
+    abu_refused("var n = 0\n\nbump() = n += 1\nnext() -> int = bump()\n\nmain()\n    print(next())\n",
+                "function 'next' should return int, but its body yields unit", "4:1")
+
+@test("an assignment body that cannot store is told once, at the assignment")
+abu_refused_store() =
+    abu_refused("var n = 0\n\nbad() = n = \"x\"\n\nmain()\n    bad()\n",
+                "cannot assign string to 'n' of type int", "3:9")
+
+// -- sysl doc -------------------------------------------------------------------------------------
+
+@test("sysl doc shows an assignment body with no arrow, plain, compound, field and element alike")
+abu_doc()
+    if !abu_ready() then return
+
+    val out = abu_documented("var n = 0\nvar a = [0, 0]\n\nput() = n = 5\nbump() = n += 1\n" +
+                             "store(i: usize) = a[i] = 7\n\nstruct Flag\n    v: bool\n\n" +
+                             "    set(*self) = self.v = true\n")
+
+    assert(out.contains("put()\n"), out)
+    assert(out.contains("bump()\n"), out)
+    assert(out.contains("store(i: usize)\n"), out)
+    assert(out.contains("  set(*self)\n"), out)
+    assert(!out.contains("->"), out)
+    assert(!out.contains(") = "), out)
+end abu_doc

@@ -590,6 +590,48 @@ A generic function's result is the body's type in terms of its parameters, so `p
 `(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
 initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
 
+**A body that is an assignment is `unit`**, plain or compound, to a variable, a field or an element:
+the store is what the function is for. The value an
+[assignment yields](/reference/expressions/#assignment) belongs to the expression around it, and a
+body has none, so `bump() = count += 1` is `bump()`, not an `int` function. A function that hands the
+stored value back says so with `-> T`.
+
+```sysl
+var count = 0
+
+struct Light
+    on: bool
+
+    switch_on(*self) = self.on = true
+
+bump() = count += 1
+reset_to(v: int) -> int = count = v
+
+var lamp = Light(false)
+
+bump()
+lamp.switch_on()
+print(count, lamp.on, bump() == (), reset_to(10), count)
+```
+
+```output
+1 true true 10 10
+```
+
+Using such a call as a value is refused, since there is none:
+
+```sysl
+var count = 0
+
+bump() = count += 1
+
+val next: int = bump()
+```
+
+```error
+cannot initialize 'next': declared int but the value is unit
+```
+
 **The result is known wherever a written one would be.** A call above the declaration, in another
 file of the module, in another module, or through a library reads it, in any order. `sysl doc` and an
 editor's hover show the declaration at the type it was read as, exactly as though `-> T` were written

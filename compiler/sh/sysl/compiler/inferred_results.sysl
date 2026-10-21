@@ -257,15 +257,30 @@ end body_result_type
 
 // A body read for the type it produces: its trailing expression with nothing expected, as a `val`'s
 // initializer is read. A body that gave up comes to `Unknown`.
+//
+// **A body that is an assignment is written for its effect**, so it declares `unit`: `set(*self) =
+// self.v = true` stores and hands nothing back, as the same store written on the line below the
+// signature does. The value an assignment yields is there for the expression around it -- `a = b = 0`,
+// `while (c = next()) != 0` -- and a body has nothing around it to take it.
 own_result_block(cx: &Analyzer, rest: Buf[Stmt]) -> TBlock
     val outer = cx.an.open_region()
-    val block = type_value_block(cx, rest, None, false)
+    val block = type_value_block(cx, rest, None, ends_in_assignment(rest))
     val gave_up = cx.an.poison.is_some()
 
     cx.an.close_region(outer)
 
     if gave_up then TBlock(block.stmts, block.result, Unknown) else block
 end own_result_block
+
+// The body's last statement is an assignment, plain or compound, to whatever place.
+private ends_in_assignment(rest: Buf[Stmt]) -> bool
+    if rest.len() == 0 then return false
+
+    *rest[rest.len() - 1].kind match
+        ExprStmt(e) -> *e.kind match
+            Assign(_, _, _) -> true
+            _ -> false
+        _ -> false
 
 // Every function that leaves its result to its body filed -- a member was filed as it was hoisted --
 // and bodies from here on readable: every declaration is in.
