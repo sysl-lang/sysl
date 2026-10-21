@@ -1,0 +1,650 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{replace_all, Search}
+
+// The error return trace (`error_trace.sysl`, `library/sysl/sys/trace.c`, `sysl.debug`): each rule of
+// `docs/design/error-traces.md`, read off a program built as a child and run -- its standard error
+// compared whole, the way `tests_bfm_bounds_message.sysl` pins the bounds report -- and the IR and the
+// archive where the claim is about what is laid down rather than what is printed.
+
+private ert_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error.
+private ert_run_at(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-ert").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end ert_run_at
+
+private ert_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// At `-O0` and at the default level, the program ends with `state`, having printed `printed` and
+// written exactly `err` to standard error. A site is a constant, so the optimizer changes none of it.
+private ert_says(files: []const (string, string), state: Status, printed: string, err: string)
+    if !ert_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (got, out, said) = ert_run_at(files, level)
+
+        assert_eq(said, err)
+        assert_eq(out, printed)
+        assert(got == state, s"-O$level ended with $got")
+end ert_says
+
+private ert_fault() -> string = raw"""
+    enum Fault
+        Missing(what: string)
+
+    impl Display for Fault
+        display(self, out: *Writer, fmt: FormatSpec) = self match
+            Missing(w) -> out.write(s"missing $w".bytes)
+
+    """
+
+// Its two fallible functions, from line 8 of a file beginning with `ert_fault`.
+private ert_loaders() -> string = raw"""
+    lookup(k: string) -> Result[int, Fault] = Err(Fault.Missing(k))
+
+    load(k: string) -> Result[int, Fault]
+        defer print("load: defer")
+        val n = lookup(k)?
+        Ok(n + 1)
+
+    """
+
+// The program `error-traces.md` § 1 reads, with its blank lines kept.
+private ert_three_frames() -> string = ert_fault() + ert_loaders() + raw"""
+    main() -> Result[unit, Fault]
+        defer print("main: defer")
+        val v = load("port")?
+        print(v)
+        Ok(())
+    """
+
+private ert_three_frames_said() -> string =
+    "error: missing port\n" +
+    "error return trace (origin first):\n" +
+    "  main.sysl:8:43 in lookup\n" +
+    "  main.sysl:12:22 in load\n" +
+    "  main.sysl:17:25 in main\n"
+
+// -- what is recorded -----------------------------------------------------------------------------------
+
+@test("main's Err prints the origin and each '?' hop under its error line, origin first")
+ert_three_frames_from_main()
+    ert_says(ert_main(ert_three_frames()), Status.Exited(1), "load: defer\nmain: defer\n",
+             ert_three_frames_said())
+
+@test("a '?' that converts through From records its own site once, after the conversion")
+ert_a_from_hop()
+    ert_says(ert_main(raw"""
+        enum Low
+            Gone
+
+        struct High
+            why: string
+
+        impl From[Low] for High
+            from(l: Low) -> High = High("lifted")
+
+        impl Display for High
+            display(self, out: *Writer, fmt: FormatSpec) = out.write(self.why.bytes)
+
+        base() -> Result[int, Low] = Err(Low.Gone)
+
+        main() -> Result[unit, High]
+            val v = base()?
+            print(v)
+            Ok(())
+        """), Status.Exited(1), "",
+        "error: lifted\nerror return trace (origin first):\n  main.sysl:13:30 in base\n" +
+        "  main.sysl:16:19 in main\n")
+
+@test("an Err in a return, an if arm, a match arm and a block's value are each an origin")
+ert_every_origin_form()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        returned(n: int) -> Result[int, string]
+            if n == 0 then return Err("zero")
+            Ok(n)
+
+        armed(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err("negative")
+
+        matched(n: int) -> Result[int, string] = n match
+            1 -> Err("one")
+            _ -> Ok(n)
+
+        blocked(n: int) -> Result[int, string]
+            if n > 9
+                return Ok(n)
+
+            val m = n * 2
+            Err("small")
+
+        at[T](r: Result[T, string]) -> string
+            val t = error_trace()
+
+            if t.len() != 1 then return s"${t.len()} sites"
+
+            s"${t.at(0).line}:${t.at(0).col} in ${t.at(0).function}"
+
+        print(at(returned(0)))
+        print(at(armed(-1)))
+        print(at(matched(1)))
+        print(at(blocked(3)))
+        """), Status.Exited(0),
+        "4:27 in returned\n7:65 in armed\n10:10 in matched\n18:5 in blocked\n", "")
+
+@test("a '?' on an Option records nothing, and neither does a computed Err returned")
+ert_option_and_computed_record_nothing()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        half(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+
+        quarter(n: int) -> Option[int]
+            val h = half(n)?
+            half(h)
+
+        made(why: string) -> Result[int, string]
+            val r: Result[int, string] = Err(why)
+            r
+
+        print(quarter(3).is_none(), error_trace().len())
+        print(made("x").is_err(), error_trace().len())
+        """), Status.Exited(0), "true 0\ntrue 0\n", "")
+
+@test("a closure's site is named after the function it was written in, a method's after its type")
+ert_closure_and_method_names()
+    ert_says(ert_main(raw"""
+        struct Config
+            port: int
+
+            check(self) -> Result[int, string] =
+                if self.port < 0 then Err("negative port") else Ok(self.port)
+
+        main() -> Result[unit, string]
+            val read: &Fn(int) -> Result[int, string] = (n) ->
+                val p = Config(n).check()?
+                Ok(p)
+
+            print(read(-1)?)
+            Ok(())
+        """), Status.Exited(1), "",
+        "error: negative port\nerror return trace (origin first):\n" +
+        "  main.sysl:5:31 in Config.check\n  main.sysl:9:34 in main.<closure>\n" +
+        "  main.sysl:12:19 in main\n")
+
+// -- what leaves it -------------------------------------------------------------------------------------
+
+@test("an error handled by a statement leaves the trace, so the next failure's is its own")
+ert_a_handled_error_is_pruned()
+    ert_says(ert_main(ert_fault() + raw"""
+        lookup(k: string) -> Result[int, Fault] = Err(Fault.Missing(k))
+
+        fallback(k: string) -> Result[int, Fault]
+            lookup("cache") match
+                Ok(n) -> print(n)
+                Err(_) -> print("no cache")
+
+            val n = lookup(k)?
+            Ok(n)
+
+        main() -> Result[unit, Fault]
+            val v = fallback("port")?
+            print(v)
+            Ok(())
+        """), Status.Exited(1), "no cache\n",
+        "error: missing port\nerror return trace (origin first):\n  main.sysl:8:43 in lookup\n" +
+        "  main.sysl:15:22 in fallback\n  main.sysl:19:29 in main\n")
+
+@test("a return from inside a handling statement keeps the chain it handled")
+ert_a_rewrap_keeps_the_inner_chain()
+    ert_says(ert_main(ert_fault() + raw"""
+        lookup(k: string) -> Result[int, Fault] = Err(Fault.Missing(k))
+
+        wrapped(k: string) -> Result[int, Fault]
+            val n = lookup(k) match
+                Ok(n) -> n
+                Err(_) -> return Err(Fault.Missing(s"$k, wrapped"))
+
+            Ok(n)
+
+        main() -> Result[unit, Fault]
+            print(wrapped("port")?)
+            Ok(())
+        """), Status.Exited(1), "",
+        "error: missing port, wrapped\nerror return trace (origin first):\n" +
+        "  main.sysl:8:43 in lookup\n  main.sysl:13:26 in wrapped\n  main.sysl:18:26 in main\n")
+
+@test("a break or continue out of a handling statement leaves the trace as the loop found it")
+ert_break_and_continue_prune()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        main()
+            for i in 0..<5
+                probe(i) match
+                    Ok(_) -> ()
+                    Err(_) -> continue
+
+            print(error_trace().len())
+
+            loop
+                probe(1) match
+                    Ok(_) -> ()
+                    Err(_) -> break
+
+            print(error_trace().len())
+        """), Status.Exited(0), "0\n0\n", "")
+
+@test("clear_error_trace empties it, and print_error_trace writes it as main does")
+ert_the_explicit_api()
+    ert_says(ert_main(raw"""
+        import sysl.debug.{clear_error_trace, error_trace, print_error_trace}
+
+        inner() -> Result[int, string] = Err("inner")
+
+        outer() -> Result[int, string]
+            val v = inner()?
+            Ok(v)
+
+        outer() match
+            Ok(_) -> ()
+            Err(_) ->
+                val t = error_trace()
+
+                print(t.len(), t.dropped(), t.is_empty())
+
+                for s in t
+                    print(s.file, s.line, s.col, s.function)
+
+                print_error_trace(stdout())
+                clear_error_trace()
+                print(error_trace().is_empty())
+        """), Status.Exited(0),
+        "2 0 false\nmain.sysl 3 34 inner\nmain.sysl 6 20 outer\n" +
+        "error return trace (origin first):\n  main.sysl:3:34 in inner\n  main.sysl:6:20 in outer\ntrue\n", "")
+
+// -- how much it holds ----------------------------------------------------------------------------------
+
+@test("thirty-three sites keep the first thirty-two and say how many more")
+ert_the_ring_wraps()
+    var said = "error: bottom\nerror return trace (origin first):\n  main.sysl:1:35 in bottom\n"
+
+    for _ in 0..<31
+        said = said + "  main.sysl:5:24 in down\n"
+
+    said = said + "  … and 1 more\n"
+
+    ert_says(ert_main(raw"""
+        bottom() -> Result[int, string] = Err("bottom")
+
+        down(n: int) -> Result[int, string]
+            if n == 0 then return bottom()
+            val v = down(n - 1)?
+            Ok(v)
+
+        main() -> Result[unit, string]
+            print(down(31)?)
+            Ok(())
+        """), Status.Exited(1), "", said)
+
+@test("forty sites keep the first thirty-two, and the count goes on")
+ert_the_ring_counts_past_its_end()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        bottom() -> Result[int, string] = Err("bottom")
+
+        down(n: int) -> Result[int, string]
+            if n == 0 then return bottom()
+            val v = down(n - 1)?
+            Ok(v)
+
+        traced(r: Result[int, string]) -> string =
+            s"${error_trace().len()} ${error_trace().dropped()} ${error_trace().at(31).function}"
+
+        print(traced(down(39)))
+        """), Status.Exited(0), "32 8 down\n", "")
+
+// -- where it is kept -----------------------------------------------------------------------------------
+
+@test("each thread has its own trace")
+ert_one_trace_per_thread()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+        import sysl.threads.spawn
+
+        bottom() -> Result[int, string] = Err("bottom")
+
+        down(n: int) -> Result[int, string]
+            if n == 0 then return bottom()
+            val v = down(n - 1)?
+            Ok(v)
+
+        traced(r: Result[int, string]) -> usize = error_trace().len()
+
+        worker(out: *usize)
+            *out = traced(down(5))
+
+        var theirs: usize = 0
+
+        down(2) match
+            Ok(_) -> ()
+            Err(_) ->
+                val t = spawn(&worker, &theirs).unwrap()
+
+                t.join()
+                print(theirs, error_trace().len())
+        """), Status.Exited(0), "6 3\n", "")
+
+@test("an awaited task's failure is a hop at the await, in the trace of the thread running it")
+ert_async_records_at_the_await()
+    ert_says(ert_main(raw"""
+        async read(n: int) -> Result[int, string] =
+            if n > 512 then Err("more than one transfer") else Ok(n)
+
+        async fill(n: int) -> Result[int, string]
+            val a = await read(n)?
+            Ok(a)
+
+        main() -> Result[unit, string]
+            print(block_on(fill(4096))?)
+            Ok(())
+        """), Status.Exited(1), "",
+        "error: more than one transfer\nerror return trace (origin first):\n" +
+        "  main.sysl:2:21 in read\n  main.sysl:5:26 in fill\n  main.sysl:9:31 in main\n")
+
+@test("an errdefer runs with the trace already holding the hop it leaves by")
+ert_errdefer_sees_the_trace()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        inner() -> Result[int, string] = Err("inner")
+
+        outer() -> Result[int, string]
+            errdefer print("unwinding with", error_trace().len())
+            val v = inner()?
+            Ok(v)
+
+        main() -> Result[unit, string]
+            print(outer()?)
+            Ok(())
+        """), Status.Exited(1), "unwinding with 2\n",
+        "error: inner\nerror return trace (origin first):\n  main.sysl:3:34 in inner\n" +
+        "  main.sysl:7:20 in outer\n  main.sysl:11:18 in main\n")
+
+// -- the forcing members --------------------------------------------------------------------------------
+
+@test("unwrap of an Err shows the error and then its trace")
+ert_unwrap_shows_the_error_and_trace()
+    ert_says(ert_main(raw"""
+        parse(s: string) -> Result[int, string] = if s == "" then Err("empty input") else Ok(1)
+
+        load(s: string) -> Result[int, string]
+            val n = parse(s)?
+            Ok(n)
+
+        print(load("").unwrap())
+        """), Status.Exited(1), "panic: unwrap of an Err value: \"empty input\"\n",
+        "error return trace (origin first):\n  main.sysl:1:59 in parse\n  main.sysl:4:21 in load\n")
+
+@test("expect of an Err says its message, then the error, then the trace")
+ert_expect_shows_the_error_and_trace()
+    ert_says(ert_main(raw"""
+        struct Code
+            n: int
+
+        parse(s: string) -> Result[int, Code] = if s == "" then Err(Code(7)) else Ok(1)
+
+        print(parse("").expect("a number"))
+        """), Status.Exited(1), "panic: a number: Code(n: 7)\n",
+        "error return trace (origin first):\n  main.sysl:4:57 in parse\n")
+
+// -- a test that answers with a Result ------------------------------------------------------------------
+
+@test("a @test returning Err fails with the error and its trace; Ok passes")
+ert_a_result_test()
+    if !ert_ready() then return
+
+    val root = make_temp_dir("sysl-ert").unwrap()
+
+    write_text(s"$root/main.sysl", raw"""
+        parse(s: string) -> Result[int, string] = if s == "" then Err("empty input") else Ok(1)
+
+        check(s: string) -> Result[unit, string]
+            val n = parse(s)?
+            assert(n > 0)
+            Ok(())
+
+        @test
+        passes() -> Result[unit, string]
+            check("abc")?
+            Ok(())
+
+        @test
+        fails() -> Result[unit, string]
+            check("")?
+            Ok(())
+        """).unwrap()
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return
+        Ok(made) -> made
+
+    assert(build.emitted.report.is_empty(), analysis_report(build.emitted.report))
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization).unwrap()
+    val ran = run_selected(exe, build.tests, TestOptions(None, false, 1, buf()), 0, piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(ran.len(), 2)
+    assert(ran.at(0).passed(), ran.at(0).detail.unwrap_or(""))
+    assert_eq(ran.at(1).detail.unwrap_or("<passed>"), "did not return — exit status 1")
+    assert(ran.at(1).output.contains("error: empty input\nerror return trace (origin first):\n" +
+                                     "  main.sysl:1:59 in parse\n  main.sysl:4:21 in check\n" +
+                                     "  main.sysl:15:14 in fails\n"), ran.at(1).output)
+end ert_a_result_test
+
+@test("a @test may answer with Result[unit, E] only; any other result is refused")
+ert_a_test_result_other_than_unit_is_refused()
+    if !ert_ready() then return
+
+    val root = make_temp_dir("sysl-ert").unwrap()
+
+    write_text(s"$root/main.sysl", "@test\nt() -> Result[int, string] = Ok(1)\n").unwrap()
+
+    val said = test_build_of(root, None) match
+        Err(refusal) -> failure_text(refusal)
+        Ok(made) -> analysis_report(made.emitted.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.contains("a '@test' function returns nothing or a 'Result[unit, E]', and 't' returns " +
+                         "'sysl.Result[int, string]'"), said)
+end ert_a_test_result_other_than_unit_is_refused
+
+// -- switched off ---------------------------------------------------------------------------------------
+
+@test("error_traces = false gives main's report without a trace")
+ert_the_manifest_switches_it_off()
+    var files: [2](string, string) = [
+        ("package.hocon", "package {\n  name = \"probe\"\n}\n\nerror_traces = false\n"),
+        ("main.sysl", ert_three_frames())]
+
+    ert_says(files[..], Status.Exited(1), "load: defer\nmain: defer\n", "error: missing port\n")
+    use_error_traces(true)
+end ert_the_manifest_switches_it_off
+
+@test("--no-error-traces does what the key does, and unwrap says the error alone")
+ert_the_flag_switches_it_off()
+    var flags: [1]string = ["--no-error-traces"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+    ert_says(ert_main(ert_three_frames()), Status.Exited(1), "load: defer\nmain: defer\n",
+             "error: missing port\n")
+    ert_says(ert_main("val r: Result[int, string] = Err(\"no\")\nprint(r.unwrap())\n"),
+             Status.Exited(1), "panic: unwrap of an Err value: \"no\"\n", "")
+    reset_search_paths()
+    use_error_traces(true)
+end ert_the_flag_switches_it_off
+
+@test("error_traces must be true or false")
+ert_the_key_is_a_boolean()
+    val root = make_temp_dir("sysl-ert").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n\nerror_traces = \"no\"\n").unwrap()
+
+    val read = manifest_at(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    read match
+        Ok(_) -> assert(false, "a string was taken as a boolean")
+        Err(why) -> assert(why.message.contains("'error_traces' says whether"), why.message)
+end ert_the_key_is_a_boolean
+
+@test("with traces off, no site, no record, no pruning and no read of the trace reaches the module")
+ert_off_lays_down_nothing()
+    if xvr_no_library() then return
+
+    use_error_traces(false)
+
+    val ir = xvr_ir(ert_main("import sysl.debug.error_trace\n" + ert_fault() + ert_loaders() +
+                             "print(load(\"x\").is_ok(), error_trace().len())\n"))
+
+    use_error_traces(true)
+    assert(ir.contains("define"), ir)
+    assert(!ir.contains("sysl_error_trace"), ir)
+    assert(!ir.contains(" in lookup"), ir)
+end ert_off_lays_down_nothing
+
+// -- what it costs --------------------------------------------------------------------------------------
+
+@test("with traces on, a '?' on an Option and a body that handles no Result call nothing")
+ert_on_costs_nothing_where_nothing_fails()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ert_main(raw"""
+        half(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+
+        quarter(n: int) -> Option[int]
+            val h = half(n)?
+            half(h)
+
+        print(quarter(8).unwrap_or(0))
+        """))
+
+    assert(ir.contains("define"), ir)
+    assert(!ir.contains("sysl_error_trace"), ir)
+end ert_on_costs_nothing_where_nothing_fails
+
+@test("a record is one call on the failure path, and a handled call is pruned by a mark and a reset")
+ert_on_lays_down_the_three_calls()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ert_main(ert_fault() + ert_loaders() + "print(load(\"x\").is_ok())\n"))
+
+    assert(ir.contains("call void @sysl_error_trace_push(ptr @.loc"), ir)
+    assert(ir.contains("c\"main.sysl:12:22 in load\\00\""), ir)
+    assert(ir.contains("= call i32 @sysl_error_trace_mark()"), ir)
+    assert(ir.contains("call void @sysl_error_trace_reset(i32 %"), ir)
+end ert_on_lays_down_the_three_calls
+
+@test("a failing chain allocates nothing: the counted heap ends where it began")
+ert_records_allocate_nothing()
+    if !ert_ready() then return
+
+    force_alloc_counting(true)
+    ert_says(ert_main(raw"""
+        bottom() -> Result[int, int] = Err(7)
+
+        down(n: int) -> Result[int, int]
+            if n == 0 then return bottom()
+            val v = down(n - 1)?
+            Ok(v)
+
+        for i in 0..<100
+            down(40) match
+                Ok(_) -> ()
+                Err(e) -> if i == 99 then print(e)
+        """), Status.Exited(0), "7\n", "")
+    force_alloc_counting(false)
+end ert_records_allocate_nothing
+
+@test("a freestanding image keeps one plain trace, with no thread-local storage")
+ert_freestanding_has_no_tls()
+    if !ert_ready() then return
+
+    val tool = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    if !exists(tool)
+        print("skipped: no arm-none-eabi-objdump")
+        return
+    end if
+
+    val root = replace_all(make_temp_dir("sysl-ert").unwrap(), "//", "/")
+
+    write_text(s"$root/main.sysl", raw"""
+        import sysl.debug.error_trace
+
+        read(n: int) -> Result[int, int] = if n > 3 then Err(n) else Ok(n)
+
+        load(n: int) -> Result[int, int]
+            val v = read(n)?
+            Ok(v + 1)
+
+        @export("main")
+        entry() -> int =
+            load(9) match
+                Ok(v) -> v
+                Err(_) -> int(error_trace().len())
+        """).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+
+    assert_eq(code, Fine)
+
+    val headers = capture(tool, ["-h", s"$root/app.a"], "", [], true).unwrap().text
+    val symbols = capture(tool, ["-t", s"$root/app.a"], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+    assert(!headers.contains(".tbss") && !headers.contains(".tdata"), headers)
+    assert(symbols.contains(".bss.sysl_trace\t00000084 sysl_trace"), symbols)
+    assert(symbols.contains(" w    F .text.sysl_error_trace_report"), symbols)
+end ert_freestanding_has_no_tls

@@ -619,6 +619,20 @@ no location string reaches the module at all. `--no-bounds-locations` on the com
 same for one build. The key is `true` or `false` and nothing else, and anything else is refused when
 the file is read.
 
+## Leaving the error return trace out
+
+Every failure a `?` hands on [records where it came from](/reference/errors/#where-a-failure-came-from),
+at every optimization level. A build that wants none of it — no site strings in the image, no
+records on a failing path, nothing put back after a handled one — says so:
+
+```hocon
+error_traces = false
+```
+
+`main`, `unwrap` and `expect` then report the error alone. `--no-error-traces` on the command line
+does the same for one build. Like `bounds_locations`, the key is `true` or `false`, is read from the
+root project only, and anything else is refused when the file is read.
+
 ## Linking a freestanding image
 
 A kernel, or a board's firmware, is an ELF image nothing loads: an emulator or a debug probe puts it

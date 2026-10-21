@@ -120,7 +120,9 @@ true 7 7
 true -1 no
 ```
 
-Only `Result` has `unwrap_err`, because `Option`'s empty case carries nothing to return.
+Only `Result` has `unwrap_err`, because `Option`'s empty case carries nothing to return. Stopping on
+an `Err` names the error after the panic line and prints [where it came
+from](#where-a-failure-came-from).
 
 The **transforming** members build a new value from the old one, and pass the other case through
 unchanged:
@@ -406,6 +408,175 @@ intact, and it is freed exactly once on whichever path consumes it.
 Neither is a special rule for `?`. Both follow from retain-on-alias and release-at-scope-end, and
 they are spelled out here because a hand-written C error return typically leaks or double-frees at
 exactly these two boundaries.
+
+## Where a failure came from
+
+An error says *what* went wrong. **The error return trace says where**: the `Err` that made the
+failure, and every `?` that handed it one frame further up on its way to the code that reported it.
+
+```sysl
+import sysl.debug.print_error_trace
+
+lookup(k: string) -> Result[int, string] = Err(s"no $k")
+
+load(k: string) -> Result[int, string]
+    val n = lookup(k)?
+    Ok(n + 1)
+
+load("port") match
+    Ok(n) -> print(n)
+    Err(why) ->
+        print("failed:", why)
+        print_error_trace(stdout())
+```
+
+```output
+failed: no port
+error return trace (origin first):
+  main.sysl:3:44 in lookup
+  main.sysl:6:22 in load
+```
+
+**`main` returning an `Err` prints the trace under its `error:` line**, on standard error, so a
+program that lets `?` carry its failures to the top reports where each one began without writing
+anything for it:
+
+```sysl
+lookup(k: string) -> Result[int, string] = Err(s"no $k")
+
+load(k: string) -> Result[int, string]
+    val n = lookup(k)?
+    Ok(n + 1)
+
+main() -> Result[unit, string]
+    print(load("port")?)
+    Ok(())
+```
+
+exits with status 1, having written
+
+```text
+error: no port
+error return trace (origin first):
+  main.sysl:1:44 in lookup
+  main.sysl:4:22 in load
+  main.sysl:8:23 in main
+```
+
+### What records a site
+
+- **A `?` on a `Result` that takes its failure arm** records the position of the `?`, after any
+  [`From` conversion](#a-converts-through-from) — the conversion is part of the hop, not a frame of
+  its own.
+- **An `Err(...)` a function hands back as its result** is the origin: the body's value, the value
+  of a `return`, or an arm of an `if` or a `match` in either place, as deeply as they nest. A
+  `Result` computed earlier and returned by name records nothing, since nothing marks it as new.
+- **A `?` on an `Option` records nothing.** `None` is absence rather than failure — it is the
+  ordinary flow of every parser — and no report prints an `Option`.
+
+A site is `file:line:column in function`. A method is named under its type (`Config.load`) and a
+closure after the function it was written in (`load.<closure>`). **The site is a constant laid down
+beside the code, never a return address**, so a trace reads the same at every optimization level and
+prints on a board with nothing to symbolize it against.
+
+### A failure that is handled leaves the trace
+
+A statement that calls something answering a `Result`, and does not hand the answer on with `?` or
+`return`, **puts the trace back as it found it when it completes**. The failure it handled is gone
+before the next one starts:
+
+```sysl
+import sysl.debug.error_trace
+
+parse(s: string) -> Result[int, string] = if s == "" then Err("empty") else Ok(1)
+
+first_of(a: string, b: string) -> Result[int, string]
+    parse(a) match
+        Ok(n) -> return Ok(n)
+        Err(_) -> print("no first; the trace holds", error_trace().len())
+
+    print("trying the second; the trace holds", error_trace().len())
+    val n = parse(b)?
+    Ok(n)
+
+print(first_of("", "x").unwrap())
+```
+
+```output
+no first; the trace holds 1
+trying the second; the trace holds 0
+1
+```
+
+A `return` from inside such a statement is not completing it, so
+`Err(e) -> return Err(Wrapped(e))` keeps the chain it is wrapping and adds its own origin to it. A
+`break` or a `continue` does complete it. The one gap the rule leaves is a result put in a `val` on
+one line and returned on a later one: the statement holding the call completed in between.
+
+### Thirty-two sites, per thread
+
+**The trace is one fixed ring per thread**, of thirty-two sites and a count, and recording allocates
+nothing. A chain longer than that keeps its first thirty-two — the origin end is where the bug is —
+and counts the rest:
+
+```text
+  main.sysl:5:25 in down
+  … and 9 more
+```
+
+A task records into the trace of the thread running it, and an `await t?` that fails is a hop at the
+`await`. On a freestanding target there is one trace for the program, with no thread-local storage
+under it.
+
+### `unwrap` and `expect` show the error, then the trace
+
+`unwrap` and `expect` of an `Err` say the error after the panic line, in its `Debug` form, and then
+print the trace on standard error before the program exits with status 1. **`Debug` rather than
+`Display`** because every type has one that writes straight into the stream, while a `Display` may
+build a string — and an `unwrap` has to stay callable from an [`@no_alloc`
+module](/reference/modules/):
+
+```sysl
+parse(s: string) -> Result[int, string] = if s == "" then Err("empty input") else Ok(1)
+
+print(parse("").expect("a number"))
+```
+
+prints `panic: a number: "empty input"`, and then
+
+```text
+error return trace (origin first):
+  main.sysl:1:59 in parse
+```
+
+A [`@test` that answers with a `Result`](/reference/attributes/#a-test-passes-by-returning) and
+returns an `Err` reports the same way.
+
+### Reading it from a program
+
+`sysl.debug` reads the current thread's trace:
+
+| | |
+|---|---|
+| `error_trace() -> ErrorTrace` | a copy of it, taken without allocating |
+| `ErrorTrace.len()`, `.dropped()`, `.is_empty()` | the sites kept, the ones counted past them, whether there are none |
+| `ErrorTrace.at(i) -> ErrorSite`, `for site in trace` | a site: `file`, `line`, `col` and `function`, origin first |
+| `print_error_trace(w: *Writer)` | writes it to `w` in the form `main` prints it in |
+| `clear_error_trace()` | empties it — what a loop that logs each failure it handles does before the next |
+
+On a freestanding target the reports print nothing: they call `sysl_error_trace_report`, a weak
+function, which a program replaces with its own under the same symbol
+(`@export("sysl_error_trace_report")`) to write the trace wherever its board writes text, reading it
+through `sysl.debug`.
+
+### Switching it off
+
+The trace is on at every optimization level. `error_traces = false` in the
+[manifest](/reference/packages/#leaving-the-error-return-trace-out), or `--no-error-traces` for one
+build, removes it entirely: no site reaches the image, nothing is recorded or put back, and `main`,
+`unwrap` and `expect` report the error alone. With it on, the cost on a path that does not fail is
+two calls per statement that handles a failure — one to read the trace's length before it, one to
+put it back after; a `?` that succeeds and an `Option`'s `?` cost nothing.
 
 ## Traps
 

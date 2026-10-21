@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.math.bigint.from_int
+
+// **The error return trace**: the places a failure travelled through on its way to the code that
+// reported it -- the `Err(...)` that made it, and every `?` that handed it one frame further up.
+//
+// **What is recorded is a site, never an address**: a constant `file:line:col in function`, laid
+// down with the bounds locations (`bounds_fail.sysl`'s `c_text_of`), whose address is handed to the
+// library's C (`library/sysl/debug/trace.c`). It prints on a board with nothing to symbolize against,
+// and inlining cannot change it.
+//
+// **Every record sits on a failure path the program already branches to**, so a success pays nothing
+// for it:
+//
+// - a **hop** is a `?` on a `Result` taking its failure arm, recorded after any `From` conversion,
+//   just before the early return (`gen_try`). A `?` on an `Option` records nothing: `None` is absence.
+// - an **origin** is an `Err(...)` the function hands back as its result: the body's value, a
+//   `return`'s, or an arm of an `if` or `match` in either place, as deep as they nest. It is recorded
+//   once the value is built, wherever the constructor is lowered (`gen_expr`, `gen_into`, and
+//   `gen_around` for a result built in the caller's storage).
+//
+// **A handled failure leaves the trace -- pruning.** A statement that calls something answering a
+// `Result` (or awaits a task that does) without handing the answer on with `?` reads the trace's
+// length before it runs and writes it back when it completes. A `return` from inside it is not
+// completing it, so `Err(e) -> return Err(Wrap(e))` keeps the inner chain; a `break` or `continue` is,
+// and puts the trace back to where the first statement it leaves found it. This is the one cost on a
+// success path: a call that reads the length and one that writes it, per such statement.
+//
+// **Off is free**: with `error_traces = false` or `--no-error-traces` nothing is recorded, no site is
+// laid down, nothing is pruned, and the library's reads of the trace are answered here without a
+// call (`trace_seam_off`), so the C holding it is never linked. The standard module's artifact is
+// keyed by the choice (`error_traces_key`), as it is by the bounds locations.
+
+// -- whether traces are on ---------------------------------------------------------------------------
+
+// Settled once per command by the driver, beside the bounds locations and for the same reason: every
+// module in the build, the standard module's artifact included, has to agree.
+private var traces_on: bool = true
+
+error_traces() -> bool = traces_on
+
+use_error_traces(on: bool)
+    traces_on = on
+end use_error_traces
+
+// What the choice adds to an artifact's key: nothing for the default.
+error_traces_key() -> string = if traces_on then "" else "-nt"
+
+// -- the calls -----------------------------------------------------------------------------------------
+
+private const PushSymbol: string = "sysl_error_trace_push"
+private const MarkSymbol: string = "sysl_error_trace_mark"
+private const ResetSymbol: string = "sysl_error_trace_reset"
+
+// The three functions a module recording into the trace calls, as it declares them.
+trace_signatures() -> Buf[(string, IrFnType)]
+    var out: Buf[(string, IrFnType)] = buf()
+    var at: Buf[IrParam] = buf()
+    var n: Buf[IrParam] = buf()
+
+    at.push(ir_param(LPtr))
+    n.push(ir_param(l_i32()))
+    out.push((PushSymbol, ir_fn_type(LVoid, at)))
+    out.push((MarkSymbol, ir_fn_type(l_i32(), no_params())))
+    out.push((ResetSymbol, ir_fn_type(LVoid, n)))
+    out
+end trace_signatures
+
+// What a library read of the trace answers in a build that records none, or nothing where traces are
+// on or the symbol is not one of them: no length, no site, and nothing to clear or report.
+trace_seam_off(symbol: string) -> Option[Val]
+    if traces_on then return None
+
+    if symbol == "sysl_error_trace_len" then return Some(VInt(from_int(0)))
+    if symbol == "sysl_error_trace_site" then return Some(VNull)
+    if symbol == "sysl_error_trace_clear" || symbol == "sysl_error_trace_report" then return Some(VNothing)
+
+    None
+end trace_seam_off
+
+// -- the function being lowered ------------------------------------------------------------------------
+
+// Settles what a site in `f` names it, and which of its `Err(...)` constructors are its results.
+trace_function(e: *Emit, f: TFunc)
+    if !traces_on then return
+
+    e.trace_fn = shown_function(e, f.name)
+
+    var found: Buf[string] = buf()
+
+    tail_origins(f.body, found)
+    walk_block_stmts(f.body, stmt_walk(false, s -> returned_origins(s, found)))
+
+    for key in found
+        e.trace_origins.add(key)
+end trace_function
+
+// A function's key as a site shows it: without its module, so `load` rather than `app.load`, and a
+// method under its type, `Config.load`. A closure is named after the function it was written in,
+// `load.<closure>`.
+private shown_function(e: *Emit, key: string) -> string
+    if is_closure_symbol(key)
+        return e.trace_owners.get(key) match
+            Some(owner) -> s"${shown_function(e, owner)}.<closure>"
+            None -> "<closure>"
+    end if
+
+    module_show(module_bare(key))
+end shown_function
+
+// The function each closure of `p` was written in: the innermost body whose text strictly holds the
+// closure's, in the same file -- so an owner's span is always wider, and naming one ends.
+trace_closure_owners(e: *Emit, p: TProgram)
+    if !traces_on then return
+
+    // The bodies of each file that has a closure in it, so a closure is held against its own file's.
+    var by_file: Map[string, Buf[TFunc]] = map()
+
+    for f in p.funcs
+        if is_closure_symbol(f.name) && f.src.is_some() then by_file.put(f.src.unwrap().name, buf())
+
+    if by_file.is_empty() then return
+
+    for f in p.funcs
+        if f.src.is_none() then continue
+
+        by_file.get(f.src.unwrap().name) match
+            Some(bodies) -> bodies.push(f)
+            None -> ()
+
+    for f in p.funcs
+        if !is_closure_symbol(f.name) || f.src.is_none() then continue
+
+        var best: Option[TFunc] = None
+
+        // **Strictly** around it: two closures with one span are one closure lowered twice -- a
+        // generic body's, once per instantiation -- and neither is the other's owner.
+        for g in by_file.get(f.src.unwrap().name).unwrap()
+            if g.span.start > f.span.start || g.span.end < f.span.end then continue
+            if g.span.start == f.span.start && g.span.end == f.span.end then continue
+
+            if best.is_none() || g.span.start >= best.unwrap().span.start then best = Some(g)
+
+        if best.is_some() then e.trace_owners.put(f.name, best.unwrap().name)
+end trace_closure_owners
+
+private returned_origins(s: TStmt, found: Buf[string]) = s match
+    TReturn(value) -> if value.is_some() then tail_expr_origins(value.unwrap(), found)
+    _ -> ()
+
+private tail_origins(b: TBlock, found: Buf[string])
+    if b.result.is_some() then tail_expr_origins(b.result.unwrap(), found)
+end tail_origins
+
+// The `Err(...)` constructors `x` can be, as a function's result: `x` itself, or the value of an arm
+// of an `if` or a `match` it is, or the value of a block it is -- as deep as they nest.
+private tail_expr_origins(x: TExpr, found: Buf[string]) = *x.kind match
+    TEnumNew(en, variant, _) -> if variant.name == "Err" && is_result_type(en) then found.push(site_key(x.span))
+    TIf(_, then_block, else_block, _) ->
+        tail_origins(then_block, found)
+
+        if else_block.is_some() then tail_origins(else_block.unwrap(), found)
+    TMatch(_, arms, _) ->
+        for arm in arms
+            tail_origins(arm.body, found)
+    TBlockExpr(b) -> tail_origins(b, found)
+    _ -> ()
+
+private site_key(s: Span) -> string = s"${s.start}:${s.end}"
+
+// Whether a type is the library's `Result`, which is the only failure a trace records.
+private is_result_type(t: Type) -> bool = repr(t) match
+    Enum(d) -> d.base == module_qualify("sysl", "Result")
+    _ -> false
+
+// -- recording -----------------------------------------------------------------------------------------
+
+// A `?` taking its failure arm, in a function whose result is `ret`.
+//
+// The site is the `?` itself, which is the last character of the expression it ends.
+trace_hop(e: *Emit, ret: Type, site: Span)
+    if traces_on && is_result_type(ret) && site.end > site.start then record(e, site.end - 1)
+end trace_hop
+
+// An `Err(...)` just built: recorded where it is one of the function's results.
+trace_origin(e: *Emit, x: TExpr)
+    if traces_on && e.trace_origins.has(site_key(x.span)) then record(e, x.span.start)
+end trace_origin
+
+// Records the site at byte `offset` of the function's file.
+private record(e: *Emit, offset: usize)
+    if e.terminated then return
+
+    val src = e.src match
+        Some(s) -> s
+        None -> return
+
+    val loc = src.locate(offset)
+    val at = c_text_of(e, s"${location_file(src.name)}:${loc.line}:${loc.col} in ${e.trace_fn}")
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, at))
+    e.traces = true
+    emit(e, ir_call(None, LVoid, VGlobal(PushSymbol), args))
+end record
+
+// -- pruning -------------------------------------------------------------------------------------------
+
+// Before a statement: where it handles a failure, the trace's length, saved for when it completes.
+trace_enter(e: *Emit, s: TStmt) -> Option[Val]
+    if !traces_on || e.terminated || !handles_failure(s) then return None
+
+    val n = fresh_reg(e)
+
+    e.traces = true
+    emit(e, ir_call(Some(n), l_i32(), VGlobal(MarkSymbol), no_ir_args()))
+    e.trace_marks.push(n)
+    Some(n)
+end trace_enter
+
+// After it: the length written back, on the path that completed it.
+trace_leave(e: *Emit, mark: Option[Val])
+    if mark.is_none() then return
+
+    e.trace_marks.pop()
+
+    if !e.terminated then reset_to(e, mark.unwrap())
+end trace_leave
+
+// A `break` or `continue` completes every statement opened inside the loop it leaves, so the trace
+// goes back to where the first of them found it.
+trace_unwind(e: *Emit, depth: usize)
+    if e.trace_marks.len() > depth && !e.terminated then reset_to(e, e.trace_marks.at(depth))
+end trace_unwind
+
+private reset_to(e: *Emit, n: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), n))
+    emit(e, ir_call(None, LVoid, VGlobal(ResetSymbol), args))
+end reset_to
+
+// What a walk of one statement found: an answer that may have failed and is not handed on by a `?`.
+// The operands of the `?`s are noted as the walk passes them, which is before it reaches them.
+struct Handled
+    found: bool
+    passed: Set[string]
+
+    note(*self, x: TExpr)
+        *x.kind match
+            TTry(operand, _, _, _, _, _, _) -> self.passed.add(site_key(operand.span))
+            TCall(_, _, ty, _) -> self.answer(x, ty)
+            TVCall(_, _, _, ty, _) -> self.answer(x, ty)
+            TCallPtr(_, _, _, ty) -> self.answer(x, ty)
+            TAwait(_, ty) -> self.answer(x, ty)
+            TBlockOn(_, ty) -> self.answer(x, ty)
+            _ -> ()
+
+    answer(*self, x: TExpr, ty: Type)
+        if is_result_type(ty) && !self.passed.has(site_key(x.span)) then self.found = true
+end Handled
+
+// Whether `s` handles a failure: it is one that completes, and it calls something answering a
+// `Result` whose answer no `?` hands on. A `return` never completes; a `defer` runs its statements
+// elsewhere, each pruned there.
+private handles_failure(s: TStmt) -> bool
+    s match
+        TReturn(_) -> return false
+        TBecome(_) -> return false
+        TBreak(_, _) -> return false
+        TContinue(_) -> return false
+        TDefer(_, _) -> return false
+        _ -> ()
+
+    val h: &Handled = Handled(false, set())
+
+    walk_stmt(s, expr_walk(false, x -> h.note(x)))
+    h.found
+end handles_failure

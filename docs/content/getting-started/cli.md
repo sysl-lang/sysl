@@ -999,6 +999,7 @@ grammars.
 | `--profile-generate <dir>` | build an instrumented program that writes its counters into this directory |
 | `--profile-use <file>` | build against a merged profile |
 | `--no-bounds-locations` | leave the `file:line:column` out of a failed bounds check's report — the [`bounds_locations` key](/reference/packages/#leaving-the-bounds-locations-out) for one build |
+| `--no-error-traces` | record no [error return trace](/reference/errors/#where-a-failure-came-from) — the [`error_traces` key](/reference/packages/#leaving-the-error-return-trace-out) for one build |
 | `--general-regs-only` | keep the code out of the floating-point and SIMD registers — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `--strict-align` | make every access aligned — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |

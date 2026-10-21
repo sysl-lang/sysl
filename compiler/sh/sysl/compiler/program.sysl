@@ -157,6 +157,46 @@ private entry_reporter(a: &Analysis, fallible: Option[Type], entry: Func) -> Opt
         _ -> None
 end entry_reporter
 
+// **A `@test` may answer with a `Result[unit, E]`**, and an `Err` fails it: the dispatcher hands the
+// answer to `sysl.test_result`, which prints the error and its error return trace and exits 1. Read
+// where the entry point is, for the same reason -- the reporter is a library function, and reaching
+// it has to happen while a pass will still analyze it. Any other result is refused at the attribute
+// (`runner_result`). Each is filed in the tables by the test's key, with the result's type, for the
+// test dispatcher (`emit_entry.sysl`).
+declared_test_reporters(a: &Analysis)
+    val reporter = a_library_key(a, "test_result")
+
+    if reporter.is_none() then return
+
+    val r = a.tables.funcs.get(reporter.unwrap())
+
+    if r.is_none() then return
+
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        if f.decl.test.is_none() || !f.decl.tparams.is_empty() || f.decl.ret_type.is_none() then continue
+
+        val ret = resolve_result(a, f.scope, f.decl.ret_type.unwrap(), no_bindings())
+
+        result_entry(a, ret) match
+            Some(Enum(d)) ->
+                if d.targs.len() < 2 then continue
+
+                var targs: Buf[Type] = buf()
+
+                targs.push(d.targs.at(1))
+
+                val sym = instantiate_func(a, r.unwrap().scope, r.unwrap().decl, targs, false)
+
+                a.uses(sym)
+                a.tables.test_reporters.put(a.tables.funcs.key_at(i), (sym, ret))
+            _ -> ()
+end declared_test_reporters
+
+// Whether a test's result is one it may answer with: a `Result[unit, E]`.
+test_may_answer(a: &Analysis, ret: Type) -> bool = result_entry(a, ret).is_some()
+
 // The key the library files one of its own names under, looked up rather than composed.
 private a_library_key(a: &Analysis, name: string) -> Option[string]
     val direct = module_qualify(StdModule, name)
@@ -184,7 +224,7 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
              declared_tests(done, analyzed, hooks), hooks, reached_extern_vars(a),
              a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps,
              entry_source(done), a.tables.module_asm, false, a.tables.target.double_unit(),
-             a.tables.target.single_unit(), a.tables.target.divider())
+             a.tables.target.single_unit(), a.tables.target.divider(), a.tables.test_reporters)
 end program_of
 
 // The file the program starts in, which `entry_body` typed the statements of.

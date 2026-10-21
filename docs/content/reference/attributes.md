@@ -544,9 +544,10 @@ argument list left open are told what `@test` wanted rather than being blamed on
 
 ### What a test may be
 
-**A test is an ordinary function with a caller nothing else has**: no parameters, no result, not
-generic. All three are the same requirement from different sides, since the runner calls it with
-nothing and reads the answer off whether it returned. They are checked **at the annotation**, because
+**A test is an ordinary function with a caller nothing else has**: no parameters, no result other
+than a `Result[unit, E]`, not generic. All three are the same requirement from different sides, since
+the runner calls it with nothing and reads the answer off whether it returned — or, for a test that
+answers with a `Result`, whether it answered `Ok`. They are checked **at the annotation**, because
 the function is a perfectly good function and it is `@test` that made a promise about it:
 
 ```sysl
@@ -575,7 +576,7 @@ gives_back() -> int = 1
 ```
 
 ```error
-a '@test' function returns nothing, and 'gives_back' returns 'int' — a test's result is whether it came back, so there is nothing to read a value with
+a '@test' function returns nothing or a 'Result[unit, E]', and 'gives_back' returns 'int' — a test's result is whether it came back or failed, so there is nothing to read a value with
 ```
 
 ### A test passes by returning
@@ -583,6 +584,35 @@ a '@test' function returns nothing, and 'gives_back' returns 'int' — a test's 
 That is the whole protocol, and it is what lets a test assert **in the language it is testing**
 rather than in a framework. A broken `require`, a bounds violation, an `unwrap` of a `None` — each
 ends the process, and none of them had to know it was running under a test.
+
+**A test may answer with a `Result[unit, E]`**, so the fallible code it exercises is called with `?`
+just as the program calls it. An `Ok` passes. An `Err` fails the test: the run says the error —
+through its `Display`, or its `Debug` where it has only that — and the
+[error return trace](/reference/errors/#where-a-failure-came-from) under it, and exits with status 1:
+
+```sysl
+parse(s: string) -> Result[usize, string] = if s == "" then Err("empty input") else Ok(s.len)
+
+check(s: string) -> Result[unit, string]
+    val n = parse(s)?
+    assert(n > 0)
+    Ok(())
+
+@test
+reads_a_word() -> Result[unit, string]
+    check("port")?
+    Ok(())
+```
+
+Given `check("")` instead, the report under the failed test reads
+
+```text
+error: empty input
+error return trace (origin first):
+  main.sysl:1:61 in parse
+  main.sysl:4:21 in check
+  main.sysl:10:14 in reads_a_word
+```
 
 `should_trap` inverts the reading, for a test whose subject *is* the check. With a string it
 additionally requires that the run printed it, which is what tells a trap from the **right** trap. A
