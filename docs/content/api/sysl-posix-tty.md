@@ -53,7 +53,7 @@ the answer cannot change under a running program in any way that matters:
 ### `tty_sink`
 
 ```sysl
-val tty_sink: *TtyWriter = ptr_cast(0usize)
+val tty_sink: *TtyWriter = ptr_cast(0)
 ```
 
 ## Functions
@@ -108,7 +108,7 @@ Put back what `raw` or `hidden` changed, and only what they changed -- `sysl.tty
 ### `flush`
 
 ```sysl
-flush()
+flush() -> unit
 ```
 
 Push out everything the C library is holding, on every stream.

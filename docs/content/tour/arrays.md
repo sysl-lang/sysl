@@ -4,21 +4,22 @@ summary: One type for storage, one for a view of it — and every index checked.
 weight: 60
 ---
 
-sysl has two sequence types where a lot of languages have one, and the split is Go's:
+sysl has two sequence types where many languages have one, divided the same way as in Go:
 
 | type | what it is |
 |---|---|
 | `[N]T` | a **fixed array**: `N` elements, a value, no header, `N` known while compiling |
 | `[]T` | a **slice**: a view of elements someone owns — `{ owner, pointer, length }` |
 
-An array *is* its elements, so copying one copies all of them. A slice *names* elements that live
-somewhere else. A function that only reads takes the view and stops caring where the bytes are.
+An array *is* its elements, so copying one copies all of them. A slice *refers to* elements stored
+elsewhere. A function that only reads takes a slice and does not need to know where the elements
+live.
 
 Both carry a length, so **every index is checked**.
 
-## Writing one down
+## Array literals
 
-A literal fixes the length from how many elements it has:
+A literal's length is the number of elements it has:
 
 ```sysl
 var primes = [2, 3, 5, 7]
@@ -30,11 +31,11 @@ print("count:", primes.len, "third:", primes[2])
 count: 4 third: 5
 ```
 
-`primes` is a `[4]int` — the count is part of the type, not a field of the value. `.len` is a
-property, so no parentheses, and on a fixed array it is a constant that costs nothing to read.
+`primes` is a `[4]int`: the count is part of the type, not a field of the value. `.len` is a
+property, so it takes no parentheses, and on a fixed array it is a compile-time constant.
 
-A declaration with no initializer starts at the type's zero value, which is what a scratch buffer
-wants. A repeat `[value; count]` fills every slot with one value:
+A declaration with no initializer starts at the type's zero value, which suits a scratch buffer. A
+repeat literal `[value; count]` fills every slot with one value:
 
 ```sysl
 var counters: [4]int
@@ -51,11 +52,11 @@ zeroed: 0 set: 9
 repeat: 5 1
 ```
 
-The zero-value form is not special to arrays — it is a `var` with a type and no `=`, and it means
-"the zero of this type" for any type that has one. A type holding a `&T` has no zero, since a
-reference always points at something live, so that one asks you for an initializer.
+The zero-value form is not specific to arrays. A `var` with a type and no `=` holds the zero of that
+type, for any type that has one. A type holding a `&T` has no zero, since a reference always points
+to a live object, so such a declaration needs an initializer.
 
-Which means the thing the [structs chapter](/tour/structs/) said about `b = a` is true here too:
+What the [structs chapter](/tour/structs/) said about `b = a` applies to arrays too:
 
 ```sysl
 var a = [1, 2, 3]
@@ -70,13 +71,13 @@ print("a:", a[0], "b:", b[0])
 a: 1 b: 99
 ```
 
-Three elements were copied. That is fine for four integers and less fine for four thousand, which is
-the reason the other type exists.
+All three elements were copied. That is inexpensive for three integers and expensive for four
+thousand, which is why the second type exists.
 
 ## A slice is a view
 
-Subscript with a range instead of an index and you get a slice. It does not copy — it names the same
-elements:
+Subscripting with a range instead of an index produces a slice. It does not copy; it refers to the
+same elements:
 
 ```sysl
 var data = [10, 20, 30, 40, 50]
@@ -93,15 +94,15 @@ view: 3 99
 original: 99
 ```
 
-Writing through the view wrote through to the array, because there is only one set of elements.
+Writing through the view changed the array, because there is only one set of elements.
 
-Both ends of the range are optional and the two operators keep the meanings they have everywhere
-else — `data[1..3]`, `data[..<2]`, `data[3..]`, and `data` on its own, since an array standing where
-a view is asked for **is** a view of itself. There is no `xs[lo..<]`: "through the last" excludes
-nothing, so the open form is `xs[lo..]`.
+Both ends of the range are optional, and the two operators mean what they mean elsewhere:
+`data[1..3]`, `data[..<2]`, `data[3..]`. An array used where a slice is expected is a view of itself,
+so `data` on its own also works. There is no `xs[lo..<]`: "up to the end" excludes nothing, so the
+open form is `xs[lo..]`.
 
-`[]const T` is a slice whose elements may not be written **through it**. It is the signature a
-function that only reads should have:
+`[]const T` is a slice whose elements may not be written **through it**. It is the right parameter
+type for a function that only reads:
 
 ```sysl
 scale(xs: []const int)
@@ -116,13 +117,12 @@ scale(data)
 this element belongs to a '[]const int', which views elements it may not write, so there is nothing to assign through. Elements you may write are elements of your own: copy them into a '[]int' first
 ```
 
-The `const` is a property of the *view*, not of the element type — which is why it sits after the
-brackets, and why a `[]T` is accepted anywhere a `[]const T` is wanted but never the other way
-round. Giving up the ability to write is a promise the caller can always make; inventing one is what
-the type exists to stop.
+`const` belongs to the *view*, not to the element type, which is why it follows the brackets. A
+`[]T` is accepted wherever a `[]const T` is expected, but not the reverse: giving up write access is
+always safe, and gaining it is what the type prevents.
 
-`for x in xs` binds a **copy** of each element, which is what value semantics mean. To change
-elements, walk the indices:
+`for x in xs` binds a **copy** of each element, as value semantics require. To change elements,
+iterate over the indices:
 
 ```sysl
 var xs = [1, 2, 3]
@@ -142,14 +142,16 @@ saw: 3
 scaled: 10 20 30
 ```
 
-The loop evaluates its sequence once, so a slice written directly in the header lives for the whole
-loop rather than being rebuilt each step.
+The loop evaluates its sequence once, so a slice written directly in the loop header lives for the
+whole loop rather than being rebuilt at each step.
 
-Every form so far fixes its length in the type, and that is exactly what a program reading a file
-cannot do — the size is in the header, and the header is read by the code that needs the buffer.
+## Sizes known only at run time
 
-A length that is not in the type is what `[]T` already is, so this needs no new spelling. The
-declared type decides which reading you get:
+Every form so far fixes its length in the type, which a program reading a file cannot do: the size
+is in the file's header, and only the code that reads the header knows it.
+
+A length that is not part of the type is exactly what `[]T` is, so no new syntax is needed. The
+declared type decides which kind of storage is made:
 
 ```sysl
 squares(n: usize) -> []int
@@ -168,19 +170,18 @@ print("len:", s.len, "last:", s[4])
 len: 5 last: 16
 ```
 
-Under a `[N]T` the count must be constant; under a `[]T` it can be any expression, and the storage
-that gets made belongs to the view. That is the whole mechanism — a slice's owner word is an
-ordinary counted reference, so storage a function makes this way can be **returned**, and a decoder
-that learns its size from what it is decoding does not have to ask its caller to size a buffer whose
-size is in a header the caller has not read.
+Under a `[N]T` the count must be a constant; under a `[]T` it can be any expression, and the storage
+created belongs to the slice. A slice's owner word is an ordinary counted reference, so storage made
+this way can be **returned**. A decoder that learns a size from the data it decodes can allocate the
+buffer itself, instead of asking its caller to size a buffer from a header the caller has not read.
 
-## Growing one
+## Growable buffers
 
-`Buf[T]` is the growable sequence, and the interesting thing about it is that it is **ordinary sysl
-in the library** — a `[]T` for the storage, a count of how much is live, and methods. The section
-above is what makes that possible.
+`Buf[T]` is the growable sequence. It is **ordinary sysl in the standard library**: a `[]T` for the
+storage, a count of the elements in use, and methods. The run-time sizing in the previous section is
+what makes that possible.
 
-Nothing in the language reaches it, so a program that wants one asks:
+`Buf` is not built into the language, so a program imports it:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -201,28 +202,28 @@ len: 4 first: 1 cap: true
 popped: 16
 ```
 
-Two details worth catching. `b.len()` has parentheses where `xs.len` did not: the built-in length is
-a property of a type the compiler knows, while `Buf`'s is an ordinary method. And `b[0]` works
-because `Buf` implements the `Index` trait — the same syntax, reaching a call rather than an address.
+Two details. `b.len()` takes parentheses where `xs.len` did not: the built-in length is a property
+of a type the compiler knows, while `Buf`'s is an ordinary method. And `b[0]` works because `Buf`
+implements the `Index` trait; the subscript syntax calls a method instead of computing an address.
 
-`pop` returns an `Option` because taking from an empty buffer is a question a caller asks on purpose,
-while `b[i]` past the end panics, because that is a mistake in the program rather than a value it
-meant to handle.
+`pop` returns an `Option` because removing from an empty buffer is a case a caller checks
+deliberately. `b[i]` past the end panics, because that is a bug in the program rather than a value
+to handle.
 
-Handing the elements to something that takes a slice is `b.view()`.
+`b.view()` passes the elements to a function that takes a slice.
 
-Taking a slice **retains whatever owns the elements**, and dropping the slice releases it. So a view
-cannot dangle: the storage it names is alive for exactly as long as the view is.
+Taking a slice **retains whatever owns the elements**, and dropping the slice releases it. A view
+therefore cannot dangle: the storage it refers to lives exactly as long as the view.
 
-That holds even across a growth. A `push` that runs out of room allocates fresh storage and copies —
-and a view taken before that keeps the *old* storage alive and goes on showing what it was made
-from. It does not become invalid, which is the half of Go's behaviour sysl could not reproduce even
-if it wanted to. What it does not do is grow with the buffer; take the view again to see more.
+That holds across growth too. A `push` that runs out of room allocates new storage and copies the
+elements, and a view taken before the `push` keeps the *old* storage alive and continues to show
+what it was created from. It stays valid, but it does not grow with the buffer; take a new view to
+see the added elements.
 
-Where there is nothing to keep alive — a view of a string literal, or of a region behind a `*T` —
-the owner word is simply null and the counting compiles away.
+Where there is nothing to keep alive, as with a view of a string literal or of a region behind a
+`*T`, the owner word is null and the counting is compiled away.
 
 ---
 
-Next: [strings](/tour/strings/) — the same three words, with a guarantee added and an operation
-taken away.
+Next: [strings](/tour/strings/), which have the same three words as a slice, with a guarantee added
+and an operation removed.

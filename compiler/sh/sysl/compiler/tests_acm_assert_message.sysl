@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+// **An `@assert`'s message is any `string` the compiler can compute while compiling**
+// (`reference/attributes.md` § `@assert`): an interpolation over constants and over what a type
+// answers, or a call whose body runs while compiling. It is worked out only once the condition has
+// come out false, in the assertion's own terms -- an instance's inside a generic, the derived type's
+// inside a `derive` copy -- and a message that cannot be worked out is refused, saying the assertion
+// failed.
+
+@test("a computed message at module level is said with the folded values in it")
+acm_module_level()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        const LIMIT: int = 4
+
+        const label(n: int) -> string = s"a limit of $n"
+
+        @assert(LIMIT == 5, s"the limit is ${LIMIT}, not five")
+        @assert(LIMIT == 6, label(LIMIT))
+
+        print(1)
+        """), ["assertion failed: the limit is 4, not five — the left side is 4",
+               "assertion failed: a limit of 4 — the left side is 4"])
+end acm_module_level
+
+@test("a computed message in a module file other than the entry one is said too")
+acm_module_file()
+    if !azb_ready() then return
+
+    azb_refused([("", "limits.sysl", raw"""
+                     const WIDTH: int = 3
+
+                     @assert(WIDTH % 2 == 0, s"a width of ${WIDTH} is not even")
+                     """),
+                 ("", "main.sysl", "print(WIDTH)\n")],
+                ["assertion failed: a width of 3 is not even"])
+end acm_module_file
+
+@test("a computed message in a body is worked out for each instance, naming the type it was given")
+acm_per_instance()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(raw"""
+        fits[T]() -> int
+            @assert(sizeof(T) <= 4, s"'${T::Name}' is wider than four bytes")
+            1
+
+        print(fits[i32]() + fits[i64]())
+        """), ["assertion failed: 'long' is wider than four bytes — the left side is 8 — where T = long"],
+        ["'int' is wider"])
+end acm_per_instance
+
+@test("a computed message in a 'derive' copy is told at the 'derives', naming the derived type")
+acm_derive_copy()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(raw"""
+        trait Named
+            name(self) -> string
+
+            derive[T] name(self: T) -> string
+                if const T::Kind == Kind.Struct
+                    T::BaseName
+                else
+                    @assert(false, s"Named cannot derive for ${T::Name}, which is not a struct")
+                    ""
+
+        struct Pin derives Named
+            x: int
+
+        enum Light derives Named
+            Red
+            Green
+
+        print(Pin(1).name())
+        """), ["assertion failed: Named cannot derive for Light, which is not a struct",
+               "main.sysl:14:20"],
+        ["for Pin"])
+end acm_derive_copy
+
+// A message whose working out would trap, or would read storage filled at run time, is never looked
+// at while the condition holds: the program builds and runs.
+@test("a message is not worked out while its condition holds")
+acm_not_worked_out_when_true()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        var seed: int = 3
+
+        boom() -> string = s"$seed"
+
+        const div(n: int) -> string = s"${10 / n}"
+
+        @assert(1 == 1, div(0))
+        @assert(true, s"${div(0)} and more")
+
+        check[T]() -> int
+            @assert(sizeof(T) > 0, boom())
+            @assert(sizeof(T) > 0, div(0))
+            1
+
+        print(check[int]())
+        """), "1\n")
+end acm_not_worked_out_when_true
+
+@test("a message that traps while it is worked out is refused, saying the assertion failed")
+acm_message_traps()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        const div(n: int) -> string = s"${10 / n}"
+
+        @assert(1 == 2, div(0))
+
+        print(1)
+        """), ["the message of this failed '@assert' traps while it is being compiled: integer " +
+               "division by zero", "inside 'div(0)'"])
+end acm_message_traps
+
+@test("a message reading storage filled at run time is refused")
+acm_message_reads_run_time_storage()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        var seed: int = 3
+
+        boom() -> string = s"$seed"
+
+        check[T]() -> int
+            @assert(sizeof(T) > 100, boom())
+            1
+
+        print(check[int]())
+        """), ["the message of this failed '@assert' cannot be computed while compiling — it has " +
+               "to be a 'string'", "nothing read out of storage filled at run time"])
+end acm_message_reads_run_time_storage
+
+@test("a message that is not a string is refused, naming its type")
+acm_message_not_a_string()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("@assert(1 == 2, 42)\n\nprint(1)\n"),
+        ["the message of this failed '@assert' is of type 'int', and a message is a 'string' — " +
+         "interpolate the value into one"])
+end acm_message_not_a_string
+
+@test("a message that does not type is refused with the ordinary complaint")
+acm_message_does_not_type()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("@assert(1 == 2, s\"${nowhere}\")\n\nprint(1)\n"), ["nowhere"])
+end acm_message_does_not_type
+
+// `docs/design/reflection.md` § 3, exactly as the note writes it, with the two members `int` and
+// `string` need -- the note's example is checked by this program.
+private acm_reflection_note() -> string = raw"""
+    @annotation
+    struct rename
+        name: string
+
+    trait Json
+        encode(self, w: *Writer)
+
+        derive[T] encode(self: T, w: *Writer)
+            if const T::Kind == Kind.Struct
+                w.write("{".bytes)
+
+                for const f in T::Fields
+                    if f.index > 0 then w.write(",".bytes)
+
+                    val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                    w.write(s"\"$key\":".bytes)
+                    self.(f).encode(w)
+
+                w.write("}".bytes)
+            else
+                @assert(false, s"Json cannot derive for ${T::Name}")
+
+    impl Json for int
+        encode(self, w: *Writer) = w.write(s"$self".bytes)
+
+    impl Json for string
+        encode(self, w: *Writer) = w.write(s"\"$self\"".bytes)
+
+    struct User derives Json
+        @rename("id") user_id: int
+        name: string
+
+    """
+
+@test("the reflection note's example compiles and runs as written")
+acm_reflection_note_example()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(acm_reflection_note() + "User(7, \"ann\").encode(stdout())\nprint(\"\")\n"),
+        "{\"id\":7,\"name\":\"ann\"}\n")
+end acm_reflection_note_example
+
+@test("the reflection note's example refuses a type it cannot derive for, naming it")
+acm_reflection_note_refusal()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(acm_reflection_note() + "enum Light derives Json\n    Red\n    Green\n\nprint(1)\n"),
+        ["assertion failed: Json cannot derive for Light"])
+end acm_reflection_note_refusal
+
+// ---- std's Display derive over an anonymous member ----
+
+@test("'derives Display' over an anonymous union is refused at the 'derives', naming the type")
+acm_display_refuses_an_anonymous_union()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Packet derives Display
+            tag: u8
+            union
+                word: u32
+                level: f32
+            len: u16
+
+        print(Packet(tag = 1, word = 7, len = 2))
+        """), ["assertion failed: 'Packet' cannot derive Display: it holds an anonymous struct or " +
+               "union block, which has no Display — write 'impl Display for Packet'",
+               "main.sysl:1:23"])
+end acm_display_refuses_an_anonymous_union
+
+@test("'derives Display' over an anonymous struct block is refused too")
+acm_display_refuses_an_anonymous_struct()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Span derives Display
+            id: u8
+            struct
+                lo: u16
+                hi: u16
+
+        print(Span(id = 1, lo = 2, hi = 3))
+        """), ["'Span' cannot derive Display: it holds an anonymous struct or union block"])
+end acm_display_refuses_an_anonymous_struct
+
+// ---- std's Eq, Ord and Hash derives over an anonymous member ----
+//
+// Each is refused at its `derives`, as the compiler's own derives refused it, whichever word opened
+// the block and whatever the block holds inside: it is the outer block that decides the message.
+
+/** `struct Packet derives <traits>` holding `block` between two named fields, with a function that
+ * uses each derived trait so its body is instantiated.
+ */
+acm_anon_packet(traits: string, block: string, body: string) -> [](string, string, string) =
+    azb_main("struct Packet derives " + traits + "\n    tag: u8\n" + block + "    len: u16\n\n" +
+             "check(a: Packet, b: Packet) -> bool = " + body + "\n\nprint(1)\n")
+
+acm_anon_union_block() -> string = "    union\n        word: u32\n        level: f32\n"
+acm_anon_struct_block() -> string = "    struct\n        x: u16\n        y: u16\n"
+acm_anon_struct_in_union() -> string =
+    "    union\n        word: u32\n        struct\n            lo: u16\n            hi: u16\n"
+acm_anon_union_in_struct() -> string =
+    "    struct\n        x: u16\n        union\n            word: u32\n            level: f32\n"
+
+/** The three derives over a struct whose outer anonymous block is a union. */
+acm_anon_refused_as_union(block: string)
+    azb_refused(acm_anon_packet("Eq", block, "a == b"),
+        ["assertion failed: '!=' is not defined for the anonymous union in 'Packet' — comparing its " +
+         "bytes is wrong for a float and for the bytes past a short field. Write 'impl Eq for Packet' " +
+         "comparing the field you know is there", "main.sysl:1:23"])
+    azb_refused(acm_anon_packet("Ord", block, "a < b"),
+        ["assertion failed: '<' is not defined for the anonymous union in 'Packet' — comparing its " +
+         "bytes is wrong for a float and for the bytes past a short field. Write 'impl Ord for Packet' " +
+         "comparing the field you know is there", "main.sysl:1:23"])
+    azb_refused(acm_anon_packet("Hash", block, "a.hash() == b.hash()"),
+        ["assertion failed: 'Packet' cannot derive Hash: it holds an anonymous union block, which has " +
+         "no Hash — hashing its bytes is wrong for a float and for the bytes past a short field. Write " +
+         "'impl Hash for Packet' hashing the field you know is there", "main.sysl:1:23"])
+end acm_anon_refused_as_union
+
+/** The three derives over a struct whose outer anonymous block is a struct. */
+acm_anon_refused_as_struct(block: string)
+    for t in ["Eq", "Ord", "Hash"]
+        val body = if t == "Eq" then "a == b" elif t == "Ord" then "a < b" else "a.hash() == b.hash()"
+
+        azb_refused(acm_anon_packet(t, block, body),
+            [s"assertion failed: 'Packet' cannot derive ${t}: it holds an anonymous struct block, which " +
+             s"has no ${t} — write 'impl ${t} for Packet'", "main.sysl:1:23"])
+end acm_anon_refused_as_struct
+
+@test("'derives Eq', 'Ord' and 'Hash' over an anonymous union are refused at the 'derives', naming the type")
+acm_eq_ord_hash_refuse_an_anonymous_union()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_union(acm_anon_union_block())
+end acm_eq_ord_hash_refuse_an_anonymous_union
+
+@test("'derives Eq', 'Ord' and 'Hash' over an anonymous struct block are refused too")
+acm_eq_ord_hash_refuse_an_anonymous_struct()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_struct(acm_anon_struct_block())
+end acm_eq_ord_hash_refuse_an_anonymous_struct
+
+@test("an anonymous union holding a struct block is refused as a union")
+acm_eq_ord_hash_refuse_a_struct_in_a_union()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_union(acm_anon_struct_in_union())
+end acm_eq_ord_hash_refuse_a_struct_in_a_union
+
+@test("an anonymous struct block holding a union is refused as a struct block")
+acm_eq_ord_hash_refuse_a_union_in_a_struct()
+    if !azb_ready() then return
+
+    acm_anon_refused_as_struct(acm_anon_union_in_struct())
+end acm_eq_ord_hash_refuse_a_union_in_a_struct
+
+@test("'derives Eq, Ord, Hash' over named fields alone still compare and hash them")
+acm_eq_ord_hash_named_fields_work()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Packet derives Eq, Ord, Hash
+            tag: u8
+            len: u16
+
+        val a = Packet(tag = 1, len = 2)
+        val b = Packet(tag = 1, len = 3)
+        print(a == b, a < b, a.hash() == (u8(1), u16(2)).hash())
+        """), "false true true\n")
+end acm_eq_ord_hash_named_fields_work
+
+@test("'derives Display' over named fields alone still renders them")
+acm_display_named_fields_render()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Size derives Display
+            w: int
+            h: int
+
+        print(Size(3, 4))
+        """), "Size(3, 4)\n")
+end acm_display_named_fields_render

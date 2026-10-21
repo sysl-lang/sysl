@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -366,19 +366,24 @@ reason.
 members of one name on one type and a call could not say which it meant — on a file, which is both.
 One shared latch leaves a single answer that each of them reaches.
 
-Reaching a trait member still needs the trait in scope:
+Reaching a trait member on a `File` needs no import of the trait, since `impl Reader for File` is
+one the program can see ([Reaching a member through its
+trait](/reference/traits/#reaching-a-member-through-its-trait)):
 
 ```sysl
-import sysl.fs.open
+import sysl.fs.{open, write_text, remove_file}
+
+write_text("/tmp/sysl-fs-doc-3.txt", "abcdef").unwrap()
 
 var f = open("/tmp/sysl-fs-doc-3.txt").unwrap()
 var window: [4]u8
 
-f.read(window)
+print(f.read(window).len)
+remove_file("/tmp/sysl-fs-doc-3.txt").unwrap()
 ```
 
-```error
-sysl.fs.File has 'read' from sysl.io.Reader, and that trait is not in scope here — import it to reach the member
+```output
+4
 ```
 
 ### Position and size
@@ -659,6 +664,29 @@ already has is the one change anybody may make. A symbolic link is followed, as 
 follows one, and there is no variant that changes the link itself, there being none for its
 permissions either. A target whose filesystem has no owners answers *not supported on this target*.
 
+**`set_modified(path, when)` sets the modification time** of a file or a directory, and its access
+time with it, over one `utimensat` hook. It is how a program records that something was used without
+writing to it: a cache that evicts the least recently used entry touches what it hands out. A path
+that is not there is `NotFound`; the filesystem keeps the time to its own resolution, so a reading
+may round what was set.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_modified, remove_file}
+import sysl.time.Instant
+
+val path = "/tmp/sysl-fs-doc-modified.txt"
+
+write_text(path, "x").unwrap()
+set_modified(path, Instant(1500000000000000)).unwrap()
+print(metadata(path).unwrap().modified.us / 1000000)
+
+remove_file(path).unwrap()
+```
+
+```output
+1500000000
+```
+
 ### Links, and the path the filesystem agrees on
 
 ```sysl
@@ -888,6 +916,12 @@ remove_dir_all(dir).unwrap()
 first unreadable directory fatal, and ignoring it makes the walk best effort. A directory that cannot
 be read is one `Err` and the walk carries on with what is left.
 
+**An entry another process removes while the walk is under way is absent, not an error.** A
+directory is listed once and its entries are looked at afterwards, so a lock directory or a temporary
+file may be gone by the time the walk reaches it. Such an entry is skipped, and a directory removed
+after it was reported is walked as an empty one. A root that is not there when the walk starts is
+still an `Err`.
+
 **A symbolic link is reported and never followed.** `is_dir` follows a link, so a walk that classified
 with it would descend into a link to a directory without ever deciding to — and a link pointing at one
 of its own ancestors would make the walk unbounded. Each entry carries a
@@ -1040,7 +1074,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata`, `set_permissions` and `set_owner` are one `stat`, `chmod` or `chown` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions`, `set_owner` and `set_modified` are one `stat`, `chmod`, `chown` or `utimensat` hook, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

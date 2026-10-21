@@ -49,7 +49,7 @@ decide.
 
 ## Index
 
-[`default_zoneinfo_root`](#default_zoneinfo_root) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
+[`default_zoneinfo_root`](#default_zoneinfo_root) [`cpu_time`](#cpu_time) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
 
 ## Constants
 
@@ -64,6 +64,27 @@ module compiles for uses this path -- macOS symlinks it at `/var/db/timezone/zon
 here too.
 
 ## Functions
+
+### `cpu_time`
+
+```sysl
+cpu_time() -> Duration
+```
+
+The processor time this process has used: user plus system, summed over every thread.
+
+Like `monotonic` it has no origin worth naming, so only the difference of two readings means
+anything, and it is a `Duration` for the same reason. **It is not wall time**: a program asleep or
+blocked on I/O spends none, and a program with several busy threads spends more than the clock on
+the wall shows.
+
+val t0 = cpu_time()
+work()
+print(s"used ${(cpu_time() - t0).us}us of processor")
+
+It never goes backwards. It lives here rather than in `sysl.time` because reading it asks an
+operating system (`clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`), exactly as `monotonic` does; there is
+no portable seam for it, so a freestanding target does not have it.
 
 ### `from_local`
 

@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, sub, to_string,
+                         and as big_and, or as big_or, xor as big_xor, not as big_not,
+                         bit_length as big_bits, shl as big_shl, shr as big_shr}
+
+// **Arithmetic written out of integer literals alone is computed exactly, and its value must fit the
+// type it is read at**, as a single literal's must. `val b: u32 = 65536 * 65536` is refused as the
+// value 4294967296 that does not fit `u32`, where reading it at the machine's width would make it
+// zero, and a division or a remainder by a literal zero anywhere inside is refused as the constant's
+// own mistake. The steps between are numbers rather than slots, so `65536 * 65536 - 1` is the `u32`
+// it comes to, and what is accepted is folded to that one literal -- a quotient or a right shift of a
+// step past the type is the exact one, not the wrapped one.
+//
+// **The outermost such expression is the one checked**: `enter_literal_arithmetic` marks the
+// analyzer while it is read, so the operators inside it type as before and say nothing of their own.
+// Only literals qualify. A typed value, a `val` or a `const` name anywhere inside keeps the run-time
+// rule, under which integer arithmetic wraps at the declared width (`reference/types.md`).
+//
+// `~` is the complement at the type's own width -- `~0` at `u32` is 4294967295 -- since that is what
+// the operator means on an unsigned value. **A left shift is a bit operation, as in C and Rust**: the
+// bits shifted past the top of the shifted value's type are dropped, so `0xffffffffffffffffu64 << 27`
+// is a mask and `1 << 31` at `int` is its minimum. Its count must be below that type's width and not
+// negative, and what is shifted must fit the type; the type is the one the shift is read at, which
+// for an unsuffixed literal is the one the whole expression is. A right shift is the exact floor
+// division it is, and by a count at or past the width the defined full shift
+// (`reference/expressions.md`).
+enter_literal_arithmetic(cx: &Analyzer, e: Expr) -> bool
+    if cx.in_literal_arithmetic || !literals_only(e) then return false
+
+    cx.in_literal_arithmetic = true
+    true
+end enter_literal_arithmetic
+
+literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
+    if !outermost then return t
+
+    cx.in_literal_arithmetic = false
+
+    val zero = zero_divisor(t)
+
+    if zero.is_some() then return cx.err(zero.unwrap(), "a constant divided by zero")
+
+    val shift = bad_shift(t)
+
+    if shift.is_some() then return cx.err(shift.unwrap().0, shift.unwrap().1)
+
+    val node = node_of(t)
+    val ty = texpr_type(node)
+    val value = exact_value(node)
+
+    if value.is_none() then return t
+
+    underlying(ty) match
+        Integer(bits, signed, _) ->
+            if !fits(value.unwrap(), bits, signed) then
+                return cx.err(node.span, s"the value${shown(value.unwrap())} does not fit ${type_show(ty)}")
+        _ -> return t
+
+    val folded = TExpr(node.span, TIntLit(value.unwrap(), ty))
+
+    *t.kind match
+        TConstrainedCheck(_, target) -> TExpr(t.span, TConstrainedCheck(folded, target))
+        _ -> folded
+end literal_arithmetic
+
+// The first division or remainder inside whose divisor is a literal zero.
+private zero_divisor(t: TExpr) -> Option[Span] = *t.kind match
+    TConstrainedCheck(inner, _) -> zero_divisor(inner)
+    TCast(inner, _) -> zero_divisor(inner)
+    TUnary(_, x, _) -> zero_divisor(x)
+    TBinary(op, l, r, _) ->
+        val left = zero_divisor(l)
+
+        if left.is_some() then return left
+
+        val right = zero_divisor(r)
+
+        if right.is_some() then return right
+
+        val y = exact_value(r)
+
+        if (op == "/" || op == "%") && y.is_some() && cmp(y.unwrap(), from_int(0)) == 0 then Some(t.span)
+        else None
+    _ -> None
+
+// The first left shift inside that has no value at the type it is read at: a count below zero or at
+// or past the width, or a shifted value the type does not hold, which dropping bits would hide.
+private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
+    TConstrainedCheck(inner, _) -> bad_shift(inner)
+    TCast(inner, _) -> bad_shift(inner)
+    TUnary(_, x, _) -> bad_shift(x)
+    TBinary(op, l, r, ty) ->
+        val left = bad_shift(l)
+
+        if left.is_some() then return left
+
+        val right = bad_shift(r)
+
+        if right.is_some() || op != "<<" then return right
+
+        val count = exact_value(r)
+
+        if count.is_none() then return None
+
+        val n = count.unwrap()
+
+        if cmp(n, from_int(0)) < 0 then return Some((t.span, s"a constant shifted by ${to_string(n)} places"))
+
+        underlying(ty) match
+            Integer(bits, signed, _) ->
+                if cmp(n, from_int(long(bits))) >= 0 then
+                    return Some((t.span, s"a constant shifted by ${to_string(n)} places, " +
+                                         s"at or past the $bits bits of ${type_show(ty)}"))
+
+                val x = exact_value(l)
+
+                if x.is_some() && !fits(x.unwrap(), bits, signed) then
+                    return Some((l.span, s"the value${shown(x.unwrap())} does not fit ${type_show(ty)}"))
+
+                None
+            _ -> None
+    _ -> None
+
+// Whether an expression is integer literals and the integer operators over them, and nothing else.
+// Parentheses are not a node, so `(1 << 31) - 1` is one.
+literals_only(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, _) -> true
+    Unary(op, operand) -> (op == "-" || op == "~") && literals_only(operand)
+    Binary(op, l, r) -> exact_operator(op) && literals_only(l) && literals_only(r)
+    _ -> false
+
+private exact_operator(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" ||
+        op == "^" || op == "<<" || op == ">>"
+
+// The operator node itself, under the check a constrained result is given where it is made.
+private node_of(t: TExpr) -> TExpr = *t.kind match
+    TConstrainedCheck(inner, _) -> node_of(inner)
+    _ -> t
+
+// The exact value of an analyzed literal-only integer expression, or `None` where it is not one --
+// an operand that was refused, a literal read as a float or a fixed-point value, a zero divisor.
+private exact_value(t: TExpr) -> Option[BigInt] = *t.kind match
+    TIntLit(v, _) -> Some(v)
+    TConstrainedCheck(inner, _) -> exact_value(inner)
+    // A conversion the analyzer inserted over a literal is a lossless widening, or a shift count
+    // brought to the shifted value's type; either way the number is the one written.
+    TCast(inner, to) -> underlying(to) match
+        Integer(_, _, _) -> exact_value(inner)
+        _ -> None
+    TBinary(op, l, r, ty) ->
+        val x = exact_value(l)
+        val y = exact_value(r)
+
+        if x.is_none() || y.is_none() then None else binary_value(op, x.unwrap(), y.unwrap(), ty)
+    TUnary(op, x, ty) ->
+        val v = exact_value(x)
+
+        if v.is_none() then None else unary_value(op, v.unwrap(), ty)
+    _ -> None
+
+// **A step is exact only as far as the widest integer type reaches.** Past it no type holds the
+// value, so it stands for every value that wide -- `beyond()` -- and whatever is built on it is too:
+// the check has its answer without the compiler multiplying out a number of megabytes.
+private binary_value(op: string, x: BigInt, y: BigInt, ty: Type) -> Option[BigInt]
+    if is_beyond(x) || is_beyond(y) then return Some(beyond())
+
+    if op == "+" then return Some(bounded(add(x, y)))
+    if op == "-" then return Some(bounded(sub(x, y)))
+    if op == "&" then return Some(big_and(x, y))
+    if op == "|" then return Some(big_or(x, y))
+    if op == "^" then return Some(big_xor(x, y))
+
+    if op == "*"
+        if big_bits(x) + big_bits(y) > ceiling() + 1 then return Some(beyond())
+
+        return Some(bounded(mul(x, y)))
+    end if
+
+    if op == "/" || op == "%"
+        if cmp(y, from_int(0)) == 0 then return None
+
+        val q = div_rem(x, y)
+
+        return Some(if op == "/" then q.0 else q.1)
+    end if
+
+    if op == "<<" then return shifted_left(x, y, ty)
+    if op == ">>" then shifted_right(x, y) else None
+end binary_value
+
+// A left shift at the width of its type, with the bits past the top dropped and the result read back
+// as that type's value. `bad_shift` has refused a count out of range and a value the type does not
+// hold, so only a shift with a value at a type reaches here.
+private shifted_left(x: BigInt, count: BigInt, ty: Type) -> Option[BigInt] = underlying(ty) match
+    Integer(bits, signed, _) ->
+        if cmp(count, from_int(0)) < 0 || cmp(count, from_int(long(bits))) >= 0 then return None
+
+        Some(wrapped(big_shl(x, usize(count.to_long().unwrap())), bits, signed))
+    _ -> None
+
+// A value brought into `bits` bits, two's complement where the type is signed.
+private wrapped(v: BigInt, bits: int, signed: bool) -> BigInt
+    val m = big_shl(from_int(1), usize(bits))
+    var r = div_rem(v, m).1
+
+    if cmp(r, from_int(0)) < 0 then r = add(r, m)
+    if signed && cmp(r, big_shl(from_int(1), usize(bits - 1))) >= 0 then r = sub(r, m)
+
+    r
+end wrapped
+
+// A right shift as the exact floor division by a power of two it is. Past every bit it leaves the
+// sign whatever the count, so the count is held to one place past them. A negative count is not a
+// literal shift this check reads.
+private shifted_right(x: BigInt, count: BigInt) -> Option[BigInt]
+    if cmp(count, from_int(0)) < 0 then return None
+    if x.is_zero() then return Some(x)
+
+    val reach = big_bits(x) + 1
+
+    if cmp(count, from_int(long(reach))) > 0 then return Some(big_shr(x, reach))
+
+    Some(big_shr(x, usize(count.to_long().unwrap())))
+end shifted_right
+
+// The most bits a step may take and still come to a value some integer type holds: the widest
+// type's, and one more, which is the step before `- 1` at it.
+private ceiling() -> usize = usize(MaxIntegerBits) + 1
+
+// Every value wider than the widest integer type, as one number one bit past the ceiling.
+private beyond() -> BigInt = big_shl(from_int(1), ceiling())
+
+private is_beyond(v: BigInt) -> bool = big_bits(v) > ceiling()
+
+private bounded(v: BigInt) -> BigInt = if is_beyond(v) then beyond() else v
+
+// A value as the refusal shows it, after "the value": its digits while they can be read, and how wide
+// it is past that.
+private shown(v: BigInt) -> string
+    if is_beyond(v) then return ", wider than every integer type,"
+    if big_bits(v) > 256 then return s", ${big_bits(v)} bits wide,"
+
+    s" ${to_string(v)}"
+end shown
+
+private unary_value(op: string, v: BigInt, ty: Type) -> Option[BigInt]
+    if op == "-" then return Some(negate(v))
+
+    if op == "~"
+        return underlying(ty) match
+            Integer(bits, signed, _) -> Some(if signed then big_not(v) else sub(max_of(bits, false), v))
+            _ -> None
+
+    None
+end unary_value

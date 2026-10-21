@@ -6,12 +6,12 @@ weight: 10
 
 ## Naming a value
 
-Three keywords, differing in what may happen to the thing afterwards:
+There are three keywords, and they differ in what may happen to the value afterwards:
 
 ```sysl
 var count = 3            // storage that may change
-val limit: int = 10      // storage that may not
-const step: int = 2      // not storage at all — a value known while compiling
+val limit = 10           // storage that may not
+const step = 2           // not storage at all — a value known while compiling
 
 count = count + step
 print("count:", count, "of", limit)
@@ -21,31 +21,27 @@ print("count:", count, "of", limit)
 count: 5 of 10
 ```
 
-`var` and `val` are the pair most languages have. `const` is the different one: it is not a variable
-that happens to be fixed, it is a value the compiler substitutes wherever the name appears, so there
-is nothing at run time to read. That is why it insists on its type being written and on having a
-value — a `const` with either missing is refused rather than inferred, because a name with no
-storage and no value is nothing at all.
+`var` and `val` are the pair most languages have. `const` is different: it is not a variable that
+cannot change, but a value the compiler substitutes wherever the name appears, so there is nothing to
+read at run time. A `const` must give a value.
 
-`limit` writes its type for a reason worth knowing early, because it is the first place the file's
-top level behaves differently from the inside of a function. These statements are at **module
-level**, and a module-level `val` is part of the module's surface — something another file can see —
-so its type is stated rather than inferred from whatever happens to be on the right today. The same
-`val limit = 10` inside a function infers happily, because a local is nobody else's business.
+None of the three needs a type: each takes the type of its value, so `step` and `limit` are `int`
+values, whether they are locals inside a function or members of a module, visible to other files. A
+type may be written on any of them (`val limit: long = 10`); where it is written it governs, and the
+value is read against it.
 
-A module-level `val` **may** hold a value the program had to build — a reference, a slice, a string
-put together while running. Storage that exists for the whole run is never let go of, so the count it
-takes is never given back, which is what a static is. What the value is decides only *when* the
-storage gets filled: numbers, characters, booleans, string literals and tables of them are complete
-before the program starts, and anything else is built by a prologue that runs before the first
-statement.
+A module-level `val` **may** hold a value the program builds at run time: a reference, a slice, a
+string assembled while running. Its storage lasts for the whole run, as a static does. The value
+decides only *when* that storage is filled. Numbers, characters, booleans, string literals and tables
+of them are in place before the program starts; anything else is built by a prologue that runs before
+the first statement.
 
-`print` takes any number of arguments, renders each one, and puts a space between them. It comes from
-`sysl`, the standard module — the one module a file may name without importing it.
+`print` takes any number of arguments, renders each one, and separates them with a space. It comes
+from `sysl`, the standard module, which is the one module a file may use without importing it.
 
-Integers are an open family: `i8`, `i16`, `i32`, `i64` and the unsigned `u8` … `u64`, with `isize`
-and `usize` for the pointer-width pair. The common ones also have friendly names, and those are what
-ordinary code uses:
+Integers form an open family: `i8`, `i16`, `i32`, `i64`, the unsigned `u8` … `u64`, and `isize` and
+`usize` for the pointer-width pair. The common widths also have short names, and ordinary code uses
+those:
 
 | friendly | is |
 |---|---|
@@ -55,15 +51,15 @@ ordinary code uses:
 | `uint`, `ushort`, `ulong` | `u32`, `u16`, `u64` |
 | `real` | `f64` |
 
-Floats are a closed set — `f32` and `f64` — because IEEE 754 defines those and not an open family.
-`real` is `f64`, and it is the width arithmetic reaches for unless a program says otherwise.
+Floats are a closed set, `f32` and `f64`, because those are the formats IEEE 754 defines. `real` is
+`f64`, and it is the width floating-point arithmetic uses unless a program says otherwise.
 
-Then `bool`, `char`, and `string`.
+The remaining scalars are `bool`, `char` and `string`.
 
 ## Every width is its own type
 
-This is the part that catches people arriving from C. A width is a *type*, not a hint, and no value
-changes width on its own:
+This is the part most likely to surprise a C programmer. A width is a *type*, not a hint, and no
+value changes width on its own:
 
 ```sysl
 var small: byte = 200
@@ -78,17 +74,15 @@ byte: 44 25
 u64 max: 18446744073709551615
 ```
 
-`small + 100` is `byte` arithmetic, so it wraps at 256 and gives 44. It does not quietly become an
-`int` because the answer would not fit — the type said `byte`, and `byte` is what the arithmetic
-is. An unsuffixed literal like `100` takes the type of what is around it, which is what lets that
-line be written without a suffix on every number.
+`small + 100` is `byte` arithmetic, so it wraps at 256 and gives 44. It is not promoted to `int`
+because the result would not fit; the type is `byte`, and so is the arithmetic. An unsuffixed literal
+such as `100` takes its type from the surrounding expression, which is why the line needs no suffixes.
 
-### The family is open, and that is not a figure of speech
+### Any bit width is a type
 
-`i8` through `i64` are the widths with familiar names, not the widths that exist. `iN` and `uN` are an
-**open family parameterized by a bit width**, so `u12`, `i5` and `u256` are types you may write, and
-each is its own type with its own arithmetic — a `u12` wraps at 4096 because that is what twelve bits
-hold:
+`i8` through `i64` are the widths with familiar names, not the only widths. `iN` and `uN` are an
+**open family parameterized by bit width**, so `u12`, `i5` and `u256` are all types you may write.
+Each has its own arithmetic: a `u12` wraps at 4096 because that is the range of twelve bits.
 
 ```sysl
 struct Pixel
@@ -96,13 +90,13 @@ struct Pixel
     green: u6
     blue:  u5
 
-var p = Pixel(31u5, 40u6, 17u5)
+var p = Pixel(31, 40, 17)
 
 var counter: u12 = 4000
 
-print("wraps at 4096:", counter + 100u12)
-print("and divides:", counter / 7u12)
-print("packed:", int(p.red), int(p.green), int(p.blue))
+print("wraps at 4096:", counter + 100)
+print("and divides:", counter / 7)
+print("packed:", p.red, p.green, p.blue)
 ```
 
 ```output
@@ -111,52 +105,56 @@ and divides: 571
 packed: 31 40 17
 ```
 
-That is the reason the rule above is worth stating as "a width is a type" rather than "there are eight
-integer types". A 16-bit colour pixel really is a 5-bit field, a 6-bit field and another 5-bit field,
-and writing it that way gets the wrapping and the range checking for free instead of hand-masking
-them out of a `u16`.
+A 16-bit RGB565 pixel is a 5-bit field, a 6-bit field and another 5-bit field. Declaring the fields
+with those widths gives each one the correct wrapping and range checks, with no hand-written masking
+of a `u16`.
 
-Storage rounds up to whole bytes and an alignment the machine has — a `u12` occupies two bytes — so a
-narrow width buys correct arithmetic rather than tight packing. The
-[reference](/reference/types/) has the ceiling and the two costs at extreme widths.
+Storage rounds up to whole bytes and to an alignment the machine supports, so a `u12` occupies two
+bytes. A narrow width gives correct arithmetic, not tighter packing. The
+[reference](/reference/types/) gives the maximum width and the costs at extreme widths.
 
-Ask for a wider type and the compiler will not do it silently:
+Converting to a wider type is implicit, because no value can be lost: every `byte` is also a valid
+`int`. Converting to a narrower type is never implicit:
 
 ```sysl
 var small: byte = 200
 var wide: int = small
-print(wide)
+var count = 300
+var back: byte = count
 ```
 
 ```error
-cannot initialize 'wide': declared int but the value is byte
+cannot initialize 'back': declared byte but the value is int
 ```
 
-The fix is to say so, and every conversion is written with call syntax:
+A conversion that can lose or change a value is written explicitly, with call syntax:
 
 ```sysl
 var small: byte = 200
+var wide: int = small
 
-print("widened:", int(small))
+print("widened:", wide, "narrowed:", byte(300))
 print("truncated:", int(3.9))
-print("divided:", f32(7) / f32(2))
+print("divided:", f32(7) / 2)
 print("code point:", u32('A'))
 ```
 
 ```output
-widened: 200
+widened: 200 narrowed: 44
 truncated: 3
 divided: 3.5
 code point: 65
 ```
 
-`int(3.9)` truncates rather than rounds, and `f32(7) / f32(2)` is float division because both
-operands are floats — writing `7 / 2` would have been integer division giving 3. Which one you get
-follows from the types, and the types are written down.
+`int(3.9)` truncates rather than rounds. `f32(7) / 2` is floating-point division because its left
+operand is a float, and the literal `2` takes the float type it meets; `7 / 2` would be integer
+division and give 3. The types decide which operation
+runs, and the types are visible in the code.
 
 ## Characters are not small integers
 
-A `char` is one Unicode scalar value. It compares and prints, and it does not do arithmetic:
+A `char` is one Unicode scalar value. It can be compared and printed, but it does not support
+arithmetic:
 
 ```sysl
 var letter = 'é'
@@ -168,11 +166,11 @@ print("char:", letter, 'a' <= letter, char(9731))
 char: é true ☃
 ```
 
-Ordering is defined, so `'a' <= letter` answers. Adding `1` to it is not, because "the next scalar
-value" is rarely what a program that wrote `letter + 1` actually meant. When the code point *is*
-what you want, `u32(letter)` says so and `char(9731)` goes back the other way.
+Characters are ordered, so `'a' <= letter` is valid. Adding `1` is not, because "the next scalar
+value" is rarely what code that writes `letter + 1` intends. When you need the code point,
+`u32(letter)` converts to it and `char(9731)` converts back.
 
 ---
 
-Next: [control flow](/tour/control-flow/), where the same "it yields a value" idea turns out to
-cover `if`, `match` and the loops as well.
+Next: [control flow](/tour/control-flow/), where `if`, `match` and the loops are all expressions
+that produce a value.

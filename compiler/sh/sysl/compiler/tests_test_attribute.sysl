@@ -28,7 +28,8 @@ private tax_ready() -> bool
     true
 end tax_ready
 
-// Everything one source has to say for itself, taken the whole way an ordinary build takes it.
+// Everything one source has to say for itself, its tests kept and analyzed as `sysl test` reads
+// them -- the one build that does; every other drops them before analysis.
 private tax_err(text: string) -> string
     val root = make_temp_dir("sysl-test-attr").unwrap()
     val src = s"$root/main.sysl"
@@ -36,7 +37,7 @@ private tax_err(text: string) -> string
     make_dir_all(root).unwrap()
     write_text(src, text).unwrap()
 
-    val out = emit_llvm_text(src, None) match
+    val out = emit_llvm_text(src, None, DefaultOptimization, buf(), None, false, true) match
         Err(why) -> why.message
         Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
 
@@ -169,7 +170,7 @@ tax_a_name_and_an_expectation()
 @test("an unknown word after '@' says what the annotations are")
 tax_an_unknown_word()
     assert_eq(pf_err("@serializable\nt() = 0\n"),
-        "'serializable' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+        "'serializable' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header. An annotation a program declares, a struct marked '@annotation', stands above a type declaration, a field or a variant")
     assert_eq(pf_at("@serializable\nt() = 0\n"), "1:14")
 
 // `#if` never reaches the grammar at all, so nothing about the annotation sigil can be about one.
@@ -288,7 +289,7 @@ tax_listed_in_declaration_order()
 @test("a method cannot be a test")
 tax_a_method_cannot_be_a_test()
     assert_eq(pf_err("struct Point\n    x: int\n\n    @test\n    t(self) = 0\n"),
-        "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
+        "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
     assert_eq(pf_at("struct Point\n    x: int\n\n    @test\n    t(self) = 0\n"), "4:5")
 
 @test("an attribute with empty parentheses says nothing, and is not a form")
@@ -298,7 +299,7 @@ tax_empty_parentheses()
     assert_eq(pf_at("@test()\nt() = 0\n"), "1:6")
 
 private tax_left_open() -> string =
-    "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
+    "'@test' closes what it opened — the description, 'should_trap', 'timeout' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
 
 @test("an argument list left open is answered by the annotation rather than by the line below it")
 tax_an_argument_list_left_open()
@@ -486,16 +487,21 @@ tax_a_hooks_result()
 
 // -- a hook is scaffolding, and a build that runs nothing drops it ----------------------------------
 
-// Analyzed in every build, emitted in one: a hook that stopped being checked outside `sysl test`
-// would rot exactly as an unchecked test would.
-@test("a broken hook is an error in an ordinary build")
+// Analyzed and emitted by `sysl test` alone: every other build drops a hook before analysis, so a
+// broken one is that command's to report, as a broken test is.
+@test("a broken hook is an error to 'sysl test', and an ordinary build never reads it")
 tax_a_broken_hook()
     if !tax_ready() then return
 
-    val said = tax_err("@setup\ns() =\n    print(undefined_name)\n")
+    val source = "@setup\ns() =\n    print(undefined_name)\n\nprint(\"program\")\n"
+    val said = tax_err(source)
 
     assert(said.contains("undefined name 'undefined_name'"), said)
     assert(said.contains("main.sysl:3:11"), said)
+
+    val out = tax_ir(source)
+
+    assert(!out.starts_with("did not compile"), out)
 
 @test("an ordinary build emits neither the hook nor what only it calls")
 tax_an_ordinary_build_drops_the_hook()
@@ -508,18 +514,18 @@ tax_an_ordinary_build_drops_the_hook()
     assert(!out.contains("only_the_hook_calls_me"), "the hook's callee is dropped with it")
     assert(out.contains("program"), "the program itself is emitted")
 
-// -- a test is analyzed whether or not the build would run it ---------------------------------------
+// -- a test is analyzed by the build that runs it, and by no other -----------------------------------
 
-@test("a broken test is an error in an ordinary build")
+@test("a broken test is no error in an ordinary build, which drops it before analysis")
 tax_a_broken_test_in_an_ordinary_build()
     if !tax_ready() then return
 
-    val said = tax_err("@test\nt() =\n    print(undefined_name)\n")
+    val out = tax_ir("@test\nt() =\n    print(undefined_name)\n\nprint(\"program\")\n")
 
-    assert(said.contains("undefined name 'undefined_name'"), said)
-    assert(said.contains("main.sysl:3:11"), said)
+    assert(!out.starts_with("did not compile"), out)
+    assert(out.contains("program"), "the program itself is emitted")
 
-@test("a broken test is an error in a test build too")
+@test("a broken test is an error in a test build")
 tax_a_broken_test_in_a_test_build()
     if !tax_ready() then return
 

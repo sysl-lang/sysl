@@ -15,9 +15,22 @@ module sysl
  * it could say that the source line does not already. These are checks a *program* makes, about
  * things it knows and the compiler does not, so the message is the whole point of them.
  *
+ * **`trap` is that same instruction, for a program that wants it.** Use it where there is nothing
+ * to say or nowhere to say it -- a bare-metal `abort`, a fault handler that must not print, a path
+ * that reaches the machine in a state no message could be written from -- and use `assert` or
+ * `panic` everywhere else. It needs no capability, allocates nothing and prints nothing.
+ *
  * Under `sysl test` either one fails the test it is written in, since a test's verdict is whether it
  * came back and neither of these comes back.
  */
+
+private extern "llvm.trap" llvm_trap() -> never
+
+/** Stops the program at once, silently, with the target's trap instruction: `udf` on Thumb, `brk`
+ * on AArch64, `unimp` on RISC-V, `ud2` on x86-64. It never returns, runs no `defer` and flushes nothing, which is what
+ * a compiler-inserted check does, and it is legal on every target and under `@no_alloc`.
+ */
+trap() -> never = llvm_trap()
 
 // Where the caller was. Both take these and neither is ever given them: a default is evaluated at
 // the call, standing exactly where the argument would have been written (`reference/declarations.md
@@ -67,10 +80,10 @@ assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LIN
 // The message could be written by hand -- `assert(a == b, s"got $a, want $b")` -- and that is the
 // form this replaces. It evaluates each side twice, and it builds a string, which makes heap
 // storage and so is unavailable to the modules that want an assertion most (`reference/modules.md §
-// Capabilities are a module property`). Rendering through `Display` into `stdout()` costs neither.
+// Capabilities are a module property`). Rendering through `Debug` into `stdout()` costs neither.
 //
-// One function rather than one per type: `Eq` says the comparison means something and `Display` says
-// the value can be shown, which together are the whole of what a report needs.
+// One function rather than one per type: `Eq` says the comparison means something and `Debug` -- which
+// every type has -- says how the value is shown, which together are the whole of what a report needs.
 
 /** The head and the tail of a report, shared by the three below so that one failure reads like
  * another. They are separate because what goes between them is each assertion's own -- a pair of
@@ -92,13 +105,15 @@ private[sysl] report_tail(file: string, line: long) -> never
     prints(")\n")
     exit(1)
 
-private[sysl] show[T: Display](v: T) = v.display(stdout(), FormatSpec(0, -1, false))
+// Each side of a failed comparison is shown through its `Debug`, which every type has: a string
+// keeps its quotes, so `got "1", want 1` cannot read as two equal values.
+private[sysl] show[T: Debug](v: T) = v.debug(stdout(), FormatSpec(0, -1, false))
 
 /** `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
  * then what was meant to.
  */
-assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", file: string = __FILE__,
-                           line: long = __LINE__)
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = __FILE__,
+                         line: long = __LINE__)
     if got != want then
         report_head(msg)
         prints("got ")
@@ -111,8 +126,8 @@ assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", file: string = __F
  * sends its reader to find out where, and finding out where is a loop nobody wants to write at each
  * call. Length first, since a length mismatch explains every index after the shorter one.
  */
-assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg: string = "",
-                                 file: string = __FILE__, line: long = __LINE__)
+assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "",
+                               file: string = __FILE__, line: long = __LINE__)
     if got.len != want.len then
         report_head(msg)
         prints("got ")

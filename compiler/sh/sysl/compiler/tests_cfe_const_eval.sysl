@@ -673,7 +673,7 @@ cfe_the_step_limit()
 
     assert_eq(cfe_said("const spin() -> int\n    loop\n        continue\n\nconst k: int = spin()\n\nprint(k)\n"),
               "5:16 'k' did not finish within 16,000,000 steps while compiling — the loop at " +
-              "main.sysl:2:5 was still running\n")
+              "main.sysl:2:5 was still running; '--const-steps <n>' allows a longer run\n")
 end cfe_the_step_limit
 
 // A loop that never ends is stopped at any limit, and the message names the number whatever the limit
@@ -722,28 +722,29 @@ cfe_an_aggregate_holding_a_string()
                       "    n + int(p.s.len)\n\nconst k: int = f(3)\n\nprint(k)\n"), "5\n")
 end cfe_an_aggregate_holding_a_string
 
-@test("a call to a function that is not 'const' inside the body stops the run, beside the checker's word")
-cfe_a_call_that_is_not_const()
+@test("a call inside the body that cannot run stops the run, beside the checker's word")
+cfe_a_call_that_cannot_run()
     if !cfe_ready() then return
 
-    val said = cfe_said("noisy(x: int) -> int = x + 1\n\nconst f(x: int) -> int = noisy(x)\n\n" +
+    val said = cfe_said("noisy(x: int) -> int\n    print(x)\n    x\n\nconst f(x: int) -> int = noisy(x)\n\n" +
                         "const k: int = f(1)\n\nprint(k)\n")
 
-    assert(said.contains("3:26 'f' is 'const', so it runs while compiling, and it calls 'noisy', which " +
-                         "is not — mark 'noisy' 'const' too, or compute this at run time\n"), said)
-    assert(said.contains("5:16 'k' cannot be computed while compiling: 'f' calls 'noisy', which is not " +
-                         "'const' (main.sysl:3:26) — inside 'f(1)', called at main.sysl:5:16\n"), said)
-end cfe_a_call_that_is_not_const
+    assert(said.contains("5:26 'f' is 'const', so it runs while compiling, and it calls 'noisy', which " +
+                         "prints, which is outside the program — nothing outside the program exists while compiling\n"), said)
+    assert(said.contains("7:16 'k' cannot be computed while compiling: 'f' calls 'noisy', which prints, " +
+                         "which is outside the program — nothing outside the program exists while compiling (main.sysl:5:26) — inside 'f(1)', " +
+                         "called at main.sysl:7:16\n"), said)
+end cfe_a_call_that_cannot_run
 
-@test("a constant that calls a function that is not 'const' is told to mark it")
-cfe_the_advice_to_mark()
+@test("a constant calling an unmarked function runs it, and one that cannot run says why")
+cfe_an_unmarked_call_in_a_constant()
     if !cfe_ready() then return
 
-    assert_eq(cfe_said("size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"),
-              "3:21 the value of 'called' is not a constant expression — 'size' is not 'const', so it " +
-              "runs only when the program does; mark it 'const' to call it here\n")
-    assert_eq(enm_ran("const size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"), "4\n")
-end cfe_the_advice_to_mark
+    assert_eq(cfe_said("size() -> int\n    print(0)\n    4\n\nconst called: int = size()\n\nprint(called)\n"),
+              "5:21 'called' cannot be computed while compiling: it calls 'size', which prints, which is " +
+              "outside the program — nothing outside the program exists while compiling (main.sysl:5:21)\n")
+    assert_eq(enm_ran("size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"), "4\n")
+end cfe_an_unmarked_call_in_a_constant
 
 @test("a module 'val' whose call traps is refused at its initializer")
 cfe_a_val_that_traps()
@@ -755,17 +756,13 @@ cfe_a_val_that_traps()
               "inside 'per(1, 0)', called at main.sysl:3:21\n")
 end cfe_a_val_that_traps
 
-@test("a 'const' call where a type is read is refused until types can be read that way")
-cfe_not_where_a_type_is_read()
+@test("a 'const' call where a type is read is run while the declarations are")
+cfe_where_a_type_is_read()
     if !cfe_ready() then return
 
-    val said = cfe_said("const four() -> int = 4\n\nconst N: int = four()\n\nstruct S\n    a: [N]u8\n\n" +
-                        "print(sizeof(S))\n")
-
-    assert(said.contains("3:16 'four' is a 'const' function, but this value is read while declarations " +
-                         "are, before any body can be run — a 'const' call is evaluated where a value is " +
-                         "wanted, and not yet where a type is read\n"), said)
-end cfe_not_where_a_type_is_read
+    assert_eq(enm_ran("const four() -> int = 4\n\nconst N: int = four()\n\nstruct S\n    a: [N]u8\n\n" +
+                      "print(sizeof(S))\n"), "4\n")
+end cfe_where_a_type_is_read
 
 @test("a constant whose function reads the constant back is a loop, told once")
 cfe_a_loop_through_a_body()

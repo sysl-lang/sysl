@@ -60,9 +60,11 @@ end refused_default
 // Reads a compilation's declarations and types every body it can.
 //
 // `also_auto_imported` names modules auto-imported beside the standard one; see
-// `Analysis.also_auto_imported`. Every command hands nothing.
-analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string] = buf()) -> TypedBodies =
-    analyze_produced(written, t, buf(), true, None, also_auto_imported)
+// `Analysis.also_auto_imported`. Every command hands nothing. `image_entry` is the symbol the root
+// manifest says a bare image starts at (`Analysis.image_entry`).
+analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string] = buf(),
+               image_entry: string = "") -> TypedBodies =
+    analyze_produced(written, t, buf(), true, None, also_auto_imported, image_entry)
 
 // The same, told which of the files it was handed are the library's own being **built** rather than
 // supplied. Every other caller hands nothing and gets the ordinary reading, where the library's
@@ -70,13 +72,29 @@ analyze_bodies(written: Buf[Program], t: Target, also_auto_imported: Buf[string]
 analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
                  has_entry_point: bool = true,
                  index: Option[&DefinitionIndex] = None,
-                 also_auto_imported: Buf[string] = buf()) -> TypedBodies
-    val a = analysis_producing(t, producing)
+                 also_auto_imported: Buf[string] = buf(),
+                 image_entry: string = "") -> TypedBodies
+    // **The declarations may be read more than once**, where a type is written in terms of a call that
+    // can only run once they all have been (`const_decl.sysl`); each reading starts from nothing.
+    val fresh = () ->
+        val made = analysis_producing(t, producing)
 
-    a.index = index
-    a.also_auto_imported = also_auto_imported
+        made.index = index
+        made.also_auto_imported = also_auto_imported
+        made.image_entry = image_entry
+        made
 
-    val units = read_decls(a, written, has_entry_point)
+    val read = read_until_settled(fresh, written, has_entry_point)
+    val a = read.0
+    val units = read.1
+
+    phase_done("declarations")
+
+    // **A `c const` or `c type` block the C compiler refused stops the analysis here**: its file has
+    // no declarations left, and typing on would report every use of them as undefined, burying the
+    // refusal that explains all of them.
+    if c_probe_refused()
+        return TypedBodies(buf(), a.diagnostics(), 0, 0, 0, buf(), a, units, None, buf(), ModuleRoot)
 
     // Every declaration is read, so a body can be typed: a `const` call may run from here on.
     a.evaluation.ready = true
@@ -100,7 +118,13 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // **Every `some` result is settled first** -- the one pass that reads a body to learn a type. It
     // waits for every declaration, since such a body may name anything the program declares, and
     // runs before every other body, any of which may ask what an associated type is.
+    //
+    // **A result left to a body is readable from the same point and for the same reason**, so it is
+    // opened first -- a `some` body may call a function whose result is read off its own -- and the
+    // program's own are all read straight after, before any body is typed.
+    open_inferred_results(a)
     settle_opaque_results(a)
+    settle_inferred_results(a)
 
     check_generic_bodies(a, units)
 
@@ -120,6 +144,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // The entry file's asserts, once every constant has been folded; every other file's were settled
     // before the eager instantiation.
     check_top_level_asserts(a, units, true)
+
+    // Every use of an annotation the program declared, read or not.
+    check_annotations(a, units)
 
     // **The library's own functions are held back**: they are analyzed below, and only if
     // something reaches them. That is what keeps a program that never prints from carrying the
@@ -182,9 +209,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
                         val lowered = a.closure_funcs.len() > opened
 
                         if lowered && (d.test.is_some() || d.hook.is_some() ||
-                                       holds_string(a.tables.test_only, typed.name))
+                                       a.tables.test_only_keys.has(typed.name))
                             for k in opened..<a.closure_funcs.len()
-                                a.tables.test_only.push(a.closure_funcs.at(k).name)
+                                note_test_only(a, a.closure_funcs.at(k).name)
                 // A `where` predicate and a struct's `invariant` clauses are functions the
                 // declaration lowered to, and are typed where the declaration stands -- which is
                 // the order every other body is typed in.
@@ -214,7 +241,11 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
         // copies would say it once per implementing type, in terms the reader never wrote.
         if refused_default(a, m.name) then continue
 
-        if from_library(a, home) then
+        // A `Debug` the compiler supplied is held on the same terms: it cannot be wrong, and every
+        // struct and enum has one.
+        // A member written from a `derive` body belongs to the type that asked for it, wherever the
+        // trait was written, so it is held only where that type is the library's.
+        if from_library(a, derived_home(a, m.name).unwrap_or(home)) || supplied_debug(m.params) then
             held.hold(m.name, HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
 
@@ -285,10 +316,13 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // body it could reach to have been typed and the checks below walk it in that order.
     val ordered = init_ordered(a, storage, funcs)
 
-    whole_program_checks(a, units, with_entry_body(funcs, started), ordered)
+    // The bodies as they stand, which is what a check asking about the image builds the program from.
+    val typed = TypedBodies(funcs, buf(), generic, defaults, declared, ordered, a, units, entry,
+                            started.0, started.1)
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered, a, units,
-                entry, started.0, started.1)
+    whole_program_checks(a, units, with_entry_body(funcs, started), ordered, typed)
+
+    typed with { reported = a.diagnostics() }
 end analyze_produced
 
 // The statements the file the program starts in carries, typed in that file's own terms.
@@ -352,22 +386,28 @@ private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
 
         cx.body = entry_check_name(scope.module_name)
 
-        var out: Buf[TStmt] = buf()
-
         cx.enter()
 
-        // The entry file's statements are a block like any other, so the functions among them are
-        // its nested functions and are lowered together where the first of them stands.
-        open_block_group(cx, written)
-
-        for j in 0..<written.len()
-            push_all(&out, recover_stmt(cx, written.at(j)))
+        val out = first_use_read(cx, written, () -> entry_statements_read(cx, written))
 
         cx.leave()
         return (out, scope.module_name)
 
     (buf(), ModuleRoot)
 end entry_body
+
+// One reading of the entry file's statements. They are a block like any other, so the functions among
+// them are its nested functions and are lowered together where the first of them stands.
+private entry_statements_read(cx: &Analyzer, written: Buf[Stmt]) -> Buf[TStmt]
+    var out: Buf[TStmt] = buf()
+
+    open_block_group(cx, written)
+
+    for j in 0..<written.len()
+        push_all(&out, recover_stmt(cx, written.at(j)))
+
+    out
+end entry_statements_read
 
 // The body of a function a declaration lowered a condition to, typed where the declaration stands.
 //
@@ -470,6 +510,8 @@ from_library(a: &Analysis, scope: Scope) -> bool =
 private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
     var guard: usize = 0
 
+    queue_generic_drops(a)
+
     while !a.tables.members.pending.is_empty() && guard < 4096
         val work = a.tables.members.pending
 
@@ -480,23 +522,71 @@ private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
             val nested = a.tables.nested_generics.get(job.name)
 
             if nested.is_some()
+                val said = a.complaints()
+
                 funcs.push(nested_instance_body(a, nested.unwrap(), job.name, job.subst))
+
+                // Its instance names are the refused base with the type arguments mangled on.
+                for base in a.tables.members.bad_generics
+                    if job.name.starts_with(base + ".") then a.restore_complaints(said)
+
                 continue
 
             val cx = analyzer_for(a, job.scope)
 
             cx.subst = job.subst
 
-            // An instantiation of a member refused at its definition adds nothing to what was said
-            // there (`bad_generics`).
+            // An instantiation of a generic refused at its definition adds nothing to what was said
+            // there (`bad_generics`): a member is filed by its own key, a free function by its
+            // module's.
             val mark = a.complaints()
 
             funcs.push(analyze_instance_in(a, cx, job.name, job.decl))
 
-            if holds_string(a.tables.members.bad_generics, job.decl.name) then a.restore_complaints(mark)
+            val bad = a.tables.members.bad_generics
 
+            if holds_string(bad, job.decl.name) ||
+                    holds_string(bad, module_qualify(job.scope.module_name, job.decl.name)) then
+                a.restore_complaints(mark)
+
+        // Typing a body may have made a type real whose destructor is generic.
+        queue_generic_drops(a)
         guard += 1
 end drain_pending
+
+// **A generic type's destructor is a member no body calls**: what reaches it is the hook a box of the
+// type runs when its count reaches zero, which emission builds from the instantiated types. So every
+// instantiated type whose family implements `Drop` generically has its `drop` made real here, beside
+// the instantiations the bodies asked for -- once, the instantiation being filed by name.
+private queue_generic_drops(a: &Analysis)
+    val drops = drops_declared(a)
+
+    if drops.is_empty() then return
+
+    var types = reached_structs(a)
+
+    for item in reached_enums(a)
+        types.push(item)
+
+    for t in types
+        if !holds_string(drops, owner_key(t)) then continue
+
+        val found = member_key(a, t, "drop")
+        val generic = a.tables.members.generic.get(member_key_of(found.0, "drop"))
+
+        if generic.is_none() then continue
+
+        val home = a.tables.members.generic_scope.get(generic.unwrap().name)
+
+        if home.is_none() then continue
+
+        val name = member_func_name(analyzer_for(a, home.unwrap()), span_zero(), t, "drop")
+
+        if name == "" then continue
+
+        a.tables.members.generic_drops.put(mangle(t), name)
+        a.uses(name)
+end queue_generic_drops
 
 // Whether a declaration's symbol is one only its own file can name.
 file_local(v: Visibility) -> bool = v match
@@ -526,20 +616,22 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     for p in d.params
         val ty = resolve_type(a, scope, p.typ, no_bindings())
-        val unique = cx.bind(p.name, ty)
+        val unique = cx.bind(p.name, ty, written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
         params.push((unique, ty))
 
     // **A function that declares no result hands nothing back**, so its body is read with nothing
-    // expected and the value it comes to is discarded -- which is why `probe() = 42` is a `unit`
-    // function rather than an `int` one.
+    // expected and the value it comes to is discarded. A body written `= value` with no result
+    // declares the value's type (`inferred_results.sysl`), so `probe() = 42` is an `int` function and
+    // `probe()` followed by an indented `42` a `unit` one.
     val written = d.ret_type.map(w -> resolve_result(a, scope, w, no_bindings()))
     val ret = body_result(d, declared_result_type(written))
 
     cx.func_name = d.name
     cx.decl_name = d.name
+    cx.views_self = d.marks.views
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
@@ -551,7 +643,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
-    val body = body_block(cx, rest, ret)
+    val body = typed_body(cx, d, rest, ret)
 
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
     // the mistake is the signature and the body disagreeing, and the signature is where it is read.
@@ -600,6 +692,12 @@ owner_of(a: &Analysis, name: string, scope: Scope) -> string =
 private check_generic_bodies(a: &Analysis, units: Buf[Program])
     for unit in units
         val scope = scope_of_unit(a, unit)
+
+        // **The library's generic bodies were read where the library was built** (`build-lib`,
+        // `test --std`), against the same bounds; they are the same text in every program, so a
+        // program does not pay to read them again. A library module being produced is read here.
+        if from_library(a, scope) then continue
+
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         for j in 0..<unit.body.len()
@@ -611,14 +709,29 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
                 FuncDecl(written) ->
                     val d = with_call_bounds(written)
 
-                    if !d.tparams.is_empty() then check_abstract_body(a, scope, d)
+                    if !d.tparams.is_empty()
+                        val said = a.kept.len()
+
+                        check_abstract_body(a, scope, d)
+
+                        // Filed under its module's key, since two modules' generics may share a name.
+                        if a.kept.len() > said then
+                            a.tables.members.bad_generics.push(module_qualify(scope.module_name, d.name))
                 // A generic struct's clauses are a generic function, read at its definition as
                 // one is -- so a clause its bounds do not license is refused once, at the struct.
                 StructDecl(d) ->
                     if !d.invariants.is_empty() && !d.tparams.is_empty()
                         val f = a.tables.funcs.get(inv_key(module_qualify(scope.module_name, d.name)))
 
-                        if f.is_some() then check_abstract_body(a, scope, f.unwrap().decl)
+                        if f.is_some()
+                            val said = a.kept.len()
+                            val clauses = f.unwrap().decl
+
+                            check_abstract_body(a, scope, clauses)
+
+                            if a.kept.len() > said then
+                                a.tables.members.bad_generics.push(module_qualify(scope.module_name,
+                                                                                  clauses.name))
                 _ -> ()
 
     // A generic type's members and a generic `impl`'s are checkable before anything instantiates
@@ -632,6 +745,9 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
 
         if !a.tables.members.default_origin.has(fd.name)
             val scope = a.tables.members.decl_scope.get(fd.name).unwrap_or(empty_scope())
+
+            if from_library(a, scope) then continue
+
             val said = a.kept.len()
 
             check_abstract_body(a, scope, fd)
@@ -659,7 +775,7 @@ private check_trait_default_bodies(a: &Analysis)
         val decl = types.at(i)
 
         decl.kind match
-            TraitOf(td) -> check_defaults_of(a, decl.scope, key, td)
+            TraitOf(td) -> if !from_library(a, decl.scope) then check_defaults_of(a, decl.scope, key, td)
             _ -> ()
 end check_trait_default_bodies
 
@@ -679,7 +795,7 @@ end check_defaults_of
 
 // The function a trait's default reads as: the receiver becomes a `self` at `Self`, and `Self` is a
 // type parameter in front of the trait's own, bounded by the trait at those parameters.
-private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
+trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
     var params: Buf[Param] = buf()
     val recv = receiver_param(m, named_type(m.span, "Self"))
 
@@ -762,6 +878,8 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     if written.is_some() then subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(),
                                                                       subst)))
 
+    subst = with_derive_param(a, d.name, subst)
+
     val cx = analyzer_for(a, scope)
 
     cx.subst = subst
@@ -770,7 +888,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
@@ -782,6 +900,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
 
     cx.func_name = d.name
     cx.decl_name = d.name
+    cx.views_self = d.marks.views
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written_result_list(d.ret_type)
@@ -827,10 +946,16 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     // parameter stands for whatever an instantiation picks, and what it is made of is checked there.
     if d.const_fn then check_const_signature(a, scope, d.name, d, params, ret)
 
-    a.tables.homes.put(d.name, scope)
-    a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
+    // **Filed under its module's key, not the name it was written with**: a free generic is declared
+    // as `spawn`, and `sh.sysl.pool`'s `spawn` and `sysl.threads`'s are two bodies -- filed under the
+    // bare name, the second one's file replaced the first's, and the standard module's body was held
+    // to the package's clause and reported at an offset of its own in the package's file.
+    val key = if d.name.contains("$") then d.name else module_qualify(scope.module_name, d.name)
+
+    a.tables.homes.put(key, scope)
+    a.tables.abstracts.push(TFunc(span_zero(), key, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
-                                  None, None, no_marks(), cx.owner, d.const_fn, Some(scope.src), false))
+                                  None, None, d.marks, cx.owner, d.const_fn, Some(scope.src), false))
 
     // Its closures are part of the body it was written as, and answer for it beside it.
     for closure_func in lowered
@@ -873,6 +998,8 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     if written.is_some() then subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(),
                                                                       subst)))
 
+    subst = with_derive_param(a, d.name, subst)
+
     val cx = analyzer_for(a, scope)
 
     cx.subst = subst
@@ -880,12 +1007,13 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
 
         if p.by_name then cx.by_name.push(unique)
 
     cx.func_name = d.name
     cx.decl_name = d.name
+    cx.views_self = d.marks.views
     cx.ret_ty = Some(Unknown)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = false
@@ -903,7 +1031,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
 
     // The closures it lowered go with the environments just rewound; the real reading lowers its own.
     a.closure_funcs.truncate(closures)
-    a.closure_count = counted
+    a.closure_count = closure_rewind(a, counted)
 
     if clean then body.ty else Unknown
 end opaque_body_type
@@ -995,8 +1123,11 @@ end analyze_instance
 // The same, on an analyzer whose terms a caller has already set.
 analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> TFunc
     val reaching = enter_reaching(a, d)
+    val said = a.complaints()
 
     defer leave_reaching(a, reaching)
+    // A member a `derives` clause wrote from a trait's template is refused at the clause.
+    defer told_at_derives(a, d.name, said)
 
     val sig = a.tables.members.func_insts.get(name)
 
@@ -1027,6 +1158,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     cx.func_name = name
     cx.body = name
     cx.decl_name = d.name
+    cx.views_self = d.marks.views
     note_body_covers(a, name)
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
@@ -1039,7 +1171,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val split = contract_length(d.body)
     val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
     val rest = statements_from(d.body, split)
-    val body = body_block(cx, rest, ret)
+    val body = typed_body(cx, d, rest, ret)
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
@@ -1124,8 +1256,22 @@ body_block(cx: &Analyzer, rest: Buf[Stmt], ret: Type) -> TBlock
 
     if gave_up then return TBlock(block.stmts, block.result, Unknown)
 
+    // A local read after a `@consumes` call emptied it, on any path (`consumes.sysl`).
+    check_consumes(cx, block)
+
+    // What the body comes to leaves the function as a `return` does, after every local it bound
+    // has been let go of (`view_borrow.sysl`).
+    if block.result.is_some() then note_view_return(cx, block.result.unwrap().span,
+                                                    block.result.unwrap())
+
     block
 end body_block
+
+// A declaration's body, read against its result -- or, where the result was to be read off the body
+// and could not be, read as that reading read it, so what stopped it is what the reader is told.
+typed_body(cx: &Analyzer, d: FuncDecl, rest: Buf[Stmt], ret: Type) -> TBlock =
+    if ret == Unknown && is_inferred_result(d.ret_type) then own_result_block(cx, rest)
+    else body_block(cx, rest, ret)
 
 // What a function hands back: the tuple a result list lays out as, and `unit` where none was
 // written.
@@ -1615,27 +1761,47 @@ private module_storage(a: &Analysis) -> Buf[TVal]
         for i in 0..<a.tables.vals.len()
             val key = a.tables.vals.key_at(i)
             val writable = holds_string(a.tables.writable, key)
+            // The value a `var` binding takes apart is read with that binding's names, ahead of
+            // them, as a `val` binding's is read ahead of its own.
+            val first = writable || held_whole_keyword(a.tables.vals.at(i).name) == "var"
 
-            if (pass == 0) == writable
+            if (pass == 0) == first
                 val d = a.tables.vals.at(i)
                 val cx = analyzer_for(a, d.scope)
                 // `stored` is what the storage is declared at, qualifier and all; `ty` is what a read
                 // of it hands back, which is what the initializer is held to.
-                val stored = if d.typ.is_none() then Unknown
+                //
+                // **Storage written with no type takes its initializer's** (`storage_type`), read here
+                // with nothing expected, as a local `val`'s is.
+                val inferred = d.typ.is_none() && d.init.is_some()
+                var stored = if d.typ.is_none() then Unknown
                 else resolve_storage(a, d.scope, d.typ.unwrap(), d.name, writable)
-                val ty = unqualified(stored)
 
                 var init: Option[TExpr] = None
 
+                if inferred
+                    a.vals_in_progress.push(key)
+                    init = Some(type_expr(cx, d.init.unwrap(), None))
+                    a.vals_in_progress.truncate(a.vals_in_progress.len() - 1)
+                    stored = inferred_storage(cx, key, d, texpr_type(init.unwrap()))
+                    check_exposed_inferred(a, d, stored)
+                end if
+
+                val ty = unqualified(stored)
+
                 if d.init.is_some()
-                    init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
+                    if !inferred then init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
 
                     // The rule a local binding is held to: the value is fine as an expression, and
                     // the declaration is the mistake.
                     val got = texpr_type(init.unwrap())
 
+                    // The value a module binding takes apart is named by the binding, in the words
+                    // the same binding in a body is refused with.
+                    val what = if is_held_whole(d.name) then "the parts of this binding" else s"'${d.name}'"
+
                     if disagree(got, ty) then
-                        cx.fault(d.span, s"cannot initialize '${d.name}': declared ${type_show(ty)} but " +
+                        cx.fault(d.span, s"cannot initialize $what: declared ${type_show(ty)} but " +
                                  s"the value is ${type_show(got)}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())
@@ -1713,10 +1879,51 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
                               d.thread_local, d.per_cpu, d.main_thread, exported_storage_symbol(d),
-                              storage_hidden(d)))
+                              storage_hidden(d), false))
 
     out
 end module_storage
+
+// The type a `val` or `var` written with none is stored at, which is its initializer's -- refused
+// where the initializer reaches the storage itself, so there is no type for it to take, and where it
+// is a bare closure, whose type has no name for module storage to be declared at.
+private inferred_storage(cx: &Analyzer, key: string, d: ValueDecl, got: Type) -> Type
+    val shown = if d.scope.module_name == "" then d.name else s"${d.scope.module_name}.${d.name}"
+
+    // The value a module binding takes apart (`hoist.sysl`'s `held_once`) is no name of the reader's,
+    // and its type is written for the whole binding.
+    if holds_string(cx.an.val_cycles, key) && is_held_whole(d.name)
+        cx.fault(d.span, "this binding takes its parts' types from its value, and the value reaches " +
+                 s"what it binds again — write the type of the whole value, '${held_whole_keyword(d.name)} (…): T = …'")
+
+        return Unknown
+    end if
+
+    if holds_string(cx.an.val_cycles, key)
+        val word = if holds_string(cx.an.tables.writable, key) then "var" else "val"
+
+        cx.fault(d.span, s"'$shown' takes its type from its value, and the value reaches '$shown' " +
+                 s"again — write its type, '$word ${d.name}: T = …'")
+
+        return Unknown
+    end if
+
+    if is_closure_literal(got)
+        cx.fault(d.span, s"'$shown' would hold a closure, whose type has no name for module storage to " +
+                 "be declared at — declare it as a function instead")
+
+        return Unknown
+    end if
+
+    var known = false
+
+    for item in cx.an.val_types
+        if item.0 == key then known = true
+
+    if !known then cx.an.val_types.push((key, got))
+
+    got
+end inferred_storage
 
 // `&` in front of a value writes it into a hidden local of the scope the `&` stands in, and a module
 // initializer runs in a prologue whose frame is gone by the program's first statement -- so the slot
@@ -1743,6 +1950,17 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 // the keyword, and a freestanding one silently gets the local-exec model, whose offset is read from
 // a register nothing on a bare machine has written -- so the alternative to this refusal is a
 // program that reads a wild address.
+// Refuses a declaration over what the machine lacks -- at once in the program's own modules and the
+// standard module's, and in a dependency's only once the program is known to reach that module
+// (`checks.sysl`'s `program_reach`), since a module the program never names is not asked.
+private refuse_for_target(cx: &Analyzer, span: Span, message: string)
+    val a = cx.an
+    val handed = holds_string(a.tables.supplied_modules, cx.scope.module_name)
+
+    if !handed || from_library(a, cx.scope) then cx.fault(span, message)
+    else a.target_refusals.push((cx.scope, span, message))
+end refuse_for_target
+
 private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool,
                          init: Option[TExpr])
     val t = cx.an.tables.target
@@ -1750,10 +1968,11 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
     // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
     // thread pointer itself on every switch, so once the manifest says which register that is
     // (`codegen.thread_pointer`), the local-exec offset is read from storage the program answers for.
-    val owned = t.cpu == Aarch64 && thread_pointer_register().is_some()
+    // `thread_local_accepted` is that answer, and `#if thread_local` reads the same one.
+    val accepted = thread_local_accepted(t)
 
-    if !t.thread_local_storage() && !owned && t.cpu == Aarch64
-        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
+    if !accepted && t.cpu == Aarch64
+        refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
                  "program says which register holds the thread pointer: there is no loader here to " +
                  "lay a thread's storage down, so the program does it — 'sysl.threads' lays the block " +
                  "of every thread it starts and 'sysl.threads.tls_place' lays the first's, and the " +
@@ -1761,8 +1980,8 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
                  "Name the register in package.hocon as 'codegen { thread_pointer = \"tpidr_el1\" }' " +
                  "('tpidr_el0', 'tpidrro_el0', 'tpidr_el2' and 'tpidr_el3' are the others), or declare " +
                  "it as a plain module 'var' and let the scheduler answer for which thread is running")
-    else if !t.thread_local_storage() && !owned
-        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
+    else if !accepted
+        refuse_for_target(cx, span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
                  "is no loader and no libc on this target, so nothing lays a thread's storage down " +
                  "and nothing writes the thread pointer the offset would be read from. Declare it " +
                  "as a plain module 'var' and let the port's scheduler answer for which task is " +
@@ -2021,18 +2240,24 @@ end storage_align
 
 // Whether a value can be **laid down** rather than worked out: everything about it is known while
 // compiling, so the object file carries the bytes and nothing runs to fill them in.
-private laid_down(t: TExpr) -> bool = *t.kind match
+laid_down(t: TExpr) -> bool = *t.kind match
     TIntLit(_, _) -> true
     TFloatLit(_, _) -> true
     TQuadLit(_, _, _) -> true
     TBoolLit(_) -> true
     TStrLit(_) -> true
+    TCStrLit(_) -> true
     TEmbed(_, _, _) -> true
     TNullLit(_) -> true
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
     TBufLit(elems, _) -> all_laid_down(elems)
-    TStructNew(_, args) -> all_laid_down(args)
+    // A `@packed` struct holding a union stays code, and so does one with C bitfields, which LLVM
+    // also sees as packed: its constant would need the packed brackets
+    // around a union's image, which LLVM's literal types do not take.
+    TStructNew(decl, args) ->
+        if decl.union_layout then written_laid_down(args)
+        else !((decl.packed || !decl.c_bits.is_empty()) && holds_union(Struct(decl))) && all_laid_down(args)
     TEnumNew(_, variant, _) -> !variant.carries
     TCast(inner, to) ->
         val pointerish = to match
@@ -2045,12 +2270,23 @@ private laid_down(t: TExpr) -> bool = *t.kind match
             _ -> false)
     _ -> false
 
-private all_laid_down(xs: Buf[TExpr]) -> bool
+all_laid_down(xs: Buf[TExpr]) -> bool
     for item in xs
         if !laid_down(item) then return false
 
     true
 end all_laid_down
+
+// A union's construction holds its one value among `()`s standing for the fields it was not built
+// with (`union_call`), and only the value is asked.
+private written_laid_down(xs: Buf[TExpr]) -> bool
+    for item in xs
+        *item.kind match
+            TUnitLit -> ()
+            _ -> if !laid_down(item) then return false
+
+    true
+end written_laid_down
 
 // Whether an initializer laid down as data would build a view: a slice literal, anywhere inside the
 // arrays and structs it is made of.
@@ -2089,11 +2325,156 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TArrayLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
     TArrayFill(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
     TBufLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
-    TStructNew(decl, args) -> static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
+    // A union is data as a struct is: its one value laid down at its first byte, and the rest of its
+    // bytes zero (`emit_static.sysl`'s `union_image`).
+    TStructNew(decl, args) ->
+        if decl.union_layout then written_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
+        else static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
     TConstrainedCheck(value, target) -> constrained_image(cx, name, t, value, target)
-    TAddrOf(place, ty) -> place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
+    TAddrOf(place, ty) ->
+        val device = device_place(cx, name, place)
+
+        if device.is_some() then return Some(device_address(cx, t, device.unwrap(), ty))
+
+        place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
+    // A function's address is a relocation too, C's `static void (*f)(void) = setup;`.
+    TFuncAddr(_, _, _) -> Some(t)
+    TErase(operand, vtable, ty) -> erase_image(cx, name, t, operand, vtable, ty)
+    TGlobal(symbol, ty, writable) ->
+        val address = if writable || !is_pointerish(ty) then None else val_address(cx, name, symbol, ty)
+
+        if address.is_some() then address else leaf_image(cx, name, t)
+    TEnumNew(en, variant, args) ->
+        if !variant.carries then return leaf_image(cx, name, t)
+
+        val parts = static_images(cx, name, args)
+
+        if parts.is_none() then return None
+
+        val whole = TExpr(t.span, TEnumNew(en, variant, parts.unwrap()))
+
+        if payloads_laid(cx.an.tables.layout, whole) then Some(whole) else None
     _ -> leaf_image(cx, name, t)
+
+// **A trait object over the address of module storage is constant data**: it is two addresses, the
+// object's and its type's table for the trait, and the linker fills in both. Anything else erased --
+// a value that is not such an address -- stays code.
+private erase_image(cx: &Analyzer, name: string, t: TExpr, operand: TExpr, vtable: string,
+                    ty: Type) -> Option[TExpr]
+    val inner = static_image(cx, name, operand)
+
+    if inner.is_none() then return None
+
+    *inner.unwrap().kind match
+        TAddrOf(_, _) -> Some(TExpr(t.span, TErase(inner.unwrap(), vtable, ty)))
+        _ -> None
+end erase_image
+
+// **A module `val` holding a constant address is that address** where another initializer names it:
+// `val PAIR: *Pair = ptr_cast(AT)` read by `var named: *Pair = PAIR` is the same device address,
+// laid down as one, and so is `&target` read through a `val` over it. A `val` whose initializer is
+// anything else -- code, or a value that is not an address -- is left to the fold and the evaluator,
+// and one being worked out already is the cycle the initialization order reports.
+private val_address(cx: &Analyzer, name: string, symbol: string, ty: Type) -> Option[TExpr]
+    val ev = cx.an.evaluation
+
+    for item in ev.vals_reading
+        if item == symbol then return None
+
+    val typed = val_init_typed(cx, symbol, ty)
+
+    if typed.is_none() then return None
+
+    // The other initializer is imaged as its own storage's is, and what that says about it is said
+    // there: a trial here reports nothing.
+    val mark = cx.an.complaints()
+
+    ev.vals_reading.push(symbol)
+
+    val image = static_image(cx, name, typed.unwrap())
+
+    ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+    cx.an.restore_complaints(mark)
+
+    if image.is_none() then return None
+
+    *image.unwrap().kind match
+        TCast(_, _) -> image
+        TAddrOf(_, _) -> image
+        _ -> None
+end val_address
+
+private is_pointerish(t: Type) -> bool = t match
+    Ptr(_) -> true
+    CFn(_, _) -> true
+    _ -> false
+
+// **A place reached through a constant device address is at a constant address too**: `&PAIR.b`
+// over `val PAIR: *Pair = ptr_cast(AT)` is `AT` plus the field's offset, and an element at an index
+// the compiler can fold is the element's size that many times further on. A bitfield has no address
+// of its own, and an index the array does not have stays code that traps where it runs.
+private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] = *place.kind match
+    TDeref(operand, _) -> device_pointer(cx, name, operand)
+    TField(receiver, index, _) ->
+        val rty = texpr_type(receiver)
+        val through = pointee(rty)
+        val holder = if through.is_some() then through.unwrap() else rty
+        val d = underlying(holder) match
+            Struct(found) -> found
+            _ -> return None
+
+        if bitfield_ranges_of(holder).is_some() || c_bit_field(holder, index) then return None
+
+        val base = if through.is_some() then device_pointer(cx, name, receiver)
+                   else device_place(cx, name, receiver)
+
+        if base.is_none() then return None
+
+        cx.an.tables.layout.field_offset(d, d.fields.at(usize(index)).0) match
+            Some(offset) -> word_address(cx, base.unwrap() + long(offset))
+            None -> None
+    TIndex(receiver, index, _) ->
+        val (length, elem) = nameless(texpr_type(receiver)) match
+            Array(n, el) -> (long(n), *el)
+            _ -> return None
+
+        val at = const_fold_typed(index, cx.an.tables.layout.little_endian) match
+            Some(ConstInt(n)) -> n.to_long()
+            _ -> None
+
+        if at.is_none() || at.unwrap() < 0 || at.unwrap() >= length then return None
+
+        val base = device_place(cx, name, receiver)
+
+        if base.is_none() then return None
+
+        word_address(cx, base.unwrap() + at.unwrap() * long(cx.an.tables.layout.size(elem)))
+    _ -> None
+
+// The device address a pointer-valued initializer comes to, where it comes to one.
+private device_pointer(cx: &Analyzer, name: string, pointer: TExpr) -> Option[long]
+    val image = static_image(cx, name, pointer)
+
+    if image.is_none() then return None
+
+    *image.unwrap().kind match
+        TCast(value, _) -> *value.kind match
+            TIntLit(n, _) -> n.to_long()
+            _ -> None
+        _ -> None
+end device_pointer
+
+// An address the target's word holds, or nothing where the sum ran past it.
+private word_address(cx: &Analyzer, at: long) -> Option[long]
+    val bits = int(cx.an.tables.layout.word_bits)
+
+    if at < 0 || (bits < 63 && at >= (long(1) << bits)) then None else Some(at)
+end word_address
+
+// A device address as the conversion the emitter writes as `inttoptr`, at the type the `&` gave it.
+private device_address(cx: &Analyzer, t: TExpr, at: long, ty: Type) -> TExpr =
+    TExpr(t.span, TCast(TExpr(t.span, TIntLit(from_int(at), usize_type(int(cx.an.tables.layout.word_bits)))), ty))
 
 // A scalar that is not an aggregate, a conversion or an address: a literal as it stands, an
 // expression the typed fold settles, or a `const` call the evaluator runs.
@@ -2121,7 +2502,12 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
 
         if d.is_some() && (d.unwrap().thread_local || d.unwrap().per_cpu) then None else Some(place)
     TField(receiver, index, ty) ->
-        if bitfield_ranges_of(texpr_type(receiver)).is_some() then return None
+        // A field through a pointer is a load before it is an address (`device_place` has the
+        // pointer that is a constant).
+        val rty = texpr_type(receiver)
+
+        if bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index) || pointee(rty).is_some() then
+            return None
 
         place_image(cx, receiver).map(r -> TExpr(place.span, TField(r, index, ty)))
     TIndex(receiver, index, ty) ->
@@ -2211,6 +2597,23 @@ private fixed_image(t: TExpr, from: TExpr, to: Type) -> Option[TExpr] =
             _ -> None
         None -> None
 
+// The same over a union's construction: its `()`s stay where they are.
+private written_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
+    var out: Buf[TExpr] = buf()
+
+    for item in xs
+        *item.kind match
+            TUnitLit -> out.push(item)
+            _ ->
+                val x = static_image(cx, name, item)
+
+                if x.is_none() then return None
+
+                out.push(x.unwrap())
+
+    Some(out)
+end written_images
+
 private static_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
     var out: Buf[TExpr] = buf()
 
@@ -2247,5 +2650,10 @@ private scalar_image(t: TExpr, little: bool) -> Option[TExpr]
         ConstRecord(_, _) -> None
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
+        ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end scalar_image
 

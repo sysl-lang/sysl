@@ -260,10 +260,27 @@ private[buf] struct BufCore[T]
         gone
     end remove
 
+    /** Room for at least `more` elements past the count, grown once now -- geometrically, as a push
+     * grows it -- where there is not that much already.
+     */
+    reserve(*self, more: usize)
+        if more > self.elems.len - self.count then self.grow(self.count + more)
+
+    /** The count moved to `n`. Past the storage is a mistake and panics; below the count is
+     * `truncate`, giving the elements up; above it, the slots between are taken as they are.
+     */
+    set_len(*self, n: usize)
+        if n > self.elems.len then past_room(n, self.elems.len)
+
+        if n < self.count then self.truncate(n) else self.count = n
+
     /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
      * a view of the storage rather than a copy, so it is only valid while nothing pushes.
      */
     view(self) -> []T = self.elems[..<self.count]
+
+    // The storage past the count.
+    spare(self) -> []T = self.elems[self.count..]
 end BufCore
 
 /** A sequence that grows, and the name every holder of it shares.
@@ -317,68 +334,95 @@ struct Buf[T]
      */
     count -> usize = self.len()
 
-    len(self) -> usize = if !is_null(self.core) then self.core.count else 0
+    const len(self) -> usize = if !is_null(self.core) then self.core.count else 0
 
-    cap(self) -> usize = if !is_null(self.core) then self.core.elems.len else 0
+    const cap(self) -> usize = if !is_null(self.core) then self.core.elems.len else 0
 
-    is_empty(self) -> bool = self.len() == 0
+    const is_empty(self) -> bool = self.len() == 0
 
-    at(self, i: usize) -> T
-        if is_null(self.core) then past_end(i, 0)
-        self.core.at(i)
+    const at(self, i: usize) -> T = self.reading().at(i)
 
-    set(self, i: usize, v: T)
-        if is_null(self.core) then past_end(i, 0)
-        self.core.set(i, v)
+    const set(self, i: usize, v: T) = self.reading().set(i, v)
+
+    /** The core an index reads through: this handle's own, or the empty one a handle naming nothing
+     * reads as -- whose count of zero refuses every index with the same report a buffer's own would.
+     *
+     * **It is a choice of address, not a branch around the read**, and that is what lets a loop of
+     * reads keep the storage and the count in registers. Behind an `if` the core's fields are read
+     * only on the arm where the handle names something, and a read the optimizer cannot prove happens
+     * on every turn is one it may not hoist; chosen this way, every turn reads the same address, and
+     * the panic that reports an index stays inside the loop where the index is.
+     */
+    private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
 
     // Every member that can move the storage or give an element up is `@relocates`, so a live `ref`
     // to an element is refused the call.
     @inline
     @relocates
-    push(self, v: T)
+    const push(self, v: T)
         if is_null(self.core) then unassigned(BufUnassigned)
         self.core.push(v)
 
     @relocates
-    extend(self, xs: []const T)
+    const extend(self, xs: []const T)
         if is_null(self.core) then unassigned(BufUnassigned)
         self.core.extend(xs)
 
     @relocates
-    pop(self) -> Option[T] = if !is_null(self.core) then self.core.pop() else None
+    const pop(self) -> Option[T] = if !is_null(self.core) then self.core.pop() else None
 
     @relocates
-    truncate(self, n: usize)
+    const truncate(self, n: usize)
         if !is_null(self.core) then self.core.truncate(n)
 
     @relocates
-    clear(self)
+    const clear(self)
         if !is_null(self.core) then self.core.truncate(0)
 
     @relocates
-    insert(self, i: usize, v: T)
+    const insert(self, i: usize, v: T)
         if is_null(self.core) then unassigned(BufUnassigned)
         self.core.insert(i, v)
 
+    /** Room for at least `more` elements past `len()`, so that many pushes -- or that many slots
+     * written through `spare()` -- need no growth. `cap()` afterwards is at least `len() + more`;
+     * the storage grows the way a push grows it, so asking for one more at a time still costs
+     * amortized constant time. The elements already here keep their values, and their addresses only
+     * where nothing had to grow.
+     */
     @relocates
-    remove(self, i: usize) -> T
+    const reserve(self, more: usize)
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.reserve(more)
+
+    @relocates
+    const remove(self, i: usize) -> T
         if is_null(self.core) then past_end(i, 0)
         self.core.remove(i)
 
     /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
      * is not this one, every other way of handing a `Buf` on handing on this one.
      */
-    copy(self) -> Buf[T]
+    const copy(self) -> Buf[T]
         var out: Buf[T] = Buf(BufCore(slot_storage(self.len()), 0))
 
         out.extend(self.view())
         out
 
+    /** The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer --
+     * through this name and every other -- left empty (`Frozen`). The elements are copied once into
+     * storage sized to them. A local this is called on may not be read again until it is assigned
+     * a new value (`@consumes`).
+     */
+    @relocates
+    @consumes
+    const freeze(self) -> &sync Frozen[T] = freeze_buf(self)
+
     /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
      * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
      * this name or any other for the same buffer.
      */
-    view(self) -> []T = if !is_null(self.core) then self.core.view() else []
+    const view(self) -> []T = if !is_null(self.core) then self.core.view() else []
 
     /** This name's share of the buffer given back, and the handle left naming nothing -- the state
      * zeroed storage starts in, where every reader answers as an empty buffer does. Nothing is
@@ -430,10 +474,56 @@ private[sysl] enum Unassigned
 // accessor: the whole member is then too big for a caller to absorb, so every read is a call and a
 // frame. Behind a name that does not return, what is left where the check was is a compare and a
 // branch, and the accessor is small enough to disappear into its caller.
+/** An empty core at every element type: storage `[]` and a count of zero are all-zero words, four of
+ * them -- the view's three and the count -- whatever `T` is. A `var` only because an address is taken
+ * of it: it is never written, since a count of zero refuses every index before anything is.
+ */
+private[buf] var NoCore: [4]usize = [0, 0, 0, 0]
+
 private past_end(i: usize, n: usize) -> never
     print("panic: index", i, "past the", n, "elements of a Buf")
     exit(1)
 end past_end
+
+// The report a length past the storage makes, out of line for `past_end`'s reason.
+private past_room(n: usize, room: usize) -> never
+    print("panic: length", n, "past the", room, "slots a Buf has room for")
+    exit(1)
+end past_room
+
+/** The storage past a buffer's elements, filled by something other than `push` -- a C function
+ * handed its address, or a writer handed it as a `[]T` -- and then taken into the count without a
+ * second copy:
+ *
+ * ```
+ * b.reserve(n)
+ * val got = fill(b.spare())       // writes into the first `got` slots
+ * b.set_len(b.len() + got)
+ * ```
+ *
+ * **Only a buffer whose element type is `AnyBits` has these.** A slot `set_len` takes in holds
+ * whatever was in its storage: the bytes written there, or, for a slot nobody wrote, whatever the
+ * allocator left -- an unspecified value, which for an `AnyBits` type is still a value of it. A
+ * `bool`, an enum, a `string` or a `&T` read out of bytes nobody wrote would not be one, so those
+ * buffers are refused the call at compile time.
+ */
+impl[T: AnyBits] Buf[T]
+
+    /** The slots past `len()`, as a slice of `cap() - len()` -- the room a writer may fill. It is a
+     * view of the storage, so it is valid only until the buffer next grows.
+     */
+    spare(self) -> []T = if !is_null(self.core) then self.core.spare() else []
+
+    /** The length set to `n`, taking the slots between the old length and `n` as the elements they
+     * already hold. **Nothing is written** -- not a fill, not a zero: a slot holds what was last
+     * stored in it, which for a slot never written is whatever the allocator left, and for one
+     * `truncate` gave up is the value it had. Below `len()` it is `truncate(n)`. Past `cap()` it
+     * panics, the way an index past the end does.
+     */
+    @relocates
+    set_len(self, n: usize)
+        if !is_null(self.core) then self.core.set_len(n)
+        else if n > 0 then past_room(n, 0)
 
 /** A buffer compares as the sequence it holds, which is `view()` -- the elements it actually has,
  * rather than the backing slice, whose slots past `count` were never written.
@@ -443,7 +533,7 @@ end past_end
  * this is the growable sequence saying it is the same sequence.
  */
 impl[T: Eq] Eq for Buf[T]
-    eq(self, rhs: Self) -> bool = self.view() == rhs.view()
+    const eq(self, rhs: Self) -> bool = self.view() == rhs.view()
 
 /** A buffer renders as the sequence it holds, which is `view()` -- the same delegation its equality
  * goes through, and for the same reason.
@@ -455,23 +545,25 @@ impl[T: Eq] Eq for Buf[T]
 impl[T: Display] Display for Buf[T]
     display(self, out: *Writer, fmt: FormatSpec) = self.view().display(out, fmt)
 
+/** A `Buf` shows as the sequence it holds, `[1, 2, 3]`, rather than as the storage it is built from. */
+impl[T: Debug] Debug for Buf[T]
+    debug(self, out: *Writer, fmt: FormatSpec) = self.view().debug(out, fmt)
+
 /** Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
  * means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
  */
 impl[T] Index[usize, T] for Buf[T]
-    index(self, i: usize) -> T = self.at(i)
+    const index(self, i: usize) -> T = self.at(i)
 
 impl[T] IndexSet[usize, T] for Buf[T]
-    index_set(self, i: usize, v: T) = self.set(i, v)
+    const index_set(self, i: usize, v: T) = self.set(i, v)
 
 /** `b[i]` is the element where it lives: the address, checked against the count, so `b[i].f` reads
  * one field without copying the element and `ref e = b[i]` names it. Good until a `@relocates`
  * member moves the storage.
  */
 impl[T] IndexPlace[usize, T] for Buf[T]
-    index_place(self, i: usize) -> *T
-        if is_null(self.core) then past_end(i, 0)
-        self.core.place(i)
+    index_place(self, i: usize) -> *T = self.reading().place(i)
 
 /** `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
  * slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
@@ -479,9 +571,9 @@ impl[T] IndexPlace[usize, T] for Buf[T]
  */
 impl[T] Walk for Buf[T]
     type Walker = []T
-    walk(self) -> []T = self.view()
+    const walk(self) -> []T = self.view()
 
-buf[T]() -> Buf[T] = Buf(BufCore([], 0))
+const buf[T]() -> Buf[T] = Buf(BufCore([], 0))
 
 /** A buffer that has already been given room for `n` elements, for a caller that knows roughly how
  * many are coming. What it saves is the reallocation-and-copy at each doubling on the way up, which
@@ -491,7 +583,23 @@ buf[T]() -> Buf[T] = Buf(BufCore([], 0))
  * is not kept alive by the room it would once have been repeated into. The parameter stays because
  * callers write it, and because it is what lets a call say the element type without brackets.
  */
-buf_with_capacity[T](n: usize, fill: T) -> Buf[T] = Buf(BufCore(slot_storage(n), 0))
+const buf_with_capacity[T](n: usize, fill: T) -> Buf[T] = Buf(BufCore(slot_storage(n), 0))
+
+/** A buffer of `n` elements, every one of them `value` -- what a RAM disk, a frame buffer or a table
+ * of counters starts as. The storage is sized to `n` once and each slot is filled in place, so it
+ * costs one allocation and `n` stores rather than the doublings of a `push` loop.
+ *
+ * **Every element is a copy of `value`**, the way any assignment copies: a plain value is repeated,
+ * and a counted one is shared -- `n` elements naming one object, holding `n` counts of it.
+ */
+const buf_filled[T](n: usize, value: T) -> Buf[T]
+    var out: Buf[T] = Buf(BufCore(slot_storage(n), 0))
+
+    for _ in 0..<n
+        out.push(value)
+
+    out
+end buf_filled
 
 /** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
  * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier

@@ -1,0 +1,134 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **A dependency is a set of modules, and a board build is asked only about the ones it reaches**
+// (`reference/modules.md § The target's half needs no clause at all`). A heap-less, thread-less target
+// refuses a module that boxes, keeps `@thread_local` storage or starts threads -- in the program's
+// own modules, and in a dependency's module the program names. One it never names is not asked: not
+// by `@no_alloc`'s machine half, not by the `@thread_local` refusal, and not by the hooks a table
+// of its closures would have kept alive. And a refusal of a module that IS named points at the
+// construct, in the file it was written in.
+
+// A source root of three modules: one a board can use, and two it cannot.
+private dmh_root() -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("sh/dmh/free/free.sysl", "module sh.dmh.free\n\ntwice(x: u32) -> u32 = x * 2\n"))
+
+    // `spawn` shares its name with `sysl.threads`'s generic, whose freestanding body allocates.
+    files.push(("sh/dmh/boxy/boxy.sysl",
+        "module sh.dmh.boxy\n" +
+        "\n" +
+        "import sysl.threads.SleepLock\n" +
+        "\n" +
+        "struct Cell\n" +
+        "    v: int\n" +
+        "\n" +
+        "// A comment long enough that an offset read against the wrong file would land inside it.\n" +
+        "@thread_local var slot: int = 0\n" +
+        "\n" +
+        "make() -> &Cell = Cell(1)\n" +
+        "\n" +
+        "spawn[T](x: T) -> &Cell = Cell(2)\n" +
+        "\n" +
+        "guard() -> SleepLock = SleepLock.new()\n"))
+
+    // A closure whose body takes a lock: its table, kept as a root, would keep `sysl.threads`'s
+    // futex hooks in a program that never names this module.
+    files.push(("sh/dmh/locky/locky.sysl",
+        "module sh.dmh.locky\n" +
+        "\n" +
+        "import sysl.threads.SleepLock\n" +
+        "\n" +
+        "private var lock: SleepLock = SleepLock.new()\n" +
+        "\n" +
+        "run(f: &sync Fn() -> unit) = f()\n" +
+        "\n" +
+        "kick() = run(() -> lock.lock())\n"))
+
+    files.push(("sh/dmh/calls/calls.sysl",
+        "module sh.dmh.calls\n" +
+        "\n" +
+        "private call(f: &Fn(int) -> int, x: int) -> int = f(x)\n" +
+        "\n" +
+        "add(n: int, x: int) -> int = call(y -> y + n, x)\n"))
+
+    lbr_tree(files)
+end dmh_root
+
+// A heap-less board program: its config, and a `main` that is its image's entry.
+private dmh_board(program: string) -> string
+    lbr_tree(lbr_two("package.hocon",
+                     "package {\n  name = \"dmh-board\"\n  version = \"0.1.0\"\n}\n\n" +
+                     "capabilities { heap = false }\n",
+                     "main.sysl", program))
+end dmh_board
+
+private dmh_build_c(program: string, lib: string, target: string) -> (int, string) =
+    lbr_cli(["sysl", "build-c", program, "--target", target, "--lib", lib, "-o", s"$program/out.a"])
+
+@test("a board program naming one module of a dependency builds although its others need a heap")
+dmh_unnamed_modules_are_not_asked()
+    if !lbr_ready() then return
+
+    val lib = dmh_root()
+    val program = dmh_board("import sh.dmh.free.twice\n\n@export(\"main\")\nmain()\n" +
+                            "    if twice(2) != 4 then loop do ()\n")
+
+    for target in ["thumbv7em-freestanding", "aarch64-freestanding"]
+        val got = dmh_build_c(program, lib, target)
+
+        assert(got.0 == 0, s"$target: ${got.1}")
+        assert(got.1.index_of("error").is_none(), s"$target: ${got.1}")
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmh_unnamed_modules_are_not_asked
+
+@test("a dependency's module the program names is refused on a heap-less board, at its constructs")
+dmh_named_module_is_refused_where_it_was_written()
+    if !lbr_ready() then return
+
+    val lib = dmh_root()
+    val program = dmh_board("import sh.dmh.boxy.make\n\n@export(\"main\")\nmain()\n" +
+                            "    val c = make()\n")
+    val got = dmh_build_c(program, lib, "thumbv7em-freestanding")
+    val boxy = s"$lib/sh/dmh/boxy/boxy.sysl"
+    val heapless = "a reference needs an allocator, and 'thumbv7em-freestanding' provides no " +
+                   "allocator — it may hold and release storage made elsewhere, and may make none of its own"
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"error: $heapless\n  --> $boxy:11:19").is_some(), got.1)
+    assert(got.1.index_of("error: 'sh.dmh.boxy.slot' cannot be '@thread_local' on " +
+                          "'thumbv7em-freestanding': there is no loader and no libc on this target")
+           .is_some(), got.1)
+    assert(got.1.index_of(s"--> $boxy:9:1").is_some(), got.1)
+    assert(got.1.index_of("error: this reaches 'sh.dmh.boxy.make', which makes heap storage, and " +
+                          "'thumbv7em-freestanding' provides no allocator").is_some(), got.1)
+
+    // Those three and nothing else: `sysl.threads`'s own `spawn` is the standard module's, and is not
+    // reported in `boxy`'s file under the name the two share; `boxy`'s own `spawn`, a generic nothing
+    // instantiates, is not in the image (`tests_hrc_heap_reach.sysl`).
+    assert(got.1.index_of("showing the first").is_none(), got.1)
+    assert(got.1.index_of(s"$boxy:13:").is_none(), got.1)
+    assert(got.1.count_of("error: ") == 3, got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmh_named_module_is_refused_where_it_was_written
+
+@test("a closure written in a dependency's module the program names keeps its table, and runs")
+dmh_named_module_keeps_its_tables()
+    if !lbr_ready() then return
+
+    val lib = dmh_root()
+    val program = lbr_program("import sh.dmh.calls.add\n\nmain()\n    print(add(40, 2))\n")
+
+    assert(lbr_run(program, [lib]) == "42\n")
+
+    remove_dir_all(lib).unwrap_or(())
+end dmh_named_module_keeps_its_tables

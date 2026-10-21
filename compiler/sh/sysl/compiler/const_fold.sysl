@@ -6,9 +6,8 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, 
                          and as big_and, or as big_or, xor as big_xor, not as big_not,
                          from_real as big_of_real, to_real as big_to_real, zero as big_zero,
                          bit_length as big_bits, shl as big_shl, shr as big_shr,
-                         is_odd as big_odd}
+                         is_odd as big_odd, from_u64, to_u64}
 import sysl.math.Float
-import sysl.text.parse_real
 
 // What an expression comes to while compiling, where it comes to anything.
 //
@@ -41,6 +40,28 @@ enum Const
     // The `*Writer` a value renders itself into: the `sink`th buffer of the evaluation running the
     // `Display` that was handed it. Made only by that evaluation, and never laid down.
     ConstWriter(sink: int)
+    // An address the linker fills in: of module storage or a place inside it at an index that came
+    // to a number (`TAddrOf` over the folded place), or of a function (`TFuncAddr`). It is handed
+    // on, stored and laid down as the relocation it is; nothing reads through it, compares it,
+    // converts it to a number or calls it while compiling, since what it points at exists only when
+    // the program runs. Made only by a `const` function's evaluation.
+    ConstLink(image: TExpr)
+    // An address of storage the evaluation owns: slot `at` of a buffer of values -- a box's one
+    // value, an array's or a slice's elements, a struct's fields, or a local's cell -- shared with
+    // whatever else holds that buffer, so a write through it is seen there. It stands for a `&T`, a
+    // `*T` and a `&sync T` alike, the evaluator keeping no counts. `owner` is the depth of the call
+    // whose local the slot is, or -1 for the heap, as a slice's is. Made only by an evaluation.
+    ConstPtr(cells: Buf[Const], at: usize, owner: int)
+    // A slot of storage `slot_storage` made that nothing has placed a value in yet: the bytes the
+    // program would find there are whatever the allocator left, so reading one is refused.
+    ConstUnset
+    // An address the run owns, converted to a pointer to another type: it may be compared and
+    // converted back to the type it was taken at, `as_was`, but what it points at is a value of that
+    // type, so reading or writing through it is refused.
+    ConstPun(addr: &Const, as_was: &Type)
+    // A trait object -- a closure's `&Fn` among them: the value behind it, `data` (a pointer to its
+    // box, or the pointer a `*Trait` was made of), and the table its calls go through, by name.
+    ConstErased(vtable: string, data: &Const)
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -56,7 +77,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     BoolLit(v) -> Some(ConstBool(v))
     CharLit(c) -> Some(ConstChar(c))
     StrLit(s) -> Some(ConstStr(s))
-    FloatLit(text, _) -> Some(ConstFloat(parse_real(text).unwrap_or(0.0)))
+    FloatLit(text, _) -> Some(ConstFloat(real_of_bits(double_bits(text))))
 
     // A **value parameter** is asked before a declared constant, and shadows one of the same name
     // for the same reason a type parameter shadows a type: the nearer binding is the one written
@@ -74,6 +95,12 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
             return manifest_builtin(call_site(cx, e.span).pkg, name) match
                 Err(why) -> refuse(cx, e.span, why)
                 Ok(value) -> Some(ConstStr(value))
+
+        // A local `const` is nearer than anything else of the name, and folds to what it came to.
+        val local = cx.lookup(name)
+
+        if local.is_some() && cx.const_local(local.unwrap().unique).is_some() then
+            return cx.const_local(local.unwrap().unique).unwrap().1
 
         val bound = const_arg_bound(cx.subst, name)
 
@@ -100,9 +127,18 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         if packed.is_some() then return packed
 
+        // `P::Fields.len`, `P::Fields[1].name`.
+        if reflects(receiver) then return reflected(cx, e)
+
+        // `f.name`, `c.index` -- read off the descriptor a `for const` copy stands at.
+        if names_descriptor(cx.subst, receiver) then return const_call(cx, e)
+
         val dotted = dotted_name(cx, receiver, name).and_then(n -> const_of_name(cx, n))
 
         if dotted.is_some() then return dotted
+
+        // A field of what a call answers is run with the call (`const_eval.sysl`).
+        if mentions_const_call(cx.an, receiver) then return const_call(cx, e)
 
         // `real.infinity`, `f32.nan` -- read off the float type they are of, exactly as the
         // analyzer reads them (`bare_type_member`).
@@ -114,35 +150,76 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
     Unary(op, operand) -> const_unary(cx, op, operand)
     Binary(op, l, r) -> const_binary(cx, e.span, op, l, r)
+    // A comparison that asks about a type's make-up -- `T::Kind == Kind.Struct`, where the enum value
+    // on the right is no constant the fold holds -- is typed and run whole.
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
-            const_binary(cx, e.span, ops.at(0), operands.at(0), operands.at(1))
+            if reflects(operands.at(0)) || reflects(operands.at(1)) then reflected(cx, e)
+            else const_binary(cx, e.span, ops.at(0), operands.at(0), operands.at(1))
         else
             None
+
+    // `T::Fields[1]` and `primes_below(10)[0]` -- an element of what a call or a type's make-up
+    // answers, run with it.
+    Index(receiver, _, _) ->
+        if reflects(receiver) then reflected(cx, e)
+        else if mentions_const_call(cx.an, receiver) then const_call(cx, e)
+        else None
 
     // A conversion is written, so what it does while compiling is what it does while running: a
     // narrowing wraps and a float-to-integer truncates toward zero.
     //
     // A call to a `const` function is run, which is what such a function is for (`const_eval.sysl`).
     Call(callee, args) ->
+        // `T::Annotation[A].is_some()` on a parameter standing for itself waits for the instance.
+        if reflects(callee) && awaits_instantiation(cx, callee) then return None
+
         val converted = const_conversion(cx, e.span, callee, args)
 
         if converted.is_some() then return converted
 
         val reordered = const_byte_order(cx, e)
 
-        if reordered.is_some() then reordered else const_call(cx, e)
+        if reordered.is_some() then return reordered
+
+        val reinterpreted = const_float_bits(cx, e)
+
+        if reinterpreted.is_some() then reinterpreted else const_call(cx, e)
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
     LayoutOf(what, t) -> layout_bytes(cx, what, measured(cx, t))
+    TraitTest(subject, bounds) -> trait_test(cx, e.span, subject, bounds)
     OffsetOf(t, field) -> offset_bytes(cx, e.span, measured(cx, t), field)
 
     // `T::Min` and `T::Max` on a built-in integer are constants for the reason `sizeof` is: the
     // answer is a property of the type and is known once the type is.
-    TypeAttr(receiver, attr, _, _) -> const_type_attr(cx, receiver, attr)
+    //
+    // `T::Kind`, `T::Name`, `T::Fields` and `T::Variants` are literals once typed, so they are typed
+    // and run as a call's answer is.
+    TypeAttr(receiver, attr, _, _) ->
+        if reflection_attr(attr) then reflected(cx, e) else const_type_attr(cx, receiver, attr)
 
     _ -> None
+
+// Whether an expression asks one of the four questions about a type's make-up anywhere in it.
+reflects(e: Expr) -> bool = *e.kind match
+    TypeAttr(_, attr, _, _) -> reflection_attr(attr)
+    Field(receiver, _, _) -> reflects(receiver)
+    Index(receiver, index, _) -> reflects(receiver) || reflects(index)
+    Unary(_, operand) -> reflects(operand)
+    Binary(_, l, r) -> reflects(l) || reflects(r)
+    Compare(operands, _) ->
+        for item in operands
+            if reflects(item) then return true
+
+        false
+    _ -> false
+
+// An expression asking about a type's make-up, typed and run -- once the type is known: a type
+// parameter standing for itself has no make-up yet, and every instantiation answers for its own.
+private reflected(cx: &Analyzer, e: Expr) -> Option[Const] =
+    if awaits_instantiation(cx, e) then None else const_call(cx, e)
 
 // How many types the pack `A` stands for, where `A.len` is what was written.
 private pack_length(subst: Buf[Binding], receiver: Expr, name: string) -> Option[Const]
@@ -245,6 +322,11 @@ private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) ->
         ConstRecord(_, _) -> None
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
+        ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end const_binary
 
 // A comparison's verdict from the sign of the difference, where the operator is a comparison.
@@ -408,9 +490,44 @@ offset_bytes(cx: &Analyzer, span: Span, t: Type, field: string) -> Option[Const]
                             "answers in bytes, and the byte it begins in is not where it is")
             end if
 
+            if !d.c_bits.is_empty()
+                val i = d.field_index(field)
+
+                if i >= 0 && d.c_bit(usize(i)).is_some()
+                    val p = c_bitfield_layout(cx.an.tables.layout, d).places.at(usize(i))
+
+                    return refuse(cx, span, s"'$shown.$field' is a bitfield — it starts at bit ${p.bit} " +
+                        s"of the struct and is ${p.width} bits wide, so it has no byte offset. 'offsetof' " +
+                        "answers in bytes, and the byte it begins in is not where it is")
+                end if
+            end if
+
             val at = cx.an.tables.layout.field_offset(d, field)
 
             if at.is_some() then return Some(ConstInt(from_int(long(at.unwrap()))))
+
+            // A field an anonymous member holds begins where the member does, plus where it sits
+            // inside the member, at every level down.
+            val through = anonymous_path(d, field)
+
+            if !through.is_empty()
+                var sum: usize = 0
+                var level = d
+
+                for k in 0..<through.len()
+                    val f = level.fields.at(usize(through.at(k)))
+                    val here = cx.an.tables.layout.field_offset(level, f.0)
+
+                    if here.is_none() then return refuse(cx, span, s"'$shown.$field' occupies no storage, so it has no offset")
+
+                    sum = sum + here.unwrap()
+
+                    f.1 match
+                        Struct(next) -> level = next
+                        _ -> ()
+
+                return Some(ConstInt(from_int(long(sum))))
+            end if
 
             if d.field_index(field) >= 0
                 return refuse(cx, span, s"'$shown.$field' occupies no storage, so it has no offset — a " +
@@ -423,7 +540,7 @@ end offset_bytes
 
 // The fields a struct declares, quoted, as the tail of a refusal naming one it does not.
 private stored_names(d: &StructType) -> string
-    val fields = d.fields
+    val fields = visible_field_names(d)
 
     if fields.len() == 0 then return ""
 
@@ -431,7 +548,7 @@ private stored_names(d: &StructType) -> string
 
     for i in 0..<fields.len()
         if i > 0 then out = out + ", "
-        out = out + s"'${fields.at(i).0}'"
+        out = out + s"'${fields.at(i)}'"
 
     out
 end stored_names
@@ -488,12 +605,39 @@ end const_conversion
 // wrap is a change of name and not of number, so nothing narrows here, and the constant's declared
 // type is what then holds the number to the base's width and to a `within` range. A type with a
 // `where` predicate has a check only a run can make, and folds nothing.
+//
+// **A value of another kind is converted as the base's own name would convert it**, since `Phase(3)`
+// over `real` is `Phase(real(3))`: an integer at a float base becomes that float, a float at an
+// integer base is truncated, and an integer and a `char` cross as their conversions do.
 private made_new_const(cx: &Analyzer, callee: Expr, arg: Expr) -> Option[Const]
-    subject_named(cx, callee) match
-        Some(Constrained(d)) -> if !d.derived || d.pred_fn.is_some() then return None
+    val subject = subject_named(cx, callee)
+
+    val base = subject match
+        Some(Constrained(d)) ->
+            if !d.derived || d.pred_fn.is_some() then return None
+            underlying(d.base)
         _ -> return None
 
-    const_fold(cx, arg)
+    val value = const_fold(cx, arg)
+
+    if value.is_none() then return None
+
+    val crosses = (value.unwrap(), base) match
+        (ConstInt(_), Floating(_, _)) -> true
+        (ConstInt(_), Char) -> true
+        (ConstFloat(_), Integer(_, _, _)) -> true
+        (ConstChar(_), Integer(_, _, _)) -> true
+        _ -> false
+
+    if !crosses then return value
+
+    // A value that is converted may be converted by the type's own `from`, which is a call, not a
+    // fold.
+    val owner = member_key(cx.an, subject.unwrap(), "from").0
+
+    if cx.an.tables.members.from_trait.get(member_key_of(owner, "from")).is_some() then return None
+
+    converted(cx, arg.span, value.unwrap(), base)
 end made_new_const
 
 private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[Const] = v match
@@ -544,15 +688,26 @@ end saturated
 // Inside a generic body the folding is done against the substitution the instantiation supplied,
 // which is the only moment `sizeof(T)` is a number -- and a condition that is still waiting for one
 // is not a mistake, since a later instantiation settles it.
-check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
+//
+// The message is worked out only once the condition has come out false (`assert_message`), so one
+// that could not be computed is never looked at while the condition holds.
+check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[Expr])
     val refusals = cx.an.const_refusals
 
     const_fold(cx, cond) match
         Some(ConstBool(true)) -> ()
         Some(ConstBool(false)) ->
-            val head = assertion_head(message)
+            if message.is_some()
+                val said = assert_message(cx, span, message.unwrap())
 
-            cx.fault(span, head + compared_note(cx, cond) + instantiation_note(cx))
+                if said.is_none() then return
+
+                cx.fault(span, s"assertion failed: ${said.unwrap()}" + compared_note(cx, cond) +
+                         instantiation_note(cx))
+                return
+            end if
+
+            cx.fault(span, "assertion failed" + compared_note(cx, cond) + instantiation_note(cx))
         Some(other) ->
             cx.fault(span, s"'@assert' takes a condition, and this is ${const_kind(other)} — an " +
                      "assertion is something that can be true or false")
@@ -561,14 +716,9 @@ check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
             if !awaits_instantiation(cx, cond) && !const_refused_since(cx.an, refusals) then
                 cx.fault(span, "'@assert' is settled while compiling, so its condition has to be " +
                          "a constant expression — a literal, a 'const', 'sizeof', 'alignof', " +
-                         "'offsetof', or the arithmetic and comparisons over them, and never a call")
+                         "'offsetof', a call whose body runs while compiling, or the arithmetic and " +
+                         "comparisons over them — and nothing read out of storage filled at run time")
 end check_assert
-
-private assertion_head(message: Option[string]) -> string
-    if message.is_none() then return "assertion failed"
-
-    s"assertion failed: ${message.unwrap()}"
-end assertion_head
 
 // What a failed **comparison** adds: the value each side folded to, for a side the reader did not
 // write out as a literal. The compiler folded both to decide the comparison, so it is holding the
@@ -625,6 +775,11 @@ private const_text(v: Const) -> string = v match
     ConstRecord(v, _) -> if v < 0 then "a struct" else "an enum value"
     ConstView(_, _, n, _) -> s"a slice of $n elements"
     ConstWriter(_) -> "a writer"
+    ConstLink(_) -> "an address"
+    ConstPtr(_, _, _) -> "an address"
+    ConstUnset -> "a slot nothing was placed in"
+    ConstPun(_, _) -> "an address"
+    ConstErased(_, _) -> "a trait object"
 
 // A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
 // rather than as the `inf` and `nan` the C formatting underneath would print.
@@ -674,14 +829,22 @@ const_kind(v: Const) -> string = v match
     ConstRecord(v, _) -> if v < 0 then "a struct" else "an enum value"
     ConstView(_, _, _, _) -> "a slice"
     ConstWriter(_) -> "a writer"
+    ConstLink(_) -> "an address"
+    ConstPtr(_, _, _) -> "an address"
+    ConstUnset -> "a slot nothing was placed in"
+    ConstPun(_, _) -> "an address"
+    ConstErased(_, _) -> "a trait object"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
 private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     LayoutOf(_, t) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
     OffsetOf(t, _) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
+    TypeArg(t) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
     Ident(n) -> binding_is_abstract(cx.subst, n)
     TypeAttr(receiver, _, _, _) -> awaits_instantiation(cx, receiver)
+    Field(receiver, _, _) -> awaits_instantiation(cx, receiver)
+    Index(receiver, index, _) -> awaits_instantiation(cx, receiver) || awaits_instantiation(cx, index)
     Unary(_, operand) -> awaits_instantiation(cx, operand)
     Binary(_, l, r) -> awaits_instantiation(cx, l) || awaits_instantiation(cx, r)
     Compare(operands, _) ->
@@ -742,12 +905,70 @@ const_fold_typed(t: TExpr, little: bool) -> Option[Const]
                 None
         TCast(inner, _) -> typed_conversion(inner, ty.unwrap(), little)
         TIntOp(op, operand, None, width, _) -> typed_byte_order(op, operand, width, little)
+        TCall(name, args, _, false) ->
+            if float_bits_routine(name) && args.len() == 1 then
+                const_fold_typed(args.at(0), little).and_then(c -> float_bits_folded(name, c))
+            else
+                None
         _ -> None
 
     if v.is_none() then return None
 
     held_at(v.unwrap(), ty.unwrap())
 end const_fold_typed
+
+// `FloatBits`' two members on a float the compiler folds -- `real.from_bits(0x3fe62e42fefa39ef)`,
+// `x.bits()` -- named as the standard module keys them. They reinterpret and round nothing, so the
+// answer is the one the program would get: a `libm`'s table of constants written as bit patterns is
+// data, as the same table written as hex floats is.
+float_bits_routine(name: string) -> bool = name match
+    "real.from_bits" | "real.bits" | "f32.from_bits" | "f32.bits" -> true
+    "f16.from_bits" | "f16.bits" | "bf16.from_bits" | "bf16.bits" -> true
+    "f128.from_bits" | "f128.bits" -> true
+    _ -> false
+
+// The value one of them gives for the value it was handed, as the evaluator holds both: a float of
+// any width narrower than `f128` as the `real` it widens to exactly, an `f128` as its two halves.
+float_bits_folded(name: string, arg: Const) -> Option[Const]
+    if name == "f128.bits"
+        return arg match
+            ConstQuad(hi, lo) -> Some(ConstInt(add(big_shl(from_u64(hi), 64), from_u64(lo))))
+            _ -> None
+
+    if name == "real.bits" || name == "f32.bits" || name == "f16.bits" || name == "bf16.bits"
+        val f = arg match
+            ConstFloat(x) -> x
+            _ -> return None
+
+        return name match
+            "real.bits" -> Some(ConstInt(from_u64(f.bits())))
+            "f32.bits" -> Some(ConstInt(from_u64(u64(f32(f).bits()))))
+            "f16.bits" -> Some(ConstInt(from_u64(u64(f16(f).bits()))))
+            "bf16.bits" -> Some(ConstInt(from_u64(u64(bf16(f).bits()))))
+            _ -> None
+    end if
+
+    val n = arg match
+        ConstInt(x) -> x
+        _ -> return None
+
+    if name == "f128.from_bits"
+        val w = wrap(n, 128, false)
+        val hi = to_u64(big_shr(w, 64))
+        val lo = to_u64(wrap(w, 64, false))
+
+        return if hi.is_none() || lo.is_none() then None else Some(ConstQuad(hi.unwrap(), lo.unwrap()))
+    end if
+
+    val u = to_u64(wrap(n, 64, false)).unwrap_or(0)
+
+    name match
+        "real.from_bits" -> Some(ConstFloat(real.from_bits(u)))
+        "f32.from_bits" -> Some(ConstFloat(real(f32.from_bits(u32(u & 0xFFFFFFFF)))))
+        "f16.from_bits" -> Some(ConstFloat(real(f16.from_bits(u16(u & 0xFFFF)))))
+        "bf16.from_bits" -> Some(ConstFloat(real(bf16.from_bits(u16(u & 0xFFFF)))))
+        _ -> None
+end float_bits_folded
 
 // `x.swap_bytes()` and the four directions of `sysl.math.ByteOrder`, over a value that folds: the
 // same reversal the machine makes, so storage initialized with `ADDR.to_be()` is laid down as data
@@ -787,6 +1008,101 @@ swapped_bytes(n: BigInt, bits: int, signed: bool) -> BigInt
     wrap(out, bits, signed)
 end swapped_bytes
 
+// An operation of the `Bits` and `Signed` traits on `n`, held at a width of `bits`: the answer the
+// machine's own instructions give. A count of zeros or ones from either end of zero is the width, as
+// the trait documents; a rotation is by its amount modulo the width, as a funnel shift of the value
+// with itself is; `abs` of the most negative value wraps to itself. `None` for an operation it does
+// not name.
+int_op_value(op: string, n: BigInt, bits: int, signed: bool, amount: Option[BigInt]) -> Option[BigInt]
+    val zero = from_int(0)
+
+    if op == "abs" then return Some(if cmp(n, zero) < 0 then wrap(negate(n), bits, signed) else n)
+    if op == "signum" then return Some(from_int(if cmp(n, zero) < 0 then -1 else if cmp(n, zero) > 0 then 1 else 0))
+
+    // The bits, lowest first.
+    var low_first: Buf[bool] = buf()
+    var raw = wrap(n, bits, false)
+
+    for _ in 0..<bits
+        val q = div_rem(raw, from_int(2))
+
+        low_first.push(cmp(q.1, zero) != 0)
+        raw = q.0
+
+    op match
+        "count_ones" -> Some(from_int(long(count_of(low_first, true))))
+        "count_zeros" -> Some(from_int(long(count_of(low_first, false))))
+        "leading_zeros" -> Some(from_int(long(run_of(low_first, false, true))))
+        "trailing_zeros" -> Some(from_int(long(run_of(low_first, false, false))))
+        "leading_ones" -> Some(from_int(long(run_of(low_first, true, true))))
+        "trailing_ones" -> Some(from_int(long(run_of(low_first, true, false))))
+        "reverse_bits" ->
+            var reversed: Buf[bool] = buf()
+
+            for i in 0..<low_first.len()
+                reversed.push(low_first.at(low_first.len() - 1 - i))
+
+            Some(bits_value(reversed, signed))
+        "rotate_left" -> Some(bits_value(rotated(low_first, amount.unwrap_or(zero), true), signed))
+        "rotate_right" -> Some(bits_value(rotated(low_first, amount.unwrap_or(zero), false), signed))
+        _ -> None
+end int_op_value
+
+private count_of(low_first: Buf[bool], want: bool) -> usize
+    var n: usize = 0
+
+    for b in low_first
+        if b == want then n += 1
+
+    n
+end count_of
+
+// How many bits equal to `want` run from one end before the first that is not -- the high end where
+// `from_top`, the low end otherwise.
+private run_of(low_first: Buf[bool], want: bool, from_top: bool) -> usize
+    val w = low_first.len()
+    var n: usize = 0
+
+    while n < w
+        val b = if from_top then low_first.at(w - 1 - n) else low_first.at(n)
+
+        if b != want then break
+
+        n += 1
+
+    n
+end run_of
+
+// The bits moved `by` places toward the high end (`left`) or the low end, those leaving one end
+// arriving at the other.
+private rotated(low_first: Buf[bool], by: BigInt, left: bool) -> Buf[bool]
+    val w = low_first.len()
+    var out: Buf[bool] = buf()
+
+    if w == 0 then return out
+
+    val k = usize(to_u64(div_rem(by, from_int(long(w))).1).unwrap_or(0))
+
+    for i in 0..<w
+        // The bit landing at `i` came from `k` places below it when moving left, above it otherwise.
+        val from = if left then (i + w - k) % w else (i + k) % w
+
+        out.push(low_first.at(from))
+
+    out
+end rotated
+
+// The value bits stand for, lowest first, read at the width's signedness.
+private bits_value(low_first: Buf[bool], signed: bool) -> BigInt
+    var out = from_int(0)
+    val w = low_first.len()
+
+    for i in 0..<w
+        out = add(mul(out, from_int(2)), from_int(if low_first.at(w - 1 - i) then 1 else 0))
+
+    wrap(out, int(w), signed)
+end bits_value
+
 // The scalar a typed node is, where it is one this fold answers for: an integer, a `f32` or `f64`,
 // a `bool`, a `char` or a `string`, or a name for one that checks nothing. A subtype with a range or
 // a predicate runs its check at run time, so it is not one.
@@ -818,6 +1134,11 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstRecord(_, _) -> None
     ConstView(_, _, _, _) -> None
     ConstWriter(_) -> None
+    ConstLink(_) -> None
+    ConstPtr(_, _, _) -> None
+    ConstUnset -> None
+    ConstPun(_, _) -> None
+    ConstErased(_, _) -> None
 
 // Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
 private scalar_value(n: BigInt) -> bool =
@@ -870,6 +1191,11 @@ private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Con
         ConstRecord(_, _) -> None
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
+        ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end typed_binary
 
 // The integer operators, answered only where run time answers the same: never a division by zero,
@@ -952,6 +1278,11 @@ private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
         ConstRecord(_, _) -> None
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
+        ConstLink(_) -> None
+        ConstPtr(_, _, _) -> None
+        ConstUnset -> None
+        ConstPun(_, _) -> None
+        ConstErased(_, _) -> None
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n
@@ -1071,6 +1402,15 @@ run_float_binary(op: string, x: real, y: real, bits: int) -> Result[Const, strin
         None -> Err(s"'$op' on a float")
 end run_float_binary
 
+// A sixteen-bit float operator -- `bf16` where `brain`, `f16` otherwise -- computed as a `f32` and
+// rounded once more to the format, which is what the lowering does on a machine without the format's
+// own arithmetic. A machine with it gets the same answer: a `f32` holds more than twice either
+// format's significand, so rounding to it first never decides the second rounding.
+run_half_binary(op: string, x: real, y: real, brain: bool) -> Result[Const, string] =
+    run_float_binary(op, x, y, 32) match
+        Ok(ConstFloat(f)) -> Ok(ConstFloat(half_of_double(f, brain)))
+        other -> other
+
 // A float negated, which flips the sign of a zero as the machine's `fneg` does.
 run_float_negate(x: real) -> real = -x
 
@@ -1107,6 +1447,10 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
             val (hi, lo) = quad_of_int(n)
 
             Ok(ConstQuad(hi, lo))
+        (_, Floating(16, brain)) ->
+            if n.is_zero() then return Ok(ConstFloat(0.0))
+
+            Ok(ConstFloat(half_of_ratio(cmp(n, from_int(0)) < 0, big_abs(n), from_int(1), brain)))
         (_, Floating(bits, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
         (Char, Char) -> Ok(v)
         (_, Char) ->
@@ -1121,11 +1465,13 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
             val (hi, lo) = quad_of_double(f.bits())
 
             Ok(ConstQuad(hi, lo))
+        Floating(16, brain) -> Ok(ConstFloat(half_of_double(f, brain)))
         Floating(bits, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstQuad(hi, lo) -> to match
         Integer(bits, signed, _) -> Ok(ConstInt(quad_to_int((hi, lo), bits, signed)))
         Floating(128, _) -> Ok(v)
+        Floating(16, brain) -> Ok(ConstFloat(narrowed_half((hi, lo), brain)))
         Floating(bits, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstBool(_) -> if to == Bool then Ok(v) else Err(s"a conversion from bool to ${type_show(to)}")

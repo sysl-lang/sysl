@@ -214,7 +214,74 @@ print(bogus(1.0))
 ```
 
 ```error
-'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.round, llvm.sqrt, llvm.trunc
+'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.sqrt, llvm.trunc
+```
+
+**`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
+result can differ from writing the two operations — exactly where the product's low bits matter,
+which is what it is for (an error term, a compensated sum, a polynomial evaluated with one rounding
+per step):
+
+```sysl
+extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
+
+val x = 1.0 + 1.0 / 1073741824.0
+val c = -(1.0 + 1.0 / 536870912.0)
+
+print(fma(x, x, c) * 1152921504606846976.0, x * x + c)
+```
+
+```output
+1 0
+```
+
+`x * x` is `1 + 2^-29 + 2^-60`, and the `2^-60` is below what a double holds beside a one: rounded
+first, it is gone before `c` cancels the rest; fused, it is the whole answer.
+
+The other six round or compare and nothing more. `llvm.rint` and `llvm.nearbyint` round to the
+nearest integer with a tie to the even one — sysl never changes the rounding mode, so the two
+always agree, and both differ from `llvm.round`, which takes a tie away from zero. `llvm.minnum`
+and `llvm.maxnum` are C's `fmin` and `fmax`, where a NaN loses to a number; `llvm.minimum` and
+`llvm.maximum` are IEEE 754-2019's, where a NaN wins and a negative zero is the lesser zero:
+
+```sysl
+extern "llvm.rint" rint(x: f64) -> f64
+extern "llvm.nearbyint" nearbyint(x: f32) -> f32
+extern "llvm.round" round(x: f64) -> f64
+extern "llvm.minnum" minnum(a: f64, b: f64) -> f64
+extern "llvm.maximum" maximum(a: f64, b: f64) -> f64
+extern "llvm.minimum" minimum(a: f64, b: f64) -> f64
+
+print(rint(2.5), nearbyint(-3.5f32), round(2.5))
+print(minnum(1.0, nan), maximum(1.0, nan), minimum(0.0, -0.0))
+```
+
+```output
+2 -4 3
+1 NaN -0
+```
+
+**Where the machine has no fused instruction, `llvm.fma` is a call to C's `fma` or `fmaf`**, and a
+freestanding machine has no C library to answer it — an Armv6-M at both widths, a Cortex-M4's
+single-precision unit at `f64`. So `sysl.softfloat` exports both on every Arm and 32-bit RISC-V
+target, correctly rounded and weak, as it does the binary64 arithmetic: a program that computes with
+`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins — a
+package exporting its own `fma` included, which is the one definition the link keeps. Whether
+the width *is* an instruction is the `#if` symbols `fma` and `fma_dp` (C's `FP_FAST_FMAF` and
+`FP_FAST_FMA`; [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)).
+
+`llvm.fma` is offered at `f32` and `f64` only. A half-width one computed in a wider format, as LLVM
+does where there is no half-precision unit, rounds twice, and a binary128 one calls a routine no
+freestanding machine has:
+
+```sysl
+extern "llvm.fma" fma16(a: f16, b: f16, c: f16) -> f16
+
+print(fma16(1.0f16, 2.0f16, 3.0f16))
+```
+
+```error
+'llvm.fma' is offered at f32 and f64, and this declaration states f16
 ```
 
 **What it is for is not only speed.** An intrinsic that lowers to an instruction leaves no symbol
@@ -288,6 +355,71 @@ to assume away.
 something else is a function the *processor* enters rather than a caller, and that is a property of
 a definition rather than of a foreign declaration — see `interrupt`
 below.
+
+**C state that points into itself is declared `@pinned`.** A library handed the address of its state
+— littlefs's `lfs_t`, which keeps a pointer to its configuration and a list of open files threaded
+through itself — goes on writing through that address after the call returns, so the struct sysl
+lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a-value-c-holds-pointers-into),
+kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
+it.
+
+### A union at the boundary
+
+A [`union`](/reference/types/#unions) crosses to C by value as C's own union does, in either
+direction: an `extern` takes and returns one, and an exported function is handed one. Each
+convention has its own answer for a union, and the compiler gives clang's on every machine it
+builds for. AArch64 counts a union of floats as a homogeneous float aggregate **by its size**, so
+`union { float a; float b[2]; }` travels in two float registers. System V asks of each eightbyte
+whether every field over it is floating, so a `float` sharing bytes with a `u32` goes in an integer
+register. RISC-V never spreads a union, or anything holding one, across float registers, where it
+would a struct of the same fields. WebAssembly passes a union of one field as that field, and any
+other union in memory.
+
+Here one module calls `u_scale` through an `extern` as C would, and the exported function on the
+other side of it is sysl's; each union crosses in the registers C's convention names:
+
+```sysl
+union Pair
+    f: [2]f32
+    bits: u64
+
+@export("u_scale")
+scale(p: Pair, by: f32) -> Pair = Pair(f = [p.f[0] * by, p.f[1] * by])
+
+extern "u_scale" c_scale(p: Pair, by: f32) -> Pair
+
+val got = c_scale(Pair(f = [1.5, 2.0]), 2.0)
+
+print(got.f[0], got.f[1])
+```
+
+```output
+3 4
+```
+
+The header `build-c` writes declares a union as `typedef union`, and an exported signature may hold
+one. `@packed` and `@align(n)` are written into the `typedef` as they are for a struct:
+
+```sysl build=c
+module mylib
+
+@export("mylib_key")
+union Key
+    code: u32
+    bytes: [4]u8
+
+@export("mylib_flip")
+flip(k: Key) -> Key = Key(bytes = [k.bytes[3], k.bytes[2], k.bytes[1], k.bytes[0]])
+```
+
+```c
+typedef union {
+	uint32_t code;
+	uint8_t bytes[4];
+} mylib_key;
+
+mylib_key mylib_flip(mylib_key k);
+```
 
 ### Several `extern`s may share a name
 
@@ -591,6 +723,56 @@ Two consequences follow:
   `dlsym` asks for are found in the dynamic symbol table, which is precisely where a hidden symbol is
   not.
 
+### A weak export
+
+`weak` after the symbol — or alone, `@export(weak)`, for the function's own name — publishes the
+entry as a **default**: a weak definition (ELF `W`, Mach-O `weak external`) that a strong definition
+of the same symbol anywhere in the link replaces, with no duplicate-symbol error. It is how a C
+library's operating-system stubs are written — `open`, `write`, `sbrk` answering -1, newlib's model —
+so that a board replaces them one at a time, in sysl or in its own C:
+
+```sysl
+// What a C library package carries: the default.
+@export("board_write", weak)
+stub_write(n: i32) -> i32 = -1
+
+// What a board supplies: the definition the link keeps.
+@export("board_write")
+uart_write(n: i32) -> i32 = n
+
+extern "board_write" c_write(n: i32) -> i32
+
+print(c_write(5))
+```
+
+```output
+5
+```
+
+Where the weak export and the strong one are in the same compilation, as here, only the strong one is
+emitted under the symbol; elsewhere — a package's own C, an artifact built separately — both are, and
+the linker keeps the strong one. A static linker does not pull an archive member in **to replace** a
+weak definition it already has, so a strong definition in a board's C is kept where something else in
+that file is already linked — its startup code, a function the board's sysl calls.
+
+`weak` is about a function's definition and nothing else, so three things are refused:
+
+- **The entry.** `main` is where the image starts, and a weak one is a default any other `main` in the
+  link replaces — the program would begin somewhere nobody wrote.
+- **Two defaults of one symbol** with no strong definition beside them: which one the link keeps is
+  the order it reads them in.
+- **`weak` on exported storage, a struct or a type**, none of which is a definition a strong one
+  replaces.
+
+```sysl
+@export("main", weak)
+start() -> i32 = 0
+```
+
+```error
+the entry point cannot be exported 'weak'
+```
+
 ### Exported storage
 
 [An `extern` reads a variable](#an-extern-also-declares-a-variable) C laid down; `@export` above a
@@ -689,7 +871,9 @@ fills it at all. Leaving the value off starts it at zero, which is constant data
 ```sysl
 module mylib
 
-counter() -> i32 = 7
+var seed: i32 = 7
+
+counter() -> i32 = seed
 
 @export
 var start: i32 = counter()
@@ -785,8 +969,9 @@ A `const` has no storage at all and never arises.
 **An initializer is constant data when every scalar in it is a constant expression** — the same
 expressions a `const` may be written as ([modules § const](/reference/modules/)): a literal, a
 `const`, a conversion, a unary `-`, `!` or `~`, or an arithmetic, bitwise, shift, comparison or
-logical operator over those — **and the arrays, structs and variants carrying nothing that are built
-from them, at any depth.** A pointer written as `ptr_cast` of such an integer is one too. The compiler
+logical operator over those — **and the arrays, structs and enum variants that are built from them,
+at any depth.** A variant's fields are written into its payload where a construction stores them, so
+one carrying a string, or a bitfield struct, stays code. A pointer written as `ptr_cast` of such an integer is one too. The compiler
 works the value out and the object file carries it, so nothing runs to fill the storage:
 
 ```sysl build=c target=thumbv7em-freestanding
@@ -830,22 +1015,152 @@ fd_of_stdout() -> i32 = stdout.fd + i32(*stdout_flags)
 
 Three addresses are not constants, and storage holding one stays code, filled before the program's
 statements like any other computed initializer: the address of `@thread_local` or `@per_cpu`
-storage, which is a different one on every thread or core; an element of a view or through a pointer,
-which is a load before it is an address — an [`embed`](/reference/arrays/#a-file-s-bytes-embedded)
+storage, which is a different one on every thread or core; an element of a view or through a pointer
+whose value is not a constant device address, which is a load before it is an address — an [`embed`](/reference/arrays/#a-file-s-bytes-embedded)
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 
-**A call is constant data only when it calls a
-[`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant
-arguments, which the compiler runs while compiling. Any other call is module storage whatever it is
-called with — `val start: i32 = counter()` below is storage even where `counter` is `= 7`, because
-nothing marked it as code the compiler may run.
+**A `c"…"` literal is constant data**: it is the address of the literal's bytes in read-only data,
+a relocation like `&files[1]`. C's `char *tzname[2] = {"UTC", "UTC"};` is therefore written as it
+reads, bare, in an array or in a struct constructor, exported or not:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+@export("tzname")
+var tzname: [2]*u8 = [c"UTC", c"UTC"]
+
+@export("zone")
+val zone: *u8 = c"UTC"
+```
+
+**Four more things are constant data, all at any depth:**
+
+- **A read of a module `val` whose own initializer is constant data** is that value, as a `const`'s
+  name is — whatever order the two are declared in. `[ZERO; 4]` over `val ZERO: P = P(0)` is laid
+  down exactly as `[P(0); 4]` is.
+- **A trait object over the address of module storage** is two addresses, the object's and its type's
+  table for the trait, and the linker fills in both.
+- **A variant carrying such an address** — `Some(&target)`, or a trait object — has the address
+  written into its payload, a relocation like any other. The linker fills a whole word, so an address
+  is laid down where it starts a payload unit as wide as a pointer; a payload whose units are wider
+  (an `Option` of a struct holding a `u64` beside the pointer, on a 32-bit target) stays code.
+- **A function's address, and a `const` function's answer holding these addresses.** `&setup` is a
+  relocation like `&bus`, and a [`const` function](/reference/declarations/) handed them, or taking
+  them itself, may store them in what it answers: C's `static Display oled = { &bus, setup };`.
+  Calling through the stored pointer is what runs when the program does.
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+trait Ring
+    ring(self) -> u32
+
+struct Bell
+    n: u32
+
+impl Ring for Bell
+    ring(self) -> u32 = self.n
+
+struct P
+    v: u32
+
+val ZERO: P = P(0)
+
+var table: [4]P = [ZERO; 4]
+var bell: Bell = Bell(7)
+var target: u32 = 5
+var current: *Ring = &bell
+var chosen: Option[*u32] = Some(&target)
+
+@export
+total() -> u32 = table[1].v + current.ring() + *chosen.unwrap()
+```
+
+A display driver's constructor is the usual shape — the bus it talks over and the C setup function
+for its chip, both stored, neither called until the program runs:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+type Setup = *extern(*u32, u32) -> unit
+
+extern "chip_setup" chip_setup(state: *u32, n: u32)
+
+struct Bus
+    address: u8
+
+struct Display
+    state: [4]u32
+    bus: *Bus
+    setup: Setup
+
+    begin(*self) = (self.setup)(&self.state[0], u32(self.bus.address))
+
+const display(bus: *Bus, setup: Setup) -> Display = Display([0; 4], bus, setup)
+
+var bus: Bus = Bus(0x3c)
+var oled: Display = display(&bus, &chip_setup)
+
+@export
+start() = oled.begin()
+```
+
+**A `val` holding a device address is that address, too**, where another initializer names it, and
+so is a place reached through it: `&PAIR.b` is `PAIR`'s address plus the field's offset, and an
+element at an index the compiler can fold is that many elements further on. A board names its
+fixed-address hardware once and builds the rest from the name:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+struct Ring
+    head: u32
+    tail: u32
+    slots: [8]u32
+
+const AT: usize = 0x3000_0000
+
+val RING: *Ring = ptr_cast(AT)
+
+var current: *Ring = RING
+var tail: *u32 = &RING.tail
+var third: *u32 = &RING.slots[2]
+
+@export
+peek() -> u32 = current.head + *tail + *third
+```
+
+A `val` that reads another reading it back is no constant at all, and is refused where the cycle
+closes, as computed storage is:
+
+```sysl
+struct P
+    v: u32
+
+static val A: P = B
+static val B: P = A
+
+print(A.v)
+```
+
+```error
+'A' cannot be initialized: its value needs 'B', whose value needs 'A' — computed module storage runs once before anything else does, so what it needs has to be settled first
+```
+
+**A call is constant data when the compiler can run it while compiling**: its arguments are
+constant, and its body — and everything it calls — holds only what exists while compiling. No mark
+is needed; a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is
+one that promises it. A call that reaches storage filled at run time, I/O or the heap is module
+storage — `val start: i32 = counter()` below is storage because `counter` reads a `var`.
 
 **The value laid down is the value the same initializer computes at run time, and where the two
 could differ it is not laid down.** An integer operation whose result its type does not hold, a
 division by zero, a shift by the operand's width or more: each of these leaves the initializer as code, run before the program's
 statements like any other computed one — so on a freestanding archive it is refused below rather
-than given a value the program would never have computed. A `f32` is rounded after every operation,
+than given a value the program would never have computed. (Arithmetic written out of literals alone
+never gets this far: [it is exact](/reference/types/#arithmetic-over-literals-is-exact), and one
+whose value does not fit, or that divides by a literal zero, is refused.) A `f32` is rounded after every operation,
 as the machine rounds it, so `val g: f32 = 16777216.0 + 1.0 + 1.0` holds `16777216`.
 
 **A conversion to a constrained type is constant data when what it converts is.** A `new` type, or
@@ -866,7 +1181,9 @@ walk is transitive:
 ```sysl build=c target=thumbv7em-freestanding
 module mylib
 
-counter() -> i32 = 7
+var seed: i32 = 7
+
+counter() -> i32 = seed
 
 val start: i32 = counter()
 
@@ -1037,6 +1354,70 @@ private struct Id
 **The chosen name reaches the header and nothing else.** The emitted aggregate keeps its mangled
 name, and C links nothing on a type name — which is what makes this a spelling an author may decide
 rather than a fact anything else depends on.
+
+### A struct's layout in the header
+
+A `@packed` or `@align(n)` struct is declared with its layout, since without it C would lay the type
+out its own way — a packed `u8` and `u32` is five bytes in sysl and eight in plain C, and every field
+after the first would be read from the wrong place:
+
+```sysl
+module mylib
+
+@packed
+@export("wire_hdr")
+struct WireHdr
+    tag: u8
+    len: u32
+
+@align(16)
+@export("slot")
+struct Slot
+    x: u8
+
+@export("mylib_send")
+send(h: WireHdr, s: *Slot) -> u32 = h.len
+
+print(sizeof(WireHdr), alignof(WireHdr), offsetof(WireHdr, len), sizeof(Slot), alignof(Slot))
+```
+
+```output
+5 1 1 16 16
+```
+
+```c
+SYSL_PACK_PUSH
+typedef struct SYSL_PACKED {
+	uint8_t tag;
+	uint32_t len;
+} wire_hdr;
+SYSL_PACK_POP
+
+typedef struct SYSL_ALIGNED(16) {
+	uint8_t x;
+} slot;
+```
+
+The three macros are defined once at the top of a header that needs them: clang and gcc get
+`__attribute__((packed))` and `__attribute__((aligned(n)))` and an empty pragma pair, MSVC gets
+`#pragma pack(push, 1)` / `pop` around the definition and `__declspec(align(n))`. A struct holding one
+of these as a field, or an array of them, needs nothing more — its layout follows from the member's.
+
+Three cases need a word each:
+
+- **A bitfield struct is the one integer it is stored as**, a `uint8_t` array where that width has no
+  C name, under a comment per field saying which bits it holds (`/* b: bits 3..7 */`). It is never a
+  C bitfield struct, whose allocation unit is the C compiler's choice. A struct whose fields are
+  written as C's — `mode: u3 in u32` — is laid out by that choice instead
+  ([attributes](/reference/attributes/)); this release writes it into the header as an incomplete
+  type, reached through a pointer.
+- **`@byte_order` has no C spelling.** The layout is the same, but each integer's bytes are in the
+  declared order rather than the machine's, so the header says so in a comment above the `typedef`
+  and the C side swaps a field where the orders differ.
+- **A `@packed` struct holding a field of an `@align(n)` type has no MSVC declaration.** clang and gcc
+  pack that field to one byte, as sysl does; MSVC's layout — clang-cl's included — keeps its
+  alignment. The header carries an `#error` for that struct under `_MSC_VER`, so the mismatch stops
+  the C build rather than corrupting memory across the boundary.
 
 ### Naming a type in the header
 
@@ -2353,10 +2734,13 @@ a directory holding nothing itself. **The tree's own root is the exception**, si
 tree rather than a directory in it: a package namespaced by reverse DNS has its modules at
 `sh/sysl/foo/` and nothing at the top, so C belonging to no single module goes there.
 
-What this costs is a vendored C library laid out in sub-directories of its own: the ones holding no
-sysl are skipped, and a link error naming the symbols is what says so. Put the `.sysl` that declares
-those `extern`s in the directory and it is a module — which is where every binding written so far has
-put it anyway.
+What this leaves out is a vendored C library laid out in sub-directories of its own: the ones holding
+no sysl are skipped, and the build warns about each. A binding's own shim belongs beside the `.sysl`
+that declares its `extern`s, which is where every binding written so far has put it. **An upstream
+tree is declared instead**, in the manifest's `c` block
+([packages](/reference/packages/#a-vendored-c-library-left-as-upstream-shipped-it)): its root, its
+include roots, the exact list of files it compiles and the macros they take — so the tree stays byte
+for byte what upstream released, and the walk compiles none of the C under its root.
 
 **A shim can be per-machine, and that is a directory rather than a condition.** A `.c`
 cannot carry a sysl attribute, so `#if` is no help to it; what selects it is where it sits. A
@@ -2391,7 +2775,7 @@ reachable from C and from nothing else, and each blocks an ordinary POSIX interf
 |---|---|
 | **a caller-allocated opaque type** | `regcomp` wants a `regex_t` the caller supplies, and its size is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows |
 | **a macro** | `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is nothing for a linker to resolve and nothing for `extern` to name |
-| **a shape with no sysl spelling** | an untagged union, an inline function, and a **C bitfield struct** — sysl lays an `iN` field out in exactly N bits inside `@packed` ([attributes](/reference/attributes/)), but C leaves *its* allocation to the implementation, so the two need not agree on a size and a shim is what settles it |
+| **a shape with no sysl spelling** | an inline function. A **C bitfield struct is spelled** field for field — `mode: u3 in u32` — and laid out by the target's C rule ([attributes](/reference/attributes/)); only a bitfield struct under `#pragma pack(n)` for `n` other than 1 has no spelling. Passing one **by value** across the boundary, and its declaration in a generated header, come in a later release: until then it crosses as a pointer |
 
 Each becomes an ordinary function in three lines of C:
 
@@ -2692,6 +3076,19 @@ answered with an undefined name:
 ```
 this reaches 'sysl.posix.regex', which requires 'posix', and this module declared 'no posix'
 ```
+
+An `import` of one of its names says the module is withheld, and why, rather than that it declares
+no such name:
+
+```
+'sysl.posix.regex' is withheld on 'thumbv7em-freestanding': it asks the C compiler about headers and
+requires 'posix', which 'thumbv7em-freestanding' does not provide, so it declares nothing here
+```
+
+**Only the file carrying the block is skipped.** Every other file is read exactly as it is in a
+compilation with no probe anywhere, whatever it requires: `sysl.threads` is `@requires(os)` and still
+answers `tls_place` on a bare AArch64 machine, beside a C library package whose own `c type` was
+measured in the same build.
 
 **What is asked is whether the machine can have the capability, not whether the project provides
 it.** [`package.hocon`](/reference/packages/#capabilities) treats a capability it does not mention as

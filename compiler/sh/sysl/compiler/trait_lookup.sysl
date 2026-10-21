@@ -573,15 +573,37 @@ end trait_members
 // there is nothing for a slot to point at. That is a fact about the member and not about the trait:
 // a `filter` that cannot be dispatched sits perfectly well beside a `map` that can, so the object
 // still forms and what is refused is the call.
+//
+// **Every table carries `Debug` after its own slots**, whether or not the trait requires it, because
+// every type has one: an object is shown through its concrete value's `Debug` exactly as a value is.
+// It goes last so that adding it moves no slot a trait's own members already had. Two kinds of table
+// carry none (`slotless_debug`).
 slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, MethodDecl)]
     var out: Buf[(Bound, MethodDecl)] = buf()
     val all = trait_members(a, b, self_bind)
+    val dbg = library_key("Debug")
+    var shown = b.name == dbg || slotless_debug(b.name)
 
     for item in all
         if item.1.tparams.is_empty() then out.push(item)
+        if item.0.name == dbg then shown = true
+
+    if !shown
+        trait_decl_at(a, dbg) match
+            Some(d) ->
+                for m in d.methods
+                    out.push((Bound(dbg, buf()), m))
+            None -> ()
 
     out
 end slotted_members
+
+// The traits whose tables carry no `Debug` slot, an object of one being shown by rule instead: a
+// **callable**, whose value is a closure's capture record with no `Debug` to point at (`<fn>`), and
+// a **`Writer`** -- a sink is where a rendering goes rather than a value to show (`<writer>`), the
+// string a `str` gathers into has a table the compiler lays down itself, and a slot in every
+// writer's table would put a `Debug` of every sink into every program that writes to one.
+slotless_debug(name: string) -> bool = fn_is_call(name) || name == library_key("Writer")
 
 // Whether a trait has a member no table can hold, which is what stops an **object** standing at a
 // bound on it: the members a bound licenses would then be more than the table can reach.
@@ -611,7 +633,28 @@ satisfies(a: &Analysis, tr: Bound, t: Type) -> bool = t match
     // the membership answerable before instantiation -- a tuple implements `Display` when every part
     // does, so a call is refused where it is written rather than inside a body already committed to.
     Pack(elems) -> every_satisfies(a, tr, elems)
-    _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t)
+    _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t) ||
+         debug_through(a, tr, t)
+
+// **A reference or a pointer is `Debug` where what it reaches is**, because a member call sees
+// through one level of `&` or `*` to find its receiver (`reference/traits.md § Any type may carry an
+// impl`), so `x.debug(…)` on one reaches the referent's -- which is what lets an `Option[&Node]` or a
+// `Buf[*P]` meet `T: Debug`. An object reaches the `Debug` its table carries, and a callable's or a
+// writer's `debug` is answered by the compiler (`callable_debug`), as is every type `Debug` by rule
+// (`debug_by_rule`).
+private debug_through(a: &Analysis, tr: Bound, t: Type) -> bool
+    if tr.name != library_key("Debug") then return false
+    if debug_by_rule(t) then return true
+
+    val inner = t match
+        Ref(i, _) -> *i
+        Ptr(i) -> *i
+        _ -> return false
+
+    if is_trait(inner) then return true
+
+    satisfies(a, tr, inner)
+end debug_through
 
 private bound_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> bool
     for item in bounds
@@ -869,6 +912,15 @@ private span_of_nothing() -> Span = Span(0, 0)
 // is that block's condition. So the condition is what is worth saying. Nothing where nothing covers
 // the type, leaving the caller's own advice -- write one -- the right advice.
 unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    // **`AnyBits` is refused with the part of the type that has a bit pattern no value has**, since
+    // that is what the bound was asked for: storage nobody wrote, read as the type.
+    if library_spelling(tr.name) == Some("AnyBits")
+        val why = any_bits_refusal(t)
+
+        if why.is_some() then
+            return Some(s"storage nobody wrote would not hold a valid value of it: ${why.unwrap()}")
+    end if
+
     // **An object refused a bound on its own trait** reads as a contradiction without a reason. What
     // is true is narrower and is worth spelling: the bound licenses every member, an object reaches
     // only what its table holds, and one member here is not in the table. Named first, because when

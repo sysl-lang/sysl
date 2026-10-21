@@ -71,6 +71,10 @@ struct Manifest
     // them than choosing its warning flags.
     defines: Buf[(string, Buf[string])]
 
+    // The `c` block: each vendored C library this package carries, with the files it compiles, the
+    // include roots they read and the roots it publishes to its dependents (`c_libraries.sysl`).
+    c_libraries: Buf[CLibrary]
+
     // The machines the `targets` block describes, each with the triple it names -- `""` where the
     // block names none. `default` is not one of them: it names a machine rather than being one.
     targets: Buf[(string, string)]
@@ -135,13 +139,41 @@ struct Manifest
     // register)`. Root project only, as the flags are.
     codegen_registers: Buf[(string, string)]
     target_codegen_registers: Buf[(string, string, string)]
+
+    // The `test` block: how this package's own suite is run where the command line does not say.
+    tests: TestSettings
+
+    // The `options` block: each valued option this package declares, its type, default and range
+    // (`options.sysl`).
+    options: Buf[PackageOption]
+
+    // The `features` block inside each `targets.<name>` block: the keys of that block each feature
+    // sets while it is on (`target_features.sysl`). Only the root project's apply.
+    feature_targets: Buf[FeatureTarget]
 end Manifest
+
+// What a package's `test` block says about running its suite (`read_test_settings`). Each is a
+// default the command line overrides; nothing here is read by any build but `sysl test`.
+struct TestSettings
+    // How many tests may run at once (`--jobs`).
+    jobs: Option[usize]
+
+    // The seconds each test may run (`--timeout`), which a test's own `@test(timeout: n)` still beats.
+    timeout: Option[int]
+
+    // The tests that run with nothing else running beside them: each is a text a test's name or key
+    // holds, as `--filter` reads one.
+    alone: Buf[string]
+end TestSettings
+
+// A package that said nothing about its suite.
+no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf())
+             buf(), buf(), no_test_settings(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -178,6 +210,10 @@ end manifest_provides
 
 // The triple a machine the `targets` block describes names, where it describes that machine.
 declared_triple(m: &Manifest, target: string) -> Option[string]
+    val featured = featured_triple(m, target)
+
+    if featured.is_some() then return featured
+
     for i in 0..<m.targets.len()
         if m.targets.at(i).0 == target then return Some(m.targets.at(i).1)
 
@@ -252,6 +288,10 @@ private standing(t: Target, cap: string) -> bool = !holds_string(machine_lacks(t
 // project's, and `otherwise` -- what the machine has by being the machine it is -- where neither
 // says anything.
 private capability_given(m: &Manifest, target: string, cap: string, otherwise: bool) -> bool
+    val featured = featured_capability(m, target, cap)
+
+    if featured.is_some() then return featured.unwrap()
+
     for row in m.target_capabilities
         if row.0 == target && row.1 == cap then return row.2
 
@@ -462,6 +502,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val pkg_config = read_pkg_config(root)?
     val headers = read_headers(root)?
     val defines = read_defines(root)?
+    val c_libraries = read_c_libraries(root)?
 
     val capabilities = conf_at(root, "capabilities") match
         None -> buf()
@@ -473,6 +514,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     var target_codegen_registers: Buf[(string, string, string)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
+    var feature_targets: Buf[FeatureTarget] = buf()
 
     conf_at(root, "targets") match
         None -> ()
@@ -488,6 +530,14 @@ read_manifest(text: string) -> Result[Manifest, string]
                     return Err(s"'targets.${named.at(i)}' is not a block describing a target")
 
                 targets.push((named.at(i), conf_text(entry, "triple")))
+
+                // A key the block does not know is said and skipped, as a top-level one is -- a block
+                // nested under a name this compiler has never heard of included.
+                for key in conf_keys(entry)
+                    if !known_target_key(key) then warnings.push(unknown_key(s"targets.${named.at(i)}.$key"))
+
+                for ft in read_feature_targets(entry, named.at(i), &warnings)?
+                    feature_targets.push(ft)
 
                 val image = read_image(entry, named.at(i))?
 
@@ -526,6 +576,8 @@ read_manifest(text: string) -> Result[Manifest, string]
     val link = read_link(root)?
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
+    val tests = read_test_settings(root, &warnings)?
+    val options = read_options(root)?
 
     val codegen_read = conf_at(root, "codegen") match
         None -> (buf(), buf(), None)
@@ -545,12 +597,73 @@ read_manifest(text: string) -> Result[Manifest, string]
     for i in 0..<keys.len()
         if !known_top_key(keys.at(i)) then warnings.push(unknown_key(keys.at(i)))
 
-    Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, pkg_config, headers, defines, targets, allocator, features,
+    val made = Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
+                target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
-                codegen_read.1, target_codegen_registers))
+                codegen_read.1, target_codegen_registers, tests, options, feature_targets)
+    val unnamed = undeclared_feature_target(made)
+
+    if unnamed.is_some() then return Err(unnamed.unwrap())
+
+    Ok(made)
 end read_manifest
+
+// The `test` block: `jobs`, `timeout` and `alone`, each what the command line would otherwise say.
+//
+// **`alone` is for the test that cannot share the machine** -- one that binds a fixed port, drives a
+// device there is one of, opens a database every test of the package opens, or measures time and is
+// thrown by a busy machine. Such a test runs with no other test of the run beside it, and the rest run
+// at once around it as `jobs` allows. It is a list of texts a test's name or key holds, as `--filter`
+// reads one, so a module's tests are made alone by naming the module.
+//
+// A key the block does not know is warned about and ignored, as a top-level one is: a manifest is
+// read by compilers older than the one it was written for.
+private read_test_settings(root: &Conf, warnings: *Buf[string]) -> Result[TestSettings, string]
+    val block = conf_at(root, "test") match
+        None -> return Ok(no_test_settings())
+        Some(b) -> b
+
+    if !conf_is_block(block)
+        return Err("'test' says how this package's suite is run, so it is a block — " +
+                   "test { jobs = 4, timeout = 60, alone = [\"port\"] }")
+
+    var settings = no_test_settings()
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        val key = keys.at(i)
+        val value = conf_at(block, key).unwrap()
+
+        if key == "jobs"
+            val given = *value match
+                Word(w) -> test_jobs(w)
+                _ -> None
+
+            if given.is_none()
+                return Err("'test.jobs' is how many tests may run at once, a whole number from 1 up")
+
+            settings.jobs = given
+        else if key == "timeout"
+            val given = *value match
+                Word(w) -> timeout_seconds(w)
+                _ -> None
+
+            if given.is_none()
+                return Err(s"'test.timeout' is the seconds each test may run, a whole number from 0 to " +
+                           s"$MostTestSeconds (0 is no limit)")
+
+            settings.timeout = given
+        else if key == "alone"
+            settings.alone = conf_list(value) match
+                Some(texts) -> texts
+                None -> return Err("'test.alone' is a list of texts a test's name holds — " +
+                                   "alone = [\"port\"], and not a single string")
+        else
+            warnings.push(unknown_key(s"test.$key"))
+
+    Ok(settings)
+end read_test_settings
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
 // `file:line:column` out of the image.
@@ -575,7 +688,7 @@ end read_bounds_locations
 // **A register setting names its register as text** (`thread_pointer = "tpidr_el1"`), checked here
 // against the registers there are; whether the machine has them is the driver's question. Beside the
 // settings and the registers, the `extensions` list, or `None` where the block names none.
-private read_codegen(block: &Conf,
+read_codegen(block: &Conf,
                      where: string) -> Result[(Buf[(string, bool)], Buf[(string, string)],
                                                Option[Buf[string]]), string]
     if !conf_is_block(block)
@@ -651,6 +764,10 @@ end read_extensions
 // What the manifest says about one code generation setting on the machine `target`: the target's
 // own `codegen` block over the project's, and off where neither says anything.
 codegen_given(m: &Manifest, target: string, setting: string) -> bool
+    val featured = featured_codegen(m, target, setting)
+
+    if featured.is_some() then return featured.unwrap()
+
     for row in m.target_codegen
         if row.0 == target && row.1 == setting then return row.2
 
@@ -663,6 +780,10 @@ end codegen_given
 // What the manifest says about one register setting on the machine `target`: the target's own
 // `codegen` block over the project's, and nothing where neither names one.
 codegen_register_given(m: &Manifest, target: string, setting: string) -> Option[string]
+    val featured = featured_register(m, target, setting)
+
+    if featured.is_some() then return featured
+
     for row in m.target_codegen_registers
         if row.0 == target && row.1 == setting then return Some(row.2)
 
@@ -702,7 +823,7 @@ end read_workspace
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
 // are understood, and a refusal would make every key ever added a break with every compiler before
 // it.
-private unknown_key(path: string) -> string =
+unknown_key(path: string) -> string =
     s"$ManifestName: '$path' is not something this sysl understands, and is ignored — either it " +
     "is a misspelling, or it was added by a newer compiler"
 
@@ -726,7 +847,7 @@ private not_a_capability(written: string, where: string) -> string =
 // A `capabilities` block, the project's or one target's: each name one of the three, and each value
 // a flag. **A misspelled name is refused rather than ignored**, since a `treads = false` that did
 // nothing would leave the writer believing the machine had been described.
-private read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
     var out: Buf[(string, bool)] = buf()
     val keys = conf_keys(block)
 
@@ -1251,7 +1372,7 @@ private read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
         // **Sorted by name**, so the command line a file is compiled with is a function of what the
         // block says rather than of the order somebody happened to write it in.
         for j in 0..<ordered.len()
-            macros.push(macro_of(key, ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
+            macros.push(macro_of(s"defines.\"$key\"", ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
 
         val paths = expand_alternatives(key)?
 
@@ -1276,11 +1397,16 @@ end read_defines
 // **A brace and not a glob.** A `*` would pick up a `.c` added later without anybody deciding, and
 // these are macros that change a struct's layout — a file joining the set by accident is the exact
 // failure this block exists to prevent, and it would fail the way the others do, silently.
-expand_alternatives(key: string) -> Result[Buf[string], string]
+//
+// `before` and `after` wrap the key into what a refusal calls it -- `'defines."<key>"'` by default,
+// `'c.tinyusb.sources' entry '<key>'` for a library's list.
+expand_alternatives(key: string, before: string = "'defines.\"",
+                    after: string = "\"'") -> Result[Buf[string], string]
     val start = key.index_of("{")
+    val who = before + key + after
 
     if start.is_none()
-        if key.index_of("}").is_some() then return Err(unbalanced_brace(key))
+        if key.index_of("}").is_some() then return Err(unbalanced_brace(who))
 
         var one: Buf[string] = buf()
 
@@ -1291,13 +1417,13 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
     val at = start.unwrap()
     val closed = key[at..].index_of("}")
 
-    if closed.is_none() then return Err(unbalanced_brace(key))
+    if closed.is_none() then return Err(unbalanced_brace(who))
 
     val end_at = at + closed.unwrap()
     val group = key[(at + 1)..<end_at]
 
     if group.index_of("{").is_some() then
-        return Err(s"'defines.\"$key\"' nests one group of alternatives inside another, which " +
+        return Err(s"$who nests one group of alternatives inside another, which " +
                    "says nothing a flat list does not")
 
     val parts = split_alternatives(group)
@@ -1305,10 +1431,10 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
 
     for i in 0..<parts.len()
         if parts.at(i) == "" then
-            return Err(s"'defines.\"$key\"' has an empty alternative — whichever was meant can be " +
+            return Err(s"$who has an empty alternative — whichever was meant can be " +
                        "written out, and a group naming nothing configures nothing")
 
-        val rest = expand_alternatives(key[0..<at] + parts.at(i) + key[(end_at + 1)..])?
+        val rest = expand_alternatives(key[0..<at] + parts.at(i) + key[(end_at + 1)..], before, after)?
 
         for j in 0..<rest.len()
             out.push(rest.at(j))
@@ -1316,8 +1442,8 @@ expand_alternatives(key: string) -> Result[Buf[string], string]
     Ok(out)
 end expand_alternatives
 
-private unbalanced_brace(key: string) -> string =
-    s"'defines.\"$key\"' has an unbalanced brace — alternatives are written '{one,two}', as a " +
+private unbalanced_brace(who: string) -> string =
+    s"$who has an unbalanced brace — alternatives are written '{one,two}', as a " +
     "shell writes them"
 
 // One group's alternatives, which is a split on commas that keeps an empty one so it can be refused.
@@ -1338,19 +1464,22 @@ end split_alternatives
 //
 // **`false` is refused**: a reader would have to guess between "do not define this" and `-DNAME=0`,
 // and those differ under `#ifdef`. Whichever was meant can be said exactly.
-private macro_of(path: string, name: string, value: &Conf) -> Result[string, string]
+//
+// `owner` is the block the line sits in as a refusal names it: `defines."c/miniz.c"`, or
+// `c.tinyusb.defines`.
+macro_of(owner: string, name: string, value: &Conf) -> Result[string, string]
     if !macro_name(name) then
-        return Err(s"'defines.\"$path\".$name' is not a name a C macro can have — letters, digits " +
+        return Err(s"'$owner.$name' is not a name a C macro can have — letters, digits " +
                    "and '_', not starting with a digit")
 
     *value match
         Flag(true) -> Ok(name)
-        Flag(false) -> Err(s"'defines.\"$path\".$name' is false, which does not say which of two " +
+        Flag(false) -> Err(s"'$owner.$name' is false, which does not say which of two " +
                            "things is meant — leave the line out to not define it, or write '0' " +
                            "to define it as zero, which '#ifdef' still sees")
         Text(v) -> Ok(s"$name=$v")
         Word(v) -> Ok(s"$name=$v")
-        _ -> Err(s"'defines.\"$path\".$name' must be true or a scalar — a macro is text the C " +
+        _ -> Err(s"'$owner.$name' must be true or a scalar — a macro is text the C " +
                  "preprocessor substitutes, so there is nothing a block or a list could mean")
 end macro_of
 
@@ -1653,8 +1782,16 @@ private known_package_key(key: string) -> bool =
     key == "name" || key == "version" || key == "sysl" || key == "description" ||
     key == "license" || key == "authors" || key == "repository" || key == "keywords"
 
+// What a `targets.<name>` block says: the machine's triple, how its image is linked
+// (`image_link.sysl`), the `capabilities` and `codegen` blocks layered over the project's, and the
+// `features` that set any of those again (`target_features.sysl`).
+private known_target_key(key: string) -> bool =
+    key == "triple" || key == "linker" || key == "linker_script" || key == "entry" ||
+    key == "capabilities" || key == "codegen" || key == "features"
+
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace" || key == "codegen"
+    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c" || key == "test" ||
+    key == "options"

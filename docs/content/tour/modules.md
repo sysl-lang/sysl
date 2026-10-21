@@ -4,17 +4,17 @@ summary: A module is a directory, an import only shortens a name you could alway
 weight: 110
 ---
 
-Every program on this site so far has been one file with no header, and that is not a special form —
-it is a module that happens to be unnamed. This chapter is what happens when there is more than one.
+Every program on this site so far has been a single file with no header. That is not a special
+form: it is a module without a name. This chapter covers programs with more than one module.
 
 ## A module is a directory
 
 The files under `oskit/arch/` make up the module `oskit.arch`; the files under `std/fs/` make up
-`std.fs`. Every declaration in every file of the directory is a member of the one module, so
-splitting a growing module into more files adds no new module and changes no import.
+`std.fs`. Every declaration in every file of the directory belongs to that one module, so splitting a
+growing module into more files creates no new module and changes no import.
 
-Each file states which module it contributes to, and the compiler checks the name against where the
-file sits:
+Each file states which module it belongs to, and the compiler checks the name against the file's
+location:
 
 ```sysl
 module oskit.arch
@@ -23,45 +23,43 @@ halt()
     print("halted")
 ```
 
-That is Scala's `package` and Go's directory-package, and it pays off directly for the target: an OS
-subsystem *is* a directory — an arch layer, a server, a driver — so the module is the subsystem, and
-the subsystem is the unit an importer depends on.
+This is the model of Scala's `package` and Go's directory packages, and it suits operating-system
+work well: a subsystem such as an architecture layer, a server or a driver is already a directory, so
+the module is the subsystem, and the subsystem is the unit an importer depends on.
 
-A file with no header at all is in the **anonymous root module**, whose name is the empty path.
-Nothing can name it, so its declarations are visible to its own files and to nothing else — which is
-the right way round for the place a program starts, and it is why a one-file program's names sit
-exactly where they always did.
+A file with no header is in the **anonymous root module**, whose name is the empty path. No other
+module can name it, so its declarations are visible only to its own files. That is appropriate for
+the code where a program starts, and it is why a one-file program needs no module header.
 
-A top-level *statement* is not a declaration. A declaration is hoisted and belongs to the module as a
-whole; a statement runs, and running happens in an order — so **one file of a program carries the
-statements it runs**, and a second that carries any is an error naming both.
+A top-level *statement* is not a declaration. A declaration is hoisted and belongs to the whole
+module; a statement runs, and statements run in order. **Only one file of a program may contain
+top-level statements**, and a second one that does is an error naming both files.
 
 That file is the program's **entry file**, and its top level is a **body**: a `val` or `var` there is
-a local initialized where it stands, and a function there reads the bindings above it.
+a local initialized where it is written, and a function there can read the bindings above it.
 
-A program may instead declare `main`, which is the other way of writing the place a program starts:
+Alternatively, a program may declare `main`:
 
 ```sysl
 main(args: []string)
-    print("the work runs here, with", args.len, "argument")
+    print("started with", args.len, "argument")
 ```
 
 ```output
-the work runs here, with 1 argument
+started with 1 argument
 ```
 
-**A program starts in one place**, so it writes one or the other and never both. What `main` gets at
-that a statement cannot is **the arguments**: a statement has nowhere to receive them, because it is
-not a call and has no parameter list.
+**A program has one starting point**, so it uses either top-level statements or `main`, never both.
+`main` has access to **the command-line arguments**, which top-level statements do not, because they
+are not a call and have no parameter list.
 
-A program in which no file carries a statement is a complete program that does nothing. That is what
-a tree of pure declarations compiles to, which is what it should compile to — a library is not an
-error.
+A program in which no file contains a statement is a valid program that does nothing. A tree of
+declarations alone compiles to exactly that, so a library is not an error.
 
 ## Imports
 
-A public member is **always** reachable fully-qualified — `sysl.math.max(2, 7)` needs no import at
-all. Nothing is required to *see* a member; an import exists only to shorten the reference:
+A public member is **always** reachable by its fully qualified name: `sysl.math.max(2, 7)` needs no
+import. Nothing needs to be imported to be *visible*; an import only shortens the reference:
 
 ```sysl
 import sysl.math.{max, min}
@@ -78,7 +76,8 @@ print(sysl.math.max(1, 4))
 4
 ```
 
-An import is a dotted path through the module tree, and **how the path ends decides what you get**:
+An import is a dotted path through the module tree, and **the end of the path decides what is
+bound**:
 
 ```sysl
 import sysl.math.max              // max(a, b)      — one member, unqualified
@@ -89,38 +88,35 @@ import sysl.math.{max as bigger}  // a member, renamed
 import sysl.math as m             // m.max(a, b)    — the module, renamed
 ```
 
-Ending the path at a **member** binds that member under its own name, so calls to it lose their
-qualifier entirely. The braces do that for several members at once, and `*` for every public member
-of the module.
+A path ending at a **member** binds that member under its own name, so calls to it need no
+qualifier. Braces do the same for several members at once, and `*` for every public member of the
+module.
 
-Ending it at the **module** binds the module's last name segment instead — so `sysl.math` becomes
-`math`, and calls keep exactly one level of qualification. That is the self-documenting middle
-ground: `math.max` says at the call site where the name came from without listing members up top,
-where the wildcard says nothing and the explicit list has to be maintained.
+A path ending at a **module** binds the module's last name segment, so `sysl.math` becomes `math` and
+calls keep one level of qualification. This is a useful middle ground: `math.max` shows at the call
+site where the name comes from, without a member list to maintain at the top of the file and without
+the opacity of a wildcard.
 
-`as` renames whatever the path ended at, member or module. It is what you reach for when two modules
-offer the same name, and the only way to resolve that collision without writing the full path at
-every use.
+`as` renames whatever the path ends at, member or module. Use it when two modules offer the same
+name; it is the only way to resolve that collision without writing the full path at every use.
 
-If you happen to know Scala 3, these are its import forms unchanged — including `as` and `*`.
+These are the same import forms as Scala 3, including `as` and `*`.
 
-Imports usually sit just below the header, but one may also appear **inside a block**, scoped to it,
-for a name wanted in one function only.
+Imports usually follow the header, but an import may also appear **inside a block**, scoped to it,
+for a name needed in one function only.
 
-Resolution is innermost-first: a local binding shadows an imported name, and the fully-qualified path
-is always available to break a tie. Two wildcard imports offering the same name make an *unqualified*
-use of it an error naming both — including when one of them is the standard library, which is
-auto-imported into every file. That is deliberate: the alternative is a precedence tier that makes the
-library quietly lose to whatever a program imported, which is the silent capture the error exists to
-prevent.
+Names resolve innermost first: a local binding shadows an imported name, and the fully qualified path
+is always available to disambiguate. When two wildcard imports offer the same name, an *unqualified*
+use of it is an error naming both, including when one of them is the standard library, which is
+imported into every file automatically. This is deliberate: giving either side precedence would let
+a name be captured silently, which is what the error prevents.
 
 ## The standard library
 
-**The library is a module, not a set of names threaded in beside your program.** `sysl` itself is
-auto-imported into every file, which is why nothing so far has had to import anything to call
-`print` — and what earns that is that it holds what the language desugars onto, which a program
-cannot avoid needing. Everything else is a submodule you ask for by name, because a submodule is an
-offer rather than part of the language.
+**The standard library is a module like any other.** The root module `sysl` is imported into every
+file automatically, which is why no example so far has imported anything to call `print`. It holds
+what the language itself depends on, which every program needs. Everything else is in a submodule
+you import by name.
 
 | module | what is in it |
 |---|---|
@@ -136,9 +132,9 @@ offer rather than part of the language.
 | `sysl.args` | command-line options — `Scan`, `Cli`, and `args_of` for a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |
 
-The split is one rule: **what a program cannot avoid needing arrives free, and what it has to ask for
-it asks for.** An array literal and a `for` loop are in the language, so nothing imports them. A
-sequence that grows is a thing a program decides it wants, so it says so:
+The division follows one rule: **what every program needs is available automatically, and anything
+else is imported.** Array literals and `for` loops are part of the language, so nothing imports them.
+A growable sequence is something a program chooses to use, so it imports one:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -169,19 +165,20 @@ print(b.finish())
 widest of 3 is 11
 ```
 
-Nothing there is a language feature. `Buf` is ordinary sysl over a slice it replaces when it runs
-out; `StrBuilder` is ordinary sysl over a `Buf[u8]`; and both are importable rather than free because
-a program that wants neither should link neither.
+None of this is a language feature. `Buf` is ordinary sysl over a slice that it replaces when it runs
+out of room, and `StrBuilder` is ordinary sysl over a `Buf[u8]`. Both are imported rather than
+automatic so that a program that uses neither does not link either.
 
-A module may also narrow itself. `@no_alloc` in the header says the module reaches no allocator, and
-`requires os` says it needs one — `sysl.fs` is `requires os` because a filesystem is something the
-environment either has or does not, and everything under `sysl.posix` requires posix. The atomics
-live apart from the threads for exactly this reason: `sysl.sync` requires **nothing**, so a kernel
-that has given up both its allocator and its operating system can still import a spinlock. A
-freestanding target importing one of the others is told so **at the import** rather than deep in code
-generation. [The reference](/reference/modules/) has the clause and how it propagates.
+A module may also declare restrictions. `@no_alloc` in the header says the module uses no allocator,
+and `requires os` says it needs an operating system. `sysl.fs` is `requires os` because a filesystem
+is something the environment either has or does not, and everything under `sysl.posix` requires
+posix. For the same reason the atomics are separate from the threads: `sysl.sync` requires
+**nothing**, so a kernel with neither an allocator nor an operating system can still import a
+spinlock. A freestanding target that imports one of the other modules is told so **at the import**,
+not deep in code generation. [The reference](/reference/modules/) describes the clause and how it
+propagates.
 
-`sysl.io` is the one that needs a word, because it is where the iteration protocol earns its keep:
+`sysl.io` deserves a closer look, because it shows the iteration protocol in use:
 
 ```sysl
 import sysl.io.{stdin, lines}
@@ -192,19 +189,19 @@ for line in lines(&src)
     print("read:", line)
 ```
 
-`lines` hands back a cursor, and `for` walks anything implementing `Iterate` — so the loop reads a
-line at a time out of a 4 KiB chunk rather than pulling the file into memory. A `Reader` is a trait
-with one method, so the same loop reads a socket, a ring buffer, or a test fixture, and a freestanding
-target substitutes one body.
+`lines` returns a cursor, and `for` iterates over anything that implements `Iterate`, so the loop
+reads one line at a time from a 4 KiB chunk instead of loading the whole input into memory. A
+`Reader` is a trait with one method, so the same loop can read a socket, a ring buffer or a test
+fixture, and a freestanding target supplies its own implementation.
 
-A module is compiled once and linked, which is what the acyclic import graph buys. The standard
-library itself is an artifact — a real `ar` archive — and the compiler builds it for you when nothing
-usable is at the default path, announced on stderr and in well under a second. It lives in your cache
-directory under a fingerprint of the library it was built from, so every project on the machine shares
-one and a new compiler makes its own without disturbing the old. There is no bootstrap step to run and
-none to remember.
+Each module is compiled once and linked, which the acyclic import graph makes possible. The standard
+library itself is built as an `ar` archive. When no usable archive exists at the default path, the
+compiler builds one automatically, reports this on stderr, and takes well under a second. The archive
+is stored in your cache directory under a fingerprint of the library it was built from, so every
+project on the machine shares it, and a different compiler version builds its own without affecting
+the existing one. There is no separate setup step.
 
 ---
 
-Next: [contracts](/tour/contracts/) — types that carry a rule, and functions that state what they
+Next: [contracts](/tour/contracts/): types that carry a rule, and functions that state what they
 require.

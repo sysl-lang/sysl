@@ -15,11 +15,13 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl`](sysl/) | The core: what every program has without importing anything. |
 | [`sysl.args`](sysl-args/) | How a program's arguments become a `[]string`, written here because every line of it is ordinary sysl. |
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
+| [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption and nothing else. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |
 | [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
+| [`sysl.encoding.json`](sysl-encoding-json/) | JSON, read and written: a document parsed into a value tree that owns itself, and a value tree written back out compactly or for a person to read. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
 | [`sysl.env.sys`](sysl-env-sys/) |  |
@@ -50,6 +52,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.process.hosted`](sysl-process-hosted/) |  |
 | [`sysl.process.sys`](sysl-process-sys/) |  |
 | [`sysl.rand`](sysl-rand/) | Pseudo-random numbers: a named, seedable, reproducible generator, and the distributions that are easy to get wrong. |
+| [`sysl.reflect`](sysl-reflect/) |  |
 | [`sysl.regex`](sysl-regex/) | Matching text against a pattern: compile one, then find, replace or split with it. |
 | [`sysl.seq`](sysl-seq/) | What a sequence of values can be asked, in one trait, so that a slice and a `Buf` answer the same names. |
 | [`sysl.signal`](sysl-signal/) | Signals as flags: a program asks to be told that one arrived, and asks again later whether it has. |
@@ -57,6 +60,9 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.signal.sys`](sysl-signal-sys/) |  |
 | [`sysl.slices`](sysl-slices/) | Operations over a built-in slice, and the pointer a C binding needs to hand one across. |
 | [`sysl.softfloat`](sysl-softfloat/) |  |
+| [`sysl.softfloat.binary64`](sysl-softfloat-binary64/) |  |
+| [`sysl.softint`](sysl-softint/) |  |
+| [`sysl.softint.aeabi`](sysl-softint-aeabi/) |  |
 | [`sysl.sync`](sysl-sync/) | What two threads may touch at once: `Atomic[T]`, `SpinLock`, and the five memory orderings. |
 | [`sysl.sys`](sysl-sys/) | The platform seam: everything the library asks of what it is hosted on, and nothing else. |
 | [`sysl.term`](sysl-term/) | What a terminal understands: the escape sequences that colour text, emphasise it, and move the cursor about. |

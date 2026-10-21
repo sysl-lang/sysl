@@ -292,8 +292,14 @@ private expr_parts(w: *Walk, e: Expr)
             walk_expr(w, b)
             walk_all(w, fields, walk_with_field)
         ImplicitMember(_) -> w.see(at, "ImplicitMember", AtExpr(e))
+        TypeArg(t) ->
+            w.see(at, "TypeArg", AtExpr(e))
+            walk_type(w, t)
         LayoutOf(_, t) ->
             w.see(at, "LayoutOf", AtExpr(e))
+            walk_type(w, t)
+        TraitTest(t, _) ->
+            w.see(at, "TraitTest", AtExpr(e))
             walk_type(w, t)
         OffsetOf(t, _) ->
             w.see(at, "OffsetOf", AtExpr(e))
@@ -326,6 +332,11 @@ private expr_parts(w: *Walk, e: Expr)
             walk_all(w, body, walk_stmt)
         IfExpr(c, t, f, _) ->
             w.see(at, "IfExpr", AtExpr(e))
+            walk_expr(w, c)
+            walk_all(w, t, walk_stmt)
+            walk_opt_all(w, f, walk_stmt)
+        ConstIf(c, t, f) ->
+            w.see(at, "ConstIf", AtExpr(e))
             walk_expr(w, c)
             walk_all(w, t, walk_stmt)
             walk_opt_all(w, f, walk_stmt)
@@ -486,6 +497,8 @@ private type_parts(w: *Walk, t: TypeRef)
         SomeType(bounds) ->
             w.see(at, "SomeType", AtType(t))
             walk_all(w, bounds, walk_bound)
+        // Nothing is written there for a position to be on.
+        InferredResult(_) -> ()
 end type_parts
 
 private walk_bound(w: *Walk, b: BoundRef)
@@ -523,7 +536,7 @@ private stmt_parts(w: *Walk, s: Stmt)
             walk_opt(w, align, walk_expr)
         ConstDecl(_, typ, v, _) ->
             w.see(at, "ConstDecl", AtStmt(s))
-            walk_type(w, typ)
+            walk_opt(w, typ, walk_type)
             walk_expr(w, v)
         CConstBlock(cs) ->
             w.see(at, "CConstBlock", AtStmt(s))
@@ -533,11 +546,16 @@ private stmt_parts(w: *Walk, s: Stmt)
 
             for item in ts
                 w.see(item.span, "CTypeDecl", AtCType(item))
-        AssertDecl(c, _) ->
+        AssertDecl(c, m) ->
             w.see(at, "AssertDecl", AtStmt(s))
             walk_expr(w, c)
+
+            if m.is_some() then walk_expr(w, m.unwrap())
         StaticDecl(inner) ->
             w.see(at, "StaticDecl", AtStmt(s))
+            walk_stmt(w, inner)
+        CopiedDecl(_, inner) ->
+            w.see(at, "CopiedDecl", AtStmt(s))
             walk_stmt(w, inner)
         ValDecl(_, typ, v, _, align, _, _, _) ->
             w.see(at, "ValDecl", AtStmt(s))
@@ -551,10 +569,10 @@ private stmt_parts(w: *Walk, s: Stmt)
             w.see(at, "MultiAssign", AtStmt(s))
             walk_all(w, ts, walk_expr)
             walk_all(w, vs, walk_expr)
-        MultiDecl(_, _, vs) ->
+        MultiDecl(_, _, vs, _) ->
             w.see(at, "MultiDecl", AtStmt(s))
             walk_all(w, vs, walk_expr)
-        PatternDecl(pat, _, v, typ) ->
+        PatternDecl(pat, _, v, typ, _) ->
             w.see(at, "PatternDecl", AtStmt(s))
             walk_pattern(w, pat)
             walk_opt(w, typ, walk_type)

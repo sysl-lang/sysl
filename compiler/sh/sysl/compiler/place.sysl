@@ -49,6 +49,15 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
     if named.is_some()
         val local = cx.lookup(named.unwrap())
 
+        // A local `const` is its value at every use, so there is no storage behind the name at all.
+        if local.is_some() && cx.const_local(local.unwrap().unique).is_some()
+            cx.fault(at, s"'${named.unwrap()}' is a constant, which is its value wherever it is used " +
+                     s"and has no storage of its own — so $what has nothing to reach. A name for " +
+                     "storage is a 'var'")
+
+            return t
+        end if
+
         if local.is_some() && local.unwrap().read_only
             cx.fault(at, written_once(local.unwrap(), what))
 
@@ -105,7 +114,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
 
     // Only a write is asked about: `&` produces a pointer and takes nothing away, so the storage a
     // `ref` found is exactly where it was.
-    if writes then check_ref_guards(cx, at, t)
+    if writes && !check_view_guards(cx, at, t) then check_ref_guards(cx, at, t)
 
     t
 end require_place
@@ -328,7 +337,7 @@ ref_place(cx: &Analyzer, unique: string) -> Option[TExpr] = local_named(cx, uniq
 // and never a little less. A `ref` name resolves to the place it stands for, so a guard built from
 // one `ref` sees a second that reached the same storage by name. **A step is written after a `/`,
 // which no name holds**, so one key being a prefix of another is a statement about whole steps.
-private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
+place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
     TLoad(name, _) ->
         val through = ref_place(cx, name)
         val stood = if through.is_some() then place_key(cx, through.unwrap()) else None
@@ -336,7 +345,14 @@ private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
         if stood.is_some() then stood else Some(name)
     TGlobal(symbol, _, _) -> Some(s"@$symbol")
     TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
-    TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
+    // Every field of a union is the same bytes, so all of them are one place: a view of one and a
+    // write through another overlap.
+    TField(recv, index, _) ->
+        val step = underlying(texpr_type(recv)) match
+            Struct(d) -> if d.union_layout then "u" else s"$index"
+            _ -> s"$index"
+
+        key_step(place_key(cx, recv), step)
     TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
     TCall(_, _, _, _) -> placed_by(cx, t) match
         Some(recv) -> key_step(place_key(cx, recv), "[]")
@@ -345,7 +361,7 @@ private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
 
 // The container a call addresses an element of, where the call is a subscript through
 // `IndexPlace` -- `b[i]` is `*b.index_place(i)`, so the step before the element is `b`.
-private placed_by(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
+placed_by(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     // Whether the call is one a subscript made is a fact filed where the subscript was lowered, not
     // something its name says. A `*self` receiver arrives as the address of the container, so the
     // step is the container.
@@ -360,7 +376,7 @@ private placed_by(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
 // Whether a container's own value holds an address, so that overwriting it -- or a `@relocates`
 // member called on it -- can let go of the storage its elements live in. A `Buf` holds its storage
 // behind a `&`; a container whose elements are a fixed array inside it holds none and moves nothing.
-private holds_storage(t: Type) -> bool
+holds_storage(t: Type) -> bool
     if owning_step(t) then return true
 
     repr(t) match
@@ -386,7 +402,7 @@ private owning_step(t: Type) -> bool = t match
     _ -> false
 
 // The step a place was reached from, where it was reached from one.
-private step_before(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
+step_before(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
     TField(recv, _, _) -> Some(recv)
     TIndex(recv, _, _) -> Some(recv)
     TDeref(operand, _) -> Some(operand)
@@ -471,7 +487,7 @@ end check_ref_guards
 
 // A refusal on a live `ref`'s account, noted so that the whole-program question about a call on
 // the same line (`checks.sysl`'s `check_ref_calls`) does not ask it again.
-private refuse_for_ref(cx: &Analyzer, at: Span, message: string)
+refuse_for_ref(cx: &Analyzer, at: Span, message: string)
     cx.fault(at, message)
     cx.an.ref_refusals.push(at.start)
 
@@ -522,6 +538,10 @@ struct RefWatch
     start: usize
     end: Option[usize]
     depth: usize
+
+    // Where the name is not a `ref` but a local holding a view borrowed from a receiver
+    // (`view_borrow.sysl`): the receiver's name, which is what a refusal names. Empty for a `ref`.
+    view_of: string
 end RefWatch
 
 // Files a `ref` just bound, where anything another name could reach holds the storage it stands in.
@@ -544,7 +564,8 @@ watch_ref(cx: &Analyzer, span: Span, name: string, place: TExpr)
 
     if types.is_empty() then return
 
-    cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, cx.locals.len() - 1))
+    cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, cx.locals.len() - 1,
+                                    ""))
 end watch_ref
 
 // The types whose values hold the owning steps a `ref` over `place` goes through: for a field the
@@ -584,7 +605,7 @@ private step_holder(cx: &Analyzer, step: TExpr) -> Option[Type] = *step.kind mat
 
 // What a receiver of this type is the storage of: the object a reference or pointer reaches, or the
 // value itself.
-private object_type(t: Type) -> Type = underlying(pointee(t).unwrap_or(t))
+object_type(t: Type) -> Type = underlying(pointee(t).unwrap_or(t))
 
 private add_type(out: *Buf[Type], t: Type)
     for item in *out
@@ -692,6 +713,8 @@ private indirect_step(cx: &Analyzer, s: TExpr) -> bool = *s.kind match
 // `Buf` handle on the same buffer -- moves the same storage, so a receiver of a type the ref's
 // storage is held in is refused the same way off the ref's own path.
 check_ref_call(cx: &Analyzer, at: Span, place: TExpr, relocating: string = "")
+    if check_view_call(cx, at, place) then return
+
     val key = place_key(cx, place)
     val inside = if key.is_some() then s"${key.unwrap()}/" else ""
     var i = cx.locals.len()
@@ -812,8 +835,8 @@ expr_try(e: TExpr) -> bool = *e.kind match
     TTypeId(r, _) -> expr_try(r)
     TAddrOf(p, _) -> expr_try(p)
     TTempAddr(v, _) -> expr_try(v)
-    TStore(p, v, _) -> expr_try(p) || expr_try(v)
-    TUpdate(p, _, v, _, _, _) -> expr_try(p) || expr_try(v)
+    TStore(p, v, _, _) -> expr_try(p) || expr_try(v)
+    TUpdate(p, _, v, _, _, _, _) -> expr_try(p) || expr_try(v)
     TIncDec(p, _, _, _, _) -> expr_try(p)
     TBinary(_, l, r, _) -> expr_try(l) || expr_try(r)
     TUnary(_, v, _) -> expr_try(v)

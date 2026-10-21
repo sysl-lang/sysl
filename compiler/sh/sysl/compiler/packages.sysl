@@ -79,14 +79,18 @@ struct Packaging
     manifest: string
     name: string
     version: string
+
+    // What a `no module is called` refusal in one of the package's files adds, where its manifest
+    // names dependencies the machine being built for leaves out (`absent_note`), and empty otherwise.
+    absent: string
 end Packaging
 
 // A file of the project being built: no prefix, and nothing mounted.
-no_packaging() -> Packaging = Packaging("", buf(), false, "", "", "")
+no_packaging() -> Packaging = Packaging("", buf(), false, "", "", "", "")
 
 // A file a library handed over under the name it was written with, which is what a source root
 // given as a library arrives as.
-supplied_packaging() -> Packaging = Packaging("", buf(), true, "", "", "")
+supplied_packaging() -> Packaging = Packaging("", buf(), true, "", "", "", "")
 
 // The manifest the files of the tree rooted at `dir` were read under, as `__NAME__` and
 // `__VERSION__` need it: its path where the tree has one, and the name and version the already-read
@@ -153,8 +157,14 @@ end names_module
 // path somebody could have written rather than a canonical name the compilation keys on. A `path`
 // dependency's canonical prefix is its label, an ordinary identifier, so it looks exactly like the head
 // of a module path while naming nothing a file writes.
-writes_module(a: &Analysis, pkg: Packaging, name: string) -> bool
+//
+// **A standard library file writes none of the program's modules.** The library and the project share
+// the empty prefix, so without `library` the library's `import sysl.unicode.{fold}` was refused in any
+// program that had a module called `fold` -- a name the library cannot know and must not depend on.
+writes_module(a: &Analysis, pkg: Packaging, library: bool, name: string) -> bool
     for m in a.tables.modules
+        if library && holds_string(a.tables.project_modules, m) then continue
+
         if package_of_module(a, m) == pkg.prefix
             val mine = if pkg.prefix == "" then m else m[pkg.prefix.bytes.len + 1..<m.bytes.len]
 

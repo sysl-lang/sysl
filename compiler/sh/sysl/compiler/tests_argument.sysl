@@ -100,14 +100,15 @@ private arg_exits_cleanly(text: string) -> bool
 
 // Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
 // the analysis makes is one of these too.
-private arg_err(text: string) -> string
+// `keep_tests` reads the program as `sysl test` does: every other build drops its tests unread.
+private arg_err(text: string, keep_tests: bool = false) -> string
     val root = make_temp_dir("sysl-argument").unwrap()
     val src = s"$root/main.sysl"
 
     make_dir_all(root).unwrap()
     write_text(src, text).unwrap()
 
-    val out = emit_llvm_text(src, None) match
+    val out = emit_llvm_text(src, None, DefaultOptimization, buf(), None, false, keep_tests) match
         Err(why) -> why.message
         Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
 
@@ -389,15 +390,25 @@ arg_struct_method_default_at_the_receiver()
         print(Box(b).bumped())
         """), "42\n")
 
+// `lo` is a real literal, so `T` is real, and an integer default is the real it names exactly.
+@test("an integer default is read as the real the arguments settle 'T' to")
+arg_integer_default_read_at_real()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
+        print(f(0.5))
+        """), "1.5\n")
+
 // The refusal is about the default, and names the argument the reader wrote nowhere: `lo` is a real
 // literal, so `T` is real -- never "'lo' of 'f' is int, but real was given". It is anchored at the
 // default (line 1, column 23).
-@test("an integer default is refused where the arguments settle 'T' to real")
-arg_integer_default_refused_at_real()
+@test("an integer default no real holds exactly is refused where the arguments settle 'T' to real")
+arg_inexact_integer_default_refused_at_real()
     if !arg_ready() then return
 
     val said = arg_err(raw"""
-        f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
+        f[T](lo: T, step: T = 9007199254740993) -> real = real(lo) + real(step)
         print(f(0.5))
         """)
 
@@ -431,11 +442,11 @@ arg_written_literal_outranks_an_earlier_default()
            said)
     assert(!arg_says(said, "'b' of 'k'"), said)
 
-@test("and a generic struct's method's, at the receiver's argument")
-arg_struct_method_default_refused_at_the_receiver()
+@test("and a generic struct's method reads an integer default as the real its receiver settles")
+arg_struct_method_default_read_at_a_real_receiver()
     if !arg_ready() then return
 
-    arg_refuses(raw"""
+    assert_eq(arg_ran(raw"""
         struct Box[T: Add]
             v: T
 
@@ -443,19 +454,19 @@ arg_struct_method_default_refused_at_the_receiver()
         end Box
 
         print(Box(0.5).bumped())
-        """, "'by' of 'Box.bumped.real' was left to its default, and the default cannot be read at real")
+        """), "1.5\n")
 
 // Beyond the reference's cases: a variable argument settling `T = real` against an integer default,
 // and a member generic in its own right, whose `U` is settled by `by` and not by the default.
-@test("an integer default is refused where a variable argument settles 'T' to real")
-arg_integer_default_refused_at_a_real_variable()
+@test("an integer default is read as the real a variable argument settles 'T' to")
+arg_integer_default_read_at_a_real_variable()
     if !arg_ready() then return
 
-    arg_refuses(raw"""
+    assert_eq(arg_ran(raw"""
         f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
         val x: real = 0.5
         print(f(x))
-        """, "'step' of 'f' was left to its default, and the default cannot be read at real")
+        """), "1.5\n")
 
 @test("a generic member's own parameter is settled by its argument, not by its default")
 arg_generic_member_default_settled_by_the_argument()
@@ -471,11 +482,21 @@ arg_generic_member_default_settled_by_the_argument()
         print(Box(2).scaled(3))
         """), "4\n")
 
-    arg_refuses(raw"""
+    assert_eq(arg_ran(raw"""
         struct Box[T]
             v: T
 
             scaled[U](self, by: U, step: U = 1) -> real = real(by) + real(step)
+        end Box
+
+        print(Box(2).scaled(0.25))
+        """), "1.25\n")
+
+    arg_refuses(raw"""
+        struct Box[T]
+            v: T
+
+            scaled[U](self, by: U, step: U = 9007199254740993) -> real = real(by) + real(step)
         end Box
 
         print(Box(2).scaled(0.25))
@@ -877,19 +898,22 @@ arg_collision_decided_for_the_name()
         print(x)
         """), "10\n7\n")
 
-@test("parentheses still say the store was meant")
+@test("':=' says the store was meant, and parentheses round '=' do not")
 arg_parentheses_say_the_store()
     if !arg_ready() then return
 
     assert_eq(arg_ran(raw"""
         f(x: int) -> int = x * 10
         var x = 7
-        print(f((x = 1)))
+        print(f(x := 1))
         print(x)
         """), "10\n1\n")
+    arg_refuses("f(x: int) -> int = x * 10\nvar x = 7\nprint(f((x = 1)))\n",
+                "'=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' " +
+                "to assign and use the value")
 
 // Only a bare identifier before `=` is a name.
-@test("a store through a field or an element at a call is untouched")
+@test("a store through a field at a call, written ':=', is a store")
 arg_store_through_a_field_untouched()
     if !arg_ready() then return
 
@@ -900,7 +924,7 @@ arg_store_through_a_field_untouched()
 
         f(n: int) -> int = n
         var c = Cell(0)
-        print(f(c.v = 5))
+        print(f(c.v := 5))
         print(c.v)
         """), "5\n5\n")
 
@@ -1170,12 +1194,14 @@ arg_trait_default_body_and_parameter_default()
 arg_test_function_parameter_with_a_default()
     if !arg_ready() then return
 
-    arg_refuses(raw"""
+    val said = arg_err(raw"""
         @test
         works(n: int = 7) -> unit
             assert(n == 7, "n")
-        """, "a '@test' function takes no parameters, and 'works' takes one — 'sysl test' calls it " +
-            "with nothing, so there is nowhere for an argument to come from")
+        """, true)
+
+    assert(arg_says(said, "a '@test' function takes no parameters, and 'works' takes one — 'sysl test' " +
+                          "calls it with nothing, so there is nowhere for an argument to come from"), said)
 
 // -- the shapes the parser reads -------------------------------------------------------------------
 

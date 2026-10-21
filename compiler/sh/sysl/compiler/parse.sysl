@@ -67,15 +67,22 @@ struct Parser
     // where no `if` is open (`sh.sysl.parsing`'s `Openers`).
     openers: Openers
 
+    // Whether the expression being read is an `if const` or `elif const` condition, the one place a
+    // `T: Trait` test stands as an operand.
+    deciding: bool
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
-    peek(self) -> Tok = self.toks.peek() match
-        Some(t) -> t.value
-        None -> Eof
+    //
+    // **Read out of the token list in place**, with no `Option` around a copy of the whole token: the
+    // parser asks this several times per token, and each copy retains and releases what the token
+    // holds.
+    peek(self) -> Tok = self.peek_at(0)
 
     // The kind of the token `n` further on.
-    peek_at(self, n: usize) -> Tok = self.toks.peek_at(n) match
-        Some(t) -> t.value
-        None -> Eof
+    peek_at(self, n: usize) -> Tok
+        val i = self.toks.position + n
+
+        if i >= self.toks.len() then Eof else self.toks.items.at(i).value
 
     // Where the next token is.
     here(self) -> Span = self.toks.here()
@@ -374,7 +381,7 @@ end Parsed
 // report: everything after an unterminated literal is being read in the wrong language, so a second
 // complaint about it is noise at best and a wrong line number at worst.
 parser_over(src: Source) -> Result[Parser, Diagnostic] =
-    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers()))
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false))
 
 // One expression, read from text.
 //
@@ -396,7 +403,7 @@ parse_expr_within(src: Source, from: usize, to: usize) -> ParsedExpr
         Ok(ts) -> ts
         Err(d) -> return one_expr(src, Err(d))
 
-    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers())))
+    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false)))
 end parse_expr_within
 
 private one_expr(src: Source, over: Result[Parser, Diagnostic]) -> ParsedExpr

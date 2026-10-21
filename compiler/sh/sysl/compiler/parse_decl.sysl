@@ -27,16 +27,16 @@ blank_method(at: Span, name: string) -> MethodDecl =
 
 blank_struct(name: string) -> StructDecl =
     StructDecl(name, buf(), buf(), buf(), buf(), buf(), Public, buf(), false, buf(), false, None,
-        None, buf(), None, buf())
+        None, buf(), None, buf(), false, false, buf(), buf(), false, buf())
 
 blank_enum(name: string) -> EnumDecl =
-    EnumDecl(name, buf(), None, buf(), buf(), buf(), Public, buf(), buf(), buf())
+    EnumDecl(name, buf(), None, buf(), buf(), buf(), Public, buf(), buf(), buf(), buf())
 
 blank_trait(name: string) -> TraitDecl = TraitDecl(name, buf(), buf(), buf(), buf(), Public, buf(),
-    buf(), buf())
+    buf(), buf(), buf())
 
 blank_impl(name: string, for_type: TypeRef) -> ImplDecl =
-    ImplDecl(name, for_type, buf(), buf(), buf(), buf(), buf(), false, buf(), buf(), buf())
+    ImplDecl(name, for_type, buf(), buf(), buf(), buf(), buf(), false, buf(), buf(), buf(), false)
 
 // -- parameters ---------------------------------------------------------------------------------
 
@@ -241,7 +241,7 @@ try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr],
 
     decl.tparams = tp.names
     decl.params = params
-    decl.ret_type = ret
+    decl.ret_type = inferred_unless_written(p, ret)
     decl.body = parse_func_body(p)
     decl.bounds = tp.bounds
     decl.variadic = variadic
@@ -254,6 +254,10 @@ try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr],
 
     accept_end_name(p, name)
     apply_func_attrs(&decl, attrs)
+
+    // **A test and a hook return nothing whatever their body ends with**: the runner reads whether one
+    // came back, never a value, so the `= value` it is written with is read for its effect.
+    if decl.test.is_some() || decl.hook.is_some() then decl.ret_type = ret
 
     if async_at.is_some()
         refuse_foreign_async(p, async_at.unwrap(), decl)
@@ -685,6 +689,16 @@ private add_bounds(tp: *TypeParams, name: string, bounds: Buf[BoundRef])
     tp.bounds.push(NamedBounds(name, bounds))
 end add_bounds
 
+// What a function declares it hands back, read before its body: the type written after `->`, or --
+// where none was and the body is `= value` -- a result read off that value, as a `val` written with
+// no type takes its initializer's. A body that is a block with no `=` declares nothing, which is
+// `unit`.
+inferred_unless_written(p: *Parser, written: Option[TypeRef]) -> Option[TypeRef]
+    if written.is_some() || !p.at_kw("=") then return written
+
+    Some(inferred_result_ref(p.here()))
+end inferred_unless_written
+
 // A function's body: `= value` on the line, `= ` with a block under it, or a block with no `=` at
 // all.
 parse_func_body(p: *Parser) -> Buf[Stmt]
@@ -845,7 +859,7 @@ parse_type_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     if p.block_ahead() then parse_type_members(p, &members, name)
 
     stmt(start.to(p.just_taken()), TypeDecl(TypeDecl(name, base, derived, range, pred, vis, false, None,
-                                                      wrapping, tp, members)))
+                                                      wrapping, tp, members, buf())))
 end parse_type_decl
 
 private parse_within(p: *Parser) -> RangeBound

@@ -1,0 +1,354 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `Buf`'s header and its elements are two allocations, and the accesses the buffer's own members
+// make to each carry a scope saying the other is not what they touch
+// (`reference/arrays.md § Its elements are never its header`). The text shows the marks; clang's
+// `-O2` shows what they buy; and programs that write elements, grow the buffer and reinterpret its
+// storage at `-O2` show the marks never claim more than is true.
+
+private var bfa_library_cache: Buf[Program] = buf()
+private var bfa_library_read: bool = false
+
+private bfa_library() -> Buf[Program]
+    if bfa_library_read then return bfa_library_cache
+
+    bfa_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bfa_library_cache = units
+
+    bfa_library_cache
+end bfa_library
+
+private bfa_no_library() -> bool
+    if bfa_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end bfa_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private bfa_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in bfa_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end bfa_ir
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private bfa_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-bfa").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, bfa_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end bfa_optimized
+
+// The body of the function whose `define` line holds `name`.
+private bfa_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end bfa_body
+
+// The lines of a body that hold every one of `parts`.
+private bfa_lines(body: string, parts: []string) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    for l in lines_of(body)
+        var all = true
+
+        for p in parts
+            if !l.contains(p) then all = false
+
+        if all then found.push(l)
+
+    found
+end bfa_lines
+
+private val HeaderScope: string = "!{!{!\"sysl.buf.header\", !{!\"sysl.buf\"}}}"
+private val ElementScope: string = "!{!{!\"sysl.buf.elements\", !{!\"sysl.buf\"}}}"
+private header_mark() -> string = s"!alias.scope $HeaderScope, !noalias $ElementScope"
+private element_mark() -> string = s"!alias.scope $ElementScope, !noalias $HeaderScope"
+
+private bfa_matrix() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct M
+        n: int
+        cells: &Buf[real]
+
+        at(self, i: int, j: int) -> real = self.cells.at(usize(i * self.n + j))
+
+        set(*self, i: int, j: int, v: real) = self.cells.set(usize(i * self.n + j), v)
+    end M
+
+    @noinline
+    axpy(m: M, i: int, r: int, f: real)
+        var a = m
+
+        for j in 0..<a.n do a.set(i, j, a.at(i, j) - f * a.at(r, j))
+
+    @noinline
+    first(v: []real) -> real = v[0]
+
+    @noinline
+    held(p: *Buf[real]) -> usize = (*p).len()
+
+    main()
+        var c: Buf[real] = buf()
+
+        for k in 0..<64 do c.push(real(k))
+
+        axpy(M(8, c), 1, 2, 0.5)
+        print(first(c.view()), held(&c))
+    """
+
+@test("a Buf's own members mark an element access and a header access apart")
+bfa_members_mark_both_sides()
+    if bfa_no_library() then return
+
+    val out = bfa_ir(bfa_matrix())
+    val set = bfa_body(out, "@sysl.buf$BufCore.set.real(")
+
+    assert(!bfa_lines(set, ["store double", element_mark()]).is_empty(), set)
+    assert(!bfa_lines(set, ["load %struct.sysl.buf$BufCore.real, ptr", header_mark()]).is_empty(), set)
+    assert(bfa_lines(set, ["store double", header_mark()]).is_empty(), set)
+
+    val at = bfa_body(out, "@sysl.buf$BufCore.at.real(")
+
+    assert(!bfa_lines(at, ["load double", element_mark()]).is_empty(), at)
+
+    val outer = bfa_body(out, "@sysl.buf$Buf.at.real(")
+
+    assert(!bfa_lines(outer, ["load %struct.sysl.buf$BufCore.real, ptr", header_mark()]).is_empty(), outer)
+
+@test("a program's read of a Buf through a counted reference is a header access")
+bfa_counted_reference_is_header()
+    if bfa_no_library() then return
+
+    val body = bfa_body(bfa_ir(bfa_matrix()), "$M.at(")
+
+    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.real, ptr", header_mark()]).is_empty(), body)
+
+// A view the program indexes may be anybody's storage, and a `*Buf` may point among another
+// buffer's elements, so neither says which side it is on.
+@test("a view the program indexes and a Buf behind a raw pointer carry no mark")
+bfa_views_and_raw_pointers_are_unmarked()
+    if bfa_no_library() then return
+
+    val out = bfa_ir(bfa_matrix())
+    val first = bfa_body(out, "@demo$first(")
+    val held = bfa_body(out, "@demo$held(")
+
+    assert(first.contains("load double"), first)
+    assert(!first.contains("sysl.buf"), first)
+    assert(held.contains("load %struct.sysl.buf$Buf.real"), held)
+    assert(!held.contains("sysl.buf.header"), held)
+
+// The point of the marks: the row loop of an elimination keeps the buffer's handle, its storage
+// pointer and its count in registers, so its loops read nothing but cells -- which is also what lets
+// clang vectorize it.
+@test("at -O2 a row loop over a Buf reads only its elements")
+bfa_row_loop_reads_only_elements()
+    if bfa_no_library() then return
+
+    bfa_optimized(bfa_matrix()) match
+        None -> ()
+        Some(out) ->
+            // clang quotes a name holding a `$`, so the name is asked for without its sigil.
+            val body = bfa_body(out, "demo$axpy")
+            val loops = bfa_loops(body)
+
+            assert(!loops.is_empty(), body)
+
+            for l in loops
+                assert(bfa_lines(l, [" = load double"]).len() + bfa_lines(l, [" = load <"]).len() >= 2, l)
+                assert(bfa_lines(l, [" = load ptr"]).is_empty(), l)
+                assert(bfa_lines(l, [" = load i64"]).is_empty(), l)
+                assert(bfa_lines(l, [" = load i32"]).is_empty(), l)
+                assert(bfa_lines(l, [" = load %"]).is_empty(), l)
+
+// Every loop of a body as clang leaves it: the text from a block's label to the branch that goes back
+// to it.
+private bfa_loops(body: string) -> Buf[string]
+    var found: Buf[string] = buf()
+    var labels: Buf[(string, usize)] = buf()
+    val lines = lines_of(body)
+
+    for n in 0..<lines.len()
+        val l = lines.at(n)
+
+        if l.len > 0 && !l.starts_with(" ") && l.contains(":")
+            labels.push((l[0..<l.index_of(":").unwrap()], n))
+
+        if l.contains("br ")
+            for item in labels
+                if l.contains(s"label %${item.0},") || l.ends_with(s"label %${item.0}") ||
+                   l.contains(s"label %${item.0} ")
+                    var text = ""
+
+                    for k in item.1..n
+                        text = text + lines.at(k) + "\n"
+
+                    found.push(text)
+
+    found
+end bfa_loops
+
+// -- the marks claim nothing that is not so ---------------------------------------------------------
+
+private bfa_runs(text: string) -> int
+    val root = runner_project("main.sysl", text)
+    val cache = make_temp_dir("sysl-bfa-cache").unwrap()
+
+    use_run_cache_dir(Some(cache))
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "run", s"$root/main.sysl", "-O2"], piece -> sink.push(piece))
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    code
+end bfa_runs
+
+private bfa_ready() -> bool = std_root().is_ok() && clang_available()
+
+// Every push may move the storage and rewrites the header, and the element read after it has to go
+// through the new storage: the marks say elements and header are apart, never that a header read
+// may be carried across a header write.
+@test("at -O2 a loop that grows a Buf while reading it computes right")
+bfa_growing_while_reading()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: &Buf[int] = buf()
+            var a: [101]int = [0; 101]
+
+            b.push(1)
+            a[0] = 1
+
+            for i in 0..<100
+                b.push((b.at(usize(i)) + b.at(usize(i / 2))) % 1000003)
+                a[i + 1] = (a[i] + a[i / 2]) % 1000003
+
+            var same = b.len() == 101 && b.cap() == 128
+
+            for i in 0..<101
+                if b.at(usize(i)) != a[i] then same = false
+
+            exit(if same && b.at(1) == 2 && b.at(2) == 3 then 42 else 1)
+        """), 42)
+
+// A buffer of buffers keeps the inner handles among the outer one's elements -- the one place a
+// `Buf` is not header storage, which is why only a counted reference's box is marked as one.
+@test("at -O2 a Buf of Bufs, pushed into through the outer one, computes right")
+bfa_buffer_of_buffers()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var outer: Buf[Buf[int]] = buf()
+
+            for i in 0..<4 do outer.push(buf())
+
+            for k in 0..<40
+                val inner = outer.at(usize(k % 4))
+
+                inner.push(k + int(inner.len()))
+
+            var sum = 0
+
+            for i in 0..<outer.len()
+                for x in outer.at(i).view() do sum += x
+
+            exit(if sum == 780 + 4 * 45 && outer.at(3).at(9) == 48 then 42 else 1)
+        """), 42)
+
+// A view handed out, and a pointer cast from an element's address, read and write the same storage
+// with no mark at all, so the optimizer has to assume they touch everything.
+@test("at -O2 storage written through a view and a reinterpreted pointer reads back through the Buf")
+bfa_reinterpreted_storage()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: &Buf[u32] = buf()
+
+            for i in 0..<8 do b.push(u32(i))
+
+            var total = 0u32
+
+            for i in 0..<8
+                val v = b.view()
+                val p: *u16 = ptr_cast(b.index_place(usize(i)))
+
+                v[i] = v[i] + 100
+                p[0] = p[0] + 1
+                total += b.at(usize(i))
+
+            exit(if total == 28 + 800 + 8 && b.at(7) == 108 then 42 else 1)
+        """), 42)

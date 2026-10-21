@@ -19,9 +19,20 @@ type_expr_discarded(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: b
 
     val allowed = cx.multi_ok
 
-    cx.multi_ok = false
+    val outer_tail = cx.unit_tail
 
-    analyze_discarded(cx, e)
+    cx.multi_ok = false
+    cx.assign_ok = false
+    cx.tail_carry = false
+
+    // A statement owes nothing, so every block it is made of may end in an assignment -- an
+    // `if const` branch included, which is read as a value block.
+    cx.unit_tail = true
+
+    val t = analyze_discarded(cx, e)
+
+    cx.unit_tail = outer_tail
+    t
 end type_expr_discarded
 
 // A discarded expression is by definition one nothing was expected of, so there is no context to
@@ -41,7 +52,10 @@ private analyze_discarded(cx: &Analyzer, e: Expr) -> TExpr = *e.kind match
     CFor(label, init, cond, step, body, else_body) ->
         c_for_expr(cx, e.span, label, init, cond, step, body, else_body, None, true)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
-    _ -> analyze_value(cx, e, None)
+    ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, None)
+    _ ->
+        cx.assign_here = is_assignment(e)
+        analyze_value(cx, e, None)
 
 // -- `if` ------------------------------------------------------------------------------------------
 
@@ -91,13 +105,15 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 
     // A leaning *then* is offered the `else`'s type rather than told it, and read as a branch with
     // nothing to go on where it does not take it.
-    val took = offered.and_then(t -> attempt_then(cx, span, cond, then_body, Some(t), discarded))
+    val took = offered.and_then(t -> offering(cx, Some(t), () -> attempt_then(cx, span, cond, then_body, Some(t),
+                                                                     discarded)))
 
     if took.is_some()
         tc = took.unwrap().0
         then_block = took.unwrap().1
     elif then_wants.is_some() || else_body.is_none()
-        val side = then_side(cx, span, cond, then_body, then_wants, discarded)
+        val side = if expected.is_some() then then_side(cx, span, cond, then_body, then_wants, discarded)
+                   else offering(cx, then_wants, () -> then_side(cx, span, cond, then_body, then_wants, discarded))
 
         tc = side.0
         then_block = side.1
@@ -121,34 +137,62 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             if sibling.is_none() then
                 want = merged_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
 
-            val side = then_side(cx, span, cond, then_body, want, discarded)
+            val side = offering(cx, want, () -> then_side(cx, span, cond, then_body, want, discarded))
 
             tc = side.0
             then_block = side.1
             settled_else = sibling
     end if
 
-    val t_else = else_branch(cx, else_body, early, settled_else, then_block, expected,
+    var t_else = else_branch(cx, else_body, early, settled_else, then_block, expected,
                              else_guesses, then_guesses, else_leans, discarded)
+
+    if t_else.is_some()
+        var tys: Buf[Type] = buf()
+
+        tys.push(then_block.ty)
+        tys.push(t_else.unwrap().ty)
+
+        val to = widest_branch(tys)
+
+        if to.is_some()
+            then_block = widened_block(then_block, to.unwrap())
+            t_else = Some(widened_block(t_else.unwrap(), to.unwrap()))
+    end if
+
     val ty = if_type(cx, span, then_block, t_else)
 
     TExpr(span, TIf(tc, then_block, t_else, ty))
 end if_expr
 
 // The type two leaning branches meet at, where both end in a tuple or an array literal and they
-// come to one -- `(n, 0)` against `(0, m)`.
+// come to one -- `(n, 0)` against `(0, m)`. An `elif` chain's branches are siblings, so
+// `(n, 0)`, `(0, n)` and `(n, 1)` meet at one type all together rather than two at a time.
 private shared_branch_type(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                            else_body: Buf[Stmt], discarded: bool) -> Option[Type]
     if !shaped_value(then_body) || !shaped_value(else_body) then return None
 
-    common_offer(2, (i, want) -> trial(cx, () -> branch_reading(cx, span, cond, then_body, else_body,
-                                                                i, want, discarded)))
+    common_offer(chain_branches(else_body),
+                 (i, want) -> offering(cx, want, () -> trial(cx, () -> branch_reading(cx, span, cond,
+                                                             then_body, else_body, i, want, discarded))))
 end shared_branch_type
 
-// The *then* branch, read in the condition's scope, for `i` 0, and the `else` for anything else.
+// Branch `i` of an `if` chain: the *then* branch, read in the condition's scope, for `i` 0, an
+// `elif`'s branches after it, and the last `else`.
 private branch_reading(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                        else_body: Buf[Stmt], i: usize, want: Option[Type], discarded: bool) -> TBlock
     if i == 0 then return then_side(cx, span, cond, then_body, want, discarded).1
+
+    val inner = elif_of(else_body)
+
+    if inner.is_some()
+        val at = inner.unwrap()
+
+        *at.kind match
+            IfExpr(c, t, e, _) -> return branch_reading(cx, at.span, c, t, e.unwrap(), i - 1, want,
+                                                        discarded)
+            _ -> ()
+    end if
 
     type_value_block(cx, else_body, want, discarded)
 
@@ -186,12 +230,13 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
     val want = expected.or_else(() -> if else_guesses && !then_guesses then settles(then_block)
                                       else None)
 
-    if want.is_some() then return Some(type_value_block(cx, b, want, discarded))
+    if want.is_some() && expected.is_some() then return Some(type_value_block(cx, b, want, discarded))
+    if want.is_some() then return Some(offering(cx, want, () -> type_value_block(cx, b, want, discarded)))
 
     // A leaning `else` is offered what the *then* settled, and read on its own where it does not
     // take it.
     val offered = if else_leans then settles(then_block) else None
-    val took = offered.and_then(t -> attempt_block(cx, b, Some(t), discarded))
+    val took = offered.and_then(t -> offering(cx, Some(t), () -> attempt_block(cx, b, Some(t), discarded)))
 
     if took.is_some() then return took
 
@@ -201,8 +246,23 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
 
     if tried.is_some() then return tried
 
-    Some(type_value_block(cx, b, settles(then_block), discarded))
+    Some(offering(cx, settles(then_block), () -> type_value_block(cx, b, settles(then_block), discarded)))
 end else_branch
+
+// A reading of a branch at the type its sibling settled, which widens nothing to that type or to a
+// part of it (`Analyzer.sibling_offers`).
+private offering[T](cx: &Analyzer, offer: Option[Type], read: () -> T) -> T
+    if offer.is_none() then return read()
+
+    val depth = cx.sibling_offers.len()
+
+    cx.sibling_offers.push(offer.unwrap())
+
+    val t = read()
+
+    cx.sibling_offers.truncate(depth)
+    t
+end offering
 
 // The branches meet at one type, and a branch that does not finish takes the other's. A branch used
 // only for its effect is a different thing: one `unit` branch makes the whole `if` a statement,
@@ -256,7 +316,54 @@ private conjuncts(out: *Buf[Expr], e: Expr)
 
 private cond_term(cx: &Analyzer, e: Expr, at: Span) -> TCondTerm = *e.kind match
     IsPattern(subject, patterns, negated) -> cond_is(cx, e.span, subject, patterns, negated)
+    Binary(op, _, _) if op == "||" -> TCondTest(disjunction(cx, e, at))
     _ -> TCondTest(analyze_bool(cx, e, at))
+
+// A `||` term of a condition, in which an `is` may stand as a plain test when it binds nothing.
+//
+// What a binding reaches is "from its own `is` rightward, and through the branch", and under `||` the
+// branch runs when either side held -- so a name bound on one side would hold nothing when the other
+// side was the one that did. A test that binds nothing has no such question to answer, and is the
+// `bool` a `match` with one arm for the pattern would have produced. The connectives are followed down
+// so `a is A || b is B && n > 0` reads as written; anything else is an ordinary `bool` operand, where
+// an `is` is refused as it is in every other position.
+private disjunction(cx: &Analyzer, e: Expr, at: Span) -> TExpr = *e.kind match
+    Binary(op, l, r) if op == "||" || op == "&&" ->
+        TExpr(e.span, TLogical(op, disjunction(cx, l, e.span), disjunction(cx, r, e.span)))
+    IsPattern(subject, patterns, negated) -> pattern_test(cx, e.span, subject, patterns, negated)
+    _ -> analyze_bool(cx, e, at)
+
+// `x is P` as the `bool` it answers: a `match` whose one arm is the pattern and whose other is `_`.
+private pattern_test(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern],
+                     negated: bool) -> TExpr
+    cond_is(cx, span, subject, patterns, negated) match
+        TCondIs(ts, tpats, _) -> pattern_match(cx, span, ts, tpats, negated)
+        _ -> bad_expr(span)
+
+private pattern_match(cx: &Analyzer, span: Span, ts: TExpr, tpats: Buf[TPattern],
+                      negated: bool) -> TExpr
+    // `is not` and `|` refuse a binder of their own, in `cond_is`; this is the one left.
+    if !negated && tpats.len() == 1 && any_pattern_binds(tpats) then
+        return cx.err(span, "a pattern under '||' cannot bind a name — the branch runs when either " +
+                      "side held, so there would be nothing for the name to hold when the other one " +
+                      "did. Write '_' for the parts you are not naming, chain it with '&&', or write " +
+                      "'match'")
+
+    if texpr_type(ts) == Unknown then return bad_expr(span)
+
+    val hit = TBlock(buf(), Some(TExpr(span, TBoolLit(!negated))), Bool)
+    val miss = TBlock(buf(), Some(TExpr(span, TBoolLit(negated))), Bool)
+    var rest: Buf[TPattern] = buf()
+
+    rest.push(TWildPattern(texpr_type(ts)))
+
+    var arms: Buf[TArm] = buf()
+
+    arms.push(TArm(tpats, None, hit))
+    arms.push(TArm(rest, None, miss))
+
+    TExpr(span, TMatch(ts, arms, Bool))
+end pattern_match
 
 private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern],
                 negated: bool) -> TCondTerm
@@ -273,9 +380,14 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     cx.bind_site = Some(span)
 
+    val held = cx.pattern_roots
+
+    cx.pattern_roots = pattern_view_roots(cx, ts)
+
     for i in 0..<patterns.len()
         tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
 
+    cx.pattern_roots = held
     cx.bind_site = site
 
     // A pattern that matches every value of the type asks a question with one answer. Refused
@@ -324,13 +436,74 @@ end any_pattern_binds
 match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected: Option[Type],
            discarded: bool) -> TExpr
     val ts = type_expr_bare(cx, scrut)
+
+    // A name an arm binds out of a borrowed view is borrowed from the same receiver.
+    val held = cx.pattern_roots
+
+    cx.pattern_roots = pattern_view_roots(cx, ts)
+
     val tarms = analyze_arms(cx, texpr_type(ts), arms, expected, discarded)
+
+    cx.pattern_roots = held
 
     // A refusal of the whole `match` -- arms that disagree, a gap in its coverage -- anchors at its
     // SCRUTINEE, as the reference's does: `Colour.Red match` is refused under `Red`, a selection's
     // own anchor being its member.
-    TExpr(span, TMatch(ts, tarms, match_result_type(cx, ts.span, texpr_type(ts), tarms)))
+    val met = arms_widened(tarms)
+
+    TExpr(span, TMatch(ts, met, match_result_type(cx, ts.span, texpr_type(ts), met)))
 end match_expr
+
+// **Branches meet at the widest of their types where it holds every value of the others** -- the
+// operand rule, so `if c then n else b` over an `int` and a `byte` is an `int`, and two branches
+// neither of which holds the other still disagree. A branch that is converted has its value widened
+// where the value is made, as a position widens one.
+private widest_branch(tys: Buf[Type]) -> Option[Type]
+    for candidate in tys
+        if !plain_value(candidate) then continue
+
+        var holds = true
+        var other = false
+
+        for ty in tys
+            if !plain_value(ty) then continue
+
+            if !type_eq(repr(ty), repr(candidate))
+                other = true
+
+                if !implicitly_widens(ty, candidate) then holds = false
+
+        if holds && other then return Some(candidate)
+
+    None
+end widest_branch
+
+// A branch type that takes part in meeting: one that finishes, was worked out, and is a value.
+private plain_value(ty: Type) -> bool = ty != Never && ty != Unknown && ty != Unit
+
+private widened_block(b: TBlock, to: Type) -> TBlock
+    if !plain_value(b.ty) || type_eq(repr(b.ty), repr(to)) || b.result.is_none() then return b
+
+    TBlock(b.stmts, Some(TExpr(b.result.unwrap().span, TCast(b.result.unwrap(), to))), to)
+end widened_block
+
+private arms_widened(arms: Buf[TArm]) -> Buf[TArm]
+    var tys: Buf[Type] = buf()
+
+    for arm in arms
+        tys.push(arm.body.ty)
+
+    val to = widest_branch(tys)
+
+    if to.is_none() then return arms
+
+    var out: Buf[TArm] = buf()
+
+    for arm in arms
+        out.push(TArm(arm.patterns, arm.guard, widened_block(arm.body, to.unwrap())))
+
+    out
+end arms_widened
 
 // A match's arms, with the ones that have **no type of their own** told what the rest settled --
 // the `if` rule above, over as many alternatives as the form has.
@@ -372,7 +545,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
 
     for i in 0..<arms.len()
         if leaning(cx, arms.at(i).body)
-            read.push(offered_arm(cx, scrut, arms.at(i), want, discarded))
+            read.push(offering(cx, want, () -> offered_arm(cx, scrut, arms.at(i), want, discarded)))
         else
             read.push(own.at(i))
 
@@ -385,7 +558,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     for i in 0..<arms.len()
         read.at(i) match
             Some(t) -> out.push(t)
-            None -> out.push(analyze_arm(cx, scrut, arms.at(i), want, discarded))
+            None -> out.push(offering(cx, want, () -> analyze_arm(cx, scrut, arms.at(i), want, discarded)))
 
     out
 end analyze_arms
@@ -400,8 +573,8 @@ private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
 
     if shaped.len() < 2 then return None
 
-    common_offer(shaped.len(), (i, want) -> trial(cx, () -> analyze_arm(cx, scrut, shaped.at(i), want,
-                                                                         discarded).body))
+    common_offer(shaped.len(), (i, want) -> offering(cx, want, () -> trial(cx, () ->
+                     analyze_arm(cx, scrut, shaped.at(i), want, discarded).body)))
 end shared_arm_type
 
 private any_unread(arms: Buf[Option[TArm]]) -> bool
@@ -577,9 +750,15 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
     if tpats.len() > 1 && any_pattern_binds(tpats) then
         cx.fault(arm.span, "alternative patterns joined by '|' cannot bind a name")
 
+    // Only the arm's patterns bind out of the scrutinee; its body's own bindings are its own.
+    val roots = cx.pattern_roots
+
+    cx.pattern_roots = buf()
+
     val guard = arm.guard.map(g -> analyze_bool(cx, g, arm.span))
     val body = type_block_body(cx, arm.body, expected, discarded)
 
+    cx.pattern_roots = roots
     cx.leave()
     TArm(tpats, guard, body)
 end analyze_arm
@@ -758,6 +937,19 @@ end loop_expr
 c_for_expr(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
            cond: Option[Expr], step: Option[Stmt], body: Buf[Stmt], else_body: Option[Buf[Stmt]],
            expected: Option[Type], discarded: bool) -> TExpr
+    // The init's binding is the loop's, so a use anywhere in the loop may fix its type.
+    var head: Buf[Stmt] = buf()
+
+    if init.is_some() then head.push(init.unwrap())
+
+    first_use_read(cx, head, () -> c_for_once(cx, span, label, init, cond, step, body, else_body,
+                                              expected, discarded))
+end c_for_expr
+
+// One reading of a three-clause `for`.
+private c_for_once(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
+                   cond: Option[Expr], step: Option[Stmt], body: Buf[Stmt],
+                   else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
     cx.enter()
 
     var tinit: Buf[TStmt] = buf()
@@ -787,7 +979,7 @@ c_for_expr(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
     val ty = c_for_type(cx, span, ctx, tcond, telse)
 
     checked_loop(ctx, span, TExpr(span, TCFor(tinit, tcond, tstep, tbody, telse, ty)))
-end c_for_expr
+end c_for_once
 
 // With no condition a three-clause `for` cannot finish on its own, so its type is what its breaks
 // carry, exactly as `loop`'s is.
@@ -819,7 +1011,7 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
         ends.push(lo)
         ends.push(hi)
 
-        val ts = analyze_operands(cx, ends, None)
+        val ts = analyze_operands(cx, ends, None, true)
         val tlo = ts.at(0)
         val thi = ts.at(1)
 
@@ -831,7 +1023,7 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
 
         cx.enter()
 
-        val u = cx.bind(name, vty)
+        val u = cx.bind(name, vty, name_after_keyword(cx, span.start, name))
         val ctx = open_loop(cx, span, expected, label)
         val tb = loop_stmts(cx, body)
 
@@ -856,7 +1048,10 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
 
     cx.enter()
 
-    val u = cx.bind(name, elem.unwrap())
+    val u = cx.bind(name, elem.unwrap(), name_after_keyword(cx, span.start, name))
+
+    note_loop_borrow(cx, iter.span, name, u, seq, elem.unwrap())
+
     val ctx = open_loop(cx, span, expected, label)
     val tb = loop_stmts(cx, body)
 
@@ -924,7 +1119,7 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
     cx.an.uses(fname)
 
     val next = TExpr(span, TCall(fname, next_args, opt_ty, false))
-    val u = cx.bind(name, item.unwrap())
+    val u = cx.bind(name, item.unwrap(), name_after_keyword(cx, span.start, name))
     var captures: Buf[TPattern] = buf()
 
     captures.push(TBindPattern(u, item.unwrap()))
@@ -1025,7 +1220,7 @@ private through_table(cx: &Analyzer, span: Span, seq: TExpr, cty: Type, name: st
     var none_args: Buf[Expr] = buf()
 
     val next = call_member(cx, span, TExpr(span, TLoad(slot, cty)), "next", none_args, Some(opt_ty))
-    val u = cx.bind(name, item.unwrap())
+    val u = cx.bind(name, item.unwrap(), name_after_keyword(cx, span.start, name))
     var captures: Buf[TPattern] = buf()
 
     captures.push(TBindPattern(u, item.unwrap()))
@@ -1150,16 +1345,14 @@ end road_offered
 // Whether calling `mname` on the sequence with no arguments answers with something a `for` walks:
 // an array, a slice, an erased `Iterate`, or a type implementing it. Nothing the trial wrote is kept.
 private answers_a_walk(cx: &Analyzer, seq: TExpr, mname: string, iterate: Option[string]) -> bool
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     var none_args: Buf[Expr] = buf()
     val t = texpr_type(call_member(cx, seq.span, seq, mname, none_args, None))
-    val clean = cx.an.complaints() == said
+    val refused = refused_since(cx, tried)
 
-    cx.an.release(mark)
-    cx.an.restore_complaints(said)
+    discard_trial(cx, tried)
 
-    if !clean then return false
+    if refused then return false
 
     t match
         Array(_, _) -> true
@@ -1190,7 +1383,7 @@ private subtype_range_for(cx: &Analyzer, span: Span, label: Option[string], name
 
     cx.enter()
 
-    val u = cx.bind(name, ends.0)
+    val u = cx.bind(name, ends.0, name_after_keyword(cx, span.start, name))
     val ctx = open_loop(cx, span, expected, label)
     val tb = loop_stmts(cx, body)
 
@@ -1233,7 +1426,7 @@ quantifier_expr(cx: &Analyzer, span: Span, universal: bool, name: string, iter: 
     ends.push(bounds.unwrap().0)
     ends.push(bounds.unwrap().1)
 
-    val ts = analyze_operands(cx, ends, None)
+    val ts = analyze_operands(cx, ends, None, true)
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -1245,7 +1438,7 @@ quantifier_expr(cx: &Analyzer, span: Span, universal: bool, name: string, iter: 
 
     cx.enter()
 
-    val u = cx.bind(name, vty)
+    val u = cx.bind(name, vty, name_after_keyword(cx, span.start, name))
     val tp = analyze_bool(cx, pred, span)
 
     cx.leave()
@@ -1259,6 +1452,26 @@ end quantifier_expr
 // feature**, and it is why this cannot be a desugaring into an ordinary `for`: the parts of a tuple
 // have different types, so one written line type-checks differently at each position.
 const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[Stmt]) -> TExpr
+    // `for const f in T::Fields` -- one copy per part of a type, the name standing at that part's
+    // descriptor (`type_reflect.sysl`). No cap applies: the type's own declaration is the bound, so a
+    // derivation over a hundred variants emits what a hundred hand-written arms would.
+    val walked = reflected_walk(cx, span, iter)
+
+    if walked.is_some()
+        val parts = walked.unwrap() match
+            Ok(ds) -> ds
+            Err(refusal) -> return refusal
+
+        var each: Buf[Buf[Binding]] = buf()
+        var labels: Buf[string] = buf()
+
+        for d in parts
+            each.push(descriptor_bindings(cx, name, d))
+            labels.push(descriptor_label(d))
+
+        return unrolled(cx, span, name, each, labels, body)
+    end if
+
     val bounds = range_bounds(iter)
 
     if bounds.is_none() then
@@ -1283,11 +1496,33 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
                       "to — a loop this long is a run-time 'for', which costs one copy whatever " +
                       "it counts to")
 
+    var each: Buf[Buf[Binding]] = buf()
+    var v = first
+
+    while v <= last
+        var one: Buf[Binding] = buf()
+
+        one.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
+        each.push(one)
+        v = v + 1
+
+    unrolled(cx, span, name, each, buf(), body)
+end const_for_expr
+
+// The copies of a `for const` body, each read under its own bindings for the loop's name -- and,
+// for a walk over a type's make-up, `name::Type` or `name::Payload` beside it -- in place of whatever
+// outer ones the name had.
+//
+// **A refusal in a copy over a type's parts names the part**, from `labels`: one line is checked
+// once per field, and the line alone does not say which field it failed for.
+private unrolled(cx: &Analyzer, span: Span, name: string, each: Buf[Buf[Binding]],
+                 labels: Buf[string], body: Buf[Stmt]) -> TExpr
     // The enclosing loops are **hidden** while the copies are read, which is what stops an
     // unlabelled `break` in one of them from silently leaving a loop the `for const` sits inside.
     val saved_loops = cx.loops
     val saved_flag = cx.in_const_for
     val saved_subst = cx.subst
+    val projected = s"$name::"
 
     cx.loops = buf()
     cx.in_const_for = true
@@ -1299,30 +1534,68 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
     if saved_outer.is_some() then cx.defer_outer = Some(0)
 
     var copies: Buf[TExpr] = buf()
-    var v = first
 
-    while v <= last
+    for k in 0..<each.len()
         var subst: Buf[Binding] = buf()
 
         for i in 0..<saved_subst.len()
-            if saved_subst.at(i).name != name then subst.push(saved_subst.at(i))
+            val held = saved_subst.at(i).name
 
-        subst.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
+            if held != name && !held.starts_with(projected) then subst.push(saved_subst.at(i))
+
+        for b in each.at(k)
+            subst.push(b)
+
         cx.subst = subst
+
+        val before = cx.an.complaints()
+
         copies.push(TExpr(span, TBlockExpr(type_value_block(cx, body, None, true))))
-        v = v + 1
+
+        if k < labels.len() then name_the_part(cx, before, labels.at(k))
 
     cx.subst = saved_subst
     cx.loops = saved_loops
     cx.in_const_for = saved_flag
     cx.defer_outer = saved_outer
     TExpr(span, TSeq(copies))
-end const_for_expr
+end unrolled
 
-// The most copies a `for const` is unrolled to -- a bound rather than no bound, because the cost is
-// in the emitted program and not in a number a reader can see: `for const i in 0..<100000` is one
-// line and a hundred thousand copies. The comparison above is the reference's own, which lets a
-// range one longer than this through.
+// `if const cond` -- the branch decided **while compiling**. The condition is folded, and only the arm
+// it picks is read: the other is never type-checked, which is what lets one generic body hold an arm
+// that makes sense only for some of its instances. A generic body read before any instance has no
+// value for its parameters, so there neither arm is read; each instance reads the one it takes.
+const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_body: Option[Buf[Stmt]],
+              expected: Option[Type]) -> TExpr
+    if cx.at_definition then return TExpr(span, TZero(Unknown))
+
+    val mark = cx.an.complaints()
+
+    val taken = const_fold(cx, cond) match
+        Some(ConstBool(b)) -> b
+        Some(_) ->
+            return cx.err(cond.span, "an 'if const' takes a 'bool' — it picks the arm to compile, " +
+                          "and this condition is not true or false")
+        None ->
+            // A refusal from the fold already says what in the condition is not constant.
+            if cx.an.complaints() > mark then return bad_expr(span)
+
+            return cx.err(cond.span, "an 'if const' is decided while compiling, so its condition " +
+                          "has to be known then — a 'const', a value parameter, or a call whose body " +
+                          "can run. A test made while the program runs is a plain 'if'")
+
+    if taken then return TExpr(span, TBlockExpr(type_value_block(cx, then_body, expected, false)))
+
+    else_body match
+        Some(b) -> TExpr(span, TBlockExpr(type_value_block(cx, b, expected, false)))
+        None -> TExpr(span, TBlockExpr(TBlock(buf(), None, Unit)))
+end const_if_expr
+
+// The most copies a `for const` over a range is unrolled to -- a bound rather than no bound, because
+// the cost is in the emitted program and not in a number a reader can see: `for const i in 0..<100000`
+// is one line and a hundred thousand copies. The comparison above is the reference's own, which lets
+// a range one longer than this through. A walk of `T::Fields`, `T::Members` or `T::Variants` is not
+// bounded by it: its length is the type's declaration, which a reader can see.
 const MaxUnrolledCopies: long = 64
 
 private const_int_of(cx: &Analyzer, e: Expr) -> Option[long]
@@ -1364,13 +1637,40 @@ private block_value(stmts: Buf[Stmt]) -> Option[Expr]
 end block_value
 
 // Whether a value block ends in a tuple or an array literal, the two constructions whose parts a
-// sibling's type is read against one by one.
+// sibling's type is read against one by one -- or in an `if` every one of whose branches does.
 private shaped_value(stmts: Buf[Stmt]) -> bool = block_value(stmts) match
     Some(e) -> *e.kind match
         Tuple(_) -> true
         ArrayLit(_) -> true
+        IfExpr(_, then_body, else_body, _) ->
+            else_body.is_some() && shaped_value(then_body) && shaped_value(else_body.unwrap())
         _ -> false
     None -> false
+
+// The `elif` an `else` branch is, where it is nothing else: the parser nests one into the branch
+// before it as the whole of that branch.
+private elif_of(stmts: Buf[Stmt]) -> Option[Expr]
+    if stmts.len() != 1 then return None
+
+    val e = block_value(stmts)
+
+    if e.is_none() then return None
+
+    *e.unwrap().kind match
+        IfExpr(_, _, else_body, _) -> if else_body.is_some() then e else None
+        _ -> None
+end elif_of
+
+// How many branches an `if` chain has, counting each `elif` as a sibling of the `if` it follows.
+private chain_branches(else_body: Buf[Stmt]) -> usize
+    val inner = elif_of(else_body)
+
+    if inner.is_none() then return 2
+
+    *inner.unwrap().kind match
+        IfExpr(_, _, e, _) -> 1 + chain_branches(e.unwrap())
+        _ -> 2
+end chain_branches
 
 // The one type every one of `n` branches can be read at, where there is one: the first is read on
 // its own, and each is then offered the type the last reading came to, until a whole round reads
@@ -1404,13 +1704,11 @@ end common_offer
 // A reading made only to learn the type it comes to, and then thrown away whole -- registrations,
 // closures and complaints alike. A reading that complained comes to nothing.
 private trial(cx: &Analyzer, read: () -> TBlock) -> Option[Type]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = read()
-    val refused = cx.an.complaints() > said
+    val refused = refused_since(cx, tried)
 
-    cx.an.release(mark)
-    cx.an.restore_complaints(said)
+    discard_trial(cx, tried)
 
     if refused then None else settles(t)
 end trial
@@ -1448,6 +1746,7 @@ private leans(cx: &Analyzer, e: Expr) -> bool
         ArrayFill(v, _) -> leans(cx, v)
         Call(_, args) -> any_leans(cx, args)
         NamedArg(_, v) -> leans(cx, v)
+        IfExpr(_, _, _, _) -> every_branch_leans(cx, e)
         _ -> false
 end leans
 
@@ -1462,10 +1761,78 @@ end any_leans
 // `elif` chain is, the parser nesting each `elif` into the branch before it: in
 // `if a then n elif b then 1 else 2` the three arms are siblings, and the two literal ones take the
 // type the first one knows, exactly as three arms of a `match` would.
+//
+// **A branch that does not finish is no evidence either way**, so it does not stop its sibling
+// guessing: `if c then 0 else continue` is a `0` of whatever its position says, exactly as the `if`
+// with a `1` in place of the `continue` is. One branch still has to be a guess -- an `if` that never
+// finishes on either side is `never`, which is a type of its own.
 private every_branch_guesses(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     IfExpr(_, then_body, else_body, _) ->
-        else_body.is_some() && guessing(cx, then_body) && guessing(cx, else_body.unwrap())
+        if else_body.is_none() then return false
+
+        val eb = else_body.unwrap()
+
+        guessing(cx, then_body) && (guessing(cx, eb) || stops(cx, eb)) ||
+            guessing(cx, eb) && stops(cx, then_body)
     _ -> false
+
+// Whether a block ends by leaving: in a `return`, a `break` or a `continue`, or in a call of a
+// function declared `-> never` -- `panic(…)`, or one of the program's own.
+//
+// **The test is on the spelling, as `guessing`'s is**, because it is asked before the block around
+// the branch has been read: a reading of the branch here would look its names up before the lines
+// that declare them.
+private stops(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
+    if stmts.is_empty() then return false
+
+    *stmts.at(stmts.len() - 1).kind match
+        Return(_) -> true
+        Break(_, _) -> true
+        Continue(_) -> true
+        ExprStmt(e) -> *e.kind match
+            Call(callee, _) -> *callee.kind match
+                Ident(name) -> declared_never(cx, name)
+                _ -> false
+            _ -> false
+        _ -> false
+end stops
+
+// Whether every function a name reaches is declared to return `never`.
+private declared_never(cx: &Analyzer, name: string) -> bool
+    val keys = function_keys_of(cx, name)
+
+    if keys.is_empty() then return false
+
+    for key in keys
+        val f = cx.an.tables.funcs.get(key)
+
+        if f.is_none() then return false
+
+        val ret = f.unwrap().decl.ret_type
+
+        if ret.is_none() then return false
+
+        val spelled_never = *ret.unwrap().kind match
+            NamedType(written, args) -> written == "never" && args.is_empty()
+            _ -> false
+
+        if !spelled_never then return false
+    end for
+
+    true
+end declared_never
+
+// Whether an `if` is a chain of branches each of which knows its type only in part or not at all --
+// `if a then (n, 0) elif b then (0, n) else (n, 1)` -- which, like its branches, is read against
+// the type its siblings settle.
+private every_branch_leans(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    IfExpr(_, then_body, else_body, _) ->
+        else_body.is_some() && branch_leans(cx, then_body) && branch_leans(cx, else_body.unwrap())
+    _ -> false
+
+private branch_leans(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> leans(cx, e)
+    None -> false
 
 // What a branch or an arm **settles** for whichever of its siblings is guessing, or nothing where
 // it settles nothing.
@@ -1485,51 +1852,39 @@ end settles
 // mistake *and* leave the mistake reported.
 private attempt_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
                       discarded: bool) -> Option[TBlock]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = type_value_block(cx, stmts, expected, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_block
 
 private attempt_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[Type],
                     discarded: bool) -> Option[TArm]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = analyze_arm(cx, scrut, arm, expected, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_arm
 
 private attempt_then(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
                      want: Option[Type], discarded: bool) -> Option[(Buf[TCondTerm], TBlock)]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val t = then_side(cx, span, cond, then_body, want, discarded)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_then

@@ -41,8 +41,9 @@ enum StmtKind
             align: Option[Expr], section: Option[string], copies: Copies,
             export: Option[ExportAttr])
 
-    // `const NAME: T = value` -- settled while compiling, so the type is not optional.
-    ConstDecl(name: string, typ: TypeRef, value: Expr, vis: Visibility)
+    // `const NAME: T = value` -- settled while compiling. The type may be left to the value, as a
+    // `val`'s may.
+    ConstDecl(name: string, typ: Option[TypeRef], value: Expr, vis: Visibility)
 
     // `cconst` with an indented block: constants whose values are read out of C.
     CConstBlock(consts: Buf[CConstDecl])
@@ -50,11 +51,17 @@ enum StmtKind
     // `ctype` with an indented block: types whose layout is read out of C.
     CTypeBlock(types: Buf[CTypeDecl])
 
-    // `@assert(cond)` standing on its own -- a condition settled while compiling.
-    AssertDecl(cond: Expr, message: Option[string])
+    // `@assert(cond)` standing on its own -- a condition settled while compiling. The message is any
+    // `string` expression the compiler can compute while compiling, worked out only when the
+    // condition comes out false.
+    AssertDecl(cond: Expr, message: Option[Expr])
 
     // `static` in front of a binding: one copy for the program rather than one per call.
     StaticDecl(inner: Stmt)
+
+    // `@thread_local` or `@per_cpu` above a `var` naming several things (a `MultiDecl` or a
+    // `PatternDecl`): every name it binds is storage with those copies, as one `var` under it is.
+    CopiedDecl(copies: Copies, inner: Stmt)
 
     // `val name: T = value`. `copies` is `OneCopy`, or `MainThreadOnly` under `@main_thread` -- the
     // two answers a binding that never changes can give.
@@ -68,12 +75,13 @@ enum StmtKind
     // `a, b = f()` -- assignment to several places at once.
     MultiAssign(op: string, targets: Buf[Expr], values: Buf[Expr])
 
-    // `val a, b = f()` -- several names bound at once.
-    MultiDecl(names: Buf[string], mutable: bool, values: Buf[Expr])
+    // `val a, b = f()` -- several names bound at once. `vis` is what a module-level one says of every
+    // name it binds; a local's is never read.
+    MultiDecl(names: Buf[string], mutable: bool, values: Buf[Expr], vis: Visibility)
 
     // `val Point(x, y) = p` -- a binding whose left side is a pattern, and `val (a, b): (u64, u64) = t`
-    // one that also states the type of the whole value it takes apart.
-    PatternDecl(pat: Pattern, mutable: bool, value: Expr, typ: Option[TypeRef])
+    // one that also states the type of the whole value it takes apart. `vis` is as `MultiDecl`'s.
+    PatternDecl(pat: Pattern, mutable: bool, value: Expr, typ: Option[TypeRef], vis: Visibility)
 
     // An expression written for its effect, or as a block's trailing value.
     ExprStmt(inner: Expr)
@@ -223,6 +231,12 @@ end RecvMode
 // pair is refused where it is written; `cold` states a frequency and composes with either. They
 // belong to the **declaration**, so every instantiation of a generic carries them.
 //
+// `inline_always` is `@inline(always)`: the request made an instruction (LLVM's `alwaysinline`,
+// which the always-inliner honours at every optimization level, `-O0` included). It sets `inline`
+// too, so everything that copies a hinted body to where its callers are -- a precompiled package's
+// `available_externally` copy, a codegen unit's -- copies this one; only the word on the `define`
+// line differs.
+//
 // `async_at` rides here too, being said of the declaration and carried to every lowered copy of it
 // the same way: where the `async` word was written, or nothing. It is not one of the optimizer's
 // three, so `any` does not count it. An async function's written result has already been made
@@ -273,6 +287,27 @@ struct FuncMarks
     // call (`place.sysl`'s `check_ref_call`), whatever mode the receiver is taken in.
     relocates: bool
 
+    // `@views(self)` above a member: the view it answers is borrowed from its receiver, so the view
+    // may not be used once the receiver can have been freed (`view_borrow.sysl`).
+    views: bool
+
+    // `@consumes` above a member: a call takes what its receiver holds, so a local it was called on
+    // may not be read again until it is assigned a new value (`consumes.sysl`).
+    consumes: bool
+
+    // `@export(..., weak)`: the exported entry is a weak definition, the default a strong definition
+    // of the same symbol anywhere in the link replaces (`emit_export.sysl`'s `export_linkage`).
+    weak_export: bool
+
+    // `@inline(always)`; `inline` is set beside it.
+    inline_always: bool
+
+    // `@disjoint(a, b)`: the parameters whose memory nothing else reaches while a call runs, so the
+    // back end may say `noalias` of them (`disjoint.sysl`, `emit_disjoint.sysl`). Carried to every
+    // lowered copy -- a member's free function, each instantiation of a generic -- where both the
+    // check at the call and the emission read it.
+    disjoint: Buf[string]
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -289,7 +324,7 @@ end FuncMarks
 
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false, buf(),
-                                    false, false)
+                                    false, false, false, false, false, false, buf())
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -376,10 +411,12 @@ struct FuncDecl
     const_fn: bool
 end FuncDecl
 
-// `@export` -- the symbol a function is visible under from C.
+// `@export` -- the symbol a function is visible under from C, and whether it is published `weak`: a
+// default any strong definition of the same symbol in the link replaces (`@export("write", weak)`).
 struct ExportAttr
     span: Span
     symbol: Option[string]
+    weakly: bool
 end ExportAttr
 
 // `@test`, with the name a report shows and what the run is expected to do.
@@ -391,6 +428,9 @@ struct TestAttr
     // Why the test is compiled and not run — `@test(ignore: "…")`. Required to say something, since
     // an ignored test nobody can say why is how one comes to be forgotten.
     ignored: Option[string]
+    // How many seconds the test's run may take — `@test(timeout: 30)` — in place of the run's own
+    // limit; zero is no limit at all. Absent where the annotation did not say.
+    timeout: Option[int]
 end TestAttr
 
 // Which of the four test hooks an attribute names.
@@ -436,7 +476,8 @@ enum Attr
     Guards(names: Buf[string])
     Needs(caps: Buf[string])
     NoInline
-    Inline
+    // `@inline`, or `@inline(always)` where `always` is set.
+    Inline(always: bool)
     Cold
     ThreadLocal
     Abandons
@@ -451,7 +492,42 @@ enum Attr
     Blocks
     // `@relocates` above a member: a call may move the storage its receiver's elements live in.
     Relocates
+    // `@views(self)` above a member: the view it answers is borrowed from its receiver.
+    Views(names: Buf[string])
+    // `@consumes` above a member: a call takes what its receiver holds.
+    Consumes
+    // `@disjoint(a, b)` above a function or a member: no memory reached through one named parameter
+    // is reached any other way while the call runs.
+    Disjoint(names: Buf[string])
+    // `@annotation` above a struct: the struct is an annotation a program writes as `@Name(...)`.
+    AnnotationMark
+    // `@rename("id")` above a type: an annotation the program declared, not one of the language's.
+    User(use: AnnotUse)
 end Attr
+
+// One use of an annotation a program declared -- `@rename("id")` or `@marker` -- on a field, a variant
+// or a type. `call` is the construction it stands for, `rename("id")`, and a bare `@marker` is the
+// construction with no arguments; `parens` says whether parentheses were written. `target` is the
+// field's or the variant's name, or empty for the type declaration itself.
+struct AnnotUse
+    span: Span
+    target: string
+    call: Expr
+    parens: bool
+end AnnotUse
+
+// The name an annotation's use was written with, dotted where it was qualified.
+annot_written(u: AnnotUse) -> string = *u.call.kind match
+    Call(callee, _) -> annot_path(callee)
+    _ -> ""
+
+private annot_path(e: Expr) -> string = *e.kind match
+    Ident(n) -> n
+    Field(receiver, n, _) ->
+        val head = annot_path(receiver)
+
+        if head == "" then "" else s"$head.$n"
+    _ -> ""
 
 // The word an attribute is written as, which is what a complaint about it names.
 attr_word(a: Attr) -> string = a match
@@ -474,7 +550,7 @@ attr_word(a: Attr) -> string = a match
     Guards(_) -> "guards"
     Needs(_) -> "needs"
     NoInline -> "noinline"
-    Inline -> "inline"
+    Inline(always) -> if always then "inline(always)" else "inline"
     Cold -> "cold"
     ThreadLocal -> "thread_local"
     Abandons -> "abandons"
@@ -485,6 +561,11 @@ attr_word(a: Attr) -> string = a match
     Forgoes(cap) -> s"no_$cap"
     Blocks -> "blocks"
     Relocates -> "relocates"
+    Views(_) -> "views"
+    Consumes -> "consumes"
+    Disjoint(_) -> "disjoint"
+    AnnotationMark -> "annotation"
+    User(u) -> annot_written(u)
 
 // A foreign function's declaration.
 struct ExternDecl
@@ -519,7 +600,40 @@ struct StructDecl
     deriving: Buf[BoundRef]
     byte_order: Option[bool]
     guards: Buf[string]
+
+    // `@pinned`: C holds pointers into a value of it, so a value is never copied or moved once it is
+    // built (`pinned.sysl`).
+    pinned: bool
+
+    // Declared `union` rather than `struct`: the fields share their storage (`union_fields.sysl`).
+    union_layout: bool
+
+    // The anonymous `union`/`struct` members written in the body (C11). Each is a declaration of its
+    // own, named `<Outer>#<n>` -- a name no program can write -- and held by a field named `#<n>`
+    // whose fields are reached as the outer type's (`anonymous.sysl`).
+    anon: Buf[StructDecl]
+
+    // The fields written `name: T in S`: C bitfields, each allocated in a unit of its declared type
+    // `S` by the target's C rule (`c_bitfields.sysl`).
+    bits: Buf[BitInDecl]
+
+    // `@annotation` above it: the struct is an annotation, written `@Name(...)` on a field, a
+    // variant or a type (`annotations.sysl`).
+    annotation: bool
+
+    // The annotations the program declared that are written on it and on its fields.
+    annots: Buf[AnnotUse]
 end StructDecl
+
+// What `in S` adds to the field at `field` (its position in `fields`): the type C declares it with,
+// which is the unit it is allocated in. `zero` is `_: in S`, C's `S : 0`, which holds nothing and
+// only moves the next field.
+struct BitInDecl
+    span: Span
+    field: usize
+    storage: TypeRef
+    zero: bool
+end BitInDecl
 
 // One variant of an enum: its name, the value it pins where the enum has an underlying integer, and
 // the fields it carries where it is a sum.
@@ -541,6 +655,9 @@ struct EnumDecl
     tdefaults: Buf[TypeBinding]
     tvalues: Buf[TypeBinding]
     deriving: Buf[BoundRef]
+
+    // The annotations the program declared that are written on it and on its variants.
+    annots: Buf[AnnotUse]
 end EnumDecl
 
 // `new 1..100` on a constrained type -- the range its values must lie in.
@@ -557,7 +674,9 @@ end RangeBound
 // in `type Acc = new i64q61 wrapping`: a fixed-point type whose arithmetic wraps rather than
 // saturates. `tp` is the bracketed parameter list a generic alias takes -- `type Pair[A, B] = (A, B)`
 // -- and is empty for every other declaration. `members` is the body indented under a `new` type,
-// which declares its methods as a struct's body does; every other declaration has none.
+// which declares its methods as a struct's body does; every other declaration has none. `annots` are
+// the program's annotations written above a declaration that makes a type of its own (`new`, a range,
+// a `where`, `wrapping`); a plain alias is refused one, being no type of its own to carry it.
 struct TypeDecl
     name: string
     base: TypeRef
@@ -570,6 +689,7 @@ struct TypeDecl
     wrapping: Option[Span]
     tp: TypeParams
     members: Buf[MethodDecl]
+    annots: Buf[AnnotUse]
 end TypeDecl
 
 // One associated type a trait requires: `type Item: Display`.
@@ -586,6 +706,15 @@ struct AssocBind
     typ: TypeRef
 end AssocBind
 
+// `derive[T] encode(self: T, w: *Writer)` -- the body a trait supplies for one of its members to a
+// type that names the trait in its `derives` clause. It is a template, not a default: a block written
+// by hand never inherits it. `member` is the member as an `impl` would have written it, its receiver
+// taken from `self: T`; `param` is the name the body calls the deriving type by.
+struct DeriveDecl
+    param: string
+    member: MethodDecl
+end DeriveDecl
+
 struct TraitDecl
     name: string
     tparams: Buf[string]
@@ -596,6 +725,7 @@ struct TraitDecl
     tdefaults: Buf[TypeBinding]
     assocs: Buf[AssocDecl]
     tvalues: Buf[TypeBinding]
+    derives: Buf[DeriveDecl]
 end TraitDecl
 
 struct ImplDecl
@@ -610,6 +740,9 @@ struct ImplDecl
     tvalues: Buf[TypeBinding]
     tpacks: Buf[string]
     assocs: Buf[AssocBind]
+    // Written by a `derives` clause, or as the `Debug` every type is given, rather than by hand: its
+    // members are the trait's `derive` bodies (`derive_members.sysl`, `hoist_impl.sysl`).
+    derived: bool
 end ImplDecl
 
 stmt(span: Span, kind: StmtKind) -> Stmt = Stmt(span, kind)

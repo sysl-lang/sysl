@@ -8,6 +8,46 @@ module sysl
 trait Hash
     hash(self) -> u64
 
+    /** What `derives Hash` writes: the fields mixed in order with FNV's prime, seeded from the offset
+     * basis -- the tuple's fold, so a struct and the tuple of its fields hash alike. An enum mixes
+     * its variant's position first, so two variants carrying equal payloads are different keys, and
+     * then the payload's fields. A struct holding an anonymous `struct` or `union` block is refused
+     * at its `derives`: the block has no `Hash`.
+     */
+    derive[T] hash(self: T) -> u64
+        var h = 0xcbf29ce484222325u64
+
+        if const T::Kind == Kind.SimpleEnum
+            for const c in T::Variants
+                if self is c then h = h * 0x100000001b3u64 ^ hash_u64(u64(c.index))
+        elif const T::Kind == Kind.DataEnum
+            for const c in T::Variants
+                if self is c
+                    h = h * 0x100000001b3u64 ^ hash_u64(u64(c.index))
+
+                    val p = self.(c)
+
+                    for const f in c::Fields
+                        h = h * 0x100000001b3u64 ^ p.(f).hash()
+                end if
+        else
+            // An anonymous `struct` or `union` block is no field, so `T::Fields` would pass over it
+            // and two values differing only inside it would hash alike.
+            for const m in T::Members
+                @assert(!m.anonymous || m::Type::Kind == Kind.Struct,
+                        s"'${T::Name}' cannot derive Hash: it holds an anonymous union block, which has " +
+                        s"no Hash — hashing its bytes is wrong for a float and for the bytes past a short " +
+                        s"field. Write 'impl Hash for ${T::Name}' hashing the field you know is there")
+                @assert(!m.anonymous || m::Type::Kind == Kind.Union,
+                        s"'${T::Name}' cannot derive Hash: it holds an anonymous struct block, which has " +
+                        s"no Hash — write 'impl Hash for ${T::Name}'")
+
+            for const f in T::Fields
+                h = h * 0x100000001b3u64 ^ self.(f).hash()
+
+        hash_u64(h)
+    end hash
+
 /** The mixers a built-in's `Hash` membership renders through. A built-in has no `impl` block, so
  * there is no lowered `int.hash` to call; what it has is one of these, chosen by type, and naming
  * them is what lets a `Hash` written for a struct mix its own fields.

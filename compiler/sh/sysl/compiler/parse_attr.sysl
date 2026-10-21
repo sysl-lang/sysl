@@ -52,7 +52,8 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
     parse_attributed_decl(p, start)
 end parse_at_stmt
 
-// `@assert(cond)`, `@assert(cond, "why")` -- a condition settled while compiling.
+// `@assert(cond)`, `@assert(cond, "why")`, `@assert(cond, s"why ${T::Name}")` -- a condition settled
+// while compiling, and what to say when it does not hold.
 private parse_assert_decl(p: *Parser, start: Span) -> Stmt
     p.bump()
     p.bump()
@@ -66,9 +67,9 @@ private parse_assert_decl(p: *Parser, start: Span) -> Stmt
     p.bump()
 
     val cond = parse_expr(p)
-    var message: Option[string] = None
+    var message: Option[Expr] = None
 
-    if p.accept_kw(",") then message = accept_string(p)
+    if p.accept_kw(",") then message = Some(parse_expr(p))
 
     p.expect_kw(")")
     stmt(start.to(p.just_taken()), AssertDecl(cond, message))
@@ -150,7 +151,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -170,7 +171,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates"]
+                 "relocates", "views", "consumes", "disjoint"]
         if word == w then return true
 
     false
@@ -179,6 +180,9 @@ end member_attr_word
 // An annotation written twice above one declaration says nothing the once does not.
 private refuse_duplicates(p: *Parser, attrs: Buf[Attr], what: string)
     for i in 0..<attrs.len()
+        // Which struct a program's annotation names is the analysis's to say, and so is a repeat.
+        if is_user(attrs.at(i)) then continue
+
         for j in 0..<i
             if attr_word(attrs.at(i)) == attr_word(attrs.at(j))
                 p.fault(p.here(), s"'@${attr_word(attrs.at(i))}' is written twice above one ${what}, and it says nothing the once does not")
@@ -200,6 +204,117 @@ private refuse_hash_attr(p: *Parser, at: Span)
     skip_line(p)
 end refuse_hash_attr
 
+// -- the annotations a program declares -------------------------------------------------------------
+//
+// **A word the language does not own is an annotation the program declared** (`@annotation struct
+// rename`) where what the annotations stand above can carry one: a type declaration, a field or a
+// variant. Which struct the word names is the analysis's question (`annotations.sysl`); the parser
+// reads the use as the construction it stands for. Above anything else the word is refused as the
+// language's own closed list refuses it.
+
+// Whether a word after `@` is one the language owns -- an annotation, a header clause or `@assert`.
+// A struct declared `@annotation` may not take one of these names.
+builtin_attr_word(w: string) -> bool
+    if header_attr_word(w) || fn_forgo_word(w) then return true
+
+    for word in ["assert", "annotation", "ignore", "test", "setup", "teardown", "setup_all", "teardown_all",
+                 "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
+                 "section", "crossing", "domain", "borrows", "lends", "disjoint", "guards", "needs",
+                 "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks"]
+        if word == w then return true
+
+    false
+end builtin_attr_word
+
+// Whether the `@` here opens an annotation the program declared: a word the language does not own.
+at_user_annotation(p: *Parser) -> bool
+    if !p.at_kw("@") then return false
+
+    val word = attr_name(p)
+
+    word != "" && !builtin_attr_word(word)
+end at_user_annotation
+
+// Every annotation from here on read past, in a reading taken back, and whether what follows them
+// is what `below` asks for -- the declaration they stand above decides whether a word the language
+// does not own is an annotation the program declared.
+annotations_then(p: *Parser, below: *Parser -> bool) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    while p.at_kw("@")
+        p.bump()
+        parse_expr_bp(p, PrefixPower)
+        p.skip_newlines()
+
+    val found = below(p)
+
+    p.rewind(tokens_at, errors_at)
+    found
+end annotations_then
+
+// Whether a type declaration a program's annotation may stand above follows: a struct, a union, an
+// enum or a `type`, after its visibility.
+private at_annotated_type(p: *Parser) -> bool
+    parse_visibility(p)
+
+    p.at_kw("struct") || p.at_kw("enum") || at_union_head(p, 0) || p.at_word("opaque") ||
+        p.at_kw("type")
+end at_annotated_type
+
+// `@rename("id")` or `@marker` -- one use of an annotation the program declared, about `target`.
+parse_user_annotation(p: *Parser, target: string) -> Option[AnnotUse]
+    val at = p.here()
+
+    p.bump()
+
+    val written = parse_expr_bp(p, PrefixPower)
+    val span = at.to(p.just_taken())
+
+    if annot_name_shaped(written) then
+        return Some(AnnotUse(span, target, expr(written.span, Call(written, buf())), false))
+
+    *written.kind match
+        Call(callee, _) -> if annot_name_shaped(callee) then return Some(AnnotUse(span, target, written, true))
+        _ -> ()
+
+    p.fault(at, "an annotation is written '@name' or '@name(arguments)' — the name of a struct declared '@annotation', and the values of its fields in the parentheses as a construction of it takes them")
+    skip_line(p)
+    None
+end parse_user_annotation
+
+// A name or a dotted path to one: what an annotation's use names its struct with.
+private annot_name_shaped(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    Field(receiver, _, _) -> annot_name_shaped(receiver)
+    _ -> false
+
+// The annotations above a field or a variant, every one of them a program's own.
+parse_part_annotations(p: *Parser, what: string) -> Buf[AnnotUse]
+    var out: Buf[AnnotUse] = buf()
+
+    while p.at_kw("@")
+        if !at_user_annotation(p)
+            p.fault(p.here(), s"'@${attr_name(p)}' is not about ${what} — what ${what} carries is an annotation the program declares, a struct marked '@annotation'")
+            skip_line(p)
+            return out
+        end if
+
+        parse_user_annotation(p, "") match
+            Some(u) -> out.push(u)
+            None -> return out
+
+        p.skip_newlines()
+
+    out
+end parse_part_annotations
+
+// The annotations read above one field or variant, made about it now that its name is known.
+about(annots: Buf[AnnotUse], target: string, into: *Buf[AnnotUse])
+    for u in annots
+        into.push(AnnotUse(u.span, target, u.call, u.parens))
+
 // One annotation.
 parse_attribute(p: *Parser) -> Option[Attr]
     val at = p.here()
@@ -208,6 +323,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
         refuse_hash_attr(p, at)
         return None
     end if
+
+    if at_user_annotation(p) && annotations_then(p, at_annotated_type) then
+        return parse_user_annotation(p, "").map(u -> User(u))
 
     p.bump()
 
@@ -241,10 +359,11 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
+    if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
-    if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
+    if word == "inline" then return parse_inline_attr(p)
     if word == "cold" then return no_inlining_args(p, Cold, "how rare a rare path is is not a number a program has")
 
     // `@thread_local` takes no parentheses for `@packed`'s reason: which thread-local model the
@@ -266,7 +385,10 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
     // number the declaration has.
     if word == "relocates" then return no_inlining_args(p, Relocates, "a call either may move its receiver's storage or it may not")
+    if word == "views" then return Some(parse_views_attr(p))
+    if word == "consumes" then return no_inlining_args(p, Consumes, "what a call takes is everything its receiver holds")
     if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
+    if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -277,7 +399,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header. An annotation a program declares, a struct marked '@annotation', stands above a type declaration, a field or a variant")
     skip_line(p)
     None
 end parse_attribute
@@ -293,6 +415,33 @@ private no_inlining_args(p: *Parser, a: Attr, because: string) -> Option[Attr]
 
     Some(a)
 end no_inlining_args
+
+// `@inline` or `@inline(always)` (`reference/attributes.md § @noinline, @inline and @cold`). Bare,
+// it raises what the inliner will spend on the definition; `always` makes it an instruction. There
+// is no other argument: a budget is not a number a program has, and the opposite request is a word
+// of its own, `@noinline`, which `never` is pointed at.
+private parse_inline_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") then return Some(Inline(false))
+
+    val at = p.here()
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word == "always"
+        p.bump()
+
+        if p.accept_kw(")") then return Some(Inline(true))
+    end if
+
+    if word == "never"
+        p.fault(at, "'@inline(never)' is written '@noinline' — keeping every call a call is a request of its own, not a degree of '@inline'")
+    else
+        p.fault(at, "'@inline' takes no argument but 'always' — '@inline' alone raises what the inliner will spend on this definition rather than naming a number, '@inline(always)' puts the body in place of every call at every optimization level, and '@noinline' keeps every call a call")
+
+    skip_line(p)
+    None
+end parse_inline_attr
 
 private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
     if p.at_kw("(")
@@ -340,6 +489,14 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     // **What stands in the parentheses is a name, never an expression** -- `@crossing(1)` is told
     // what the annotation names rather than that an identifier was expected, as the empty form is.
     loop
+        // The receiver is not a parameter these name: it is the one name a list could hold that is
+        // not a name, and it gets its own answer rather than the empty form's.
+        if p.at_kw("self")
+            p.fault(p.here(), receiver_refusal(word))
+            skip_line(p)
+            return out
+        end if
+
         p.peek() match
             Ident(n) ->
                 p.bump()
@@ -357,6 +514,26 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     p.expect_kw(")")
     out
 end parse_named_list
+
+// `@views(self)`: what a member's returned view is borrowed from. **Only the receiver may be named**
+// -- a view borrowed from another parameter would need the caller to know which argument it was,
+// which is a lifetime in the signature, and the language has none.
+private parse_views_attr(p: *Parser) -> Attr
+    if p.accept_kw("(") && p.accept_kw("self") && p.accept_kw(")") then return Views(one_name("self"))
+
+    p.fault(p.here(), "'@views' says what a member's returned view is borrowed from, and that can " +
+            "only be the member's own receiver — '@views(self)'. A view of anything else is the " +
+            "caller's to keep alive")
+    skip_line(p)
+    Views(one_name("self"))
+end parse_views_attr
+
+private one_name(n: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(n)
+    out
+end one_name
 
 // The domains a function may say it is entered in. One today; the annotation is a name rather than a
 // bare word so that a second (a signal handler, a second core's own loop) is a row here and not a
@@ -431,6 +608,19 @@ private quoted_list(names: Buf[string]) -> string
     out
 end quoted_list
 
+// `self` written in one of those lists. For `@disjoint` the answer is that naming the other
+// parameters already covers the receiver: what a named parameter reaches, nothing else the call can
+// reach does, `self` included.
+private receiver_refusal(word: string) -> string
+    if word == "disjoint"
+        return "'@disjoint' names parameters, and 'self' is the receiver — leave it out: a parameter " +
+               "'@disjoint' names is kept apart from every other pointer the body reaches, 'self' " +
+               "included, so '@disjoint(data)' already says it"
+    end if
+
+    s"'@$word' names parameters, and 'self' is the receiver, which it does not name"
+end receiver_refusal
+
 private named_list_refusal(word: string) -> string
     if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
 
@@ -441,6 +631,8 @@ private named_list_refusal(word: string) -> string
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
+
+    if word == "disjoint" then return "'@disjoint' names the pointer and slice parameters whose memory nothing else reaches while a call runs, in parentheses — '@disjoint(y, x)'. There is no empty form: a function whose parameters may overlap says so by not writing the annotation"
 
     "'@needs' names the capabilities reaching this declaration requires, in parentheses — '@needs(heap)', '@needs(os, posix)'. There is no empty form: a declaration that needs nothing beyond what its module has says so by not writing the annotation"
 end named_list_refusal
@@ -485,24 +677,47 @@ private parse_byte_order_attr(p: *Parser) -> Option[Attr]
 end parse_byte_order_attr
 
 // `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
-// a struct's `typedef` carries in a generated header.
+// a struct's `typedef` carries in a generated header. `weak` after the symbol, or alone
+// (`@export("write", weak)`, `@export(weak)`), publishes the function as a default any strong
+// definition of the symbol in the link replaces.
 private parse_export_attr(p: *Parser, at: Span) -> Attr
-    if !p.accept_kw("(") then return Export(ExportAttr(at.to(p.just_taken()), None))
+    if !p.accept_kw("(") then return Export(ExportAttr(at.to(p.just_taken()), None, false))
 
     var symbol: Option[string] = None
+    var weakly = p.accept_kw("weak")
 
-    p.peek() match
-        StrLit(v) ->
-            p.bump()
-            symbol = Some(v)
-        _ ->
-            p.fault(p.here(), "'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no parentheses at all, which exports the function under its own name")
-            skip_line(p)
-            return Export(ExportAttr(at.to(p.just_taken()), None))
+    if !weakly
+        p.peek() match
+            StrLit(v) ->
+                p.bump()
+                symbol = Some(v)
+            _ ->
+                p.fault(p.here(), "'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no parentheses at all, which exports the function under its own name")
+                skip_line(p)
+                return Export(ExportAttr(at.to(p.just_taken()), None, false))
+
+        if p.accept_kw(",")
+            if !p.accept_kw("weak")
+                p.fault(p.here(), "'weak' expected — the one word '@export' takes after its symbol is 'weak', '@export(\"write\", weak)', which publishes a default a strong definition of the symbol replaces")
+                skip_line(p)
+                return Export(ExportAttr(at.to(p.just_taken()), symbol, false))
+            end if
+
+            weakly = true
+        end if
+    end if
 
     p.expect_kw(")")
-    Export(ExportAttr(at.to(p.just_taken()), symbol))
+    Export(ExportAttr(at.to(p.just_taken()), symbol, weakly))
 end parse_export_attr
+
+// `weak` is about a function's definition, the one thing a strong definition elsewhere can replace;
+// above anything else it is refused with the reason that declaration has none.
+private refuse_weak_export(p: *Parser, attrs: Buf[Attr], why: string)
+    for attr in attrs
+        attr match
+            Export(e) -> if e.weakly then p.fault(e.span, s"only a function's '@export' may be 'weak' — $why")
+            _ -> ()
 
 private parse_section_attr(p: *Parser) -> Attr
     val bad = "'@section' names the linker section as a string — '@section(\".vectors\")' on the storage or the definition that goes there. The spelling is the target's: '.noinit' and '.ramfunc' are ELF's, '__DATA,__mysection' is Mach-O's"
@@ -530,16 +745,16 @@ private parse_section_attr(p: *Parser) -> Attr
 end parse_section_attr
 
 // `@test`, `@test("what it shows")`, `@test("...", should_trap)`, `@test(should_trap: "text")`,
-// `@test(ignore: "why")` — a description, then `should_trap`, then `ignore`, each optional and in
-// that order.
+// `@test(timeout: 30)`, `@test(ignore: "why")` — a description, then `should_trap`, then `timeout`,
+// then `ignore`, each optional and in that order.
 private parse_test_attr(p: *Parser, at: Span) -> TestAttr
-    if !p.at_kw("(") then return TestAttr(at.to(p.just_taken()), None, false, None, None)
+    if !p.at_kw("(") then return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
 
     if p.kw_at(1, ")")
         p.fault(p.here(), "'@test' takes a description or nothing at all, and '()' is neither — drop the parentheses, and the function's own name becomes its description")
         p.bump()
         p.bump()
-        return TestAttr(at.to(p.just_taken()), None, false, None, None)
+        return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
     end if
 
     p.bump()
@@ -548,6 +763,7 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
     var should_trap = false
     var expected: Option[string] = None
     var ignored: Option[string] = None
+    var timeout: Option[int] = None
 
     p.peek() match
         StrLit(v) ->
@@ -555,19 +771,29 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
             display = Some(v)
         _ -> ()
 
-    if display.is_none() && !p.at_word("should_trap") && !p.at_word("ignore")
-        p.fault(p.here(), "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
+    if display.is_none() && !p.at_word("should_trap") && !p.at_word("timeout") && !p.at_word("ignore")
+        p.fault(p.here(), "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, 'timeout: 30' for the seconds a run may take, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
         skip_line(p)
-        return TestAttr(at.to(p.just_taken()), None, false, None, None)
+        return TestAttr(at.to(p.just_taken()), None, false, None, None, None)
     end if
 
-    if display.is_some() && p.kw_at(0, ",") && (p.word_at(1, "should_trap") || p.word_at(1, "ignore"))
-        p.bump()
+    if display.is_some() && p.kw_at(0, ",") && test_word_at(p, 1) then p.bump()
 
     if p.accept_word("should_trap")
         should_trap = true
 
         if p.accept_kw(":") then expected = accept_string(p)
+
+        if p.kw_at(0, ",") && (p.word_at(1, "timeout") || p.word_at(1, "ignore")) then p.bump()
+    end if
+
+    if p.accept_word("timeout")
+        timeout = parse_test_timeout(p)
+
+        if timeout.is_none()
+            skip_line(p)
+            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None, None)
+        end if
 
         if p.kw_at(0, ",") && p.word_at(1, "ignore") then p.bump()
     end if
@@ -577,15 +803,54 @@ private parse_test_attr(p: *Parser, at: Span) -> TestAttr
 
         if ignored.is_none()
             skip_line(p)
-            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None)
+            return TestAttr(at.to(p.just_taken()), display, should_trap, expected, None, timeout)
         end if
     end if
 
     if !p.accept_kw(")")
-        p.fault(p.here(), "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them")
+        p.fault(p.here(), "'@test' closes what it opened — the description, 'should_trap', 'timeout' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them")
 
-    TestAttr(at.to(p.just_taken()), display, should_trap, expected, ignored)
+    TestAttr(at.to(p.just_taken()), display, should_trap, expected, ignored, timeout)
 end parse_test_attr
+
+// Whether the token `n` ahead is one of the words `@test` takes after its description.
+private test_word_at(p: *Parser, n: usize) -> bool =
+    p.word_at(n, "should_trap") || p.word_at(n, "timeout") || p.word_at(n, "ignore")
+
+// What follows `timeout` inside `@test(...)`: a `:` and a whole number of seconds, zero meaning no
+// limit. The bound is the most a run's clock is asked to count in milliseconds, which is about
+// twenty-four days — a limit past it is not a limit anybody meant.
+private parse_test_timeout(p: *Parser) -> Option[int]
+    val refusal = s"'timeout' needs the seconds the test may run, written as a whole number from 0 " +
+        s"to ${MostTestSeconds} — '@test(timeout: 30)'; 0 is no limit at all"
+
+    if !p.accept_kw(":")
+        p.fault(p.here(), refusal)
+        return None
+    end if
+
+    val at = p.here()
+
+    p.peek() match
+        IntLit(digits, base, suffix) ->
+            p.bump()
+
+            val seconds = literal_value(digits, base).to_long()
+
+            if suffix != "" || seconds.is_none() || seconds.unwrap() > long(MostTestSeconds)
+                p.fault(at, refusal)
+                return None
+            end if
+
+            Some(int(seconds.unwrap()))
+        _ ->
+            p.fault(at, refusal)
+            None
+end parse_test_timeout
+
+// The longest limit a test may be given, in seconds: the most milliseconds an `int` holds, rounded
+// down to a whole second.
+const MostTestSeconds: int = 2147483
 
 // What follows `ignore` inside `@test(...)`: a `:` and the reason, which is not optional and may not
 // be blank — an ignored test that does not say what it is waiting for is the one nobody comes back
@@ -626,14 +891,19 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Ghost -> f.ghost = true
             Reads(ns) -> f.reads = Some(ns)
             Writes(ns) -> f.writes = Some(ns)
-            Export(e) -> f.exported = Some(e)
+            Export(e) ->
+                f.exported = Some(e)
+                f.marks.weak_export = e.weakly
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
             Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
             Lends(ns) -> f.marks.lends = ns
+            Disjoint(ns) -> f.marks.disjoint = ns
             NoInline -> f.marks.noinline = true
-            Inline -> f.marks.inline = true
+            Inline(always) ->
+                f.marks.inline = true
+                f.marks.inline_always = always
             Cold -> f.marks.cold = true
             Abandons -> f.marks.abandons = true
             Pinned -> f.marks.pinned = true
@@ -649,16 +919,21 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Crossing(ns) -> m.crossing = ns
             Borrows(ns) -> m.borrows = ns
             Lends(ns) -> m.marks.lends = ns
+            Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
             NoInline -> m.marks.noinline = true
-            Inline -> m.marks.inline = true
+            Inline(always) ->
+                m.marks.inline = true
+                m.marks.inline_always = always
             Cold -> m.marks.cold = true
             Pinned -> m.marks.pinned = true
             Pins -> m.marks.pins = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             Relocates -> m.marks.relocates = true
+            Views(_) -> m.marks.views = true
+            Consumes -> m.marks.consumes = true
             _ -> ()
 end apply_member_attrs
 
@@ -706,16 +981,26 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return stmt(start.to(p.just_taken()), Bad)
     end if
 
-    if p.at_kw("struct") || (p.at_word("opaque") && p.kw_at(1, "struct"))
+    val a_union = at_union_head(p, 0) || at_opaque_union(p)
+
+    if p.at_kw("struct") || (p.at_word("opaque") && p.kw_at(1, "struct")) || a_union
         // **`@packed`, `@align(n)` and `@export("...")` are the three that mark a struct**, and
-        // anything else above one is about a function that is not here.
+        // anything else above one is about a function that is not here. A union takes the same.
         refuse_unless(p, at, attrs, "struct")
+        refuse_weak_export(p, attrs, "a struct's '@export' names a type in a generated header, which is no definition the link could replace")
 
         val hidden = p.at_word("opaque")
 
         if hidden then return from_first(start, laid_out(p, at, parse_opaque_struct(p, at, vis), attrs))
 
-        return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false), attrs))
+        return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false, a_union), attrs))
+    end if
+
+    // An enum takes the annotations a program declares and nothing else: its layout is the
+    // compiler's, and it names no symbol.
+    if p.at_kw("enum") && any_user(attrs)
+        refuse_unless(p, at, attrs, "enum")
+        return from_first(start, annotated_enum(parse_enum_decl(p, at, vis), attrs))
     end if
 
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
@@ -731,6 +1016,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // and between them they are what a binding may carry.
     if storage
         refuse_unless(p, at, attrs, "binding")
+        refuse_weak_export(p, attrs, "exported storage is one object every reader and writer names, and 'weak' is a default only a function may be")
         return from_first(start, placed(p, parse_stmt_at(p, false), attrs, vis))
     end if
 
@@ -762,9 +1048,12 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
-    // of a declaration with no fields -- so it takes `@export` alone and nothing that lays out.
-    if p.at_kw("type") && all_are(attrs, "export")
-        return from_first(start, exported_type(parse_type_decl(p, at, vis), attrs))
+    // of a declaration with no fields -- so it takes `@export` and nothing that lays out. A type of its
+    // own takes the annotations a program declares too.
+    if p.at_kw("type") && (all_are(attrs, "export") || any_user(attrs))
+        refuse_unless(p, at, attrs, "type")
+        refuse_weak_export(p, attrs, "a type's '@export' names it in a generated header, which is no definition the link could replace")
+        return from_first(start, exported_type(p, parse_type_decl(p, at, vis), attrs))
 
     // At the end of the file there is no declaration below for the annotations to be about, so
     // nothing an annotation's own sentence says is true of it: the grammar refuses it, at the word
@@ -819,17 +1108,37 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
             return
 
 private may_carry(form: string, a: Attr) -> bool
-    if form == "struct" then return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards"
+    if form == "struct"
+        return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" ||
+            attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
+    end if
+
+    if form == "enum" then return is_user(a)
+    if form == "type" then return is_user(a) || attr_word(a) == "export"
+
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
-    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" && attr_word(a) != "relocates"
+    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" &&
+        attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
+        !is_user(a) && !is_annotation_mark(a)
 end may_carry
+
+private is_user(a: Attr) -> bool = a match
+    User(_) -> true
+    _ -> false
+
+private is_annotation_mark(a: Attr) -> bool = a match
+    AnnotationMark -> true
+    _ -> false
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
+
+    if any_is(attrs, "annotation")
+        return "'@annotation' makes a struct an annotation, whose fields are what a use of it writes in its parentheses — so it marks a struct, and this declares none"
 
     if all_are(attrs, "blocks")
         return "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them"
@@ -837,11 +1146,27 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
 
+    // An `extern` is where this is most often tried, and it has no body here to put in place of a
+    // call: the definition is the linked object's, and only its own compiler can inline it.
+    if any_is(attrs, "inline(always)")
+        return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
+
+    // An `extern`'s body is C, compiled where the sysl declaration is never read, so the promise
+    // could not reach the code it is about; the C declaration's `restrict` is where it is made.
+    if any_is(attrs, "disjoint")
+        return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
+
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
 
     if any_is(attrs, "relocates")
         return "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none"
+
+    if any_is(attrs, "views")
+        return "'@views(self)' says the view a call answers is borrowed from what it is called on, so it marks a method — and this declares none"
+
+    if any_is(attrs, "consumes")
+        return "'@consumes' says a call takes everything its receiver holds, so it marks a method — and this declares none"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
@@ -901,6 +1226,8 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     var ghost = false
     var noinline = false
     var inline = false
+    var hinted = false
+    var always = false
     var marks = ""
 
     for attr in attrs
@@ -914,7 +1241,10 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
             Section(_) -> section = true
             Ghost -> ghost = true
             NoInline -> noinline = true
-            Inline -> inline = true
+            Inline(a) ->
+                always = always || a
+                hinted = hinted || !a
+                inline = true
             _ -> ()
 
         if is_inlining(attr) then marks = joined(marks, attr_word(attr))
@@ -944,8 +1274,20 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // `@noinline` forbids inlining and `@inline` asks for it, so the two above one declaration are
     // contradictory requests rather than a stronger one. Answered before `@ghost` is looked at,
     // because the pair is wrong whatever else stands beside it.
+    if noinline && always
+        p.fault(p.here(), "'@noinline' forbids inlining and '@inline(always)' demands it, so they contradict above one declaration — write the one the definition is for, and '@cold' beside it if it is also reached rarely, which is a different thing to say")
+        return
+    end if
+
     if noinline && inline
         p.fault(p.here(), "'@noinline' forbids inlining and '@inline' asks for it, so they contradict above one declaration — write the one the definition is for, and '@cold' beside it if it is also reached rarely, which is a different thing to say")
+        return
+    end if
+
+    // `@inline(always)` already says everything `@inline` does, and more, so the two together say
+    // one thing twice -- and the weaker word would leave a reader wondering which was meant.
+    if hinted && always
+        p.fault(p.here(), "'@inline(always)' already asks for everything '@inline' does, so the two together say one thing twice — write '@inline(always)' alone where every call is to be replaced by the body, and '@inline' alone where it is a hint")
         return
     end if
 
@@ -1027,9 +1369,12 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
 end refuse_impossible_pairs
 
 // Whether any annotation in the set is neither about a layout nor `@section`'s placing of an object.
+// `@pinned` marks a struct as readily as a function, so it settles neither reading.
 private marks_a_function(attrs: Buf[Attr]) -> bool
     for attr in attrs
-        if !is_layout(attr) && attr_word(attr) != "section" then return true
+        if !is_layout(attr) && attr_word(attr) != "section" && attr_word(attr) != "pinned" &&
+                !is_user(attr) && !is_annotation_mark(attr) then
+            return true
 
     false
 end marks_a_function
@@ -1045,7 +1390,7 @@ end joined
 // is what `@ghost` takes away.
 private is_inlining(a: Attr) -> bool = a match
     NoInline -> true
-    Inline -> true
+    Inline(_) -> true
     Cold -> true
     _ -> false
 
@@ -1177,11 +1522,50 @@ private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
                     ByteOrder(big) -> decl.byte_order = Some(big)
                     Export(e) -> decl.cname = Some(e)
                     Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
+                    Pinned -> decl.pinned = true
+                    AnnotationMark -> decl.annotation = true
+                    User(u) -> decl.annots.push(u)
                     _ -> ()
+
+            if decl.annotation then refuse_annotation_shape(p, at, decl)
 
             stmt(s.span, StructDecl(decl))
         _ -> s
 end laid_out
+
+// An annotation's struct is named by every use of it, and its fields are what a use writes, so a
+// name the language's own annotations take and a type parameter no use could supply are refused.
+private refuse_annotation_shape(p: *Parser, at: Span, d: StructDecl)
+    if builtin_attr_word(d.name)
+        p.fault(at, s"'@${d.name}' is one of the language's own annotations, so an annotation a program declares may not take the name — a use of it would read as the built-in one")
+        return
+    end if
+
+    if !d.tparams.is_empty() then
+        p.fault(at, s"an annotation takes no type parameters — what a use of '@${d.name}' says is the values written in its parentheses, and reflection asks for it by one name, '::Annotation[${d.name}]'")
+end refuse_annotation_shape
+
+private any_user(attrs: Buf[Attr]) -> bool
+    for a in attrs
+        if is_user(a) then return true
+
+    false
+end any_user
+
+// The program's annotations written above an enum, kept on its declaration.
+private annotated_enum(s: Stmt, attrs: Buf[Attr]) -> Stmt
+    *s.kind match
+        EnumDecl(d) ->
+            var decl = d
+
+            for attr in attrs
+                attr match
+                    User(u) -> decl.annots.push(u)
+                    _ -> ()
+
+            stmt(s.span, EnumDecl(decl))
+        _ -> s
+end annotated_enum
 
 // The fields `@guards(...)` names, each held to being one the struct declares and keeps `private`.
 //
@@ -1212,15 +1596,24 @@ private file_private(v: Visibility) -> bool = v match
     File -> true
     _ -> false
 
-// The C name `@export` gives a `type` in a generated header.
-private exported_type(s: Stmt, attrs: Buf[Attr]) -> Stmt
+// The C name `@export` gives a `type` in a generated header, and the program's annotations a type of
+// its own carries.
+//
+// **A plain alias carries none**: `type Id = int` is a second name for `int`, the one type, so an
+// annotation on it would be one `int` had under one of its names and not under the other.
+private exported_type(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     *s.kind match
         TypeDecl(d) ->
             var decl = d
+            val alias = !d.derived && d.range.is_none() && d.pred.is_none() && d.wrapping.is_none()
 
             for attr in attrs
                 attr match
                     Export(e) -> decl.cname = Some(e)
+                    User(u) ->
+                        if alias
+                            p.fault(u.span, s"'@${annot_written(u)}' is about a type of its own, and 'type ${d.name} = ${type_text(d.base)}' declares none — it is a second name for '${type_text(d.base)}', the same type, so an annotation is written above a 'new' type, a range, a 'where' or the declaration of '${type_text(d.base)}'")
+                        else decl.annots.push(u)
                     _ -> ()
 
             stmt(s.span, TypeDecl(decl))
@@ -1272,10 +1665,29 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr], written: Visibility) -> St
         // **Both annotations are about one object**, so a binding that names several has nothing for
         // them to be about. The refusal names the annotation rather than the binding, since the
         // annotation is the half that has to go.
-        MultiDecl(_, _, _) -> refuse_several(p, s, attrs)
-        PatternDecl(_, _, _, _) -> refuse_several(p, s, attrs)
+        //
+        // **A copy per thread or per core is not about one object**: it says how many copies each
+        // name's storage has, which a `var` naming several things says of each name.
+        MultiDecl(names, mutable, values, vis) ->
+            several_placed(p, s, attrs, copies, MultiDecl(names, mutable, values, either_vis(written, vis)))
+        PatternDecl(pat, mutable, value, typ, vis) ->
+            several_placed(p, s, attrs, copies, PatternDecl(pat, mutable, value, typ, either_vis(written, vis)))
         _ -> s
 end placed
+
+// A binding naming several things under annotations: refused for the ones about one object, and
+// otherwise given the copies the annotations ask each name for.
+private several_placed(p: *Parser, s: Stmt, attrs: Buf[Attr], copies: Copies, kind: StmtKind) -> Stmt
+    var about_one: Buf[Attr] = buf()
+
+    for attr in attrs
+        if attr_word(attr) != "thread_local" && attr_word(attr) != "per_cpu" then about_one.push(attr)
+
+    if !about_one.is_empty() then return refuse_several(p, s, about_one)
+    if copies == OneCopy then return s
+
+    stmt(s.span, CopiedDecl(copies, stmt(s.span, kind)))
+end several_placed
 
 // The visibility written in front of the annotations' declaration, where one was, and the binding's
 // own reading otherwise.
@@ -1318,11 +1730,10 @@ private refuse_several(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
 end refuse_several
 
 // Whether a binding is a `var` -- the one keyword `@thread_local` marks -- reaching through the
-// `static` wrapper. A comma list and a pattern are `var`s too, refused a line later for naming
-// several.
+// `static` wrapper. A comma list and a pattern are `var`s too.
 private holds_a_var(s: Stmt) -> bool = *s.kind match
     VarDecl(_, _, _, _, _, _, _, _) -> true
-    MultiDecl(_, mutable, _) -> mutable
-    PatternDecl(_, mutable, _, _) -> mutable
+    MultiDecl(_, mutable, _, _) -> mutable
+    PatternDecl(_, mutable, _, _, _) -> mutable
     StaticDecl(inner) -> holds_a_var(inner)
     _ -> false

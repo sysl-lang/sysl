@@ -942,3 +942,47 @@ vo_it_costs_no_storage()
 
     assert_eq(vo_ran(src), "8 4 8\n")
 end vo_it_costs_no_storage
+
+// -- a register changed with `with` ---------------------------------------------------------------------
+
+// The copy a `with` works on is a value it made for itself, so its fields are no registers: the
+// register is read once and written once, and the fields between are folded in registers rather than
+// written to a volatile stack slot one by one. An exported function's body is its `$$sysl` define;
+// the export is a wrapper that calls it.
+private vo_shcsr() -> string =
+    "@packed\nstruct Shcsr\n    memfaultact: volatile u1\n    busfaultact: volatile u1\n" +
+    "    _: volatile u14\n    memfaultena: volatile u1\n    busfaultena: volatile u1\n" +
+    "    usgfaultena: volatile u1\n    _: volatile u13\n\nstruct Block\n    shcsr: Shcsr\n\n"
+
+@test("a register changed with 'with' is one volatile load and one volatile store, with nothing between")
+vo_a_register_changed_with_with()
+    if !vo_ready() then return
+
+    val out = vo_ir(vo_shcsr() + "@export(\"three_fields\")\nthree_fields(p: *Block)\n" +
+                    "    p.shcsr = p.shcsr with { memfaultena = 1, busfaultena = 1, usgfaultena = 1 }\n")
+    val body = vo_define(out, "three_fields$$sysl")
+
+    assert_eq(vo_count(body, "load volatile"), 1)
+    assert_eq(vo_count(body, "store volatile"), 1)
+end vo_a_register_changed_with_with
+
+@test("and a register written from a constant changed with 'with' is the one volatile store")
+vo_a_constant_changed_with_with()
+    if !vo_ready() then return
+
+    val out = vo_ir(vo_shcsr() + "@export(\"enable\")\nenable(p: *Block)\n" +
+                    "    p.shcsr = Shcsr::Bits(0) with { memfaultena = 1, usgfaultena = 1 }\n")
+    val body = vo_define(out, "enable$$sysl")
+
+    assert_eq(vo_count(body, "load volatile"), 0)
+    assert_eq(vo_count(body, "store volatile"), 1)
+end vo_a_constant_changed_with_with
+
+@test("the value a 'with' makes of a register is the register's with the fields changed")
+vo_with_on_a_register_computes_the_value()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran(vo_shcsr() + "var b = Block(Shcsr::Bits(0x3))\n" +
+                     "b.shcsr = b.shcsr with { memfaultena = 1, usgfaultena = 1 }\n" +
+                     "print(b.shcsr.bits, b.shcsr.memfaultact, b.shcsr.busfaultena)\n"), "327683 1 0\n")
+end vo_with_on_a_register_computes_the_value

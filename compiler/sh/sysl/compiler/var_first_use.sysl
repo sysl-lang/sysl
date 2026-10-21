@@ -1,0 +1,261 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A local `var` or `val` whose initial value is a bare literal takes its type from its first use
+// that fixes one (`reference/declarations.md § A literal binding takes its type from its first
+// use`).
+//
+// **A use fixes a type where it stands at one**: compared with a typed operand, assigned a typed
+// value with `=`, handed to a parameter, used as an index, returned -- every position that reads the
+// name at a type it expects. An operand of arithmetic does not: `sum + b` keeps `sum` at its default
+// and widens `b`, as it would with the default written out. A binding no use fixes has the
+// literal's default, `int` or `real`.
+//
+// **The block is read, and read again where a use fixed one of its bindings.** The first reading is
+// a trial in which each such binding is bound at its default and every fixing use is logged; where
+// none fixed a binding to anything but its default, that reading is the one the program gets.
+// Otherwise it is thrown away whole and the block is read again with the fixed types known, which is
+// as though each binding had been declared with its type written out -- so a second use that
+// disagrees is told exactly as it would be then. A binding fixed by a use that reads another binding
+// still open waits for the round after that one is settled.
+
+// A binding still waiting for a use to fix its type: its unique name in this body, where its
+// declaration starts (what a fix is filed under), the literal it was given, and how long the log of
+// fixes was when it was bound -- only a fix after that is about this reading of it.
+struct OpenVar
+    unique: string
+    at: usize
+    init: Expr
+    since: usize
+end OpenVar
+
+// How far a scope's bindings and imports reached when a reading began.
+struct ScopeMark
+    locals: usize
+    names: usize
+    modules: usize
+    wildcards: usize
+    levels: usize
+
+// A use that fixed the type of the binding declared at `at`.
+struct VarFix
+    at: usize
+    ty: Type
+
+// A type a block is being read again with, for the binding `name` declared at `at`.
+struct KnownFix
+    name: string
+    at: usize
+    ty: Type
+
+// Reads a run of statements -- a block, a loop's body, an arm's -- once, and again for as long as a
+// reading finds a binding the run declares fixed by a use at something other than its default.
+first_use_read[T](cx: &Analyzer, stmts: Buf[Stmt], read: () -> T) -> T
+    if !declares_open(stmts) then return read()
+
+    val open_mark = cx.open_vars.len()
+    val known_mark = cx.var_fixes.len()
+
+    loop
+        val tried = begin_trial(cx)
+        val scope = cx.scope_mark()
+        val got = read()
+        val found = fixes_of(cx, stmts, tried.var_fixes)
+
+        cx.open_vars.truncate(open_mark)
+
+        if found.is_empty()
+            keep_trial(cx)
+            cx.var_fixes.truncate(known_mark)
+
+            return got
+        end if
+
+        discard_trial(cx, tried)
+        cx.rewind_scope(scope)
+
+        for f in found
+            cx.var_fixes.push(f)
+end first_use_read
+
+// Whether a run of statements declares a binding whose type its first use fixes.
+private declares_open(stmts: Buf[Stmt]) -> bool
+    for s in stmts
+        if open_declaration(s).is_some() then return true
+
+    false
+end declares_open
+
+// The name a statement binds where it is a `var` or `val` with no type written and a bare literal
+// for its value.
+private open_declaration(s: Stmt) -> Option[string] = *s.kind match
+    VarDecl(name, typ, init, _, _, _, _, _) ->
+        if typ.is_none() && init.is_some() && literal_default(init.unwrap()).is_some() then Some(name) else None
+    ValDecl(name, typ, value, _, _, _, _, _) ->
+        if typ.is_none() && literal_default(value).is_some() then Some(name) else None
+    _ -> None
+
+// The fixes a reading logged since `from` for bindings the run declares, at a type other than the
+// literal's default -- one fixed at its default reads the same either way.
+private fixes_of(cx: &Analyzer, stmts: Buf[Stmt], from: usize) -> Buf[KnownFix]
+    var out: Buf[KnownFix] = buf()
+
+    for k in from..<cx.var_fix_log.len()
+        val f = cx.var_fix_log.at(k)
+
+        for s in stmts
+            if s.span.start != f.at then continue
+
+            val name = open_declaration(s)
+
+            if name.is_some() && !type_eq(f.ty, literal_default(bound_literal(s)).unwrap()) then
+                out.push(KnownFix(name.unwrap(), f.at, f.ty))
+    out
+end fixes_of
+
+// The literal an open declaration binds.
+private bound_literal(s: Stmt) -> Expr = *s.kind match
+    VarDecl(_, _, init, _, _, _, _, _) -> init.unwrap()
+    ValDecl(_, _, value, _, _, _, _, _) -> value
+    _ -> Expr(s.span, Bad)
+
+// The type a declaration is read at where an earlier reading found it fixed, and nothing where it is
+// not one whose type a use fixes or no use has fixed it yet.
+fixed_type(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], init: Expr) -> Option[Type]
+    if typ.is_some() || literal_default(init).is_none() then return None
+
+    for f in cx.var_fixes
+        if f.at == span.start && f.name == name then return Some(f.ty)
+
+    None
+end fixed_type
+
+// Records a binding just made as one waiting for its first use, where it is one.
+open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique: string)
+    if typ.is_some() || literal_default(init).is_none() then return
+
+    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len()))
+
+// A name read where a type is expected of it: the use that fixes an open binding's type, unless the
+// name is an operand.
+fixed_by_position(cx: &Analyzer, span: Span, unique: string, ty: Type)
+    for at in cx.not_fixing
+        if at == span.start then return
+
+    note_var_fix(cx, unique, ty)
+end fixed_by_position
+
+// Files a use as fixing a binding's type, where the binding is open, no use has fixed it yet, and
+// the literal it was given reads at the type -- a number no `u8` holds is not made one by its use.
+note_var_fix(cx: &Analyzer, unique: string, ty: Type)
+    for o in cx.open_vars
+        if o.unique != unique then continue
+
+        if !numeric_scalar(ty) then return
+
+        for k in o.since..<cx.var_fix_log.len()
+            if cx.var_fix_log.at(k).at == o.at then return
+
+        if !literal_fits(cx, o.init, ty) then return
+
+        cx.var_fix_log.push(VarFix(o.at, ty))
+        return
+end note_var_fix
+
+private numeric_scalar(t: Type) -> bool = repr(t) match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    _ -> false
+
+// A name read as an operand of arithmetic, or where an open binding's own assignment reads it, is
+// one whose position fixes nothing: whatever its operator settles on is not a type it was used at.
+not_fixing_at(cx: &Analyzer, e: Expr)
+    if cx.open_vars.is_empty() then return
+
+    *e.kind match
+        Ident(_) -> cx.not_fixing.push(e.span.start)
+        _ -> ()
+
+// The open binding an expression names, if it is one.
+private open_name(cx: &Analyzer, e: Expr) -> Option[string]
+    if cx.open_vars.is_empty() then return None
+
+    *e.kind match
+        Ident(name) ->
+            val local = cx.lookup(name)
+
+            if local.is_none() then return None
+
+            for o in cx.open_vars
+                if o.unique == local.unwrap().unique then return Some(o.unique)
+
+            None
+        _ -> None
+end open_name
+
+// Whether a typed value reads a binding still open, whose type is not yet the one it will have.
+private reads_open(cx: &Analyzer, t: TExpr) -> bool
+    var found: Buf[string] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TLoad(unique, _) ->
+            for o in cx.open_vars
+                if o.unique == unique then sink.push(unique)
+        _ -> ()))
+
+    !found.is_empty()
+end reads_open
+
+// Whether an operand's own reading is a type that fixes a neighbour: one the program gave it, not a
+// literal's and not an open binding's.
+private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
+    texpr_type(t) != Unknown && !adaptable(e, t) && open_name(cx, e).is_none() && !reads_open(cx, t)
+
+// A comparison: an open binding compared with an operand of a type of its own is fixed at that type.
+// `own` holds each operand's reading alone, before the pair settles anything.
+compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
+    for i in 0..<operands.len()
+        val unique = open_name(cx, operands.at(i))
+
+        if unique.is_none() then continue
+
+        for j in 0..<operands.len()
+            if j + 1 != i && j != i + 1 then continue
+
+            own.at(j) match
+                Some(t) ->
+                    if fixes_a_neighbour(cx, operands.at(j), t)
+                        note_var_fix(cx, unique.unwrap(), texpr_type(t))
+                        break
+                    end if
+                None -> ()
+end compare_fixes
+
+// `n = v`: an open binding assigned a value of a type of its own is fixed at that type. The value is
+// read alone, in a trial, for the type it has; the assignment reads it again at the binding's.
+assigned_fix(cx: &Analyzer, target: Expr, value: Expr)
+    val unique = open_name(cx, target)
+
+    if unique.is_none() then return
+
+    not_fixing_at(cx, value)
+
+    val tried = begin_trial(cx)
+    val tv = type_expr_bare(cx, value)
+    val refused = refused_since(cx, tried)
+
+    discard_trial(cx, tried)
+
+    if !refused && fixes_a_neighbour(cx, value, tv) then note_var_fix(cx, unique.unwrap(), texpr_type(tv))
+end assigned_fix
+
+// A closure's or a nested function's body reading a binding of the body around it that is still
+// open: the capture is the binding, so a use in the inner body fixes it as one in the outer would.
+// The inner analyzer files its fixes in the outer's log.
+carry_open(outer: &Analyzer, inner: &Analyzer, outer_unique: string, inner_unique: string)
+    for o in outer.open_vars
+        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since))

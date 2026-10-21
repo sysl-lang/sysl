@@ -1,0 +1,338 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.text.{join, parse_int_base, split, Search}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// **That a struct with C bitfields is laid out as clang lays its C counterpart out, asked of clang at
+// test time** (`c_bitfields.sysl`; `docs/design/bitfields.md` §3). The twenty-nine structs of
+// `bitfield-probes/layout.c` and seven more -- unions, a zero-width field under `packed`, an ordinary
+// field between runs -- are compiled by clang with `-fdump-record-layouts` for every triple sysl
+// names, and every field's bit offset (and a bitfield's width), the size and the alignment are
+// compared with what `c_bitfield_layout` says for the same target. CRAFT has no clang and is not
+// asked; i386 is, though sysl does not build for it, since its rule is one of the four.
+
+// One probe: the C declaration and its sysl twin, each with its name. `tests_cbr_` writes and reads
+// the same structs through C.
+struct CblProbe
+    cname: string
+    c: string
+    sname: string
+    sysl: string
+end CblProbe
+
+private cbl(cname: string, c: string, sname: string, sysl: string) -> CblProbe = CblProbe(cname, c, sname, sysl)
+
+cbl_probes() -> Buf[CblProbe]
+    var out: Buf[CblProbe] = buf()
+
+    out.push(cbl("mixed", "struct mixed { unsigned a:3; unsigned b:7; unsigned c:22; };", "Mixed",
+                 "struct Mixed\n    a: u3 in u32\n    b: u7 in u32\n    c: u22 in u32\n"))
+    out.push(cbl("strad_int", "struct strad_int { unsigned a:30; unsigned b:4; };", "StradInt",
+                 "struct StradInt\n    a: u30 in u32\n    b: u4 in u32\n"))
+    out.push(cbl("strad_char", "struct strad_char { unsigned char a:5; unsigned char b:4; };", "StradChar",
+                 "struct StradChar\n    a: u5 in u8\n    b: u4 in u8\n"))
+    out.push(cbl("strad_ll", "struct strad_ll { unsigned a:30; unsigned long long b:40; };", "StradLl",
+                 "struct StradLl\n    a: u30 in u32\n    b: u40 in u64\n"))
+    out.push(cbl("fits_ll", "struct fits_ll { unsigned a:20; unsigned long long b:20; };", "FitsLl",
+                 "struct FitsLl\n    a: u20 in u32\n    b: u20 in u64\n"))
+    out.push(cbl("zero_int", "struct zero_int { unsigned a:3; unsigned :0; unsigned b:3; };", "ZeroInt",
+                 "struct ZeroInt\n    a: u3 in u32\n    _: in u32\n    b: u3 in u32\n"))
+    out.push(cbl("zero_char", "struct zero_char { unsigned char a:3; unsigned char :0; unsigned char b:3; };",
+                 "ZeroChar", "struct ZeroChar\n    a: u3 in u8\n    _: in u8\n    b: u3 in u8\n"))
+    out.push(cbl("zero_align", "struct zero_align { char a; int :0; char b; };", "ZeroAlign",
+                 "struct ZeroAlign\n    a: i8\n    _: in i32\n    b: i8\n"))
+    out.push(cbl("unnamed", "struct unnamed { unsigned a:3; unsigned :5; unsigned b:3; };", "Unnamed",
+                 "struct Unnamed\n    a: u3 in u32\n    _: u5 in u32\n    b: u3 in u32\n"))
+    out.push(cbl("unnamed_al", "struct unnamed_al { char a; int :4; };", "UnnamedAl",
+                 "struct UnnamedAl\n    a: i8\n    _: i4 in i32\n"))
+    out.push(cbl("sgn", "struct sgn { int a:3; unsigned b:3; signed char c:3; };", "Sgn",
+                 "struct Sgn\n    a: i3 in i32\n    b: u3 in u32\n    c: i3 in i8\n"))
+    out.push(cbl("char_int", "struct char_int { signed char a:3; int b:5; };", "CharInt",
+                 "struct CharInt\n    a: i3 in i8\n    b: i5 in i32\n"))
+    out.push(cbl("char_int2", "struct char_int2 { char a; int b:5; };", "CharInt2",
+                 "struct CharInt2\n    a: i8\n    b: i5 in i32\n"))
+    out.push(cbl("short_char", "struct short_char { short a:9; signed char b:7; };", "ShortChar",
+                 "struct ShortChar\n    a: i9 in i16\n    b: i7 in i8\n"))
+    out.push(cbl("int_char", "struct int_char { int a:20; signed char b:6; };", "IntChar",
+                 "struct IntChar\n    a: i20 in i32\n    b: i6 in i8\n"))
+    out.push(cbl("beside", "struct beside { unsigned a:3; unsigned char c; unsigned b:5; };", "Beside",
+                 "struct Beside\n    a: u3 in u32\n    c: u8\n    b: u5 in u32\n"))
+    out.push(cbl("beside2", "struct beside2 { unsigned char c; unsigned b:20; };", "Beside2",
+                 "struct Beside2\n    c: u8\n    b: u20 in u32\n"))
+    out.push(cbl("boolf", "struct boolf { _Bool a:1; _Bool b:1; unsigned char c:6; };", "Boolf",
+                 "struct Boolf\n    a: bool in bool\n    b: bool in bool\n    c: u6 in u8\n"))
+    out.push(cbl("bool_int", "struct bool_int { _Bool a:1; unsigned b:3; };", "BoolInt",
+                 "struct BoolInt\n    a: bool in bool\n    b: u3 in u32\n"))
+    out.push(cbl("packed1", "struct __attribute__((packed)) packed1 { unsigned a:3; unsigned b:30; };",
+                 "Packed1", "@packed\nstruct Packed1\n    a: u3 in u32\n    b: u30 in u32\n"))
+    out.push(cbl("packed2", "struct __attribute__((packed)) packed2 { unsigned char c; unsigned b:20; " +
+                 "unsigned long long d:40; };", "Packed2",
+                 "@packed\nstruct Packed2\n    c: u8\n    b: u20 in u32\n    d: u40 in u64\n"))
+    out.push(cbl("pragma1", "#pragma pack(push, 1)\nstruct pragma1 { unsigned a:3; unsigned b:30; };\n" +
+                 "#pragma pack(pop)", "Pragma1", "@packed\nstruct Pragma1\n    a: u3 in u32\n    b: u30 in u32\n"))
+    out.push(cbl("pragma2", "#pragma pack(push, 1)\nstruct pragma2 { unsigned char c; unsigned b:20; };\n" +
+                 "#pragma pack(pop)", "Pragma2", "@packed\nstruct Pragma2\n    c: u8\n    b: u20 in u32\n"))
+    out.push(cbl("one_char", "struct one_char { unsigned char a:3; };", "OneChar", "struct OneChar\n    a: u3 in u8\n"))
+    out.push(cbl("one_int", "struct one_int { unsigned a:3; };", "OneInt", "struct OneInt\n    a: u3 in u32\n"))
+    out.push(cbl("one_ll", "struct one_ll { unsigned long long a:3; };", "OneLl", "struct OneLl\n    a: u3 in u64\n"))
+    out.push(cbl("wide63", "struct wide63 { unsigned a:1; unsigned long long b:63; };", "Wide63",
+                 "struct Wide63\n    a: u1 in u32\n    b: u63 in u64\n"))
+    out.push(cbl("esr", "struct esr { unsigned long long iss:25, il:1, ec:6, iss2:5, res0:27; };", "Esr",
+                 "struct Esr\n    iss: u25 in u64\n    il: u1 in u64\n    ec: u6 in u64\n    iss2: u5 in u64\n" +
+                 "    res0: u27 in u64\n"))
+    out.push(cbl("enumf", "enum E { EX, EY, EZ };\nstruct enumf { enum E e:2; unsigned b:3; };", "Enumf",
+                 "struct Enumf\n    e: u2 in u32\n    b: u3 in u32\n"))
+
+    // Past the design note's twenty-nine: unions, a zero-width field under `packed`, and an ordinary
+    // field between two runs of one declared type.
+    out.push(cbl("u_bits", "union u_bits { unsigned a:3; unsigned b; };", "UBits",
+                 "union UBits\n    a: u3 in u32\n    b: u32\n"))
+    out.push(cbl("u_one", "union u_one { unsigned a:3; };", "UOne", "union UOne\n    a: u3 in u32\n"))
+    out.push(cbl("u_mix", "union u_mix { unsigned char a:3; unsigned long long b:40; char c; };", "UMix",
+                 "union UMix\n    a: u3 in u8\n    b: u40 in u64\n    c: i8\n"))
+    out.push(cbl("u_unnamed", "union u_unnamed { char c; int :4; };", "UUnnamed",
+                 "union UUnnamed\n    c: i8\n    _: i4 in i32\n"))
+    out.push(cbl("u_packed", "union __attribute__((packed)) u_packed { unsigned a:20; unsigned char c; };",
+                 "UPacked", "@packed\nunion UPacked\n    a: u20 in u32\n    c: u8\n"))
+    out.push(cbl("packed_zero", "struct __attribute__((packed)) packed_zero { unsigned char a:3; " +
+                 "unsigned :0; unsigned char b:3; };", "PackedZero",
+                 "@packed\nstruct PackedZero\n    a: u3 in u8\n    _: in u32\n    b: u3 in u8\n"))
+    out.push(cbl("between", "struct between { unsigned a:20; unsigned short s; unsigned b:3; unsigned c:30; };",
+                 "Between", "struct Between\n    a: u20 in u32\n    s: u16\n    b: u3 in u32\n    c: u30 in u32\n"))
+    out
+end cbl_probes
+
+// The clang this asks: `SYSL_ABI_CLANG`, then the Homebrew LLVM, then `clang`, as `abc_` chooses.
+private cbl_oracle() -> string
+    var candidates: Buf[string] = buf()
+
+    env_var("SYSL_ABI_CLANG") match
+        Some(p) -> candidates.push(p)
+        None -> ()
+
+    candidates.push("/opt/homebrew/opt/llvm/bin/clang")
+    candidates.push("/usr/local/opt/llvm/bin/clang")
+    candidates.push("clang")
+
+    for p in candidates
+        capture(p, ["--version"], "", [], true) match
+            Ok(r) -> if r.status.ok() then return p
+            Err(_) -> ()
+
+    skip("no clang answered '--version' among SYSL_ABI_CLANG, the Homebrew LLVM and 'clang'")
+end cbl_oracle
+
+private cbl_has(xs: Buf[string], x: string) -> bool
+    for item in xs
+        if item == x then return true
+
+    false
+end cbl_has
+
+private cbl_int(s: string) -> int = parse_int_base(s.trim(), 10).unwrap()
+
+// One field line of a record dump, as `@bit+width` for a bitfield (`+0` for a zero-width one) and
+// `@bit` for an ordinary field: `     3:1-1 |   unsigned long long il`, `       4:- |   unsigned int`,
+// `         4 |   unsigned char c`.
+private cbl_field_token(left: string) -> string
+    if left.index_of(":").is_none() then return s"@${cbl_int(left) * 8}"
+
+    val parts = split(left, ":")
+    val at = cbl_int(parts[0]) * 8
+
+    if parts[1].trim() == "-" then return s"@$at+0"
+
+    val ends = split(parts[1], "-")
+    val first = cbl_int(ends[0])
+
+    s"@${at + first}+${cbl_int(ends[1]) - first + 1}"
+end cbl_field_token
+
+// The number after `key` in a `[sizeof=4, align=4]` line.
+private cbl_after(line: string, key: string) -> int
+    val at = line.index_of(key).unwrap() + key.len
+    var stop = at
+
+    while stop < line.len && line.bytes[stop] >= u8('0') && line.bytes[stop] <= u8('9')
+        stop += 1
+
+    cbl_int(line[at..<stop])
+end cbl_after
+
+// What clang says of every record: its name, then a line of tokens and `| size/align`.
+private cbl_clang_says(cc: string, t: Target, dir: string, probes: Buf[CblProbe]) -> Buf[(string, string)]
+    val src = s"$dir/layout.c"
+    var c = ""
+
+    // clang lays out, and so dumps, only a record something asks the size of.
+    var sizes = "int cbl_sizes[] = {"
+
+    for p in probes
+        c += p.c + "\n"
+        sizes += s" sizeof(${if p.c.contains("union ") then "union" else "struct"} ${p.cname}),"
+
+    write_text(src, c + sizes + " };\n").unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+    args.extend(["-ffreestanding", "-fsyntax-only", "-Xclang", "-fdump-record-layouts", src])
+
+    val got = capture(cc, args.view(), "", [], true).unwrap()
+
+    assert(got.status.ok(), s"clang refused the probes for ${t.triple}")
+
+    var out: Buf[(string, string)] = buf()
+    var name = ""
+    var line_of = ""
+
+    for line in split(got.text, "\n")
+        if line.index_of("*** Dumping AST Record Layout").is_some()
+            name = ""
+            continue
+        end if
+
+        val bar = line.index_of(" |")
+
+        if bar.is_none() then continue
+
+        if name == ""
+            val words = split(line.trim(), " ")
+
+            name = words[words.len - 1]
+            line_of = ""
+            continue
+        end if
+
+        if line.index_of("[sizeof=").is_some()
+            out.push((name, s"$line_of | ${cbl_after(line, "sizeof=")}/${cbl_after(line, " align=")}"))
+            name = ""
+            continue
+        end if
+
+        line_of += " " + cbl_field_token(line[0..<bar.unwrap()].trim())
+
+    out
+end cbl_clang_says
+
+// What sysl says of the struct named `sname`, in clang's terms.
+private cbl_sysl_says(l: TargetLayout, d: &StructType) -> string
+    val c = c_bitfield_layout(l, d)
+    var line = ""
+
+    for p in c.places
+        line += if p.is_bit then s" @${p.bit}+${p.width}" else s" @${p.bit}"
+
+    s"$line | ${l.size(Struct(d))}/${l.align(Struct(d))}"
+end cbl_sysl_says
+
+private cbl_find(done: TypedBodies, sname: string) -> Option[&StructType]
+    val insts = done.an.tables.struct_insts
+
+    for k in 0..<insts.len()
+        insts.get(insts.key_at(k)) match
+            Some(Struct(d)) -> if d.base == sname || d.base.ends_with(s".$sname") then return Some(d)
+            _ -> ()
+
+    None
+end cbl_find
+
+// Every probe's layout on every triple sysl names, as clang dumps it -- or, with `rule` set, the same
+// with every target's rule replaced by it, which is what shows the comparison can fail.
+private cbl_compare(rule: Option[BitfieldRule]) -> (usize, usize, Buf[string])
+    val cc = cbl_oracle()
+    val backends = clang_backends(cc)
+    val probes = cbl_probes()
+    val dir = make_temp_dir("sysl-cbl-").unwrap()
+    var triples: Buf[string] = buf()
+    var asked: usize = 0
+    var wrong: Buf[string] = buf()
+    var text = ""
+
+    for p in probes
+        text += p.sysl + "\n"
+
+    for t in all_targets()
+        if !t.builds_with_clang() || cbl_has(triples, t.triple) then continue
+
+        if !cbl_has(backends, cpu_backend(t.cpu))
+            print(s"not asked: '$cc' has no '${cpu_backend(t.cpu)}' back end, which '${t.triple}' needs")
+            continue
+        end if
+
+        triples.push(t.triple)
+
+        val parsed = parse(source_of("cbl.sysl", text), t)
+
+        assert(parsed.ok(), s"${t.triple}: ${if parsed.ok() then "" else parsed.first().message}")
+
+        var units: Buf[Program] = buf()
+
+        units.push(parsed.program)
+
+        val done = analyze_bodies(units, t)
+        val said = errors_of(done.an.diagnostics())
+
+        assert(said.is_empty(), s"${t.triple}: ${analysis_report(said)}")
+
+        val base = memo_layout_for(t)
+        val l = rule match
+            Some(r) -> TargetLayout(base.word_bits, None, base.little_endian, r, base.unit_align_cap)
+            None -> base
+
+        val clang = cbl_clang_says(cc, t, dir, probes)
+
+        for p in probes
+            val d = cbl_find(done, p.sname)
+
+            assert(d.is_some(), s"${t.triple}: sysl declared no '${p.sname}'")
+
+            var theirs = "(clang dumped no record)"
+
+            for item in clang
+                if item.0 == p.cname then theirs = item.1
+
+            val ours = cbl_sysl_says(l, d.unwrap())
+
+            if ours != theirs then wrong.push(s"${t.triple} ${p.cname}: sysl${ours}, clang$theirs")
+
+            asked += 1
+
+    remove_dir_all(dir).unwrap_or(())
+    (triples.len(), asked, wrong)
+end cbl_compare
+
+@test("every struct with C bitfields is laid out as clang lays it out, on every triple sysl names")
+cbl_every_triple_agrees_with_clang()
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val (machines, asked, wrong) = cbl_compare(None)
+
+    if machines == 0 then skip("this clang has none of the back ends these machines need")
+
+    assert(wrong.is_empty(), join(wrong.view(), "\n"))
+
+    // Thirty-six probes on each of twenty triples: every `all_targets` row but CRAFT, rows sharing a
+    // triple asked once -- the design note's nineteen and `thumbv7em-none-eabi` -- and i386, which
+    // sysl names and does not build for.
+    assert_eq(machines, 20)
+    assert_eq(asked, 20 * 36)
+
+@test("the comparison can fail: AAPCS's rule on every triple is caught by clang")
+cbl_a_wrong_rule_is_caught()
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val (machines, _, wrong) = cbl_compare(Some(BfAapcs))
+
+    if machines == 0 then skip("this clang has none of the back ends these machines need")
+
+    // `char a; int :0; char b` is 8/4 under AAPCS and 5/1 under the generic rule.
+    val said = join(wrong.view(), "\n")
+
+    assert(said.contains("x86_64-unknown-linux-gnu zero_align: sysl @0 @32+0 @32 | 8/4, clang @0 @32+0 @32 | 5/1"), said)

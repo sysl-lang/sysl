@@ -51,6 +51,32 @@ enum Cpu
     Craft
 end Cpu
 
+// How a target's C compiler allocates bitfields (`c_bitfields.sysl`; `docs/design/bitfields.md` §3,
+// measured with clang on every triple). `BfItanium` is the generic rule: a field goes at the next
+// free bit unless its declared type's unit there cannot hold it, and only a named field raises the
+// struct's boundary. `BfAapcs` is the same but for that last point: an unnamed and a zero-width field
+// raise it too -- every Arm target but Apple's. `BfMsvc` is Windows' own algorithm: a unit per run
+// of fields whose declared types have one size, never straddled.
+enum BitfieldRule
+    BfItanium
+    BfAapcs
+    BfMsvc
+end BitfieldRule
+
+// The rule a target's C compiler lays bitfields out by. CRAFT has no C compiler to measure and
+// follows the generic rule; i386 follows it too, its difference being only the 4-byte boundary of an
+// 8-byte integer inside a struct (`TargetLayout.unit_align_cap`).
+bitfield_rule_of(os: Os, cpu: Cpu) -> BitfieldRule
+    if os == Windows then return BfMsvc
+    if cpu == Thumb || (cpu == Aarch64 && os != MacOS) then return BfAapcs
+
+    BfItanium
+end bitfield_rule_of
+
+// The boundary an integer's alignment inside a struct stops at, where the C ABI caps it below its
+// size: 4 on i386, which aligns `long long` to four bytes in a struct; 0 where nothing caps it.
+struct_int_align_cap(cpu: Cpu) -> usize = if cpu == X86 then 4 else 0
+
 // What an operating system is called where a *source file* names one.
 //
 // The same words a `__<os>__` directory selects on, because `#if linux` and `__linux__/` are one
@@ -94,6 +120,23 @@ cpu_bits(cpu: Cpu) -> usize
         X86 -> 32
         Craft -> 16
 end cpu_bits
+
+// The widest integer a processor reads, writes and changes indivisibly in one instruction (or one
+// exclusive pair). **Every 32-bit Arm M-profile core stops at 32**: Armv6-M, Armv7-M and Armv8-M have
+// `ldrex`/`strex` at most for a word and no `ldrexd`, and RV32's A extension is a word too. A 64-bit
+// atomic there is a call into `__atomic_*_8`, which no board's runtime defines. 32-bit x86 has
+// `cmpxchg8b`, and wasm's threads proposal has `i64.atomic.*`.
+cpu_atomic_bits(cpu: Cpu) -> int
+    cpu match
+        Aarch64 -> 64
+        X86_64 -> 64
+        Riscv64 -> 64
+        X86 -> 64
+        Wasm32 -> 64
+        Riscv32 -> 32
+        Thumb -> 32
+        Craft -> 16
+end cpu_atomic_bits
 
 // Which order a processor's memory holds a value's bytes in. Every processor sysl targets is
 // little-endian -- aarch64 and Arm run that way under every system sysl names, and CRAFT is specified
@@ -233,6 +276,59 @@ struct Target
 
     hard_float(self) -> bool = !self.soft_float
 
+    // Whether the floating-point unit computes in double precision as well as single: an Arm unit
+    // whose `-mfpu` name carries no `-sp-` (`fpv5-d16` on a Cortex-M7, where `fpv4-sp-d16` and
+    // `fpv5-sp-d16` are single precision only). Every other processor answers false, which only
+    // matters on the 32-bit machines whose binary64 runtime it decides.
+    double_unit(self) -> bool =
+        self.cpu == Thumb && self.hard_float() && !self.no_fpu && self.fpu != "" && !self.fpu.contains("-sp-")
+
+    // Whether the machine has a floating-point unit at all, so an `f32` operation is an instruction:
+    // any Arm unit, single precision or double, whichever float ABI passes the values. Every other
+    // processor answers false, which only matters on the 32-bit machines whose `f32` runtime it decides.
+    single_unit(self) -> bool = self.cpu == Thumb && !self.no_fpu && self.fpu != ""
+
+    // Whether the machine has **floating-point registers**, whichever float ABI it is built for --
+    // what `#if fpu` asks. On Arm it is the row's unit, so a soft-float-ABI build of a core with one
+    // answers yes: the registers are there, and code that saves them must save them. Elsewhere it is
+    // the row's own `no_fpu`, so every hosted machine answers yes, and the freestanding RISC-V and
+    // CRAFT rows, built without an F extension or a unit, answer no. A wasm module computes in
+    // floating point natively and answers yes.
+    fp_registers(self) -> bool = if self.cpu == Thumb then self.single_unit() else !self.no_fpu
+
+    // Whether those registers hold a **double** as well as a single -- `#if fpu_dp`. On Arm, a unit
+    // whose `-mfpu` name carries no `-sp-`; every other machine with registers has double precision.
+    fp_double_registers(self) -> bool =
+        self.fp_registers() && !(self.cpu == Thumb && self.fpu.contains("-sp-"))
+
+    // The float ABI, for a machine that has registers to pass a float in: `#if hardfloat` where a
+    // float argument travels in one, `#if softfp` where it travels in an integer register although
+    // the unit is there. A machine with no registers is neither -- it is soft float throughout, and
+    // `!fpu` is what says so.
+    hard_float_abi(self) -> bool = self.fp_registers() && self.hard_float()
+    soft_fp_abi(self) -> bool = self.fp_registers() && self.soft_float
+
+    // Whether a fused multiply-add (`llvm.fma`) is one instruction at binary32, which is C's
+    // `FP_FAST_FMAF`. It is a fact about the **unit**, not the convention, so a soft-float ABI over a
+    // unit still fuses: every Arm unit a row names is VFPv4 or later, AArch64's is always there, and a
+    // hosted RISC-V machine is `rv64gc`. The x86 rows ask for no processor past the baseline, which has
+    // no FMA, and WebAssembly has none; a machine that answers false calls `fmaf`, which
+    // `sysl.softfloat` exports where there is no C library to ask.
+    fused_single(self) -> bool = self.cpu match
+        Aarch64 -> true
+        Riscv64 -> !self.soft_float
+        Thumb -> !self.no_fpu && self.fpu != ""
+        _ -> false
+
+    // The same at binary64, which is C's `FP_FAST_FMA`: on Arm only a double-precision unit has it.
+    fused_double(self) -> bool =
+        if self.cpu == Thumb then self.fused_single() && !self.fpu.contains("-sp-") else self.fused_single()
+
+    // Whether the machine divides 32-bit integers itself. Armv6-M is the one core sysl targets that
+    // has no divider -- nor a long multiply, `clz` or a two-word shift -- so LLVM calls a routine for
+    // each, and `sysl.softint` answers them.
+    divider(self) -> bool = !(self.cpu == Thumb && self.triple.starts_with("thumbv6m"))
+
     // Whether the manifest took this capability away from this machine.
     lacks_capability(self, cap: string) -> bool
         for lack in self.lacks
@@ -249,6 +345,18 @@ struct Target
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
 
     pointer_bytes(self) -> usize = cpu_bits(self.cpu) / 8
+
+    // The widest integer an atomic form may run at here (`cpu_atomic_bits`).
+    atomic_bits(self) -> int = cpu_atomic_bits(self.cpu)
+
+    // The widest integer an atomic read-modify-write -- an exchange, an add, a compare-and-swap -- may
+    // change here. **Armv6-M has none at all**: no `ldrex`/`strex`, so it reads and writes a word
+    // indivisibly and changes nothing (`atomic_reach.sysl`).
+    atomic_rmw_bits(self) -> int = if self.triple.starts_with("thumbv6m") then 0 else self.atomic_bits()
+
+    // Whether the processor masks interrupts through PRIMASK, which is what an `IrqLock` takes: every
+    // Thumb row is a Cortex-M core.
+    has_primask(self) -> bool = self.cpu == Thumb
 
     // Whether memory holds a value's least significant byte first, which is what `to_be` and a
     // `@byte_order(big)` field reverse against.
@@ -379,6 +487,8 @@ all_targets() -> Buf[Target]
                     "fpv4-sp-d16", false, true, VaLoaded, 4))
     out.push(row("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true,
                     "", true, true, VaLoaded, 4))
+    out.push(row("thumbv7em-freestanding-dp", "thumbv7em-none-eabihf", Thumb, Freestanding, false,
+                    "fpv5-d16", false, true, VaLoaded, 4))
     out.push(row("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true, "",
                     true, false, VaLoaded, 4))
     out.push(row("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false, "",

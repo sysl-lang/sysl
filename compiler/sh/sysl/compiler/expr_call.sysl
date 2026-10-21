@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, cmp, from_int, to_string as big_text}
+import sysl.math.bigint.{BigInt, cmp, from_int, negate, to_string as big_text}
 
 // What a pair of parentheses means, which is six different things told apart by what stands in
 // front of them: a conversion, a variant, a struct's constructor, a simple enum read out of an
@@ -102,12 +102,14 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             written_call(cx, span, head, open, targs, args, expected)
         // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
         // and is re-read here where the name is one a generic declares -- and only where nothing
-        // nearer holds the name: a local shadowing the function is what is indexed.
+        // nearer holds the name: a local shadowing the function is what is indexed. A function the
+        // entry file's body keeps is one too, out of reach from here, and told so.
         Index(head, one, open) ->
             val name = written_name_of(cx, head)
 
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
-               (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some())
+               (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some() ||
+                holds_string(cx.an.tables.entry_captures, name.unwrap()))
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
@@ -187,9 +189,16 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // the reader wrote the instantiation of.
             val on_type_args = written_on_generic_type(cx, receiver)
 
-            if on_type_args.is_some() then
+            if on_type_args.is_some()
+                val on_applied = applied_associated_call(cx, span, on_type_args.unwrap().0,
+                                                         on_type_args.unwrap().1, member, args,
+                                                         expected)
+
+                if on_applied.is_some() then return on_applied.unwrap()
+
                 return type_args_at_selection(cx, span, on_type_args.unwrap().0,
                                               on_type_args.unwrap().1, member, args)
+            end if
 
             val dotted = module_path_of(cx, receiver, member)
 
@@ -285,7 +294,9 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                     return cx.err(named_at, s"undefined function '${module_qualify(owner.unwrap(), member)}'")
             end if
 
-            val tr = sum_receiver(cx, receiver, member, args, expected)
+            val tr = unwrapped_associated(cx, receiver, member, args, expected) match
+                Some(read) -> read
+                None -> sum_receiver(cx, receiver, member, args, expected)
 
             if texpr_type(tr) == Unknown then return tr
 
@@ -406,10 +417,7 @@ end written_call
 private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string,
                           targ_exprs: Buf[Expr], args: Buf[Expr], expected: Option[Type]) -> TExpr
     val key = renamed_generic(cx, lookup_type_key(cx.an, cx.scope, name).unwrap())
-    var targs: Buf[Type] = buf()
-
-    for targ_expr in targ_exprs
-        targs.push(written_type_arg(cx, targ_expr))
+    val targs = written_type_args_for(cx, key, targ_exprs)
 
     cx.an.tables.types.get(key).unwrap().kind match
         StructOf(_) -> struct_call(cx, span, key, name, args, expected, targs)
@@ -437,8 +445,9 @@ end applied_type_call
 
 // The generic struct or enum a type-argument list is written on -- bare, or reached through the
 // module that declares it -- as the key it is filed under and the spelling a refusal quotes back. A
-// local of the name stands in front, since then the brackets are a subscript.
-generic_type_head(cx: &Analyzer, head: Expr) -> Option[(string, string)]
+// local of the name stands in front, since then the brackets are a subscript. With `subtypes`, a
+// generic `new` type counts too: reflection asks `Handle[int]::Name` of one as of a struct.
+generic_type_head(cx: &Analyzer, head: Expr, subtypes: bool = false) -> Option[(string, string)]
     val written = written_name_of(cx, head)
 
     if written.is_none() || local_head(cx, head) then return None
@@ -455,14 +464,15 @@ generic_type_head(cx: &Analyzer, head: Expr) -> Option[(string, string)]
     val generic = decl.unwrap().kind match
         StructOf(sd) -> !sd.tparams.is_empty()
         EnumOf(ed) -> !ed.tparams.is_empty()
+        TypeOf(td) -> subtypes && !td.tp.names.is_empty()
         _ -> false
 
     if generic then Some((key.unwrap(), written.unwrap())) else None
 end generic_type_head
 
 // The head and the list of `H[A]` or `H[A, B]` where the brackets are written on a generic type,
-// which is what a selection after them is made from.
-written_on_generic_type(cx: &Analyzer, e: Expr) -> Option[((string, string), Buf[Expr])]
+// which is what a selection after them is made from; `subtypes` as `generic_type_head` takes it.
+written_on_generic_type(cx: &Analyzer, e: Expr, subtypes: bool = false) -> Option[((string, string), Buf[Expr])]
     var head = e
     var targs: Buf[Expr] = buf()
 
@@ -475,17 +485,53 @@ written_on_generic_type(cx: &Analyzer, e: Expr) -> Option[((string, string), Buf
             targs = list
         _ -> return None
 
-    val found = generic_type_head(cx, head)
+    val found = generic_type_head(cx, head, subtypes)
 
     if found.is_none() then return None
 
     Some((found.unwrap(), targs))
 end written_on_generic_type
 
+// `Of[int].twice()` -- an associated function CALLED through the instantiation its type's name was
+// written at, which is the spelling `type OfInt = Of[int]; OfInt.twice()` already is without the
+// alias. A member with no receiver may have nothing else that could carry the type's arguments, so
+// the list is the type's, settled outright, and the member's own parameters are solved from the
+// call as they are through the alias. Everything a member declared on
+// the type can be is asked the alias's way: a METHOD reached so is refused there in the words
+// `T.method(x)` is, since a type in front of the dot is no value to call it on.
+//
+// Nothing where the name selects a variant, or nothing the type declares, which `type_args_at_selection`
+// answers.
+private applied_associated_call(cx: &Analyzer, span: Span, head: (string, string),
+                                targ_exprs: Buf[Expr], sel: string, args: Buf[Expr],
+                                expected: Option[Type]) -> Option[TExpr]
+    val variant = cx.an.tables.types.get(head.0).unwrap().kind match
+        EnumOf(ed) -> variant_decl_named(ed, sel).is_some()
+        _ -> false
+
+    if variant then return None
+
+    val targs = written_type_args_for(cx, head.0, targ_exprs)
+
+    for t in targs
+        if t == Unknown then return Some(bad_expr(span))
+
+    val ty = reinstantiate_at(cx.an, cx.scope, span, head.0, targs)
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    val key = member_key(cx.an, ty, sel).0
+
+    if member_at(cx.an, key, sel).is_none() && !cx.an.tables.members.alts.has(member_key_of(key, sel)) then
+        return None
+
+    associated_on(cx, span, ty, sel, args, expected, no_bound_traits())
+end applied_associated_call
+
 // `Maybe[int].Just(3)`, and `b.Maybe[string].Nothing` with nothing called -- a variant selected from
-// the instantiation its enum's name was written at. **A variant is the only thing a written list
-// may be selected from**: an associated function takes its type from what receives the result, so
-// the list is refused there with the place to write it instead.
+// the instantiation its enum's name was written at. **A variant and a called associated function are
+// the only things a written list may be selected from** (`applied_associated_call` is the second):
+// read without a call, a member is refused with the place to write the type instead.
 type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_exprs: Buf[Expr],
                        sel: string, args: Buf[Expr]) -> TExpr
     val variant = cx.an.tables.types.get(head.0).unwrap().kind match
@@ -497,14 +543,10 @@ type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_e
                       s"from it; write the type on what receives the result — 'var x: ${head.1}[…] " +
                       s"= …' — and select '$sel' from the plain name")
 
-    var targs: Buf[Type] = buf()
+    val targs = written_type_args_for(cx, head.0, targ_exprs)
 
-    for targ_expr in targ_exprs
-        val t = written_type_arg(cx, targ_expr)
-
+    for t in targs
         if t == Unknown then return bad_expr(span)
-
-        targs.push(t)
 
     reinstantiate_at(cx.an, cx.scope, span, head.0, targs) match
         Enum(d) ->
@@ -702,6 +744,9 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     // `embed("file")` yields to a declaration of the name in the same way.
     if embed_form(cx, name) then return Some(embed_call(cx, span, args))
 
+    if debug_form(cx, name) then return Some(debug_string(cx, span, args))
+    if name == DebugPart then return Some(debug_part(cx, span, args))
+
     if name == "str_cast" then return Some(str_cast_call(cx, span, args))
     if name == "str_alias" then return Some(str_alias_call(cx, span, args))
 
@@ -716,7 +761,9 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     if name == "str" then
         if args.len() != 1 then return Some(cx.err(span, "str takes exactly one value"))
 
-        val v = type_expr_bare(cx, args.at(0))
+        val v = through_ref(cx, type_expr_bare(cx, args.at(0)))
+
+        warn_placeholder(cx, args.at(0).span, args.at(0), v)
 
         // A float is written as Rust's `{}` writes it, at its own width: the fewest digits that read
         // back as a value of that type, set out positionally (`sysl.fmt.format_real_plain`).
@@ -825,7 +872,7 @@ private release_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     val place = require_place(cx, t, args.at(0), "'release'", true, Some(span))
     var writes: Buf[TExpr] = buf()
 
-    writes.push(rechecked(cx, span, place, TExpr(span, TStore(place, TExpr(span, TZero(ty)), ty))))
+    writes.push(rechecked(cx, span, place, TExpr(span, TStore(place, TExpr(span, TZero(ty)), ty, false))))
     TExpr(span, TSeq(writes))
 end release_call
 
@@ -861,7 +908,7 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
     if args.len() != 1 then
         return cx.err(span, "'ptr_cast' takes exactly one value, the address to read as a pointer")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = address_operand(cx, args.at(0))
 
     if expected.is_none() then
         return cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and nothing " +
@@ -874,6 +921,28 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
 
     TExpr(span, TCast(t, to))
 end ptr_cast_call
+
+// The address `ptr_cast` is handed, analyzed. **The operand is an address-width position**, as the
+// initializer of a `val a: usize` is: a bare integer literal, or an expression made of nothing but
+// bare integer literals (`0x4000 + 16`, `1 << 20`), is read at the target's `usize`, and one too large
+// for that width -- or a negative one, or arithmetic that comes to one -- is refused as the value
+// that does not fit (`literal_arith.sysl`). Anything with a
+// type of its own keeps it, so an `int` value, a suffixed literal of another type, or an expression
+// with either inside it is still refused.
+private address_operand(cx: &Analyzer, e: Expr) -> TExpr =
+    if int_literal_only(e) then type_expr(cx, e, Some(usize_type(word_bits(cx))))
+    else type_expr_bare(cx, e)
+
+// An unsuffixed integer literal, or integer arithmetic over nothing else.
+private int_literal_only(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, suffix) -> suffix == ""
+    Unary(op, operand) -> (op == "-" || op == "~") && int_literal_only(operand)
+    Binary(op, l, r) -> integer_operator(op) && int_literal_only(l) && int_literal_only(r)
+    _ -> false
+
+private integer_operator(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" ||
+        op == "^" || op == "<<" || op == ">>"
 
 // What a reinterpreted address may NOT be read as, named by what the type promises that an address
 // cannot supply. A function pointer is an address like any other.
@@ -926,7 +995,7 @@ private is_trait_type(t: Type) -> bool = t match
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
     null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name) ||
-    embed_form(cx, name)
+    embed_form(cx, name) || debug_form(cx, name) || name == DebugPart
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
@@ -944,12 +1013,46 @@ private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = type_expr(cx, args.at(0), literal_target(args.at(0), to))
 
     if texpr_type(t) == Unknown then return t
 
     convert_to(cx, span, t, to, None)
 end convert_call
+
+// The type an integer literal written as a conversion's argument is read at: **the target's**,
+// wherever the value fits it, so `i128(9223372036854775807)` is the `i128` it says and never an
+// `int` too narrow to hold it first. A value that fits `int` and not the target keeps the conversion
+// it always had, from `int` -- `u8(300)` is `44` and `u64(-1)` is the largest `u64` -- and one that
+// fits neither is refused at the target, which is the type the line names.
+private literal_target(arg: Expr, to: Type) -> Option[Type]
+    val value = integer_literal_value(arg)
+
+    if value.is_none() then return None
+
+    val v = value.unwrap()
+
+    to match
+        Integer(bits, signed, _) ->
+            if fits(v, bits, signed) || !fits_int(v) then Some(to) else None
+        _ -> None
+end literal_target
+
+private fits_int(v: BigInt) -> bool = int_type() match
+    Integer(bits, signed, _) -> fits(v, bits, signed)
+    _ -> true
+
+// The value of an unsuffixed integer literal, with the minus in front of it where one is written --
+// the minus and the literal are one unit for the range check, as they are anywhere else.
+private integer_literal_value(arg: Expr) -> Option[BigInt] = *arg.kind match
+    IntLit(digits, base, suffix) -> if suffix == "" then Some(literal_value(digits, base)) else None
+    Unary(op, operand) -> if op == "-" then negated_literal(operand) else None
+    _ -> None
+
+private negated_literal(operand: Expr) -> Option[BigInt] = *operand.kind match
+    IntLit(digits, base, suffix) ->
+        if suffix == "" then Some(negate(literal_value(digits, base))) else None
+    _ -> None
 
 // The conversion itself, which a subtype's cast also reaches.
 //
@@ -1228,6 +1331,17 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             // **The count and naming refusals quote the DECLARATION, not the spelling** -- `struct
             // 'b.T'` where the call wrote a bare `T` it imported, as a callee is quoted: a reader with
             // only the bare name has nowhere to go and read the fields.
+            if has_anonymous_member(d)
+                if !layout_known(cx.an, cx.scope, span, key, qualified_name(key)) then
+                    return bad_expr(span)
+
+                val made = anonymous_new(cx, span, qualified_name(key), d, args, true)
+
+                return if d.union_layout then made else checked_new(cx, span, made, d)
+            end if
+
+            if d.union_layout then return union_call(cx, span, key, d, args)
+
             val slots = bind_field_args(cx, span, qualified_name(key), d, args)
 
             if slots.is_none() then return bad_expr(span)
@@ -1253,9 +1367,11 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             val before = cx.an.complaints()
             var given: Buf[Expr] = buf()
 
+            // An unnamed bitfield is written by no one, and holds zero (`c_bitfields.sysl`).
             for i in 0..<d.fields.len()
-                given.push(slots.unwrap().at(i).unwrap())
-                ts.push(type_expr(cx, given.at(i), Some(d.fields.at(i).1)))
+                given.push(slots.unwrap().at(i).unwrap_or(expr(span, IntLit("0", 10, ""))))
+                ts.push(if unnamed_c_bit(d, i) then unnamed_zero(span, d.fields.at(i).1)
+                        else type_expr(cx, given.at(i), Some(d.fields.at(i).1)))
 
             val refused = refused_field(cx, span, built, d.fields, given, ts, before)
 
@@ -1268,6 +1384,183 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// `U(f = v)`: a union is built from **exactly one field, and by name** -- the name is the only thing
+// that says which field, so a value by position is refused even where there is one field, and adding
+// a field never changes what an existing construction means. **The bytes past the field are zero**,
+// so a union's bytes never carry what the stack held before.
+//
+// The node is the struct's, with the one value at its field's position and a `()` standing at every
+// other (`gen_borrowed_into` zeroes the storage and stores the one).
+private union_call(cx: &Analyzer, span: Span, key: string, d: &StructType, args: Buf[Expr]) -> TExpr
+    val written = qualified_name(key)
+    val example = s"'$written(${d.fields.at(0).0} = …)'"
+
+    if args.len() != 1
+        return cx.err(span, s"union '$written' is built from exactly one field, named — $example — and " +
+                      s"${supplied(args.len(), "value")}")
+
+    val one = args.at(0)
+
+    *one.kind match
+        NamedArg(name, value) ->
+            val idx = d.field_index(name)
+
+            if idx < 0 then
+                return cx.err(one.span, s"union '$written' declares no field named '$name' — it holds " +
+                              field_name_list(d))
+
+            if !layout_known(cx.an, cx.scope, span, key, written) then return bad_expr(span)
+
+            every_field_visible(cx, span, d, "the constructor",
+                                "build it through an associated function of its own")
+
+            val field = d.fields.at(usize(idx))
+            val before = cx.an.complaints()
+            val typed = type_expr(cx, value, Some(field.1))
+
+            var fields: Buf[(string, Type)] = buf()
+            var given: Buf[Expr] = buf()
+            var checked: Buf[TExpr] = buf()
+
+            fields.push(field)
+            given.push(value)
+            checked.push(typed)
+
+            val refused = refused_field(cx, span, qualified(written, d.targs), fields, given, checked, before)
+
+            if refused.is_some() then return refused.unwrap()
+
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<d.fields.len()
+                ts.push(if i == usize(idx) then typed else TExpr(span, TUnitLit))
+
+            TExpr(span, TStructNew(d, ts))
+        _ ->
+            cx.err(one.span, s"union '$written' is built from one field, named — $example: a value by " +
+                   "position would mean another field once one is declared in front of it")
+end union_call
+
+private has_anonymous_member(d: &StructType) -> bool
+    for f in d.fields
+        if is_anonymous_field(f.0) then return true
+
+    false
+end has_anonymous_member
+
+// A struct or union holding an anonymous member, built by the names of the fields at every level:
+// `Packet(tag = 1, word = 7, len = 2)` fills `word` in the anonymous union between the other two.
+// **Every value is named**, since a position would have to count the anonymous member's fields as
+// one or as many and either reading surprises someone. A struct names every field of its own and
+// one field of each anonymous union it holds; a union names exactly one field at its level, and the
+// rest of its bytes are zero (`union_call`).
+private anonymous_new(cx: &Analyzer, span: Span, written: string, d: &StructType, args: Buf[Expr],
+                      outermost: bool) -> TExpr
+    val kind = if d.union_layout then "union" else "struct"
+
+    for one in args
+        *one.kind match
+            NamedArg(name, _) ->
+                if outermost && (name == "_" || (d.field_index(name) < 0 && anonymous_path(d, name).is_empty())) then
+                    return cx.err(one.span, s"$kind '$written' declares no field named '$name' — it holds " +
+                                  quoted_names(visible_field_names(d)))
+            _ ->
+                return cx.err(one.span, s"$kind '$written' holds an anonymous member, so it is built by " +
+                              "naming its fields — a value by position would have to count the member's " +
+                              "fields as one or as many")
+
+    every_field_visible(cx, span, d, "the constructor", "build it through an associated function of its own")
+
+    val before = cx.an.complaints()
+    var ts: Buf[TExpr] = buf()
+    var fields: Buf[(string, Type)] = buf()
+    var given: Buf[Expr] = buf()
+    var checked: Buf[TExpr] = buf()
+    var filled: usize = 0
+
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        if is_anonymous_field(f.0)
+            var sub: Buf[Expr] = buf()
+            var inner_names: Buf[string] = buf()
+
+            f.1 match
+                Struct(inner) ->
+                    inner_names = visible_field_names(inner)
+
+                    for one in args
+                        *one.kind match
+                            NamedArg(name, _) ->
+                                if inner.field_index(name) >= 0 || !anonymous_path(inner, name).is_empty() then
+                                    sub.push(one)
+                            _ -> ()
+
+                    if sub.is_empty()
+                        if !d.union_layout then
+                            return cx.err(span, s"struct '$written' is built naming a field of its anonymous " +
+                                          s"${anonymous_kind(inner)} — one of ${quoted_names(inner_names)}")
+
+                        ts.push(TExpr(span, TUnitLit))
+                    else
+                        ts.push(anonymous_new(cx, span, written, inner, sub, false))
+                        filled += 1
+                    end if
+                _ -> ts.push(bad_expr(span))
+        else
+            var value: Option[Expr] = None
+
+            for one in args
+                *one.kind match
+                    NamedArg(name, v) -> if name == f.0 then value = Some(v)
+                    _ -> ()
+
+            if value.is_none() && unnamed_c_bit(d, i)
+                // An unnamed bitfield is written by no one, and holds zero (`c_bitfields.sysl`).
+                ts.push(unnamed_zero(span, f.1))
+            else if value.is_none()
+                if !d.union_layout then
+                    return cx.err(span, s"struct '$written' is built naming every field, and '${f.0}' is missing")
+
+                ts.push(TExpr(span, TUnitLit))
+            else
+                val typed = type_expr(cx, value.unwrap(), Some(f.1))
+
+                fields.push(f)
+                given.push(value.unwrap())
+                checked.push(typed)
+                ts.push(typed)
+                filled += 1
+            end if
+        end if
+
+    if d.union_layout && filled != 1
+        val which = if outermost then s"union '$written'" else s"the anonymous union in '$written'"
+
+        return cx.err(span, s"$which is built from exactly one field, and $filled were named — it holds " +
+                      quoted_names(visible_field_names(d)))
+    end if
+
+    val refused = refused_field(cx, span, qualified(written, d.targs), fields, given, checked, before)
+
+    if refused.is_some() then return refused.unwrap()
+
+    TExpr(span, TStructNew(d, ts))
+end anonymous_new
+
+private anonymous_kind(d: &StructType) -> string = if d.union_layout then "union" else "struct"
+
+private quoted_names(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i + 1 == names.len() then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
+
+    out
+end quoted_names
 
 // Whether the position expects an instantiation of the struct declared under `key`.
 private expects_struct(expected: Option[Type], key: string) -> bool = expected match
@@ -1298,7 +1591,7 @@ private bind_field_args(cx: &Analyzer, span: Span, written: string, d: &StructTy
 
                 val idx = d.field_index(name)
 
-                if idx < 0
+                if idx < 0 || unnamed_c_bit(d, usize(idx))
                     cx.fault(a.span, s"struct '$written' declares no parameter named '$name' — " +
                              s"it takes ${field_name_list(d)}")
                     refused = true
@@ -1307,6 +1600,9 @@ private bind_field_args(cx: &Analyzer, span: Span, written: string, d: &StructTy
                     refused = true
                 else slots.set(usize(idx), Some(value))
             _ ->
+                while next < d.fields.len() && unnamed_c_bit(d, next)
+                    next += 1
+
                 if next >= d.fields.len() then extra += 1
                 else
                     slots.set(next, Some(a))
@@ -1317,7 +1613,7 @@ private bind_field_args(cx: &Analyzer, span: Span, written: string, d: &StructTy
     var missing_at: int = -1
 
     for i in 0..<d.fields.len()
-        if missing_at < 0 && slots.at(i).is_none() then missing_at = int(i)
+        if missing_at < 0 && slots.at(i).is_none() && !unnamed_c_bit(d, i) then missing_at = int(i)
 
     if extra > 0 || missing_at >= 0
         if named_seen && extra == 0
@@ -1325,7 +1621,7 @@ private bind_field_args(cx: &Analyzer, span: Span, written: string, d: &StructTy
                      s"'${d.fields.at(usize(missing_at)).0}', and that parameter declares no " +
                      "default")
         else
-            cx.fault(span, s"struct '$written' has ${quantity(d.fields.len(), "field")}, but " +
+            cx.fault(span, s"struct '$written' has ${quantity(named_field_count(d), "field")}, but " +
                      s"${quantity(args.len(), "value")} " +
                      s"${if args.len() == 1 then "was" else "were"} given")
 
@@ -1337,15 +1633,25 @@ end bind_field_args
 
 // The fields of a record, as a refusal lists them.
 private field_name_list(d: &StructType) -> string
-    var out = ""
+    var names: Buf[string] = buf()
 
     for i in 0..<d.fields.len()
-        if i > 0 then out = out + (if i + 1 == d.fields.len() then " and " else ", ")
+        if !unnamed_c_bit(d, i) then names.push(d.fields.at(i).0)
 
-        out = out + s"'${d.fields.at(i).0}'"
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i + 1 == names.len() then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
 
     out
 end field_name_list
+
+// The value an unnamed bitfield holds in a value built field by field: zero.
+private unnamed_zero(span: Span, t: Type) -> TExpr = underlying(t) match
+    Bool -> TExpr(span, TBoolLit(false))
+    _ -> TExpr(span, TIntLit(from_int(0), unqualified(t)))
 
 // A construction with the invariant check its type owes wrapped around it, where it states one. A
 // generic one is checked by its clauses made real at this construction's type arguments.
@@ -1368,26 +1674,32 @@ private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: St
             _ -> ()
     end if
 
+    // Each value is read against the field it fills -- a named one against the field of its name,
+    // which is where `G(value = 3)` says its `T` is -- and the solve is handed the pairs in that order.
+    val placed = field_args(sd, args)
     var field_refs: Buf[TypeRef] = buf()
-
-    for i in 0..<sd.fields.len()
-        field_refs.push(sd.fields.at(i).typ)
-
     var prov: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
-    for i in 0..<args.len()
-        if i < field_refs.len() && !ref_mentions(field_refs.at(i), sd.tparams)
-            val want = resolve_qualified(cx.an, home, field_refs.at(i), no_bindings())
-            val t = sandboxed_read(cx, args.at(i), Some(want))
+    for item in placed
+        if item.0 < 0 then continue
+
+        val value = item.1
+        val typ = sd.fields.at(usize(item.0)).typ
+
+        field_refs.push(typ)
+
+        if !ref_mentions(typ, sd.tparams)
+            val want = resolve_qualified(cx.an, home, typ, no_bindings())
+            val t = sandboxed_read(cx, value, Some(want))
 
             prov.push(texpr_type(t))
             soft.push(false)
         else
-            val t = sandboxed_read(cx, args.at(i), None)
+            val t = sandboxed_read(cx, value, None)
 
             prov.push(texpr_type(t))
-            soft.push(adaptable(args.at(i), t))
+            soft.push(adaptable(value, t))
 
     solve(cx.an, home, cx.scope, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
           buf())
@@ -1398,13 +1710,36 @@ end struct_targs
 // readings are sandboxed, and the solve stays quiet about a parameter an unknown value left open,
 // taking the value to have spoken already. Only the leftmost speaks.
 private voice_unknown_fields(cx: &Analyzer, sd: StructDecl, args: Buf[Expr])
-    for i in 0..<args.len()
-        if i < sd.fields.len() && ref_mentions(sd.fields.at(i).typ, sd.tparams) &&
-           mentions_unknown(texpr_type(sandboxed_read(cx, args.at(i), None)))
-            type_expr(cx, args.at(i), None)
+    for item in field_args(sd, args)
+        if item.0 >= 0 && ref_mentions(sd.fields.at(usize(item.0)).typ, sd.tparams) &&
+           mentions_unknown(texpr_type(sandboxed_read(cx, item.1, None)))
+            type_expr(cx, item.1, None)
             return
         end if
 end voice_unknown_fields
+
+// Which field each written value fills, and the value itself with any `name =` taken off: a name
+// chooses its field, everything else takes the next by position, and -1 is a value that fills none
+// (a name the struct does not declare, or one past the end, which `bind_field_args` refuses).
+private field_args(sd: StructDecl, args: Buf[Expr]) -> Buf[(int, Expr)]
+    var out: Buf[(int, Expr)] = buf()
+    var next = 0
+
+    for a in args
+        *a.kind match
+            NamedArg(name, value) ->
+                var at = -1
+
+                for i in 0..<sd.fields.len()
+                    if sd.fields.at(i).name == name then at = int(i)
+
+                out.push((at, value))
+            _ ->
+                out.push((if next < int(sd.fields.len()) then next else -1, a))
+                next += 1
+
+    out
+end field_args
 
 // A simple enum's name in call position is a checked cast from an integer.
 private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
@@ -1509,7 +1844,7 @@ private written_floating(t: Type) -> bool = t match
     _ -> false
 
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written: Buf[Expr]) -> TExpr
-    val v = type_expr_bare(cx, arg)
+    val v = through_ref(cx, type_expr_bare(cx, arg))
     val ty = texpr_type(v)
     var counts: Buf[TExpr] = buf()
 
@@ -1523,6 +1858,12 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     if ty == Unknown then return TExpr(span, TFormat(v, spec, counts))
 
     val c = spec_conversion(spec)
+
+    // **`%?` takes any value at all** and shows it through its `Debug`, under the width the hole
+    // wrote.
+    if c == '?' || spec_is_str(c) then warn_placeholder(cx, arg.span, arg, v)
+
+    if c == '?' then return spec_render(cx, span, v, spec, counts)
 
     // A conversion says what kind of value it renders, and a value of another kind is a mistake in
     // the specifier rather than something to convert: `%d` over a float would silently truncate it.
@@ -1791,28 +2132,80 @@ end constrained_call
 // A value made into a subtype: converted to its base where it is not already that, then checked
 // against what the subtype states. A type parameter standing for a subtype comes here too, so
 // `T(n)` at `Small` checks the range exactly as `Small(n)` written out does.
+//
+// **A subtype's name converts from whatever its base's name converts from**, a `new` type's included:
+// `Phase(3)` over `real` is `Phase(real(3))`, accepted exactly where `real(3)` is and refused with
+// that conversion's own refusal, and a rounding mode is taken where the base's conversion takes one.
+// A value already at the base is wrapped, not converted. A chain of `new` types reaches the scalar at
+// the bottom, since the base's own conversion is asked the same question.
+//
+// **A `new` type's own `From[X]` comes first**: where the type implements `From` for the value's
+// type, `N(x)` is that `from`, whatever the base would have made of `x` -- except inside that very
+// `from`, where `N(x)` is the base's conversion, so the impl can be written in terms of it.
 private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
                      args: Buf[Expr]) -> TExpr
+    if args.len() == 2 then
+        val rounded = rounded_convert(cx, span, written, underlying(target), args)
+
+        if texpr_type(rounded) == Unknown then return rounded
+
+        return subtype_from(cx, span, rounded, target, written)
+    end if
+
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
     target match
         Constrained(d) ->
-            val t = type_expr(cx, args.at(0), Some(d.base))
+            // Read without widening: the conversion below is the one this call names, and a value
+            // widened to the base first would never reach the type's own `From` for it. So is an
+            // integer literal where the type has its own `From[int]`: read at a float base it would be
+            // that float, and wrapped rather than handed to the `from` the type wrote for it.
+            val own_int = d.derived && literal_default(args.at(0)).unwrap_or(Unknown) == int_type() &&
+                          from_conversion(cx.an, int_type(), target).is_some()
 
-            // A derived type's name WRAPS a value already at its base; only a transparent subtype's
-            // name converts, being its base's name with a check after it.
-            if disagree(texpr_type(t), d.base) && d.derived then
-                return cx.err(span, refusal(Some(written), texpr_type(t), target))
+            // A conversion's value is not used at the type it is converted to, so a literal binding
+            // is not fixed by it (`var_first_use.sysl`).
+            not_fixing_at(cx, args.at(0))
 
-            if disagree(texpr_type(t), d.base) then
-                val converted = convert_to(cx, span, t, d.base, Some(written))
+            val t = type_expr_unwidened(cx, args.at(0), if own_int then None else Some(d.base))
 
-                return TExpr(span, TConstrainedCheck(converted, target))
+            if texpr_type(t) == Unknown then return t
 
-            TExpr(span, TConstrainedCheck(t, target))
+            subtype_from(cx, span, t, target, written)
         _ -> bad_expr(span)
 end into_subtype
+
+// A typed value made into a subtype, by the rule `into_subtype` states: wrapped where it is at the
+// base, through the type's own `from` where it has one for the value, and otherwise converted to the
+// base -- itself a subtype's conversion where the base is one -- and then checked.
+private subtype_from(cx: &Analyzer, span: Span, t: TExpr, target: Type, written: string) -> TExpr
+    target match
+        Constrained(d) ->
+            if !disagree(texpr_type(t), d.base) then return TExpr(span, TConstrainedCheck(t, target))
+
+            if d.derived
+                val own = from_conversion(cx.an, texpr_type(t), target)
+
+                if own.is_some() && own.unwrap() != cx.body
+                    cx.an.uses(own.unwrap())
+
+                    var ts: Buf[TExpr] = buf()
+
+                    ts.push(t)
+
+                    return TExpr(span, TCall(own.unwrap(), ts, target, false))
+            end if
+
+            val converted = d.base match
+                Constrained(_) -> subtype_from(cx, span, t, d.base, written)
+                _ -> convert_to(cx, span, t, d.base, Some(written))
+
+            if texpr_type(converted) == Unknown then return converted
+
+            TExpr(span, TConstrainedCheck(converted, target))
+        _ -> bad_expr(span)
+end subtype_from
 
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
@@ -2113,15 +2506,11 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
             if ed.tparams.len() != targ_exprs.len() then return VsNone
             if variant_decl_named(ed, member).is_none() then return VsNone
 
-            var targs: Buf[Type] = buf()
+            val targs = written_type_args_for(cx, key.unwrap(), targ_exprs)
 
-            for targ_expr in targ_exprs
-                val t = written_type_arg(cx, targ_expr)
-
-                // A type argument that names nothing has said so already.
+            // A type argument that names nothing has said so already.
+            for t in targs
                 if mentions_unknown(t) then return VsSaid
-
-                targs.push(t)
 
             reinstantiate_at(cx.an, cx.scope, anchor_of(receiver), key.unwrap(), targs) match
                 Enum(d) -> d.variant(member) match
@@ -2195,7 +2584,7 @@ private function_in_scope(cx: &Analyzer, written: string) -> bool
     false
 end function_in_scope
 
-private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
+function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     // A module bound to a name is written before a dot, so `unicode.is_alpha` is the module's key
     // and the name after it. It is asked first, since the alias is what the file said the word
     // means.
@@ -2409,6 +2798,18 @@ private first_dot_in(name: string) -> Option[usize]
     None
 end first_dot_in
 
+// A function of the entry file that reads the body's bindings is part of the body, and a call made
+// from outside it -- a `static` initializer or a `const`, settled before any statement runs -- has no
+// body to reach it through (`entry.sysl`'s `capturing`). `None` where the name is not one of those.
+// Asked by a call written with type arguments too (`f[int]()`), which names the same function.
+body_only_call(cx: &Analyzer, span: Span, written: string) -> Option[TExpr]
+    if !holds_string(cx.an.tables.entry_captures, written) then return None
+
+    Some(cx.err(span, s"'$written' reads the entry file's body, so only the body can call it — " +
+                "this call is the module's, made before any statement runs, when there is no body " +
+                s"yet. Make what '$written' reads 'static' too, or make the call part of the body"))
+end body_only_call
+
 // A call of a function this compilation knows by key.
 //
 // **Which declaration a call means is decided by its arguments**, so a name with more than one
@@ -2421,6 +2822,9 @@ end first_dot_in
 private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: string, args: Buf[Expr],
                       expected: Option[Type]) -> TExpr
     val keys = function_keys(cx, written)
+    val shadowing = extern_over_library(cx, written, keys)
+
+    if shadowing.is_some() then return extern_named_call(cx, span, written, shadowing.unwrap(), args)
 
     if !keys.is_empty() then depends_on(cx.an, cx.scope, keys.at(0), callee_at)
 
@@ -2442,6 +2846,10 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
         if rivals.len() > 1 then return cx.err(span, ambiguous_offer(written, rivals))
 
+        val captured = body_only_call(cx, span, written)
+
+        if captured.is_some() then return captured.unwrap()
+
         return cx.err(span, s"undefined function '$written'")
 
     // **A name written out in full is held to the same reach as a bare one.** The set a written
@@ -2455,6 +2863,9 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     var fitting: Buf[string] = buf()
     var fitted: Buf[Buf[Type]] = buf()
+    // The first thing each refused candidate said, so a refusal no candidate is the cause of -- an
+    // argument naming nothing this place can see -- is reported as itself rather than as a roster.
+    var first_said: Buf[Placed] = buf()
 
     for i in 0..<keys.len()
         // **A CANDIDATE THAT WAS NOT CHOSEN BUILT NOTHING.** Reading a call against a declaration
@@ -2462,20 +2873,17 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
         // at the very call a written-out `copy` on bytes wins -- and the chosen one is read again
         // from scratch. So the whole trial is rewound, not only what it had to say: a name a
         // discarded reading registered is a body the program never calls.
-        val mark = cx.an.complaints()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
+        val tried = begin_trial(cx)
         val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
-        val said = cx.an.complaints() > mark
+        val said = refused_since(cx, tried)
 
         // The signature the fit arrived at is read before the instantiation it made is dropped:
         // the types outlive the trial, and for a generic candidate they are what the call solved.
         val sig = if said then buf() else fitted_signature(cx, keys.at(i), trial)
 
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-        cx.an.restore_complaints(mark)
+        if said then first_said.push(cx.an.found.at(tried.said))
+
+        discard_trial(cx, tried)
 
         if !said
             fitting.push(keys.at(i))
@@ -2515,9 +2923,35 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     if plausible.len() == 1 then return call_key(cx, span, written, plausible.at(0), args, expected, true)
 
+    // **Every candidate refused for one and the same reason, so the reason is not which one was
+    // meant** -- an argument that cannot be read at all, whatever it is passed to -- and that reason
+    // is the message. Read again with reporting on, it says exactly what each trial said.
+    if same_refusal(first_said, keys.len(), args)
+        return call_key(cx, span, written, keys.at(0), args, expected, true)
+
     cx.err(span, s"no '${qualified_callee(keys.at(0), written)}' takes these arguments — the " +
            s"declarations of that name are:\n${signature_list(cx, keys)}")
 end function_call
+
+// Whether every one of `count` candidates was refused, each first saying the same thing at the same
+// place **inside one of the arguments** -- a complaint at the call itself (a count no declaration
+// takes) is about which declaration was meant, and the roster answers that.
+private same_refusal(said: Buf[Placed], count: usize, args: Buf[Expr]) -> bool
+    if count < 2 || said.len() != count then return false
+
+    val first = said.at(0)
+
+    for item in said
+        if item.src.name != first.src.name || item.diag.message != first.diag.message ||
+                item.diag.span.start != first.diag.span.start then return false
+
+    val at = first.diag.span
+
+    for a in args
+        if a.span.start <= at.start && at.end <= a.span.end then return true
+
+    false
+end same_refusal
 
 // Which of the declarations a call fits is the one meant (`reference/declarations.md §
 // Overloading`): the three tie-breaks, in order, stopping as soon as one leaves a single answer.
@@ -2583,6 +3017,14 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val preferred = signed_literal_preference(fitted, ranked, args)
 
         if preferred.len() == 1 then return preferred
+
+        val narrowest = narrowest_widening(fitted, ranked, args)
+
+        if narrowest.len() == 1 then return narrowest
+
+        val defaulted = literal_default_preference(fitted, ranked, args)
+
+        if defaulted.len() == 1 then return defaulted
     end if
 
     var pool: Buf[usize] = buf()
@@ -2663,9 +3105,104 @@ private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
     narrowest
 end signed_literal_preference
 
-// An integer literal written with no suffix, which is what has no type until a position gives one.
+// **Among candidates every argument reached by widening, the one with the narrowest parameters is
+// meant**: a candidate beats another where each of its parameters is the other's or widens to it, so
+// `f(b)` over `f(x: int)` and `f(x: long)` at a `byte` is the `int` one. A literal has no type to be
+// widened from, so a position holding one decides nothing here -- what it means is the literal's
+// own rule above. Empty where no candidate beats every other.
+private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
+    var winners: Buf[usize] = buf()
+
+    if ranked.len() < 2 then return winners
+
+    for a in 0..<ranked.len()
+        var beats_all = true
+
+        for b in 0..<ranked.len()
+            if a != b && !params_narrower(fitted.at(ranked.at(a)), fitted.at(ranked.at(b)), args)
+                beats_all = false
+
+        if beats_all then winners.push(ranked.at(a))
+
+    winners
+end narrowest_widening
+
+// **Candidates tied only by bare literals take the literals at their default types.** Where every
+// position the candidates still standing differ at holds a numeric literal with no suffix, the one
+// candidate whose parameter at each such position is that literal's default beats the rest. The
+// default is `real` for a float literal; for an integer literal it is `int` at an integer parameter
+// and `real` at a float one, since an integer literal is the float a float position expects. So
+// `nextafter(1.0, 2)` over `(real, real)` and `(f32, f32)` is the `real` one, while `(f32, f32)`
+// beside `(f128, f128)` offers no default and stays ambiguous, as do two candidates both at the
+// defaults (`(int, real)` beside `(real, int)` at `(2, 2)`). Empty where the rule does not apply.
+private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
+    var none: Buf[usize] = buf()
+
+    if ranked.len() < 2 then return none
+
+    var differ: Buf[usize] = buf()
+
+    for j in 0..<args.len()
+        val first = fitted.at(ranked.at(0))
+        var differs = false
+
+        for r in 0..<ranked.len()
+            val here = fitted.at(ranked.at(r))
+
+            if j >= here.len() || j >= first.len() || !type_eq(here.at(j), first.at(j))
+                differs = true
+
+        if differs
+            if literal_default(args.at(j)).is_none() then return none
+
+            differ.push(j)
+        end if
+
+    if differ.is_empty() then return none
+
+    var winners: Buf[usize] = buf()
+
+    for r in 0..<ranked.len()
+        val here = fitted.at(ranked.at(r))
+        var all = true
+
+        for d in differ
+            if !type_eq(here.at(d), literal_default_at(args.at(d), here.at(d))) then all = false
+
+        if all then winners.push(ranked.at(r))
+
+    winners
+end literal_default_preference
+
+// The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
+// an integer literal `real` at a float parameter and `int` anywhere else.
+literal_default_at(e: Expr, param: Type) -> Type
+    val own = literal_default(e).unwrap()
+    val float_param = param match
+        Floating(_, _) -> true
+        _ -> false
+
+    if float_param then real_type() else own
+
+private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> bool
+    if mine.len() != theirs.len() || mine.len() != args.len() then return false
+
+    var strictly = false
+
+    for j in 0..<mine.len()
+        if type_eq(mine.at(j), theirs.at(j)) then continue
+        if is_literal(args.at(j)) || !implicitly_widens(mine.at(j), theirs.at(j)) then return false
+
+        strictly = true
+
+    strictly
+end params_narrower
+
+// An integer literal written with no suffix, which is what has no type until a position gives one --
+// negated or not, so `f(-3)` prefers the signed widening as `f(3)` does.
 private bare_int_literal(e: Expr) -> bool = *e.kind match
     IntLit(_, _, suffix) -> suffix == ""
+    Unary(op, operand) -> op == "-" && bare_int_literal(operand)
     _ -> false
 
 // The width of a signed integer parameter at a position, and 0 for anything else.
@@ -2774,14 +3311,7 @@ private natural_types(cx: &Analyzer, args: Buf[Expr]) -> Buf[Option[Type]]
     var out: Buf[Option[Type]] = buf()
 
     for i in 0..<args.len()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
         val read = sandboxed_reading(cx, args.at(i))
-
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-
         val own = texpr_type(read.0)
 
         out.push(if read.1 || own == Unknown then None else Some(own))
@@ -2937,6 +3467,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type, f.decl.needs)
 
+    check_shared_result(cx, span, ret)
     cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end call_key
@@ -2950,9 +3481,13 @@ end call_key
 // so an argument that could not be read at all is told rather than the parameter it went to, and
 // the checks stop at the first that disagrees -- the reference gives up on the whole statement
 // there, so a second bad argument, and a result the call never had, are consequences.
-refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
+refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                  slots: Buf[Option[Expr]], ts: Buf[TExpr], wants: Buf[Type],
-                 before: usize, report: bool = true) -> Option[TExpr]
+                 before: usize, report: bool = true, unread: Buf[usize] = buf()) -> Option[TExpr]
+    // Every caller quotes the declaration it reached, which for an overload or a second
+    // implementation is the slot it was filed under and not the name anybody wrote.
+    val shown = unslotted_quote(quoted)
+
     // Only where reading them said something: an `Unknown` nothing reported is not a mistake
     // already told, and must not quietly become one the build never mentions.
     if cx.an.complaints() > before
@@ -2987,11 +3522,13 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
             // declaration that type is only known here: `step: T = 1` cannot be checked where it is
             // written, `T` standing for itself there, and at `T = real` the literal is an `int`
             // handed to a `real` -- which lowered as the integer's bits read as a float. It is
-            // refused at the default, in the reference's words.
+            // refused at the default, in the reference's words -- and so is one whose reading at
+            // that type was refused outright (`default_at`), which is the same mistake.
             None ->
                 val d = params.at(i).default
 
-                if i < ts.len() && d.is_some() && disagree(texpr_type(ts.at(i)), wants.at(i))
+                if i < ts.len() && d.is_some() &&
+                   (holds_index(unread, i) || disagree(texpr_type(ts.at(i)), wants.at(i)))
                     if !report then return Some(cx.err(d.unwrap().span, "argument disagrees"))
 
                     return Some(cx.err(d.unwrap().span, s"'${params.at(i).name}' of $shown was left " +
@@ -3002,6 +3539,12 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
 
     None
 end refused_argument
+
+private holds_index(items: Buf[usize], i: usize) -> bool
+    for item in items
+        if item == i then return true
+
+    false
 
 // **A by-value `va_list` parameter takes the address of the walk**, at a sysl callee as at an
 // `extern`: that is what sysl has to give and what every target's answer is formed from, so the
@@ -3194,6 +3737,24 @@ end name_list
 
 // -- the calls a later stage resolves --------------------------------------------------------------
 
+// The `extern` a call means where the only function of the spelling is the standard module's.
+//
+// **The library is searched after everything else**, and an `extern` the reader's own module
+// declares, or one it imports, is part of "everything else" exactly as a function is: `trap` the
+// module binds from C answers before `sysl.trap`.
+extern_over_library(cx: &Analyzer, written: string, keys: Buf[string]) -> Option[string]
+    if keys.is_empty() then return None
+
+    val library = module_qualify(AutoImportedModule, written)
+
+    for i in 0..<keys.len()
+        if keys.at(i) != library then return None
+
+    val ext = extern_key(cx, written)
+
+    if ext.is_some() && ext.unwrap() != library then ext else None
+end extern_over_library
+
 extern_key(cx: &Analyzer, written: string) -> Option[string]
     // **A module written before the dot**, which a call to a *function* has always asked for and a
     // call to an `extern` did not -- so `c.surface_destroy(h)`, which is what every binding in the
@@ -3253,17 +3814,16 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
     if keys.is_empty() then return cx.err(span, out_of_reach(cx.an, base))
     if keys.len() == 1 then return extern_call(cx, span, written, keys.at(0), args)
 
-    for i in 0..<keys.len()
-        val mark = cx.an.complaints()
-        val sandbox = cx.an.sandboxed()
-        val queued = cx.an.tables.members.pending.len()
-        val tables = cx.an.tables.members.vtables.len()
-        val trial = extern_call(cx, span, written, keys.at(i), args)
-        val said = cx.an.complaints() > mark
+    var first_said: Buf[Placed] = buf()
 
-        cx.an.release(sandbox)
-        rewind_instantiations(cx.an, queued, tables)
-        cx.an.restore_complaints(mark)
+    for i in 0..<keys.len()
+        val tried = begin_trial(cx)
+        val trial = extern_call(cx, span, written, keys.at(i), args)
+        val said = refused_since(cx, tried)
+
+        if said then first_said.push(cx.an.found.at(tried.said))
+
+        discard_trial(cx, tried)
 
         if !said then return extern_call(cx, span, written, keys.at(i), args)
 
@@ -3276,6 +3836,8 @@ private extern_named_call(cx: &Analyzer, span: Span, written: string, base: stri
             plausible.push(keys.at(i))
 
     if plausible.len() == 1 then return extern_call(cx, span, written, plausible.at(0), args)
+
+    if same_refusal(first_said, keys.len(), args) then return extern_call(cx, span, written, keys.at(0), args)
 
     var roster = ""
 

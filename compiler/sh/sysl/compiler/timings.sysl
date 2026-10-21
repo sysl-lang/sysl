@@ -1,0 +1,43 @@
+module sh.sysl.compiler
+
+import sysl.env.get
+import sysl.time.monotonic
+
+// `SYSL_TIMINGS=1`: how long each phase of a compilation took, one line on standard error as each
+// one ends -- `sysl: phase parse 182ms` -- so a build that is slow says which phase without a
+// profiler; a sampler (`sample`, `perf`) then says which functions, since hosted code keeps its frame
+// pointers (`toolchain.sysl`'s `frame_pointer`).
+//
+// A phase is measured from the end of the one before it, so the lines add up to the whole
+// compilation with nothing counted twice. Unset, it costs one environment lookup per compilation.
+
+private var timings_asked: int = -1
+private var timings_since: long = 0
+private var timings_muted: bool = false
+
+// Whether `SYSL_TIMINGS=1` was set, asked once.
+private timings_on() -> bool
+    if timings_asked < 0 then timings_asked = if get("SYSL_TIMINGS").unwrap_or("") == "1" then 1 else 0
+
+    timings_asked == 1
+end timings_on
+
+// The clock started: the phases after it are measured from here.
+phase_start()
+    if timings_on() && !timings_muted then timings_since = monotonic().us
+
+// The phase called `name` ended now, and is said with how long it took since the last mark.
+phase_done(name: string)
+    // A compilation entered without `phase_start` -- a test build, a library build -- has no mark
+    // to measure from, and says nothing rather than the time since the clock's epoch.
+    if !timings_on() || timings_muted || timings_since == 0 then return
+
+    val now = monotonic().us
+
+    eprints(s"sysl: phase $name ${(now - timings_since) / 1000}ms\n")
+    timings_since = now
+end phase_done
+
+// While muted, no phase is said: a compilation nested inside the one being timed -- the standard
+// module's artifact, built on first use -- is one phase of the outer compilation, not phases of its own.
+phase_mute(on: bool) = timings_muted = on

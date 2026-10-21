@@ -183,7 +183,8 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
              no_alloc_modules(done.units, false), no_alloc_modules(done.units, true), main_module,
              declared_tests(done, analyzed, hooks), hooks, reached_extern_vars(a),
              a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps,
-             entry_source(done), a.tables.module_asm, false)
+             entry_source(done), a.tables.module_asm, false, a.tables.target.double_unit(),
+             a.tables.target.single_unit(), a.tables.target.divider())
 end program_of
 
 // The file the program starts in, which `entry_body` typed the statements of.
@@ -250,7 +251,9 @@ private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, str
 
     if !holds_string(drops, owner) then return
 
-    val filed = a.tables.members.funcs.get(member_key_of(owner, "drop"))
+    // A generic family's destructor is filed per instantiated type (`queue_generic_drops`).
+    val made = a.tables.members.generic_drops.get(mangle(t))
+    val filed = if made.is_some() then made else a.tables.members.funcs.get(member_key_of(owner, "drop"))
 
     out.push((mangle(t), filed.unwrap_or(s"${member_symbol(t)}.drop")))
 end push_destructor
@@ -465,7 +468,8 @@ private declared_tests(done: TypedBodies, analyzed: Set[string], hooks: Buf[THoo
                             out.push(TTest(key, attr.display.unwrap_or(module_bare(key)),
                                            attr.should_trap, attr.expected, unit.src.name,
                                            int(unit.src.locate(attr.span.start).line),
-                                           module_hooks(hooks, module_of(key)), attr.ignored))
+                                           module_hooks(hooks, module_of(key)), attr.ignored,
+                                           attr.timeout))
                 _ -> ()
 
     out
@@ -564,7 +568,9 @@ private module_clauses(units: Buf[Program], module_name: string,
                 mine = unit.capabilities
                 found_mine = true
 
-    if for_tests && found_theirs then theirs else mine
+    // **The tests' list is the `@tests` file's own clauses and never the module's**: `@no_alloc`
+    // binds the files that ship, and tests are hosted code that may allocate.
+    if for_tests then (if found_theirs then theirs else buf()) else mine
 end module_clauses
 
 // Whether a module's clauses give up the allocator. `no alloc` is the word a module writes for it.
@@ -587,7 +593,7 @@ const IntrinsicPrefix: string = LlvmPrefix
 
 is_intrinsic_name(symbol: string) -> bool = symbol.starts_with(IntrinsicPrefix)
 
-// The seven float operations the library declares an `extern` for, with what each takes.
+// The float operations an `extern` may name, with what each takes.
 //
 // **What is validated here is a signature somebody WROTE** -- an `extern` in library source, which
 // can disagree with LLVM's and has to be held to it before the verifier is reached, where the
@@ -602,6 +608,13 @@ private intrinsic_arity(base: string) -> Option[usize] = base match
     "llvm.trunc" -> Some(1)
     "llvm.round" -> Some(1)
     "llvm.copysign" -> Some(2)
+    "llvm.fma" -> Some(3)
+    "llvm.rint" -> Some(1)
+    "llvm.nearbyint" -> Some(1)
+    "llvm.minnum" -> Some(2)
+    "llvm.maxnum" -> Some(2)
+    "llvm.minimum" -> Some(2)
+    "llvm.maximum" -> Some(2)
     _ -> None
 
 // The ones there are, in the order a refusal lists them: the registry's library floats.
@@ -622,6 +635,10 @@ end intrinsics_supported
 // The name to emit, or why the declaration cannot be honoured. The checks are the ones the LLVM
 // verifier would otherwise find.
 private resolve_intrinsic(base: string, params: Buf[Type], ret: Type) -> Result[string, string]
+    // The one that is not a float operation: it takes nothing, answers nothing and has no overload
+    // suffix, so it is checked on its own.
+    if base == llvm_trap_entry().base then return resolve_trap(params, ret)
+
     val arity = intrinsic_arity(base) match
         Some(n) -> n
         None -> return Err(s"'$base' is not an intrinsic sysl supports — it has " +
@@ -657,8 +674,28 @@ private resolve_intrinsic(base: string, params: Buf[Type], ret: Type) -> Result[
         return Err(s"'$base' takes and returns one floating-point type, and this declaration " +
                    s"states ${intrinsic_states(params, ret)}")
 
+    // **A fused multiply-add rounds once, and only a binary32 or binary64 one is sure to.** Where the
+    // machine has no instruction, LLVM computes a half-width one in a wider format and rounds twice,
+    // and a binary128 one calls a routine no freestanding machine has; the two widths `sysl.softfloat`
+    // answers in software are the ones offered.
+    if base == "llvm.fma" && (brain || (bits != 32 && bits != 64))
+        return Err(s"'llvm.fma' is offered at f32 and f64, and this declaration states " +
+                   s"${intrinsic_states(params, ret)}")
+
     Ok(if brain then s"$base.bf16" else s"$base.f$bits")
 end resolve_intrinsic
+
+// `llvm.trap` stops the program at once and never returns, so a declaration of it states no
+// arguments and answers `never`.
+private resolve_trap(params: Buf[Type], ret: Type) -> Result[string, string]
+    if params.len() != 0
+        return Err(s"'llvm.trap' takes 0 arguments, but ${params.len()} were declared")
+
+    ret match
+        Never -> Ok("llvm.trap")
+        _ -> Err(s"'llvm.trap' never returns, so a declaration of it answers 'never' — this one " +
+                 s"answers '${type_show(ret)}'")
+end resolve_trap
 
 // The distinct types a declaration named, as the refusal lists them.
 private intrinsic_states(params: Buf[Type], ret: Type) -> string

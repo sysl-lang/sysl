@@ -4,7 +4,7 @@ summary: A file with no ceremony in it, and what the compiler did with it.
 weight: 20
 ---
 
-Put this in `hello.sysl`, anywhere you like:
+Put this in `hello.sysl`, in any directory:
 
 ```sysl
 print("Hello, sysl!")
@@ -20,9 +20,6 @@ Run it:
 sysl run hello.sysl
 ```
 
-(From a source checkout instead of an installed binary, that is
-`sbt "syslJVM/run run hello.sysl"`.)
-
 ```output
 Hello, sysl!
 area = 42
@@ -30,12 +27,11 @@ area = 42
 
 ## What is not there
 
-No `main`. No imports. No class wrapped around the statements to give them somewhere to live. A
-sysl file is a module, and statements written at its top level run in order — so the smallest
-program is the code you actually meant to write.
+There is no `main`, no import, and no class around the statements. A sysl file is a module, and
+statements at its top level run in order, so the smallest program is just the code you meant to
+write.
 
-A `main` is available when you want one, and you want one as soon as you care about the program's
-arguments:
+You can write a `main` when you need one, typically to read the program's arguments:
 
 ```sysl
 main(args: []string)
@@ -43,24 +39,23 @@ main(args: []string)
     print(args.len - 1, "argument(s) given")
 ```
 
-`print` came from `sysl`, the standard module — the one module a file may write the names of without
-importing it, because it holds what the language desugars onto. It takes any number of arguments,
-converts each one to text, and separates them with spaces.
+`print` comes from `sysl`, the standard module. It is the one module whose names a file can use
+without importing it, because it holds what the language itself is built on. `print` takes any
+number of arguments, converts each one to text, and separates them with spaces.
 
 ## What the compiler did
 
-`run` is one command of several, and it did four things in a row: parsed and checked the source,
-emitted textual LLVM IR, handed that to `clang` to assemble and link against the standard library
-archive, and ran the binary that came out. The binary is real — there is no interpreter and no VM
-underneath it.
+`run` performed four steps: it parsed and checked the source, emitted textual LLVM IR, passed that
+to `clang` to assemble and link against the standard library archive, and ran the resulting binary.
+That binary is native code; there is no interpreter or virtual machine underneath it.
 
-`build` stops after producing that binary instead of running it, and `test` runs the `@test`
-functions in a directory. The tour uses `run` throughout.
+`build` stops once the binary is produced, and `test` runs the `@test` functions in a directory.
+The tour uses `run` throughout.
 
 ## Where to go next
 
 The [tour](/tour/) starts here and builds up. It is meant to be read in order, and every program in
-it is one you can paste into a file and run.
+it can be pasted into a file and run.
 
-[The command line](/getting-started/cli/) is the other direction: the rest of the subcommands, the
-flags they share, and what each one leaves as an exit status. Nothing in the tour needs it.
+[The command line](/getting-started/cli/) covers the rest of the subcommands, the flags they share,
+and the exit status each one returns. Nothing in the tour depends on it.

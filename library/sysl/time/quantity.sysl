@@ -176,3 +176,49 @@ end offset_text
 
 impl Display for Offset
     display(self, out: *Writer, fmt: FormatSpec) = display_str(offset_text(self), out, fmt)
+
+/** A length of time as a person reads one off a stopwatch: `1.234567s`, `12ms`, `1.5ms`, `7µs`,
+ * `-3s`, and `0s` for none.
+ *
+ * **The unit is the largest of seconds, milliseconds and microseconds the length reaches**, and the
+ * digits below it are written only as far as the value has any -- the rule `time_text` keeps for the
+ * microseconds of a time of day. So nothing the value says is dropped and nothing it does not say
+ * is padded on. Seconds are the largest unit because a duration is a measurement rather than a
+ * calendar reading: `5400s` is what a timer says, and `1h30m` is a rendering a caller can build out of
+ * `whole_hours` and `odd_minutes` where it wants one.
+ */
+duration_text(d: Duration) -> string
+    if d.us == 0 then return "0s"
+
+    // The magnitude, reached without negating the most negative count, which has no positive twin.
+    val mag = if d.us < 0 then ulong(-(d.us + 1)) + 1 else ulong(d.us)
+    val sign = if d.us < 0 then "-" else ""
+
+    if mag >= 1000000 then return s"$sign${scaled(mag, 1000000, 6)}s"
+    if mag >= 1000 then return s"$sign${scaled(mag, 1000, 3)}ms"
+
+    s"$sign${mag}µs"
+end duration_text
+
+// `n / unit` with the remainder as decimal digits, written only as far as they are not zero.
+private scaled(n: ulong, unit: ulong, digits: usize) -> string
+    var frac = n % unit
+
+    if frac == 0 then return s"${n / unit}"
+
+    var width = digits
+
+    while frac % 10 == 0
+        frac /= 10
+        width -= 1
+
+    var text = s"$frac"
+
+    while text.bytes.len < width
+        text = "0" + text
+
+    s"${n / unit}.$text"
+end scaled
+
+impl Display for Duration
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(duration_text(self), out, fmt)

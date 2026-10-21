@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A scalar on the LEFT of an operator whose right operand is a user type (`reference/expressions.md §
+// Operator dispatch`): `2 * p` is `Mul::mul(2, p)`, so the
+// literal is the receiver and is read at the scalar whose implementation takes `Point` --
+// `operator_call.sysl`'s `scalar_impls_at`, chosen between by `chosen_scalar` with the rule a method
+// call's argument is chosen by. A typed scalar widens to such a subject losslessly, as a right operand
+// widens to an implementation's right-hand type. A literal or type no implementation takes keeps the
+// "needs matching types" refusal.
+
+private lsc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lsc_ready
+
+// What a program prints, built and run.
+private lsc_ran(text: string) -> string
+    val root = make_temp_dir("sysl-lsc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lsc_ran
+
+// Everything a source has to say for itself.
+private lsc_err(text: string) -> string
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lsc_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private lsc_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+private lsc_point() -> string = raw"""
+    struct Point
+        x: real
+        y: real
+    impl Mul[Point, Point] for real
+        mul(self, p: Point) -> Point = Point(self * p.x, self * p.y)
+    val p = Point(1, 2)
+    """
+
+// A tag struct and one implementation per scalar named, each saying which one ran.
+private lsc_tagged(subjects: []string) -> string
+    var text = "struct Tag\n    n: int\nval t = Tag(1)\n"
+
+    for s in subjects
+        text = text + s"impl Mul[Tag, string] for $s\n    mul(self, t: Tag) -> string = \"$s\"\n"
+
+    text
+end lsc_tagged
+
+@test("an integer literal on the left takes a real implementation, bare or negated")
+lsc_integer_literal_takes_the_real_impl()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_point() + raw"""
+        print(2 * p)
+        print(-2 * p)
+        print(2.0 * p)
+        print(2.5 * p)
+        """), "Point(x: 2, y: 4)\nPoint(x: -2, y: -4)\nPoint(x: 2, y: 4)\nPoint(x: 2.5, y: 5)\n")
+
+@test("every operator whose trait takes a right-hand type reaches the left literal")
+lsc_other_operators_reach_the_left_literal()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_point() + raw"""
+        impl Add[Point, Point] for real
+            add(self, p: Point) -> Point = Point(self + p.x, self + p.y)
+        impl Div[Point, Point] for f32
+            div(self, p: Point) -> Point = Point(real(self) / p.x, real(self) / p.y)
+        print(1 + p, 4 / p)
+        """), "Point(x: 2, y: 3) Point(x: 4, y: 2)\n")
+
+@test("an implementation at the literal's own type is exact and wins")
+lsc_literal_default_is_exact()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_tagged(["real", "int"]) + "print(2 * t, 2.5 * t, -3 * t)\n"),
+              "int real int\n")
+
+@test("a float literal over f32 and real takes real; an integer literal does too")
+lsc_float_subjects_take_real()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_tagged(["f32", "real"]) + "print(2.5 * t, 2 * t)\n"), "real real\n")
+
+@test("an integer literal prefers the signed widening, as an argument does")
+lsc_signed_preference_holds()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_tagged(["real", "long", "ulong"]) + "print(2 * t)\n"), "long\n")
+    assert_eq(lsc_ran(lsc_tagged(["f32"]) + "print(2 * t, 0.5 * t)\n"), "f32 f32\n")
+
+@test("a typed scalar on the left widens to the implementation it reaches")
+lsc_typed_left_widens()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_point() + raw"""
+        val k = 2
+        val h: f32 = 0.5
+        print(k * p, h * p)
+        """), "Point(x: 2, y: 4) Point(x: 0.5, y: 1)\n")
+    assert_eq(lsc_ran(lsc_tagged(["long", "int"]) + raw"""
+        val s: i16 = 2
+        val k = 3
+        print(s * t, k * t)
+        """), "int int\n")
+    assert_eq(lsc_ran(lsc_tagged(["real", "f32"]) + raw"""
+        val s: i16 = 2
+        print(s * t)
+        """), "f32\n")
+
+@test("a literal no implementation takes keeps the matching-types refusal")
+lsc_unfitting_literal_is_refused()
+    if !lsc_ready() then return
+
+    val a = lsc_err(lsc_tagged(["int"]) + "print(2.5 * t)\n")
+    val b = lsc_err(lsc_tagged(["byte"]) + "print(300 * t)\n")
+    val c = lsc_err(lsc_tagged(["f32"]) + "print(16777217 * t)\n")
+
+    assert(lsc_says(a, "'*' needs matching types, got real and Tag", "6:13"), a)
+    assert(lsc_says(b, "'*' needs matching types, got int and Tag", "6:13"), b)
+    assert(lsc_says(c, "'*' needs matching types, got int and Tag", "6:18"), c)
+
+@test("a typed scalar that widens to no implementation keeps the matching-types refusal")
+lsc_unwidening_typed_left_is_refused()
+    if !lsc_ready() then return
+
+    val a = lsc_err(lsc_point() + "val n: long = 2\nprint(n * p)\n")
+    val b = lsc_err(lsc_tagged(["int"]) + "val u: uint = 2\nprint(u * t)\n")
+
+    assert(lsc_says(a, "'*' needs matching types, got long and Point", "8:11"), a)
+    assert(lsc_says(b, "'*' needs matching types, got uint and Tag", "7:11"), b)
+
+@test("several subjects the rule cannot choose between are ambiguous")
+lsc_tied_subjects_are_ambiguous()
+    if !lsc_ready() then return
+
+    val a = lsc_err(lsc_tagged(["f16", "f32"]) + "print(2 * t)\n")
+    val b = lsc_err(lsc_tagged(["isize", "i64"]) + "val k = 2\nprint(k * t)\n")
+
+    assert(lsc_says(a, "'*' between int and Tag comes from 2 implementations of one trait on " +
+                       "different scalars, and the operands do not say which was meant — they are " +
+                       "'f16: sysl.Mul[Tag, string]' and 'f32: sysl.Mul[Tag, string]'", "8:7"), a)
+    assert(lsc_says(b, "'*' between int and Tag comes from 2 implementations of one trait on " +
+                       "different scalars", "9:7"), b)
+
+@test("compound assignment's left is a place and keeps its own refusal")
+lsc_compound_assignment_is_unaffected()
+    if !lsc_ready() then return
+
+    val e = lsc_err(lsc_point() + "var k = 2\nk *= p\n")
+
+    assert(lsc_says(e, "'*' needs matching types, got int and Point", "8:6"), e)

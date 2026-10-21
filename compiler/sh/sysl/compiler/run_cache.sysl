@@ -3,8 +3,11 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.seq.Sequence
-import sysl.fs.{entries, is_file, make_dir_all, metadata, read_text, remove_file, write_text_atomic}
-import sysl.text.{from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
+import sysl.container.{Map, map, Set, set}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text,
+                write_text_atomic}
+import sysl.slices.sort_by
+import sysl.text.{cstring, from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
 
 // The executable `sysl run` and `sysl test` built last time, kept so that running the same tree
 // twice costs the second one nothing.
@@ -66,6 +69,7 @@ private var run_cache_home: string = ""
 // else's entries.
 use_run_cache_dir(dir: Option[string])
     run_cache_home = dir.unwrap_or("")
+    run_cache_swept = false
 
 // How many entries a program's cache holds before eviction is considered at all.
 //
@@ -81,14 +85,157 @@ const CacheKeep: usize = 256
 // one another process was about to run. Nothing this old is in flight anywhere.
 const CacheStale: long = 604800000000
 
+// The most a cache directory holds, in bytes. Past it the oldest entries go, whatever `CacheKeep` and
+// `CacheStale` say: age alone is no bound on a machine that builds all day, where one week came to
+// 77,000 objects (41 GB) in the C object cache and 38 GB of binaries in this one.
+const CacheBytes: long = 4294967296
+
+// What the byte bound never takes, in microseconds -- anything written in the last hour, for the reason
+// `CacheStale` gives. A directory filled faster than that sits over the bound until it ages.
+const CacheFresh: long = 3600000000
+
+// How long after one sweep of a directory another process's sweep of it is skipped, in microseconds --
+// ten minutes. A sweep lists and stats the whole directory, so ten builds finishing together pay for
+// one of them rather than ten.
+const SweepGap: long = 600000000
+
+// The two files a sweep keeps for itself, BESIDE the directory rather than in it, so that nothing
+// listing the cache's entries sees them: when the last one ran, and a file written to read the
+// filesystem's own clock.
+private const SweepStamp: string = ".swept"
+private const SweepClock: string = ".clock"
+
+// The installed compiler's stand-in for `sysl.fs.set_modified`, which sets a time to now where it is
+// given none: this compiler is built by the installed release, whose library cannot yet set a time.
+// It is replaced by `set_modified` once a release that ships it is installed.
+private extern "utimes" c_utimes(path: *u8, times: *u8) -> int
+
+// What this process has already marked as used, so each file is touched once however often it is hit.
+private var touched: Set[string] = set()
+
+// Mark a cache file as used now -- its modification time is what every sweep reads as its age, so an
+// entry that is used stays among the newest however long ago it was made, and a sweep removes the
+// least recently used first. Once per file per process, one `utimes`; a file that is not there, or a
+// filesystem that will not take a time, costs the entry nothing but its age.
+touch_used(file: string)
+    if touched.has(file) then return
+
+    touched.add(file)
+
+    val name = cstring(file)
+
+    c_utimes(name.ptr, null)
+    ()
+end touch_used
+
+// Forget what was touched, as a new process would have.
+forget_touched()
+    touched = set()
+
+// A bound a test holds a directory to in place of `CacheBytes`. Zero is none.
+private var cache_bound_override: long = 0
+
+// Hold every cache directory to `bytes` rather than `CacheBytes`, or go back with `None`.
+use_cache_bound(bytes: Option[long])
+    cache_bound_override = bytes.unwrap_or(0)
+
+cache_bound() -> long = if cache_bound_override > 0 then cache_bound_override else CacheBytes
+
+// Whether a sweep of `dir` is due, claiming it where it is: none has run there in the last `SweepGap`,
+// by the directory's own clock rather than this machine's -- a file written now says what now is.
+claim_sweep(dir: string) -> bool
+    val clock = s"$dir$SweepClock"
+
+    write_text(clock, "now") match
+        Err(_) -> return false
+        Ok(_) -> ()
+
+    val now = cache_modified_at(clock)
+    val stamp = s"$dir$SweepStamp"
+    val last = cache_modified_at(stamp)
+
+    if last != 0 && now >= last && now - last < SweepGap then return false
+
+    write_text(stamp, "swept").is_ok()
+end claim_sweep
+
+// One file of a cache directory as a sweep reads it -- one `stat` each.
+struct CacheFile
+    file: string
+    modified: long
+    size: long
+
+// Every file in `dir`, or nothing where the directory cannot be listed.
+cache_files(dir: string) -> Option[Buf[CacheFile]]
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return None
+
+    var out: Buf[CacheFile] = buf()
+
+    for n in names
+        val one = s"$dir/$n"
+
+        metadata(one) match
+            Ok(m) -> out.push(CacheFile(one, m.modified.us, m.size))
+            Err(_) -> ()
+
+    Some(out)
+end cache_files
+
+// The oldest of `files` removed until what is left fits in the bound, sparing what `spared` names and
+// anything younger than `CacheFresh`; an entry's `partner` (its `.sum`, its `.tests`) goes with it.
+// `gone` already holds what an earlier pass removed, and gains what this one does.
+trim_to_bound(files: Buf[CacheFile], gone: *Set[string], spared: string -> bool, partner: string)
+    var total: long = 0
+    var now: long = 0
+    var sizes: Map[string, long] = map()
+
+    for f in files
+        sizes.put(f.file, f.size)
+
+        if !gone.has(f.file) then total += f.size
+        if f.modified > now then now = f.modified
+
+    val bound = cache_bound()
+
+    if total <= bound then return
+
+    var oldest: Buf[CacheFile] = buf()
+
+    for f in files
+        if !gone.has(f.file) then oldest.push(f)
+
+    sort_by(oldest.view(), (a, b) -> a.modified < b.modified)
+
+    for f in oldest
+        if total <= bound then return
+        if gone.has(f.file) || spared(f.file) || now - f.modified < CacheFresh then continue
+
+        remove_file(f.file).unwrap_or(())
+        gone.add(f.file)
+        total -= f.size
+
+        val other = s"${f.file}$partner"
+
+        sizes.get(other) match
+            Some(n) ->
+                if !gone.has(other) && !spared(other)
+                    remove_file(other).unwrap_or(())
+                    gone.add(other)
+                    total -= n
+            None -> ()
+end trim_to_bound
+
 // The field separator inside the test list, which is the one character a `@test`'s display name
 // cannot hold: a name is read out of source, and a NUL does not survive the lexer.
 private const Nul: string = "\0"
 
 // How many separators a well-formed line of the test list has: seven fields for the test, three for
-// each of the four hooks, and two for why it is ignored. A line written before `ignore` existed has
-// two fewer, and reads as no cache rather than as a suite with nothing ignored.
-private const Marks: usize = 20
+// each of the four hooks, two for why it is ignored, and one for its own timeout (empty where it has
+// none). A line written before a field existed is short of it, and reads as no cache rather than as a
+// suite where nothing was ignored or bounded.
+private const Marks: usize = 21
 
 // --- the key --------------------------------------------------------------------------
 
@@ -203,6 +350,11 @@ settings_parts(parts: *Buf[string], path: string)
     // **Whether failed bounds checks name their locations is a different binary** too; the default
     // adds nothing, so every key made before the choice existed still matches.
     if !bounds_locations() then parts.push("bounds_locations:false")
+    // **How long an evaluation while compiling may run decides whether the tree compiles at all**, so
+    // a limit given outright is part of the key; the default adds nothing.
+    const_steps_flag() match
+        Some(n) -> parts.push(s"const_steps:$n")
+        None -> ()
     // **What the code may use of the machine** (`codegen_features.sysl`); nothing when nothing is set.
     if codegen_features_key() != "" then parts.push(s"codegen:${codegen_features_key()}")
 end settings_parts
@@ -283,8 +435,27 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
         manifest_at(tree_root) match
             Ok(m) ->
                 if !m.features.is_empty() then files.push((s"$i/features", features_part(m.features)))
+
+                // Its options and the values its entries set, which decide what a package's source
+                // computes (`options.sysl`): one tree under two values is two programs.
+                val valued = options_part(m)
+
+                if !valued.is_empty() then files.push((s"$i/options", valued))
                 if !m.name.is_empty() then files.push((s"$i/name", m.name))
                 if !m.version.is_empty() then files.push((s"$i/version", m.version))
+
+                // What the tree's C is compiled with (`defines`, `c`), and each vendored library's
+                // files with every header under the roots it reads -- an upstream tree's headers sit
+                // where nothing else here hashes them, and a configuration is as much the program as
+                // a file is.
+                val configured = c_block_text(m)
+
+                if !configured.is_empty() then files.push((s"$i/c", configured))
+
+                val vendored = c_library_inputs(tree_root, m)
+
+                for item in vendored
+                    files.push((s"$i/c/${item.0}", item.1))
             Err(_) -> ()
 
         for item in found
@@ -303,11 +474,12 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
             Ok(cs) -> cs
 
         for item in carried
-            val text = read_text(item) match
-                Err(_) -> return Err(Refusal(s"cannot read ${item}"))
+            // C is bytes, not text: a Latin-1 byte in a comment is still a file to hash.
+            val bytes = read_bytes(item) match
+                Err(e) -> return Err(Refusal(s"cannot read ${io_refusal(item, e)}"))
                 Ok(got) -> got
 
-            files.push((s"$i/${relative_to(trees.at(i), item)}", text))
+            files.push((s"$i/${relative_to(trees.at(i), item)}", from_utf8_unchecked(bytes.view())))
 
     Ok(library_fingerprint(files))
 end program_fingerprint
@@ -366,9 +538,18 @@ private run_cache_slot(key: string) -> Option[string]
 end run_cache_slot
 
 // The program built for this key, where one is there and is still executable.
-run_cache_hit(key: string) -> Option[string] = run_cache_slot(key) match
-    Some(path) -> if is_file(path) && is_executable(path) then Some(path) else None
-    None -> None
+run_cache_hit(key: string) -> Option[string]
+    val path = run_cache_slot(key) match
+        Some(p) -> p
+        None -> return None
+
+    if !is_file(path) || !is_executable(path) then return None
+
+    // A hit is a use: the entry and its test list are as young as this run.
+    touch_used(path)
+    touch_used(s"$path.tests")
+    Some(path)
+end run_cache_hit
 
 // Where to link, for a build that is about to happen: a path in the cache with the directory already
 // made, or nothing where there is no cache to write into.
@@ -389,7 +570,7 @@ run_cache_reserve(key: string) -> Option[string]
         Err(_) -> return None
         Ok(_) -> ()
 
-    evict_around(path)
+    sweep_run_cache(path)
     Some(path)
 end run_cache_reserve
 
@@ -445,30 +626,56 @@ private is_executable(path: string) -> bool = metadata(path) match
     Ok(m) -> (m.mode & 0x49) != 0
     Err(_) -> false
 
-// Entries past `Keep` that are also older than `Stale`, removed.
-//
-// A failure here is not a failure of the build: the worst an unevicted cache costs is disk, and the
-// worst a failed eviction costs is nothing at all. `now` is read from the newest entry rather than
-// from a clock, so a machine whose clock has moved evicts nothing rather than everything.
-private evict_around(fresh: string)
+// Whether this process has swept the run cache. **One sweep per process**, and none where another
+// process swept the directory in the last `SweepGap` -- a sweep stats every entry.
+private var run_cache_swept: bool = false
+
+// How many sweeps this process has made of the run cache, for a test to count.
+private var run_cache_sweeps: int = 0
+
+run_cache_sweep_count() -> int = run_cache_sweeps
+
+// The sweep, where one is due: `evict_around` once per process, beside the entry being reserved.
+private sweep_run_cache(fresh: string)
+    if run_cache_swept then return
+
+    run_cache_swept = true
+
     val dir = parent_of(fresh) match
         Some(d) -> d
         None -> return
 
-    val kept = entries(dir) match
-        Ok(names) -> names.map((n) -> join_path(dir, n)).filter((one) -> one != fresh)
-        Err(_) -> return
+    if claim_sweep(dir) then evict_around(dir, fresh)
+end sweep_run_cache
 
-    if kept.len < CacheKeep then return
+// Entries past `CacheKeep` that are also older than `CacheStale`, removed; then the oldest, until the
+// directory fits in `CacheBytes`. The entry being reserved and its test list are never taken.
+//
+// A failure here is not a failure of the build: the worst an unevicted cache costs is disk, and the
+// worst a failed eviction costs is nothing at all. `now` is read from the newest entry rather than
+// from a clock, so a machine whose clock has moved evicts nothing rather than everything.
+private evict_around(dir: string, fresh: string)
+    run_cache_sweeps += 1
 
-    val start: long = 0
-    val now = kept.fold(start, (so_far, one) -> max_long(so_far, cache_modified_at(one)))
+    val files = cache_files(dir) match
+        Some(f) -> f
+        None -> return
 
-    kept.filter((one) -> now - cache_modified_at(one) > CacheStale)
-        .each((one) -> remove_file(one).unwrap_or(()))
+    val spared = (one: string) -> one == fresh || one == s"$fresh.tests"
+    var gone: Set[string] = set()
+    var now: long = 0
+
+    for f in files
+        if f.modified > now then now = f.modified
+
+    if files.len() >= CacheKeep
+        for f in files
+            if !spared(f.file) && now - f.modified > CacheStale
+                remove_file(f.file).unwrap_or(())
+                gone.add(f.file)
+
+    trim_to_bound(files, &gone, spared, ".tests")
 end evict_around
-
-private max_long(a: long, b: long) -> long = if a > b then a else b
 
 // When a path was last written, in microseconds, or zero where it cannot be asked -- which evicts
 // nothing, since zero is older than every threshold read against the newest entry.
@@ -512,6 +719,11 @@ encode_test_list(tests: Buf[TTest]) -> string
         b.push(t.ignored.unwrap_or(""))
         b.push(Nul)
         b.push(if t.ignored.is_some() then "1" else "0")
+        b.push(Nul)
+
+        t.timeout match
+            Some(n) -> b.push(s"$n")
+            None -> ()
 
     b.finish()
 end encode_test_list
@@ -547,11 +759,12 @@ decode_test_list(text: string) -> Option[Buf[TTest]]
 
         val expected = if f[4] == "1" then Some(f[3]) else None
         val ignored = if f[20] == "1" then Some(f[19]) else None
+        val timeout = if f[21] == "" then None else Some(read_line_number(f[21]))
 
         out.push(TTest(f[0], f[1], f[2] == "true", expected, f[5], read_line_number(f[6]),
                        THooks(hook_from(Setup, f, 7), hook_from(Teardown, f, 10),
                               hook_from(SetupAll, f, 13), hook_from(TeardownAll, f, 16)),
-                       ignored))
+                       ignored, timeout))
 
     Some(out)
 end decode_test_list

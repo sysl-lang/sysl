@@ -1,0 +1,446 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+import sysl.time.monotonic
+
+// Two things a program for a board met that a hosted build never shows. **An atomic is as wide as
+// the build's processor allows** (`library/sync.md § What T may be`): a 32-bit Arm M-profile core has
+// no 64-bit exclusive pair, so an `Atomic[i64]` there is refused rather than lowered to an
+// `__atomic_*_8` call no board's runtime defines. **A module's storage is filled where it lives**: a
+// struct holding a large array, built by a call, is written field by field into the global rather
+// than staged in a frame and stored as one LLVM value, which clang took minutes to lower.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bdb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bdb_ready
+
+// A project in a fresh directory: `main.sysl`, and `store/store.sysl` where one is given.
+private bdb_root(main_text: string, store_text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-bdb").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    if store_text != ""
+        make_dir_all(s"$root/store").unwrap()
+        write_text(s"$root/store/store.sysl", store_text).unwrap()
+    end if
+
+    root
+end bdb_root
+
+private bdb_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end bdb_cli
+
+// `sysl build-c` of a one-file program for a board: the exit code, what was said, and the archive's
+// undefined symbols as `arm-none-eabi-nm -u` lists them.
+private bdb_board(program: string, target: string) -> (int, string, string)
+    val root = bdb_root(program, "")
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = bdb_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"])
+    var undefined = ""
+
+    if got.0 == Fine
+        val tool = "/opt/homebrew/bin/arm-none-eabi-nm"
+
+        assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-nm")
+
+        capture(tool, ["-u", s"$root/app.a"], "", [], true) match
+            Ok(out) -> undefined = out.text
+            Err(_) -> ()
+    end if
+
+    remove_dir_all(root).unwrap_or(())
+    (got.0, replace_all(got.1, root, "@"), undefined)
+end bdb_board
+
+private bdb_counter(ty: string) -> string =
+    s"import sysl.sync.*\n\nvar ticks: Atomic[$ty] = Atomic(0)\n\n" +
+    s"@export(\"tick\")\ntick() -> $ty = ticks.add(1, Relaxed)\n"
+
+// =================================================================================================
+// An atomic is as wide as the processor allows
+// =================================================================================================
+
+@test("a 64-bit atomic on a Cortex-M4 is refused, naming the target and the width it has")
+bdb_a_64_bit_atomic_on_an_m4_is_refused()
+    if !bdb_ready() then return
+
+    // A 64-bit integer is shown by its own name, `long` / `ulong`, as every diagnostic shows it.
+    for (ty, shown) in [("i64", "long"), ("u64", "ulong")]
+        val got = bdb_board(bdb_counter(ty), "thumbv7em-freestanding")
+
+        assert(got.0 != Fine, got.1)
+        assert(got.1.contains(s"'atomic_add' is one machine instruction, and " +
+                              s"'thumbv7em-freestanding' has one for 32 bits at most — $shown is 64, " +
+                              "so there is nothing to emit. Count at a width the machine has where " +
+                              "the value fits one, or hold it in a 'Guarded[SpinLock, T]'"), got.1)
+end bdb_a_64_bit_atomic_on_an_m4_is_refused
+
+@test("a load and a store of a 64-bit atomic are refused on an M0+ and an M3 too")
+bdb_every_form_on_every_32_bit_arm_core()
+    if !bdb_ready() then return
+
+    val program = "import sysl.sync.*\n\nvar w: Atomic[i64] = Atomic(0)\n\n" +
+                  "@export(\"put\")\nput(n: i64) = w.store(n, Release)\n\n" +
+                  "@export(\"get\")\nget() -> i64 = w.load(Acquire)\n"
+
+    for target in ["thumbv6m-freestanding", "thumbv7m-freestanding"]
+        val got = bdb_board(program, target)
+
+        assert(got.0 != Fine, got.1)
+        assert(got.1.contains(s"'atomic_store' is one machine instruction, and '$target' has one " +
+                              "for 32 bits at most — long is 64"), got.1)
+        assert(got.1.contains(s"'atomic_load' is one machine instruction, and '$target' has one " +
+                              "for 32 bits at most — long is 64"), got.1)
+end bdb_every_form_on_every_32_bit_arm_core
+
+@test("a 32-bit and a word-wide atomic on a Cortex-M4 build, and call no __atomic_ routine")
+bdb_the_widths_an_m4_has_build_without_a_libcall()
+    if !bdb_ready() then return
+
+    for ty in ["u32", "i32", "u16", "u8", "usize"]
+        val got = bdb_board(bdb_counter(ty), "thumbv7em-freestanding")
+
+        assert_eq(got.0, Fine, got.1)
+        assert(!got.2.contains("__atomic_"), s"$ty: ${got.2}")
+end bdb_the_widths_an_m4_has_build_without_a_libcall
+
+@test("an atomic load and store on an M0+ are ldr and str, not an __atomic_ call")
+bdb_an_m0_loads_and_stores_a_word_without_a_libcall()
+    if !bdb_ready() then return
+
+    for ty in ["u32", "u16", "u8", "usize"]
+        val program = s"import sysl.sync.*\n\nvar w: Atomic[$ty] = Atomic(0)\n\n" +
+                      s"@export(\"put\")\nput(n: $ty) = w.store(n, Release)\n\n" +
+                      s"@export(\"get\")\nget() -> $ty = w.load(Acquire)\n\n" +
+                      s"@export(\"all\")\nall() -> $ty = w.load(SeqCst)\n"
+        val got = bdb_board(program, "thumbv6m-freestanding")
+
+        assert_eq(got.0, Fine, got.1)
+        assert(!got.2.contains("__atomic_"), s"$ty: ${got.2}")
+end bdb_an_m0_loads_and_stores_a_word_without_a_libcall
+
+@test("an Armv6-M build tells clang its core has 32-bit atomic loads and stores")
+bdb_an_m0_build_names_atomics_32()
+    val said = join(codegen_feature_flags(target_named("thumbv6m-freestanding").unwrap()).view(), " ")
+
+    assert(said.contains("-Xclang -target-feature -Xclang +atomics-32"), said)
+    assert(!join(codegen_feature_flags(target_named("thumbv7em-freestanding").unwrap()).view(), " ")
+               .contains("atomics-32"))
+end bdb_an_m0_build_names_atomics_32
+
+// =================================================================================================
+// Armv6-M changes nothing atomically, and IrqLock is its lock
+// =================================================================================================
+
+private bdb_rmw_tail() -> string =
+    "and 'thumbv6m-freestanding' has no instruction for one — use an 'IrqLock' where the code runs " +
+    "on one core, or a board's hardware lock (the RP2040's SIO spinlocks) through 'Guarded[L, T]'"
+
+@test("on an M0+ a read-modify-write, a compare-and-swap and a SpinLock are refused where the program reaches them")
+bdb_an_m0_refuses_every_read_modify_write()
+    if !bdb_ready() then return
+
+    val program = "import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\n" +
+                  "var g: Guarded[SpinLock, int] = Guarded.new(SpinLock(0), 0)\n" +
+                  "var n: Atomic[u32] = Atomic(0)\nvar w: u32 = 0\n\n" +
+                  "@export(\"a\")\na() = lock.lock()\n\n" +
+                  "@export(\"b\")\nb() -> u32 = n.add(1, Relaxed)\n\n" +
+                  "@export(\"c\")\nc() -> u32 = n.cas(0, 1, AcqRel)\n\n" +
+                  "@export(\"d\")\nd() -> u32 = atomic_swap(&w, 1, Acquire)\n\n" +
+                  "@export(\"e\")\ne() -> unit = g.with((v) -> *v = 1)\n"
+    val got = bdb_board(program, "thumbv6m-freestanding")
+    val said = got.1
+
+    assert(got.0 != Fine, said)
+    assert(said.contains(s"error: 'SpinLock' takes its flag with an atomic exchange, ${bdb_rmw_tail()}\n" +
+                         " --> @/main.sysl:9:12\n"), said)
+    assert(said.contains(s"error: this reaches 'sysl.sync.Atomic.add', which changes memory with an " +
+                         s"atomic read-modify-write, ${bdb_rmw_tail()}\n  --> @/main.sysl:12:16\n"), said)
+    assert(said.contains(s"error: this reaches 'sysl.sync.Atomic.cas', which changes memory with an " +
+                         s"atomic read-modify-write, ${bdb_rmw_tail()}\n  --> @/main.sysl:15:16\n"), said)
+    assert(said.contains("error: 'atomic_swap' is an atomic read-modify-write, and " +
+                         "'thumbv6m-freestanding' has no instruction for one: an Armv6-M core reads " +
+                         "and writes a word indivisibly but cannot change one — use an 'IrqLock'"), said)
+    assert(said.contains(s"error: 'SpinLock' takes its flag with an atomic exchange, ${bdb_rmw_tail()}\n" +
+                         "  --> @/main.sysl:21:17\n"), said)
+end bdb_an_m0_refuses_every_read_modify_write
+
+@test("the same SpinLock and add build on an M3, which has the exclusive pair")
+bdb_an_m3_keeps_its_read_modify_write()
+    if !bdb_ready() then return
+
+    val program = "import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\nvar n: Atomic[u32] = Atomic(0)\n\n" +
+                  "@export(\"a\")\na() -> u32\n    lock.lock()\n    val v = n.add(1, Relaxed)\n" +
+                  "    lock.unlock()\n    v\n"
+    val got = bdb_board(program, "thumbv7m-freestanding")
+
+    assert_eq(got.0, Fine, got.1)
+    assert(!got.2.contains("__atomic_") && !got.2.contains("__sync_"), got.2)
+end bdb_an_m3_keeps_its_read_modify_write
+
+private bdb_irq_program() -> string =
+    "import sysl.sync.*\n\nvar table: Guarded[IrqLock, int] = Guarded.new(IrqLock(0), 0)\n" +
+    "var n: Atomic[u32] = Atomic(0)\n\n" +
+    "@export(\"bump\")\nbump() -> int\n    n.store(n.load(Acquire) + 1, Release)\n" +
+    "    table.with((v) -> *v = *v + 1)\n    0\n"
+
+@test("Guarded[IrqLock, T] builds for an M0+, M3, M4 and M33 and calls no atomic routine")
+bdb_an_irq_lock_builds_on_every_cortex_m()
+    if !bdb_ready() then return
+
+    for target in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                   "thumb-freestanding"]
+        val got = bdb_board(bdb_irq_program(), target)
+
+        assert_eq(got.0, Fine, s"$target: ${got.1}")
+        assert(!got.2.contains("__atomic_") && !got.2.contains("__sync_"), s"$target: ${got.2}")
+end bdb_an_irq_lock_builds_on_every_cortex_m
+
+@test("IrqLock saves PRIMASK, masks with cpsid i, and puts PRIMASK back")
+bdb_an_irq_lock_is_mrs_cpsid_msr()
+    if !bdb_ready() then return
+
+    val root = bdb_root(bdb_irq_program(), "")
+
+    write_text(s"$root/package.hocon", "targets {\n  default = \"thumbv6m-freestanding\"\n" +
+               "  thumbv6m-freestanding { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = bdb_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding", "-o",
+                       s"$root/app.a"])
+    val tool = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    assert_eq(got.0, Fine, got.1)
+    assert(exists(tool), "this test reads a board's code and there is no arm-none-eabi-objdump")
+
+    val dis = capture(tool, ["-d", s"$root/app.a"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+
+    val taken = dis.index_of("mrs")
+    val masked = dis.index_of("cpsid")
+    val restored = dis.index_of("msr")
+
+    assert(taken.is_some() && masked.is_some() && restored.is_some(), dis)
+    assert(dis.contains("PRIMASK") || dis.contains("primask"), dis)
+    assert(taken.unwrap() < masked.unwrap() && masked.unwrap() < restored.unwrap(), dis)
+end bdb_an_irq_lock_is_mrs_cpsid_msr
+
+@test("IrqLock reached on a host is refused, naming the cores it is for")
+bdb_an_irq_lock_is_refused_off_cortex_m()
+    if !bdb_ready() then return
+
+    val root = bdb_root("import sysl.sync.*\n\nvar l: IrqLock = IrqLock(0)\n\nl.lock()\nl.unlock()\n", "")
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    val host = host_target().name
+
+    assert(said.contains(s"error: 'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and " +
+                         s"'$host' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; " +
+                         "elsewhere use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are " +
+                         "threads\n --> @/main.sysl:5:3\n"), said)
+end bdb_an_irq_lock_is_refused_off_cortex_m
+
+@test("the read-modify-write width of each target: none on Armv6-M, the atomic width elsewhere")
+bdb_the_rmw_width_of_each_target()
+    for (name, bits, primask) in [("thumbv6m-freestanding", 0, true), ("thumbv7m-freestanding", 32, true),
+                                  ("thumb-freestanding", 32, true), ("riscv32-freestanding", 32, false),
+                                  ("aarch64-freestanding", 64, false)]
+        val t = target_named(name).unwrap()
+
+        assert_eq(t.atomic_rmw_bits(), bits, name)
+        assert_eq(t.has_primask(), primask, name)
+end bdb_the_rmw_width_of_each_target
+
+@test("a 64-bit atomic on a 64-bit board is accepted")
+bdb_a_64_bit_board_keeps_its_64_bit_atomics()
+    if !bdb_ready() then return
+
+    val root = bdb_root(bdb_counter("i64"), "")
+
+    write_text(s"$root/package.hocon", "targets {\n  default = \"aarch64-freestanding\"\n" +
+               "  aarch64-freestanding { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = bdb_cli(["sysl", "build-c", root, "--target", "aarch64-freestanding", "-o",
+                       s"$root/app.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+end bdb_a_64_bit_board_keeps_its_64_bit_atomics
+
+@test("the processors' atomic widths: 32 on every 32-bit board, 64 wherever the machine has it")
+bdb_the_atomic_width_of_each_target()
+    for (name, bits) in [("thumbv6m-freestanding", 32), ("thumbv7m-freestanding", 32),
+                         ("thumbv7em-freestanding", 32), ("thumb-freestanding", 32),
+                         ("riscv32-freestanding", 32), ("aarch64-freestanding", 64),
+                         ("riscv64-freestanding", 64), ("x86_64-freestanding", 64),
+                         ("wasm32-wasi", 64)]
+        assert_eq(target_named(name).unwrap().atomic_bits(), bits, name)
+end bdb_the_atomic_width_of_each_target
+
+// =================================================================================================
+// A module's storage is filled where it lives
+// =================================================================================================
+
+private bdb_store() -> string = raw"""
+    module store
+
+    struct S
+        name: string
+        a: int
+        big: [2000000]u8
+
+    mk() -> int = 7
+
+    make() -> S = S(s"made ${mk()}", 9, [1; 2000000])
+
+    var s: S = S(s"lit ${mk()}", mk(), [3; 2000000])
+    var t: S = make()
+
+    sum() -> int = s.a + int(s.big[1999999]) + t.a + int(t.big[0])
+    names() -> string = s"${s.name}, ${t.name}"
+    """
+
+private bdb_main() -> string = "print(store.sum())\nprint(store.names())\n"
+
+@test("a struct holding a large array, built by a call, is never one LLVM value or one frame slot")
+bdb_a_large_module_var_is_written_field_by_field()
+    if !bdb_ready() then return
+
+    val root = bdb_root(bdb_main(), bdb_store())
+
+    val ir = emit_llvm_text(root, None) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(made) -> made.text
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(ir.contains("%struct.store$S = type"), ir)
+    assert(!ir.contains("load %struct.store$S"), ir)
+    assert(!ir.contains("store %struct.store$S"), ir)
+    assert(!ir.contains("alloca %struct.store$S"), ir)
+end bdb_a_large_module_var_is_written_field_by_field
+
+@test("that program builds in well under a minute and fills both, counts and all")
+bdb_a_large_module_var_builds_quickly_and_runs()
+    if !bdb_ready() then return
+
+    val root = bdb_root(bdb_main(), bdb_store())
+    val exe = s"$root/built"
+    val began = monotonic().us
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+    val took = (monotonic().us - began) / 1000000
+
+    val said = built match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Ok(out) -> out.text
+            Err(_) -> "the program that was built could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(said, "20\nlit 7, made 7\n")
+    assert(took < 60, s"building took $took s")
+end bdb_a_large_module_var_builds_quickly_and_runs
+
+@test("a small module var is still loaded and stored whole, and a counted one keeps its count")
+bdb_a_small_module_var_is_unchanged()
+    if !bdb_ready() then return
+
+    val store = "module store\n\nmk() -> int = 4\n\nvar n: int = mk() + 1\n" +
+                "var word: string = s\"w${mk()}\"\n\nshow() -> string = s\"$n $word\"\n"
+    val root = bdb_root("print(store.show())\n", store)
+    val exe = s"$root/built"
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Ok(out) -> out.text
+            Err(_) -> "the program that was built could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "5 w4\n")
+end bdb_a_small_module_var_is_unchanged
+
+// =================================================================================================
+// The standard module's own flag is charged to the program that reaches it
+// =================================================================================================
+
+// `sysl emit-llvm` of a one-file program for the 16-bit CRAFT, whose atomics stop at 16 bits: the
+// exit code and what was said.
+private bdb_craft(program: string) -> (int, string)
+    val root = bdb_root(program, "")
+    val got = bdb_cli(["sysl", "emit-llvm", "--target", "craft-freestanding", root])
+
+    remove_dir_all(root).unwrap_or(())
+    (got.0, replace_all(got.1, root, "@"))
+end bdb_craft
+
+@test("a 16-bit CRAFT build takes the standard module whole although SpinLock's flag is an i32")
+bdb_craft_builds_past_the_spinlock_flag()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("@export(\"seven\")\nseven() -> int = 7\n")
+
+    assert(got.0 == Fine, got.1)
+    assert(!got.1.contains("one machine instruction"), got.1)
+end bdb_craft_builds_past_the_spinlock_flag
+
+@test("while a program reaching SpinLock there is refused at its own call, naming the width")
+bdb_craft_refuses_a_reached_spinlock()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("import sysl.sync.*\n\nvar lock: SpinLock = SpinLock(0)\n\n" +
+                        "@export(\"take\")\ntake() = lock.lock()\n")
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("this reaches 'sysl.sync.SpinLock.lock', which runs an atomic wider than " +
+                          "'craft-freestanding' has one for — 16 bits at most, so there is nothing " +
+                          "to emit"), got.1)
+    assert(got.1.contains("@/main.sysl:6:"), got.1)
+end bdb_craft_refuses_a_reached_spinlock
+
+@test("and an instantiation the program chose is still refused where it is typed, on CRAFT too")
+bdb_craft_refuses_a_wide_instantiation()
+    if !bdb_ready() then return
+
+    val got = bdb_craft("import sysl.sync.*\n\nvar n: Atomic[i32] = Atomic(0)\n\n" +
+                        "@export(\"tick\")\ntick() -> i32 = n.add(1, Relaxed)\n")
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("'atomic_add' is one machine instruction, and 'craft-freestanding' has " +
+                          "one for 16 bits at most — int is 32"), got.1)
+end bdb_craft_refuses_a_wide_instantiation

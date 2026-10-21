@@ -114,7 +114,7 @@ whose C asserts otherwise must pass storage it owns rather than an empty slice.
 ### `binary_search`
 
 ```sysl
-binary_search[T: Ord](xs: []const T, x: T) -> (bool, usize)
+const binary_search[T: Ord](xs: []const T, x: T) -> (bool, usize)
 ```
 
 Where a value is in a sorted slice, and where it would go if it is not there.
@@ -135,13 +135,13 @@ unspecified rather than wrong in some particular way.
 ### `binary_search_by`
 
 ```sysl
-binary_search_by[T](xs: []const T, x: T, lt: (T, T) -> bool) -> (bool, usize)
+const binary_search_by[T](xs: []const T, x: T, lt: (T, T) -> bool) -> (bool, usize)
 ```
 
 ### `contains`
 
 ```sysl
-contains[T: Eq](xs: []const T, x: T) -> bool
+const contains[T: Eq](xs: []const T, x: T) -> bool
 ```
 
 Whether the value appears at all -- `index_of` where the position is not wanted.
@@ -229,7 +229,7 @@ The same over bytes, reaching `memmove` through the byte `copy` beside it.
 ### `ends_with`
 
 ```sysl
-ends_with[T: Eq](xs: []const T, suffix: []const T) -> bool
+const ends_with[T: Eq](xs: []const T, suffix: []const T) -> bool
 ```
 
 Whether the slice ends with the given elements.
@@ -237,7 +237,7 @@ Whether the slice ends with the given elements.
 ### `equal`
 
 ```sysl
-equal[T: Eq](a: []const T, b: []const T) -> bool
+const equal[T: Eq](a: []const T, b: []const T) -> bool
 ```
 
 Whether two slices have the same length and the same elements in the same order.
@@ -247,7 +247,7 @@ The length test comes first and is what makes the common refusal cost nothing.
 ### `fill`
 
 ```sysl
-fill[T](xs: []T, v: T)
+const fill[T](xs: []T, v: T)
 ```
 
 Every element set to one value.
@@ -255,7 +255,7 @@ Every element set to one value.
 ### `index_of`
 
 ```sysl
-index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
+const index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
 ```
 
 Where a value first appears, or `None`.
@@ -267,7 +267,7 @@ absence is in the type, where a caller has to look at it.
 ### `index_of_from`
 
 ```sysl
-index_of_from[T: Eq](xs: []const T, x: T, from: usize) -> Option[usize]
+const index_of_from[T: Eq](xs: []const T, x: T, from: usize) -> Option[usize]
 ```
 
 The same search begun part-way along, which is what walks every occurrence without cutting the
@@ -296,7 +296,7 @@ answers a real question about divisibility rather than nonsense.
 ### `is_sorted`
 
 ```sysl
-is_sorted[T: Ord](xs: []const T) -> bool
+const is_sorted[T: Ord](xs: []const T) -> bool
 ```
 
 Whether the slice is already in order. Worth having on its own, and it is also the sorts' own
@@ -305,13 +305,13 @@ postcondition, which is what the tests assert against.
 ### `is_sorted_by`
 
 ```sysl
-is_sorted_by[T](xs: []const T, lt: (T, T) -> bool) -> bool
+const is_sorted_by[T](xs: []const T, lt: (T, T) -> bool) -> bool
 ```
 
 ### `last_index_of`
 
 ```sysl
-last_index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
+const last_index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
 ```
 
 Where a value last appears, or `None`. Walks down from the end, so it stops at the first match
@@ -320,7 +320,7 @@ rather than scanning the whole slice to keep the latest one.
 ### `last_index_of_from`
 
 ```sysl
-last_index_of_from[T: Eq](xs: []const T, x: T, from: usize) -> Option[usize]
+const last_index_of_from[T: Eq](xs: []const T, x: T, from: usize) -> Option[usize]
 ```
 
 The last occurrence at or after `from` -- the backward search over the same suffix
@@ -331,7 +331,7 @@ past the end answers `None` from either.
 ### `max_index`
 
 ```sysl
-max_index[T: Ord](xs: []const T) -> Option[usize]
+const max_index[T: Ord](xs: []const T) -> Option[usize]
 ```
 
 Where the largest element is, or `None`. Ties go to the first, as above -- written `xs[best] <
@@ -341,7 +341,7 @@ held.
 ### `min_index`
 
 ```sysl
-min_index[T: Ord](xs: []const T) -> Option[usize]
+const min_index[T: Ord](xs: []const T) -> Option[usize]
 ```
 
 Where the smallest element is, or `None` for an empty slice.
@@ -355,7 +355,7 @@ comes back is something a caller can observe.
 ### `reverse`
 
 ```sysl
-reverse[T](xs: []T)
+const reverse[T](xs: []T)
 ```
 
 The elements in the opposite order, in place.
@@ -366,7 +366,7 @@ is left alone rather than swapped with itself.
 ### `sort`
 
 ```sysl
-sort[T: Ord](xs: []T)
+const sort[T: Ord](xs: []T)
 ```
 
 The slice in order, in place, using no extra storage.
@@ -383,13 +383,13 @@ caller who cares wants `sort_stable`, which says so in its name.
 ### `sort_by`
 
 ```sysl
-sort_by[T](xs: []T, lt: (T, T) -> bool)
+const sort_by[T](xs: []T, lt: (T, T) -> bool)
 ```
 
 ### `sort_stable`
 
 ```sysl
-sort_stable[T: Ord](xs: []T, scratch: []T) -> bool
+const sort_stable[T: Ord](xs: []T, scratch: []T) -> bool
 ```
 
 The slice in order, with equal elements left in the order they were given, merged through storage
@@ -405,13 +405,13 @@ O(log n) frames for the same result.
 ### `sort_stable_by`
 
 ```sysl
-sort_stable_by[T](xs: []T, scratch: []T, lt: (T, T) -> bool) -> bool
+const sort_stable_by[T](xs: []T, scratch: []T, lt: (T, T) -> bool) -> bool
 ```
 
 ### `starts_with`
 
 ```sysl
-starts_with[T: Eq](xs: []const T, prefix: []const T) -> bool
+const starts_with[T: Eq](xs: []const T, prefix: []const T) -> bool
 ```
 
 Whether the slice begins with the given elements. An empty prefix is a prefix of everything, which
@@ -420,7 +420,7 @@ falls out of the loop rather than being decided here.
 ### `swap`
 
 ```sysl
-swap[T](xs: []T, i: usize, j: usize)
+const swap[T](xs: []T, i: usize, j: usize)
 ```
 
 Two elements exchanged, in place.

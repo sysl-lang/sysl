@@ -1,0 +1,1101 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// `T::Kind`, `T::Name`, `T::BaseName`, `T::Fields`, `T::Members` and `T::Variants` -- what a type is
+// made of, answered while compiling.
+//
+// **Every answer is a literal**, so it folds wherever a constant is wanted and costs nothing where
+// the program runs: the kind is a value of the library's `Kind`, a name is a string, and a list of
+// fields, members or variants is a `[]const` over literals of `sysl.reflect.Field`, `Member` or
+// `Variant`, laid down as read-only data. On a type parameter each instantiation answers for the type
+// it was given; the walk that checks a generic body on its own terms gets a stand-in of the right
+// type and folds nothing, as `sizeof(T)` does there.
+//
+// **`T::Fields` lists what a reader names, and `T::Members` everything the type stores**: the named
+// fields alone, against those plus each anonymous `struct`/`union` block and each unnamed `_`
+// bitfield, in declaration order. A zero-width `_` stores nothing and is in neither.
+
+// Whether an attribute is one of those that describe a type's make-up.
+reflection_attr(attr: string) -> bool = attr match
+    "Kind" | "Name" | "BaseName" | "Fields" | "Members" | "Variants" | "Annotation" -> true
+    _ -> false
+
+// The answer to one of them for the type `written` stands for here.
+reflect_attr(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr], ty: Type) -> TExpr
+    if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
+
+    attr match
+        "Kind" -> kind_answer(cx, span, written, ty)
+        "Name" -> TExpr(span, TStrLit(type_show(ty)))
+        "BaseName" -> TExpr(span, TStrLit(base_name(ty)))
+        "Fields" -> fields_answer(cx, span, written, ty, false)
+        "Members" -> fields_answer(cx, span, written, ty, true)
+        "Annotation" -> annotation_unnamed(cx, span, written)
+        _ -> variants_answer(cx, span, written, ty)
+end reflect_attr
+
+// The name a type was declared under, with no module before it and no arguments after it: `Box` for
+// `Box[int]`, `Q` for `demo.Q`. A type no declaration names -- `int`, `[4]u8`, a tuple -- is shown
+// as `T::Name` shows it. An anonymous `union` or `struct` block has no name a reader wrote, and
+// answers the word that opened it, which is how `Debug` shows one.
+private base_name(ty: Type) -> string = ty match
+    Struct(d) -> if is_tuple(d) || is_closure_literal(ty) then type_show(ty)
+                 else if is_anonymous_type(d) then (if d.union_layout then "union" else "struct")
+                 else if d.base == TaskBase then "Task"
+                 else last_segment(d.base)
+    Enum(d) -> last_segment(d.base)
+    Constrained(d) -> last_segment(if d.targs.is_empty() then d.name else d.generic)
+    Volatile(inner) -> base_name(*inner)
+    _ -> type_show(ty)
+
+// What follows the last dot of a declaration's key, as a reader is shown it.
+private last_segment(key: string) -> string
+    val shown = module_show(key)
+
+    last_dot_in(shown) match
+        Some(i) -> shown[i + 1..<shown.bytes.len]
+        None -> shown
+end last_segment
+
+// The key of the generic struct a written name declares, where it declares one and no type
+// parameter of the body being read stands in front of it: written bare, it names no single type.
+generic_struct_named(cx: &Analyzer, written: string) -> Option[string]
+    if bound_type(cx.subst, written).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if key.is_none() then return None
+
+    cx.an.tables.types.get(key.unwrap()).unwrap().kind match
+        StructOf(sd) -> if sd.tparams.is_empty() then None else key
+        _ -> None
+end generic_struct_named
+
+// `Box[int]::Fields` -- one of the four asked of a generic type at the arguments written on it.
+// `None` where the left side is not a generic type's name with brackets after it.
+reflect_on_written_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> Option[TExpr]
+    val found = written_instance(cx, span, receiver)
+
+    if found.is_none() then return None
+
+    val ty = found.unwrap()
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    Some(reflect_attr(cx, span, type_show(ty), attr, buf(), ty))
+end reflect_on_written_instance
+
+// The type `Box[int]` names, where the left side of a `::` is a generic type's name with brackets
+// after it; `Unknown` where the arguments were refused, and `None` where it is no such thing.
+private written_instance(cx: &Analyzer, span: Span, receiver: Expr) -> Option[Type]
+    val found = written_on_generic_type(cx, receiver, true)
+
+    if found.is_none() then return None
+
+    val head = found.unwrap().0
+    val targs = written_type_args_for(cx, head.0, found.unwrap().1)
+
+    for t in targs
+        if t == Unknown then return Some(Unknown)
+
+    Some(reinstantiate_at(cx.an, cx.scope, span, head.0, targs))
+end written_instance
+
+// A type of the library's that the answers are made of, by its full name.
+//
+// **Read in the declaring module's own terms**, so it makes no edge in the module graph: the
+// compiler names the type, not the code being read -- and that code may be the standard module's
+// own, where a `derive` body reading `c.index` would otherwise make `sysl` depend on
+// `sysl.reflect`, which depends on `sysl`.
+private library_type(cx: &Analyzer, span: Span, name: string) -> Type
+    val home = Scope(name[0..<last_dot_in(name).unwrap_or(0)], no_imports(), source_of("", ""),
+                     no_packaging())
+
+    resolve_type(cx.an, home, named_type(span, name), no_bindings())
+end library_type
+
+// -- `x::Annotation[A]` ----------------------------------------------------------------------------
+//
+// **What a program's annotation said, read back as an `Option[A]` constant**: `Some` of the literal
+// its use came to (`annotations.sysl`), or `None` where nothing carries it. `x` is a type, or a name a
+// `for const` copy binds to a field, a variant or a field of a variant's payload. A tuple's part and
+// a type no struct, enum, `new`, range or `where` declaration makes carry none, so they answer `None`
+// (a plain alias is its base, and answers the base's); a type parameter read in its
+// own terms has no declaration yet and answers `None` as a stand-in, as `T::Fields` answers empty.
+
+// `x::Annotation` with no brackets: the annotation it reads is not named.
+annotation_unnamed(cx: &Analyzer, span: Span, written: string) -> TExpr =
+    cx.err(span, s"'$written::Annotation' reads one annotation, named in brackets — " +
+           s"'$written::Annotation[rename]'")
+
+annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
+    val asked = written_type_arg(cx, item)
+
+    if asked == Unknown then return bad_expr(span)
+
+    val shown = type_show(asked)
+
+    val akey = underlying(asked) match
+        Struct(s) -> s.base
+        _ -> ""
+
+    var is_annotation = false
+
+    cx.an.tables.types.get(akey) match
+        Some(decl) ->
+            decl.kind match
+                StructOf(sd) -> is_annotation = sd.annotation
+                _ -> ()
+        None -> ()
+
+    if !is_annotation then
+        return cx.err(span, s"'$shown' is ${kind_phrase(asked)}, not an annotation — an annotation is a " +
+                      s"struct marked '@annotation', which is what lets '::Annotation[$shown]' read it")
+
+    val opt = reinstantiate(cx.an, library_key("Option"), one_type(asked))
+    val name = attr_type_name(subject)
+    val d = if name.is_some() then descriptor_bound(cx.subst, name.unwrap()) else None
+
+    // Whose annotations, and which of them: the declaration's key and the part's name.
+    var owner = ""
+    var target = ""
+
+    if d.is_some()
+        d.unwrap() match
+            Descriptor(o, v, f) ->
+                if v < 0 && f >= 0
+                    owner = declared_key(*o)
+                    target = walked_fields(*o, v).at(usize(f)).0
+                else if v >= 0 && f < 0
+                    owner = declared_key(*o)
+                    target = variant_name(*o, v)
+                else if v >= 0 && f >= 0
+                    owner = declared_key(*o)
+                    target = variant_name(*o, v) + "." + walked_fields(*o, v).at(usize(f)).0
+            _ -> ()
+    else
+        val ty = if name.is_some() then attr_subject(cx, span, name.unwrap())
+                 else written_instance(cx, span, subject)
+
+        if ty.is_none() then
+            return cx.err(span, "'::Annotation[…]' is asked of a type, or of a field or a variant a " +
+                          "'for const' walk stands at, and its left side is none of them")
+
+        if ty.unwrap() == Unknown then return bad_expr(span)
+
+        owner = own_key(ty.unwrap())
+    end if
+
+    if owner == "" then return absent_annotation(span, opt)
+
+    val held = annotations_of(cx.an, owner)
+
+    if held.is_none() then return absent_annotation(span, opt)
+
+    val found = annotation_on(cx.an, held.unwrap().1, held.unwrap().0, target, akey)
+
+    if found.is_none() then return absent_annotation(span, opt)
+
+    val value = annotation_value(cx.an, held.unwrap().1, found.unwrap().0, found.unwrap().1, asked)
+
+    if value.is_none() then return bad_expr(span)
+
+    val some = option_variant(opt, "Some")
+
+    if some.is_none() then return bad_expr(span)
+
+    var payload: Buf[TExpr] = buf()
+
+    payload.push(value.unwrap())
+    TExpr(span, TEnumNew(opt, some.unwrap(), payload))
+end annotation_query
+
+// The key of the struct or enum declaration a type is made from; empty for every other type.
+private declared_key(t: Type) -> string = underlying(t) match
+    Struct(s) -> s.base
+    Enum(e) -> e.base
+    _ -> ""
+
+// The key of the declaration that made this type itself: a `new` type, a range or a `where` is a
+// declaration of its own and answers its own annotations, not those of the type it is made over.
+private own_key(t: Type) -> string = t match
+    Constrained(c) -> if c.generic != "" then c.generic else c.name
+    Volatile(inner) -> own_key(*inner)
+    _ -> declared_key(t)
+
+private one_type(t: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(t)
+    out
+end one_type
+
+// `None` of an annotation's `Option`.
+private absent_annotation(span: Span, opt: Type) -> TExpr = option_variant(opt, "None") match
+    Some(v) -> TExpr(span, TEnumNew(opt, v, buf()))
+    None -> bad_expr(span)
+
+private option_variant(opt: Type, name: string) -> Option[EnumVariant]
+    underlying(opt) match
+        Enum(e) ->
+            for v in e.variants
+                if v.name == name then return Some(v)
+        _ -> ()
+
+    None
+end option_variant
+
+// -- `T::Kind` -------------------------------------------------------------------------------------
+
+private kind_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
+    val kind_ty = library_type(cx, span, "sysl.Kind")
+
+    val d = underlying(kind_ty) match
+        Enum(e) -> e
+        _ -> return bad_expr(span)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TZero(kind_ty))
+        _ -> ()
+
+    // An opaque struct is a struct where its fields are listed (`opaque_shut`).
+    val name = underlying(ty) match
+        Struct(s) ->
+            if s.opaque && !opaque_shut(cx, s) then Some(if s.union_layout then "Union" else "Struct")
+            else kind_name(ty)
+        _ -> kind_name(ty)
+
+    if name.is_none() then
+        return cx.err(span, s"'$written' is ${type_show(ty)}, which is not a type a value can have, " +
+                      s"so '$written::Kind' has nothing to answer")
+
+    val v = d.variant(name.unwrap())
+
+    if v.is_none() then return bad_expr(span)
+
+    TExpr(span, TEnumNew(kind_ty, v.unwrap(), buf()))
+end kind_answer
+
+// Which of `Kind`'s variants a type is. A subtype is its base's kind and `volatile T` is `T`'s, which
+// `underlying` already sees through.
+kind_name(ty: Type) -> Option[string] = underlying(ty) match
+    Integer(_, _, _) -> Some("Int")
+    Floating(_, _) -> Some("Float")
+    Fixed(_, _, _) -> Some("Fixed")
+    Char -> Some("Char")
+    Bool -> Some("Bool")
+    Unit -> Some("Unit")
+    Str -> Some("String")
+    Ptr(_) -> Some("Pointer")
+    CFn(_, _) -> Some("Fn")
+    Ref(_, _) -> Some("Ref")
+    Weak(_) -> Some("Weak")
+    Array(_, _) -> Some("Array")
+    Vector(_, _) -> Some("Vector")
+    Slice(_, _) -> Some("Slice")
+    Trait(_, _, _) -> Some("Trait")
+    VaList -> Some("Opaque")
+    Results(_) -> Some("Tuple")
+    Struct(d) ->
+        if d.opaque then Some("Opaque")
+        else if d.union_layout then Some("Union")
+        else if is_tuple(d) then Some("Tuple")
+        else Some("Struct")
+    Enum(d) -> if carries_any(d) then Some("DataEnum") else Some("SimpleEnum")
+    _ -> None
+
+private carries_any(d: &EnumType) -> bool
+    for v in d.variants
+        if v.carries then return true
+
+    false
+end carries_any
+
+// What a type is, in words, for a refusal naming it.
+private kind_phrase(ty: Type) -> string = kind_name(ty).unwrap_or("") match
+    "Int" -> "an integer"
+    "Float" -> "a float"
+    "Fixed" -> "a fixed-point number"
+    "Char" -> "a char"
+    "Bool" -> "a bool"
+    "Unit" -> "the unit type"
+    "String" -> "a string"
+    "Pointer" -> "a pointer"
+    "Fn" -> "a function pointer"
+    "Ref" -> "a reference"
+    "Weak" -> "a weak reference"
+    "Array" -> "an array"
+    "Vector" -> "a vector"
+    "Slice" -> "a slice"
+    "Trait" -> "a trait object"
+    "Opaque" -> "an opaque type"
+    "Tuple" -> "a tuple"
+    "Union" -> "a union"
+    "Struct" -> "a struct"
+    "SimpleEnum" -> "an enum"
+    "DataEnum" -> "an enum"
+    _ -> "not a type a value can have"
+
+// -- `T::Fields` and `T::Members` ------------------------------------------------------------------
+
+// The `variant` a walk over `T::Members` gives its descriptors, which tells them from a walk over
+// `T::Fields` (-1): both stand at a part of the type itself, and each copy reads as a `Member` rather
+// than a `Field`.
+val MembersWalk: int = -2
+
+// `T::Fields`, or with `members` `T::Members`.
+private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type, members: bool) -> TExpr
+    val item_ty = library_type(cx, span, if members then "sysl.reflect.Member" else "sysl.reflect.Field")
+
+    val fd = underlying(item_ty) match
+        Struct(f) -> f
+        _ -> return bad_expr(span)
+
+    val list_ty = Slice(item_ty, true)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TBufLit(buf(), list_ty))
+        _ -> ()
+
+    val d = underlying(ty) match
+        Struct(s) -> if opaque_shut(cx, s) then None else Some(s)
+        Results(s) -> Some(s)
+        _ -> None
+
+    if d.is_none() then
+        val what = if members then "Members' lists the members" else "Fields' lists the fields"
+
+        return cx.err(span, s"'$written::$what of a struct, a tuple or a union, and " +
+                      s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+    end if
+
+    val s = d.unwrap()
+    val measured = !mentions_abstract(ty)
+    var items: Buf[TExpr] = buf()
+    val parts = listed_parts(s, members)
+
+    for k in 0..<parts.len()
+        val name = s.fields.at(parts.at(k)).0
+        val at = if measured then cx.an.tables.layout.field_offset(s, name).unwrap_or(0) else 0
+
+        items.push(part_literal(cx, span, fd, name, k, at, field_public(cx, s, name), members))
+
+    TExpr(span, TBufLit(items, list_ty))
+end fields_answer
+
+// **Whether an `opaque struct` keeps its parts to itself here.** One that declares its fields has
+// them where its layout is known -- its own module -- and in a derivation it asked for, which is the
+// type's author opting in exactly as for a private field; there it is a struct like any other. One
+// with no body has none anywhere. Every other struct is open.
+private opaque_shut(cx: &Analyzer, s: &StructType) -> bool =
+    s.opaque && (s.fields.is_empty() ||
+                 (layout_hidden(cx.an, cx.scope, s.base) && !in_own_derivation(cx, s.base)))
+
+// The positions among a struct's declared parts that `T::Members` lists, or `T::Fields`.
+//
+// An anonymous member is storage the struct holds rather than a field a reader names -- the fields
+// it holds are reached through the struct -- and an unnamed `_` bitfield only moves the fields after
+// it, so `T::Fields` lists neither. A zero-width `_` stores nothing, so neither lists it.
+private listed_parts(s: &StructType, members: bool) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for i in 0..<s.fields.len()
+        val name = s.fields.at(i).0
+        val unnamed_bit = name == "_" && s.c_bit(i).is_some()
+
+        if unnamed_bit && s.c_bit(i).unwrap().width == 0 then continue
+        if !members && (unnamed_bit || is_anonymous_field(name)) then continue
+
+        out.push(i)
+
+    out
+end listed_parts
+
+// **A part's `index` is its position in the list that names it**, not its slot in the struct's
+// storage: the first field of a struct that opens with an anonymous block is field 0. A descriptor
+// keeps the storage slot, which is what `v.(f)` selects, and its `index` is asked here.
+private listed_position(s: &StructType, members: bool, slot: usize) -> usize
+    val parts = listed_parts(s, members)
+
+    for k in 0..<parts.len()
+        if parts.at(k) == slot then return k
+
+    slot
+end listed_position
+
+// One `sysl.reflect.Field`, or with `member` one `sysl.reflect.Member`, as a literal. An anonymous
+// member's name is `""`, since no reader wrote one; an unnamed bitfield's is the `_` it was written as.
+private part_literal(cx: &Analyzer, span: Span, fd: &StructType, name: string, index: usize,
+                     at: usize, public: bool, member: bool) -> TExpr
+    val usize_ty = usize_type(word_bits(cx))
+    val anonymous = is_anonymous_field(name)
+    var parts: Buf[TExpr] = buf()
+
+    parts.push(TExpr(span, TStrLit(if anonymous then "" else name)))
+    parts.push(TExpr(span, TIntLit(from_int(long(index)), usize_ty)))
+    parts.push(TExpr(span, TIntLit(from_int(long(at)), usize_ty)))
+    parts.push(TExpr(span, TBoolLit(public)))
+
+    if member then parts.push(TExpr(span, TBoolLit(anonymous)))
+
+    TExpr(span, TStructNew(fd, parts))
+end part_literal
+
+private field_literal(cx: &Analyzer, span: Span, fd: &StructType, name: string, index: usize,
+                      at: usize, public: bool) -> TExpr =
+    part_literal(cx, span, fd, name, index, at, public, false)
+
+// One `sysl.reflect.Variant`, as a literal.
+private variant_literal(cx: &Analyzer, span: Span, vd: &StructType, name: string, index: usize) -> TExpr
+    var parts: Buf[TExpr] = buf()
+
+    parts.push(TExpr(span, TStrLit(name)))
+    parts.push(TExpr(span, TIntLit(from_int(long(index)), usize_type(word_bits(cx)))))
+    TExpr(span, TStructNew(vd, parts))
+end variant_literal
+
+// Whether code outside the declaring file may name a field: what the declaration wrote on it. A
+// tuple's parts, which no declaration writes, are public.
+private field_public(cx: &Analyzer, s: &StructType, name: string) -> bool
+    val decl = cx.an.tables.types.get(s.base)
+
+    if decl.is_none() then return true
+
+    decl.unwrap().kind match
+        StructOf(sd) ->
+            for f in sd.fields
+                if f.name == name
+                    f.vis match
+                        Public -> return true
+                        _ -> return false
+        _ -> ()
+
+    true
+end field_public
+
+// -- `T::Variants` ---------------------------------------------------------------------------------
+
+private variants_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> TExpr
+    val variant_ty = library_type(cx, span, "sysl.reflect.Variant")
+
+    val vd = underlying(variant_ty) match
+        Struct(v) -> v
+        _ -> return bad_expr(span)
+
+    val list_ty = Slice(variant_ty, true)
+
+    ty match
+        Abstract(_, _) -> return TExpr(span, TBufLit(buf(), list_ty))
+        _ -> ()
+
+    val d = underlying(ty) match
+        Enum(e) -> e
+        _ ->
+            return cx.err(span, s"'$written::Variants' lists the variants of an enum, and " +
+                          s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+
+    var items: Buf[TExpr] = buf()
+
+    for i in 0..<d.variants.len()
+        items.push(variant_literal(cx, span, vd, d.variants.at(i).name, i))
+
+    TExpr(span, TBufLit(items, list_ty))
+end variants_answer
+
+// -- walking a type's make-up ----------------------------------------------------------------------
+//
+// **A `for const` over `T::Fields` or `T::Variants` binds its name, in each copy, to a descriptor**
+// -- a `Descriptor` in the substitution, as `for const i in 0..<A.len` binds a `ConstArg` -- and
+// each form that reads one asks the substitution: the name alone is the `sysl.reflect.Field` or
+// `Variant` it stands for (so `f.name` folds), `f::Type` is the field's type wherever a type is
+// written, `v.(f)` selects the field, and over a variant `x is c`, `x.(c)` and `T::Make(c, p)` test,
+// take apart and build it. Each copy is read on its own, so a line ill-typed for one field is
+// refused there, naming that field.
+//
+// **A variant's payload travels as the tuple of its fields** -- `unit` where it has none, and the
+// field itself where it has one, since a one-element product is the element -- and `c::Fields`
+// walks it, so `p.(f)` over a payload of one field is `p` itself.
+
+// The descriptor a name stands at in this copy, where it stands at one.
+descriptor_bound(subst: Buf[Binding], name: string) -> Option[Type]
+    val held = bound_type(subst, name)
+
+    if held.is_some() && is_descriptor(held.unwrap()) then held else None
+end descriptor_bound
+
+private is_descriptor(t: Type) -> bool = t match
+    Descriptor(_, _, _) -> true
+    _ -> false
+
+// Whether an expression is a name a copy binds to a descriptor, which is what makes `f.name` and
+// `c.index` constants.
+names_descriptor(subst: Buf[Binding], e: Expr) -> bool = *e.kind match
+    Ident(n) -> descriptor_bound(subst, n).is_some()
+    _ -> false
+
+// `for const f in T::Fields`, `for const c in T::Variants` and `for const f in c::Fields` -- the
+// descriptor each copy stands at, in order. `None` where the loop walks none of the three, and an
+// `Err` holding the refusal where the type has no such parts. A type parameter read in its own
+// terms has none yet, so it is walked zero times, and every instantiation walks its own.
+reflected_walk(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[Buf[Type], TExpr]]
+    val asked: Option[(Expr, string)] = *iter.kind match
+        TypeAttr(r, a, _, _) ->
+            if a == "Fields" || a == "Members" || a == "Variants" then Some((r, a)) else None
+        _ -> None
+
+    if asked.is_none() then return None
+
+    val receiver = asked.unwrap().0
+    val attr = asked.unwrap().1
+    var out: Buf[Type] = buf()
+
+    // `c::Fields` -- the payload of the variant a copy of an enclosing walk stands at.
+    val written = attr_type_name(receiver)
+    val held = written.and_then(n -> descriptor_bound(cx.subst, n))
+
+    if held.is_some()
+        held.unwrap() match
+            Descriptor(owner, v, f) ->
+                if attr != "Fields" || v < 0 || f >= 0 then
+                    return Some(Err(descriptor_attr(cx, span, written.unwrap(), attr, held.unwrap())))
+
+                for j in 0..<walked_fields(*owner, v).len()
+                    out.push(Descriptor(*owner, v, int(j)))
+            _ -> ()
+
+        return Some(Ok(out))
+    end if
+
+    val ty = reflected_subject(cx, span, receiver)
+
+    // The ordinary reading of the attribute says what is wrong with the left side.
+    if ty.is_none() || ty.unwrap() == Unknown then return Some(Err(type_expr_bare(cx, iter)))
+
+    val t = ty.unwrap()
+
+    t match
+        Abstract(_, _) -> return Some(Ok(out))
+        _ -> ()
+
+    if attr == "Variants"
+        underlying(t) match
+            Enum(d) ->
+                for i in 0..<d.variants.len()
+                    out.push(Descriptor(t, int(i), -1))
+            _ -> return Some(Err(variants_answer(cx, span, type_show(t), t)))
+
+        return Some(Ok(out))
+    end if
+
+    val members = attr == "Members"
+
+    val s = underlying(t) match
+        Struct(s) -> if opaque_shut(cx, s) then None else Some(s)
+        Results(s) -> Some(s)
+        _ -> None
+
+    if s.is_none() then return Some(Err(fields_answer(cx, span, type_show(t), t, members)))
+
+    // The parts the attribute lists, as `T::Fields` and `T::Members` list them.
+    for i in listed_parts(s.unwrap(), members)
+        out.push(Descriptor(t, if members then MembersWalk else -1, int(i)))
+
+    Some(Ok(out))
+end reflected_walk
+
+// The type a walk's `T::Fields` or `T::Variants` asks about: a type's name, a type parameter, or a
+// generic type with its arguments written. `None` where the left side is a value, a generic type
+// written bare, or nothing at all, each of which the attribute's ordinary reading refuses.
+private reflected_subject(cx: &Analyzer, span: Span, receiver: Expr) -> Option[Type]
+    val name = attr_type_name(receiver)
+
+    if name.is_none() then return written_instance(cx, span, receiver)
+    if cx.lookup(name.unwrap()).is_some() then return None
+    if generic_struct_named(cx, name.unwrap()).is_some() then return None
+    if generic_enum_named(cx, name.unwrap()).is_some() then return None
+
+    attr_subject(cx, span, name.unwrap())
+end reflected_subject
+
+// What one copy binds: the name at its descriptor and, for a field, `name::Type` at the field's
+// type, or for a variant, `name::Payload` at its payload's type -- which is how `f::Type` and
+// `c::Payload` resolve wherever a type is written.
+descriptor_bindings(cx: &Analyzer, name: string, d: Type) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    out.push(Binding(name, d))
+
+    val ft = descriptor_field_type(d)
+
+    if ft.is_some() then out.push(Binding(s"$name::Type", ft.unwrap()))
+
+    d match
+        Descriptor(owner, v, f) ->
+            if f < 0 && v >= 0 then
+                out.push(Binding(s"$name::Payload", payload_type(cx, walked_fields(*owner, v))))
+        _ -> ()
+
+    out
+end descriptor_bindings
+
+// `f::Type` and `c::Payload` written where a type is: the type the copy bound under that spelling.
+// `None` where the left side is not a descriptor's name; a member the descriptor does not answer is
+// refused here, naming what it does answer.
+descriptor_projection(a: &Analysis, scope: Scope, span: Span, base: TypeRef, member: string,
+                      subst: Buf[Binding]) -> Option[Type]
+    val name = *base.kind match
+        NamedType(n, args) -> if args.is_empty() then n else return None
+        _ -> return None
+
+    val d = descriptor_bound(subst, name)
+
+    if d.is_none() then return None
+
+    val held = bound_type(subst, s"$name::$member")
+
+    if held.is_some() then return held
+
+    a.fault(scope, span, descriptor_refusal(name, member, d.unwrap()))
+    Some(Unknown)
+end descriptor_projection
+
+// What a descriptor's name answers after `::`, said when it is asked something else.
+private descriptor_refusal(written: string, attr: string, d: Type) -> string = d match
+    Descriptor(owner, v, f) ->
+        val answers = if f >= 0 then "'::Type', the field's type"
+        else "'::Fields', its payload's fields, and '::Payload', its payload's type"
+
+        s"'$written' is the descriptor '${descriptor_text(*owner, v, f)}', which answers $answers, " +
+        s"and not '::$attr'"
+    _ -> ""
+
+// The part a copy stands at, as a refusal made in that copy names it.
+descriptor_label(d: Type) -> string = d match
+    Descriptor(owner, v, f) ->
+        s"${if v == MembersWalk then "member" else if f >= 0 then "field" else "variant"} " +
+        s"'${descriptor_text(*owner, v, f)}'"
+    _ -> ""
+
+// Every refusal said since `before` -- in one copy of a walk over a type's parts -- says which part
+// the copy was for: the line was checked once per part, and the same line may be refused for one.
+name_the_part(cx: &Analyzer, before: usize, label: string)
+    val found = cx.an.found
+
+    for i in before..<found.len()
+        val p = found.at(i)
+        val d = p.diag
+
+        found.set(i, Placed(p.src, Diagnostic(d.severity, d.span, s"${d.message} (in the copy for $label)",
+                                              d.label, d.note), p.at_place))
+end name_the_part
+
+// The type of the field a descriptor stands for; `None` for a variant.
+private descriptor_field_type(d: Type) -> Option[Type] = d match
+    Descriptor(owner, v, f) ->
+        if f < 0 then None else Some(unqualified(walked_fields(*owner, v).at(usize(f)).1))
+    _ -> None
+
+// The fields a descriptor's owner holds at the level it walks: a struct's or a tuple's own where `v`
+// is -1, and otherwise the payload of the variant `v`.
+private walked_fields(owner: Type, v: int) -> Buf[(string, Type)]
+    val none: Buf[(string, Type)] = buf()
+
+    if v >= 0
+        return underlying(owner) match
+            Enum(d) -> d.variants.at(usize(v)).fields
+            _ -> none
+
+    underlying(owner) match
+        Struct(s) -> s.fields
+        Results(s) -> s.fields
+        _ -> none
+end walked_fields
+
+// The name of the variant `v` of an enum.
+private variant_name(owner: Type, v: int) -> string = underlying(owner) match
+    Enum(d) -> d.variants.at(usize(v)).name
+    _ -> ""
+
+// What a variant's payload travels as: `unit` with no fields, the field itself with one, and the
+// tuple of them with more.
+private payload_type(cx: &Analyzer, fields: Buf[(string, Type)]) -> Type
+    if fields.is_empty() then return Unit
+    if fields.len() == 1 then return unqualified(fields.at(0).1)
+
+    var ts: Buf[Type] = buf()
+
+    for item in fields
+        ts.push(unqualified(item.1))
+
+    Struct(registered_tuple(cx.an, ts))
+end payload_type
+
+// A descriptor as a diagnostic names it: `P.x`, `Shape.Circle`, `Shape.Circle.r`.
+descriptor_text(owner: Type, v: int, f: int) -> string
+    var out = type_show(owner)
+
+    if v >= 0 then out = out + "." + variant_name(owner, v)
+    if f >= 0
+        val name = walked_fields(owner, v).at(usize(f)).0
+
+        // An anonymous member has no name a reader wrote; it is shown as what it is.
+        out = out + "." + (if is_anonymous_field(name) then s"(anonymous member $f)" else name)
+    end if
+
+    out
+end descriptor_text
+
+// A descriptor's name read as a value: the `sysl.reflect.Field`, `Member` or `Variant` it stands
+// for, the literal `T::Fields`, `T::Members` or `T::Variants` lists it as.
+descriptor_value(cx: &Analyzer, span: Span, d: Type) -> TExpr = d match
+    Descriptor(owner, v, f) ->
+        if f < 0 then
+            underlying(library_type(cx, span, "sysl.reflect.Variant")) match
+                Struct(vd) -> variant_literal(cx, span, vd, variant_name(*owner, v), usize(v))
+                _ -> bad_expr(span)
+        else
+            underlying(library_type(cx, span, if v == MembersWalk then "sysl.reflect.Member"
+                                              else "sysl.reflect.Field")) match
+                Struct(fd) -> descriptor_field_literal(cx, span, fd, *owner, v, f)
+                _ -> bad_expr(span)
+    _ -> bad_expr(span)
+
+// The `sysl.reflect.Field` a field descriptor stands for, or the `Member` one of a walk over
+// `T::Members` does. A payload's fields are public, as every variant's are, and each sits where the
+// payload's tuple places it.
+private descriptor_field_literal(cx: &Analyzer, span: Span, fd: &StructType, owner: Type, v: int,
+                                 f: int) -> TExpr
+    val fields = walked_fields(owner, v)
+    val name = fields.at(usize(f)).0
+
+    if v >= 0
+        val at = underlying(payload_type(cx, fields)) match
+            Struct(s) -> cx.an.tables.layout.field_offset(s, str(f)).unwrap_or(0)
+            _ -> 0
+
+        return field_literal(cx, span, fd, name, usize(f), at, true)
+    end if
+
+    val s = underlying(owner) match
+        Struct(s) -> s
+        Results(s) -> s
+        _ -> return bad_expr(span)
+
+    val at = if mentions_abstract(owner) then 0 else cx.an.tables.layout.field_offset(s, name).unwrap_or(0)
+
+    val members = v == MembersWalk
+
+    part_literal(cx, span, fd, name, listed_position(s, members, usize(f)), at, field_public(cx, s, name),
+                 members)
+end descriptor_field_literal
+
+// A type attribute asked of a descriptor's name: `c::Fields` lists a variant's payload, and the
+// rest are refused with what the descriptor does answer.
+descriptor_attr(cx: &Analyzer, span: Span, written: string, attr: string, d: Type) -> TExpr = d match
+    Descriptor(owner, v, f) ->
+        if attr == "Annotation" then annotation_unnamed(cx, span, written)
+        else if attr == "Fields" && v >= 0 && f < 0 then
+            payload_fields_answer(cx, span, *owner, v)
+        else if (attr == "Type" && f >= 0) || (attr == "Payload" && f < 0) then
+            cx.err(span, s"'$written::$attr' is a type, so it stands where a type is written — " +
+                   s"'var x: $written::$attr', 'sizeof($written::$attr)', 'decode[$written::$attr](r)'")
+        else
+            cx.err(span, descriptor_refusal(written, attr, d))
+    _ -> bad_expr(span)
+
+// `c::Fields` read as a value: the payload's fields, as `T::Fields` lists a struct's.
+private payload_fields_answer(cx: &Analyzer, span: Span, owner: Type, v: int) -> TExpr
+    val field_ty = library_type(cx, span, "sysl.reflect.Field")
+
+    val fd = underlying(field_ty) match
+        Struct(f) -> f
+        _ -> return bad_expr(span)
+
+    var items: Buf[TExpr] = buf()
+
+    for j in 0..<walked_fields(owner, v).len()
+        items.push(descriptor_field_literal(cx, span, fd, owner, v, int(j)))
+
+    TExpr(span, TBufLit(items, Slice(field_ty, true)))
+end payload_fields_answer
+
+// Whether `v.(f)` may reach a field from here. **Reflection reaches what the file could name**, so
+// a private field is reached only in the type's own file. A derivation the type asked for with
+// `derives` is the one other place that may (`docs/design/reflection.md` § 2, row 7), and this is
+// where that is answered.
+private reflected_field_in_reach(cx: &Analyzer, base: string, name: string) -> bool =
+    field_visible(cx, base, name) || in_own_derivation(cx, base)
+
+// `v.(f)` and `x.(c)` -- the field a descriptor stands for, read off a value of the type it was
+// walked from (a place where `v` is one, so `out.(f) = …` writes it), and a variant's payload.
+reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) -> TExpr
+    val d = descriptor_bound(cx.subst, selector)
+
+    if d.is_none() then
+        return cx.err(span, s"'$selector' is not a descriptor here — '.( )' selects with the 'f' of a " +
+                      "'for const f in T::Fields', or the 'c' of a 'for const c in T::Variants'")
+
+    val outer = type_expr_bare(cx, receiver)
+
+    if texpr_type(outer) == Unknown then return outer
+
+    val tr = auto_deref(cx, outer)
+    val rt = texpr_type(tr)
+
+    d.unwrap() match
+        Descriptor(owner, v, f) ->
+            if f < 0 then return payload_of(cx, span, tr, *owner, v, selector)
+
+            val fields = walked_fields(*owner, v)
+            val wanted = if v >= 0 then payload_type(cx, fields) else *owner
+
+            if disagree(rt, wanted) then
+                return cx.err(span, s"'$selector' is the field '${descriptor_text(*owner, v, f)}', which " +
+                              s"a value of '${type_show(wanted)}' holds, and this is a value of " +
+                              s"'${type_show(rt)}'")
+
+            val name = fields.at(usize(f)).0
+
+            if v < 0
+                val base = underlying(*owner) match
+                    Struct(s) -> s.base
+                    _ -> ""
+
+                if base != "" && !reflected_field_in_reach(cx, base, name) then
+                    return cx.err(span, field_out_of_reach(cx, base, name))
+            end if
+
+            // A payload of one field is that field, so there is nothing to select.
+            if v >= 0 && fields.len() == 1 then return tr
+
+            TExpr(span, TField(tr, f, unqualified(fields.at(usize(f)).1)))
+        _ -> bad_expr(span)
+end reflected_select
+
+// `x.(c)` -- the payload of the variant `c` stands for, shaped as `payload_type` says, read by a
+// `match` whose other arm traps: a value holding another variant has no such payload to give.
+private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, selector: string) -> TExpr
+    val rt = texpr_type(tr)
+
+    if disagree(rt, owner) then
+        return cx.err(span, s"'$selector' is the variant '${descriptor_text(owner, v, -1)}', which a " +
+                      s"value of '${type_show(owner)}' holds, and this is a value of '${type_show(rt)}'")
+
+    val variant = underlying(owner) match
+        Enum(d) -> d.variants.at(usize(v))
+        _ -> return bad_expr(span)
+
+    val pt = payload_type(cx, variant.fields)
+    var pats: Buf[TPattern] = buf()
+    var parts: Buf[TExpr] = buf()
+
+    cx.enter()
+
+    for j in 0..<variant.fields.len()
+        val ft = variant.fields.at(j).1
+        val u = cx.bind_pattern(s"${ModuleSep}payload$j", ft)
+
+        pats.push(TBindPattern(u, ft))
+        parts.push(TExpr(span, TLoad(u, ft)))
+
+    cx.leave()
+
+    val value = if parts.is_empty() then TExpr(span, TUnitLit)
+    else if parts.len() == 1 then parts.at(0)
+    else underlying(pt) match
+        Struct(s) -> TExpr(span, TStructNew(s, parts))
+        _ -> bad_expr(span)
+
+    var hit: Buf[TPattern] = buf()
+    var arms: Buf[TArm] = buf()
+
+    hit.push(TVariantPattern(underlying(owner), variant, pats))
+    arms.push(TArm(hit, None, TBlock(buf(), Some(value), pt)))
+
+    val asked = descriptor_text(owner, v, -1)
+    val en = underlying(owner) match
+        Enum(d) -> d
+        _ -> return bad_expr(span)
+    val variants = en.variants
+
+    // Every other variant is one arm, which names the variant the value holds from a table indexed
+    // by its tag -- one test per `x.(c)`, so the copies of a walk over a few hundred variants stay
+    // a few hundred tests and not the square of it. The table needs tags that are the positions.
+    if !en.simple && positional_tags(variants)
+        cx.enter()
+
+        val u = cx.bind_pattern(s"${ModuleSep}held", owner)
+
+        cx.leave()
+
+        var rest: Buf[TPattern] = buf()
+
+        rest.push(TBindPattern(u, owner))
+
+        val fail = TExpr(span, TVariantFailHeld(asked, TExpr(span, TLoad(u, owner))))
+
+        arms.push(TArm(rest, None, TBlock(buf(), Some(fail), Never)))
+        return TExpr(span, TMatch(tr, arms, pt))
+    end if
+
+    // Otherwise every other variant is an arm of its own, the variant it holds named in its failure.
+    for i in 0..<variants.len()
+        if int(i) == v then continue
+
+        val other = variants.at(i)
+        var wild: Buf[TPattern] = buf()
+        var at: Buf[TPattern] = buf()
+
+        for item in other.fields
+            wild.push(TWildPattern(item.1))
+
+        at.push(TVariantPattern(underlying(owner), other, wild))
+
+        val fail = TExpr(span, TVariantFail(asked, descriptor_text(owner, int(i), -1)))
+
+        arms.push(TArm(at, None, TBlock(buf(), Some(fail), Never)))
+
+    TExpr(span, TMatch(tr, arms, pt))
+end payload_of
+
+// Whether each variant's tag is its position, so a tag indexes a table of the variants' names.
+private positional_tags(variants: Buf[EnumVariant]) -> bool
+    for i in 0..<variants.len()
+        if variants.at(i).tag != from_int(long(i)) then return false
+
+    true
+
+// `x is c`, and a `c` arm of a `match` -- the variant a descriptor stands for, every field let go.
+descriptor_pattern(cx: &Analyzer, span: Span, name: string, d: Type, ty: Type) -> TPattern = d match
+    Descriptor(owner, v, f) ->
+        if f >= 0 then
+            cx.fault(span, s"'$name' is the field '${descriptor_text(*owner, v, f)}', and a pattern " +
+                     "tests a variant — 'x is c' takes the 'c' of a 'for const c in T::Variants'")
+            return TWildPattern(ty)
+        end if
+
+        if disagree(ty, *owner) then
+            cx.fault(span, s"'$name' is the variant '${descriptor_text(*owner, v, f)}', and the value " +
+                     s"is ${type_show(ty)}")
+            return TWildPattern(ty)
+        end if
+
+        val variant = underlying(*owner) match
+            Enum(e) -> e.variants.at(usize(v))
+            _ -> return TWildPattern(ty)
+
+        var wild: Buf[TPattern] = buf()
+
+        for item in variant.fields
+            wild.push(TWildPattern(item.1))
+
+        TVariantPattern(underlying(ty), variant, wild)
+    _ -> TWildPattern(ty)
+
+// `T::Make(c, payload)` -- the variant `c` stands for, built from the payload `x.(c)` hands back.
+make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Type) -> TExpr
+    if args.len() != 2 then
+        return cx.err(span, s"'$written::Make' takes a variant and its payload — " +
+                      s"'$written::Make(c, (a, b))', where 'c' is the name of a " +
+                      s"'for const c in $written::Variants'")
+
+    val named = attr_type_name(args.at(0))
+    val d = named.and_then(n -> descriptor_bound(cx.subst, n))
+
+    if d.is_none() then
+        return cx.err(args.at(0).span, s"'$written::Make' is told the variant by the 'c' of a " +
+                      s"'for const c in $written::Variants', and this is not one")
+
+    val en = underlying(ty) match
+        Enum(e) -> e
+        _ -> return cx.err(span, s"'$written::Make' builds a variant of an enum, and " +
+                           s"'${type_show(ty)}' is ${kind_phrase(ty)}")
+
+    d.unwrap() match
+        Descriptor(owner, v, f) ->
+            if f >= 0 || disagree(ty, *owner) then
+                return cx.err(args.at(0).span, s"'${named.unwrap()}' is " +
+                              s"'${descriptor_text(*owner, v, f)}', and '$written::Make' builds a " +
+                              s"variant of ${type_show(ty)}")
+
+            val variant = en.variants.at(usize(v))
+            val pt = payload_type(cx, variant.fields)
+            val tv = type_expr(cx, args.at(1), Some(pt))
+
+            if texpr_type(tv) == Unknown then return bad_expr(span)
+
+            if disagree(texpr_type(tv), pt) then
+                return cx.err(args.at(1).span, s"'${variant.name}' is built from its payload, a value " +
+                              s"of '${type_show(pt)}', and this is a value of '${type_show(texpr_type(tv))}'")
+
+            built_variant(cx, span, Enum(en), variant, tv, pt)
+        _ -> bad_expr(span)
+end make_variant
+
+// The variant made from a payload already typed: with no fields the payload is run for what it does
+// and the variant follows, with one it is the field, and with more each field is read off it once
+// it is held.
+private built_variant(cx: &Analyzer, span: Span, en: Type, variant: EnumVariant, tv: TExpr,
+                      pt: Type) -> TExpr
+    var stmts: Buf[TStmt] = buf()
+    var fields: Buf[TExpr] = buf()
+
+    if variant.fields.is_empty()
+        stmts.push(TExprStmt(tv))
+    else if variant.fields.len() == 1
+        fields.push(tv)
+    else
+        *tv.kind match
+            TStructNew(_, parts) ->
+                for item in parts
+                    fields.push(item)
+            _ ->
+                val held = cx.fresh_name(s"${ModuleSep}payload")
+                val load = TExpr(span, TLoad(held, pt))
+
+                stmts.push(TVarDecl(held, pt, tv, None))
+
+                for j in 0..<variant.fields.len()
+                    fields.push(TExpr(span, TField(load, int(j), unqualified(variant.fields.at(j).1))))
+    end if
+
+    val made = TExpr(span, TEnumNew(en, variant, fields))
+
+    if stmts.is_empty() then made else TExpr(span, TBlockExpr(TBlock(stmts, Some(made), en)))
+end built_variant
+
+// -- asking what a type can do ---------------------------------------------------------------------
+
+// `T: Display + Hash` in an `if const` condition -- whether the type implements every trait named,
+// asked as a bound asks it (`satisfies`), so an own `impl`, a `derives`, a built-in's membership by
+// rule and a parameter's own bounds all answer yes. `None` where the subject or a trait is refused,
+// which the refusal has said.
+trait_test(cx: &Analyzer, span: Span, subject: TypeRef, bounds: Buf[BoundRef]) -> Option[Const]
+    val mark = cx.an.complaints()
+    val t = resolve_type(cx.an, cx.scope, subject, cx.subst)
+    var holds = true
+
+    for b in bounds
+        if lookup_trait_key(cx.an, cx.scope, b.name).is_none()
+            val a_type = lookup_type_key(cx.an, cx.scope, b.name).is_some() ||
+                         scalar_named(b.name, word_bits(cx)).is_some()
+
+            if a_type then
+                cx.fault(b.span, s"'${b.name}' is a type and not a trait — the right of ':' in an " +
+                         "'if const' names a trait, as a bound does")
+            else
+                cx.fault(b.span, s"unknown trait '${b.name}'")
+        else if !satisfies(cx.an, resolve_bound(cx.an, cx.scope, b.span, b, cx.subst), t)
+            holds = false
+        end if
+
+    if t == Unknown || cx.an.complaints() > mark
+        cx.an.const_refusals += 1
+        return None
+    end if
+
+    Some(ConstBool(holds))
+end trait_test

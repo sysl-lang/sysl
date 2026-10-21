@@ -33,8 +33,9 @@
 #      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
 #      is stage 2 having miscompiled itself. Stage 1 against stage 2 is logged and does not decide:
 #      built over two libraries, the two may differ honestly
-#   6. package `sysl-<version>-darwin-arm64.tar.gz`: `bin/sysl` and `share/sysl/library`, which is a
-#      prefix (the binary finds its library beside itself), and its sha256
+#   6. package `sysl-<version>-darwin-arm64.tar.gz`: `bin/sysl`, `share/sysl/library`, and the TextMate
+#      grammar at `share/sysl/editors/sysl.tmLanguage.json` -- a prefix (the binary finds its library
+#      beside itself) -- and its sha256
 #   7. unpack it to a scratch prefix and, with that prefix's binary and no `SYSL_LIB`: `--version`;
 #      build and run a hello program; `sysl test` a small org package; `sysl test <library> --std`
 #   8. write a release-notes skeleton into `<out>`, and print the manual steps that remain
@@ -211,12 +212,12 @@ stamp() {
     local text old new
 
     text=$(< $main_file)
-    old=$(print -r -- $text | grep -m1 '^const Version: string = "') || { print "no 'const Version' in $main_file"; return 1 }
+    old=$(grep -m1 '^const Version: string = "' <<< $text) || { print "no 'const Version' in $main_file"; return 1 }
     new="const Version: string = \"$version\""
     [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $main_file
 
     text=$(< $manifest)
-    old=$(print -r -- $text | grep -m1 '^  version = "') || { print "no package.version in $manifest"; return 1 }
+    old=$(grep -m1 '^  version = "' <<< $text) || { print "no package.version in $manifest"; return 1 }
     new="  version = \"$version\""
     [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $manifest
 
@@ -243,7 +244,8 @@ say "release commit: $release_commit"
 
 # --- 3-5. the stages -----------------------------------------------------------------------------
 
-seed_version=$($seed --version 2>&1 | head -1)
+seed_version=$($seed --version 2>&1)
+seed_version=${seed_version%%$'\n'*}
 say "seed: $seed ($seed_version)"
 say "seed library: $seed_lib"
 say "compiler project: $proj"
@@ -321,9 +323,10 @@ say "report only -- stage 1 vs stage 2 emit-llvm: $stage12"
 package() {
     local stage=$out/stage
     rm -rf $stage $tarball
-    mkdir -p $stage/bin $stage/share/sysl || return 1
+    mkdir -p $stage/bin $stage/share/sysl/editors || return 1
     cp $out/stage2 $stage/bin/sysl || return 1
     cp -R $library $stage/share/sysl/library || return 1
+    cp $repo/docs/grammars/sysl.tmLanguage.json $stage/share/sysl/editors/sysl.tmLanguage.json || return 1
 
     # No AppleDouble files: `-C stage .` makes the tarball a prefix, and brew installs all of it.
     COPYFILE_DISABLE=1 tar -czf $tarball -C $stage . || return 1
@@ -421,13 +424,12 @@ cat > $notes <<NOTES
 
 <!-- A skeleton written by scripts/release.sh. Fill in every <...>, delete what does not apply. -->
 
-<ONE PARAGRAPH: what this release is for. For 0.1.0-alpha.1: the self-hosted compiler, written in
-sysl, replaces the Scala bootstrap as \`sysl\`.>
+<ONE PARAGRAPH: what this release is for.>
 
 ## Install
 
 \`\`\`
-brew install sysl-lang/tap/<sysl or sysl-alpha>
+brew install sysl-lang/tap/sysl
 \`\`\`
 
 or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler finds
@@ -447,7 +449,7 @@ or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler fin
 
 ## Platforms
 
-- **macOS arm64 only.** Linux (x86_64, arm64) and macOS x86_64 are not built for this alpha; the
+- **macOS arm64 only.** Linux (x86_64, arm64) and macOS x86_64 are not built for this release; the
   bootstrap's Linux tarballs came from \`.github/workflows/release-linux.yml\` on CI runners, and
   this compiler has no such workflow yet.
 

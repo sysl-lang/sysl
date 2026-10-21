@@ -63,7 +63,49 @@ enum TypeKind
 
     // `some Trait + Other` -- a result whose type is read off the body that produced it.
     SomeType(bounds: Buf[BoundRef])
+
+    // No result written, on a function whose body is `= value`: the result is that value's type,
+    // read off the body as a `val`'s type is read off its initializer. Nothing in the source spells
+    // it, so a printer of the declaration writes nothing. The slot is shared by every copy of the
+    // declaration and names the function the analysis filed it under (`inferred_results.sysl`).
+    InferredResult(slot: &ResultSlot)
 end TypeKind
+
+// Which function an inferred result belongs to, filled in where the analysis files the declaration.
+//
+// `shown` is the result clause `sysl doc` prints for it -- ` -> T`, or nothing for `unit` -- filled
+// in once an analysis of the tree has read the body (`doc_cli.sysl`'s `settle_doc_results`).
+struct ResultSlot
+    site: string
+    shown: Option[string]
+
+// A result to be read off the body, at the `=` that opens it.
+inferred_result_ref(at: Span) -> TypeRef = TypeRef(at, InferredResult(ResultSlot("", None)))
+
+// The result a declaration wrote, which is none where it leaves it to the body: what a printer of the
+// declaration shows.
+as_written(ret: Option[TypeRef]) -> Option[TypeRef]
+    if ret.is_none() then return ret
+
+    *ret.unwrap().kind match
+        InferredResult(_) -> None
+        _ -> ret
+end as_written
+
+// Whether a declaration's result is to be read off its body rather than written.
+is_inferred_result(written: Option[TypeRef]) -> bool = result_slot_of(written).is_some()
+
+// The slot of a result read off the body, where that is what the declaration has -- an `async`
+// function's included, whose caller receives a task of it.
+result_slot_of(written: Option[TypeRef]) -> Option[&ResultSlot]
+    if written.is_none() then return None
+
+    *written.unwrap().kind match
+        InferredResult(slot) -> Some(slot)
+        NamedType(name, args) -> if name == TaskBase && args.len() == 1 then result_slot_of(Some(args.at(0)))
+                                 else None
+        _ -> None
+end result_slot_of
 
 // A trait named as a bound: `Display`, `Add[int]`.
 struct BoundRef

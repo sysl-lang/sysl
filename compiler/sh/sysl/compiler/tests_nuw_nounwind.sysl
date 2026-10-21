@@ -48,12 +48,12 @@ end nuw_freestanding_is_nounwind_alone
 
 @test("a hosted definition is nounwind and keeps clang's unwind table")
 nuw_hosted_keeps_the_table()
-    assert_eq(nuw_attrs("aarch64-macos"), "nounwind uwtable(sync)")
-    assert_eq(nuw_attrs("x86_64-macos"), "nounwind uwtable")
+    assert_eq(nuw_attrs("aarch64-macos"), "nounwind uwtable(sync) \"frame-pointer\"=\"non-leaf\"")
+    assert_eq(nuw_attrs("x86_64-macos"), "nounwind uwtable \"frame-pointer\"=\"all\"")
     assert_eq(nuw_attrs("x86_64-linux"), "nounwind uwtable")
-    assert_eq(nuw_attrs("aarch64-linux"), "nounwind uwtable")
+    assert_eq(nuw_attrs("aarch64-linux"), "nounwind uwtable \"frame-pointer\"=\"non-leaf\"")
     assert_eq(nuw_attrs("x86_64-windows"), "nounwind uwtable")
-    assert_eq(nuw_attrs("aarch64-android"), "nounwind uwtable")
+    assert_eq(nuw_attrs("aarch64-android"), "nounwind uwtable \"frame-pointer\"=\"non-leaf\"")
     assert_eq(nuw_attrs("wasm32-wasi"), "nounwind")
 end nuw_hosted_keeps_the_table
 
@@ -97,11 +97,29 @@ nuw_every_row_matches_clang()
         val ours = unwind_table(t).unwrap_or("")
 
         assert_eq(s"${t.name}: $ours", s"${t.name}: $theirs")
+
+        // And a hosted row keeps the frame pointer clang's C keeps there.
+        if os_hosted(t.os)
+            val fp = nuw_frame_pointer_in(group)
+
+            assert_eq(s"${t.name}: ${frame_pointer(t).unwrap_or("")}", s"${t.name}: $fp")
+        end if
+
         asked += 1
 
     remove_dir_all(dir).unwrap_or(())
     assert(asked > 20, s"asked $asked rows")
 end nuw_every_row_matches_clang
+
+// The `"frame-pointer"="…"` word of a group, or nothing.
+private nuw_frame_pointer_in(group: string) -> string
+    val words = nuw_words(group)
+
+    for item in words
+        if item.starts_with("\"frame-pointer\"=") then return item
+
+    ""
+end nuw_frame_pointer_in
 
 // The text of `attributes #0 = { ... }`, padded with a space each side so a word test needs no
 // boundary handling.

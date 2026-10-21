@@ -44,7 +44,7 @@ correct for those lengths.
 ### `difference`
 
 ```sysl
-difference[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+const difference[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
 ```
 
 The keys in the first set and not the second. Not symmetric, so it walks `a` whatever the sizes.
@@ -80,7 +80,7 @@ A heap whose storage is already big enough for `n` elements. The fill is written
 ### `intersection`
 
 ```sysl
-intersection[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+const intersection[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
 ```
 
 The keys in both sets. **The smaller set is the one walked**, because every key walked costs a
@@ -90,7 +90,7 @@ larger would ask more questions to reach the same answer.
 ### `is_subset`
 
 ```sysl
-is_subset[K: Hash + Eq](a: Set[K], b: Set[K]) -> bool
+const is_subset[K: Hash + Eq](a: Set[K], b: Set[K]) -> bool
 ```
 
 Whether every key of the first set is in the second. A set cannot be a subset of a smaller one, so
@@ -118,7 +118,7 @@ forwards would produce the reverse and need a second pass to correct.
 ### `map`
 
 ```sysl
-map[K: Hash + Eq, V]() -> Map[K, V]
+const map[K: Hash + Eq, V]() -> Map[K, V]
 ```
 
 An empty map, which holds **no table at all** until something is put in it.
@@ -127,13 +127,11 @@ An empty map, which holds **no table at all** until something is put in it.
 map built inside a loop, held in a struct that is usually empty, or made and dropped on a branch
 that turns out not to be taken would otherwise pay for a table of slots every time, and no caller
 can see that it is paying. The cell is the `MapCore` every name for the map shares -- three words,
-whatever the key and value. The first `put` finds the table over its load -- nothing is over
-nothing -- and rehashes to `initial_slots` before it places anything, which is the path `put`
-already took for a table that had filled up. So there is no separate "grow from empty" case to get
-wrong.
+whatever the key and value. The first `put` makes the `list_room` slots a small map lives in, and
+the ninth distinct key turns them into a table.
 
 Reach for `map_with_capacity` where entries are known to be coming: a caller who names a size is
-saying so, and gets its table immediately.
+saying so, and gets its storage immediately.
 
 **The annotation on `core` is required and is not noise.** `MapCore`'s parameters would have to
 come from the constructor's arguments while the empty table waits to hear what it is a table of,
@@ -142,23 +140,24 @@ and neither can go first.
 ### `map_with_capacity`
 
 ```sysl
-map_with_capacity[K: Hash + Eq, V](n: usize) -> Map[K, V]
+const map_with_capacity[K: Hash + Eq, V](n: usize) -> Map[K, V]
 ```
 
-A map whose table is already big enough for `n` entries without rehashing, for a caller that knows
-roughly how many are coming. The table is sized to twice `n` because the map rehashes at three
-quarters full, so a table of exactly `n` slots would grow before the `n`th entry arrived.
+A map whose storage is already big enough for `n` entries without rehashing, for a caller that
+knows roughly how many are coming. Up to `list_room` entries that is the list's slots, since so few
+would be a list anyway. Past it the map starts as a table, sized to twice `n` because it rehashes
+at three quarters full, so a table of exactly `n` slots would grow before the `n`th entry arrived.
 
 ### `set`
 
 ```sysl
-set[K: Hash + Eq]() -> Set[K]
+const set[K: Hash + Eq]() -> Set[K]
 ```
 
 ### `set_of`
 
 ```sysl
-set_of[K: Hash + Eq](xs: []const K) -> Set[K]
+const set_of[K: Hash + Eq](xs: []const K) -> Set[K]
 ```
 
 Every key of a slice, with duplicates collapsed. The shape that makes a set worth reaching for in
@@ -167,13 +166,13 @@ one line rather than three.
 ### `set_with_capacity`
 
 ```sysl
-set_with_capacity[K: Hash + Eq](n: usize) -> Set[K]
+const set_with_capacity[K: Hash + Eq](n: usize) -> Set[K]
 ```
 
 ### `union`
 
 ```sysl
-union[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+const union[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
 ```
 
 The keys in either set. Sized for the larger of the two, since that is the least it can come to.
@@ -381,16 +380,16 @@ entry the other's count never learned of.
 | `cell` | `cell -> []Slot[K, V]` | The table itself, every slot of it, for a reader that wants to look rather than ask. |
 | `count` | `count -> usize` | How many entries are live. |
 | `dead` | `dead -> usize` | How many tombstones the table is carrying. |
-| `len` | `len(self) -> usize` |  |
-| `is_empty` | `is_empty(self) -> bool` |  |
-| `capacity` | `capacity(self) -> usize` | How many slots the table has, which is what the load factor is measured against. |
-| `get` | `get(self, k: K) -> Option[V]` |  |
-| `get_or` | `get_or(self, k: K, default: V) -> V` | The value a key names, or the one the caller supplies where it names none. |
-| `has` | `has(self, k: K) -> bool` |  |
-| `put` | `put(self, k: K, v: V)` | A key given a value: the entry it already had takes the new one, or a fresh entry is placed. |
-| `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
-| `clear` | `clear(self)` | Every entry dropped and the table let go entirely; see `MapCore.clear`. |
-| `copy` | `copy(self) -> Map[K, V]` | A second map holding the same entries, its table sized to them -- the one way to get a map that is not this one, every other way of handing a `Map` on handing on this one. |
+| `len` | `const len(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `capacity` | `const capacity(self) -> usize` | How many slots the map's storage has. |
+| `get` | `const get(self, k: K) -> Option[V]` |  |
+| `get_or` | `const get_or(self, k: K, default: V) -> V` | The value a key names, or the one the caller supplies where it names none. |
+| `has` | `const has(self, k: K) -> bool` |  |
+| `put` | `const put(self, k: K, v: V)` | A key given a value: the entry it already had takes the new one, or a fresh entry is placed. |
+| `remove` | `const remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
+| `clear` | `const clear(self)` | Every entry dropped and the table let go entirely; see `MapCore.clear`. |
+| `copy` | `const copy(self) -> Map[K, V]` | A second map holding the same entries, its table sized to them -- the one way to get a map that is not this one, every other way of handing a `Map` on handing on this one. |
 | `release` | `release(*self)` | This name's share of the table given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty map does. |
 
 ### `Set`
@@ -418,13 +417,13 @@ the key is in the map at all.
 
 | Member | Signature | Description |
 |---|---|---|
-| `len` | `len(self) -> usize` |  |
-| `is_empty` | `is_empty(self) -> bool` |  |
-| `capacity` | `capacity(self) -> usize` |  |
-| `has` | `has(self, k: K) -> bool` |  |
-| `add` | `add(self, k: K) -> bool` | A key put in, answering whether it was **new**. |
-| `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
-| `clear` | `clear(self)` |  |
+| `len` | `const len(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `capacity` | `const capacity(self) -> usize` |  |
+| `has` | `const has(self, k: K) -> bool` |  |
+| `add` | `const add(self, k: K) -> bool` | A key put in, answering whether it was **new**. |
+| `remove` | `const remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
+| `clear` | `const clear(self)` |  |
 | `release` | `release(*self)` | The map underneath given back without allocating, as `Map.release` does -- for a set in storage the program zeroed itself, which answers as empty until it is assigned. |
 
 ### `SetCursor`
@@ -455,7 +454,8 @@ and so cannot be further along. It does **not** stop at `Dead`: something was he
 is looking for was inserted, so the chain it belongs to may continue past it.
 
 `Live` carries the hash beside the key so that a probe can reject a slot on an integer comparison
-and `rehash` can re-place an entry without asking the key to mix itself down again.
+and `rehash` can re-place an entry without asking the key to mix itself down again. While the map
+is still a list nothing has been hashed, and the field holds zero.
 
 | Member | Signature | Description |
 |---|---|---|

@@ -8,7 +8,7 @@ import sysl.text.Search
 // What a module says it needs of a machine, and what it gives up in exchange.
 //
 // **A capability is a property of the MODULE**, not of a file and not of a declaration, so every
-// file of a module states the same clauses and its `@tests` files state one thing between them. What
+// file of a module that ships states the same clauses; each `@tests` file states its own. What
 // a clause leaves behind is the module's two sets -- what it requires, and what it narrowed away --
 // and it is those the rest of the compiler asks.
 
@@ -263,16 +263,17 @@ private check_module_agreement(a: &Analysis, units: Buf[Program])
 
         seen.push(module_name)
 
-        agree_within(a, units, module_name, true)
-        agree_within(a, units, module_name, false)
+        agree_within(a, units, module_name)
 end check_module_agreement
 
-private agree_within(a: &Analysis, units: Buf[Program], module_name: string, scaffolding: bool)
+// **Only the files that ship are held to agreeing.** A `@tests` file states what its own bodies need
+// (`record_module_tests`), so two of them may say different things and neither repeats the other.
+private agree_within(a: &Analysis, units: Buf[Program], module_name: string)
     var first: Option[Program] = None
 
     for unit in units
         if from_library(a, scope_of_unit(a, unit)) then continue
-        if module_of_unit(unit) != module_name || unit.test_only != scaffolding then continue
+        if module_of_unit(unit) != module_name || unit.test_only then continue
 
         if first.is_none()
             first = Some(unit)
@@ -281,21 +282,12 @@ private agree_within(a: &Analysis, units: Buf[Program], module_name: string, sca
 
         if clauses_written(unit) == clauses_written(first.unwrap()) then continue
 
-        // The two groups are held to agreeing for the same reason and are not held to each other,
-        // so the sentence has to say which rule was broken -- a reader told that every file of the
-        // module states the clause, having just been told a `@tests` file states its own, would
-        // take one of the two for a lie.
-        val whose =
-            if scaffolding then
-                "the tests of a module are one body of scaffolding, so its '@tests' files " +
-                "state one thing between them"
-            else "a capability is a property of the module, so every one of its files " +
-                 "states it"
         val whose_module = if module_name == "" then "the same module" else s"'$module_name'"
 
         a.fault(scope_of_unit(a, unit), disagreement_span(unit),
                 s"${unit.src.name} and ${first.unwrap().src.name} are both files of " +
-                s"$whose_module, and they declare different capabilities — $whose: " +
+                s"$whose_module, and they declare different capabilities — a capability is a " +
+                s"property of the module, so every one of its files states it: " +
                 s"${spell_clauses(unit)} against ${spell_clauses(first.unwrap())}")
 end agree_within
 
@@ -367,21 +359,24 @@ record_capabilities(a: &Analysis, units: Buf[Program])
         if supplied_unit(a, units.at(i)) then a.tables.supplied_modules.push(module_name)
 
         val shipped = first_file_of(units, module_name, false)
-        val scaffolding = first_file_of(units, module_name, true)
 
         if shipped.is_some()
             record_module(a, module_name, shipped.unwrap())
 
         // After the module's own, because what the scaffolding states is an override of it.
         //
-        // **A module with no `@tests` file still has tests' set, and it is the module's own**: a
-        // `@test` written beside what it tests is scaffolding, and with no file taking anything back
-        // it answers to the module's clause.
-        if scaffolding.is_some()
-            record_module_tests(a, module_name, shipped, scaffolding.unwrap())
-        else
-            for pair in a.tables.module_narrows
-                if pair.0 == module_name then a.tables.module_test_narrows.push(pair)
+        // **A `@test` written beside what it tests answers to the module's own clause**, as the code
+        // it tests does -- less the allocator, which tests are never held to by inheritance. It is
+        // filed under the module's name.
+        for pair in a.tables.module_narrows
+            if pair.0 == module_name && pair.1 != CapHeap then
+                a.tables.module_test_narrows.push(pair)
+
+        // **Each `@tests` file states what its own bodies need**, filed under the file: one file's
+        // `@requires(heap)` asks nothing of another's, and nothing repeats another file's needs.
+        for unit in units
+            if module_of_unit(unit) == module_name && unit.test_only
+                record_module_tests(a, module_name, tests_file_key(module_name, unit.src.name), unit)
 end record_capabilities
 
 private first_file_of(units: Buf[Program], module_name: string, tests: bool) -> Option[Program]
@@ -390,6 +385,18 @@ private first_file_of(units: Buf[Program], module_name: string, tests: bool) -> 
 
     None
 end first_file_of
+
+// The key a body's tests' set is filed under: its `@tests` file's own where it was written in one,
+// and the module's where it is a `@test` or hook written beside what it tests.
+tests_key(a: &Analysis, module_name: string, scope: Scope) -> string =
+    if test_only_file(a, scope.src.name) then tests_file_key(module_name, scope.src.name)
+    else module_name
+
+private tests_file_key(module_name: string, file: string) -> string = s"$module_name\t$file"
+
+// The file a `@tests` clause was written in, as a refusal names it: the module is a directory, so its
+// files' last components already tell them apart.
+tests_file_named(scope: Scope) -> string = basename(scope.src.name)
 
 private record_module(a: &Analysis, module_name: string, u: Program)
     for c in u.capabilities
@@ -415,8 +422,8 @@ private supplied_unit(a: &Analysis, u: Program) -> bool =
 // **What writing `requires` buys is this one clean error**, naming the module, the capability and
 // the machine, where otherwise the build would fail somewhere inside whatever the module reached.
 // Only the program's own modules are asked -- a library's clause is its author's -- and only a file
-// that ships: a `@tests` file is analyzed and then dropped, so a requirement checked there would
-// refuse a build over a facility only the discarded file wanted.
+// that ships: a `@tests` file is scaffolding, which every build but a test run drops before analysis,
+// so a requirement checked there would hold the module to a facility only its tests want.
 private unmet_by_target(a: &Analysis, module_name: string, u: Program, c: CapabilityClause,
                         cap: string)
     if !a.tables.target.lacks_capability(cap) then return
@@ -442,13 +449,14 @@ private libc_advice(otherwise: string) -> string =
     "a freestanding target starts without a C library, so either " + otherwise + " or " +
         "'package.hocon' grants one with 'capabilities { libc = true }'"
 
-// The tests' set is the module's own with the scaffolding's changes folded in, per capability: a
-// `@tests` file writing no clause records the module's, one that requires a capability takes it back
-// out of the narrowing, and one that narrows it narrows it whatever the module said.
+// One `@tests` file's set is the module's own with that file's changes folded in, per capability: a
+// file writing no clause records the module's, one that requires a capability takes it back out of
+// the narrowing, and one that narrows it narrows it whatever the module said. It is filed under `key`,
+// the file's own, so the module's other `@tests` files are not touched by it.
 //
 // Only the narrowing is kept. What the scaffolding **requires** is not asked of the target, because
-// every build but a test run analyzes a `@tests` file and then drops it.
-private record_module_tests(a: &Analysis, module_name: string, shipped: Option[Program], u: Program)
+// every build but a test run drops a `@tests` file before analysis.
+private record_module_tests(a: &Analysis, module_name: string, key: string, u: Program)
     var taken_back: Buf[string] = buf()
     var narrowed: Buf[string] = buf()
 
@@ -462,15 +470,19 @@ private record_module_tests(a: &Analysis, module_name: string, shipped: Option[P
                 Requires -> taken_back.push(spread.at(j))
                 Narrows -> narrowed.push(spread.at(j))
 
-    // What the module gave up, less what the scaffolding took back.
+    // What the module gave up, less what the scaffolding took back. **The allocator is never
+    // inherited**: tests are hosted code that renders and builds what they check, so only a clause
+    // the `@tests` file writes itself (`narrowed`, below) holds it to `@no_alloc`.
     for pair in a.tables.module_narrows
+        if pair.1 == CapHeap then continue
+
         if pair.0 == module_name && !holds_string(taken_back, pair.1) &&
                 !holds_string(narrowed, pair.1) then
-            a.tables.module_test_narrows.push(pair)
+            a.tables.module_test_narrows.push((key, pair.1))
 
     for item in narrowed
-        a.tables.module_test_narrows.push((module_name, item))
-        a.tables.module_test_own.push((module_name, item))
+        a.tables.module_test_narrows.push((key, item))
+        a.tables.module_test_own.push((key, item))
 end record_module_tests
 
 // A clause's capability and the ones that come with it, in whichever direction it points.
@@ -496,13 +508,14 @@ end implied_by
 module_narrowed(a: &Analysis, module_name: string, cap: string) -> bool =
     holds_pair(a.tables.module_narrows, module_name, cap)
 
-module_tests_narrowed(a: &Analysis, module_name: string, cap: string) -> bool =
-    holds_pair(a.tables.module_test_narrows, module_name, cap)
+// `key` is `tests_key`'s: one `@tests` file's, or the module's for a test written beside its code.
+module_tests_narrowed(a: &Analysis, key: string, cap: string) -> bool =
+    holds_pair(a.tables.module_test_narrows, key, cap)
 
 // Whether the narrowing on the tests' side is one the `@tests` file wrote rather than one it
 // inherited, which is what tells a reader which line to go and look at.
-module_tests_own_narrowing(a: &Analysis, module_name: string, cap: string) -> bool =
-    holds_pair(a.tables.module_test_own, module_name, cap)
+module_tests_own_narrowing(a: &Analysis, key: string, cap: string) -> bool =
+    holds_pair(a.tables.module_test_own, key, cap)
 
 private holds_pair(pairs: Buf[(string, string)], a: string, b: string) -> bool
     for item in pairs
@@ -695,7 +708,7 @@ end check_need_names
 // target's half, as it is at an edge: its files are compiled into every program, and a mistake in
 // them is not one this compilation's author can change.
 private lacks(a: &Analysis, scope: Scope, module_name: string, cap: string, scaffolding: bool) -> bool
-    val narrowed = if scaffolding then module_tests_narrowed(a, module_name, cap)
+    val narrowed = if scaffolding then module_tests_narrowed(a, tests_key(a, module_name, scope), cap)
     else module_narrowed(a, module_name, cap)
 
     narrowed || target_lacks_for(a, scope, module_name, cap)
@@ -709,14 +722,16 @@ private target_lacks_for(a: &Analysis, scope: Scope, module_name: string, cap: s
 // Which of the two put the capability out of reach, said the way the diagnostic needs it. A reader
 // told their module "declared 'no os'" when no file of it says any such thing would go looking for a
 // clause that is not there.
-private why_lacking(a: &Analysis, module_name: string, cap: string, scaffolding: bool) -> string
+private why_lacking(a: &Analysis, scope: Scope, module_name: string, cap: string,
+                    scaffolding: bool) -> string
     val word = narrow_word(cap)
     val here = if module_name == "" then "this module" else s"'$module_name'"
+    val key = tests_key(a, module_name, scope)
 
-    if scaffolding && module_tests_own_narrowing(a, module_name, cap) then
-        return s"the '@tests' file of $here declared '@no_$word'"
+    if scaffolding && module_tests_own_narrowing(a, key, cap) then
+        return s"the '@tests' file ${tests_file_named(scope)} of $here declared '@no_$word'"
 
-    val narrowed = if scaffolding then module_tests_narrowed(a, module_name, cap)
+    val narrowed = if scaffolding then module_tests_narrowed(a, key, cap)
     else module_narrowed(a, module_name, cap)
 
     if narrowed then return s"$here declared '@no_$word'"
@@ -770,7 +785,7 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
             if !lacks(a, scope, module_name, cap, scaffolding) then continue
 
             blame_needs(a, walk, scope, f.body, cap,
-                        why_lacking(a, module_name, cap, scaffolding))
+                        why_lacking(a, scope, module_name, cap, scaffolding))
 
         for i in 0..<vals.len()
             val v = vals.at(i)
@@ -778,14 +793,14 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
             if v.init.is_none() then continue
 
             val module_name = module_of(v.symbol)
-            val scaffolding = holds_string(a.tables.test_only, v.symbol)
+            val scaffolding = a.tables.test_only_keys.has(v.symbol)
             val d = a.tables.vals.get(v.symbol)
             val scope = if d.is_some() then d.unwrap().scope else empty_scope()
 
             if !lacks(a, scope, module_name, cap, scaffolding) then continue
 
             blame_needs_expr(a, walk, scope, v.init.unwrap(), cap,
-                             why_lacking(a, module_name, cap, scaffolding))
+                             why_lacking(a, scope, module_name, cap, scaffolding))
 end check_decl_capabilities
 
 private blame_needs(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, cap: string, why: string)
@@ -1184,7 +1199,7 @@ private note_call_refs(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables
         if a.tables.members.func_origin.has(f.name) then continue
 
         val scope = func_home(a, f.name)
-        val scaffolding = test_only_file(a, scope.src.name) || holds_string(a.tables.test_only, f.name)
+        val scaffolding = test_only_file(a, scope.src.name) || a.tables.test_only_keys.has(f.name)
         var calls: Buf[(string, Span)] = buf()
         val sink = &calls
 
@@ -1202,7 +1217,7 @@ private note_call_refs(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables
         val sink = &calls
 
         walk_texpr(v.init.unwrap(), TWalk(false, e -> note_calls(sink, vtables, e), w -> (), st -> ()))
-        charge_calls(a, &known, module_of(v.symbol), scope, buf(), holds_string(a.tables.test_only, v.symbol),
+        charge_calls(a, &known, module_of(v.symbol), scope, buf(), a.tables.test_only_keys.has(v.symbol),
                      calls)
 end note_call_refs
 

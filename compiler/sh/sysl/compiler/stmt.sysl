@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.BigInt
+import sysl.math.bigint.{BigInt, from_int}
 
 // Statements, and the blocks they live in.
 //
@@ -26,13 +26,20 @@ type_value_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
     // the statements themselves, rather than by looking ahead from the one being read. What the
     // block declares is given back at its end for the same reason its scope is: an inner block's
     // nested functions are not the outer block's.
-    val group = open_group(cx, stmts)
-    val b = type_block_body(cx, stmts, expected, discarded)
+    val b = first_use_read(cx, stmts, () -> grouped_block(cx, stmts, expected, discarded))
 
-    close_group(cx, group)
     cx.leave()
     b
 end type_value_block
+
+// One reading of a value block, its nested functions with it.
+private grouped_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type], discarded: bool) -> TBlock
+    val group = open_group(cx, stmts)
+    val b = block_body_once(cx, stmts, expected, discarded)
+
+    close_group(cx, group)
+    b
+end grouped_block
 
 // What a block took over from the one around it, so that its end can give it back.
 struct BlockGroup
@@ -171,7 +178,16 @@ end settle_needs
 // The body of a value block, in whatever scope the caller has established -- a match arm runs this
 // after declaring its pattern bindings, so they are visible to the body.
 type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
-                discarded: bool) -> TBlock
+                discarded: bool) -> TBlock =
+    first_use_read(cx, stmts, () -> block_body_once(cx, stmts, expected, discarded))
+
+// One reading of a value block's body.
+private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
+                        discarded: bool) -> TBlock
+    val tail_ok = cx.unit_tail
+
+    cx.unit_tail = false
+
     val last = trailing_kind(stmts)
 
     if last == TrailingValue
@@ -192,9 +208,10 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 
         // A block whose value *is* the enclosing function's result is the third place a result list
         // may stand, which is what lets a branch or a nested block forward one.
-        val tr = trailing_value(cx, e, expected, discarded)
+        val tr = trailing_value(cx, e, expected, discarded, tail_ok)
 
         cx.bind_site = site
+        cx.unit_tail = tail_ok
         val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
 
         return TBlock(init, Some(tr), ty)
@@ -205,14 +222,23 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
     for item in stmts
         push_all(&out, recover_stmt(cx, item))
 
+    cx.unit_tail = tail_ok
     TBlock(out, None, if last == TrailingJump then Never else Unit)
-end type_block_body
+end block_body_once
 
 // A block's trailing expression. A block whose value *is* the enclosing function's result is the
 // third place a result list may stand, which is what lets a branch or a nested block forward one.
-private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr
+private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool,
+                       tail_ok: bool) -> TExpr
     if wants_results(cx, expected) then
         return if cx.result_chain then type_results(cx, e, expected) else type_expr_multi(cx, e, expected)
+
+    // A block's last line may be an assignment written for its effect where the block owes nothing
+    // -- `unit` is asked for, or it is a body whose result is read off it, which is then `unit`. A
+    // branch whose value is bound is neither, and an assignment there is refused rather than giving
+    // the binding a `unit` nobody wrote.
+    cx.assign_ok = tail_ok || (expected.is_some() && expected.unwrap() == Unit)
+    cx.tail_carry = tail_ok
 
     type_expr_discarded(cx, e, expected, discarded)
 end trailing_value
@@ -260,7 +286,11 @@ end type_stmts
 // what lets one read the loop variable and stops one reading a local declared under it. The split
 // is by position, exactly as a function's contract block is -- so a clause that reaches
 // `recover_stmt` is one written somewhere it may not be, and says so there.
-loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
+loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt] =
+    first_use_read(cx, stmts, () -> loop_stmts_once(cx, stmts))
+
+// One reading of a loop body.
+private loop_stmts_once(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
     // A loop body is a block, so its nested functions are its own. The caller opened the scope, and
     // this is where the statements are, which is what the group is read from.
     val group = open_group(cx, stmts)
@@ -284,7 +314,7 @@ loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
     cx.pending_variant = slot
     close_group(cx, group)
     out
-end loop_stmts
+end loop_stmts_once
 
 private is_loop_clause(s: Stmt) -> bool = *s.kind match
     Invariant(_, _) -> true
@@ -492,9 +522,14 @@ end recover_stmt
 // this hands back a list: a binding that names several things is several declarations.
 type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     MultiAssign(op, targets, values) -> multi_assign(cx, stmt.span, op, targets, values)
-    MultiDecl(names, mutable, values) -> multi_decl(cx, stmt.span, names, mutable, values)
-    PatternDecl(pat, mutable, value, typ) ->
+    MultiDecl(names, mutable, values, _) -> multi_decl(cx, stmt.span, names, mutable, values)
+    PatternDecl(pat, mutable, value, typ, _) ->
         pattern_decl(cx, stmt.span, pat, mutable, value, typ)
+    // Copies per thread or per core are module storage's; the binding is still read, so what it
+    // binds is there for the rest of the block.
+    CopiedDecl(copies, inner) ->
+        no_thread_local(cx, stmt.span, first_bound(inner), copies)
+        type_stmt(cx, inner)
 
     VarDecl(name, typ, init, _, align, section, copies, export) ->
         var_decl(cx, stmt.span, name, typ, init, align, section, copies, export)
@@ -532,13 +567,9 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     // body is this walk's to bind, and the scope it was written in gives it back at the dedent.
     ImportDecl(d) -> one(block_import(cx, stmt.span, d))
 
-    // A `const` written at the top of a file is folded into its uses before anything runs, so it
-    // never reaches the statement walk. One that reaches here was written **inside a body**, where
-    // there is nothing to hoist it into.
-    ConstDecl(_, _, _, _) ->
-        refuse(cx, stmt.span, "a constant is a module member and is declared at the top level — " +
-               "it is folded into its uses before the program runs, so there is no block for one " +
-               "written here to belong to. A name bound to a value inside a body is a 'val'")
+    // A `const` inside a body is folded where it is written: its value is run while compiling, and
+    // every use of the name is the literal it came to.
+    ConstDecl(name, typ, value, _) -> const_decl(cx, stmt.span, name, typ, value)
 
     CConstBlock(_) ->
         refuse(cx, stmt.span, "a 'c const' block is declared at the top level of a file — the C " +
@@ -652,7 +683,8 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
         if declared.is_none()
             cx.fault(span, s"'$name' needs either a type or an initial value")
 
-            return one(TVarDecl(cx.bind(name, Unknown), Unknown, TExpr(span, TZero(Unknown)), None))
+            return one(TVarDecl(cx.bind(name, Unknown, name_after_keyword(cx, span.start, name)), Unknown,
+                                TExpr(span, TZero(Unknown)), None))
         end if
 
         val ty = declared.unwrap()
@@ -660,15 +692,23 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
         if !has_zero(ty) then
             cx.fault(span, s"${type_show(ty)} has no zero value, so '$name' needs an initial value")
 
-        return one(TVarDecl(cx.bind(name, ty), ty, checked_zero(cx, span, ty),
+        return one(TVarDecl(cx.bind(name, ty, name_after_keyword(cx, span.start, name)), ty, checked_zero(cx, span, ty),
                             boundary(cx, name, align)))
     end if
 
-    val ti = type_expr(cx, init.unwrap(), declared)
+    // A bare literal is read at the type a use fixed, where an earlier reading found one.
+    val fixed = fixed_type(cx, span, name, typ, init.unwrap())
+    val ti = type_expr(cx, init.unwrap(), if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, span, name, declared, decl_ty, ti)
-    one(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+
+    val unique = cx.bind(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    if fixed.is_none() then open_binding(cx, span, typ, init.unwrap(), unique)
+
+    note_view_binding(cx, span, name, unique, ti)
+    one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))
 end var_decl
 
 private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
@@ -681,12 +721,131 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
         if section.is_none() then no_thread_local(cx, span, name, copies)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
-    val ti = type_expr(cx, value, declared)
+    val fixed = fixed_type(cx, span, name, typ, value)
+    val ti = type_expr(cx, value, if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, span, name, declared, decl_ty, ti)
-    one(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+
+    val unique = cx.bind_read_only(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    if fixed.is_none() then open_binding(cx, span, typ, value, unique)
+
+    note_view_binding(cx, span, name, unique, ti)
+    one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))
 end val_decl
+
+// `const NAME: T = e` inside a body. The value is read in this block's terms and run while compiling,
+// and the name is bound to the literal it came to: nothing is kept for it at run time, and every use
+// is the value. It may read a value parameter, another constant and any function whose body can run
+// -- and nothing the body binds, which holds a value only once the program runs.
+//
+// **A generic body read before any instance** has no value for its value parameters, so there the
+// initializer is typed and kept as code; each instance runs it with its own arguments.
+//
+// **A type left off is the value's own**, as a `val`'s is.
+private const_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
+                   value: Expr) -> Buf[TStmt]
+    val written = typ.map(t -> resolve_type(cx.an, cx.scope, t, cx.subst))
+    val ti = type_expr(cx, value, written)
+    val declared = written.unwrap_or(texpr_type(ti))
+    val read = body_binding_read(cx, ti)
+
+    check_binding(cx, span, name, Some(declared), declared, ti)
+
+    val unique = cx.bind_read_only(name, declared, name_after_keyword(cx, span.start, name))
+
+    if cx.at_definition || declared == Unknown || texpr_type(ti) == Unknown then
+        return one(TVarDecl(unique, declared, ti, boundary(cx, name, None)))
+
+    // The same types a constant at the top of a file may have, refused in the same words.
+    val refused = local_const_type_refusal(declared, name)
+
+    if refused != ""
+        cx.fault(span, refused)
+        return buf()
+    end if
+
+    if read.is_some()
+        cx.fault(span, s"'$name' is a constant, so its value is known while compiling, and it reads " +
+                 s"'${read.unwrap()}', which the body binds and which holds a value only once the " +
+                 "program runs. A name bound to such a value is a 'val'")
+        return buf()
+    end if
+
+    const_local_image(cx, name, ti) match
+        Ok(image) ->
+            val folded = const_fold_typed(image, cx.an.tables.layout.little_endian)
+
+            cx.local_consts.push((unique, image, folded))
+
+            // **A number stands where a type is read too** -- an array length, a value argument --
+            // as a value parameter does, so it is bound the way one is, ahead of any of the name.
+            val arg = folded match
+                Some(ConstInt(n)) -> Some(n)
+                Some(ConstBool(b)) -> Some(from_int(if b then 1 else 0))
+                Some(ConstChar(c)) -> Some(from_int(long(u32(c))))
+                _ -> None
+
+            // A fresh substitution rather than a write into the one in hand, which an instance's
+            // record may share.
+            if arg.is_some()
+                var subst: Buf[Binding] = buf()
+
+                // An integer travels at the width every other value argument does, so the copy it
+                // names is the one a literal would.
+                val width = underlying(declared) match
+                    Integer(_, _, _) -> usize_type(word_bits(cx))
+                    _ -> declared
+
+                subst.push(Binding(name, ConstArg(arg.unwrap(), width, false)))
+
+                for b in cx.subst
+                    subst.push(b)
+
+                cx.subst = subst
+            end if
+        Err(why) -> if why != "" then cx.fault(span, why)
+
+    buf()
+end const_decl
+
+// Why a local `const` may not have the type it was declared with, or nothing: a constant is a
+// scalar, folded into its uses, and an aggregate is storage, which a `val` holds.
+private local_const_type_refusal(t: Type, name: string) -> string
+    if is_fixed(t)
+        return s"a constant is folded as an integer or a real, and ${type_show(t)} is fixed-point — " +
+            s"write '$name' as a 'val'"
+    end if
+
+    underlying(t) match
+        Integer(_, _, _) -> ""
+        Floating(_, _) -> ""
+        Bool -> ""
+        Char -> ""
+        Str -> ""
+        Array(_, _) -> local_const_storage(t, name)
+        Vector(_, _) -> local_const_storage(t, name)
+        Struct(_) -> local_const_storage(t, name)
+        _ -> s"a constant is a scalar, and ${type_show(t)} is not — '$name'"
+end local_const_type_refusal
+
+private local_const_storage(t: Type, name: string) -> string =
+    s"a constant is a scalar, and ${type_show(t)} is storage — write '$name' as a 'val'"
+
+// The first binding of the body around it that a typed value reads, by its written name.
+private body_binding_read(cx: &Analyzer, t: TExpr) -> Option[string]
+    var found: Buf[string] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TLoad(unique, _) ->
+            for local in cx.locals
+                if local.unique == unique then sink.push(local.name)
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found.at(0))
+end body_binding_read
 
 // The type a binding holds: the one it was declared with, and the value's where it was not.
 private settled_binding_type(declared: Option[Type], ti: TExpr) -> Type
@@ -729,12 +888,20 @@ private ref_decl(cx: &Analyzer, span: Span, name: string, place: Expr) -> Buf[TS
     if texpr_type(tp) == Never then
         cx.fault(span, s"cannot bind '$name' to an expression that never returns")
 
-    if ordered_field(tp).is_some() then refuse_ordered_field(cx, span, tp, "'ref'")
+    if !refuse_c_bit_place(cx, span, tp, "'ref'") && ordered_field(tp).is_some() then
+        refuse_ordered_field(cx, span, tp, "'ref'")
+
+    // A read of a union field whose bytes can be wrong is checked where it is read, and a read
+    // through the name would be no such read -- while a sibling field changes the bytes under it.
+    if checked_union_place(tp) then
+        cx.fault(span, s"'ref' cannot name a field of a union that is ${type_show(texpr_type(tp))} — " +
+                 "a read of it checks its bytes, a read through the name would not, and a write to " +
+                 s"another field changes them. Read it into a 'val', or take its address with '&'")
 
     // The binding keeps the place as well as the type: every walk that discharges a promise through
     // a place carries on through the name, and the owning steps of the path are held still while it
     // is in scope (`place.sysl`'s `check_ref_guards`).
-    val unique = cx.bind_ref(name, tp, read_only_storage(cx, tp))
+    val unique = cx.bind_ref(name, tp, read_only_storage(cx, tp), name_after_keyword(cx, span.start, name))
 
     watch_ref(cx, span, name, tp)
     one(TRefDecl(unique, texpr_type(tp), tp))
@@ -764,6 +931,18 @@ private no_export(cx: &Analyzer, span: Span, name: string) =
 // tell module storage from a local, and this is the first place that can. A local already belongs
 // to one thread -- its storage is the frame of whichever call is running, and a frame is one
 // thread's stack -- so the attribute asks for something the declaration already has.
+// The first name a binding naming several things gives, which a refusal of the whole binding names.
+private first_bound(s: Stmt) -> string
+    var names: Buf[string] = buf()
+
+    *s.kind match
+        MultiDecl(ns, _, _, _) -> return if ns.is_empty() then "_" else ns.at(0)
+        PatternDecl(pat, _, _, _, _) -> pattern_names(&names, pat)
+        _ -> ()
+
+    if names.is_empty() then "_" else names.at(0)
+end first_bound
+
 private no_thread_local(cx: &Analyzer, span: Span, name: string, copies: Copies)
     if copies == OneCopy then return
 
@@ -832,14 +1011,18 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
 
     val want = cx.ret_ty.unwrap_or(Unit)
 
+    // A result not known -- one being read off the body, or one that could not be -- agrees with a
+    // bare `return` as it agrees with every value.
     if value.is_none()
-        if want != Unit then
+        if want != Unit && want != Unknown then
             cx.fault(span, s"this function must return a ${type_show(want)} value")
 
         return one(TReturn(None))
     end if
 
     val tv = returned_value(cx, value.unwrap(), want)
+
+    note_view_return(cx, span, tv)
 
     if want == Unit then
         cx.fault(span, "cannot return a value from a function with no return type")
@@ -1026,7 +1209,8 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
                  "nothing to run: write the statement itself after this 'defer'")
         VarDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         ValDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
-        MultiDecl(_, _, _) -> Some(deferred_declaration())
+        MultiDecl(_, _, _, _) -> Some(deferred_declaration())
+        CopiedDecl(_, _) -> Some(deferred_declaration())
         ConstDecl(_, _, _, _) -> Some(deferred_declaration())
         _ -> None
 

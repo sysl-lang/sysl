@@ -120,21 +120,21 @@ te_a_literal_too_large_for_the_width_it_landed_in()
     assert(a.contains("does not fit byte"), a)
     assert(b.contains("does not fit int"), b)
 
-@test("an integer literal does not quietly become a float")
+@test("an integer literal a float cannot hold exactly does not quietly become one")
 te_an_integer_literal_does_not_quietly_become_a_float()
     if type_errors_no_library() then return
 
-    val a = err("var x: real = 1")
+    val a = err("var x: real = 9007199254740993")
 
-    assert(a.contains("declared real but the value is int"), a)
+    assert(a.contains("the literal 9007199254740993 is not exactly a real"), a)
 
-@test("mixed widths need a conversion rather than promoting")
+@test("types neither of which holds the other need a conversion rather than promoting")
 te_mixed_widths_need_a_conversion_rather_than_promoting()
     if type_errors_no_library() then return
 
-    val a = err("var a: byte = 1\nvar b: int = 2\nprint(a + b)")
+    val a = err("var a: byte = 1\nvar b: i8 = 2\nprint(a + b)")
 
-    assert(a.contains("'+' needs matching types, got byte and int"), a)
+    assert(a.contains("'+' needs matching types, got byte and i8"), a)
 
 @test("an unsupported width is named as such")
 te_an_unsupported_width_is_named_as_such()
@@ -232,13 +232,14 @@ te_assigning_through_a_pointer_checks_the_pointee_type()
 
     assert(a.contains("cannot assign real"), a)
 
-@test("a pointer cannot be printed")
-te_a_pointer_cannot_be_printed()
+// Every value prints (`reference/traits.md § Every type has a Debug`): a pointer as its address.
+@test("a pointer prints")
+te_a_pointer_prints()
     if type_errors_no_library() then return
 
     val a = err("var n = 1\nprint(&n)")
 
-    assert(a.contains("cannot print a *int value"), a)
+    assert(a.is_empty(), a)
 
 @test("null must know which pointer it is")
 te_null_must_know_which_pointer_it_is()
@@ -284,13 +285,17 @@ te_a_value_of_an_unrelated_type_is_still_a_mismatch_not_a_box()
 
     assert(a.contains("declared &P but the value is int"), a)
 
-@test("a reference cannot be printed")
-te_a_reference_cannot_be_printed()
+// `print` reaches through one reference to the referent (`reference/strings.md`), so a reference
+// prints as what it refers to: its `Display`, or its `Debug` where it has none.
+@test("a reference prints as its referent")
+te_a_reference_prints_as_its_referent()
     if type_errors_no_library() then return
 
     val a = err("struct P\n    x: int\nvar p: &P = P(1)\nprint(p)")
+    val b = err("var r: &int = 5\nprint(r)")
 
-    assert(a.contains("cannot print a &P value"), a)
+    assert(a.is_empty(), a)
+    assert(b.is_empty(), b)
 
 @test("references have equality but no ordering")
 te_references_have_equality_but_no_ordering()
@@ -321,7 +326,7 @@ te_arrays_have_a_length_settled_before_the_program_runs()
 te_arrays_hold_one_element_type()
     if type_errors_no_library() then return
 
-    val a = err("var a = [1, 2.5]")
+    val a = err("var a = [1i64, 2.5]")
 
     assert(a.contains("needs one element type"), a)
 
@@ -365,13 +370,13 @@ te_arrays_have_no_field_but_their_length()
 
     assert(a.contains("cannot read field 'size'"), a)
 
-@test("print an array of anything printable, and name the element when they do not")
-te_print_an_array_names_the_element_when_it_does_not_implement_display()
+@test("print an array of anything, its elements through Debug where they have no Display")
+te_print_an_array_of_anything()
     if type_errors_no_library() then return
 
     val a = err("struct P\n    v: int\nvar a: [2]P = [P(1), P(2)]\nprint(a)")
 
-    assert(a.contains("which does not implement it"), a)
+    assert(a.is_empty(), a)
 
 @test("arrays have no zero value when their elements have none")
 te_arrays_have_no_zero_value_when_their_elements_have_none()
@@ -505,35 +510,38 @@ te_strings_need_a_string_on_the_right_of_plus_equals()
 
     assert(a.contains("'+' needs matching types, got string and int"), a)
 
-@test("str will not render a struct, an enum, or a container")
-te_str_will_not_render_a_struct_an_enum_or_a_container()
+@test("str renders a struct, an enum and a container with no Display")
+te_str_renders_a_struct_an_enum_and_a_container()
     if type_errors_no_library() then return
 
     val a = err("struct P\n    x: int\nend P\nprint(str(P(1)))")
     val b = err("enum E\n    A\n    B\nend E\nprint(str(A))")
     val c = err("struct Q\n    v: int\nvar a: [3]Q = [Q(1), Q(2), Q(3)]\nprint(str(a))")
 
-    assert(a.contains("cannot make a string of a P value"), a)
-    assert(b.contains("cannot make a string of a"), b)
-    assert(c.contains("which does not implement it"), c)
+    assert(a.is_empty(), a)
+    assert(b.is_empty(), b)
+    assert(c.is_empty(), c)
 
-@test("str will not render a reference or a raw pointer")
-te_str_will_not_render_a_reference_or_a_raw_pointer()
+// A reference renders as its referent; a raw pointer is not reached through, and renders as its
+// address (`reference/strings.md`).
+@test("str renders a reference as its referent, and a raw pointer as its address")
+te_str_renders_a_reference_and_a_raw_pointer()
     if type_errors_no_library() then return
 
     val a = err("var r: &int = 5\nprint(str(r))")
     val b = err("var n = 5\nvar p = &n\nprint(str(p))")
 
-    assert(a.contains("cannot make a string of a"), a)
-    assert(b.contains("cannot make a string of a"), b)
+    assert(a.is_empty(), a)
+    assert(b.is_empty(), b)
 
-@test("str will not render a unit value")
-te_str_will_not_render_a_unit_value()
+// Unit implements `Display`, rendering as `()`.
+@test("str renders a unit value")
+te_str_renders_a_unit_value()
     if type_errors_no_library() then return
 
     val a = err("print(str(print(1)))")
 
-    assert(a.contains("cannot make a string of a unit value"), a)
+    assert(a.is_empty(), a)
 
 @test("str takes exactly one value")
 te_str_takes_exactly_one_value()

@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **Whether a library's module `val` is laid down as data is the library's answer, not the program's**
+// (`const_eval.sysl`'s `step_limit`). The standard module's artifact is built once and kept for every
+// program after it, so its own initializers run under the default limit whatever `--const-steps` the
+// program that imports it gave; a program re-deciding one under a smaller limit used to declare the
+// artifact's table `external constant` and then write it at startup -- a fault on the first store.
+
+// The counting program `tests_cte_more_values.sysl` holds its limit to: a hundred trips round a loop.
+private lvd_counting() -> string = raw"""
+    count(n: int) -> int
+        var i = 0
+
+        while i < n
+            i += 1
+
+        i
+
+    const K: int = count(100)
+
+    print(K)
+    """
+
+// What a program prints when built with `--const-steps <steps>`, or what stopped it.
+private lvd_ran_with(steps: string, text: string) -> string
+    var flag: [2]string = ["--const-steps", steps]
+
+    assert_eq(took_search_flag(flag[..], 0), 2)
+
+    val ran = enm_ran(text)
+
+    reset_search_paths()
+    ran
+end lvd_ran_with
+
+@test("a program's own constant is held to its --const-steps, and given enough it runs")
+lvd_program_constant_follows_the_flag()
+    if !enm_ready() then return
+
+    var flag: [2]string = ["--const-steps", "300"]
+
+    assert_eq(took_search_flag(flag[..], 0), 2)
+
+    val said = enm_outcome(lvd_counting()).0
+
+    reset_search_paths()
+
+    assert(said.contains("'K' did not finish within 300 steps while compiling — the loop at main.sysl:4:5 " +
+                         "was still running; '--const-steps <n>' allows a longer run"), said)
+    assert_eq(lvd_ran_with("2000", lvd_counting()), "100\n")
+end lvd_program_constant_follows_the_flag
+
+@test("a library table needing more steps than the program allows is still the library's data, and runs")
+lvd_std_table_ignores_the_program_flag()
+    if !enm_ready() then return
+
+    val program = raw"""
+        import sysl.checksum.crc32
+
+        val sum = crc32("123456789".bytes)
+
+        print(f"${sum}%x")
+        """
+
+    assert_eq(lvd_ran_with("50", program), "cbf43926\n")
+    assert_eq(lvd_ran_with("2000", program), "cbf43926\n")
+end lvd_std_table_ignores_the_program_flag
+
+// A root whose `val` is a table a `const` function fills in a loop: far more than fifty steps.
+private lvd_root() -> string = lbr_tree(lbr_one("squares/lib.sysl", raw"""
+    module squares
+
+    const make_squares() -> [64]int
+        var out: [64]int = [0; 64]
+
+        for i in 0..<64
+            out[i] = i * i
+
+        out
+
+    val table: [64]int = make_squares()
+
+    square(n: int) -> int = table[n]
+    """))
+
+@test("a --lib root's table needing more steps than the program allows still runs")
+lvd_root_table_under_a_small_limit()
+    if !lbr_ready() then return
+
+    val root = lvd_root()
+    val prog = lbr_program("print(squares.square(63))\nprint(squares.table[9])\n")
+    val out_dir = lbr_temp("sysl-lvd-exe")
+
+    for steps in ["50", "1000000"]
+        lbr_hand([root])
+
+        var flag: [2]string = ["--const-steps", steps]
+
+        assert_eq(took_search_flag(flag[..], 0), 2)
+
+        val exe = s"$out_dir/program-$steps"
+
+        val said = build_native_program(prog, None, None, DefaultOptimization, Some(exe)) match
+            Err(why) -> s"refused: ${failure_text(why)}"
+            Ok(made) ->
+                capture(made, [], "", [], true) match
+                    Err(_) -> "the program that was built could not be run"
+                    Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+        reset_search_paths()
+        assert_eq(said, "3969\n81\n")
+
+    remove_dir_all(out_dir).unwrap_or(())
+    lbr_drop([root, prog])
+end lvd_root_table_under_a_small_limit

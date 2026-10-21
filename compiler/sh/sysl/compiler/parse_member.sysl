@@ -14,20 +14,36 @@ import sysl.buf.{Buf, buf}
 
 parse_opaque_struct(p: *Parser, start: Span, vis: Visibility) -> Stmt
     p.bump()
-    parse_struct_decl(p, start, vis, true)
+    parse_struct_decl(p, start, vis, true, at_union_head(p, 0))
 end parse_opaque_struct
 
-parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool) -> Stmt
+// **`union` is a soft word**: it opens a declaration only where a name follows it, so `union(a, b)`
+// and `union[K](a, b)` stay a call and a function of that name -- `sysl.container.set` declares one.
+// Two names side by side are never an expression, so the test needs nothing past the second token.
+at_union_head(p: *Parser, at: usize) -> bool
+    if !p.word_at(at, "union") then return false
+
+    p.peek_at(at + 1) match
+        Ident(_) -> true
+        _ -> false
+end at_union_head
+
+// `opaque union Name`, which the header spells as a union tag with no body.
+at_opaque_union(p: *Parser) -> bool = p.at_word("opaque") && at_union_head(p, 1)
+
+parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool,
+                  union_layout: bool = false) -> Stmt
     p.bump()
 
     val name = parse_bound_name(p)
+    val word = if union_layout then "union" else "struct"
     var tp = no_type_params()
 
     if p.at_kw("[") then tp = parse_type_params(p)
 
     val derives = parse_deriving(p)
 
-    refuse_packs(p, tp, "a struct")
+    refuse_packs(p, tp, s"a $word")
 
     tp = parse_where_on(p, tp)
 
@@ -40,11 +56,22 @@ parse_struct_decl(p: *Parser, start: Span, vis: Visibility, opaque: bool) -> Stm
     decl.opaque = opaque
     decl.tvalues = tp.values
     decl.deriving = derives
+    decl.union_layout = union_layout
 
     if p.block_ahead()
         parse_struct_body(p, &decl)
         accept_end_name(p, name)
+
+        if !decl.anon.is_empty() then refuse_names_across_levels(p, decl)
+
         return stmt(start.to(p.just_taken()), StructDecl(decl))
+    end if
+
+    // A union with no fields has no storage to share, and C refuses `union {}` too.
+    if union_layout && !opaque
+        p.fault(p.here(), s"'union ${name}' declares no fields — a union is storage its fields share, and one with none has nothing to share (C refuses an empty union too). One with no layout of its own is written 'opaque union ${name}'")
+        if at_end_marker(p) then accept_end_name(p, name)
+        return stmt(start.to(p.just_taken()), Bad)
     end if
 
     // A struct with **no fields**, whose emptiness is written rather than inferred from an absence:
@@ -89,16 +116,29 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
 
         val before = p.report.len()
 
-        if refuse_stray_member(p, first, InType) then ()
+        // Only a struct's or a union's body holds an anonymous member, so it is let through here
+        // rather than by `can_begin_member`, which an enum's body asks too.
+        if !at_anonymous_member(p) && refuse_stray_member(p, first, InType) then ()
+        elif at_invariant_clause(p) && decl.union_layout
+            p.fault(p.here(), s"a union states no 'invariant' — nothing records which of '${decl.name}''s fields was written last, so there is no field a clause could be stated over")
+            skip_line(p)
         elif at_invariant_clause(p)
             p.bump()
             decl.invariants.push(parse_expr(p))
-        elif at_field(p)
-            val vis = parse_visibility(p)
-            var field = parse_field_param(p)
+        elif at_anonymous_member(p)
+            parse_anonymous_member(p, decl)
+        elif at_user_annotation(p) && annotations_then(p, at_field)
+            val annots = parse_part_annotations(p, "a field")
 
-            field.vis = vis
-            decl.fields.push(field)
+            if at_field(p)
+                val count = decl.fields.len()
+
+                parse_field_line(p, decl)
+
+                if decl.fields.len() > count then about(annots, decl.fields.at(count).name, &decl.annots)
+            end if
+        elif at_field(p)
+            parse_field_line(p, decl)
         else
             parse_member_line(p, &decl.members, InType)
 
@@ -110,6 +150,56 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
 
     if !p.accept(Dedent) then p.want("dedent")
 end parse_struct_body
+
+// One field of a struct's body, with the `in S` a C bitfield adds.
+private parse_field_line(p: *Parser, decl: *StructDecl)
+    val vis = parse_visibility(p)
+
+    if p.kw_at(1, ":") && p.kw_at(2, "in")
+        parse_zero_width(p, decl, vis)
+        return
+    end if
+
+    var field = parse_field_param(p)
+
+    field.vis = vis
+
+    if p.accept_kw("in")
+        val storage = parse_type(p)
+
+        decl.bits.push(BitInDecl(field.span.to(p.just_taken()), decl.fields.len(), storage, false))
+    end if
+
+    decl.fields.push(field)
+end parse_field_line
+
+// `_: in S`: C's zero-width bitfield `S : 0`, which holds nothing and moves the next field onto a
+// boundary of `S`. It has no width to write, so its field's type is its declared type, and the
+// record marks it as holding nothing.
+private parse_zero_width(p: *Parser, decl: *StructDecl, vis: Visibility)
+    val start = p.here()
+    val name = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    p.bump()
+    p.expect_kw(":")
+    p.expect_kw("in")
+
+    val storage = parse_type(p)
+    val at = start.to(p.just_taken())
+
+    if name != "_"
+        val c = type_text(storage)
+
+        p.fault(at, s"a zero-width bitfield holds nothing, so it has no name: write '_: in $c', C's '$c : 0'")
+        return
+    end if
+
+    decl.bits.push(BitInDecl(at, decl.fields.len(), storage, true))
+    decl.fields.push(Param(at, name, storage, vis, None, false, false))
+end parse_zero_width
 
 // The body of a `type` declaration: its members, and nothing else. A `new` type's value is its base,
 // so there is no field for a line to declare -- and one written as a field is told so, rather than
@@ -146,6 +236,90 @@ parse_type_members(p: *Parser, out: *Buf[MethodDecl], name: string)
 
     accept_end_type(p, named_type(at, name))
 end parse_type_members
+
+// An anonymous `union` or `struct` member (C11). Its body is a declaration of its own, `<Outer>#<n>`,
+// generic over the outer type's parameters and held by a field `#<n>`; neither name can be written in
+// a program, and the outer type answers for the inner one's fields (`anonymous.sysl`).
+private parse_anonymous_member(p: *Parser, decl: *StructDecl)
+    val at = p.here()
+    val is_union = p.at_word("union")
+    val kind = if is_union then "union" else "struct"
+    val n = decl.anon.len() + 1
+    var inner = blank_struct(s"${decl.name}#$n")
+
+    p.bump()
+    inner.tparams = decl.tparams
+    inner.bounds = decl.bounds
+    inner.tvalues = decl.tvalues
+    inner.vis = decl.vis
+    inner.union_layout = is_union
+
+    if !p.block_ahead()
+        p.fault(at, s"an anonymous '$kind' member declares no fields — they are indented under it")
+        return
+    end if
+
+    parse_struct_body(p, &inner)
+    accept_anonymous_end(p, kind)
+
+    if !inner.members.is_empty() || !inner.invariants.is_empty() then
+        p.fault(at, s"an anonymous '$kind' member holds fields only — a method or an 'invariant' belongs to '${decl.name}' itself")
+
+    var args: Buf[TypeRef] = buf()
+
+    for t in decl.tparams
+        args.push(named_type(at, t))
+
+    decl.fields.push(Param(at, s"#$n", type_ref(at, NamedType(inner.name, args)), Public, None, false,
+                           false))
+    decl.anon.push(inner)
+end parse_anonymous_member
+
+// The `end union` / `end struct` an anonymous member may close with.
+private accept_anonymous_end(p: *Parser, kind: string)
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_word("end") && (p.accept_word(kind) || p.accept_kw(kind)) then return
+
+    p.rewind(tokens_at, errors_at)
+end accept_anonymous_end
+
+// C11's rule: an anonymous member's fields are the enclosing type's, so a name may appear once across
+// all the levels. A name twice at one level is the field rule's to refuse.
+private refuse_names_across_levels(p: *Parser, decl: StructDecl)
+    var seen: Buf[string] = buf()
+    var nested: Buf[bool] = buf()
+
+    note_level_names(p, decl, false, &seen, &nested)
+end refuse_names_across_levels
+
+private note_level_names(p: *Parser, decl: StructDecl, inside: bool, seen: *Buf[string],
+                         nested: *Buf[bool])
+    for f in decl.fields
+        if f.name.starts_with("#")
+            for inner in decl.anon
+                if inner.name == s"${decl.name}${f.name}" then
+                    note_level_names(p, inner, true, seen, nested)
+
+            continue
+        end if
+
+        for i in 0..<seen.len()
+            if seen.at(i) == f.name && (inside || nested.at(i))
+                p.fault(f.span, s"'${f.name}' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels")
+                break
+            end if
+
+        seen.push(f.name)
+        nested.push(inside)
+end note_level_names
+
+// A line that is exactly `union` or `struct`, which in C11 opens an anonymous member.
+private at_anonymous_member(p: *Parser) -> bool =
+    (p.at_word("union") || p.at_kw("struct")) && p.peek_at(1) == Newline
 
 // `invariant cond` inside a type's body. The word is contextual, so a field called `invariant` is
 // told apart by the `:` that follows it.
@@ -244,8 +418,20 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         if refuse_stray_member(p, first, InType) then ()
         elif refuse_reserved_variant(p) then ()
         elif refuse_positional_payload(p) then ()
+        elif at_user_annotation(p) && annotations_then(p, at_enum_variant)
+            val annots = parse_part_annotations(p, "a variant")
+
+            if at_enum_variant(p)
+                val variant = parse_enum_variant(p, &decl.annots)
+
+                about(annots, variant.name, &decl.annots)
+                decl.variants.push(variant)
+
+                if p.report.len() == before && !(p.at(Newline) || p.at(Dedent) || p.at(Eof))
+                    p.want("dedent")
+            end if
         elif at_enum_variant(p)
-            decl.variants.push(parse_enum_variant(p))
+            decl.variants.push(parse_enum_variant(p, &decl.annots))
 
             // A variant is the whole of its line, so anything after it is where the body ended:
             // `B x` is not a second variant on the same line but a missing dedent at the `x`.
@@ -395,8 +581,10 @@ private at_enum_variant(p: *Parser) -> bool
             !(p.peek_at(3) == Newline && p.peek_at(4) == Indent)
     end if
 
-    if !names_a_field(p.peek_at(2)) then return false
-    if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
+    // An annotation before the first field is a payload's: a parameter carries none.
+    if !p.kw_at(2, "@")
+        if !names_a_field(p.peek_at(2)) then return false
+        if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
 
     // **A variant's named payload and an ASSOCIATED FUNCTION's parameter list are spelled the same
     // as far as the closing bracket**, so what settles it is what comes after one: a result type, an
@@ -434,7 +622,7 @@ end past_parameters
 // one nothing in any corpus writes, and a bound is what keeps the lookahead from walking a file.
 private const ParameterLookahead: usize = 256
 
-private parse_enum_variant(p: *Parser) -> EnumVariantDecl
+private parse_enum_variant(p: *Parser, into: *Buf[AnnotUse]) -> EnumVariantDecl
     val start = p.here()
     val name = parse_bound_name(p)
 
@@ -459,12 +647,18 @@ private parse_enum_variant(p: *Parser) -> EnumVariantDecl
 
     if !p.at_kw(")")
         loop
-            fields.push(parse_field_param(p))
+            // A payload's field carries the program's annotations as a struct's does, written before
+            // it -- on its own line where the payload spans several. They are about `Variant.field`.
+            val annots = parse_part_annotations(p, "a payload's field")
+            val field = parse_field_param(p)
+
+            about(annots, s"$name.${field.name}", into)
+            fields.push(field)
 
             if !p.accept_kw(",") then break
             // A comma may trail the last field, so what follows one is a field only where it could
             // name one; anything else is where the bracket should have closed.
-            if !names_a_field(p.peek()) then break
+            if !names_a_field(p.peek()) && !p.at_kw("@") then break
 
     p.expect_kw(")")
     EnumVariantDecl(start.to(p.just_taken()), name, None, fields)
@@ -498,9 +692,11 @@ parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     decl.tvalues = tp.values
 
     // **A trait with supertraits and nothing else is a name for the union of them**, so its body is
-    // optional where it has any and required where it has none.
+    // optional where it has any. Where it has none, the emptiness is written as a struct's is -- an
+    // `end Name` and nothing between -- which is how a trait whose membership the compiler settles,
+    // and which declares nothing, is spelled.
     if !p.block_ahead()
-        if supers.is_empty() then p.want("indent")
+        if supers.is_empty() && !at_end_marker(p) then p.want("indent")
 
         accept_end_name(p, name)
         return stmt(start.to(p.just_taken()), TraitDecl(decl))
@@ -519,6 +715,10 @@ parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
 
         if refuse_stray_member(p, first, InTrait) then ()
         elif at_assoc(p) then decl.assocs.push(parse_assoc_decl(p))
+        elif at_derive_member(p)
+            parse_derive_member(p) match
+                Some(d) -> decl.derives.push(d)
+                None -> ()
         else parse_member_line(p, &decl.methods, InTrait)
 
         if p.report.len() != before && !p.end_of_statement() then drop_line(p)
@@ -529,11 +729,180 @@ parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
 
     if !p.accept(Dedent) then p.want("dedent")
 
+    check_derive_members(p, decl)
     accept_end_name(p, name)
     stmt(start.to(p.just_taken()), TraitDecl(decl))
 end parse_trait_decl
 
 private at_assoc(p: *Parser) -> bool = p.at_kw("type") && !at_reserved_member_head(p)
+
+// `derive[T] name(` -- a `derive` member, told apart from a member *named* `derive` by the name that
+// follows its bracket: `derive[T](self)` is a generic method of that name.
+private at_derive_member(p: *Parser) -> bool
+    if !p.at_word("derive") || !p.kw_at(1, "[") then return false
+
+    var depth: int = 0
+    var i: usize = 1
+
+    while i < ParameterLookahead
+        if p.peek_at(i) == Eof then return false
+
+        if p.kw_at(i, "[") then depth += 1
+        else if p.kw_at(i, "]")
+            depth -= 1
+
+            if depth == 0
+                return p.peek_at(i + 1) match
+                    Ident(_) -> true
+                    _ -> false
+        end if
+
+        i += 1
+
+    false
+end at_derive_member
+
+// `derive[T] encode(self: T, w: *Writer)` and its body. **The subject comes first and is named
+// `self`**, typed as the one parameter, `*` it or `&` it -- which is the receiver the member an
+// `impl` would have written takes -- and the rest of the list is that member's.
+private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
+    val start = p.here()
+
+    p.bump()
+
+    val tp = parse_type_params(p)
+    val name = parse_bound_name(p)
+
+    if tp.names.len() != 1 || !tp.values.is_empty() || !tp.packs.is_empty()
+        p.fault(start, "a 'derive' member takes one type parameter, which stands for the type that " +
+                s"derives the trait — write 'derive[T] $name(self: T, …)'")
+        skip_line(p)
+        return None
+    end if
+
+    val param = tp.names.at(0)
+
+    if !tp.bounds.is_empty()
+        p.fault(start, s"'$param' stands for the type that derives the trait, which the 'derives' " +
+                "clause names, so it takes no bound — a field's type is asked what it can do with " +
+                "'if const f::Type: Trait'")
+        skip_line(p)
+        return None
+    end if
+
+    var decl = blank_method(start, name)
+
+    if !p.expect_kw("(")
+        skip_line(p)
+        return None
+    end if
+
+    val mode = derive_receiver(p, param)
+
+    if mode.is_none()
+        p.fault(p.here(), s"a 'derive' member takes the deriving type first, as 'self: $param' (or " +
+                s"'self: *$param', 'self: &$param') — it is the receiver of the member it writes")
+        skip_line(p)
+        return None
+    end if
+
+    decl.receiver = mode
+
+    loop
+        if !p.accept_kw(",") then break
+        if p.at_kw(")") then break
+
+        decl.params.push(parse_func_param(p))
+
+    p.expect_kw(")")
+
+    if p.accept_kw("->") then decl.ret_type = Some(parse_result_type(p))
+
+    if !p.at_kw("=") && !p.block_ahead()
+        p.fault(p.here(), s"a 'derive' member is the body the trait writes for '$name', so it has one")
+        return None
+    end if
+
+    decl.body = parse_func_body(p)
+    accept_end_name(p, name)
+    decl.span = start.to(p.just_taken())
+    decl.named_at = decl.span
+    Some(DeriveDecl(param, decl))
+end parse_derive_member
+
+// `self: T`, `self: *T`, `self: &T` -- the receiver the deriving type is taken by, or nothing where
+// the list does not open that way.
+private derive_receiver(p: *Parser, param: string) -> Option[RecvMode]
+    if !p.at_kw("self") || !p.kw_at(1, ":") then return None
+
+    p.bump()
+    p.bump()
+
+    val written = parse_type(p)
+
+    *written.kind match
+        NamedType(n, args) -> if n == param && args.is_empty() then Some(ByValue) else None
+        PtrType(inner) -> *inner.kind match
+            NamedType(n, args) -> if n == param && args.is_empty() then Some(ByPtr) else None
+            _ -> None
+        RefType(inner, _) -> *inner.kind match
+            NamedType(n, args) -> if n == param && args.is_empty() then Some(ByRef(false)) else None
+            _ -> None
+        _ -> None
+end derive_receiver
+
+// Every `derive` member writes a member the trait declares, taking its receiver the way that member
+// does and as many parameters: it is that member's body for one type, so a `derive` with nothing to
+// stand for, or with another shape, is a mistake in the trait rather than in each type deriving it.
+private check_derive_members(p: *Parser, decl: TraitDecl)
+    var seen: Buf[string] = buf()
+
+    for d in decl.derives
+        val m = d.member
+        var declared: Option[MethodDecl] = None
+
+        for tm in decl.methods
+            if tm.name == m.name then declared = Some(tm)
+
+        if declared.is_none()
+            p.fault(m.span, s"'derive' writes the body of a member trait '${decl.name}' declares, and it " +
+                    s"declares no '${m.name}' — declare '${m.name}' in the trait, then derive it")
+            continue
+        end if
+
+        if holds_derive(seen, m.name)
+            p.fault(m.span, s"'${m.name}' is derived twice in trait '${decl.name}' — one 'derive' " +
+                    "member writes it for every type")
+            continue
+        end if
+
+        seen.push(m.name)
+
+        if holds_derive(decl.tparams, d.param)
+            p.fault(m.span, s"'${d.param}' is already a parameter of trait '${decl.name}' — the " +
+                    "'derive' member's parameter stands for the deriving type, so it takes a name of " +
+                    "its own")
+            continue
+        end if
+
+        val tm = declared.unwrap()
+
+        if tm.is_property || !same_receiver(tm.recv_mode(), m.receiver)
+            p.fault(m.span, s"'derive' member '${m.name}' takes its receiver differently from the " +
+                    s"'${m.name}' trait '${decl.name}' declares — 'self: ${d.param}' is 'self', " +
+                    s"'self: *${d.param}' is '*self' and 'self: &${d.param}' is '&self'")
+        else if tm.params.len() != m.params.len()
+            p.fault(m.span, s"'derive' member '${m.name}' takes ${m.params.len()} parameters after " +
+                    s"'self', but trait '${decl.name}' declares ${tm.params.len()}")
+        end if
+end check_derive_members
+
+private holds_derive(seen: Buf[string], name: string) -> bool
+    for item in seen
+        if item == name then return true
+
+    false
+end holds_derive
 
 // `type Item: Display` -- the associated type an implementation supplies.
 private parse_assoc_decl(p: *Parser) -> AssocDecl
@@ -570,6 +939,8 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
 
     var trait_name = ""
     var trait_args: Buf[TypeRef] = buf()
+    var for_type = named_type(p.here(), "")
+    val head_at = p.here()
 
     // `impl Fn(int) -> int for F` -- the callable trait, written as the type it stands for.
     if p.at_word("Fn") && p.kw_at(1, "(")
@@ -590,9 +961,17 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
         if p.at_kw("[") then trait_args = parse_type_args(p)
     end if
 
-    p.expect_kw("for")
-
-    val for_type = parse_type(p)
+    // **A block naming no trait adds the type's own members** -- `impl[F: Float] Quaternion[F]` --
+    // so what was read as the trait is the type, and the trait is left empty for the hoisting pass
+    // to tell the two kinds apart by.
+    if trait_name != "" &&!fn_is_call(trait_name) && !p.at_kw("for")
+        for_type = type_ref(head_at.to(p.just_taken()), NamedType(trait_name, trait_args))
+        trait_name = ""
+        trait_args = buf()
+    else
+        p.expect_kw("for")
+        for_type = parse_type(p)
+    end if
 
     tp = parse_where_on(p, tp)
 
@@ -618,9 +997,11 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
 
             val before = p.report.len()
 
-            if refuse_stray_member(p, first, InImpl) then ()
+            val site = if trait_name == "" then InOwnImpl else InImpl
+
+            if refuse_stray_member(p, first, site) then ()
             elif at_assoc(p) then decl.assocs.push(parse_assoc_bind(p))
-            else parse_member_line(p, &decl.methods, InImpl)
+            else parse_member_line(p, &decl.methods, site)
 
             if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
@@ -717,8 +1098,12 @@ enum MemberSite
     // member an implementation must supply.
     InTrait
 
-    // An `impl` block's: no visibility either, and `override` is written here and nowhere else.
+    // A trait implementation's: no visibility either, and `override` is written here and nowhere else.
     InImpl
+
+    // An inherent `impl` block's: the members are the type's own exactly as its body's are, so one
+    // may be `private`, and `override` is written here as in any `impl`.
+    InOwnImpl
 end MemberSite
 
 // One line of a type's body that is neither a field, a variant nor an invariant.
@@ -774,7 +1159,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
     var vis = Public
 
     if p.at_kw("private")
-        if site != InType
+        if site != InType && site != InOwnImpl
             // The complaint sits on what the word was written in front of, as the reference has it.
             p.bump()
             p.fault(p.here(), "a trait's members and an 'impl' block's carry no visibility of their own — a trait's member is as visible as the trait, and an implementation supplies what the trait asked for")
@@ -788,7 +1173,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
     var overrides = false
 
     if p.at_kw("override")
-        if site != InImpl
+        if site != InImpl && site != InOwnImpl
             // The complaint sits on what the word was written in front of, as the reference has it.
             p.bump()
             p.fault(p.here(), "'override' says a member replaces a body its trait supplied, and it is written on that member inside the 'impl' block — a trait's own member is where a default is written rather than replaced, and a member of a type's body implements no trait")
@@ -833,12 +1218,43 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
             member.const_fn = marked_const
             apply_member_attrs(&member, attrs)
 
+            if member.marks.views then check_views_member(p, member)
+
+            // What a call takes is what its receiver held, so a member called on nothing takes nothing.
+            if member.marks.consumes && member.recv_mode().is_none() then
+                p.fault(member.named_at, s"'@consumes' says a call to '${member.name}' takes " +
+                        "everything its receiver holds, and it has none — it takes no 'self'")
+
             // **A property is read, not called**, so there is no call for a task to come out of.
             if async_at.is_some() then mark_async_member(p, &member, async_at.unwrap())
 
             out.push(member)
         None -> ()
 end parse_member_line
+
+// `@views(self)` is a statement about a view a member hands back of its own receiver, so the member
+// needs both: a receiver, and a written result that is a view -- `[]T`, `[]const T` or a `string`.
+// **Narrow on purpose**: a view inside a struct or an `Option` would need the borrow carried through
+// a type, and nothing here puts a borrow in a type.
+private check_views_member(p: *Parser, m: MethodDecl)
+    if m.recv_mode().is_none()
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "what it is called on, and it is called on nothing — it takes no 'self'")
+        return
+    end if
+
+    val is_view = m.ret_type match
+        Some(t) -> *t.kind match
+            ArrayType(length, _, _) -> length.is_none()
+            NamedType(n, args) -> n == "string" && args.is_empty()
+            _ -> false
+        None -> false
+
+    if !is_view then
+        p.fault(m.named_at, s"'@views(self)' says the view '${m.name}' answers is borrowed from " +
+                "its receiver, so it marks a member whose result is a view — '[]T', '[]const T' " +
+                "or 'string'")
+end check_views_member
 
 // An `async` member: a method's result becomes the task its call hands back. **A property is read,
 // not called**, so there is no call for a task to come out of, and it is refused at the word.
@@ -893,6 +1309,7 @@ private parse_member_named(p: *Parser, start: Span, site: MemberSite,
     end if
 
     if p.at_kw("->") then return Some(parse_property_tail(p, start, name, signatures))
+    if p.at_kw("=") && !signatures then return Some(parse_inferred_property(p, start, name, false))
 
     p.want(if site == InType then "':'" else "'->'")
     None
@@ -988,6 +1405,8 @@ private parse_static_member(p: *Parser, start: Span, signatures: bool) -> Method
         return bad
     end if
 
+    if p.at_kw("=") && !signatures then return parse_inferred_property(p, start, name, true)
+
     p.expect_kw("->")
 
     var decl = blank_method(start, name)
@@ -1040,6 +1459,10 @@ private parse_method_tail(p: *Parser, start: Span, name: string, params: TypePar
     decl.tvalues = tp.values
     decl.tpacks = tp.packs
 
+    // A trait's member is a signature every implementation is held to, so what it hands back is
+    // what it writes; a member of a type or an `impl` block reads a result left off its `= value`.
+    if !signatures then decl.ret_type = inferred_unless_written(p, decl.ret_type)
+
     if !signatures || p.at_kw("=") || p.block_ahead()
         decl.body = parse_func_body(p)
         accept_end_name(p, name)
@@ -1070,6 +1493,22 @@ private parse_property_tail(p: *Parser, start: Span, name: string,
     decl.span = start.to(p.just_taken())
     decl
 end parse_property_tail
+
+// `count = self.n` -- a property whose type is its body's, read exactly as a function's `= value` is
+// (`inferred_unless_written`). **Only where a body is owed**: a trait's property is a signature every
+// implementation is held to, so there the line is still a property missing its `->`. An enum's body
+// never reaches here with `name = value`, which is a variant and its discriminant.
+private parse_inferred_property(p: *Parser, start: Span, name: string, is_static: bool) -> MethodDecl
+    var decl = blank_method(start, name)
+
+    decl.is_property = true
+    decl.is_static = is_static
+    decl.ret_type = inferred_unless_written(p, None)
+    decl.body = parse_func_body(p)
+    accept_end_name(p, name)
+    decl.span = start.to(p.just_taken())
+    decl
+end parse_inferred_property
 
 // `sync self` after the `&`, which is the receiver a synchronized method takes.
 private at_sync_self(p: *Parser) -> bool = p.peek_at(1) match

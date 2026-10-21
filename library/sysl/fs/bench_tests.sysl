@@ -26,7 +26,24 @@ private extern "fread" bench_fread(p: *u8, size: usize, n: usize, f: *u8) -> usi
 private extern "fwrite" bench_fwrite(p: *u8, size: usize, n: usize, f: *u8) -> usize
 private extern "fclose" bench_fclose(f: *u8) -> int
 
-private val bench_file: string = "/tmp/sysl-fs-bench"
+// The file one test's workloads write and read: in a directory of that test's own, since the suite
+// runs its tests several at once and two of these sharing one file would read each other's bytes.
+private bench_file() -> string = s"${make_temp_dir("sysl-fs-bench").unwrap()}/bench"
+
+// The same path NUL-terminated for C, kept alive by the caller across the call.
+private bench_c_path(path: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for b in path.bytes do out.push(b)
+
+    out.push(0)
+    out
+end bench_c_path
+
+// The file and the directory it was made in, both gone.
+private bench_done(path: string)
+    remove_file(path).unwrap()
+    remove_dir(path[0..<path.len - 6]).unwrap()
 
 private const bench_rounds: usize = 7
 
@@ -56,15 +73,17 @@ impl Reader for Stdio
 
         into[0..<bench_fread(&into[0], 1, into.len, self.h)]
 
-private stdio_write_text(text: string)
-    val h = bench_fopen(c"/tmp/sysl-fs-bench", c"wb")
+private stdio_write_text(path: string, text: string)
+    val c_path = bench_c_path(path)
+    val h = bench_fopen(&c_path.view()[0], c"wb")
 
     bench_fwrite(&text.bytes[0], 1, text.bytes.len, h)
     bench_fclose(h)
 end stdio_write_text
 
-private stdio_small_writes()
-    val h = bench_fopen(c"/tmp/sysl-fs-bench", c"wb")
+private stdio_small_writes(path: string)
+    val c_path = bench_c_path(path)
+    val h = bench_fopen(&c_path.view()[0], c"wb")
     val line = bench_line()
 
     for i in 0..<65536 do bench_fwrite(&line.bytes[0], 1, line.bytes.len, h)
@@ -73,8 +92,9 @@ private stdio_small_writes()
 end stdio_small_writes
 
 // What `read_text` was: chunks from the stream, grown into a buffer, decoded at the end.
-private stdio_read_text() -> usize
-    var s = Stdio(bench_fopen(c"/tmp/sysl-fs-bench", c"rb"))
+private stdio_read_text(path: string) -> usize
+    val c_path = bench_c_path(path)
+    var s = Stdio(bench_fopen(&c_path.view()[0], c"rb"))
     var out: Buf[u8] = buf()
     var chunk: []u8 = [0; 8192]
 
@@ -92,8 +112,9 @@ private stdio_read_text() -> usize
         Err(_) -> 0
 end stdio_read_text
 
-private stdio_lines() -> usize
-    var s = Stdio(bench_fopen(c"/tmp/sysl-fs-bench", c"rb"))
+private stdio_lines(path: string) -> usize
+    val c_path = bench_c_path(path)
+    var s = Stdio(bench_fopen(&c_path.view()[0], c"rb"))
     var n: usize = 0
 
     for l in lines(&s) do n += 1
@@ -102,8 +123,8 @@ private stdio_lines() -> usize
     n
 end stdio_lines
 
-private ours_small_writes()
-    var f = create(bench_file).unwrap()
+private ours_small_writes(path: string)
+    var f = create(path).unwrap()
     val line = bench_line()
 
     for i in 0..<65536 do f.write(line.bytes)
@@ -111,8 +132,8 @@ private ours_small_writes()
     f.close().unwrap()
 end ours_small_writes
 
-private ours_lines() -> usize
-    var f = open(bench_file).unwrap()
+private ours_lines(path: string) -> usize
+    var f = open(path).unwrap()
     var n: usize = 0
 
     for l in lines(&f) do n += 1
@@ -134,6 +155,7 @@ end bench_holds
 
 @test("writing a whole file of a few MB is as fast as C's stdio")
 bench_write_text()
+    val path = bench_file()
     val text = bench_text()
 
     var ours: long = 1000000000
@@ -142,11 +164,11 @@ bench_write_text()
     for r in 0..<bench_rounds
         val t0 = monotonic().us
 
-        for i in 0..<4 do write_text(bench_file, text).unwrap()
+        for i in 0..<4 do write_text(path, text).unwrap()
 
         val t1 = monotonic().us
 
-        for i in 0..<4 do stdio_write_text(text)
+        for i in 0..<4 do stdio_write_text(path, text)
 
         val t2 = monotonic().us
 
@@ -154,22 +176,24 @@ bench_write_text()
         if t2 - t1 < theirs then theirs = t2 - t1
 
     bench_holds("write_text of 4 MiB, four times", ours, theirs)
-    remove_file(bench_file).unwrap()
+    bench_done(path)
 end bench_write_text
 
 @test("many small writes are as fast as C's stdio")
 bench_small_writes()
+    val path = bench_file()
+
     var ours: long = 1000000000
     var theirs: long = 1000000000
 
     for r in 0..<bench_rounds
         val t0 = monotonic().us
 
-        ours_small_writes()
+        ours_small_writes(path)
 
         val t1 = monotonic().us
 
-        stdio_small_writes()
+        stdio_small_writes(path)
 
         val t2 = monotonic().us
 
@@ -177,12 +201,14 @@ bench_small_writes()
         if t2 - t1 < theirs then theirs = t2 - t1
 
     bench_holds("65536 writes of one line", ours, theirs)
-    remove_file(bench_file).unwrap()
+    bench_done(path)
 end bench_small_writes
 
 @test("reading a whole file of a few MB is as fast as C's stdio")
 bench_read_text()
-    write_text(bench_file, bench_text()).unwrap()
+    val path = bench_file()
+
+    write_text(path, bench_text()).unwrap()
 
     var ours: long = 1000000000
     var theirs: long = 1000000000
@@ -190,9 +216,9 @@ bench_read_text()
 
     for r in 0..<bench_rounds
         val t0 = monotonic().us
-        val a = read_text(bench_file).unwrap().bytes.len
+        val a = read_text(path).unwrap().bytes.len
         val t1 = monotonic().us
-        val b = stdio_read_text()
+        val b = stdio_read_text(path)
         val t2 = monotonic().us
 
         sizes = (a, b)
@@ -202,12 +228,14 @@ bench_read_text()
 
     assert_eq(sizes.0, sizes.1)
     bench_holds("read_text of 4 MiB", ours, theirs)
-    remove_file(bench_file).unwrap()
+    bench_done(path)
 end bench_read_text
 
 @test("reading a few MB a line at a time is as fast as C's stdio")
 bench_lines()
-    write_text(bench_file, bench_text()).unwrap()
+    val path = bench_file()
+
+    write_text(path, bench_text()).unwrap()
 
     var ours: long = 1000000000
     var theirs: long = 1000000000
@@ -215,9 +243,9 @@ bench_lines()
 
     for r in 0..<bench_rounds
         val t0 = monotonic().us
-        val a = ours_lines()
+        val a = ours_lines(path)
         val t1 = monotonic().us
-        val b = stdio_lines()
+        val b = stdio_lines(path)
         val t2 = monotonic().us
 
         counts = (a, b)
@@ -228,5 +256,5 @@ bench_lines()
     assert_eq(counts.0, counts.1)
     assert(counts.0 > 60000, "the lines were not all read")
     bench_holds("lines over 4 MiB", ours, theirs)
-    remove_file(bench_file).unwrap()
+    bench_done(path)
 end bench_lines

@@ -15,6 +15,21 @@ import sysl.math.bigint.{BigInt, from_int}
 // A member read off a value, where the value is one the compiler knows the shape of.
 field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
            expected: Option[Type]) -> TExpr
+    // `v.(f)` -- the field or variant a `for const` over a type's make-up stands at. The parser
+    // keeps the selector in its parentheses, which no field name has.
+    if name.starts_with("(") then
+        return reflected_select(cx, span, receiver, name[1..<name.bytes.len - 1])
+
+    // `f.name` -- a field of the descriptor a copy of such a walk stands at, which the substitution
+    // holds as a type parameter is held and is nonetheless a value.
+    if names_descriptor(cx.subst, receiver)
+        val held = type_expr_bare(cx, receiver)
+
+        return texpr_type(held) match
+            Struct(d) -> struct_field(cx, span, held, d, name, expected)
+            _ -> held
+    end if
+
     // A module path folded into a name -- `m.limit` is one name and not a member read.
     // Storage read through another module is an edge of the module graph, made at the member's name.
     cx.an.tables.reference_at = Span(span.end - name.bytes.len, span.end)
@@ -55,7 +70,7 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     // A bare variant reached through the **module** that declares it rather than through its enum --
     // `inflate.BadBlock`, which is the one spelling available to a file that imported the module and
     // not the name.
-    val in_module = module_variant(cx, span, receiver, name)
+    val in_module = module_variant(cx, span, receiver, name, expected)
 
     if in_module.is_some() then return in_module.unwrap()
 
@@ -147,6 +162,33 @@ private beyond_one_level(cx: &Analyzer, span: Span, outer: TExpr, tr: TExpr, nam
            s"'$name' off the ${type_show(left)} it leaves")
 end beyond_one_level
 
+// The selection of a field an anonymous member holds: one `TField` per level, the last one's
+// qualifier taken off as a direct field's is.
+private through_anonymous(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
+                          path: Buf[int]) -> TExpr
+    var at = tr
+    var level = d
+
+    for k in 0..<path.len()
+        val i = path.at(k)
+        val t = level.fields.at(usize(i)).1
+
+        if k + 1 == path.len()
+            if !field_visible(cx, level.base, name) then
+                return cx.err(span, field_out_of_reach(cx, level.base, name))
+
+            at = TExpr(span, TField(at, i, unqualified(t)))
+        else
+            at = TExpr(span, TField(at, i, t))
+
+            t match
+                Struct(next) -> level = next
+                _ -> ()
+        end if
+
+    at
+end through_anonymous
+
 // A struct's field, by the index the declaration gave it. A tuple's parts are named for their
 // positions, so `t.0` arrives here as an ordinary field selection.
 private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
@@ -162,9 +204,33 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
         if !field_visible(cx, d.base, name) then
             return cx.err(span, field_out_of_reach(cx, d.base, name))
 
+        // An unnamed bitfield is C's `S : W`: it holds the place of bits nothing reads.
+        if unnamed_c_bit(d, usize(idx)) then
+            return cx.err(span, s"'${type_show(Struct(d))}' has no field named '_' — an unnamed bitfield " +
+                          "only moves the fields after it, and nothing reads or writes it")
+
+        // A `volatile` bitfield is reached by one access of its declared type's width, and under
+        // `@packed` one may lie across two such units, where there is no single access to make.
+        if d.c_bit(usize(idx)).is_some() && volatile_in(d.fields.at(usize(idx)).1) &&
+           c_volatile_unit(cx.an.tables.layout, d, usize(idx)).is_none() then
+            return cx.err(span, s"'${type_show(Struct(d))}.$name' is a 'volatile' bitfield that lies across " +
+                          "two units of its declared type in a '@packed' struct — a volatile access is " +
+                          "exactly one unit, and no one unit holds it")
+
         // Whatever qualifier the field was declared with stays in the struct's field list and comes
         // off here: reading a register yields an ordinary value.
         return TExpr(span, TField(tr, idx, unqualified(d.fields.at(usize(idx)).1)))
+
+    // A field an anonymous member holds is the outer type's own to name (`anonymous.sysl`), so the
+    // selection is the chain of fields down to it.
+    val through = anonymous_path(d, name)
+
+    if !through.is_empty()
+        if !layout_known(cx.an, cx.scope, span, d.base, qualified_name(d.base)) then
+            return bad_expr(span)
+
+        return through_anonymous(cx, span, tr, d, name, through)
+    end if
 
     // A **compile-time constant** selects a part by its value, which is what makes one written line
     // cover parts of different types inside a `for const`. It is the same selection `t.0` already
@@ -540,11 +606,15 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
     // carries nothing to solve from, so where the position says nothing there is nothing to say.
     val settled = variant_from_expected(cx, name, expected)
 
-    if settled.is_some() then
-        return TExpr(span, TEnumNew(settled.unwrap().0, settled.unwrap().1, buf()))
-
     // The member's own name, which is what each refusal below is about.
     val named_at = Span(span.end - name.bytes.len, span.end)
+
+    // **The position settling the enum settles nothing about what the variant carries**: one with a
+    // payload is refused here exactly as it is where the enum's own instantiation answers below.
+    if settled.is_some()
+        if settled.unwrap().1.carries then return carries_data(cx, named_at, name)
+
+        return TExpr(span, TEnumNew(settled.unwrap().0, settled.unwrap().1, buf()))
 
     // **A name that is not a variant is asked of the DECLARATION**, generic or not: whether the enum
     // has parameters says which instantiation a variant would build, and nothing about a name it
@@ -673,9 +743,13 @@ private module_path(cx: &Analyzer, receiver: Expr, name: string) -> Option[strin
 // what it can write -- the enum need not be named, and often is not exported under a name worth
 // writing.
 //
-// The module says which enum is meant, so the variant is read against that instantiation rather
-// than against whatever the position expected.
-private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) -> Option[TExpr]
+// The module says which enum is meant, so the variant is read against that enum rather than against
+// whatever the position expected. **Which instantiation of it is the position's to say** where the
+// position expects that very enum: a generic enum has one instantiation per argument list, and the
+// first one recorded -- `Box[T]` itself, where any generic body in its module matched on the variant
+// -- is not the `Box[int]` a `val c: g.Box[int] = g.Empty` asked for.
+private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                       expected: Option[Type]) -> Option[TExpr]
     val head = dotted_name_written(cx, receiver)
 
     if head.is_none() then return None
@@ -696,8 +770,13 @@ private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) 
         t match
             Enum(d) ->
                 if module_of(d.base) == owner.unwrap() && reachable_key(cx.an, d.base, cx.scope) &&
-                        d.variant(name).is_some() then
-                    return named_variant_expr(cx, span, name, Some(t))
+                        d.variant(name).is_some()
+                    val wanted = expected match
+                        Some(Enum(e)) -> if e.base == d.base then expected else Some(t)
+                        _ -> Some(t)
+
+                    return named_variant_expr(cx, span, name, wanted)
+                end if
             _ -> ()
 
     None
@@ -821,10 +900,10 @@ with_expr(cx: &Analyzer, span: Span, word: Span, base: Expr, fields: Buf[WithFie
           expected: Option[Type]) -> TExpr
     // Asked speculatively: a base that does not analyze at all has a complaint of its own, and the
     // desugaring below reaches it in its own position rather than having it reported here.
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
     val probed = texpr_type(type_expr(cx, base, None))
 
-    cx.an.release(mark)
+    discard_trial(cx, tried)
 
     if probed != Unknown
         repr(probed) match

@@ -1,0 +1,176 @@
+module sh.sysl.compiler
+@tests
+
+// **References while compiling**: a box, a pointer to a local, an element or a field, and a write
+// through either -- each seen wherever else the storage is held, as the program sees it -- and the
+// refusals of what depends on the program running: an address read as a number, memory read as
+// another type, a box whose `drop` counts would decide, and a pointer that outlives its call.
+
+@test("a box and a pointer to a local, an element or a field are run while compiling")
+cte_references_run_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct P
+            x: int
+            y: int
+
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        bump(p: *int)
+            *p += 1
+
+        boxes() -> int
+            var r: &P = P(1, 2)
+            r.x = 5
+            val q = &r.y
+            *q = 7
+            val s = r
+            s.x += 10
+            r.x + r.y
+
+        locals() -> int
+            var n = 3
+            bump(&n)
+            bump(&n)
+            var a: [3]int = [1, 2, 3]
+            val p = &a[1]
+            *p = 20
+            bump(&a[2])
+            n + a[0] + a[1] + a[2]
+
+        listed(k: int) -> int
+            var head: Option[&Node] = None
+
+            for i in 0..<k
+                head = Some(Node(i, head))
+
+            var total = 0
+            var cur = head
+
+            while cur is Some(n)
+                total += n.v
+                cur = n.next
+
+            total
+
+        same() -> bool
+            val a: &P = P(1, 2)
+            val b = a
+            val c: &P = P(1, 2)
+            a == b && a != c
+
+        fresh() -> &P = P(1, 2)
+
+        unshared() -> int
+            val a = fresh()
+            val b = fresh()
+            a.x = 9
+            b.x
+
+        const B: int = boxes()
+        const L: int = locals()
+        const N: int = listed(5)
+        const S: bool = same()
+        const U: int = unshared()
+
+        var five = 5
+
+        print(B, L, N, S, U)
+        print(B == boxes(), L == locals(), N == listed(five), S == same(), U == unshared())
+        """), "22 30 10 true 1\ntrue true true true true\n")
+end cte_references_run_while_compiling
+
+@test("a pointer that outlives its call, an address as a number, a box with a 'Drop', and null are refused")
+cte_reference_refusals()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct Q
+            p: *int
+
+        struct T
+            v: int
+
+        impl Drop for T
+            drop(self)
+                print("gone")
+
+        leak() -> Q
+            var x = 1
+            Q(&x)
+
+        use() -> int = *leak().p
+
+        num() -> bool
+            var x = 1
+            val p = &x
+            usize(p) > 0
+
+        make() -> int
+            val t: &T = T(3)
+            t.v
+
+        nul() -> int
+            val p: *int = null
+            *p
+
+        const A: int = use()
+        const B: bool = num()
+        const C: int = make()
+        const D: int = nul()
+
+        print(A, B, C, D)
+        """).0
+
+    for part in ["'A' cannot be computed while compiling: 'leak' answers a slice of, or a pointer to, storage " +
+                 "local to its call, which ends when the call returns — what is answered while compiling may " +
+                 "reach only what its caller handed in, the heap, or module storage (main.sysl:15:17) — " +
+                 "inside 'use()'",
+                 "'B' cannot be computed while compiling: it calls 'num', which converts a pointer — an " +
+                 "address exists only when the program runs",
+                 "'C' cannot be computed while compiling: a box of a 'T', which has a 'Drop', is not made " +
+                 "while compiling — its 'drop' runs when the last share of the box goes, and when that is, is " +
+                 "decided by counts kept only when the program runs (main.sysl:23:17) — inside 'make()'",
+                 "'D' traps while it is being compiled: a read or write through a null pointer " +
+                 "(main.sysl:28:6) — inside 'nul()'"]
+        assert(said.contains(part), said)
+end cte_reference_refusals
+
+@test("memory read as another type and a weak reference are refused, each for what it depends on")
+cte_reinterpreting_and_weak_are_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct A
+            v: int
+
+        struct P
+            x: int
+
+        pun() -> u32
+            var a = A(1)
+            val p: *u32 = ptr_cast(&a)
+            *p
+
+        weakly() -> bool
+            val a: &P = P(1)
+            val w: weak P = a
+            w.get().is_some()
+
+        const K: u32 = pun()
+        const W: bool = weakly()
+
+        print(K, W)
+        """).0
+
+    for part in ["'K' cannot be computed while compiling: memory a '*A' points at, read as another type, is not " +
+                 "evaluated while compiling — the evaluator holds values, not the bytes they are laid out in " +
+                 "(main.sysl:10:6) — inside 'pun()'",
+                 "'W' cannot be computed while compiling: it calls 'weakly', which uses a 'weak P' — a weak " +
+                 "reference answers whether its object is still alive, which is decided by counts kept only " +
+                 "when the program runs"]
+        assert(said.contains(part), said)
+end cte_reinterpreting_and_weak_are_refused

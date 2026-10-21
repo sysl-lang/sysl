@@ -331,12 +331,13 @@ im_the_full_path_still_works()
 
 // -- which name wins ------------------------------------------------------------------------------------
 
-// The order is this module, then the imports, then the library.
-@test("a declaration of this module beats an import of the same name")
+// The order is this module, then the imports, then the library. An import BY NAME of a spelling the
+// module declares is refused outright (`tests_icl_import_clash.sysl`), so the order is a wildcard's.
+@test("a declaration of this module beats a wildcard offering the same name")
 im_this_module_beats_an_import()
     if im_can_run() then return
 
-    assert_eq(im_ran("import geom.twice\ntwice(n: int) -> int = n * 10\nprint(twice(4))"), "40\n")
+    assert_eq(im_ran("import geom.*\ntwice(n: int) -> int = n * 10\nprint(twice(4))"), "40\n")
 
 @test("a selective import beats a wildcard that also offers the name")
 im_a_selective_import_beats_a_wildcard()
@@ -594,6 +595,61 @@ im_a_name_that_is_a_module()
     assert(said.contains("'text' is a module, so importing something else under that name would " +
                          "hide it"), said)
 end im_a_name_that_is_a_module
+
+// **The program's module names are the program's.** The library shares the project's empty prefix,
+// and its `import sysl.unicode.{fold}` and `import sysl.buf.{Buf, buf}` were refused in any program
+// that had a module called `fold` or `buf` -- names the library cannot know about.
+private mnl_library_users() -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    for m in ["fold", "buf", "text", "unicode"]
+        fs.push((m, "m.sysl", s"module $m\n$m(s: string) -> string = \"mine: \" + s\n"))
+
+    fs
+end mnl_library_users
+
+@test("a program's module named after what the library imports does not reach the library")
+mnl_library_imports_ignore_program_modules()
+    if im_can_run() then return
+
+    var fs = mnl_library_users()
+
+    fs.push(("", "main.sysl",
+             "import sysl.buf.{Buf, buf as made}\n" +
+             "var b: Buf[int] = made()\nb.push(4)\nprint(b.len())\n" +
+             "print(sysl.text.eq_fold(\"Straße\", \"STRASSE\"))\n" +
+             "print(sysl.text.to_upper(\"ab\"))\n"))
+
+    assert_eq(im_out(fs), "1\ntrue\nAB\n")
+end mnl_library_imports_ignore_program_modules
+
+@test("and the library's imports and the program's modules each answer their own")
+mnl_each_side_answers_its_own()
+    if im_can_run() then return
+
+    var fs = mnl_library_users()
+
+    fs.push(("", "main.sysl",
+             "print(fold.fold(\"AbC\"))\nprint(buf.buf(\"x\"))\n" +
+             "print(sysl.unicode.fold(\"AbC\"))\nprint(sysl.text.contains_fold(\"HeLLo\", \"ell\"))\n"))
+
+    assert_eq(im_out(fs), "mine: AbC\nmine: x\nabc\ntrue\n")
+end mnl_each_side_answers_its_own
+
+@test("and the program's own import of a library name its module shadows is still refused")
+mnl_program_import_still_refused()
+    if im_can_run() then return
+
+    var fs = mnl_library_users()
+
+    fs.push(("", "main.sysl", "import sysl.unicode.{fold}\nprint(fold(\"AbC\"))\n"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'fold' is a module, so importing something else under that name would " +
+                         "hide it — import it as another name with 'as'"), said)
+    assert(!said.contains("library/"), said)
+end mnl_program_import_still_refused
 
 @test("and a module imported under a module's name is refused the same way")
 im_a_module_under_a_modules_name()

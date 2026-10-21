@@ -1,0 +1,449 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// A package's **valued options** (`reference/packages.md § Options`): what the `options` block
+// declares and refuses, what a consumer's entry sets and is refused for, which value a package is
+// built with across a graph, the constant every file of the package reads, and the caches keeping one
+// entry per value.
+
+private vlo_temp() -> string = absolute_path(make_temp_dir("sysl-vlo").unwrap())
+
+private vlo_ready() -> bool = std_root().is_ok() && clang_available()
+
+private vlo_manifest(name: string, deps: string, extra: string) -> string =
+    s"package { name = \"$name\", version = \"1.0.0\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n") + extra
+
+// What reading a manifest whose body is `body` refuses, or `read` where it reads.
+private vlo_refused(body: string) -> string = read_manifest(vlo_manifest("app", "", body)) match
+    Err(why) -> why
+    Ok(_) -> "read"
+
+private vlo_slots(extra: string) -> string = s"options { slots { type = usize, default = 16$extra } }"
+
+// -- what the block declares -----------------------------------------------------------------------
+
+@test("an option's type, default, range and doc are read, in the order the block wrote them")
+vlo_declarations_are_read()
+    val m = read_manifest(vlo_manifest("k", "",
+        "options {\n  slots { type = usize, default = 16, range = [2, 256], doc = \"how many\" }\n" +
+        "  tag { type = string, default = \"a\\\"b\" }\n  fast { type = bool, default = true }\n" +
+        "  bias { type = i8, default = -128 }\n}\n")).unwrap()
+    var rows: Buf[string] = buf()
+
+    for opt in m.options
+        rows.push(s"${opt.name}:${opt.type_name}=${opt.default}:${opt.doc}:${opt.range.is_some()}")
+
+    assert_eq(join(rows.view(), " | "),
+              "slots:usize=16:how many:true | tag:string=\"a\\\"b\"::false | fast:bool=true::false | " +
+              "bias:i8=-128::false")
+
+@test("every integer type is an option's type: an alias, iN and uN of any width, usize and isize")
+vlo_every_integer_type()
+    for t in ["int", "uint", "byte", "short", "ushort", "long", "ulong", "usize", "isize", "u3", "i128",
+              "u200"]
+        assert_eq(vlo_refused(s"options { n { type = $t, default = 1 } }"), "read")
+
+@test("an option that is not a block, or a block that is not a block, is refused")
+vlo_shape_refused()
+    assert_eq(vlo_refused("options = 3"),
+              "'options' is not a block — it names each option and what it is, as " +
+              "'options { slots { type = usize, default = 16 } }'")
+    assert_eq(vlo_refused("options { slots = 16 }"),
+              "'options.slots' is not a block — an option names its 'type' and its 'default', and may " +
+              "name a 'range' and a 'doc'")
+
+@test("a key an option does not know is refused, listing the ones it does")
+vlo_unknown_key_refused()
+    assert_eq(vlo_refused("options { slots { type = usize, defualt = 16 } }"),
+              "'options.slots.defualt' is not something an option says — the keys are 'default', " +
+              "'doc', 'range', 'type'")
+
+@test("a name that cannot follow 'option_' in source is refused")
+vlo_bad_name_refused()
+    assert_eq(vlo_refused("options { \"two words\" { type = usize, default = 1 } }"),
+              "'options.two words' is not a name an option can have — the package's source reads it " +
+              "as 'option_two words', so it is a letter or '_' followed by letters, digits and '_'")
+
+@test("an option with no type, or a type an option cannot be, is refused")
+vlo_type_refused()
+    assert_eq(vlo_refused("options { slots { default = 16 } }"),
+              "'options.slots' names no 'type' — an option is an integer type, 'bool' or 'string'")
+
+    for t in ["f32", "real", "char", "u0", "i", "u08", "Buf"]
+        assert_eq(vlo_refused(s"options { slots { type = $t, default = 1 } }"),
+                  s"'options.slots.type' is '$t', which an option cannot be — an option is an integer " +
+                  "type ('usize', 'u8', 'int', 'i64', …), 'bool' or 'string'")
+
+@test("an option with no default is refused")
+vlo_no_default_refused()
+    assert_eq(vlo_refused("options { slots { type = usize } }"),
+              "'options.slots' names no 'default' — an option has the value its package is built with " +
+              "where no consumer sets one")
+
+@test("a default of the wrong type is refused, for each kind of option")
+vlo_default_wrong_type_refused()
+    assert_eq(vlo_refused("options { slots { type = usize, default = \"16\" } }"),
+              "'options.slots.default' is \"16\", which is not a 'usize' — an integer option's value " +
+              "is a decimal number, written without quotes")
+    assert_eq(vlo_refused("options { slots { type = usize, default = 0x10 } }"),
+              "'options.slots.default' is 0x10, which is not a 'usize' — an integer option's value is " +
+              "a decimal number, written without quotes")
+    assert_eq(vlo_refused("options { fast { type = bool, default = 1 } }"),
+              "'options.fast.default' is 1, which is not a 'bool' — it is 'true' or 'false', without " +
+              "quotes")
+    assert_eq(vlo_refused("options { tag { type = string, default = 4 } }"),
+              "'options.tag.default' is 4, which is not a 'string' — a string option's value is " +
+              "written in quotes")
+    assert_eq(vlo_refused("options { tag { type = string, default = [a] } }"),
+              "'options.tag.default' is a list, which is not a 'string' — a string option's value is " +
+              "written in quotes")
+
+@test("a default its type cannot hold is refused, at both ends of a signed and an unsigned width")
+vlo_default_outside_type_refused()
+    assert_eq(vlo_refused("options { n { type = u8, default = 256 } }"),
+              "'options.n.default' is 256, which no 'u8' holds")
+    assert_eq(vlo_refused("options { n { type = u8, default = -1 } }"),
+              "'options.n.default' is -1, which no 'u8' holds")
+    assert_eq(vlo_refused("options { n { type = i8, default = 128 } }"),
+              "'options.n.default' is 128, which no 'i8' holds")
+    assert_eq(vlo_refused("options { n { type = i8, default = -129 } }"),
+              "'options.n.default' is -129, which no 'i8' holds")
+    assert_eq(vlo_refused("options { n { type = u64, default = 18446744073709551616 } }"),
+              "'options.n.default' is 18446744073709551616, which no 'u64' holds")
+
+    // Freedom to disagree: the ends themselves are held.
+    assert_eq(vlo_refused("options { a { type = u8, default = 255 }, b { type = i8, default = -128 }, " +
+                          "c { type = u64, default = 18446744073709551615 }, d { type = u1, default = 1 } }"),
+              "read")
+
+@test("a default outside the declared range is refused, and either end of the range is a default")
+vlo_default_outside_range_refused()
+    assert_eq(vlo_refused(vlo_slots(", range = [32, 256]")),
+              "'options.slots.default' is 16, outside the option's range [32, 256]")
+    assert_eq(vlo_refused("options { slots { type = usize, default = 300, range = [2, 256] } }"),
+              "'options.slots.default' is 300, outside the option's range [2, 256]")
+    assert_eq(vlo_refused("options { slots { type = usize, default = 2, range = [2, 256] } }"), "read")
+    assert_eq(vlo_refused("options { slots { type = usize, default = 256, range = [2, 256] } }"), "read")
+
+@test("a range is two integers within the type, low end first, on an integer option only")
+vlo_range_refused()
+    assert_eq(vlo_refused("options { fast { type = bool, default = true, range = [0, 1] } }"),
+              "'options.fast.range' bounds a 'bool' option, and only an integer option has a range")
+
+    val shape = "'options.slots.range' is not a list of two integers — it is written '[low, high]', both " +
+        "ends included"
+
+    assert_eq(vlo_refused(vlo_slots(", range = 4")), shape)
+    assert_eq(vlo_refused(vlo_slots(", range = [4]")), shape)
+    assert_eq(vlo_refused(vlo_slots(", range = [1, 2, 3]")), shape)
+    assert_eq(vlo_refused(vlo_slots(", range = [\"1\", 20]")), shape)
+    assert_eq(vlo_refused(vlo_slots(", range = [64, 8]")),
+              "'options.slots.range' is [64, 8], whose low end is above its high end")
+    assert_eq(vlo_refused("options { n { type = u8, default = 1, range = [0, 300] } }"),
+              "'options.n.range' reaches 300, which no 'u8' holds")
+
+@test("a doc is a string")
+vlo_doc_refused()
+    assert_eq(vlo_refused(vlo_slots(", doc = 4")),
+              "'options.slots.doc' is not a string — it says what the option is for, in quotes")
+    assert_eq(vlo_refused(vlo_slots(", doc = \"tasks\"")), "read")
+
+@test("a dependency entry's options are a block")
+vlo_entry_options_shape_refused()
+    assert_eq(read_manifest(vlo_manifest("app", "k { path = \"../k\", options = 8 }", "")).unwrap_err(),
+              "'dependencies.k.options' is not a block — it sets the package's options by name, as " +
+              "'options = { slots = 8 }'")
+
+// -- which value a graph settles on ----------------------------------------------------------------
+
+// A package at a coordinate in the project's `vendor/` tree, as a fetch would have left it.
+private vlo_publish(root: string, coordinate: string, module_name: string, deps: string, extra: string)
+    val dir = s"$root/vendor/$coordinate/@v1.0.0"
+
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/package.hocon", vlo_manifest(module_name, deps, extra)).unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl",
+               s"module $module_name\n\nslots() -> usize = option_slots\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end vlo_publish
+
+private vlo_entry(label: string, coordinate: string, extra: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"1.0.0\"" + (if extra.is_empty() then "" else s", $extra") +
+    " }"
+
+// `kern`, declaring `slots`; `mid_a` and `mid_b`, each depending on it with what `a` and `b` set.
+private vlo_graph_tree(a: string, b: string) -> string
+    val root = vlo_temp()
+
+    vlo_publish(root, "github.com/e/kern", "kern", "", vlo_slots(", range = [2, 256]"))
+    vlo_publish(root, "github.com/e/mid_a", "mid_a", vlo_entry("kern", "github.com/e/kern", a), "")
+    vlo_publish(root, "github.com/e/mid_b", "mid_b", vlo_entry("kern", "github.com/e/kern", b), "")
+    root
+end vlo_graph_tree
+
+// What `kern` is built with, or why the graph was refused.
+private vlo_settled(root: string, deps: string) -> string
+    val m = read_manifest(vlo_manifest("app", deps, "")).unwrap()
+
+    val said = resolve_graph(root, m, empty_sums(), s"$root/vendor") match
+        Err(why) -> why
+        Ok(g) -> join(option_lines_of(g.options, "github.com.e.kern").view(), "\n")
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end vlo_settled
+
+private vlo_mids() -> string =
+    vlo_entry("mid_a", "github.com/e/mid_a", "") + " " + vlo_entry("mid_b", "github.com/e/mid_b", "")
+
+@test("a package no consumer configures is built with its defaults")
+vlo_defaults_where_nobody_sets()
+    assert_eq(vlo_settled(vlo_graph_tree("", ""), vlo_mids()),
+              "private const option_slots: usize = 16")
+
+@test("an intermediate package's value applies where the root sets none")
+vlo_intermediate_applies()
+    assert_eq(vlo_settled(vlo_graph_tree("options = { slots = 4 }", ""), vlo_mids()),
+              "private const option_slots: usize = 4")
+
+@test("two intermediate packages that agree are one value")
+vlo_intermediates_agree()
+    assert_eq(vlo_settled(vlo_graph_tree("options = { slots = 4 }", "options = { slots = 4 }"), vlo_mids()),
+              "private const option_slots: usize = 4")
+
+@test("two intermediate packages that disagree, with the root silent, are refused naming both")
+vlo_intermediates_disagree()
+    assert_eq(vlo_settled(vlo_graph_tree("options = { slots = 4 }", "options = { slots = 6 }"), vlo_mids()),
+              "'github.com.e.mid_a' sets the option 'slots' of 'kern' to 4, and 'github.com.e.mid_b' " +
+              "sets it to 6 — a package is built once, with one value for each option, so this project " +
+              "decides: set it in this project's own entry for 'kern'")
+
+@test("the root configures a transitive package through an ordinary entry, under any label, and wins")
+vlo_root_overrides_transitively()
+    val tree = vlo_graph_tree("options = { slots = 4 }", "options = { slots = 6 }")
+
+    assert_eq(vlo_settled(tree, vlo_mids() + " " +
+                          vlo_entry("kernel", "github.com/e/kern", "options = { slots = 8 }")),
+              "private const option_slots: usize = 8")
+
+@test("the root's own entry beats the one intermediate that set a value")
+vlo_root_beats_one_intermediate()
+    assert_eq(vlo_settled(vlo_graph_tree("options = { slots = 4 }", ""),
+                          vlo_mids() + " " + vlo_entry("k", "github.com/e/kern", "options = { slots = 32 }")),
+              "private const option_slots: usize = 32")
+
+@test("a consumer's value is held to the declaration: its name, its type and its range")
+vlo_consumer_values_refused()
+    assert_eq(vlo_settled(vlo_graph_tree("", ""), vlo_entry("k", "github.com/e/kern", "options = { slotz = 3 }")),
+              "this project sets the option 'slotz' of 'k', which 'github.com.e.kern' does not declare — " +
+              "a consumer may only set an option that package's own manifest names. It declares 'slots'")
+    assert_eq(vlo_settled(vlo_graph_tree("", ""),
+                          vlo_entry("k", "github.com/e/kern", "options = { slots = \"3\" }")),
+              "this project sets the option 'slots' of 'k' to \"3\", which is not a 'usize' — an " +
+              "integer option's value is a decimal number, written without quotes")
+    assert_eq(vlo_settled(vlo_graph_tree("", ""), vlo_entry("k", "github.com/e/kern", "options = { slots = 300 }")),
+              "this project sets the option 'slots' of 'k' to 300, outside the option's range [2, 256]")
+    assert_eq(vlo_settled(vlo_graph_tree("", ""), vlo_entry("k", "github.com/e/kern", "options = { slots = 1 }")),
+              "this project sets the option 'slots' of 'k' to 1, outside the option's range [2, 256]")
+
+@test("an intermediate package's value is held to the declaration too, and named as the one that set it")
+vlo_intermediate_value_refused()
+    assert_eq(vlo_settled(vlo_graph_tree("options = { slots = 999 }", ""), vlo_mids()),
+              "'github.com.e.mid_a' sets the option 'slots' of 'kern' to 999, outside the option's range " +
+              "[2, 256]")
+
+@test("setting an option of a package that declares none is refused")
+vlo_package_declares_none()
+    val root = vlo_temp()
+
+    vlo_publish(root, "github.com/e/plain", "plain", "", "")
+
+    val m = read_manifest(vlo_manifest("app", vlo_entry("p", "github.com/e/plain", "options = { slots = 3 }"),
+                                       "")).unwrap()
+
+    val said = resolve_graph(root, m, empty_sums(), s"$root/vendor") match
+        Err(why) -> why
+        Ok(_) -> "resolved"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "this project sets the option 'slots' of 'p', which 'github.com.e.plain' does not " +
+              "declare — a consumer may only set an option that package's own manifest names, and it " +
+              "declares none")
+
+// -- what the source reads --------------------------------------------------------------------------
+
+// A package on disk whose module is `text`, declaring `options`.
+private vlo_dependency(text: string, options: string) -> string
+    val root = vlo_temp()
+
+    make_dir_all(s"$root/kern").unwrap()
+    write_text(s"$root/package.hocon", vlo_manifest("kern", "", options)).unwrap()
+    write_text(s"$root/kern/kern.sysl", s"module kern\n\n$text\n").unwrap()
+    write_text(s"$root/kern/more.sysl", "module kern\n\ntwice() -> usize = option_slots * 2\n").unwrap()
+    root
+end vlo_dependency
+
+private vlo_app(deps: string, extra: string, program: string) -> string
+    val root = vlo_temp()
+
+    write_text(s"$root/package.hocon", vlo_manifest("app", deps, extra)).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end vlo_app
+
+// What the program a build of `root` makes prints, or what stopped it.
+private vlo_run(root: string) -> string
+    reset_feature_request()
+
+    val out_dir = vlo_temp()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end vlo_run
+
+private vlo_kern_text() -> string =
+    "val table: [option_slots]u8 = [0; option_slots]\n\n" +
+    "@assert(option_slots % 2 == 0, \"slots must be even\")\n\n" +
+    "slots() -> usize = table.len\nlabel() -> string = option_tag\nfast() -> bool = option_fast"
+
+private vlo_kern_options() -> string =
+    "options {\n  slots { type = usize, default = 16, range = [2, 256] }\n" +
+    "  tag { type = string, default = \"k\\\"ern\" }\n  fast { type = bool, default = false }\n}\n"
+
+private vlo_kern_program() -> string = "print(kern.slots(), kern.twice(), kern.label(), kern.fast())\n"
+
+@test("a value reaches an array length, an @assert and every file of the package; the defaults otherwise")
+vlo_value_reaches_the_source()
+    if !vlo_ready() then return
+
+    val dep = vlo_dependency(vlo_kern_text(), vlo_kern_options())
+    val set = vlo_app(s"kern { path = \"$dep\", options = { slots = 4, tag = \"t\", fast = true } }", "",
+                      vlo_kern_program())
+    val plain = vlo_app(s"kern { path = \"$dep\" }", "", vlo_kern_program())
+
+    assert_eq(vlo_run(set), "4 8 t true\n")
+    assert_eq(vlo_run(plain), "16 32 k\"ern false\n")
+    remove_dir_all(set).unwrap_or(())
+    remove_dir_all(plain).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+@test("a value the range allows and the package's own @assert does not is refused by the @assert")
+vlo_value_meets_the_assert()
+    if !vlo_ready() then return
+
+    val dep = vlo_dependency(vlo_kern_text(), vlo_kern_options())
+    val app = vlo_app(s"kern { path = \"$dep\", options = { slots = 5 } }", "", vlo_kern_program())
+    val said = vlo_run(app)
+
+    assert(said.contains("slots must be even"), said)
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+@test("the root's own options are read at their defaults, and its files read them as a package's do")
+vlo_root_reads_its_defaults()
+    if !vlo_ready() then return
+
+    val app = vlo_app("", "options { width { type = u8, default = 7 } }\n",
+                      "print(option_width + 1)\n")
+
+    assert_eq(vlo_run(app), "8\n")
+    remove_dir_all(app).unwrap_or(())
+
+@test("an option is the package's own: its constant is not visible in the consumer")
+vlo_constant_is_the_packages_own()
+    if !vlo_ready() then return
+
+    val dep = vlo_dependency(vlo_kern_text(), vlo_kern_options())
+    val app = vlo_app(s"kern { path = \"$dep\" }", "", "print(option_slots)\n")
+    val said = vlo_run(app)
+
+    assert(said.starts_with("refused: ") && said.contains("'option_slots'"), said)
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+// -- the caches --------------------------------------------------------------------------------------
+
+@test("two values are two run cache keys, and the same value is the same key")
+vlo_run_cache_keys_differ()
+    if !vlo_ready() then return
+
+    val dep = vlo_dependency(vlo_kern_text(), vlo_kern_options())
+    val app = vlo_app(s"kern { path = \"$dep\", options = { slots = 4 } }", "", vlo_kern_program())
+    val four = run_cache_key_for("run", app, None, DefaultOptimization, None)
+    val again = run_cache_key_for("run", app, None, DefaultOptimization, None)
+
+    write_text(s"$app/package.hocon",
+               vlo_manifest("app", s"kern { path = \"$dep\", options = { slots = 8 } }", "")).unwrap()
+
+    val eight = run_cache_key_for("run", app, None, DefaultOptimization, None)
+
+    write_text(s"$dep/package.hocon", vlo_manifest("kern", "",
+        "options {\n  slots { type = usize, default = 32, range = [2, 256] }\n" +
+        "  tag { type = string, default = \"k\\\"ern\" }\n  fast { type = bool, default = false }\n}\n"))
+        .unwrap()
+
+    val other_default = run_cache_key_for("run", app, None, DefaultOptimization, None)
+
+    assert(four.is_some() && eight.is_some() && other_default.is_some())
+    assert_eq(four, again)
+    assert(four != eight)
+    assert(eight != other_default)
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+@test("a source root's kept artifact is one entry per value, each printing its own")
+vlo_root_artifact_per_value()
+    if !vlo_ready() then return
+
+    val cache = vlo_temp()
+    val lib = vlo_temp()
+
+    make_dir_all(s"$lib/kern").unwrap()
+    write_text(s"$lib/package.hocon", vlo_manifest("kern", "", vlo_kern_options())).unwrap()
+    write_text(s"$lib/kern/kern.sysl", s"module kern\n\n${vlo_kern_text()}\n").unwrap()
+    write_text(s"$lib/kern/more.sysl", "module kern\n\ntwice() -> usize = option_slots * 2\n").unwrap()
+
+    val entry = (n: int) -> vlo_entry("kern", "github.com/e/kern", s"options = { slots = $n }")
+    val app = vlo_app(entry(4), "", vlo_kern_program())
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+    lbr_hand([lib])
+
+    val four = vlo_run(app)
+
+    write_text(s"$app/package.hocon", vlo_manifest("app", entry(8), "")).unwrap()
+    lbr_hand([lib])
+
+    val eight = vlo_run(app)
+
+    write_text(s"$app/package.hocon", vlo_manifest("app", entry(4), "")).unwrap()
+    lbr_hand([lib])
+
+    val four_again = vlo_run(app)
+    val counts = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    lbr_drop([cache, lib, app])
+
+    assert_eq(four, "4 8 k\"ern false\n")
+    assert_eq(eight, "8 16 k\"ern false\n")
+    assert_eq(four_again, four)
+    assert_eq(s"hits ${counts.0}, built ${counts.1}, from source ${counts.2}", "hits 1, built 2, from source 0")
+end vlo_root_artifact_per_value

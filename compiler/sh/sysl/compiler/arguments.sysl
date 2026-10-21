@@ -319,15 +319,41 @@ fill_nested_default(cx: &Analyzer, span: Span, owner: string, p: Param, want: Ty
 // `int.zero()` at a call that settled `T` to `int`, and `a4: F = F(440.0)` an `f32` at one that
 // settled `F` to `f32`. The bounds go with them, being what says which trait's member a name on a
 // type parameter meant. Nothing local is in scope, the call's or the declaration's.
+//
+// **A member that is not generic itself may still be read under bindings**: a default inherited from
+// a generic trait names the trait's parameters, which the `impl` fixed (`impl Pad[f64] for A` makes
+// `T` the `f64` it wrote) and which the member's copy was lowered under. Those are its bindings.
 default_reader(cx: &Analyzer, span: Span, scope: Scope, inst: string,
                bounds: Buf[NamedBounds]) -> &Analyzer
     val inner = analyzer_for(cx.an, scope)
 
     inner.here = Some(call_site(cx, span))
-    inner.subst = cx.an.tables.members.func_substs.get(inst).unwrap_or(buf())
+    val fixed = cx.an.tables.members.selves.get(inst).unwrap_or(buf())
+
+    inner.subst = cx.an.tables.members.func_substs.get(inst).unwrap_or(fixed)
     inner.tbounds = bounds
     inner
 end default_reader
+
+// A default read at the type its parameter has at this call, by the analyzer `default_reader` made,
+// and nothing where that reading was refused.
+//
+// **A default the call's type cannot take is refused as a default**, in the words `refused_argument`
+// gives it, and not by whatever reading it at that type happened to say: `step: T = 9007199254740993`
+// at `T = real` is a literal no `real` holds, and the program's mistake is the default it left in
+// place. So a refused reading is thrown away whole, and the caller names its position to
+// `refused_argument` as unread.
+default_at(inner: &Analyzer, e: Expr, want: Type) -> Option[TExpr]
+    val tried = begin_trial(inner)
+    val t = type_expr(inner, e, Some(want))
+
+    if refused_since(inner, tried)
+        discard_trial(inner, tried)
+        return None
+
+    keep_trial(inner)
+    Some(t)
+end default_at
 
 private fill_default_in(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, want: Type,
                         carry: bool) -> TExpr

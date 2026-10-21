@@ -26,8 +26,12 @@ init_ordered(a: &Analysis, vals: Buf[TVal], funcs: Buf[TFunc]) -> Buf[TVal]
     var constant: Buf[TVal] = buf()
     var computed: Buf[TVal] = buf()
 
+    // Storage refused a type because its value reaches it again (`storage_type`) has had that loop
+    // reported already, and the loop is the one an order would find: it takes no part in the walk.
     for i in 0..<vals.len()
-        if vals.at(i).computed then computed.push(vals.at(i)) else constant.push(vals.at(i))
+        val v = vals.at(i)
+
+        if v.computed && !holds_string(a.val_cycles, v.symbol) then computed.push(v) else constant.push(v)
 
     if computed.is_empty() then return vals
 
@@ -36,11 +40,11 @@ init_ordered(a: &Analysis, vals: Buf[TVal], funcs: Buf[TFunc]) -> Buf[TVal]
     for item in computed
         names.push(item.symbol)
 
-    val vtables = reached_vtables(a)
+    val reader = vals_reader(funcs, reached_vtables(a))
     var deps: Buf[Buf[string]] = buf()
 
     for item in computed
-        val read = vals_read_by(item.init.unwrap(), funcs, vtables)
+        val read = reader.read(item.init.unwrap())
         var mine: Buf[string] = buf()
 
         for j in 0..<read.len()
@@ -94,7 +98,28 @@ end init_walk
 
 // Reported at the declaration that comes first by name, once per cycle: a second declaration on the
 // same loop has the same mistake in it, and saying so twice would not help anyone find it.
-private report_init_cycle(a: &Analysis, w: *InitWalk, cycle: Buf[string])
+//
+// **The value a module binding takes apart is left out of the chain**: it is no name the reader
+// wrote, and the loop is the same loop through the names the binding gives. Every loop through that
+// value is one mistake in one binding, so the binding is reported once, however many of its names
+// the value reaches.
+private report_init_cycle(a: &Analysis, w: *InitWalk, whole_cycle: Buf[string])
+    var cycle: Buf[string] = buf()
+    var binding = ""
+
+    for item in whole_cycle
+        if !is_held_whole(a.tables.vals.get(item).unwrap().name)
+            cycle.push(item)
+        else if binding == "" || item < binding
+            binding = item
+
+    if binding != ""
+        if holds_string(w.blamed, binding) then return
+
+        w.blamed.push(binding)
+
+    if cycle.is_empty() then cycle = whole_cycle
+
     var h: usize = 0
 
     for i in 1..<cycle.len()

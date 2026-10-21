@@ -233,6 +233,57 @@ std_unparsed(root: string, report: string) -> string =
 std_usable_units(root: string, t: Target) -> Result[Buf[Program], string] =
     std_measured(std_units(root, t)?, t)
 
+// The library's units parsed and measured for one compilation, as `std_usable_units` makes them --
+// or, in a process that analyzes again and again (`sysl lsp`, `keep_std_units`), the ones an earlier
+// compilation made for the same library and target.
+//
+// **They are a function of the library's files and the target alone**, so a process that keeps them
+// pays for the parse and the `c const` measuring once instead of on every keystroke. A library file an
+// editor holds unsaved text for is the one way the files can change under a running process, so while
+// any is held the units are made afresh and not kept.
+std_prepared(root: string, t: Target) -> Result[Buf[Program], string]
+    val reusable = keeping_std && !editor_holds_under(root)
+
+    if reusable
+        for k in kept_std
+            if k.root == root && k.target == t.name
+                kept_std_hits = kept_std_hits + 1
+                return Ok(k.units)
+
+    val units = std_usable_units(root, t)?
+
+    if reusable then kept_std.push(KeptStd(root, t.name, units))
+
+    Ok(units)
+end std_prepared
+
+// One library's prepared units, for one target.
+struct KeptStd
+    root: string
+    target: string
+    units: Buf[Program]
+end KeptStd
+
+private var keeping_std: bool = false
+private var kept_std: Buf[KeptStd] = buf()
+private var kept_std_hits: usize = 0
+
+// Whether `std_prepared` keeps what it makes. Turning it off lets go of everything kept, and starts
+// the count of answers given from what was kept again.
+keep_std_units(on: bool)
+    keeping_std = on
+    kept_std_hits = 0
+
+    if !on then kept_std = buf()
+
+// How many prepared libraries are kept -- what a test of the keeping reads.
+kept_std_count() -> usize = kept_std.len()
+
+// How many times `std_prepared` answered with units it had kept rather than preparing them, since the
+// keeping was last switched -- the test's evidence that a re-analysis read the cache, which a clock
+// cannot give on a loaded machine.
+kept_std_hit_count() -> usize = kept_std_hits
+
 // The library's units with their `c const` blocks measured, or the C compiler's refusal rendered
 // under one sentence naming whose it is -- a header the standard module cannot read is a broken
 // installation, not something the program did. Measuring here rather than inside the program's

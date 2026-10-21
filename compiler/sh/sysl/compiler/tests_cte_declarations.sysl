@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **Calls run while the declarations are read**: a length in a field, a parameter's type or an alias,
+// an `@assert` beside the declarations, and a value argument written as an expression -- whether
+// the function runs where it stands or needs the members of a type, which are read last. A
+// declaration whose value needs itself is refused naming both, and so are two that need each other.
+
+@test("a call sizes a field, a parameter, an alias and an assertion while declarations are read")
+cte_calls_run_while_declarations_are_read()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        sq(n: int) -> int = n * n
+
+        primes_below(n: int) -> int
+            var out = buf[int]()
+
+            for i in 2..<n
+                var p = true
+                for d in 2..<i
+                    if i % d == 0 then p = false
+                if p then out.push(i)
+
+            int(out.len())
+
+        struct P
+            x: int
+            y: int
+
+        impl P
+            sum(self) -> int = self.x + self.y
+
+        width() -> int = P(2, 3).sum()
+
+        struct Table
+            primes: [primes_below(30)]int
+            cells: [width()]u8
+
+        struct Grid
+            cells: [sq(2)]int
+
+        type Quad = [sq(2)]u8
+
+        total(a: [sq(2)]int) -> int
+            var t = 0
+            for x in a
+                t += x
+            t
+
+        @assert(sq(3) == 9, "nine")
+        @assert(primes_below(10) == 4, "four primes below ten")
+
+        main()
+            val t = Table([0; 10], [0; 5])
+            val g = Grid([0; 4])
+            val q: Quad = [1, 2, 3, 4]
+            print(t.primes.len, t.cells.len, g.cells.len, q.len, total([1, 2, 3, 4]))
+        """), "10 5 4 4 10\n")
+end cte_calls_run_while_declarations_are_read
+
+@test("a value read from a declaration that waits on another is settled after it")
+cte_a_chain_of_waiting_declarations_is_settled_in_order()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct B
+            y: [fb()]u8
+
+        struct A
+            x: [fa()]u8
+
+        fa() -> int
+            var b = buf[int]()
+            b.push(3)
+            b[0]
+
+        fb() -> int
+            var b = buf[int]()
+            b.push(int(sizeof(A)) * 2)
+            b[0]
+
+        main()
+            print(sizeof(A), sizeof(B))
+        """), "3 6\n")
+end cte_a_chain_of_waiting_declarations_is_settled_in_order
+
+@test("a value argument may be a call, arithmetic over a 'const', or a comparison, in a call or a type")
+cte_value_arguments_are_expressions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        sq(n: int) -> int = n * n
+        cap(n: int) -> int = n * 2
+
+        const L: int = 3
+
+        struct Ring[T, const N: int]
+            items: [N]T
+
+        f[const N: int]() -> int = N + 1
+        flag[const B: bool]() -> int = if B then 1 else 0
+
+        sized(r: Ring[int, cap(2)]) -> int = int(r.items.len)
+
+        main()
+            val a: Ring[int, cap(4)] = Ring([0; 8])
+            val b: Ring[int, L] = Ring([0; 3])
+            val c = Ring[int, L + 1]([0; 4])
+            print(f[sq(3)](), f[L](), a.items.len, b.items.len, c.items.len, sized(Ring([0; 4])),
+                  flag[cap(1) == 2](), flag[L > 5]())
+        """), "10 4 8 3 4 4 1 0\n")
+end cte_value_arguments_are_expressions
+
+@test("a declaration whose value needs itself is refused naming both, and so are two that need each other")
+cte_declaration_cycles_are_refused()
+    if !enm_ready() then return
+
+    val own = enm_outcome(raw"""
+        struct S
+            items: [f()]int
+
+        f() -> int = int(sizeof(S))
+
+        main()
+            print(f())
+        """).0
+
+    assert(own.contains("'S' cannot be read while compiling: it needs the value of a call to 'f', and " +
+                        "running 'f' reads 'S' itself — a declaration cannot wait on a value worked out " +
+                        "from it"), own)
+
+    val each = enm_outcome(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct A
+            x: [fa()]int
+
+        struct B
+            y: [fb()]int
+
+        fa() -> int
+            var b = buf[int]()
+            b.push(int(sizeof(B)))
+            b[0]
+
+        fb() -> int
+            var b = buf[int]()
+            b.push(int(sizeof(A)))
+            b[0]
+
+        main()
+            print(fa(), fb())
+        """).0
+
+    for part in ["'A' cannot be read while compiling: it needs the value of a call to 'fa', which reads " +
+                 "'B', and 'B' waits on a value of its own that needs this one — the declarations wait " +
+                 "on each other",
+                 "'B' cannot be read while compiling: it needs the value of a call to 'fb', which reads " +
+                 "'A', and 'A' waits on a value of its own that needs this one"]
+        assert(each.contains(part), each)
+
+    val signature = enm_outcome(raw"""
+        g(a: [f()]int) -> int = int(a.len)
+
+        f() -> int = g([0; 3])
+
+        main()
+            print(f())
+        """).0
+
+    assert(signature.contains("'g' cannot be read while compiling: it needs the value of a call to 'f', " +
+                              "and running 'f' reads 'g' itself"), signature)
+end cte_declaration_cycles_are_refused
+
+@test("a value argument that cannot run is refused for why, and the body is not read without it")
+cte_a_value_argument_that_cannot_run_is_refused()
+    if !enm_ready() then return
+
+    val local = enm_outcome(raw"""
+        f[const N: int]() -> int = N + 1
+
+        main()
+            var n = 3
+            print(f[n]())
+        """).0
+
+    assert(local.contains("a value argument must be a constant — a literal, or a 'const' naming one"), local)
+    assert(!local.contains("undefined name 'N'"), local)
+
+    val loud = enm_outcome(raw"""
+        loud() -> int
+            print("hi")
+            3
+
+        struct Ring[T, const N: int]
+            items: [N]T
+
+        struct Bad
+            items: [loud()]int
+
+        main()
+            val r: Ring[int, loud()] = Ring([0; 3])
+            print(r.items.len)
+        """).0
+
+    assert(loud.contains("this value cannot be computed while compiling: it calls 'loud', which prints"), loud)
+    assert(!loud.contains("must be a constant"), loud)
+end cte_a_value_argument_that_cannot_run_is_refused
+
+// What a program of two files does -- the module `m` beside the beginning -- as `<status>: <output>`,
+// or `unbuilt: <why>`.
+private cte_module_does(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-cte").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) -> out.status match
+            Status.Exited(code) -> s"$code: ${out.text}"
+            _ -> s"signalled: ${out.text}"
+end cte_module_does
+
+@test("an '@assert' beside a module's declarations runs a call that needs a type's members")
+cte_a_module_assert_runs_a_call()
+    if !enm_ready() then return
+
+    val module_text = raw"""
+        module m
+
+        import sysl.buf.{Buf, buf}
+
+        squares(n: int) -> int
+            var b = buf[int]()
+            for i in 0..<n
+                b.push(i * i)
+            var t = 0
+            for x in b
+                t += x
+            t
+
+        @assert(squares(4) == 14, "0 + 1 + 4 + 9")
+
+        const TOTAL: int = squares(4)
+        """
+
+    assert_eq(cte_module_does(module_text, "import m.TOTAL\n\nmain()\n    print(TOTAL)\n"), "0: 14\n")
+
+    val wrong = cte_module_does(module_text + "\n@assert(squares(3) == 6, \"a wrong sum\")\n",
+                                "import m.TOTAL\n\nmain()\n    print(TOTAL)\n")
+
+    assert(wrong.contains("assertion failed: a wrong sum — the left side is 5"), wrong)
+end cte_a_module_assert_runs_a_call

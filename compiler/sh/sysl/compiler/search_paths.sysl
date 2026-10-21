@@ -60,6 +60,7 @@ reset_search_paths()
     sp_say = None
     sp_link_mode = None
     sp_no_bounds_locations = false
+    sp_const_steps = None
     sp_general_regs_only = false
     sp_strict_align = false
     forget_link_notes()
@@ -71,6 +72,29 @@ end reset_search_paths
 private var sp_no_bounds_locations: bool = false
 
 no_bounds_locations_flag() -> bool = sp_no_bounds_locations
+
+// What `--const-steps <n>` gave: how many steps one compile-time evaluation may take before it is
+// stopped (`const_eval.sysl`), where a table generator legitimately runs longer than the default.
+private var sp_const_steps: Option[long] = None
+
+const_steps_flag() -> Option[long] = sp_const_steps
+
+// The operand of `--const-steps`: a count of steps, at least one, written in decimal with `_` or `,`
+// between digit groups if wanted. Anything else is the command line's usage error.
+private const_steps_operand(text: string) -> Option[long]
+    var n: long = 0
+    var digits = 0
+
+    for b in text.bytes
+        if b == u8('_') || b == u8(',') then continue
+
+        if b < u8('0') || b > u8('9') || n > 100000000000000 then return None
+
+        n = n * 10 + long(b - u8('0'))
+        digits += 1
+
+    if digits == 0 || n == 0 then None else Some(n)
+end const_steps_operand
 
 // Whether `--general-regs-only` and `--strict-align` were given. Each turns its setting on whatever
 // the root manifest's `codegen` block says (`codegen_features.sysl`); there is no flag to turn one off.
@@ -87,8 +111,8 @@ private var sp_link_mode: Option[LinkMode] = None
 
 link_flag() -> Option[LinkMode] = sp_link_mode
 
-// The refusal for a `--link` whose operand names an empty library, said before any command reads its
-// own flags -- every command takes the flag, so every command refuses it the same way. Arguments
+// The refusal for a `--link` whose operand names an empty library, or a `--const-steps` whose operand
+// is not a count, said before any command reads its own flags -- every command takes the flag, so every command refuses it the same way. Arguments
 // after a `--` are the program's and are not looked at.
 link_flag_refusal(args: []string) -> Option[string]
     for i in 0..<args.len
@@ -98,6 +122,11 @@ link_flag_refusal(args: []string) -> Option[string]
             parse_link_mode(args[i + 1]) match
                 Err(why) -> return Some(why)
                 Ok(_) -> ()
+        end if
+
+        if args[i] == "--const-steps" && i + 1 < args.len && const_steps_operand(args[i + 1]).is_none()
+            return Some(s"'--const-steps' takes how many steps a compile-time evaluation may run, a " +
+                        s"whole number above zero, and '${args[i + 1]}' is not one")
         end if
 
     None
@@ -374,6 +403,16 @@ took_search_flag(args: []string, i: usize) -> int
         parse_link_mode(args[i + 1]) match
             Ok(mode) -> sp_link_mode = Some(mode)
             Err(_) -> return 0
+
+        return 2
+    end if
+
+    if arg == "--const-steps"
+        if i + 1 >= args.len then return 0
+
+        const_steps_operand(args[i + 1]) match
+            Some(n) -> sp_const_steps = Some(n)
+            None -> return 0
 
         return 2
     end if

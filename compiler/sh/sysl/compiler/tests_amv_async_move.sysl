@@ -1,0 +1,138 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A temporary handed to an async call moves into the task's frame** (`emit_arc.sysl`'s
+// `move_into_task`): the caller gives its own count back as soon as the call returns, so a task's
+// parameter goes when the task returns rather than when the caller's statement ends. A named local
+// keeps the caller's count, and a plain call keeps the temporary to the end of the statement. Each
+// program is built at `-O0` and at the default level, and both have to print the same thing.
+
+private amv_outcome(program: string, level: string) -> string
+    val root = make_temp_dir("sysl-amv").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end amv_outcome
+
+private amv_ran(program: string) -> string
+    if std_root().is_err() then return "skipped"
+
+    val low = amv_outcome(program, "0")
+    val high = amv_outcome(program, DefaultOptimization)
+
+    if low != high then return s"-O0 printed:\n$low\nthe default level printed:\n$high"
+
+    low
+end amv_ran
+
+private amv_expect(program: string, expected: string)
+    val got = amv_ran(program)
+
+    if got == "skipped"
+        print("skipped: the standard module's source is not on this machine")
+        return
+
+    assert_eq(got, expected)
+end amv_expect
+
+@test("a task handed to an async call as a temporary is cancelled when the callee returns")
+amv_task_temporary_cancelled_at_return()
+    amv_expect(raw"""
+        async parked()
+            defer print("defer ran")
+            await park((w) -> ())
+
+        async give_up(t: Task[unit]) -> Option[int]
+            step(t, () -> ())
+            None
+
+        async b()
+            (await give_up(parked())) match
+                None -> print("in arm")
+                Some(n) -> ()
+            print("after")
+
+        block_on(b())
+        """, "defer ran\nin arm\nafter\n")
+
+@test("a counted and a by-value struct temporary move into the frame; a named local stays the caller's")
+amv_temporaries_move_locals_stay()
+    amv_expect(raw"""
+        struct Noisy
+            id: int
+
+        impl Drop for Noisy
+            drop(self)
+                print(s"dropped ${self.id}")
+
+        struct Pair
+            n: &Noisy
+            k: int
+
+        async keep(n: &Noisy) -> int = n.id
+
+        async take(p: Pair) -> int = p.k + p.n.id
+
+        async b()
+            print(s"counted ${await keep(Noisy(1))}")
+            print(s"struct ${await take(Pair(Noisy(2), 10))}")
+
+            val n: &Noisy = Noisy(3)
+
+            print(s"local ${await keep(n)}")
+            print("end of b")
+
+        block_on(b())
+        print("done")
+        """, "dropped 1\ncounted 1\ndropped 2\nstruct 12\nlocal 3\nend of b\ndropped 3\ndone\n")
+
+@test("a moved parameter goes at a return through ? and at an early return; a plain call keeps it")
+amv_try_early_return_and_plain_call()
+    amv_expect(raw"""
+        struct Noisy
+            id: int
+
+        impl Drop for Noisy
+            drop(self)
+                print(s"dropped ${self.id}")
+
+        bad() -> Result[int, string] = Err("bad")
+
+        async fails(n: &Noisy) -> Result[int, string]
+            val v = bad()?
+            Ok(v + n.id)
+
+        async early(n: &Noisy, stop: bool) -> int
+            if stop then return 0
+            n.id
+
+        plain(n: &Noisy) -> int = n.id
+
+        async b()
+            (await fails(Noisy(4))) match
+                Ok(v) -> print(s"ok $v")
+                Err(m) -> print(s"err $m")
+            print(s"early ${await early(Noisy(5), true)}")
+            print(s"plain ${plain(Noisy(6))}")
+
+        block_on(b())
+        """, "dropped 4\nerr bad\ndropped 5\nearly 0\nplain 6\ndropped 6\n")

@@ -1,0 +1,614 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A local read after a `@consumes` member took what it held.
+//
+// **`@consumes` above a member says a call takes everything its receiver holds** -- `Buf.freeze`
+// moves a buffer's elements into the frozen buffer it answers and leaves the buffer empty. The
+// emptying is done at run time whatever the receiver is, so nothing here is about safety: it is
+// about a read that can only see nothing, which is a mistake the reader should hear about where it
+// is written.
+//
+// **Only a local is followed.** A field, an element or what a pointer reaches may have another name
+// the body cannot see, so a call on one is accepted and the run-time emptying is what answers a later
+// read of it. A local has one name, and the body is the whole of what can happen to it.
+//
+// **The check follows every path.** A body is walked in the order it runs, carrying the locals that
+// may be empty at each point: a branch that consumed on one side only leaves the local empty after
+// the join, and a loop is walked until what reaches its head stops changing, so a read on a later
+// turn of the loop counts. Assigning the local a new value -- or binding the name afresh, as a loop
+// body's `val` does every turn -- ends it.
+
+// One call to a `@consumes` member on a local: where the call is, the local's unique name, the name
+// as written, and the member, which is what the refusal of a later read names.
+struct ConsumeCall
+    span: Span
+    unique: string
+    name: string
+    member: string
+end ConsumeCall
+
+// What may be true at one point of a body: whether the point is reached at all, and the locals that
+// may have been consumed on some path to it. **A state is never changed once made** -- every step
+// answers a new one -- so two paths may share one without either seeing the other's steps.
+private struct ConsumeFlow
+    dead: bool
+    gone: Buf[ConsumeCall]
+end ConsumeFlow
+
+// The states a loop is left and resumed with, gathered from its `break`s and `continue`s while one
+// turn of its body is walked.
+private struct ConsumeLoop
+    breaks: ConsumeFlow
+    conts: ConsumeFlow
+end ConsumeLoop
+
+private struct ConsumeWalk
+    calls: Buf[ConsumeCall]
+    loops: Buf[&ConsumeLoop]
+    told: Buf[Span]
+    cx: &Analyzer
+end ConsumeWalk
+
+// A call to a `@consumes` member, noted against its receiver where that is a local.
+note_consume_call(cx: &Analyzer, span: Span, receiver: TExpr, member: string)
+    val unique = local_under(receiver)
+
+    if unique == "" then return
+
+    var name = unique
+
+    for item in cx.locals
+        if item.unique == unique then name = item.name
+
+    cx.consume_calls.push(ConsumeCall(span, unique, name, member))
+end note_consume_call
+
+private local_under(t: TExpr) -> string = *t.kind match
+    TLoad(unique, _) -> unique
+    TConstView(arg) -> local_under(arg)
+    TAddrOf(inner, _) -> local_under(inner)
+    _ -> ""
+
+// Every read of a consumed local in one body, refused once each.
+check_consumes(cx: &Analyzer, block: TBlock)
+    if cx.consume_calls.is_empty() then return
+
+    val w: &ConsumeWalk = ConsumeWalk(cx.consume_calls, buf(), buf(), cx)
+
+    flow_seq(w, block.stmts, block.result, flow_live())
+end check_consumes
+
+// -- states -----------------------------------------------------------------------------------------
+
+private flow_live() -> ConsumeFlow = ConsumeFlow(false, buf())
+
+private flow_dead() -> ConsumeFlow = ConsumeFlow(true, buf())
+
+private gone_entry(gone: Buf[ConsumeCall], unique: string) -> Option[ConsumeCall]
+    for item in gone
+        if item.unique == unique then return Some(item)
+
+    None
+end gone_entry
+
+// Where two paths meet: a local consumed on either may be empty after.
+private flow_join(a: ConsumeFlow, b: ConsumeFlow) -> ConsumeFlow
+    if a.dead then return b
+    if b.dead then return a
+
+    var gone: Buf[ConsumeCall] = buf()
+
+    for item in a.gone
+        gone.push(item)
+
+    for item in b.gone
+        if gone_entry(a.gone, item.unique).is_none() then gone.push(item)
+
+    ConsumeFlow(false, gone)
+end flow_join
+
+private flow_with(f: ConsumeFlow, c: ConsumeCall) -> ConsumeFlow
+    if f.dead then return f
+
+    var gone: Buf[ConsumeCall] = buf()
+
+    for item in f.gone
+        if item.unique != c.unique then gone.push(item)
+
+    gone.push(c)
+    ConsumeFlow(false, gone)
+end flow_with
+
+private flow_without(f: ConsumeFlow, unique: string) -> ConsumeFlow
+    if f.dead || gone_entry(f.gone, unique).is_none() then return f
+
+    var gone: Buf[ConsumeCall] = buf()
+
+    for item in f.gone
+        if item.unique != unique then gone.push(item)
+
+    ConsumeFlow(false, gone)
+end flow_without
+
+private flow_same(a: ConsumeFlow, b: ConsumeFlow) -> bool
+    if a.dead != b.dead || a.gone.len() != b.gone.len() then return false
+
+    for item in a.gone
+        if gone_entry(b.gone, item.unique).is_none() then return false
+
+    true
+end flow_same
+
+// A pattern binds its names afresh, so whatever an earlier binding of them was consumed by is over.
+private flow_unbind(f: ConsumeFlow, p: TPattern) -> ConsumeFlow = p match
+    TBindPattern(name, _) -> flow_without(f, name)
+    TAtPattern(name, inner) -> flow_unbind(flow_without(f, name), *inner)
+    TVariantPattern(_, _, args) -> flow_unbind_all(f, args)
+    TStructPattern(_, args) -> flow_unbind_all(f, args)
+    _ -> f
+
+private flow_unbind_all(f: ConsumeFlow, ps: Buf[TPattern]) -> ConsumeFlow
+    var g = f
+
+    for item in ps
+        g = flow_unbind(g, item)
+
+    g
+end flow_unbind_all
+
+// -- reads ------------------------------------------------------------------------------------------
+
+private flow_read(w: &ConsumeWalk, at: Span, unique: string, f: ConsumeFlow)
+    if f.dead then return
+
+    val c = gone_entry(f.gone, unique)
+
+    if c.is_none() then return
+
+    for s in w.told
+        if s.start == at.start && s.end == at.end then return
+
+    w.told.push(at)
+
+    val call = c.unwrap()
+
+    w.cx.fault(at, s"'${call.name}' is read here after '${call.name}.${call.member}()' took " +
+               s"everything it held — '${call.member}' is '@consumes', so '${call.name}' has " +
+               "nothing in it on this path until it is assigned again. Read what the call answered " +
+               "instead")
+end flow_read
+
+private consume_at(w: &ConsumeWalk, e: TExpr) -> Option[ConsumeCall]
+    val is_call = *e.kind match
+        TCall(_, _, _, _) -> true
+        _ -> false
+
+    if !is_call then return None
+
+    for item in w.calls
+        if item.span.start == e.span.start && item.span.end == e.span.end then return Some(item)
+
+    None
+end consume_at
+
+private loaded(t: TExpr) -> string = *t.kind match
+    TLoad(unique, _) -> unique
+    _ -> ""
+
+// -- statements -------------------------------------------------------------------------------------
+
+// A run of statements and what it comes to, with every `defer` among them run after both, last
+// first.
+private flow_seq(w: &ConsumeWalk, stmts: Buf[TStmt], result: Option[TExpr],
+                 entry: ConsumeFlow) -> ConsumeFlow
+    var f = entry
+    var held: Buf[Buf[TStmt]] = buf()
+
+    for s in stmts
+        s match
+            TDefer(body) -> held.push(body)
+            _ -> f = flow_stmt(w, s, f)
+
+    if result.is_some() then f = flow_expr(w, result.unwrap(), f)
+
+    var i = held.len()
+
+    while i > 0
+        i -= 1
+        f = flow_seq(w, held.at(i), None, f)
+
+    f
+end flow_seq
+
+private flow_block(w: &ConsumeWalk, b: TBlock, f: ConsumeFlow) -> ConsumeFlow =
+    flow_seq(w, b.stmts, b.result, f)
+
+private flow_opt_block(w: &ConsumeWalk, b: Option[TBlock], f: ConsumeFlow) -> ConsumeFlow =
+    if b.is_some() then flow_block(w, b.unwrap(), f) else f
+
+private flow_stmt(w: &ConsumeWalk, s: TStmt, f: ConsumeFlow) -> ConsumeFlow = s match
+    TVarDecl(name, _, init, _) -> flow_without(flow_expr(w, init, f), name)
+    TExprStmt(e) -> flow_expr(w, e, f)
+    TRefDecl(_, _, place) -> flow_expr(w, place, f)
+    TWriteStmt(write) -> flow_write(w, write, f)
+    TMultiAssign(writes) -> flow_writes(w, writes, f)
+    TReturn(value) ->
+        if value.is_some() then flow_expr(w, value.unwrap(), f)
+
+        flow_dead()
+    TBecome(call) ->
+        flow_expr(w, call, f)
+        flow_dead()
+    TBreak(value, depth) ->
+        val g = if value.is_some() then flow_expr(w, value.unwrap(), f) else f
+        val frame = loop_at_depth(w, depth)
+
+        if frame.is_some() then frame.unwrap().breaks = flow_join(frame.unwrap().breaks, g)
+
+        flow_dead()
+    TContinue(depth) ->
+        val frame = loop_at_depth(w, depth)
+
+        if frame.is_some() then frame.unwrap().conts = flow_join(frame.unwrap().conts, f)
+
+        flow_dead()
+    _ -> f
+
+private loop_at_depth(w: &ConsumeWalk, depth: int) -> Option[&ConsumeLoop]
+    if depth < 0 || usize(depth) >= w.loops.len() then return None
+
+    Some(w.loops.at(w.loops.len() - 1 - usize(depth)))
+end loop_at_depth
+
+// A plain assignment to a local fills it again; anything else reads what it writes to.
+private flow_write(w: &ConsumeWalk, write: TWrite, f: ConsumeFlow) -> ConsumeFlow
+    val unique = if write.op == "=" then loaded(write.place) else ""
+
+    if unique != "" then return flow_without(flow_expr(w, write.value, f), unique)
+
+    flow_expr(w, write.value, flow_expr(w, write.place, f))
+end flow_write
+
+// Every value of a multiple assignment is read before any place is written.
+private flow_writes(w: &ConsumeWalk, writes: Buf[TWrite], f: ConsumeFlow) -> ConsumeFlow
+    var g = f
+
+    for item in writes
+        if item.op != "=" || loaded(item.place) == "" then g = flow_expr(w, item.place, g)
+
+        g = flow_expr(w, item.value, g)
+
+    for item in writes
+        if item.op == "=" && loaded(item.place) != "" then g = flow_without(g, loaded(item.place))
+
+    g
+end flow_writes
+
+// -- expressions ------------------------------------------------------------------------------------
+
+private flow_expr(w: &ConsumeWalk, e: TExpr, f: ConsumeFlow) -> ConsumeFlow
+    val out = *e.kind match
+        TLoad(unique, _) ->
+            flow_read(w, e.span, unique, f)
+            f
+        TStore(place, value, _, _) ->
+            if loaded(place) != "" then flow_without(flow_expr(w, value, f), loaded(place))
+            else flow_expr(w, value, flow_expr(w, place, f))
+
+        // The receiver is read again after the call only to check what the call left, which is
+        // the compiler's reading rather than the program's.
+        TRecheck(after, _, _, _) -> flow_expr(w, after, f)
+        TLogical(_, left, right) ->
+            val l = flow_expr(w, left, f)
+
+            flow_join(l, flow_expr(w, right, l))
+        TIf(cond, then_block, else_block, _) -> flow_if(w, cond, then_block, else_block, f)
+        TMatch(scrutinee, arms, _) -> flow_match(w, scrutinee, arms, f)
+        TBlockExpr(block) -> flow_block(w, block, f)
+        TWhile(_, _, _, _) -> flow_loop(w, e, f)
+        TDoWhile(_, _, _, _) -> flow_loop(w, e, f)
+        TLoop(_, _) -> flow_loop(w, e, f)
+        TFor(_, _, _, _, _, _, _, _) -> flow_loop(w, e, f)
+        TCFor(_, _, _, _, _, _) -> flow_loop(w, e, f)
+        TForEach(_, _, _, _, _, _) -> flow_loop(w, e, f)
+        TIterate(_, _, _, _, _, _, _, _) -> flow_loop(w, e, f)
+        TCheckedLoop(_, _, loop_expr) -> flow_expr(w, loop_expr, f)
+        TQuantifier(_, _, _, _, _, _, _) -> f
+        _ -> flow_all(w, children(e), f)
+
+    if texpr_type(e) == Never then return flow_dead()
+
+    val c = consume_at(w, e)
+
+    if c.is_some() then return flow_with(out, c.unwrap())
+
+    out
+end flow_expr
+
+private flow_all(w: &ConsumeWalk, es: Buf[TExpr], f: ConsumeFlow) -> ConsumeFlow
+    var g = f
+
+    for item in es
+        g = flow_expr(w, item, g)
+
+    g
+end flow_all
+
+private flow_term(w: &ConsumeWalk, term: TCondTerm, f: ConsumeFlow) -> ConsumeFlow = term match
+    TCondTest(c) -> flow_expr(w, c, f)
+    TCondIs(subject, patterns, _) -> flow_unbind_all(flow_expr(w, subject, f), patterns)
+
+// The branch not taken is left from wherever a condition failed, which is after any of its terms.
+private flow_if(w: &ConsumeWalk, cond: Buf[TCondTerm], then_block: TBlock,
+                else_block: Option[TBlock], f: ConsumeFlow) -> ConsumeFlow
+    var g = f
+    var failed = flow_dead()
+
+    for term in cond
+        g = flow_term(w, term, g)
+        failed = flow_join(failed, g)
+
+    flow_join(flow_block(w, then_block, g), flow_opt_block(w, else_block, failed))
+end flow_if
+
+private flow_match(w: &ConsumeWalk, scrutinee: TExpr, arms: Buf[TArm], f: ConsumeFlow) -> ConsumeFlow
+    var into = flow_expr(w, scrutinee, f)
+    var out = flow_dead()
+
+    for arm in arms
+        var a = flow_unbind_all(into, arm.patterns)
+
+        if arm.guard.is_some()
+            a = flow_expr(w, arm.guard.unwrap(), a)
+            into = flow_join(into, a)
+        end if
+
+        out = flow_join(out, flow_block(w, arm.body, a))
+
+    out
+end flow_match
+
+// -- loops ------------------------------------------------------------------------------------------
+
+// A loop, walked turn by turn until the state reaching its head stops growing -- which it must, since
+// a turn can only add locals a body names. What leaves it is every `break` and the way it ends on its
+// own, through its `else` where it has one.
+private flow_loop(w: &ConsumeWalk, e: TExpr, f: ConsumeFlow) -> ConsumeFlow
+    val entry = loop_entry(w, e, f)
+    var head = entry
+    var exits = flow_dead()
+    var turns = 0
+
+    loop
+        val frame: &ConsumeLoop = ConsumeLoop(flow_dead(), flow_dead())
+
+        w.loops.push(frame)
+
+        val turn = loop_turn(w, e, head, frame)
+
+        w.loops.pop()
+        exits = flow_join(frame.breaks, flow_opt_block(w, loop_else(e), turn.1))
+
+        val next = flow_join(entry, turn.0)
+
+        turns += 1
+
+        if flow_same(next, head) || turns > 32 then break
+
+        head = next
+
+    exits
+end flow_loop
+
+// What runs once, before the first turn.
+private loop_entry(w: &ConsumeWalk, e: TExpr, f: ConsumeFlow) -> ConsumeFlow = *e.kind match
+    TFor(_, _, lo, hi, _, _, _, _) -> flow_expr(w, hi, flow_expr(w, lo, f))
+    TCFor(init, _, _, _, _, _) -> flow_seq(w, init, None, f)
+    TForEach(_, _, seq, _, _, _) -> flow_expr(w, seq, f)
+    TIterate(cursor, _, init, _, _, _, _, _) -> flow_without(flow_expr(w, init, f), cursor)
+    _ -> f
+
+private loop_else(e: TExpr) -> Option[TBlock] = *e.kind match
+    TWhile(_, _, else_block, _) -> else_block
+    TDoWhile(_, _, else_block, _) -> else_block
+    TFor(_, _, _, _, _, _, else_block, _) -> else_block
+    TCFor(_, _, _, _, else_block, _) -> else_block
+    TForEach(_, _, _, _, else_block, _) -> else_block
+    TIterate(_, _, _, _, _, _, else_block, _) -> else_block
+    _ -> None
+
+// One turn from the head: the state it comes back to the head with, and the one it leaves the loop
+// with when it ends on its own.
+private loop_turn(w: &ConsumeWalk, e: TExpr, head: ConsumeFlow,
+                  frame: &ConsumeLoop) -> (ConsumeFlow, ConsumeFlow) = *e.kind match
+    TWhile(cond, body, _, _) ->
+        var g = head
+        var failed = flow_dead()
+
+        for term in cond
+            g = flow_term(w, term, g)
+            failed = flow_join(failed, g)
+
+        val end_body = flow_seq(w, body, None, g)
+
+        (flow_join(end_body, frame.conts), failed)
+    TDoWhile(body, cond, _, _) ->
+        val end_body = flow_seq(w, body, None, head)
+        val c = flow_expr(w, cond, flow_join(end_body, frame.conts))
+
+        (c, c)
+    TLoop(body, _) ->
+        val end_body = flow_seq(w, body, None, head)
+
+        (flow_join(end_body, frame.conts), flow_dead())
+    TFor(name, _, _, _, _, body, _, _) ->
+        val end_body = flow_seq(w, body, None, flow_without(head, name))
+
+        (flow_join(end_body, frame.conts), head)
+    TCFor(_, cond, step, body, _, _) ->
+        val c = if cond.is_some() then flow_expr(w, cond.unwrap(), head) else head
+        val end_body = flow_seq(w, body, None, c)
+        val stepped = flow_seq(w, step, None, flow_join(end_body, frame.conts))
+
+        (stepped, if cond.is_some() then c else flow_dead())
+    TForEach(name, _, _, body, _, _) ->
+        val end_body = flow_seq(w, body, None, flow_without(head, name))
+
+        (flow_join(end_body, frame.conts), head)
+    TIterate(cursor, _, _, next, bind, body, _, _) ->
+        val n = flow_expr(w, next, flow_without(head, cursor))
+        val end_body = flow_seq(w, body, None, flow_unbind(n, bind))
+
+        (flow_join(end_body, frame.conts), n)
+    _ -> (head, head)
+
+// -- the rest: every operand, in the order it is read -----------------------------------------------
+
+private children(e: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    *e.kind match
+        TBox(value, _) -> out.push(value)
+        TDowngrade(value, _) -> out.push(value)
+        TUpgrade(value, _, _, _) -> out.push(value)
+        TArrayLit(elems, _) ->
+            for item in elems
+                out.push(item)
+        TArrayFill(value, _) -> out.push(value)
+        TVectorLit(lanes, _) ->
+            for item in lanes
+                out.push(item)
+        TSplat(value, _) -> out.push(value)
+        TLane(receiver, _, _) -> out.push(receiver)
+        TVecCompare(_, left, right, _) ->
+            out.push(left)
+            out.push(right)
+        TSelect(mask, when_true, when_false, _) ->
+            out.push(mask)
+            out.push(when_true)
+            out.push(when_false)
+        TReduce(_, receiver, _) -> out.push(receiver)
+        TVecLoad(receiver, index, _) ->
+            out.push(receiver)
+            out.push(index)
+        TVecStore(receiver, index, value) ->
+            out.push(receiver)
+            out.push(index)
+            out.push(value)
+        TBufLit(elems, _) ->
+            for item in elems
+                out.push(item)
+        TBufFill(value, count, _) ->
+            out.push(value)
+            out.push(count)
+        TIndex(receiver, index, _) ->
+            out.push(receiver)
+            out.push(index)
+        TLen(receiver, _) -> out.push(receiver)
+        TBytes(receiver) -> out.push(receiver)
+        TSlice(base, lo, hi, _, _) ->
+            out.push(base)
+
+            if lo.is_some() then out.push(lo.unwrap())
+            if hi.is_some() then out.push(hi.unwrap())
+        TCast(operand, _) -> out.push(operand)
+        TFloorCast(operand, _) -> out.push(operand)
+        TConstrainedCheck(value, _) -> out.push(value)
+        TConstrainedValid(value, _) -> out.push(value)
+        TConstrainedStep(value, _, _, _) -> out.push(value)
+        TDeref(operand, _) -> out.push(operand)
+        TTypeId(receiver, _) -> out.push(receiver)
+        TAddrOf(place, _) -> out.push(place)
+        TTempAddr(value, _) -> out.push(value)
+        TUpdate(place, _, value, _, _, _, _) ->
+            out.push(place)
+            out.push(value)
+        TIncDec(place, _, _, _, _) -> out.push(place)
+        TBinary(_, left, right, _) ->
+            out.push(left)
+            out.push(right)
+        TUnary(_, operand, _) -> out.push(operand)
+        TIntOp(_, operand, amount, _, _) ->
+            out.push(operand)
+
+            if amount.is_some() then out.push(amount.unwrap())
+        TAtomic(_, addr, ops, _, _, _) ->
+            out.push(addr)
+
+            for item in ops
+                out.push(item)
+        TSlots(_, args, _, _) ->
+            for item in args
+                out.push(item)
+        TSysOp(_, _, args) ->
+            for item in args
+                out.push(item)
+        TCompare(operands, _) ->
+            for item in operands
+                out.push(item)
+        TSeq(exprs) ->
+            for item in exprs
+                out.push(item)
+        TStr(arg) -> out.push(arg)
+        TFromBytes(arg) -> out.push(arg)
+        TStrView(arg) -> out.push(arg)
+        TConstView(arg) -> out.push(arg)
+        TViewAs(arg, _) -> out.push(arg)
+        TFormat(arg, _, counts) ->
+            out.push(arg)
+
+            for item in counts
+                out.push(item)
+        TRender(value, _, spec, _) ->
+            out.push(value)
+            out.push(spec)
+        TCall(_, args, _, _) ->
+            for item in args
+                out.push(item)
+        TCallPtr(callee, args, _, _) ->
+            out.push(callee)
+
+            for item in args
+                out.push(item)
+        TErase(operand, _, _) -> out.push(operand)
+        TVCall(receiver, _, args, _, _) ->
+            out.push(receiver)
+
+            for item in args
+                out.push(item)
+        TVaStart(ap) -> out.push(ap)
+        TVaEnd(ap) -> out.push(ap)
+        TVaArg(ap, _) -> out.push(ap)
+        TVaCopy(dst, src) ->
+            out.push(dst)
+            out.push(src)
+        TVaPass(ap) -> out.push(ap)
+        TStructNew(_, args) ->
+            for item in args
+                out.push(item)
+        TStructInvCheck(value, _, _) -> out.push(value)
+        TEnumNew(_, _, args) ->
+            for item in args
+                out.push(item)
+        TEnumFromInt(value, _) -> out.push(value)
+        TEnumTry(value, _, _, _, _) -> out.push(value)
+        TDecode(bytes, _, _, _, _) -> out.push(bytes)
+        TEncode(value, dest) ->
+            out.push(value)
+            out.push(dest)
+        TEnumAttr(_, _, arg, _) -> out.push(arg)
+        TTry(operand, _, _, _, _, _, _) -> out.push(operand)
+        TAwait(operand, _) -> out.push(operand)
+        TBlockOn(operand, _) -> out.push(operand)
+        TStep(task, wake) ->
+            out.push(task)
+            out.push(wake)
+        TPark(register) -> out.push(register)
+        TField(receiver, _, _) -> out.push(receiver)
+        _ -> ()
+
+    out
+end children

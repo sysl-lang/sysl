@@ -39,6 +39,67 @@ note_quad_runtime(a: &Analysis)
         if a.tables.funcs.has(key) then a.uses(key)
 end note_quad_runtime
 
+// The routines a 32-bit machine's two runtimes export -- `sysl.softfloat.binary64`'s for a machine
+// with no double-precision unit, `sysl.softint`'s 64-bit division -- under both machines' names.
+private val MachineRoutines: []const (string, string) = [
+    ("sysl.softfloat.binary64", "aeabi_dadd"), ("sysl.softfloat.binary64", "aeabi_dsub"),
+    ("sysl.softfloat.binary64", "aeabi_dmul"), ("sysl.softfloat.binary64", "aeabi_ddiv"),
+    ("sysl.softfloat.binary64", "aeabi_dcmpeq"), ("sysl.softfloat.binary64", "aeabi_dcmplt"),
+    ("sysl.softfloat.binary64", "aeabi_dcmple"), ("sysl.softfloat.binary64", "aeabi_dcmpge"),
+    ("sysl.softfloat.binary64", "aeabi_dcmpgt"), ("sysl.softfloat.binary64", "aeabi_dcmpun"),
+    ("sysl.softfloat.binary64", "aeabi_i2d"), ("sysl.softfloat.binary64", "aeabi_ui2d"),
+    ("sysl.softfloat.binary64", "aeabi_l2d"), ("sysl.softfloat.binary64", "aeabi_ul2d"),
+    ("sysl.softfloat.binary64", "aeabi_d2iz"), ("sysl.softfloat.binary64", "aeabi_d2uiz"),
+    ("sysl.softfloat.binary64", "aeabi_d2lz"), ("sysl.softfloat.binary64", "aeabi_d2ulz"),
+    ("sysl.softfloat.binary64", "aeabi_f2d"), ("sysl.softfloat.binary64", "aeabi_d2f"),
+    ("sysl.softfloat.binary64", "aeabi_f2lz"), ("sysl.softfloat.binary64", "aeabi_f2ulz"),
+    ("sysl.softfloat.binary64", "aeabi_l2f"), ("sysl.softfloat.binary64", "aeabi_ul2f"),
+    ("sysl.softfloat.binary64", "adddf3"), ("sysl.softfloat.binary64", "subdf3"),
+    ("sysl.softfloat.binary64", "muldf3"), ("sysl.softfloat.binary64", "divdf3"),
+    ("sysl.softfloat.binary64", "eqdf2"), ("sysl.softfloat.binary64", "nedf2"),
+    ("sysl.softfloat.binary64", "ltdf2"), ("sysl.softfloat.binary64", "ledf2"),
+    ("sysl.softfloat.binary64", "gtdf2"), ("sysl.softfloat.binary64", "gedf2"),
+    ("sysl.softfloat.binary64", "unorddf2"), ("sysl.softfloat.binary64", "floatsidf"),
+    ("sysl.softfloat.binary64", "floatunsidf"), ("sysl.softfloat.binary64", "floatdidf"),
+    ("sysl.softfloat.binary64", "floatundidf"), ("sysl.softfloat.binary64", "fixdfsi"),
+    ("sysl.softfloat.binary64", "fixunsdfsi"), ("sysl.softfloat.binary64", "fixdfdi"),
+    ("sysl.softfloat.binary64", "fixunsdfdi"), ("sysl.softfloat.binary64", "extendsfdf2"),
+    ("sysl.softfloat.binary64", "truncdfsf2"), ("sysl.softfloat.binary64", "fixsfdi"),
+    ("sysl.softfloat.binary64", "fixunssfdi"), ("sysl.softfloat.binary64", "floatdisf"),
+    ("sysl.softfloat.binary64", "floatundisf"), ("sysl.softfloat.binary64", "aeabi_fcmpeq"),
+    ("sysl.softfloat.binary64", "aeabi_fcmplt"), ("sysl.softfloat.binary64", "aeabi_fcmple"),
+    ("sysl.softfloat.binary64", "aeabi_fcmpge"), ("sysl.softfloat.binary64", "aeabi_fcmpgt"),
+    ("sysl.softfloat.binary64", "aeabi_fcmpun"), ("sysl.softfloat.binary64", "eqsf2"),
+    ("sysl.softfloat.binary64", "nesf2"), ("sysl.softfloat.binary64", "ltsf2"),
+    ("sysl.softfloat.binary64", "lesf2"), ("sysl.softfloat.binary64", "gtsf2"),
+    ("sysl.softfloat.binary64", "gesf2"), ("sysl.softfloat.binary64", "unordsf2"),
+    ("sysl.softfloat.binary64", "aeabi_fadd"), ("sysl.softfloat.binary64", "aeabi_fsub"),
+    ("sysl.softfloat.binary64", "aeabi_fmul"), ("sysl.softfloat.binary64", "aeabi_fdiv"),
+    ("sysl.softfloat.binary64", "aeabi_i2f"), ("sysl.softfloat.binary64", "aeabi_ui2f"),
+    ("sysl.softfloat.binary64", "aeabi_f2iz"), ("sysl.softfloat.binary64", "aeabi_f2uiz"),
+    ("sysl.softfloat.binary64", "addsf3"), ("sysl.softfloat.binary64", "subsf3"),
+    ("sysl.softfloat.binary64", "mulsf3"), ("sysl.softfloat.binary64", "divsf3"),
+    ("sysl.softfloat.binary64", "floatsisf"), ("sysl.softfloat.binary64", "floatunsisf"),
+    ("sysl.softfloat.binary64", "fixsfsi"), ("sysl.softfloat.binary64", "fixunssfsi"),
+    ("sysl.softfloat.binary64", "fma"), ("sysl.softfloat.binary64", "fmaf"),
+    ("sysl.softint", "udivmoddi4"), ("sysl.softint", "divmoddi4"), ("sysl.softint", "udivdi3"),
+    ("sysl.softint", "umoddi3"), ("sysl.softint", "divdi3"), ("sysl.softint", "moddi3"),
+    ("sysl.softint", "aeabi_uidiv"), ("sysl.softint", "aeabi_idiv"), ("sysl.softint", "udivmodsi4"),
+    ("sysl.softint", "divmodsi4"), ("sysl.softint", "aeabi_llsl"), ("sysl.softint", "aeabi_llsr"),
+    ("sysl.softint", "aeabi_lasr"), ("sysl.softint", "aeabi_lmul"), ("sysl.softint", "clzsi2")]
+
+// **A 32-bit machine's runtimes are typed in every build for one**, though nothing names them, for the
+// reason the quad runtime is: LLVM makes the calls after this compiler has finished. They exist only
+// where their modules' `#if` admits the processor, so elsewhere this marks nothing; and typing is not
+// keeping -- `reachability.sysl` keeps them only where a reached body divides a 64-bit integer or
+// computes with a binary64.
+note_machine_runtimes(a: &Analysis)
+    for item in MachineRoutines
+        val key = module_qualify(item.0, item.1)
+
+        if a.tables.funcs.has(key) then a.uses(key)
+end note_machine_runtimes
+
 // Whether C's `long double` is binary128 on `t` -- which is when `f128` and it are one type, and a
 // header may spell one as the other.
 //
@@ -154,6 +215,44 @@ quad_of_double(bits: u64) -> (u64, u64)
     if e2 >= 0 then quad_of_ratio(negative, shl(m, usize(e2)), from_int(1))
     else quad_of_ratio(negative, m, shl(from_int(1), usize(-e2)))
 end quad_of_double
+
+// `num / den`, both positive, as the nearest value of a sixteen-bit float -- `bf16` where `brain`,
+// `f16` otherwise -- rounded once, to nearest with ties to even, and given `negative`'s sign. It is
+// held as the `real` it is, which is exact: every value of either format is a `double`.
+half_of_ratio(negative: bool, num: BigInt, den: BigInt, brain: bool) -> real
+    val fraction = if brain then 7 else 10
+    val top = if brain then 127 else 15
+    val (biased, field) = binary_of_ratio(num, den, fraction, 1 - top, top)
+
+    var magnitude = infinity
+
+    if biased != 2 * top + 1
+        val hidden: long = if biased > 0 then long(1) << long(fraction) else 0
+        val significand = real(to_u64(field).unwrap_or(0)) + real(hidden)
+        // The weight of the significand's last bit, `2^(exponent - fraction)`, at most 2^120 and at
+        // least 2^-133 -- a normal `double` either way, so its pattern is written outright.
+        val weight = (if biased == 0 then 1 else biased) - top - fraction
+
+        magnitude = significand * real.from_bits(u64(weight + 1023) << 52)
+    end if
+
+    if negative then -magnitude else magnitude
+end half_of_ratio
+
+// A `double` as the nearest value of a sixteen-bit float, held as the `real` that value is. A NaN, an
+// infinity and a zero of either sign are already values of both formats.
+half_of_double(x: real, brain: bool) -> real
+    if x != x || x == 0.0 || x == infinity || x == -infinity then return x
+
+    val bits = x.bits()
+    val biased = int((bits >> 52) & 0x7FF)
+    val fraction = bits & 0x000FFFFFFFFFFFFF
+    val m = if biased == 0 then from_u64(fraction) else from_u64(fraction | 0x0010000000000000)
+    val e2 = if biased == 0 then -1074 else biased - 1075
+
+    if e2 >= 0 then half_of_ratio(x < 0.0, shl(m, usize(e2)), from_int(1), brain)
+    else half_of_ratio(x < 0.0, m, shl(from_int(1), usize(-e2)), brain)
+end half_of_double
 
 // `num / den`, both positive, rounded to nearest with ties to even and given `negative`'s sign.
 //

@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// A `const` takes its type as a `val` does (`reference/declarations.md § Bindings`): left off, it is
+// the value's own; written, it governs. Everything else about a constant -- folded while compiling,
+// an array length, a value argument, a pattern, a body's own, a library's export -- holds of one
+// whose type was inferred exactly as of one whose type was written.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cti_ready() -> bool = std_root().is_ok() && clang_available()
+
+private cti_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-cti").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cti_root
+
+// What a one-file program prints, or the report it was refused with.
+private cti_ran(text: string) -> string
+    val root = cti_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cti_ran
+
+private cti_report(text: string) -> string
+    val root = cti_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end cti_report
+
+private cti_prints(text: string, want: string)
+    if !cti_ready() then return
+
+    assert_eq(cti_ran(text), want)
+end cti_prints
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private cti_refused(text: string, message: string, at: string)
+    if !cti_ready() then return
+
+    val said = cti_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end cti_refused
+
+// The `sysl doc` signatures of a module's declarations, one per line.
+private cti_signatures(src: string) -> string
+    val r = parse(source_of("t.sysl", s"module m\n\n${src}\n"))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    var found: Buf[string] = buf()
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> found.push(t)
+            None -> ()
+
+    var out = ""
+
+    for t in found
+        out = out + t + "\n"
+
+    out
+end cti_signatures
+
+// -- the type the value gives ---------------------------------------------------------------------
+
+@test("a const with no type is an int, a string, a real, or whatever the call it is answers")
+cti_inferred_types() =
+    cti_prints("sq(x: int) -> int = x * x\n\nconst Step = 2\nconst Name = \"x\"\nconst Half = 0.5\n" +
+               "const L = sq(6)\n\n" +
+               "print(Step + 1, Name, Half * 2, L)\n",
+               "3 x 1 36\n")
+    cti_refused("const Step = 2\n\nval s: string = Step\n",
+                "cannot initialize 's': declared string but the value is int", "3:1")
+    cti_refused("const Big = 1 << 40\n", "a constant shifted by 40 places, at or past the 32 bits of int", "1:13")
+    cti_refused("const Big = 65536 * 65536\n", "the value 4294967296 does not fit int", "1:13")
+    cti_refused("const Big = 1099511627776\n", "the literal 1099511627776 does not fit int", "1:13")
+
+@test("an inferred const is an array length, a value argument and a pattern")
+cti_inferred_in_compile_time_positions() =
+    cti_prints("const N = 3\n\ntwice[const K: int]() -> int = K * 2\n\nvar a: [N]u8\nval k = 3\n" +
+               "val said = k match\n    N -> \"three\"\n    _ -> \"other\"\n\nprint(a.len, twice[N](), said)\n",
+               "3 6 three\n")
+
+@test("a const inside a body infers its type and stands where a constant is wanted")
+cti_inferred_inside_a_body() =
+    cti_prints("sq(x: int) -> int = x * x\n\ntwice[const N: int]() -> int = N * 2\n\nmain()\n" +
+               "    const L = sq(6)\n    const S = \"in\"\n    var a: [L]int\n\n" +
+               "    print(L, S, a.len, twice[L]())\n", "36 in 36 72\n")
+
+@test("a written type still governs the value: it is read at the type, and refused where it does not fit")
+cti_written_type_governs()
+    cti_prints("const B: u8 = 200\nconst R: real = 1\n\nprint(B, B + 100, R / 4)\n", "200 44 0.25\n")
+    cti_refused("const x: u8 = 300\n", "'x' does not fit byte: 300", "1:15")
+    cti_refused("main()\n    const y: u8 = 300\n    print(y)\n", "the literal 300 does not fit byte", "2:19")
+end cti_written_type_governs
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("an inferred const is still a scalar, still read while compiling, and still needs its value")
+cti_refusals()
+    cti_refused("struct Point\n    x: int\n    y: int\n\nconst P = Point(1, 2)\n",
+                "a constant is a scalar, and Point is storage — write 'P' as a 'val'", "5:1")
+    cti_refused("main()\n    var n = 3\n    const A = n + 1\n    print(A)\n",
+                "'A' is a constant, so its value is known while compiling, and it reads 'n'", "3:5")
+    cti_refused("const C = C + 1\n", "constant 'C' is defined in terms of itself: C → C", "1:1")
+    cti_refused("const D\n", "'=' expected", "2:1")
+end cti_refusals
+
+// -- a library's export ---------------------------------------------------------------------------
+
+@test("sysl doc writes an inferred const as it was declared")
+cti_doc_signature()
+    assert_eq(cti_signatures("const step = 2\nconst limit: usize = 512"),
+              "const step = 2\nconst limit: usize = 512\n")
+
+@test("a library exports an inferred const, which build-lib checks and a program reads at its type")
+cti_library_export()
+    if !cti_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-cti-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-cti-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nconst Step = 3\nconst Label = \"demo\"\nconst Scale: real = 2\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\nvar cells: [demo.Step]u8\n\n" +
+               "print(demo.Step * 2, demo.Label, demo.Scale / 4, cells.len)\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "6 demo 0.5 3\n")
+end cti_library_export

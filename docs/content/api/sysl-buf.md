@@ -15,20 +15,33 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 
 ## Index
 
-[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`freeze_buf`](#freeze_buf) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
 ### `buf`
 
 ```sysl
-buf[T]() -> Buf[T]
+const buf[T]() -> Buf[T]
 ```
+
+### `buf_filled`
+
+```sysl
+const buf_filled[T](n: usize, value: T) -> Buf[T]
+```
+
+A buffer of `n` elements, every one of them `value` -- what a RAM disk, a frame buffer or a table
+of counters starts as. The storage is sized to `n` once and each slot is filled in place, so it
+costs one allocation and `n` stores rather than the doublings of a `push` loop.
+
+**Every element is a copy of `value`**, the way any assignment copies: a plain value is repeated,
+and a counted one is shared -- `n` elements naming one object, holding `n` counts of it.
 
 ### `buf_with_capacity`
 
 ```sysl
-buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
+const buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
 ```
 
 A buffer that has already been given room for `n` elements, for a caller that knows roughly how
@@ -44,6 +57,17 @@ callers write it, and because it is what lets a call say the element type withou
 ```sysl
 byte_sink() -> ByteSink
 ```
+
+### `freeze_buf`
+
+```sysl
+freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
+```
+
+The buffer's elements, taken: copied once into storage of their own, sized to them, and the
+buffer left empty -- for this name and every other name of the same buffer, which is what makes the
+result immutable. A view taken of the buffer earlier still reads the old storage, which the frozen
+one shares nothing with.
 
 ## Types
 
@@ -95,20 +119,22 @@ asks on purpose.
 |---|---|---|
 | `elems` | `elems -> []T` | The storage, spare capacity included -- for a reader that wants the address of an element, as `&b.elems[i]` is. |
 | `count` | `count -> usize` | How many elements there are -- `len()` under the name the field had. |
-| `len` | `len(self) -> usize` |  |
-| `cap` | `cap(self) -> usize` |  |
-| `is_empty` | `is_empty(self) -> bool` |  |
-| `at` | `at(self, i: usize) -> T` |  |
-| `set` | `set(self, i: usize, v: T)` |  |
-| `push` | `push(self, v: T)` |  |
-| `extend` | `extend(self, xs: []const T)` |  |
-| `pop` | `pop(self) -> Option[T]` |  |
-| `truncate` | `truncate(self, n: usize)` |  |
-| `clear` | `clear(self)` |  |
-| `insert` | `insert(self, i: usize, v: T)` |  |
-| `remove` | `remove(self, i: usize) -> T` |  |
-| `copy` | `copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
-| `view` | `view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
+| `len` | `const len(self) -> usize` |  |
+| `cap` | `const cap(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `at` | `const at(self, i: usize) -> T` |  |
+| `set` | `const set(self, i: usize, v: T)` |  |
+| `push` | `const push(self, v: T)` |  |
+| `extend` | `const extend(self, xs: []const T)` |  |
+| `pop` | `const pop(self) -> Option[T]` |  |
+| `truncate` | `const truncate(self, n: usize)` |  |
+| `clear` | `const clear(self)` |  |
+| `insert` | `const insert(self, i: usize, v: T)` |  |
+| `reserve` | `const reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
+| `remove` | `const remove(self, i: usize) -> T` |  |
+| `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
+| `freeze` | `const freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
+| `view` | `const view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
 | `release` | `release(*self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
 
 ### `ByteSink`
@@ -130,7 +156,98 @@ stands for standard output and holds no state at all.
 |---|---|---|
 | `text` | `text(self) -> []u8` |  |
 
+### `Frozen`
+
+```sysl
+struct Frozen[T]
+    private owner: usize
+    private data: *T
+    private n: usize
+```
+
+A buffer that will never change again, shared by every thread that holds it.
+
+`Buf.freeze()` makes one: it takes the buffer's elements and answers a `&sync Frozen[T]`, which
+is one atomic count on the whole buffer. A `&sync` object may hold it, and a `&sync Fn` may
+capture it, so read-only heap data -- decoded pixels, a list of shapes -- is read by every thread
+at once with no lock and no count per element (`reference/memory.md § A frozen buffer crosses`).
+
+**Nothing writes it.** There is no `push`, no `set`, no subscript assignment and no writable view;
+what it has is `len`, `f[i]`, `for x in f` and `view()`, a `[]const T`.
+
+**A frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is formed only
+where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other frozen buffers, and the
+structs and arrays built of them. The compiler asks that of the type argument where the reference
+is formed, as it asks a struct's fields.
+
+**Its fields carry no count**, and that is what makes it safe to read from every thread: the
+storage is owned through a count that is not atomic, held here as the bare words of the slice that
+owns it, so copying the struct -- as a `(self)` member does -- takes no share of anything. Only the
+destructor touches that count, once, run by whichever thread lets go of the box's last share.
+
+| Member | Signature | Description |
+|---|---|---|
+| `len` | `const len(self) -> usize` |  |
+| `is_empty` | `const is_empty(self) -> bool` |  |
+| `at` | `const at(self, i: usize) -> T` | The element at `i`, checked against the length. |
+| `view` | `const view(&sync self) -> []const T` | The elements as a read-only slice. |
+
+### `FrozenWalk`
+
+```sysl
+struct FrozenWalk[T]
+    private data: *T
+    private n: usize
+    private i: usize
+```
+
+The cursor a `for` over a frozen buffer walks: the storage's address and length, read while the
+frozen buffer the `for` was handed keeps it alive.
+
 ## Implementations
+
+### Buf[T]
+
+```sysl
+impl[T: AnyBits] Buf[T]
+```
+
+The storage past a buffer's elements, filled by something other than `push` -- a C function
+handed its address, or a writer handed it as a `[]T` -- and then taken into the count without a
+second copy:
+
+```
+b.reserve(n)
+val got = fill(b.spare())       // writes into the first `got` slots
+b.set_len(b.len() + got)
+```
+
+**Only a buffer whose element type is `AnyBits` has these.** A slot `set_len` takes in holds
+whatever was in its storage: the bytes written there, or, for a slot nobody wrote, whatever the
+allocator left -- an unspecified value, which for an `AnyBits` type is still a value of it. A
+`bool`, an enum, a `string` or a `&T` read out of bytes nobody wrote would not be one, so those
+buffers are refused the call at compile time.
+
+| Member | Signature | Description |
+|---|---|---|
+| `spare` | `spare(self) -> []T` | The slots past `len()`, as a slice of `cap() - len()` -- the room a writer may fill. |
+| `set_len` | `set_len(self, n: usize)` | The length set to `n`, taking the slots between the old length and `n` as the elements they already hold. |
+
+### Debug for Buf[T]
+
+```sysl
+impl[T: Debug] Debug for Buf[T]
+```
+
+A `Buf` shows as the sequence it holds, `[1, 2, 3]`, rather than as the storage it is built from.
+
+### Debug for Frozen[T]
+
+```sysl
+impl[T: Debug] Debug for Frozen[T]
+```
+
+A frozen buffer shows as the sequence it holds, as a `Buf` does.
 
 ### Display for Buf[T]
 
@@ -144,6 +261,24 @@ goes through, and for the same reason.
 What the delegation buys here beyond agreement is the padding: a specifier describes the field the
 whole value occupies, and `[]T`'s own block already measures a rendering before it pads one, so a
 width on a `Buf` pads the whole sequence rather than being worked out a second time.
+
+### Display for Frozen[T]
+
+```sysl
+impl[T: Display] Display for Frozen[T]
+```
+
+A frozen buffer renders as the sequence it holds, as a `Buf` does.
+
+### Drop for Frozen[T]
+
+```sysl
+impl[T] Drop for Frozen[T]
+```
+
+The storage given back: the slice the words describe is rebuilt in a local, without a share being
+taken, and the local going out of scope is the one release the storage gets -- which lets go of every
+element it holds.
 
 ### Eq for Buf[T]
 
@@ -177,6 +312,12 @@ impl[T] Index[usize, T] for Buf[T]
 Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
 means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
 
+### Index for Frozen[T]
+
+```sysl
+impl[T] Index[usize, T] for Frozen[T]
+```
+
 ### IndexPlace for Buf[T]
 
 ```sysl
@@ -193,6 +334,12 @@ member moves the storage.
 impl[T] IndexSet[usize, T] for Buf[T]
 ```
 
+### Iterate for FrozenWalk[T]
+
+```sysl
+impl[T] Iterate for FrozenWalk[T]
+```
+
 ### Walk for Buf[T]
 
 ```sysl
@@ -202,6 +349,15 @@ impl[T] Walk for Buf[T]
 `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
 slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
 the walk is not visited, the view having been taken before the first turn.
+
+### Walk for Frozen[T]
+
+```sysl
+impl[T] Walk for Frozen[T]
+```
+
+`for x in f` walks the elements by index through a cursor holding one share of the buffer, so the
+walk allocates nothing.
 
 ### Writer for ByteSink
 

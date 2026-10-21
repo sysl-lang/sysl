@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **A heap-less machine is asked about the image, and the image is what the program reaches**
+// (`reference/modules.md § The target's half needs no clause at all`). A function of a module the
+// program names, a trait's default no implementing type is called through, a generic nothing
+// instantiated: none of them is in the image, so none is refused. What the program does reach is
+// refused exactly as before, at the construct and at the call.
+
+// A source root of one module: something a board can use beside things it cannot.
+private hrc_root() -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("sh/hrc/mixed/mixed.sysl",
+        "module sh.hrc.mixed\n" +
+        "\n" +
+        "struct Cell\n" +
+        "    v: int\n" +
+        "\n" +
+        "twice(x: u32) -> u32 = x * 2\n" +
+        "\n" +
+        "make() -> &Cell = Cell(1)\n" +
+        "\n" +
+        "boxed[T](x: T) -> &Cell = Cell(2)\n" +
+        "\n" +
+        "trait Get\n" +
+        "    get(self) -> int\n" +
+        "    held(self) -> &Cell = Cell(self.get())\n" +
+        "\n" +
+        "struct Three\n" +
+        "end Three\n" +
+        "\n" +
+        "impl Get for Three\n" +
+        "    get(self) -> int = 3\n"))
+
+    lbr_tree(files)
+end hrc_root
+
+private hrc_board(program: string) -> string
+    lbr_tree(lbr_two("package.hocon",
+                     "package {\n  name = \"hrc-board\"\n  version = \"0.1.0\"\n}\n\n" +
+                     "capabilities { heap = false }\n",
+                     "main.sysl", program))
+end hrc_board
+
+private hrc_build_c(program: string, lib: string) -> (int, string) =
+    lbr_cli(["sysl", "build-c", program, "--target", "thumbv7em-freestanding", "--lib", lib, "-o",
+             s"$program/out.a"])
+
+private val hrc_heapless: string =
+    "a reference needs an allocator, and 'thumbv7em-freestanding' provides no allocator — it may " +
+    "hold and release storage made elsewhere, and may make none of its own"
+
+@test("a function of a module the program names, which nothing calls, is not asked about the heap")
+hrc_unreached_function_is_not_asked()
+    if !lbr_ready() then return
+
+    val lib = hrc_root()
+    val program = hrc_board("import sh.hrc.mixed.{twice, Three, Get}\n\n@export(\"main\")\nmain()\n" +
+                            "    if twice(2) != 4 || Three().get() != 3 then loop do ()\n")
+    val got = hrc_build_c(program, lib)
+
+    assert(got.0 == 0, got.1)
+    assert(got.1.index_of("error").is_none(), got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end hrc_unreached_function_is_not_asked
+
+@test("the program's own function that nothing calls is not asked either")
+hrc_own_unreached_function_is_not_asked()
+    if !lbr_ready() then return
+
+    val program = hrc_board("struct Box\n    v: int\n\nspare() -> &Box = Box(1)\n\n" +
+                            "@export(\"main\")\nmain()\n    if 2 + 2 != 4 then loop do ()\n")
+    val got = lbr_cli(["sysl", "build-c", program, "--target", "thumbv7em-freestanding", "-o",
+                       s"$program/out.a"])
+
+    assert(got.0 == 0, got.1)
+    assert(got.1.index_of("error").is_none(), got.1)
+
+    remove_dir_all(program).unwrap_or(())
+end hrc_own_unreached_function_is_not_asked
+
+@test("a reached function of a dependency is refused at its construct and at the call")
+hrc_reached_function_is_refused()
+    if !lbr_ready() then return
+
+    val lib = hrc_root()
+    val program = hrc_board("import sh.hrc.mixed.make\n\n@export(\"main\")\nmain()\n" +
+                            "    val c = make()\n")
+    val got = hrc_build_c(program, lib)
+    val mixed = s"$lib/sh/hrc/mixed/mixed.sysl"
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"error: $hrc_heapless\n --> $mixed:8:19").is_some(), got.1)
+    assert(got.1.index_of("error: this reaches 'sh.hrc.mixed.make', which makes heap storage, and " +
+                          "'thumbv7em-freestanding' provides no allocator").is_some(), got.1)
+    assert(got.1.index_of(s"--> $program/main.sysl:5:13").is_some(), got.1)
+
+    // Those two and nothing else: the generic and the default beside `make` are not in the image.
+    assert(got.1.count_of("error: ") == 2, got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end hrc_reached_function_is_refused
+
+@test("a trait default the program calls is refused, in the trait's file")
+hrc_reached_default_is_refused()
+    if !lbr_ready() then return
+
+    val lib = hrc_root()
+    val program = hrc_board("import sh.hrc.mixed.{Three, Get}\n\n@export(\"main\")\nmain()\n" +
+                            "    val c = Three().held()\n")
+    val got = hrc_build_c(program, lib)
+    val mixed = s"$lib/sh/hrc/mixed/mixed.sysl"
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"error: $hrc_heapless\n  --> $mixed:14:27").is_some(), got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end hrc_reached_default_is_refused
+
+@test("a generic the program instantiates is refused by the body it was written as")
+hrc_reached_generic_is_refused()
+    if !lbr_ready() then return
+
+    val lib = hrc_root()
+    val program = hrc_board("import sh.hrc.mixed.boxed\n\n@export(\"main\")\nmain()\n" +
+                            "    val c = boxed(7)\n")
+    val got = hrc_build_c(program, lib)
+    val mixed = s"$lib/sh/hrc/mixed/mixed.sysl"
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"error: $hrc_heapless\n  --> $mixed:10:27").is_some(), got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end hrc_reached_generic_is_refused
+
+@test("in a test build a test is a root, so what it reaches on a heap-less machine is refused")
+hrc_test_is_a_root()
+    if !lbr_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("package.hocon", "package {\n  name = \"hrc-tested\"\n  version = \"0.1.0\"\n}\n\n" +
+                                 "capabilities { heap = false }\n"))
+    files.push(("cells/cells.sysl", "module cells\n\nstruct Box\n    v: int\n\n" +
+                                    "make() -> &Box = Box(1)\n"))
+    files.push(("cells/cells_tests.sysl", "module cells\n@tests\n\n@test(\"makes\")\n" +
+                                          "makes()\n    assert(make().v == 1)\n"))
+
+    val project = lbr_tree(files)
+    val got = lbr_cli(["sysl", "test", project])
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("provides no allocator — it may hold and release storage made " +
+                          s"elsewhere, and may make none of its own\n --> $project/cells/cells.sysl:6:18")
+           .is_some(), got.1)
+
+    remove_dir_all(project).unwrap_or(())
+end hrc_test_is_a_root
+
+@test("a module that declared '@no_alloc' is still held to it in a body nothing reaches")
+hrc_module_clause_holds_every_body()
+    if !lbr_ready() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("package.hocon", "package {\n  name = \"hrc-tidy\"\n  version = \"0.1.0\"\n}\n\n" +
+                                 "capabilities { heap = false }\n"))
+    files.push(("tidy/tidy.sysl", "module tidy\n@no_alloc\n\nstruct Box\n    v: int\n\n" +
+                                  "spare() -> &Box = Box(1)\n\nfour() -> int = 4\n"))
+    files.push(("main.sysl", "import tidy.four\n\n@export(\"main\")\nmain()\n" +
+                             "    if four() != 4 then loop do ()\n"))
+
+    val program = lbr_tree(files)
+    val got = lbr_cli(["sysl", "build-c", program, "--target", "thumbv7em-freestanding", "-o",
+                       s"$program/out.a"])
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("error: a reference needs an allocator, and this module declared " +
+                          s"'@no_alloc' — it may hold and release storage made elsewhere, and may " +
+                          s"make none of its own\n --> $program/tidy/tidy.sysl:7:19").is_some(), got.1)
+
+    remove_dir_all(program).unwrap_or(())
+end hrc_module_clause_holds_every_body

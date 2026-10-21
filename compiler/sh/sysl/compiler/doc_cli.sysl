@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, is_file, make_dir_all, read_text, remove_file, write_text}
+import sysl.path.normalize
 import sysl.process.{capture, Output}
 import sysl.text.{parse_int, Search, split}
 
@@ -146,6 +147,8 @@ read_doc_tree(dir: string, include_private: bool, warn: string -> unit) -> Resul
         for j in 0..<found.len()
             warn(s"${unit.src.name}:${found.at(j).tag.line}: warning: ${found.at(j).message}")
 
+    settle_doc_results(dir, units)
+
     val modules = build_doc_modules(units, include_private)
 
     if modules.is_empty()
@@ -154,6 +157,104 @@ read_doc_tree(dir: string, include_private: bool, warn: string -> unit) -> Resul
 
     Ok(modules)
 end read_doc_tree
+
+// **A function that leaves its result to its body is documented at the type the body has**, as though
+// it had been written: a page shows an API, never an implementation. That one question is the only one
+// the command asks an analysis, and only where some declaration needs it: the tree is compiled as
+// `sysl build` would compile it -- as the standard library where it declares `sysl` -- each result is
+// read, and the answer is filed on the declaration's slot (`ResultSlot.shown`) for the signature to
+// print. A tree that does not compile still documents; a result its analysis could not read is shown
+// as ` = …`.
+//
+// The two parses are matched by where each declaration is written -- its file and its offset -- since
+// both read the files for this machine.
+settle_doc_results(dir: string, units: Buf[Program])
+    var asked: Buf[&ResultSlot] = buf()
+    var at: Buf[string] = buf()
+
+    for unit in units
+        if unit.test_only || unit.module_name.is_none() then continue
+
+        for item in unit.body
+            dcl_slots_of(unit, item, &asked, &at)
+
+    if asked.is_empty() then return
+
+    val t = host_target()
+    var std = false
+
+    for unit in units
+        if unit.module_name.is_some() && unit.module_name.unwrap().show() == "sysl" then std = true
+
+    val made = if std then std_compilation_of(dir, t) else packaged_compilation_of(dir, t, false)
+    val program = made match
+        Ok(p) -> p
+        Err(_) -> return
+
+    val done = analyze_produced(program.units, t, buf(), false)
+    val shown: &Table[string] = table()
+    // A trait's default is filed once under each type that inherits it, and where those readings
+    // disagree no one type is the signature's.
+    val split: &Table[bool] = table()
+
+    for i in 0..<done.an.results.sites.len()
+        val s = done.an.results.sites.at(i)
+
+        if s.frame.is_some() then continue
+
+        val key = dcl_site_key(dcl_analyzed_file(s.scope.src.name, dir, std), s.span.start)
+        val clause = settled_result_of(done.an, s.key).and_then(doc_result_of)
+
+        if clause.is_none() || split.has(key) then continue
+
+        shown.get(key) match
+            Some(before) ->
+                if before != clause.unwrap()
+                    shown.remove(key)
+                    split.put(key, true)
+                end if
+            None -> shown.put(key, clause.unwrap())
+    end for
+
+    for i in 0..<asked.len()
+        asked.at(i).shown = shown.get(at.at(i))
+end settle_doc_results
+
+// Every slot a documented declaration leaves to its body -- a function's, or a member's of a type, a
+// trait or an `impl` -- with where the analysis files it: `decl_anchor` and `method_anchor`.
+private dcl_slots_of(unit: Program, s: Stmt, asked: *Buf[&ResultSlot], at: *Buf[string])
+    val name = unit.src.name
+
+    *s.kind match
+        FuncDecl(d) -> dcl_note(result_slot_of(d.ret_type), dcl_site_key(name, decl_anchor(d).start), asked, at)
+        StructDecl(d) -> dcl_members(name, d.members, asked, at)
+        EnumDecl(d) -> dcl_members(name, d.members, asked, at)
+        TraitDecl(d) -> dcl_members(name, d.methods, asked, at)
+        ImplDecl(d) -> dcl_members(name, d.methods, asked, at)
+        StaticDecl(inner) -> dcl_slots_of(unit, inner, asked, at)
+        CopiedDecl(_, inner) -> dcl_slots_of(unit, inner, asked, at)
+        _ -> ()
+end dcl_slots_of
+
+private dcl_members(name: string, ms: Buf[MethodDecl], asked: *Buf[&ResultSlot], at: *Buf[string])
+    for m in ms
+        dcl_note(result_slot_of(m.ret_type), dcl_site_key(name, method_anchor(m).start), asked, at)
+
+private dcl_note(slot: Option[&ResultSlot], key: string, asked: *Buf[&ResultSlot], at: *Buf[string])
+    if slot.is_none() then return
+
+    asked.push(slot.unwrap())
+    at.push(key)
+end dcl_note
+
+// A declaration's place, in terms both parses agree on whatever path each was handed.
+private dcl_site_key(file: string, offset: usize) -> string = s"${normalize(absolute_path(file))}:$offset"
+
+// The file an analyzed declaration is written in, as the tree's own parse names it: the standard
+// library's files are named by their place in it (`library/sysl/buf/buf.sysl`, `std.sysl`'s
+// `std_named`), which is that place under the tree being documented.
+private dcl_analyzed_file(name: string, dir: string, std: bool) -> string =
+    if std && name.starts_with("library/") then s"$dir/${name[8..<name.bytes.len]}" else name
 
 // `sysl doc [options] [<dir>]`. `args` is the whole command line, `sysl` and `doc` included.
 doc_command(args: []string, say: string -> unit) -> int

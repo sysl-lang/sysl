@@ -28,12 +28,20 @@ import sysl.container.{Set, set}
 //
 // `name` is what the declaration calls itself, which is not always how the reference spelled it: a
 // name reached through an import is named with its module, as the declaration's own module calls it.
+//
+// **The spans are kept beside the positions**, because an editor counts columns in neither bytes nor
+// characters but UTF-16 code units, and only the bytes can be counted again in any unit asked for.
+// `detail` is what the analyzer knew about the thing at the moment it resolved the name -- a local's
+// type, a function's signature -- which is what hover shows; empty where nothing was recorded.
 struct Reference
     at_file: string
     at: Loc
     declared_file: string
     declared_at: Loc
     name: string
+    at_span: Span
+    declared_span: Span
+    detail: string
 end Reference
 
 // The references one analysis made, in the order resolution reached them and each kept once.
@@ -47,13 +55,13 @@ struct DefinitionIndex
     seen: Set[string]
 
     // Records one reference, unless it is already recorded.
-    note(*self, src: Source, at: Span, home: Source, declared: Span, name: string)
+    note(*self, src: Source, at: Span, home: Source, declared: Span, name: string, detail: string = "")
         val here = src.locate(at.start)
         val there = home.locate(declared.start)
         val key = s"${src.name}:${here.line}:${here.col}>${home.name}:${there.line}:${there.col}:$name"
 
         if self.seen.add(key) then
-            self.references.push(Reference(src.name, here, home.name, there, name))
+            self.references.push(Reference(src.name, here, home.name, there, name, at, declared, detail))
     end note
 end DefinitionIndex
 
@@ -79,17 +87,58 @@ end Indexing
 
 // A reference from a name written at `at` in the file `cx` is reading, where the analysis is
 // recording any.
-note_reference(cx: &Analyzer, at: Span, home: Source, declared: Span, name: string)
+note_reference(cx: &Analyzer, at: Span, home: Source, declared: Span, name: string, detail: string = "")
     cx.an.index match
-        Some(ix) -> ix.note(cx.scope.src, at, home, declared, name)
+        Some(ix) -> ix.note(cx.scope.src, at, home, declared, name, detail)
         None -> ()
+
+// Where a binding's name is written, when it starts at `at` in the file being read -- bare, or
+// quoted in backticks -- for the index to record as the binding's place (`Local.declared`). Nothing
+// when no index is being filled, or when what is written there is not the name.
+written_name(cx: &Analyzer, at: usize, name: string) -> Option[Span]
+    if cx.an.index.is_none() then return None
+
+    val b = cx.scope.src.bytes
+    val start = if at < b.len && b[at] == u8('`') then at + 1 else at
+    val n = name.bytes.len
+
+    if n == 0 || start + n > b.len then return None
+
+    for i in 0..<n
+        if b[start + i] != name.bytes[i] then return None
+
+    if start + n < b.len && lsp_word_byte(b[start + n]) then return None
+
+    Some(Span(start, start + n))
+end written_name
+
+// The name a binding statement writes after its keyword (`val`, `var`, `ref`, `for`), the statement
+// starting at `at`: the keyword, the blanks after it, then the name. Nothing where the statement
+// starts with something else -- an attribute, a label -- and the binding's place stays the statement.
+name_after_keyword(cx: &Analyzer, at: usize, name: string) -> Option[Span]
+    if cx.an.index.is_none() then return None
+
+    val b = cx.scope.src.bytes
+    var i = at
+
+    while i < b.len && b[i] >= u8('a') && b[i] <= u8('z')
+        i += 1
+
+    if i == at then return None
+
+    while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+
+    written_name(cx, i, name)
+end name_after_keyword
 
 // A reference to a local, whose binding is in the file being read.
 note_local_reference(cx: &Analyzer, at: Span, local: Local)
     if cx.an.index.is_none() then return
 
     local.declared match
-        Some(where) -> note_reference(cx, at, cx.scope.src, where, local.name)
+        Some(where) ->
+            note_reference(cx, at, cx.scope.src, where, local.name, s"${local.name}: ${type_show(local.ty)}")
         None -> ()
 end note_local_reference
 
@@ -102,13 +151,46 @@ note_func_reference(cx: &Analyzer, at: Span, key: string)
     if f.is_none() then return
 
     val home = f.unwrap().scope
+    val d = f.unwrap().decl
 
-    note_reference(cx, at, home.src, f.unwrap().span, declared_name(home, f.unwrap().decl.name))
+    // A result read off the body is shown at the type it was read as, as an inferred `val` is, and
+    // as `sysl doc` shows it: no arrow for `unit`.
+    val clause = if is_inferred_result(d.ret_type) then settled_result_of(cx.an, key).and_then(doc_result_of)
+    else None
+    val shown = clause match
+        Some(c) -> s"${doc_func(d with { ret_type = None })}$c"
+        None -> doc_func(d)
+
+    note_reference(cx, at, home.src, f.unwrap().span, declared_name(home, d.name), shown)
 end note_func_reference
 
-// A reference to module storage -- a `val`, a module `var` or an `extern` variable.
-note_storage_reference(cx: &Analyzer, at: Span, d: ValueDecl)
-    if cx.an.index.is_some() then note_reference(cx, at, d.scope.src, d.span, declared_name(d.scope, d.name))
+// A reference to a member -- a method called, a property read -- filed under `fname`, the function
+// it lowers to. Shown as `sysl doc` shows the member, with a result read off its body at that result.
+note_member_reference(cx: &Analyzer, at: Span, fname: string, m: MethodDecl)
+    if cx.an.index.is_none() then return
+
+    val home = cx.an.tables.members.decl_scope.get(fname)
+    val declared = cx.an.tables.members.decl_spans.get(fname)
+
+    if home.is_none() || declared.is_none() then return
+
+    val clause = if is_inferred_result(m.ret_type) then settled_result_of(cx.an, fname).and_then(doc_result_of)
+    else None
+    val shown = clause match
+        Some(c) -> s"${doc_method(m with { ret_type = None })}$c"
+        None -> doc_method(m)
+
+    note_reference(cx, at, home.unwrap().src, declared.unwrap(), m.name, shown)
+end note_member_reference
+
+// A reference to module storage -- a `val`, a module `var` or an `extern` variable -- shown at the
+// type it is stored at, which for a `val` written with none is its initializer's.
+note_storage_reference(cx: &Analyzer, at: Span, d: ValueDecl, stored: Type)
+    if cx.an.index.is_none() then return
+
+    note_reference(cx, at, d.scope.src, d.span, declared_name(d.scope, d.name),
+                   s"${d.name}: ${type_show(stored)}")
+end note_storage_reference
 
 // What a declaration calls itself: its name, qualified by its module where it has one.
 private declared_name(home: Scope, name: string) -> string =

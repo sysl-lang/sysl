@@ -32,11 +32,19 @@ import sysl.text.{Search, StrBuilder, str_builder, from_utf8_unchecked, replace_
 // to survive. `chosen` is whether any branch of the group has been taken yet, which is what an
 // `#elif` and an `#else` consult. `else_line` is where this group's `#else` is, or `0` for a group
 // that has not reached one.
+//
+// `in_block` marks a group opened inside a text block, which has to close inside it too. `text` marks
+// a group of the text's own -- a C `#if LIMIT > 2` or `#ifdef` and the lines down to its `#endif`,
+// directive-shaped or not, which are all the block's text. It selects nothing: its `taken` is the
+// enclosing one's, and it is on the stack only so that its own `#else` and `#endif` are known to be
+// its own.
 private struct Frame
     line: usize
     taken: bool
     chosen: bool
     else_line: usize
+    in_block: bool
+    text: bool
 end Frame
 
 // The directive a line carries: the word, and the column its argument would start at.
@@ -63,10 +71,46 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     var keep: Buf[bool] = buf()
     var touched = false
 
+    // Where the live code not yet read for literals begins (`inside_literal`).
+    var scan_from: usize = 0
+
+    // The stretch of literals the last directive-shaped line was found inside: where it began, and
+    // where the code after it starts, or 0 outside every literal. A text block and a block comment can
+    // share one stretch (`*/ s = """`), so each line in it is asked which it is inside.
+    var block_from: usize = 0
+    var block_end: usize = 0
+
     for line in 1..lines
         val text = from_utf8_unchecked(src.line_text(line))
+        val start = src.line_span(line).start
 
-        directive_of(text) match
+        // Past the literal's end, a group opened inside it is one that crossed its end. The text's
+        // own groups end with it: C in a text block need not balance.
+        if block_end > 0 && start >= block_end
+            crossing(src, stack, line - 1) match
+                Some(bad) -> return Err(bad)
+                None -> ()
+
+            while stack.len() > 0 && stack.at(stack.len() - 1).in_block
+                stack.pop()
+
+            block_end = 0
+
+        // A margin line inside a literal that opened in live code is asked whether it is sysl's. In a
+        // block comment none is; in a text block a condition sysl can read gates, and everything
+        // else is the block's text (`in_text_block`). An inactive branch is never read this way,
+        // since it need not even lex.
+        val found = directive_of(text) match
+            Some(d) ->
+                if block_end == 0 && all_taken(stack) && inside_literal(src, &scan_from, &block_from, start)
+                    block_end = scan_from
+
+                if block_end == 0 then Some(d)
+                elif literal_reach_text(src, block_from, start).1 && in_text_block(d, text, line, &stack, on) then Some(d)
+                else None
+            None -> None
+
+        found match
             None ->
                 // A line survives when every open group is in its taken branch: an `#if` inside a
                 // branch that was not taken selects nothing at all, however its own condition reads.
@@ -79,6 +123,10 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
                 touched = true
                 keep.push(false)
 
+                // A directive line is not code, so live code starts again on the line after it --
+                // unless it is inside a text block, which goes on past it.
+                if block_end == 0 then scan_from = src.line_span(line + 1).start
+
                 val word = d.word
 
                 if word == "if"
@@ -87,7 +135,7 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
 
                     if all_taken(stack) && value then taken = true
 
-                    stack.push(Frame(line, taken, value, 0))
+                    stack.push(Frame(line, taken, value, 0, block_end > 0, false))
                 elif word == "elif"
                     if stack.len() == 0
                         return Err(fail_at(src, line, 1,
@@ -107,7 +155,8 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
                     // however its own condition reads.
                     if outer_taken(stack) && !top.chosen && value then taken = true
 
-                    stack.set(stack.len() - 1, Frame(top.line, taken, top.chosen || value, top.else_line))
+                    stack.set(stack.len() - 1, Frame(top.line, taken, top.chosen || value, top.else_line,
+                        top.in_block, false))
                 elif word == "else"
                     trailing(src, line, text, d.at, word) match
                         Some(bad) -> return Err(bad)
@@ -127,7 +176,7 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
 
                     if outer_taken(stack) && !top.chosen then taken = true
 
-                    stack.set(stack.len() - 1, Frame(top.line, taken, true, line))
+                    stack.set(stack.len() - 1, Frame(top.line, taken, true, line, top.in_block, false))
                 elif word == "endif"
                     trailing(src, line, text, d.at, word) match
                         Some(bad) -> return Err(bad)
@@ -144,6 +193,14 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     // has to go and look at: an unterminated group is a missing `#endif`, and with several groups
     // open the end of the file says nothing about which one is missing it. The outermost is named
     // because it is the one whose `#endif` would have to come last.
+    if block_end > 0
+        crossing(src, stack, lines) match
+            Some(bad) -> return Err(bad)
+            None -> ()
+
+        while stack.len() > 0 && stack.at(stack.len() - 1).in_block
+            stack.pop()
+
     if stack.len() > 0
         return Err(fail_at(src, stack.at(0).line, 1, "this '#if' is never closed — add an '#endif'"))
 
@@ -158,10 +215,72 @@ gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Sourc
     Ok(source_of(src.name, out.finish()))
 end gate
 
+// Whether the line starting at `start` is inside a literal -- a text block or a block comment -- that
+// opened in the live code before it. The code from `scan_from` on is read with the lexer's own scans
+// (`literal_reach`), a line's reach at a time, so a file with no directive reads nothing twice and a
+// file with some reads only its live stretches. Where the answer is yes, `scan_from` is left at the
+// code after the reach and `reach_start` where the reach began, which is where a line in it is asked
+// which of its literals it is inside (`literal_reach_text`).
+private inside_literal(src: Source, scan_from: *usize, reach_start: *usize, start: usize) -> bool
+    while *scan_from < start
+        *reach_start = *scan_from
+        *scan_from = literal_reach(src, *scan_from) + 1
+
+    *scan_from > start
+end inside_literal
+
+// Whether a directive-shaped line inside a text block is sysl's -- and where it is the text's own,
+// what it opens or closes among the text's groups.
+//
+// **A condition sysl can read, over symbols sysl knows, gates; everything else is the text's.** The
+// test is the live-code reading itself: `#if feature_http2` and `#if posix` gate, and `#if LIMIT > 2`,
+// `#if defined(X)` and `#if NDEBUG` are C. A `feature_` name is read as it is in live code, where a
+// feature the manifest does not declare is false rather than refused -- so a misspelled one gates its
+// lines out, exactly as it would outside the block, instead of passing through as text. Every other
+// directive word -- `#ifdef`, `#define`, `#include` -- is text, and a text `#if` or `#ifdef` opens a
+// group of the text's own whose `#elif`, `#else` and `#endif` are text too, so a C conditional stays
+// whole inside a sysl group or around one. An `#elif`, `#else` or `#endif` is sysl's only where the
+// innermost group open is a sysl group opened in this block.
+private in_text_block(d: Directive, text: string, line: usize, stack: *Buf[Frame], on: Buf[string]) -> bool
+    val word = d.word
+    val n = stack.len()
+    val ours = n > 0 && stack.at(n - 1).in_block
+    val texts = ours && stack.at(n - 1).text
+
+    if word == "if"
+        if read_condition(argument(text, d.at), d.at, "#if", on, symbols(), true).is_ok() then return true
+
+        stack.push(Frame(line, all_taken(*stack), true, 0, true, true))
+        return false
+
+    if word == "ifdef" || word == "ifndef"
+        stack.push(Frame(line, all_taken(*stack), true, 0, true, true))
+        return false
+
+    if word == "elif" || word == "else" || word == "endif"
+        if ours && !texts then return true
+        if word == "endif" && texts then stack.pop()
+
+    false
+end in_text_block
+
+// A sysl group opened inside the text block that ends on line `closing` and is still open after it.
+// The group is reported at its `#if`, with the block's last line named: gating a block's lines is
+// something the block does, and a group reaching past it would gate code with the text's directives.
+private crossing(src: Source, stack: Buf[Frame], closing: usize) -> Option[Diagnostic]
+    for item in stack
+        if item.in_block && !item.text
+            return Some(fail_at(src, item.line, 1,
+                s"this '#if' opens a group inside the text block that ends on line $closing, and the group has to close inside the block — add its '#endif' before line $closing"))
+
+    None
+end crossing
+
 // Every symbol a condition may name, whatever the target.
 //
 // The set is **closed and derived**: the operating systems and processors the registry knows, plus
-// the three facts worth a name of their own, and nothing a project can add to. Derived so that a new
+// the three system facts, the four floating-point ones and `thread_local` worth a name of their
+// own, and nothing a project can add to. Derived so that a new
 // system extends it by existing rather than by also being written down here, where the two could
 // come to disagree.
 //
@@ -182,15 +301,54 @@ symbols() -> Buf[string]
     out.push("hosted")
     out.push("posix")
     out.push("bsd")
+
+    for item in fp_symbols()
+        out.push(item)
+
+    out.push("fma")
+    out.push("fma_dp")
+    out.push("thread_local")
     out
 end symbols
 
+// The four facts about **floating point** a condition may ask: whether the machine has the
+// registers (`fpu`), whether they hold a double (`fpu_dp`), and which float ABI passes a value
+// (`hardfloat`, `softfp`). They are a fact of the whole target, not of the processor -- seven Arm
+// rows share `thumb` and differ in exactly this -- and code that saves the registers (a `setjmp`, a
+// context switch) has to know, because touching them where there are none faults.
+fp_symbols() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("fpu")
+    out.push("fpu_dp")
+    out.push("hardfloat")
+    out.push("softfp")
+    out
+end fp_symbols
+
 // The symbols that are **true** for a target. Everything in `symbols` and not in here is false;
 // everything in neither is a mistake.
+//
+// `fma` and `fma_dp` say a fused multiply-add is one instruction at binary32 and at binary64 -- C's
+// `FP_FAST_FMAF` and `FP_FAST_FMA` -- and are the machine's, so a directory cannot select on them.
+//
+// `thread_local` says a `@thread_local` is accepted here (`thread_local_accepted`), and is the one
+// symbol that reads more than the target: on a bare AArch64 machine it is the root manifest's
+// `codegen.thread_pointer` that decides, so every command settles the registers before it reads a
+// condition.
 defined(target: Target) -> Buf[string]
     var out = os_defined(target.os)
 
     out.push(cpu_symbol(target.cpu))
+
+    if target.fp_registers() then out.push("fpu")
+    if target.fp_double_registers() then out.push("fpu_dp")
+    if target.hard_float_abi() then out.push("hardfloat")
+    if target.soft_fp_abi() then out.push("softfp")
+    if target.fused_single() then out.push("fma")
+    if target.fused_double() then out.push("fma_dp")
+    if thread_local_accepted(target) then out.push("thread_local")
+
     out
 end defined
 
@@ -232,8 +390,11 @@ directory_symbols() -> Buf[string]
 end directory_symbols
 
 // The whole vocabulary in one line, sorted, as a refusal names it.
-symbols_listed() -> string
-    val sorted = sorted_strings(symbols())
+symbols_listed() -> string = listed(symbols())
+
+// A vocabulary in one line, sorted.
+private listed(known: Buf[string]) -> string
+    val sorted = sorted_strings(known)
     var out = ""
 
     for i in 0..<sorted.len()
@@ -242,7 +403,7 @@ symbols_listed() -> string
         out = out + sorted.at(i)
 
     out
-end symbols_listed
+end listed
 
 // The symbol a package's feature is named by in a condition: `server` is `feature_server`. The
 // prefix keeps the two vocabularies apart, so a package cannot declare a feature called `linux` and
@@ -359,16 +520,24 @@ private struct CondTok
     col: usize
 end CondTok
 
-// A condition being read, which is a token list and a position in it.
+// A condition being read, which is a token list and a position in it. `word` is what a complaint
+// calls the place the condition was written (`#if`, or a manifest key), and `source` whether it gates
+// a source file -- where a package's `feature_` symbols may be named as well as the closed set `known`.
 private struct Cond
-    src: Source
-    line: usize
     word: string
     at: usize
     toks: Buf[CondTok]
     i: usize
     on: Buf[string]
+    known: Buf[string]
+    source: bool
 end Cond
+
+// What is wrong with a condition, and the column it is wrong at.
+private struct CondFault
+    col: usize
+    message: string
+end CondFault
 
 // Whether a directive's condition holds for the symbols given, or what is wrong with it.
 //
@@ -378,14 +547,55 @@ end Cond
 // condition can hold are exactly the ones that would otherwise gate code out with nothing said.
 private condition(src: Source, line: usize, text: string, at: usize, word: string,
                   on: Buf[string]) -> Result[bool, Diagnostic]
-    val arg = argument(text, at)
+    read_condition(argument(text, at), at, s"#$word", on, symbols(), true) match
+        Ok(value) -> Ok(value)
+        Err(fault) -> Err(fail_at(src, line, fault.col, fault.message))
+end condition
+
+// The symbols a dependency's `if` may name: everything a `#if` may, and `libc` -- the one capability
+// that says what is linked under the program, which is what a dependency's own C collides with
+// (`reference/packages.md § A dependency only some machines take`).
+dependency_symbols() -> Buf[string]
+    var out = symbols()
+
+    out.push("libc")
+    out
+end dependency_symbols
+
+// The symbols that are true for a machine as its project describes it, read by a dependency's `if`:
+// what `#if` reads, and `libc` where the machine has a C library under the program.
+dependency_defined(t: Target) -> Buf[string]
+    var out = defined(t)
+
+    if !t.lacks_capability("libc") then out.push("libc")
+
+    out
+end dependency_defined
+
+// Whether a dependency's `if` holds for the symbols given, or what is wrong with it. The grammar and
+// the checks are `#if`'s, so the two places a machine is asked about read one language; the
+// vocabulary is `dependency_symbols`, and a feature is not in it -- `optional` is how a feature turns
+// a dependency on.
+dependency_condition(text: string, on: Buf[string]) -> Result[bool, string]
+    if text.trim().is_empty()
+        return Err("is empty — a condition names at least one fact of the machine, and a dependency " +
+            "every machine takes is written without 'if'")
+
+    read_condition(text, 0, "if", on, dependency_symbols(), false) match
+        Ok(value) -> Ok(value)
+        Err(fault) -> Err(s"is \"$text\", and ${fault.message}")
+end dependency_condition
+
+// The condition `arg` read against `on`, `at` being the column it starts at.
+private read_condition(arg: string, at: usize, word: string, on: Buf[string], known: Buf[string],
+                       source: bool) -> Result[bool, CondFault]
     val named = arg.trim()
 
     // A target's *name* is the thing a reader most plausibly reaches for and the one thing that
     // cannot be a symbol: it has a `-` in it, which no identifier carries. Left to the tokenizer they
     // are told a `-` is not an operator, which is true and no help.
     if target_named(named).is_some()
-        return Err(fail_at(src, line, at + content_at(arg),
+        return Err(CondFault(at + content_at(arg),
             s"'${named}' is a target's name rather than something a condition asks about — a condition asks about one fact of the machine at a time, so this is written '${replace_all(named, "-", " && ")}'"))
 
     var toks: Buf[CondTok] = buf()
@@ -421,24 +631,24 @@ private condition(src: Source, line: usize, text: string, at: usize, word: strin
             toks.push(CondTok(arg[i..<i + 1], arg[i..<i + 1], col))
             i += 1
         else
-            return Err(fail_at(src, line, col,
+            return Err(CondFault(col,
                 s"a condition is built from symbols, '!', '&&', '||' and parentheses, and '${char_at(arg, i)}' is none of them"))
 
-    var c = Cond(src, line, word, at, toks, 0, on)
+    var c = Cond(word, at, toks, 0, on, known, source)
     val value = cond_or(&c)?
 
     if c.i < c.toks.len()
         val extra = c.toks.at(c.i)
 
-        return Err(fail_at(src, line, extra.col, s"the condition is complete before '${extra.text}'"))
+        return Err(CondFault(extra.col, s"the condition is complete before '${extra.text}'"))
 
     Ok(value)
-end condition
+end read_condition
 
 // **Both sides are evaluated even where the result is already settled** -- this is a checker as much
 // as an evaluator, and short-circuiting would let a misspelled symbol through whenever the other
 // half of the condition happened to decide the answer.
-private cond_or(c: *Cond) -> Result[bool, Diagnostic]
+private cond_or(c: *Cond) -> Result[bool, CondFault]
     var acc = cond_and(c)?
 
     loop
@@ -453,7 +663,7 @@ private cond_or(c: *Cond) -> Result[bool, Diagnostic]
     Ok(acc)
 end cond_or
 
-private cond_and(c: *Cond) -> Result[bool, Diagnostic]
+private cond_and(c: *Cond) -> Result[bool, CondFault]
     var acc = cond_unary(c)?
 
     loop
@@ -468,7 +678,7 @@ private cond_and(c: *Cond) -> Result[bool, Diagnostic]
     Ok(acc)
 end cond_and
 
-private cond_unary(c: *Cond) -> Result[bool, Diagnostic]
+private cond_unary(c: *Cond) -> Result[bool, CondFault]
     if cond_kind(c) != "!" then return cond_atom(c)
 
     c.i += 1
@@ -478,11 +688,10 @@ private cond_unary(c: *Cond) -> Result[bool, Diagnostic]
     Ok(!value)
 end cond_unary
 
-private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
+private cond_atom(c: *Cond) -> Result[bool, CondFault]
     val kind = cond_kind(c)
 
-    if kind == ""
-        return Err(fail_at(c.src, c.line, cond_end(c), s"'#${c.word}' needs a condition after it"))
+    if kind == "" then return Err(CondFault(cond_end(c), s"'${c.word}' needs a condition after it"))
 
     val tok = c.toks.at(c.i)
 
@@ -491,10 +700,15 @@ private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
 
         // **The feature family is open where the target's symbols are closed**: a feature exists
         // because the manifest of the file being gated says so, so `feature_x` in a package that
-        // declares no `x` is false rather than refused.
-        if !has(symbols(), tok.text) && !is_feature_symbol(tok.text)
-            return Err(fail_at(c.src, c.line, tok.col,
-                s"'${tok.text}' is not something a target says about itself — sysl knows ${symbols_listed()}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
+        // declares no `x` is false rather than refused. A dependency's condition has no feature
+        // family: `optional` is how a feature turns a dependency on.
+        if c.source && !has(c.known, tok.text) && !is_feature_symbol(tok.text)
+            return Err(CondFault(tok.col,
+                s"'${tok.text}' is not something a target says about itself — sysl knows ${listed(c.known)}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
+
+        if !c.source && !has(c.known, tok.text)
+            return Err(CondFault(tok.col,
+                s"'${tok.text}' is not something a dependency's condition can ask about the machine — it knows ${listed(c.known)}. A dependency a feature turns on is 'optional = true' and named by the feature"))
 
         return Ok(has(c.on, tok.text))
 
@@ -507,15 +721,13 @@ private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
             c.i += 1
             return Ok(inner)
 
-        if cond_kind(c) == ""
-            return Err(fail_at(c.src, c.line, cond_end(c), "this '(' is never closed"))
+        if cond_kind(c) == "" then return Err(CondFault(cond_end(c), "this '(' is never closed"))
 
         val next = c.toks.at(c.i)
 
-        return Err(fail_at(c.src, c.line, next.col, s"this '(' wants a ')' before '${next.text}'"))
+        return Err(CondFault(next.col, s"this '(' wants a ')' before '${next.text}'"))
 
-    Err(fail_at(c.src, c.line, tok.col,
-        s"a condition needs a symbol here, and '${tok.text}' is what is written"))
+    Err(CondFault(tok.col, s"a condition needs a symbol here, and '${tok.text}' is what is written"))
 end cond_atom
 
 private cond_kind(c: *Cond) -> string

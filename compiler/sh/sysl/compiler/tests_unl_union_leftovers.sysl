@@ -1,0 +1,551 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// Three places a union met a rule written for structs: a `const` function writing a union's field, a
+// `@packed` struct holding a union laid down as data, and `&` of an anonymous union's field in a struct
+// with an `invariant` (`reference/types.md § Unions`).
+
+private unl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private unl_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-unl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end unl_run
+
+private unl_prints(text: string, printed: string)
+    if !unl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = unl_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end unl_prints
+
+private unl_refused(text: string, message: string, line: int, col: int)
+    if !unl_ready() then return
+
+    val (_, _, err) = unl_run(text, "0")
+    val head = s"error: $message"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end unl_refused
+
+// The LLVM text a program lowers to on this machine, or what its analysis said.
+private unl_ir(text: string) -> string
+    val root = make_temp_dir("sysl-unl-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end unl_ir
+
+// -- a const function writes a union's field ------------------------------------------------------
+
+@test("a const function writes a union's field, and the union is then the one built with it")
+unl_const_write()
+    unl_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        struct Box
+            tag: u8
+            r: Reg
+
+        const set(n: u32) -> u32
+            var r = Reg(level = 1.0)
+
+            r.bits = n
+            r.bits += 1
+            r.bits
+
+        const boxed(n: u32) -> Reg
+            var b = Box(tag = 1, r = Reg(level = 2.0))
+            var rs: [2]Reg = [Reg(bits = 1), Reg(bits = 2)]
+
+            b.r.bits = n
+            rs[1].level = 0.5
+            b.r
+
+        const K: u32 = set(7)
+        val B: Reg = boxed(9)
+
+        main()
+            print(K, B.bits)
+        """, "8 9\n")
+
+@test("a const function reads a union back only through the field last written")
+unl_const_write_then_cross_read()
+    unl_refused(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const flip(n: u32) -> f32
+            var r = Reg(level = 1.0)
+
+            r.bits = n
+            r.level
+
+        const K: f32 = flip(7)
+
+        main()
+            print(K)
+        """, "'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'bits', and 'level' would read its bytes as another type", 11, 16)
+
+@test("a compound assignment to a field the union was not written through is a read of it, and refused")
+unl_const_update_cross_field()
+    unl_refused(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const bump() -> u32
+            var r = Reg(level = 1.0)
+
+            r.bits += 1
+            r.bits
+
+        const K: u32 = bump()
+
+        main()
+            print(K)
+        """, "'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'level', and 'bits' would read its bytes as another type", 11, 16)
+
+// -- a @packed struct holding a union is laid down as data -----------------------------------------
+
+@test("a module 'val' of a @packed struct holding a union is data, its union at the packed offset")
+unl_packed_static_image()
+    val text = raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        @packed
+        struct Wire
+            tag: u8
+            v: Reg
+
+        @packed
+        union Thin
+            word: u32
+            byte: u8
+
+        struct Holder
+            a: u8
+            t: Thin
+            b: u8
+
+        val table: [2]Wire = [Wire(tag = 1, v = Reg(bits = 5)), Wire(tag = 2, v = Reg(level = 1.0))]
+        val one: Wire = Wire(tag = 3, v = Reg(bits = 6))
+        val h: Holder = Holder(a = 7, t = Thin(word = 8), b = 9)
+
+        main()
+            print(table[0].tag, table[0].v.bits, table[1].tag, table[1].v.bits, one.v.bits, sizeof(Wire))
+            print(h.a, h.t.word, h.b, sizeof(Holder))
+        """
+
+    unl_prints(text, "1 5 2 1065353216 6 5\n7 8 9 6\n")
+
+    if !unl_ready() then return
+
+    val ir = unl_ir(text)
+
+    assert(ir.contains("@one = private constant <{ i8, { [0 x %struct.Reg], i32 } }> <{ i8 3, "), ir)
+    assert(ir.contains("@h = private constant { i8, <{ [0 x %struct.Thin], i32 }>, i8 }"), ir)
+end unl_packed_static_image
+
+// -- & into an anonymous union of a struct with an invariant --------------------------------------
+
+@test("'&' of an anonymous union's field is allowed where the invariant reads none of its fields")
+unl_anonymous_address_allowed()
+    unl_prints(raw"""
+        struct Cell
+            n: int
+            union
+                bits: u32
+                level: f32
+            invariant n >= 0
+
+        poke(p: *u32)
+            *p = 9
+
+        main()
+            var c = Cell(n = 1, bits = 3)
+
+            poke(&c.bits)
+            print(c.bits, c.n)
+        """, "9 1\n")
+
+@test("beside an anonymous union's field, '&' of the field the invariant reads is still refused")
+unl_anonymous_address_refused()
+    unl_refused(raw"""
+        struct Cell
+            n: int
+            union
+                bits: u32
+                level: f32
+            invariant n >= 0
+
+        main()
+            var c = Cell(n = 1, bits = 3)
+            val p = &c.bits
+            val q = &c.n
+
+            print(c.n)
+        """, "'&' here makes a '*int' pointing inside Cell, whose invariant reads 'n'", 11, 13)
+
+// -- an invariant names an anonymous member's fields ------------------------------------------------
+
+// At both levels, the program stops on SIGTRAP, having written exactly `printed` -- a trap flushes
+// standard output first, so the value each starts from is shown to hold before the write that breaks it.
+private unl_traps(text: string, printed: string)
+    if !unl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, _) = unl_run(text, level)
+
+        assert_eq(out, printed)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
+
+private val UnlNested: string = raw"""
+    struct Span
+        lo: int
+        struct
+            len: int
+            struct
+                cap: int
+        invariant len <= cap
+
+    """
+
+@test("an invariant names an anonymous struct's fields at any depth, and a write keeping it holds")
+unl_invariant_anonymous_struct()
+    unl_prints(UnlNested + raw"""
+        main()
+            var s = Span(lo = 0, len = 2, cap = 4)
+
+            s.len = 4
+            s.cap = 9
+            print(s.lo, s.len, s.cap)
+        """, "0 4 9\n")
+
+@test("a write breaking an invariant over an anonymous struct's field traps")
+unl_invariant_anonymous_struct_violated()
+    unl_traps(UnlNested + raw"""
+        main()
+            var s = Span(lo = 0, len = 2, cap = 4)
+
+            print(s.len)
+            s.len = 5
+            print(s.len)
+        """, "2\n")
+
+private val UnlTagged: string = raw"""
+    struct Packet
+        tag: int
+        union
+            ok: bool
+            raw: u8
+        invariant tag == 0 || ok
+
+    """
+
+@test("an invariant names an anonymous union's field, and a value keeping it is built")
+unl_invariant_anonymous_union()
+    unl_prints(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+
+            p.tag = 2
+            print(p.tag, p.ok)
+        """, "2 true\n")
+
+@test("a value breaking an invariant over an anonymous union's field traps")
+unl_invariant_anonymous_union_violated()
+    unl_traps(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+
+            print(p.ok)
+            p.ok = false
+            print(p.ok)
+        """, "true\n")
+
+// The clause reads the union's field only where it reaches the name, so a bool holding a byte that is
+// no bool is not read while `tag == 0` answers -- and is read, and traps, once the clause gets there.
+@test("a union field the clause does not reach is not read, so a pattern it would refuse cannot trap")
+unl_invariant_anonymous_union_lazy()
+    unl_prints(UnlTagged + raw"""
+        main()
+            val p = Packet(tag = 0, raw = 7)
+
+            print(p.tag, p.raw)
+        """, "0 7\n")
+
+@test("a union field the clause reaches is a checked read, and a pattern no bool has traps")
+unl_invariant_anonymous_union_reached()
+    unl_traps(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 0, raw = 7)
+
+            print(p.raw)
+            p.tag = 1
+            print(p.tag)
+        """, "7\n")
+
+@test("'&' of the anonymous union's field an invariant reads is refused")
+unl_invariant_anonymous_union_address()
+    unl_refused(UnlTagged + raw"""
+        main()
+            var p = Packet(tag = 1, ok = true)
+            val q = &p.raw
+
+            print(p.tag)
+        """, "'&' here makes a '*byte' pointing inside Packet, whose invariant reads 'ok'", 10, 13)
+
+@test("a struct whose invariant reads a union field passes the union to the clause by its address")
+unl_invariant_named_union()
+    unl_prints(raw"""
+        union Word
+            n: u32
+            f: f32
+
+        struct Reg
+            w: Word
+            invariant w.n < 100
+
+        main()
+            var r = Reg(Word(n = 5))
+
+            r.w = Word(n = 99)
+            print(r.w.n)
+        """, "99\n")
+
+@test("a union led by a bool keeps every bit another field wrote through a copy")
+unl_bool_led_union_copy()
+    unl_prints(raw"""
+        union Flag
+            on: bool
+            raw: u8
+
+        struct Holder
+            tag: int
+            f: Flag
+
+        main()
+            val h = Holder(1, Flag(raw = 7))
+            val g = h
+
+            print(g.f.raw)
+        """, "7\n")
+
+// -- a union led by an aggregate holding bools ----------------------------------------------------
+//
+// Each union below is led by its first field (the widest boundary, and the larger on a tie), which
+// holds a `bool`. The bytes written through `raw` put something other than 0 or 1 where the bool is,
+// and a copy, a by-value argument and a return must each carry every one of those bytes.
+
+// `decls` declares the union `U` and `show`, which prints its `raw` field.
+private unl_bool_aggregate(decls: string, built: string, printed: string)
+    unl_prints(s"""
+        $decls
+
+        struct Holder
+            tag: int
+            u: U
+
+        @noinline
+        pass(u: U) -> U = u
+
+        main()
+            val h = Holder(1, U(raw = $built))
+            val g = h
+
+            show(g.u.raw)
+            show(pass(h.u).raw)
+        """, s"$printed\n$printed\n")
+end unl_bool_aggregate
+
+@test("a union led by an array of bools keeps every bit another field wrote through a copy, an argument and a return")
+unl_bool_array_led_union_copy()
+    unl_bool_aggregate(raw"""
+        union U
+            flags: [4]bool
+            raw: [4]u8
+
+        show(r: [4]u8) = print(s"${r[0]} ${r[1]} ${r[2]} ${r[3]}")
+        """, "[7, 254, 9, 128]", "7 254 9 128")
+
+@test("a union led by a struct holding a bool keeps every bit another field wrote through a copy, an argument and a return")
+unl_bool_struct_led_union_copy()
+    unl_bool_aggregate(raw"""
+        struct S
+            on: bool
+            n: u32
+
+        union U
+            s: S
+            raw: [2]u32
+
+        show(r: [2]u32) = print(s"${r[0]} ${r[1]}")
+        """, "[0xfe07, 9]", "65031 9")
+
+@test("a union led by a struct whose nested struct holds a bool keeps every bit through a copy, an argument and a return")
+unl_bool_nested_struct_led_union_copy()
+    unl_bool_aggregate(raw"""
+        struct Inner
+            on: bool
+            x: u16
+
+        struct Outer
+            i: Inner
+            y: u16
+
+        union U
+            o: Outer
+            raw: [3]u16
+
+        show(r: [3]u16) = print(s"${r[0]} ${r[1]} ${r[2]}")
+        """, "[0x3f07, 5, 6]", "16135 5 6")
+
+@test("a union led by a struct holding a bool is stored as bytes, @packed or inside a @packed struct")
+unl_bool_struct_led_union_packed()
+    val text = raw"""
+        struct S
+            on: bool
+            n: u32
+
+        union U
+            s: S
+            raw: [2]u32
+
+        @packed
+        union P
+            s: S
+            raw: [8]u8
+
+        @packed
+        struct Wire
+            tag: u8
+            u: U
+            p: P
+
+        @noinline
+        pass(w: Wire) -> Wire = w
+
+        main()
+            val w = Wire(tag = 1, u = U(raw = [0xfe07, 9]), p = P(raw = [7, 254, 0, 0, 9, 0, 0, 0]))
+            val v = pass(w)
+
+            print(v.tag, v.u.raw[0], v.u.raw[1], v.p.raw[0], v.p.raw[1], v.p.raw[4], sizeof(Wire))
+        """
+
+    unl_prints(text, "1 65031 9 7 254 9 17\n")
+
+    if !unl_ready() then return
+
+    val ir = unl_ir(text)
+
+    assert(ir.contains("%struct.U = type { [0 x %struct.S], [8 x i8] }"), ir)
+    assert(ir.contains("%struct.P = type <{ [0 x %struct.S], [8 x i8] }>"), ir)
+end unl_bool_struct_led_union_packed
+
+// -- an unnamed bitfield beside an anonymous block ------------------------------------------------
+
+@test("a struct holding an anonymous union and an unnamed bitfield is built naming its other fields")
+unl_unnamed_bitfield_beside_union()
+    unl_prints(raw"""
+        struct Opens
+            union
+                word: u32
+            tag: u8
+            lo: u4 in u32
+            _: u4 in u32
+            hi: u8 in u32
+
+        main()
+            val o = Opens(word = 0, tag = 7, lo = 1, hi = 9)
+
+            print(o.tag, o.lo, o.hi)
+        """, "7 1 9\n")
+
+@test("the anonymous union may come last, and the unnamed bitfield holds zero")
+unl_unnamed_bitfield_union_last()
+    unl_prints(raw"""
+        struct Opens
+            tag: u8
+            lo: u4 in u32
+            _: u4 in u32
+            hi: u8 in u32
+            union
+                word: u32
+
+        main()
+            val o = Opens(tag = 7, lo = 1, hi = 9, word = 0)
+
+            print(o.tag, o.lo, o.hi)
+        """, "7 1 9\n")
+
+@test("an anonymous struct block beside an unnamed bitfield is built the same way")
+unl_unnamed_bitfield_beside_struct()
+    unl_prints(raw"""
+        struct Opens
+            struct
+                a: u8
+                b: u8
+            tag: u8
+            lo: u4 in u32
+            _: u4 in u32
+            hi: u8 in u32
+
+        main()
+            val o = Opens(a = 2, b = 3, tag = 7, lo = 1, hi = 9)
+
+            print(o.a, o.b, o.tag, o.lo, o.hi)
+        """, "2 3 7 1 9\n")
+
+@test("the unnamed bitfield cannot be named in a construction, anonymous block or not")
+unl_unnamed_bitfield_not_nameable()
+    unl_refused(raw"""
+        struct Opens
+            union
+                word: u32
+            tag: u8
+            lo: u4 in u32
+            _: u4 in u32
+
+        main()
+            val o = Opens(_ = 0, word = 0, tag = 7, lo = 1)
+        """, "struct 'Opens' declares no field named '_' — it holds 'word', 'tag' and 'lo'", 9, 19)

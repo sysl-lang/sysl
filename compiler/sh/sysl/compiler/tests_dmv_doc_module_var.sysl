@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A module's `var` on a `sysl doc` page (`doc_model.sysl`, `doc_signature.sysl`, `doc_markdown.sysl`):
+// storage a caller may write is part of the module's API exactly as a `val` is, so it is listed
+// under the same visibility rule, with its own prose, and its signature is the declaration as
+// written.
+
+private dmv_modules(text: string, include_private: bool) -> Buf[DocModule]
+    var us: Buf[Program] = buf()
+
+    us.push(parse(source_of("t.sysl", text)).program)
+    build_doc_modules(us, include_private)
+end dmv_modules
+
+private dmv_only(text: string, include_private: bool) -> DocModule
+    val ms = dmv_modules(text, include_private)
+
+    assert_eq(ms.len(), 1)
+    ms.at(0)
+end dmv_only
+
+private dmv_vars(text: string, include_private: bool) -> Buf[DocSymbol] =
+    dmv_only(text, include_private).of(DocKind.DkVariable)
+
+private dmv_sigs(syms: Buf[DocSymbol]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for sym in syms
+        out.push(sym.signature)
+
+    out
+end dmv_sigs
+
+private dmv_strs(ts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end dmv_strs
+
+private dmv_at(text: string, part: string) -> usize = text.index_of(part).unwrap()
+
+@test("a public module var is listed with its declaration as written, typed or inferred")
+dmv_public_var_is_listed()
+    val syms = dmv_vars("module m\n\nvar count = 0\n\nvar limit: int = 8\n\nvar slots: [4]u8\n\n" +
+                        "var name = \"x\"\n", false)
+
+    assert_eq(dmv_sigs(syms), dmv_strs(["var count = 0", "var limit: int = 8", "var name = \"x\"", "var slots: [4]u8"]))
+
+    for sym in syms
+        assert(sym.access == DocAccess.DaPublic)
+end dmv_public_var_is_listed
+
+@test("a var is a Variable, not a Value, and a val beside it stays a Value")
+dmv_var_is_its_own_kind()
+    val m = dmv_only("module m\n\nval fixed = 1\n\nvar moving = 2\n", false)
+
+    assert_eq(m.of(DocKind.DkValue).len(), 1)
+    assert_eq(m.of(DocKind.DkValue).at(0).name, "fixed")
+    assert_eq(m.of(DocKind.DkVariable).len(), 1)
+    assert_eq(m.of(DocKind.DkVariable).at(0).name, "moving")
+end dmv_var_is_its_own_kind
+
+@test("a private and a module-scoped var are absent from the API, as a val is")
+dmv_private_var_is_absent()
+    val syms = dmv_vars("module m\n\nprivate var hidden = 0\n\nprivate[m] var wide: int = 1\n\nvar shown = 2\n", false)
+
+    assert_eq(dmv_sigs(syms), dmv_strs(["var shown = 2"]))
+end dmv_private_var_is_absent
+
+@test("a private var is listed when private items are asked for, its mark on the signature")
+dmv_private_var_when_asked()
+    val syms = dmv_vars("module m\n\nprivate var hidden = 0\n\nprivate[m] var wide: int = 1\n", true)
+
+    assert_eq(dmv_sigs(syms), dmv_strs(["private var hidden = 0", "private[m] var wide: int = 1"]))
+    assert(syms.at(0).access == DocAccess.DaFile)
+    assert(syms.at(1).access == DocAccess.DaModule)
+end dmv_private_var_when_asked
+
+@test("a var carries the doc comment above it")
+dmv_var_carries_its_prose()
+    val syms = dmv_vars("module m\n\n/** How many times it ran. */\nvar runs = 0\n\nvar bare = 1\n", false)
+
+    assert_eq(syms.at(0).name, "bare")
+    assert(syms.at(0).doc.is_none())
+    assert_eq(syms.at(1).doc.unwrap().summary, "How many times it ran.")
+end dmv_var_carries_its_prose
+
+@test("a @thread_local var is listed, its prose reaching it across the attribute")
+dmv_thread_local_var()
+    val syms = dmv_vars("module m\n\n/** This thread's last error. */\n@thread_local\nvar last_error: int = 0\n", false)
+
+    assert_eq(dmv_sigs(syms), dmv_strs(["var last_error: int = 0"]))
+    assert_eq(syms.at(0).doc.unwrap().summary, "This thread's last error.")
+end dmv_thread_local_var
+
+@test("a static var is listed with 'static' on its signature, after any visibility mark")
+dmv_static_var()
+    val syms = dmv_vars("module m\n\n/** Built once. */\nstatic var built: int = 0\n\nprivate static var hits = 0\n", true)
+
+    assert_eq(dmv_sigs(syms), dmv_strs(["static var built: int = 0", "private static var hits = 0"]))
+    assert_eq(syms.at(0).doc.unwrap().summary, "Built once.")
+    assert(syms.at(1).access == DocAccess.DaFile)
+    assert_eq(dmv_sigs(dmv_vars("module m\n\nprivate static var hits = 0\n", false)).len(), 0)
+    assert_eq(dmv_sigs(dmv_vars("module m\n\nprivate[m] static var wide = 1\n", true)),
+              dmv_strs(["private[m] static var wide = 1"]))
+end dmv_static_var
+
+@test("a static val keeps its kind and gains the word")
+dmv_static_val()
+    val vals = dmv_only("module m\n\nstatic val seed = 7\n", false).of(DocKind.DkValue)
+
+    assert_eq(dmv_sigs(vals), dmv_strs(["static val seed = 7"]))
+end dmv_static_val
+
+@test("a multi-name and a pattern var are listed once, under the names they give")
+dmv_multi_and_pattern_var()
+    val syms = dmv_vars("module m\n\nvar lo, hi = 0, 9\n\nvar (w, h): (int, int) = (1, 2)\n\nval a, b = 1, 2\n", false)
+
+    assert_eq(syms.len(), 2)
+    assert_eq(syms.at(0).name, "lo, hi")
+    assert_eq(syms.at(0).signature, "var lo, hi = 0, 9")
+    assert_eq(syms.at(1).name, "w, h")
+    assert_eq(syms.at(1).signature, "var (w, h): (int, int) = (1, 2)")
+end dmv_multi_and_pattern_var
+
+@test("the page lists the vars under Variables, after the Values and before the Functions")
+dmv_markdown_page()
+    val text = doc_module_page(dmv_only("module m\n\n/** Calls so far. */\nvar count = 0\n\nval zero: int = 0\n\n" +
+                                        "f() -> int = 1\n\nprivate var secret = 1\n", false), None).text
+
+    assert(dmv_at(text, "\n## Values\n") < dmv_at(text, "\n## Variables\n"))
+    assert(dmv_at(text, "\n## Variables\n") < dmv_at(text, "\n## Functions\n"))
+    assert(dmv_at(text, "## Variables\n\n### `count`\n\n```sysl\nvar count = 0\n```\n\nCalls so far.\n") > 0)
+    assert(text.index_of("secret").is_none())
+end dmv_markdown_page

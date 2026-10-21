@@ -438,7 +438,7 @@ private arf_not_constant() -> string =
 arf_a_count_that_is_not_a_constant()
     if !arf_ready() then return
 
-    val e = arf_err("f() -> usize = 3usize\nvar xs = [0; f()]")
+    val e = arf_err("var seed: usize = 3usize\nf() -> usize = seed\nvar xs = [0; f()]")
 
     assert(arf_says(e, arf_not_constant()), e)
 
@@ -530,26 +530,33 @@ arf_a_nested_literal_settles_row_by_row()
 arf_a_literal_that_does_not_fit()
     if !arf_ready() then return
 
-    val e = arf_err("val zs = [1u8, 300]\nprint(zs[0])")
+    val e = arf_err("val zs = [1u8, 1_000_000_000_000]\nprint(zs[0])")
 
-    assert(arf_says(e, "the literal 300 does not fit byte"), e)
+    assert(arf_says(e, "the literal 1000000000000 does not fit byte"), e)
     assert(!arf_says(e, "one element type"), e)
 
-@test("two array elements that each have a type, and disagree, are still refused")
+    // One that only its own default holds takes it, and the typed element widens to it.
+    assert_eq(arf_ran("val zs = [1u8, 300]\nval w: [2]int = zs\nprint(w[1])"), "300\n")
+
+@test("two array elements that each have a type, neither holding the other, are still refused")
 arf_two_elements_that_disagree()
     if !arf_ready() then return
 
-    val e = arf_err("val zs = [1u8, 2usize]\nprint(zs[0])")
+    val e = arf_err("val zs = [1u32, 2i32]\nprint(zs[0])")
 
-    assert(arf_says(e, "an array literal needs one element type, got byte and usize"), e)
+    assert(arf_says(e, "an array literal needs one element type, got uint and int"), e)
 
-@test("an integer array element beside a real is not made a real")
+@test("an integer literal element beside a real literal is a real; a suffixed one is not")
 arf_an_integer_beside_a_real()
     if !arf_ready() then return
 
-    val e = arf_err("val rs = [1.5, 2]\nprint(rs[0])")
+    val e = arf_err("val rs = [1.5, 2i64]\nprint(rs[0])")
 
-    assert(arf_says(e, "an array literal needs one element type, got real and int"), e)
+    assert(arf_says(e, "an array literal needs one element type, got real and long"), e)
+
+    val out = arf_ir("val rs = [1.5, 2]\nprint(rs[1])")
+
+    assert(arf_says(out, "[2 x double]"), out)
 
 // -- ArrayCodegenTests: the layout, the checked subscript, the length ----------------------------
 
@@ -584,9 +591,14 @@ arf_an_element_read_is_a_bounds_test()
 arf_a_signed_index_is_widened()
     if !arf_ready() then return
 
-    val out = arf_ir("var a = [1, 2, 3]\nvar i = 0\nprint(a[i])")
+    val out = arf_ir("var a = [1, 2, 3]\nvar i: int = 0\nprint(a[i])")
 
     assert(arf_says(out, "  %t5 = sext i32 %t4 to i64\n  %t6 = icmp ult i64 %t5, 3\n"), out)
+
+    // A literal binding is fixed as a usize by its use as an index, so the index is tested as loaded.
+    val fixed = arf_ir("var a = [1, 2, 3]\nvar i = 0\nprint(a[i])")
+
+    assert(arf_says(fixed, "  %t4 = load i64, ptr %i.addr\n  %t5 = icmp ult i64 %t4, 3\n"), fixed)
 
 @test("an array's length is a constant")
 arf_an_arrays_length_is_a_constant()

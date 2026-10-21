@@ -1,0 +1,448 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A local `var` or `val` whose value is a bare literal takes its type from its first use that fixes
+// one (`var_first_use.sysl`, `reference/declarations.md § A literal binding takes its type from its
+// first use`): a comparison with a typed operand, an assignment of a typed value, an argument, an
+// index, a return. Arithmetic fixes nothing, a binding no use fixes keeps the literal's default, and
+// a second use that disagrees with the first is told exactly as it would be with the type written.
+
+private vfu_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vfu_ready
+
+// What a program prints, built and run.
+private vfu_ran(text: string) -> string
+    val root = make_temp_dir("sysl-vfu").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vfu_ran
+
+// Everything a source has to say for itself.
+private vfu_err(text: string) -> string
+    val root = make_temp_dir("sysl-vfu").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vfu_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private vfu_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+// How many diagnostics a report carries.
+private vfu_count(report: string) -> usize
+    var seen: usize = 0
+    var rest = report
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + 7)..<rest.bytes.len]
+
+    seen
+end vfu_count
+
+private vfu_fns() -> string = raw"""
+    wide(n: usize) -> usize = n
+    narrow(n: u8) -> u8 = n
+    half(x: f32) -> f32 = x / 2
+    """
+
+@test("a comparison with a usize fixes a val and a var as usize")
+vfu_comparison_fixes_val_and_var()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val n = 0
+            var i = 0
+
+            while i < xs.len
+                print(xs[i])
+                i += 1
+
+            print(n < xs.len, xs.len > n)
+        """), "10\n20\n30\ntrue true\n")
+
+@test("a comparison fixes the binding on either side, and the type is the typed operand's")
+vfu_comparison_either_side()
+    if !vfu_ready() then return
+
+    val report = vfu_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val a = 0
+            val b = 0
+            print(a < xs.len, xs.len > b)
+            val y: int = a
+            val z: int = b
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'y': declared int but the value is usize", "6:5"))
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "7:5"))
+    assert_eq(vfu_count(report), 2)
+
+@test("an argument fixes the binding at the parameter's type")
+vfu_argument_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(vfu_fns() + raw"""
+        main()
+            var i = 7
+            print(wide(i))
+            val back: usize = i
+            print(back)
+        """), "7\n7\n")
+
+    val report = vfu_err(vfu_fns() + raw"""
+        main()
+            var i = 7
+            print(wide(i))
+            val z: int = i
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "7:5"))
+
+@test("an index fixes the binding as usize")
+vfu_index_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val d = 2
+            print(xs[d])
+        """), "30\n")
+
+    val report = vfu_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val d = 2
+            print(xs[d])
+            val z: int = d
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "5:5"))
+
+@test("a return, written or the body's last line, fixes the binding at the result type")
+vfu_return_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        counted(xs: []const int) -> usize
+            var k = 0
+            while k < 100
+                if k == xs.len then return k
+                k += 1
+            k
+
+        last() -> u8
+            val b = 200
+            b
+
+        main()
+            print(counted([1, 2, 3]), last())
+        """), "3 200\n")
+
+@test("an assignment fixes the binding, from a typed value or into a typed place")
+vfu_assignment_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var m = 0
+            m = xs.len
+            var big: u64 = 0
+            var a = 5
+            big = a
+            a = 4000000000
+            print(m, big, a)
+        """), "3 5 4000000000\n")
+
+    val report = vfu_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var m = 0
+            m = xs.len
+            val z: int = m
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "5:5"))
+
+@test("arithmetic fixes nothing: the binding keeps its default and the typed operand widens")
+vfu_arithmetic_does_not_fix()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            var sum = 250
+            val b: u8 = 10
+            print(sum + b, b + sum)
+            var s = 250
+            s += b
+            print(s)
+            var x = 5
+            val y: long = -x
+            val z: int = x
+            print(y, z)
+        """), "260 260\n260\n-5 5\n")
+
+@test("a conversion fixes nothing, a new type's own From included")
+vfu_conversion_does_not_fix()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        type Phase = new real
+
+        impl From[int] for Phase
+            from(n: int) -> Phase = Phase(n) * 2.0
+
+        main()
+            val i = 3
+            var k = 300
+            print(f64(Phase(i)), real(i), u8(k))
+            val z: int = i
+            val w: int = k
+            print(z, w)
+        """), "6 3 44\n3 300\n")
+
+@test("a binding no use fixes keeps the literal's default")
+vfu_no_fixing_use_keeps_the_default()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            var x = 7
+            val r = 7.0
+            x += 1
+            print(x / 3, r / 2)
+        """), "2 3.5\n")
+
+@test("the first fixing use wins, and a second that disagrees is told as a written type would be")
+vfu_second_use_disagrees()
+    if !vfu_ready() then return
+
+    val report = vfu_err(vfu_fns() + raw"""
+        main()
+            var i = 0
+            print(wide(i))
+            print(narrow(i))
+        """)
+
+    assert(vfu_says(report, "'n' of 'narrow' is byte, but usize was given", "7:18"))
+    assert_eq(vfu_count(report), 1)
+
+    // Exactly the report of the same program with the type written out.
+    val written = vfu_err(vfu_fns() + raw"""
+        main()
+            var i: usize = 0
+            print(wide(i))
+            print(narrow(i))
+        """)
+
+    assert(vfu_says(written, "'n' of 'narrow' is byte, but usize was given", "7:18"))
+
+    val compared = vfu_err(raw"""
+        main()
+            val xs = [1, 2]
+            val b: i8 = 1
+            var i = 0
+            print(i < xs.len)
+            print(i == b)
+        """)
+
+    assert(vfu_says(compared, "cannot compare usize with i8", "6:11"))
+    assert_eq(vfu_count(compared), 1)
+
+@test("a use whose type cannot hold the literal does not fix it, and is told as today")
+vfu_literal_that_does_not_fit()
+    if !vfu_ready() then return
+
+    val report = vfu_err(vfu_fns() + raw"""
+        main()
+            var big = 300
+            print(narrow(big))
+        """)
+
+    assert(vfu_says(report, "'n' of 'narrow' is byte, but int was given", "6:18"))
+
+    val real = vfu_err(vfu_fns() + raw"""
+        main()
+            var r = 1.5
+            print(wide(r))
+        """)
+
+    assert(vfu_says(real, "'n' of 'wide' is usize, but real was given", "6:16"))
+
+@test("an integer literal is fixed at a float where it is exact")
+vfu_integer_literal_at_a_float()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(vfu_fns() + raw"""
+        main()
+            var h = 3
+            print(half(h), h / 2)
+        """), "1.5 1.5\n")
+
+@test("a closure's use fixes the binding it captures")
+vfu_closure_use_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var q = 0
+            val f = () -> q < xs.len
+            print(f())
+            val g = (n: usize) -> n + 1
+            val k = 4
+            print(g(k))
+        """), "true\n5\n")
+
+    val report = vfu_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val q = 0
+            val f = () -> q < xs.len
+            val z: int = q
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "5:5"))
+
+@test("a nested function's use fixes the binding of its frame")
+vfu_nested_function_use_fixes()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var k = 0
+            under() -> bool = k < xs.len
+            while under()
+                k += 1
+            print(k)
+        """), "3\n")
+
+@test("a binding in a loop body, an arm, a branch and a three-clause for is fixed by its use")
+vfu_in_every_block()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+
+            for x in xs
+                var j = 0
+                while j < xs.len
+                    j += 1
+                print(x, j)
+
+            xs.len match
+                3 ->
+                    val n = 1
+                    print(xs[n])
+                _ -> ()
+
+            if xs.len > 0
+                var t = 0
+                t = xs.len
+                print(t)
+
+            for var c = 0; c < xs.len; c += 1
+                print(c)
+        """), "10 3\n20 3\n30 3\n20\n3\n0\n1\n2\n")
+
+@test("a use that reads another binding still open waits for that one to be fixed")
+vfu_use_reading_an_open_binding_waits()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 0
+            var j = 0
+            var a = 0
+            var b = 1
+            print(a < b)
+            j = xs.len
+            while i < j
+                i += 1
+            print(i, wide(a))
+
+        wide(n: usize) -> usize = n
+        """), "true\n3 0\n")
+
+    val report = vfu_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 0
+            var j = 0
+            j = xs.len
+            print(i < j)
+            val z: int = i
+        """)
+
+    assert(vfu_says(report, "cannot initialize 'z': declared int but the value is usize", "7:5"))
+
+@test("a generic body fixes its bindings per instance, and the entry file's statements are a block")
+vfu_generic_and_entry_body()
+    if !vfu_ready() then return
+
+    assert_eq(vfu_ran(raw"""
+        count[T](xs: []const T) -> usize
+            var n = 0
+            while n < xs.len
+                n += 1
+            n
+
+        print(count([1, 2, 3]), count(["a"]))
+        """), "3 1\n")
+
+    assert_eq(vfu_ran(raw"""
+        val xs = [10, 20, 30]
+        var i = 0
+        while i < xs.len
+            i += 1
+        print(i)
+        """), "3\n")

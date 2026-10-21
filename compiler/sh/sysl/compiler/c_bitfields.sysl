@@ -1,0 +1,383 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **C bitfields**: a struct field written `name: T in S` is `width(T)` bits allocated in a unit of
+// `S`, the type C declares it with, by the target's C rule (`docs/design/bitfields.md`). A struct
+// with any such field is an ordinary struct laid out field by field the way the target's C compiler
+// lays its counterpart out -- not today's `@packed` bitfield struct, which is one integer.
+//
+// The rules were measured with clang on every triple sysl names (§3 of the design note) and are
+// checked against clang again by `tests_cbl_c_bitfield_layout.sysl`, which asks it at test time.
+
+// The `in S` written on the declaration's field at `i`, where there is one.
+c_bit_written(d: StructDecl, i: usize) -> Option[BitInDecl]
+    for b in d.bits
+        if b.field == i then return Some(b)
+
+    None
+end c_bit_written
+
+// How many bits a field's value takes as a C bitfield: a `bool` one, an integer or a simple enum its
+// own width. -1 for anything else, which the field rule refuses.
+c_bit_width(value: Type) -> int = underlying(value) match
+    Bool -> 1
+    _ -> bitfield_width(value).unwrap_or(-1)
+
+// -- the field rule --------------------------------------------------------------------------------
+
+// **What a struct with C bitfields may hold**, checked once its fields are resolved: each `in` field
+// against its declared type, `@byte_order` (refused: C has no portable spelling for it), and the
+// other fields of a `@packed` one, which may not be today's narrow fields -- the two models do not
+// mix in one struct.
+check_c_bits(a: &Analysis, scope: Scope, d: StructDecl, s: &StructType)
+    val name = type_show(Struct(s))
+
+    if s.big_endian.is_some()
+        val first = d.bits.at(0)
+        val field = s.fields.at(first.field).0
+
+        a.fault(scope, first.span, s"'$name' is '@byte_order(${order_word(s)})' and '$name.$field' is a C " +
+                "bitfield — the order applies to whole integers, and C has no portable spelling for a " +
+                "bitfield stored the other way round")
+        return
+    end if
+
+    for i in 0..<s.fields.len()
+        val item = s.fields.at(i)
+
+        s.c_bit(i) match
+            Some(b) ->
+                val written = c_bit_written(d, i).unwrap()
+
+                c_bit_fault(s"$name.${item.0}", item.0, item.1, b, type_text(d.fields.at(i).typ),
+                            type_text(written.storage)) match
+                    Some(why) -> a.fault(scope, written.span, why)
+                    None -> ()
+            None ->
+                if contains_counted(item.1) && !mentions_abstract(item.1)
+                    a.fault(scope, d.fields.at(i).span, s"'$name.${item.0}' is ${type_show(item.1)}, which " +
+                            s"carries a count, and '$name' has C bitfields — a struct with C bitfields is " +
+                            "laid out as C lays its counterpart out, and C holds nothing that carries a count")
+                elif s.packed && narrow_field(item.1)
+                    a.fault(scope, d.fields.at(i).span, s"'$name.${item.0}' is ${type_show(item.1)}, " +
+                            s"narrower than a byte, in a '@packed' struct with C bitfields — a '@packed' " +
+                            "struct with such a field is one integer, and the two models do not mix in " +
+                            s"one struct: declare it as C does, '${item.0}: ${type_show(item.1)} in <C type>'")
+end check_c_bits
+
+private narrow_field(t: Type) -> bool = bitfield_width(t) match
+    Some(w) -> w % 8 != 0
+    None -> false
+
+// Why the field cannot be a C bitfield, or nothing where it can. A type still standing for a
+// parameter is asked again at each instantiation, and one already refused says nothing more. `vt`
+// and `st` are the value type and the declared type as written.
+private c_bit_fault(whole: string, field: string, value: Type, b: CBit, vt: string, st: string) -> Option[string]
+    if underlying(value) == Unknown || underlying(b.storage) == Unknown then return None
+    if mentions_abstract(value) || mentions_abstract(b.storage) then return None
+
+    val head = if b.width == 0 then s"'$whole' is allocated in $st" else s"'$whole' is $vt in $st"
+
+    val (unit_bits, unit_signed) = underlying(b.storage) match
+        Bool -> (1, false)
+        Integer(bits, signed, _) if bits == 8 || bits == 16 || bits == 32 || bits == 64 -> (bits, signed)
+        _ -> return Some(s"$head — the type a bitfield is declared with is the unit C allocates it " +
+                         "in: an integer of 8, 16, 32 or 64 bits, or 'bool'")
+
+    if b.width == 0 then return None
+
+    val value_signed = underlying(value) match
+        Bool -> false
+        Integer(_, signed, _) -> signed
+        Enum(e) if e.simple -> underlying(e.underlying) match
+            Integer(_, signed, _) -> signed
+            _ -> false
+        _ -> return Some(s"'$whole' is $vt — a bitfield holds an integer, a simple enum or 'bool'")
+
+    if b.width < 0 then return Some(s"'$whole' is $vt — a bitfield holds an integer, a simple enum or 'bool'")
+
+    if underlying(b.storage) == Bool && underlying(value) != Bool
+        return Some(s"$head — a field declared 'bool' (C's '_Bool') holds a 'bool': '$field: bool in bool'")
+
+    if b.width > unit_bits
+        return Some(s"$head — ${b.width} bits do not fit in $st's $unit_bits")
+
+    if value_signed != unit_signed
+        val word = if value_signed then "a signed" else "an unsigned"
+        val twin = s"${if value_signed then "i" else "u"}$unit_bits"
+
+        return Some(s"$head — a bitfield is read with its declared type's signedness, so $word field " +
+                    s"is declared in $word type: '$field: $vt in $twin'")
+    end if
+
+    None
+end c_bit_fault
+
+// -- the fields a program names ----------------------------------------------------------------------
+//
+// An **unnamed** bitfield -- `_: uW in S` or `_: in S` -- is C's `S : W` or `S : 0`: it only moves
+// the fields after it, and C leaves it out of initialization (C11 6.7.9 ¶9). So a construction, a
+// positional pattern and a derived trait pass over it as if it were not written, and its bits are
+// zero in every value a construction builds.
+
+// Whether the field at `i` is a bitfield with no name.
+unnamed_c_bit(d: &StructType, i: usize) -> bool = d.c_bit(i).is_some() && d.fields.at(i).0 == "_"
+
+// How many fields a construction or a positional pattern writes: every one but the unnamed bitfields.
+named_field_count(d: &StructType) -> usize
+    var n: usize = 0
+
+    for i in 0..<d.fields.len()
+        if !unnamed_c_bit(d, i) then n += 1
+
+    n
+end named_field_count
+
+// A positional pattern's parts with a `_` standing at each unnamed bitfield, so the parts line up
+// with the fields again -- or the parts as written where their count is not the named fields'.
+with_unnamed_wild(d: &StructType, args: Buf[Pattern]) -> Buf[Pattern]
+    if d.c_bits.is_empty() || args.len() != named_field_count(d) then return args
+
+    val at = if args.is_empty() then span_zero() else args.at(0).span
+    var out: Buf[Pattern] = buf()
+    var next: usize = 0
+
+    for i in 0..<d.fields.len()
+        if unnamed_c_bit(d, i)
+            out.push(pattern_of(at, WildcardPattern))
+        else
+            out.push(args.at(next))
+            next += 1
+
+    out
+end with_unnamed_wild
+
+// Whether `receiver.<index>` is a C bitfield: bits inside a unit, with no address of its own.
+c_bit_field(receiver: Type, index: int) -> bool = underlying(receiver) match
+    Struct(d) -> index >= 0 && d.c_bit(usize(index)).is_some()
+    _ -> false
+
+// -- what is not built in this release ------------------------------------------------------------------
+//
+// A struct with C bitfields crossing a C boundary by value: how C passes one is not built in this
+// release (it differs from an ordinary struct's on wasm32 and on riscv64's lp64d), so it crosses as
+// an address.
+c_bits_by_value(t: Type, what: string) -> string = underlying(t) match
+    Struct(d) ->
+        s"'${type_show(t)}' has C bitfields, and $what is not built in this release — pass its " +
+        s"address, as a '*${type_show(t)}'"
+    _ -> what
+
+// Whether the type is a struct with C bitfields.
+has_c_bits(t: Type) -> bool = underlying(t) match
+    Struct(d) -> !d.c_bits.is_empty()
+    _ -> false
+
+// -- the layout ------------------------------------------------------------------------------------
+
+// Where one field of a struct with C bitfields lands. `bit` is where it begins, counted from the
+// struct's first bit, and `width` how many bits it takes (zero for `_: in S`). For a bitfield, `unit`
+// is the byte offset of the storage unit a read loads -- the `alignof(S)`-aligned `sizeof(S)` block
+// holding it, or under `@packed` on the generic rule the bytes it spans -- and `unit_bytes` its
+// size; for an ordinary field they are its offset and its size.
+struct CPlace
+    bit: int
+    width: int
+    is_bit: bool
+    unit: usize
+    unit_bytes: usize
+end CPlace
+
+// A struct with C bitfields, laid out: one place per declared field, in declaration order, and the
+// size and boundary of the whole before any `@align(n)`.
+struct CBitLayout
+    places: Buf[CPlace]
+    size: usize
+    align: usize
+end CBitLayout
+
+// The layout the target's C compiler gives the struct.
+c_bitfield_layout(l: TargetLayout, s: &StructType) -> CBitLayout = l.bitfield_rule match
+    BfItanium -> c_generic_layout(l, s, false)
+    BfAapcs -> c_generic_layout(l, s, true)
+    BfMsvc -> c_msvc_layout(l, s)
+
+// Where an ordinary field of a struct with C bitfields begins, in bytes. A bitfield has no byte
+// offset, which `offsetof` says in its own words before it asks.
+c_field_offset(l: TargetLayout, s: &StructType, field: string) -> Option[usize]
+    val c = c_bitfield_layout(l, s)
+
+    for i in 0..<s.fields.len()
+        if s.fields.at(i).0 == field
+            val p = c.places.at(i)
+
+            return if p.is_bit then None else Some(p.unit)
+        end if
+
+    None
+end c_field_offset
+
+// **The one access a `volatile` bitfield is read and written with**: its unit, exactly the declared
+// type's width. Under `@packed` on the generic rule a field's place is only the bytes it spans, so
+// the unit is the block of the declared type's size, on a multiple of that size, holding it -- and
+// there is none where the field straddles two such blocks or the block runs past the struct's end.
+c_volatile_unit(l: TargetLayout, s: &StructType, i: usize) -> Option[(usize, usize)]
+    val p = c_bitfield_layout(l, s).places.at(i)
+
+    if !s.packed || l.bitfield_rule == BfMsvc then return Some((p.unit, p.unit_bytes))
+
+    val size = l.size(s.c_bit(i).unwrap().storage)
+    val bits = int(size) * 8
+    val last = p.bit + (if p.width > 0 then p.width - 1 else 0)
+
+    if p.bit / bits != last / bits then return None
+
+    val at = usize(p.bit / bits) * size
+
+    if at + size > l.size(Struct(s)) then None else Some((at, size))
+end c_volatile_unit
+
+// A declared type's unit: its size, and the boundary C aligns it to inside a struct.
+private c_unit(l: TargetLayout, storage: Type) -> (usize, usize)
+    val natural = l.align(storage)
+    val cap = l.unit_align_cap
+
+    (l.size(storage), if cap > 0 && natural > cap then cap else natural)
+end c_unit
+
+private round_bits(n: int, to: int) -> int = (n + to - 1) / to * to
+
+private wider(a: usize, b: usize) -> usize = if a > b then a else b
+
+// The generic rule and AAPCS's. A field goes at the next free bit unless the `alignof(S)`-aligned
+// unit of `sizeof(S)` bytes holding that bit cannot also hold its last one; then it moves to the next
+// `alignof(S)` boundary. A zero-width field moves the next field to that boundary. A named field
+// raises the struct's boundary to `alignof(S)`; on AAPCS an unnamed or a zero-width one does too.
+// `@packed` drops the unit restriction and the raising -- the fields abut bit for bit -- but not a
+// zero-width field's move to the boundary, nor, on AAPCS, its raising. An ordinary
+// field begins at the next byte on its own boundary. In a union every field begins at bit 0.
+private c_generic_layout(l: TargetLayout, s: &StructType, aapcs: bool) -> CBitLayout
+    var places: Buf[CPlace] = buf()
+    var bit = 0
+    var widest: usize = 1
+    var largest: usize = 0
+
+    for i in 0..<s.fields.len()
+        val item = s.fields.at(i)
+
+        s.c_bit(i) match
+            Some(b) ->
+                val (size, a) = c_unit(l, b.storage)
+                val unit = int(a) * 8
+                var at = if s.union_layout then 0 else bit
+
+                if b.width == 0 || (!s.packed && at % unit + b.width > int(size) * 8) then at = round_bits(at, unit)
+
+                // On AAPCS a zero-width field raises the boundary even under `packed`.
+                if aapcs && b.width == 0 then widest = wider(widest, a)
+                elif !s.packed && (aapcs || (b.width > 0 && item.0 != "_")) then widest = wider(widest, a)
+
+                if s.packed
+                    val first = usize(at / 8)
+
+                    places.push(CPlace(at, b.width, true, first, usize(at + b.width + 7) / 8 - first))
+                else
+                    places.push(CPlace(at, b.width, true, usize(at / unit) * a, size))
+
+                if s.union_layout then largest = wider(largest, usize(b.width + 7) / 8) else bit = at + b.width
+            None ->
+                val a = if s.packed then 1 else l.align(item.1)
+                val n = l.size(item.1)
+                val off = if s.union_layout then 0 else round_up(usize(bit + 7) / 8, a)
+
+                widest = wider(widest, a)
+                places.push(CPlace(int(off) * 8, int(n) * 8, false, off, n))
+
+                if s.union_layout then largest = wider(largest, n) else bit = int(off + n) * 8
+
+    val used = if s.union_layout then largest else usize(bit + 7) / 8
+
+    CBitLayout(places, round_up(used, widest), widest)
+end c_generic_layout
+
+// Windows' rule, a different algorithm: a bitfield shares the unit the previous one opened only
+// while their declared types have one size and the unit has room, and otherwise opens a unit of its
+// own at the next boundary of its type -- so no field ever straddles a unit, `@packed` included,
+// which only removes the padding between units. A zero-width field closes the open unit, and is
+// ignored where none is open. Every bitfield, named or not, raises the struct's boundary; in a union
+// a bitfield does not.
+private c_msvc_layout(l: TargetLayout, s: &StructType) -> CBitLayout
+    var places: Buf[CPlace] = buf()
+    var size: usize = 0
+    var widest: usize = 1
+    var open = false
+    var unit_size: usize = 0
+    var unit_at: usize = 0
+    var left = 0
+
+    for i in 0..<s.fields.len()
+        val item = s.fields.at(i)
+
+        s.c_bit(i) match
+            Some(b) ->
+                val (n, natural) = c_unit(l, b.storage)
+                val a = if s.packed then 1 else natural
+
+                if b.width == 0
+                    if !open || s.union_layout
+                        if open then size = wider(size, n)
+
+                        open = false
+                        places.push(CPlace(if s.union_layout then 0 else int(size) * 8, 0, true, size, 0))
+                        continue
+                    end if
+
+                    open = false
+
+                    val off = round_up(size, a)
+
+                    size = off
+                    widest = wider(widest, a)
+                    places.push(CPlace(int(off) * 8, 0, true, off, 0))
+                    continue
+                end if
+
+                if !s.union_layout && open && unit_size == n && b.width <= left
+                    places.push(CPlace(int(size) * 8 - left, b.width, true, unit_at, n))
+                    left -= b.width
+                    continue
+                end if
+
+                open = true
+                unit_size = n
+
+                if s.union_layout
+                    size = wider(size, n)
+                    unit_at = 0
+                    places.push(CPlace(0, b.width, true, 0, n))
+                else
+                    unit_at = round_up(size, a)
+                    size = unit_at + n
+                    widest = wider(widest, a)
+                    left = int(n) * 8 - b.width
+                    places.push(CPlace(int(unit_at) * 8, b.width, true, unit_at, n))
+            None ->
+                val a = if s.packed then 1 else l.align(item.1)
+                val n = l.size(item.1)
+
+                open = false
+                widest = wider(widest, a)
+
+                if s.union_layout
+                    size = wider(size, n)
+                    places.push(CPlace(0, int(n) * 8, false, 0, n))
+                else
+                    val off = round_up(size, a)
+
+                    size = off + n
+                    places.push(CPlace(int(off) * 8, int(n) * 8, false, off, n))
+
+    CBitLayout(places, round_up(size, widest), widest)
+end c_msvc_layout

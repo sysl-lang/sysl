@@ -21,10 +21,14 @@ struct Table[V]
     order: Buf[string]
     by_key: Map[string, V]
 
+    // How many times the table has been written, so an index built over it can tell it is stale.
+    changes: usize
+
     put(*self, key: string, v: V)
         if !self.by_key.has(key) then self.order.push(key)
 
         self.by_key.put(key, v)
+        self.changes += 1
 
     get(self, key: string) -> Option[V] = self.by_key.get(key)
 
@@ -34,6 +38,7 @@ struct Table[V]
         if !self.by_key.has(key) then return
 
         self.by_key.remove(key)
+        self.changes += 1
 
         var kept: Buf[string] = buf()
 
@@ -53,7 +58,7 @@ struct Table[V]
 end Table
 
 // A table with nothing in it.
-table[V]() -> &Table[V] = Table(buf(), map())
+table[V]() -> &Table[V] = Table(buf(), map(), 0)
 
 // What one file's `import` clauses brought into scope.
 //
@@ -345,7 +350,10 @@ struct Tables
     // files that said it -- which is what a declaration is held against, because `@tests` is a
     // property of the FILE and a key alone does not say which file wrote it.
     test_only: Buf[string]
-    test_only_files: Buf[string]
+    test_only_files: Set[string]
+
+    // The same keys as `test_only`, for asking whether one is among them.
+    test_only_keys: Set[string]
 
     // Which modules each module reached, in the order each edge was first made. It is what an
     // unused-import warning is read out of, and what the acyclicity of the module graph is asked of.
@@ -368,8 +376,9 @@ struct Tables
     //
     // **The tests' set is an OVERRIDE per capability rather than a set of its own**, which is what
     // keeps the silent case meaning what it always meant: a `@tests` file writing no clause records
-    // the module's. `module_test_own` is the half that file wrote itself, which is what tells a
-    // reader which line to go and look at.
+    // the module's. Each is filed under `tests_key`: a `@tests` file's own, or the module's for a test
+    // written beside its code. `module_test_own` is the half that file wrote itself, which is what
+    // tells a reader which line to go and look at.
     module_narrows: Buf[(string, string)]
     module_requires: Buf[(string, string)]
     module_test_narrows: Buf[(string, string)]
@@ -479,8 +488,8 @@ struct Tables
     override_checks: Buf[OverrideCheck]
 
     // Every lowered body read inside a `@test` or hook declaration, by the name it was lowered under:
-    // a test written beside what it tests is scaffolding, and answers to the tests' clause as a
-    // `@tests` file's body does.
+    // a test written beside what it tests is scaffolding, and answers to the module's own clause less
+    // the allocator (`capabilities.sysl`'s `tests_key`).
     test_bodies: Buf[string]
 
     // Every function written `const`, by the name its body is typed under: a declaration's key, a
@@ -507,6 +516,20 @@ struct Tables
     // the subscript is lowered, so a function that merely has `index_place` in its name is not in it.
     place_calls: &Table[bool]
 
+    // The same names as `modules`, for asking whether one is among them.
+    module_names: Set[string]
+
+    // Where each capability reference sits in `capability_refs`, by the terms that make two of them
+    // one (`capability_ref_terms`) -- so recording a reference is a lookup, not a pass over every
+    // reference the compilation has made.
+    capability_ref_at: Map[string, usize]
+
+    // The enum declarations declaring each variant spelling, in declaration order
+    // (`enums_declaring`), and the `types` table's change count it was built at, plus one -- zero is
+    // never built.
+    variant_index: Map[string, Buf[string]]
+    variant_index_for: usize
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -514,12 +537,11 @@ struct Tables
     module_of_key(self, key: string) -> string = module_of(key)
 
     // Whether this compilation has files for a module.
-    has_module(self, name: string) -> bool
-        for item in self.modules
-            if item == name then return true
+    has_module(self, name: string) -> bool = self.module_names.has(name)
 
-        false
-    end has_module
+    // A module this compilation has files for, recorded once.
+    add_module(self, name: string)
+        if self.module_names.add(name) then self.modules.push(name)
 end Tables
 
 // Empty tables for one target.
@@ -527,7 +549,7 @@ tables_for(t: Target) -> &Tables =
     Tables(t, layout_for(t), buf(), table(), table(), table(), table(), table(), table(), table(),
            table(), table(), table(), buf(), table(), table(), table(), table(), table(), table(),
            buf(),
-           buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), "", buf(), buf(), buf(),
+           set(), set(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), "", buf(), buf(), buf(),
            table(),
            member_tables(),
            buf(),
@@ -543,7 +565,11 @@ tables_for(t: Target) -> &Tables =
            buf(),
            buf(),
            table(),
-           table())
+           table(),
+           set(),
+           map(),
+           map(),
+           0)
 
 // One `override impl` still to be held to there being something for it to override: the type as a
 // reader spelled it, the promise the block makes, the type it covers, and where to point.
@@ -789,6 +815,32 @@ struct Analysis
     // does not refuse the same line a second time in other words.
     ref_refusals: Buf[usize]
 
+    // The symbol a bare image starts at, as the root manifest's block for the machine names it, and
+    // `""` everywhere else. One other than `main` is the program writing where it begins, which is
+    // what `entry_file` asks (`names_its_entry`).
+    image_entry: string
+
+    // What a dependency's declaration asked of a machine that does not have it, kept rather than
+    // reported: whether it is refused depends on whether the program reaches the declaration's
+    // module, which is known once every body has been typed (`checks.sysl`'s `program_reach`).
+    target_refusals: Buf[(Scope, Span, string)]
+
+    // Each module a file of which was emptied because it carries a C probe this machine cannot
+    // answer, with the requirement it wrote (`c_probe_lower`). The module keeps its name, so an
+    // import of one of its members is told why it is not there rather than that it never was.
+    withheld: Buf[(string, string)]
+
+    // The type of each module `val` written with none, once its initializer has been read for it,
+    // and the ones being read now, outermost first -- a `val` whose value names itself would be
+    // followed for ever (`expr.sysl`'s `storage_type`).
+    val_types: Buf[(string, Type)]
+    vals_in_progress: Buf[string]
+    val_cycles: Buf[string]
+
+    // Every function whose result is read off its body, and the readings under way
+    // (`inferred_results.sysl`).
+    results: &ResultSites
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
     uses(*self, name: string) = note_reached(self.reached, self.journal, name)
@@ -826,6 +878,17 @@ struct Analysis
         if !already_said(self.kept, d) && !already_said(self.found, d) then self.kept.push(d)
     end bound_fault
 
+    // Whether the walk at a generic's definition already said, at this place, a complaint that ends
+    // the way `rest` does -- the same refusal about the same written call, naming the member by the
+    // bound it was read through rather than by the type an instantiation reached.
+    said_through_bound(self, scope: Scope, span: Span, rest: string) -> bool
+        for d in self.kept
+            if d.src.name == scope.src.name && d.diag.span.start == span.start &&
+                    d.diag.message.ends_with(rest) then return true
+
+        false
+    end said_through_bound
+
     // Records an error about a place, unless the same thing has already been said about it.
     //
     // Inside a recovery region the first one is also where that region gives up: it is still
@@ -839,6 +902,15 @@ struct Analysis
 
         if self.regions > 0 && self.poison.is_none() then self.poison = Some((before, self.found.len()))
     end fault
+
+    // Records again a complaint a discarded trial made, exactly as it was said there.
+    fault_again(*self, d: Placed)
+        val before = self.found.len()
+
+        if !already_said(self.found, d) then self.found.push(d)
+
+        if self.regions > 0 && self.poison.is_none() then self.poison = Some((before, self.found.len()))
+    end fault_again
 
     // Records an error about the program as a whole, which is printed with no position: `span`
     // orders it in the report and is never shown. Nothing that calls it is inside a region.
@@ -984,7 +1056,7 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
     Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, 0, 0, 0, buf(), buf(), buf(), buf(),
              set(), reached_none(), producing, reached_none(), reached_none(), 0, buf(), 0, None,
              false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation(), false,
-             None, buf(), buf())
+             None, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), result_sites())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

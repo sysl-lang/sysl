@@ -392,6 +392,10 @@ sanitizers_asked(flags: Buf[string]) -> Buf[string]
     out
 end sanitizers_asked
 
+// Whether `flags` ask for ThreadSanitizer, which changes one instruction of the runtime as well as
+// the attributes: see `arc_atomic`.
+thread_sanitized(flags: Buf[string]) -> bool = holds_string(sanitizers_asked(flags), "thread")
+
 // The attributes every generated function needs for what `flags` asked, in the table's order rather
 // than the flags', so that the text a build writes is the same however the flags were spelled. The
 // flags are a parameter so that a test can ask about a build it is not running in.
@@ -502,6 +506,10 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bo
         Some(u) -> out.push(u)
         None -> ()
 
+    frame_pointer(t) match
+        Some(f) -> out.push(f)
+        None -> ()
+
     if !os_hosted(t.os) || libcalls then out.push("\"no-builtins\"")
 
     val sanitizers = sanitizer_attrs(flags)
@@ -531,6 +539,17 @@ unwind_table(t: Target) -> Option[string] = t.triple match
     "aarch64-linux-android24" -> Some("uwtable")
     "x86_64-unknown-none-elf" -> Some("uwtable")
     "i386-unknown-linux-gnu" -> Some("uwtable")
+    _ -> None
+
+// The frame pointer a hosted triple's C keeps, as clang's own attribute: a frame record on every
+// function that calls another, which is what a platform's ABI promises (Apple's and AArch64 Linux's)
+// and what a profiler, a crash report and a debugger walk the stack by. Without it a sampled sysl
+// program is a flat list of leaves. A bare-metal target is left as it was, its frame register its own.
+frame_pointer(t: Target) -> Option[string] = if !os_hosted(t.os) then None else t.triple match
+    "arm64-apple-macosx" -> Some("\"frame-pointer\"=\"non-leaf\"")
+    "x86_64-apple-macosx" -> Some("\"frame-pointer\"=\"all\"")
+    "aarch64-unknown-linux-gnu" -> Some("\"frame-pointer\"=\"non-leaf\"")
+    "aarch64-linux-android24" -> Some("\"frame-pointer\"=\"non-leaf\"")
     _ -> None
 
 // The text clang is handed for a module built for `t`: every definition marked with the function
@@ -828,8 +847,14 @@ end linker_flags
 // block, as clang spells them. A vendored library's compile-time options are the package author's
 // decision, and every one worth setting either deletes a symbol or changes the size of a state the
 // package exports as a constant.
+//
+// `includes` is where the package says this file's headers are (`c_libraries.sysl`): a vendored
+// library's own include roots and the roots the packages it depends on publish, ahead of anything the
+// command line names -- a library's configuration header is the package's, and one of the same name
+// elsewhere on the machine is not the one it was written against.
 compile_c(cc: string, src: string, obj: string, target: Target,
-          level: string, probed: PkgAnswer, macros: Buf[string] = buf()) -> Result[unit, string]
+          level: string, probed: PkgAnswer, macros: Buf[string] = buf(),
+          includes: Buf[string] = buf()) -> Result[unit, string]
     var args: Buf[string] = buf()
 
     args.push(s"--target=${target.triple}")
@@ -852,6 +877,9 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     val extra = extra_cflags()
 
     for item in extra
+        args.push(item)
+
+    for item in includes
         args.push(item)
 
     // **Where a command line said the headers are, which is the only answer a cross build has.**

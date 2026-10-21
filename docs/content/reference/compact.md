@@ -68,6 +68,7 @@ file that belongs to no package. Written as a **default argument** the location 
 
 ```
 =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=      ||  &&  !
+:=  +:=  -:=  *:=  /:=  %:=  &:=  |:=  ^:=  <<:=  >>:=
 ==  !=  <  >  <=  >=      ..  ..<  ...      |  ^  &  ~
 +  -  *  /  %  <<  >>      ++  --      (  )  [  ]  {  }  .  ?  .*
 ,  ::  :  ->      #  ;      @
@@ -146,10 +147,11 @@ is a body, the module member is asked for with `static val` / `static var`.
 
 **A function is a name, a parameter list, an optional `-> result`, and a body** — no keyword. The
 body is `= expr` or an indented block whose **trailing expression** is the result; `=` may also open
-a block. An absent result type means `unit`.
+a block. **With no `-> result`, a `= value` body takes the value's type** as a `val` does, and a block
+body with no `=` hands back `unit`.
 
 ```sysl
-double(n: int) -> int = n * 2
+double(n: int) = n * 2
 
 sum(a: int, b: int) -> int
     val t = a + b
@@ -238,7 +240,7 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 - **Comparison chains**: `0 <= i < n` is one expression, each operand evaluated once.
 - **`x is Pat`** and `x is not Pat` test against the full pattern grammar, alternatives included, and
   stand **in the condition of an `if` or a `while` and nowhere else** — chain them with `&&`, or use a
-  `match`.
+  `match`. Under that condition's `||` a test stands too, so long as it binds nothing.
 - **`?`** is postfix and tightest — except that **`await`** takes the postfix chain up to the first
   `?`, so `await f()?` is `(await f())?`: on `Ok(v)`/`Some(v)` it is `v`, otherwise it returns the
   failure from the enclosing function — which must return the same channel. It converts the error
@@ -345,6 +347,10 @@ checks that `&self.tasks[i]` would have given up.
   trait.
 - **A blanket `impl[T: Bound]` is allowed only over a family the compiler closes** — `Integer` is
   one; `Float` is an ordinary trait, so its two widths need two blocks.
+- **Some memberships are the compiler's, and nothing implements them**: `Integer`; `AnyBits`, every
+  type whose every bit pattern is a value (whole-byte integers, floats, whole-byte fixed point, `*T`,
+  arrays and structs of them — not `bool`, enums, `char`, `&T`, strings or slices); and
+  `sysl.encoding.Plain`. A trait that declares nothing is written closed by `end Name`.
 
 **Trait objects** are fat pointers: `*Trait` points at the value, `&Trait` at the box. A trait is
 erasable when it declares no associated type and every member has a receiver, mentions `Self` nowhere
@@ -634,10 +640,12 @@ do all along. One program and one `sysl build` settle it.
 | `this loop breaks with a int but has no 'else'` | add the `else` block that says what a normal finish is worth |
 | `a 'for' names one thing, and a pattern is what takes it apart` | `for (k, v) in …`, with the parentheses |
 | `'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else` | chain with `&&` inside the condition, or write a `match` |
+| `a pattern under '\|\|' cannot bind a name` | write `_` for the parts you do not name, chain with `&&`, or write a `match` |
 | `already implements 'sysl.Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |
 | `'require'/'ensure' clauses must come before any other statement` | move the whole contract block to the top of the body |
 | `a program starts in one place, and this 'main' is a second` | put the top-level statements inside `main` |
+| `a program starts in one place, and this function exported as 'main' is a second` | the export is the program's `main`: put the statements, or the declared `main`'s body, inside it |
 | `is exported and reaches … module storage an initializer fills` | the bare-metal `val` above: make it a local or a field |
 | `'private[…]' names one enclosing module by its simple name rather than by a path` | `private[b]` — the bracket takes a simple name |
 | `Undefined symbols … _stdout` | a macro, not a symbol; put a line of C beside the module |

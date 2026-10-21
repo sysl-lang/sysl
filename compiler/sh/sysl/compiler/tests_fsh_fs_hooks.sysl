@@ -71,7 +71,10 @@ private val fsh_runtime: string = raw"""
     mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
     """
 
-// One `@export` per hook of `sysl.fs.sys`, by symbol, each answering "not supported".
+// One `@export` per hook of `sysl.fs.sys`, by symbol, each answering "not supported". The std's
+// callers are optimized with the program, so a hook that only answered a constant would be a call with
+// no effect: deleted, its symbol reached by nothing and dead-stripped from the image. Each reads its
+// answer through a volatile and is `@noinline`, so every call stays a call to the program's hook.
 private fsh_hooks(left_out: []string) -> string
     var rows: Buf[(string, string)] = buf()
 
@@ -90,6 +93,7 @@ private fsh_hooks(left_out: []string) -> string
     rows.push(("rename", "from: *u8, from_len: usize, to: *u8, to_len: usize"))
     rows.push(("access", "path: *u8, len: usize, how: int"))
     rows.push(("chmod", "path: *u8, len: usize, mode: u32"))
+    rows.push(("set_modified", "path: *u8, len: usize, micros: long"))
     rows.push(("opendir", "path: *u8, len: usize, dir: *usize"))
     rows.push(("readdir", "dir: usize, into: *u8, room: usize, got: *usize"))
     rows.push(("closedir", "dir: usize"))
@@ -109,7 +113,9 @@ private fsh_hooks(left_out: []string) -> string
         for name in left_out
             if name == row.0 then kept = false
 
-        if kept then out = out + s"@export(\"sysl_fs_${row.0}\")\nk_${row.0}(${row.1}) -> int = -38\n\n"
+        if kept
+            out = out + s"@export(\"sysl_fs_${row.0}\")\n@noinline\nk_${row.0}(${row.1}) -> int\n" +
+                  "    var answer = -38\n    val v: *volatile int = ptr_cast(&answer)\n\n    v[0]\n\n"
 
     out
 end fsh_hooks
@@ -685,8 +691,11 @@ fsh_reading_surface_links_freestanding()
 
     assert_eq(fsh_symbols(elf, true).trim(), "")
 
+    // A call the program's own unit makes reaches the hook by the function's name, and the export
+    // symbol, then reached by nothing, is dead-stripped; either way the body linked is the program's.
     for name in ["stat", "chmod", "opendir", "readdir", "closedir", "rmdir", "unlink", "temp_dir", "realpath"]
-        assert(all.contains(s" T sysl_fs_$name"), s"'sysl_fs_$name' is not the program's: $all")
+        assert(all.contains(s" T sysl_fs_$name") || all.contains(s" T k_$name"),
+               s"'sysl_fs_$name' is not the program's: $all")
 
     for name in ["stat", "lstat", "chmod", "opendir", "readdir", "realpath", "mkdtemp", "__errno_location",
                  "__error", "sysl_fs_host_stat"]

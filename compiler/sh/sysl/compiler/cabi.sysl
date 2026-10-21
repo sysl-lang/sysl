@@ -177,7 +177,7 @@ private c_aapcs64(l: TargetLayout, t: Type, size: int, mac_os: bool) -> CShape
     val ls = c_leaf_types(l, t)
     val addresses = !ls.is_empty() && c_all_addresses(ls)
 
-    c_hfa(l, ls) match
+    c_hfa(l, t, ls) match
         // Away from Darwin the convention says how far to align a floating aggregate that runs out
         // of registers and lands on the stack. Darwin's variant does not ask for it. A quad member's
         // slot is sixteen bytes rather than eight, as its own alignment is.
@@ -209,15 +209,44 @@ end c_aapcs64
 // The floating type and count of a homogeneous floating aggregate, or nothing. Four is the limit
 // because that is how many registers the convention sets aside for one; a fifth member makes the
 // whole thing an ordinary aggregate again, however small it is.
-private c_hfa(l: TargetLayout, ls: Buf[Type]) -> Option[(LType, int)]
-    if ls.is_empty() || ls.len() > 4 then return None
+//
+// **Where a union is anywhere inside, the members are counted by SIZE, not by leaf.** The fields of
+// a union overlap, so `union { float a; float b[2]; }` has three float leaves and is two floats wide
+// -- clang counts a union as its widest field and then requires the aggregate to be exactly that many
+// members of the one type, which is the aggregate's size over the member's.
+private c_hfa(l: TargetLayout, t: Type, ls: Buf[Type]) -> Option[(LType, int)]
+    if ls.is_empty() then return None
 
     for i in 0..<ls.len()
         if !c_floating(ls.at(i)) then return None
         if !type_eq(ls.at(i), ls.at(0)) then return None
 
-    Some((c_lty(l, ls.at(0)), int(ls.len())))
+    var count = int(ls.len())
+
+    if c_has_union(t)
+        val each = int(l.size(ls.at(0)))
+        val size = int(l.size(t))
+
+        if size % each != 0 then return None
+
+        count = size / each
+
+    if count > 4 then return None
+
+    Some((c_lty(l, ls.at(0)), count))
 end c_hfa
+
+// Whether a union is anywhere in an aggregate's layout -- itself, a field, or an element.
+private c_has_union(t: Type) -> bool = underlying(t) match
+    Struct(d) ->
+        if d.union_layout then return true
+
+        for field in d.stored()
+            if c_has_union(field.1) then return true
+
+        false
+    Array(_, elem) -> c_has_union(*elem)
+    _ -> false
 
 // -- AAPCS32 --------------------------------------------------------------------------------------
 
@@ -235,7 +264,7 @@ end c_hfa
 // of its size and takes the rules below.
 private c_aapcs32(l: TargetLayout, t: Type, size: int, hard_float: bool) -> CShape
     val ls = c_leaf_types(l, t)
-    val floats = if hard_float then c_hfa(l, ls) else None
+    val floats = if hard_float then c_hfa(l, t, ls) else None
 
     floats match
         // An HFA crosses as the struct type itself in both directions: one VFP register per member
@@ -308,7 +337,8 @@ private c_struct_misaligned(l: TargetLayout, d: &StructType, at: int) -> bool
     for field in fields
         val f = field.1
 
-        if !d.packed then off = int(round_up(usize(off), l.align(f)))
+        if d.union_layout then off = at
+        elif !d.packed then off = int(round_up(usize(off), l.align(f)))
         if off % int(l.align(f)) != 0 || c_misaligned(l, f, off) then bad = true
 
         off += int(l.size(f))
@@ -328,9 +358,22 @@ private c_floating_chunk(l: TargetLayout, here: Buf[(usize, Type)]) -> LType
         if !c_holds_lty(kinds, k) then kinds.push(k)
 
     if kinds.len() > 1 then return LFloat(64, false)
-    if here.len() == 1 then return kinds.at(0)
 
-    LVec(int(here.len()), kinds.at(0))
+    // Counted by the bytes they start at, not by member: a union's fields overlap, so two floats at
+    // the same offset are one float's worth of the chunk.
+    var starts: Buf[usize] = buf()
+
+    for item in here
+        var seen = false
+
+        for s in starts
+            if s == item.0 then seen = true
+
+        if !seen then starts.push(item.0)
+
+    if starts.len() == 1 then return kinds.at(0)
+
+    LVec(int(starts.len()), kinds.at(0))
 end c_floating_chunk
 
 // An integer chunk is named by **the member that starts it**, when that member is all the chunk
@@ -341,8 +384,13 @@ private c_integer_chunk(l: TargetLayout, ls: Buf[(usize, Type)], lo: int, hi: in
                         size: int) -> LType
     var starts: Option[Type] = None
 
+    // Where several start there -- a union's fields all do -- the widest is the one the chunk is
+    // named after, as clang names a union by its widest field.
     for item in ls
-        if starts.is_none() && int(item.0) == lo then starts = Some(item.1)
+        if int(item.0) == lo
+            starts = starts match
+                Some(m) if l.size(m) >= l.size(item.1) -> Some(m)
+                _ -> Some(item.1)
 
     // Clamped to what is left of the aggregate, because a member's *allocation* may be wider than
     // the storage it occupies here: a bitfield struct's three-byte container is an `i24`, whose
@@ -396,7 +444,10 @@ private c_riscv(l: TargetLayout, t: Type, size: int, hard_float: bool, xlen: int
         if c_floating(item) && l.size(item) <= 8 then fps += 1
         if c_integral(item) && int(l.size(item)) <= xlen then ints += 1
 
-    if hard_float && ls.len() <= 2 && fps >= 1 && fps + ints == int(ls.len())
+    // **A union is never flattened, and neither is anything holding one**: clang's flattening walks
+    // struct fields and gives up at a union, so a union of one `float` travels as the integer its
+    // size is where a struct of one `float` travels as a float.
+    if hard_float && ls.len() <= 2 && fps >= 1 && fps + ints == int(ls.len()) && !c_has_union(t)
         var pieces: Buf[LType] = buf()
 
         for m in ls
@@ -478,6 +529,12 @@ private c_walk(l: TargetLayout, t: Type, at: usize, acc: *Buf[(usize, Type)])
         // put each at a byte offset of its own and make a one-byte struct three bytes of members.
         Struct(d) -> bitfield_ranges(d) match
             Some(ranges) -> acc.push((at, Integer(bitfield_bits(ranges), false, false)))
+            // A union's fields all start at its first byte, so their leaves overlap -- which is what
+            // every convention's question has to be asked of: System V's "is every byte of this
+            // eightbyte floating?" counts a float and an integer over the same bytes as INTEGER.
+            None if d.union_layout ->
+                for field in d.stored()
+                    c_walk(l, field.1, at, acc)
             None ->
                 var off = at
                 val fields = d.stored()

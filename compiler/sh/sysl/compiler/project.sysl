@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.{Source, source}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{current_dir, entries, is_file, metadata, read_bytes}
+import sysl.fs.{current_dir, entries, is_file, link_metadata, metadata, read_bytes}
 import sysl.text.{split, Search}
 
 // Which files one invocation compiles, and which module each of them is in.
@@ -39,6 +39,92 @@ val ExamplesDir: string = "examples"
 // Where a project keeps the packages it vendored, which the walk is not to read as modules.
 val VendorDir: string = "vendor"
 
+// The project's own working directory: what the toolchain derives and keeps beside the tree (the
+// standard module's artifact on a machine with no cache directory), and the scratch a project's
+// tests write. Nothing in it is source, and another process may be writing it while a build walks.
+val LocalDir: string = ".sysl"
+
+// `tests/refused/` under the root: the programs a package's `sysl test` requires the compiler to
+// refuse, which no build reads as a module. Two names, because the walk meets them one level apart.
+val RefusedParent: string = "tests"
+val RefusedLeaf: string = "refused"
+
+// The text an editor holds for a file, by the file's absolute path, in place of what is on disk.
+//
+// **Module storage, as the search paths are**: what an editor has open is a fact about the process
+// rather than about one compilation, and every file read reaches `collect` through forty signatures
+// that have no reason to carry it. A command line holds nothing here, so a build reads the disk.
+private var editor_texts: Buf[(string, string)] = buf()
+
+// **Every key is the path made absolute and normalized**, on the way in and on the way out: a walk
+// names a file `absolute_path(root)` + its segments, so `$TMPDIR/x` -- whose `TMPDIR` ends in a
+// slash -- is held as `…/T//x` and read as `…/T/x`, and the two have to meet.
+
+// Reads `file` as `text` from now on, until it is let go.
+hold_editor_text(file: string, text: string)
+    release_editor_text(file)
+    editor_texts.push((absolute_path(file), text))
+
+// Reads `file` from the disk again.
+release_editor_text(file: string)
+    val key = absolute_path(file)
+    var kept: Buf[(string, string)] = buf()
+
+    for item in editor_texts
+        if item.0 != key then kept.push(item)
+
+    editor_texts = kept
+end release_editor_text
+
+// What an editor holds for `file`, where it holds anything. A build holds nothing and pays nothing.
+editor_text(file: string) -> Option[string]
+    if editor_texts.is_empty() then return None
+
+    val key = absolute_path(file)
+
+    for item in editor_texts
+        if item.0 == key then return Some(item.1)
+
+    None
+end editor_text
+
+// A directory's entries, and each file an editor holds directly in it that the disk does not have
+// yet: a new file nobody has saved is part of its package to every sibling, as it will be once saved.
+private with_unsaved(dir: string, names: Buf[string]) -> Buf[string]
+    if editor_texts.is_empty() then return names
+
+    var out: Buf[string] = buf()
+
+    for n in names
+        out.push(n)
+
+    val here = absolute_path(dir)
+
+    for item in editor_texts
+        val name = basename(item.0)
+        var listed = false
+
+        for n in names
+            if n == name then listed = true
+
+        if !listed && parent_of(item.0).unwrap_or("") == here then out.push(name)
+
+    out
+end with_unsaved
+
+// Whether an editor holds text for any file under `dir`.
+editor_holds_under(dir: string) -> bool
+    if editor_texts.is_empty() then return false
+
+    val whole = absolute_path(dir)
+    val key = if whole.ends_with("/") then whole else whole + "/"
+
+    for item in editor_texts
+        if item.0.starts_with(key) then return true
+
+    false
+end editor_holds_under
+
 // The source files one invocation compiles.
 //
 // `os` is which operating system's per-OS directories to take. It has **no default** on purpose: a
@@ -47,6 +133,14 @@ val VendorDir: string = "vendor"
 collect(root: string, os: Option[Os]) -> Result[Buf[Found], Selection]
     if !is_directory(root)
         var one: Buf[Found] = buf()
+
+        // A file an editor holds is read as the editor holds it, which is how `sysl lsp` analyzes
+        // text nobody has saved.
+        editor_text(root) match
+            Some(text) ->
+                one.push(Found(source(root, text.bytes), buf()))
+                return Ok(one)
+            None -> ()
 
         // A path with nothing at it is told so, which is a different mistake from a file that is
         // there and cannot be read.
@@ -129,9 +223,12 @@ private walk_tree(root: string, path: string, dir: Buf[string], os: Option[Os], 
 
     for file in here.files
         if is_sysl_file(file)
-            read_bytes(file) match
-                Err(_) -> ()
-                Ok(bytes) -> out.push(Found(source(file, bytes), dir))
+            editor_text(file) match
+                Some(text) -> out.push(Found(source(file, text.bytes), dir))
+                None ->
+                    read_bytes(file) match
+                        Err(_) -> ()
+                        Ok(bytes) -> out.push(Found(source(file, bytes), dir))
         end if
 
     for sub in here.subs
@@ -166,7 +263,18 @@ c_sources(root: string, os: Option[Os]) -> Result[Buf[string], Selection]
 
     walk_c(root, absolute_path(root), buf(), os, None, &out)?
 
-    Ok(out)
+    // **The C under a vendored library's root is the library's list's to compile** (`c_libraries`),
+    // so a module that happens to sit inside such a tree does not compile the rest of it.
+    val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
+
+    if declared.c_libraries.is_empty() then return Ok(out)
+
+    var kept: Buf[string] = buf()
+
+    for item in out
+        if !claimed_by_library(root, declared, item) then kept.push(item)
+
+    Ok(kept)
 end c_sources
 
 private walk_c(root: string, path: string, dir: Buf[string], os: Option[Os], within: Option[string],
@@ -210,7 +318,12 @@ stray_c_warnings(root: string) -> Buf[string]
 
     var out: Buf[string] = buf()
 
+    // A vendored library's tree is no module and is meant to be none: its list says what is compiled.
+    val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
+
     for item in dirs
+        if claimed_by_library(root, declared, item) then continue
+
         out.push(s"'${item}' holds C and no sysl, so it is not a module and its '.c' files are " +
             "compiled by nothing — a directory becomes one by holding the '.sysl' that declares " +
             "those 'extern's")
@@ -256,14 +369,17 @@ end walk_stray_c
 private walked_into(dir: Buf[string], sub: string) -> bool =
     !skipped_at_root(dir, sub) && !is_file(join_path(sub, ManifestName))
 
-// The root's `examples/` and `vendor/` are left out, and the `dir.is_empty()` test is what makes it
-// the *root's* one: everywhere else the name is ordinary.
+// The root's `examples/`, `vendor/` and `.sysl/` are left out, and the `dir.is_empty()` test is what
+// makes it the *root's* one: everywhere else the name is ordinary. So is the root's `tests/refused/`,
+// whose files are programs `sysl test` requires to be refused, each compiled on its own
+// (`refused_files`).
 private skipped_at_root(dir: Buf[string], sub: string) -> bool
-    if !dir.is_empty() then return false
-
     val name = basename(sub)
 
-    name == ExamplesDir || name == VendorDir
+    if dir.len() == 1 && dir.at(0) == RefusedParent then return name == RefusedLeaf
+    if !dir.is_empty() then return false
+
+    name == ExamplesDir || name == VendorDir || name == LocalDir
 end skipped_at_root
 
 // One directory's contents with per-OS selection already folded in: the files that belong to it,
@@ -279,11 +395,18 @@ end Contents
 //
 // **A directory that cannot be listed is refused, naming it**: left out, the modules below it would
 // vanish from the build with nothing said.
+//
+// **One that is no longer there is not**, below the root: its parent listed it, so another process
+// removed it while the walk was under way -- a test's lock directory, a temporary tree -- and what
+// is gone holds no modules. A name removed between the listing and the look at what it is goes the
+// same way, unless it is an editor's unsaved file, which was never on disk to begin with, or a link
+// whose target is missing, which is still there to be reported by whatever reads it.
 private contents(root: string, path: string, os: Option[Os], within: Option[string]) -> Result[Contents, Selection]
     val names = entries(path) match
         Ok(found) -> found
+        Err(NotFound) if path != absolute_path(root) -> return Ok(Contents(buf(), buf()))
         Err(e) -> return Err(Selection(s"cannot read $root: ${io_refusal(path, e)}"))
-    var sorted = sort_names(names)
+    var sorted = sort_names(with_unsaved(path, names))
 
     var files: Buf[string] = buf()
     var plain: Buf[(string, Option[string])] = buf()
@@ -292,7 +415,13 @@ private contents(root: string, path: string, os: Option[Os], within: Option[stri
     for item in sorted
         val full = join_path(path, item)
 
-        if !is_directory(full)
+        val dir = metadata(full) match
+            Ok(m) -> m.is_dir()
+            // A link whose target is missing is still an entry, so it is asked of the name itself.
+            Err(NotFound) -> if link_metadata(full).is_err() && editor_text(full).is_none() then continue else false
+            Err(_) -> false
+
+        if !dir
             files.push(full)
         else if marked(item)
             selectors.push(full)

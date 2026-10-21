@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **`@export("write", weak)` -- an export a strong definition of the same symbol replaces.**
+//
+// A C library's OS stubs (`open`, `write`, `sbrk`, ... answering -1, newlib's model) are defaults a
+// board replaces one at a time. The weak export is emitted `define weak`, so a strong definition
+// anywhere in the link -- the program's own `@export`, a board package's C -- is the one kept, with no
+// duplicate-symbol error. One weak and one strong export in the same compilation emit only the strong
+// one (`codegen.sysl`'s `overridden_weak`); two weak ones of one symbol are refused, as is a weak entry.
+
+private val wkx_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// The package of stubs: a weak default for `wkx_write`, and the sysl surface calling it through the
+// C symbol, as a C library's `write` is reached.
+private val wkx_stubs: string = raw"""
+    module cstd
+
+    @export("wkx_write", weak)
+    stub_write(n: i32) -> i32 = -1
+
+    extern "wkx_write" c_write(n: i32) -> i32
+
+    write_it(n: i32) -> i32 = c_write(n)
+    """
+
+// A board package whose C defines `wkx_write` strongly, beside a symbol its sysl reaches -- so the C
+// object is in the link for its own sake, as a board's startup code is.
+private val wkx_board: string = raw"""
+    module board
+
+    extern "wkx_board_id" c_id() -> i32
+
+    id() -> i32 = c_id()
+    """
+
+private val wkx_board_c: string = "int wkx_board_id(void) { return 1; }\nint wkx_write(int n) { return n * 3; }\n"
+
+// The lib root holding the stubs, and the board where it is asked for.
+private wkx_lib(with_board: bool) -> string
+    var files = lbr_one("cstd/cstd.sysl", wkx_stubs)
+
+    if with_board
+        files.push(("board/board.sysl", wkx_board))
+        files.push(("board/board.c", wkx_board_c))
+    end if
+
+    lbr_tree(files)
+end wkx_lib
+
+// What a one-file program says for itself through the lowering: its diagnostics, or `""`.
+private wkx_err(text: string) -> string
+    val root = make_temp_dir("sysl-wkx-").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end wkx_err
+
+// The `define` line of `symbol` in `text`, or `""` where there is none.
+private wkx_define(text: string, symbol: string) -> string
+    val lines = lines_of(text)
+
+    for line in lines
+        if line.starts_with("define ") && line.contains(s" @$symbol(") then return line
+
+    ""
+end wkx_define
+
+private wkx_defines(text: string, symbol: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with("define ") && line.contains(s" @$symbol(") then n += 1
+
+    n
+end wkx_defines
+
+// -- the run: the default, and the two ways it is replaced -----------------------------------------
+
+@test("a weak export alone links and runs: the stub answers")
+wkx_the_stub_alone()
+    if !lbr_ready() then return
+
+    val lib = wkx_lib(false)
+    val main = lbr_program("print(cstd.write_it(5))\n")
+
+    assert_eq(lbr_run(main, [lib]), "-1\n")
+    lbr_drop([main, lib])
+end wkx_the_stub_alone
+
+@test("a strong export in the program replaces the package's weak one")
+wkx_the_program_wins()
+    if !lbr_ready() then return
+
+    val lib = wkx_lib(false)
+    val main = lbr_program("@export(\"wkx_write\")\nmine(n: i32) -> i32 = n * 2\n\nprint(cstd.write_it(5))\n")
+
+    assert_eq(lbr_run(main, [lib]), "10\n")
+    lbr_drop([main, lib])
+end wkx_the_program_wins
+
+@test("a strong definition in a board package's C replaces the weak export")
+wkx_the_board_c_wins()
+    if !lbr_ready() then return
+
+    val lib = wkx_lib(true)
+    val main = lbr_program("print(board.id() + cstd.write_it(5))\n")
+
+    assert_eq(lbr_run(main, [lib]), "16\n")
+    lbr_drop([main, lib])
+end wkx_the_board_c_wins
+
+// -- what is emitted ---------------------------------------------------------------------------------
+
+@test("the weak export's entry is 'define weak'; an ordinary export's is not")
+wkx_the_entry_is_weak()
+    if !lbr_ready() then return
+
+    val text = lbr_text(lbr_program(raw"""
+        @export("wkx_a", weak)
+        a(n: i32) -> i32 = n
+
+        @export(weak)
+        wkx_b(n: i32) -> i32 = n
+
+        @export("wkx_c", weak)
+        private c(n: i32) -> i32 = n
+
+        @export("wkx_d")
+        d(n: i32) -> i32 = n
+
+        print(a(1) + wkx_b(2) + c(3) + d(4))
+        """), [])
+
+    assert(wkx_define(text, "wkx_a").starts_with("define weak "), text)
+    assert(wkx_define(text, "wkx_b").starts_with("define weak "), wkx_define(text, "wkx_b"))
+    assert(wkx_define(text, "wkx_c").starts_with("define weak "), wkx_define(text, "wkx_c"))
+    assert(wkx_define(text, "wkx_c").contains(" hidden "), wkx_define(text, "wkx_c"))
+    assert(!wkx_define(text, "wkx_d").is_empty(), text)
+    assert(!wkx_define(text, "wkx_d").contains("weak"), wkx_define(text, "wkx_d"))
+end wkx_the_entry_is_weak
+
+@test("a weak and a strong export of one symbol in one compilation emit the strong one alone")
+wkx_one_compilation_keeps_the_strong()
+    if !lbr_ready() then return
+
+    val text = lbr_text(lbr_program(raw"""
+        @export("wkx_w", weak)
+        stub(n: i32) -> i32 = -1
+
+        @export("wkx_w")
+        real(n: i32) -> i32 = n * 2
+
+        print(stub(1) + real(2))
+        """), [])
+
+    assert_eq(wkx_defines(text, "wkx_w"), 1)
+    assert(!wkx_define(text, "wkx_w").contains("weak"), wkx_define(text, "wkx_w"))
+end wkx_one_compilation_keeps_the_strong
+
+// Builds the stubs program's archive for `target` and lists its symbols with `llvm-nm`, the darwin
+// listing on the host since a Mach-O weak definition prints as 'T' in the plain one.
+private wkx_archive_symbols(target: string, strong: bool) -> string
+    val lib = wkx_lib(false)
+    val own = if strong then "@export(\"wkx_own\")\nown(n: i32) -> i32 = n\n\n" else ""
+    val main = lbr_program(s"$own@export(\"main\")\nstart() -> i32 = cstd.write_it(5)\n")
+    val dir = parent_of(main).unwrap_or(main)
+    val out = s"$dir/out.a"
+    var args: Buf[string] = buf()
+
+    for word in ["sysl", "build-c", dir, "--lib", lib, "-o", out]
+        args.push(word)
+
+    if !target.is_empty()
+        args.push("--target")
+        args.push(target)
+    end if
+
+    val built = lbr_cli(args.view())
+
+    if built.0 != 0
+        lbr_drop([main, lib])
+        return s"refused: ${built.1}"
+    end if
+
+    var flags: Buf[string] = buf()
+
+    if target.is_empty() then flags.push("-m")
+
+    flags.push(out)
+
+    val said = capture(wkx_nm, flags.view(), "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    lbr_drop([main, lib])
+    said
+end wkx_archive_symbols
+
+@test("on the host the weak export is a Mach-O weak definition")
+wkx_host_nm()
+    if !lbr_ready() then return
+    if !is_file(wkx_nm) then skip(s"there is no llvm-nm at $wkx_nm to read the archive")
+
+    val said = wkx_archive_symbols("", false)
+
+    assert(said.contains("weak external _wkx_write"), said)
+end wkx_host_nm
+
+@test("on thumbv7em the weak export is an ELF 'W' and a strong one a 'T'")
+wkx_thumb_nm()
+    if !lbr_ready() then return
+    if !is_file(wkx_nm) then skip(s"there is no llvm-nm at $wkx_nm to read the archive")
+
+    val said = wkx_archive_symbols("thumbv7em-freestanding", true)
+
+    assert(said.contains(" W wkx_write"), said)
+    assert(said.contains(" T wkx_own"), said)
+    assert(!said.contains(" T wkx_write"), said)
+end wkx_thumb_nm
+
+// -- what is refused ---------------------------------------------------------------------------------
+
+@test("the entry point cannot be exported weak")
+wkx_the_entry_is_refused()
+    if !lbr_ready() then return
+
+    assert(wkx_err("@export(\"main\", weak)\nstart() -> i32 = 0\n").contains(
+        "the entry point cannot be exported 'weak' — 'main' is where the image starts"))
+end wkx_the_entry_is_refused
+
+@test("two weak exports of one symbol and no strong one are refused, naming both")
+wkx_two_defaults_are_refused()
+    if !lbr_ready() then return
+
+    val said = wkx_err("@export(\"wkx_x\", weak)\na() -> i32 = 1\n\n@export(\"wkx_x\", weak)\nb() -> i32 = 2\n\nprint(a() + b())\n")
+
+    assert(said.contains("'wkx_x' is exported 'weak' by 'a' and 'b' — two defaults of one symbol"), said)
+end wkx_two_defaults_are_refused
+
+@test("two strong exports of one symbol beside a weak one are still refused")
+wkx_two_strong_are_still_refused()
+    if !lbr_ready() then return
+
+    val said = wkx_err("@export(\"wkx_y\", weak)\na() -> i32 = 1\n\n@export(\"wkx_y\")\nb() -> i32 = 2\n\n" +
+                       "@export(\"wkx_y\")\nc() -> i32 = 3\n\nprint(a() + b() + c())\n")
+
+    assert(said.contains("'wkx_y' is exported by 'b' and 'c' — one symbol is one definition"), said)
+end wkx_two_strong_are_still_refused
+
+@test("a word after the symbol other than 'weak' is refused")
+wkx_another_word_is_refused()
+    if !lbr_ready() then return
+
+    val said = wkx_err("@export(\"wkx_z\", strong)\na() -> i32 = 1\n\nprint(a())\n")
+
+    assert(said.contains("'weak' expected — the one word '@export' takes after its symbol is 'weak'"), said)
+end wkx_another_word_is_refused
+
+@test("weak is refused on exported storage, a struct and a type")
+wkx_weak_is_a_function_word()
+    if !lbr_ready() then return
+
+    val storage = wkx_err("@export(\"wkx_s\", weak)\nvar s: i32 = 0\n\nprint(s)\n")
+    val record = wkx_err("@export(\"wkx_p\", weak)\nstruct P\n    x: i32\n\nprint(P(1).x)\n")
+    val named = wkx_err("@export(\"wkx_t\", weak)\ntype T = i32\n\nval t: T = 1\nprint(t)\n")
+
+    assert(storage.contains("only a function's '@export' may be 'weak' — exported storage"), storage)
+    assert(record.contains("only a function's '@export' may be 'weak' — a struct's"), record)
+    assert(named.contains("only a function's '@export' may be 'weak' — a type's"), named)
+end wkx_weak_is_a_function_word

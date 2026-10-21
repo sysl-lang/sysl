@@ -198,6 +198,23 @@ refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     false
 end refuse_ref_captures
 
+// A capture is a copy, so a local whose type is `@pinned` cannot be captured: the closure would carry
+// a second value of it, which nothing C holds a pointer into. A pointer to it can be.
+private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+    for i in 0..<captured.len()
+        val local = cx.lookup(captured.at(i))
+
+        if local.is_some() && pinned_type(cx.an, local.unwrap().ty)
+            val held = type_show(local.unwrap().ty)
+
+            cx.fault(span, pinned_refusal(held, s"captures '${captured.at(i)}' by value in a closure",
+                                          s"Capture a pointer to it instead ('val p = &${captured.at(i)}')"))
+            return true
+        end if
+
+    false
+end refuse_pinned_captures
+
 // Builds the struct, the implementation and the body of one closure, and yields the struct value
 // that *is* the closure -- its captures, in the order the fields hold them.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
@@ -205,6 +222,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
+    if refuse_pinned_captures(cx, span, captured) then return bad_expr(span)
 
     var fields: Buf[(string, Type)] = buf()
 
@@ -215,7 +233,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     cx.an.closure_count += 1
 
-    val st = StructType(base, buf(), fields, false, None, None, false, None, buf())
+    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf())
 
     cx.an.tables.struct_insts.put(base, Struct(st))
 
@@ -262,8 +280,8 @@ private note_read_only(a: &Analysis, base: string, reads_only: bool)
 
 private note_env_write(seen: &EnvWrites, e: TExpr)
     val hit = *e.kind match
-        TStore(place, _, _) -> reaches_self(place)
-        TUpdate(place, _, _, _, _, _) -> reaches_self(place)
+        TStore(place, _, _, _) -> reaches_self(place)
+        TUpdate(place, _, _, _, _, _, _) -> reaches_self(place)
         TIncDec(place, _, _, _, _) -> reaches_self(place)
         TVecStore(recv, _, _) -> reaches_self(recv)
         _ -> false
@@ -301,6 +319,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     inner.body = fname
     inner.owner = nested_owner(cx)
+    inner.var_fix_log = cx.var_fix_log
 
     val self_ty = Ptr(Struct(st))
 
@@ -325,6 +344,10 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
                                                          Struct(st))), int(st.slot(i)), stored))
 
         val unique = inner.bind(captured.at(i), stored)
+        val outer = cx.lookup(captured.at(i))
+
+        // A capture of a binding whose type its first use fixes is that binding, for the use.
+        if outer.is_some() then carry_open(cx, inner, outer.unwrap().unique, unique)
 
         // A by-name parameter captured is still one: the field holds the callable, and a read of
         // the name calls it.
@@ -350,9 +373,17 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // A closure whose result the context did not fix is analyzed with nothing expected, so what its
     // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
     // all.
+    val was = inner.unit_tail
+
+    inner.unit_tail = result.is_none()
+
     val block = if result.is_some() && result.unwrap() == Unit then
         type_value_block(inner, rest, None, true)
     else type_value_block(inner, rest, result, false)
+
+    inner.unit_tail = was
+
+    check_consumes(inner, block)
 
     var ret = Unit
 
@@ -408,7 +439,7 @@ private register_call_trait(cx: &Analyzer, span: Span, st: &StructType, ptypes: 
 
     val subject = TypeRef(span, NamedType(st.base, buf()))
     val block = ImplDecl(key.unwrap(), subject, buf(), buf(), buf(), buf(), buf(), false, buf(),
-                         buf(), buf())
+                         buf(), buf(), false)
     var rows: Buf[TraitImpl] = buf()
 
     // A closure's call trait declares no associated type, and could not: the shape is synthesized
@@ -508,12 +539,12 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
         MultiAssign(_, targets, values) ->
             read_each(keep, targets, *bound, found)
             read_each(keep, values, *bound, found)
-        MultiDecl(names, _, values) ->
+        MultiDecl(names, _, values, _) ->
             read_each(keep, values, *bound, found)
 
             for item in names
                 bound.push(item)
-        PatternDecl(pat, _, value, _) ->
+        PatternDecl(pat, _, value, _, _) ->
             read_expr(keep, value, *bound, found)
             pattern_binds_into(pat, bound)
         Return(value) -> read_opt(keep, value, *bound, found)
@@ -521,11 +552,15 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
         Break(_, value) -> read_opt(keep, value, *bound, found)
         Defer(inner) -> read_stmt(keep, inner, bound, found)
         StaticDecl(inner) -> read_stmt(keep, inner, bound, found)
+        CopiedDecl(_, inner) -> read_stmt(keep, inner, bound, found)
         Require(cond, _) -> read_expr(keep, cond, *bound, found)
         Ensure(cond, _) -> read_expr(keep, cond, *bound, found)
         Invariant(cond, _) -> read_expr(keep, cond, *bound, found)
         Variant(measure) -> read_expr(keep, measure, *bound, found)
-        AssertDecl(cond, _) -> read_expr(keep, cond, *bound, found)
+        AssertDecl(cond, message) ->
+            read_expr(keep, cond, *bound, found)
+
+            if message.is_some() then read_expr(keep, message.unwrap(), *bound, found)
         // A function nested in the body is a closure by another spelling, so what it reads from
         // around it is read here too -- and its own parameters shadow, exactly as a closure's do.
         FuncDecl(d) ->
@@ -615,6 +650,10 @@ private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found:
             read_expr(keep, count, bound, found)
         Block(stmts) -> read_block(keep, stmts, bound, found)
         IfExpr(cond, then_body, else_body, _) ->
+            read_expr(keep, cond, bound, found)
+            read_block(keep, then_body, bound, found)
+            read_opt_block(keep, else_body, bound, found)
+        ConstIf(cond, then_body, else_body) ->
             read_expr(keep, cond, bound, found)
             read_block(keep, then_body, bound, found)
             read_opt_block(keep, else_body, bound, found)
@@ -858,7 +897,8 @@ with_trait_call_bounds(d: TraitDecl) -> TraitDecl
     for item in d.methods
         methods.push(with_member_call_bounds(item))
 
-    TraitDecl(d.name, d.tparams, methods, d.bounds, d.supers, d.vis, d.tdefaults, d.assocs, d.tvalues)
+    TraitDecl(d.name, d.tparams, methods, d.bounds, d.supers, d.vis, d.tdefaults, d.assocs, d.tvalues,
+              d.derives)
 end with_trait_call_bounds
 
 // The same for the three other declaration forms that carry members, so that a signature written
@@ -866,16 +906,17 @@ end with_trait_call_bounds
 // body an `impl` block wrote.
 with_impl_call_bounds(d: ImplDecl) -> ImplDecl
     ImplDecl(d.trait_name, d.for_type, lowered_members(d.methods), d.tparams, d.bounds,
-             d.trait_args, d.tdefaults, d.overrides, d.tvalues, d.tpacks, d.assocs)
+             d.trait_args, d.tdefaults, d.overrides, d.tvalues, d.tpacks, d.assocs, d.derived)
 
 with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
-               d.byte_order, d.guards)
+               d.byte_order, d.guards, d.pinned, d.union_layout, d.anon, d.bits, d.annotation,
+               d.annots)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,
-             d.vis, d.tdefaults, d.tvalues, d.deriving)
+             d.vis, d.tdefaults, d.tvalues, d.deriving, d.annots)
 
 private lowered_members(ms: Buf[MethodDecl]) -> Buf[MethodDecl]
     var out: Buf[MethodDecl] = buf()

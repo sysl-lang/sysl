@@ -142,6 +142,14 @@ private var cf_per_cpu_offset: string = ""
 thread_pointer_register() -> Option[string] =
     if cf_thread_pointer == "" then None else Some(cf_thread_pointer)
 
+// Whether a `@thread_local` is accepted on `t` as this build describes it: where a loader and a libc
+// lay a thread's storage down, or on a bare AArch64 machine whose root manifest names the register
+// the program writes the thread pointer to (`codegen.thread_pointer`). The refusal of a
+// `@thread_local` and the `#if thread_local` symbol both read this one answer, so a declaration the
+// symbol admits is never one the analyzer refuses.
+thread_local_accepted(t: Target) -> bool =
+    t.thread_local_storage() || (t.cpu == Aarch64 && thread_pointer_register().is_some())
+
 // The register holding this core's offset from the `.percpu` image, or nothing.
 per_cpu_register() -> Option[string] = if cf_per_cpu_offset == "" then None else Some(cf_per_cpu_offset)
 
@@ -250,6 +258,17 @@ codegen_feature_flags(t: Target) -> Buf[string]
 
     if cf_general_regs_only && (t.cpu == Aarch64 || t.cpu == X86_64)
         out.push("-mgeneral-regs-only")
+
+    // **An Armv6-M core reads and writes a word indivisibly**, but has no exclusive pair, so LLVM's
+    // default for it is no lock-free width at all and every atomic -- a plain load or store included
+    // -- becomes an `__atomic_*_4` call no board defines. `atomics-32` says what the core does have,
+    // as Rust's `thumbv6m-none-eabi` does: loads and stores of up to 32 bits become `ldr`/`str` with
+    // the barriers their ordering needs.
+    if t.triple.starts_with("thumbv6m")
+        out.push("-Xclang")
+        out.push("-target-feature")
+        out.push("-Xclang")
+        out.push("+atomics-32")
 
     if cf_strict_align
         if t.cpu == Thumb
@@ -397,6 +416,10 @@ end extension_known
 // The `extensions` named in `codegen` blocks: the target's own list over the project's, and none
 // where neither says anything. A target's empty list takes the project's away.
 codegen_extensions(m: &Manifest, target: string) -> Buf[string]
+    val featured = featured_extensions(m, target)
+
+    if featured.is_some() then return featured.unwrap()
+
     for row in m.target_extensions
         if row.0 == target then return row.1
 

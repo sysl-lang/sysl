@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.source
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
+import sysl.cpu_count
 import sysl.prints
 import sysl.text.{join, split, Search}
 
@@ -19,7 +20,7 @@ val Misused: int = 2
 
 // What `sysl --version` answers. Written here as well as in `package.hocon`, because a program is
 // handed nothing about its own manifest; the test beside this file keeps the two in step.
-const Version: string = "0.1.0-alpha.12"
+const Version: string = "0.3.7"
 
 // The answer to a command line: the lines to say, and the status to exit with. What
 // `--explain-escapes` reports is said on the same channel, in the order it was found.
@@ -50,6 +51,10 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int 
 run_cli_reported(args: []string, say: string -> unit, note: string -> unit, report: string -> unit) -> int
     val code = run_cli_command(args, say, note, report)
 
+    // The C object cache is swept once its compilations are done, not after each of them.
+    sweep_c_objects()
+    sweep_roots()
+    sweep_std_artifacts()
     close_explain_sink()
     code
 end run_cli_reported
@@ -65,6 +70,7 @@ private run_cli_command(args: []string, say: string -> unit, note: string -> uni
     reset_search_paths()
     set_explain_sink(note)
     reset_feature_request()
+    use_resolution_machine(None)
 
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
@@ -129,6 +135,7 @@ private run_cli_command(args: []string, say: string -> unit, note: string -> uni
         "prove" -> prove_command(args, say, note)
         "import-c" -> import_c_command(args, say, note)
         "targets" -> targets_command(args, say, note)
+        "lsp" -> lsp_command(args, note)
         other ->
             // **An unknown word is a mistake, and the answer lists what sysl has**, so a typo is
             // answerable from the refusal alone. Nothing is looked for on the PATH: `doc` is built in
@@ -915,8 +922,11 @@ where_flags() -> string =
 private emit_typed_usage() -> string =
     "usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] " + where_flags() + " <path>"
 
-// `sysl test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>` --
-// the `@test` functions of a tree, built into one binary and run one process each.
+// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>]
+// [--target <name>] [--cc <path>] [-O<level>] <path>` --
+// the `@test` functions of a tree, built into one binary and run one process each, `--jobs` of them at
+// once. `--file` keeps the
+// tests written in the one file it names (`file_named`), beside whatever `--filter` keeps.
 //
 // **The report is written as the run goes rather than at the end**, which is why it does not go
 // through `say`: a suite that takes half an hour is watched from a log file while it runs, and a run
@@ -928,8 +938,11 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var named: Option[string] = None
     var cc: Option[string] = None
     var filter: Option[string] = None
+    var within: Option[string] = None
     var fail_fast = false
     var std = false
+    var seconds: Option[int] = None
+    var jobs: Option[usize] = None
     var named_level: Option[string] = None
     var picked: Option[string] = None
     var file = ""
@@ -949,7 +962,33 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             if took == 2 then i += 1
         else if featured > 0
             if featured == 2 then i += 1
-        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
+        else if args[i] == "--timeout"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+
+            timeout_seconds(args[i]) match
+                Some(n) -> seconds = Some(n)
+                None ->
+                    mistakes.push(bad_timeout(args[i]))
+                    break
+        else if args[i] == "--jobs"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+
+            test_jobs(args[i]) match
+                Some(n) -> jobs = Some(n)
+                None ->
+                    mistakes.push(bad_jobs(args[i]))
+                    break
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
                 break
@@ -961,6 +1000,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
 
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
+            else if flag == "--file" then within = Some(args[i])
             else filter = Some(args[i])
         else if args[i] == "--fail-fast"
             fail_fast = true
@@ -1019,18 +1059,78 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             return Failed
         Ok(found) -> found
 
+    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
+    val opts = TestOptions(filter, fail_fast, 0, buf())
+    val asked = TestAsked(jobs, seconds)
+
     projects match
-        None -> test_project(file, named, cc, filter, fail_fast, std, named_level, note, report)
-        Some(members) -> test_members(members, named, cc, filter, fail_fast, std, named_level, say, note,
-                                      report)
+        None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within)
+        Some(members) -> test_members(members, named, cc, opts, asked, std, named_level, say, note,
+                                      report, within)
 end test_command
+
+// `--timeout`'s value: a whole number of seconds, zero for no limit, up to the most a test's own
+// `@test(timeout: n)` may say (`MostTestSeconds`). Anything else -- a sign, a unit, a fraction -- is
+// refused rather than read as far as it goes.
+timeout_seconds(text: string) -> Option[int]
+    if text.bytes.len == 0 || text.bytes.len > 7 then return None
+
+    var n = 0
+
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return None
+
+        n = n * 10 + int(c - u8('0'))
+
+    if n > MostTestSeconds then None else Some(n)
+end timeout_seconds
+
+// `--jobs`'s value: how many tests may run at once, a whole number from one up. Without the flag it is
+// this machine's processor count (`cpu_count`), as `cargo test` takes it.
+test_jobs(text: string) -> Option[usize]
+    if text.bytes.len == 0 || text.bytes.len > 4 then return None
+
+    var n: usize = 0
+
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return None
+
+        n = n * 10 + usize(c - u8('0'))
+
+    if n == 0 then None else Some(n)
+end test_jobs
+
+// What the command line said about how to run, where it said anything: each is `None` where a
+// project's `test` block, and then the default, decides.
+private struct TestAsked
+    jobs: Option[usize]
+    seconds: Option[int]
+end TestAsked
+
+// The `test` block of the manifest beside `path` -- a project directory, or a file in one -- or none
+// where there is no readable manifest there; a manifest that cannot be read is said by the build.
+test_settings_of(path: string) -> TestSettings
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    manifest_at(root) match
+        Ok(m) -> m.tests
+        Err(_) -> no_test_settings()
+end test_settings_of
+
+private bad_jobs(text: string) -> string =
+    s"'--jobs' takes how many tests may run at once, a whole number from 1 up, and '$text' is not one"
+
+private bad_timeout(text: string) -> string =
+    s"'--timeout' takes the seconds each test may run, a whole number from 0 to $MostTestSeconds " +
+        s"(0 is no limit), and '$text' is not one"
 
 // **Every member's suite, each reported under its own name**, and a line at the end saying how the
 // workspace came out. A failing member does not stop the others unless `--fail-fast` asked for that:
 // the point of testing a workspace at once is to hear about all of it.
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
-                     filter: Option[string], fail_fast: bool, std: bool, named_level: Option[string],
-                     say: string -> unit, note: string -> unit, report: string -> unit) -> int
+                     opts: TestOptions, asked: TestAsked, std: bool, named_level: Option[string],
+                     say: string -> unit, note: string -> unit, report: string -> unit,
+                     within: Option[string]) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
 
@@ -1038,10 +1138,10 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, filter, fail_fast, std, named_level, note, report) != Fine
+        if test_project(mb.dir, named, cc, opts, asked, std, named_level, note, report, within) != Fine
             failed.push(mb.name)
 
-            if fail_fast then break
+            if opts.fail_fast then break
         end if
 
     if members.len() > 1
@@ -1054,9 +1154,15 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
 end test_members
 
 // One project's suite, once the command line has been read.
-private test_project(file: string, named: Option[string], cc: Option[string], filter: Option[string],
-                     fail_fast: bool, std: bool, named_level: Option[string], note: string -> unit,
-                     report: string -> unit) -> int
+private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
+                     asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
+                     report: string -> unit, within: Option[string]) -> int
+    // The package's own `test` block, under whatever the command line said.
+    val settings = test_settings_of(file)
+    val seconds = asked.seconds.unwrap_or(settings.timeout.unwrap_or(DefaultTestSeconds))
+    val opts = TestOptions(given.filter, given.fail_fast,
+                           asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
+
     val level = build_level(file, named_level) match
         Err(why) ->
             say_failure(why, note)
@@ -1070,8 +1176,12 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     // one, so the same sources at the same machine come to different bytes.
     val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
 
+    // The package's `tests/refused/` programs: never cached, since what each comes to is a
+    // compilation of its own, and that compilation is the whole of what it tests.
+    val run = RefusedRun(if std then buf() else refused_files(file), named, level)
+
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, filter, fail_fast, false, note, report)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within)
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
@@ -1089,9 +1199,13 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     end if
 
     // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
-    nothing_to_run(file, build.tests, filter, note) match
+    nothing_to_run(file, build.tests, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
+
+    // Refused programs and no `@test` function the filter keeps: there is no binary to link.
+    if selected_in(build.tests, opts.filter, within).is_empty()
+        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within)
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
@@ -1103,21 +1217,37 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, note, report)
+    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report, within)
 end test_project
+
+// What a project's refused programs are compiled with: the files, and the run's own target and
+// optimization, so each is compiled as the test build was.
+private struct RefusedRun
+    files: Buf[string]
+    named: Option[string]
+    level: string
+end RefusedRun
 
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
 // the tests there are lead to the same empty report and are different mistakes, so each is named.
-// Neither is a failure: a program is allowed to have no tests.
-private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
-                       note: string -> unit) -> Option[int]
-    if all.is_empty()
+// Neither is a failure: a program is allowed to have no tests. A refused program is a test here.
+// `--file` naming no file that has a test is the same mistake as a filter matching nothing, and is
+// said the same way, with the file named.
+private nothing_to_run(file: string, all: Buf[TTest], programs: Buf[string], filter: Option[string],
+                       within: Option[string], note: string -> unit) -> Option[int]
+    if all.is_empty() && programs.is_empty()
         note(s"no '@test' functions in $file")
         return Some(Fine)
     end if
 
-    if selected_tests(all, filter).is_empty()
-        note(s"no test matches '${filter.unwrap_or("")}' — ${all.len()} to choose from")
+    if selected_in(all, filter, within).is_empty() && selected_refused(programs, filter, within).is_empty()
+        val asked = within match
+            None -> s"'${filter.unwrap_or("")}'"
+            Some(named) -> filter match
+                None -> s"in file '$named'"
+                Some(f) -> s"'$f' in file '$named'"
+
+        note(s"no test matches $asked — ${all.len() + programs.len()} to choose from")
         return Some(Fine)
     end if
 
@@ -1125,16 +1255,23 @@ private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
 end nothing_to_run
 
 // The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
-// whole point of it being there.
-private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[string],
-                  fail_fast: bool, discard: bool, note: string -> unit, report: string -> unit) -> int
-    nothing_to_run(file, all, filter, note) match
+// whole point of it being there. `exe` is empty where no `@test` function was chosen.
+private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
+                  discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit,
+                  within: Option[string]) -> int
+    nothing_to_run(file, all, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
 
-    val chosen = selected_tests(all, filter)
-    val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
-                                all.len() - chosen.len(), report)
+    val chosen = selected_in(all, opts.filter, within)
+    val picked = selected_refused(run.files, opts.filter, within)
+    var judged: Buf[Outcome] = buf()
+
+    for item in picked
+        judged.push(refused_outcome(file, run.named, run.level, item))
+
+    val filtered = all.len() - chosen.len() + run.files.len() - picked.len()
+    val outcomes = run_selected(exe, chosen, opts, filtered, report, seconds, judged)
 
     if discard then discard_test_binary(exe)
 
@@ -1146,7 +1283,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[str
     if failed == 0 then Fine else Failed
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     pipeline_usage() + " <path>"
 
@@ -1171,14 +1308,17 @@ private build_lib_command(args: []string, note: string -> unit) -> int
 
     while i < args.len
         val took = took_search_flag(args, i)
+        val featured = took_feature_flag(args, i)
 
-        if took == 0
+        if took == 0 || featured == 0
             mistakes.push(missing_value(args[i]))
             break
         end if
 
         if took > 0
             if took == 2 then i += 1
+        else if featured > 0
+            if featured == 2 then i += 1
         else if args[i] == "-o" || args[i] == "--output"
             note(refused(build_lib_output_refusal()))
             return Misused
@@ -1204,8 +1344,8 @@ private build_lib_command(args: []string, note: string -> unit) -> int
 
             if given.0 == 2 then i += 1
         else
-            // An option this command does not take -- the feature flags among them, `build-lib`
-            // resolving no graph -- is the command line's mistake, as the reference's parser says.
+            // An option this command does not take is the command line's mistake, as the reference's
+            // parser says.
             val taken = took_any_command_flag(args, i, &mistakes)
 
             if taken == 0 then file = args[i] else i += taken - 1
@@ -1221,6 +1361,8 @@ private build_lib_command(args: []string, note: string -> unit) -> int
         note(build_lib_usage())
         return Misused
     end if
+
+    if refused_features(note) then return Failed
 
     val at = build_level(file, level) match
         Err(why) ->
@@ -1252,7 +1394,8 @@ private build_lib_command(args: []string, note: string -> unit) -> int
 end build_lib_command
 
 private build_lib_usage() -> string =
-    "usage: sysl build-lib [--std] [--target <name>] [-O<level>] " + where_flags() + " <path>"
+    "usage: sysl build-lib [--std] [--target <name>] [-O<level>] " + where_flags() + " " + feature_flags() +
+    " <path>"
 
 // What is said of `-o` given to `build-lib`, which is refused before anything is read.
 //
@@ -1423,12 +1566,12 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | deps <path> | vendor <path> | tidy [--check] [<path>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +
-    "targets\n" +
-    "build, build-c, run and test, which resolve a package graph, also take " + feature_flags() +
+    "targets | lsp [--stdio]\n" +
+    "build, build-c, build-lib, run and test, which resolve a package graph, also take " + feature_flags() +
     ": a feature of the root project to turn on beside 'default', comma-separated and repeatable; " +
     "leave the root's 'default' feature off; turn on every feature the root's manifest declares"
 
@@ -1440,7 +1583,7 @@ builtin_commands() -> Buf[string]
     for c in ["run", "build", "build-lib", "build-c", "emit-header", "weave", "tangle", "test",
               "emit-llvm",
               "emit-ast", "emit-typed", "prove", "deps", "add", "vendor", "tidy", "doc", "import-c",
-              "targets"]
+              "targets", "lsp"]
         out.push(c)
 
     out
@@ -1462,7 +1605,7 @@ help_text() -> string
               emit_typed_usage(), "usage: sysl prove [--emit-whyml] [--overflow check|ignore] <path>",
               deps_usage(), add_usage(), "usage: sysl vendor <path>", "usage: sysl tidy [--check] [<path>]",
               "usage: sysl doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] " +
-              "[--check] [<dir>]", import_c_usage(), "usage: sysl targets"]
+              "[--check] [<dir>]", import_c_usage(), "usage: sysl targets", lsp_usage()]
         // A usage's first line is the command; anything under it is that command's own explanation.
         val first = split(u, "\n")[0]
 
@@ -1499,7 +1642,9 @@ help_text() -> string
                 ("--profile-generate <dir>", "build an instrumented program that writes a counter " +
                  "file into this directory each time it runs"),
                 ("--profile-use <file>", "build against the profile 'llvm-profdata merge' wrote"),
-                ("--no-bounds-locations", "leave the place out of a failed bounds check's message")]
+                ("--no-bounds-locations", "leave the place out of a failed bounds check's message"),
+                ("--const-steps <n>", "how many steps one evaluation while compiling may take; " +
+                 "defaults to 16,000,000")]
         lines.push(s"  ${pad_to(row.0, 24)} ${row.1}")
 
     join(lines.view(), "\n")

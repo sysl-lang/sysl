@@ -3,6 +3,8 @@ module sysl.process
 @tests
 
 import sysl.fs.{IoError, make_temp_dir, metadata, remove_dir_all, set_owner, write_text}
+import sysl.process.sys as psys
+import sysl.slices.as_mut_ptr
 import sysl.testing.skip
 
 // Who the program is, over `sysl.process.sys`'s `get_id` and `set_id` hooks as `sysl.process.hosted`
@@ -93,3 +95,44 @@ id_set_to_root_is_refused()
 
     assert(user() != 0, "the refusal changed the user anyway")
 end id_set_to_root_is_refused
+
+@test("hostname is the name `uname -n` reports, and is not empty")
+hostname_matches_uname()
+    val name = hostname().unwrap()
+    val out = capture("uname", ["-n"]).unwrap()
+
+    assert(out.status.ok(), "uname -n failed")
+    assert(name.len > 0, "the host name is empty")
+    assert_eq(name, out.text.trim())
+
+@test("a host name that does not fit the room it is given is a failure, never a cut-short success")
+hostname_refuses_a_short_room()
+    var raw: []u8 = [0; 1]
+
+    val n = psys.hostname(as_mut_ptr(raw), 0)
+
+    assert(n < 0, s"a room of zero bytes was answered with $n")
+
+    val whole = hostname().unwrap()
+    var one: []u8 = [0; 1]
+
+    if whole.len > 1 then assert(psys.hostname(as_mut_ptr(one), 1) < 0, "a one-byte room held a longer name")
+
+@test("pid is this program's process id: the parent a child it starts reports")
+id_pid_is_the_childs_parent()
+    val out = capture("sh", ["-c", "echo $PPID"]).unwrap()
+
+    assert(out.status.ok(), "sh -c failed")
+    assert_eq(out.text, s"${pid()}\n")
+    assert(pid() > 0, "a hosted program has a process id")
+
+@test("a child's pid is not the program's own")
+id_pid_is_not_a_childs()
+    var child = start("sh", ["-c", "exit 0"]).unwrap()
+
+    assert(child.pid() != int(pid()), "the child has a process of its own")
+    child.wait().unwrap()
+
+@test("the process id is asked, never set")
+id_the_process_is_not_set()
+    assert(psys.set_id(psys.id_process, 1) < 0, "set_id took the process id")

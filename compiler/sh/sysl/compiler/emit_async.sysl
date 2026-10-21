@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.math.bigint.{BigInt, from_int}
 
 // **An `async` function is an LLVM coroutine**, of the switched-resume kind: its frame is on the heap,
@@ -163,6 +164,180 @@ private using_coroutines(e: *Emit)
     e.traps = true
 end using_coroutines
 
+// -- the locals that live in the promise -------------------------------------------------------------
+
+// **A local whose address or view the body takes lives in the promise**, which is in the frame
+// whatever LLVM decides about the body's other slots. The frame never moves, so a view of such a
+// local, or a `*T` to it, may be held across an `await` -- by this body, by a task it awaits, or by
+// whatever that task handed the address to.
+//
+// LLVM's coroutine split decides on its own which of the other slots outlive a suspension, and
+// **at `-O0` some splits do not count a use made only through a view** as a use of the slot: an
+// array read after an `await` only through `buf[0..<4]` stays on the resumption's own stack, and the
+// view held in the frame then points at a stack that is gone. Laying these locals in the promise
+// takes the question away from that analysis at every level and with every clang.
+//
+// The set is every declared local some view or address is taken of, whether or not the loan in fact
+// crosses an `await`: a local only lent between two suspensions costs its bytes in the frame rather
+// than on the stack, and nothing else. Left out are a local with no size, and an array the escape
+// analysis moved into a buffer (its storage is a box already).
+//
+// **A local asking for a raised boundary** -- a `@align(n)` binding, or one of a type declared
+// `@align(n)` -- is laid in the promise too, though a field of an LLVM struct begins only on its own
+// type's natural boundary. Its field is a run of bytes `n - 1` longer than the local, and the local's
+// slot is the first address in the run on the `n`-byte boundary, worked out from the address itself:
+// the boundary holds wherever LLVM places the promise in the frame and whatever the frame came from.
+private struct FrameLocal
+    name: string
+    ty: Type
+    // The boundary the slot is placed on by hand, or 0 where its field's own boundary is enough.
+    raised: int
+end FrameLocal
+
+private struct LentSink
+    names: Set[string]
+
+    add(*self, name: string)
+        self.names.add(name)
+end LentSink
+
+private struct DeclSink
+    decls: Buf[(string, Type, Option[usize])]
+
+    add(*self, name: string, ty: Type, align: Option[usize])
+        self.decls.push((name, ty, align))
+end DeclSink
+
+private lent_root(out: &LentSink, place: TExpr) -> unit = *place.kind match
+    TLoad(name, _) -> out.add(name)
+    TField(r, _, _) -> lent_root(out, r)
+    TIndex(r, _, _) -> lent_root(out, r)
+    TLane(r, _, _) -> lent_root(out, r)
+    _ -> ()
+
+private note_lent(out: &LentSink, x: TExpr) = *x.kind match
+    TAddrOf(place, _) -> lent_root(out, place)
+    TSlice(base, _, _, _, _) -> lent_root(out, base)
+    _ -> ()
+
+private note_decl(out: &DeclSink, s: TStmt) = s match
+    TVarDecl(name, ty, _, align) -> out.add(name, ty, align)
+    _ -> ()
+
+// The boundary a local's slot is placed on by hand: what its `@align(n)` asks, or its type's where
+// that type holds a raised one; 0 where neither does.
+private raised_boundary(e: *Emit, ty: Type, align: Option[usize]) -> int
+    var widest = 0
+
+    align match
+        Some(a) -> widest = int(a)
+        None -> ()
+
+    if slot_align(e, lty(e, ty)).is_some()
+        val a = int(e.layout.align(ty))
+
+        if a > widest then widest = a
+
+    widest
+end raised_boundary
+
+// The locals of `f` laid in its promise, in the order they were declared.
+private frame_locals(e: *Emit, f: TFunc) -> Buf[FrameLocal]
+    val lent: &LentSink = LentSink(set())
+    val declared: &DeclSink = DeclSink(buf())
+
+    walk_stmts(f.body.stmts, TWalk(false, x -> note_lent(lent, x), w -> (), s -> note_decl(declared, s)))
+
+    if f.body.result.is_some()
+        walk_texpr(f.body.result.unwrap(), TWalk(false, x -> note_lent(lent, x), w -> (),
+                                                   s -> note_decl(declared, s)))
+
+    var out: Buf[FrameLocal] = buf()
+
+    for item in declared.decls
+        if lent.names.has(item.0) && !zero_sized(item.1) && !is_promoted(e, item.0)
+            out.push(FrameLocal(item.0, item.1, raised_boundary(e, item.1, item.2)))
+
+    out
+end frame_locals
+
+// A local's field of the promise: its own type, or, for a slot placed by hand, the bytes it needs and
+// the `n - 1` it may have to skip to reach its boundary.
+private frame_field(e: *Emit, local: FrameLocal) -> LType =
+    if local.raised == 0 then lty(e, local.ty) else
+        LArr(int(e.layout.size(local.ty)) + local.raised - 1, LInt(8))
+
+// The promise of a task ending with `result`, with the locals `frame_locals` chose after its fields.
+private promise_with_locals(e: *Emit, result: Type, locals: Buf[FrameLocal]) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+
+    if !no_value(result) then fields.push(lty(e, result))
+
+    for item in locals
+        fields.push(frame_field(e, item))
+
+    LStruct(fields)
+end promise_with_locals
+
+// The promise's boundary: its header's and its result's, and every local's it holds as its own type
+// (a slot placed by hand is a run of bytes, and asks nothing of the promise).
+private promise_align_with(e: *Emit, result: Type, locals: Buf[FrameLocal]) -> int
+    var widest = promise_align(e, result)
+
+    for item in locals
+        if item.raised == 0
+            val a = int(e.layout.align(item.ty))
+
+            if a > widest then widest = a
+
+    widest
+end promise_align_with
+
+// Names each local's slot as its field of the promise. Written after `llvm.coro.begin`, which every
+// use of the slot follows -- the body starts at the first resumption.
+//
+// A slot placed by hand is its field's address moved forward to the next multiple of its boundary
+// `n`: by `(0 - address) & (n - 1)` bytes, a step through the field itself, so the slot is still
+// known to be the promise's.
+private name_frame_slots(e: *Emit, whole: LType, promise: Val, result: Type, locals: Buf[FrameLocal])
+    val first: usize = if no_value(result) then 4 else 5
+
+    for i in 0..<locals.len()
+        val local = locals.at(i)
+        val slot = s"${local.name}.addr"
+        val field = if local.raised == 0 then VReg(slot) else VReg(s"${local.name}.field")
+
+        e.declared.add(slot)
+        e.frame_slots.add(local.name)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(first + i)))))
+        emit(e, InGep(field, whole, promise, idx))
+
+        if local.raised != 0
+            val w = word_lty(e)
+            val at = VReg(s"${local.name}.field.at")
+            val back = VReg(s"${local.name}.field.back")
+            val skip = VReg(s"${local.name}.field.skip")
+
+            emit(e, InCast(at, CastPtrToInt, LPtr, field, w))
+            emit(e, InBin(back, OpSub, w, VInt(from_int(0)), at))
+            emit(e, InBin(skip, OpAnd, w, back, VInt(from_int(long(local.raised - 1)))))
+
+            var by: Buf[IrArg] = buf()
+
+            by.push(ir_arg(w, skip))
+            emit(e, InGep(VReg(slot), LInt(8), field, by))
+        end if
+end name_frame_slots
+
 // -- the ramp: what calling an async function does --------------------------------------------------
 
 // The frame, its promise's header, and the task's handle, written before the parameters are copied
@@ -173,14 +348,17 @@ begin_coroutine(e: *Emit, f: TFunc)
 
     val result = coro_body_result(f)
     val shape = promise_shape(e, result)
-    val promise = emit_alloca(e, VReg("task.promise"), shape, Some(promise_align(e, result)))
+    val locals = frame_locals(e, f)
+    val whole = promise_with_locals(e, result, locals)
+    val boundary_of_promise = promise_align_with(e, result, locals)
+    val promise = emit_alloca(e, VReg("task.promise"), whole, Some(boundary_of_promise))
     val mem_slot = emit_alloca(e, VReg("task.mem"), LPtr, None)
     val id = VReg("task.id")
     val hdl = VReg("task.hdl")
 
     var id_args: Buf[IrArg] = buf()
 
-    id_args.push(ir_arg(l_i32(), VInt(from_int(long(promise_align(e, result))))))
+    id_args.push(ir_arg(l_i32(), VInt(from_int(long(boundary_of_promise)))))
     id_args.push(ir_arg(LPtr, promise))
     id_args.push(ir_arg(LPtr, VNull))
     id_args.push(ir_arg(LPtr, VNull))
@@ -238,6 +416,7 @@ begin_coroutine(e: *Emit, f: TFunc)
     emit(e, InStore(LPtr, task_hook(e, result), field_addr(e, shape, promise, 1), AccPlain, None))
     emit(e, InStore(word_lty(e), VInt(from_int(1)), field_addr(e, shape, promise, 2), AccPlain, None))
     emit(e, InStore(LPtr, hdl, field_addr(e, shape, promise, task_handle_field()), AccPlain, None))
+    name_frame_slots(e, whole, promise, result, locals)
 
     e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out", aligned))
 end begin_coroutine
@@ -339,7 +518,7 @@ finish_coroutine(e: *Emit)
 
     // Resuming a finished task is what `await` and `block_on` never do, since both ask first.
     emit_label(e, resumed)
-    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
 
     emit_label(e, c.free_label)
@@ -641,7 +820,7 @@ private task_drive_text(e: *Emit) -> string
     "  %k = load i1, ptr @sysl.task.woken\n" +
     "  br i1 %k, label %round, label %stuck\n" +
     "stuck:\n" +
-    "  call void @llvm.trap()\n" +
+    s"  call void @${trap_symbol(e)}()\n" +
     "  unreachable\n" +
     "out:\n" +
     "  store i1 %was, ptr @sysl.task.woken\n" +
@@ -802,7 +981,7 @@ private task_park_text(e: *Emit) -> string
     "  switch i8 %s2, label %out [ i8 0, label %resumed\n" +
     "                              i8 1, label %free ]\n" +
     "resumed:\n" +
-    "  call void @llvm.trap()\n" +
+    s"  call void @${trap_symbol(e)}()\n" +
     "  unreachable\n" +
     "free:\n" +
     "  %m = call ptr @llvm.coro.free(token %id, ptr %hdl)\n" +
@@ -865,7 +1044,7 @@ private task_yield_text(e: *Emit) -> string
     "  switch i8 %s2, label %out [ i8 0, label %resumed\n" +
     "                              i8 1, label %free ]\n" +
     "resumed:\n" +
-    "  call void @llvm.trap()\n" +
+    s"  call void @${trap_symbol(e)}()\n" +
     "  unreachable\n" +
     "free:\n" +
     "  %m = call ptr @llvm.coro.free(token %id, ptr %hdl)\n" +

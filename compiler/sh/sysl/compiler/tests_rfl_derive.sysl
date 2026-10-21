@@ -1,0 +1,587 @@
+module sh.sysl.compiler
+@tests
+
+// **A trait's `derive` members and the open `derives` clause** (`derive_members.sysl`,
+// `docs/design/reflection.md` § 2, rows 7 and 8): `derive[T] encode(self: T, …)` is the body a trait
+// writes for one of its members, and `struct S derives Json` instantiates it with `T = S` as the
+// `impl Json for S` a person would have written. A refusal in the copy is told at the `derives`, and
+// the copy may reach the type's private fields.
+
+// The reflection page's worked example, with the members `int` and `string` need to be encoded and an
+// arm for a data enum besides (the note's own program, as written, is `tests_acm_assert_message`'s).
+private rfl_derive_json() -> string = raw"""
+    @annotation
+    struct rename
+        name: string
+
+    trait Json
+        encode(self, w: *Writer)
+
+        derive[T] encode(self: T, w: *Writer)
+            if const T::Kind == Kind.Struct
+                w.write("{".bytes)
+
+                for const f in T::Fields
+                    if f.index > 0 then w.write(",".bytes)
+
+                    val key = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                    w.write(s"\"$key\":".bytes)
+                    self.(f).encode(w)
+
+                w.write("}".bytes)
+            elif const T::Kind == Kind.DataEnum
+                for const c in T::Variants
+                    if self is c
+                        w.write(s"{\"${c.name}\":[".bytes)
+
+                        val p = self.(c)
+
+                        for const f in c::Fields
+                            if f.index > 0 then w.write(",".bytes)
+
+                            p.(f).encode(w)
+
+                        w.write("]}".bytes)
+                    end if
+            else
+                @assert(false, "Json derives for a struct or a data enum")
+
+    impl Json for int
+        encode(self, w: *Writer) = w.write(s"$self".bytes)
+
+    impl Json for string
+        encode(self, w: *Writer) = w.write(s"\"$self\"".bytes)
+
+    """
+
+@test("the reflection page's example derives Json for a struct, renaming the key an annotation names")
+rfl_derive_worked_example()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        struct User derives Json
+            @rename("id") user_id: int
+            name: string
+
+        User(7, "ann").encode(stdout())
+        print("")
+        """), "{\"id\":7,\"name\":\"ann\"}\n")
+end rfl_derive_worked_example
+
+@test("a generic type derives at each instance, its own 'T' meaning nothing inside the trait's body")
+rfl_derive_generic_type()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        struct Box[T] derives Json
+            item: T
+            count: int
+
+        Box("x", 2).encode(stdout())
+        print("")
+        Box(Box(5, 1), 2).encode(stdout())
+        print("")
+        """), "{\"item\":\"x\",\"count\":2}\n{\"item\":{\"item\":5,\"count\":1},\"count\":2}\n")
+end rfl_derive_generic_type
+
+@test("a struct opening with an anonymous block derives Json with no comma before its first field")
+rfl_derive_index_after_a_block()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        struct Opens derives Json
+            union
+                word: u32
+                real: f32
+            tag: int
+            len: int
+
+        Opens(word = 0, tag = 1, len = 2).encode(stdout())
+        print("")
+        """), "{\"tag\":1,\"len\":2}\n")
+end rfl_derive_index_after_a_block
+
+@test("a derive body's 'T' answers the deriving type's own attributes: 'T::Image' on a simple enum")
+rfl_derive_type_attr_on_t()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Named
+            named(self) -> string
+
+            derive[T] named(self: T) -> string
+                if const T::Kind == Kind.SimpleEnum
+                    s"${T::Image(self)}/${T::Pos(self)}/${T::Image(T::Last)}"
+                else
+                    s"${T::BaseName}"
+
+        enum Light derives Named
+            Red
+            Green
+            Blue
+
+        struct P derives Named
+            x: int
+
+        print(Light.Green.named(), Light.Red.named(), P(1).named())
+        """), "Green/1/Blue Red/0/Blue P\n")
+end rfl_derive_type_attr_on_t
+
+@test("a plain generic function's 'T' still answers only 'Min' and 'Max', in every reading")
+rfl_derive_plain_generic_still_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        name_of[T](v: T) -> string = T::Image(v)
+
+        enum Light
+            Red
+
+        print(name_of(Light.Red))
+        """), ["'T' is a type parameter, and the only attributes one answers are 'T::Min' and 'T::Max'"])
+end rfl_derive_plain_generic_still_refused
+
+@test("a data enum derives through 'for const c in T::Variants'")
+rfl_derive_data_enum()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        enum Shape derives Json
+            Circle(r: int)
+            Rect(w: int, h: int)
+
+        Shape.Rect(3, 4).encode(stdout())
+        print("")
+        Shape.Circle(9).encode(stdout())
+        print("")
+        """), "{\"Rect\":[3,4]}\n{\"Circle\":[9]}\n")
+end rfl_derive_data_enum
+
+@test("a derived member is found, checked and erased as a written one is")
+rfl_derive_erases()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        struct Pair derives Json
+            a: int
+            b: int
+
+        put(v: &Json) = v.encode(stdout())
+
+        val p: &Pair = Pair(1, 2)
+
+        put(p)
+        print("")
+        """), "{\"a\":1,\"b\":2}\n")
+end rfl_derive_erases
+
+@test("a derivation the type asked for reaches its private fields from the trait's file")
+rfl_derive_reaches_private_fields()
+    if !azb_ready() then return
+
+    azb_prints([("", "json.sysl", rfl_derive_json()),
+                ("", "main.sysl", raw"""
+                    struct Secret derives Json
+                        shown: int
+                        private hidden: int
+
+                    Secret(1, 2).encode(stdout())
+                    print("")
+                    """)], "{\"shown\":1,\"hidden\":2}\n")
+end rfl_derive_reaches_private_fields
+
+@test("a walk in the trait's file that is not the type's derivation is refused the private field")
+rfl_derive_other_walks_are_refused_private_fields()
+    if !azb_ready() then return
+
+    azb_refused([("", "json.sysl", rfl_derive_json() + raw"""
+                     dump[T](v: T) -> string
+                         var out = ""
+
+                         for const f in T::Fields
+                             out = out + s"${v.(f)} "
+
+                         out
+
+                     """),
+                  ("", "main.sysl", raw"""
+                      struct Secret derives Json
+                          shown: int
+                          private hidden: int
+
+                      print(dump(Secret(1, 2)))
+                      """)],
+                 ["field 'hidden' of 'Secret' is", "(in the copy for field 'Secret.hidden')"])
+end rfl_derive_other_walks_are_refused_private_fields
+
+@test("a field whose type does not implement the trait is refused at the 'derives', naming the field")
+rfl_derive_field_does_not_implement()
+    if !azb_ready() then return
+
+    val said = azb_refusal(azb_main(raw"""
+        trait Json
+            to_json(self) -> string
+
+            derive[T] to_json(self: T) -> string
+                var out = ""
+
+                for const f in T::Fields
+                    out = out + self.(f).to_json()
+
+                out
+
+        impl Json for int
+            to_json(self) -> string = s"$self"
+
+        struct Pin
+            on: bool
+
+        struct Lamp derives Json
+            level: int
+            pin: Pin
+
+        print(Lamp(1, Pin(true)).to_json())
+        """))
+
+    assert(said.contains("'Pin' does not implement 'Json': method 'to_json' is missing (in the copy " +
+                         "for field 'Lamp.pin')"), said)
+    // Told at the clause, not inside the trait's body.
+    assert(said.contains("main.sysl:18:"), said)
+end rfl_derive_field_does_not_implement
+
+@test("'encode' in a derivation of Json is Json's: a field that is not Json is refused, never Plain's")
+rfl_derive_member_is_the_derived_traits()
+    if !azb_ready() then return
+
+    // A `bool` has `sysl.encoding.Plain`'s `encode`, reached on it with no import; the body asked for
+    // `Json`'s, and a `bool` has none.
+    val said = azb_refusal(azb_main(rfl_derive_json() + raw"""
+        struct Lamp derives Json
+            level: int
+            on: bool
+
+        Lamp(1, true).encode(stdout())
+        """))
+
+    assert(said.contains("'bool' does not implement 'Json': method 'encode' is missing (in the copy " +
+                         "for field 'Lamp.on')"), said)
+    assert(!said.contains("Plain"), said)
+end rfl_derive_member_is_the_derived_traits
+
+@test("another trait's member of the same name and signature is not the one a derivation calls")
+rfl_derive_same_named_member_of_another_trait()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_json() + raw"""
+        trait Loud
+            encode(self, w: *Writer)
+
+        impl Loud for int
+            encode(self, w: *Writer) = w.write("LOUD".bytes)
+
+        struct Dial derives Json
+            level: int
+
+        Dial(4).encode(stdout())
+        print("")
+        """), "{\"level\":4}\n")
+end rfl_derive_same_named_member_of_another_trait
+
+// A trait the derived one requires, its members reached in the body as a bound `T: Tagged` would
+// reach them -- and another trait's member of the same name is not the one meant.
+private rfl_derive_tagged() -> string = raw"""
+    trait Named
+        name(self) -> string
+
+    trait Loud
+        name(self) -> string
+
+    trait Tagged: Named
+        tag(self) -> string
+
+        derive[T] tag(self: T) -> string
+            var out = ""
+
+            for const f in T::Fields
+                out = out + self.(f).name()
+
+            out
+
+    impl Named for int
+        name(self) -> string = "int"
+
+    impl Loud for bool
+        name(self) -> string = "LOUD"
+
+    """
+
+@test("a member of a trait the derived one requires is reached through that trait in the copy")
+rfl_derive_supertrait_member()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(rfl_derive_tagged() + raw"""
+        struct P derives Tagged
+            a: int
+            b: int
+
+        impl Named for P
+            name(self) -> string = "P"
+
+        print(P(1, 2).tag())
+        """), "intint\n")
+end rfl_derive_supertrait_member
+
+@test("a supertrait's member in a derivation is never another trait's member of the same name")
+rfl_derive_supertrait_member_not_another_traits()
+    if !azb_ready() then return
+
+    val said = azb_refusal(azb_main(rfl_derive_tagged() + raw"""
+        struct Q derives Tagged
+            level: int
+            on: bool
+
+        impl Named for Q
+            name(self) -> string = "Q"
+
+        print(Q(1, true).tag())
+        """))
+
+    assert(said.contains("'bool' does not implement 'Named': method 'name' is missing (in the copy " +
+                         "for field 'Q.on')"), said)
+    assert(!said.contains("LOUD"), said)
+end rfl_derive_supertrait_member_not_another_traits
+
+// The library's `Eq`, `Ord` and `Hash` are `derive` bodies in the standard module, and an enum's are
+// written with `c.index` -- which reads a `sysl.reflect.Variant`, so it must make no edge from `sysl`
+// to `sysl.reflect` (which depends on `sysl`) for the standard module to build at all.
+@test("the library's Eq, Ord and Hash derive a data enum through 'c.index'")
+rfl_derive_std_data_enum()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        enum D derives Eq, Ord, Hash
+            P(a: int, b: string)
+            Q
+            R(c: int)
+
+        print(P(1, "a") == P(1, "a"), P(1, "a") == Q, Q == Q, R(2) < P(9, ""), P(1, "b") < P(1, "c"))
+        print(Q < R(0), R(0) < Q, Q.hash() == Q.hash(), P(1, "a").hash() == P(1, "b").hash())
+        """), "true false true false true\ntrue false true false\n")
+end rfl_derive_std_data_enum
+
+// An opaque struct that declares its fields withholds its layout outside its module, and a
+// derivation it asked for is its author opting in -- so the library's bodies walk the fields, read in
+// the standard module's file, exactly as they walk a private one.
+@test("an opaque struct that declares its fields derives Eq, Ord and Hash")
+rfl_derive_opaque_with_fields()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        opaque struct H derives Eq, Ord, Hash
+            x: int
+            y: string
+
+        print(H(1, "a") == H(1, "a"), H(1, "a") == H(1, "b"), H(1, "a") < H(1, "b"), H(2, "") < H(1, "z"))
+        print(H(1, "a").hash() == H(1, "a").hash(), H(1, "a").hash() == H(1, "b").hash())
+        """), "true false true false\ntrue false\n")
+end rfl_derive_opaque_with_fields
+
+@test("a trait with no 'derive' member is refused at the 'derives' that names it")
+rfl_derive_trait_without_derive_members()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+                    trait Show
+                        show(self) -> string
+
+                    struct P derives Show
+                        x: int
+
+                    print(1)
+                    """),
+                ["'Show' is not a trait the compiler knows how to write, and it carries no 'derive' " +
+                 "member — 'derives' names Eq, Ord, Hash or Display, or a trait with a 'derive' body " +
+                 "for its members. A trait without one is implemented with an 'impl' block"])
+end rfl_derive_trait_without_derive_members
+
+@test("a name in 'derives' that is no trait in scope is refused, saying what the clause names")
+rfl_derive_unknown_trait()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("struct P derives Nope\n    x: int\n\nprint(1)\n"),
+                ["unknown trait 'Nope' — 'derives' names Eq, Ord, Hash or Display, or a trait in " +
+                 "scope with a 'derive' body for its members"])
+end rfl_derive_unknown_trait
+
+@test("a member with neither a 'derive' body nor a default leaves the derivation nothing to write")
+rfl_derive_member_without_body()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+                    trait Pair
+                        left(self) -> int
+                        right(self) -> int
+
+                        derive[T] left(self: T) -> int = 1
+
+                    struct Q derives Pair
+                        x: int
+
+                    print(1)
+                    """),
+                ["'Q' cannot derive 'Pair': it declares method 'right' with neither a 'derive' body " +
+                 "nor a default, so the derivation has nothing to write it with"])
+end rfl_derive_member_without_body
+
+@test("a 'derive' body is a template and not a default: a block written by hand inherits nothing")
+rfl_derive_is_not_a_default()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+                    trait Size
+                        size(self) -> int
+
+                        derive[T] size(self: T) -> int = 1
+
+                    struct P
+                        x: int
+
+                    impl Size for P
+
+                    print(1)
+                    """),
+                ["'P' does not implement 'Size': method 'size' is missing"])
+end rfl_derive_is_not_a_default
+
+@test("a 'derive' member written wrong is refused in the trait, each mistake by name")
+rfl_derive_member_refusals()
+    if !azb_ready() then return
+
+    val cases = [
+        ("derive[T] other(self: T) -> int = 1",
+         "'derive' writes the body of a member trait 'Bad' declares, and it declares no 'other' — " +
+         "declare 'other' in the trait, then derive it"),
+        ("derive[T, V] go(self: T) -> int = 1",
+         "a 'derive' member takes one type parameter, which stands for the type that derives the " +
+         "trait — write 'derive[T] go(self: T, …)'"),
+        ("derive[T: Eq] go(self: T) -> int = 1",
+         "'T' stands for the type that derives the trait, which the 'derives' clause names, so it " +
+         "takes no bound — a field's type is asked what it can do with 'if const f::Type: Trait'"),
+        ("derive[T] go(x: T) -> int = 1",
+         "a 'derive' member takes the deriving type first, as 'self: T' (or 'self: *T', 'self: &T') " +
+         "— it is the receiver of the member it writes"),
+        ("derive[T] go(self: T, n: int) -> int = 1",
+         "'derive' member 'go' takes 1 parameters after 'self', but trait 'Bad' declares 0"),
+        ("derive[T] go(self: &T) -> int = 1",
+         "'derive' member 'go' takes its receiver differently from the 'go' trait 'Bad' declares — " +
+         "'self: T' is 'self', 'self: *T' is '*self' and 'self: &T' is '&self'"),
+        ("derive[U] go(self: U) -> int = 1",
+         "'U' is already a parameter of trait 'Bad' — the 'derive' member's parameter stands for the " +
+         "deriving type, so it takes a name of its own"),
+        ("derive[T] go(self: T) -> int",
+         "a 'derive' member is the body the trait writes for 'go', so it has one"),
+        ("derive[T] go(self: T) -> int = 1\n    derive[T] go(self: T) -> int = 2",
+         "'go' is derived twice in trait 'Bad' — one 'derive' member writes it for every type")]
+
+    for c in cases
+        azb_refused(azb_main(s"trait Bad[U]\n    go(self) -> int\n\n    ${c.0}\n\nprint(1)\n"), [c.1])
+end rfl_derive_member_refusals
+
+// -- `Display` and `Debug`, from the library's `derive` bodies ---------------------------------------
+
+@test("'derives Display' renders through the library's derive body, a width padding the whole once")
+rfl_derive_display_from_std()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Point derives Display
+            x: int
+            y: string
+
+        struct Unit derives Display
+        end Unit
+
+        struct Box[T] derives Display
+            v: T
+
+        enum Shape derives Display
+            Circle(r: real)
+            Rect(w: int, h: int)
+            Empty
+
+        enum Tone derives Display
+            Low
+            High
+
+        print(Point(1, "q"), Unit(), Box(Box(Tone.High)), Shape.Rect(1, 2), Shape.Empty, Tone.Low)
+        print(f"[${Point(2, "z")}%14s][${Point(2, "z")}%-14s][${Unit()}%6s][${Shape.Rect(3, 4)}%12s]")
+        """),
+               "Point(1, q) Unit Box(Box(High)) Rect(1, 2) Empty Low\n" +
+               "[   Point(2, z)][Point(2, z)   ][  Unit][  Rect(3, 4)]\n")
+end rfl_derive_display_from_std
+
+@test("every type's Debug is the library's derive body: anonymous blocks by their word, '_' left out, depth cut")
+rfl_derive_debug_from_std()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct Packet
+            tag: u8
+            union
+                word: u32
+                level: f32
+            len: u16
+            struct
+                lo: u8
+                hi: u8
+                union
+                    q: u16
+                    r: i16
+
+        struct Bits
+            a: u3 in u32
+            _: u5 in u32
+            b: u4 in u32
+
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        struct Odd
+            debug: int
+
+        enum Shape
+            Circle(r: real)
+            Empty
+
+        val pk = Packet(tag = 1, word = 0x3f800000, len = 2, lo = 3, hi = 4, q = 5)
+
+        print(debug(pk))
+        print(debug(Bits(1, 2)), debug(Odd(5)), debug(Shape.Circle(2.5)), debug(Shape.Empty))
+        print(f"[${Bits(1, 2)}%20?][${Shape.Empty}%-13?]")
+
+        var last: &Node = Node(0, None)
+
+        for i in 1..<40
+            last = Node(i, Some(last))
+
+        val shown = debug(*last)
+
+        print(shown[shown.bytes.len - 110..<shown.bytes.len])
+        """),
+               "Packet(tag: 1, union(00 00 80 3f), len: 2, struct(lo: 3, hi: 4, union(05 00)))\n" +
+               "Bits(a: 1, b: 2) Odd(debug: 5) Shape.Circle(r: 2.5) Shape.Empty\n" +
+               "[    Bits(a: 1, b: 2)][Shape.Empty  ]\n" +
+               "ode(v: 9, next: Some(Node(v: 8, next: Some(…))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))\n")
+end rfl_derive_debug_from_std
+
+@test("'derives Debug' is refused: every type has one already, and one of its own is an 'impl'")
+rfl_derive_debug_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("struct P derives Debug\n    x: int\n\nprint(debug(P(1)))\n"),
+                ["'Debug' is not a trait the compiler knows how to write, and it carries no 'derive' " +
+                 "member — 'derives' names Eq, Ord, Hash or Display, or a trait with a 'derive' body " +
+                 "for its members"])
+end rfl_derive_debug_refused

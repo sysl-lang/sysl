@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.text.Search
 
 // The context an expression is typed in: the declaration tables the whole compilation shares, the
@@ -43,8 +44,10 @@ struct Local
     // for as long as the name is in scope, which is exactly as long as this entry is.
     stands_for: Option[TExpr]
 
-    // Where the binding was made -- the statement, function header, closure or arm being read when
-    // the name was bound (`Analyzer.bind_site`). Read by the definition index and by nothing in a
+    // Where the binding was made -- the name itself where its binding form records where it wrote
+    // it (a parameter, a pattern, a `val`/`var`/`ref`, a `for`), and otherwise the statement,
+    // function header, closure or arm being read when the name was bound (`Analyzer.bind_site`),
+    // which `lsp_name_in` searches for the name. Read by the definition index and by nothing in a
     // build: carried in the binding rather than in a table keyed by the unique name, because a
     // unique name is unique within one function and a table keyed by it collides across functions.
     declared: Option[Span]
@@ -324,8 +327,108 @@ struct Analyzer
     // the entry file's check name -- which is how a live `ref` is found again among the typed bodies.
     body: string
 
+    // Every call to a `@views(self)` method this body made, by the call's span, with the place it
+    // was called on -- what the view it answers is borrowed from (`view_borrow.sysl`).
+    view_calls: Buf[(Span, ViewRoot)]
+
+    // Every local of this body that holds a view borrowed from a receiver, by its unique name, with
+    // the places it is borrowed from. A unique name is unique within the function, so an entry
+    // outlives the scope that bound it, which is what lets a block's result be traced back to it.
+    view_borrows: Buf[(string, Buf[ViewRoot])]
+
+    // The places a pattern being bound right now takes its parts from, so that a name a pattern
+    // binds out of a borrowed view is borrowed too.
+    pattern_roots: Buf[ViewRoot]
+
+    // Whether the body is a `@views(self)` method's, the one body allowed to hand back a view
+    // borrowed from `self`.
+    views_self: bool
+
+    // Every call to a `@consumes` member this body made on a local, by the call's span: the local's
+    // unique name, its name as written, and the member -- what a later read of it is refused against
+    // (`consumes.sysl`).
+    consume_calls: Buf[ConsumeCall]
+
+    // Every local `const` in scope or out of it, by unique name: the literal its value came to while
+    // compiling, which is what each use of the name is, and the scalar the fold reads it as.
+    local_consts: Buf[(string, TExpr, Option[Const])]
+
+    // Where each name in `used` stands, so asking whether one is taken is one lookup; an entry is
+    // believed only while `used` still holds that name there, which lets a rewind truncate `used`
+    // alone. And for each base `fresh_name` numbered, the last suffix it gave and where that name
+    // stands: while it is still there, every smaller suffix is too, so the search starts above it.
+    // Without these, the copies of a walk over a few hundred variants, each binding the same names,
+    // asked every name before them about every suffix.
+    used_at: Map[string, usize]
+    suffixes: Map[string, (int, usize)]
+
+    // The types branches are being read at because a SIBLING settled them. Such a reading asks
+    // whether the branch already is that type, so nothing is widened to the type offered or to a
+    // part of it: branches meet at the wider of their types once each has one (`expr_flow.sysl`'s
+    // `widest_branch`). A position inside the branch with a type of its own -- a `return`, an
+    // argument -- still widens.
+    sibling_offers: Buf[Type]
+
+    // Whether an expression made only of integer literals is being read, inside which an operator
+    // over literals is part of the one exact value the outermost of them is checked and folded to
+    // (`literal_arith.sysl`).
+    in_literal_arithmetic: bool
+
+    // A local `var` or `val` whose initial value is a bare literal takes its type from its first use
+    // that fixes one (`var_first_use.sysl`). The bindings still open in the reading under way; the
+    // fixes that reading found, which a thrown-away trial takes back; the fixes a block is being
+    // read again with; and where a name is read as an operand, a place no use fixes a type from.
+    open_vars: Buf[OpenVar]
+    var_fix_log: Buf[VarFix]
+    var_fixes: Buf[KnownFix]
+    not_fixing: Buf[usize]
+
+    // Whether the expression about to be read stands where its value is nobody's or is the value of
+    // a block -- the one kind of position an assignment written with `=` may take, since it yields
+    // nothing. Set by the position, spent at the top of `type_expr` as `multi_ok` is.
+    assign_ok: bool
+
+    // The same permission, handed from that funnel to the assignment it reached. An assignment
+    // takes it at its very start, before anything inside it is read.
+    assign_here: bool
+
+    // Whether the block about to be read owes nothing but may be `unit` -- a function's `= value`
+    // body, a closure's with no result fixed, a block in statement position, or a branch of an `if`
+    // or `match` that is the last line of one of those -- so its last line may be an assignment.
+    // Every block clears it for what it holds and puts it back as it leaves, and every expression read
+    // in a value position does the same, so a branch whose value is bound somewhere never has it.
+    unit_tail: bool
+
+    // The same, handed from a block's last line to the branching form standing there (`if`, `match`,
+    // a block), which passes it on to its branches. Spent at the top of `type_expr`.
+    tail_carry: bool
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
+
+    // The literal a local `const` came to, where `unique` names one.
+    const_local(self, unique: string) -> Option[(TExpr, Option[Const])]
+        for item in self.local_consts
+            if item.0 == unique then return Some((item.1, item.2))
+
+        None
+    end const_local
+
+    // Takes the nearest value-argument binding of a local `const` out of the substitution.
+    private unbind_const(*self, name: string)
+        var out: Buf[Binding] = buf()
+        var gone = false
+
+        for b in self.subst
+            val bound = b.ty match
+                ConstArg(_, _, _) -> true
+                _ -> false
+
+            if !gone && bound && b.name == name then gone = true
+            else out.push(b)
+
+        self.subst = out
+    end unbind_const
 
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
@@ -356,8 +459,14 @@ struct Analyzer
 
             if w.func == self.watch_key() && w.end.is_none() && w.depth >= mark
                 self.an.ref_watches.set(i, RefWatch(w.func, w.name, w.types, w.start, Some(self.reach),
-                                                    w.depth))
+                                                    w.depth, w.view_of))
             end if
+
+        // A local `const` bound as a value argument goes with its scope.
+        for i in mark..<self.locals.len()
+            val local = self.locals.at(i)
+
+            if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
 
         self.locals.truncate(mark)
 
@@ -378,6 +487,27 @@ struct Analyzer
 
             self.scope.imports.levels.truncate(self.scope.imports.levels.len() - 1)
     end leave
+
+    // Where the innermost scope's bindings and imports stand now, for a reading that may be read
+    // again (`var_first_use.sysl`).
+    scope_mark(self) -> ScopeMark =
+        ScopeMark(self.locals.len(), self.scope.imports.names.len(), self.scope.imports.modules.len(),
+                  self.scope.imports.wildcards.len(), self.scope.imports.levels.len())
+
+    // Takes back every binding and import made since `at`, leaving the scope they were made in open:
+    // a block read again binds its names afresh, and the first reading's must not answer a lookup.
+    rewind_scope(*self, at: ScopeMark)
+        for i in at.locals..<self.locals.len()
+            val local = self.locals.at(i)
+
+            if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
+
+        self.locals.truncate(at.locals)
+        self.scope.imports.names.truncate(at.names)
+        self.scope.imports.modules.truncate(at.modules)
+        self.scope.imports.wildcards.truncate(at.wildcards)
+        self.scope.imports.levels.truncate(at.levels)
+    end rewind_scope
 
     // Makes the innermost block's imports a level of their own, where it is about to take its first:
     // a name is asked of that block's imports before an outer block's or the file's.
@@ -407,23 +537,29 @@ struct Analyzer
             None -> ()
     end refuse_reserved_binding
 
-    // Binds a name in the innermost scope, under a unique name of its own.
-    bind(*self, name: string, ty: Type) -> string
+    // Where a binding is recorded as declared: the name's own place where the binding form says
+    // where it wrote it (`named`), and the binding site where it does not.
+    private declared_at(self, named: Option[Span]) -> Option[Span] =
+        if named.is_some() then named else self.bind_site
+
+    // Binds a name in the innermost scope, under a unique name of its own. `named` is where the
+    // name itself is written, where the caller knows it.
+    bind(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named)))
         unique
     end bind
 
     // Binds a name that may not be assigned to again -- what a local `val` declares.
-    bind_read_only(*self, name: string, ty: Type) -> string
+    bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named)))
         unique
     end bind_read_only
 
@@ -431,24 +567,24 @@ struct Analyzer
     // place's, a `ref` stating nothing of its own, and the name is written once exactly where the
     // storage it found is: reaching into a `val` keeps the property, and a `ref` is a way of
     // reaching in.
-    bind_ref(*self, name: string, place: TExpr, read_only: bool) -> string
+    bind_ref(*self, name: string, place: TExpr, read_only: bool, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
-                               self.bind_site))
+                               self.declared_at(named)))
         unique
     end bind_ref
 
     // Binds a name a **pattern** captured, which is written once for the reason a `val` is and
     // says so in its own words.
-    bind_pattern(*self, name: string, ty: Type) -> string
+    bind_pattern(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named)))
         unique
     end bind_pattern
 
@@ -467,28 +603,36 @@ struct Analyzer
         val safe = if base.starts_with("$") then base else guarded(base)
 
         if !self.holds(safe)
-            self.used.push(safe)
+            self.take(safe)
 
             return safe
         end if
 
         var k = 1
 
+        self.suffixes.get(safe) match
+            Some((last, at)) -> if self.held_at(s"$safe.$last", at) then k = last + 1
+            None -> ()
+
         while self.holds(s"$safe.$k")
             k = k + 1
 
         val n = s"$safe.$k"
 
-        self.used.push(n)
+        self.suffixes.put(safe, (k, self.used.len()))
+        self.take(n)
         n
     end fresh_name
 
-    private holds(self, name: string) -> bool
-        for item in self.used
-            if item == name then return true
+    private take(*self, name: string)
+        self.used_at.put(name, self.used.len())
+        self.used.push(name)
 
-        false
-    end holds
+    private holds(self, name: string) -> bool = self.used_at.get(name) match
+        Some(at) -> self.held_at(name, at)
+        None -> false
+
+    private held_at(self, name: string, at: usize) -> bool = at < self.used.len() && self.used[at] == name
 
     // The innermost binding of a name, or none.
     lookup(self, name: string) -> Option[Local]
@@ -539,7 +683,9 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
-             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "")
+             false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
+             false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), false, false,
+             false, false)
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

@@ -41,6 +41,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | destruction | `Drop` | [the memory model](/reference/memory/) |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
 | their identities | `Zero`, `One` | [expressions](/reference/expressions/), and [math](/library/math/) |
+| storage whose every bit pattern is a value | `AnyBits` | below |
 | conversion between two types | `From` | [errors and contracts](/reference/errors/#a-converts-through-from) |
 | a range as a value | `Range` | [expressions](/reference/expressions/), and [seq](/library/seq/) |
 | subscripting and walking | `Index`, `IndexSet`, `Iterate`, `Walk` | below |
@@ -87,6 +88,78 @@ sources — and a call says which it means by the argument it wrote.
 **`?` is the one thing in the language that reads it**, and it is what makes two layers of error type
 compose; see [errors](/reference/errors/#a-converts-through-from). Everywhere else it is an ordinary
 trait a program declares and calls for itself.
+
+## `AnyBits` — storage whose every bit pattern is a value
+
+**`AnyBits` is the types for which storage nobody wrote still holds a value** — an unspecified one,
+never an invalid one. It declares nothing, and its membership is the compiler's: a type is one
+where every part of it is
+
+- an integer of a whole number of bytes (`u8` … `u128`, `i24`), a float, or a fixed-point number of
+  whole bytes (`q15`);
+- a raw pointer `*T`, or a function pointer `*extern(…) -> R` — one may already be `null`, and
+  calling one that names no function is the same act as dereferencing a `*T` that names nothing;
+- or an array, a vector (`<4>f32`), a struct or a union (`reference/types.md § Unions`) made only
+  of those, padding and all. A field of a bitfield struct is a few bits of one integer, so it counts
+  as an integer unless it is an enum.
+
+Everything with a bit pattern that is no value is out: a `bool` (only 0 and 1 are), an enum (only its
+variants' numbers are), a `char` (most numbers are not a scalar value), a subtype with a range or a
+predicate, and whatever names something the program made — `&T`, `weak T`, a string, a slice.
+**An integer that is not a whole number of bytes is out too**: a `u12` sits in two
+bytes of its slot, and the four bits above it are not its own, so storage nobody wrote holds a `u12`
+whose stored form no `u12` has.
+
+```sysl
+same_size[T: AnyBits](x: T) -> usize = sizeof(T)
+
+struct Sample
+    at: *u8
+    level: f32
+    pair: [2]u16
+
+var x: u8 = 0
+
+print(same_size(1u32), same_size(Sample(&x, 0.5f32, [1u16, 2])))
+```
+
+```output
+4 16
+```
+
+A type outside it is refused at the bound, with the part of it that has a bit pattern no value has:
+
+```sysl
+same_size[T: AnyBits](x: T) -> usize = sizeof(T)
+
+struct Flagged
+    n: u32
+    on: bool
+
+print(same_size(Flagged(1, true)))
+```
+
+```error
+'same_size' requires its type parameter 'T' to implement 'sysl.AnyBits', but Flagged does not — storage nobody wrote would not hold a valid value of it: its field 'on' is bool — a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
+```
+
+**Nothing implements it**, as nothing implements `Integer`: a type is one or it is not.
+
+```sysl
+struct Flag
+    on: bool
+
+impl AnyBits for Flag
+```
+
+```error
+'sysl.AnyBits' names a family of types the compiler settles, so nothing implements it — a type is one of them or it is not, and 'Flag' is not
+```
+
+Unlike `Integer` it is not a family a blanket `impl` is written over: it holds every integer, and a
+blanket over each would be two implementations at every one of them. What reads it is
+[`Buf`'s `spare` and `set_len`](/library/buf/#filling-the-spare-room), which
+take a buffer's unwritten room into its length.
 
 ## Stopping the program
 
@@ -145,8 +218,8 @@ find out what the two values actually were — and running it again is exactly w
 have saved you.
 
 ```sysl
-assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", …)
-assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg: string = "", …)
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", …)
+assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "", …)
 ```
 
 ```sysl
@@ -167,10 +240,12 @@ print("both held")
 both held
 ```
 
-**The bound is `Eq + Display` and not `Eq` alone**, which is what lets the report say what the two
-values were rather than only that they differed — so a type reaches `assert_eq` by rendering as well
-as by comparing. Both halves are written for an [`Option` and a `Result`](/reference/errors/), so a
-function answering with one is asserted about directly:
+**The bound is `Eq + Debug` and not `Eq` alone**, which is what lets the report say what the two
+values were rather than only that they differed. Every type has a
+[`Debug`](/reference/traits/#every-type-has-a-debug), so the bound asks nothing more of a type than
+`Eq`; and the report shows each side through it, so a string keeps its quotes and `got "1", want 1`
+cannot read as two equal values. Both halves are written for an [`Option` and a
+`Result`](/reference/errors/), so a function answering with one is asserted about directly:
 
 ```sysl
 first_even(xs: []const int) -> Option[int]
@@ -195,14 +270,35 @@ panic: got 5, want 6 (main.sysl:9)
 panic: the running total: got 5, want 6 (main.sysl:10)
 ```
 
+Each side is shown through its `Debug`, so a string is quoted and a struct with no `Display` shows
+its fields:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+impl Eq for Point
+    eq(self, rhs: Self) -> bool = self.x == rhs.x && self.y == rhs.y
+
+assert_eq(Point(1, 2), Point(1, 2))
+print(f"${"1"}%? ${Point(1, 2)}%?")
+```
+
+```output
+"1" Point(x: 1, y: 2)
+```
+
+and a failed `assert_eq("1", "2")` reads `panic: got "1", want "2"`.
+
 **Why this is a function and not advice to write the message yourself.** The hand-written form is
 `assert(a == b, s"got $a, want $b")`, and it has two costs: it evaluates each side twice, and it
 builds a string. Building one makes heap storage, which puts it out of reach of a module that
 declared [`@no_alloc`](/reference/attributes/) — the module that wants an assertion most. Rendering
-through [`Display`](/library/core/) into the output costs neither.
+through `Debug` into the output costs neither.
 
-**One function rather than one per type.** `Eq` says the comparison means something and `Display`
-says the value can be shown, which together are the whole of what a report needs.
+**One function rather than one per type.** `Eq` says the comparison means something and `Debug`
+says how the value is shown, which together are the whole of what a report needs.
 
 `assert_slice_eq` earns a name of its own, and it is worth being exact about what for now that
 [a slice is `Eq` and `Display`](#a-slice-or-an-array-of-anything-equatable) and so reaches
@@ -732,7 +828,8 @@ Every rendering the language does ends up in this family, one function per shape
 the library forwarding to the function above. The `iN`/`uN` families are open — `i5` and `u24` are
 types you may write — so no finite list of blocks reaches them; what reaches them is a single
 **blanket** block, `impl[T: Integer] Display for T`, whose buffer is measured from the width it is
-instantiated at.
+instantiated at. `unit` has a written block too, printing `()`, beside its `Eq`, `Ord` and `Hash`
+([`unit` and `never`](/reference/types/#unit-and-never)).
 
 Either way they are `Display` exactly the way your own struct is, and **a `*Display` can carry any
 of them**. That is what the blanket bought: a `[]*Display` holding an `int`, a `u8`, a `string` and
@@ -944,7 +1041,9 @@ is what the library's own multi-part renderings do, and what a `Point` printed i
 This recipe is the one to start from; that one is what to reach for when the rendering is hot, or the
 module has no allocator.
 
-A type with no `Display` cannot be printed, and the diagnostic says what to write:
+A type with no `Display` still prints, through the [`Debug`](/reference/traits/#every-type-has-a-debug)
+every type has — its name and its fields — so `Display` is the presentation you choose rather than a
+requirement for printing at all:
 
 ```sysl
 struct Scale
@@ -953,8 +1052,8 @@ struct Scale
 print(Scale(3))
 ```
 
-```error
-cannot print a Scale value — write an 'impl sysl.Display for Scale' to say how it renders
+```output
+Scale(k: 3)
 ```
 
 ### A slice or an array of anything printable

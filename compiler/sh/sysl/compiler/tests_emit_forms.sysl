@@ -299,7 +299,7 @@ a_comma_assignment_re_checks_one_invariant_once()
               "  %t9 = call i1 @Window$inv(i32 %t7, i32 %t8)\n" +
               "  br i1 %t9, label %invariant.ok1, label %invariant.bad2\n" +
               "invariant.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "invariant.ok1:\n" +
               "  ret void\n" +
@@ -332,8 +332,6 @@ a_reference_weakens_by_counting_in_the_third_word()
               "  store ptr %r.param, ptr %r.addr\n" +
               "  %t1 = load ptr, ptr %r.addr\n" +
               "  call void @arc.weak_retain(ptr %t1)\n" +
-              "  call void @arc.weak_retain(ptr %t1)\n" +
-              "  call void @arc.weak_release(ptr %t1)\n" +
               "  ret ptr %t1\n" +
               "}\n")
 end a_reference_weakens_by_counting_in_the_third_word
@@ -392,7 +390,6 @@ a_weak_reference_asks_the_box_whether_the_object_is_there()
               "  %t13 = getelementptr %enum.sysl$Option.ref.Node, ptr %t6, i32 0, i32 1\n" +
               "  %t14 = load %sysl$Option.ref.Node.Some, ptr %t13\n" +
               "  %t15 = extractvalue %sysl$Option.ref.Node.Some %t14, 0\n" +
-              "  call void @arc.retain(ptr %t15)\n" +
               "  store ptr %t15, ptr %p.addr\n" +
               "  %t16 = load ptr, ptr %p.addr\n" +
               "  %t17 = getelementptr %arc.Node, ptr %t16, i32 0, i32 3\n" +
@@ -400,7 +397,6 @@ a_weak_reference_asks_the_box_whether_the_object_is_there()
               "  %t19 = extractvalue %struct.Node %t18, 0\n" +
               "  store i32 %t19, ptr %t11\n" +
               "  %t20 = load ptr, ptr %p.addr\n" +
-              "  call void @arc.release(ptr %t20)\n" +
               "  br label %match.end4\n" +
               "match.arm6:\n" +
               "  store i32 0, ptr %t11\n" +
@@ -489,7 +485,7 @@ the_neighbouring_value_traps_at_the_end_it_runs_off()
               "  %t2 = icmp ne i32 %t1, 20\n" +
               "  br i1 %t2, label %succ.ok1, label %succ.bad2\n" +
               "succ.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "succ.ok1:\n" +
               "  %t4 = icmp eq i32 %t1, 10\n" +
@@ -537,7 +533,7 @@ a_position_back_to_a_value_is_range_checked_first()
               "  %t4 = and i1 %t2, %t3\n" +
               "  br i1 %t4, label %val.ok1, label %val.bad2\n" +
               "val.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "val.ok1:\n" +
               "  %t6 = icmp eq i32 %t1, 1\n" +
@@ -626,8 +622,9 @@ end a_pattern_in_a_condition_binds_on_the_edge_that_took_it
 
 // That is what makes a `&T` destructured out of a value outlive the value it was read from: the arm
 // is its own ownership region, opened where the bindings are made and closed where the arm hands
-// its value over.
-@test("a name bound out of a variant takes a count of what it names, and the arm gives it back")
+// its value over. Where nothing in the arm could give back the subject's count, the binding's share
+// and its release are one pair with nothing between them, and neither is emitted (`arc_elide.sysl`).
+@test("a name bound out of a variant reads through the subject's count when nothing in the arm can give it back")
 a_binding_that_holds_a_reference_takes_a_share_of_it()
     if no_form_library() then return
 
@@ -672,7 +669,6 @@ a_binding_that_holds_a_reference_takes_a_share_of_it()
               "  %t5 = getelementptr %enum.Held, ptr %t4, i32 0, i32 1\n" +
               "  %t6 = load %Held.One, ptr %t5\n" +
               "  %t7 = extractvalue %Held.One %t6, 0\n" +
-              "  call void @arc.retain(ptr %t7)\n" +
               "  store ptr %t7, ptr %n.addr\n" +
               "  %t8 = load ptr, ptr %n.addr\n" +
               "  %t9 = getelementptr %arc.Node, ptr %t8, i32 0, i32 3\n" +
@@ -680,7 +676,6 @@ a_binding_that_holds_a_reference_takes_a_share_of_it()
               "  %t11 = extractvalue %struct.Node %t10, 0\n" +
               "  store i32 %t11, ptr %t2\n" +
               "  %t12 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t12)\n" +
               "  br label %match.end1\n" +
               "match.arm3:\n" +
               "  store i32 0, ptr %t2\n" +
@@ -694,8 +689,9 @@ a_binding_that_holds_a_reference_takes_a_share_of_it()
 end a_binding_that_holds_a_reference_takes_a_share_of_it
 
 // The bind retains out of the subject, so the subject has to still be held when it runs. That puts
-// the release after the branch on the taken edge, and in a block of its own on the other.
-@test("a reference bound by an 'is' in a condition is released on the taken edge and on the unbind block")
+// the release after the branch on the taken edge, and in a block of its own on the other. Here the
+// taken edge only reads a field before it returns, so the share and its release cancel.
+@test("a reference bound by an 'is' in a condition takes no share where the taken edge cannot give one back")
 a_condition_that_binds_a_reference_releases_it_on_every_edge()
     if no_form_library() then return
 
@@ -740,14 +736,12 @@ a_condition_that_binds_a_reference_releases_it_on_every_edge()
               "  %t5 = getelementptr %enum.Held, ptr %t4, i32 0, i32 1\n" +
               "  %t6 = load %Held.One, ptr %t5\n" +
               "  %t7 = extractvalue %Held.One %t6, 0\n" +
-              "  call void @arc.retain(ptr %t7)\n" +
               "  store ptr %t7, ptr %n.addr\n" +
               "  %t8 = load ptr, ptr %n.addr\n" +
               "  %t9 = getelementptr %arc.Node, ptr %t8, i32 0, i32 3\n" +
               "  %t10 = load %struct.Node, ptr %t9\n" +
               "  %t11 = extractvalue %struct.Node %t10, 0\n" +
               "  %t12 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t12)\n" +
               "  ret i32 %t11\n" +
               "cond.unbind4:\n" +
               "  unreachable\n" +
@@ -876,7 +870,7 @@ a_large_parameter_is_copied_into_the_frame_as_bytes()
               "  br i1 %t2, label %bounds.ok1, label %bounds.bad2\n" +
               "bounds.bad2:\n" +
               "  call void @sysl_bounds_fail(i32 0, i64 0, i64 0, i64 40, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok1:\n" +
               "  %t3 = getelementptr i32, ptr %t1, i64 0\n" +
@@ -1181,7 +1175,7 @@ a_large_temporary_is_given_a_slot()
               "  br i1 %t9, label %bounds.ok4, label %bounds.bad5\n" +
               "bounds.bad5:\n" +
               "  call void @sysl_bounds_fail(i32 0, i64 3, i64 0, i64 20, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok4:\n" +
               "  %t10 = getelementptr i64, ptr %t8, i64 3\n" +
@@ -1326,7 +1320,7 @@ a_conversion_to_char_is_checked()
               "  %t7 = and i1 %t3, %t6\n" +
               "  br i1 %t7, label %char.ok1, label %char.bad2\n" +
               "char.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "char.ok1:\n" +
               "  %t8 = trunc i64 %t2 to i32\n" +
@@ -1415,8 +1409,9 @@ fsat_u32_over_an_f32_saturates()
 // **A counted argument to a tail call takes its count while the frame is still whole**, and the
 // frame gives up everything it holds only after that. Written the other way round, `go(next, list)`
 // would free the list at the moment the parameter holding it was reassigned, and hand the second
-// argument a dangling reference.
-@test("a counted argument to a tail call is retained before the old bindings let go")
+// argument a dangling reference. Where the argument IS the binding it replaces, as `s` is here, the
+// retain and the release are of one reference with nothing between them, and both go.
+@test("a counted argument to a tail call that is the binding it replaces costs no count")
 a_counted_tail_call_argument_is_retained_first()
     if no_form_library() then return
 
@@ -1454,10 +1449,8 @@ a_counted_tail_call_argument_is_retained_first()
               "  %t9 = sub i32 %t8, 1\n" +
               "  %t10 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
               "  %t11 = extractvalue { ptr, ptr, i64 } %t10, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t11)\n" +
               "  %t12 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
               "  %t13 = extractvalue { ptr, ptr, i64 } %t12, 0\n" +
-              "  call void @arc.release_maybe(ptr %t13)\n" +
               "  store i32 %t9, ptr %n.addr\n" +
               "  store { ptr, ptr, i64 } %t10, ptr %s.addr\n" +
               "  br label %tailrec1\n" +
@@ -1504,7 +1497,7 @@ a_large_tail_call_argument_is_staged_in_a_slot()
               "  br i1 %t4, label %bounds.ok5, label %bounds.bad6\n" +
               "bounds.bad6:\n" +
               "  call void @sysl_bounds_fail(i32 0, i64 0, i64 0, i64 20, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok5:\n" +
               "  %t5 = getelementptr i64, ptr %t3, i64 0\n" +
@@ -1564,14 +1557,14 @@ a_view_broken_out_of_a_walk_promotes_what_it_views()
               "  %t13 = xor i1 %t12, true\n" +
               "  br i1 %t13, label %size.ok1, label %size.bad2\n" +
               "size.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "size.ok1:\n" +
               "  %t14 = call ptr @malloc(i64 %t10)\n" +
               "  %t15 = icmp ne ptr %t14, null\n" +
               "  br i1 %t15, label %alloc.ok3, label %alloc.bad4\n" +
               "alloc.bad4:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "alloc.ok3:\n" +
               "  store i64 1, ptr %t14\n" +
@@ -1602,7 +1595,7 @@ a_view_broken_out_of_a_walk_promotes_what_it_views()
               "  br i1 %t29, label %bounds.ok10, label %bounds.bad11\n" +
               "bounds.bad11:\n" +
               "  call void @sysl_bounds_fail(i32 5, i64 0, i64 0, i64 1, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok10:\n" +
               "  %t30 = getelementptr i32, ptr %frame.addr, i64 0\n" +
@@ -1612,10 +1605,8 @@ a_view_broken_out_of_a_walk_promotes_what_it_views()
               "  %t33 = insertvalue { ptr, ptr, i64 } %t32, ptr %t30, 1\n" +
               "  %t34 = insertvalue { ptr, ptr, i64 } %t33, i64 %t31, 2\n" +
               "  %t35 = extractvalue { ptr, ptr, i64 } %t34, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t35)\n" +
               "  store { ptr, ptr, i64 } %t34, ptr %t24\n" +
               "  %t36 = extractvalue { ptr, ptr, i64 } %t34, 0\n" +
-              "  call void @arc.release_maybe(ptr %t36)\n" +
               "  br label %each.end8\n" +
               "each.step7:\n" +
               "  unreachable\n" +
@@ -1624,7 +1615,7 @@ a_view_broken_out_of_a_walk_promotes_what_it_views()
               "  br i1 %t39, label %bounds.ok12, label %bounds.bad13\n" +
               "bounds.bad13:\n" +
               "  call void @sysl_bounds_fail(i32 5, i64 0, i64 0, i64 1, ptr @.loc1)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok12:\n" +
               "  %t40 = getelementptr i32, ptr %frame.addr, i64 0\n" +
@@ -1634,17 +1625,13 @@ a_view_broken_out_of_a_walk_promotes_what_it_views()
               "  %t43 = insertvalue { ptr, ptr, i64 } %t42, ptr %t40, 1\n" +
               "  %t44 = insertvalue { ptr, ptr, i64 } %t43, i64 %t41, 2\n" +
               "  %t45 = extractvalue { ptr, ptr, i64 } %t44, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t45)\n" +
               "  %t46 = extractvalue { ptr, ptr, i64 } %t44, 0\n" +
-              "  call void @arc.release_maybe(ptr %t46)\n" +
               "  store { ptr, ptr, i64 } %t44, ptr %t24\n" +
               "  br label %each.end8\n" +
               "each.end8:\n" +
               "  %t47 = load { ptr, ptr, i64 }, ptr %t24\n" +
               "  %t48 = extractvalue { ptr, ptr, i64 } %t47, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t48)\n" +
               "  %t49 = extractvalue { ptr, ptr, i64 } %t47, 0\n" +
-              "  call void @arc.release_maybe(ptr %t49)\n" +
               "  %t50 = load ptr, ptr %frame.box\n" +
               "  call void @arc.release(ptr %t50)\n" +
               "  ret { ptr, ptr, i64 } %t47\n" +
@@ -2122,7 +2109,7 @@ a_vector_kernel_reaches_memory_and_reduces()
               "  br i1 %t7, label %bounds.ok1, label %bounds.bad2\n" +
               "bounds.bad2:\n" +
               "  call void @sysl_bounds_fail(i32 9, i64 0, i64 4, i64 %t3, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok1:\n" +
               "  %t8 = getelementptr float, ptr %t2, i64 0\n" +
@@ -2157,7 +2144,7 @@ a_vector_kernel_reaches_memory_and_reduces()
               "  br i1 %t31, label %bounds.ok3, label %bounds.bad4\n" +
               "bounds.bad4:\n" +
               "  call void @sysl_bounds_fail(i32 9, i64 0, i64 4, i64 %t27, ptr @.loc1)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok3:\n" +
               "  %t32 = getelementptr float, ptr %t26, i64 0\n" +
@@ -2284,7 +2271,7 @@ a_quantifier_stops_at_the_element_that_settles_it()
               "  br i1 %t6, label %bounds.ok6, label %bounds.bad7\n" +
               "bounds.bad7:\n" +
               "  call void @sysl_bounds_fail(i32 256, i64 %t5, i64 0, i64 3, ptr @.loc0)\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "bounds.ok6:\n" +
               "  %t7 = getelementptr i32, ptr %a.addr, i64 %t5\n" +
@@ -2361,7 +2348,7 @@ a_checked_loop_arms_its_measure_where_it_is_entered()
               "  %t10 = load i1, ptr %t6\n" +
               "  br i1 %t10, label %invariant.ok6, label %invariant.bad7\n" +
               "invariant.bad7:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "invariant.ok6:\n" +
               "  %t11 = load i32, ptr %n.addr\n" +
@@ -2374,7 +2361,7 @@ a_checked_loop_arms_its_measure_where_it_is_entered()
               "  %t16 = icmp slt i32 %t13, %t15\n" +
               "  br i1 %t16, label %variant.ok10, label %variant.bad11\n" +
               "variant.bad11:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "variant.ok10:\n" +
               "  br label %variant.set9\n" +
@@ -2452,7 +2439,7 @@ a_tail_recursive_frame_checks_its_measure_before_the_jump()
               "  %t18 = icmp slt i32 %t15, %t10\n" +
               "  br i1 %t18, label %variant.ok5, label %variant.bad6\n" +
               "variant.bad6:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "variant.ok5:\n" +
               "  store i32 %t6, ptr %n.addr\n" +
@@ -2527,7 +2514,7 @@ a_ghostly_clause_is_erased()
               "  %t2 = icmp sge i32 %t1, 0\n" +
               "  br i1 %t2, label %require.ok1, label %require.bad2\n" +
               "require.bad2:\n" +
-              "  call void @llvm.trap()\n" +
+              "  call void @sysl.trap()\n" +
               "  unreachable\n" +
               "require.ok1:\n" +
               "  %t3 = load i32, ptr %n.addr\n" +

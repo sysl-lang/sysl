@@ -19,14 +19,127 @@ private val_init(e: *Emit, v: TVal) -> Val
         None -> VZero
 end val_init
 
+// A `val`'s storage as LLVM declares it: its type's own, or -- where the value laid down holds a union
+// -- the literal type of the image (`constant_image`).
+private val_image(e: *Emit, v: TVal) -> IrArg
+    if v.computed || !holds_union(v.ty) then return ir_arg(lty(e, v.ty), val_init(e, v))
+
+    v.init match
+        Some(x) -> constant_image(e, v.ty, x)
+        None -> ir_arg(lty(e, v.ty), VZero)
+end val_image
+
+// **A constant holding a union is written in a literal type of its own.** LLVM's constant for an
+// aggregate names a value for each element of its type, and a union's type has one element -- the
+// field `union_type_def` chose -- which is not the one a constant was built with whenever another
+// field was. So the image of a union is `{ [0 x %struct.U], <field>, [pad x i8] }`: the empty array
+// gives it the union's own alignment, then the one field it was built with and zeros to the union's
+// size. Everything holding one is written in literal types too, element for element as its own type
+// would lay it out (a struct's gaps included), so every offset is the one the declared type has; an
+// array of them is a literal struct, since its elements' images need not be one type.
+constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
+    if !holds_union(ty) then return ir_arg(lty(e, ty), constant_value(e, t))
+
+    *t.kind match
+        TStructNew(decl, args) ->
+            if decl.union_layout then return union_image(e, decl, args)
+
+            var fields: Buf[IrArg] = buf()
+
+            for i in 0..<args.len()
+                val ft = decl.fields.at(i).1
+
+                if !zero_sized(ft)
+                    val part = constant_image(e, ft, args.at(i))
+                    val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                    fields.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
+
+            literal_image(gapped_values(fields, struct_gaps(e.layout, decl)), decl.packed)
+        TArrayLit(items, array_ty) ->
+            val ety = element(array_ty).unwrap_or(int_type())
+            var parts: Buf[IrArg] = buf()
+
+            for item in items
+                parts.push(constant_image(e, ety, item))
+
+            literal_image(parts, false)
+        TArrayFill(value, array_ty) ->
+            val ety = element(array_ty).unwrap_or(int_type())
+            val part = constant_image(e, ety, value)
+            val n = underlying(array_ty) match
+                Array(len, _) -> len
+                _ -> 0
+            var parts: Buf[IrArg] = buf()
+
+            for i in 0..<n
+                parts.push(part)
+
+            literal_image(parts, false)
+        _ -> ir_arg(lty(e, ty), constant_value(e, t))
+end constant_image
+
+// The parts as one literal aggregate. A `@packed` type's is packed too: a literal struct rounds each
+// part up to its own alignment, which would move every field after the first one that is not
+// byte-aligned away from where the declared type has it.
+private literal_image(parts: Buf[IrArg], packed: bool) -> IrArg
+    var types: Buf[LType] = buf()
+
+    for p in parts
+        types.push(p.ty)
+
+    if packed then ir_arg(LPackedStruct(types), VPackedAgg(parts)) else ir_arg(LStruct(types), VAgg(parts))
+end literal_image
+
+// A union built from constants: the one field it was built with, at its first byte, in the stated byte
+// order where it has one, and zeros to its size.
+private union_image(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> IrArg
+    var parts: Buf[IrArg] = buf()
+
+    parts.push(ir_arg(LArr(0, struct_lty(decl)), VZero))
+
+    var used: usize = 0
+
+    for i in 0..<args.len()
+        val ft = decl.fields.at(i).1
+
+        *args.at(i).kind match
+            TUnitLit -> ()
+            _ ->
+                if !zero_sized(ft)
+                    val part = constant_image(e, ft, args.at(i))
+                    val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                    parts.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
+                    used = e.layout.size(ft)
+                end if
+
+    val total = e.layout.size(Struct(decl))
+
+    if total > used then parts.push(ir_arg(LArr(int(total - used), LInt(8)), VZero))
+
+    literal_image(parts, decl.packed)
+end union_image
+
 // The storage a program's `val`s come to.
-gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
+//
+// **Storage another object defines is declared, as a precompiled function is** (`precompiled`): a
+// library's constant storage, laid down once in its own half (`library.sysl`'s `shared_storage`).
+// That half defines it with external linkage (`TVal.shared`), so the program and every other half
+// linked with it name one object -- one address, one value written.
+gen_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string]) -> Buf[IrGlobal]
     var out: Buf[IrGlobal] = buf()
 
     for i in 0..<vals.len()
         val v = vals.at(i)
 
-        val init = val_init(e, v)
+        if holds_string(precompiled, v.symbol)
+            val decl = ir_extern_global(v.symbol, lty(e, v.ty), binds_locally(e))
+
+            out.push(decl with { constant = !v.writable })
+            continue
+
+        val image = val_image(e, v)
 
         // The binding's own `@align(n)`, or the boundary its type raises -- the greater of the two.
         val own: Option[int] = v.align match
@@ -41,15 +154,16 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
         // module's own and stays private.
         val exported = v.exported.is_some()
         val name = v.exported.unwrap_or(v.symbol)
-        val linkage = if exported then LinkDefault else LinkPrivate
+        val linkage = if exported || v.shared then LinkDefault else LinkPrivate
 
         // **A `@per_cpu` binding is the image every core's copy is made from**, so it goes in
         // `.percpu` -- data even where it is all zeros, a named section keeping it out of `.bss` --
         // and a linker script bounds that section for the program to copy.
         val section = if v.per_cpu then Some(per_cpu_section()) else v.section
 
-        out.push(IrGlobal(name, !(v.computed || v.writable), lty(e, v.ty), Some(init),
-                          linkage, section, align, v.thread_local, exported && binds_locally(e),
+        out.push(IrGlobal(name, !(v.computed || v.writable), image.ty, Some(image.value),
+                          linkage, section, align, v.thread_local,
+                          (exported || v.shared) && binds_locally(e),
                           v.export_hidden))
 
     out
@@ -83,6 +197,19 @@ private constant_address(e: *Emit, place: TExpr) -> Val = *place.kind match
 
         idx.push(ir_arg(word_lty(e), VInt(at)))
         VGep(lty(e, elem), constant_address(e, receiver), idx)
+    // An array a run while compiling made and froze: laid down as read-only storage of its own, which
+    // the frozen buffer's pointer to its first element names.
+    TArrayLit(_, array_ty) ->
+        e.table_id += 1
+
+        val name = s".frozen${e.table_id}"
+        val elem = nameless(array_ty) match
+            Array(_, el) -> *el
+            _ -> int_type()
+
+        e.globals.push(IrGlobal(name, true, lty(e, array_ty), Some(constant_value(e, place)), LinkPrivate,
+                                None, e.layout.storage_align(elem), false, false, false))
+        VGlobal(name)
     _ -> gap_at(e, "a constant address of something that is not module storage")
 
 // The section every `@per_cpu` binding's image is laid down in.
@@ -144,6 +271,9 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // value a constant expression rather than something a prologue has to build.
     TStrLit(s) -> string_const(e, s)
 
+    // The address of the literal's bytes in read-only data: a relocation, so constant data.
+    TCStrLit(s) -> string_global(e, s)
+
     // The same three words over the file's bytes.
     TEmbed(file, bytes, align) -> embed_const(e, file, bytes, align)
 
@@ -182,13 +312,36 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
         VArray(elems)
 
+    // A vector computed while compiling, laid down as its lanes.
+    TVectorLit(lanes, vec_ty) ->
+        val lane_ty = underlying(vec_ty) match
+            Vector(_, el) -> *el
+            _ -> int_type()
+
+        var out: Buf[IrArg] = buf()
+
+        for lane in lanes
+            out.push(ir_arg(lty(e, lane_ty), constant_value(e, lane)))
+
+        VVector(out)
+
     // A slice over literals: its elements laid down as an array of their own, and the view over them
     // with no owner -- the three words a string literal is, so nothing ever counts it.
     TBufLit(items, slice_ty) -> view_const(e, items, slice_ty)
 
+    // A box a run while compiling made: header and payload laid down whole, in **writable** data,
+    // since a reference names the header and taking a share writes the count there. The count starts
+    // at one -- the storage's own share, which is never given back -- so nothing frees the box, and
+    // the hook is null, so nothing destroys it either.
+    TBox(value, _) -> box_const(e, value)
+
     // A struct constant lists its fields in the order the type declares them, and skips the ones that
     // occupy nothing -- the initializer has to match the type this module emitted.
     TStructNew(decl, args) ->
+        // A struct with C bitfields is its runs of bitfields as the bytes their values make, and its
+        // other fields as themselves (`emit_c_bits.sysl`).
+        if !decl.c_bits.is_empty() then return c_bits_constant(e, decl, args)
+
         var fields: Buf[IrArg] = buf()
 
         for i in 0..<args.len()
@@ -212,6 +365,18 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // The address of module storage, or of a place inside it: a relocation the linker fills in,
     // written as a constant `getelementptr` over the global (`analyze_body.sysl`'s `place_image`).
     TAddrOf(place, _) -> constant_address(e, place)
+
+    // A function's address: its C-callable entry, as `&f` anywhere else names it (`emit_expr.sysl`).
+    TFuncAddr(_, entry, _) -> VGlobal(entry_of(e, entry))
+
+    // A trait object over such an address: the table's address and the object's, the two words
+    // `gen_erase` builds -- both relocations, so nothing runs to pair them.
+    TErase(operand, vtable, _) ->
+        var words: Buf[IrArg] = buf()
+
+        words.push(ir_arg(LPtr, VGlobal(vtable)))
+        words.push(ir_arg(LPtr, constant_value(e, operand)))
+        VAgg(words)
 
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
@@ -242,7 +407,13 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
                 var cells: Buf[IrArg] = buf()
 
                 for u in units
-                    cells.push(ir_arg(area.0, VInt(u)))
+                    val cell = u match
+                        UnitBits(n) -> VInt(n)
+                        UnitAddr(place) -> VPtrToInt(area.0, constant_address(e, place))
+                        UnitTable(symbol) -> VPtrToInt(area.0, VGlobal(symbol))
+                        UnitFn(entry) -> VPtrToInt(area.0, VGlobal(entry_of(e, entry)))
+
+                    cells.push(ir_arg(area.0, cell))
 
                 payload = VArray(cells)
             end if
@@ -294,10 +465,12 @@ private is_constant_image(t: TExpr) -> bool = *t.kind match
     TFloatLit(_, ty) -> ty == real_type() || ty == Floating(32, false)
     TQuadLit(_, _, _) -> true
     TStrLit(_) -> true
+    TCStrLit(_) -> true
     TEmbed(_, _, _) -> true
     TNullLit(_) -> true
     TArrayLit(items, _) -> all_constant(items)
-    TStructNew(decl, args) -> bitfield_ranges_of(Struct(decl)).is_none() && all_constant(args)
+    TStructNew(decl, args) -> !decl.union_layout && bitfield_ranges_of(Struct(decl)).is_none() &&
+        decl.c_bits.is_empty() && all_constant(args)
     _ -> false
 
 private all_constant(items: Buf[TExpr]) -> bool
@@ -306,6 +479,30 @@ private all_constant(items: Buf[TExpr]) -> bool
 
     true
 end all_constant
+
+// A box laid down whole, as `TBox`'s arm says.
+private box_const(e: *Emit, value: TExpr) -> Val
+    val payload = texpr_type(value)
+    val bn = box_lty(e, payload)
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(word_lty(e), VInt(from_int(1))))
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(1))))
+
+    val pad = box_pad(e, payload)
+
+    if pad > 0 then fields.push(ir_arg(LArr(int(pad), LInt(8)), VZero))
+
+    fields.push(ir_arg(lty(e, payload), constant_value(e, value)))
+
+    e.table_id += 1
+
+    val name = s".box${e.table_id}"
+
+    e.globals.push(IrGlobal(name, false, bn, Some(VAgg(fields)), LinkPrivate, None, None, false, false, false))
+    VGlobal(name)
+end box_const
 
 // A string as a value: the owner nothing frees, the bytes, and how many there are.
 string_const(e: *Emit, s: string) -> Val
@@ -316,6 +513,22 @@ string_const(e: *Emit, s: string) -> Val
     fields.push(ir_arg(word_lty(e), VInt(from_int(long(s.bytes.len)))))
     VAgg(fields)
 end string_const
+
+// **A `[]const T` literal whose every element is constant data is that data**, wherever it is
+// written: nothing can write through the view, so one read-only array serves every evaluation, and
+// the view over it owns nothing, as a string literal's does. `T::Fields` is one.
+read_only_literal(elems: Buf[TExpr], slice_ty: Type) -> bool
+    if elems.is_empty() then return false
+
+    val read_only = underlying(slice_ty) match
+        Slice(_, ro) -> ro
+        _ -> false
+
+    read_only && all_laid_down(elems)
+end read_only_literal
+
+// The same literal as the value a body reads: the view over its laid-down array.
+static_view(e: *Emit, items: Buf[TExpr], slice_ty: Type) -> Val = view_const(e, items, slice_ty)
 
 // A slice literal as a value: the owner nothing frees, its elements, and how many there are. **The
 // elements are read-only data only where the view is**: a `[]T` is written through wherever it is
@@ -395,6 +608,7 @@ private is_zero_const(v: Val) -> bool = v match
     VAgg(fields) -> all_zero(fields)
     VPackedAgg(fields) -> all_zero(fields)
     VArray(elems) -> all_zero(elems)
+    VVector(lanes) -> all_zero(lanes)
     _ -> false
 
 private all_zero(items: Buf[IrArg]) -> bool

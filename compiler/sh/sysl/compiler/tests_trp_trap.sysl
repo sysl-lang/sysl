@@ -1,0 +1,262 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, join, replace_all, split}
+
+// `trap()`: the target's trap instruction, reachable from a program. It is the standard module's
+// `llvm.trap` extern, which the intrinsic list admits for a declaration that takes nothing and
+// answers `never`.
+
+// -- the harness ------------------------------------------------------------------------------------
+
+private trp_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private trp_board_program() -> string =
+    "@no_alloc\n@export(\"stop\")\nstop() -> never = trap()\n"
+
+// The archive `sysl build-c` makes of the stopping program for a board, or why it was not made.
+private trp_build(target: string) -> (int, string, string)
+    val root = replace_all(make_temp_dir("sysl-trp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", trp_board_program()).unwrap()
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"), root)
+end trp_build
+
+// The disassembly of that archive by the first of the tools that exists, or "" where none does.
+private trp_disassembly(root: string, tools: []const string) -> string
+    for i in 0..<tools.len
+        if exists(tools[i])
+            capture(tools[i], ["-d", s"$root/app.a"], "", [], true) match
+                Ok(out) -> return out.text
+                Err(_) -> return ""
+
+    ""
+end trp_disassembly
+
+private trp_arm_tools() -> []const string =
+    ["/opt/homebrew/bin/arm-none-eabi-objdump", "/usr/local/bin/arm-none-eabi-objdump",
+     "/usr/bin/arm-none-eabi-objdump"]
+
+private trp_llvm_tools() -> []const string =
+    ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+// Whether this machine has a clang with the back end the target needs; a target it cannot build is
+// reported and skipped, never counted as built.
+private trp_can_build(target: string) -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    target_named(target) match
+        None -> false
+        Some(t) -> find_backend_clang(t).is_ok()
+end trp_can_build
+
+// -- the type ---------------------------------------------------------------------------------------
+
+@test("a function may end in trap() and return nothing, since it answers never")
+trp_ends_a_function()
+    if xvr_no_library() then return
+
+    val said = xvr_ran(trp_main("pick(x: int) -> int\n    if x > 0 then return x\n    trap()\n\n" +
+                                "print(pick(7))\n"))
+
+    assert_eq(said, "7\n")
+
+@test("trap() as an expression of a function's result type needs no value")
+trp_is_never()
+    if xvr_no_library() then return
+
+    val said = xvr_ran(trp_main("pick(x: int) -> int = if x > 0 then x else trap()\n\nprint(pick(3))\n"))
+
+    assert_eq(said, "3\n")
+
+// -- the emitted code -------------------------------------------------------------------------------
+
+@test("trap() is the llvm.trap call preceded by a flush of standard output, and nothing that prints or exits")
+trp_is_the_instruction()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(trp_main("stop() -> never = trap()\n\nstop()\n"))
+
+    // `trap()` calls the one stop, and the stop is the flush, then the instruction, and nothing else
+    // of note: no print, no exit.
+    val defs = split(ir, "\ndefine ")
+    var found = false
+    var stop_found = false
+
+    for i in 0..<defs.len
+        val d = split(defs[i], "\n}")[0]
+        val head = split(d, "\n")[0]
+
+        if head.contains("@sysl$trap()")
+            found = true
+            assert(d.contains("call void @sysl.trap()"), d)
+            assert(!d.contains("@printf"), d)
+            assert(!d.contains("@exit"), d)
+            assert(!d.contains("@putbytes"), d)
+
+        if head.contains("@sysl.trap() cold noinline noreturn")
+            stop_found = true
+
+            val flush = d.index_of("call i32 @fflush(ptr null)")
+            val instruction = d.index_of("call void @llvm.trap()")
+
+            assert(flush.is_some() && instruction.is_some(), d)
+            assert(flush.unwrap() < instruction.unwrap(), d)
+            assert_eq(d.count_of("call "), 2)
+            assert(!d.contains("@printf"), d)
+            assert(!d.contains("@exit"), d)
+            assert(!d.contains("@putbytes"), d)
+
+    assert(found, ir)
+    assert(stop_found, ir)
+
+@test("trap() takes no capability and is legal under @no_alloc")
+trp_needs_nothing()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(trp_main("@no_alloc\nstop() -> never = trap()\n\nstop()\n"))
+
+    assert(ir.contains("call void @llvm.trap()"), ir)
+    assert(!ir.contains("error:"), ir)
+
+// -- the error path ---------------------------------------------------------------------------------
+
+@test("an llvm.trap declaration that takes an argument is refused by name")
+trp_extern_with_an_argument()
+    if xvr_no_library() then return
+
+    val said = xvr_ir(trp_main("private extern \"llvm.trap\" f(x: int) -> never\n\nf(1)\n"))
+
+    assert(said.contains("error: 'llvm.trap' takes 0 arguments, but 1 were declared\n --> main.sysl:1:1\n"), said)
+
+@test("an llvm.trap declaration that answers something is refused by name")
+trp_extern_that_answers()
+    if xvr_no_library() then return
+
+    val said = xvr_ir(trp_main("private extern \"llvm.trap\" f() -> int\n\nprint(f())\n"))
+
+    assert(said.contains("error: 'llvm.trap' never returns, so a declaration of it answers 'never' — " +
+                         "this one answers 'int'\n --> main.sysl:1:1\n"), said)
+
+@test("trap() takes no argument")
+trp_takes_nothing()
+    if xvr_no_library() then return
+
+    val said = xvr_ir(trp_main("trap(1)\n"))
+
+    assert(said.contains("error:"), said)
+    assert(said.contains("main.sysl:1:"), said)
+
+// -- every machine ----------------------------------------------------------------------------------
+
+@test("a thumbv7em board gets a udf")
+trp_thumbv7em()
+    if !trp_can_build("thumbv7em-freestanding") then return
+
+    val (code, said, root) = trp_build("thumbv7em-freestanding")
+    val dis = trp_disassembly(root, trp_arm_tools())
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+    assert(dis.contains("udf"), dis)
+
+@test("a thumbv6m board gets a udf")
+trp_thumbv6m()
+    if !trp_can_build("thumbv6m-freestanding") then return
+
+    val (code, said, root) = trp_build("thumbv6m-freestanding")
+    val dis = trp_disassembly(root, trp_arm_tools())
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+    assert(dis.contains("udf"), dis)
+
+@test("a riscv32 board gets an unimp")
+trp_riscv32()
+    if !trp_can_build("riscv32-freestanding") then return
+
+    val (code, said, root) = trp_build("riscv32-freestanding")
+    val dis = trp_disassembly(root, trp_llvm_tools())
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+    assert(dis == "" || dis.contains("unimp"), dis)
+
+@test("an aarch64 board builds with the trap")
+trp_aarch64()
+    if !trp_can_build("aarch64-freestanding") then return
+
+    val (code, said, root) = trp_build("aarch64-freestanding")
+    val dis = trp_disassembly(root, ["/opt/homebrew/bin/aarch64-elf-objdump"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+    assert(dis == "" || dis.contains("brk"), dis)
+
+@test("a wasm32 board builds with the trap")
+trp_wasm32()
+    if !trp_can_build("wasm32-freestanding") then return
+
+    val (code, said, root) = trp_build("wasm32-freestanding")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+
+@test("a craft board builds with the trap")
+trp_craft()
+    if !trp_can_build("craft-freestanding") then return
+
+    val (code, said, root) = trp_build("craft-freestanding")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, said)
+
+// -- under the runner -------------------------------------------------------------------------------
+
+@test("a test that calls trap() fails and the runner reports it instead of hanging")
+trp_a_trapping_test_fails()
+    if !clx_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-trp-test").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", "@test\na_stops()\n    trap()\n\n@test\nb_runs_after()\n" +
+               "    assert(true, \"up\")\n").unwrap()
+
+    val (code, out, _) = clx_ran(["sysl", "test", s"$root/prog.sysl", "--timeout", "60"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed, out)
+    assert(out.contains("FAIL  a_stops"), out)
+    assert(out.contains("ok    b_runs_after"), out)
+    assert(out.contains("1 passed, 1 failed"), out)
+
+@test("a test that expects the trap passes")
+trp_should_trap_passes()
+    if !clx_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-trp-test").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", "@test(should_trap)\na_stops()\n    trap()\n").unwrap()
+
+    val (code, out, _) = clx_ran(["sysl", "test", s"$root/prog.sysl", "--timeout", "60"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, out)
+    assert(out.contains("ok    a_stops"), out)

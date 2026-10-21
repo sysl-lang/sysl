@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+@tests
+
+// An `extern` a module declares, or one a file imports, is read before the standard module's
+// function of the same spelling, exactly as a function the module declares is. The library is
+// searched after everything else.
+
+private xsh_ran(files: []const (string, string)) -> string = xvr_ran(files)
+
+@test("a private extern named like a standard function answers a call in its own file")
+xsh_private_extern_beats_the_library()
+    if xvr_no_library() then return
+
+    val m = "module m\n\nprivate extern \"abs\" trap(a: int) -> int\n\na() -> int = trap(-5)\n"
+
+    assert_eq(xsh_ran([("main.sysl", "print(m.a())\n"), ("m/a.sysl", m)]), "5\n")
+
+@test("a public extern named like a standard function answers a call in its own file and by import")
+xsh_public_extern_beats_the_library()
+    if xvr_no_library() then return
+
+    val m = "module m\n\nextern \"abs\" trap(a: int) -> int\n\na() -> int = trap(-6)\n"
+    val main = "import m.trap\n\nprint(m.a(), trap(-7))\n"
+
+    assert_eq(xsh_ran([("main.sysl", main), ("m/a.sysl", m)]), "6 7\n")
+
+@test("an extern of one file answers a call in a sibling file of the module")
+xsh_sibling_extern_beats_the_library()
+    if xvr_no_library() then return
+
+    val a = "module m\n\nextern \"abs\" trap(a: int) -> int\n"
+    val b = "module m\n\nb() -> int = trap(-9)\n"
+
+    assert_eq(xsh_ran([("main.sysl", "print(m.b())\n"), ("m/a.sysl", a), ("m/b.sysl", b)]), "9\n")
+
+@test("an extern named like another standard function, panic, answers in its own module")
+xsh_extern_named_panic()
+    if xvr_no_library() then return
+
+    val m = "module m\n\nprivate extern \"abs\" panic(a: int) -> int\n\na() -> int = panic(-4)\n"
+
+    assert_eq(xsh_ran([("main.sysl", "print(m.a())\n"), ("m/a.sysl", m)]), "4\n")
+
+@test("the standard trap() still answers in a module with no trap of its own")
+xsh_library_trap_still_answers()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", "f() -> never = trap()\n\nf()\n")])
+
+    assert(ir.contains("call void @llvm.trap()"), ir)
+
+@test("the address of an extern named like a standard function is the extern's")
+xsh_extern_address_beats_the_library()
+    if xvr_no_library() then return
+
+    val m = "module m\n\nprivate extern \"abs\" panic(a: int) -> int\n\n" +
+            "a() -> int\n    val f = &panic\n    f(-3)\n"
+
+    assert_eq(xsh_ran([("main.sysl", "print(m.a())\n"), ("m/a.sysl", m)]), "3\n")

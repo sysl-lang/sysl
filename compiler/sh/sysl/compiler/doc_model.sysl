@@ -23,13 +23,15 @@ import sysl.unicode
 // module offers before the types those mention, and the trait implementations last, being facts
 // about the types above rather than things to call. Each kind the `sysl-doc` of 0.0.152 left off the
 // page follows the kind it is a variety of -- a module `val` after the constants, an `extern` after
-// the functions, a `type` alias after the types.
+// the functions, a `type` alias after the types. A module `var` follows the `val`s: storage a caller
+// may read and write is as much of the module's surface as storage it may only read.
 //
 // **Every variant carries a prefix** because a variant is resolved module-wide: a bare `Type`,
 // `Trait` or `Public` here would collide with the compiler's own `Type` and `Visibility`.
 enum DocKind
     DkConst
     DkValue
+    DkVariable
     DkFunction
     DkExtern
     DkType
@@ -262,6 +264,11 @@ private dm_carries_prose(s: Stmt) -> bool = *s.kind match
     ExternDecl(_) -> true
     ExternVarDecl(_, _, _, _, _) -> true
     ValDecl(_, _, _, _, _, _, _, _) -> true
+    VarDecl(_, _, _, _, _, _, _, _) -> true
+    MultiDecl(_, _, _, _) -> true
+    PatternDecl(_, _, _, _, _) -> true
+    StaticDecl(inner) -> dm_carries_prose(inner)
+    CopiedDecl(_, inner) -> dm_carries_prose(inner)
     _ -> false
 
 // `lib/sysl/path/glob.sysl` is `glob`: the directory and the one extension off.
@@ -347,7 +354,17 @@ private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSy
             Some(dm_symbol(name, DocKind.DkConst,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         // An `impl` is named for what it says -- this type has this trait -- which is also what a
         // reader searches for. It has no visibility of its own.
+        //
+        // A block naming no trait adds the type's own members, so those are what it lists.
         ImplDecl(d) ->
+            if d.trait_name == ""
+                var sym = dm_symbol(doc_type_text(d.for_type), DocKind.DkImplementation,
+                                    DocAccess.DaPublic, sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+
+                sym.members = dm_members(u, d.methods, include_private)
+                return Some(sym)
+            end if
+
             Some(dm_symbol(s"${d.trait_name} for ${doc_type_text(d.for_type)}", DocKind.DkImplementation, DocAccess.DaPublic,
                            sig, dm_doc_at(u, s.span, buf(), d.tparams), line))
         TypeDecl(d) ->
@@ -359,8 +376,33 @@ private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSy
             Some(dm_symbol(name, DocKind.DkExtern,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         ValDecl(name, _, _, vis, _, _, _, _) ->
             Some(dm_symbol(name, DocKind.DkValue,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        VarDecl(name, _, _, vis, _, _, _, _) ->
+            Some(dm_symbol(name, DocKind.DkVariable, dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        // A binding naming several things is listed once, under the names it gives.
+        MultiDecl(names, mutable, _, vis) ->
+            Some(dm_symbol(doc_names(names), dm_binding_kind(mutable), dm_access(vis), sig,
+                           dm_doc_at(u, s.span, buf(), buf()), line))
+        PatternDecl(pat, mutable, _, _, vis) ->
+            var names: Buf[string] = buf()
+
+            pattern_names(&names, pat)
+            Some(dm_symbol(doc_names(names), dm_binding_kind(mutable), dm_access(vis), sig,
+                           dm_doc_at(u, s.span, buf(), buf()), line))
+        // `static` is on the line the binding is, so the binding's own reading finds its prose; only
+        // the signature is the whole declaration's.
+        StaticDecl(inner) -> dm_symbol_of(u, inner, include_private) match
+            Some(sym) ->
+                var out = sym
+
+                out.signature = sig
+                Some(out)
+            None -> None
+        // `@thread_local` above a binding naming several is left off, as above a single one.
+        CopiedDecl(_, inner) -> dm_symbol_of(u, inner, include_private)
         _ -> None
 end dm_symbol_of
+
+private dm_binding_kind(mutable: bool) -> DocKind = if mutable then DocKind.DkVariable else DocKind.DkValue
 
 // A type's or trait's methods, in the order written; private ones only when asked for.
 private dm_members(u: Program, ms: Buf[MethodDecl], include_private: bool) -> Buf[DocSymbol]
@@ -452,12 +494,13 @@ private dm_is_space(b: u8) -> bool =
 private dm_rank(k: DocKind) -> int = k match
     DkConst -> 0
     DkValue -> 1
-    DkFunction -> 2
-    DkExtern -> 3
-    DkType -> 4
-    DkAlias -> 5
-    DkTrait -> 6
-    DkImplementation -> 7
+    DkVariable -> 2
+    DkFunction -> 3
+    DkExtern -> 4
+    DkType -> 5
+    DkAlias -> 6
+    DkTrait -> 7
+    DkImplementation -> 8
 
 private dm_lower(s: string) -> string
     var out = str_builder()

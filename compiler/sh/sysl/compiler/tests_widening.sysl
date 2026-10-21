@@ -1,0 +1,531 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// A value converts without being written exactly where every value of its type is exactly a value of
+// the type the position wants (`reference/expressions.md § Which conversions are implicit`). Each
+// row of the table is held at its boundary on both sides; each position that converts is shown
+// converting; and everything that can lose a value is still refused, with the message it always had.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private wid_ready() -> bool = std_root().is_ok() && clang_available()
+
+private wid_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-wid").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end wid_root
+
+// What a one-file program prints on this machine, or the report it was refused with.
+private wid_ran(text: string) -> string
+    val root = wid_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end wid_ran
+
+// The report a one-file program is refused with on a machine (this one where none is named), its
+// locations relative to the program's directory, or nothing where it is accepted.
+private wid_report(machine: Option[string], text: string) -> string
+    val root = wid_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end wid_report
+
+private wid_prints(text: string, want: string)
+    if !wid_ready() then return
+
+    assert_eq(wid_ran(text), want)
+end wid_prints
+
+// Refused on `machine` with exactly `message`, first, at `at` (`line:col`).
+private wid_refused_on(machine: Option[string], text: string, message: string, at: string)
+    if !wid_ready() then return
+
+    val said = wid_report(machine, text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end wid_refused_on
+
+private wid_refused(text: string, message: string, at: string) = wid_refused_on(None, text, message, at)
+
+private wid_accepted_on(machine: string, text: string)
+    if !wid_ready() then return
+
+    assert_eq(wid_report(Some(machine), text), "")
+end wid_accepted_on
+
+// -- the table, at each boundary ------------------------------------------------------------------
+
+@test("an integer widens to a wider integer of its sign, and an unsigned one to a strictly wider signed one")
+wid_integers()
+    wid_prints("var a: u8 = 200\nvar b: i8 = -100\nval c: u16 = a\nval d: i16 = a\nval e: long = b\n" +
+               "val f: u64 = a\nval g: i9 = a\nprint(c, d, e, f, g)\n",
+               "200 200 -100 200 200\n")
+
+@test("an unsigned integer does not reach a signed one of its own width")
+wid_unsigned_to_same_width_signed() =
+    wid_refused("var a: u8 = 1\nval b: i8 = a\n", "cannot initialize 'b': declared i8 but the value is byte",
+                "2:1")
+
+@test("a signed integer reaches no unsigned one, however wide")
+wid_signed_to_unsigned() =
+    wid_refused("var a: i8 = 1\nval b: u64 = a\n",
+                "cannot initialize 'b': declared ulong but the value is i8", "2:1")
+
+@test("a narrowing is still refused with the message it always had")
+wid_narrowing() =
+    wid_refused("var a: long = 5\nval b: int = a\n",
+                "cannot initialize 'b': declared int but the value is long", "2:1")
+
+@test("a widened signed value is sign-extended and an unsigned one zero-extended")
+wid_extension_at_run_time() =
+    wid_prints("var s: i8 = -1\nvar u: u8 = 255\nval l: long = s\nval n: int = u\nval w: u32 = u\n" +
+               "print(l, n, w)\n", "-1 255 255\n")
+
+@test("a char widens to an integer that holds 0x10FFFF: u21 and i22 upward")
+wid_char() =
+    wid_prints("var c = '\\u{10FFFF}'\nval a: u32 = c\nval b: int = c\nval d: u21 = c\nval e: i22 = c\n" +
+               "print(a, b, d, e)\n", "1114111 1114111 1114111 1114111\n")
+
+@test("a char does not widen to a u16 or an i21")
+wid_char_too_narrow()
+    wid_refused("var c = 'x'\nval b: u16 = c\n", "cannot initialize 'b': declared ushort but the value is char",
+                "2:1")
+    wid_refused("var c = 'x'\nval b: i21 = c\n", "cannot initialize 'b': declared i21 but the value is char",
+                "2:1")
+
+@test("an integer never becomes a char without being written")
+wid_integer_to_char() =
+    wid_refused("var a: u8 = 65\nval c: char = a\n",
+                "cannot initialize 'c': declared char but the value is byte", "2:1")
+
+@test("a float widens to a wider format, and a NaN, an infinity and a subnormal arrive as themselves")
+wid_floats() =
+    wid_prints("var z: f32 = 0.0\nvar h: f16 = 1.5\nvar g: bf16 = 2.5\nval n: f64 = z / z\n" +
+               "val i: real = 1.0f32 / z\nval s: real = 1.0e-45f32\nval a: f32 = h\nval b: f64 = g\n" +
+               "print(n, i, s == 1.401298464324817e-45, a, b)\n",
+               "NaN inf true 1.5 2.5\n")
+
+@test("f16 and bf16 never convert to each other, and a float never narrows")
+wid_float_refusals()
+    wid_refused("var a: f16 = 1.5\nval b: bf16 = a\n", "cannot initialize 'b': declared bf16 but the value is f16",
+                "2:1")
+    wid_refused("var a: bf16 = 1.5\nval b: f16 = a\n", "cannot initialize 'b': declared f16 but the value is bf16",
+                "2:1")
+    wid_refused("var a: real = 1.5\nval b: f32 = a\n", "cannot initialize 'b': declared f32 but the value is real",
+                "2:1")
+
+@test("an integer widens to a float whose significand holds it: i25 and u24 to f32, int to real")
+wid_integer_to_float() =
+    wid_prints("var a: i25 = -16777216\nvar b: u24 = 16777215\nvar n: int = -7\nval x: f32 = a\n" +
+               "val y: f32 = b\nval r: real = n\nprint(x, y, r)\n", "-16777216 16777215 -7\n")
+
+@test("an integer one bit past the significand is refused: i26 and u25 to f32, int to f32")
+wid_integer_to_float_refused()
+    wid_refused("var a: i26 = 1\nval b: f32 = a\n", "cannot initialize 'b': declared f32 but the value is i26",
+                "2:1")
+    wid_refused("var a: u25 = 1\nval b: f32 = a\n", "cannot initialize 'b': declared f32 but the value is u25",
+                "2:1")
+    wid_refused("var a: int = 1\nval b: f32 = a\n", "cannot initialize 'b': declared f32 but the value is int",
+                "2:1")
+
+@test("a fixed-point value widens where no fraction bit and no integer bit is lost, and is rescaled")
+wid_fixed() =
+    wid_prints("var q: q15 = -0.5\nvar u: u8q4 = 1.5\nvar n: i8 = -3\nval a: i32q16 = q\n" +
+               "var w: q31 = 0.25\nval b: i9q4 = u\nval c: i16q8 = n\nval d: f32 = q\nval e: real = w\n" +
+               "print(a, b, c, d, e, a.bits)\n",
+               "-0.5 1.5 -3 -0.5 0.25 -32768\n")
+
+@test("a fixed-point value is refused where a bit would be lost or the sign has nowhere to go")
+wid_fixed_refused()
+    wid_refused("var a: q31 = 0.5\nval b: f32 = a\n", "cannot initialize 'b': declared f32 but the value is q31",
+                "2:1")
+    wid_refused("var a: u8q4 = 1.5\nval b: i8q4 = a\n",
+                "cannot initialize 'b': declared i8q4 but the value is u8q4", "2:1")
+    wid_refused("var a: i16q8 = 1.5\nval b: u16q8 = a\n",
+                "cannot initialize 'b': declared u16q8 but the value is i16q8", "2:1")
+    wid_refused("var a: i16q8 = 1.5\nval b: i16q4 = a\n",
+                "cannot initialize 'b': declared i16q4 but the value is i16q8", "2:1")
+    wid_refused("var a: i16q8 = 1.5\nval b: int = a\n",
+                "cannot initialize 'b': declared int but the value is i16q8", "2:1")
+    wid_refused("var a: real = 1.5\nval b: q31 = a\n",
+                "cannot initialize 'b': declared q31 but the value is real", "2:1")
+
+@test("nothing converts through a bool, a pointer, a slice or an Option")
+wid_nothing_else_converts()
+    wid_refused("var b = true\nval n: int = b\n", "cannot initialize 'n': declared int but the value is bool",
+                "2:1")
+    wid_refused("var b: byte = 1\nvar p: *byte = &b\nval u: usize = p\n",
+                "cannot initialize 'u': declared usize but the value is *byte", "3:1")
+    wid_refused("val xs: []u8 = [1u8]\nval ys: []int = xs\n",
+                "cannot initialize 'ys': declared []int but the value is []byte", "2:1")
+    wid_refused("var b: byte = 1\nval o: Option[int] = b\n",
+                "cannot initialize 'o': declared sysl.Option[int] but the value is byte", "2:1")
+
+// -- an address-width integer is its target's width -----------------------------------------------
+
+@test("u32 reaches usize on this 64-bit machine and usize reaches u64, but never isize or u32")
+wid_usize_here()
+    wid_prints("var a: u32 = 7\nval b: usize = a\nval c: u64 = b\nprint(b, c)\n", "7 7\n")
+    wid_refused("var a: usize = 7\nval b: isize = a\n",
+                "cannot initialize 'b': declared isize but the value is usize", "2:1")
+    wid_refused("var a: usize = 7\nval b: u32 = a\n",
+                "cannot initialize 'b': declared uint but the value is usize", "2:1")
+
+@test("on a 32-bit target u32 and usize reach each other, and u64 no longer reaches usize")
+wid_usize_on_thumb()
+    wid_accepted_on("thumbv7em-freestanding",
+                    "@export(\"wid_probe\")\nprobe(a: u32) -> u32\n    val b: usize = a\n    b\nend probe\n")
+    wid_refused_on(Some("thumbv7em-freestanding"),
+                   "@export(\"wid_probe\")\nprobe(a: u64) -> usize = a\n",
+                   "function 'probe' should return usize, but its body yields ulong", "1:1")
+
+@test("on Craft's 16-bit target u32 does not reach usize")
+wid_usize_on_craft() =
+    wid_refused_on(Some("craft-freestanding"), "@export(\"wid_probe\")\nprobe(a: u32) -> usize = a\n",
+                   "function 'probe' should return usize, but its body yields uint", "1:1")
+
+// -- the positions that convert -------------------------------------------------------------------
+
+@test("a declared binding, an assignment and a compound assignment widen the value")
+wid_bindings_and_assignments() =
+    wid_prints("var b: byte = 4\nvar n: long = b\nvar r: real = 0.0\nn = b\nn += b\nn *= b\nr = b\n" +
+               "r += b\nprint(n, r)\n", "32 8\n")
+
+@test("a compound assignment converts its right side to the left's type, never the reverse")
+wid_compound_never_narrows() =
+    wid_refused("var b: byte = 1\nvar n: int = 5\nb += n\n", "'+' needs matching types, got byte and int",
+                "3:6")
+
+@test("an argument widens to its parameter, an extern's among them, and a result to the declared one")
+wid_arguments_and_results() =
+    wid_prints("extern abs(n: i32) -> i32\n\ntake(x: long) -> long = x\n\nwhole(b: byte) -> int = b\n\n" +
+               "early(b: byte) -> long\n    if b == 0 then return b\n    return b + b\nend early\n\n" +
+               "var b: i8 = -3\nvar u: byte = 9\nprint(abs(b), take(b), whole(u), early(u))\n",
+               "3 -3 9 18\n")
+
+@test("each element of a literal whose element type the context gives widens to it")
+wid_aggregate_elements() =
+    wid_prints("struct P\n    x: long\n    y: real\n\nvar n: int = 3\nvar b: byte = 4\n" +
+               "val xs: [3]long = [n, b, n]\nval ys: []real = [n, b]\nval t: (long, real) = (n, b)\n" +
+               "val p = P(n, b)\nprint(xs[1], ys[0], t.0, t.1, p.x, p.y)\n", "4 3 3 4 3 4\n")
+
+@test("the branches of an if or a match meet at the wider of their types, in either order")
+wid_branches() =
+    wid_prints("var b: byte = 200\nvar n: int = -1\nval x = if n < 0 then b else n\n" +
+               "val y = if n > 0 then n else b\nval z = b match\n    200 -> b\n    _ -> n\n" +
+               "val w: long = if n < 0 then n else b\nprint(x + n, y, z, w)\n", "199 200 200 -1\n")
+
+@test("branches neither of whose types holds the other still disagree")
+wid_branches_refused()
+    wid_refused("var b: byte = 1\nvar c: i8 = 2\nval x = if b > 0 then b else c\n",
+                "if branches have different types: byte and i8", "3:9")
+    wid_refused("var b: byte = 1\nvar c: i8 = 2\nval x = b match\n    1 -> c\n    _ -> b\n",
+                "match arms have different types: i8 and byte", "3:9")
+
+// -- operands --------------------------------------------------------------------------------------
+
+@test("an operand widens to the other operand's type, in either order, under arithmetic and comparison")
+wid_operands() =
+    wid_prints("var n: int = 1000\nvar b: byte = 200\nvar r: real = 0.5\n" +
+               "print(n + b, b + n, n * r, r + n, b < n, n == b, b < n < 2000)\n",
+               "1200 1200 500 1000.5 true false true\n")
+
+@test("operands sum at their own type, and only the sum widens to the position's")
+wid_no_third_type() =
+    wid_prints("var a: i8 = 100\nval wide: int = a + a\nprint(wide)\n", "-56\n")
+
+@test("an operand never converts to a third type: byte + i8, int + f32 and u32 < int are refused")
+wid_operands_refused()
+    wid_refused("var a: byte = 1\nvar b: i8 = 2\nprint(a + b)\n", "'+' needs matching types, got byte and i8",
+                "3:11")
+    wid_refused("var a: int = 1\nvar b: f32 = 2.0\nprint(a + b)\n",
+                "'+' needs matching types, got int and f32", "3:11")
+    wid_refused("var a: u32 = 1\nvar b: int = 2\nprint(a < b)\n", "cannot compare uint with int", "3:7")
+
+@test("a shift count is still any integer, and an integer still scales a fixed-point value")
+wid_shift_and_scale_unchanged() =
+    wid_prints("var n: int = 3\nvar q: q15 = 0.25\nvar k: int = 2\nvar b: u8 = 0x81\nvar wide: u64 = 1\n" +
+               "print(n << 2u8, q * k, b << wide)\n", "12 0.5 2\n")
+
+@test("a product of two fixed-point formats still takes the format of where it is written")
+wid_fixed_product_unchanged()
+    wid_prints("var a: u16q16 = 0.5\nvar x: u8q8 = 0.25\nval p: u24q24 = a * x\nprint(p)\n", "0.125\n")
+    wid_refused("f()\n    val a: u16q16 = 0.5\n    val x: u8q8 = 0.25\n    val y = a * x\n",
+                "the product of u16q16 and u8q8 has no format of its own — it is exactly a u24q24; " +
+                "give it a type", "4:13")
+
+@test("a char operand never widens: char + int and int + char are refused, in either order")
+wid_char_operand_refused()
+    wid_refused("var c = 'a'\nvar n: int = 1\nprint(c + n)\n", "'+' needs matching types, got char and int",
+                "3:11")
+    wid_refused("var c = 'a'\nvar n: int = 1\nprint(n + c)\n", "'+' needs matching types, got int and char",
+                "3:11")
+    wid_refused("var c = 'a'\nvar n: int = 97\nprint(n == c)\n", "cannot compare int with char", "3:7")
+
+@test("two chars still compare, and a char still widens where a position asks for an integer")
+wid_char_operands_of_one_type() =
+    wid_prints("var c = 'a'\nvar d = 'a'\nvar n: int = 1\nval k: int = c\nprint(c == d, c < 'b', k + n)\n",
+               "true true 98\n")
+
+// -- ranges and unannotated array literals ---------------------------------------------------------
+
+@test("the bounds of a range meet at the wider type, in either order, in a for and as a value")
+wid_range_bounds_meet() =
+    wid_prints("var i: int = 2147483646\nvar n: long = 2147483649\nfor k in i..<n\n    print(k)\n" +
+               "var j: long = 1\nvar m: int = 2\nfor k in j..m\n    print(k)\n" +
+               "val r = i..<n\nfor k in r\n    print(k)\n",
+               "2147483646\n2147483647\n2147483648\n1\n2\n2147483646\n2147483647\n2147483648\n")
+
+@test("range bounds with no common widening are refused: u32 and int, in a for and as a value")
+wid_range_bounds_refused()
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nfor i in a..<b\n    print(i)\n",
+                "a 'for' range needs matching bounds, got uint and int", "3:1")
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nval r = a..<b\n",
+                "a range needs matching bounds, got uint and int", "3:9")
+
+@test("an unannotated array literal's elements meet at the widest: [int, long], [byte, int, byte], [real, int], [long, 1]")
+wid_bare_array_meets() =
+    wid_prints("var a: int = 1\nvar b: long = 2\nvar p: byte = 3\nvar r: real = 0.5\n" +
+               "val xs = [a, b]\nval lx: [2]long = xs\n" +
+               "val ys = [p, a, p]\nval iy: [3]int = ys\n" +
+               "val zs = [r, a]\nval rz: [2]real = zs\n" +
+               "val ws = [b, 1]\nval lw: [2]long = ws\n" +
+               "print(lx[0] + lx[1], iy[0] + iy[1] + iy[2], rz[0] + rz[1], lw[1])\n",
+               "3 7 1.5 1\n")
+
+@test("array elements with no common widening are refused: u32 and int")
+wid_bare_array_refused()
+    wid_refused("var a: u32 = 1\nvar b: int = 5\nval xs = [a, b]\n",
+                "an array literal needs one element type, got uint and int", "3:10")
+
+@test("a char beside an int in a bare array literal is two types, and an annotated one widens each")
+wid_bare_array_char_refused()
+    wid_refused("var c = 'a'\nvar n: int = 5\nval xs = [c, n]\n",
+                "an array literal needs one element type, got char and int", "3:10")
+    wid_prints("var c = 'a'\nvar n: int = 5\nval xs: [2]int = [c, n]\nprint(xs[0], xs[1])\n", "97 5\n")
+
+@test("a branch read at its sibling's type is not widened to it, so tuple branches meet as before")
+wid_sibling_branches_exact() =
+    wid_prints("joined(n: u8, m: u16) -> u16\n    val t = if n < 3 then (n, 1) else (0, m)\n\n" +
+               "    u16(t.0) + t.1\n\nprint(joined(1, 5), joined(7, 5))\n", "2 5\n")
+
+@test("a new type's own From for a value's type still comes before the base's conversion")
+wid_from_before_widening() =
+    wid_prints("type Phase = new real\n\nimpl From[int] for Phase\n    from(n: int) -> Phase = Phase(n) * 2.0\n\n" +
+               "val i = 3\nprint(f64(Phase(i)))\n", "6\n")
+
+@test("a bitfield struct's Bits widens a narrower unsigned integer as any argument does")
+wid_bits_widens() =
+    wid_prints("@packed\nstruct Esr\n    iss: u25\n    il: u1\n    ec: u6\n    iss2: u5\n    res0: u27\n\n" +
+               "val low: u32 = 0xF2000000\nprint(Esr::Bits(low).ec)\n", "60\n")
+
+// -- generics and overloads ------------------------------------------------------------------------
+
+@test("a conversion never decides a type parameter: max of an int and a long is refused in either order")
+wid_generic_refused()
+    wid_refused("import sysl.math.max\n\nvar a: int = 1\nvar b: long = 2\nprint(max(a, b))\n",
+                "'b' of 'sysl.math.max' is int, but long was given", "5:14")
+    wid_refused("import sysl.math.max\n\nvar a: long = 1\nvar b: int = 2\nprint(max(a, b))\n",
+                "'b' of 'sysl.math.max' is long, but int was given", "5:14")
+
+@test("once a type parameter is fixed -- written, or by the receiver -- an argument widens to it")
+wid_generic_fixed() =
+    wid_prints("import sysl.buf.{Buf, buf}\nimport sysl.math.max\n\nvar a: int = 1\nvar b: long = 2\n" +
+               "var xs: Buf[long] = buf()\nvar s: byte = 7\nxs.push(s)\nval m: long = max(a, a)\n" +
+               "print(max[long](a, b), xs.at(0), m)\n", "2 7 1\n")
+
+@test("an exact overload beats a widening one, and among widenings the narrowest wins")
+wid_overloads() =
+    wid_prints("f(x: int) -> string = \"int\"\nf(x: long) -> string = \"long\"\n" +
+               "g(x: int) -> string = \"int\"\ng(x: real) -> string = \"real\"\n\n" +
+               "var b: byte = 1\nvar n: int = 1\nvar l: long = 1\nprint(f(b), f(n), f(l), g(b))\n",
+               "int int long int\n")
+
+@test("overloads neither of which is narrower at every position are ambiguous")
+wid_overloads_ambiguous() =
+    wid_refused("f(x: int, y: long) -> string = \"a\"\nf(x: long, y: int) -> string = \"b\"\n\n" +
+                "var b: byte = 1\nprint(f(b, b))\n",
+                "'f' is ambiguous here — 2 of its declarations take these arguments:", "5:7")
+
+// -- a literal that does not fit beside a typed operand -------------------------------------------
+
+@test("a float literal beside an int takes real, and the int widens to it, in either order")
+wid_float_literal_beside_int() =
+    wid_prints("var k = 4\nval a: real = 1.0 / k\nval b: real = k / 2.0\nprint(a, b, 2.0 * k, k * 2.5)\n",
+               "0.25 2 8 10\n")
+
+@test("an int compared with a float literal compares as real, in either order")
+wid_float_literal_compared() =
+    wid_prints("var k = 4\nprint(k < 1.5, 1.5 < k, k == 4.0, 4.5 > k, k >= 4.5)\n",
+               "false true true true false\n")
+
+@test("an integer literal a byte cannot hold makes the sum an int, in either order")
+wid_int_literal_beside_byte() =
+    wid_prints("var b: u8 = 2\nval s: int = b + 300\nval t: int = 300 + b\nprint(s, t, b * 1000, 1000 * b, b / 300, b < 256)\n",
+               "302 302 2000 2000 0 true\n")
+
+@test("a range over an int is unchanged, and a byte bound beside a literal past it widens to int")
+wid_literal_range_bounds() =
+    wid_prints("var k = 4\nvar i: u8 = 250\nvar s = 0\nfor j in 0..<k\n    s += j\n\nvar t = 0\n" +
+               "for j in i..<300\n    t += j\n\nprint(s, t)\n", "6 13725\n")
+
+@test("an unannotated array of a byte and a literal past it is an array of int")
+wid_literal_array() =
+    wid_prints("var b: u8 = 2\nval a = [b, 300]\nval c: [2]int = a\nprint(c[0], c[1])\n", "2 300\n")
+
+@test("if and match arms meet a float literal and an int at real")
+wid_literal_arms() =
+    wid_prints("var k = 4\nval a: real = if k > 1 then k else 0.5\nval b: real = k match\n" +
+               "    4 -> 1.5\n    _ -> k\n\nprint(a, b)\n", "4 1.5\n")
+
+@test("a literal that fits the typed operand is still read at its type: f32, long and byte stay")
+wid_literal_fits_stays() =
+    wid_prints("var h: f32 = 1.5\nval x: f32 = h * 0.5\nval y: f32 = 0.5 * h\nvar b: u8 = 2\n" +
+               "val z: u8 = b + 3\nval w: u8 = b * 3\nprint(x, y, z, w)\n", "0.75 0.75 5 6\n")
+    wid_refused("var q: long = 3\nval r: int = q + 1\n", "cannot initialize 'r': declared int but the value is long",
+                "2:1")
+
+@test("a typed operand that does not widen to the literal's default keeps today's refusal")
+wid_literal_no_widen_refused()
+    wid_refused("var q: long = 3\nprint(q / 2.0)\n", "'/' needs matching types, got long and real", "2:11")
+    wid_refused("var q: long = 3\nprint(2.0 / q)\n", "'/' needs matching types, got real and long", "2:13")
+    wid_refused("var b: u8 = 2\nprint(b + 1_000_000_000_000)\n",
+                "the literal 1000000000000 does not fit byte", "2:11")
+    wid_refused("var b: u8 = 2\nprint(1_000_000_000_000 + b)\n",
+                "the literal 1000000000000 does not fit byte", "2:7")
+    wid_refused("var c = 'a'\nprint(c + 1.5)\n", "'+' needs matching types, got char and real", "2:11")
+    wid_refused("var c = 'a'\nprint(c + 300)\n", "'+' needs matching types, got char and int", "2:11")
+end wid_literal_no_widen_refused
+
+@test("a position the literal's default does not reach keeps the literal's own refusal")
+wid_literal_position_refused()
+    wid_refused("var b: u8 = 2\nval z: u8 = b + 300\n", "the literal 300 does not fit byte", "2:17")
+    wid_refused("var b: u8 = 2\nval z: u8 = b * 300\n", "the literal 300 does not fit byte", "2:17")
+    wid_refused("var k = 4\nval z: int = k / 2.0\n", "'/' needs matching types, got int and real", "2:18")
+end wid_literal_position_refused
+
+// -- an integer literal where a float is wanted --------------------------------------------------
+
+@test("an integer literal is the float an initializer, an assignment, an argument and a return want")
+wid_int_literal_float_positions() =
+    wid_prints("half(x: real) -> real = x / 4\nthree() -> f32 = 3\n\nval r: real = 2\nvar s: f32 = 0\n" +
+               "s = 5\nval q: f128 = 7\nval g: f16 = 1\n\nprint(r, s, q, g, half(2), three())\n",
+               "2 5 7 1 0.5 3\n")
+
+@test("an integer literal is a float element of a struct, an array and a vector")
+wid_int_literal_float_elements() =
+    wid_prints("struct P\n    x: real\n    y: f32\n\nval p = P(1, 2)\nval xs: [3]real = [1, 2, 3]\n" +
+               "val v: <4>f32 = [1, 2, 3, 4]\n\nprint(p.x / 2, p.y / 4, xs[2] / 2, v[3] / 8)\n",
+               "0.5 0.5 1.5 0.5\n")
+
+@test("an integer literal beside a float operand is that float, in either order and in a comparison")
+wid_int_literal_beside_float() =
+    wid_prints("var r: real = 3\nvar h: f32 = 1.5\nvar g: f16 = 0.5\nvar b: bf16 = 0.5\n\n" +
+               "val a: f32 = h + 1\nval c: f32 = 2 * h\nval d: f16 = g * 2\nval e: bf16 = 1 + b\n\n" +
+               "print(r / 2, 2 * r, r < 1, 4 > r, a, c, d, e)\n",
+               "1.5 6 false true 2.5 3 1 1.5\n")
+
+@test("an integer literal a float holds only by rounding is refused, at the literal")
+wid_int_literal_not_exactly() =
+    wid_refused("val r: real = 9007199254740993\n", "the literal 9007199254740993 is not exactly a real", "1:15")
+    wid_refused("var h: f32 = 1.5\nprint(h + 16777217)\n", "the literal 16777217 is not exactly an f32", "2:11")
+    wid_refused("var h: f32 = 1.5\nprint(16777217 * h)\n", "the literal 16777217 is not exactly an f32", "2:7")
+    wid_refused("val x: f32 = -16777217\n", "the literal -16777217 is not exactly an f32", "1:14")
+    wid_refused("val g: f16 = 65520\n", "the literal 65520 is not exactly an f16", "1:14")
+    wid_refused("val g: f16 = 65536\n", "the literal 65536 is not exactly an f16", "1:14")
+    wid_refused("val b: bf16 = 257\n", "the literal 257 is not exactly a bf16", "1:15")
+    wid_prints("val r: real = 9007199254740992\nval x: f32 = -16777216\nval g: f16 = 65504\n" +
+               "val b: bf16 = 256\n\nprint(r, x, g, b)\n", "9007199254740992 -16777216 65500 256\n")
+end wid_int_literal_not_exactly
+
+@test("a suffixed integer literal is an integer value and converts only by the widening table")
+wid_int_literal_suffixed_unchanged()
+    wid_prints("val k: real = 2i32\nprint(k / 4)\n", "0.5\n")
+    wid_refused("val k: real = 2i64\n", "cannot initialize 'k': declared real but the value is long", "1:1")
+    wid_refused("var r: real = 1.5\nprint(r / 2i64)\n", "'/' needs matching types, got real and long", "2:11")
+end wid_int_literal_suffixed_unchanged
+
+@test("an integer beside a fixed-point value is still a scale under * and /, and the value elsewhere")
+wid_int_literal_fixed_unchanged() =
+    wid_prints("val fx: i32q16 = 1\nval half: i32q16 = 0.5\n\nprint(fx * 3, fx / 2, fx + 1, 3 * half, fx < 2)\n",
+               "3 0.5 2 1.5 true\n")
+
+@test("a float constant's integer value is that float, and one the float would round is refused")
+wid_int_literal_float_const()
+    wid_prints("const H: real = 1\nconst W: f32 = 16777216\n\nmain()\n    const L: f16 = 2\n" +
+               "    print(H / 4, W, L / 8)\n", "0.25 16777216 0.25\n")
+    wid_refused("const BAD: f32 = 16777217\n", "'BAD' is not exactly an f32: 16777217", "1:18")
+end wid_int_literal_float_const
+
+@test("an integer literal beside a float literal is that float, in arithmetic and a comparison, either order")
+wid_literal_pair_arithmetic() =
+    wid_prints("print(1 + 2.0, 2.0 + 1, 3 / 2.0, -1 + 0.5, 0.5 - -2)\nprint(1 < 2.5, 2.5 > 3, 2 == 2.0)\n",
+               "3 3 1.5 -0.5 2.5\ntrue false true\n")
+
+@test("an unannotated array literal of float and integer literals is an array of real, either order")
+wid_literal_pair_array() =
+    wid_prints("val rs = [1.5, 2]\nval qs = [2, 0.5, 3]\n\nprint(rs[1] / 4, qs[0] / 4, qs.len)\n", "0.5 0.5 3\n")
+
+@test("if and match arms of float and integer literals are real, either order and along an elif chain")
+wid_literal_pair_arms() =
+    wid_prints("val c = 3 > 4\nval a = if c then 1 else 2.5\nval b = if c then 2.5 else 1\n" +
+               "val d = if c then 1 elif !c then 3 else 2.5\nval m = 3 match\n    1 -> 2.5\n    _ -> 7\n\n" +
+               "print(a / 2, b / 2, d / 2, m / 2)\n", "1.25 0.5 1.5 3.5\n")
+
+@test("range bounds of a float and an integer literal meet at real, and a range refuses real bounds")
+wid_literal_pair_range()
+    wid_refused("val r = 1..2.5\n", "a range runs between integer bounds, not real", "1:9")
+    wid_refused("val r = 0.5..<2\n", "a range runs between integer bounds, not real", "1:9")
+end wid_literal_pair_range
+
+@test("a position's type governs a pair of literals before the float literal does")
+wid_literal_pair_position()
+    wid_prints("val h: f32 = 1 + 2.0\nval gs: [2]f16 = [0.5, 2]\n\nprint(h / 4, gs[1] / 4)\n", "0.75 0.5\n")
+    wid_refused("val n: int = 1 + 2.0\n", "'+' needs matching types, got int and real", "1:18")
+end wid_literal_pair_position
+
+@test("an integer literal a real holds only by rounding is refused beside a float literal, either order")
+wid_literal_pair_not_exactly()
+    wid_refused("print(9007199254740993 + 0.5)\n", "the literal 9007199254740993 is not exactly a real", "1:7")
+    wid_refused("print(0.5 * 9007199254740993)\n", "the literal 9007199254740993 is not exactly a real", "1:13")
+    wid_refused("val rs = [0.5, 9007199254740993]\n", "the literal 9007199254740993 is not exactly a real", "1:16")
+    wid_refused("val c = 3 > 4\nval x = if c then 9007199254740993 else 2.5\n",
+                "the literal 9007199254740993 is not exactly a real", "2:19")
+end wid_literal_pair_not_exactly
+
+@test("a suffixed integer literal beside a float literal is a typed operand and widens only by the table")
+wid_literal_pair_suffixed()
+    wid_prints("print(1i32 + 2.0, [2i32, 0.5][0] / 4)\n", "3 0.5\n")
+    wid_refused("print(1i64 + 2.0)\n", "'+' needs matching types, got long and real", "1:14")
+    wid_refused("print(2.0 < 1i64)\n", "cannot compare real with long", "1:7")
+end wid_literal_pair_suffixed

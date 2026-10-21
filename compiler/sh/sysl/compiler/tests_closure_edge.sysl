@@ -990,8 +990,8 @@ private ce_counter() -> string = raw"""
     """
 
 // **The storage that would have made the case above unsound cannot be written at all**, which is
-// what licenses admitting it rather than luck: a module-level `val` must state its type, and a bare
-// closure's type is a struct with no spellable name.
+// what licenses admitting it rather than luck: a module-level `val` with no written type takes its
+// value's, and one whose value is a bare closure -- a struct with no spellable name -- is refused.
 @test("and a module-level 'val' cannot hold one at all, which is why none of this reaches read-only storage")
 ce_a_module_level_val_cannot_hold_one()
     if !ce_ready() then return
@@ -999,7 +999,8 @@ ce_a_module_level_val_cannot_hold_one()
     val said = ce_err_of("module m\n\n" + ce_counter() + "val tick = () -> c.bump()\n",
         "print(m.tick())\n")
 
-    assert(ce_says(said, "a module-level 'val' states its type"), said)
+    assert(ce_says(said, "'m.tick' would hold a closure, whose type has no name for module storage to be " +
+                         "declared at — declare it as a function instead"), said)
 
 // One that names its type reaches module storage as any function does -- by name, not by capture,
 // since module storage is not a binding of any block. What it writes is the module's `var`, which is
@@ -1025,16 +1026,22 @@ ce_one_that_names_its_type_reaches_module_storage()
     assert_eq(ce_ran_of("module m\n\n" + counter + "val tick: &Fn() -> int = () -> c.bump()\n",
         "print(m.tick(), m.tick(), m.peek())\n"), "1 2 2\n")
 
-// Untyped, the module `var` is refused for the type it did not state, and for nothing after it.
-@test("while an untyped one is refused for its type alone")
+// Untyped, the module `var` takes its value's type; with no value either, it is refused for the type
+// it did not state, and for nothing after it.
+@test("while an untyped one takes its value's type, and one with no value is refused for its type alone")
 ce_an_untyped_one_is_refused_for_its_type_alone()
     if !ce_ready() then return
 
-    val said = ce_err_of("module m\n\n" + ce_counter() +
+    assert_eq(ce_ran_of("module m\n\n" + ce_counter() + "val tick: &Fn() -> int = () -> c.bump()\n",
+        "print(m.tick(), m.tick())\n"), "1 2\n")
+
+    val said = ce_err_of("module m\n\nstruct Counter\n    n: int\n\n    bump(*self) -> int\n" +
+        "        self.n += 1\n        self.n\n\nprivate var c\n\n" +
         "val tick: &Fn() -> int = () -> c.bump()\n", "print(m.tick())\n")
 
     assert(ce_says(said, "'c' is module storage, and module storage states its type"), said)
     assert(!ce_says(said, "undefined name"), said)
+end ce_an_untyped_one_is_refused_for_its_type_alone
 
 // -- how a call on one goes wrong -----------------------------------------------------------------
 
@@ -1769,26 +1776,27 @@ ce_a_reading_closure_on_a_val()
 
     assert_eq(ce_ran("var n = 0\nval peek = () -> n + 1\nprint(peek())\n"), "1\n")
 
-// -- a module-level binding states its type ---------------------------------------------------------
+// -- module storage takes its value's type, and states one only where it has no value -------------
 
-@test("a module 'var' with no type is refused for its type alone")
+@test("a module 'var' with no type takes its value's, and one with no value either is refused for its type alone")
 ce_a_module_var_states_its_type()
     if !ce_ready() then return
 
-    val said = ce_err_of("module m\n\nvar count = 0\n\nget() -> int = count\n", "print(m.get())\n")
+    assert_eq(ce_ran_of("module m\n\nvar count = 0\n\nget() -> int = count\nbump() = count += 1\n",
+                        "m.bump()\nprint(m.get())\n"), "1\n")
+
+    val said = ce_err_of("module m\n\nvar count\n\nget() -> int = count\n", "print(m.get())\n")
 
     assert(ce_says(said, "'count' is module storage, and module storage states its type — write " +
                          "'count: T'"), said)
     assert(!ce_says(said, "undefined name"), said)
+end ce_a_module_var_states_its_type
 
-@test("a module 'val' with no type is refused")
+@test("a module 'val' with no type takes its value's")
 ce_a_module_val_states_its_type()
     if !ce_ready() then return
 
-    val said = ce_err_of("module m\n\nval limit = 3\n", "print(m.limit)\n")
-
-    assert(ce_says(said, "a module-level 'val' states its type, so 'limit' needs one — " +
-                         "'val limit: T = …'"), said)
+    assert_eq(ce_ran_of("module m\n\nval limit = 3\n", "print(m.limit * 2)\n"), "6\n")
 
 // -- a written type-argument list on a method -------------------------------------------------------
 

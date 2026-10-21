@@ -1,0 +1,82 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{split, Search}
+
+// `SYSL_TIMINGS=1` as somebody sets it: a built compiler run with it says each phase of a build, in
+// order, on standard error -- and run without it says none. The compiler is the stage-2 binary the
+// gate names in `SYSL_STAGE2`, since the switch is read once per process and a test cannot set it
+// for its own.
+
+private tmg_compiler() -> Option[string] = get("SYSL_STAGE2")
+
+// The phases a `sysl build` of a program says, in the order it said them, with what else it printed.
+private tmg_phases(binary: string, timed: bool) -> (Buf[string], string)
+    val dir = make_temp_dir("sysl-tmg").unwrap()
+
+    write_text(s"$dir/main.sysl", "main()\n    print(\"hi\")\n").unwrap()
+
+    var env: Buf[Var] = buf()
+
+    // A replayed build compiles nothing, so it would have no phases to say.
+    env.push(Var("SYSL_NO_CACHE", "1"))
+
+    if timed then env.push(Var("SYSL_TIMINGS", "1"))
+
+    val said = capture(binary, ["build", s"$dir/main.sysl", "-o", s"$dir/main"], "", env.view(), true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    val out = said.unwrap()
+    val text = out.text + out.err.unwrap_or("")
+    var phases: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        // The name is everything between the prefix and the last word, the milliseconds: a name may
+        // be more than one word ("parse std").
+        if line.starts_with("sysl: phase ")
+            val words = split(line, " ")
+            var name = ""
+
+            for i in 2..<words.len - 1
+                name = if name == "" then words[i] else name + " " + words[i]
+
+            phases.push(name)
+
+    (phases, text)
+end tmg_phases
+
+@test("SYSL_TIMINGS=1 says every phase of a build, in order, each with its milliseconds")
+tmg_a_build_says_its_phases()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (phases, text) = tmg_phases(binary, true)
+    var named = ""
+
+    for p in phases
+        named = named + p + ","
+
+    assert_eq(named, "parse std,parse program,declarations,bodies,checks,prune,std,codegen,link,", text)
+
+    for line in split(text, "\n")
+        if line.starts_with("sysl: phase ") then assert(line.ends_with("ms"), line)
+
+@test("without SYSL_TIMINGS a build says no phase")
+tmg_unasked_says_nothing()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (phases, text) = tmg_phases(binary, false)
+
+    assert(phases.is_empty(), text)

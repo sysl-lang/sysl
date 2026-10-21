@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The expected type reaches across modules** (`reference/types.md § A variant belongs to its
+// enum`): an enum imported by name lends its bare variants to every position that expects it -- an
+// annotated binding, a result, a `return`, and a payload nested in `Err` or `Some` -- exactly as
+// they are lent in the enum's own module. A name the file already has for something else keeps its
+// meaning, and an enum the file never imported lends nothing.
+
+private vxm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vxm_ready
+
+private vxm_tree(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-vxm").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    root
+end vxm_tree
+
+// What a program of several files prints, or why it was not built.
+private vxm_ran(main: string) -> string
+    val root = vxm_tree([("lib/m/m.sysl", vxm_lib()), ("main.sysl", main)])
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vxm_ran
+
+// Everything the analysis refuses, as its report.
+private vxm_err(main: string) -> string
+    val root = vxm_tree([("lib/m/m.sysl", vxm_lib()), ("main.sysl", main)])
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vxm_err
+
+private vxm_lib() -> string = raw"""
+    module lib.m
+
+    enum Why
+        Empty
+        Full
+
+    pick(w: Why) -> int = w match
+        Empty -> 0
+        Full -> 1
+    """
+
+@test("an enum imported by name lends its bare variants to a binding and a result")
+vxm_a_named_import_lends_its_variants()
+    if !vxm_ready() then return
+
+    assert_eq(vxm_ran(raw"""
+        import lib.m.Why
+
+        annotated() -> Why
+            val w: Why = Empty
+            w
+
+        returned() -> Why = Full
+
+        main()
+            print(annotated() == Why.Empty, returned() == Why.Full)
+        """), "true true\n")
+
+@test("and to a payload nested in Err and Some, and to a return")
+vxm_a_nested_position_is_reached_too()
+    if !vxm_ready() then return
+
+    assert_eq(vxm_ran(raw"""
+        import lib.m.{Why, pick}
+
+        check(n: int) -> Result[int, Why]
+            if n == 0 then return Err(Empty)
+            if n > 9 then return Err(Full)
+            Ok(n)
+
+        first(n: int) -> Option[Why] = if n == 0 then None else Some(Full)
+
+        main()
+            print(check(0).is_err(), pick(check(10).unwrap_err()), check(3).unwrap())
+            print(pick(first(1).unwrap()), pick(Empty))
+        """), "true 1 3\n1 0\n")
+
+@test("the qualified spelling needs no import at all")
+vxm_the_qualified_spelling_needs_no_import()
+    if !vxm_ready() then return
+
+    assert_eq(vxm_ran(raw"""
+        main()
+            val w: lib.m.Why = lib.m.Why.Full
+            print(lib.m.pick(w), lib.m.pick(lib.m.Why.Empty))
+        """), "1 0\n")
+
+@test("a function of the variant's spelling is still the function")
+vxm_a_function_is_not_repointed()
+    if !vxm_ready() then return
+
+    assert_eq(vxm_ran(raw"""
+        import lib.m.{Why, pick}
+
+        Full() -> Why = Why.Empty
+
+        main()
+            print(pick(Full()))
+        """), "0\n")
+
+@test("a name the imported enum does not declare is still undefined")
+vxm_an_undeclared_variant_is_refused()
+    if !vxm_ready() then return
+
+    val said = vxm_err(raw"""
+        import lib.m.Why
+
+        main()
+            val w: Why = Gone
+            print(w == Why.Full)
+        """)
+
+    assert(said.index_of("error: undefined name 'Gone'").is_some(), said)
+    assert(said.index_of("main.sysl:4:18").is_some(), said)

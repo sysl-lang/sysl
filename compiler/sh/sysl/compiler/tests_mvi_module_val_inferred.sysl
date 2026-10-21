@@ -1,0 +1,389 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A module-level `val` takes its type as a local one does (`reference/declarations.md § A module
+// member takes its type as a local does`): left off, it is the initializer's; written, it governs.
+// The type is known wherever a written one was -- in a body analyzed before the storage, in another
+// `val`'s initializer above or below, in another file of the module, through a library -- and the
+// storage is laid down as data or computed exactly as a written one's would be.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mvi_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of a `main.sysl` beginning and the files of one module beside it.
+private mvi_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-mvi").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end mvi_root
+
+// What the program prints, or the report it was refused with.
+private mvi_ran(files: []const (string, string)) -> string
+    val root = mvi_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mvi_ran
+
+// The emitted module, or the report the program was refused with.
+private mvi_ir(files: []const (string, string)) -> string
+    val root = mvi_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mvi_ir
+
+private mvi_prints(module_text: string, main_text: string, want: string)
+    if !mvi_ready() then return
+
+    assert_eq(mvi_ran([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)]), want)
+
+// Refused with `message`, at `at` (`line:col` of the module's file).
+private mvi_refused(module_text: string, main_text: string, message: string, at: string)
+    if !mvi_ready() then return
+
+    val said = mvi_ir([("cfg/cfg.sysl", module_text), ("main.sysl", main_text)])
+    val place = s"error: $message\n --> cfg/cfg.sysl:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+end mvi_refused
+
+// -- the type the value gives ---------------------------------------------------------------------
+
+@test("a module val with no type is an int, a string, a call's result, an array and a real sum")
+mvi_inferred_types() =
+    mvi_prints("module cfg\n\nval limit = 10\nval name = \"cfg\"\nval area = sq(6)\nval table = [1, 2, 3]\n" +
+               "val half = 1 + 0.5\n\nsq(n: int) -> int = n * n\n",
+               "import cfg\n\nprint(cfg.limit / 3, cfg.name, cfg.area, cfg.table[2], cfg.half * 2)\n",
+               "3 cfg 36 3 3\n")
+
+@test("an inferred module val is read before its declaration, by a generic body and from another file")
+mvi_read_anywhere()
+    if !mvi_ready() then return
+
+    val a = "module cfg\n\nval doubled = limit * 2\n\npick[T](x: T) -> int = limit + 1\n\nuses() -> int = limit + area\n"
+    val b = "module cfg\n\nval limit = 10\nval area = sq(6)\n\nsq(n: int) -> int = n * n\n"
+    val main = "import cfg\n\nprint(cfg.doubled, cfg.pick(\"x\"), cfg.uses(), cfg.limit)\n"
+
+    assert_eq(mvi_ran([("cfg/a.sysl", a), ("cfg/b.sysl", b), ("main.sysl", main)]), "20 11 46 10\n")
+end mvi_read_anywhere
+
+@test("a written type still governs a module val, and the value is held to it")
+mvi_written_type_governs()
+    mvi_prints("module cfg\n\nval ratio: real = 3\nval small: u8 = 200\nval wide: long = 1 << 40\n",
+               "import cfg\n\nprint(cfg.ratio / 2, cfg.small + 55, cfg.wide)\n", "1.5 255 1099511627776\n")
+    mvi_refused("module cfg\n\nval bad: int = \"no\"\n", "import cfg\n\nprint(cfg.bad)\n",
+                "cannot initialize 'bad': declared int but the value is string", "3:1")
+end mvi_written_type_governs
+
+// -- where the storage is -------------------------------------------------------------------------
+
+@test("an inferred module val over a constant is data in the object file, and one over a call that builds is filled")
+mvi_static_data()
+    if !mvi_ready() then return
+
+    val ir = mvi_ir([("cfg/cfg.sysl",
+                      "module cfg\n\nimport sysl.buf.{Buf, buf}\n\nval limit = 10\nval table = [1, 2, 3]\n" +
+                      "val half = 1 + 0.5\nval area = sq(6)\nval held = holder()\n\nsq(n: int) -> int = n * n\n\n" +
+                      "holder() -> Buf[int]\n    var b: Buf[int] = buf()\n\n    b.push(limit)\n    b\n"),
+                     ("main.sysl", "import cfg\n\nprint(cfg.limit, cfg.table[0], cfg.half, cfg.area, cfg.held.len())\n")])
+
+    assert(ir.contains("@cfg$limit = private constant i32 10\n"), ir)
+    assert(ir.contains("@cfg$table = private constant [3 x i32] [i32 1, i32 2, i32 3]\n"), ir)
+    assert(ir.contains("@cfg$half = private constant double 0x3FF8000000000000\n"), ir)
+    assert(ir.contains("@cfg$area = private constant i32 36\n"), ir)
+    assert(ir.contains("@cfg$held = private global %struct.sysl.buf$Buf.int zeroinitializer\n"), ir)
+end mvi_static_data
+
+// -- what has no type to take ---------------------------------------------------------------------
+
+@test("a module val whose value reaches itself, or is a bare closure, or is wrong, is refused at the declaration")
+mvi_refusals()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvi_refused("module cfg\n\nval a = b + 1\nval b = a + 1\n\nuses() -> int = a\n", main,
+                "'cfg.a' takes its type from its value, and the value reaches 'cfg.a' again — write its type, " +
+                "'val a: T = …'", "3:1")
+    mvi_refused("module cfg\n\nval f = (x: int) -> x * 2\n\nuses() -> int = f(2)\n", main,
+                "'cfg.f' would hold a closure, whose type has no name for module storage to be declared at — " +
+                "declare it as a function instead", "3:1")
+    mvi_refused("module cfg\n\nval bad = missing + 1\n\nuses() -> int = bad\n", main,
+                "undefined name 'cfg.missing'", "3:11")
+end mvi_refusals
+
+// -- a library's export ---------------------------------------------------------------------------
+
+@test("sysl doc shows an inferred module val as it was written, and a written type with it")
+mvi_doc_signature()
+    val r = parse(source_of("t.sysl", "module m\n\nval Limit = 3\nval Scale: real = 2\n"))
+
+    assert(r.ok(), "the module did not parse")
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+    assert_eq(out, "val Limit = 3\nval Scale: real = 2\n")
+end mvi_doc_signature
+
+@test("a library exports an inferred module val, which build-lib checks and a program reads at its type")
+mvi_library_export()
+    if !mvi_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-mvi-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-mvi-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nval Limit = 3\nval Label = \"demo\"\nval Area = square(4)\nval Scale: real = 2\n\n" +
+               "square(n: int) -> int = n * n\n\ntwice() -> int = Limit * 2\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\nprint(demo.Limit * 2, demo.Label, demo.Area, demo.Scale / 4, demo.twice())\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "6 demo 16 0.5 6\n")
+end mvi_library_export
+
+// -- a module binding naming several things -------------------------------------------------------
+
+// The forms a body takes, at module level: a list shared out, one value taken apart (computed once),
+// a tuple pattern, one with the whole value's type written, and a struct's positional form -- each
+// name read from another file of the module and from the program.
+private mvi_several_module() -> string =
+    "module cfg\n\nval q, r = divmod(17, 5)\nval a, b = 1, 2.5\nval (x, y) = (3, \"s\")\n" +
+    "val (m, n): (u8, long) = (7, 1 << 40)\nval Pt(px, py) = Pt(4, 5)\n\nstruct Pt\n    x: int\n    y: int\n\n" +
+    "divmod(p: int, d: int) -> (int, int)\n    print(\"once\")\n    (p / d, p % d)\n"
+
+@test("a module val naming several things gives each its part's type, read from another file and the program")
+mvi_several_names()
+    if !mvi_ready() then return
+
+    val other = "module cfg\n\nsum() -> int = q + r + a + x + px + py\n\nlabel() -> string = s\"$y$b\"\n"
+    val main = "import cfg\n\nprint(cfg.q, cfg.r, cfg.a, cfg.b, cfg.x, cfg.y, cfg.m + 250, cfg.n, cfg.sum(), " +
+               "cfg.label())\n"
+
+    assert_eq(mvi_ran([("cfg/a.sysl", mvi_several_module()), ("cfg/b.sysl", other), ("main.sysl", main)]),
+              "once\n3 2 1 2.5 3 s 1 1099511627776 18 s2.5\n")
+end mvi_several_names
+
+@test("a part over a constant is data in the object file, and parts of a call are filled from one call")
+mvi_several_static_data()
+    if !mvi_ready() then return
+
+    val ir = mvi_ir([("cfg/cfg.sysl", mvi_several_module()),
+                     ("main.sysl", "import cfg\n\nprint(cfg.q, cfg.a, cfg.b, cfg.x, cfg.m, cfg.n, cfg.px)\n")])
+
+    assert(ir.contains("@cfg$a = private constant i32 1\n"), ir)
+    assert(ir.contains("@cfg$b = private constant double 0x4004000000000000\n"), ir)
+    assert(ir.contains("@cfg$x = private constant i32 3\n"), ir)
+    assert(ir.contains("@cfg$m = private constant i8 7\n"), ir)
+    assert(ir.contains("@cfg$n = private constant i64 1099511627776\n"), ir)
+    assert(ir.contains("@cfg$px = private constant i32 4\n"), ir)
+    assert(ir.contains("@cfg$q = private global i32 zeroinitializer\n"), ir)
+    assert(ir.contains("@cfg$r = private global i32 zeroinitializer\n"), ir)
+end mvi_several_static_data
+
+@test("a module binding is refused as the body's is, once, at the binding")
+mvi_several_refusals()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvi_refused("module cfg\n\nval a, b, c = 1, 2\n\nuses() -> int = a\n", main,
+                "this binding names 3 things and has 2 values to give them", "3:1")
+    mvi_refused("module cfg\n\nval d, d = 1, 2\n\nuses() -> int = d\n", main,
+                "'d' is named twice in one binding", "3:1")
+    mvi_refused("module cfg\n\nval q, r = 5\n\nuses() -> int = q\n", main,
+                "this binding names 2 things, and one int is not something to take apart — only a tuple is",
+                "3:12")
+    mvi_refused("module cfg\n\nval (x, 1) = (3, 1)\n\nuses() -> int = x\n", main,
+                "a binding cannot test a value — this pattern matches only some values, and a binding has no " +
+                "other arm to take when it does not match", "3:1")
+    mvi_refused("module cfg\n\nval (e, f, g) = (1, 2)\n\nuses() -> int = e + f\n", main,
+                "this pattern takes 3 parts, and a (int, int) has 2 parts to give it", "3:1")
+    mvi_refused("module cfg\n\nval Pt(h, i) = (1, 2)\n\nstruct Pt\n    x: int\n    y: int\n\nuses() -> int = h + i\n",
+                main, "'Pt(…)' does not match a (int, int) value", "3:1")
+    mvi_refused("module cfg\n\nval q, r = two(q)\n\ntwo(n: int) -> (int, int) = (n, n)\n\nuses() -> int = q\n", main,
+                "this binding takes its parts' types from its value, and the value reaches what it binds again — " +
+                "write the type of the whole value, 'val (…): T = …'", "3:1")
+
+    if !mvi_ready() then return
+
+    // Each refusal is said once, though every name of the binding reads it.
+    val said = mvi_ir([("cfg/cfg.sysl", "module cfg\n\nval (e, f, g) = (1, 2)\n\nuses() -> int = e + f + g\n"),
+                       ("main.sysl", main)])
+
+    assert(said.contains("error: this pattern takes 3 parts"), said)
+    assert_eq(said.index_of("error: "), said.last_index_of("error: "))
+    assert(!said.contains("reaches"), said)
+end mvi_several_refusals
+
+@test("a private module binding is its file's, and read from another file is refused as a private val is")
+mvi_several_private()
+    if !mvi_ready() then return
+
+    val a = "module cfg\n\nprivate val hid, den = 8, 9\n\nuses() -> int = hid + den\n"
+
+    assert_eq(mvi_ran([("cfg/a.sysl", a), ("main.sysl", "import cfg\n\nprint(cfg.uses())\n")]), "17\n")
+
+    val said = mvi_ir([("cfg/a.sysl", a), ("cfg/b.sysl", "module cfg\n\nother() -> int = hid\n"),
+                       ("main.sysl", "import cfg\n\nprint(cfg.uses(), cfg.other())\n")])
+
+    assert(said.contains("error: 'cfg.hid' is private to 'cfg/a.sysl', the file that declares it\n --> cfg/b.sysl:3:18\n"),
+           said)
+end mvi_several_private
+
+@test("a library exports a module binding's names, which build-lib checks and a program reads at their types")
+mvi_several_library_export()
+    if !mvi_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-mvi-lib").unwrap())
+    val prog = absolute_path(make_temp_dir("sysl-mvi-prog").unwrap())
+
+    make_dir_all(s"$lib/demo").unwrap()
+    write_text(s"$lib/demo/demo.sysl",
+               "module demo\n\nval Q, R = split(17)\nval (Lo, Name) = (2, \"demo\")\nval W, H = 4, 2.5\n\n" +
+               "split(n: int) -> (int, int) = (n / 3, n % 3)\n").unwrap()
+    write_text(s"$prog/main.sysl",
+               "import demo\n\nprint(demo.Q * 2, demo.R, demo.Lo + 1, demo.Name, demo.W, demo.H / 2)\n").unwrap()
+
+    val checked = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(checked.0, 0, checked.1)
+
+    val built = lbr_cli(["sysl", "build", "-o", s"$prog/program", prog, "--lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$prog/program", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "10 2 3 demo 4 1.25\n")
+end mvi_several_library_export
+
+@test("sysl doc shows a module binding naming several things as it was written")
+mvi_several_doc_signature()
+    val r = parse(source_of("t.sysl", "module m\n\nval Q, R = divmod(17, 5)\nprivate val (A, B): (u8, u16) = (1, 2)\n" +
+                            "val Pt(X, Y) = Pt(1, 2)\nval P { x, y: b } = p\nval whole @ (_, c) = pair\n"))
+
+    assert(r.ok(), "the module did not parse")
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+    assert_eq(out, "val Q, R = divmod(17, 5)\nprivate val (A, B): (u8, u16) = (1, 2)\nval Pt(X, Y) = Pt(1, 2)\n" +
+              "val P { x, y: b } = p\nval whole @ (_, c) = pair\n")
+end mvi_several_doc_signature
+
+// -- an inferred type is held to the exposure rule ------------------------------------------------
+
+private mvi_exposure_module(decls: string) -> string =
+    s"module cfg\n\nprivate struct P\n    x: int\n\nprivate type H = new u16\n\n$decls\n\n" +
+    "private mk() -> P = P(1)\n\nuses() -> int = 1\n"
+
+private mvi_exposed(what: string, type_name: string) -> string =
+    s"'$what' is public, but its type names 'cfg.$type_name', which is private to 'cfg/cfg.sysl', the file " +
+    "that declares it — a declaration may not be more visible than the types it names"
+
+@test("a public val or const whose inferred type is private is refused as one written is, at the declaration")
+mvi_exposure_inferred()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvi_refused(mvi_exposure_module("val p = mk()"), main, mvi_exposed("p", "P"), "8:1")
+    mvi_refused(mvi_exposure_module("const h = H(3)"), main, mvi_exposed("h", "H"), "8:1")
+    mvi_refused(mvi_exposure_module("val q, r = (mk(), 2)"), main, mvi_exposed("q", "P"), "8:1")
+    mvi_refused(mvi_exposure_module("val held = [mk()]"), main, mvi_exposed("held", "P"), "8:1")
+end mvi_exposure_inferred
+
+@test("the same type written is refused with the same words, at the type")
+mvi_exposure_written()
+    val main = "import cfg\n\nprint(cfg.uses())\n"
+
+    mvi_refused(mvi_exposure_module("val p: P = mk()"), main, mvi_exposed("p", "P"), "8:8")
+    mvi_refused(mvi_exposure_module("const h: H = H(3)"), main, mvi_exposed("h", "H"), "8:10")
+end mvi_exposure_written
+
+@test("a private val of a private type, and a public val of a public type, are fine")
+mvi_exposure_fine()
+    mvi_prints(mvi_exposure_module("private val p = mk()\nprivate const h = H(3)\nprivate val q, r = (mk(), 2)\n" +
+                                   "val fine = 3\nval s, t = (fine, \"t\")\n\nread() -> int = p.x + r + int(u16(h))"),
+               "import cfg\n\nprint(cfg.uses(), cfg.fine, cfg.s, cfg.t, cfg.read())\n", "1 3 3 t 6\n")
+end mvi_exposure_fine
+
+@test("an editor's hover shows an inferred module val at its type")
+mvi_hover_inferred_type()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-mvi-hover").unwrap()
+
+    write_text(s"$root/t.sysl", "static val limit = 10\nstatic val q, r = (1, \"s\")\n\nf() -> int = limit + q\n\n" +
+               "print(f(), r)\n").unwrap()
+
+    val ix = indexed_file(s"$root/t.sysl").unwrap()
+    var out = ""
+
+    for item in ix.references
+        if item.at_file.ends_with("/t.sysl") && item.detail != "" && !holds_string_in(out, item.detail) then
+            out = s"$out${item.detail};"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains("limit: int;"), out)
+    assert(out.contains("q: int;"), out)
+    assert(out.contains("r: string;"), out)
+end mvi_hover_inferred_type
+
+private holds_string_in(text: string, part: string) -> bool = text.contains(s"$part;")

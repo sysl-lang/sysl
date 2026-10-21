@@ -120,7 +120,7 @@ akr_a_wanted_reference_goes_on_the_heap()
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
 
     akr_has(out, "  %t5 = call ptr @malloc(i64 %t4)\n  %t6 = icmp ne ptr %t5, null\n")
-    akr_has(out, "alloc.bad2:\n  call void @llvm.trap()\n  unreachable\nalloc.ok1:\n  store i64 1, ptr %t5\n")
+    akr_has(out, "alloc.bad2:\n  call void @sysl.trap()\n  unreachable\nalloc.ok1:\n  store i64 1, ptr %t5\n")
     akr_has(out, "  store ptr @arc.drop.plain, ptr %t7\n")
 
 // The strong references hold one share of the weak count between them, so the storage lives exactly
@@ -142,25 +142,29 @@ akr_no_expectation_stays_a_value()
     akr_lacks(out, "@malloc")
     akr_has(out, "%p.addr = alloca %struct.Point")
 
-@test("a local takes a count of its own and gives it back when its scope ends")
+// The local's share and the temporary's would be a retain and a release of one fresh object with
+// nothing between them, so the local takes over the count the object was made with
+// (`arc_elide.sysl`).
+@test("a local takes over a fresh object's count and gives it back when its scope ends")
 akr_a_local_holds_a_count_for_its_scope()
     if akr_no_library() then return
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\nprint(p.x)")
 
-    akr_has(out, "  call void @arc.retain(ptr %t5)\n  store ptr %t5, ptr %p.addr\n")
+    akr_has(out, "  store %struct.Point %t2, ptr %t9\n  store ptr %t5, ptr %p.addr\n")
+    akr_lacks(out, "@arc.retain(ptr %t5)")
     akr_has(out, "  %t15 = load ptr, ptr %p.addr\n  call void @arc.release(ptr %t15)\n  ret i32 0\n")
 
-@test("assignment retains the new reference before releasing the old one")
+@test("assignment stores the new reference before releasing the old one")
 akr_assignment_retains_before_it_releases()
     if akr_no_library() then return
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np = Point(3, 4)")
 
     akr_has(out, "  %t19 = load ptr, ptr %p.addr\n" +
-                 "  call void @arc.retain(ptr %t14)\n" +
                  "  store ptr %t14, ptr %p.addr\n" +
                  "  call void @arc.release(ptr %t19)\n")
+    akr_lacks(out, "@arc.retain(ptr %t14)")
 
 // A by-value parameter is read through the count its caller holds for the length of the call, so
 // nothing is taken at entry; what comes back is the caller's to hold, so it arrives with a count.

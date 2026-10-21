@@ -194,6 +194,29 @@ in `n` is what `LIMIT` means in that file, beside a sibling's `private const LIM
 Where nothing else answers at all, the restriction is then reported, because at that point it is the
 whole story and a better one than an undefined name.
 
+**A bare name in a pattern binds unless it means something the file can see**, so a sibling file's
+private `val`, `var` or `const` leaves the name free to bind:
+
+```sysl
+// m/one.sysl
+module m
+pick(o: Option[u32]) -> u32 = o match
+    Some(a) -> a
+    None -> 0
+```
+
+```sysl
+// m/two.sysl
+module m
+private val a: u32 = 3
+```
+
+`m.pick(Some(7u32))` is `7`: the `a` in `one.sysl` is a new binding, and `two.sysl`'s `a` plays no
+part. Make the `val` public, `private[m]`, or declare it in `one.sysl` itself, and the file can see
+it — the pattern is then [refused](/reference/patterns/#a-backticked-name-references-rather-than-binds)
+as a bare name that would bind rather than match. A qualified `m.a` cannot bind, so there the reader
+is told the `val` is private.
+
 **A wildcard offers only what is visible; a selector is refused where it is not.** A wildcard has
 claimed nothing, so a name it cannot see is simply not among what it brings in, and cannot make
 another module's name ambiguous either. Naming something deliberately is the opposite case, and being
@@ -251,21 +274,16 @@ something a reader can rely on, and it is additive in the safe direction: forbid
 nothing a later rule would have had to keep allowing, while allowing it and tightening later would
 break programs.
 
-### Anything visible outside its file states its types
+### What a declaration visible outside its file writes
 
-**A declaration visible beyond the file that declares it carries explicit types.** Inference is
-available only at the bare-`private` level — the one level that provably never crosses a file boundary
-— which is why the two rules are really one.
-
-Most of it the syntax already enforces: parameter and field types are mandatory, and a return type is
-written or its absence *means* `unit`. What the rule genuinely binds is the two declarations that are
-a name and a type — a `const` and a module-level `val`, both below.
-
-**Why: it makes interface extraction parse-only.** A file's exported surface can be read off its
-syntax tree without resolving a name, checking a body, or having compiled anything the file imports.
-That is what a fast, parallel, and eventually incremental build rests on. Scala infers types for
-public members and pays for it with a far heavier extraction step; this is a deliberate divergence,
-and it is cheap here precisely because sysl's signatures were already explicit for other reasons.
+**A signature is written in full**: parameter and field types are mandatory, and a return type is
+written or its absence *means* `unit`. The declarations that are a name and a value — a `const`, a
+module-level `val` and module storage written with `var`, all below — may leave the type to the
+value, exactly as a local may
+([Bindings](/reference/declarations/#a-module-member-takes-its-type-as-a-local-does)): the type is
+then the initializer's, and another file or a program built against the library reads it as it would
+a written one. A `var` written with no initializer states its type, since there is no value to read
+one off.
 
 ## Imports
 
@@ -381,6 +399,7 @@ the library's
 | a wildcard offers a name that is also defined locally or imported selectively | the more specific one wins |
 | two wildcards both offer one name | an *unqualified* use is a compile error naming both — unless it is a variant and the expected type says whose |
 | two selectors bind one name, or two statements do | reported at the second import |
+| a selector binds a name the importing file's own module declares | a compile error at the import, naming both |
 
 **A wildcard offers a name; a selector binds one.** That is the whole of the difference: a wildcard
 neither collides with a selective import of a name it also offers, nor with a second wildcard over the
@@ -411,6 +430,50 @@ print(max(1, 2))
 ```error
 'max' is already imported
 ```
+
+**An import by name may not bind a spelling its own module declares.** The module's declaration
+answers first, so the import would be written, read, and then mean nothing — and the first sign of it
+would be a type error somewhere else naming two types of one spelling. The import is refused instead,
+naming both declarations. The spelling counted is the one the file could write bare: its own
+file-private declarations and the module's public ones, but not a sibling file's file-private one,
+which this file cannot see. An enum variant is not counted, since the type expected of a bare variant
+already says whose it is. A wildcard claims nothing, so it still yields to the module, as above.
+
+```sysl
+import sysl.math.max
+
+max(a: int, b: int) -> int = 99
+
+print(max(1, 2))
+```
+
+```error
+'max' is declared by this program, so importing 'sysl.math.max' under that name would mean two things — import it as another name with 'as', or write its path
+```
+
+Both ways out keep the two apart: `import sysl.math.{max as larger}`, or `sysl.math.max(1, 2)`
+written in full. An import of the module's own declaration by its full path is that declaration, not
+a second one, and is allowed.
+
+**An import may not take a name a module path begins with**, since `fs.read` would then mean one thing
+in a file that imported it and another in the file beside it. The name can always be bound to
+something else with `as`:
+
+```sysl
+import sysl.unicode.{fold as sysl}
+
+print(sysl("A"))
+```
+
+```error
+'sysl' is a module, so importing something else under that name would hide it — import it as another name with 'as'
+```
+
+**The names that check counts are the ones the importing file could have written.** A program's own
+modules are the program's: a program with a module called `fold` or `buf` cannot write
+`import sysl.unicode.{fold}` itself, but the library's own files, which import exactly that, are not
+held to the program's module names, and the reverse is equally true — the library's internal imports
+bind nothing in the program.
 
 **The standard module counts as one of those wildcards.** `sysl` is auto-imported into every file, so
 a written `import a.*` where `a` declares an `Option` of its own is the two-wildcard case, and an
@@ -762,25 +825,45 @@ allocation-free primitive means rendering what it produced and building inputs o
 and both allocate — so a module could have the promise or have tests, and not both.
 
 **What a `@tests` file writes is an override of its module's, per capability, not a set of its own.**
-A file that writes no clause is held to the module's, which is what every one of them meant before
-there was another answer:
+**The allocator is the exception: `@no_alloc` binds the module's own files and never its tests.**
+Tests are hosted code that checks the module, so a `@tests` file that writes no clause may render a
+value with `str`, build an f-string or fill a `Buf` with no `@requires(heap)` above it, and so may a
+`@test` written beside what it tests. The module's functions stay checked as allocator-free
+wherever they are called from, a test included: a test that calls a function of the module which
+allocates is refused at that function, in the module's own file, with the module's own message.
+Every other capability (`@no_os`, `@no_block`) is still inherited by a `@tests` file that writes no
+clause:
 
 ```text
-error: a reference needs an allocator, and this module declared '@no_alloc' — it may hold and
-release storage made elsewhere, and may make none of its own
+error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
 ```
 
-A file that writes one hears about its own instead, since that is the line to go and read:
+A `@tests` file may still hold itself to the allocator with a `@no_alloc` of its own, and then hears
+about its own line, since that is the line to go and read:
 
 ```text
-error: a reference needs an allocator, and this module's '@tests' file declared '@no_alloc' — it may
+error: a reference needs an allocator, and this module's '@tests' file tests.sysl declared '@no_alloc' — it may
 hold and release storage made elsewhere, and may make none of its own
 ```
 
-**A test is scaffolding wherever it is written.** A `@test` function written beside what it tests, in
-an ordinary file, answers to the `@tests` file's clause too — the alternative puts a seam through the
-middle of one module's tests. And a module's `@tests` files are held to agreeing with **each other**,
-for the reason its shipping files are: a module has one answer to what its tests may do.
+**Each `@tests` file states what its own bodies need, and nothing more.** Its clause binds the
+declarations and tests written in it, so a module's `@tests` files are not held to agreeing: one that
+renders vectors writes `@requires(heap)`, a sibling that does not need the allocator writes nothing,
+and neither repeats the other's needs. A body breaking its own file's clause is refused naming that
+file:
+
+```text
+error: a reference needs an allocator, and this module's '@tests' file t2.sysl declared '@no_alloc' — it may
+hold and release storage made elsewhere, and may make none of its own
+```
+
+**A `@test` written beside what it tests answers to the module's own clause**, as the code it tests
+does — less the allocator, which no test is held to by inheritance. A `@tests` file's `@requires`
+takes nothing back for it:
+
+```text
+error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
+```
 
 **Only the module's half of the two-level rule moves.** A `@tests` file may take back a promise the
 module made about what ships; it cannot take back a facility the machine does not have. On a target
@@ -828,6 +911,26 @@ module hears nothing.
 a module of a path or git dependency is asked the same question as one into the standard module: a
 program on a `posix = false` target, or one that wrote `@no_posix`, is refused at the line that
 reaches a dependency's `@requires(posix)` module, naming that module by its package-qualified name.
+
+**What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
+target whose `package.hocon` says `heap = false`, or one with no thread-local storage, a fetched
+package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
+at the construct, in its own file — when the program names that module or names one that does. A
+package is a set of modules, and the program uses the ones it names: a board program that imports
+only a package's fixed-capacity queue builds, although the thread pool beside the queue in the same
+package boxes its tasks and keeps per-thread storage, and none of the pool's code — its closures'
+tables included — is in the image. The program's own modules and the standard module's are asked as
+before.
+
+**And within a module the program reaches, a heap-less machine asks only about the functions the
+program arrives at.** The machine is a statement about the image, and the image holds what the
+program's roots reach: its entry, its `@export`s, each `@test` and hook in a build that runs them, and
+the tables of the closures it keeps. A board program that names a parser module for its span type
+builds although the module's error renderer allocates; a trait's default that no implementing type is
+called through is not asked; a generic is asked, by the body it was written as, once something
+reached instantiates it. What the program does reach is refused exactly as before, at the construct
+and at the call. A module's own `@no_alloc` is different: it is a promise about everything the module
+wrote, and holds every body in it whether anything calls that body or not.
 
 ### A generic answers for what it wrote, not for what its caller chose
 
@@ -1149,6 +1252,41 @@ main() -> int = 0
 'main' yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status is not something a signature can say
 ```
 
+**A function exported as `main` is the third way to write the beginning**, and the one a bare-metal
+root file uses: the [export](/reference/ffi/) *is* the platform's `main`, called by that symbol by the
+host's start-up code or by a board's reset handler, so the program gets no `main` of the compiler's own
+beside it. What that one would have done first is done on the way into the export instead — the
+program's computed `val`s are filled before its body runs — and what it answers is C's status, at C's
+signature:
+
+```sysl
+seed() -> int = 41
+
+val answer: int = seed() + 1
+
+@export("main")
+start() -> i32
+    print("the answer is", answer)
+    0
+```
+
+```output
+the answer is 42
+```
+
+It is a beginning like the other two, so it is refused beside statements, and beside a declared `main`:
+
+```sysl
+print("initialization")
+
+@export("main")
+start() -> i32 = 0
+```
+
+```error
+a program starts in one place, and this function exported as 'main' is a second — whichever of the two the program means, the other belongs inside it
+```
+
 **A program in which no file carries a statement is a complete program that does nothing.** The entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to, which
 is what it should compile to — a library is not an error.
@@ -1212,7 +1350,7 @@ What it cannot be is addressed, passed as a value, or reached from another file.
 ordinary module function again:
 
 ```sysl
-static var failures: int = 0
+static var failures = 0
 
 failed[T](r: Result[T, int])
     if !r.is_ok() then failures += 1
@@ -1287,13 +1425,14 @@ Both moves the message names work, and neither is preferred: put the call after 
 **A file whose only running lines are `var`s is a body only when nothing else is the beginning.** A
 `var` could be read either way — a local of the statements a script runs, or storage its module
 owns — and the rest of the program chooses. With no `main` anywhere, a lone `var n = 1` is a script's
-first line, as it always was. With a `main`, the program has written where it starts, so there is no
+first line, as it always was. With a `main` — declared, or a function exported as `main`, which is
+how a bare-metal root file names its entry — the program has written where it starts, so there is no
 body for the `var` to be a local of, and it is the module's: exactly what a `val` beside the `main`
 is, and what a `var` in a file with a `module` line always is. A program shaped like most programs —
 a counter, the functions that bump it, and a `main` calling them — is therefore just that:
 
 ```sysl
-var counter: int = 0
+var counter = 0
 
 bump() =
     counter += 1
@@ -1308,12 +1447,13 @@ main()
 2
 ```
 
-Being the module's, it is held to what module storage is held to, and the first of those is a
-stated type. That is the one line reported, on the `var` itself — every use of the name below it
-still resolves:
+Being the module's, it is held to what module storage is held to. Its type is its value's, as a
+module `val`'s is; with no value it starts at its type's zero, so that type is written. Left off
+there, it is the one line reported, on the `var` itself — every use of the name below it still
+resolves:
 
 ```sysl
-var counter = 0
+var counter
 
 bump() =
     counter += 1
@@ -1350,12 +1490,26 @@ It is then hoisted, laid into the object file, visible to every file of the modu
 before any statement runs — which is also why its initializer may not call a helper that reads the
 body: at that moment there is no body yet.
 
+```sysl
+var seed: int = 7
+
+next() -> int = seed
+
+static val first: int = next()
+
+print(first)
+```
+
+```error
+'next' reads the entry file's body, so only the body can call it — this call is the module's, made before any statement runs, when there is no body yet. Make what 'next' reads 'static' too, or make the call part of the body
+```
+
 A **`static var`** is the same storage, written — assignment at every depth and `&`, which is what the
 word `var` already means, and which a `val` refuses because a `val` promises its storage is written
 once:
 
 ```sysl
-static var ticks: int = 0
+static var ticks = 0
 
 tick() = ticks += 1
 
@@ -1368,8 +1522,78 @@ print(ticks)
 2
 ```
 
+**Its type is its initializer's**, read exactly as a module `val`'s is: a literal takes its default,
+a call its result, and a written type governs the value where one is given. The type is known to
+every reader of the storage, wherever it is written, and storage over a constant is still laid down
+as data. A value that reaches the storage itself has no type to give it, and is refused at the
+declaration:
+
+```sysl
+static var scale = 1.5
+static var names = ["a", "b"]
+static var small: u8 = 200
+
+names[1] = "z"
+scale *= 2
+small += 55
+print(scale, names[1], small)
+```
+
+```output
+3 z 255
+```
+
+```sysl
+static var a = b + 1
+static var b = a + 1
+
+print(a)
+```
+
+```error
+'a' takes its type from its value, and the value reaches 'a' again — write its type, 'var a: T = …'
+```
+
 Its initializer may be **absent**, which a `val`'s may not — the type's zero is what it starts at, and
-that is the cheapest form and the one an arena wants.
+that is the cheapest form and the one an arena wants. With no value to read one off, that form states
+its type:
+
+```sysl
+static var slot
+
+print(slot)
+```
+
+```error
+'slot' is module storage, and module storage states its type — write 'slot: T'
+```
+
+**A `var` naming several things is module storage per name**, as the same `val` is a module `val`
+per name: a comma list shares its values out one each, and a single value taken apart — by a comma
+list or a [pattern](/reference/declarations/#by-pattern-when-the-shape-matters) — is computed once,
+each name filled from its part as the storage is. From then on each name is storage of its own, so a
+write to one leaves the others as they were. `@thread_local` above one gives every name it binds a copy
+per thread:
+
+```sysl
+static var lo, hi = 0, 10
+static var (hits, label) = (0, "none")
+@thread_local static var (seen, limit) = (0, 3)
+
+record(s: string)
+    hits += 1
+    seen += 1
+    label = s
+
+record("a")
+record("b")
+lo = 5
+print(lo, hi, hits, label, seen, limit)
+```
+
+```output
+5 10 2 b 2 3
+```
 
 **It holds a counted value, and the last one it holds is never released.** A `string`, a slice, a
 `&T`, a `weak T` and anything built out of them are all module storage; every assignment during the
@@ -1377,7 +1601,7 @@ run gives back the count it replaces, and the only release with nowhere to go is
 which is the release a static is *defined* by not taking.
 
 ```sysl
-static var current: string = ""
+static var current = ""
 
 set(s: string) = current = "[" + s + "]"
 
@@ -1417,10 +1641,28 @@ A [destructor](/reference/memory/) takes the same ruling and for the same reason
 storage never reaches a count of zero, so its `drop` does not run when the program ends.
 
 **`static` is meaningful only in the entry file**, since only that file has a body for a declaration
-to *not* belong to. In a file with a `module` header, or a headerless file carrying no statements,
-everything is the module's already and the modifier is refused rather than ignored. A function never
+to *not* belong to. In a file with a `module` header, or a headerless file that is not the program's
+beginning (the ruling that closes this section), everything is the module's already and the
+modifier is refused rather than ignored. A function never
 takes it either: settled by what it reads, the modifier would be redundant on one and impossible on
 the other.
+
+A bare-metal root file is the usual case: it runs no statement and names its entry with
+`@export("main")`, so its storage is the module's already — laid into `.bss`/`.data`, read by
+ordinary module functions and methods — and the modifier says nothing:
+
+```sysl
+private static var kept: [2]u32 = [0, 0]
+
+private bump() -> u32 = kept[0]
+
+@export("main")
+probe() -> i32 = i32(bump())
+```
+
+```error
+'static' says a declaration belongs to the module rather than to the body of the file the program starts in — and this file has no such body, so everything it declares is the module's already
+```
 
 **So everywhere else the same storage is written plain `var`**, and it is the same declaration —
 visibility, the shared value namespace, the initializer graph and the release rule all answer for it
@@ -1429,7 +1671,7 @@ exactly as above:
 ```sysl
 module counter
 
-var count: int = 0
+var count = 0
 
 bump() = count += 1
 ```
@@ -1444,7 +1686,7 @@ functions that maintain the storage are public and the storage itself is nobody'
 ```sysl
 module counter
 
-private var count: int = 0
+private var count = 0
 
 bump() = count += 1
 peek() -> int = count
@@ -1457,7 +1699,10 @@ in.
 and declaring storage runs nothing — a file holding a counter is no more the program's beginning than
 one holding a table. Where a file carries a statement that is not a binding, it is the entry file and
 every other file's top-level `var`s are their module's. Where nothing runs anywhere, a single
-**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did.
+**headerless** file of bindings is still a body, so a one-file `var n = 1` means what it always did —
+unless the program names its beginning elsewhere, with a `main` or a function exported as `main`.
+**This is the one ruling**: the file it chooses is the only one where `static` means anything, and
+every other file's `var`s are the module's.
 
 That word is load-bearing: **a file naming a module is never the program's beginning**, and it is the
 sentence at the top of this section seen from the other side — a header means everything the file
@@ -1473,11 +1718,12 @@ reached from opposite sides: one asks what the *file* says, the other what is be
 ## `const` — a value
 
 A **`const` is a module member**: hoisted, order-free, visible to the whole module and beyond it under
-the ordinary rules, and never running at all.
+the ordinary rules, and never running at all. One written inside a body is that block's instead —
+[a `const` inside a body](/reference/declarations/#a-const-inside-a-body).
 
 ```sysl
 const capacity: usize = 512
-const window: int = 1 << 15
+const window = 1 << 15
 
 type Slot = usize within 0..<capacity
 
@@ -1494,10 +1740,9 @@ print(table.len, window, capacity)
 bound is a compile-time constant and a call is not. Without `const`, a program carries `[512]u8` next
 to a `capacity()` function and a comment asking the reader to keep the two in step.
 
-**The type is always written** — not because it could not be inferred from the initializer, but
-because the rule that anything visible outside its file states its types is what keeps interface
-extraction parse-only. Writing it is also what fixes the literal's type, so `const capacity: usize =
-512` needs no suffix on the `512`.
+**The type may be left to the value**, as a [binding's](/reference/declarations/#bindings) may:
+`const window = 1 << 15` is an `int`. Written, it fixes the literal's type, so `const capacity: usize
+= 512` needs no suffix on the `512`.
 
 **And the type is a scalar, or a transparent subtype of one.** The first half is the shape of what a
 constant expression can produce rather than a restriction anybody chose — there is no aggregate
@@ -1587,30 +1832,18 @@ const n: Even = 4
 
 **A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
 arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
-a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** whose
-arguments are constant expressions. Integers, floats, `bool` and `char` fold, and a `string` constant
-is a **literal** or a `const` function's call — `const LABEL: string = label(3)` — which builds the
-string the same call builds when the program runs.
-
-**A call to any other function is refused:**
-
-```sysl
-size() -> int = 4
-
-const called: int = size()
-
-print(called)
-```
-
-```error
-the value of 'called' is not a constant expression — 'size' is not 'const', so it runs only when the program does; mark it 'const' to call it here
-```
-
-A `const` function is the one kind of code the compiler runs while it compiles, so marking it is
-all the call needs:
+a function whose body can run while compiling**, with arguments that are constant expressions. No
+mark is needed for that: a
+[`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is one that
+*promises* it, and any other function is run where its body turns out to hold only what exists
+while compiling. Integers, floats, `bool` and `char` fold, and a `string` constant is a **literal**
+or such a call — `const LABEL: string = label(3)` — which builds the string the same call builds
+when the program runs.
 
 ```sysl
-const size() -> int = 4
+import sysl.math.max
+
+size() -> int = max(3, 4)
 
 const called: int = size()
 
@@ -1621,6 +1854,23 @@ print(called)
 4
 ```
 
+**A call whose body reaches something that exists only when the program runs is refused**, and
+the refusal follows the calls down to it:
+
+```sysl
+size() -> int
+    print("asked")
+    4
+
+const called: int = size()
+
+print(called)
+```
+
+```error
+'called' cannot be computed while compiling: it calls 'size', which prints, which is outside the program — nothing outside the program exists while compiling
+```
+
 **The call is run, not guessed at.** The compiler runs the function's body over the arguments, at
 the target's widths — a `usize` wraps at 32 bits when the target's `usize` is 32 bits — with every
 integer operation wrapping as it does at run time and every `f32` operation rounded as it is at run
@@ -1629,7 +1879,7 @@ initialized by such a call is laid into the object file as data on every target,
 one included, rather than computed before the program's statements:
 
 ```sysl
-const fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
 
 static val V: int = fact(10)
 
@@ -1641,8 +1891,9 @@ print(V)
 ```
 
 **Every run is bounded**: 16,000,000 steps — one per expression and statement the run visits — and
-calls 512 deep. Running out of either is an error naming the constant, not a warning, and there is
-no setting that raises them:
+calls 512 deep. Running out of either is an error naming the constant, not a warning. A table
+generator that legitimately runs longer is given more with **`--const-steps <n>`**, which any command
+takes; the depth stays:
 
 ```sysl
 const spin() -> int
@@ -1659,7 +1910,8 @@ print(k)
 ```
 
 **What a body may hold while it runs is narrower than what it may hold**: integers of every width,
-`f32` and `real`, fixed-point formats, `bool`, `char` and `unit`, constrained types of them with their
+every float width — `f16` and `bf16` rounded to their format at every operation, as the program
+rounds them, and `f128` computed exactly and rounded once — fixed-point formats, `bool`, `char` and `unit`, constrained types of them with their
 checks run, and **fixed arrays, structs and enums** of any of these at any depth — an array built by a
 literal or a fill, read and written by element, walked by `for x in`; a struct built by its
 constructor, read and written by field, its `invariant` run; an enum value built by its variant,
@@ -1672,9 +1924,40 @@ the library's `display_*` routines and the `display` of every type it renders wr
 nested `display` is handed the same one), indexed by byte, sliced where characters start,
 compared by bytes and matched. **A slice** is held as a view of an array or a string the run holds,
 read, walked by `for x in`, sub-sliced and written through; a call handed one is run afresh rather
-than remembered. A pointer or a reference stops the run with *"a 'P' is not evaluated while
-compiling yet — integers, floats, fixed-point, 'bool', 'char', strings, and fixed arrays, structs,
-enums and slices of them are"*; the program's own run-time call is unaffected.
+than remembered. **A vector** is held as its lanes, and every operator is its lane's, lane by lane:
+built by a literal or a splat, read by lane, compared into a mask, chosen between by `select`,
+reduced by `min`, `max`, `any`, `all` and an integer `sum`, loaded from and stored into an array or a
+slice the run holds. **A float vector's `sum` is refused** — the program's reduction adds the lanes
+in whatever order the target's instructions take, so no one value is the program's. **A call
+through a function's address** runs the function the address was taken of. **A reference** — a box,
+or a pointer to a local, an element or a field — is held as the storage it names, and a `Buf`, a
+`Map` and a `Set` run by their own library bodies on a heap the run owns. A vector and a
+sixteen-bit float come to what the program's run does:
+
+```sysl
+const mix(seed: int) -> int
+    var xs: [8]int = [0; 8]
+
+    for i in 0..<8
+        xs[i] = seed * i
+
+    val v: <4>int = xs.load(2)
+    val w = (v > 10).select(v * 2, v)
+
+    xs.store(4, w)
+    w.sum() + xs[7]
+
+const half_step(x: f16) -> f16 = x / f16(3) + f16(0.1)
+
+const MIX: int = mix(3)
+const H: f16 = half_step(f16(1))
+
+print(MIX, H)
+```
+
+```output
+99 0.433
+```
 
 **A table is the reason arrays are evaluated.** A module `val` whose initializer calls a `const`
 function returning an array is laid into the object file as the elements the call came to — a sine
@@ -1697,6 +1980,46 @@ print(SQUARES[3], SQUARES[7])
 
 ```output
 9 49
+```
+
+**A table the run builds on its heap is frozen into the object file**, where it is answered through a
+type that says nothing writes it: a `[]const T` is laid down as an array of its own with a view of
+it, and a frozen buffer (`b.freeze()`) as its box and its elements — both constant data on a board
+too. A whole `Buf` or `Map`, a reference, or a writable `[]T` answered this way stays code, computed
+when the program starts, and a board build says which of these it is and what to answer instead:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+primes_below(n: int) -> []const int
+    var out = buf[int]()
+
+    for i in 2..<n
+        var p = true
+
+        for d in 2..<i
+            if i % d == 0 then p = false
+
+        if p then out.push(i)
+
+    out.view()
+
+squares(n: int) -> &sync Frozen[int]
+    var b = buf[int]()
+
+    for i in 0..<n
+        b.push(i * i)
+
+    b.freeze()
+
+val PRIMES: []const int = primes_below(100)
+val SQ: &sync Frozen[int] = squares(6)
+
+print(PRIMES.len, PRIMES[24], SQ.at(5))
+```
+
+```output
+25 97 25
 ```
 
 **A table of records is laid down the same way**: a struct as the constructor over the literals its
@@ -1741,13 +2064,18 @@ down; the value stays code, and a freestanding artifact's refusal says so. **A s
 the literal it came to**, its bytes constant data owned by nothing — a table of `(string, int)` tuples
 is `.rodata` on a bare board. **A slice is not laid down**: it views storage rather than holding a
 value, so a `val` over a call answering one stays code. Making an array costs a step per element and
-a string a step per byte, so the same 16,000,000 steps bound how large a table or a string may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
+a string a step per byte, so the same step limit bounds how large a table or a string may be. An index past the end traps, and is refused at the initializer as any other trap is. Where the
 call cannot be run — it reaches an `extern`, storage filled at run time, or more steps than the bound
 — the initializer stays code, filled before the program's statements; a freestanding artifact, which
 has nothing to fill it, refuses the storage and says what stopped the call: *"'T' did not finish
-within 16,000,000 steps while compiling — the loop at main.sysl:5:5 was still running"*. A `const` call where a **type** is read — an array bound, a `within` —
-is not evaluated yet either, and is refused with *"'four' is a 'const' function, but this value is
-read while declarations are, before any body can be run"*.
+within 16,000,000 steps while compiling — the loop at main.sysl:5:5 was still running"*.
+
+**A call where a type is read is run while the declarations are**: an array bound in a field, a
+parameter or an alias, a value argument, an `@assert` beside the declarations. A body of arithmetic
+runs where it stands; one that calls a type's members waits until every declaration is read, and the
+declarations are then read again with its value in hand
+([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)).
+A declaration whose value needs that declaration itself is refused naming both.
 
 **"A `const`" above means the declaration, not a spelling of it.** A constant reached by its full path
 is the same constant as one reached by an import, and the two fold alike in every position below —
@@ -1907,7 +2235,7 @@ at the limit other
 ```
 
 The rest of what a module-level `val` may hold — read-only at every depth, and the `[]const T` a
-slice of one yields — is on [declarations](/reference/declarations/#a-module-member-states-its-type).
+slice of one yields — is on [declarations](/reference/declarations/#a-module-member-takes-its-type-as-a-local-does).
 
 ## Separate compilation
 
@@ -1978,7 +2306,7 @@ an archive that does not match is built again rather than linked.
      lbm_a_roots_header_requirement_is_asked, lbm_a_roots_pkg_config_is_probed,
      lbm_a_root_with_no_manifest_requires_nothing) and tests_lib_root_deps.sysl
      (lbd_two_roots_dependencies_claim_one_module, lbd_a_roots_dependency_and_the_projects_module,
-     lbd_build_lib_refuses_a_roots_dependencies). A page cannot run a build of two directories, so
+     lbd_build_lib_reads_a_roots_path_dependency). A page cannot run a build of two directories, so
      the command line is a `text` block and the tests are the evidence. -->
 
 A directory handed to `--lib` is a **source root**: a tree of modules that joins the compilation
@@ -2009,7 +2337,8 @@ macros the root's manifest defines for it and linked with the program's — into
 
 **A root's `dependencies` resolve in the one graph** with the project's, under the same rule: two
 packages offering one module are refused, and so is a root's dependency offering a module the project
-declares. `build-lib` fetches nothing, so it refuses a root that declares dependencies by name.
+declares. `build-lib` resolves them as every other command does: a `path` is read where it is, a
+coordinate a `--lib` root stands in for is not fetched, and any other is fetched.
 
 A root that *is* one of the project's dependencies — its manifest names the package the coordinate
 does — stands in for that dependency instead;

@@ -105,6 +105,12 @@ enum ExprKind
     // the analyzer re-reads where the name is a generic function. `open` is the `[`.
     TypeArgs(receiver: Expr, args: Buf[Expr], open: Span)
 
+    // One item between those brackets that only the type grammar can read -- `&sync C`, `[]u8`,
+    // `[4]u8`, `Fn(int) -> int`, `weak T` -- where the expression grammar has no spelling for it.
+    // Brackets hold a type argument or a subscript and the parser cannot tell which, so an item is
+    // read as an expression first and as a type only where that reading fails.
+    TypeArg(typ: TypeRef)
+
     // `T::Attr` -- metadata a type exposes under a name, with `::` rather than `.` because it
     // belongs to the type itself and not to a value of it. `colons` is the `::`, which is where the
     // reference anchors the node (`anchor.sysl`); `name_at` is the attribute's name.
@@ -192,6 +198,15 @@ enum ExprKind
     // `for const name in iter body` -- the loop the compiler unrolls, whose copies are type-checked
     // separately. It carries no label and no `else`: there is no loop at run time to leave.
     ConstFor(name: string, iter: Expr, body: Buf[Stmt])
+
+    // `if const cond` -- the branch decided while compiling: only the arm taken is read, once for
+    // each instance of a generic and each copy of a `for const`. An `elif const` is one of these in
+    // the `else` of the one before it.
+    ConstIf(cond: Expr, then_body: Buf[Stmt], else_body: Option[Buf[Stmt]])
+
+    // `T: Display + Hash` in an `if const` condition -- true while compiling where the type
+    // implements every trait named, written as a bound is.
+    TraitTest(subject: TypeRef, bounds: Buf[BoundRef])
 
     // `['label] for init; cond; step` -- the three-clause loop, written without parentheses.
     CFor(label: Option[string], init: Option[Stmt], cond: Option[Expr], step: Option[Stmt],

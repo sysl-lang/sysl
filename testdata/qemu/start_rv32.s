@@ -14,6 +14,11 @@ _start:
 1:
 
     call main
+
+    // `exit(status)` is the same door, with the status already in a0: the library calls it when a
+    // program panics.
+    .global exit
+exit:
     li   t0, 0x100000
     slli a0, a0, 16
     li   t1, 0x3333

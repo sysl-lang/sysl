@@ -1,0 +1,116 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `sysl test --file <name>`: the tests written in one file, beside whatever `--filter` keeps. A file
+// is named by whole path components, so a name filter's substring never reaches a file by accident and
+// `--file tests_arc` is not also `tests_arcs.sysl`.
+
+private rgp_test(name: string, file: string) -> TTest = TTest(name, name, false, None, file, 1, no_hooks(), None, None)
+
+// Two files whose names one is a prefix of the other, and a file whose name holds a family prefix
+// that its tests do not.
+private rgp_tests() -> Buf[TTest]
+    var out: Buf[TTest] = buf()
+
+    out.push(rgp_test("one", "sh/x/tests_arc.sysl"))
+    out.push(rgp_test("two", "sh/x/tests_arc.sysl"))
+    out.push(rgp_test("three", "sh/x/tests_arcs.sysl"))
+    out.push(rgp_test("unl_four", "sh/x/tests_other.sysl"))
+    out.push(rgp_test("five", "sh/x/tests_unl_five.sysl"))
+    out.push(rgp_test("six", "tests_arc.sysl"))
+    out
+end rgp_tests
+
+private rgp_names(tests: Buf[TTest]) -> string
+    var out = ""
+
+    for t in tests
+        out = out + t.display + " "
+
+    out
+end rgp_names
+
+@test("a file is named by its base name, with or without .sysl, or by its trailing path")
+rgp_a_file_is_named_by_whole_components()
+    assert(file_named("sh/x/tests_arc.sysl", "tests_arc"), "base name")
+    assert(file_named("sh/x/tests_arc.sysl", "tests_arc.sysl"), "with .sysl")
+    assert(file_named("sh/x/tests_arc.sysl", "x/tests_arc"), "trailing path")
+    assert(file_named("tests_arc.sysl", "tests_arc"), "a relative file")
+    assert(file_named("sh/x/tests_arc.sysl", "sh/x/tests_arc.sysl"), "the whole path")
+    assert(!file_named("sh/x/tests_arcs.sysl", "tests_arc"), "a longer name")
+    assert(!file_named("sh/x/tests_arc.sysl", "arc"), "a piece of the name")
+    assert(!file_named("sh/x/tests_arc.sysl", "y/tests_arc"), "another directory")
+    assert(!file_named("sh/x/tests_arc.sysl", ""), "nothing")
+
+@test("--file keeps exactly the tests written in that file")
+rgp_a_file_selects_its_own_tests()
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("tests_arc"))), "one two six ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("x/tests_arc.sysl"))), "one two ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("tests_arcs"))), "three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), Some("tw"), Some("tests_arc"))), "two ")
+    assert(selected_in(rgp_tests(), None, Some("tests_nothing")).is_empty(), "no such file")
+
+@test("a name filter selects what it did, and never a test because of the file it is in")
+rgp_a_name_filter_is_unchanged()
+    assert_eq(rgp_names(selected_tests(rgp_tests(), Some("unl_"))), "unl_four ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), Some("unl_"), None)), "unl_four ")
+    assert_eq(selected_tests(rgp_tests(), None).len(), 6)
+    assert_eq(rgp_names(selected_tests(rgp_tests(), Some("arc"))), "")
+
+@test("--file picks out one refused program by its file")
+rgp_a_file_selects_a_refused_program()
+    var files: Buf[string] = buf()
+
+    files.push("/r/tests/refused/a.sysl")
+    files.push("/r/tests/refused/ab.sysl")
+
+    assert_eq(selected_refused(files, None, Some("a")).len(), 1)
+    assert_eq(selected_refused(files, None, Some("refused/ab.sysl")).at(0), "/r/tests/refused/ab.sysl")
+    assert_eq(selected_refused(files, Some("ab"), Some("a")).len(), 0)
+    assert_eq(selected_refused(files, None).len(), 2)
+
+// A package with tests in two files, one name a prefix of the other's.
+private rgp_package() -> string
+    val root = absolute_path(make_temp_dir("sysl-rgp").unwrap())
+
+    write_text(s"$root/package.hocon", "package { name = \"two\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/one.sysl", "@test\nfirst() =\n    assert(true, \"up\")\n\n@test\nsecond() =\n    assert(true, \"up\")\n")
+        .unwrap()
+    write_text(s"$root/ones.sysl", "@test\nthird() =\n    assert(false, \"down\")\n").unwrap()
+    root
+end rgp_package
+
+@test("sysl test --file runs one file's tests and counts the rest as filtered")
+rgp_the_command_runs_one_file()
+    if !clx_ready() then return
+
+    val root = rgp_package()
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--file", "one"])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("running 2 tests of 3"), out)
+    assert(out.contains("first") && out.contains("second"), out)
+    assert(!out.contains("third"), out)
+
+    val (both, both_out, _) = clx_ran(["sysl", "test", root, "--file", "one.sysl", "--filter", "sec"])
+
+    assert_eq(both, Fine, both_out)
+    assert(both_out.contains("running 1 test of 3"), both_out)
+
+    val (none, none_out, none_err) = clx_ran(["sysl", "test", root, "--file", "on"])
+
+    assert_eq(none, Fine)
+    assert_eq(none_out, "")
+    assert_eq(none_err, "no test matches in file 'on' — 3 to choose from")
+
+    val (missing, _, missing_err) = clx_ran(["sysl", "test", root, "--file"])
+
+    assert_eq(missing, Misused)
+    assert(missing_err.contains("--file"), missing_err)
+
+    remove_dir_all(root).unwrap_or(())
+end rgp_the_command_runs_one_file

@@ -69,6 +69,14 @@ private struct_plain_refusal(d: &StructType) -> Option[string]
     if d.opaque || d.base == TaskBase then
         return Some(s"'${type_show(Struct(d))}' has no layout this program can see")
 
+    // Nothing in a union's bytes says which field is there, so a decode cannot know which field's
+    // bytes to check: a union is plain only where no field has any byte to check.
+    if d.union_layout
+        for item in d.fields
+            if !is_any_bits(item.1)
+                return Some(s"its field '${item.0}' is ${type_show(item.1)}, and nothing in a union's " +
+                            "bytes says which field is there to be checked")
+
     // A bitfield struct is one integer, and an enum range in it would be an unchecked read.
     bitfield_ranges(d) match
         Some(_) ->
@@ -83,7 +91,22 @@ private struct_plain_refusal(d: &StructType) -> Option[string]
             return None
         None -> ()
 
-    for item in d.fields
+    for i in 0..<d.fields.len()
+        val item = d.fields.at(i)
+
+        // A C bitfield is bits of an integer unit: an integer or a `bool` there has no pattern that
+        // is not a value, and an enum is refused as one in a bitfield struct is.
+        if d.c_bit(i).is_some()
+            underlying(item.1) match
+                Enum(_) ->
+                    return Some(s"'${type_show(Struct(d))}.${item.0}' is an enum held in a few " +
+                                "bits, which is read unchecked. Hold the field as an integer and " +
+                                "convert it with 'try'")
+                _ -> ()
+
+            continue
+        end if
+
         val why = plain_refusal(item.1)
 
         if why.is_some() then
@@ -176,7 +199,7 @@ end plain_encode_call
 // Whether the trait is declared in this compilation and may be named where the call is written --
 // what every member a trait gives a built-in asks first.
 private plain_in_reach(cx: &Analyzer) -> bool = catalog_key(cx.an, "Plain") match
-    Some(key) -> names_trait(cx, key)
+    Some(key) -> names_trait(cx, key) || reachable_key(cx.an, key, cx.scope)
     None -> false
 
 // -- lowering ------------------------------------------------------------------------------------
@@ -249,7 +272,7 @@ end gen_decode
 
 // Whether the value of type `t` lying at `p` is one its type can hold, as an `i1`. `reversed` is the
 // width an enum here is held reversed at -- the field's, inside a `@byte_order` struct.
-private plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
+plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
     if !needs_check(t) then return VBool(true)
 
     underlying(t) match
@@ -274,7 +297,7 @@ private plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
             for i in 0..<d.fields.len()
                 val ft = d.fields.at(i).1
 
-                if !zero_sized(ft) && needs_check(ft)
+                if !zero_sized(ft) && needs_check(ft) && d.c_bit(i).is_none()
                     val fp = fresh_reg(e)
 
                     var idx: Buf[IrArg] = buf()
@@ -303,8 +326,8 @@ private needs_check(t: Type) -> bool = underlying(t) match
     _ -> false
 
 private any_field_needs_check(d: &StructType) -> bool
-    for item in d.fields
-        if needs_check(item.1) then return true
+    for i in 0..<d.fields.len()
+        if d.c_bit(i).is_none() && needs_check(d.fields.at(i).1) then return true
 
     false
 end any_field_needs_check
@@ -441,7 +464,11 @@ private copy_dense(e: *Emit, src: Val, dst: Val, t: Type)
             for i in 0..<d.fields.len()
                 val ft = d.fields.at(i).1
 
-                if !zero_sized(ft)
+                // A C bitfield is read out of its unit and written into the other one's.
+                if d.c_bit(i).is_some()
+                    if !unnamed_c_bit(d, i) then
+                        c_bit_store(e, d, i, dst, Struct(d), c_bit_load(e, d, i, src, Struct(d)))
+                elif !zero_sized(ft)
                     val at = struct_field_index(e.layout, d, d.slot(i))
                     val sp = field_address(e, d, src, at)
                     val dp = field_address(e, d, dst, at)
@@ -514,6 +541,9 @@ private padded(e: *Emit, t: Type) -> bool
     underlying(t) match
         Struct(d) ->
             if bitfield_ranges(d).is_some() then return int(e.layout.size(t)) != own_bytes(t)
+
+            // The bits between C bitfields are padding, so their fields are copied one by one.
+            if !d.c_bits.is_empty() then return true
 
             var used = 0
 

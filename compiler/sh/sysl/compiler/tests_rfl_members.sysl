@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+// **`T::Members`, `T::BaseName`, and what `T::Fields` leaves out** (`type_reflect.sysl`). `T::Members`
+// lists everything a struct stores -- its named fields, each anonymous block and each unnamed `_`
+// bitfield -- where `T::Fields` lists only the named fields; `T::BaseName` is the declared name with
+// no module and no arguments; and an `opaque struct` that declares its fields is a struct where its
+// layout is known.
+
+private rfl_member_types() -> string = raw"""
+    struct Packet
+        tag: u8
+        union
+            word: u32
+            level: f32
+        len: u16
+
+    struct G
+        a: i4 in i32
+        _: u4 in u32
+        b: u8 in u32
+        _: in u32
+        c: u16 in u32
+
+    type Pair = (int, u8)
+
+    members(ms: []const sysl.reflect.Member) -> string
+        var out = ""
+        for m in ms
+            out = out + s"[${m.name}]:${m.index}@${m.offset}${if m.anonymous then " anon" else ""} "
+        out
+
+    fields(fs: []const sysl.reflect.Field) -> string
+        var out = ""
+        for f in fs
+            out = out + s"${f.name}:${f.index} "
+        out
+
+    """
+
+@test("'T::Members' lists named fields, anonymous blocks and unnamed bitfields; 'T::Fields' the named alone")
+rfl_members_and_fields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_member_types() + raw"""
+        print(members(Packet::Members))
+        print(fields(Packet::Fields))
+        print(members(G::Members))
+        print(fields(G::Fields))
+        print(members(Pair::Members), Packet::Members.len, G::Members.len)
+        """), "[tag]:0@0 []:1@4 anon [len]:2@8 \n" +
+              "tag:0 len:1 \n" +
+              "[a]:0@0 [_]:1@0 [b]:2@0 [c]:3@0 \n" +
+              "a:0 b:1 c:2 \n" +
+              "[0]:0@0 [1]:1@4  3 4\n")
+end rfl_members_and_fields
+
+@test("a Field's index counts the fields and a Member's the members, so 'f.index > 0' is 'not the first'")
+rfl_index_counts_its_own_list()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Opens
+            union
+                word: u32
+                real: f32
+            tag: u8
+            lo: u4 in u32
+            _: u4 in u32
+            hi: u8 in u32
+
+        enum E
+            A(x: int, y: int)
+
+        val p = Opens(word = 0, tag = 7, lo = 1, hi = 9)
+        var out = ""
+
+        for const m in Opens::Members
+            out = out + s"${m.index}:${m.name} "
+
+        for const f in Opens::Fields
+            if f.index > 0 then out = out + ","
+
+            out = out + s"${f.index}:${f.name}=${p.(f)}"
+
+        for const f in Opens::Fields
+            out = out + s" ${Opens::Fields[f.index].name}"
+
+        for const c in E::Variants
+            for const f in c::Fields
+                out = out + s" ${f.index}:${f.name}"
+
+        print(out)
+        """), "0: 1:tag 2:lo 3:_ 4:hi 0:tag=7,1:lo=1,2:hi=9 tag lo hi 0:x 1:y\n")
+end rfl_index_counts_its_own_list
+
+@test("a walk over 'T::Members' types each member as itself, an anonymous one as its own union or struct")
+rfl_members_walk_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_member_types() + raw"""
+        walk[T]() -> string
+            var out = ""
+
+            for const m in T::Members
+                out = out + s"${m.name}/${Kind::Image(m::Type::Kind)}/${m.anonymous}/${sizeof(m::Type)} "
+
+            out
+
+        print(walk[Packet]())
+        print(walk[G]())
+        """), "tag/Int/false/1 /Union/true/4 len/Int/false/2 \n" +
+              "a/Int/false/1 _/Int/false/1 b/Int/false/1 c/Int/false/2 \n")
+end rfl_members_walk_types
+
+@test("'v.(m)' reads and writes an anonymous union and an unnamed bitfield through 'T::Members'")
+rfl_members_read_and_write()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_member_types() + raw"""
+        copy[T](v: T, out: *T)
+            for const m in T::Members
+                out.(m) = v.(m)
+
+        var p = Packet(tag = 0, word = 0, len = 0)
+
+        copy(Packet(tag = 1, word = 0x3f800000, len = 2), &p)
+        print(p.tag, p.level, p.len)
+
+        // The unnamed four bits sit above 'a' in the first unit: writing them shows there.
+        var g = G(-3, 200, 65535)
+
+        for const m in G::Members
+            if const m.name == "_" then g.(m) = 15
+
+        val words: *u32 = ptr_cast(&g)
+
+        print(g.a, g.b, g.c, words[0])
+
+        var h = G(0, 0, 0)
+
+        copy(g, &h)
+
+        val copied: *u32 = ptr_cast(&h)
+
+        print(h.a, h.b, h.c, copied[0] == words[0])
+        """), "1 1 2\n-3 200 65535 51453\n-3 200 65535 true\n")
+end rfl_members_read_and_write
+
+@test("'T::Members' keeps a private member to the type's own file, as 'T::Fields' does")
+rfl_members_private_reach()
+    if !azb_ready() then return
+
+    val secret = raw"""
+        struct Secret
+            shown: int
+            private hidden: int
+            union
+                w: u32
+                f: f32
+
+        make_secret() -> Secret = Secret(shown = 1, hidden = 2, w = 3)
+
+        dump_here(s: Secret) -> string
+            var out = ""
+
+            for const m in Secret::Members
+                if const !m.anonymous then out = out + s"${s.(m)}${if m.public then "" else "!"} "
+
+            out
+
+        """
+
+    azb_prints([("", "secret.sysl", secret),
+                ("", "main.sysl", "print(dump_here(make_secret()))\n")], "1 2! \n")
+
+    azb_refused([("", "secret.sysl", secret),
+                 ("", "main.sysl", raw"""
+                     dump[T](v: T) -> string
+                         var out = ""
+
+                         for const m in T::Members
+                             if const !m.anonymous then out = out + s"${v.(m)} "
+
+                         out
+
+                     print(dump(make_secret()))
+                     """)],
+                ["field 'hidden' of 'Secret' is", "(in the copy for member 'Secret.hidden')"])
+end rfl_members_private_reach
+
+@test("'T::Members' is refused where 'T::Fields' is, naming the type and what it is")
+rfl_members_refused()
+    if !enm_ready() then return
+
+    val ints = enm_outcome("print(int::Members.len)\n")
+
+    assert(ints.0.contains("'int::Members' lists the members of a struct, a tuple or a union, and " +
+                           "'int' is an integer"), ints.0)
+
+    val walked = enm_outcome("enum E\n    A\n    B\n\nfor const m in E::Members\n    print(m.name)\n")
+
+    assert(walked.0.contains("'E::Members' lists the members of a struct, a tuple or a union, and " +
+                             "'E' is an enum"), walked.0)
+
+    val payload = enm_outcome(raw"""
+        enum S
+            C(r: real)
+
+        for const c in S::Variants
+            for const m in c::Members
+                print(m.name)
+        """)
+
+    assert(payload.0.contains("which answers '::Fields', its payload's fields"), payload.0)
+end rfl_members_refused
+
+@test("'T::BaseName' is the declared name with no module and no arguments, and is refused where 'T::Name' is")
+rfl_base_name()
+    if !azb_ready() then return
+
+    azb_prints([("demo", "q.sysl", "module demo\n\nstruct Q\n    x: int\n\nenum Tone\n    Low\n    High\n"),
+                ("", "main.sysl", raw"""
+                    import demo.*
+
+                    struct Box[T]
+                        item: T
+
+                    type Small = int within 0..10
+
+                    name[T]() -> string = T::BaseName
+
+                    print(Box[int]::BaseName, Box[int]::Name, Q::BaseName, Q::Name, Tone::BaseName)
+                    print(int::BaseName, name[Option[u8]](), name[Small](), name[(int, u8)](), name[[2]int]())
+                    """)],
+               "Box Box[int] Q demo.Q Tone\nint Option Small (int, byte) [2]int\n")
+
+    val bare = enm_outcome("struct Box[T]\n    item: T\n\nprint(Box::BaseName)\n")
+
+    assert(bare.0.contains("is generic, so 'Box::BaseName' has no single type to read"), bare.0)
+
+    val value = enm_outcome("val n = 1\nprint(n::BaseName)\n")
+
+    assert(value.0.contains("'::BaseName' is a type attribute, so its left side must be a type name"),
+           value.0)
+
+    val args = enm_outcome("print(int::BaseName(1))\n")
+
+    assert(args.0.contains("'int::BaseName' takes no arguments"), args.0)
+end rfl_base_name
+
+@test("an anonymous block's 'T::BaseName' is the word that opened it, as 'Debug' shows it")
+rfl_base_name_anonymous()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Outer
+            a: u8
+            union
+                w: u32
+                f: f32
+            struct
+                lo: u8
+                hi: u8
+
+        names[T]() -> string
+            var out = ""
+
+            for const m in T::Members
+                out = out + s"${m::Type::BaseName} "
+
+            out
+
+        print(Outer::BaseName, names[Outer]())
+        """), "Outer byte union struct \n")
+end rfl_base_name_anonymous
+
+@test("an opaque struct with fields is a struct with fields in its own module, and opaque outside it")
+rfl_opaque_with_fields_in_its_module()
+    if !azb_ready() then return
+
+    val lib = raw"""
+        module lib
+
+        opaque struct H
+            x: int
+            private y: u8
+
+        opaque struct Bare
+
+        inside() -> string
+            var out = Kind::Image(H::Kind) + " " + Kind::Image(Bare::Kind) + " "
+
+            for f in H::Fields
+                out = out + f.name + " "
+
+            for const m in H::Members
+                out = out + s"${m.name}@${m.offset} "
+
+            out
+
+        """
+
+    azb_prints([("lib", "lib.sysl", lib),
+                ("", "main.sysl", "import lib.*\n\nprint(inside(), Kind::Image(H::Kind), Kind::Image(Bare::Kind))\n")],
+               "Struct Opaque x y x@0 y@4  Opaque Opaque\n")
+
+    azb_refused([("lib", "lib.sysl", lib), ("", "main.sysl", "import lib.*\n\nprint(H::Fields.len)\n")],
+                ["'H::Fields' lists the fields of a struct, a tuple or a union, and 'lib.H' is an opaque type"])
+
+    azb_refused([("lib", "lib.sysl", lib),
+                 ("", "main.sysl", "import lib.*\n\nfor const m in H::Members\n    print(m.name)\n")],
+                ["'lib.H::Members' lists the members of a struct, a tuple or a union, and 'lib.H' is an " +
+                 "opaque type"])
+
+    azb_refused([("lib", "lib.sysl", lib), ("", "main.sysl", "import lib.*\n\nprint(Bare::Members.len)\n")],
+                ["'Bare::Members' lists the members of a struct, a tuple or a union, and 'lib.Bare' is an " +
+                 "opaque type"])
+end rfl_opaque_with_fields_in_its_module
+
+// A derived `Hash` reads the named fields alone, so a struct with unnamed bitfields hashes to what the
+// compiler-written derivation of 0.2.5 gave it: the values below are what that release prints.
+@test("a derived Hash and Eq pass over an unnamed bitfield, hashing as 0.2.5 did")
+rfl_derived_hash_skips_unnamed_bitfields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct W derives Eq, Hash
+            x: u12 in u32
+            _: u4 in u32
+            y: i16 in i32
+            _: in u32
+            z: u8 in u32
+
+        var a = W(4000, -500, 7)
+        val b = W(4000, -500, 7)
+
+        for const m in W::Members
+            if const m.name == "_" then a.(m) = 9
+
+        print(W(4000, -500, 7).hash(), W(1, 2, 3).hash())
+        print(a == b, a.hash() == b.hash())
+        """), "14812974526519901149 710711862073044533\ntrue true\n")
+end rfl_derived_hash_skips_unnamed_bitfields

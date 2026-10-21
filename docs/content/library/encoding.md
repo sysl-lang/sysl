@@ -92,7 +92,7 @@ forgiving about what cannot be ambiguous.
 
 ## What a refusal says
 
-`DecodeError` has four cases, separated by what a caller would **do** about each rather than by
+`DecodeError` has five cases, separated by what a caller would **do** about each rather than by
 taxonomy.
 
 | | |
@@ -101,6 +101,7 @@ taxonomy.
 | `BadLength` | not a whole number of encoded units |
 | `BadPadding(at)` | `=` somewhere it cannot be |
 | `Short(needed)` | the output slice is too small, and by how much |
+| `Utf8(at)` | decoded bytes that are not UTF-8 (`percent_decode_string` only), and where |
 
 `Short` carries the length that *would* have been enough, so a caller resizes once rather than
 discovering the requirement a byte at a time.
@@ -131,6 +132,63 @@ needs 3 bytes
 It is a type of its own rather than [`sysl.text`](/library/text/)'s `ParseError`, which is about
 reading a *number* out of text: two of that type's four cases could never occur here, and a caller
 matching on it would be told cases exist that cannot.
+
+## Percent-encoding
+
+`percent_encode` / `percent_string` and `percent_decode` carry bytes through a URL. The unreserved
+set of RFC 3986 (`A-Z a-z 0-9 - . _ ~`) is written as itself and every other byte as upper-case
+`%XX`, so a multibyte character becomes one escape per byte. The `Percent` argument picks the
+dialect, which differs in exactly the space:
+
+| | space encodes as | `+` decodes as |
+|---|---|---|
+| `Component` | `%20` | `+` |
+| `Form` | `+` | space |
+
+`Component` is the right encoding for one **path segment** and for one **query key or value**: it
+escapes `/`, `?`, `=` and `&`, so the piece is safe wherever it is later placed. `Form` is
+`application/x-www-form-urlencoded`.
+
+Decoding writes into a slice the caller lends and refuses a malformed escape rather than passing it
+through: a `%` with fewer than two bytes after it is `BadLength`, and a `%` followed by a non-hex
+byte is `BadByte` at that byte. Either case of hex digit is accepted. Decoding does not check that
+the bytes are UTF-8; `percent_decode_string` is the form for text, and refuses a result that is not
+UTF-8 with `Utf8(at)`, the offset in the decoded bytes (`%C3%28` is a lead byte followed by `(`).
+
+```sysl
+import sysl.encoding.{percent_string, percent_decode, percent_decode_string, Component, Form, BadLength, Utf8}
+
+var out: []u8 = [0; 16]
+
+print(percent_string("a b/c é".bytes, Component))
+print(percent_string("a b+c".bytes, Form))
+
+val n = percent_decode("a%20b%C3%A9".bytes, out, Component).unwrap()
+
+print(n)
+
+val bad = percent_decode("100%".bytes, out, Component) match
+    Err(BadLength) -> "truncated escape"
+    _ -> "something else"
+
+print(bad)
+print(percent_decode_string("caf%C3%A9+au+lait".bytes, Form).unwrap())
+
+val not_text = percent_decode_string("%C3%28".bytes, Component) match
+    Err(Utf8(at)) -> s"not UTF-8 at $at"
+    _ -> "something else"
+
+print(not_text)
+```
+
+```output
+a%20b%2Fc%20%C3%A9
+a+b%2Bc
+5
+truncated escape
+café au lait
+not UTF-8 at 0
+```
 
 ## Fixed-width integers, at either byte order
 
@@ -165,6 +223,38 @@ struct with [`@byte_order`](/reference/attributes/), read and written whole with
 
 Unsigned only: the signed read of the same bytes is a cast at the call site, and doubling a
 twelve-function surface to spare one cast is not a trade worth making.
+
+### Appending to a growing buffer
+
+Where `put_` writes into storage that is already the right size, `push_` appends to a `Buf[u8]`, so
+there is no short slice to refuse. They are free functions taking the buffer by value: a `Buf` is a
+handle, and the caller's buffer grows through the copy.
+
+```sysl
+import sysl.buf.buf
+import sysl.encoding.{push_u16_be, push_u32_le, push_u64_be}
+
+val out = buf[u8]()
+
+out.push(0xaa)
+push_u16_be(out, 0x1122)
+push_u32_le(out, 0x11223344)
+push_u64_be(out, 0x1122334455667788)
+
+print(out.len())
+print(out.at(1), out.at(2))
+print(out.at(3), out.at(6))
+print(out.at(7), out.at(14))
+```
+
+```output
+15
+17 34
+68 17
+17 136
+```
+
+`push_u16`, `push_u32` and `push_u64` each come in `_le` and `_be`.
 
 ## Plain data — a record read out of bytes, and written back
 

@@ -323,3 +323,96 @@ walk_matching_does_not_prune()
 
     ignore(remove_dir_all(dir))
 end walk_matching_does_not_prune
+
+// -- an entry that disappears while the walk is under way -------------------------------------------
+//
+// A directory is listed once and its names are read afterwards, so a name removed in between is the
+// race a walk of a tree another process is writing runs into. Each case below removes the entry in
+// exactly that gap, by driving the walk by hand, so none of them is a race.
+
+/** The one item a walk answers next, which the case requires to be an entry. */
+private next_entry(w: *Walk) -> Entry = w.next().unwrap().unwrap()
+
+@test("a file removed after its directory was listed is skipped, not reported as an error")
+walk_skips_a_file_that_vanished()
+    val dir = scratch("vanished-file")
+
+    write_text(join(dir, "x"), "1").unwrap()
+    write_text(join(dir, "y"), "2").unwrap()
+
+    var w = walk(dir)
+
+    assert_eq(next_entry(&w).path, dir)
+
+    // The second call lists the root and reports one of its two files; the other is then removed
+    // before the walk reads what it is.
+    val first = next_entry(&w).path
+    val other = if first == join(dir, "x") then join(dir, "y") else join(dir, "x")
+
+    remove_file(other).unwrap()
+    assert(w.next().is_none(), "a name removed after the listing was reported")
+
+    ignore(remove_dir_all(dir))
+end walk_skips_a_file_that_vanished
+
+@test("a directory removed after it was reported is walked as an empty one")
+walk_skips_a_directory_that_vanished()
+    val dir = scratch("vanished-dir")
+
+    make_dir_all(join(dir, "lock")).unwrap()
+    write_text(join(dir, "lock/held"), "1").unwrap()
+
+    var w = walk(dir)
+
+    assert_eq(next_entry(&w).path, dir)
+    assert_eq(next_entry(&w).path, join(dir, "lock"))
+
+    remove_dir_all(join(dir, "lock")).unwrap()
+    assert(w.next().is_none(), "a directory removed before it was opened was reported")
+
+    ignore(remove_dir_all(dir))
+end walk_skips_a_directory_that_vanished
+
+@test("bottom up, a name removed after the listing is skipped and the root still comes last")
+walk_bottom_up_skips_what_vanished()
+    val dir = scratch("vanished-up")
+
+    write_text(join(dir, "x"), "1").unwrap()
+    write_text(join(dir, "y"), "2").unwrap()
+
+    var w = walk(dir).bottom_up()
+
+    val first = next_entry(&w).path
+    val other = if first == join(dir, "x") then join(dir, "y") else join(dir, "x")
+
+    remove_file(other).unwrap()
+    assert_eq(next_entry(&w).path, dir)
+    assert(w.next().is_none(), "the walk went on past its root")
+
+    ignore(remove_dir_all(dir))
+end walk_bottom_up_skips_what_vanished
+
+@test("a directory that cannot be read is still an error item, and the walk goes on")
+walk_still_reports_an_unreadable_directory()
+    val dir = scratch("unreadable")
+
+    make_dir_all(join(dir, "shut")).unwrap()
+    write_text(join(dir, "shut/inside"), "1").unwrap()
+    set_permissions(join(dir, "shut"), 0o000).unwrap()
+
+    var errors: Buf[IoError] = buf()
+    var seen: Buf[string] = buf()
+
+    for item in walk(dir)
+        item match
+            Ok(e) -> seen.push(e.path)
+            Err(e) -> errors.push(e)
+
+    set_permissions(join(dir, "shut"), 0o755).unwrap()
+    ignore(remove_dir_all(dir))
+
+    assert_eq(errors.len(), 1)
+    assert_eq(errors.at(0), PermissionDenied)
+    assert(has(seen, join(dir, "shut")), "the unreadable directory itself was not reported")
+    assert(!has(seen, join(dir, "shut/inside")), "a directory that cannot be listed was walked")
+end walk_still_reports_an_unreadable_directory

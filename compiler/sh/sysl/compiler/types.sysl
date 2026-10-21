@@ -89,6 +89,22 @@ struct StructType
     // hold is not shared by sharing the struct (`sharing.sysl`).
     guarded: Buf[string]
 
+    // `union`: every field begins at the first byte, the storage is as large as the largest of them
+    // rounded up to the widest boundary, and nothing records which field was written last.
+    union_layout: bool
+
+    // The fields written `name: T in S` -- C bitfields. A struct with any is laid out by the target's
+    // C rule (`c_bitfields.sysl`) rather than field after field.
+    c_bits: Buf[CBit]
+
+    // The `in S` of the field at `i`, where it has one.
+    c_bit(self, i: usize) -> Option[CBit]
+        for b in self.c_bits
+            if b.field == i then return Some(b)
+
+        None
+    end c_bit
+
     // The name a table keys on and a diagnostic starts from.
     name(self) -> string = qualified(self.base, self.targs)
 
@@ -111,6 +127,14 @@ struct StructType
 
     slot(self, i: usize) -> usize = field_slot(self.fields, i)
 end StructType
+
+// A C bitfield: the field at `field` in the declaration is `width` bits allocated in a unit of
+// `storage`, the type C declares it with. A width of zero is `_: in S`, which holds nothing.
+struct CBit
+    field: usize
+    storage: Type
+    width: int
+end CBit
 
 // An `enum` declaration, as one record shared by every use of it.
 //
@@ -304,6 +328,13 @@ enum Type
     // `derived` says the name is a type of its own rather than another spelling of its base -- a
     // `type Metres = int` that may not be added to an `int`.
     Constrained(decl: &ConstrainedType)
+
+    // What one copy of a `for const` over `T::Fields`, `T::Members` or `T::Variants` binds its name
+    // to: the field `field` of `owner` (a struct or a tuple, `variant` -1, or -2 over `T::Members`),
+    // the variant `variant` of `owner` (an enum, `field` -1), or the field `field` of that variant's
+    // payload. Like a `ConstArg` it stands
+    // only in a substitution; no value has it (`type_reflect.sysl`).
+    Descriptor(owner: &Type, variant: int, field: int)
 end Type
 
 // -- the scalars, by name ------------------------------------------------------------------------
@@ -458,6 +489,9 @@ type_eq(a: Type, b: Type) -> bool = a match
         _ -> false
     Constrained(ad) -> b match
         Constrained(bd) -> constrained_eq(ad, bd)
+        _ -> false
+    Descriptor(ao, av, af) -> b match
+        Descriptor(bo, bv, bf) -> av == bv && af == bf && type_eq(*ao, *bo)
         _ -> false
 
 // Two named subtypes, field for field, as the case class this mirrors compares.

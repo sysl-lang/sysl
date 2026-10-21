@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A string literal where a `[N]u8` is expected is the array of its UTF-8 bytes, when it has exactly
+// `N` of them (`reference/arrays.md § A byte array from a string literal`): in every position that
+// passes an expected type down, as constant data on a bare-metal target, and refused with both
+// lengths named when they differ. `[N]i8` and `[N]char` are not byte arrays and keep the literal a
+// `string`. Beside it, `sysl.buf.buf_filled` -- a buffer made at a length, every element one value.
+
+private byl_says(out: string, part: string)
+    assert(out.contains(part), out)
+
+@test("a string literal fills a [N]u8 binding, field, argument, element and result")
+byl_every_position()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Boot\n    oem: [8]u8\n\n" +
+                      "label() -> [5]u8 = \"NO NA\"\n\n" +
+                      "sum(b: [4]u8) -> int = int(b[0]) + int(b[1]) + int(b[2]) + int(b[3])\n\n" +
+                      "val oem: [8]u8 = \"MSWIN4.1\"\n" +
+                      "var slot: [3]u8 = \"abc\"\n" +
+                      "val boot = Boot(\"MSDOS5.0\")\n" +
+                      "val names: [2][3]u8 = [\"FAT\", \"EXT\"]\n\n" +
+                      "slot = \"xyz\"\n\n" +
+                      "print(oem[0], oem[7], str_cast(oem[0..<8]), boot.oem[5])\n" +
+                      "print(sum(\"abcd\"), label()[3], names[1][0], slot[2])\n"),
+              "77 49 MSWIN4.1 53\n394 78 69 122\n")
+end byl_every_position
+
+@test("a non-ASCII literal counts its UTF-8 bytes, and an escape its encoded bytes")
+byl_bytes_not_characters()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("val e: [2]u8 = \"é\"\nval esc: [4]u8 = \"\\n\\t\\0\\u{7F}\"\n" +
+                      "val smile: [4]u8 = \"😀\"\n\n" +
+                      "print(e[0], e[1], esc[0], esc[1], esc[2], esc[3], smile[0], smile[3])\n"),
+              "195 169 10 9 0 127 240 128\n")
+end byl_bytes_not_characters
+
+@test("an empty literal fills a [0]u8")
+byl_empty()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("val z: [0]u8 = \"\"\n\nprint(z.len)\n"), "0\n")
+end byl_empty
+
+@test("a literal longer than the array is refused, naming both lengths")
+byl_too_long()
+    if !enm_ready() then return
+
+    byl_says(enm_err("val a: [8]u8 = \"MSWIN4.10\"\n"),
+             "this string literal is 9 bytes and [8]byte holds 8 — a string literal fills a byte " +
+             "array only when its UTF-8 length is exactly the array's")
+end byl_too_long
+
+@test("a literal shorter than the array is refused, not padded")
+byl_too_short()
+    if !enm_ready() then return
+
+    byl_says(enm_err("f(b: [4]u8) -> int = int(b[0])\n\nprint(f(\"ab\"))\n"),
+             "this string literal is 2 bytes and [4]byte holds 4")
+end byl_too_short
+
+@test("a non-ASCII character's bytes are what is measured")
+byl_measured_in_bytes()
+    if !enm_ready() then return
+
+    byl_says(enm_err("val a: [1]u8 = \"é\"\n"), "this string literal is 2 bytes and [1]byte holds 1")
+end byl_measured_in_bytes
+
+@test("a [N]i8 or a [N]char does not take a string literal")
+byl_only_u8()
+    if !enm_ready() then return
+
+    byl_says(enm_err("val a: [2]i8 = \"ab\"\n"),
+             "cannot initialize 'a': declared [2]i8 but the value is string")
+    byl_says(enm_err("val a: [2]char = \"ab\"\n"),
+             "cannot initialize 'a': declared [2]char but the value is string")
+end byl_only_u8
+
+@test("a string literal where a string is expected is still a string")
+byl_string_stays_a_string()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("val s = \"MSWIN4.1\"\nval t: string = \"ab\"\n\nprint(s.len, t)\n"),
+              "8 ab\n")
+end byl_string_stays_a_string
+
+@test("a module val and var spelled by a literal are laid down as data on a Cortex-M4")
+byl_laid_down_on_bare_metal()
+    if ctb_skip() then return
+
+    val out = ctb_freestanding("val oem: [8]u8 = \"MSWIN4.1\"\n" +
+                               "private var label: [3]u8 = \"NO \"\n\n" +
+                               "@export(\"peek\")\npeek(i: int) -> i32\n" +
+                               "    label[0] = u8(i)\n" +
+                               "    i32(oem[i & 7]) + i32(label[i & 1])\n")
+
+    ctb_laid_down(out, "@oem = private constant [8 x i8] [i8 77, i8 83, i8 87, i8 73, i8 78, i8 52, " +
+                  "i8 46, i8 49]")
+    byl_says(out, "@label = private global [3 x i8] [i8 78, i8 79, i8 32]")
+end byl_laid_down_on_bare_metal
+
+@test("buf_filled makes a buffer of n copies, for n of 0, 1 and many")
+byl_buf_filled()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.buf.{Buf, buf_filled}\n\n" +
+                      "val disk: Buf[u8] = buf_filled(65536, 0)\n" +
+                      "val none: Buf[int] = buf_filled(0, 9)\n" +
+                      "val one = buf_filled(1, \"x\")\n\n" +
+                      "disk[512] = 0xEB\n" +
+                      "var total = 0\n\nfor b in disk\n    total += int(b)\n\n" +
+                      "print(disk.len(), disk[0], disk[65535], disk[512], total)\n" +
+                      "print(none.len(), one.len(), one[0])\n" +
+                      "disk.push(7)\nprint(disk.len(), disk[65536])\n"),
+              "65536 0 0 235 235\n0 1 x\n65537 7\n")
+end byl_buf_filled
+
+@test("buf_filled of a counted value shares it, one count per element, and frees it")
+byl_buf_filled_counted()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.buf.{Buf, buf_filled}\n\n" +
+                      "struct Cell\n    n: int\n\nimpl Drop for Cell\n" +
+                      "    drop(self) = print(\"dropped\", self.n)\n\n" +
+                      "make()\n    val cells: Buf[&Cell] = buf_filled(3, Cell(0))\n\n" +
+                      "    cells[0].n = 7\n    print(cells[0].n, cells[1].n, cells[2].n)\n\n" +
+                      "make()\nprint(\"after\")\n"),
+              "7 7 7\ndropped 7\nafter\n")
+end byl_buf_filled_counted
+
+@test("buf_filled is refused in an allocator-free module")
+byl_buf_filled_no_alloc()
+    if !enm_ready() then return
+
+    byl_says(enm_err("@no_alloc\n\nimport sysl.buf.{Buf, buf_filled}\n\n" +
+                     "val b: Buf[int] = buf_filled(4, 1)\n\nprint(b.len())\n"),
+             "this reaches 'sysl.buf.buf_filled.int', which makes heap storage, and this module " +
+             "declared '@no_alloc'")
+end byl_buf_filled_no_alloc

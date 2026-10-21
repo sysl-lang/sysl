@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// A manifest's `test` block: how a package's own suite is run where the command line does not say.
+
+private tst_read(text: string) -> Manifest = read_manifest(text).unwrap()
+
+private tst_refused(text: string) -> string = read_manifest(text) match
+    Err(why) -> why
+    Ok(_) -> ""
+
+@test("a manifest with no 'test' block says nothing about how its suite runs")
+tst_no_block_says_nothing()
+    val t = tst_read("package { name = p, version = \"0.1.0\" }\n").tests
+
+    assert(t.jobs.is_none() && t.timeout.is_none() && t.alone.is_empty(), "nothing was said")
+
+@test("'test' gives the jobs, the limit and the tests that run alone")
+tst_the_three_keys_are_read()
+    val m = tst_read("test {\n  jobs = 2\n  timeout = 600\n  alone = [\"port\", db_]\n}\n")
+
+    assert_eq(m.tests.jobs.unwrap(), 2)
+    assert_eq(m.tests.timeout.unwrap(), 600)
+    assert_eq(m.tests.alone.len(), 2)
+    assert_eq(m.tests.alone.at(0), "port")
+    assert_eq(m.tests.alone.at(1), "db_")
+    assert(m.warnings.is_empty(), "'test' is a key this compiler knows")
+
+@test("'test.timeout = 0' is no limit, as '--timeout 0' is")
+tst_a_zero_timeout_is_no_limit()
+    assert_eq(tst_read("test { timeout = 0 }\n").tests.timeout.unwrap(), 0)
+
+@test("'test.jobs' is a whole number from one up, and anything else is refused")
+tst_jobs_is_refused_unless_a_count()
+    for bad in ["test { jobs = 0 }\n", "test { jobs = -1 }\n", "test { jobs = \"4\" }\n", "test { jobs = many }\n"]
+        assert_eq(tst_refused(bad), "'test.jobs' is how many tests may run at once, a whole number from 1 up")
+
+@test("'test.timeout' is a whole number of seconds, and anything else is refused")
+tst_timeout_is_refused_unless_seconds()
+    val why = tst_refused("test { timeout = 1.5 }\n")
+
+    assert(why.starts_with("'test.timeout' is the seconds each test may run"), why)
+    assert_eq(tst_refused("test { timeout = \"60\" }\n"), why)
+
+@test("'test.alone' is a list, and a single string is refused for the list it meant")
+tst_alone_is_a_list()
+    assert_eq(tst_refused("test { alone = \"port\" }\n"),
+              "'test.alone' is a list of texts a test's name holds — alone = [\"port\"], and not a single string")
+
+@test("'test' is a block, and the refusal writes one")
+tst_test_is_a_block()
+    val why = tst_refused("test = 4\n")
+
+    assert(why.starts_with("'test' says how this package's suite is run, so it is a block"), why)
+
+@test("a key the 'test' block does not know is warned about and ignored")
+tst_an_unknown_key_is_warned_about()
+    val m = tst_read("test {\n  jobs = 3\n  retries = 2\n}\n")
+
+    assert_eq(m.tests.jobs.unwrap(), 3)
+    assert_eq(m.warnings.len(), 1)
+    assert(m.warnings.at(0).contains("'test.retries'"), m.warnings.at(0))
+    assert(m.warnings.at(0).contains("ignored"), m.warnings.at(0))
+
+@test("the 'test' block is read from the manifest beside the tree a run names")
+tst_settings_are_read_beside_the_tree()
+    val root = make_temp_dir("sysl-tst").unwrap()
+    val bare = make_temp_dir("sysl-tst").unwrap()
+
+    write_text(s"$root/$ManifestName", "test { jobs = 5, alone = [serial_] }\n").unwrap()
+    write_text(s"$root/main.sysl", "main() = 0\n").unwrap()
+
+    val beside = test_settings_of(root)
+    val of_a_file = test_settings_of(s"$root/main.sysl")
+    val none = test_settings_of(bare)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(bare).unwrap_or(())
+    assert_eq(of_a_file.jobs.unwrap(), 5)
+    assert_eq(beside.jobs.unwrap(), 5)
+    assert_eq(beside.alone.at(0), "serial_")
+    assert(none.jobs.is_none() && none.alone.is_empty(), "no manifest says nothing")

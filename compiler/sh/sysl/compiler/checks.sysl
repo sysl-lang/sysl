@@ -14,27 +14,32 @@ import sysl.text.{Search, from_utf8_unchecked}
 // about what it says.
 
 // Everything a program has to answer for, run in the order the reference runs them.
-whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals: Buf[TVal])
+whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals: Buf[TVal],
+                     typed: TypedBodies)
     check_conventions(a)
     check_exports(a)
     check_doc_comments(a, units)
     check_drop_returns(a)
     check_ghost(a, funcs)
     check_module_graph(a)
+    check_target_refusals(a, funcs)
     check_gated_modules(a, funcs, vals, reached_vtables(a))
-    check_no_alloc(a, funcs, vals, reached_vtables(a))
+    check_no_alloc(a, funcs, vals, reached_vtables(a), typed)
     check_no_block(a, funcs, vals, reached_vtables(a))
     check_decl_capabilities(a, funcs, vals, reached_vtables(a))
+    check_atomic_reach(a, funcs, reached_vtables(a))
     check_purity(a, funcs, reached_externs(a))
-    check_const_fns(a, funcs, vals, reached_externs(a))
+    check_const_fns(a, funcs, vals)
     check_frames(a, funcs, reached_externs(a))
     check_self_aliasing(a, funcs)
     check_lent_bodies(a, funcs)
+    check_disjoint(a, funcs)
     check_guarded_results(a, funcs)
     check_test_scope(a, funcs)
     check_task_crossings(a, funcs)
     check_abandons(a, funcs, reached_externs(a), reached_vtables(a))
     check_ref_calls(a, funcs, vals)
+    check_pinned(a, funcs, vals)
 end whole_program_checks
 
 // -- a call that may release what a live `ref` stands on ---------------------------------------
@@ -63,7 +68,8 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         globals.push(item.ty)
 
     val p = TProgram(buf(), buf(), buf(), buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
-                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false)
+                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
+                     false, false, true)
     var u = untouched_summary(p, dropping_reached(a))
     var known: Set[string] = set()
     val sink: &ErasedSink = ErasedSink(buf())
@@ -137,6 +143,14 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
                 var what = "a call through a pointer or a trait names no body to ask"
 
                 if name != "" then what = s"'${qualified_name(name)}' may write a '${type_show(t)}'"
+
+                if w.view_of != ""
+                    a.fault(scope, e.span, s"'${w.name}' is a view borrowed from '${w.view_of}', " +
+                            s"held in a '${type_show(t)}', and $what — which could free what " +
+                            "the view reads. Make the call before the view is taken, or put the " +
+                            "view in a block that closes first")
+                    return
+                end if
 
                 a.fault(scope, e.span, s"'${w.name}' is a 'ref' standing on storage held in a " +
                         s"'${type_show(t)}', and $what — another name for the same object would " +
@@ -231,6 +245,107 @@ end any_type_reaches
 
 // The file a typed body was written in, or an empty one where the body has no source of its own.
 func_home(a: &Analysis, name: string) -> Scope = a.tables.homes.get(name).unwrap_or(empty_scope())
+
+// -- the modules a program reaches ------------------------------------------------------------
+
+// The modules the program's own reach, or nothing where every module counts -- a compilation with no
+// program of its own, such as a build of a library.
+//
+// **A dependency is a set of modules, and a program uses the ones it names**
+// (`reference/modules.md § The target's half needs no clause at all`). So the target's half of a promise --
+// a machine with no heap, no thread-local storage -- is asked of a fetched package's or a `--lib`
+// root's module only where the program reaches it: one that never names `sh.sysl.pool` builds for a
+// board although `sh.sysl.pool.deque`, which it does name, sits beside a module that boxes and keeps
+// per-thread storage. The referring is asked of the graph name resolution built, which records an
+// `import` as readily as a call, so a module is reached through whatever a reached module wrote.
+//
+// **Two modules are reached that nothing names**: one whose top-of-file `asm` is laid down, and one
+// holding an `@export` that answers an `extern` the program calls -- the image carries both whether
+// or not an import leads there, as `reachability.sysl`'s roots do.
+program_reach(a: &Analysis, funcs: Buf[TFunc]) -> Option[Set[string]]
+    var order: Buf[string] = buf()
+    var reached: Set[string] = set()
+
+    // The program's own modules are every one nobody handed over (`Tables.supplied_modules`).
+    for item in a.tables.modules
+        if !holds_string(a.tables.supplied_modules, item) && reached.add(item) then order.push(item)
+
+    if order.is_empty() then return None
+
+    if reached.add(ModuleRoot) then order.push(ModuleRoot)
+
+    for item in a.tables.module_asm
+        if reached.add(item.home) then order.push(item.home)
+
+    val externs = reached_externs(a)
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.exported.is_none() then continue
+
+        for x in externs
+            if f.exported == Some(x.symbol) && reached.add(module_of(f.name)) then
+                order.push(module_of(f.name))
+
+    var i: usize = 0
+
+    while i < order.len()
+        val from = order.at(i)
+
+        i += 1
+
+        for module_dep in a.tables.module_deps
+            if module_dep.0 == from
+                for to in module_dep.1
+                    if reached.add(to) then order.push(to)
+
+    Some(reached)
+end program_reach
+
+// The functions the program's roots arrive at -- its entry, its `@export`s, its tests and hooks in a
+// build that runs them, and the tables of closures written where it reaches (`funcs_reached`) -- or
+// nothing where every function counts: a build of a library, which is compiled for whichever program
+// reaches it, or a compilation with no program of its own.
+//
+// **The image is what the machine's half is asked of**, and a body nothing arrives at is not in it:
+// `sh.sysl.parsing`'s `render`, in a module the program reaches for its `Span`, or a trait's default
+// that an implementing type never has called. The entry file's statements are a body of their own
+// (`entry_check_name`) and are always reached.
+program_func_reach(done: TypedBodies) -> Option[Set[string]]
+    val a = done.an
+
+    if !a.producing.is_empty() then return None
+
+    var own: Buf[string] = buf()
+
+    for item in a.tables.modules
+        if !holds_string(a.tables.supplied_modules, item) then own.push(item)
+
+    if own.is_empty() then return None
+
+    var reached = funcs_reached(program_of(done, done.main_module), own)
+
+    reached.add(entry_check_name(done.main_module))
+
+    Some(reached)
+end program_func_reach
+
+// Whether a module is one the program reaches, where `reach` came from `program_reach`.
+reached_module(reach: Option[Set[string]], module_name: string) -> bool = reach match
+    Some(names) -> names.has(module_name)
+    None -> true
+
+// The refusals a declaration earned from the machine alone, kept until the program's reach is known
+// (`Analysis.target_refusals`) and made now for the modules it reaches.
+private check_target_refusals(a: &Analysis, funcs: Buf[TFunc])
+    if a.target_refusals.is_empty() then return
+
+    val reach = program_reach(a, funcs)
+
+    for item in a.target_refusals
+        if reached_module(reach, item.0.module_name) then a.fault(item.0, item.1, item.2)
+end check_target_refusals
 
 // -- doc comments ----------------------------------------------------------------------------
 
@@ -724,6 +839,24 @@ private check_struct_export(a: &Analysis, key: string, at: Decl, d: StructDecl, 
 end check_struct_export
 
 // Refuses an export whose symbol C could not name, or whose function C could not call.
+// A struct with C bitfields by value across an export: how C passes one is not built yet.
+private check_export_c_bits(a: &Analysis, key: string, f: Func, e: ExportAttr)
+    val name = qualified_name(key)
+
+    for item in f.decl.params
+        val t = signature_type(a, f.decl.needs, f.scope, item.typ, no_bindings())
+
+        if has_c_bits(t)
+            a.fault(f.scope, e.span, c_bits_by_value(t, s"passing it by value to the exported '$name'"))
+            return
+        end if
+
+    val ret = declared_result_type(f.decl.ret_type.map(t -> signature_result(a, f.decl.needs, f.scope,
+                                                                             t, no_bindings())))
+
+    if has_c_bits(ret) then a.fault(f.scope, e.span, c_bits_by_value(ret, s"returning it by value from the exported '$name'"))
+end check_export_c_bits
+
 private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
     if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
         a.fault(f.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can call — an exported " +
@@ -754,10 +887,20 @@ private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
                 "instantiation the linker holds. Export a wrapper per instantiation, each naming " +
                 "its own symbol")
 
+    // **The entry is never a default.** A weak `main` is the image's start a link may silently swap
+    // for any other `main` it meets -- a C runtime's, a test harness's -- so the program would begin
+    // somewhere nobody wrote.
+    if e.weakly &&e.symbol.unwrap_or(module_bare(spelled_key(overload_plain(key)))) == "main" then
+        a.fault(f.scope, e.span, "the entry point cannot be exported 'weak' — 'main' is where the " +
+                "image starts, and a weak one is a default any other 'main' in the link replaces, so " +
+                "the program would begin somewhere nobody wrote. Export it without 'weak'")
+
     // **`private` is not refused**: it is a promise about the sysl NAME, and an export is a promise
     // about a symbol. A private export keeps the name file-private and publishes the symbol hidden,
     // for the linker of the image it lands in -- module `asm` or a package's own C calling back in
     // (`emit_export.sysl`).
+
+    if f.decl.tparams.is_empty() then check_export_c_bits(a, key, f, e)
 
     if f.decl.ghost then
         a.fault(f.scope, e.span, s"'${qualified_name(key)}' is '@ghost', so it is erased before " +

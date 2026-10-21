@@ -1,0 +1,286 @@
+module sh.sysl.compiler
+@tests
+
+// **What a body decides while compiling**: a `const` written inside it, an `if const` that picks the
+// arm to compile, and an `@assert` checked for each instance of a generic and each copy of a
+// `for const`. Each claim is a whole program, built and run.
+
+@test("a constant inside a body is its value: a length, a value argument and a pattern read it")
+cte_a_local_const_folds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        sq(x: int) -> int = x * x
+
+        twice[const N: usize]() -> usize
+            const D: usize = N * 2
+            D + 1
+
+        main()
+            const L: int = sq(6)
+            const M: int = L + 1
+            const S: string = "s" + str(M)
+            var a: [L]int
+            print(L, M, S, a.len, twice[4](), twice[L]())
+            36 match
+                L -> print("matched")
+                _ -> print("missed")
+        """), "36 37 s37 36 9 73\nmatched\n")
+end cte_a_local_const_folds
+
+@test("a constant inside a body ends with its block, shadows an outer one, and is read by a closure")
+cte_a_local_const_is_scoped()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const G: int = 1
+
+        rep[const N: int]() -> int = N * 10
+
+        own[const N: int]() -> int
+            const N: int = 50
+            N
+
+        widths[..P](p: (..P)) -> int
+            var t = 0
+            for const i in 0..<P.len
+                const W: usize = i * 10
+                var a: [W]u8
+                t += int(a.len)
+            t
+
+        main()
+            const G: int = 2
+            val f = (x: int) -> x + G
+            if true
+                const G: int = 7
+                var b: [G]u8
+                print(G, b.len, rep[G]())
+            helper() -> int = G + 40
+            print(G, f(1), helper(), own[3](), widths((1, 2, 3)))
+        """), "7 7 70\n2 3 42 50 30\n")
+
+    assert(enm_outcome(raw"""
+        main()
+            if true
+                const Z: int = 2
+            print(Z)
+        """).0.contains("undefined name 'Z'"), "a constant outlived its block")
+end cte_a_local_const_is_scoped
+
+@test("a constant inside a body is refused where its value is not known while compiling")
+cte_a_local_const_that_cannot_be_known()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        noisy(x: int) -> int
+            print("hi")
+            x
+
+        main()
+            var n = 3
+            const A: int = n + 1
+            const B: int = noisy(2)
+            const C: int = 1 / 0
+            print(A, B, C)
+        """).0
+
+    for part in ["'A' is a constant, so its value is known while compiling, and it reads 'n', which " +
+                 "the body binds and which holds a value only once the program runs. A name bound " +
+                 "to such a value is a 'val'",
+                 "'B' cannot be computed while compiling: it calls 'noisy', which prints, which is " +
+                 "outside the program",
+                 "a constant divided by zero"]
+        assert(said.contains(part), said)
+end cte_a_local_const_that_cannot_be_known
+
+@test("a constant inside a body has the types one at the top of a file has, and its range is checked")
+cte_a_local_const_is_a_scalar()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        type Age = int within 0..150
+
+        struct P
+            x: int
+
+        enum Dir
+            Up
+            Down
+
+        old(n: int) -> int = n * 100
+
+        main()
+            const A: Age = 122
+            const B: Age = old(3)
+            const C: P = P(1)
+            const D: [2]int = [1, 2]
+            const E: Dir = Dir.Up
+            print(A)
+        """).0
+
+    for part in ["'B' traps while it is being compiled: 300 is not a value 'Age' admits",
+                 "a constant is a scalar, and P is storage — write 'C' as a 'val'",
+                 "a constant is a scalar, and [2]int is storage — write 'D' as a 'val'",
+                 "a constant is a scalar, and Dir is not — 'E'"]
+        assert(said.contains(part), said)
+end cte_a_local_const_is_a_scalar
+
+@test("a constant inside a body has no storage, so nothing writes it or takes its address")
+cte_a_local_const_has_no_storage()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        main()
+            const Z: int = 2
+            Z = 3
+            print(&Z)
+        """).0
+
+    for what in ["assignment", "'&'"]
+        assert(said.contains(s"'Z' is a constant, which is its value wherever it is used and has no " +
+                             s"storage of its own — so $what has nothing to reach"), said)
+end cte_a_local_const_has_no_storage
+
+@test("an 'if const' compiles only the arm it picks, per instance and per unrolled copy")
+cte_if_const_picks_an_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        describe[const N: usize]() -> string
+            if const N > 64
+                "big"
+            elif const N == 0
+                "empty"
+            else
+                "small"
+
+        pick[T](x: T) -> int
+            if const sizeof(T) == 1
+                x.nothing_here()
+            else
+                7
+
+        parts[..P](p: (..P)) -> int
+            var total = 0
+            for const i in 0..<P.len
+                if const i == 1
+                    total += 100
+                else
+                    total += 1
+            total
+
+        main()
+            print(describe[100](), describe[0](), describe[3]())
+            print(pick(5), parts((1, "a", 2.0)))
+            const D: bool = false
+            if const D then print("D") else print("not D")
+            if const !D
+                print("no else")
+        """), "big empty small\n7 102\nnot D\nno else\n")
+end cte_if_const_picks_an_arm
+
+@test("an 'if const' is refused where its condition is not known while compiling, or not a 'bool'")
+cte_if_const_refusals()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        noisy() -> bool
+            print("q")
+            true
+
+        main()
+            var n = 3
+            if const n > 2
+                print("x")
+            if const 5
+                print("y")
+            if const noisy()
+                print("z")
+        """).0
+
+    for part in ["an 'if const' is decided while compiling, so its condition has to be known then — " +
+                 "a 'const', a value parameter, or a call whose body can run. A test made while the " +
+                 "program runs is a plain 'if'",
+                 "an 'if const' takes a 'bool' — it picks the arm to compile, and this condition is " +
+                 "not true or false",
+                 "it calls 'noisy', which prints, which is outside the program"]
+        assert(said.contains(part), said)
+end cte_if_const_refusals
+
+@test("an 'if const' chain is decided in one place: every 'elif' is 'elif const', or none is")
+cte_if_const_chains_agree()
+    if !enm_ready() then return
+
+    assert(enm_outcome(raw"""
+        main()
+            if const true
+                print("a")
+            elif 1 > 0
+                print("b")
+        """).0.contains("an 'if const' is decided while compiling, so each 'elif' after it is too — " +
+                        "write 'elif const'"), "a plain 'elif' followed an 'if const'")
+
+    assert(enm_outcome(raw"""
+        main()
+            var n = 1
+            if n > 0
+                print("a")
+            elif const true
+                print("b")
+        """).0.contains("an 'elif const' follows an 'if const' — this chain's 'if' tests while the " +
+                        "program runs"), "an 'elif const' followed a plain 'if'")
+end cte_if_const_chains_agree
+
+@test("an '@assert' in a body is checked for each instance, each unrolled copy and each arm taken")
+cte_an_assert_in_a_body()
+    if !enm_ready() then return
+
+    val ok = raw"""
+        sq(x: int) -> int = x * x
+
+        ring[T, const N: usize]() -> usize
+            if const N > 64
+                @assert(sizeof(T) * N <= 4096, "a ring this large belongs on the heap")
+            N
+
+        each[..P](p: (..P)) -> int
+            for const i in 0..<P.len
+                @assert(i < 2, "at most two parts")
+            0
+
+        main()
+            const K: int = sq(3)
+            @assert(K == 9, "K is nine")
+            @assert(sq(4) == 16)
+            print(ring[u8, 100](), ring[u64, 10](), each((1, 2)))
+        """
+
+    assert_eq(enm_ran(ok), "100 10 0\n")
+
+    val said = enm_outcome(ok + "    print(ring[u64, 1000](), each((1, 2, 3)))\n" +
+                           "    @assert(K == 10, \"K is not ten\")\n").0
+
+    for part in ["assertion failed: a ring this large belongs on the heap — the left side is 8000 — " +
+                 "where N = 1000",
+                 "assertion failed: at most two parts — the left side is 2 — where P = int, int, int, i = 2",
+                 "assertion failed: K is not ten — the left side is 9"]
+        assert(said.contains(part), said)
+end cte_an_assert_in_a_body
+
+@test("a value parameter is read at the type it declared, whatever wrote its argument")
+cte_a_value_parameter_reads_at_its_declared_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        rep[const N: int]() -> int = N * 10
+        low[const B: u8]() -> u8 = B + 1
+        wide[const W: i64]() -> i64 = W * 1000000000000
+
+        f[const N: int](a: [N]int) -> int = rep[N]()
+
+        main()
+            const K: int = 4
+            print(rep[7](), rep[K](), low[254](), wide[3](), f([1, 2]))
+        """), "70 40 255 3000000000000 20\n")
+end cte_a_value_parameter_reads_at_its_declared_type

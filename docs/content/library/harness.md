@@ -103,8 +103,8 @@ usually the same failure seen again through worse state.
 | | |
 |---|---|
 | `check(cond, msg = "")` | a condition that has to hold |
-| `check_eq[T: Eq + Display](got, want)` | two values that have to be equal, both rendered when they are not |
-| `check_slice_eq[T: Eq + Display](got, want)` | the same for a `[]const T`, naming the index that differs |
+| `check_eq[T: Eq + Debug](got, want)` | two values that have to be equal, both shown through their `Debug` when they are not |
+| `check_slice_eq[T: Eq + Debug](got, want)` | the same for a `[]const T`, naming the index that differs |
 
 One generic member stands in for Unity's several hundred assertion macros and does more than they
 can: `TEST_ASSERT_EQUAL_*` covers a fixed list of C's own types and falls back to a hex dump of the
@@ -202,7 +202,7 @@ impl Writer for Console
     write(*self, bytes: []const u8)
         for b in bytes do putc(b)
 
-val uart: *Console = ptr_cast(0usize)
+val uart: *Console = ptr_cast(0)
 
 console() -> *Writer = uart
 ```
@@ -215,7 +215,7 @@ default `failed`, which answers false. A UART that cannot fail has nothing to ad
 
 **`Console` has no fields, so its receiver is a null pointer.** A trait object is two words, a method
 table and a datum, and `write` here never looks at the datum — everything it needs is the module's
-own `regs`. Given nothing to point at, `ptr_cast(0usize)` is the honest spelling; the alternative
+own `regs`. Given nothing to point at, `ptr_cast(0)` is the honest spelling; the alternative
 would be to take the address of a temporary, which is a dangling pointer with better manners.
 
 **And it has to be a module of its own rather than the file your statements are in.** An `impl`

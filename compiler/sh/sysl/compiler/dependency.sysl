@@ -46,11 +46,82 @@ struct Dependency
     // too. Accepted as written here and resolved against that package's own manifest elsewhere.
     features: Buf[string]
     default_features: bool
+
+    // Directories of the CONSUMER's, relative to the manifest that wrote this entry, searched ahead of
+    // the package's own include roots by every C file of the package (`c_libraries.sysl`) -- which is
+    // how a consumer supplies the configuration header a vendored library is written to take.
+    c_include: Buf[string]
+
+    // The machines the dependency is taken on, as the condition its `if` wrote -- `#if`'s language
+    // over `dependency_symbols` -- or the empty string where it is taken on every machine.
+    condition: string
+
+    // The options of the dependency this entry sets, each by name with the value as written
+    // (`options.sysl`). Held to the dependency's own declarations once its manifest is read.
+    options: Buf[(string, &Conf)]
 end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
 plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
-    Dependency(label, origin, mount, false, buf(), true)
+    Dependency(label, origin, mount, false, buf(), true, buf(), "", buf())
+
+// **The machine a graph is resolved for**, which decides the dependencies an `if` leaves out. Module
+// storage for the reason `features.sysl` gives for the feature request: it is written by the one
+// funnel a command that lowers anything comes through (`target_for`) and read by every resolution
+// that build makes -- the compilation, the C walk, the run cache's key -- which must all agree.
+//
+// **None takes every dependency whatever its condition**, which is what a question about the
+// manifests rather than about one build wants: `sysl deps`, `sysl tidy` and `sysl vendor` answer for
+// every machine a project may be built for, as they do for every feature.
+private var resolution_machine: Option[Target] = None
+
+// Said by a command once it knows the machine it builds for, and with `None` before any other.
+use_resolution_machine(t: Option[Target]) = resolution_machine = t
+
+// Whether a dependency is part of a graph resolved for the machine `use_resolution_machine` named.
+present_here(dep: &Dependency) -> bool
+    if dep.condition.is_empty() then return true
+
+    resolution_machine match
+        None -> true
+        Some(t) -> dependency_condition(dep.condition, dependency_defined(t)).unwrap_or(true)
+end present_here
+
+// The dependencies a list keeps on this machine, and the ones it leaves out.
+present_and_absent(deps: &Buf[Dependency]) -> (Buf[Dependency], Buf[Dependency])
+    var present: Buf[Dependency] = buf()
+    var absent: Buf[Dependency] = buf()
+
+    for dep in deps
+        if present_here(dep) then present.push(dep) else absent.push(dep)
+
+    (present, absent)
+end present_and_absent
+
+// What a `no module is called` refusal adds where the graph left a dependency out on this machine,
+// each with who declared it ("this project" or a package's name): the module may be one of those,
+// and the build is not for a machine that takes it. **The whole graph's, since imports are
+// transitive**: a package reached through another is importable where it is present, so its
+// absence is news to every file of the build.
+absent_note(absent: &Buf[(string, Dependency)]) -> string
+    if absent.is_empty() then return ""
+
+    val machine = resolution_machine match
+        None -> "this machine"
+        Some(t) -> s"'${t.name}'"
+
+    var out = ""
+
+    for i in 0..<absent.len()
+        val (asker, dep) = absent.at(i)
+
+        out = out + (if i == 0 then " — " else "; ") +
+            s"'${dep.label}', which $asker takes only where '${dep.condition}' holds"
+
+    val verb = if absent.len() == 1 then "is" else "are"
+
+    out + s", $verb left out: $machine is not such a machine, and nothing of it is in this build"
+end absent_note
 
 // The identity everything mangles, caches and resolves by -- the coordinate, with the separators a
 // module name is allowed to hold.
@@ -109,8 +180,7 @@ resolved_against(dep: &Dependency, declaring_dir: string) -> Dependency
         Local(dir) ->
             val joined = if dir.starts_with("/") then dir else join_path(declaring_dir, dir)
 
-            Dependency(dep.label, Local(absolute_path(joined)), dep.mount, dep.optional,
-                       dep.features, dep.default_features)
+            (*dep) with { origin = Local(absolute_path(joined)) }
 end resolved_against
 
 // Every dependency of a list read against the directory holding the manifest that wrote it.
@@ -240,13 +310,14 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version', " +
-                "'workspace'")
+                "'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', " +
+                "'options', 'path', 'rev', 'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
     val origin = read_origin(sub, where)?
     val optional = read_yes_no(sub, where, "optional", false)?
     val defaults = read_yes_no(sub, where, "default_features", true)?
+    val condition = read_condition_key(sub, where)?
 
     val features = conf_at(sub, "features") match
         None -> buf()
@@ -254,12 +325,63 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
             None -> return Err(not_a_feature_list(s"$where.features"))
             Some(names) -> names
 
-    Ok(Dependency(label, origin, mount, optional, features, defaults))
+    var c_include: Buf[string] = buf()
+
+    conf_at(sub, "c_include") match
+        None -> ()
+        Some(v) -> conf_list(v) match
+            None -> return Err(s"'$where.c_include' must be a list of directories, relative to this " +
+                               "manifest")
+            Some(dirs) ->
+                for dir in dirs
+                    c_include.push(inside_package(s"$where.c_include", "", dir)?)
+
+    val options = read_option_settings(sub, where)?
+
+    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, condition, options))
 end read_dependency
 
+// An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
+// the build turns out to be for -- so a misspelling is refused when the file is read rather than
+// leaving the dependency out of every build with nothing said.
+private read_condition_key(sub: &Conf, where: string) -> Result[string, string]
+    val text = conf_at(sub, "if") match
+        None -> return Ok("")
+        Some(v) -> *v match
+            Text(s) -> s
+            Word(s) -> s
+            _ -> return Err(s"'$where.if' is not a string — it is a condition, as '#if' writes " +
+                "one, in quotes: if = \"freestanding\"")
+
+    dependency_condition(text, buf()) match
+        Err(why) -> Err(s"'$where.if' $why")
+        Ok(_) -> Ok(text)
+end read_condition_key
+
 private known_dependency_key(key: string) -> bool =
-    key == "git" || key == "version" || key == "path" || key == "mount" || key == "optional" ||
-    key == "features" || key == "default_features" || key == "workspace"
+    key == "git" || key == "version" || key == "rev" || key == "path" || key == "mount" || key == "optional" ||
+    key == "features" || key == "default_features" || key == "workspace" || key == "c_include" ||
+    key == "if" || key == "options"
+
+// An entry's `options`: each option of the dependency this consumer sets, by name, with the value as
+// written. What the value may be is the dependency's manifest's to say, so it is held to that once the
+// manifest is read (`settle_options`); here only the shape is.
+private read_option_settings(sub: &Conf, where: string) -> Result[Buf[(string, &Conf)], string]
+    var out: Buf[(string, &Conf)] = buf()
+
+    val block = conf_at(sub, "options") match
+        None -> return Ok(out)
+        Some(b) -> b
+
+    if !conf_is_block(block)
+        return Err(s"'$where.options' is not a block — it sets the package's options by name, as " +
+            "'options = { slots = 8 }'")
+
+    for name in conf_keys(block)
+        out.push((name, conf_at(block, name).unwrap()))
+
+    Ok(out)
+end read_option_settings
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.
@@ -321,7 +443,7 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
             return Err(s"'$where.workspace' is only ever 'true' — leave it out and name a 'git' " +
                 "coordinate or a 'path' instead")
 
-        if has_git || has_path || conf_at(sub, "version").is_some()
+        if has_git || has_path || conf_at(sub, "version").is_some() || conf_at(sub, "rev").is_some()
             return Err(s"'$where' names 'workspace = true' and a 'git', 'path' or 'version' as well " +
                 "— a workspace member is the directory the workspace lists, at no version, so it " +
                 "is named by the workspace alone")
@@ -343,6 +465,10 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
             return Err(s"'$where' names a 'path' and a 'version' — a path dependency is the " +
                 "directory as it is now, and there is nothing to resolve a version against")
 
+        if conf_at(sub, "rev").is_some()
+            return Err(s"'$where' names a 'path' and a 'rev' — a path dependency is the " +
+                "directory as it is now, and there is no repository to pin a commit of")
+
         val dir = conf_text(sub, "path")
 
         if dir.is_empty() then return Err(s"'$where.path' is empty")
@@ -350,10 +476,29 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
         return Ok(Local(dir))
 
     val coordinate = conf_text(sub, "git")
+    val has_rev = conf_at(sub, "rev").is_some()
+
+    if has_rev && conf_at(sub, "version").is_some()
+        return Err(s"'$where' names a 'version' and a 'rev' — a dependency is read at a release or " +
+            "at a pinned commit, and exactly one of the two says which")
+
+    // **A pin is a commit and nothing else**: the sha, whole or shortened, because a branch name
+    // moves and a tag already has `version`. It is lowercase hex since that is what git prints and
+    // what `sysl.sum` records, so one commit is never two spellings.
+    if has_rev
+        val sha = conf_text(sub, "rev")
+
+        if !is_commit_sha(sha)
+            return Err(s"'$where.rev' is '$sha', which is not a commit — a pin is a commit's sha, " +
+                "in lowercase hex, whole or shortened to at least seven digits")
+
+        check_coordinate(coordinate, where)?
+        return Ok(Git(coordinate, release_at_rev(sha)))
+    end if
 
     if conf_at(sub, "version").is_none()
-        return Err(s"'$where' names a 'git' coordinate and no 'version' — a coordinate says which " +
-            "repository and a version says which of it")
+        return Err(s"'$where' names a 'git' coordinate and neither a 'version' nor a 'rev' — a " +
+            "coordinate says which repository, and a version or a pinned commit says which of it")
 
     val version = release_of(conf_text(sub, "version")) match
         Err(why) -> return Err(s"'$where.version': $why")
@@ -363,6 +508,17 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
     check_major(coordinate, version, where)?
     Ok(Git(coordinate, version))
 end read_origin
+
+// Whether text is a commit's sha as a pin writes one: lowercase hex, from git's usual seven-digit
+// abbreviation up to the whole forty.
+is_commit_sha(text: string) -> bool
+    if text.bytes.len < 7 || text.bytes.len > 40 then return false
+
+    for c in text.bytes
+        if !((c >= u8('0') && c <= u8('9')) || (c >= u8('a') && c <= u8('f'))) then return false
+
+    true
+end is_commit_sha
 
 // What a coordinate is: a host and a path under it, as `git` would be given, and **not a URL**.
 //

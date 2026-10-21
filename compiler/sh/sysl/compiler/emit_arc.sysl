@@ -90,9 +90,14 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
     _ -> aggregate_arc(e, ty, v, retain)
 
 // The per-type helper an aggregate's walk is, called on the value.
+//
+// A **large** value is walked at its address, by the helper `walk_at` uses. The call is written with
+// the value as its argument, and `emit_large.sysl` puts the address the value was read from in its
+// place -- so the value-taking helper, whose parameter would be one LLVM value as wide as the type,
+// is never asked for.
 private aggregate_arc(e: *Emit, ty: Type, v: Val, retain: bool)
     if contains_counted(ty)
-        val name = value_helper(e, ty, retain)
+        val name = if e.layout.indirect(ty) then slot_helper(e, ty, retain) else value_helper(e, ty, retain)
 
         var args: Buf[IrArg] = buf()
 
@@ -791,6 +796,58 @@ temps_here(e: *Emit) -> Buf[(Val, Type)]
     out
 end temps_here
 
+// **A temporary handed to an async function moves into the task's frame.** The frame keeps a count of
+// every parameter of its own, taken before the call returns, so the count this frame took for the
+// argument is given back as soon as the call returns rather than with the statement's other
+// temporaries -- and a task the callee lets go of is cancelled there, not after the statement that
+// made the call has run to its end. `mark` and `worked_out` are the height of the temporaries before
+// and after the arguments were worked out.
+//
+// **Every temporary the arguments made goes, not only the arguments themselves**: a struct built in
+// an argument holds its fields' counts in the temporaries they came from, and a temporary read
+// only on the way to an argument is read by nothing after the call. The frame holds a count of
+// everything a parameter reaches through a counted reference, so nothing it reads is let go. The
+// exception is a raw pointer, which holds no count: where an argument can hold one, only the
+// arguments themselves are given back, since the pointer may point into one of the others.
+move_into_task(e: *Emit, mark: usize, worked_out: usize, exprs: Buf[TExpr], args: Buf[IrArg])
+    var whole = true
+
+    for x in exprs
+        if holds_pointer(texpr_type(x)) then whole = false
+
+    var moved: Buf[(Val, Type)] = buf()
+    var kept: Buf[(Val, Type)] = buf()
+
+    for i in mark..<e.temps.len()
+        val t = e.temps.at(i)
+
+        if i < worked_out && (whole || handed(args, t.0)) then moved.push(t) else kept.push(t)
+
+    if moved.is_empty() then return
+
+    release_values(e, moved)
+    e.temps.truncate(mark)
+
+    for t in kept
+        e.temps.push(t)
+end move_into_task
+
+// Whether a register is one of a call's arguments.
+private handed(args: Buf[IrArg], v: Val) -> bool
+    val name = reg_name(v)
+
+    if name == "" then return false
+
+    for a in args
+        if reg_name(a.value) == name then return true
+
+    false
+end handed
+
+private reg_name(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""
+
 // Every value in a list let go of, last taken first -- by value, or at its address where it was
 // registered as a slot (`own_temp_at`).
 release_values(e: *Emit, vs: Buf[(Val, Type)])
@@ -912,8 +969,13 @@ end pop_owned
 private run_deferrals(e: *Emit, k: usize)
     val ds = scope_defers(e, k)
 
+    // Laid down at an exit, out of the order a guard was proved in (`nowrap.sysl`).
+    nowrap_suspend(e)
+
     for i in 0..<ds.len()
         gen_stmt(e, ds.at(ds.len() - 1 - i))
+
+    nowrap_resume(e)
 end run_deferrals
 
 // Lets go of everything the function holds, for a `return` that leaves from the middle of it.
@@ -967,13 +1029,28 @@ set_promotions(e: *Emit, promotions: Promotions)
         e.promoted_temps.push(temporarie)
 end set_promotions
 
-// The arrays the body about to be lowered must move, which the escape analysis settled.
-set_promoted(e: *Emit, names: Buf[string])
+// The arrays the body about to be lowered must move, and the array literals it lays in its frame,
+// which the escape analysis settled. `name` is the function's, or the empty string for the
+// statements a program runs.
+set_promoted(e: *Emit, pr: Promotions, name: string)
     e.promoted.clear()
 
-    for item in names
+    for item in pr.for_func(name)
         e.promoted.push(item)
+
+    e.framed_lits.clear()
+
+    for at in pr.framed_for(name)
+        e.framed_lits.push(at)
 end set_promoted
+
+// Whether the array literal at this span is laid in the frame of the body being lowered.
+is_framed_lit(e: *Emit, at: Span) -> bool
+    for framed in e.framed_lits
+        if framed == at then return true
+
+    false
+end is_framed_lit
 
 // Whether the temporary at this span is one given storage of its own. It is the seam a view of a
 // whole array literal reads: the escape analysis has already decided, and what is left is for the

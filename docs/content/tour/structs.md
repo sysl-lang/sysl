@@ -20,10 +20,10 @@ print("point:", p.x, p.y)
 point: 6 7
 ```
 
-Construction is positional and uses the type's own name. There is no `new`, and no allocation has
-happened: `p` is a value, it lives in this frame, and it is exactly as big as its fields.
+Construction is positional and uses the type's name. There is no `new`, and nothing is allocated:
+`p` is a value, it lives in the current frame, and it is exactly the size of its fields.
 
-A struct is copied when you assign it, the same as any other value:
+A struct is copied when it is assigned, like any other value:
 
 ```sysl
 struct Point
@@ -42,11 +42,11 @@ print("a:", a.x, "b:", b.x)
 a: 1 b: 99
 ```
 
-That is worth pausing on if you are used to a language where every object is a reference. `b = a`
-copied the point. If you want two names for *one* object, you ask for it — and that is the
-[memory chapter](/tour/memory/).
+This differs from languages in which every object is a reference: `b = a` copied the point. Two
+names for *one* object are something you ask for explicitly, and the
+[memory chapter](/tour/memory/) shows how.
 
-A member with a `self` receiver is a method. The sigil on `self` says how the method takes the
+A member with a `self` receiver is a method. The sigil on `self` says how the method receives the
 instance, exactly as it would on any other parameter:
 
 ```sysl
@@ -75,16 +75,16 @@ before: 7
 after: 37
 ```
 
-`self` by value gets a copy, which is what a read wants and what stops a method that only reads from
-being able to write. `*self` is the receiver a mutating method takes, and it is spelled with the
-same sigil that means "raw pointer" everywhere else — because that is what it is.
+`self` by value receives a copy, which suits a method that only reads and guarantees it cannot write
+to the caller's value. `*self` is the receiver for a mutating method. It uses the same sigil as a raw
+pointer everywhere else, because it is one.
 
-There is no `this` and no implicit receiver: `self` is written, and a field access through it is
-written too.
+There is no `this` and no implicit receiver: `self` is written explicitly, and so is every field
+access through it.
 
 ## Properties and associated functions
 
-A member with no parameter list is a **property** — it reads like a field but is computed:
+A member with no parameter list is a **property**: it reads like a field but is computed:
 
 ```sysl
 struct Rect
@@ -104,15 +104,14 @@ print("area:", r.area, "perimeter:", r.perimeter)
 area: 12 perimeter: 14
 ```
 
-Note the missing parentheses at the call: `r.area`, not `r.area()`. The convention that goes with
-that spelling is that a property is *cheap* — anything that allocates or loops is a method, so that
-the parentheses warn you.
+The call has no parentheses: `r.area`, not `r.area()`. By convention a property is *cheap*; anything
+that allocates or loops is written as a method, so the parentheses signal the cost.
 
-A property may be **written** too, by declaring a `set` beside it, which is how a value notices its
-own writes — [the reference](/reference/declarations/#a-property-may-be-settable) has the form.
+A property may also be **assigned**, by declaring a `set` beside it, which lets a value act on writes
+to it; [the reference](/reference/declarations/#a-property-may-be-settable) has the form.
 
-A member with no `self` at all is an **associated function**, called through the type name. It is
-where a named constructor goes, since the positional `Rect(w, h)` covers only one shape:
+A member with no `self` is an **associated function**, called through the type name. This is where
+named constructors go, since the positional `Rect(w, h)` covers only one form:
 
 ```sysl
 struct Rect
@@ -133,5 +132,5 @@ square: 25
 
 ---
 
-Next: [memory](/tour/memory/) — the three modes, and the chapter that makes sysl a different
-language rather than a different syntax.
+Next: [memory](/tour/memory/), the three memory modes, which are what most distinguish sysl from
+other languages.

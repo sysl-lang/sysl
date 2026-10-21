@@ -23,7 +23,7 @@ var two = 2.0
 var u = 0b1011u8
 
 print(two.sqrt(), pi, min(3, 7))
-print(u.count_ones(), u.rotate_left(1u32))
+print(u.count_ones(), u.rotate_left(1))
 ```
 
 ```output
@@ -158,8 +158,8 @@ something the widening introduced.
 ```sysl
 import sysl.math.Float
 
-var h: f16 = 9.0
-var b: bf16 = 9.0
+var h: f16 = 9
+var b: bf16 = 9
 
 print(h.sqrt(), b.sqrt())
 print(real(f16.max_value()), real(bf16.epsilon()))
@@ -183,12 +183,12 @@ var three = 3.0
 var eight = 8.0
 var hundred = 100.0
 var eightyone = 81.0
-var quarter = tau / 4.0
+var quarter = tau / 4
 
 print(two.sqrt(), eight.cbrt())
 print(e.ln(), two.exp2())
 print(hundred.log10(), eight.log2(), eightyone.log(three))
-print(two.pow(10.0), three.hypot(4.0))
+print(two.pow(10), three.hypot(4))
 print(quarter.sin(), quarter.cos())
 ```
 
@@ -231,8 +231,8 @@ var ten = 10.0
 var one = 1.0
 
 print(half.floor(), half.ceil(), half.round(), neg.trunc())
-print(neg.abs(), three.copysign(-1.0))
-print(seven.fmod(2.0))
+print(neg.abs(), three.copysign(-1))
+print(seven.fmod(2))
 print(four.recip(), three.square(), zero.lerp(ten, 0.25))
 print(one.atan2(one).to_degrees())
 print(neg.signum(), zero.signum())
@@ -308,7 +308,7 @@ meets.
 ```sysl
 import sysl.math.Float
 
-var f: f32 = 2.0f32
+var f: f32 = 2
 
 print(real.epsilon(), real.max_value())
 print(f.sqrt(), f32.pi(), f32.epsilon())
@@ -430,8 +430,8 @@ against a written-down number needs a tolerance rather than an equality:
 import sysl.math.{approx_eq, approx_eq_rel, nan, infinity, Float}
 
 print(approx_eq(0.1 + 0.2, 0.3, 1e-12), approx_eq(1.0, 1.5, 0.1))
-print(approx_eq(infinity(), infinity(), 0.0), approx_eq(nan(), nan(), 1.0))
-print(approx_eq_rel(1e18, 1e18 + 1000.0, 1e-6), approx_eq_rel(1.0, 1.5, 1e-6))
+print(approx_eq(infinity(), infinity(), 0), approx_eq(nan(), nan(), 1))
+print(approx_eq_rel(1e18, 1e18 + 1000, 1e-6), approx_eq_rel(1.0, 1.5, 1e-6))
 ```
 
 ```output
@@ -498,11 +498,11 @@ they answer the same on a freestanding target as on a hosted one.
 ```sysl
 import sysl.math.{nextafter, ulp, infinity, nan, Float}
 
-val up = nextafter(1.0, 2.0)
-print(up > 1.0, up - 1.0 == ulp(1.0), nextafter(up, 0.0) == 1.0)
-print(nextafter(0.0, 1.0) > 0.0, nextafter(2.0, 2.0) == 2.0)
+val up = nextafter(1.0, 2)
+print(up > 1, up - 1 == ulp(1.0), nextafter(up, 0) == 1)
+print(nextafter(0.0, 1) > 0, nextafter(2.0, 2) == 2)
 print(nextafter(1.7976931348623157e308, infinity()) == infinity(), ulp(infinity()) == infinity())
-print(nextafter(nan(), 1.0).is_nan(), ulp(nan()).is_nan())
+print(nextafter(nan(), 1).is_nan(), ulp(nan()).is_nan())
 ```
 
 ```output
@@ -555,8 +555,10 @@ So membership is the **compiler's**, by the same rule that makes an `int` an `Ad
 having written `impl Add for int`. What is in the source file is the part a declaration can say: the
 names, the signatures, and what each one means.
 
-**The trait still has to be in scope to be reached.** That is what a compiler-provided membership does
-*not* change — it settles which types have the member, not which files may name it:
+**A concrete value reaches the members with no import**, the way every impl's members are reached
+([Reaching a member through its trait](/reference/traits/#reaching-a-member-through-its-trait)): a
+`real` has its `sqrt` in a file that imports only `pi`. What still needs the trait is generic code,
+where a `T` has the members its bounds promise and no others:
 
 ```sysl
 import sysl.math.pi
@@ -566,12 +568,9 @@ var x = 2.0
 print(pi, x.sqrt())
 ```
 
-```error
-real has 'sqrt' from sysl.math.Float, and that trait is not in scope here — import it to reach the member
+```output
+3.141592653589793 1.4142135623730951
 ```
-
-Importing the module is not the same as importing the trait: `pi` is in scope on that line and
-`sqrt` is not.
 
 `Signed` covers the signed widths only; `Bits` covers both signednesses, because a bit pattern is a
 bit pattern:
@@ -595,7 +594,7 @@ import sysl.math.Signed
 
 var n = -42
 var z = 0
-var m: i32 = -2147483647 - 1
+var m = -2147483647 - 1
 var big: i128 = -170141183460469231731687303715884105727
 
 print(n.abs(), n.signum(), z.signum())
@@ -625,15 +624,15 @@ import sysl.math.Bits
 var u = 0b1011u8
 var zero8 = 0u8
 var all8 = 255u8
-var wide: u32 = 1u32
+var wide: u32 = 1
 
 print(u.count_ones(), u.count_zeros())
 print(u.leading_zeros(), u.trailing_zeros())
 print(u.leading_ones(), u.trailing_ones())
-print(u.reverse_bits(), u.rotate_left(1u32), u.rotate_right(1u32))
+print(u.reverse_bits(), u.rotate_left(1), u.rotate_right(1))
 print(zero8.leading_zeros(), zero8.trailing_zeros())
 print(all8.leading_ones(), all8.count_zeros())
-print(wide.leading_zeros(), wide.rotate_right(1u32))
+print(wide.leading_zeros(), wide.rotate_right(1))
 print(u8.width(), u32.width(), i64.width())
 ```
 
@@ -707,14 +706,17 @@ every type.
 ```sysl
 import sysl.math.Bits
 
-var w: u32 = 7u32
+var w: u12 = 7
 
 print(w.swap_bytes())
 ```
 
 ```error
-type 'uint' has no method 'swap_bytes'
+type 'u12' has no method 'swap_bytes'
 ```
+
+A `u32` does have one — `ByteOrder`'s, reached with no import as every impl's members are — and a
+`u12` is a member of neither.
 
 Reversing the byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it.
 **Every member of `Bits` is total over every integer type**, because a `[T: Bits]` body is written
@@ -766,7 +768,7 @@ down as data — which a board with no loader needs:
 ```sysl
 import sysl.math.ByteOrder
 
-const PORT: u16 = 0x0035u16.to_be()
+const PORT = 0x0035u16.to_be()
 
 print(PORT)
 ```
@@ -851,7 +853,7 @@ import sysl.math.complex.Complex
 
 size(x: &Magnitude[real]) -> real = x.magnitude()
 
-var scalar: real = -7.5
+var scalar = -7.5
 
 print(size(scalar), size(Complex(3.0, 4.0)))
 ```
@@ -941,11 +943,12 @@ print(7.extent(), 200u8.extent())
 
 ## The arithmetic above the operators
 
-Six free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
+Eight free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
 
 ```
 pow(base, exponent)          gcd(a, b)                lcm(a, b)
 divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Option[T]
+div_floor(a, b)              mod_floor(a, b)
 ```
 
 ```sysl
@@ -954,7 +957,7 @@ divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Op
 
 import sysl.math.{pow, gcd, lcm, is_power_of_two, next_power_of_two}
 
-print(pow(2, 10), pow(3, 0u32))
+print(pow(2, 10), pow(3, 0))
 print(gcd(12, 18), lcm(4, 6), lcm(21, 6))
 print(is_power_of_two(8), is_power_of_two(0))
 print(next_power_of_two(17).unwrap_or(-1))
@@ -982,6 +985,8 @@ What each one actually needs is written in its own bound instead:
 | `gcd` | `Rem + Eq + Ord + Sub` |
 | `lcm` | `Rem + Eq + Ord + Sub + Div + Mul` |
 | `divmod` | `Div + Rem` |
+| `div_floor` | `Div + Rem + Eq + Ord + Sub` |
+| `mod_floor` | `Rem + Add + Eq + Ord` |
 | `is_power_of_two` | `Bits + Ord` |
 | `next_power_of_two` | `Bits + Ord + Shl + Sub` |
 
@@ -1026,8 +1031,8 @@ undefined function 'gcd'
 
 import sysl.math.pow
 
-print(pow(2, 10), pow(-3, 3u32))
-print(pow(2, 64u32), pow(2u8, 9u32))
+print(pow(2, 10), pow(-3, 3))
+print(pow(2, 64), pow(2u8, 9))
 ```
 
 ```output
@@ -1057,21 +1062,25 @@ at `int` is `0` and `pow(2u8, 9)` is `0`, both arrived at honestly — the doubl
 The implementation is repeated squaring, so the exponent costs a logarithmic number of multiplies
 rather than a linear one.
 
-**This one is the integers'.** Its bound admits a `real`, and the body does not:
+**Its bound admits a float, and so does its body**: the `1` it starts from is read at the float, as
+an integer literal is wherever a float is wanted, so a float raised to a whole power is the same
+repeated squaring:
 
 ```sysl
 import sysl.math.pow
 
-print(pow(2.0, 10u32))
+print(pow(2.0, 10))
+print(pow(1.5f32, 2))
 ```
 
-```error
-cannot initialize 'acc': declared real but the value is int
+```output
+1024
+2.25
 ```
 
-A float raises through [`Float`](#float)'s own member — `2.0.pow(10.0)` — which takes its exponent as
-a `Self` rather than a count, because a float exponent is a meaningful thing to have and an integer
-one is not the same operation.
+A float exponent goes through [`Float`](#float)'s own member — `2.0.pow(10.0)` — which takes it as a
+`Self` rather than a count, because a float exponent is a meaningful thing to have and a count is not
+the same operation.
 
 ### Checked and overflowing arithmetic
 
@@ -1200,8 +1209,8 @@ It answers a [result list](/reference/declarations/) and not a tuple, because th
 callee to caller and nothing afterwards needs to hold the two together. A caller that *does* need to
 hold them writes the tuple itself.
 
-A binding naming several things is a **local** form — its parts have nowhere to write a type — so the
-top of a program, which is a body, takes one exactly as a function does:
+A binding naming several things gives each name the type of its part, so the top of a program, which
+is a body, takes one exactly as a function does:
 
 ```sysl
 import sysl.math.divmod
@@ -1215,19 +1224,60 @@ print(q, r)
 3 2
 ```
 
-Asking for the module's storage instead is what has nowhere to put the types, and is refused:
+and so does the module, asked for with `static`: each name is then a module `val` of its part's type,
+read by the module's functions as well as by the body, and the call is made once.
 
 ```sysl
 import sysl.math.divmod
 
 static val q, r = divmod(17, 5)
 
+show() = print(q * 5 + r)
+
 print(q, r)
+show()
 ```
 
-```error
-a module-level 'val' states its type, and a binding that names several things has nowhere to write one — declare 'q' and 'r' separately
+```output
+3 2
+17
 ```
+
+### `div_floor` and `mod_floor`
+
+```sysl
+@no_alloc
+@no_os
+
+import sysl.math.{div_floor, mod_floor}
+
+show()
+    print(-7 / 2, -7 % 2)
+    print(div_floor(-7, 2), mod_floor(-7, 2))
+    print(div_floor(7, -2), mod_floor(7, -2))
+
+    val day = mod_floor(-1, 7)
+
+    print(day)
+
+show()
+```
+
+```output
+-3 -1
+-4 1
+-4 -1
+6
+```
+
+The operators truncate toward zero; these round toward **negative infinity**, and the remainder
+takes the **divisor's** sign. That is the division a calendar, a grid or a ring buffer wants:
+`mod_floor(i, n)` is a valid index into `n` cells for any `i`, and
+`div_floor(a, b) * b + mod_floor(a, b)` is always `a`. They work at every integer width; for
+unsigned types they are the operators. They trap where the operators do: a zero divisor, and the
+one signed overflow `MIN / -1`.
+
+(`sysl.math.bigint` has its own `div_floor` and `mod_floor` over `BigInt`.)
 
 ### `is_power_of_two` and `next_power_of_two`
 

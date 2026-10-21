@@ -21,6 +21,14 @@ import sysl.math.decimal.{Decimal, rescale, Rounding}
 type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
     val name = attr_type_name(receiver)
 
+    // `Box[int]::Fields` -- the four that describe a type's make-up are asked of an instance written
+    // out in place, as a selection after `Box[int]` already is.
+    if name.is_none() && reflection_attr(attr)
+        val instance = reflect_on_written_instance(cx, span, receiver, attr)
+
+        if instance.is_some() then return instance.unwrap()
+    end if
+
     // **`::Id` on a value reads the identity an erased value carries**, and that is the case the
     // form exists for: an object has forgotten which type is inside it, and this is the one fact
     // about that type it still holds. Everywhere else the static type is known and `T::Id` is how
@@ -45,6 +53,11 @@ end type_attr_expr
 
 // `T::Attr(x)` -- the attributes that carry an operand, and the ones that do not, refused by name.
 type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr]) -> TExpr
+    // The name a `for const` over a type's make-up binds answers for the part it stands at.
+    val descriptor = descriptor_bound(cx.subst, written)
+
+    if descriptor.is_some() then return descriptor_attr(cx, span, written, attr, descriptor.unwrap())
+
     // **A generic enum written bare names no type at all** -- resolving `Option` with no arguments
     // is refused for the arguments, which says nothing about the attribute -- so it is told here,
     // before the name is resolved, that there is no single enum for the attribute to read.
@@ -54,6 +67,15 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
         val shown = qualified_name(generic.unwrap())
 
         return cx.err(span, s"'$shown' is generic, so '$shown::$attr' has no single enum to read")
+    end if
+
+    val generic_struct = if reflection_attr(attr) then generic_struct_named(cx, written) else None
+
+    if generic_struct.is_some() then
+        val shown = qualified_name(generic_struct.unwrap())
+
+        return cx.err(span, s"'$shown' is generic, so '$shown::$attr' has no single type to read — " +
+                      s"write the arguments, '$shown[…]::$attr'")
     end if
 
     val subject = attr_subject(cx, span, written)
@@ -74,10 +96,18 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
                                    usize_type(word_bits(cx))))
     end if
 
+    // The four that describe a type's make-up are, like `Id`, asked of every type -- and of a type
+    // parameter per instantiation, since each one is a fact about the type it was given.
+    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
+
+    // `T::Make(c, payload)` builds the variant a walk over `T::Variants` stands at.
+    if attr == "Make" then return make_variant(cx, span, written, args, ty)
+
     // **A type parameter answers the same two attributes in every reading of the body**, the one
     // where it stands for itself and each instantiation alike -- so what it was bound to decides
-    // the value and never which attributes may be asked.
-    if written != "Self" && bound_type(cx.subst, written).is_some() then
+    // the value and never which attributes may be asked. `Self`, and a `derive` body's name for the
+    // deriving type, are read once per type and answer as that type does.
+    if written != "Self" && !names_deriving_type(cx, written) && bound_type(cx.subst, written).is_some() then
         return bound_parameter_attr(cx, span, written, attr, args, ty)
 
     ty match
@@ -103,11 +133,16 @@ end type_attr_call
 // The written name a type attribute is asked of, where the left side is one.
 attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
     Ident(n) -> Some(n)
+    // `f::Type::Kind`, `c::Payload::Fields` -- a descriptor's projection is a type a copy bound under
+    // that spelling (`descriptor_bindings`), so it is asked as the name it was bound to.
+    TypeAttr(inner, a, _, _) -> *inner.kind match
+        Ident(n) -> if a == "Type" || a == "Payload" then Some(s"$n::$a") else None
+        _ -> None
     _ -> None
 
 // The key of the generic enum a written name declares, where it declares one and no type parameter
 // of the body being read stands in front of it.
-private generic_enum_named(cx: &Analyzer, written: string) -> Option[string]
+generic_enum_named(cx: &Analyzer, written: string) -> Option[string]
     if bound_type(cx.subst, written).is_some() then return None
 
     val key = lookup_type_key(cx.an, cx.scope, written)
@@ -125,12 +160,22 @@ end generic_enum_named
 
 // The type a written name stands for here, in the order a reader's own terms are consulted: a type
 // parameter of the body being read, then a declared type, then a built-in integer.
-private attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
+attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
     val stood = bound_type(cx.subst, written)
 
     if stood.is_some() then return stood
 
     val key = lookup_type_key(cx.an, cx.scope, written)
+
+    // **An `opaque struct` is asked about outside its module as `*Name` names it**: a `::` question
+    // needs no layout, so `H::Kind` answers `Opaque` there and `H::Fields` is refused for having none.
+    if key.is_some() && layout_hidden(cx.an, cx.scope, key.unwrap())
+        val behind = type_ref(span, PtrType(named_type(span, written)))
+
+        return resolve_type(cx.an, cx.scope, behind, cx.subst) match
+            Ptr(inner) -> Some(*inner)
+            other -> Some(other)
+    end if
 
     if key.is_some() then
         return Some(resolve_type(cx.an, cx.scope, named_type(span, written), cx.subst))
@@ -297,6 +342,21 @@ private constrained_attr(cx: &Analyzer, span: Span, d: &ConstrainedType, ty: Typ
     val shown = module_show(d.name)
     val what = s"$shown::$attr"
     val base = underlying(ty)
+
+    // **A `new` type over a fixed-point format is the format under a name of its own** -- `type Acc =
+    // new i64q61 wrapping` changes what the operators do and nothing about the storage -- so it
+    // answers the format's attributes, each at itself. One with a range or a predicate is the
+    // exception for `Bits`: a value made from raw bits is one nothing checked, so it is made at the
+    // base and wrapped, where the check is.
+    base match
+        Fixed(_, _, _) ->
+            if d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none() then
+                return fixed_attr(cx, span, shown, ty, attr, args)
+
+            if attr == "Bits" then
+                return cx.err(span, s"'$what' would make a value nothing checks against '$shown' — " +
+                              s"write '$shown(${type_show(base)}::Bits(…))', which checks it")
+        _ -> ()
 
     val bits = base match
         Integer(b, _, _) -> b

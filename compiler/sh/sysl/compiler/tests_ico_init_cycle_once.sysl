@@ -1,0 +1,128 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.replace_all
+
+// A loop among module-level values is one mistake, and it is reported once: storage refused a type
+// because its value reaches it again is not refused a second time for the order it runs in, and every
+// loop through the value a binding takes apart is reported once for the binding.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ico_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The report a module `cfg` holding `decls` is refused with, read from a program that imports it.
+private ico_report(decls: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ico").unwrap(), "//", "/")
+
+    make_dir_all(s"$root/cfg").unwrap()
+    write_text(s"$root/cfg/cfg.sysl", s"module cfg\n\n${decls}\nuses() -> int = 1\n").unwrap()
+    write_text(s"$root/main.sysl", "import cfg\n\nprint(cfg.uses())\n").unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ico_report
+
+// Refused with exactly one error, `message` at `at` in the module's file.
+private ico_once(decls: string, message: string, at: string)
+    if !ico_ready() then return
+
+    val said = ico_report(decls)
+    val place = s"error: $message\n --> cfg/cfg.sysl:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+    assert_eq(said.count_of("error: "), 1, said)
+end ico_once
+
+private ico_inferred(name: string, word: string) -> string =
+    s"'cfg.$name' takes its type from its value, and the value reaches 'cfg.$name' again — write its type, " +
+    s"'$word $name: T = …'"
+
+private ico_order(chain: string) -> string =
+    s"$chain — computed module storage runs once before anything else does, so what it needs has to be " +
+    "settled first"
+
+private ico_whole(word: string) -> string =
+    "this binding takes its parts' types from its value, and the value reaches what it binds again — " +
+    s"write the type of the whole value, '$word (…): T = …'"
+
+// -- single names ---------------------------------------------------------------------------------
+
+@test("a val or var whose inferred type reaches itself is refused for its type, and not again for its order")
+ico_single_inferred()
+    ico_once("val a = b\nval b = a\n", ico_inferred("a", "val"), "3:1")
+    ico_once("val b = a\nval a = b\n", ico_inferred("b", "val"), "3:1")
+    ico_once("var a = b\nvar b = a\n", ico_inferred("a", "var"), "3:1")
+    ico_once("val a = (b, 1)\nval b = a.0\n", ico_inferred("a", "val"), "3:1")
+    ico_once("val a = sq(a)\n\nsq(n: int) -> int = n * n\n", ico_inferred("a", "val"), "3:1")
+    ico_once("var a = a + 1\n", ico_inferred("a", "var"), "3:1")
+end ico_single_inferred
+
+@test("a typed val or var on a loop is refused once, for the order it runs in")
+ico_single_typed()
+    ico_once("val a: int = b + 1\nval b: int = a\n",
+             ico_order("'cfg.a' cannot be initialized: its value needs 'cfg.b', whose value needs 'cfg.a'"), "3:1")
+    ico_once("val b: int = a + 1\nval a: int = b\n",
+             ico_order("'cfg.a' cannot be initialized: its value needs 'cfg.b', whose value needs 'cfg.a'"), "4:1")
+    ico_once("var a: int = a + 1\n", ico_order("'cfg.a' cannot be initialized: its value needs 'cfg.a'"), "3:1")
+end ico_single_typed
+
+@test("a const defined in terms of itself is refused once")
+ico_const()
+    ico_once("const a: int = b + 1\nconst b: int = a\n",
+             "constant 'cfg.a' is defined in terms of itself: cfg.a → cfg.b → cfg.a", "3:1")
+    ico_once("const a = a + 1\n", "constant 'cfg.a' is defined in terms of itself: cfg.a → cfg.a", "3:1")
+end ico_const
+
+// -- several names at once ------------------------------------------------------------------------
+
+@test("a multi-name val or var whose values reach each other is refused once")
+ico_multi_name()
+    ico_once("var c, d = d, c\n", ico_inferred("c", "var"), "3:1")
+    ico_once("val c, d = d, c\n", ico_inferred("c", "val"), "3:1")
+    ico_once("var c, d = d + 1, c + 1\n", ico_inferred("c", "var"), "3:1")
+end ico_multi_name
+
+@test("a pattern binding whose value reaches its names is refused once for the binding")
+ico_pattern()
+    ico_once("var (e, f) = (f, e)\n", ico_whole("var"), "3:1")
+    ico_once("val (a, b) = (b + 1, 0)\n", ico_whole("val"), "3:1")
+    ico_once("var (e, f) = two(e)\n\ntwo(n: int) -> (int, int) = (n, n)\n", ico_whole("var"), "3:1")
+    ico_once("var (e, f): (int, int) = (f, e)\n",
+             ico_order("'cfg.e' cannot be initialized: its value needs 'cfg.e'"), "3:1")
+    ico_once("val (e, f): (int, int) = (f, e)\n",
+             ico_order("'cfg.e' cannot be initialized: its value needs 'cfg.e'"), "3:1")
+    ico_once("val (a, b): (int, int) = (b + 1, 0)\n",
+             ico_order("'cfg.b' cannot be initialized: its value needs 'cfg.b'"), "3:1")
+end ico_pattern
+
+// -- separate loops are still each reported -------------------------------------------------------
+
+@test("two separate loops are two reports, one each")
+ico_separate_loops()
+    if !ico_ready() then return
+
+    val two = ico_report("val a: int = b\nval b: int = a\nval c: int = d\nval d: int = c\n")
+
+    assert_eq(two.count_of("error: "), 2, two)
+    assert(two.contains(ico_order("'cfg.a' cannot be initialized: its value needs 'cfg.b', whose value needs 'cfg.a'")), two)
+    assert(two.contains(ico_order("'cfg.c' cannot be initialized: its value needs 'cfg.d', whose value needs 'cfg.c'")), two)
+
+    val bindings = ico_report("var (e, f): (int, int) = (f, e)\nvar (g, h): (int, int) = (h, g)\n")
+
+    assert_eq(bindings.count_of("error: "), 2, bindings)
+    assert(bindings.contains(" --> cfg/cfg.sysl:3:1\n"), bindings)
+    assert(bindings.contains(" --> cfg/cfg.sysl:4:1\n"), bindings)
+
+    val mixed = ico_report("val a = b\nval b = a\nval c: int = d\nval d: int = c\n")
+
+    assert_eq(mixed.count_of("error: "), 2, mixed)
+    assert(mixed.contains(ico_inferred("a", "val")), mixed)
+    assert(mixed.contains(ico_order("'cfg.c' cannot be initialized: its value needs 'cfg.d', whose value needs 'cfg.c'")), mixed)
+end ico_separate_loops

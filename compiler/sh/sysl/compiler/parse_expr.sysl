@@ -98,8 +98,16 @@ is_assign_op(w: string) -> bool
     for o in ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="]
         if o == w then return true
 
-    false
+    is_yielding_assign(w)
 end is_assign_op
+
+// `:=` and its compound forms: an assignment that yields what the place holds once it is written.
+is_yielding_assign(w: string) -> bool
+    for o in [":=", "+:=", "-:=", "*:=", "/:=", "%:=", "&:=", "|:=", "^:=", "<<:=", ">>:="]
+        if o == w then return true
+
+    false
+end is_yielding_assign
 
 private is_compare_op(w: string) -> bool
     for o in ["==", "!=", "<=", ">=", "<", ">"]
@@ -312,6 +320,12 @@ end refuse_operand
 
 private nud(t: Spanned[Tok], p: *Parser) -> Expr
     val at = t.span
+
+    if p.deciding
+        val tested = trait_test_at(p, at)
+
+        if tested.is_some() then return tested.unwrap()
+    end if
 
     t.value match
         IntLit(digits, base, suffix) -> expr(at, IntLit(digits, base, suffix))
@@ -554,7 +568,8 @@ private refuse_offsetof(p: *Parser)
 private parse_if_expr(p: *Parser, at: Span) -> Expr
     open_construct(p, "if", at)
 
-    val cond = parse_expr(p)
+    val decided = p.accept_kw("const")
+    val cond = parse_condition(p, decided)
     val then_body = parse_body(p, "then")
     var conds: Buf[Expr] = buf()
     var bodies: Buf[Buf[Stmt]] = buf()
@@ -564,7 +579,22 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         if !accept_on_next_line_kw(p, "elif") then break
 
         elifs.push(p.just_taken())
-        conds.push(parse_expr(p))
+
+        // **A chain is decided in one place or the other**: an `elif` after an `if const` picks an
+        // arm while compiling as the `if` did, and one after a plain `if` tests while running.
+        val also = p.accept_kw("const")
+
+        if decided && !also then
+            p.fault(elifs.at(elifs.len() - 1), "an 'if const' is decided while compiling, so each " +
+                    "'elif' after it is too — write 'elif const', or put a plain 'if' inside the " +
+                    "'else' for a test made while the program runs")
+
+        if also && !decided then
+            p.fault(elifs.at(elifs.len() - 1), "an 'elif const' follows an 'if const' — this chain's " +
+                    "'if' tests while the program runs. Start the chain with 'if const', or put the " +
+                    "'if const' inside the 'else'")
+
+        conds.push(parse_condition(p, also))
         bodies.push(parse_body(p, "then"))
 
     var else_body: Option[Buf[Stmt]] = None
@@ -584,13 +614,62 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         i -= 1
 
         var wrapped: Buf[Stmt] = buf()
-        val inner = expr(elifs.at(i).to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body, true))
+        val shape = if decided then ConstIf(conds.at(i), bodies.at(i), else_body)
+                    else IfExpr(conds.at(i), bodies.at(i), else_body, true)
+        val inner = expr(elifs.at(i).to(p.just_taken()), shape)
 
         wrapped.push(stmt(inner.span, ExprStmt(inner)))
         else_body = Some(wrapped)
 
+    if decided then return expr(at.to(p.just_taken()), ConstIf(cond, then_body, else_body))
+
     expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body, false))
 end parse_if_expr
+
+// An `if` or `elif` condition. One decided while compiling may test a type against a trait --
+// `T: Display`, written as a bound is -- wherever an operand stands in it.
+private parse_condition(p: *Parser, decided: bool) -> Expr
+    val outer = p.deciding
+
+    p.deciding = decided
+
+    val cond = parse_expr(p)
+
+    p.deciding = outer
+    cond
+end parse_condition
+
+// `T: Trait` -- tried where an operand of an `if const` condition begins, with the operand's first
+// token already taken. **It is a type, read without a complaint, followed by a single `:` and a
+// name**, which no other operand
+// is: `T::Kind` is one token pair the type reads whole, a trailing block's `:` ends its line, and a
+// named argument is written with `=`. Anything else is put back as it was found.
+private trait_test_at(p: *Parser, at: Span) -> Option[Expr]
+    val resume = p.mark()
+    val errors_at = p.errors_at()
+
+    p.rewind(resume - 1, errors_at)
+
+    if begins_type(p.peek())
+        val subject = parse_type(p)
+
+        // A type that would not read is no subject: `(T: Encode)` stops inside its parentheses.
+        if p.errors_at() == errors_at && p.at_kw(":") && is_ident(p.peek_at(1))
+            p.bump()
+
+            val bounds = parse_bounds(p)
+
+            return Some(expr(at.to(p.just_taken()), TraitTest(subject, bounds)))
+        end if
+    end if
+
+    p.rewind(resume, errors_at)
+    None
+end trait_test_at
+
+private is_ident(t: Tok) -> bool = t match
+    Ident(_) -> true
+    _ -> false
 
 // -- infix and postfix position -----------------------------------------------------------------
 
@@ -773,7 +852,7 @@ end parse_trailing_block
 // bracket (`anchor.sysl`'s `anchor_of`), the receiver having a span of its own.
 private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
     val from = left_start(lhs, p)
-    val first = parse_expr(p)
+    val first = parse_index_item(p)
 
     if !p.at_kw(",")
         p.expect_kw("]")
@@ -788,11 +867,44 @@ private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
         if !p.accept_kw(",") then break
         if p.at_kw("]") then break
 
-        args.push(parse_expr(p))
+        args.push(parse_index_item(p))
 
     p.expect_kw("]")
     expr(from.to(p.just_taken()), TypeArgs(lhs, args, at))
 end led_index
+
+// One item inside brackets: an expression, or -- where no expression reads there -- a type.
+//
+// **The expression reading wins wherever it ends the item cleanly** (at the `]` or `,` with nothing
+// reported), so a subscript, a value argument and every type with an expression spelling (`T`, `*T`,
+// `&T`, `Box[T]`, `(A, B)`) parse as they always did. What it cannot read -- `&sync C`, `[]u8`,
+// `Fn(int) -> int` -- is re-read by the type grammar from the same place. A parenthesised list
+// before an arrow reads as a closure, which no subscript ever holds, so that is tried as a type too.
+private parse_index_item(p: *Parser) -> Expr
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+    val e = parse_expr(p)
+    val ends = p.errors_at() == errors_at && (p.at_kw("]") || p.at_kw(","))
+
+    var closure = false
+
+    *e.kind match
+        Lambda(_, _, _) -> closure = true
+        _ -> ()
+
+    if ends && !closure then return e
+
+    p.rewind(tokens_at, errors_at)
+
+    val start = p.here()
+    val t = parse_type(p)
+
+    if p.errors_at() == errors_at && (p.at_kw("]") || p.at_kw(","))
+        return expr(start.to(p.just_taken()), TypeArg(t))
+
+    p.rewind(tokens_at, errors_at)
+    parse_expr(p)
+end parse_index_item
 
 // `a.b`, and `a.0` -- a tuple's parts are selected by number and are fields like any other.
 //
@@ -802,6 +914,30 @@ end led_index
 private led_field(lhs: Expr, p: *Parser) -> Expr
     val from = left_start(lhs, p)
     val at = p.here()
+
+    // `v.(f)` -- the field or variant a `for const` over `T::Fields` or `T::Variants` stands at in
+    // one copy. The selector is a name, kept in its parentheses so the field it is never collides
+    // with one the type declares.
+    if p.accept_kw("(")
+        val inner = p.here()
+
+        p.peek() match
+            Ident(n) ->
+                if p.kw_at(1, ")")
+                    p.bump()
+                    p.expect_kw(")")
+                    return expr(from.to(p.just_taken()), Field(lhs, s"($n)", inner))
+                end if
+            _ -> ()
+
+        val written = parse_expr(p)
+
+        p.expect_kw(")")
+        p.fault(written.span, "'.( )' selects with a descriptor a 'for const' binds — the 'f' of " +
+                "'for const f in T::Fields', or the 'c' of 'for const c in T::Variants' — and this is " +
+                "not a name")
+        return expr(at, Bad)
+    end if
 
     p.peek() match
         Ident(n) ->
@@ -828,6 +964,20 @@ private led_field(lhs: Expr, p: *Parser) -> Expr
                 p.fault(at, s"'.${text}' reads as a number rather than as two tuple indices \u{2014} " +
                     s"write '(x.${parts.at(0)}).${parts.at(1)}' to select part ${parts.at(1)} of part " +
                     s"${parts.at(0)}")
+            else
+                p.want("tuple index")
+
+            expr(at, Bad)
+
+        // A reserved word after the `.` is a field written without its backticks. The complaint
+        // says so, and says how to write it, rather than asking for a tuple index.
+        Keyword(w) ->
+            val b = w.bytes
+
+            if b.len > 0 && ((b[0] >= u8('a') && b[0] <= u8('z')) || b[0] == u8('_'))
+                p.bump()
+                p.fault(at, s"'${w}' is a reserved word, so it is not a field name as written \u{2014} " +
+                    s"write it in backticks: '.`${w}`'")
             else
                 p.want("tuple index")
 

@@ -35,7 +35,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
             gen_into(e, VReg(s"$own.addr"), init)
         else if is_promoted(e, name) && promoted_elem(ty).is_some()
             gen_promoted_decl(e, name, ty, promoted_elem(ty).unwrap(), init)
-        else if align.is_none() && match_in_place(e, ty, init).is_some()
+        else if align.is_none() && !e.frame_slots.has(name) && match_in_place(e, ty, init).is_some()
             // `var p = make() match { Ok(s) -> s; Err(_) -> return 1 }`: the payload the one arm
             // that arrives hands back is already in the storage the call's result was written to,
             // and that storage is a slot of this frame nothing else will ever name -- so it is `p`'s
@@ -277,6 +277,27 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
     *x.kind match
         // A bitfield struct has one slot however many fields were written, so there is nothing to
         // build field by field: the container is assembled as a value and stored once.
+        // A union is zeroed and then the one field it was built from is stored at its first byte; the
+        // other positions hold `()` (`union_call`). Under `@byte_order` that field is an integer whose
+        // bytes are stored in the stated order, as a struct's are.
+        // A struct or union with C bitfields is zeroed and each field written where it lies
+        // (`emit_c_bits.sysl`).
+        TStructNew(decl, args) if !decl.c_bits.is_empty() -> c_bits_new_into(e, decl, dest, args)
+        TStructNew(decl, args) if decl.union_layout ->
+            emit(e, InStore(struct_lty(decl), VZero, dest, AccPlain, None))
+
+            for i in 0..<args.len()
+                *args.at(i).kind match
+                    TUnitLit -> ()
+                    _ ->
+                        val ft = decl.fields.at(i).1
+                        val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                        if bits > 0 then
+                            emit(e, InStore(lty(e, ft), swap_bytes_of(e, bits, gen_expr(e, args.at(i))),
+                                            dest, AccPlain, None))
+                        else gen_borrowed_into(e, dest, args.at(i))
+
         TStructNew(decl, args) ->
             bitfield_ranges_of(Struct(decl)) match
                 Some(ranges) ->
@@ -838,13 +859,16 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
         if !zero_sized(ft)
             val r = ranges match
                 Some(rs) -> read_bits(e, rs, rs.at(d.slot(i)), container)
+                None if d.c_bit(i).is_some() -> c_bit_of_value(e, d, i, v)
                 None ->
                     val t = fresh_reg(e)
 
                     emit(e, InExtract(t, struct_lty(d), v, index_list(struct_field_index(e.layout, d, d.slot(i)))))
                     reordered(e, reversed_width(d, ft, e.target.little_endian()), t)
 
-            args.push(ir_arg(lty(e, ft), r))
+            // A field the boundary takes by address -- a union, a large aggregate -- crosses as a
+            // slot holding it, which is how the clause function receives it.
+            args.push(operand_arg(e, ft, r))
 
     val ok = fresh_reg(e)
 

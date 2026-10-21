@@ -1,0 +1,118 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The expected type reaches a prefix operator's operand, and a conversion's literal argument
+// (`reference/expressions.md § A leading dot — the qualifier the context already knows` and
+// `§ Conversions are calls`). `-` and `~` answer the type they are given -- `Neg` and `Not` return
+// `Self` -- so the type the position wants is the operand's; and an integer literal written as a
+// conversion's argument is read at the target wherever it fits there. Helpers are
+// `tests_twp_width.sysl`'s and `tests_aza_rest_param.sysl`'s.
+
+private iuo_p() -> string = raw"""
+    struct P[T]
+        v: T
+
+        make() -> P[T] = P(T(1))
+
+    impl[T: Neg] Neg for P[T]
+        neg(self) -> P[T] = P(-self.v)
+
+    struct W[T]
+        v: T
+
+        make() -> W[T] = W(T(1))
+
+    impl[T: Not] Not for W[T]
+        not(self) -> W[T] = W(~self.v)
+
+    struct Q[T]
+        v: T
+
+        make() -> Q[T] = Q(T(1))
+
+    """
+
+private iuo_has(text: string, want: string)
+    val got = aza_err(text)
+
+    if !got.contains(want) then assert_eq(got, want)
+end iuo_has
+
+@test("a unary minus passes the expected type to its operand, settling a generic call there")
+iuo_minus_settles_the_operand()
+    if !twp_ready() then return
+
+    twp_prints(iuo_p() + raw"""
+        val a: P[int] = P.make()
+        val b: P[int] = -P.make()
+        val c: P[i64] = -P.make()
+        print(a.v, b.v, c.v)
+        """, "1 -1 -1\n")
+
+@test("so does a complement, and both reach an argument and a return")
+iuo_complement_and_other_positions()
+    if !twp_ready() then return
+
+    twp_prints(iuo_p() + raw"""
+        show(w: W[u8]) -> u8 = w.v
+        flipped() -> P[int] = -P.make()
+        print(show(~W.make()), flipped().v)
+        """, "254 -1\n")
+
+@test("an operator over an operator passes it on")
+iuo_nested_operators()
+    if !twp_ready() then return
+
+    twp_prints(iuo_p() + raw"""
+        val d: P[int] = -(-P.make())
+        val e: W[u8] = ~~W.make()
+        print(d.v, e.v)
+        """, "1 1\n")
+
+@test("with nothing expected the operand still cannot be settled, in the call's own words")
+iuo_nothing_expected_is_refused()
+    if !twp_ready() then return
+
+    iuo_has(iuo_p() + "val b = -P.make()\nprint(b.v)\n",
+            "cannot infer the type argument 'T' of 'P.make' here")
+
+@test("the expected type does not lend an operator to a type that has none")
+iuo_no_neg_is_refused()
+    if !twp_ready() then return
+
+    iuo_has(iuo_p() + "val q: Q[int] = -Q.make()\nprint(q.v)\n", "unary '-' is not defined for Q[int]")
+
+@test("an integer literal in a conversion is read at the target where it fits there")
+iuo_conversion_literal_at_the_target()
+    if !twp_ready() then return
+
+    twp_prints(raw"""
+        print(i128(9223372036854775807), i128(-9223372036854775808), u64(18446744073709551615))
+        print(i128(170141183460469231731687303715884105727), i64(-2147483649))
+        """, "9223372036854775807 -9223372036854775808 18446744073709551615\n" +
+             "170141183460469231731687303715884105727 -2147483649\n")
+
+@test("one that fits int and not the target keeps the conversion from int")
+iuo_conversion_from_int_unchanged()
+    if !twp_ready() then return
+
+    twp_prints("print(u8(300), u64(-1), i8(200), real(7))\n", "44 18446744073709551615 -56 7\n")
+
+@test("a suffixed literal and a value keep their own types")
+iuo_conversion_suffix_and_value()
+    if !twp_ready() then return
+
+    twp_prints("val n = 5\nprint(i128(9223372036854775807i64), i128(n), u16(70000u32))\n",
+               "9223372036854775807 5 4464\n")
+
+@test("one that fits neither int nor the target is refused at the target")
+iuo_conversion_literal_too_large()
+    if !twp_ready() then return
+
+    iuo_has("print(i64(9223372036854775808))\n", "the literal 9223372036854775808 does not fit long")
+    iuo_has("print(u8(5000000000))\n", "the literal 5000000000 does not fit byte")
+    iuo_has("print(i64(-9223372036854775809))\n", "the literal -9223372036854775809 does not fit long")
+    iuo_has("print(i128(170141183460469231731687303715884105728))\n",
+            "the literal 170141183460469231731687303715884105728 does not fit i128")

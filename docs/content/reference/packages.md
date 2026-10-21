@@ -108,6 +108,139 @@ that walked upward would make a build depend on directories above the one it was
 **The exclusion is at the root and nowhere else.** `sh/sysl/mypkg/examples/` is an ordinary module
 named `sh.sysl.mypkg.examples`, so a package that wants the word still has it.
 
+## The root's `.sysl/` is a working directory, not source
+
+**`.sysl/` at a project root is left out of the tree** on the same terms as `examples/`: out of the
+library build, out of the C the package carries, out of `sysl test .`'s walk, and out of what the
+run cache keys a build on. It is where the toolchain keeps what it derives beside a project (the
+standard module's artifact, on a machine with no cache directory) and where a package's tests keep
+their scratch files, so it belongs in `.gitignore` and nothing in it is compiled. A test that writes
+there while another test's build is running changes nothing that build reads.
+
+```
+mypkg/sh/sysl/mypkg/mypkg.sysl     the library
+mypkg/.sysl/c-tests/case.c         a test's scratch, not part of it
+```
+
+As with `examples/`, the exclusion is at the root only; a `.sysl/` further down is an ordinary
+directory.
+
+**A tree that changes while it is walked is read as it stands.** A file or directory that another
+process removes between the walk listing a directory and looking at the entry — a lock directory, a
+temporary file — is absent, and the build goes on with what is there. A directory that is present
+and cannot be read is still refused, naming it, since the modules below it would otherwise drop out
+of the build unannounced.
+
+## A package may test what it refuses
+
+**`tests/refused/` at a project root holds programs that `sysl test` requires the compiler to
+refuse.** A `@test` function can only say what code does once it compiles. What a package promises
+its users *cannot* compile — moving a value C holds pointers into, building a type through a
+constructor it keeps to itself — needs a program that is refused, and a run that notices the day it
+stops being refused.
+
+```
+mypkg/package.hocon
+mypkg/sh/sysl/mypkg/mypkg.sysl          the library
+mypkg/tests/refused/move.sysl           a program the compiler must refuse
+```
+
+Each file is one program, and its leading comment says what the refusal must say, in one or more
+`// error:` lines:
+
+```sysl
+// A mounted filesystem is never moved: C holds pointers into it.
+// error: 'sh.sysl.mypkg.Fs' is '@pinned'
+// error: binds a copy of it
+import sh.sysl.mypkg.Fs
+
+var fs: Fs = Fs(0)
+
+moved() -> int
+    var copy = fs
+    copy.open
+```
+
+where the library declares
+
+```sysl
+module sh.sysl.mypkg
+
+@pinned
+struct Fs
+    open: int
+```
+
+**The file passes when compiling it is refused and some diagnostic *contains* every `// error:`
+text** — a substring, the rule a page's `error` block is held to, so a line may quote one clause of a
+message rather than the whole of it. The `// error:` lines are read from the comment at the head of
+the file, up to its first line of code.
+
+- **It compiled** is a failure: `tests/refused/move.sysl was expected to be refused, but it compiled`.
+- **It was refused in other words** is a failure that names the text no diagnostic contained and
+  shows, under the row, everything the compiler did say.
+- **A file with no `// error:` line, or one with nothing after the colon, is a failure too** — a
+  refused test that asks nothing of the refusal would pass whatever the compiler said.
+
+**Each file is compiled on its own, with the package it tests**: as a file of the package's root
+module (so it writes no `module` header), for the run's target, features and optimization, with the
+package's own modules and its dependencies in scope, exactly as a consumer's program would see them.
+One file being refused cannot hide another that compiles, and two files may declare the same names.
+
+**The rows are tests like any other.** Each is named by its path — `tests/refused/move.sysl` — counted
+in the summary, and selected by `--filter`. A package whose only tests are refused programs runs
+them and links nothing.
+
+**Only `sysl test` reads the directory.** Every build, the library build and the walk that collects a
+tree's modules leave `tests/refused/` out, as they leave out `examples/`; the rest of `tests/` is an
+ordinary module directory.
+
+## How a package's suite is run
+
+**`sysl test` runs several tests at once**, as many as the machine has processors, and holds each
+test to 300 seconds ([the CLI](/getting-started/cli/#test)). A package whose suite needs something
+else says so in a `test` block, so that everyone who runs the suite — its author, a contributor, CI —
+gets it without a flag:
+
+```hocon
+package {
+  name    = "pg"
+  version = "0.4.0"
+}
+
+test {
+  jobs    = 4
+  timeout = 600
+  alone   = ["listen_", "sh.sysl.pg.server"]
+}
+```
+
+| key | what it says | the flag it is the default for |
+|---|---|---|
+| `jobs` | how many tests may run at once, a whole number from 1 up | `--jobs` |
+| `timeout` | the seconds each test may run, 0 for no limit | `--timeout` |
+| `alone` | the tests that run with no other test beside them | — |
+
+**`alone` is for the test that cannot share the machine**: one that binds a fixed port, drives a
+device there is one of, opens a database every test of the package opens, or measures time and is
+thrown by a busy machine. Each entry is a text a test's name **or module** holds, read as `--filter`
+reads one, so naming a module makes all of its tests alone. Such a test waits until nothing else is
+running, and nothing starts beside it until it is in; the rest of the suite still runs at once around
+it. A suite whose every test is like that says `jobs = 1` instead.
+
+**The flag beats the key, and the key beats the default**, as with
+[`optimization`](#the-optimization-level-a-project-is-built-at). A test's own
+[`@test(timeout: n)`](/reference/attributes/#a-test-may-be-given-a-limit) beats both limits. In a
+workspace, each member's suite is run by its own block.
+
+**The block is about this package's own suite**, so a dependency's is never read: its tests are not
+run by a consumer's `sysl test`. A value the block cannot mean is refused, and a key it does not know
+is [warned about and ignored](#a-key-this-compiler-does-not-know-is-reported-and-ignored):
+
+```
+package.hocon: 'test.jobs' is how many tests may run at once, a whole number from 1 up
+```
+
 ## A key this compiler does not know is reported and ignored
 
 A manifest is read by whatever compiler is in hand, which may be older than the manifest. So an
@@ -124,6 +257,14 @@ manifest has to clear. **Refusing** would mean no key could ever be added withou
 released compiler, which for a format whose consumers pin coordinates is a promise not to grow.
 **Ignoring silently** is the failure that reads as success: a mistyped `dependencis` block does
 nothing and says nothing.
+
+**A key inside a `targets.<name>` block is held to the same rule**, a misspelling and a block nested
+under a name this compiler does not know alike, and the path says which block it was in:
+
+```
+package.hocon: 'targets.aarch64-freestanding.linker_scrpt' is not something this sysl understands,
+               and is ignored — either it is a misspelling, or it was added by a newer compiler
+```
 
 A **dependency's** unknown keys are reported with the package root in front of them, because that is
 the case a manifest cannot report for itself — a package written against a newer sysl, being built by
@@ -511,13 +652,85 @@ to link by hand and no flags in the environment.
 |---|---|---|
 | `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `package.hocon` | `ld.lld` |
 | `linker_script` | the script the image is laid out by, relative to `package.hocon`; handed over as `-T <script>` | none — the linker's own layout |
-| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | none — the script's `ENTRY`, if it has one |
+| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | the script's `ENTRY` where there is a script; `main` where there is none |
 
 **A freestanding target never reaches the host's linker, whether or not the block says anything.**
 Its image is linked with `-nostdlib` through `ld.lld` (or the `linker` named), so no start file, no
 libc and no compiler runtime is on the line; a library is there only because a `@link` directive or a
 `pkg_config` block named it. WebAssembly is the exception and keeps its own link: `wasm-ld` has no
 script, and a module starts at `main`.
+
+**An image whose block names neither a script nor an entry starts at `main`**, and `main` is
+required in the same way a named entry is. The link collects the garbage, and an executable's only
+roots are its entry and what a script keeps, so with neither the linker would look for a `_start`
+nothing defines and drop every section — an empty image starting at address zero. A function
+exported as `main` is that `main`, so the smallest board program needs no block at all:
+
+```sysl build=c target=thumbv6m-freestanding
+@no_os
+
+@export("main")
+probe_main() -> int = 7
+```
+
+`sysl build --target thumbv6m-freestanding -o probe.elf .` writes an image whose entry is `main`;
+it is laid out by the linker's own defaults, which say nothing about a board's flash, so an image a
+board is to run names its `linker_script` too. Where there is a script and no `entry`, the script's
+`ENTRY` decides and the command line names none.
+
+### A feature may set a target's keys again
+
+One program built for two cores of one chip, or for two memory layouts of one board, links by two
+scripts from one manifest. **A `features` block inside a target block sets that block's keys again
+while a feature is on**:
+
+```hocon
+features { m7 = [], m4 = [] }
+
+targets {
+  thumb-freestanding {
+    linker_script = "m7.ld"
+    features {
+      m7 { linker_script = "m7.ld" }
+      m4 { linker_script = "m4.ld", entry = "m4_reset" }
+    }
+  }
+}
+```
+
+`sysl build --target thumb-freestanding --features m4 .` links by `m4.ld` and starts at `m4_reset`;
+`--features m7`, or no feature at all, links by `m7.ld`. A feature's block sets only what it names,
+and the target block's own keys stand for every key no enabled feature sets.
+
+A feature block may set **every key a target block takes**: `triple`, `linker`, `linker_script`,
+`entry`, `capabilities` and `codegen` (a capability or a code generation setting each counting as one
+key). What it may not do is be ambiguous:
+
+- **two enabled features that set the same key are refused**, naming both, since the build would be
+  told two things about one link:
+
+  ```
+  the features 'm7' and 'm4' are both on, and both set 'targets.thumb-freestanding.linker_script' —
+  'targets.thumb-freestanding.features.m7' and 'targets.thumb-freestanding.features.m4' would each
+  lay out the same key, so turn one of the two off, or set the key in only one of them
+  ```
+
+  Only the block for the machine being built is held to this, so `sysl test`, which turns every
+  feature on and builds for the host, is not refused over a board's block;
+- **a block for a feature the package does not declare is refused** when the file is read, as a
+  misspelling would otherwise configure nothing:
+
+  ```
+  'targets.thumb-freestanding.features.m5' sets keys for the feature 'm5', which this package does
+  not declare — a feature has to be declared in the 'features' block before a target block can say
+  what it changes. It declares 'm7', 'm4'
+  ```
+
+As with the target block itself, **only the root project's feature blocks apply**, and a dependency
+whose feature block names a linker, script or entry is refused as its target block would be.
+
+This spelling is provisional: the manifest's syntax is reviewed as a whole in 0.4.0, and a feature's
+target keys may be respelled there.
 
 ### When the image has a `main`
 
@@ -1293,9 +1506,12 @@ selection sees every claim at once and a package two roots share is one copy at 
 root's manifest binds is reachable from your own files as well, which is no more true of a
 dependency's name than it always was of the root's own modules.
 
-`build-lib` is the one command that refuses them instead, and that is not an inconsistency: it
-compiles one tree into an artifact for one machine and does not reach the network, so it has nothing
-to fetch **with**. It says so, and names `--lib` as what to write instead.
+`build-lib` resolves them too, through the same resolver as `build-c` and `test`: a `path` dependency
+is read where it is, a coordinate a `--lib` root or a path dependency
+[stands in](#a-source-root-stands-in-for-the-package-it-is) for is never fetched, and any other
+coordinate is fetched into the cache (or the project's `vendor/`) and checked against `sysl.sum`. A
+dependency an `if` leaves out for the target being checked is not fetched either, so a freestanding
+check of a board package fetches the packages that target takes and no others.
 
 What is still not read is the rest of the manifest. A root's capabilities are the program's to state,
 and they have none of the one-answer-per-program character that makes the allocator settle for
@@ -1420,6 +1636,12 @@ dependencies {
 }
 ```
 
+**A path dependency may name paths of its own**, each read against the manifest that wrote it, so a
+tree of packages checked out side by side builds with no [workspace](#workspaces) around it. A
+directory reached twice is read once; two different directories reached under one name are refused,
+since a package's modules are named by it. A *fetched* package may not name a path: it would be
+relative to a checkout that exists only on the machine that published it.
+
 A third kind names **a member of the workspace the project is in**, by its `package.name`, and is
 resolved to that member's directory ([workspaces](#workspaces)):
 
@@ -1494,6 +1716,44 @@ on, and every claim that was made on it, including the ones that lost. That is t
 losing claim survives: selection keeps the maximum and forgets the rest, so once a build is over
 there is nothing left to reconstruct it from.
 
+### Pinning a commit
+
+A git dependency may name **a commit** in place of a version — a fix not yet released, or a package
+that has never been tagged:
+
+```hocon
+dependencies {
+  orbits { git = "github.com/edadma/orbits", rev = "3f9c2e1" }
+}
+```
+
+`rev` is the commit's sha in lowercase hex, whole or shortened to at least seven digits; a branch name
+is refused, since a branch moves and a pin is a promise about one tree. **Exactly one of `version`
+and `rev` is written** — both together are refused, and so is a `rev` beside a `path`. `features`,
+`default_features`, `optional` and `mount` read exactly as they do beside a version.
+
+**What is recorded is the whole sha.** A shortened `rev` is lengthened against the repository's
+commits the first time it is resolved, and `sysl.sum` gets a line naming the whole sha where a
+version line names its tag, so later builds lengthen it from the file without asking the network:
+
+```text
+github.com/edadma/orbits 3f9c2e1a7d04b6c58e1f0a9b2c3d4e5f60718293 h1:…
+```
+
+The package is fetched at that commit and cached under it, beside the tagged versions of the same
+coordinate. A short sha that two commits start with is refused with both shas listed — the
+shortening is what lost which one was meant — and one no commit starts with is refused by name:
+
+```text
+'orbits' pins github.com/edadma/orbits at '3f9c2e1', and no commit of https://github.com/edadma/orbits.git starts with it
+```
+
+**A pin outranks every version.** Selection takes the highest minimum, and a commit cannot be ordered
+against a tag without the repository's history, so where any manifest in the graph pins a coordinate
+the pinned commit is what every claimant gets — the decision a pin exists to make. **Two pins of one
+coordinate at different commits are refused**, naming both claimants, since nothing orders two
+commits and the build holds one copy of a package.
+
 ### Dependencies a test alone needs
 
 A package's own suite often reaches for something no consumer of it should have to install — a second
@@ -1513,9 +1773,10 @@ dev_dependencies {
 The difference is entirely in **who resolves them**:
 
 - `sysl test` on this project resolves them, exactly like an ordinary dependency;
-- `sysl build`, `sysl build-lib` and `sysl build-c` do not — every other build drops the source that
-  could name one before it analyzes anything, so fetching the package would compile something the
-  compilation cannot refer to;
+- `sysl build`, `sysl run`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` do not — every
+  build but `sysl test` drops the project's tests (each `@tests` file, and every `@test` function and
+  hook) after the parse and before it analyzes anything, so a test's import of one is never read and
+  fetching the package would compile something the compilation cannot refer to;
 - **anything that depends on this package does not resolve them at all**, at any command. They are
   not fetched, not built, and not on the link line.
 
@@ -1544,6 +1805,81 @@ so it is refused the way a `git` beside a `path` is.
 
 [`sysl deps`](/getting-started/cli/#deps) lists them with the rest, marked `(dev)`, since what a
 project takes is a property of its manifests rather than of any one build.
+
+### A dependency only some machines take
+
+Some packages belong under a program on one kind of machine and must not be there on another. The
+plainest is a C library written for boards: a filesystem package needs `strlen` and `memcpy` from
+somewhere, a bare board has nothing to give them, and a hosted machine already has them from its own
+C library — where a second copy collides at the link. **An `if` on the entry says which machines take
+it:**
+
+```hocon
+dependencies {
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.3.0", if = "!libc" }
+}
+```
+
+The condition is [`#if`](/reference/attributes/#if-gating-lines-before-the-lexer)'s, in its own
+language — symbols, `!`, `&&`, `||` and parentheses — so the two places a project names a machine read
+one way. It knows every symbol `#if` does (each operating system, `freestanding`, `hosted`, `posix`,
+`bsd` and each processor) and one more, **`libc`**: true where the machine has a C library under the
+program. That is the [capability](#libc-the-one-a-freestanding-target-starts-without), as the **root
+project** states it, rather than a fact of the triple, because what a C library collides with is
+whatever is actually linked: a Pico SDK build that grants `libc` links newlib, and `!libc` keeps the
+second copy out there as it does on a Mac.
+
+| `if` | taken on |
+|---|---|
+| `"!libc"` | a machine with no C library under the program |
+| `"freestanding"` | every bare machine, whatever the board links |
+| `"hosted"` | every machine with an operating system |
+| `"freestanding && thumb"` | a bare Cortex-M |
+| `"linux \|\| macos"` | either system, on any processor |
+
+**The machine is the one being built for** — `--target`, or `targets.default`, or this one — and the
+entry is dropped before anything is fetched, exactly as an
+[optional dependency nobody turns on](#an-optional-dependency-nobody-turns-on-is-not-in-the-build) is:
+on a machine the condition leaves out, the package is not cloned, not asked for the libraries and
+headers its manifest requires, not walked for C, not on the link line, and not written to
+`sysl.sum`. A package that names a conditional dependency of its own hands the condition on with it:
+**imports are transitive** where the dependency is present, and nowhere in the graph where it is not.
+
+The two keys compose rather than compete. `optional = true` with an `if` is taken where a feature
+turns it on **and** the machine meets its condition; a feature cannot name a machine, and a condition
+cannot name a feature — `feature_x` is refused in an `if`, since a feature reaches a dependency by
+naming it. A [pinned commit](#pinning-a-commit) is a version and a condition is a machine, so `rev`
+and `if` sit side by side, and the sum a freestanding build recorded is left alone by a hosted one.
+
+**A question about the manifests takes every machine's dependencies.** `sysl deps`, `sysl tidy` and
+`sysl vendor` answer for every machine a project may be built for, as they answer for every feature,
+so a vendored tree or a tidied `sysl.sum` serves a board build made on a laptop.
+
+**An import of a dependency the machine leaves out says so.** Its tree was never fetched, so what
+modules it offers is unknown; the refusal of `import cstd.answer` on a Mac names what is known
+instead:
+
+```text
+error: no module is called 'cstd.answer', and nothing declares it — 'cstd', which this project
+takes only where 'freestanding' holds, is left out: 'aarch64-macos' is not such a machine, and
+nothing of it is in this build
+```
+
+Source that reaches such a dependency is gated by the same condition, `#if freestanding`, so the
+lines and the package come and go together.
+
+**The condition is checked when the file is read**, every symbol of it, whichever machine the build
+turns out to be for — a misspelling that read as false would leave the dependency out of every build
+with nothing said:
+
+```text
+'dependencies.cstd.if' is "frestanding", and 'frestanding' is not something a dependency's
+condition can ask about the machine — it knows aarch64, bsd, ..., freestanding, hardfloat, hosted, libc, ...
+```
+
+A target's name is refused with the condition it means (`"thumb-freestanding"` is written
+`"thumb && freestanding"`), as `#if` refuses it; so are a value that is not a string and an empty
+condition, which is a dependency every machine takes written without `if`.
 
 ## Features
 
@@ -1629,8 +1965,9 @@ something else. Writing the bare name says exactly that:
 
 ```
 'server' is not something a target says about itself — sysl knows aarch64, android, bsd, craft,
-freestanding, hosted, linux, macos, posix, riscv32, riscv64, thumb, wasi, wasm32, windows, x86,
-x86_64. A feature this package's manifest declares is named 'feature_server'
+fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64,
+softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
+declares is named 'feature_server'
 ```
 
 **A file is gated against its own package's features and nobody else's.** The root project's
@@ -1727,7 +2064,7 @@ graph that somehow did not settle is refused rather than built against whichever
 
 ### Choosing them on the command line
 
-Three flags, and [`run`, `build`, `build-c`, `test` and
+Three flags, and [`run`, `build`, `build-c`, `build-lib`, `test` and
 `deps`](/getting-started/cli/#the-feature-flags) take them, and so does `vendor`:
 
 | | |
@@ -1819,6 +2156,125 @@ package.hocon: the features here turn each other on — 'server' turns on 'tls',
 
 All four are read when the manifest is, so they stop a build before anything is fetched — which is
 the same point as the pruning: what a feature decides is decided before the network is touched.
+
+## Options
+
+A feature turns a part of a package on. **An option sizes or tunes a part that is always there** — how
+many tasks a kernel schedules, how deep a queue is, whether a driver logs — and it has a value rather
+than being on or off. A package declares each of its options with a type and a default:
+
+```hocon
+package { name = "kernel", version = "0.1.0" }
+
+options {
+  max_tasks { type = usize, default = 16, range = [2, 256], doc = "how many tasks may exist at once" }
+  trace     { type = bool,  default = false }
+}
+```
+
+| key | says | |
+|---|---|---|
+| `type` | an integer type (`usize`, `u8`, `int`, `i64`, any `iN` or `uN`), `bool` or `string` | required |
+| `default` | the value the package is built with where no consumer sets one | required |
+| `range` | `[low, high]`, both ends included; integer options only | optional |
+| `doc` | what the option is for | optional |
+
+**The package's own files read each option as a constant, `option_<name>`, of the declared type.**
+It is a constant in every sense the language has: it can size an array, appear in an `@assert`, and
+fold wherever a literal would:
+
+```text
+module kernel
+
+val tasks: [option_max_tasks]u32 = [0; option_max_tasks]
+
+@assert(option_max_tasks % 2 == 0, "max_tasks must be even")
+
+capacity() -> usize = tasks.len
+tracing() -> bool = option_trace
+```
+
+As with a feature's `feature_x`, **the name is visible in the package that declared the option and
+nowhere else**. A consumer that writes `option_max_tasks` is told that no such name exists, because
+the constant belongs to the package's files rather than to its interface.
+
+### What a consumer sets
+
+A dependency entry sets values by name:
+
+```hocon
+dependencies {
+  kernel { path = "../kernel", options = { max_tasks = 8 } }
+}
+```
+
+```text
+print(kernel.capacity(), kernel.tracing())
+```
+
+```
+8 false
+```
+
+The entry sets only what it names; `trace` keeps its default. **A package's own manifest gives
+defaults and never values** — `options` in its own file is a declaration, and the only place a value
+is chosen is a consumer's entry.
+
+### The project being built decides
+
+A package is compiled once per build, so each option has one value across the whole graph. **The root
+project's entry wins** wherever it sets one. An intermediate package's value applies only where the
+root sets none, and where two intermediate packages set different values with the root silent, the
+build is refused and both are named:
+
+```
+'github.com.e.mid_a' sets the option 'slots' of 'kern' to 4, and 'github.com.e.mid_b' sets it to 6 —
+a package is built once, with one value for each option, so this project decides: set it in this
+project's own entry for 'kern'
+```
+
+**The root configures a package it does not import directly by giving it an ordinary dependency
+entry.** The entry is matched to the package by its coordinate, or by the directory a `path` names —
+never by the label — so `kernel2 { git = "github.com/e/kernel", version = "0.1.0", options = { … } }`
+configures the same package a dependency reaches as `kernel`.
+
+### What is refused
+
+Everything is checked when the manifests are read, before anything is compiled. A value is held to
+the declaration: **a name the package does not declare**,
+
+```
+this project sets the option 'max_task' of 'kernel', which 'kernel' does not declare — a consumer
+may only set an option that package's own manifest names. It declares 'max_tasks', 'trace'
+```
+
+**a value of the wrong type** — an integer is a decimal number without quotes, a `bool` is `true` or
+`false`, a `string` is quoted — and **a value outside the range**:
+
+```
+this project sets the option 'max_tasks' of 'kernel' to 512, outside the option's range [2, 256]
+```
+
+A declaration is held to itself the same way: a type an option cannot be, a default its type cannot
+hold or that falls outside its range, a range on a non-integer, and a range whose low end is above its
+high end are all refused, naming the key. A key an option does not know (`defualt`) is refused rather
+than ignored, as one in a dependency entry is: somebody who wrote it believes they set a default.
+
+A value inside the range can still be one the package does not accept, and the package says so in its
+own words — the range is the manifest's check, and an `@assert` is the source's:
+
+```
+error: assertion failed: max_tasks must be even — the left side is 1
+```
+
+### Values and the caches
+
+Two builds of one tree with two values are two programs. The run cache and a source root's kept
+artifact each keep one entry per value, so changing a value rebuilds, and changing it back replays the
+entry already made.
+
+Options are set only through dependency entries. The root project's own options always take their
+defaults: there is no command-line flag that sets them.
 
 ## What a dependency's modules are called
 
@@ -2001,6 +2457,25 @@ it is that package — when its package.hocon names it 'geom'
 
 A `mount` on the stood-in dependency still renames it for the manifest that wrote one.
 
+**A `path` dependency stands in by the same rule.** A directory any manifest of the graph names, whose
+`package.name` is a coordinate's repository name, is that package wherever the coordinate is named —
+nothing is selected or fetched for it, and every edge naming it reaches the directory. A board
+checked out beside the network stack and the C library both use names the two by `path`, and the
+stack's own `cstd { git = "github.com/you/cstd", version = "0.1.0" }` reads the board's checkout:
+
+```hocon
+dependencies {
+  lwip { path = "../lwip" }
+  cstd { path = "../cstd" }
+}
+```
+
+It is the same decision `--lib` makes, written in the manifest instead of on the command line, and it
+holds for the same reason: the directory was named on purpose, and a graph holding two copies of one
+package — the checkout and the published release — is the outcome nobody wanted. A `--lib` root that
+stands in for the coordinate as well wins, being the later and more explicit of the two. A directory
+naming itself anything else is not the package, and the coordinate is fetched as ever beside it.
+
 ## `sysl.sum`
 
 `sysl.sum` sits beside `package.hocon` and **should be committed**. It records a content hash for
@@ -2013,6 +2488,10 @@ github.com/edadma/sysl-json v1.4.0 sha256:6f1b…
 What it protects against is the class of change a version number cannot describe — a tag moved to
 point at different commits, a repository rewritten, a mirror serving something other than what the
 author published. In all three the version number is exactly what it was.
+
+The hash covers every file of the package except a `.git` anywhere in it and the root's own `.sysl/`,
+which is what building the package leaves beside it: a package that has been built hashes the same as
+one that has not. A `.sysl` further down is an ordinary directory and is covered.
 
 It is **not a lockfile**: version selection is already a function of the manifests, so there is
 nothing to record about which versions were chosen. The first time a package is seen it is trusted
@@ -2314,7 +2793,8 @@ guess between *do not define this* and `-DNAME=0` — and those differ under `#i
 meant can be said exactly: leave the line out, or write `0`.
 
 This is not a general flags channel. It reaches the C a package carries and nothing else: no include
-paths, no warning flags, nothing for an installed library's headers. `--define` remains what a
+paths (a vendored library's are [the `c` block's](#a-vendored-c-library-left-as-upstream-shipped-it)),
+no warning flags, nothing for an installed library's headers. `--define` remains what a
 *build* says and applies to every C compilation in it; a `defines` block is what a *package* says
 and applies to the file it names. Where both name the same macro the package wins, since the whole
 point is that its configuration is not the consumer's to change by accident.
@@ -2408,3 +2888,205 @@ Any definition made before including that header — from a `defines` block, fro
 anything — is overridden there, with a `macro redefined` warning and no other effect. A vendored
 copy has to guard the line. That is one line of difference from upstream rather than a wrapper
 header, but it is not nothing, and no mechanism here can remove it.
+
+## A vendored C library, left as upstream shipped it
+
+The C a module carries is found by the walk: a `.c` beside the sysl that declares its `extern`s
+([ffi](/reference/ffi/)). An upstream library is not laid out that way. TinyUSB, lwIP, mbedTLS and
+littlefs each keep their C in directories holding no sysl, reach their headers through an include
+root (`#include "common/tusb_common.h"`), take a configuration header from wherever the integrator
+put it, and ship far more C than one build compiles — TinyUSB carries a device driver for each of
+some fifty chips. A `c` block says all of that in the manifest, so the tree itself stays **byte for
+byte what upstream released**, and an upgrade is a copy of the new release over the old:
+
+```hocon
+c {
+  tinyusb {
+    root    = "c/tinyusb/src"
+    include = [".", "../../config"]
+    sources = ["tusb.c", "common/tusb_fifo.c", "device/{usbd,usbd_control}.c",
+               "class/cdc/cdc_device.c"]
+    defines { CFG_TUSB_CONFIG_FILE = "\"tusb_config.h\"" }
+  }
+}
+```
+
+Each key is one library, named for refusals to call it by:
+
+| key | what it says |
+|---|---|
+| `root` | where the library's tree is, relative to the package root; the package root if left out |
+| `include` | the directories its files are compiled with `-I` on, relative to `root`, searched in the order written |
+| `include_private` | directories only its own files read, searched ahead of `include` — never the package's shims, probes or dependents |
+| `sources` | the files it compiles, relative to `root`: named outright, or by a pattern |
+| `exclude` | files taken back out of what the patterns match, by path or by pattern |
+| `defines` | the macros every one of them is compiled with, as a `defines` block's are |
+| `export` | include roots it publishes to the C of the packages that depend on this one; `true` publishes its `include` roots |
+| `libc` | `true` where those roots are the C standard library's headers |
+
+**The list is the whole of what is compiled under the root.** The walk compiles none of the C there,
+even in a directory that holds sysl, so a driver nobody listed stays out however the tree is laid
+out, and a directory of C no list reaches is not a stray to warn about. A library that lists no
+`sources` claims no C: it is a header library, there to be read or published.
+
+**A pattern is allowed here, where a `defines` key may not use one.** A vendored tree is upstream's
+and changes only when somebody re-vendors it, and the diff of that commit shows every file the new
+release added — so `src/**/*.c` decides nothing behind anybody's back, while spelling out BearSSL's
+277 files would be a list nobody reads. `*` and `?` match within one name, `**` is a whole segment
+standing for any number of directories, and braces work as everywhere else. `exclude` takes files
+back out:
+
+```hocon
+c {
+  bearssl {
+    root    = "c/bearssl"
+    include = ["src", "inc"]
+    sources = ["src/**/*.c"]
+    defines { BR_USE_URANDOM = 0, BR_USE_GETENTROPY = 0 }
+  }
+}
+```
+
+The rest of the rules are the `defines` block's, for the same reasons:
+
+- **No character class**, and `**` only as a whole segment. A pattern **matching no file** stops the
+  build, and so does an `exclude` entry **taking out no file** a pattern matched: each is a path that
+  is merely wrong, and either would otherwise build — short of what it meant, or compiling the file
+  it meant to leave out. An `exclude` beside no pattern is refused when the manifest is read; leave
+  the file out of the list instead.
+- **Every path is relative and stays inside the package.** A path is relative to `root`, and **a
+  leading `/` makes it relative to the package root instead** — `"/config"` is the package's own
+  configuration directory however deep the vendored tree sits, where the relative spelling would be
+  `"../../../config"`. There is no way to name the machine's root. `..` may climb while it stays in
+  the package, and one that climbs out is refused when the manifest is read.
+- **A named file the tree does not hold stops the build**, as does an include or export root that is
+  not a directory. The list is everything the library compiles, so a missing file is a typo or an
+  upgrade that renamed it, never a file to leave out.
+- **An unknown key in a library is refused**, where one at the top of the file is only warned about:
+  a misspelt `source` would compile nothing, and the first anybody heard of it would be a link that
+  cannot find the library's symbols.
+- A file is compiled once, so one listed twice, or by two libraries, is refused; and a library
+  declaring none of `sources`, `include` and `export` is a block to delete.
+
+```
+package.hocon: 'c.tinyusb.sources' names 'c/tinyusb/src/device/usbx.c', which this package does
+not hold — a library compiles exactly the files it lists, so a missing one is a mistake rather than
+a file to leave out
+```
+
+### What the package's own C reads
+
+A library's own files read its `include` roots and are compiled with its `defines`, plus any key of
+a top-level `defines` block naming one of them. **The package's other C reads every library's roots
+under every library's macros**: the shim beside the sysl, and the translation unit a
+[`c const`](/reference/ffi/) block is measured from. A shim including `tusb.h` has to see the
+configuration the objects beside it were built with, and a probe measuring a configured struct has
+to measure the one the package compiled — the reason a `c const` block inherits from the `defines`
+beside it, carried one step further.
+
+A package's include roots come before any `--include-path`: a configuration header is the package's,
+and one of the same name elsewhere on the machine is not the one the library was written against.
+
+`include_private` roots are the exception: they are the library's internals (BearSSL's `src/`,
+holding `inner.h`), read by its own files and by nothing else. A shim reaching for a header there is
+told it is not found.
+
+**A probe the C compiler refuses is the whole report.** Its file loses every declaration it holds, so
+going on would report each use of them elsewhere as undefined and bury the one line that explains
+them all; the build stops at the refusal, quoting clang.
+
+`sysl build-lib` compiles a package's C exactly as every other command does — the library's list,
+its shims, and the roots and macros each is given.
+
+### Publishing headers to the packages that depend on this one
+
+`export` names include roots a package hands on. **Every package that depends on it, directly or
+through another, compiles its C with them** — imports are transitive, and so are the headers behind
+them — and nothing else does. A package that only publishes headers says so and nothing more:
+
+```hocon
+c {
+  headers { export = ["include"] }
+}
+```
+
+**However the package arrived, it publishes the same roots**: fetched by its coordinate, read from a
+`path`, or a `--lib` root [standing in](#a-source-root-stands-in-for-the-package-it-is) for the
+coordinate. A checkout handed over with `--lib` is that package to the C of everything depending on it,
+and the roots of what the checkout itself depends on reach its own C, as they would a fetched copy's.
+`sysl build -v` says what each tree took — `c headers: '<tree>' takes -I… from the 2 packages it
+depends on`, or `takes no include roots` where nothing it depends on publishes any.
+
+### A consumer's own configuration header
+
+A vendored library is usually written to take its configuration from its integrator: lwIP includes
+`lwipopts.h` and `arch/cc.h`, TinyUSB `tusb_config.h`. The package ships a default, in a directory
+its `include` names, and a consumer that wants another says where its own are, on the dependency:
+
+```hocon
+dependencies {
+  lwip { git = "github.com/you/lwip", version = "0.1.0", c_include = ["config"] }
+}
+```
+
+`c_include` names directories **of the consumer's**, relative to its manifest and staying inside
+its project, and they are searched **before the package's own roots** — so the consumer's
+`lwipopts.h` stands in for the default and a header it does not supply (`arch/cc.h`) still comes
+from the package. They reach every C file of the package: its library's files, its shims, and its
+`c const` probes, so a pool size the package measures is the one its objects were compiled with.
+They travel with the package's exported roots too, so the consumer's own C including `lwip/tcp.h`
+reads the same `lwipopts.h`.
+
+A package is compiled once, so **two consumers each configuring it is refused**, naming both entries.
+A `c_include` directory that is not there stops the build.
+
+**The pattern that works: defaults the package guards, overrides the consumer chains to them.** The
+package's own `lwipopts.h` gives every option it cares about with `#ifndef`, so each is a default
+rather than a decision:
+
+```c
+/* the package's config/lwipopts.h */
+#ifndef MEMP_NUM_PBUF
+#define MEMP_NUM_PBUF 16
+#endif
+```
+
+The consumer's header of the same name, found first, sets only what it changes and then includes the
+package's with `#include_next`, which continues the search after the directory it was found in:
+
+```c
+/* the consumer's config/lwipopts.h */
+#define MEMP_NUM_PBUF 23
+#include_next <lwipopts.h>
+```
+
+The consumer then writes three lines rather than a copy of the package's whole configuration, and a
+default the package adds in a later release reaches it without an edit.
+
+### A package that supplies the C standard library's headers
+
+A vendored library that includes `<string.h>` has nothing to compile against on a machine with no
+libc, and that is what a package written to be one is for. `libc = true` marks its exported roots as
+the standard library's:
+
+```hocon
+c {
+  libc { export = ["include"], libc = true }
+}
+```
+
+**Where the target has no libc**, the C of every dependent is compiled with the machine's own search
+for those headers taken away (`-nostdlibinc`) and these in its place (`-isystem`). clang's own
+freestanding headers — `stddef.h`, `stdint.h`, `stdbool.h`, `limits.h` — are kept, being the
+compiler's rather than a libc's. **Where the target has a libc the roots are not used at all**: the
+program links that libc, and its headers are the ones that describe it.
+
+Two packages in one build supplying them is refused — a file is compiled against one `string.h`, and
+there is no telling which was meant.
+
+### The run cache sees all of it
+
+What a library is compiled with is a change to the program, and so is a header in a vendored tree:
+`sysl run` and `sysl test` replay no binary built under a different `c` or `defines` block or
+`c_include`, against a file a pattern has since started or stopped matching, or against a header
+under a library's `include` or `export` roots, or a consumer's `c_include`, that has since changed.

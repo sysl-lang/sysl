@@ -15,6 +15,22 @@ import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
 // keep for itself.
 access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlain
 
+// Whether a place is part of the copy a `with` works on (`expr_member.sysl`'s `with_expr`).
+//
+// **The copy is a value the form made for itself**, and nothing else reaches it. A `volatile` field of
+// it is therefore no register -- what a read of a register hands back is an ordinary value
+// (`reference/memory.md`) -- so the fields a `with` changes are folded in registers, and the device
+// sees the one load of the base and the one store of the result the source wrote.
+in_with_copy(x: TExpr) -> bool = *x.kind match
+    TLoad(name, _) -> with_copy_name(name)
+    TField(receiver, _, _) -> in_with_copy(receiver)
+    _ -> false
+
+private with_copy_name(name: string) -> bool = name.starts_with(s"${ModuleSep}with")
+
+// How a place is accessed: as its storage was declared, except within the copy a `with` works on.
+storage_access(x: TExpr) -> IrAccess = if in_with_copy(x) then AccPlain else access_of(place_ty(x))
+
 // The same asked of the node a place came from.
 //
 // **A `ref` name is the one node with no declaration to read a qualifier off**: the qualifier is on
@@ -23,11 +39,56 @@ access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlai
 // store, free to be reordered or dropped, where the path it stands for gets `store volatile`.
 place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
     TLoad(name, ty) -> ref_access(e, name, ty)
-    _ -> access_of(place_ty(x))
+    _ -> storage_access(x) match
+        AccPlain -> buf_side(x)
+        other -> other
+
+// Which side of a `Buf` a place is on, for the scopes a plain access carries (`ir_inst.sysl`,
+// `reference/arrays.md § Its elements are never its header`).
+//
+// **The header** is what is reached through a counted reference to a `Buf` or a `BufCore` -- a box,
+// which is an allocation of its own -- or through a `*BufCore`, and every field of a `BufCore`
+// wherever it sits: the type is private to `sysl.buf`, so a `BufCore` is only ever in a box or a
+// frame. A `Buf` reached any other way is NOT the header: a `Buf[Buf[T]]` keeps its handles among
+// its elements.
+//
+// **An element** is what `core.elems[i]` reaches for a `BufCore` `core`, and anything inside that
+// element. Indexing any other view, or reading through a pointer an element holds, is neither, and
+// keeps the plain access that says nothing.
+buf_side(x: TExpr) -> IrAccess = *x.kind match
+    TDeref(operand, _) -> if header_pointer(texpr_type(operand)) then AccBufHeader else AccPlain
+    TField(receiver, _, _) -> if is_buf_core(texpr_type(receiver)) then AccBufHeader else buf_side(receiver)
+    TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
+        Array(_, _) -> buf_side(receiver)
+        Slice(_, _) -> if is_core_elems(receiver) then AccBufElement else AccPlain
+        _ -> AccPlain
+    _ -> AccPlain
+
+private header_pointer(t: Type) -> bool = underlying(t) match
+    Ref(inner, _) -> is_buf_core(*inner) || struct_base_is(*inner, "Buf")
+    Ptr(inner) -> is_buf_core(*inner)
+    _ -> false
+
+private is_buf_core(t: Type) -> bool = struct_base_is(t, "BufCore")
+
+// Whether a type is the named struct of `sysl.buf`, at any element type.
+private struct_base_is(t: Type, name: string) -> bool = underlying(t) match
+    Struct(d) -> d.base == module_qualify("sysl.buf", name)
+    _ -> false
+
+// Whether a view is a `BufCore`'s own `elems` field.
+private is_core_elems(x: TExpr) -> bool = *x.kind match
+    TField(receiver, i, _) -> underlying(texpr_type(receiver)) match
+        Struct(d) -> d.base == module_qualify("sysl.buf", "BufCore") && i >= 0 &&
+            usize(i) < d.fields.len() && d.fields.at(usize(i)).0 == "elems"
+        _ -> false
+    _ -> false
 
 // How storage reached through a local's name is accessed: as the place a `ref` stands on was
 // declared, and as the local's own type says everywhere else.
 ref_access(e: *Emit, written: string, ty: Type) -> IrAccess
+    if with_copy_name(written) then return AccPlain
+
     val name = local_name(e, written)
 
     for ref_place in e.ref_places
@@ -72,7 +133,11 @@ end global_address
 
 // The address of a place, as a `ptr` register or an existing slot name.
 address(e: *Emit, place: TExpr) -> Val = *place.kind match
-    TLoad(name, _) -> local_slot(e, name)
+    // A zero-sized local has no slot (`gen_stmt_body`), and nothing is ever read or written through
+    // its address -- so the address is the dangling, non-null, aligned one, which is what a `&u`
+    // erased to a trait object carries.
+    TLoad(name, ty) -> if zero_sized(ty) then VIntToPtr(LInt(64), VInt(from_int(1)))
+                       else local_slot(e, name)
 
     // A `val`'s storage is the global itself, so its address needs no instruction to compute -- it
     // is what makes indexing one reach into the table rather than copy it out first.
@@ -87,7 +152,7 @@ address(e: *Emit, place: TExpr) -> Val = *place.kind match
 
         val rty = texpr_type(receiver)
 
-        if bitfield_ranges_of(rty).is_some()
+        if bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index)
             return gap_at(e, "address of a bitfield")
 
         val base = address(e, receiver)
@@ -288,9 +353,21 @@ end bounds_check
 // Where a write to this place goes: a bitfield's **container**, since the field itself has no
 // address at all, and the place's own otherwise. A field of a bitfield struct that is itself a field
 // of one has no address either, so the walk goes on out to the outermost container.
+//
+// A **C bitfield** is reached through its struct's address, which is what `load_place` and
+// `store_over` take for one (`emit_c_bits.sysl`).
 place_addr(e: *Emit, place: TExpr) -> Val = bit_place(place) match
     Some(p) -> place_addr(e, p.0)
-    None -> address(e, place)
+    None -> c_bit_place(place) match
+        Some(c) -> address(e, c.0)
+        None -> address(e, place)
+
+// A place that is a C bitfield: the receiver, the struct and the field's position in it.
+c_bit_place(place: TExpr) -> Option[(TExpr, &StructType, usize)] = *place.kind match
+    TField(receiver, index, _) -> c_bit_struct(texpr_type(receiver), index) match
+        Some(d) -> Some((receiver, d, usize(index)))
+        None -> None
+    _ -> None
 
 // A place that is a bit range of a bitfield struct: the receiver holding the container, the struct's
 // ranges, and this field's one -- or nothing for every other place, which is nearly all of them.
@@ -309,6 +386,10 @@ bit_place(place: TExpr) -> Option[(TExpr, Buf[BitRange], BitRange)] = *place.kin
 // reversed for a field of a `@byte_order` struct whose order is not the machine's.
 load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
     Some(b) -> read_bits(e, b.1, b.2, container_at(e, b.1, b.0, p))
+    None if c_bit_place(place).is_some() ->
+        val c = c_bit_place(place).unwrap()
+
+        c_bit_load(e, c.1, c.2, p, place_ty(c.0))
     None ->
         val t = fresh_reg(e)
 
@@ -340,7 +421,7 @@ end container_at
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
     val t = fresh_reg(e)
 
-    emit(e, InLoad(t, container_lty(ranges), addr, access_of(place_ty(receiver)), None))
+    emit(e, InLoad(t, container_lty(ranges), addr, storage_access(receiver), None))
     reordered(e, container_reversal_of(texpr_type(receiver), e.target.little_endian()), t)
 end load_container
 
@@ -354,7 +435,7 @@ store_place(e: *Emit, place: TExpr, p: Val, v: Val) = store_over(e, place, p, v,
 // a count. **Its container is re-read here** rather than reused, because two arms of one statement
 // may be two fields of one container and the second has to see what the first left behind. A field
 // of a bitfield struct held in another is a write of the inner container back into the outer one.
-store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place(place) match
+store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) -> unit = bit_place(place) match
     Some(b) ->
         if bit_place(b.0).is_some()
             val rty = lty(e, texpr_type(b.0))
@@ -366,12 +447,17 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place
             store_over(e, b.0, p, inner, None)
             return
 
-        val acc = access_of(place_ty(b.0))
+        val acc = storage_access(b.0)
         val c = load_container(e, b.1, b.0, p)
         val back = container_reversal_of(texpr_type(b.0), e.target.little_endian())
 
         emit(e, InStore(container_lty(b.1), reordered(e, back, write_bits(e, b.1, b.2, c, v)), p, acc,
                         None))
+    // A C bitfield holds an integer, an enum or a `bool`, none of which carries a count.
+    None if c_bit_place(place).is_some() ->
+        val c = c_bit_place(place).unwrap()
+
+        c_bit_store(e, c.1, c.2, p, place_ty(c.0), v)
     None ->
         val ty = texpr_type(place)
         val acc = place_access(e, place)
@@ -417,8 +503,10 @@ end store_into
 
 // Whether an access says nothing beyond "read it" -- which is the only one an aggregate written at
 // its address may be, since the other two are per-instruction and there is no one instruction here.
+// A `Buf` access is a plain one with a scope beside it, and the scope is only ever a licence the
+// back end may decline, so the aggregate written at its address simply goes without.
 private is_plain(acc: IrAccess) -> bool = acc match
-    AccPlain -> true
+    AccPlain | AccBufHeader | AccBufElement -> true
     _ -> false
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------
@@ -692,8 +780,32 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
           slice_ty: Type, site: Span) -> Val
+    gen_slice_of(e, slice_base(e, base), lo, hi, inclusive, slice_ty, site)
+end gen_slice
+
+// A slice of a view already made: what keeps its elements alive, where the first is, and how many.
+// A temporary promoted for a part of it is this -- the whole array moved into a buffer, and the
+// part narrowed over that buffer.
+gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
+                  slice_ty: Type, site: Span) -> Val
+    val wty = lty(e, slice_ty)
+    val o = fresh_reg(e)
+
+    emit(e, InExtract(o, wty, whole, index_list(0)))
+
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, wty, whole, index_list(1)))
+
+    val l = fresh_reg(e)
+
+    emit(e, InExtract(l, wty, whole, index_list(2)))
+    gen_slice_of(e, (o, p, Some(l)), lo, hi, inclusive, slice_ty, site)
+end gen_slice_of_view
+
+private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr], hi: Option[TExpr],
+                     inclusive: bool, slice_ty: Type, site: Span) -> Val
     val elem = element(slice_ty).unwrap_or(byte_type())
-    val parts = slice_base(e, base)
     val owner = parts.0
     val first = parts.1
     val len = parts.2
@@ -808,7 +920,7 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
 
     emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
     own_temp(e, whole, slice_ty)
-end gen_slice
+end gen_slice_of
 
 // What a slice's base gives up: what keeps the elements alive, where the first of them is, and how
 // many there are -- which a `*T` region does not know.

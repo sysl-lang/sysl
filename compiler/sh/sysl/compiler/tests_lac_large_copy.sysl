@@ -1,0 +1,228 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.time.monotonic
+
+// **A large aggregate is copied as bytes** (`emit_large.sysl`). A struct holding a thirty-kilobyte
+// array, built from calls, assigned, passed, returned, wrapped in an `Option` and bound out of a data
+// enum, never becomes one LLVM value: every copy is a `memcpy`, every member read is a
+// `getelementptr` and a load of that member, and its counted fields are walked at an address. Before,
+// each copy was a whole-value `load` and `store` that LLVM took apart element by element -- a
+// four-field literal of `[33000]u8` structs held clang for over twenty minutes.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lac_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end lac_ready
+
+private lac_root(main_text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-lac").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+    root
+end lac_root
+
+private lac_ir(main_text: string) -> string
+    val root = lac_root(main_text)
+
+    val ir = emit_llvm_text(root, None) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(made) -> made.text
+
+    remove_dir_all(root).unwrap_or(())
+    ir
+end lac_ir
+
+// Builds and runs a program: what it printed, and how many whole seconds the build took.
+private lac_run(main_text: string) -> (string, long)
+    val root = lac_root(main_text)
+    val exe = s"$root/built"
+    val began = monotonic().us
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+    val took = (monotonic().us - began) / 1000000
+
+    val said = built match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Ok(out) -> out.text
+            Err(_) -> "the program that was built could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    (said, took)
+end lac_run
+
+// Every form a large value is copied in, with a counted field whose destructor says when it runs.
+private lac_program() -> string = raw"""
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self)
+            print(s"drop ${self.id}")
+
+    struct Big
+        data: [33000]u8
+        tag: &Tag
+        n: int
+
+    struct Two
+        a: Big
+        b: Big
+
+    struct Raw
+        data: [33000]u8
+        n: int
+
+    struct Four
+        a: Raw
+        b: Raw
+        c: Raw
+        d: Raw
+
+    enum Shape
+        Blob(b: Big)
+        Dot
+
+    big(k: int) -> Big = Big([u8(k); 33000], Tag(k), k)
+
+    raw(k: int) -> Raw = Raw([u8(k); 33000], k)
+
+    four() -> &Four = Four(raw(1), raw(2), raw(3), raw(4))
+
+    two(i: int, j: int) -> &Two = Two(big(i), big(j))
+
+    pair(i: int, j: int) -> Two = Two(big(i), big(j))
+
+    take(b: Big) -> int = b.n + int(b.data[32999])
+
+    first(t: &Two) -> Big = t.a
+
+    wrap(k: int) -> Option[Big] = Some(big(k))
+
+    shape(k: int) -> Shape = Shape.Blob(big(k))
+
+    run()
+        val f = four()
+        print(f.a.n + f.b.n + f.c.n + f.d.n + int(f.d.data[32999]))
+        val t = two(1, 2)
+        var x = big(3)
+        x = big(4)
+        x = t.b
+        var p = pair(5, 6)
+        p.a = x
+        var a = big(7)
+        val b = a
+        a.n = 70
+        a.data[0] = 9
+        print(s"b ${b.n} ${b.data[0]} a ${a.n} ${a.data[0]}")
+        var c = big(8)
+        a, c = c, a
+        print(s"swap ${a.n} ${c.n}")
+        val sh = shape(9)
+        val n = sh match
+            Shape.Blob(bb) -> bb.n + bb.tag.id
+            Shape.Dot -> 0
+        print(t.a.n + t.b.n + take(x) + first(t).n + p.a.n + wrap(10).unwrap().n + n)
+        print(s"${p.a.tag.id} ${x.tag.id}")
+
+    run()
+    print("end")
+    """
+
+// =================================================================================================
+// A large value is never one LLVM value
+// =================================================================================================
+
+@test("no large struct, enum or payload is loaded, stored or walked as one LLVM value")
+lac_no_large_value_is_an_llvm_value()
+    if !lac_ready() then return
+
+    val ir = lac_ir(lac_program())
+
+    assert(ir.contains("%struct.Big = type"), ir)
+
+    for name in ["%struct.Big", "%struct.Two", "%struct.Raw", "%struct.Four", "%enum.Shape", "%Shape.Blob",
+                 "%enum.sysl$Option.Big"]
+        assert(!ir.contains(s"load $name,"), s"load $name")
+        assert(!ir.contains(s"store $name "), s"store $name")
+        assert(!ir.contains(s"extractvalue $name "), s"extractvalue $name")
+        assert(!ir.contains(s"insertvalue $name "), s"insertvalue $name")
+
+    // The counted fields are walked at an address, and the walk that takes a whole value is never
+    // asked for.
+    assert(ir.contains("call void @arc.copy_at.Big(ptr "), ir)
+    assert(ir.contains("call void @arc.dispose_at.Big(ptr "), ir)
+    assert(!ir.contains("@arc.copy.Big("), ir)
+    assert(!ir.contains("@arc.dispose.Big("), ir)
+    assert(ir.contains("i64 33016, i1 false)"), ir)
+end lac_no_large_value_is_an_llvm_value
+
+@test("a struct at or under the line is still loaded and stored as a value")
+lac_a_small_struct_is_still_a_value()
+    if !lac_ready() then return
+
+    val ir = lac_ir("struct Small\n    data: [120]u8\n    n: int\n\nmk(k: int) -> Small = Small([u8(k); 120], k)\n\n" +
+                    "var s = mk(1)\ns = mk(2)\nval t = s\nprint(t.n + int(t.data[119]))\n")
+
+    assert(ir.contains("load %struct.Small, ptr %s.addr"), ir)
+    assert(ir.contains("store %struct.Small"), ir)
+end lac_a_small_struct_is_still_a_value
+
+// =================================================================================================
+// It builds quickly, and copies, counts and releases exactly as before
+// =================================================================================================
+
+@test("that program builds in well under a minute, and every copy holds what its source held")
+lac_builds_quickly_and_counts_right()
+    if !lac_ready() then return
+
+    val got = lac_run(lac_program())
+
+    // The copy `b` made keeps what `a` held when it was made; the swap reads both sides first; every
+    // tag is dropped exactly once, when its last holder goes.
+    assert_eq(got.0, "14\n" + "drop 3\ndrop 4\ndrop 5\nb 7 7 a 70 9\nswap 8 70\n38\ndrop 10\n2 2\n" +
+                     "drop 9\ndrop 7\ndrop 8\ndrop 6\ndrop 2\ndrop 1\nend\n")
+    assert(got.1 < 60, s"building took ${got.1} s")
+end lac_builds_quickly_and_counts_right
+
+@test("a large value read in one block and copied in another is copied as it was when it was read")
+lac_a_value_used_past_a_branch_is_held()
+    if !lac_ready() then return
+
+    val got = lac_run(raw"""
+        struct Big
+            data: [4000]u8
+            n: int
+
+        big(k: int) -> Big = Big([u8(k); 4000], k)
+
+        pick(flag: bool) -> int
+            var a = big(1)
+            val b = big(2)
+            val c = if flag then a else b
+            a.n = 5
+            a.data[3999] = 6
+            c.n + int(c.data[3999])
+
+        print(pick(true))
+        print(pick(false))
+        """)
+
+    assert_eq(got.0, "2\n4\n")
+end lac_a_value_used_past_a_branch_is_held

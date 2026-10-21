@@ -2,8 +2,9 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.math.bigint.from_int
-import sysl.text.Search
+import sysl.text.{Search, str_builder}
 
 // The declaration pass, from parsed files to the tables the later stages read.
 //
@@ -83,10 +84,17 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
 
     val measured = c_probe_lower(a, written, a.tables.target)
 
+    // **A block the C compiler refused stops the reading here**, before anything is registered. Its
+    // file has lost every name the block declared, and each type, array length or constant written
+    // in terms of one -- in any file -- would be refused in turn, ahead of the one refusal that
+    // explains them all. Stopping is the whole answer where poisoning the names would need every
+    // rule that can mention a name to learn to stay quiet about it.
+    if c_probe_refused() then return measured
+
     // **A `derives` clause becomes the `impl` block a reader could have written**, before anything
     // is registered: everything downstream then finds an ordinary block and needs to know nothing
     // about deriving.
-    val units = derived_units(a, measured)
+    val units = debug_units(derived_units(a, measured))
 
     // **Which file the program starts in is settled before anything is hoisted**, because it decides
     // what the hoisting passes are given: that file is a body, so its `val`s and the functions that
@@ -100,6 +108,7 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     if entry.is_some()
         a.tables.entry_src = units.at(entry.unwrap()).src.name
         a.tables.entry_captures = capturing(units.at(entry.unwrap()).body)
+        refuse_nested_tests(a, units.at(entry.unwrap()), a.tables.entry_captures)
 
     hoist_units(a, units)
 
@@ -140,6 +149,7 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // Module-level assembly names nothing and nothing names it, so it is settled once, here, in
     // every file -- the one a program starts in included -- and is never subject to reachability.
     check_module_asm(a, units)
+    note_machine_runtimes(a)
 
     // A type that takes no arguments is instantiated whether or not anything uses it, so a field of
     // a type that does not exist is a mistake reported at the declaration rather than at whatever
@@ -179,6 +189,9 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // Then the members: every type's own, and the ones an `impl` block gives it. It runs after the
     // eager instantiation because a member's `Self` is that instantiation.
     hoist_all_members(a, units)
+
+    // What a union may hold, once every `impl` -- a `drop` among them -- is in.
+    settle_union_fields(a)
     units
 end read_decls
 
@@ -217,7 +230,7 @@ import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
     // IS a dependency, whether or not anything below it names what was brought in.
     if d.wildcard
         if a.tables.has_module(path) then depends_on_module(a, scope, path, span, true)
-        else out.push((span, s"no module is called '$written'"))
+        else out.push((span, s"no module is called '$written'${scope.pkg.absent}"))
 
         return out
 
@@ -226,7 +239,7 @@ import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
     // and each selector is a module beneath it or a member of it.
     if !d.selectors.is_empty()
         if !names_module(a, path)
-            out.push((span, s"no module is called '$written'"))
+            out.push((span, s"no module is called '$written'${scope.pkg.absent}"))
             return out
 
         for s in d.selectors
@@ -249,7 +262,7 @@ import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
     val home = if cut.is_some() then in_package(a, scope.pkg, written[0..<cut.unwrap()]) else ""
 
     if cut.is_none() || !a.tables.has_module(home)
-        out.push((span, s"no module is called '$written', and nothing declares it"))
+        out.push((span, s"no module is called '$written', and nothing declares it${scope.pkg.absent}"))
         return out
 
     import_name(a, scope, span, import_bound(d), home, written[cut.unwrap() + 1..<written.bytes.len],
@@ -284,9 +297,67 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
     if !declares(a, key) && imports_a_form(name)
         out.push((at, s"'$name' is a built-in form rather than a member of any module — it is in scope " +
                       "everywhere and needs no import"))
-    elif !declares(a, key) then out.push((at, s"'$home' declares no '$name' — there is no '$home.$name'"))
+    elif !declares(a, key)
+        withheld_for(a, home) match
+            Some(cap) -> out.push((at, withheld_refusal(a, home, name, cap)))
+            None -> out.push((at, s"'$home' declares no '$name' — there is no '$home.$name'"))
     elif !reachable_key(a, key, scope) then out.push((at, out_of_reach(a, key)))
+    else
+        val own = own_declaration(a, scope, bound)
+
+        if own.is_some() && reexported(a, own.unwrap()) != reexported(a, key)
+            var mine = "this program"
+
+            if scope.module_name != ""
+                mine = s"this module as '${module_qualify(scope.module_name, bound)}'"
+
+            out.push((at, s"'$bound' is declared by $mine, so importing '$home.$name' under that name " +
+                          "would mean two things — import it as another name with 'as', or write its path"))
+    end if
 end import_name
+
+// The requirement a module's emptied file wrote, where `c_probe_lower` withheld one of its files.
+private withheld_for(a: &Analysis, home: string) -> Option[string]
+    for pair in a.withheld
+        if pair.0 == home then return Some(pair.1)
+
+    None
+
+// **A withheld module is not one that declares nothing**, and saying so would send a reader looking
+// for a misspelling. It names the requirement and the machine, which are the two things to change.
+private withheld_refusal(a: &Analysis, home: string, name: string, cap: string) -> string
+    val machine = a.tables.target.name
+
+    s"'$home' is withheld on '$machine': it asks the C compiler about headers and requires '$cap', " +
+        s"which '$machine' does not provide, so it declares nothing here — there is no '$home.$name' " +
+        "on this machine"
+end withheld_refusal
+
+// The declaration of a spelling the importing file's own module makes and the file could write bare:
+// its own file-private one first, then the module's. **A sibling file's file-private declaration is
+// not one** -- the file cannot see it, so an import of the spelling is the only thing the name means
+// there. A variant is not one either: a bare variant is settled by the type expected of it, which is
+// what keeps two variants of one spelling apart already.
+private own_declaration(a: &Analysis, scope: Scope, name: string) -> Option[string]
+    val plain = module_qualify(scope.module_name, name)
+    val here = file_private_key(a, scope.src.name, plain)
+
+    if own_visible(a, scope, here) then return Some(here)
+    if here != plain && own_visible(a, scope, plain) then return Some(plain)
+    None
+
+// Whether a key is a declaration a file reaches, as one declaration or as an overload set any member
+// of which it reaches.
+private own_visible(a: &Analysis, scope: Scope, key: string) -> bool
+    val single = a.tables.types.has(key) || a.tables.funcs.has(key) || a.tables.consts.has(key) ||
+        a.tables.vals.has(key) || a.tables.externs.has(key) || a.tables.extern_vars.has(key)
+
+    if single && reachable_key(a, key, scope) then return true
+
+    for item in overload_keys(a, key)
+        if reachable_key(a, item, scope) then return true
+
+    false
 
 // A name the compiler answers itself, which no module declares however the import spells its home.
 private imports_a_form(name: string) -> bool =
@@ -304,7 +375,7 @@ private imports_a_form(name: string) -> bool =
 // never a canonical prefix: a `path` dependency's is its label, which looks like a module's head.
 private import_name_free(a: &Analysis, scope: Scope, at: Span, bound: string, taken: *Buf[string],
                          out: *Buf[(Span, string)]) -> bool
-    if writes_module(a, scope.pkg, bound)
+    if writes_module(a, scope.pkg, scope.src.name.starts_with(s"$StdPrefix/"), bound)
         out.push((at, s"'$bound' is a module, so importing something else under that name would hide " +
                       "it — import it as another name with 'as'"))
         return false
@@ -394,31 +465,40 @@ private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string
     val needs = a.tables.reaching_needs
     val scaffolding = a.tables.reaching_test || test_only_file(a, scope.src.name)
 
-    for i in 0..<a.tables.capability_refs.len()
-        val r = a.tables.capability_refs.at(i)
+    val terms = capability_ref_terms(from, to, needs, scaffolding, imported, named)
 
-        if r.from != from || r.to != to || r.scaffolding != scaffolding then continue
-        if r.imported != imported || r.named != named then continue
-        if !same_strings(r.needs, needs) then continue
-
-        if r.span.is_empty() && !span.is_empty() then
-            a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
-                                                          imported, named, false))
-
-        return
-
-    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding, imported,
-                                                named, false))
+    a.tables.capability_ref_at.get(terms) match
+        Some(i) ->
+            if a.tables.capability_refs.at(i).span.is_empty() && !span.is_empty() then
+                a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                              imported, named, false))
+        None ->
+            a.tables.capability_ref_at.put(terms, a.tables.capability_refs.len())
+            a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                        imported, named, false))
 end note_capability_ref
 
-private same_strings(xs: Buf[string], ys: Buf[string]) -> bool
-    if xs.len() != ys.len() then return false
+// What makes two capability references one: the edge, what the referring declaration needs, and the
+// three ways a reference is told apart. The fields are joined by a byte no name holds.
+private capability_ref_terms(from: string, to: string, needs: Buf[string], scaffolding: bool,
+                             imported: bool, named: string) -> string
+    var b = str_builder()
 
-    for i in 0..<xs.len()
-        if xs.at(i) != ys.at(i) then return false
+    b.push(from)
+    b.push_char('\u{1}')
+    b.push(to)
+    b.push_char('\u{1}')
+    b.push(named)
+    b.push_char('\u{1}')
+    b.push(if scaffolding then "s" else "-")
+    b.push(if imported then "i" else "-")
 
-    true
-end same_strings
+    for item in needs
+        b.push_char('\u{1}')
+        b.push(item)
+
+    b.finish()
+end capability_ref_terms
 
 // Fills in the position of an edge already recorded, where the first reference to make it had none.
 private position_edge(a: &Analysis, from: string, to: string, scope: Scope, span: Span)
@@ -545,21 +625,46 @@ private is_variant_name(a: &Analysis, key: string) -> bool = enum_of_variant(a, 
 // as well.
 enum_of_variant(a: &Analysis, key: string) -> Option[string]
     val here = module_of(key)
-    val name = module_bare(key)
 
-    for i in 0..<a.tables.types.len()
-        val decl = a.tables.types.at(i)
-
-        if module_of(a.tables.types.key_at(i)) == here then
-            decl.kind match
-                EnumOf(e) ->
-                    for item in e.variants
-                        if item.name == name then
-                            return Some(a.tables.types.key_at(i))
-                _ -> ()
+    for k in enums_declaring(a, module_bare(key))
+        if module_of(k) == here then return Some(k)
 
     None
 end enum_of_variant
+
+// The enum declarations that declare a variant of this spelling, in the order the types were declared.
+//
+// **A bare name is asked this on every lookup**, so it is an index rather than a pass over every type:
+// built once over the `types` table and rebuilt whenever the table has been written since, which
+// covers the declarations still being hoisted and a reading that is rewound.
+enums_declaring(a: &Analysis, name: string) -> Buf[string]
+    val types = a.tables.types
+
+    if a.tables.variant_index_for != types.changes + 1
+        var index: Map[string, Buf[string]] = map()
+
+        for i in 0..<types.len()
+            val key = types.key_at(i)
+
+            types.at(i).kind match
+                EnumOf(e) ->
+                    for item in e.variants
+                        index.get(item.name) match
+                            Some(keys) ->
+                                if keys.at(keys.len() - 1) != key then keys.push(key)
+                            None ->
+                                var keys: Buf[string] = buf()
+
+                                keys.push(key)
+                                index.put(item.name, keys)
+                _ -> ()
+
+        a.tables.variant_index = index
+        a.tables.variant_index_for = types.changes + 1
+    end if
+
+    a.tables.variant_index.get(name).unwrap_or(buf())
+end enums_declaring
 
 // A pinned underlying type says which one integer the discriminants are laid in. A generic enum has
 // an instantiation for every argument list rather than one, so there is no single storage for the
@@ -727,6 +832,7 @@ private resolve_signatures(a: &Analysis)
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
         check_crossing_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
         check_lends_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
+        check_disjoint_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
 
         // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE
         // PROGRAM HAS.** `spawn[T](…) -> Option[Thread]` names an `Option[Thread]` at every
@@ -781,10 +887,20 @@ private resolve_signatures(a: &Analysis)
                 vector_said = true
             end if
 
+            if !vector_said && has_c_bits(t)
+                extern_vector_fault(a, key, c_bits_by_value(t, s"passing it by value to the 'extern' '${d.name}'"))
+                vector_said = true
+            end if
+
         if d.ret_type.is_some()
             val t = resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
 
             answer = t
+
+            if !vector_said && has_c_bits(t)
+                extern_vector_fault(a, key, c_bits_by_value(t, s"returning it by value from the 'extern' '${d.name}'"))
+                vector_said = true
+            end if
 
             if !vector_said && is_vector(t) then
                 extern_vector_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, and how " +
@@ -1343,7 +1459,7 @@ private is_private_reach(v: Visibility) -> bool = v match
 
 // **A member carries no modifier of its own**, so it is as visible as the type it belongs to; one
 // that says something of its own is held to that instead.
-private member_reach(owner: Visibility, own: Visibility) -> Visibility = own match
+member_reach(owner: Visibility, own: Visibility) -> Visibility = own match
     Public -> owner
     _ -> own
 
@@ -1411,22 +1527,95 @@ private check_exposed_name(a: &Analysis, scope: Scope, label: string, vis: Visib
 
     val key = lookup_type_key(a, scope, name)
 
-    if key.is_none() then return
+    if key.is_some() then check_exposed_key(a, scope, label, vis, what, key.unwrap(), span)
+end check_exposed_name
 
+private check_exposed_key(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
+                          key: string, span: Span)
     // **A name the declaration cannot reach at all is one mistake, not two** -- it is refused where
     // it is written, and saying a second time that the signature is too visible for it would be a
     // second complaint about the same word.
-    if !reachable_key(a, key.unwrap(), scope) then return
+    if !reachable_key(a, key, scope) then return
 
-    val acc = a.tables.access.get(key.unwrap())
+    val acc = a.tables.access.get(key)
 
     if acc.is_none() || reaches_as_far(vis, scope.module_name, acc.unwrap()) then return
 
     a.fault(scope, span,
-            s"'$label' is ${reach_phrase(vis)}, but $what names '${qualified_name(key.unwrap())}', " +
+            s"'$label' is ${reach_phrase(vis)}, but $what names '${qualified_name(key)}', " +
             s"which is ${no_further_than(acc.unwrap())} — a declaration may not be more visible " +
             "than the types it names")
-end check_exposed_name
+end check_exposed_key
+
+// **A type left off is held to the rule a written one is**: the value's type is what a reader of
+// the declaration gets, so a private type in it is exposed exactly as one written would be. Said at
+// the declaration, there being no written name to point at; asked once the type has been read, by
+// whatever reads the declaration (`module_storage`, `check_const_admits`).
+check_exposed_inferred(a: &Analysis, v: ValueDecl, t: Type)
+    if is_private_reach(v.vis) then return
+
+    var keys: Buf[string] = buf()
+
+    type_keys(&keys, t)
+
+    for key in keys
+        check_exposed_key(a, v.scope, v.name, v.vis, "its type", key, v.span)
+end check_exposed_inferred
+
+// The same rule for a function's result read off its body: what a caller gets back is the
+// signature's as much as a written `-> T` would be, so a private type in it is exposed exactly as one
+// written would be.
+check_exposed_result(a: &Analysis, scope: Scope, label: string, vis: Visibility, t: Type, span: Span)
+    if is_private_reach(vis) then return
+
+    var keys: Buf[string] = buf()
+
+    type_keys(&keys, t)
+
+    for key in keys
+        check_exposed_key(a, scope, label, vis, "its result", key, span)
+end check_exposed_result
+
+// Every declared type a type is made of -- what a written type would have had to name -- outermost
+// first, each once. A struct's fields are its own declaration's business and are not followed.
+private type_keys(out: *Buf[string], t: Type)
+    t match
+        Struct(d) ->
+            push_key(out, d.base)
+            each_type_key(out, d.targs)
+        Enum(d) ->
+            push_key(out, d.base)
+            each_type_key(out, d.targs)
+        Results(parts) ->
+            for item in parts.fields
+                type_keys(out, item.1)
+        Trait(name, args, assocs) ->
+            push_key(out, name)
+            each_type_key(out, args)
+
+            for item in assocs
+                type_keys(out, item.1)
+        Constrained(d) -> push_key(out, d.name)
+        Ptr(inner) -> type_keys(out, *inner)
+        Volatile(inner) -> type_keys(out, *inner)
+        Ref(inner, _) -> type_keys(out, *inner)
+        Weak(inner) -> type_keys(out, *inner)
+        Array(_, elem) -> type_keys(out, *elem)
+        Vector(_, elem) -> type_keys(out, *elem)
+        Slice(elem, _) -> type_keys(out, *elem)
+        CFn(params, ret) ->
+            each_type_key(out, params)
+            type_keys(out, *ret)
+        Pack(elems) -> each_type_key(out, elems)
+        _ -> ()
+end type_keys
+
+private each_type_key(out: *Buf[string], ts: Buf[Type])
+    for item in ts
+        type_keys(out, item)
+
+private push_key(out: *Buf[string], key: string)
+    if !holds_string(*out, key) then out.push(key)
 
 // Whether every reader of a declaration at this reach is also a reader of a type at that one. The
 // file level is not asked: a file-private declaration is read in one file, and every type it names

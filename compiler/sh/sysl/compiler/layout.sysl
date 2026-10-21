@@ -51,7 +51,7 @@ range_width(t: Type) -> Option[int] = bitfield_width(t) match
 // decides it**: a bitfield struct held in an otherwise whole-byte `@packed` struct is a field of its
 // container's size there, and only inside a bitfield struct does it shrink to its own width.
 bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
-    if !s.packed then return None
+    if !s.packed || s.union_layout || !s.c_bits.is_empty() then return None
 
     val fields = s.stored()
     var any_odd = false
@@ -134,6 +134,12 @@ struct TargetLayout
     // much as a width is, and what a constant reordered by `to_be` is folded against.
     little_endian: bool
 
+    // How the target's C compiler allocates a bitfield (`c_bitfields.sysl`), and the boundary an
+    // integer's alignment stops at inside a C struct, 0 where nothing caps it -- the one way i386's
+    // bitfields differ from the generic rule.
+    bitfield_rule: BitfieldRule
+    unit_align_cap: usize
+
     pointer_bytes(self) -> usize = self.word_bits / 8
 
     // A pointer that carries a table beside it.
@@ -169,8 +175,12 @@ struct TargetLayout
         if d.simple then self.size(d.underlying) else self.enum_size(d)
 
     // Whether a value of the type is handed to a function by address rather than in registers.
+    //
+    // **A union is always handed by address**: its fields share one offset, so a field is reached
+    // through storage and never lifted out of a register aggregate whose element type is some other
+    // field's.
     indirect(self, t: Type) -> bool = underlying(t) match
-        Struct(_) -> self.size(t) > DirectBytes
+        Struct(d) -> d.union_layout || self.size(t) > DirectBytes
         Array(_, _) -> self.size(t) > DirectBytes
         Enum(d) -> !d.simple && self.size(t) > DirectBytes
         _ -> false
@@ -244,12 +254,23 @@ struct TargetLayout
         var bytes: usize = 0
         var alignment: usize = 0
 
+        if !s.c_bits.is_empty()
+            val c = c_bitfield_layout(self, s)
+
+            return self.raised_to(s, c.size, c.align)
+        end if
+
         bitfield_ranges(s) match
             Some(ranges) ->
                 bytes = usize(bitfield_bits(ranges) / 8)
                 alignment = 1
             None ->
-                if s.packed then
+                if s.union_layout then
+                    val both = self.union_extent(members, s.packed)
+
+                    bytes = both.0
+                    alignment = both.1
+                else if s.packed then
                     var total: usize = 0
 
                     for item in members
@@ -263,13 +284,33 @@ struct TargetLayout
                     bytes = both.0
                     alignment = both.1
 
-        s.min_align match
-            Some(n) -> if n > alignment then (max_usize(round_up(bytes, n), n), n) else (bytes, alignment)
-            None -> (bytes, alignment)
+        self.raised_to(s, bytes, alignment)
     end struct_computed
 
-    // Where a field begins inside its struct.
+    // A size and a boundary with `@align(n)` applied: it raises both, never lowers either.
+    private raised_to(self, s: &StructType, bytes: usize, alignment: usize) -> (usize, usize) = s.min_align match
+        Some(n) -> if n > alignment then (max_usize(round_up(bytes, n), n), n) else (bytes, alignment)
+        None -> (bytes, alignment)
+
+    // A union's size and boundary, C's on every target the design note measured: the largest field
+    // rounded up to the widest boundary among them, and under `@packed` a boundary of one and no
+    // rounding. `@align(n)` raises both afterwards, as for a struct.
+    private union_extent(self, members: Buf[Type], packed: bool) -> (usize, usize)
+        var largest: usize = 0
+        var widest: usize = 1
+
+        for m in members
+            largest = max_usize(largest, self.size(m))
+            widest = max_usize(widest, self.align(m))
+
+        if packed then (largest, 1) else (round_up(largest, widest), widest)
+    end union_extent
+
+    // Where a field begins inside its struct. Every field of a union begins at its first byte.
     field_offset(self, s: &StructType, field: string) -> Option[usize]
+        if !s.c_bits.is_empty() then return c_field_offset(self, s, field)
+        if s.union_layout then return if s.field_index(field) >= 0 then Some(0) else None
+
         var offset: usize = 0
         val fields = s.stored()
 
@@ -327,7 +368,8 @@ struct TargetLayout
         (bytes, widest)
     end payload_computed
 
-    private variant_aggregate(self, v: EnumVariant) -> (usize, usize)
+    // The size and the boundary of one variant's payload, laid out as a struct of its fields.
+    variant_aggregate(self, v: EnumVariant) -> (usize, usize)
         var members: Buf[Type] = buf()
         val fields = v.stored()
 
@@ -356,6 +398,11 @@ struct TargetLayout
     // Whether `@align(n)` on this struct asks for more than its fields already give it.
     raises(self, d: &StructType) -> bool
         if d.base == TaskBase then return false
+
+        // A struct with C bitfields is written to LLVM as bytes at the offsets C gives them, its
+        // boundary carried by nothing in the type (`ir_lower.sysl`'s `c_bits_type_def`), so every
+        // holder writes its gaps out just as for a raised one.
+        if !d.c_bits.is_empty() then return true
 
         val n = d.min_align match
             Some(k) -> k
@@ -462,11 +509,14 @@ end TargetLayout
 
 // The layout a target measures with, remembering nothing: the one the analysis uses, while the
 // records it measures are still being filled in.
-layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), None, t.little_endian())
+layout_for(t: Target) -> TargetLayout =
+    TargetLayout(t.pointer_bits(), None, t.little_endian(), bitfield_rule_of(t.os, t.cpu), struct_int_align_cap(t.cpu))
 
 // The layout a target measures with over a finished program, remembering every struct and enum it
 // has measured.
-memo_layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), Some(layout_memo()), t.little_endian())
+memo_layout_for(t: Target) -> TargetLayout =
+    TargetLayout(t.pointer_bits(), Some(layout_memo()), t.little_endian(), bitfield_rule_of(t.os, t.cpu),
+                 struct_int_align_cap(t.cpu))
 
 // An integer's alignment: the next power of two at or above its byte count, capped at sixteen.
 int_align(bits: int) -> usize

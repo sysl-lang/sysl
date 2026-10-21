@@ -1,0 +1,98 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// A reading of an expression made to find something out, and thrown away whole where it is not kept.
+//
+// **The analyzer tries things**: which branch of an `if` knows its type, whether an argument reads at
+// a candidate's parameter, whether an operand stands alone. A reading writes into more than the
+// diagnostics -- the instantiations it asked for, the closures it lowered, the unique names its
+// locals took, the views it borrowed, the checks it left for the end of the body -- and a reading
+// that is thrown away must take every one of those with it. One it leaves behind is a complaint
+// about code the program never had (an `undefined name` from a branch read out of its scope), a
+// borrow naming a local no scope holds, or a body nobody calls.
+//
+// **One record says what a trial must put back, so no site has to remember the list.** A site opens
+// a trial with `begin_trial`, asks `refused_since` whether the reading complained, and closes it with
+// `keep_trial` (the reading is the one the program gets) or `discard_trial` (it is not).
+//
+// **What a trial deliberately leaves**: `partials`, the parts of a type each generic variant settled,
+// which is what a merging reading is made *for*; a gap in the nested-function counter, which numbers
+// a lowered environment that may already be filed; and a complaint the walk at a generic's own
+// definition kept, which is that walk's to keep, not a trial's inside it.
+struct Trial
+    journal: usize
+    said: usize
+    warned: usize
+    kept: usize
+    lowered: usize
+    made: usize
+    queued: usize
+    tables: usize
+    shared: usize
+    crossings: usize
+    watches: usize
+    ref_refusals: usize
+    target_refusals: usize
+    const_cycles: usize
+    used: usize
+    view_calls: usize
+    view_borrows: Buf[(string, Buf[ViewRoot])]
+    consume_calls: usize
+    by_name: usize
+    refused_nested: usize
+    variant_seq: int
+    reach: usize
+    var_fixes: usize
+end Trial
+
+// Opens a trial: where everything a reading writes stands now. The borrows are the one table a
+// reading rewrites in place rather than only adding to, so they are copied -- and only where there
+// are any, since nearly every body has none.
+begin_trial(cx: &Analyzer) -> Trial
+    val a = cx.an
+    val borrows = if cx.view_borrows.is_empty() then buf() else cx.view_borrows.copy()
+
+    Trial(a.sandboxed(), a.complaints(), a.warned.len(), a.kept.len(), a.closure_count,
+          a.closure_funcs.len(), a.tables.members.pending.len(), a.tables.members.vtables.len(),
+          a.shared_checks.len(), a.task_crossings.len(), a.ref_watches.len(), a.ref_refusals.len(),
+          a.target_refusals.len(), a.const_cycles.len(), cx.used.len(), cx.view_calls.len(),
+          borrows, cx.consume_calls.len(), cx.by_name.len(), cx.refused_nested.len(),
+          cx.variant_seq, cx.reach, cx.var_fix_log.len())
+end begin_trial
+
+// Whether the reading complained since the trial opened.
+refused_since(cx: &Analyzer, t: Trial) -> bool = cx.an.complaints() > t.said
+
+// Closes a trial keeping everything it wrote: the reading is the one the program gets.
+keep_trial(cx: &Analyzer) = cx.an.keep()
+
+// Closes a trial putting back everything it wrote, most of it by cutting a list back to the length
+// it had when the trial opened.
+discard_trial(cx: &Analyzer, t: Trial)
+    val a = cx.an
+
+    a.release(t.journal)
+    rewind_instantiations(a, t.queued, t.tables)
+    a.restore_complaints(t.said)
+    a.warned.truncate(t.warned)
+    a.kept.truncate(t.kept)
+    a.closure_count = closure_rewind(a, t.lowered)
+    a.closure_funcs.truncate(t.made)
+    a.shared_checks.truncate(t.shared)
+    a.task_crossings.truncate(t.crossings)
+    a.ref_watches.truncate(t.watches)
+    a.ref_refusals.truncate(t.ref_refusals)
+    a.target_refusals.truncate(t.target_refusals)
+    a.const_cycles.truncate(t.const_cycles)
+
+    cx.used.truncate(t.used)
+    cx.view_calls.truncate(t.view_calls)
+    cx.view_borrows = t.view_borrows
+    cx.consume_calls.truncate(t.consume_calls)
+    cx.by_name.truncate(t.by_name)
+    cx.refused_nested.truncate(t.refused_nested)
+    cx.variant_seq = t.variant_seq
+    cx.reach = t.reach
+    cx.var_fix_log.truncate(t.var_fixes)
+end discard_trial

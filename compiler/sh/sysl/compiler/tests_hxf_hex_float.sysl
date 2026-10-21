@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Hex float literals -- `0x1.62e42fefa39efp-1`, the digits a libm's constants are written in -- and
+// `FloatBits` folded in a `const`. A hex float is exact or it is refused, naming the type: it exists
+// so that the digits are the bits, and rounding one quietly would undo the only reason to write it.
+
+// The first token a text lexes to, as its kind and what it carries.
+private hxf_tok(text: string) -> string
+    lex(source_of("<t>", text)) match
+        Err(d) -> s"!${d.message}"
+        Ok(toks) -> toks.at(0).value match
+            FloatLit(t, sfx) -> s"float $t $sfx"
+            IntLit(digits, base, sfx) -> s"int $digits $base $sfx"
+            Ident(n) -> s"ident $n"
+            _ -> "other"
+end hxf_tok
+
+// What a program prints, built and run.
+private hxf_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// What a program's analysis says, or its LLVM text where it says nothing.
+private hxf_said(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// -- the lexer ------------------------------------------------------------------------------------
+
+@test("a hex float keeps its 0x, its fraction and a p exponent, and takes a suffix after the exponent")
+hxf_lexes()
+    assert_eq(hxf_tok("0x1.8p3"), "float 0x1.8p3 ")
+    assert_eq(hxf_tok("0x1p-1074"), "float 0x1p-1074 ")
+    assert_eq(hxf_tok("0X1.8P+3"), "float 0x1.8p+3 ")
+    assert_eq(hxf_tok("0x1.fffffep127f32"), "float 0x1.fffffep127 f32")
+    assert_eq(hxf_tok("0x1_0.0_8p1_0"), "float 0x10.08p10 ")
+end hxf_lexes
+
+@test("without a p exponent an 0x literal is still an integer, and a dot after it is not a fraction")
+hxf_no_exponent_is_an_integer()
+    assert_eq(hxf_tok("0x1f"), "int 1f 16 ")
+    assert_eq(hxf_tok("0xff.max"), "int ff 16 ")
+    assert_eq(hxf_tok("0x1.b"), "int 1 16 ")
+end hxf_no_exponent_is_an_integer
+
+@test("a hex float's suffixes are a float family's, and binary and octal still have no float form")
+hxf_suffix_errors()
+    assert_eq(hxf_tok("0x1p3i32"), "!floating-point literal cannot have the integer suffix 'i32'")
+    assert_eq(hxf_tok("0x1p"), "!invalid literal suffix 'p'")
+    assert_eq(hxf_tok("0b1f32"), "!floating-point suffix on a non-decimal literal")
+    assert_eq(hxf_tok("0b1p3"), "!invalid literal suffix 'p3'")
+end hxf_suffix_errors
+
+// -- values ---------------------------------------------------------------------------------------
+
+@test("hex floats are the bit patterns they spell: normals, subnormals, the extremes, every width")
+hxf_round_trips()
+    if xvr_no_library() then return
+
+    val text = "main()\n" +
+        "    print(0x1.8p3 == 12.0)\n" +
+        "    print((0x1.62e42fefa39efp-1).bits() == 0x3fe62e42fefa39ef)\n" +
+        "    print(0x1p-1074.bits() == 1)\n" +
+        "    print(0x0.0000000000001p-1022.bits() == 1)\n" +
+        "    print(0x1p-1022.bits() == 0x0010000000000000)\n" +
+        "    print(0x0.fffffffffffffp-1022.bits() == 0x000fffffffffffff)\n" +
+        "    print(0x1.fffffffffffffp1023.bits() == 0x7fefffffffffffff)\n" +
+        "    print(0x1.fffffep127f32.bits() == 0x7f7fffff)\n" +
+        "    print(0x1p-149f32.bits() == 1)\n" +
+        "    val f: f32 = 0x1.8p1\n" +
+        "    print(f == 3.0)\n" +
+        "    print(0x1.ffcp15f16.bits() == 0x7bff)\n" +
+        "    print(0x1p-24f16.bits() == 1)\n" +
+        "    print(0x1p-133bf16.bits() == 1)\n" +
+        "    print(0x1.0000000000000000000000000001p0f128.bits() == 0x3fff0000000000000000000000000001)\n" +
+        "    print((-0x1p0).bits() == 0xbff0000000000000)\n" +
+        "    print((-0x0p0).bits() == 0x8000000000000000)\n" +
+        "    print(0x10.08p-4 == 1.001953125)\n" +
+        "    val q: q15 = 0x1p-15\n" +
+        "    print(q.bits == 1)\n"
+
+    var want = ""
+
+    for _ in 0..<18
+        want = want + "true\n"
+
+    assert_eq(hxf_ran(text), want)
+end hxf_round_trips
+
+@test("a hex float its type cannot hold exactly is refused, naming the type and why")
+hxf_inexact_is_refused()
+    if xvr_no_library() then return
+
+    assert(hxf_said("val x: real = 0x1.00000000000001p0\n").contains(
+        "the hex float '0x1.00000000000001p0' is not exactly a 'real': it has 57 significant bits, " +
+        "and a 'real' holds 53"), hxf_said("val x: real = 0x1.00000000000001p0\n"))
+    assert(hxf_said("val y: f32 = 0x1.000001p0\n").contains(
+        "the hex float '0x1.000001p0' is not exactly a 'f32': it has 25 significant bits, and a 'f32' holds 24"),
+        hxf_said("val y: f32 = 0x1.000001p0\n"))
+    assert(hxf_said("val z: real = 0x1p1024\n").contains(
+        "the hex float '0x1p1024' is not exactly a 'real': it is at least 2^1024, and the largest 'real' " +
+        "is below 2^1024"), hxf_said("val z: real = 0x1p1024\n"))
+    assert(hxf_said("val w: real = 0x1p-1075\n").contains(
+        "the hex float '0x1p-1075' is not exactly a 'real': its lowest bit is 2^-1075, and the smallest " +
+        "'real' is 2^-1074"), hxf_said("val w: real = 0x1p-1075\n"))
+    assert(hxf_said("val v: f32 = 0x1p-150f32\n").contains("and the smallest 'f32' is 2^-149"),
+           hxf_said("val v: f32 = 0x1p-150f32\n"))
+    assert(hxf_said("val u: f16 = 0x1p16f16\n").contains("it is at least 2^16, and the largest 'f16' is below 2^16"),
+           hxf_said("val u: f16 = 0x1p16f16\n"))
+    assert(hxf_said("val n: real = -0x1.00000000000001p0\n").contains("'-0x1.00000000000001p0' is not exactly a 'real'"),
+           hxf_said("val n: real = -0x1.00000000000001p0\n"))
+    assert(hxf_said("val q: q15 = 0x1p-16\n").contains(
+        "the hex float '0x1p-16' is not exactly a 'q15': its lowest bit is 2^-16, and a 'q15' steps by 2^-15"),
+        hxf_said("val q: q15 = 0x1p-16\n"))
+end hxf_inexact_is_refused
+
+@test("the same digits are accepted at the type that holds them")
+hxf_exact_at_the_wider_type()
+    if xvr_no_library() then return
+
+    val as_real = hxf_said("val y: real = 0x1.000001p0\nval z: real = 0x1p1023\nval w: real = 0x1p-1074\n")
+    val as_quad = hxf_said("val x: f128 = 0x1.00000000000001p0\n")
+
+    assert(!as_real.contains("error:") && !as_real.contains("not exactly"), as_real)
+    assert(!as_quad.contains("error:") && !as_quad.contains("not exactly"), as_quad)
+end hxf_exact_at_the_wider_type
+
+// -- FloatBits in a const ---------------------------------------------------------------------------
+
+@test("from_bits and bits fold in a const, both ways, at real and f32")
+hxf_float_bits_fold_in_a_const()
+    if xvr_no_library() then return
+
+    val text = "const c1: real = real.from_bits(0x3fe62e42fefa39ef)\n" +
+        "const c2: f32 = f32.from_bits(0x3f800000)\n" +
+        "const b1: u64 = (1.5).bits()\n" +
+        "const b2: u32 = f32(1.5).bits()\n" +
+        "const c3: real = 0x1.62e42fefa39efp-1\n" +
+        "\nmain()\n" +
+        "    print(c1 == c3)\n" +
+        "    print(c2 == 1.0)\n" +
+        "    print(b1 == 0x3ff8000000000000)\n" +
+        "    print(b2 == 0x3fc00000)\n"
+
+    assert_eq(hxf_ran(text), "true\ntrue\ntrue\ntrue\n")
+end hxf_float_bits_fold_in_a_const
+
+@test("a 'const' function may call from_bits and bits, and is run while compiling")
+hxf_float_bits_in_a_const_function()
+    if xvr_no_library() then return
+
+    val text = "const next_up(x: real) -> real = real.from_bits(x.bits() + 1)\n" +
+        "const h: f16 = f16.from_bits(0x3c00)\n" +
+        "const n: real = next_up(1.0)\n" +
+        "\nmain()\n" +
+        "    print(n.bits() == 0x3ff0000000000001)\n" +
+        "    print(h == 1.0)\n"
+
+    assert_eq(hxf_ran(text), "true\ntrue\n")
+end hxf_float_bits_in_a_const_function
+
+// -- a freestanding table ---------------------------------------------------------------------------
+
+// The LLVM text a `thumbv7em-freestanding` archive lowers to, or the first thing its compilation said.
+private hxf_freestanding(text: string) -> string
+    val t = target_named("thumbv7em-freestanding").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "no library"
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> return "no library"
+            Ok(us) -> units = us
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+
+    for item in done.reported
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    for item in done.an.diagnostics()
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end hxf_freestanding
+
+@test("a table written in hex floats and one written with from_bits are both constant data on a board")
+hxf_tables_are_rodata_on_a_board()
+    val out = hxf_freestanding(
+        "val LN2: [2]real = [0x1.62e42fefa39efp-1, 0x1.abc9e3b39803fp-56]\n" +
+        "val BITS: [2]real = [real.from_bits(0x3fe62e42fefa39ef), real.from_bits(0x3c7abc9e3b39803f)]\n" +
+        "val F: [2]f32 = [0x1.8p1, f32.from_bits(0x40400000)]\n" +
+        "\n@export(\"main\")\nmain_entry() -> int = int(LN2[0] + BITS[1] + real(F[1]))\n")
+
+    if out == "no library" then return
+
+    assert(out.contains("@LN2 = private constant [2 x double] [double 0x3FE62E42FEFA39EF, double 0x3C7ABC9E3B39803F]"),
+           out)
+    assert(out.contains("@BITS = private constant [2 x double] [double 0x3FE62E42FEFA39EF, double 0x3C7ABC9E3B39803F]"),
+           out)
+    assert(out.contains("@F = private constant [2 x float] [float 0x4008000000000000, float 0x4008000000000000]"), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end hxf_tables_are_rodata_on_a_board

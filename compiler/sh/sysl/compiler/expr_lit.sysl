@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int, negate, parse_radix, to_string}
+import sysl.math.bigint.{BigInt, bit_length, from_int, negate, parse_radix, to_string, trailing_zeros}
 import sysl.text.parse_real
 
 // The scalar leaves of expression analysis: how a literal takes its type, how operands that must
@@ -48,8 +48,8 @@ private base_of_new(t: Type) -> Type = t match
 private made_new(span: Span, lit: TExpr, target: Type) -> TExpr =
     if texpr_type(lit) == Unknown then lit else TExpr(span, TConstrainedCheck(lit, target))
 
-// An integer literal takes its type from its suffix, else from the type the context expects, else
-// `int`. The default is never magnitude-dependent: a value too large for the type it landed in is
+// An integer literal takes its type from its suffix, else from the type the context expects -- a
+// float type among them, where the float holds it exactly -- else `int`. The default is never magnitude-dependent: a value too large for the type it landed in is
 // an error asking for a suffix, not a silent widening.
 //
 // **The expected type is consulted through `repr`**, which is the same identity `disagree` uses --
@@ -59,9 +59,16 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
             expected: Option[Type]) -> TExpr
     val made = if suffix == "" then new_type_wanted(expected) else None
 
-    if made.is_some() then
-        return made_new(span, int_literal(cx, span, value, suffix, Some(base_of_new(made.unwrap()))),
-                        made.unwrap())
+    // A literal the base would not take stays what it is, so the position refuses it as it would at
+    // the base: `300` is no more a `Slot` over `u8` than it is a `u8`.
+    if made.is_some()
+        val base = base_of_new(made.unwrap())
+        val at_base = int_literal(cx, span, value, suffix, Some(base))
+
+        if disagree(texpr_type(at_base), base) then return at_base
+
+        return made_new(span, at_base, made.unwrap())
+    end if
 
     // A whole number written where a fixed-point value is wanted is that value, `1` at `i32q16`
     // being one -- converted exactly and held to the format's range as a decimal literal is.
@@ -69,6 +76,10 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
 
     if fixed.is_some() then
         return fixed_literal(cx, span, to_string(value), Some((value, 0)), fixed.unwrap())
+
+    val float_at = if suffix == "" then float_wanted(expected) else None
+
+    if float_at.is_some() then return int_as_float(cx, span, value, float_at.unwrap())
 
     val ty = if suffix != "" then suffixed_int(cx, span, suffix) else expected_int(cx, expected)
 
@@ -80,6 +91,81 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
 
     TExpr(span, TIntLit(value, ty))
 end int_literal
+
+// The floating-point type a position wants an unsuffixed integer literal to be, where it wants one
+// -- seen through a vector, as the literal's integer type is.
+private float_wanted(expected: Option[Type]) -> Option[Type] = expected match
+    Some(t) -> scalar_wanted(t) match
+        Floating(bits, brain) -> Some(Floating(bits, brain))
+        _ -> None
+    None -> None
+
+// **An integer literal where a float is wanted is that float, when the float holds it exactly**:
+// `val r: real = 2` is two, and so is the `2` of `r / 2`. One the format would round is refused, as
+// a literal too wide for an integer type is -- the written number is what the program means, and a
+// rounded one is a different number.
+private int_as_float(cx: &Analyzer, span: Span, value: BigInt, ty: Type) -> TExpr
+    if !exactly_float(value, ty) then
+        return cx.err(span, s"the literal ${to_string(value)} is not exactly ${float_named(ty)}")
+
+    val text = to_string(value)
+
+    if is_quad(ty)
+        val (hi, lo) = quad_of_text(text).unwrap_or((0, 0))
+
+        return TExpr(span, TQuadLit(hi, lo, ty))
+
+    TExpr(span, TFloatLit(double_bits(text), ty))
+end int_as_float
+
+// Whether a format holds an integer exactly: its significant bits fit the significand, and its
+// magnitude stays below the format's overflow at `2^(emax + 1)`.
+exactly_float(value: BigInt, ty: Type) -> bool
+    if value.is_zero() then return true
+
+    val (precision, emax) = ty match
+        Floating(16, true) -> (8, 127)
+        Floating(16, false) -> (11, 15)
+        Floating(32, _) -> (24, 127)
+        Floating(128, _) -> (113, 16383)
+        _ -> (53, 1023)
+
+    val width = bit_length(value)
+
+    width - trailing_zeros(value) <= usize(precision) && width <= usize(emax + 1)
+end exactly_float
+
+// `an f32`, `a real`, `a bf16` -- the format's name with its article.
+float_named(ty: Type) -> string
+    val name = type_show(ty)
+
+    if name.starts_with("f") then s"an $name" else s"a $name"
+end float_named
+
+// A character literal is a `char`, except where its position wants a `u8`: there an ASCII one is
+// that byte, read exactly as an integer literal would be, so `b[i] == ';'` and `out.push('\n')`
+// need no conversion.
+//
+// **Only `u8`, and only below 128.** A `u8` is a byte of UTF-8 text, and a code point from 128 up is
+// more than one byte of it, so such a literal is refused rather than truncated. No other integer
+// type takes one: a character is not a number to a signed or wider type.
+char_literal(cx: &Analyzer, span: Span, cp: char, expected: Option[Type]) -> TExpr
+    if !wants_byte(expected) then return TExpr(span, TIntLit(from_int(long(uint(cp))), Char))
+
+    val code = u32(cp)
+
+    if code >= 128 then
+        return cx.err(span, s"the character U+${hex_upper(u64(code), 4)} is not ASCII, so it is " +
+                      "more than one byte in UTF-8 and cannot be a u8 — write a string for its " +
+                      "bytes, or u8(0x..) for one byte")
+
+    TExpr(span, TIntLit(from_int(long(code)), Integer(8, false, false)))
+end char_literal
+
+// Whether a position wants a byte -- seen through a vector, as an integer literal's is.
+wants_byte(expected: Option[Type]) -> bool = expected match
+    Some(t) -> scalar_wanted(t) == Integer(8, false, false)
+    None -> false
 
 private suffixed_int(cx: &Analyzer, span: Span, suffix: string) -> Type
     val named = scalar_type_named(cx, span, suffix)
@@ -110,22 +196,42 @@ private expected_int(cx: &Analyzer, expected: Option[Type]) -> Type
 end expected_int
 
 // A float literal takes its type from its suffix, else from the expected type when that is a
-// float, else `real`. An integer literal never becomes a float on its own -- writing `1` where a
-// `real` is wanted is a type error, not a silent conversion.
+// float, else `real`.
 float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
               expected: Option[Type]) -> TExpr
     val made = if suffix == "" then new_type_wanted(expected) else None
 
-    if made.is_some() then
-        return made_new(span, float_literal(cx, span, text, suffix, Some(base_of_new(made.unwrap()))),
-                        made.unwrap())
+    if made.is_some()
+        val base = base_of_new(made.unwrap())
+        val at_base = float_literal(cx, span, text, suffix, Some(base))
+
+        if disagree(texpr_type(at_base), base) then return at_base
+
+        return made_new(span, at_base, made.unwrap())
+    end if
 
     // At a fixed-point type the literal is read from its TEXT, exactly, and never through a double.
     val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
 
+    if fixed.is_some() && is_hex_float_text(text)
+        val refused = hex_fixed_refusal(text, fixed.unwrap())
+
+        if refused.is_some() then return cx.err(span, refused.unwrap())
+    end if
+
     if fixed.is_some() then return fixed_literal(cx, span, text, exact_of_text(text), fixed.unwrap())
 
     val ty = if suffix != "" then suffixed_float(cx, span, suffix) else expected_float(cx, expected)
+
+    // A hex float is exact or it is refused (`hex_float.sysl`).
+    if is_hex_float_text(text)
+        val refused = ty match
+            Floating(_, _) -> hex_float_refusal(text, ty)
+            Abstract(_, _) -> hex_float_refusal(text, ty)
+            _ -> None
+
+        if refused.is_some() then cx.fault(span, refused.unwrap())
+    end if
 
     // At `f128` the literal is read from its text too: a `double` would round it to 53 bits first.
     if is_quad(ty)
@@ -169,11 +275,14 @@ private expected_float(cx: &Analyzer, expected: Option[Type]) -> Type
         _ -> real_type()
 end expected_float
 
-// The bits of a decimal literal's `double` value, which is what the typed tree carries.
+// The bits of a literal's `double` value, which is what the typed tree carries.
 //
 // **The reference compiler holds a float literal as `doubleToLongBits` of the text**, so a narrower
-// type is reached by rounding that constant down to it and costs nothing at run time.
-double_bits(text: string) -> long = signed_bits(parse_real(text).unwrap_or(0.0).bits())
+// type is reached by rounding that constant down to it and costs nothing at run time. A hex float
+// narrower than `f128` was refused unless it is exact at its type, so it is exact here too.
+double_bits(text: string) -> long =
+    if is_hex_float_text(text) then signed_bits(hex_double_bits(text).unwrap_or(0))
+    else signed_bits(parse_real(text).unwrap_or(0.0).bits())
 
 // -- which operand a pair takes its type from ----------------------------------------------------
 
@@ -232,7 +341,17 @@ constructed(t: TExpr) -> bool = *t.kind match
 // spelling says that one of them chose its width. `constructed` reads the analyzed node, and is
 // what separates `Some(3)` from `f(3)`: the two parse identically, and a function's result has
 // nothing to do with the literals handed to it.
-adaptable(e: Expr, t: TExpr) -> bool = is_literal(e) || literal_shaped(e) && constructed(t)
+//
+// **A character literal is adaptable too, though it is not a bare literal**: it has a type of its
+// own, `char`, and keeps it wherever nothing else is said, but beside a `u8` it is that byte -- so
+// `';' == b[i]` takes the byte's type rather than imposing its own.
+adaptable(e: Expr, t: TExpr) -> bool =
+    is_literal(e) || is_char_literal(e) || literal_shaped(e) && constructed(t)
+
+// Whether an expression is a character literal, as written.
+is_char_literal(e: Expr) -> bool = *e.kind match
+    CharLit(_) -> true
+    _ -> false
 
 // The type an adaptable literal falls back to, worked out from how it is written rather than by
 // analyzing it.

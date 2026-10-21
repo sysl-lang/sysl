@@ -104,11 +104,21 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
         end if
 
         Unknown
+    // A result left off an `= value` body is that body's type, read where it is first asked for and
+    // put in the terms of the reading that asks (`inferred_results.sysl`).
+    InferredResult(slot) -> inferred_result(a, slot, subst)
     // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
     // anything else the moment the subject is known: the subject is resolved first, and a parameter
     // standing in for itself answers off the bounds it carries.
+    //
+    // `f::Type` is the type of the field a `for const` over `T::Fields` stands at in this copy, and
+    // `c::Payload` the payload of the variant one over `T::Variants` stands at, which the copy binds
+    // under that very spelling.
     AssocType(base, member) ->
-        assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
+        val projected = descriptor_projection(a, scope, t.span, base, member, subst)
+
+        if projected.is_some() then projected.unwrap()
+        else assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
     ValueArgType(e) -> const_argument(a, scope, t.span, e, subst)
 
@@ -415,6 +425,15 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Unknown
     end if
 
+    // So is one past what an array's type can carry, where reading it as a length would leave some
+    // other number of elements -- `[1 << 32]u8` would otherwise be an array of none.
+    val oversized = oversized_extent(a, scope, written, subst)
+
+    if oversized.is_some()
+        a.fault(scope, span, s"an array cannot have ${to_string(oversized.unwrap())} elements")
+        return Unknown
+    end if
+
     Array(int(const_extent(a, scope, span, written, subst)), addressable(a, scope, span, e, "an array"))
 end resolve_array
 
@@ -474,6 +493,20 @@ private negative_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]
     if n < from_int(0) then Some(n) else None
 end negative_extent
 
+// A written length that folds to more elements than an array's type holds, literal or not.
+private oversized_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
+
+    if folded.is_none() || !too_many_elements(folded.unwrap()) then None else folded
+end oversized_extent
+
 // The names a substitution binds to a value -- a value parameter, or the loop variable of a
 // `for const`.
 private const_arg_names(subst: Buf[Binding]) -> Buf[string]
@@ -520,6 +553,7 @@ private awaits_instantiation(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Bin
             None -> false
         LayoutOf(_, tr) -> abstract_operand(a, scope, tr, subst)
         OffsetOf(tr, _) -> abstract_operand(a, scope, tr, subst)
+        TypeArg(tr) -> abstract_operand(a, scope, tr, subst)
         TypeAttr(receiver, _, _, _) -> awaits_instantiation(a, scope, receiver, subst)
         Unary(_, operand) -> awaits_instantiation(a, scope, operand, subst)
         Binary(_, l, r) ->
@@ -703,7 +737,7 @@ tuple_type(written: Buf[Type]) -> &StructType
     for i in 0..<ts.len()
         fields.push((str(i), ts.at(i)))
 
-    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf())
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false, buf())
 end tuple_type
 
 // The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
@@ -945,6 +979,12 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         // A parameter used here stands where the declaration wrote it, and what it stands for is
         // held exactly as the parameter is -- so this is where the argument position's deferral is
         // paid for.
+        if stood_for.is_some() && descriptor_bound(subst, name).is_some()
+            a.fault(scope, span, s"'$name' is a descriptor a 'for const' binds, not a type — the type " +
+                    s"of the field it stands at is '$name::Type'")
+            return Unknown
+        end if
+
         if stood_for.is_some() then return substituted(a, scope, span, stood_for.unwrap())
 
     if name == "never"
@@ -1154,7 +1194,8 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
             out.push(open.unwrap())
         elif written.is_some()
             val ty = resolve_type(a, home, written.unwrap(), no_bindings())
-            val v = value_arg(a, scope, span, arg, ty, subst)
+            val v = value_arg(a, scope, span, arg, ty, subst,
+                              subject = s"'${pair.0.at(i)}' of '${generic_type_name(a, key)}'")
 
             if v.is_none() then return None
 
@@ -1179,8 +1220,13 @@ end read_args_for
 // **The value has to be one the declared type holds** -- a value argument is the declaration's
 // parameter, so `Buf[-1]` is refused at the argument rather than at the array it would have sized.
 // `what` is the subject that sentence is about: the argument, or the default standing in for one.
+//
+// **And it has to be of the declared type**, before any of that: `true` at a `usize` is not 1, `1` at
+// a `bool` or an enum is not `true` or a variant, and a string is not a constant of the wrong kind but
+// a value of the wrong type. That refusal is a call's argument mismatch in a call's words, naming the
+// parameter -- `subject` is `'N' of 'Ring'` where the caller knows them.
 private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type,
-                  subst: Buf[Binding], what: string = "this argument") -> Option[Type]
+                  subst: Buf[Binding], what: string = "this argument", subject: string = "") -> Option[Type]
     val written = *arg.kind match
         ValueArgType(e) -> Some(e)
         NamedType(n, targs) -> if targs.is_empty() then Some(expr(arg.span, Ident(n))) else None
@@ -1193,9 +1239,24 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     end if
 
     val e = written.unwrap()
+
+    // A variant is read against the enum the parameter names before anything is folded: a bare
+    // `High` is that enum's, whatever else the name might mean.
+    val tag = variant_tag(a, scope, e, ty)
+
+    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
+
+    val refusals = a.const_refusals
     val folded = const_arg_value(a, scope, e, subst)
 
     if folded.is_some()
+        val read = value_arg_reading(a, scope, e, ty, subst)
+
+        if read.1.is_some()
+            a.fault(scope, e.span, value_arg_mismatch(ty, read.1.unwrap(), what, subject))
+            return None
+        end if
+
         ty match
             Integer(bits, signed, _) ->
                 if !fits(folded.unwrap(), bits, signed)
@@ -1206,10 +1267,6 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
 
         return Some(ConstArg(folded.unwrap(), ty, names_stand_in(e, subst)))
     end if
-
-    val tag = variant_tag(a, scope, e, ty)
-
-    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
 
     if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
 
@@ -1247,14 +1304,128 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
             end if
         _ -> ()
 
+    // **A fold that refused has its own reason** -- a call that prints, a trap -- so it is made once
+    // more keeping what it says, the one above having put its complaints back.
+    if const_refused_since(a, refusals)
+        val inner = analyzer_for(a, scope)
+
+        inner.subst = subst
+        const_fold(inner, e)
+        return None
+    end if
+
+    // **An argument that does not read at the declared type says so**, at the part that does not:
+    // `Ring[double(Base)]` over an `int` `Base` and a `usize` parameter is a constant expression, and
+    // what is wrong with it is the parameter it is handed to. Only an argument whose every name is a
+    // constant is read so: one naming storage is not a constant, and that is what is wrong with it.
+    // A literal of another type -- a string, a float, a tuple -- reads without a complaint and is
+    // refused as the mismatch it is.
+    val reader = analyzer_for(a, scope)
+
+    reader.subst = subst
+
+    if names_only_constants(reader, e)
+        val read = value_arg_reading(a, scope, e, ty, subst)
+
+        if read.0.is_some()
+            a.fault_again(read.0.unwrap())
+            return None
+        end if
+
+        if read.1.is_some()
+            a.fault(scope, e.span, value_arg_mismatch(ty, read.1.unwrap(), what, subject))
+            return None
+        end if
+    end if
+
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
 end value_arg
 
+// A value argument read once, as an ordinary expression, at the type its parameter declared -- in a
+// trial, so nothing it registers or says outlives the question. It answers the first complaint the
+// reading made, and the type it read as where that is not the parameter's: an integer of any width
+// agrees with an integer parameter, since a value argument is fit-checked by its value, not its
+// width. A parameter whose type is open (a type parameter's) is not asked.
+private value_arg_reading(a: &Analysis, scope: Scope, e: Expr, ty: Type,
+                          subst: Buf[Binding]) -> (Option[Placed], Option[Type])
+    if !value_arg_kind_known(ty) then return (None, None)
+
+    val reader = analyzer_for(a, scope)
+
+    reader.subst = subst
+
+    val trial = begin_trial(reader)
+    val got = texpr_type(type_expr(reader, e, Some(ty)))
+    val said = if a.complaints() > trial.said then Some(a.found.at(trial.said)) else None
+
+    discard_trial(reader, trial)
+
+    if integral(got) && integral(ty) then return (said, None)
+
+    (said, if disagree(got, ty) then Some(got) else None)
+end value_arg_reading
+
+// Whether a value parameter's declared type is one of the kinds a value argument is checked
+// against: an integer, a `char`, a `bool` or a simple enum, under any name.
+private value_arg_kind_known(ty: Type) -> bool = repr(ty) match
+    Integer(_, _, _) -> true
+    Char -> true
+    Bool -> true
+    Enum(_) -> true
+    Constrained(d) -> value_arg_kind_known(d.base)
+    _ -> false
+
+private integral(ty: Type) -> bool = repr(ty) match
+    Integer(_, _, _) -> true
+    Constrained(d) -> integral(d.base)
+    _ -> false
+
+// The refusal of a value argument of the wrong type, in the words a call's argument mismatch uses.
+private value_arg_mismatch(ty: Type, got: Type, what: string, subject: string) -> string =
+    s"${if subject.is_empty() then what else subject} is ${type_show(ty)}, but ${type_show(got)} was given"
+
+// Whether every name a value argument reads as a value is a constant: a `const`, a value parameter,
+// a variant. A callee is not read as a value, and neither is the name a member is called on.
+private names_only_constants(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    Ident(_) ->
+        val mark = cx.an.complaints()
+        val refusals = cx.an.const_refusals
+        val folded = const_fold(cx, e)
+
+        cx.an.restore_complaints(mark)
+        cx.an.const_refusals = refusals
+        folded.is_some()
+    Unary(_, operand) -> names_only_constants(cx, operand)
+    Binary(_, l, r) -> names_only_constants(cx, l) && names_only_constants(cx, r)
+    Compare(operands, _) ->
+        var all = true
+
+        for item in operands
+            if !names_only_constants(cx, item) then all = false
+
+        all
+    Call(callee, args) ->
+        var all = *callee.kind match
+            Field(receiver, _, _) -> *receiver.kind match
+                Ident(_) -> true
+                _ -> names_only_constants(cx, receiver)
+            _ -> true
+
+        for item in args
+            if !names_only_constants(cx, item) then all = false
+
+        all
+    NamedArg(_, value) -> names_only_constants(cx, value)
+    Index(receiver, index, _) -> names_only_constants(cx, receiver) && names_only_constants(cx, index)
+    _ -> true
+
 // A value argument written as an expression -- `f[High]()` on a generic function -- at the simple
 // enum its parameter was declared as.
-enum_value_arg(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding]) -> Type =
-    value_arg(a, scope, span, type_ref(e.span, ValueArgType(e)), ty, subst).unwrap_or(Unknown)
+// `subject` names the parameter and its function, as a refusal of the argument says them.
+enum_value_arg(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding],
+               subject: string) -> Type =
+    value_arg(a, scope, span, type_ref(e.span, ValueArgType(e)), ty, subst, subject = subject).unwrap_or(Unknown)
 
 // A value parameter's default, read as the argument it stands in for -- at the type the declaration
 // wrote for the parameter, under the arguments already fixed to its left.
@@ -1341,6 +1512,16 @@ private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBind
             EnumOf(ed) -> (ed.tparams, ed.tvalues)
             TraitOf(td) -> (td.tparams, td.tvalues)
             _ -> (buf(), buf())
+
+// The name a generic type was declared with, as a refusal of one of its arguments names it.
+generic_type_name(a: &Analysis, key: string) -> string =
+    a.tables.types.get(key) match
+        None -> key
+        Some(d) -> d.kind match
+            StructOf(sd) -> sd.name
+            EnumOf(ed) -> ed.name
+            TraitOf(td) -> td.name
+            _ -> key
 
 // A type that takes no arguments, told so where any were written.
 private plain_type(a: &Analysis, scope: Scope, span: Span, name: string, targs: Buf[Type],
@@ -1487,6 +1668,9 @@ lookup_type_key(a: &Analysis, scope: Scope, name: string) -> Option[string]
     // is gated (`check_gated_modules`).
     if found.is_some() then depends_on_named(a, scope, found.unwrap(), span_zero())
 
+    // A run watched for what it reads (`const_decl.sysl`) is told every declaration a name reached.
+    if found.is_some() && a.evaluation.watching then a.evaluation.touched.push(found.unwrap())
+
     found
 end lookup_type_key
 
@@ -1597,7 +1781,7 @@ private opaque_c_type(a: &Analysis, key: string) -> Type
 
     if already.is_some() then return already.unwrap()
 
-    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf()))
+    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false, buf()))
 
     a.tables.struct_insts.put(key, made)
     made
@@ -1789,7 +1973,8 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // bare name is what it chose.
     val made: &StructType = StructType(key, targs, buf(), d.packed,
                                        aligned_to(a, scope, span, written, d.alignment),
-                                       exported_c_name(d), d.opaque, d.byte_order, d.guards)
+                                       exported_c_name(d), d.opaque, d.byte_order, d.guards,
+                                       d.union_layout, buf())
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -1800,13 +1985,28 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // refusal is the arguments', made where they were written (see `applied_bounds`).
     val outer = enter_fields(a, checked)
 
-    for f in d.fields
-        made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        c_bit_written(d, i) match
+            Some(b) ->
+                val storage = resolve_qualified(a, home, b.storage, subst)
+                val value = if b.zero then Unit else resolve_qualified(a, home, f.typ, subst)
+
+                made.fields.push((f.name, value))
+                made.c_bits.push(CBit(i, storage, if b.zero then 0 else c_bit_width(value)))
+            None -> made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
 
     leave_fields(a, outer)
 
+    if !made.c_bits.is_empty() then check_c_bits(a, scope, d, made)
+
     check_bitfields(a, scope, span, made)
     check_byte_order(a, scope, span, made)
+    check_pinned_holder(a, scope, span, d, made)
+
+    // Before every `impl` is in, `settle_union_fields` asks this for every union made so far.
+    if made.union_layout && a.tables.members.hoisted then check_union_fields(a, scope, span, made)
 
     a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
@@ -1932,6 +2132,8 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     // order and it refuses an explicit value.
     if simple && first then refuse_repeated_tags(a, scope, span, made.variants)
 
+    check_pinned_payloads(a, scope, span, made)
+
     a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
     a.tables.enum_insts.put(inst, ty)
@@ -1978,7 +2180,7 @@ end refuse_repeated_tags
 // field of its size. A struct one of whose fields did not resolve has been complained about already,
 // and is left alone.
 private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
-    if !s.packed then return
+    if !s.packed || !s.c_bits.is_empty() then return
 
     val stored = s.stored()
     var narrow = false
@@ -2610,9 +2812,18 @@ check_const_admits(a: &Analysis)
         val v = a.tables.consts.at(i)
         val key = a.tables.consts.key_at(i)
 
-        if v.typ.is_none() || v.init.is_none() then continue
+        if v.init.is_none() then continue
 
-        val t = resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+        // A type left off is the value's own, read as a use of the constant reads it.
+        val t = if v.typ.is_some() then resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+        else
+            a.consts_in_progress.push(key)
+
+            val own = const_type(analyzer_for(a, v.scope), v)
+
+            a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+            check_exposed_inferred(a, v, own)
+            own
 
         if const_type_refused(a, v, t) then continue
 
@@ -2656,9 +2867,11 @@ end check_const_admits
 // Whether a constant's declared type is one it may not be, said where it is. A struct, an enum and a
 // `where` predicate are told at the declaration by `check_const_named`, and are only passed over here.
 private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
-    val named = *v.typ.unwrap().kind match
-        NamedType(_, _) -> true
-        _ -> false
+    val named = v.typ match
+        Some(w) -> *w.kind match
+            NamedType(_, _) -> true
+            _ -> false
+        None -> false
 
     val scalar = t match
         Integer(_, _, _) -> true
@@ -2710,6 +2923,7 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
     val kind_fits = value match
         ConstInt(_) -> t match
             Integer(_, _, _) -> true
+            Floating(_, _) -> true
             _ -> false
         ConstFloat(_) -> t match
             Floating(_, _) -> true
@@ -2728,6 +2942,11 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
         ConstRecord(_, _) -> false
         ConstView(_, _, _, _) -> false
         ConstWriter(_) -> false
+        ConstLink(_) -> false
+        ConstPtr(_, _, _) -> false
+        ConstUnset -> false
+        ConstPun(_, _) -> false
+        ConstErased(_, _) -> false
 
     if !kind_fits
         a.fault(v.scope, at, s"'${v.name}' is declared ${type_show(t)} but its value is " +
@@ -2740,6 +2959,12 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
             Integer(bits, signed, _) ->
                 if !fits(n, bits, signed)
                     a.fault(v.scope, at, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
+                    return false
+                end if
+            // A whole number is a float constant's value where the float holds it exactly.
+            Floating(_, _) ->
+                if !exactly_float(n, t)
+                    a.fault(v.scope, at, s"'${v.name}' is not exactly ${float_named(t)}: ${to_string(n)}")
                     return false
                 end if
             _ -> ()

@@ -17,32 +17,65 @@ import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, 
 // operation does is not defined here either: `const_fold.sysl`'s run-time arithmetic is the one
 // definition (`run_int_binary`, `run_float_binary`, `run_convert`), read by the typed fold too.
 //
-// **What it holds is scalars**: every integer width, `f32` and `f64`, `bool`, `char` and `unit`,
-// constrained subtypes of them with their checks run. Locals, assignment, every loop, `break`,
-// `continue`, an early `return`, recursion and the contract clauses are evaluated. A form outside
-// that -- a struct, an array, a string, a call to a function that is not `const` -- stops the run
-// and says so; it never falls back to a guess.
+// **What it holds is values**: every integer width, every float width -- the two sixteen-bit ones
+// rounded to their format at every operation, `f128` computed exactly -- fixed point, `bool`, `char`
+// and `unit`, constrained subtypes of them with their checks run; strings; and arrays, vectors,
+// structs, enums and slices of all of these. Locals, assignment, every loop, `break`, `continue`, an
+// early `return`, recursion, the contract clauses and calls through a function's address are
+// evaluated. A form outside that -- a reference, the heap, a call outside the program -- stops the
+// run and says so; it never falls back to a guess.
 //
 // **A trap is a compile error.** Whatever would stop the program at run time -- a division by zero,
 // a quotient a width cannot hold, a value a `within` type does not admit, a failed `require` -- stops
 // the evaluation, and the constant is refused with what stopped it and the calls it was inside.
 //
-// **Every run is bounded**: 16,000,000 steps, one per expression and statement visited, and calls
-// 512 deep. Running out of either is an error naming the constant, not a warning.
+// **Every run is bounded**: 16,000,000 steps unless `--const-steps` says otherwise, one per expression
+// and statement visited, and calls 512 deep. Running out of either is an error naming the constant,
+// not a warning.
+//
+// **The standard module's own constants and storage run under the default whatever the program
+// asked for.** Whether a library `val` is laid down as data is the library's answer, made once when
+// its artifact is built and kept for every program after -- so a program re-reading the same
+// initializer under its own `--const-steps` could only disagree with it, and a disagreement is a
+// global the artifact defines as constant that the program then writes at startup. What decides is
+// the file the constant was written in, not the files its calls reach: a program's constant calling a
+// library function runs under the program's limit.
 //
 // **A callee's body is typed for the evaluation in a trial that is taken back** -- the reading
 // `opaque_body_type` makes of a `some` member's body -- so the main pass types it as it always would,
 // once, and nothing the trial registered survives into the program. The typed tree is kept here for
 // the rest of the compilation, since a body reads the same way every time it is asked.
 
-private const EvStepLimit: long = 16000000
+private const EvStepDefault: long = 16000000
+
+// How many steps one run of a constant written in `base` may take: the default for the standard
+// module's own, and otherwise what `--const-steps` gave, or the default.
+private step_limit(base: Scope) -> long =
+    if base.src.name.starts_with(s"$StdPrefix/") then EvStepDefault
+    else const_steps_flag().unwrap_or(EvStepDefault)
+
+// The limit as a reader writes a large count, its digits grouped in threes.
+private step_limit_text(limit: long) -> string
+    val digits = str(limit)
+    var out = ""
+
+    for i in 0..<digits.bytes.len
+        if i > 0 && (digits.bytes.len - i) % 3 == 0 then out = out + ","
+
+        out = out + digits[i..<i + 1]
+
+    out
+end step_limit_text
+
+// What a run stopped at its limit is told last: how to give it more.
+private step_advice() -> string = "; '--const-steps <n>' allows a longer run"
 
 private const EvDepthLimit: usize = 512
 
 // What the evaluator keeps for the whole compilation.
 struct ConstEvaluation
-    // Whether every declaration has been read, which is when a body can be typed at all. A constant
-    // folded before then -- one a type is read in terms of -- cannot run a call.
+    // Whether every declaration has been read. A call folded before then -- one a type is read in
+    // terms of -- is run where it can be, or waits for another reading (`const_decl.sysl`).
     ready: bool
 
     // The bodies typed for evaluation, by the key a call names.
@@ -70,11 +103,47 @@ struct ConstEvaluation
     // That reason for each piece of module storage whose initializer stayed code because of it, by
     // symbol: what a freestanding artifact's refusal of the storage tells its reader.
     val_stops: Map[string, string]
+
+    // What each function nobody marked `const` was found to hold, by name: the reason it cannot run
+    // while compiling, or empty where it can (`const_check.sysl`'s `evaluable_refusal`).
+    unmarked: Map[string, string]
+
+    // How many folds are under way that only ask whether a value can be had -- a module `val` read
+    // from inside a run -- so a call that cannot run says nothing: the run asking is what reports.
+    asking: usize
+
+    // The tables a trial made a trait object through -- a closure's `&Fn` among them -- by name, and
+    // kept here as the closures' bodies are in `bodies`: the trial that made them is taken back, and
+    // a value made then is still called through them.
+    vtables: Map[string, TVtable]
+
+    // How far the closure counter has gone in a trial whose closures were kept. A reading thrown away
+    // rewinds the counter no lower (`closure_rewind`), so no later closure takes a kept one's name.
+    closure_floor: usize
+
+    // What the readings of the declarations settled about the calls they needed a value of, shared
+    // by every reading of one compilation (`const_decl.sysl`).
+    answers: &DeclAnswers
+
+    // Whether this reading may be followed by another: only a compilation that goes on to type its
+    // bodies reads its declarations again for a call it could not run the first time.
+    declaring: bool
+
+    // The calls this reading could not run yet, each waiting for the next reading.
+    pending: Buf[DeclSite]
+
+    // The files this reading was handed, where the declaration a waiting call is written in is found.
+    units: Buf[Program]
+
+    // Whether a run is being watched for the declarations it reads, and the ones it has read.
+    watching: bool
+    touched: Buf[string]
 end ConstEvaluation
 
 // An evaluator that has evaluated nothing.
 const_evaluation() -> &ConstEvaluation =
-    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map())
+    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map(), map(), 0, map(), 0,
+                    decl_answers(), false, buf(), buf(), false, buf())
 
 // -- the seams ---------------------------------------------------------------------------------------
 
@@ -82,31 +151,52 @@ const_evaluation() -> &ConstEvaluation =
 // `const_fold` asks of a `Call` that is not a conversion. `None` where the call is not one this
 // answers for, or where it stopped -- having said why, and counted the refusal, where it was a
 // mistake.
+//
+// **A field read off what a call answers is run the same way**, `primes_below(10).len`: the whole
+// expression typed and evaluated, as a method called on the answer already is.
 const_call(cx: &Analyzer, e: Expr) -> Option[Const]
-    val callee = *e.kind match
-        Call(c, _) -> c
+    val off_a_call = *e.kind match
+        Call(c, _) ->
+            if callee_word(c).is_none() then return None
+
+            false
+        Field(receiver, _, _) ->
+            if !mentions_const_call(cx.an, receiver) && !names_descriptor(cx.subst, receiver) then
+                return None
+
+            true
+        Index(receiver, _, _) ->
+            if !mentions_const_call(cx.an, receiver) then return None
+
+            true
+        // What a type's make-up answers is a literal once typed (`type_reflect.sysl`), and so is a
+        // comparison over it.
+        TypeAttr(_, _, _, _) | Compare(_, _) ->
+            if !reflects(e) then return None
+
+            true
         _ -> return None
-
-    val written = callee_word(callee)
-
-    if written.is_none() || !names_const_fn(cx.an, written.unwrap()) then return None
 
     val ev = cx.an.evaluation
 
-    if !ev.ready
-        cx.fault(e.span, s"'${written.unwrap()}' is a 'const' function, but this value is read while " +
-                 "declarations are, before any body can be run — a 'const' call is evaluated where a " +
-                 "value is wanted, and not yet where a type is read")
-        cx.an.const_refusals += 1
-        return None
-    end if
+    // Before every declaration is read, the call is one a declaration needs the value of.
+    if !ev.ready then return declared_value(cx, e)
 
     val key = call_site_key(cx, e.span)
+
+    // What the reading of the declarations settled is the answer from then on: a type read again
+    // while the bodies are must come to the type it came to there.
+    val settled = settled_value(cx, key, e.span)
+
+    if settled.is_some() then return settled.unwrap()
+
     val known = ev.done.get(key)
 
     if known.is_some() then return known.unwrap()
 
     val refused = ev.failed.get(key)
+
+    if refused.is_some() && ev.asking > 0 then return None
 
     if refused.is_some()
         cx.fault(e.span, refused.unwrap())
@@ -119,8 +209,8 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TCall(name, _, _, _) -> if !cx.an.tables.const_fns.has(name) then return None
-        _ -> return None
+        TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
+        _ -> if !off_a_call then return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
         // An array is storage, not a constant's value: it is laid down only as a `val`'s data.
@@ -133,6 +223,9 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             out
         EvFail(message, _) ->
             ev.failed.put(key, message)
+
+            if ev.asking > 0 then return None
+
             cx.fault(e.span, message)
             cx.an.const_refusals += 1
             None
@@ -141,6 +234,59 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             None
         EvQuiet -> None
 end const_call
+
+// The message of an `@assert` whose condition came out false, worked out now -- and only now, so a
+// message that could not be computed costs nothing while the condition holds. It is any `string`
+// expression the compiler can compute: a literal, an interpolation over constants and what a type
+// answers (`T::Name`, `f.name`), a call whose body runs while compiling. It is typed and run whole in
+// the assertion's own terms, which inside a generic are the instance's.
+//
+// `None` where it could not be, having said why at the assertion, in words that say it failed:
+// the reader is told both that the condition is false and why its message could not be said.
+assert_message(cx: &Analyzer, span: Span, e: Expr) -> Option[string]
+    *e.kind match
+        StrLit(v) -> return Some(v)
+        _ -> ()
+
+    val head = "the message of this failed '@assert'"
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none()
+        // The trial took its complaint back; reading it again for real is what tells it.
+        val mark = cx.an.complaints()
+
+        type_expr(cx, e, None)
+
+        if cx.an.complaints() == mark then
+            cx.fault(span, unworkable_message(head))
+
+        return None
+    end if
+
+    val t = typed.unwrap()
+    val ty = texpr_type(t)
+
+    if ty != Str
+        cx.fault(span, s"$head is of type '${type_show(ty)}', and a message is a 'string' — " +
+                 "interpolate the value into one")
+        return None
+    end if
+
+    evaluate(cx.an, cx.scope, head, t) match
+        EvValue(Some(ConstStr(v))) -> Some(v)
+        EvFail(message, _) ->
+            cx.fault(span, message)
+            None
+        EvBroken -> None
+        _ ->
+            cx.fault(span, unworkable_message(head))
+            None
+end assert_message
+
+private unworkable_message(head: string) -> string =
+    s"$head cannot be computed while compiling — it has to be a 'string' made of constants, what a " +
+        "type answers and calls whose bodies run while compiling, and nothing read out of storage " +
+        "filled at run time"
 
 // `ADDR.to_be()` written straight into a `const`: one of `sysl.math.ByteOrder`'s members over a value
 // that folds. The call is typed in a trial -- the receiver's width is what the reversal is at, and
@@ -165,6 +311,35 @@ const_byte_order(cx: &Analyzer, e: Expr) -> Option[Const]
         TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), cx.an.tables.layout.little_endian)
         _ -> None
 end const_byte_order
+
+// `real.from_bits(0x3fe62e42fefa39ef)` and `x.bits()` written straight into a `const`: typed in a trial,
+// for the width only the typed tree knows, and folded where they reach `FloatBits` over a value that
+// folds (`float_bits_routine`).
+const_float_bits(cx: &Analyzer, e: Expr) -> Option[Const]
+    val callee = *e.kind match
+        Call(c, _) -> c
+        _ -> return None
+
+    val op = *callee.kind match
+        Field(_, name, _) -> name
+        _ -> return None
+
+    if op != "from_bits" && op != "bits" then return None
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return None
+
+    // The argument is folded rather than the call, so a width the typed fold does not hold a value of
+    // -- `f16`, `bf16`, `f128` -- is still reached: its encoding is an integer.
+    *typed.unwrap().kind match
+        TCall(name, args, _, _) ->
+            if !float_bits_routine(name) || args.len() != 1 then return None
+
+            const_fold_typed(args.at(0), cx.an.tables.layout.little_endian)
+                .and_then(c -> float_bits_folded(name, c))
+        _ -> None
+end const_float_bits
 
 // A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
 // constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
@@ -198,7 +373,7 @@ end const_quad_value
 
 // A module `val`'s initializer as the literal it comes to, where it calls a `const` function: such a
 // value is laid down on every target, the compiler having run the call -- a scalar, or a whole table
-// the function fills in a loop. A trap is refused at the initializer. Where the evaluation meets
+// the function fills in a loop. A trap in a `const` function is refused at the initializer. Where the evaluation meets
 // something it does not hold, or runs out of steps, the initializer stays code, computed before the
 // program's statements, and why is kept in `last_stop` for a target that cannot run that code.
 const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr] = const_val_run(cx, name, init) match
@@ -213,10 +388,12 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
 
     evaluate(cx.an, cx.scope, s"'$name'", init) match
         EvValue(Some(v)) ->
-            // A slice is a view of storage, and what it views is not a value the call answered.
-            if holds_view(v)
-                cx.an.evaluation.last_stop = s"'$name' came to a slice, which views storage rather than " +
-                                             "holding a value, and is not laid down as constant data"
+            // What the run made on its heap is frozen into the object file only through a type that
+            // says nothing writes it; anything else stays code, computed when the program starts.
+            val refused = answer_refusal(v, texpr_type(init))
+
+            if refused.is_some()
+                cx.an.evaluation.last_stop = s"'$name' ${refused.unwrap()}"
                 return Ok(None)
             end if
 
@@ -227,8 +404,11 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
             cx.an.evaluation.last_stop = s"'$name' came to a value holding an enum variant whose fields " +
                                          "have no fixed bit pattern, which is not laid down as constant data"
             Ok(None)
+        // A trap is refused where the initializer calls a `const` function, which promised to run
+        // while compiling. A call to one nobody marked keeps its meaning: it traps when the program
+        // starts, as written.
         EvFail(message, trapped) ->
-            if trapped
+            if trapped && calls_marked(cx.an, init)
                 cx.fault(init.span, message)
                 return Err(())
             end if
@@ -238,8 +418,81 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
         _ -> Ok(None)
 end const_val_run
 
-// What a `const` initializer that calls a function owes its reader, where the function is not
-// `const`: the advice to mark it. Empty where the initializer is anything else.
+// A local `const`'s value, run while compiling and made the literal it came to -- or what stopped
+// it, empty where that was already reported.
+const_local_image(cx: &Analyzer, name: string, init: TExpr) -> Result[TExpr, string]
+    val subject = s"'$name'"
+
+    evaluate(cx.an, cx.scope, subject, init) match
+        EvValue(Some(v)) ->
+            val refused = answer_refusal(v, texpr_type(init))
+
+            if refused.is_some() then return Err(s"$subject ${refused.unwrap()}")
+
+            value_literal(init.span, v, texpr_type(init)) match
+                Some(image) -> Ok(image)
+                None -> Err(s"$subject came to a value with no form as a literal, so there is nothing " +
+                            "for a use of the name to be")
+        EvValue(None) -> Ok(TExpr(init.span, TZero(texpr_type(init))))
+        EvFail(message, _) -> Err(message)
+        EvBroken -> Err("")
+        EvQuiet -> Err(s"$subject is a constant, so its value is known while compiling — this one reads " +
+                       "something that holds a value only once the program runs. A name bound to such a " +
+                       "value is a 'val'")
+end const_local_image
+
+// What one use of a program's annotation comes to -- `@rename("id")` read as the construction
+// `rename("id")` in the terms of the file that wrote it, run while compiling, and made the literal it
+// came to. `None` where it was refused, which has been said at the use.
+//
+// **The construction is typed in a trial taken back**, as a constant's call is: nothing a use of
+// an annotation reaches is reached by the program. Where the trial complained, the construction is
+// typed again for real so that the complaint is told -- the arguments a struct's construction would
+// refuse are the ones an annotation refuses, in the same words.
+annotation_image(cx: &Analyzer, written: string, call: Expr, ty: Type) -> Option[TExpr]
+    val typed = typed_call(cx, call, Some(ty))
+
+    if typed.is_none()
+        type_expr(cx, call, Some(ty))
+        return None
+    end if
+
+    val init = typed.unwrap()
+    val stopped = s"what an annotation says is settled while compiling, so '@$written' takes constants — " +
+                  "this reads something that holds a value only once the program runs"
+
+    evaluate(cx.an, cx.scope, s"'@$written'", init) match
+        EvValue(Some(v)) ->
+            val image = if answer_refusal(v, texpr_type(init)).is_some() then None
+                        else value_literal(call.span, v, texpr_type(init))
+
+            if image.is_none() then cx.fault(call.span, stopped)
+
+            image
+        EvValue(None) -> Some(TExpr(call.span, TZero(ty)))
+        EvFail(message, _) ->
+            cx.fault(call.span, message)
+            None
+        EvBroken -> None
+        EvQuiet ->
+            cx.fault(call.span, stopped)
+            None
+end annotation_image
+
+// Whether a typed tree calls a function marked `const`.
+private calls_marked(a: &Analysis, t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        _ -> ()))
+
+    !found.is_empty()
+end calls_marked
+
+// What a `const` initializer that calls a function owes its reader, where that function cannot run
+// while compiling: what in its body stops it. Empty where the initializer is anything else.
 const_call_advice(cx: &Analyzer, e: Expr) -> string
     val callee = *e.kind match
         Call(c, _) -> c
@@ -255,29 +508,31 @@ const_call_advice(cx: &Analyzer, e: Expr) -> string
 
     *typed.unwrap().kind match
         TCall(name, _, _, _) ->
-            if cx.an.tables.funcs.has(name) && !cx.an.tables.const_fns.has(name) then
-                s" — '${written.unwrap()}' is not 'const', so it runs only when the program does; " +
-                "mark it 'const' to call it here"
-            else ""
+            if !cx.an.tables.funcs.has(name) then return ""
+
+            evaluable_refusal(cx.an, name) match
+                Some(why) -> s" — '${written.unwrap()}' ${if why.starts_with("it ") then why[3..] else why}"
+                None -> ""
         _ -> ""
 end const_call_advice
 
 // -- reading the call --------------------------------------------------------------------------------
 
-// The word a call's callee was written as: `f` or the `f` of `m.f`.
-private callee_word(callee: Expr) -> Option[string] = *callee.kind match
+// The word a call's callee was written as: `f` or the `f` of `m.f`, with any type arguments written
+// after it (`f[int]`, `m.f[A, B]`) set aside -- the same function, its instance named outright. One
+// type argument arrives as a subscript, which the typing re-reads (`expr_call.sysl`); a subscript of
+// anything but a name is not a callee this reads.
+callee_word(callee: Expr) -> Option[string] = *callee.kind match
+    Ident(n) -> Some(n)
+    Field(_, n, _) -> Some(n)
+    TypeArgs(receiver, _, _) -> bare_callee_word(receiver)
+    Index(receiver, _, _) -> bare_callee_word(receiver)
+    _ -> None
+
+private bare_callee_word(callee: Expr) -> Option[string] = *callee.kind match
     Ident(n) -> Some(n)
     Field(_, n, _) -> Some(n)
     _ -> None
-
-// Whether some `const` function is spelled `word` -- the cheap question asked before anything is
-// typed, so a constant that calls nothing marked pays nothing.
-private names_const_fn(a: &Analysis, word: string) -> bool
-    for i in 0..<a.tables.const_fns.len()
-        if spelled_word(a.tables.const_fns.key_at(i)) == word then return true
-
-    false
-end names_const_fn
 
 // The name a key was written as: the module and any owning type in front of it dropped, and an
 // overload's number after it.
@@ -301,17 +556,25 @@ private spelled_word(key: string) -> string
     key[start..<end_at]
 end spelled_word
 
-// Whether a written expression calls something spelled as a `const` function anywhere in it.
-private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
-    Call(c, args) ->
-        val w = callee_word(c)
+// Whether a call names a function the evaluator may try to run: one with a body, marked or not. An
+// `extern` has none here, and a constant that calls one is the fold's to refuse.
+private runs_while_compiling(a: &Analysis, name: string) -> bool =
+    a.tables.funcs.has(name) || a.tables.members.func_origin.has(name) ||
+        a.tables.members.eval_insts.has(name)
 
-        if w.is_some() && names_const_fn(a, w.unwrap()) then return true
+// Whether a written expression calls anything anywhere in it -- the cheap question asked before
+// anything is typed, so a constant that calls nothing pays nothing.
+mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
+    Call(c, args) ->
+        if callee_word(c).is_some() then return true
 
         for arg in args
             if mentions_const_call(a, arg) then return true
 
         false
+    Field(receiver, _, _) -> mentions_const_call(a, receiver)
+    Index(receiver, index, _) -> mentions_const_call(a, receiver) || mentions_const_call(a, index)
+    TypeAttr(_, attr, _, _) -> reflection_attr(attr)
     Unary(_, operand) -> mentions_const_call(a, operand)
     Binary(_, l, r) -> mentions_const_call(a, l) || mentions_const_call(a, r)
     Compare(operands, _) ->
@@ -321,13 +584,17 @@ private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
         false
     _ -> false
 
-// Whether a typed tree calls a `const` function anywhere in it.
+// Whether a typed tree has anything in it the evaluator runs rather than the fold settles: a call to
+// a `const` function, or a read of a module `val`, whose value is what its own initializer comes to
+// where that is constant data. A read of a `val` whose initializer is code -- or one that comes back
+// to the storage being worked out -- stops the run, and the initializer stays code.
 private calls_const_fn(a: &Analysis, t: TExpr) -> bool
     var found: Buf[bool] = buf()
     val sink = &found
 
     walk_texpr(t, expr_walk(true, x -> *x.kind match
-        TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        TCall(name, _, _, _) -> if runs_while_compiling(a, name) then sink.push(true)
+        TGlobal(symbol, _, writable) -> if !writable && a.tables.vals.has(symbol) then sink.push(true)
         _ -> ()))
 
     !found.is_empty()
@@ -335,8 +602,10 @@ end calls_const_fn
 
 // Where a call in a constant was written, with the type arguments it was read under -- the key its
 // answer is kept by.
-private call_site_key(cx: &Analyzer, at: Span) -> string
-    var out = s"${cx.scope.src.name}:${at.start}"
+call_site_key(cx: &Analyzer, at: Span) -> string
+    // Both ends: a comparison run whole begins where its left operand does, and each has its own
+    // answer.
+    var out = s"${cx.scope.src.name}:${at.start}-${at.end}"
 
     for item in cx.subst
         out = out + s";${item.name}=${type_show(item.ty)}"
@@ -371,15 +640,56 @@ private typed_call(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TEx
 
     a.release(trial)
     a.restore_complaints(mark)
+    keep_made(a, tables, closures)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
     a.closure_funcs.truncate(closures)
 
     if clean then Some(t) else None
 end typed_call
 
+// The closures' bodies and the tables a trial made, kept for the values made from them, which the
+// run may still call once the trial is taken back.
+private keep_made(a: &Analysis, tables: usize, closures: usize)
+    val ev = a.evaluation
+    val vts = a.tables.members.vtables
+
+    for i in tables..<vts.len()
+        ev.vtables.put(vts.key_at(i), vts.at(i))
+
+    for i in closures..<a.closure_funcs.len()
+        val f: &TFunc = a.closure_funcs.at(i)
+
+        ev.bodies.put(f.name, f)
+
+    if a.closure_count > ev.closure_floor then ev.closure_floor = a.closure_count
+end keep_made
+
+// Where a reading thrown away puts the closure counter back to: where it stood when the reading
+// began, but never below a name an evaluation kept.
+closure_rewind(a: &Analysis, to: usize) -> usize =
+    if to < a.evaluation.closure_floor then a.evaluation.closure_floor else to
+
+// A module `val`'s own initializer, typed at the storage's type as the program types it, for another
+// initializer that names the `val` (`analyze_body.sysl`'s `static_image`). `None` for storage with no
+// initializer, and for per-thread and per-core storage, whose value is a different one on every
+// thread or core.
+val_init_typed(cx: &Analyzer, symbol: string, ty: Type) -> Option[TExpr]
+    val d = cx.an.tables.vals.get(symbol)
+
+    if d.is_none() || d.unwrap().init.is_none() then return None
+
+    val decl = d.unwrap()
+
+    if decl.thread_local || decl.per_cpu then return None
+
+    typed_call(analyzer_for(cx.an, decl.scope), decl.init.unwrap(), Some(ty))
+end val_init_typed
+
 // A callee's body, typed in a trial that is taken back (see the file's header). `None` where it has
 // no body here or the reading complained -- the main pass reads it again and says so there.
 private trial_body(a: &Analysis, name: string) -> Option[TFunc]
+    if a.evaluation.watching then a.evaluation.touched.push(callee_origin(a, name))
+
     val mark = a.complaints()
     val trial = a.sandboxed()
     val queued = a.tables.members.pending.len()
@@ -391,14 +701,14 @@ private trial_body(a: &Analysis, name: string) -> Option[TFunc]
     val covers = a.tables.body_covers.len()
     var typed: Option[TFunc] = None
     val f = a.tables.funcs.get(name)
-    val inst = a.tables.members.const_insts.get(name)
+    val inst = a.tables.members.eval_insts.get(name)
 
     if f.is_some()
         val d = f.unwrap()
 
         typed = Some(analyze_body(a, d.scope, d.span, with_call_bounds(d.decl), name))
     else if inst.is_some()
-        // An instantiation of a generic `const` function, read at the terms it was made at. Its
+        // An instantiation of a generic function, read at the terms it was made at. Its
         // signature is filed again for the reading, since the trial that asked for it took it back.
         val (job, sig) = inst.unwrap()
         val filed = a.tables.members.func_insts.has(name)
@@ -416,12 +726,17 @@ private trial_body(a: &Analysis, name: string) -> Option[TFunc]
         for item in lowered
             if typed.is_none() && item.name == name then
                 typed = Some(analyze_instance(a, name, item))
+
+        // A closure the program's own reading lowered: its body is already typed.
+        for item in a.closure_funcs
+            if typed.is_none() && item.name == name then typed = Some(item)
     end if
 
     val clean = a.complaints() == mark
 
     a.release(trial)
     a.restore_complaints(mark)
+    keep_made(a, tables, closures)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
     a.closure_funcs.truncate(closures)
     a.tables.body_covers.truncate(covers)
@@ -475,7 +790,8 @@ private struct EvFrame
     call: Span
     caller: Scope
     home: Scope
-    locals: Map[string, Const]
+    // Each local's cell: a buffer of one value, so a pointer to the local is a pointer into it.
+    locals: Map[string, Buf[Const]]
     olds: Buf[Const]
     result: Option[Const]
     slots: Map[string, Const]
@@ -487,6 +803,8 @@ private struct EvRun
     subject: string
     base: Scope
     steps: long
+    // How many steps this run may take (`step_limit`).
+    limit: long
     frames: Buf[&EvFrame]
     loops: Buf[(Scope, Span)]
     kind: EvStopKind
@@ -498,7 +816,7 @@ end EvRun
 // Runs one typed expression standing in a constant: `subject` is what a refusal names, `base` the
 // file it was written in.
 private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr) -> EvOutcome
-    val r: &EvRun = EvRun(a, subject, base, 0, buf(), buf(), EvRunning, "", buf())
+    val r: &EvRun = EvRun(a, subject, base, 0, step_limit(base), buf(), buf(), EvRunning, "", buf())
 
     // The expression itself is read in a frame of its own, which names no call: what it binds -- a
     // pattern in a `match` -- lands there.
@@ -595,7 +913,7 @@ end not_constant
 private tick(r: &EvRun) -> bool
     r.steps += 1
 
-    if r.steps <= EvStepLimit then return true
+    if r.steps <= r.limit then return true
 
     out_of_steps(r)
 
@@ -617,7 +935,8 @@ private out_of_steps(r: &EvRun)
 
             still = s"the loop at ${place_text(l.0, l.1)} was still running"
 
-        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $still"
+        r.message = s"${r.subject} did not finish within ${step_limit_text(r.limit)} steps while compiling — $still" +
+                    step_advice()
     end if
 end out_of_steps
 
@@ -627,9 +946,7 @@ end out_of_steps
 private unheld(t: Type) -> Option[string] = t match
     Constrained(d) -> unheld(d.base)
     Integer(_, _, _) -> None
-    Floating(bits, brain) ->
-        if !brain && (bits == 32 || bits == 64 || bits == 128) then None
-        else Some("'f16' and 'bf16' are not evaluated while compiling yet")
+    Floating(_, _) -> None
     Fixed(_, _, _) -> None
     Array(_, elem) -> unheld(*elem)
     Struct(d) ->
@@ -648,13 +965,19 @@ private unheld(t: Type) -> Option[string] = t match
     Unknown -> None
     Str -> None
     Slice(elem, _) -> unheld(*elem)
-    // The writer a rendering hands its `display` (`ConstWriter`).
-    Ptr(_) -> if writes_a_rendering(t) then None else unheld_other(t)
+    Vector(_, elem) -> unheld(*elem)
+    // The writer a rendering hands its `display` (`ConstWriter`), and an address the linker fills
+    // in (`ConstLink`): held and handed on, never read through.
+    Ptr(_) -> None
+    CFn(_, _) -> None
+    // A reference to storage the evaluation owns (`ConstPtr`), or a trait object (`ConstErased`).
+    Ref(_, _) -> None
     _ -> unheld_other(t)
 
 private unheld_other(t: Type) -> Option[string] =
     Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, " +
-              "fixed-point, 'bool', 'char', strings, and fixed arrays, structs, enums and slices of them are")
+              "fixed-point, 'bool', 'char', strings, and fixed arrays, vectors, structs, enums and slices " +
+              "of them are")
 
 // The first field whose type the evaluation does not hold, as `unheld` says it.
 private unheld_fields(fields: Buf[(string, Type)]) -> Option[string]
@@ -680,6 +1003,13 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstRecord(variant, fields) -> record_text(variant, fields, t)
     ConstView(xs, lo, n, _) -> array_text(viewed(xs, lo, n), element_type(t))
     ConstWriter(_) -> "a writer"
+    ConstLink(image) -> *image.kind match
+        TNullLit(_) -> "null"
+        _ -> s"&${link_key(image)}"
+    ConstPtr(xs, at, _) -> s"&${value_text(xs.at(at), pointee(t).unwrap_or(Unknown))}"
+    ConstUnset -> "nothing"
+    ConstPun(addr, as_was) -> value_text(*addr, *as_was)
+    ConstErased(_, _) -> s"a '${type_show(t)}'"
 
 // The elements a slice sees, as a buffer of their own.
 private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
@@ -694,6 +1024,13 @@ end viewed
 // A struct as `Name(a, b)`, an enum value as its variant's name and what it carries.
 @noinline
 private record_text(variant: int, fields: Buf[Const], t: Type) -> string
+    if variant <= -2
+        val (named, declared) = record_shape(-1, t)
+        val i = usize(union_written(variant))
+
+        return s"$named(${declared.at(i).0} = ${value_text(fields.at(i), declared.at(i).1)})"
+    end if
+
     val (head, types) = record_shape(variant, t)
     var out = head
 
@@ -730,6 +1067,7 @@ end array_text
 private element_type(t: Type) -> Type = underlying(t) match
     Array(_, elem) -> *elem
     Slice(elem, _) -> *elem
+    Vector(_, elem) -> *elem
     _ -> Unknown
 
 // A value a place takes, as a copy of its own: an array's elements are a buffer, and two places
@@ -759,6 +1097,9 @@ private copied_all(xs: Buf[Const]) -> Buf[Const]
 // through, so that it is never remembered either.
 private holds_view(v: Const) -> bool = v match
     ConstView(_, _, _, _) -> true
+    ConstPtr(_, _, _) -> true
+    ConstPun(_, _) -> true
+    ConstErased(_, _) -> true
     ConstWriter(_) -> true
     ConstArray(xs) -> any_view(xs)
     ConstRecord(_, fields) -> any_view(fields)
@@ -774,6 +1115,9 @@ private any_view(xs: Buf[Const]) -> bool
 // outlive the storage it views, once that call returns.
 private dangles(v: Const, depth: int) -> bool = v match
     ConstView(_, _, _, owner) -> owner >= depth
+    ConstPtr(_, _, owner) -> owner >= depth
+    ConstPun(addr, _) -> dangles(*addr, depth)
+    ConstErased(_, data) -> dangles(*data, depth)
     ConstArray(xs) -> any_dangles(xs, depth)
     ConstRecord(_, fields) -> any_dangles(fields, depth)
     _ -> false
@@ -816,19 +1160,138 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
-    ConstArray(xs) -> array_literal(span, xs, t)
+    ConstArray(xs) -> underlying(t) match
+        Vector(_, _) -> vector_literal(span, xs, t)
+        _ -> array_literal(span, xs, t)
     ConstRecord(variant, fields) -> record_literal(span, variant, fields, t)
+    // An address is laid down as the relocation it is: the folded place's address, or the function's.
+    ConstLink(image) -> Some(image)
+    // Storage the run made, frozen (`answer_refusal` says which may be): a slice's elements as an
+    // array of their own, a box as the box, and a pointer into fresh elements -- a frozen buffer's --
+    // as the address of the first of an array laid down for them.
+    ConstView(xs, lo, n, _) -> frozen_view(span, viewed(xs, lo, n), t)
+    ConstPtr(cells, at, _) -> underlying(t) match
+        Ref(inner, _) -> value_literal(span, cells.at(at), *inner).map(lit -> TExpr(span, TBox(lit, t)))
+        Ptr(inner) ->
+            var rest: Buf[Const] = buf()
+
+            for i in at..<cells.len()
+                rest.push(cells.at(i))
+
+            array_literal(span, rest, Array(int(rest.len()), inner)).map(arr ->
+                TExpr(span, TAddrOf(TExpr(span, TIndex(arr, TExpr(span, TIntLit(from_int(0), int_type())), *inner)), t)))
+        _ -> None
     _ -> None
+
+// A slice's elements, laid down as the literal of a slice over constant data.
+private frozen_view(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+    val elem = element_type(t)
+    var items: Buf[TExpr] = buf()
+
+    for x in xs
+        val lit = value_literal(span, x, elem)
+
+        if lit.is_none() then return None
+
+        items.push(lit.unwrap())
+
+    Some(TExpr(span, TBufLit(items, t)))
+end frozen_view
+
+// **Why a value a run came to is not laid into the object file**, or nothing where it is. What the
+// run made on its heap is frozen there, and the object file's copy is read by every use, so it may be
+// answered only through a type that says nothing writes it: a `[]const T`, a string, or a frozen
+// buffer. Said after the subject's name.
+answer_refusal(v: Const, t: Type) -> Option[string] = answer_refusal_in(v, t, false)
+
+private answer_refusal_in(v: Const, t: Type, in_frozen: bool) -> Option[string] = v match
+    ConstView(xs, lo, n, _) -> underlying(t) match
+        Slice(elem, read_only) ->
+            if !read_only then Some(s"is a writable slice '${type_show(t)}', ${laid_text()} — answer it as a " +
+                                    s"'[]const ${type_show(*elem)}'")
+            else elements_refusal(viewed(xs, lo, n), *elem, in_frozen)
+        _ -> None
+    ConstPtr(cells, at, _) -> underlying(t) match
+        Ref(inner, _) ->
+            if container_named(*inner) == "sysl.buf.Frozen" then answer_refusal_in(cells.at(at), *inner, true)
+            else Some(s"holds a reference, ${laid_text()} — answer the value itself, or a buffer's 'freeze()'")
+        Ptr(inner) ->
+            if !in_frozen then Some(s"holds a pointer to storage the run made, ${laid_text()} — answer the value " +
+                                    "itself")
+            else
+                var rest: Buf[Const] = buf()
+
+                for i in at..<cells.len()
+                    rest.push(cells.at(i))
+
+                elements_refusal(rest, *inner, true)
+        _ -> Some(s"holds an address of storage the run made, ${laid_text()}")
+    ConstArray(xs) -> elements_refusal(xs, element_type(t), in_frozen)
+    ConstRecord(variant, fields) ->
+        val named = container_named(t)
+
+        if named == "sysl.buf.Buf"
+            return Some(s"holds a 'Buf', ${laid_text()} — answer its 'view()' as a '[]const T', or its 'freeze()'")
+        if named == "sysl.container.Map" || named == "sysl.container.Set"
+            return Some(s"holds a '${short_name(named)}', ${laid_text()} — " +
+                        "answer what is read out of it")
+
+        val (_, types) = record_shape(if variant <= -2 then -1 else variant, t)
+
+        for i in 0..<fields.len()
+            if i < types.len()
+                val why = answer_refusal_in(fields.at(i), types.at(i).1, in_frozen)
+
+                if why.is_some() then return why
+        None
+    ConstErased(_, _) -> Some("holds a trait object, a closure's '&Fn' among them, whose table and value the " +
+                              "program builds — answer the value itself")
+    ConstPun(_, _) -> Some(s"holds an address read as another type, ${laid_text()}")
+    ConstWriter(_) -> Some("holds a writer, which exists only while a value renders")
+    _ -> None
+
+private elements_refusal(xs: Buf[Const], elem: Type, in_frozen: bool) -> Option[string]
+    for x in xs
+        val why = answer_refusal_in(x, elem, in_frozen)
+
+        if why.is_some() then return why
+
+    None
+end elements_refusal
+
+private laid_text() -> string =
+    "and what a run while compiling makes is laid into the object file, where nothing may write it"
+
+// The library container a type is, by its generic's qualified name, or empty for anything else.
+private container_named(t: Type) -> string = underlying(t) match
+    Struct(d) -> qualified_name(d.base)
+    _ -> ""
+
+private short_name(qualified: string) -> string
+    val b = qualified.bytes
+    var from: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then from = i + 1
+
+    from_utf8_unchecked(b[from..<b.len])
+end short_name
 
 // A struct as the constructor over literals it is laid down as, and an enum value as its variant.
 // A variant's payload is laid down as bytes (`payload_image.sysl`); where one has no byte image the
 // value stays code, and `const_val_run` says why.
 @noinline
 private record_literal(span: Span, variant: int, fields: Buf[Const], t: Type) -> Option[TExpr]
-    val (_, types) = record_shape(variant, t)
+    val (_, types) = record_shape(if variant <= -2 then -1 else variant, t)
     var args: Buf[TExpr] = buf()
 
     for i in 0..<fields.len()
+        // A union lays down the one field it was built with; the rest of its bytes are zero.
+        if variant <= -2 && int(i) != union_written(variant)
+            args.push(TExpr(span, TUnitLit))
+            continue
+        end if
+
         val lit = value_literal(span, fields.at(i), types.at(i).1)
 
         if lit.is_none() then return None
@@ -843,6 +1306,22 @@ private record_literal(span: Span, variant: int, fields: Buf[Const], t: Type) ->
             Some(TExpr(span, TEnumNew(t, v, args)))
         _ -> None
 end record_literal
+
+// A vector as the literal of its lanes it is laid down as.
+@noinline
+private vector_literal(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+    val lane = element_type(t)
+    var lits: Buf[TExpr] = buf()
+
+    for x in xs
+        val lit = value_literal(span, x, lane)
+
+        if lit.is_none() then return None
+
+        lits.push(lit.unwrap())
+
+    Some(TExpr(span, TVectorLit(lits, t)))
+end vector_literal
 
 // A table as the array literal it is laid down as, every element a literal at the element type.
 @noinline
@@ -873,6 +1352,7 @@ end float_pattern
 // The value a float literal of a width stands for.
 private float_at(f: real, t: Type) -> real = underlying(t) match
     Floating(32, _) -> real(f32(f))
+    Floating(16, brain) -> half_of_double(f, brain)
     _ -> f
 
 // What a step that has to produce a value produced, or the control it handed back.
@@ -911,10 +1391,11 @@ private eval(r: &EvRun, e: TExpr) -> Flow
         TLoop(_, _) -> loop_node(r, e)
         TWhile(_, _, _, _) -> while_node(r, e)
         TDoWhile(_, _, _, _) -> do_while_node(r, e)
+        TIterate(_, _, _, _, _, _, _, _) -> do_while_node(r, e)
         TFor(_, _, _, _, _, _, _, _) -> for_node(r, e)
         TCFor(_, _, _, _, _, _) -> c_for_node(r, e)
-        TStore(_, _, _) -> store_node(r, e)
-        TUpdate(_, _, _, _, _, _) -> update_node(r, e)
+        TStore(_, _, _, _) -> store_node(r, e)
+        TUpdate(_, _, _, _, _, _, _) -> update_node(r, e)
         TIncDec(_, _, _, _, _) -> inc_dec_node(r, e)
         _ -> eval_rest(r, e)
 end eval
@@ -956,8 +1437,15 @@ private compare_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
 
 @noinline
 private call_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    // **A call that never returns ends the program** -- a library's panic, which says why and exits --
+    // so reaching one while compiling is a trap, as reaching it is where the program runs.
+    TCall(name, _, Never, _) -> ends_the_program(r, e.span, name)
     TCall(name, args, _, results) -> call(r, e.span, name, args, results)
     _ -> EvStop
+
+@noinline
+private ends_the_program(r: &EvRun, at: Span, name: string) -> Flow =
+    trap(r, at, s"it reaches '${qualified_name(callee_origin(r.a, name))}', which ends the program")
 
 @noinline
 private block_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
@@ -987,6 +1475,8 @@ private while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
 @noinline
 private do_while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
     TDoWhile(body, cond, else_block, _) -> ev_do_while(r, e.span, body, cond, else_block)
+    TIterate(cursor, _, init, next, bind, body, else_block, _) ->
+        ev_iterate(r, e.span, cursor, init, next, bind, body, else_block)
     _ -> EvStop
 
 @noinline
@@ -1002,12 +1492,12 @@ private c_for_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
 
 @noinline
 private store_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
-    TStore(place, value, _) -> store(r, e.span, place, value)
+    TStore(place, value, _, _) -> store(r, e.span, place, value)
     _ -> EvStop
 
 @noinline
 private update_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
-    TUpdate(place, op, value, ty, dispatch, check) -> update(r, e.span, place, op, value, ty, dispatch, check)
+    TUpdate(place, op, value, ty, dispatch, check, _) -> update(r, e.span, place, op, value, ty, dispatch, check)
     _ -> EvStop
 
 @noinline
@@ -1021,6 +1511,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
     *e.kind match
         TFloatLit(bits, ty) -> EvGave(ConstFloat(float_at(real_of_bits(bits), ty)))
         TQuadLit(hi, lo, _) -> EvGave(ConstQuad(hi, lo))
+        TUnitLit -> EvNone
         TZero(ty) -> zero_value(r, e.span, ty)
         TGlobal(symbol, ty, writable) -> global_value(r, e.span, symbol, ty, writable)
         TResult(_) ->
@@ -1044,14 +1535,23 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TStrLit(s) -> EvGave(ConstStr(s))
         TStr(arg) -> rendered(r, e.span, arg)
         TRender(value, method, spec, slot) -> render(r, e.span, value, method, spec, slot)
-        TVCall(receiver, _, args, _, _) -> writer_call(r, e.span, receiver, args)
+        TVCall(receiver, slot, args, _, results) -> dispatched(r, e.span, receiver, slot, args, results)
+        TErase(operand, vtable, _) -> erased(r, operand, vtable)
+        TTypeId(receiver, _) -> erased_identity(r, receiver)
+        TAtomic(op, addr, ops, _, at_ty, _) -> atomic(r, e.span, op, addr, ops, at_ty)
+        // An evaluation is one thread, so there is nothing for a fence to order.
+        TFence(_) -> EvNone
+        TVariantFail(asked, holds) -> trap(r, e.span, variant_fail_text(asked, holds))
+        TVariantFailHeld(asked, held) -> held_variant_fail(r, e.span, asked, held)
         TLen(receiver, _) -> length(r, receiver)
         TBytes(receiver) -> bytes_of(r, receiver)
         TSlice(base, lo, hi, inclusive, _) -> sliced(r, e.span, base, lo, hi, inclusive)
         TFromBytes(arg) -> text_of(r, arg)
         TStrView(arg) -> text_of(r, arg)
         TConstView(arg) -> eval(r, arg)
-        TStructNew(decl, args) -> record_new(r, e.span, -1, args, Struct(decl))
+        TStructNew(decl, args) ->
+            if decl.union_layout then union_new(r, e.span, decl, args)
+            else record_new(r, e.span, -1, args, Struct(decl))
         TEnumNew(enum_ty, variant, args) -> record_new(r, e.span, variant_position(enum_ty, variant), args, enum_ty)
         TArrayLit(elems, ty) -> array_lit(r, e.span, elems, ty)
         TArrayFill(value, ty) -> array_fill(r, e.span, value, ty)
@@ -1059,14 +1559,167 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TStructInvCheck(value, decl, inv_fn) -> invariant_check(r, e.span, value, decl, inv_fn)
         TRecheck(after, recv, decl, inv_fn) -> recheck(r, e.span, after, recv, decl, inv_fn)
         TIndex(receiver, index, _) -> element_read(r, receiver, index)
+        TVectorLit(lanes, _) -> vector_new(r, lanes)
+        TSplat(value, vec_ty) -> splat(r, value, vec_ty)
+        TLane(receiver, lane, _) -> lane_read(r, receiver, lane)
+        TVecCompare(op, l, r2, ty) -> vector_compare(r, e.span, op, l, r2, ty)
+        TSelect(mask, when_true, when_false, _) -> select_lanes(r, mask, when_true, when_false)
+        TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
+        TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
+        TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
-        TIntOp(op, operand, None, width, ty) ->
+        TAddrOf(place, ty) -> address_of(r, e.span, place, ty)
+        TBox(value, _) -> boxed(r, e.span, value)
+        TBufLit(elems, ty) -> buffer_lit(r, e.span, elems, ty)
+        TBufFill(value, count, ty) -> buffer_fill(r, e.span, value, count, ty)
+        TSlots(op, args, _, _) -> slots(r, e.span, op, args)
+        TTempAddr(value, _) -> temp_address(r, value)
+        TFuncAddr(_, _, _) -> EvGave(ConstLink(e))
+        TCallPtr(callee, args, _, _) -> call_through(r, e.span, callee, args)
+        // `null` is the one address known before the linker runs, and is held the same way.
+        TNullLit(_) -> EvGave(ConstLink(e))
+        TDeref(operand, _) -> read_through(r, operand)
+        TIntOp(op, operand, amount, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
-            else byte_order(r, e.span, op, operand, width)
-        TIntOp(op, _, _, _, _) ->
-            refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
+            else bit_operation(r, e.span, op, operand, amount, width)
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
+
+// A call through a function's address: the address is the function it was taken of, so the call is
+// that function's, run as a call by name is. Null is a trap, as it is where the program runs.
+@noinline
+private call_through(r: &EvRun, at: Span, callee: TExpr, args: Buf[TExpr]) -> Flow
+    val image = eval_value(r, callee) match
+        Ok(ConstLink(found)) -> found
+        Ok(_) -> return refuse_form(r, callee.span, "a call through something that is not a function's address")
+        Err(f) -> return f
+
+    *image.kind match
+        TFuncAddr(name, _, _) -> call(r, at, name, args, false)
+        TNullLit(_) -> trap(r, callee.span, "a call through a null function pointer")
+        _ -> refuse_form(r, callee.span, "a call through an address that is not a function's")
+end call_through
+
+// **The address of module storage is a value while compiling**, as it is in constant data: the
+// linker fills it in (`ConstLink`). So is the address of a field of it, or of an element at an index
+// that comes to a number the array has. The address of storage the evaluation owns -- a local, an
+// element or field of one, what a pointer or a slice reaches -- is the slot it names (`ConstPtr`).
+// Thread-local and per-core storage's exists only when the program runs.
+@noinline
+private address_of(r: &EvRun, at: Span, place: TExpr, ty: Type) -> Flow
+    if rooted_in_module(place)
+        return linked_place(r, place) match
+            Ok(Some(p)) -> EvGave(ConstLink(TExpr(at, TAddrOf(p, ty))))
+            Ok(None) -> refuse_form(r, at, "the address of a thread's or a core's own storage is not evaluated " +
+                                    "while compiling — it exists only when the program runs")
+            Err(f) -> f
+    end if
+
+    slot_of(r, place) match
+        Ok(SlotElem(xs, i, owner)) -> EvGave(ConstPtr(xs, i, owner))
+        Ok(SlotLocal(name)) -> refuse_form(r, at, s"'$name' is read before anything was written to it")
+        Ok(SlotUnion(_, _, _, _, _)) ->
+            refuse_form(r, at, "the address of a union's field is not evaluated while compiling yet")
+        Err(f) -> f
+end address_of
+
+// Whether a place is module storage or inside it, reached without a pointer.
+private rooted_in_module(place: TExpr) -> bool = *place.kind match
+    TGlobal(_, _, _) -> true
+    TField(receiver, _, _) -> rooted_in_module(receiver)
+    TIndex(receiver, _, _) -> rooted_in_module(receiver)
+    _ -> false
+
+// A place inside module storage, its indices run to the numbers they come to, or `None` where the
+// place is not one; an index the array does not have traps, as taking its address would.
+private linked_place(r: &EvRun, place: TExpr) -> Result[Option[TExpr], Flow] = *place.kind match
+    TGlobal(symbol, _, _) ->
+        val d = r.a.tables.vals.get(symbol)
+
+        if d.is_some() && (d.unwrap().thread_local || d.unwrap().per_cpu) then Ok(None) else Ok(Some(place))
+    TField(receiver, index, ty) ->
+        if bitfield_ranges_of(texpr_type(receiver)).is_some() || c_bit_field(texpr_type(receiver), index) then
+            return Ok(None)
+
+        // A field reached through a pointer is a load before it is an address.
+        nameless(texpr_type(receiver)) match
+            Ptr(_) -> return Ok(None)
+            _ -> ()
+
+        linked_place(r, receiver) match
+            Ok(Some(p)) -> Ok(Some(TExpr(place.span, TField(p, index, ty))))
+            other -> other
+    TIndex(receiver, index, ty) ->
+        val length = nameless(texpr_type(receiver)) match
+            Array(n, _) -> usize(n)
+            _ -> return Ok(None)
+
+        val inside = linked_place(r, receiver) match
+            Ok(Some(p)) -> p
+            other -> return other
+
+        val i = element_index(r, index, length) match
+            Ok(found) -> found
+            Err(f) -> return Err(f)
+
+        val folded = TExpr(index.span, TIntLit(from_int(long(i)), texpr_type(index)))
+
+        Ok(Some(TExpr(place.span, TIndex(inside, folded, ty))))
+    _ -> Ok(None)
+
+// `*p`: the value in the slot the pointer names, where the evaluation owns it. Through an address the
+// linker fills in, what is there exists only when the program runs.
+@noinline
+private read_through(r: &EvRun, operand: TExpr) -> Flow = eval_value(r, operand) match
+    Ok(ConstPtr(xs, at, _)) -> EvGave(xs.at(at))
+    Ok(v) -> through_unowned(r, operand.span, v)
+    Err(f) -> f
+
+// A value put on the heap: a box of its own, which nothing frees while the evaluation runs.
+@noinline
+private boxed(r: &EvRun, at: Span, value: TExpr) -> Flow
+    val why = dropped_box(r.a, texpr_type(value))
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    eval_value(r, value) match
+        Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, -1))
+        Err(f) -> f
+end boxed
+
+// `&value` over a value with no place of its own: a slot made for it in the running call, as the
+// program makes one in its frame.
+@noinline
+private temp_address(r: &EvRun, value: TExpr) -> Flow = eval_value(r, value) match
+    Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, int(r.frames.len()) - 1))
+    Err(f) -> f
+
+// Why a box of this type is not made while compiling: **a type with a `Drop` runs it when its box's
+// last share goes**, and when that is, is decided by counts the evaluator does not keep.
+private dropped_box(a: &Analysis, t: Type) -> Option[string] = underlying(t) match
+    Struct(_) -> if holds_string(drops_declared(a), owner_key(underlying(t))) then Some(dropped_text(t)) else None
+    Enum(_) -> if holds_string(drops_declared(a), owner_key(underlying(t))) then Some(dropped_text(t)) else None
+    _ -> None
+
+private dropped_text(t: Type) -> string =
+    s"a box of a '${type_show(t)}', which has a 'Drop', is not made while compiling — its 'drop' runs when " +
+    "the last share of the box goes, and when that is, is decided by counts kept only when the program runs"
+
+private link_reason() -> string =
+    "reading through an address is not evaluated while compiling — the linker fills an address in, " +
+    "and what it points at exists only when the program runs"
+
+// An address as a reader would write it: the storage, field and element it names, or the function.
+private link_key(image: TExpr) -> string = *image.kind match
+    TAddrOf(place, _) -> link_key(place)
+    TFuncAddr(name, _, _) -> qualified_name(name)
+    TNullLit(_) -> "null"
+    TGlobal(symbol, _, _) -> qualified_name(symbol)
+    TField(receiver, index, _) -> s"${link_key(receiver)}.$index"
+    TIndex(receiver, index, _) -> *index.kind match
+        TIntLit(n, _) -> s"${link_key(receiver)}[${to_string(n)}]"
+        _ -> s"${link_key(receiver)}[?]"
+    _ -> "?"
 
 // Expressions run in turn for their effects.
 @noinline
@@ -1110,6 +1763,8 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Unit -> EvNone
     Str -> EvGave(ConstStr(""))
     Slice(_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
+    // A pointer's zero is null.
+    Ptr(_) -> EvGave(ConstLink(TExpr(at, TNullLit(ty))))
     Array(n, elem) ->
         if !sized(r, at, long(n)) then return EvStop
 
@@ -1129,12 +1784,18 @@ private zero_record(r: &EvRun, at: Span, d: &StructType) -> Flow
     var out: Buf[Const] = buf()
 
     for f in d.fields
+        // A union's zero is all-zero bytes, which is its first field's zero; the rest stand in.
+        if d.union_layout && !out.is_empty()
+            out.push(ConstBool(false))
+            continue
+        end if
+
         zero_value(r, at, f.1) match
             EvGave(v) -> out.push(v)
             EvNone -> return refuse_form(r, at, "a 'unit' field is not evaluated while compiling yet")
             other -> return other
 
-    EvGave(ConstRecord(-1, out))
+    EvGave(ConstRecord(if d.union_layout then union_variant(0) else -1, out))
 end zero_record
 
 // -- arrays ------------------------------------------------------------------------------------------
@@ -1160,15 +1821,15 @@ private sized(r: &EvRun, at: Span, n: long) -> bool = charged(r, at, n, s"an arr
 // The same for any value made a step per element or byte: `what` names it.
 @noinline
 private charged(r: &EvRun, at: Span, n: long, what: string) -> bool
-    if r.steps + n <= EvStepLimit
+    if r.steps + n <= r.limit
         r.steps += n
         return true
     end if
 
     if r.kind == EvRunning
         r.kind = EvLimit
-        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $what at " +
-                    s"${place_text(here(r), at)} is past the steps that were left"
+        r.message = s"${r.subject} did not finish within ${step_limit_text(r.limit)} steps while compiling — $what at " +
+                    s"${place_text(here(r), at)} is past the steps that were left" + step_advice()
     end if
 
     false
@@ -1234,15 +1895,334 @@ private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
         Ok(ConstStr(s)) -> return element_index(r, index, s.bytes.len) match
             Ok(i) -> EvGave(ConstInt(from_int(long(s.bytes[i]))))
             Err(f) -> f
+        // A pointer's subscript counts from the slot it points at.
+        Ok(ConstPtr(found, at, _)) -> (found, at, found.len() - at)
+        Ok(ConstLink(image)) -> return through_unowned(r, receiver.span, ConstLink(image))
         Ok(_) -> return refuse_form(r, receiver.span, s"an element of a '${type_show(texpr_type(receiver))}' " +
                                     "is not evaluated while compiling yet — a fixed array's, a slice's and a " +
                                     "string's are")
         Err(f) -> return f
 
     element_index(r, index, n) match
-        Ok(i) -> EvGave(xs.at(lo + i))
+        Ok(i) -> placed(r, index.span, xs.at(lo + i))
         Err(f) -> f
 end element_read
+
+// -- the heap ----------------------------------------------------------------------------------------
+//
+// **What the program puts on the heap, the run puts in buffers of its own**, which nothing frees
+// while it runs: a slice of fresh elements is a view whose owner is the heap (-1), so it may be
+// answered by the call that made it, and a box is a buffer of one (`boxed`).
+
+// `[a, b, c]` where a slice is wanted: its own elements, on the heap.
+@noinline
+private buffer_lit(r: &EvRun, at: Span, elems: Buf[TExpr], ty: Type) -> Flow
+    val why = unheld(ty)
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    var out: Buf[Const] = buf()
+
+    for elem in elems
+        eval_value(r, elem) match
+            Ok(v) -> out.push(copied(v))
+            Err(f) -> return f
+
+    EvGave(ConstView(out, 0, out.len(), -1))
+end buffer_lit
+
+// `[value; count]` where a slice is wanted, the count known only as the program runs.
+@noinline
+private buffer_fill(r: &EvRun, at: Span, value: TExpr, count: TExpr, ty: Type) -> Flow
+    val why = unheld(ty)
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val n = eval_value(r, count) match
+        Ok(ConstInt(k)) -> k.to_long().unwrap_or(-1)
+        Ok(_) -> return refuse_form(r, count.span, "a count that is not an integer")
+        Err(f) -> return f
+
+    if n < 0 then return trap(r, count.span, s"a buffer of ${n} elements")
+    if !sized(r, at, n) then return EvStop
+
+    EvGave(ConstView(filled(v, int(n)), 0, usize(n), -1))
+end buffer_fill
+
+// The three slot forms over a buffer's storage (`slots.sysl`). Fresh storage holds nothing in any
+// slot until one is placed there, and the run keeps no count for a vacate to let go of.
+@noinline
+private slots(r: &EvRun, at: Span, op: string, args: Buf[TExpr]) -> Flow
+    var vals: Buf[Const] = buf()
+
+    for arg in args
+        eval_value(r, arg) match
+            Ok(v) -> vals.push(v)
+            Err(f) -> return f
+
+    op match
+        "slot_storage" ->
+            val n = vals.at(0) match
+                ConstInt(k) -> k.to_long().unwrap_or(-1)
+                _ -> -1
+
+            if n < 0 then return refuse_form(r, at, "a count that is not a size")
+            if !sized(r, at, n) then return EvStop
+
+            EvGave(ConstView(filled(ConstUnset, int(n)), 0, usize(n), -1))
+        "slot_place" -> (vals.at(0), vals.at(1)) match
+            (ConstView(xs, lo, n, _), ConstInt(k)) ->
+                val i = k.to_long().unwrap_or(-1)
+
+                if i < 0 || i >= long(n) then
+                    return trap(r, args.at(1).span, s"index $i is out of bounds for a slice of $n elements")
+
+                written_over(xs, lo + usize(i), vals.at(2))
+                EvNone
+            _ -> refuse_form(r, at, "'slot_place' over something that is not a slice")
+        _ -> EvNone
+end slots
+
+// A slot read: a value, or the refusal of one fresh storage has nothing placed in yet.
+private placed(r: &EvRun, at: Span, v: Const) -> Flow = v match
+    ConstUnset -> refuse_form(r, at, "a slot of storage 'slot_storage' made is read before anything was " +
+                              "placed in it — its bytes are whatever the allocator left")
+    _ -> EvGave(v)
+
+// -- vectors -------------------------------------------------------------------------------------------
+
+// **A vector is held as its lanes**, an array of them, and what an operator does to one is what the
+// lane's operator does to each lane, by the same definitions a scalar is run with (`operate`,
+// `fixed_operate`) at the lane type. No lane operation is checked, as the lowering checks none: an
+// integer lane wraps, and the two operators that would trap on one lane, integer `/` and `%`, are
+// refused on a vector before anything runs.
+
+// A vector's lanes; nothing for a value that is not one.
+private lanes_of(v: Const) -> Buf[Const] = v match
+    ConstArray(xs) -> xs
+    _ -> buf()
+
+// How many lanes a vector type has.
+private lane_count(t: Type) -> int = underlying(t) match
+    Vector(n, _) -> n
+    _ -> 0
+
+// `[a, b, c, d]` at a vector type: each lane computed in order.
+@noinline
+private vector_new(r: &EvRun, lanes: Buf[TExpr]) -> Flow
+    var out: Buf[Const] = buf()
+
+    for lane in lanes
+        eval_value(r, lane) match
+            Ok(v) -> out.push(v)
+            Err(f) -> return f
+
+    EvGave(ConstArray(out))
+end vector_new
+
+// One value in every lane.
+@noinline
+private splat(r: &EvRun, value: TExpr, vec_ty: Type) -> Flow = eval_value(r, value) match
+    Ok(v) -> EvGave(ConstArray(filled(v, lane_count(vec_ty))))
+    Err(f) -> f
+
+// `v[2]`: the analyzer has already checked the lane is one the vector has.
+@noinline
+private lane_read(r: &EvRun, receiver: TExpr, lane: int) -> Flow = eval_value(r, receiver) match
+    Ok(ConstArray(xs)) -> EvGave(xs.at(usize(lane)))
+    Ok(_) -> refuse_form(r, receiver.span, "a lane of something that is not a vector")
+    Err(f) -> f
+
+// An operator between two vectors, lane by lane. A shift's count may be one scalar for every lane.
+@noinline
+private lanewise(r: &EvRun, at: Span, op: string, lt: Type, rt: Type, ty: Type, x: Const, y: Const) -> Flow
+    val xs = lanes_of(x)
+    val ys = y match
+        ConstArray(found) -> found
+        _ -> filled(y, int(xs.len()))
+    val (ll, rl, tl) = (vector_lane_of(lt), vector_lane_of(rt), vector_lane_of(ty))
+    var out: Buf[Const] = buf()
+
+    for i in 0..<xs.len()
+        val lane = if fixed_arith_op(op, ll, rl, tl) then fixed_operate(r, at, op, ll, rl, tl, xs.at(i), ys.at(i))
+        else operate(r, at, op, ll, xs.at(i), ys.at(i), false)
+
+        lane match
+            EvGave(v) -> out.push(v)
+            other -> return other
+
+    EvGave(ConstArray(out))
+end lanewise
+
+// `a < b` between vectors: a mask, each lane the comparison of the two lanes.
+@noinline
+private vector_compare(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
+    val x = eval_value(r, l) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val y = eval_value(r, rt) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
+end vector_compare
+
+// `m.select(a, b)`: every operand computed, as the lowering computes them, and each lane taken from
+// `a` where the mask's lane is true and from `b` where it is not.
+@noinline
+private select_lanes(r: &EvRun, mask: TExpr, when_true: TExpr, when_false: TExpr) -> Flow
+    val m = eval_value(r, mask) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val a = eval_value(r, when_true) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val b = eval_value(r, when_false) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    var out: Buf[Const] = buf()
+
+    for i in 0..<m.len()
+        val chosen = m.at(i) match
+            ConstBool(true) -> a.at(i)
+            _ -> b.at(i)
+
+        out.push(chosen)
+
+    EvGave(ConstArray(out))
+end select_lanes
+
+// A vector's lanes folded into one value, by the reduction the analyzer chose (`vectors.sysl`).
+//
+// **A float sum is refused**: it is lowered as a sum the machine may reassociate, and which lanes it
+// adds first is the target's instructions' to choose -- an AArch64 core adds neighbouring pairs, the
+// generic expansion halves -- so no one value is the one the program computes. The minimum and
+// maximum of floats answer the other lane where one is a NaN, as `fmin` does; the integer and
+// fixed-point ones compare the values held, signed or not as the lane is. An integer sum wraps, and
+// wrapping addition gives one answer in any order.
+@noinline
+private reduce(r: &EvRun, at: Span, op: string, receiver: TExpr, ty: Type) -> Flow
+    if op == "fadd" then
+        return refuse_form(r, at, "a float vector's 'sum' adds its lanes in the order the target's " +
+                           "instructions take, so its value is known only where the program runs — add " +
+                           "the lanes in the order meant, 'v[0] + v[1] + …'")
+
+    val xs = eval_value(r, receiver) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    if xs.is_empty() then return refuse_form(r, at, "a vector with no lanes")
+
+    var acc = xs.at(0)
+
+    for i in 1..<xs.len()
+        val x = xs.at(i)
+
+        acc = (op, acc, x) match
+            ("add", _, _) -> operate(r, at, "+", ty, acc, x, false) match
+                EvGave(v) -> v
+                other -> return other
+            ("or", ConstBool(a), ConstBool(b)) -> ConstBool(a || b)
+            ("and", ConstBool(a), ConstBool(b)) -> ConstBool(a && b)
+            (_, ConstInt(a), ConstInt(b)) ->
+                val smaller = cmp(b, a) < 0
+
+                if (op.ends_with("min") && smaller) || (op.ends_with("max") && cmp(b, a) > 0) then x else acc
+            (_, ConstFloat(a), ConstFloat(b)) ->
+                if a != a then x
+                else if b != b then acc
+                else if (op == "fmin" && b < a) || (op == "fmax" && b > a) then x
+                else acc
+            _ -> return refuse_form(r, at, s"the reduction '$op' of ${type_show(texpr_type(receiver))}")
+    end for
+
+    EvGave(acc)
+end reduce
+
+// The run of elements a vector is loaded from or stored to, `n` of them from `index`: where they are
+// held, and the position of the first. A run that does not fit traps, as it does where the program
+// runs -- checked as a whole, so a run starting at an element that exists still traps if the last
+// does not.
+private lane_run(r: &EvRun, held: Const, receiver: TExpr, index: TExpr, n: int) -> Result[(Buf[Const], usize), Flow]
+    val (xs, lo, len) = held match
+        ConstArray(found) -> (found, usize(0), found.len())
+        ConstView(found, from, count, _) -> (found, from, count)
+        _ -> return Err(refuse_form(r, receiver.span, s"a vector of the elements of a " +
+                                    s"'${type_show(texpr_type(receiver))}' is not evaluated while compiling yet"))
+
+    val i = eval_value(r, index) match
+        Ok(ConstInt(v)) -> v
+        Ok(_) -> return Err(refuse_form(r, index.span, "an index that is not an integer"))
+        Err(f) -> return Err(f)
+
+    val count = from_int(long(n))
+
+    if cmp(from_int(long(len)), count) < 0 || cmp(i, from_int(0)) < 0 || cmp(add(i, count), from_int(long(len))) > 0 then
+        return Err(trap(r, index.span, s"$n elements from index ${to_string(i)} are out of bounds for a length of $len"))
+
+    Ok((xs, lo + usize(i.to_long().unwrap_or(0))))
+end lane_run
+
+// `xs.load(i)`: the lanes are copies of the elements, read where they are held.
+@noinline
+private vector_load(r: &EvRun, receiver: TExpr, index: TExpr, vec_ty: Type) -> Flow
+    val held = eval_value(r, receiver) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val n = lane_count(vec_ty)
+
+    lane_run(r, held, receiver, index, n) match
+        Ok((xs, first)) ->
+            var out: Buf[Const] = buf()
+
+            for k in 0..<usize(n)
+                out.push(copied(xs.at(first + k)))
+
+            EvGave(ConstArray(out))
+        Err(f) -> f
+end vector_load
+
+// `xs.store(i, v)`: the value first and the run second, the order an assignment takes, and each lane
+// written into the element where it is held -- an array a local holds, or the one a slice views.
+@noinline
+private vector_store(r: &EvRun, receiver: TExpr, index: TExpr, value: TExpr) -> Flow
+    val lanes = eval_value(r, value) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    // A place is read where it is held, so the writes land in it; a slice made on the spot views its
+    // array's own storage, and lands there.
+    val found = if is_place(receiver) then slot_of(r, receiver).and_then(s -> slot_value(r, receiver.span, s))
+    else eval_value(r, receiver)
+
+    val held = found match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    // An array that is not a place is a value of its own, and a write into it would land nowhere.
+    held match
+        ConstArray(_) -> if !is_place(receiver) then return no_place(r, receiver)
+        _ -> ()
+
+    lane_run(r, held, receiver, index, int(lanes.len())) match
+        Ok((xs, first)) ->
+            var target = xs
+
+            for k in 0..<lanes.len()
+                target.set(first + k, copied(lanes.at(k)))
+
+            EvNone
+        Err(f) -> f
+end vector_store
 
 // `for x in a` over a fixed array: the elements as they were when the loop began.
 @noinline
@@ -1335,6 +2315,16 @@ private length(r: &EvRun, receiver: TExpr) -> Flow = eval_value(r, receiver) mat
     Ok(_) -> refuse_form(r, receiver.span, s"the length of a '${type_show(texpr_type(receiver))}' is not " +
                          "evaluated while compiling")
     Err(f) -> f
+
+// `x.(c)` on a value holding another variant, named from the value itself.
+@noinline
+private held_variant_fail(r: &EvRun, at: Span, asked: string, held: TExpr) -> Flow =
+    eval_value(r, held) match
+        Ok(ConstRecord(v, _)) ->
+            trap(r, at, variant_fail_text(asked, descriptor_text(texpr_type(held), v, -1)))
+        Ok(_) -> refuse_form(r, held.span, s"a '${type_show(texpr_type(held))}' is not evaluated " +
+                             "while compiling")
+        Err(f) -> f
 
 // `s.bytes`: a read-only view of a string's bytes, which outlive every call.
 @noinline
@@ -1499,12 +2489,25 @@ private quad_arg(vals: Buf[Const], i: usize) -> f128 = vals.at(i) match
 // lands in it becomes the string. Through a trait object the `display` is chosen at run time.
 @noinline
 private render(r: &EvRun, at: Span, value: TExpr, method: string, spec: TExpr, slot: Option[int]) -> Flow
-    if slot.is_some() then
-        return refuse_form(r, at, "a value rendered through a trait object is not evaluated while compiling")
-
-    val shown = eval_value(r, value) match
+    val held = eval_value(r, value) match
         Ok(v) -> v
         Err(f) -> return f
+
+    // Through a trait object, the method is the one its table holds in the slot, handed the value
+    // the way that method takes it.
+    val (shown, routine) = if slot.is_none() then (held, method) else
+        held match
+            ConstErased(name, data) -> vtable_named(r, name) match
+                Some(vt) ->
+                    val target = vt.slots.at(usize(slot.unwrap()))
+
+                    target.recv match
+                        ByValue -> *data match
+                            ConstPtr(cells, i, _) -> (cells.at(i), target.target)
+                            other -> return through_unowned(r, value.span, other)
+                        _ -> (*data, target.target)
+                None -> return refuse_form(r, at, s"the table '$name', which this compilation does not have")
+            other -> return through_unowned(r, value.span, other)
 
     val fmt = eval_value(r, spec) match
         Ok(v) -> v
@@ -1520,7 +2523,7 @@ private render(r: &EvRun, at: Span, value: TExpr, method: string, spec: TExpr, s
     vals.push(ConstWriter(int(k)))
     vals.push(fmt)
 
-    val flow = run_call(r, at, method, vals)
+    val flow = run_call(r, at, routine, vals)
     val sink = r.writers.at(k)
 
     r.writers.truncate(k)
@@ -1698,11 +2701,53 @@ private record_new(r: &EvRun, at: Span, variant: int, args: Buf[TExpr], ty: Type
     EvGave(ConstRecord(variant, out))
 end record_new
 
+// **A union is held as the field it was built with**: a record whose variant is `-2 - i` for the `i`th
+// field, with that field's value at its position and a stand-in at every other. Evaluation has a value
+// model, not a byte model, so it has no answer for what another field's bytes would read as.
+private union_variant(i: int) -> int = -2 - i
+
+private union_written(variant: int) -> int = -2 - variant
+
+// `U(f = v)`: the one value, at its field's position.
+@noinline
+private union_new(r: &EvRun, at: Span, decl: &StructType, args: Buf[TExpr]) -> Flow
+    val why = unheld(Struct(decl))
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    var written = 0
+    var out: Buf[Const] = buf()
+
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            TUnitLit -> out.push(ConstBool(false))
+            _ ->
+                written = int(i)
+
+                eval_value(r, args.at(i)) match
+                    Ok(v) -> out.push(copied(v))
+                    Err(f) -> return f
+
+    EvGave(ConstRecord(union_variant(written), out))
+end union_new
+
+// What a read through a field other than the one a union was built with is told.
+private union_cross_read(t: Type, written: int, index: int) -> string = underlying(t) match
+    Struct(d) ->
+        s"evaluation while compiling reads a union only through the field it was built with — this " +
+            s"'${type_show(t)}' was built with '${d.fields.at(usize(written)).0}', and " +
+            s"'${d.fields.at(usize(index)).0}' would read its bytes as another type"
+    _ -> "evaluation while compiling reads a union only through the field it was built with"
+
 // `s.f`, read: the struct is read where it is held, without a copy.
 @noinline
 private field_read(r: &EvRun, receiver: TExpr, index: int) -> Flow
     eval_value(r, receiver) match
         Ok(ConstRecord(-1, fields)) -> EvGave(fields.at(usize(index)))
+        Ok(ConstRecord(v, fields)) if v <= -2 ->
+            if union_written(v) == index then EvGave(fields.at(usize(index)))
+            else refuse_form(r, receiver.span, union_cross_read(texpr_type(receiver), union_written(v), index))
+        Ok(ConstLink(_)) -> refuse_form(r, receiver.span, link_reason())
         Ok(_) -> refuse_form(r, receiver.span, s"a field of a '${type_show(texpr_type(receiver))}' is not " +
                              "evaluated while compiling yet — a struct's is")
         Err(f) -> f
@@ -1788,9 +2833,9 @@ end fixed_bits
 
 @noinline
 private load(r: &EvRun, at: Span, name: string, ty: Type) -> Flow
-    val v = running(r).locals.get(name)
+    val cell = running(r).locals.get(name)
 
-    if v.is_some() then return EvGave(v.unwrap())
+    if cell.is_some() then return EvGave(cell.unwrap().at(0))
 
     if underlying(ty) == Unit then return EvNone
 
@@ -1832,9 +2877,19 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
             None -> refuse_form(r, at, s"'$shown' is filled when the program runs")
     end if
 
+    ev.asking += 1
+
     val folded = const_fold(analyzer_for(r.a, d.unwrap().scope), d.unwrap().init.unwrap())
 
+    ev.asking -= 1
+
+    // **An initializer the untyped fold cannot settle is run**, as a whole value's is: `B + 1` over
+    // another `val B` reads `B` through here in turn, where the fold knows only a `const`'s name.
+    val ran = if folded.is_none() && !is_quad(base) then whole_value(r.a, d.unwrap(), shown, ty) else None
+
     ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+
+    if ran.is_some() then return EvGave(ran.unwrap())
 
     // **An `f128` is read from the literal it was written as**, since the untyped fold above reads a
     // float through a `double`.
@@ -1874,7 +2929,7 @@ private whole_value(a: &Analysis, d: ValueDecl, shown: string, ty: Type) -> Opti
     if typed.is_none() then return None
 
     evaluate(a, d.scope, s"'$shown'", typed.unwrap()) match
-        EvValue(Some(v)) -> if holds_view(v) then None else Some(v)
+        EvValue(Some(v)) -> if answer_refusal(v, ty).is_some() then None else Some(v)
         _ -> None
 end whole_value
 
@@ -1894,6 +2949,21 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
         Ok(x) -> x
         Err(f) -> return f
 
+    underlying(ty) match
+        Vector(_, _) ->
+            var out: Buf[Const] = buf()
+
+            for x in lanes_of(v)
+                unary_value(r, at, op, x, vector_lane_of(ty)) match
+                    EvGave(y) -> out.push(y)
+                    other -> return other
+
+            EvGave(ConstArray(out))
+        _ -> unary_value(r, at, op, v, ty)
+end unary
+
+// A unary operator applied to a value of a scalar type.
+private unary_value(r: &EvRun, at: Span, op: string, v: Const, ty: Type) -> Flow
     v match
         ConstInt(n) -> underlying(ty) match
             Fixed(_, _, _) ->
@@ -1915,7 +2985,7 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
             else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
         ConstBool(b) -> if op == "!" then EvGave(ConstBool(!b)) else refuse_form(r, at, s"'$op' on bool")
         _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
-end unary
+end unary_value
 
 @noinline
 private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
@@ -1926,6 +2996,10 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
     val y = eval_value(r, rt) match
         Ok(v) -> v
         Err(f) -> return f
+
+    underlying(texpr_type(l)) match
+        Vector(_, _) -> return lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
+        _ -> ()
 
     if fixed_arith_op(op, texpr_type(l), texpr_type(rt), ty) then
         return fixed_operate(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
@@ -1973,6 +3047,7 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
             Fixed(bits, _, signed) -> run_int_binary(op, a, b, bits, signed, false)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstFloat(a), ConstFloat(b)) -> underlying(lt) match
+            Floating(16, brain) -> run_half_binary(op, a, b, brain)
             Floating(bits, _) -> run_float_binary(op, a, b, bits)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstQuad(ah, al), ConstQuad(bh, bl)) -> run_quad_binary(op, (ah, al), (bh, bl))
@@ -1991,6 +3066,9 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
                 else Err(s"'$op' on ${type_show(lt)}")
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstStr(a), ConstStr(b)) -> return str_operate(r, at, op, a, b)
+        (ConstPtr(_, _, _), _) -> same_address(op, x, y, lt)
+        (ConstLink(_), _) -> same_address(op, x, y, lt)
+        (ConstPun(_, _), _) -> same_address(op, x, y, lt)
         _ -> Err(s"'$op' on ${type_show(lt)}")
 
     out match
@@ -2001,6 +3079,25 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
             if is_trap_text(why) then trap(r, at, why)
             else refuse_form(r, at, s"$why is not evaluated while compiling yet")
 end operate
+
+// Two addresses compared, which only `==` and `!=` do while compiling: the same slot of the same
+// storage, or the same storage the linker fills in. A slot the evaluation owns is never at an address
+// the linker fills in, nor at null; where two such addresses fall in memory is the linker's to say.
+private same_address(op: string, x: Const, y: Const, lt: Type) -> Result[Const, string]
+    if op != "==" && op != "!=" then return Err(s"'$op' on ${type_show(lt)}")
+
+    val same = (unpunned(x), unpunned(y)) match
+        (ConstPtr(xs, i, _), ConstPtr(ys, j, _)) -> usize(&xs.elems[i]) == usize(&ys.elems[j])
+        (ConstLink(a), ConstLink(b)) -> link_key(a) == link_key(b)
+        _ -> false
+
+    Ok(ConstBool(if op == "==" then same else !same))
+end same_address
+
+// The address under any conversions to other pointer types.
+private unpunned(v: Const) -> Const = v match
+    ConstPun(addr, _) -> *addr
+    _ -> v
 
 // Whether what the arithmetic answered is a trap rather than an operator it does not have.
 private is_trap_text(why: string) -> bool =
@@ -2058,6 +3155,23 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
 
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
+    // An address stays the address it is under another pointer type; as a number it is something
+    // only the linker knows.
+    v match
+        ConstLink(_) ->
+            return underlying(ty) match
+                Ptr(_) -> EvGave(v)
+                CFn(_, _) -> EvGave(v)
+                _ -> refuse_form(r, at, "an address converted to a number is not evaluated while compiling — " +
+                                 "the linker fills an address in, so its value exists only when the " +
+                                 "program runs")
+        // A slot stays the slot it is under a reference or pointer to the same type, and is the same
+        // address under one to another type -- which may be compared, and converted back, but not read
+        // through. As a number it is where storage falls in memory, decided when the program runs.
+        ConstPtr(_, _, _) -> return punned(r, at, v, texpr_type(operand), ty)
+        ConstPun(addr, as_was) -> return punned(r, at, *addr, *as_was, ty)
+        _ -> ()
+
     // A bare enum converts as the integer its variant's tag is, at the enum's underlying type.
     val (held, from) = (v, underlying(texpr_type(operand))) match
         (ConstRecord(i, _), Enum(d)) -> (ConstInt(d.variants.at(usize(i)).tag), underlying(d.underlying))
@@ -2072,10 +3186,49 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
             else refuse_form(r, at, s"$message is not evaluated while compiling yet")
 end cast
 
+// An address the run owns, taken at `from` and converted to `ty`.
+private punned(r: &EvRun, at: Span, addr: Const, from: Type, ty: Type) -> Flow =
+    (pointee(from), pointee(ty)) match
+        (Some(was), Some(to)) ->
+            if underlying(was) == underlying(to) then EvGave(addr) else EvGave(ConstPun(addr, from))
+        _ -> refuse_form(r, at, "an address converted to a number is not evaluated while compiling — " +
+                         "where storage falls in memory is decided when the program runs")
+
 // `sysl.math.ByteOrder`'s members, which reorder the bytes of a value already in hand -- the one
 // family of compiler-provided members a constant is computed with. The direction is the target's,
 // read off the layout every constant is folded against.
 @noinline
+// An operation of the `Bits` or `Signed` trait on an integer -- a count, a reversal, a rotation, `abs`
+// or `signum` -- answered as the program's instructions answer it (`int_op_value`).
+private bit_operation(r: &EvRun, at: Span, op: string, operand: TExpr, amount: Option[TExpr],
+                      width: Type) -> Flow
+    if amount.is_none() && byte_order_op(op) then return byte_order(r, at, op, operand, width)
+
+    val v = eval_value(r, operand) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    var by: Option[BigInt] = None
+
+    if amount.is_some()
+        eval_value(r, amount.unwrap()) match
+            Ok(ConstInt(k)) -> by = Some(k)
+            Ok(_) -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            Err(f) -> return f
+    end if
+
+    v match
+        ConstInt(n) -> width match
+            Integer(bits, signed, _) -> int_op_value(op, n, bits, signed, by) match
+                Some(out) -> EvGave(ConstInt(out))
+                None -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+        _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+end bit_operation
+
+private byte_order_op(op: string) -> bool =
+    op == "swap_bytes" || op == "to_be" || op == "from_be" || op == "to_le" || op == "from_le"
+
 private byte_order(r: &EvRun, at: Span, op: string, operand: TExpr, width: Type) -> Flow
     val little = r.a.tables.layout.little_endian
     val swaps = op match
@@ -2229,16 +3382,248 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
             Ok(v) -> vals.push(v)
             Err(f) -> return f
 
+    call_with(r, at, name, vals)
+end call
+
+// A call whose arguments are worked out: the library's routines the compiler runs itself, or the
+// body.
+private call_with(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
     val shown = qualified_name(name)
 
     if const_renderer(shown) then return library_render(r, at, shown, vals)
+
+    // A float's encoding and back, which the library writes as a read through a pointer.
+    if float_bits_routine(name) && vals.len() == 1
+        val folded = float_bits_folded(name, vals.at(0))
+
+        if folded.is_some() then return EvGave(folded.unwrap())
+    end if
 
     val routine = qualified_name(r.a.tables.members.func_origin.get(name).unwrap_or(name))
 
     if writer_routine(routine) then return writer_render(r, at, routine, vals)
 
+    if frozen_routine(routine) then return frozen_call(r, at, routine, name, vals)
+
     run_call(r, at, name, vals)
-end call
+end call_with
+
+// -- trait objects ------------------------------------------------------------------------------------
+//
+// **A trait object is its value and its table** (`ConstErased`), and a call through it is the call of
+// the slot's function -- a closure's `&Fn` the same way, its one slot being the closure's body.
+
+// The table a trait object was made with: one the program has, or one a trial made and the
+// evaluation kept.
+private vtable_named(r: &EvRun, name: string) -> Option[TVtable]
+    val kept = r.a.evaluation.vtables.get(name)
+
+    if kept.is_some() then return kept
+
+    r.a.tables.members.vtables.get(name)
+end vtable_named
+
+// A call through a trait object: the receiver handed over the way the slot's function takes it -- a
+// copy of the value for `self`, the pointer for `*self` and `&self`.
+@noinline
+private dispatched(r: &EvRun, at: Span, receiver: TExpr, slot: int, args: Buf[TExpr], results: bool) -> Flow
+    if results then
+        return refuse_form(r, at, "a call answering a list of results is not evaluated while compiling yet")
+
+    val (vt_name, data) = eval_value(r, receiver) match
+        Ok(ConstErased(name, held)) -> (name, *held)
+        Ok(ConstWriter(_)) -> return writer_call(r, at, receiver, args)
+        Ok(v) -> return through_unowned(r, receiver.span, v)
+        Err(f) -> return f
+
+    val vt = vtable_named(r, vt_name) match
+        Some(found) -> found
+        None -> return refuse_form(r, at, s"a call through the table '$vt_name', which this compilation does not have")
+
+    val target = vt.slots.at(usize(slot))
+    var vals: Buf[Const] = buf()
+
+    target.recv match
+        ByValue -> data match
+            ConstPtr(cells, i, _) -> vals.push(cells.at(i))
+            other -> return through_unowned(r, receiver.span, other)
+        _ -> vals.push(data)
+
+    for arg in args
+        eval_value(r, arg) match
+            Ok(v) -> vals.push(v)
+            Err(f) -> return f
+
+    call_with(r, at, target.target, vals)
+end dispatched
+
+// -- atomics -------------------------------------------------------------------------------------------
+//
+// **An evaluation is one thread**, so an atomic operation on storage it owns is the plain operation:
+// a load, a store, or a read-modify-write that answers the value it found. The arithmetic wraps, as
+// the instruction's does; a compare-and-swap stores only where it found the value it was told to
+// expect, and answers what it found either way.
+
+@noinline
+private atomic(r: &EvRun, at: Span, op: string, addr: TExpr, ops: Buf[TExpr], at_ty: Type) -> Flow
+    val (xs, i) = eval_value(r, addr) match
+        Ok(ConstPtr(cells, k, _)) -> (cells, k)
+        Ok(v) -> return through_unowned(r, addr.span, v)
+        Err(f) -> return f
+
+    var vals: Buf[Const] = buf()
+
+    for o in ops
+        eval_value(r, o) match
+            Ok(v) -> vals.push(v)
+            Err(f) -> return f
+
+    if op == "atomic_store"
+        written_over(xs, i, vals.at(0))
+        return EvNone
+    end if
+
+    val found = placed(r, addr.span, xs.at(i)) match
+        EvGave(v) -> v
+        f -> return f
+
+    if op == "atomic_load" then return EvGave(found)
+
+    if op == "atomic_swap"
+        written_over(xs, i, vals.at(0))
+        return EvGave(found)
+    end if
+
+    if op == "atomic_cas"
+        operate(r, at, "==", at_ty, found, vals.at(0), false) match
+            EvGave(ConstBool(true)) -> written_over(xs, i, vals.at(1))
+            EvGave(_) -> ()
+            f -> return f
+
+        return EvGave(found)
+    end if
+
+    val symbol = op match
+        "atomic_add" -> "+"
+        "atomic_sub" -> "-"
+        "atomic_and" -> "&"
+        "atomic_or" -> "|"
+        _ -> "^"
+
+    operate(r, at, symbol, at_ty, found, vals.at(0), false) match
+        EvGave(v) -> written_over(xs, i, v)
+        f -> return f
+
+    EvGave(found)
+end atomic
+
+// A value put behind a trait's table.
+@noinline
+private erased(r: &EvRun, operand: TExpr, vtable: string) -> Flow = eval_value(r, operand) match
+    Ok(v) -> EvGave(ConstErased(vtable, v))
+    Err(f) -> f
+
+// What a downcast tests: the identity of the type behind the table.
+@noinline
+private erased_identity(r: &EvRun, receiver: TExpr) -> Flow = eval_value(r, receiver) match
+    Ok(ConstErased(name, _)) -> vtable_named(r, name) match
+        Some(vt) -> EvGave(ConstInt(vt.type_id))
+        None -> refuse_form(r, receiver.span, s"the table '$name', which this compilation does not have")
+    Ok(v) -> through_unowned(r, receiver.span, v)
+    Err(f) -> f
+
+// **A frozen buffer is made, and viewed, by reading words as other types** (`sysl.buf.Frozen`), which
+// the evaluator does not hold values as -- so both are run here, to the values those words come to.
+frozen_routine(shown: string) -> bool = shown == "sysl.buf.freeze_buf" || shown == "sysl.buf.Frozen.view"
+
+// A `Frozen` is the elements' storage, a pointer to the first, and the count; the storage's owner word
+// is 0, which is what a frozen buffer nothing frees has. Freezing copies the elements into storage
+// sized to them and leaves the buffer empty, through every name it has, as the program's does.
+@noinline
+private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Buf[Const]) -> Flow
+    if routine == "sysl.buf.Frozen.view"
+        return vals.at(0) match
+            ConstPtr(cells, i, _) -> cells.at(i) match
+                ConstRecord(_, fields) -> (fields.at(1), fields.at(2)) match
+                    (ConstPtr(xs, lo, _), ConstInt(n)) -> EvGave(ConstView(xs, lo, usize(n.to_long().unwrap_or(0)), -1))
+                    (_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
+                _ -> refuse_form(r, at, "a frozen buffer the run did not make")
+            _ -> refuse_form(r, at, "a frozen buffer the run did not make")
+    end if
+
+    // The buffer's core, which every name for the buffer shares.
+    val core = vals.at(0) match
+        ConstRecord(_, fields) -> fields.at(0)
+        _ -> return refuse_form(r, at, "a buffer the run did not make")
+
+    val (core_cells, core_at) = core match
+        ConstPtr(xs, i, _) -> (xs, i)
+        _ -> return refuse_form(r, at, "a buffer that names no storage")
+
+    val (elems, lo, count) = core_cells.at(core_at) match
+        ConstRecord(_, fields) -> (fields.at(0), fields.at(1)) match
+            (ConstView(xs, from, _, _), ConstInt(n)) -> (xs, from, usize(n.to_long().unwrap_or(0)))
+            _ -> return refuse_form(r, at, "a buffer the run did not make")
+        _ -> return refuse_form(r, at, "a buffer the run did not make")
+
+    val data_ty = r.a.tables.members.func_insts.get(name).map(sig -> frozen_data_type(sig.ret)).unwrap_or(Unknown)
+    var items: Buf[Const] = buf()
+
+    for i in 0..<count
+        items.push(copied(elems.at(lo + i)))
+
+    var fields: Buf[Const] = buf()
+
+    fields.push(ConstInt(from_int(0)))
+
+    if count == 0 then fields.push(ConstLink(TExpr(at, TNullLit(data_ty))))
+    else fields.push(ConstPtr(items, 0, -1))
+
+    fields.push(ConstInt(from_int(long(count))))
+
+    // The buffer is left empty, through every name it has.
+    var core_fields = core_cells.at(core_at) match
+        ConstRecord(_, xs) -> xs
+        _ -> buf()
+
+    core_fields.set(1, ConstInt(from_int(0)))
+
+    EvGave(ConstPtr(cell_of(ConstRecord(-1, fields)), 0, -1))
+end frozen_call
+
+// The type of a `Frozen`'s pointer to its first element, from the `&sync Frozen[T]` freezing answers.
+private frozen_data_type(ret: Type) -> Type = pointee(ret) match
+    Some(Struct(d)) -> d.fields.at(1).1
+    _ -> Unknown
+
+// The declaration an instantiation was made from, which is what a reader wrote.
+private callee_origin(a: &Analysis, name: string) -> string =
+    a.tables.members.func_origin.get(name).unwrap_or(name)
+
+// A function's body typed for the evaluation, once, and kept -- or `None` where it has none here, or
+// where typing it needs the value being worked out.
+evaluation_body(a: &Analysis, name: string) -> Option[&TFunc]
+    val ev = a.evaluation
+    val kept = ev.bodies.get(name)
+
+    if kept.is_some() then return kept
+
+    for item in ev.typing
+        if item == name then return None
+
+    ev.typing.push(name)
+
+    val typed = trial_body(a, name)
+
+    ev.typing.truncate(ev.typing.len() - 1)
+
+    if typed.is_none() then return None
+
+    val kept_now: &TFunc = typed.unwrap()
+
+    ev.bodies.put(name, kept_now)
+    Some(kept_now)
+end evaluation_body
 
 // The body a call names, typed for the evaluation once and kept.
 @noinline
@@ -2250,17 +3635,17 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
 
     val caller = if r.frames.len() > 1 then s"'${qualified_name(running(r).func)}'" else "it"
 
-    // A struct's `invariant` clauses are a function the compiler made from them, and run wherever a
-    // value of the struct is made -- so they run here too.
-    if !r.a.tables.const_fns.has(name) && !name.ends_with(s"${ModuleSep}inv")
-        refuse_form(r, at, s"$caller calls '${qualified_name(name)}', which is not 'const'")
-        return None
-    end if
+    // A function nobody marked runs where its body can. A struct's `invariant` clauses are a
+    // function the compiler made from them, and run wherever a value of the struct is made -- so they
+    // run here too.
+    if !name.ends_with(s"${ModuleSep}inv")
+        val why = evaluable_refusal(r.a, name)
 
-    if r.a.tables.members.func_origin.has(name) && !r.a.tables.members.const_insts.has(name)
-        refuse_form(r, at, s"'${qualified_name(name)}' is an instance of a generic 'const' function, and " +
-                    "those are not evaluated while compiling yet")
-        return None
+        if why.is_some()
+            refuse_form(r, at, s"$caller calls '${qualified_name(callee_origin(r.a, name))}', " +
+                        chained_reason(why.unwrap()))
+            return None
+        end if
     end if
 
     // The loop is found inside the reading of the body, which is a trial whose complaints are taken
@@ -2326,23 +3711,26 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
 
     r.frames.truncate(r.frames.len() - 1)
 
-    // A slice of the call's own storage would outlive it: the program's run keeps that storage alive
-    // on the heap, and a run while compiling has no heap to keep it on.
+    // A slice of the call's own storage would outlive it: the program's run moves that storage to
+    // the heap where the slice escapes, which the evaluation does not follow. A pointer to it would
+    // name storage that is gone, as it does when the program runs.
     val dangling = out match
         EvGave(v) -> dangles(v, depth)
         _ -> false
 
     if dangling then
-        return refuse_form(r, at, s"'${qualified_name(name)}' answers a slice of storage local to its call, " +
-                           "which ends when the call returns — a slice answered while compiling may view " +
-                           "only what its caller handed in, or module storage")
+        return refuse_form(r, at, s"'${qualified_name(name)}' answers a slice of, or a pointer to, storage " +
+                           "local to its call, which ends when the call returns — what is answered while " +
+                           "compiling may reach only what its caller handed in, the heap, or module storage")
 
     // A call handed a slice is not remembered: what it reads is wherever the slice points, which a
     // later call with an equal-looking slice need not find the same.
     if key == "" then return out
 
+    // Nor is one that answered storage -- a box, or a slice of fresh elements: each call makes its
+    // own, and two callers handed one would see each other's writes.
     out match
-        EvGave(v) -> r.a.evaluation.memo.put(key, Some(v))
+        EvGave(v) -> if !holds_view(v) then r.a.evaluation.memo.put(key, Some(v))
         EvNone -> r.a.evaluation.memo.put(key, None)
         _ -> ()
 
@@ -2382,7 +3770,7 @@ private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
     val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
 
     for i in 0..<f.params.len()
-        frame.locals.put(f.params.at(i).0, copied(vals.at(i)))
+        frame.locals.put(f.params.at(i).0, cell_of(copied(vals.at(i))))
 
     Ok(frame)
 end entered
@@ -2502,6 +3890,13 @@ private key_part(v: Const) -> string = v match
     ConstRecord(variant, fields) -> key_part(ConstInt(from_int(long(variant)))) + key_part(ConstArray(fields))
     // Never part of a key either: a call handed a writer writes through it.
     ConstWriter(_) -> "w"
+    // An address is the storage or function it names: two calls handed the same one answer alike.
+    ConstLink(image) -> s"&${link_key(image)};"
+    // Never part of a key: a call handed a pointer reads, and may write, wherever it points.
+    ConstPtr(_, _, _) -> "p"
+    ConstUnset -> "u"
+    ConstPun(_, _) -> "p"
+    ConstErased(_, _) -> "e"
 
 // A float's own pattern, a NaN's included, so that two arguments differing in a bit are two runs.
 private float_pattern_exact(f: real) -> u64 = f.bits()
@@ -2669,11 +4064,15 @@ private variant_check(r: &EvRun, slot: string, e: TExpr) -> Flow
     EvNone
 end variant_check
 
-// Where a write lands: a local, or one element of an array or field of a struct a local holds, at any
-// depth -- an element and a field are both a position in a buffer of values.
+// Where a write lands: a position in a buffer of values -- a local's cell, an element of an array or
+// a slice, a field of a struct, a box's value -- at any depth, with the depth of the call whose
+// storage it is (-1 for the heap); or a local not written yet. A union's field is a slot of its own:
+// a write into it changes which field the union was last written through, which is part of the
+// union's value and so lands in the slot that holds the union.
 private enum EvSlot
     SlotLocal(name: string)
-    SlotElem(elems: Buf[Const], at: usize)
+    SlotElem(elems: Buf[Const], at: usize, owner: int)
+    SlotUnion(holder: &EvSlot, fields: Buf[Const], written: int, at: usize, ty: Type)
 end EvSlot
 
 // The slot a place names, its indices worked out: a local, an element, a field, at any depth.
@@ -2682,58 +4081,119 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
     if r.frames.is_empty() then return Err(no_place(r, place))
 
     *place.kind match
-        TLoad(name, _) -> Ok(SlotLocal(name))
+        TLoad(name, _) ->
+            val cell = running(r).locals.get(name)
+
+            if cell.is_some() then Ok(SlotElem(cell.unwrap(), 0, int(r.frames.len()) - 1))
+            else Ok(SlotLocal(name))
         TIndex(receiver, index, _) ->
-            val held = slot_of(r, receiver) match
-                Ok(s) -> slot_value(r, receiver.span, s)
+            // An index through a pointer counts from the slot it points at, in the buffer that slot
+            // is in: `p[i]` is the element `i` past `*p`.
+            nameless(texpr_type(receiver)) match
+                Ptr(_) ->
+                    return eval_value(r, receiver) match
+                        Ok(ConstPtr(xs, at, owner)) ->
+                            element_index(r, index, xs.len() - at).map(i -> SlotElem(xs, at + i, owner))
+                        Ok(v) -> Err(through_unowned(r, receiver.span, v))
+                        Err(f) -> Err(f)
+                _ -> ()
+
+            val outer = slot_of(r, receiver) match
+                Ok(s) -> s
                 Err(f) -> return Err(f)
 
-            // A slice's element is a place in the array it views.
-            val (xs, lo, n) = held match
-                Ok(ConstArray(found)) -> (found, usize(0), found.len())
-                Ok(ConstView(found, from, count, _)) -> (found, from, count)
+            // A slice's element is a place in the array it views, and the slice's owner is the
+            // element's.
+            val (xs, lo, n, owner) = slot_value(r, receiver.span, outer) match
+                Ok(ConstArray(found)) -> (found, usize(0), found.len(), slot_owner(outer))
+                Ok(ConstView(found, from, count, whose)) -> (found, from, count, whose)
                 Ok(_) -> return Err(no_place(r, place))
                 Err(f) -> return Err(f)
 
-            element_index(r, index, n).map(i -> SlotElem(xs, lo + i))
+            element_index(r, index, n).map(i -> SlotElem(xs, lo + i, owner))
         // A field is a slot in the struct's own fields, so a write into it lands where it is held.
         TField(receiver, index, _) ->
-            val held = slot_of(r, receiver) match
-                Ok(s) -> slot_value(r, receiver.span, s)
+            val outer = slot_of(r, receiver) match
+                Ok(s) -> s
                 Err(f) -> return Err(f)
 
-            held match
-                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index)))
+            slot_value(r, receiver.span, outer) match
+                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index), slot_owner(outer)))
+                Ok(ConstRecord(v, fields)) if v <= -2 ->
+                    Ok(SlotUnion(outer, fields, union_written(v), usize(index), texpr_type(receiver)))
                 Ok(_) -> Err(no_place(r, place))
                 Err(f) -> Err(f)
+        // What a pointer points at is the slot it names.
+        TDeref(operand, _) -> eval_value(r, operand) match
+            Ok(ConstPtr(xs, at, owner)) -> Ok(SlotElem(xs, at, owner))
+            Ok(v) -> Err(through_unowned(r, operand.span, v))
+            Err(f) -> Err(f)
         _ -> Err(no_place(r, place))
 end slot_of
 
+// Whose storage a slot is: the depth of the call that holds it, or -1 for the heap.
+private slot_owner(s: EvSlot) -> int = s match
+    SlotElem(_, _, owner) -> owner
+    SlotUnion(holder, _, _, _, _) -> slot_owner(*holder)
+    SlotLocal(_) -> -1
+
+// A read or write through a pointer the evaluation does not own: null is a trap, as it is where the
+// program runs; an address the linker fills in names storage that exists only then.
+private through_unowned(r: &EvRun, at: Span, v: Const) -> Flow = v match
+    ConstPun(_, as_was) ->
+        refuse_form(r, at, s"memory a '${type_show(*as_was)}' points at, read as another type, is not evaluated " +
+                    "while compiling — the evaluator holds values, not the bytes they are laid out in")
+    ConstLink(image) -> *image.kind match
+        TNullLit(_) -> trap(r, at, "a read or write through a null pointer")
+        _ -> refuse_form(r, at, link_reason())
+    _ -> refuse_form(r, at, link_reason())
+
 // What a slot holds now.
 private slot_value(r: &EvRun, at: Span, s: EvSlot) -> Result[Const, Flow] = s match
-    SlotLocal(name) ->
-        val v = running(r).locals.get(name)
+    SlotLocal(name) -> Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
+    SlotElem(xs, i, _) -> placed(r, at, xs.at(i)) match
+        EvGave(v) -> Ok(v)
+        f -> Err(f)
+    SlotUnion(_, xs, written, i, ty) ->
+        if written == int(i) then Ok(xs.at(i))
+        else Err(refuse_form(r, at, union_cross_read(ty, written, int(i))))
 
-        if v.is_some() then Ok(v.unwrap())
-        else Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
-    SlotElem(xs, i) -> Ok(xs.at(i))
-
-// A value written into a slot, as a copy of its own.
-private slot_write(r: &EvRun, s: EvSlot, v: Const) = s match
+// A value written into a slot, as a copy of its own. A union written through a field is the union
+// built with that field.
+private slot_write(r: &EvRun, s: EvSlot, v: Const) -> unit = s match
     SlotLocal(name) -> assign(r, name, v)
-    SlotElem(xs, i) ->
+    SlotElem(xs, i, _) -> written_over(xs, i, v)
+    SlotUnion(holder, xs, _, i, _) ->
         var held = xs
 
         held.set(i, copied(v))
+        slot_write(r, *holder, ConstRecord(union_variant(int(i)), xs))
 
 private assign(r: &EvRun, name: string, v: Const)
     val frame = r.frames.at(r.frames.len() - 1)
-    val old = frame.locals.get(name)
+    val cell = frame.locals.get(name)
 
-    if old.is_some() && overwrite(old.unwrap(), v) then return
-
-    frame.locals.put(name, copied(v))
+    if cell.is_some() then written_over(cell.unwrap(), 0, v) else frame.locals.put(name, cell_of(copied(v)))
 end assign
+
+// A value written into slot `i` of a buffer of values: in the storage already there where the two
+// have the same shape, so a slice or a pointer taken into the old value sees the new one, as the
+// program's would; as a copy of its own where they do not.
+private written_over(xs: Buf[Const], i: usize, v: Const)
+    if overwrite(xs.at(i), v) then return
+
+    var held = xs
+
+    held.set(i, copied(v))
+end written_over
+
+// A local's cell, holding its first value.
+private cell_of(v: Const) -> Buf[Const]
+    var out: Buf[Const] = buf()
+
+    out.push(v)
+    out
+end cell_of
 
 private no_place(r: &EvRun, place: TExpr) -> Flow =
     refuse_form(r, place.span, "a write into anything but a local, an element or a field is not evaluated " +
@@ -3074,6 +4534,37 @@ private ev_while(r: &EvRun, at: Span, cond: Buf[TCondTerm], body: Buf[TStmt],
             TurnDone(v) -> return left(r, gave(v))
             TurnOut(f) -> return left(r, f)
 end ev_while
+
+// `for x in c` over a type that walks itself: the cursor `walk` answered kept in a local of its own,
+// and each turn the element its `next` gives, bound by the pattern -- the loop ending where `next`
+// answers what the pattern does not take.
+@noinline
+private ev_iterate(r: &EvRun, at: Span, cursor: string, init: TExpr, next: TExpr, bind: TPattern,
+                   body: Buf[TStmt], else_block: Option[TBlock]) -> Flow
+    val start = eval_value(r, init) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    r.frames.at(r.frames.len() - 1).locals.put(cursor, cell_of(copied(start)))
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        val item = eval_value(r, next) match
+            Ok(x) -> x
+            Err(f) -> return left(r, f)
+
+        matches(r, bind, item) match
+            Ok(true) -> ()
+            Ok(false) -> return ran_out(r, else_block)
+            Err(f) -> return left(r, f)
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+end ev_iterate
 
 @noinline
 private ev_do_while(r: &EvRun, at: Span, body: Buf[TStmt], cond: TExpr,

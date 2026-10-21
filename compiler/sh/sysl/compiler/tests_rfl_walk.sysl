@@ -1,0 +1,456 @@
+module sh.sysl.compiler
+@tests
+
+// **`for const` over a type's make-up** (`type_reflect.sysl`): `for const f in T::Fields` and
+// `for const c in T::Variants` unroll once per part, the name standing at that part's descriptor.
+// `f.name` and its siblings fold, `v.(f)` selects the field (and is a place), `f::Type` is its type
+// wherever a type is written, and over a variant `x is c`, `x.(c)` and `T::Make(c, payload)` test,
+// take apart and build it.
+
+private rfl_walk_types() -> string = raw"""
+    struct P
+        x: int
+        y: string
+        private z: bool
+
+    struct Q
+        a: int
+        b: u8
+        c: i64
+
+    enum Shape
+        Circle(r: int)
+        Rect(w: int, h: int)
+        Empty
+
+    struct Wire
+        tag: usize
+        a: int
+        b: int
+
+    """
+
+@test("a generic field printer walks a struct's fields and a tuple's parts, each copy typed on its own")
+rfl_walk_prints_fields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        show[T](v: T) -> string
+            var out = ""
+
+            for const f in T::Fields
+                if f.index > 0 then out = out + ", "
+                out = out + s"${f.name}=${v.(f)}"
+
+            out
+
+        print(show(P(1, "a", true)))
+        print(show((7, 'q')))
+        print(show((2.5, "s", false)))
+        """), "x=1, y=a, z=true\n0=7, 1=q\n0=2.5, 1=s, 2=false\n")
+end rfl_walk_prints_fields
+
+@test("a descriptor's name, index, offset and publicity fold in an 'if const' and an '@assert'")
+rfl_walk_descriptor_folds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        public_names[T]() -> string
+            var out = ""
+
+            for const f in T::Fields
+                if const f.public
+                    out = out + f.name
+
+                @assert(f.index < 3, "three at most")
+
+            out
+
+        offsets[T]() -> string
+            var out = ""
+
+            for const f in T::Fields
+                val d: sysl.reflect.Field = f
+
+                out = out + s"${d.name}@${f.offset} "
+
+            out
+
+        print(public_names[P](), offsets[Q]())
+        """), "xy a@0 b@4 c@8 \n")
+
+    val wrong = enm_outcome(rfl_walk_types() + raw"""
+        check[T]()
+            for const f in T::Fields
+                @assert(f.index < 2, "two at most")
+
+        check[P]()
+        """).0
+
+    assert(wrong.contains("assertion failed: two at most"), wrong)
+    assert(wrong.contains("f = P.z, f::Type = bool (in the copy for field 'P.z')"), wrong)
+end rfl_walk_descriptor_folds
+
+@test("'out.(f) = …' writes each field of a value built field by field")
+rfl_walk_builds_field_by_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        copy_of[T](src: T) -> T
+            var out: T
+
+            for const f in T::Fields
+                out.(f) = src.(f)
+
+            out
+
+        // A field the walk skips keeps the zero 'var out: T' started it at.
+        partial[T](src: T) -> T
+            var out: T
+
+            for const f in T::Fields
+                if const f.name != "y"
+                    out.(f) = src.(f)
+
+            out
+
+        val c = copy_of(P(2, "b", true))
+        val p = partial(P(3, "c", true))
+        val t = copy_of((1, "two"))
+
+        print(c.x, c.y, p.x, p.y.len, t.1)
+        """), "2 b 3 0 two\n")
+end rfl_walk_builds_field_by_field
+
+@test("'f::Type' is the field's type in a declaration, in 'sizeof' and as a type argument")
+rfl_walk_field_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        twice[U](u: U) -> (U, U) = (u, u)
+
+        sizes[T](v: T) -> string
+            var out = ""
+
+            for const f in T::Fields
+                val held: f::Type = v.(f)
+                val pair = twice[f::Type](held)
+
+                out = out + s"${f.name}:${sizeof(f::Type)}:${pair.1} "
+
+            out
+
+        print(sizes(Q(1, 2, 3)))
+        """), "a:4:1 b:1:2 c:8:3 \n")
+end rfl_walk_field_type
+
+@test("a data enum round-trips through 'x is c', 'x.(c)', 'c::Fields', 'c::Payload' and 'T::Make'")
+rfl_walk_enum_round_trip()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        encode[E](x: E) -> Wire
+            var w = Wire(0, 0, 0)
+
+            for const c in E::Variants
+                if x is c
+                    w.tag = c.index
+
+                    val p = x.(c)
+
+                    for const f in c::Fields
+                        if const f.index == 0 then w.a = p.(f) else w.b = p.(f)
+
+            w
+
+        decode[E](w: Wire) -> Option[E]
+            for const c in E::Variants
+                if w.tag == c.index
+                    var p: c::Payload
+
+                    for const f in c::Fields
+                        if const f.index == 0 then p.(f) = w.a else p.(f) = w.b
+
+                    return Some(E::Make(c, p))
+
+            None
+
+        describe(s: Shape) -> string = s match
+            Circle(r) -> s"Circle $r"
+            Rect(w, h) -> s"Rect $w $h"
+            Empty -> "Empty"
+
+        payload_names[E]() -> string
+            var out = ""
+
+            for const c in E::Variants
+                out = out + s"${c.name}:${c::Fields.len}"
+
+                for const f in c::Fields
+                    out = out + s".${f.name}"
+
+                out = out + " "
+
+            out
+
+        val shapes: []const Shape = [Shape.Circle(3), Shape.Rect(4, 5), Shape.Empty]
+
+        for s in shapes
+            val w = encode(s)
+
+            print(w.tag, w.a, w.b, describe(decode[Shape](w).unwrap()))
+
+        print(payload_names[Shape]())
+        """), "0 3 0 Circle 3\n1 4 5 Rect 4 5\n2 0 0 Empty\nCircle:1.r Rect:2.w.h Empty:0 \n")
+end rfl_walk_enum_round_trip
+
+@test("'x.(c)' traps when the value holds another variant, naming both variants and where")
+rfl_walk_payload_traps_on_another_variant()
+    if !enm_ready() then return
+
+    val out = enm_outcome(rfl_walk_types() + raw"""
+        radius[E](x: E) -> int
+            var out = 0
+
+            for const c in E::Variants
+                if const c.name == "Circle"
+                    out = x.(c)
+
+            out
+
+        print(radius(Shape.Circle(7)))
+        print(radius(Shape.Empty))
+        print("not reached")
+        """)
+
+    assert(!out.1, out.0)
+    // The location names the file by the temporary directory the program was built in.
+    assert(out.0.starts_with("7\nvariant 'Shape.Circle' was asked for, and the value is 'Shape.Empty' ("), out.0)
+    assert(out.0.ends_with("/main.sysl:26:22)\n"), out.0)
+end rfl_walk_payload_traps_on_another_variant
+
+@test("'x.(c)' on another variant while compiling stops the evaluation with the same words")
+rfl_walk_payload_traps_while_compiling()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        enum Shape
+            Dot
+            Circle(r: int)
+
+        const radius(s: Shape) -> int
+            for const c in Shape::Variants
+                if const c.name == "Circle" then return s.(c)
+
+            -1
+
+        const R: int = radius(Shape.Dot)
+
+        print(R)
+        """), ["'R' traps while it is being compiled: variant 'Shape.Circle' was asked for, and the value " +
+               "is 'Shape.Dot'"])
+end rfl_walk_payload_traps_while_compiling
+
+@test("'v.(f)' reaches a private field in the type's own file and is refused from another")
+rfl_walk_private_field_reach()
+    if !azb_ready() then return
+
+    val secret = raw"""
+        struct Secret
+            shown: int
+            private hidden: int
+
+        make_secret() -> Secret = Secret(1, 2)
+
+        dump_here(s: Secret) -> string
+            var out = ""
+
+            for const f in Secret::Fields
+                out = out + s"${s.(f)} "
+
+            out
+
+        """
+
+    azb_prints([("", "secret.sysl", secret),
+                ("", "main.sysl", "print(dump_here(make_secret()))\n")], "1 2 \n")
+
+    azb_refused([("", "secret.sysl", secret),
+                 ("", "main.sysl", raw"""
+                     dump[T](v: T) -> string
+                         var out = ""
+
+                         for const f in T::Fields
+                             out = out + s"${v.(f)} "
+
+                         out
+
+                     print(dump(make_secret()))
+                     """)],
+                ["field 'hidden' of 'Secret' is", "(in the copy for field 'Secret.hidden')"])
+end rfl_walk_private_field_reach
+
+@test("a descriptor used where it does not fit is refused, naming the descriptor and the copy")
+rfl_walk_descriptor_misuse()
+    if !enm_ready() then return
+
+    val literal = enm_outcome(rfl_walk_types() + "val p = P(1, \"a\", true)\nprint(p.(3))\n")
+
+    assert(literal.0.contains("'.( )' selects with a descriptor a 'for const' binds"), literal.0)
+
+    val plain = enm_outcome(rfl_walk_types() + "val p = P(1, \"a\", true)\nval n = 0\nprint(p.(n))\n")
+
+    assert(plain.0.contains("'n' is not a descriptor here"), plain.0)
+
+    val other = enm_outcome(rfl_walk_types() + raw"""
+        val q = Q(1, 2, 3)
+
+        for const f in P::Fields
+            print(q.(f))
+        """)
+
+    assert(other.0.contains("'f' is the field 'P.x', which a value of 'P' holds, and this is a " +
+                            "value of 'Q' (in the copy for field 'P.x')"), other.0)
+
+    val typed = enm_outcome(rfl_walk_types() + raw"""
+        sum[T](v: T) -> int
+            var n = 0
+
+            for const f in T::Fields
+                n = n + v.(f)
+
+            n
+
+        print(sum(Q(1, 2, 3)), sum(P(1, "a", true)))
+        """)
+
+    assert(typed.0.contains("(in the copy for field 'P.y')"), typed.0)
+    assert(!typed.0.contains("(in the copy for field 'P.x')"), typed.0)
+
+    val pattern = enm_outcome(rfl_walk_types() + raw"""
+        val s = Shape.Empty
+
+        for const f in Q::Fields
+            if s is f then print(1)
+        """)
+
+    assert(pattern.0.contains("'f' is the field 'Q.a', and a pattern tests a variant"), pattern.0)
+
+    val payload = enm_outcome(rfl_walk_types() + raw"""
+        for const c in Shape::Variants
+            print(describe(Shape::Make(c, "no")))
+
+        describe(s: Shape) -> string = "?"
+        """)
+
+    assert(payload.0.contains("'Circle' is built from its payload, a value of 'int', and this is a value of 'string'"),
+           payload.0)
+
+    val as_type = enm_outcome(rfl_walk_types() + raw"""
+        for const f in Q::Fields
+            var x: f = 0
+        """)
+
+    assert(as_type.0.contains("'f' is a descriptor a 'for const' binds, not a type — the type of " +
+                              "the field it stands at is 'f::Type'"), as_type.0)
+
+    val no_fields = enm_outcome(rfl_walk_types() + raw"""
+        for const f in int::Fields
+            print(1)
+        """)
+
+    assert(no_fields.0.contains("'int::Fields' lists the fields of a struct, a tuple or a union"),
+           no_fields.0)
+
+    val field_payload = enm_outcome(rfl_walk_types() + raw"""
+        for const f in Q::Fields
+            var x: f::Payload
+        """)
+
+    assert(field_payload.0.contains("'f' is the descriptor 'Q.a', which answers '::Type', the " +
+                                    "field's type, and not '::Payload'"), field_payload.0)
+
+    val variant_type = enm_outcome(rfl_walk_types() + raw"""
+        for const c in Shape::Variants
+            var x: c::Type
+        """)
+
+    assert(variant_type.0.contains("'c' is the descriptor 'Shape.Circle', which answers '::Fields', " +
+                                   "its payload's fields, and '::Payload', its payload's type, and " +
+                                   "not '::Type'"), variant_type.0)
+
+    val payload_value = enm_outcome(rfl_walk_types() + raw"""
+        for const c in Shape::Variants
+            print(c::Payload)
+        """)
+
+    assert(payload_value.0.contains("'c::Payload' is a type, so it stands where a type is written"),
+           payload_value.0)
+
+    val outside = enm_outcome(rfl_walk_types() + raw"""
+        decode[T]() -> int
+            var p: T::Payload
+            0
+
+        print(decode[Shape]())
+        """)
+
+    assert(outside.0.contains("Payload"), outside.0)
+    assert(!outside.1, outside.0)
+end rfl_walk_descriptor_misuse
+
+@test("'c::Payload' is unit, the one field's type, or the tuple of the fields, and 'p.(f)' writes it")
+rfl_walk_payload_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rfl_walk_types() + raw"""
+        enum Mixed
+            Pair(a: u8, b: i64)
+            One(x: i16)
+            Nothing
+
+        sizes[E]() -> string
+            var out = ""
+
+            for const c in E::Variants
+                var p: c::Payload
+
+                for const f in c::Fields
+                    p.(f) = if const f.index == 0 then 1 else 2
+
+                out = out + s"${c.name}:${sizeof(c::Payload)}:${describe(E::Make(c, p))} "
+
+            out
+
+        describe(m: Mixed) -> string = m match
+            Pair(a, b) -> s"$a/$b"
+            One(x) -> s"$x"
+            Nothing -> "-"
+
+        print(sizes[Mixed]())
+        """), "Pair:16:1/2 One:2:1 Nothing:0:- \n")
+end rfl_walk_payload_type
+
+@test("a projection off a type parameter is a type argument, as it is a type anywhere else")
+rfl_walk_projection_type_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Holder
+            type Item
+            get(self) -> Self::Item
+
+        struct IntBox
+            v: int
+
+        impl Holder for IntBox
+            type Item = int
+            get(self) -> int = self.v
+
+        ident[U](u: U) -> U = u
+
+        first[H: Holder](h: H) -> H::Item = ident[H::Item](h.get())
+
+        print(first(IntBox(5)))
+        """), "5\n")
+end rfl_walk_projection_type_argument

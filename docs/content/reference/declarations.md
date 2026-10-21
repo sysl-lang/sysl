@@ -17,12 +17,84 @@ where it lives.
 |---|---|---|---|
 | `var name = v` | yes | optional — a `var` may be declared and assigned later | optional |
 | `val name = v` | no, written once | **required** | optional |
-| `const Name: T = v` | no, and known while compiling | required | **required** |
+| `const Name = v` | no, and known while compiling | required | optional |
 
-The type is mandatory on a `const` and optional on a `val`, and that arrangement is deliberate in
-both directions. A `const` states an interface — its value is substituted where it is used, so what
-that value *is* matters less than what it is a value **of**. A `val` has its type readable off the
-value it was given, and a `val` with no value is not a declaration of anything.
+**A `const` takes its type exactly as a `val` does**: left off, the type is the value's own —
+`const Step = 2` is an `int`, `const Greeting = "hello"` a `string`, `const Area = sq(3)` whatever
+`sq` answers. Written, `const Name: T = v`, the type governs: the value is read at `T`, and refused
+where `T` does not hold it. A `val` or a `const` with no value is not a declaration of anything.
+
+```sysl
+const Step = 2
+const Greeting = "hello"
+const Half: real = 1
+
+sq(x: int) -> int = x * x
+
+const Area = sq(Step + 1)
+
+var cells: [Area]u8
+
+print(Step * 10, Greeting, Half / 4, Area, cells.len)
+```
+
+```output
+20 hello 0.25 9 9
+```
+
+```sysl
+const Limit: u8 = 300
+```
+
+```error
+'Limit' does not fit byte: 300
+```
+
+### A `const` inside a body
+
+A `const` may be written inside a body too. Its value is computed **while compiling**, where it is
+written, and every use of the name is that value — so it stands wherever a constant is wanted: an
+array length, a value argument, a pattern, an `@assert`. It belongs to its block, as a `val` does,
+and may read a value parameter, another constant, and any function whose body can run:
+
+```sysl
+sq(x: int) -> int = x * x
+
+twice[const N: usize]() -> usize
+    const D: usize = N * 2
+    D + 1
+
+main()
+    const L = sq(6)
+    var a: [L]int
+
+    print(L, a.len, twice[4](), twice[L]())
+```
+
+```output
+36 36 9 73
+```
+
+That last call is the point of it: `twice[L]()` hands `L` to a value parameter, which a `val` could
+not be. A `val` over the same call is computed when the program runs, unless the optimiser folds it.
+
+**It reads nothing the body binds**, since a binding of the body holds a value only once the program
+runs:
+
+```sysl
+main()
+    var n = 3
+    const A: int = n + 1
+    print(A)
+```
+
+```error
+'A' is a constant, so its value is known while compiling, and it reads 'n', which the body binds and which holds a value only once the program runs. A name bound to such a value is a 'val'
+```
+
+Its type follows the rule for a module's `const` — [a scalar](/reference/modules/#const-a-value) —
+and a value its type does not admit is refused while compiling. It has no storage of its own, so
+nothing assigns to it and `&` does not reach it.
 
 ### The value may be an indented block
 
@@ -95,28 +167,92 @@ print(Limit)
 'Limit' is a 'const', so its value is folded into every use of it
 ```
 
-### A module member states its type
+### A literal binding takes its type from its first use
 
-Where a binding is a **member of a module** rather than a local, the annotation stops being optional
-even on a `val`. That is a rule about *where* the binding was written, so the grammar accepts either
-form and the analyzer applies the rule.
-
-It is worth reading as one rule rather than two, because it is one: **anything visible outside its
-file states its types**, and a module member always could be, while a local states nothing to anyone
-and so infers exactly as a `var` does. Most of it the syntax already enforced — a parameter type and
-a field type are mandatory, and an absent return type *means* `unit` rather than being inferred — so
-a module-level binding is simply the last declaration the rule had left to reach.
-
-**The payoff is that interface extraction is parse-only.** A file's exported surface can be read off
-its syntax tree without resolving a name, checking a body, or having compiled anything the file
-imports, which is what lets the collect pass depend on nothing but parsing — and that is what a fast,
-parallel, eventually incremental build rests on. Scala infers types for public members and pays for
-it with a far heavier extraction step; this is a deliberate divergence, and a cheap one here because
-sysl's signatures were already explicit for other reasons.
+A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
+its type from its **first use that fixes one**: a comparison with an operand that has a type of its
+own, an assignment of such a value or into a typed place, an argument, an index, a `return` or the
+body's result. A counter compared with a length is a `usize`, and an index read with it needs no
+conversion:
 
 ```sysl
-const Limit: int = 3
-static val Scale: int = 2
+val xs = [10, 20, 30]
+val first = 0
+var i = 0
+
+while i < xs.len
+    print(xs[i])
+    i += 1
+
+print(first < xs.len, i)
+```
+
+```output
+10
+20
+30
+true 3
+```
+
+**Arithmetic fixes nothing.** In `sum + b` the binding keeps its default and the typed operand widens
+to it, exactly as though the default had been written. Nor does a conversion: `u8(n)` converts `n`
+from what it is rather than deciding it. A binding no use fixes has the literal's
+default: `int`, or `real` for a float literal. A use whose type cannot hold the literal — `300` handed
+to a `u8` — fixes nothing either, and is refused as it would be with `int` written. An integer
+literal is fixed at a float type where it holds the value exactly. A use inside a closure or a nested
+function is a use like any other.
+
+```sysl
+half(x: f32) -> f32 = x / 2
+
+var sum = 250
+val b: u8 = 10
+var h = 3
+
+print(sum + b, half(h), h / 2)
+```
+
+```output
+260 1.5 1.5
+```
+
+**The first such use decides**, and a later use that disagrees is told exactly as it would be had the
+type been written on the declaration:
+
+```sysl
+wide(n: usize) -> usize = n
+narrow(n: u8) -> u8 = n
+
+var i = 0
+
+print(wide(i))
+print(narrow(i))
+```
+
+```error
+'n' of 'narrow' is byte, but usize was given
+```
+
+### A module member takes its type as a local does
+
+A **member of a module** may leave its type off as a local may: `val limit = 10` is an `int`
+wherever it is declared, `val name = "sysl"` a `string`, and `val area = square(6)` whatever `square`
+returns. A module member's literal is its default, `int` or `real`: its uses are spread across the
+module, so no one of them is first. Where the type is written it governs, and the value is read against it — `val ratio: real =
+3` is a `real` three. A `const` follows the same rule, and so does module storage written with `var`
+— `static var ticks = 0` is an `int` the program may write. Only a `var` with **no initializer**
+states its type, since there is no value to read one off and it starts at its type's zero.
+
+The type is the initializer's wherever the name is read — in a body, in another `val`'s initializer
+above or below it, in another file of the module, or in a program built against a library that exports
+it — and `sysl doc` shows the declaration as it was written. What the value is decides, as it always
+did, whether the storage is laid into the object file or filled before the first statement.
+
+```sysl
+const Limit = 3
+static val Scale = 2
+static val Ratio: real = 3
+static var calls = 0
 
 show()
     var count = 0
@@ -124,20 +260,40 @@ show()
     val name = "sysl"
 
     count += 1
+    calls += 1
 
-    print(count, doubled, name, Limit)
+    print(count, doubled, name, Ratio / 2, calls)
 
+show()
 show()
 ```
 
 ```output
-1 6 sysl 3
+1 6 sysl 1.5 1
+1 6 sysl 1.5 2
 ```
 
-The two `val`s in that program are one keyword doing one thing: the module member says `: int`
-because it is visible outside its file, and the one inside `show` is visible to nobody and does not
-have to. The `static` is what asks for the member — this is the file the program starts in, so a plain
-`val` there would be a local of its body, and a local infers exactly as a `var` does.
+The `static` is what asks for the member — this is the file the program starts in, so a plain `val`
+there would be a local of its body.
+
+**Two values give a module `val` or `var` no type to take.** One whose initializer reaches the
+storage itself has nothing to read the type from first, and one whose value is a bare closure has a
+type with no name for storage to be declared at — a function is the declaration for that:
+
+```sysl
+static val a = b + 1
+static val b = a + 1
+
+print(a)
+```
+
+```error
+'a' takes its type from its value, and the value reaches 'a' again — write its type, 'val a: T = …'
+```
+
+A loop is one mistake and is reported once, at the declaration it is named by: storage refused a
+type for it is not refused again for the order it would run in, and a binding that names several
+things is reported once for the binding, however many of its names the value reaches.
 
 **A module-level `val` may hold a counted value, and never releases it.** Storage that exists for the
 whole run is never let go of, so the one release with nowhere to go is the one at exit — and not
@@ -289,9 +445,27 @@ binding with nothing to take apart names nothing. The right side is produced bef
 bound, so a value there still means whatever the enclosing scope calls it — the binding does not
 shadow itself half way through its own right-hand side.
 
-**It is a local form.** The parts carry no type annotation and there is nowhere to write one, so a
-multiple `val` at the top of a file collides with the rule above and is refused rather than becoming
-a quiet local of the entry point. A module member that wants the form declares its names separately.
+**A module takes it too**, since module storage takes its type as a local does: each name is a module
+`val` — or, written with `var`, module storage — of its part's type, read from the module's
+functions, its other files and the modules that import it like any other. A list of values is shared
+out one each, so a part over a constant is constant data; one value taken apart is computed once,
+however many names it gives. Each name a `var` binds is storage of its own, written without touching
+the others.
+
+```sysl
+static val width, height = 640, 480
+static val q, r = halves(17)
+
+halves(n: int) -> (int, int) = (n / 2, n % 2)
+
+area() -> int = width * height
+
+print(area(), q, r)
+```
+
+```output
+307200 8 1
+```
 
 The same spelling also takes a **result list** and a **tuple** apart, which is why a function with
 several results needs no special form at the call.
@@ -399,8 +573,23 @@ show()
 cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
 ```
 
-Like the comma form, this is **a local form**, so one at the top of a file is refused rather than
-becoming a quiet local of the entry point.
+Like the comma form, it **is a module `val` per name** at the top of a file — module storage per name,
+written with `var` — and a type written for the whole value governs there as it does here:
+
+```sysl
+static val (lo, hi): (u8, u16) = (1, 300)
+static var (count, limit): (u8, u16) = (0, 2)
+
+span() -> u16 = hi - u16(lo)
+
+count += 1
+limit *= 100
+print(lo, hi, span(), count, limit)
+```
+
+```output
+1 300 299 1 200
+```
 
 The same pattern stands in a
 [`for` header](/reference/statements/#the-loop-variable-may-be-a-pattern), where it takes the element
@@ -409,13 +598,13 @@ apart as the loop hands it over.
 ## Functions
 
 A name, a parameter list, an optional `-> result`, and a body. There is no keyword: the shape is what
-identifies it. An absent result type means `unit`.
+identifies it.
 
 The body is either `= expr` — whose value is the result — or an indented block, whose **trailing
 expression** is the result.
 
 ```sysl
-double(n: int) -> int = n * 2
+double(n: int) = n * 2
 
 sum(a: int, b: int) -> int
     var t = a + b
@@ -436,6 +625,131 @@ hi you
 
 `= ` may also open an indented block, so a body does not have to change shape when it outgrows a
 line.
+
+### The result type
+
+**A body written `= value` with no `-> T` takes the value's type**, exactly as a `val` written with
+no type takes its initializer's. A body that is an indented block with no `=` and no `-> T` hands back
+nothing: its result is `unit`, and the value its last line comes to is discarded.
+
+```sysl
+twice(x: int) = x * 2
+name() = "sysl"
+pair[T](x: T) = (x, x)
+area(w: int, h: int) =
+    val inner = w * h
+
+    inner + 1
+
+shout(word: string) = print(word + "!")
+
+tally()
+    42
+
+print(twice(21) + 1, name(), pair(2.5).1, area(3, 4))
+shout("hey")
+print(tally() == ())
+```
+
+```output
+43 sysl 2.5 13
+hey!
+true
+```
+
+A generic function's result is the body's type in terms of its parameters, so `pair` above is
+`(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
+initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
+
+**A body that is an assignment written `=` is `unit`**, plain or compound, to a variable, a field or
+an element, because [that assignment is](/reference/expressions/#assignment): the store is what the
+function is for, so `bump() = count += 1` is `bump()`, not an `int` function. A body written `:=`
+hands back what it stored, and takes its type.
+
+```sysl
+var count = 0
+
+struct Light
+    on: bool
+
+    switch_on(*self) = self.on = true
+
+bump() = count += 1
+reset_to(v: int) = count := v
+
+var lamp = Light(false)
+
+bump()
+lamp.switch_on()
+print(count, lamp.on, bump() == (), reset_to(10) + 1, count)
+```
+
+```output
+1 true true 11 10
+```
+
+Using such a call as a value is refused, since there is none:
+
+```sysl
+var count = 0
+
+bump() = count += 1
+
+val next: int = bump()
+```
+
+```error
+cannot initialize 'next': declared int but the value is unit
+```
+
+**The result is known wherever a written one would be.** A call above the declaration, in another
+file of the module, in another module, or through a library reads it, in any order. `sysl doc` and an
+editor's hover show the declaration at the type it was read as, exactly as though `-> T` were written
+— `twice(x: int) -> int`, and `shout(word: string)` with no arrow for a `unit` one — and never show
+the body. A signature whose result could not be read, in a tree that does not compile, is shown as
+`twice(x: int) = …`.
+
+**A body that reaches its own function before the result is known has no type to take**, directly or
+through another function that does the same, and is refused at the declaration. Writing the result on
+any one function of the loop settles it:
+
+```sysl
+fact(n: int) = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```error
+'fact' takes its result type from its body, and the body reaches 'fact' again — write its result type, 'fact(…) -> T'
+```
+
+```sysl
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```output
+120
+```
+
+The rest of what a result read off the body is held to:
+
+- **It is the signature's**, so it obeys the
+  [visibility rule](/reference/modules/#a-declaration-may-not-be-more-visible-than-the-types-it-names)
+  exactly as a written one does: a public function whose body yields a type private to its file is
+  refused at the declaration.
+- **A member of an `impl` block for a trait takes the trait's result.** The block is held to the
+  trait's signature, so `size(self) = 255` supplying a trait's `size(self) -> u8` is a `u8`, and its
+  body is read against it. A trait's own member states its result, since every implementation is held
+  to it: a default written `= value` with no `-> T` is `unit`.
+- **A `@test` function and a hook return nothing** whatever their `= value` comes to.
+- **C reads what an `@export` or `@convention` function hands back**, so one whose body yields a value
+  writes its result type; one whose body is `unit` need not.
+- **A body that hands back a bare closure is refused**: its type has no name for a signature to state,
+  so the function writes `-> &Fn(…) -> R`.
+- An `async` function's task is of its body's type, and a `const` function's value folds as a written
+  one's does.
 
 ### Tail calls
 
@@ -465,14 +779,53 @@ A tail call is a call, so the jump lands where a call would: **every `require` i
 the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
 its own precondition at depth four stops at depth four.
 
-Two things end a tail position instead of being optimized around:
+Three things end a tail position instead of being optimized around:
 
 - **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
   ordinary call, and before it is entered for a jump;
 - **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
-  returns.
+  returns;
+- **an argument that may point into the frame**. A jump reuses the frame: the locals are released on
+  the way to it, and the next round writes every slot again, so `&sub` handed down would be read
+  after `sub` was freed or written over. Where the body takes the address of its own storage
+  anywhere — `&` of a local, a parameter or a temporary, or a slice of a local array — a self-call
+  whose arguments can hold an address (a pointer, a slice, or a value made of one) stays a call. A
+  parameter passed on as it arrived — never written, its address never taken — is the caller's, and
+  does not count.
 
-Either one leaves the function compiled exactly as written.
+Any of them leaves the function compiled exactly as written:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct P
+    toks: Buf[string]
+    pos: usize
+
+decl(p: *P, base: string) -> string
+    if p.pos < p.toks.len() && p.toks[p.pos] == "*" then
+        p.pos += 1
+        return decl(p, base + "*")
+
+    if p.pos < p.toks.len() && p.toks[p.pos] == "("
+        var inner: Buf[string] = buf()
+        inner.push("*")
+        var sub = P(inner, 0)
+        return decl(&sub, base + "()")
+
+    base
+
+var toks: Buf[string] = buf()
+toks.push("(")
+var top = P(toks, 0)
+print(decl(&top, "void"))
+```
+
+```output
+void()*
+```
+
+The call that passes `&sub` keeps its frame, so `sub`'s buffer is alive while the callee reads it.
 
 It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
 calls, however they are written.
@@ -492,6 +845,29 @@ print(sum(5))
 
 ```error
 calls itself nowhere the jump can replace
+```
+
+A self-call in tail position that may hand down an address in the frame is refused with its own
+reason:
+
+```sysl
+struct S
+    n: int
+
+@tailrec
+walk(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    walk(&next, acc + s.n)
+
+var s = S(4)
+print(walk(&s, 0))
+```
+
+```error
+its tail call may pass an address in its own frame
 ```
 
 It changes nothing about what is emitted — write it on the functions where losing the jump silently
@@ -605,6 +981,60 @@ print(f(x))
 
 ```error
 counted value
+```
+
+**No argument may point into the frame being replaced.** The callee runs in the replaced frame's
+place, so `&` of a local, a parameter or a temporary — or a slice of a local array — would hand it
+storage that no longer exists. The test is the one a self tail call is held to: where the body takes
+the address of its own storage anywhere, an argument that can hold an address (a pointer, a slice,
+or a value made of one) is refused, unless it is one of the function's own parameters passed on as
+it arrived, which points at its caller's storage:
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    if s.n == 0 then return acc
+
+    var next = S(s.n - 1)
+
+    become g(&next, acc + s.n)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```error
+an argument may point into this frame
+```
+
+```sysl
+struct S
+    n: int
+
+f(s: *S, acc: int) -> int
+    var probe = S(0)
+    val seen = &probe
+
+    if s.n == 0 then return acc + seen.n
+
+    s.n -= 1
+
+    become g(s, acc + 1)
+
+g(s: *S, acc: int) -> int = f(s, acc)
+
+var s = S(4)
+
+print(f(&s, 0))
+```
+
+```output
+4
 ```
 
 The rest are the tail call's own, for the reasons `Tail calls` gives: an `ensures` is checked when a
@@ -834,11 +1264,10 @@ print(box(3), box(2, 2), box(2, fill = "#"))
 *** **** ##
 ```
 
-`name = value` is also a legal expression — assignment yields the value stored — so the two readings
-collide, and the named argument is the one taken. It applies only where the name is a bare
-identifier: `p.x = 1` and `b[i] = v` are stores as they always were, since neither is a name a
-parameter list could have written. A store to a plain variable is still reachable in an argument by
-parenthesizing it.
+An assignment written `=` yields nothing, so it is never an argument, and `name = value` there is
+always the named argument. A store whose value is passed on is written
+[`:=`](/reference/expressions/#assignment), which reads as no parameter's name: `f(n := 1)` stores to
+`n` and passes what it stored.
 
 A default is read at **the type its parameter declares**, so a value that says nothing about its own
 type needs no annotation beside it: written where an `Option[int]` is wanted, `None` is that
@@ -906,6 +1335,102 @@ anything calls it — while a conversion written at `T` is checked at each call,
 
 A **closure's** parameter declares no default. A call reaches a closure through the `Fn` traits,
 which carry the types and not the names, so there would be nothing at the call to fill one from.
+
+A **trait member's** defaults and parameter names are part of the trait's signature, so they reach
+every call made through it: through a bound on a type parameter (a method, an associated function, a
+`where` clause, an associated type's bound) and through a trait object, exactly as on the type that
+implements it. The default is the trait's on every path, which is why an `impl` block's member
+declares none — a call through an object or a bound has no implementation to read one from — and an
+implementation that replaces the member keeps the trait's.
+
+```sysl
+trait Greet
+    greet(self, n: int = 3, m: int = 10) -> int = n + m
+
+struct A
+    x: int
+
+impl Greet for A
+
+via[G: Greet](g: G) -> int = g.greet()
+named[G: Greet](g: G) -> int = g.greet(m = 100)
+obj(g: &Greet) -> int = g.greet(n = 0)
+
+print(A(1).greet(), via(A(1)), named(A(1)), obj(A(1)))
+```
+
+```output
+13 13 103 10
+```
+
+A trait's default may name **the trait's own type parameters**, and it is read at what the `impl`
+fixed them to — `f64` below, on every one of those paths. Where the `impl` is generic itself, at what
+each instantiation gives its parameter. The default is still held to the trait's bounds where it is
+written: `T.zero()` in a `trait Pad[T]` with no `Zero` among `T`'s bounds is refused, though every
+type that implements it might have a `zero`.
+
+```sysl
+trait Pad[T: Zero + Add]
+    pad(self, x: T, by: T = T.zero()) -> T = x + by
+
+struct A
+    x: int
+
+struct W[U]
+    u: U
+
+impl Pad[f64] for A
+impl[U: Zero + Add] Pad[U] for W[U]
+
+via[P: Pad[f64]](p: P) -> f64 = p.pad(2.5)
+obj(p: &Pad[f64]) -> f64 = p.pad(4.5)
+
+val n: int = W(3).pad(4)
+
+print(A(1).pad(1.5), via(A(1)), obj(A(1)), n)
+```
+
+```output
+1.5 2.5 4.5 4
+```
+
+```sysl
+trait Pad[T]
+    pad(self, x: T, by: T = T.zero()) -> T = x
+```
+
+```error
+'zero' needs 'T: sysl.Zero'
+```
+
+```sysl
+trait Greet
+    greet(self, n: int = 3) -> int = n
+
+struct A
+    x: int
+
+impl Greet for A
+    override greet(self, n: int = 5) -> int = n * 10
+```
+
+```error
+a member of an 'impl' block declares no default
+```
+
+A parameter that has no default is still owed through a bound, and the refusal names the trait's
+member, since that is the signature the call was read against:
+
+```sysl
+trait Greet
+    greet(self, n: int, m: int = 1) -> int = n + m
+
+via[G: Greet](g: G) -> int = g.greet(m = 2)
+```
+
+```error
+method 'Greet.greet' was given no value for 'n', and that parameter declares no default
+```
 
 ### A parameter may collect the rest of the call
 
@@ -1145,8 +1670,8 @@ different one are ambiguous, and saying so beats a ladder of precedences nobody 
 the source.
 
 **The one exception is a bare integer literal, which prefers the signed widening.** Where the
-candidates differ only at positions holding an integer literal with no suffix, and none takes it at
-`int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
+candidates differ only at positions holding an integer literal with no suffix, negated or not, and
+none takes it at `int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
 unsigned, a narrower signed or a float one, and among several the narrowest wins. Two unsigned
 candidates offer nothing signed and stay ambiguous. The rule is the same for a member several
 implementations of one trait answer, so `BigInt.from(3)` is its `From[long]`:
@@ -1163,6 +1688,47 @@ print(pick(3u64))
 long
 u64
 ```
+
+**Candidates tied only by bare literals take each literal at its default type.** Where every
+position the candidates differ at holds a numeric literal with no suffix, and no rule above has
+chosen, the candidate whose parameter at each of those positions is the literal's default wins. A
+float literal's default is `real`. An integer literal's default is `int` at an integer parameter and
+`real` at a float one, since an integer literal is read as the float its position expects. So
+`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one:
+
+```sysl
+import sysl.math.nextafter
+
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+print(scale(1.5, 2), scale(1, 2), scale(1.5f32, 2f32))
+print(nextafter(1.0, 2) > 1)
+```
+
+```output
+real real f32
+true
+```
+
+The call stays ambiguous where an argument with a type of its own is part of the tie, where no
+candidate takes the literals at their defaults (`f32` beside `f128` at `2`), and where two do
+(`(int, real)` beside `(real, int)` at `(2, 2)`):
+
+```sysl
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+val s: i16 = 3
+print(scale(s, 2))
+```
+
+```error
+'scale' is ambiguous here — 2 of its declarations take these arguments:
+```
+
+An operator choosing between implementations of its trait settles a literal operand the same way,
+so `x * 2` means what `x.mul(2)` means.
 
 **Exactness is asked of the types a candidate was fitted at, which for a generic one is what the call
 solved it to.** `g[T]` below takes the `[]int` at `T = []int`, as it was written; the other takes it
@@ -1244,6 +1810,107 @@ print(one(41), two(6, 7))
 42 13
 ```
 
+### Overloading a member
+
+**A type's own members overload by exactly the rules above.** A method or an associated function
+may be declared more than once in a type's body, and a call — `s.f(…)` or `S.make(…)` — means the
+one its arguments fit, with the same tie-breaks. The receiver is not part of what tells them apart:
+it is the same type in every one of them.
+
+```sysl
+struct S
+    n: int
+
+    f(self, x: int) -> int = x + self.n
+    f(self, x: string) -> int = int(x.len)
+    f(self, x: int, y: int) -> int = x * y
+    make(n: int) -> S = S(n)
+    make(s: string) -> S = S(int(s.len))
+
+val s = S.make("abcdefghij")
+print(s.f(1), s.f("abc"), s.f(3, 4), S.make(2).n)
+```
+
+```output
+11 3 12 2
+```
+
+**On a generic type the choice is made at the receiver's instantiation**, so a member taking `T`
+beside one taking `string` is two members on a `Box[int]` and the call picks by its arguments, in a
+generic body as well as outside one:
+
+```sysl
+struct Box[T]
+    v: T
+
+    put(self, x: T) -> string = "same"
+    put(self, x: string, y: int) -> string = "pair"
+
+g[T](b: Box[T], x: T) -> string = b.put(x)
+
+val b = Box(1)
+print(b.put(2), b.put("x", 3), g(b, 7))
+```
+
+```output
+same pair same
+```
+
+**A pair a call could not tell apart is refused at the second**, in the words a function pair gets,
+and its body is not read against the first's parameters:
+
+```sysl
+struct D
+    n: int
+
+    h(self, x: int) -> string = "s"
+    h(self, x: int, y: int = 0) -> int = 1
+```
+
+```error
+type 'D' already has a member named 'h' with parameters this one could not be told from — a call passing 1 argument would fit both
+```
+
+**A call that several fit equally, or that none fits, is refused at the call with the roster:**
+
+```sysl
+struct W
+    n: int
+
+    width(self, x: u8) -> string = "u8"
+    width(self, x: u16) -> string = "u16"
+
+print(W(0).width(1))
+```
+
+```error
+'W.width' is ambiguous here — 2 of its declarations take these arguments:
+    W.width(x: u8)
+    W.width(x: u16)
+```
+
+Three things do not overload, each because it is one name with one meaning rather than a set of
+calls:
+
+- **A [property](#a-property)** is read without parentheses, so there is no argument list to choose
+  by. A property and a method of one name are refused as before.
+- **A trait's member.** An implementation supplies each member of its trait by name, and a bound
+  reaches each by name, so a trait declares a name once:
+
+  ```sysl
+  trait Tr
+      f(self, x: int) -> string
+      f(self, x: string) -> string
+  ```
+
+  ```error
+  trait 'Tr' already declares a member named 'f' — an implementation supplies a trait's members by name, so a trait declares each name once
+  ```
+
+- **A type's own member and a trait's member of one name** still collide, whatever their
+  parameters: the trait's member is reachable only where the trait is in scope, and a name meaning
+  a different set of declarations in different files is exactly what that rule keeps out.
+
 ### Overloading an `extern`
 
 **Two `extern`s of one name are two functions exactly when they name two symbols.** A C library's
@@ -1278,8 +1945,9 @@ A bracketed list directly after the name declares type parameters, with optional
 
 ### A `const` function runs while compiling
 
-`const` in front of a function's name marks one the compiler may run while it compiles, so that a
-call to it can stand where a [constant](/reference/modules/) is required. Called anywhere else it is
+`const` in front of a function's name **promises** that the compiler can run it while it compiles,
+so that a call to it can stand where a [constant](/reference/modules/) is required. The promise is
+checked at the declaration, against the body and every function it calls. Called anywhere else it is
 an ordinary function, and an ordinary call:
 
 ```sysl
@@ -1292,6 +1960,46 @@ print(sq(n))
 
 ```output
 49
+```
+
+**The mark is a promise, not a permission.** Any function whose body can run while compiling is run
+where a constant wants it, marked or not — [modules § const](/reference/modules/) shows one. What
+the mark adds is that the promise is held at the declaration: a later change to the body, or to
+something it calls, that would stop it running is refused there, rather than at a constant in some
+other package that relied on it.
+
+**The standard library marks what it promises.** That covers:
+- `sysl.math`'s integer helpers and comparisons: `min`, `max`, `clamp`, `pow`, `gcd`, `lcm`, the
+  flooring division, the checked and overflowing arithmetic, the powers of two and `magnitude`;
+- `Buf`'s constructors and members, `Frozen`'s readers, and `Map` and `Set` with their operations;
+- `sysl.slices`' searches, comparisons and sorts;
+- `StrBuilder`.
+
+What it leaves unmarked still runs where its body can. Two things are left out on purpose: the C
+library's floating-point mathematics, and `slices.copy`, which compares addresses to handle
+overlapping slices.
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.math.gcd
+import sysl.slices.sort
+
+const sorted_gcds(xs: []const int) -> Buf[int]
+    var out = buf[int]()
+
+    for i in 1..<xs.len
+        out.push(gcd(xs[i - 1], xs[i]))
+
+    sort(out.view())
+    out
+
+const LEAST: int = sorted_gcds([12, 18, 27, 36][..]).at(0)
+
+print(LEAST)
+```
+
+```output
+6
 ```
 
 The word is the one sysl already uses for "settled while compiling" — a `const` declaration,
@@ -1428,11 +2136,10 @@ const K: int = head()
 ```
 
 ```error
-'local' answers a slice of storage local to its call, which ends when the call returns
+'local' answers a slice of, or a pointer to, storage local to its call, which ends when the call returns
 ```
 
-**A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere,
-and such a pointer can only point at a local of the evaluation that made the call:
+**A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere:
 
 ```sysl
 struct Counter
@@ -1456,38 +2163,206 @@ print(counted(4))
 4
 ```
 
+**An address may come in, be stored, and go out, where the linker fills it in**: the address of
+module storage, of a field or an element inside it, and of a function — and `null`, which needs no
+linker at all. While compiling, such an
+address is held as the relocation it is, so a `const` constructor that stores one makes constant
+data, laid into the object file as C's `static Display oled = { &bus, setup };` is
+([ffi § What constant data is](/reference/ffi/#what-constant-data-is)):
+
+```sysl
+const f(p: *int) -> *int = p
+
+var x = 1
+val q = f(&x)
+print(q == &x)
+```
+
+```output
+true
+```
+
+What such an address points at exists only when the program runs, so reading through one, or
+converting one to a number, is not evaluated — and neither is the address of thread-local or
+per-core storage. A function pointer may be stored and answered, and calling through
+it runs the function the address was taken of. On a bare machine, where storage must be constant
+data, the refusal says which:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+var x: i32 = 1
+
+const peek(p: *i32) -> i32 = *p
+
+val seen: i32 = peek(&x)
+
+@export
+begin() -> i32 = seen
+```
+
+```error
+reading through an address is not evaluated while compiling — the linker fills an address in, and what it points at exists only when the program runs
+```
+
+**A reference, and a pointer to storage the run owns, are values while compiling.** A box made with
+`&T`, a local, an element or a field reached through `&` or `*` is held by the run itself, and a
+write through one is seen wherever else the storage is held, as it is when the program runs. A
+pointer may not outlive its call, nor be converted to a number or read as another type:
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+bump(p: *int)
+    *p += 1
+
+const total(k: int) -> int
+    var head: Option[&Node] = None
+
+    for i in 0..<k
+        head = Some(Node(i, head))
+
+    var sum = 0
+    var cur = head
+
+    while cur is Some(n)
+        sum += n.v
+        cur = n.next
+
+    bump(&sum)
+    sum
+
+const T: int = total(5)
+
+print(T)
+```
+
+```output
+11
+```
+
+**The heap is the run's own**, so a `Buf`, a `Map`, a `Set` and a frozen buffer run while
+compiling by their own library bodies, as they do when the program runs. A library's panic — an
+index past the end — is a trap there, as it is here:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+const counts() -> int
+    var m: Map[string, int] = map()
+    var seen = buf[string]()
+
+    for w in ["to", "be", "or", "not", "to", "be"]
+        if !m.has(w) then seen.push(w)
+        m.put(w, m.get(w).unwrap_or(0) + 1)
+
+    int(seen.len()) * 10 + m.get("be").unwrap_or(0)
+
+const C: int = counts()
+
+print(C)
+```
+
+```output
+42
+```
+
+**A closure and a trait object are called while compiling** as the program calls them — a closure
+where it is written, handed on as a type argument or a `&Fn`, kept in a buffer, returned with state of
+its own; a call through a trait object goes to the function its table names. **An atomic operation** on
+storage the run owns is the plain one, since a run while compiling is one thread:
+
+```sysl
+import sysl.sync.{Atomic, SeqCst}
+
+counter() -> &Fn() -> int
+    var n = 0
+
+    () ->
+        n += 1
+        n
+
+const ticks() -> int
+    val c = counter()
+    var a = Atomic[int](0)
+
+    for _ in 0..<3
+        a.add(c(), SeqCst)
+
+    a.load(SeqCst)
+
+const T: int = ticks()
+
+print(T)
+```
+
+```output
+6
+```
+
+A box of a type with a `Drop` is refused, since its `drop` runs when the box's last share goes, and
+when that is, is decided by counts kept only when the program runs:
+
+```sysl
+struct Lamp
+    on: bool
+
+impl Drop for Lamp
+    drop(self)
+        print("off")
+
+lit() -> bool
+    val l: &Lamp = Lamp(true)
+    l.on
+
+const ON: bool = lit()
+
+print(ON)
+```
+
+```error
+a box of a 'Lamp', which has a 'Drop', is not made while compiling — its 'drop' runs when the last share of the box goes, and when that is, is decided by counts kept only when the program runs
+```
+
 **What it may not hold** is everything that exists only once the program runs, and the few kinds of
 value the compiler does not evaluate yet. Each is refused where it was written:
 
 | construct | refusal |
 |---|---|
-| a call to a function that is not `const` | `'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time` |
-| a call into the standard library | `… it calls 'sysl.math.max', which is not — the standard library marks nothing 'const' yet, so compute this at run time` |
+| a call to a function whose body cannot run | `'f' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling` — the calls are followed down to what stops them |
 | `print` | `… it prints, which is outside the program — nothing outside the program exists while compiling` |
 | the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
 | any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
 | an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
-| a box, a buffer | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`) |
-| a value rendered through a `display` that is not `const` | `… it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time` |
-| a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
-| a pointer answered | `… its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at` |
-| a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
+| a weak reference | `… it uses a 'weak P' — a weak reference answers whether its object is still alive, which is decided by counts kept only when the program runs` |
+| a value rendered through a `display` whose body cannot run | `… it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling` |
+| a pointer converted, a C string | `… it converts a pointer — an address exists only when the program runs` (and `takes the address of a C string`) |
 | module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
-| atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
-| `f16`, `bf16` | `… its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while compiling yet` |
+| C variadic arguments | `… it walks C variadic arguments — C variadic arguments are not evaluated while compiling yet` |
+| a float vector's `sum` | `… it sums a float vector, whose lanes are added in the order the target's instructions take — so the value is known only where the program runs` |
 
-One worked refusal for each of the commonest:
+One worked refusal for each of the commonest. A function that is not marked is no reason to refuse;
+what its body does is:
 
 ```sysl
-noisy(x: int) -> int = x + 1
+plain(x: int) -> int = x + 1
 
-const f(x: int) -> int = noisy(x)
+noisy(x: int) -> int
+    print(x)
+    plain(x)
 
-print(f(1))
+const f(x: int) -> int = plain(x)
+
+const g(x: int) -> int = noisy(x)
+
+print(f(1), g(1))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
 ```sysl
@@ -1515,34 +2390,7 @@ print(f(1.0))
 ```
 
 ```sysl
-struct Cell
-    v: int
-
-const f() -> int
-    val b: &Cell = Cell(1)
-    b.v
-
-print(f())
-```
-
-```error
-'f' is 'const', so it runs while compiling, and it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap
-```
-
-```sysl
-const f(p: *int) -> *int = p
-
-var x = 1
-val q = f(&x)
-print(q == &x)
-```
-
-```error
-'f' is 'const', so it runs while compiling, and its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at
-```
-
-```sysl
-static var counter: int = 0
+static var counter = 0
 
 const f() -> int = counter
 
@@ -1558,7 +2406,9 @@ struct R
     n: int
 
 impl Display for R
-    display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.n), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec)
+        print("rendering")
+        display_int(long(self.n), out, fmt)
 
 const f(r: R) -> string = str(r)
 
@@ -1566,13 +2416,13 @@ print(f(R(1)))
 ```
 
 ```error
-'f' is 'const', so it runs while compiling, and it calls 'R.display', which is not — mark 'R.display' 'const' too, or compute this at run time
+'f' is 'const', so it runs while compiling, and it calls 'R.display', which prints, which is outside the program — nothing outside the program exists while compiling
 ```
 
 **Text is rendered while compiling as the program renders it.** A float goes through the library's
 own renderers — the shortest round trip for `str`, the exact digits under a specifier — so `-0`, a
-subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` is `const`
-runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
+subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` can run
+while compiling runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
 and the `display` of every type the library renders write into it, and a nested `display` is handed
 the same writer:
 
@@ -1614,7 +2464,9 @@ print(twice(21), twice(u8(2)))
 ```
 
 ```sysl
-noisy() -> int = 1
+noisy() -> int
+    print("asked")
+    1
 
 const g[T](x: T) -> int = noisy()
 
@@ -1622,7 +2474,139 @@ print(g(5))
 ```
 
 ```error
-'g' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+'g' is 'const', so it runs while compiling, and it calls 'noisy', which prints, which is outside the program — nothing outside the program exists while compiling
+```
+
+### Calls where a type is read
+
+**A call may stand wherever a type needs a value**: an array length in a field, a parameter or an
+alias, a value argument, and an `@assert` beside the declarations. It is run while the declarations
+are read. A body of arithmetic and plain calls runs where it stands. One that calls a type's members
+— `push` on a `Buf`, a method of the program's own — waits until every declaration has been read,
+and the declarations are then read again with its value in hand:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+sq(n: int) -> int = n * n
+
+primes_below(n: int) -> int
+    var out = buf[int]()
+
+    for i in 2..<n
+        var p = true
+        for d in 2..<i
+            if i % d == 0 then p = false
+        if p then out.push(i)
+
+    int(out.len())
+
+struct Table
+    primes: [primes_below(30)]int
+    cells: [sq(2)]u8
+
+type Quad = [sq(2)]u8
+
+@assert(primes_below(10) == 4, "four primes below ten")
+
+val t = Table([0; 10], [0; 4])
+val q: Quad = [1, 2, 3, 4]
+
+print(t.primes.len, t.cells.len, q.len)
+```
+
+```output
+10 4 4
+```
+
+**A value argument is an expression too**, in a call or in a type — a call, arithmetic over a
+`const`, a comparison for a `bool` parameter:
+
+```sysl
+cap(n: int) -> int = n * 2
+
+const L: int = 3
+
+struct Ring[T, const N: int]
+    items: [N]T
+
+f[const N: int]() -> int = N + 1
+
+val a: Ring[int, cap(4)] = Ring([0; 8])
+val b = Ring[int, L + 1]([0; 4])
+
+print(f[cap(3)](), a.items.len, b.items.len)
+```
+
+```output
+7 8 4
+```
+
+**A call may name its type arguments outright**, and stands in all of these positions just as the
+same call with them inferred does. A function with no value parameter to infer from is called this
+way — here a fingerprint of a struct's layout, settled while compiling and checked in an `@assert`:
+
+```sysl
+struct Header
+    tag: u8
+    length: u32
+    flags: u16
+
+const fingerprint[T]() -> u32
+    var h: u32 = 2166136261
+
+    for const f in T::Fields
+        h = (h ^ u32(f.offset)) * 16777619
+
+    (h ^ u32(sizeof(T))) * 16777619
+
+const width[T]() -> int = int(sizeof(T))
+
+const Layout = fingerprint[Header]()
+
+struct Frame
+    header: Header
+    pad: [width[u64]()]u8
+
+@assert(fingerprint[Header]() == 2081354981, "the header's layout moved")
+
+print(Layout, sizeof(Frame))
+```
+
+```output
+2081354981 20
+```
+
+**A declaration whose value needs that declaration itself is refused, naming both** — reading it
+waits for the value, and the value is worked out by reading it:
+
+```sysl
+struct S
+    items: [f()]int
+
+f() -> int = int(sizeof(S))
+
+print(f())
+```
+
+```error
+'S' cannot be read while compiling: it needs the value of a call to 'f', and running 'f' reads 'S' itself — a declaration cannot wait on a value worked out from it
+```
+
+Two declarations that each wait on the other are refused the same way, each naming the other. A
+value argument that is not a constant is refused where it is written, and the generic is not read
+with it:
+
+```sysl
+f[const N: int]() -> int = N + 1
+
+var n = 3
+
+print(f[n]())
+```
+
+```error
+a value argument must be a constant — a literal, or a 'const' naming one
 ```
 
 ## Structs
@@ -1718,6 +2702,60 @@ a *method* at all — a parameter list with no receiver in it declares an **asso
 reached through the type rather than through a value. A property has no parameter list to write one
 in, which is what [`static`](#a-static-property) is for.
 
+**A property written `= value` with no `->` takes the value's type**, exactly as a
+[function's result](#the-result-type) does: `count = self.n` is `count -> int`. It is read the same
+way wherever the property is used — above its declaration, through a generic type's parameters, in an
+`impl` block — and a body whose value is `unit` makes a unit property. A setter beside it takes that
+type for its value. `sysl doc` and an editor's hover show the type, never the body:
+
+```sysl
+struct Counter
+    n: int
+
+    count = self.n
+    doubled = self.count * 2
+    label = s"#${self.n}"
+
+    set count(v)
+        self.n = v
+
+struct Box[T]
+    v: T
+
+    get = self.v
+
+var c = Counter(4)
+
+c.count = 20
+print(c.count + 1, c.doubled, c.label, Box("lid").get, Box(2.5).get * 2)
+```
+
+```output
+21 40 #20 lid 5
+```
+
+The function's rules come with it. A body that reaches the property again before its type is known
+has no type to take, and is told to write one:
+
+```sysl
+struct P
+    x: int
+
+    a = self.b + 1
+    b = self.a * 2
+
+print(P(1).a)
+```
+
+```error
+'P.a' takes its result type from its body, and the body reaches 'P.a' again through 'P.b' — write its result type, 'P.a -> T'
+```
+
+A public property may not hand back a type its readers cannot name, as a written `->` may not. A
+trait's property is a signature every implementation is held to, so it writes its type; an `impl`
+member supplying one may leave it off and takes the trait's. In an enum's body `name = value` is a
+variant and its discriminant, so an enum's inferred property is written in an `impl` block.
+
 ### A property may be settable
 
 **A property may be written as well as read**, by declaring a setter beside it. `set` is a contextual
@@ -1752,10 +2790,11 @@ have nowhere to take its value's type from. Visibility is the ordinary modifier,
 is a property the world reads and only the type writes.
 
 **A write is a call rather than a store**, which is what a property computing rather than naming
-storage amounts to. Three things follow, and they are the same three that follow for an element
-reached through [`Index`](/reference/expressions/): the expression yields `unit` rather than the
-value assigned, the write cannot be one place of a multiple assignment, and `&t.f` is refused because
-there is no address.
+storage amounts to. Two things follow, and they are the same two that follow for an element
+reached through [`Index`](/reference/expressions/): the write cannot be one place of a multiple
+assignment, and `&t.f` is refused because there is no address. Written
+[`:=`](/reference/expressions/#assignment), the write yields what the getter reads back once the
+setter has run.
 
 The compound forms do work, and that is where a property differs from an element: there is no index
 to evaluate twice, and the receiver's address is taken once for the pair of calls.
@@ -2108,7 +3147,7 @@ parameter list is an associated function already, reached the same way and calle
 `static` in front of one is refused rather than being a second spelling of what already exists.
 
 `static` is not a new word: it is the same one that makes a binding in an entry file belong to the
-module rather than to that file's body ([bindings](#a-module-member-states-its-type)). The two are
+module rather than to that file's body ([bindings](#a-module-member-takes-its-type-as-a-local-does)). The two are
 told apart by what follows it.
 
 ### `invariant`
@@ -2171,6 +3210,136 @@ decides who may know the shape. See [modules](/reference/modules/).
 
 An opaque struct with no body at all is C's incomplete type, `struct sqlite3;` — nothing in sysl lays
 one out, and the declaration exists so that `*Session` is a type a `*u8` cannot be mistaken for.
+
+### Members in an `impl` block of their own
+
+**An `impl` naming no trait adds members to a struct or an enum**, written in any file of the module
+that declares the type. A type whose methods outgrow its declaration — a `Quaternion` with fifty
+operations, an enum with a parser and a printer — keeps its fields together and its members where
+they read best:
+
+```sysl
+// geom/quat.sysl
+module geom
+
+struct Quat[F]
+    w: F
+    x: F
+```
+
+```sysl
+// geom/ops.sysl
+module geom
+
+import sysl.math.Float
+
+impl[F: Float] Quat[F]
+    norm2(self) -> F = self.w * self.w + self.x * self.x
+
+    scaled(self, k: F) -> Quat[F] = Quat(self.w * k, self.x * k)
+```
+
+The block's members are the type's own exactly as the body's are: no trait to import, reached
+wherever the type is, and one namespace with the body — so a name the body already uses is a
+duplicate whichever was written first:
+
+```sysl
+struct P
+    n: int
+
+    show(self) -> int = self.n
+
+impl P
+    show(self) -> int = 2
+
+print(P(1).show())
+```
+
+```error
+type 'P' already has a member named 'show'
+```
+
+**A member of the block may be `private` or `private[m]`**, with the same reach as one written in the
+body — the file that wrote it, or the module it names. A trait's `impl` has no such modifier, since
+what it supplies is as visible as the trait:
+
+```sysl
+struct P
+    n: int
+
+impl P
+    private twice(self) -> int = self.n * 2
+
+    shown(self) -> int = self.twice()
+
+print(P(4).shown())
+```
+
+```output
+8
+```
+
+**The block's header binds the type's parameters**, under names of its own, as a trait's `impl`
+does. **A bound it adds is a condition on the members it brings**: they exist only where the
+receiver's arguments meet it, while the type and its body's members stay as they were. It is the
+inherent counterpart of [a conditional conformance](/reference/traits/#conditional-conformance):
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+    swapped(self) -> Pair[T] = Pair(self.hi, self.lo)
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(3, 7).larger())
+print(Pair(Tag(1), Tag(2)).swapped().lo.n)
+```
+
+```output
+7
+2
+```
+
+A `Pair[Tag]` is built and swapped; asking it for `larger` is refused at the call, naming the bound
+the block wrote:
+
+```sysl
+struct Pair[T]
+    lo: T
+    hi: T
+
+impl[T: Ord] Pair[T]
+    larger(self) -> T = if self.lo < self.hi then self.hi else self.lo
+
+struct Tag
+    n: int
+
+print(Pair(Tag(1), Tag(2)).larger().n)
+```
+
+```error
+'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', but Tag does not
+```
+
+**Another module may not add members**: a type's own members are part of what its declaration
+promises, and what another module wants to add is a trait, which it may implement for the type:
+
+```sysl
+impl[T] Option[T]
+    or_zero(self) -> int = 0
+
+print(1)
+```
+
+```error
+'sysl.Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
+```
 
 ## Enums
 
@@ -2306,8 +3475,25 @@ print(f64(d) * 2.0, u8(s))
 3 3
 ```
 
+A `new` type's name converts from whatever its base's name converts from: `Phase(3)` over
+`type Phase = new real` is `Phase(real(3))`, accepted exactly where `real(3)` is. Only the written
+conversion does it — a `3` or an `int` is still not a `Phase` where one is wanted:
+
+```sysl
+type Phase = new real
+
+val n = 3
+
+print(f64(Phase(3)) + f64(Phase(n)))
+```
+
+```output
+6
+```
+
 `new`, `within` and `where` are contextual words, so a function or field may still be named `where`.
-See [errors and contracts](/reference/errors/) for what a bound costs and when it is checked.
+See [errors and contracts](/reference/errors/) for what a bound costs and when it is checked, and for
+[how a `new` type converts](/reference/errors/#a-new-type-s-name-converts-from-whatever-its-base-s-name-converts-from).
 
 ### A `new` type may take parameters
 

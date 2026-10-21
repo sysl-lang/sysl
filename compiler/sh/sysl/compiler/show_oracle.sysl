@@ -656,6 +656,11 @@ private emit_test_attr(out: *StrBuilder, f: *AstFmt, a: TestAttr, ind: string)
     opt_text_val(out, a.expected)
     fld(out, kid, "ignored")
     opt_text_val(out, a.ignored)
+    fld(out, kid, "timeout")
+
+    a.timeout match
+        None -> out.push("None\n")
+        Some(n) -> num_val(out, usize(n))
 end emit_test_attr
 
 private emit_hook_attr(out: *StrBuilder, f: *AstFmt, a: HookAttr, ind: string)
@@ -785,6 +790,7 @@ private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
             head(out, f, "SomeType", t.span, true)
             fld(out, kid, "bounds")
             list_val(out, f, bounds, kid, emit_bound)
+        InferredResult(_) -> head(out, f, "InferredResult", t.span, true)
 end emit_type
 
 // -- patterns --------------------------------------------------------------------------------
@@ -1015,12 +1021,22 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             head(out, f, "ImplicitMember", anchor, placed)
             fld(out, kid, "name")
             text_val(out, name)
+        TypeArg(typ) ->
+            head(out, f, "TypeArg", anchor, placed)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
         LayoutOf(op, typ) ->
             head(out, f, "LayoutOf", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "typ")
             emit_type(out, f, typ, kid)
+        TraitTest(typ, bounds) ->
+            head(out, f, "TraitTest", anchor, placed)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+            fld(out, kid, "bounds")
+            text_val(out, bounds_text(bounds))
         OffsetOf(typ, field) ->
             head(out, f, "OffsetOf", anchor, placed)
             fld(out, kid, "typ")
@@ -1067,6 +1083,14 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             head(out, f, "Block", anchor, placed)
             fld(out, kid, "stmts")
             list_val(out, f, stmts, kid, emit_stmt)
+        ConstIf(cond, then_body, else_body) ->
+            head(out, f, "ConstIf", anchor, placed)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "thenBody")
+            list_val(out, f, then_body, kid, emit_stmt)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
         IfExpr(cond, then_body, else_body, _) ->
             head(out, f, "IfExpr", anchor, placed)
             fld(out, kid, "cond")
@@ -1276,7 +1300,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "typ")
-            emit_type(out, f, typ, kid)
+            opt_node_val(out, f, typ, kid, emit_type)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
             fld(out, kid, "vis")
@@ -1294,12 +1318,19 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "message")
-            opt_text_val(out, message)
+            opt_node_val(out, f, message, kid, emit_expr)
         StaticDecl(inner) ->
             head(out, f, "StaticDecl", s.span, placed)
             fld(out, kid, "inner")
 
             // The `static` wrapper takes the position; the binding inside it has none.
+            f.unplaced = true
+            emit_stmt(out, f, inner, kid)
+        CopiedDecl(copies, inner) ->
+            head(out, f, "CopiedDecl", s.span, placed)
+            fld(out, kid, "threadLocal")
+            bool_val(out, copies == CopyPerThread)
+            fld(out, kid, "inner")
             f.unplaced = true
             emit_stmt(out, f, inner, kid)
         ValDecl(name, typ, value, vis, align, section, copies, _) ->
@@ -1334,7 +1365,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             list_val(out, f, targets, kid, emit_expr)
             fld(out, kid, "values")
             list_val(out, f, values, kid, emit_expr)
-        MultiDecl(names, mutable, values) ->
+        MultiDecl(names, mutable, values, _) ->
             head(out, f, "MultiDecl", s.span, placed)
             fld(out, kid, "names")
             texts_val(out, names)
@@ -1342,7 +1373,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             bool_val(out, mutable)
             fld(out, kid, "values")
             list_val(out, f, values, kid, emit_expr)
-        PatternDecl(pat, mutable, value, typ) ->
+        PatternDecl(pat, mutable, value, typ, _) ->
             head(out, f, "PatternDecl", s.span, placed)
             fld(out, kid, "pattern")
             emit_pattern(out, f, pat, kid)
@@ -1446,7 +1477,7 @@ private emit_func(out: *StrBuilder, f: *AstFmt, d: FuncDecl, at: Span, kid: stri
     fld(out, kid, "params")
     list_val(out, f, d.params, kid, emit_param)
     fld(out, kid, "retType")
-    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    opt_node_val(out, f, as_written(d.ret_type), kid, emit_type)
     fld(out, kid, "body")
     list_val(out, f, d.body, kid, emit_stmt)
     fld(out, kid, "bounds")
@@ -1488,7 +1519,8 @@ private emit_func(out: *StrBuilder, f: *AstFmt, d: FuncDecl, at: Span, kid: stri
     emit_marks(out, d.marks, kid)
 end emit_func
 
-// `@noinline`, `@cold` and `@inline`, in the reference's field order.
+// `@noinline`, `@cold` and `@inline`, in the reference's field order, then `@inline(always)`'s
+// field -- only where it is set, so an unmarked function reads as the reference renders it.
 private emit_marks(out: *StrBuilder, m: FuncMarks, kid: string)
     fld(out, kid, "noinline")
     bool_val(out, m.noinline)
@@ -1496,6 +1528,10 @@ private emit_marks(out: *StrBuilder, m: FuncMarks, kid: string)
     bool_val(out, m.cold)
     fld(out, kid, "inline")
     bool_val(out, m.inline)
+
+    if m.inline_always
+        fld(out, kid, "inline_always")
+        bool_val(out, true)
 end emit_marks
 
 private emit_method(out: *StrBuilder, f: *AstFmt, d: MethodDecl, ind: string)
@@ -1521,7 +1557,7 @@ private emit_method(out: *StrBuilder, f: *AstFmt, d: MethodDecl, ind: string)
     list_val(out, f, d.params, kid, emit_param)
     f.made_params = false
     fld(out, kid, "retType")
-    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    opt_node_val(out, f, as_written(d.ret_type), kid, emit_type)
     fld(out, kid, "body")
     list_val(out, f, d.body, kid, emit_stmt)
     fld(out, kid, "bounds")
@@ -1558,7 +1594,7 @@ private emit_extern(out: *StrBuilder, f: *AstFmt, d: ExternDecl, at: Span, kid: 
     fld(out, kid, "params")
     list_val(out, f, d.params, kid, emit_param)
     fld(out, kid, "retType")
-    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    opt_node_val(out, f, as_written(d.ret_type), kid, emit_type)
     fld(out, kid, "variadic")
     bool_val(out, d.variadic)
     fld(out, kid, "link")

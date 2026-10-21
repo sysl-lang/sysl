@@ -43,7 +43,7 @@ gen_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     push_temps(e)
     push_owned(e)
     gen_stack_guard(e)
-    gen_computed_vals(e, p.vals)
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
 
     // The storage's initializers were written in whichever files declared them; the statements
@@ -111,7 +111,7 @@ end gen_main
 // also what keeps it, since nothing here calls it.
 gen_module_init(e: *Emit, p: TProgram) -> Option[IrInit]
     val sig = ir_sig(module_init_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal }
-    val f = gen_init_body(e, p, sig)?
+    val f = gen_init_body(e, p, sig, false)?
 
     // LLVM's own element type for the list: a priority, the function, and the global the entry is
     // tied to the liveness of -- nothing here, so the entry lives as long as the object does.
@@ -144,16 +144,33 @@ end gen_module_init
 // (`runtime_init_symbol`). It is defined whether or not anything needs filling, so a start file may
 // call it unconditionally and keep calling it as the storage grows.
 gen_runtime_init(e: *Emit, p: TProgram) -> Option[IrFunc]
-    gen_init_body(e, p, ir_sig(runtime_init_symbol(), ir_fn_type(LVoid, buf())))
+    gen_init_body(e, p, ir_sig(runtime_init_symbol(), ir_fn_type(LVoid, buf())), false)
 
-// The filling both share: every computed `val`, each in a region of its own, in the order `@main`
-// lays them down.
-private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig) -> Option[IrFunc]
+// **What a program whose entry is a function exported as `main` runs first.** That export *is* the
+// program's `main` -- the platform's start-up code, or a bare image's start file, calls it by that
+// symbol -- so no `@main` of the compiler's own is emitted beside it, and the work `@main` would have
+// done before the program's own code runs is done here instead: the stack guard where the machine has
+// signals, then every computed `val`. The export's thunk calls this before anything else
+// (`gen_export_thunk`), so the export's body finds its storage filled exactly as a declared `main`
+// does. It is `internal`: nothing but that thunk names it.
+gen_entry_prologue(e: *Emit, p: TProgram) -> Option[IrFunc] =
+    gen_init_body(e, p, ir_sig(entry_prologue_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal },
+                  true)
+
+// The prologue's symbol, spelled as a runtime helper's so nothing a module declares lands on it.
+entry_prologue_symbol() -> string = "sysl.entry_prologue"
+
+// The filling all three share: every computed `val`, each in a region of its own, in the order `@main`
+// lays them down -- behind the stack guard where the body is a program's entry (`guard`).
+private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig, guard: bool) -> Option[IrFunc]
     start_function(e)
     e.caller_exposed = exposed_in(buf(), None, p.vals)
     push_temps(e)
     push_owned(e)
-    gen_computed_vals(e, p.vals)
+
+    if guard then gen_stack_guard(e)
+
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
     release_all(e)
     emit_term(e, InRet(None, None))
@@ -185,18 +202,29 @@ private module_init_priority() -> long = 65535
 // region and the storage left addressing freed bytes. The release is *absent* because there is
 // nothing to release: the storage has never held anything, and a `&T`'s zero is not a reference --
 // loading it and letting go of it would be a decrement through null.
-private gen_computed_vals(e: *Emit, vals: Buf[TVal])
+//
+// **Storage an artifact lays down is never filled here** (`emit_static.sysl`'s `gen_vals` declares
+// it): a library `val` the artifact carries as data is declared `constant`, and a store into it is a
+// write to read-only memory. The decision is the library's, made once (`const_eval.sysl`'s
+// `step_limit`), so meeting one here is a compiler fault, and it is said as one rather than emitted.
+private gen_computed_vals(e: *Emit, vals: Buf[TVal], precompiled: Buf[string])
     for i in 0..<vals.len()
         val v = vals.at(i)
+
+        if v.computed && v.init.is_some() && holds_string(precompiled, v.symbol)
+            panic(s"internal error: '${v.symbol}' is storage a linked artifact lays down, and this " +
+                  "program was about to fill it at startup — the program and the artifact disagree on " +
+                  "whether its initializer is constant data")
+        end if
 
         if v.computed && v.init.is_some()
             push_temps(e)
 
-            val value = gen_expr(e, v.init.unwrap())
-
-            if contains_counted(v.ty) then retain_value(e, v.ty, value)
-
-            emit(e, InStore(lty(e, v.ty), value, VGlobal(v.symbol), AccPlain, None))
+            // **A large value is built where it is going.** `gen_into` writes an aggregate field by
+            // field into the storage itself, so a struct holding a two-megabyte array is neither
+            // staged in a frame the size of the array nor loaded and stored as one LLVM value --
+            // which clang takes minutes to lower, and which a board has no stack for.
+            gen_into(e, VGlobal(v.symbol), v.init.unwrap())
             pop_temps(e)
 end gen_computed_vals
 
@@ -250,7 +278,8 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     e.caller_exposed = exposed_in(no_stmts, None, p.vals)
     push_temps(e)
     push_owned(e)
-    gen_computed_vals(e, p.vals)
+    gen_parent_watch(e)
+    gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
 
     val named = fresh_label(e, "test.named")
@@ -329,6 +358,22 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
 
     Some(finish_func(e, entry_sig(e.target)))
 end gen_test_main
+
+// **A test process keeps what it prints and does not outlive the runner that started it.** The first
+// thing a test build's entry does on a machine with processes is `testprocess.c`'s start: standard
+// output a line at a time, so a test stopped for running too long still shows what it printed, and a
+// watch that ends the test -- and the process group the runner gave it -- once its parent is gone,
+// however the parent went. Before the module's `val`s are filled, since a computed `val` that never
+// finishes is as much a hang as a test that never does.
+private gen_parent_watch(e: *Emit)
+    if !posix_machine(e.target.os) then return
+
+    request_intrinsic(e, ir_sig(test_process_symbol(), ir_fn_type(LVoid, no_params())))
+    emit(e, ir_call(None, LVoid, VGlobal(test_process_symbol()), no_ir_args()))
+end gen_parent_watch
+
+// The C function a test build's entry calls first, where the machine has processes.
+test_process_symbol() -> string = "sysl_test_process_start"
 
 private dispatch_on(e: *Emit, want: Val, key: string, run: string, next: string)
     val named = request_text(e, test_named_symbol(), test_named_text(s"i${e.word_bits}"))

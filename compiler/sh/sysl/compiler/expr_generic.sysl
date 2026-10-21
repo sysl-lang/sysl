@@ -33,7 +33,13 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
                      args: Buf[Expr], expected: Option[Type]) -> TExpr
     val keys = function_keys(cx, written)
 
-    if keys.is_empty() then return cx.err(span, s"undefined function '$written'")
+    if keys.is_empty()
+        val captured = body_only_call(cx, span, written)
+
+        if captured.is_some() then return captured.unwrap()
+
+        return cx.err(span, s"undefined function '$written'")
+    end if
 
     var key = keys.at(0)
 
@@ -67,6 +73,9 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         for i in 0..<authored.len()
             known.push(Binding(authored.at(i), written_arg_for(cx, f, authored.at(i), targ_exprs.at(i))))
 
+        for b in known
+            if b.ty == Unknown then return bad_expr(span)
+
         return generic_call_with(cx, span, written, key, f, args, expected, true, known)
     end if
 
@@ -74,6 +83,11 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
 
     for i in 0..<targ_exprs.len()
         targs.push(written_arg_for(cx, f, authored.at(i), targ_exprs.at(i)))
+
+    // **An argument already refused instantiates nothing**: the body read with that parameter bound
+    // to nothing would report every use of it as a name nobody declared.
+    for t in targs
+        if t == Unknown then return bad_expr(span)
 
     // **A BOUND IS RESOLVED WHERE IT WAS WRITTEN, WHICH IS THE DECLARATION'S SCOPE AND NOT THE
     // CALLER'S.** `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that
@@ -96,6 +110,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
     val slots = bound.unwrap()
 
     for i in 0..<slots.len()
@@ -105,13 +120,17 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         wants.push(want)
 
         slots.at(i) match
-            Some(e) -> ts.push(argument_at(cx, decl, i, e, want))
+            Some(e) -> ts.push(argument_at(cx, decl, i, e, want, buf()))
             None ->
                 val inner = default_reader(cx, span, f.scope, name, decl.bounds)
+                val read = default_at(inner, decl.params.at(i).default.unwrap(), want)
 
-                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                if read.is_none() then unread.push(i)
 
-    val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before)
+                ts.push(read.unwrap_or(bad_expr(span)))
+
+    val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before,
+                                   true, unread)
 
     if refused.is_some() then return refused.unwrap()
 
@@ -135,13 +154,60 @@ private written_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type
     if declared.is_some()
         val ty = nameless(resolve_type(cx.an, f.scope, declared.unwrap(), no_bindings()))
 
-        ty match
-            Enum(_) -> return enum_value_arg(cx.an, cx.scope, anchor_of(e), e, ty, cx.subst)
-            _ -> ()
+        // **Anything else written for a value parameter is a value**: a `const` it names, or an
+        // expression run while compiling, `f[sq(3)]()` -- never a type, whatever its spelling.
+        return value_written(cx, e, ty, s"'$name' of '${f.decl.name}'")
     end if
 
     written_type_arg(cx, e)
 end written_arg_for
+
+// One argument written for a value parameter of type `ty`: a value whatever its spelling. A number
+// travels at the width a length does, as one written as a literal does. `subject` names the
+// parameter and its owner for a refusal of the argument's type.
+private value_written(cx: &Analyzer, e: Expr, ty: Type, subject: string) -> Type
+    val got = enum_value_arg(cx.an, cx.scope, anchor_of(e), e, ty, cx.subst, subject)
+
+    ty match
+        Integer(_, _, _) -> got match
+            ConstArg(v, _, stood) -> ConstArg(v, usize_type(word_bits(cx)), stood)
+            other -> other
+        _ -> got
+end value_written
+
+// The arguments written for a generic **type**, `Ring[int, cap(8)](…)`, each read against the
+// parameter it fills: a value where the declaration wrote `const`, a type everywhere else.
+written_type_args_for(cx: &Analyzer, key: string, targ_exprs: Buf[Expr]) -> Buf[Type]
+    val decl = cx.an.tables.types.get(key)
+    var params: Buf[string] = buf()
+    var values: Buf[TypeBinding] = buf()
+
+    if decl.is_some()
+        decl.unwrap().kind match
+            StructOf(d) ->
+                params = d.tparams
+                values = d.tvalues
+            EnumOf(d) ->
+                params = d.tparams
+                values = d.tvalues
+            _ -> ()
+    end if
+
+    var out: Buf[Type] = buf()
+
+    for i in 0..<targ_exprs.len()
+        val declared = if i < params.len() then binding_named(values, params.at(i)) else None
+
+        if declared.is_some()
+            val ty = nameless(resolve_type(cx.an, decl.unwrap().scope, declared.unwrap(), no_bindings()))
+
+            out.push(value_written(cx, targ_exprs.at(i), ty, s"'${params.at(i)}' of '${generic_type_name(cx.an, key)}'"))
+        else
+            out.push(written_type_arg(cx, targ_exprs.at(i)))
+        end if
+
+    out
+end written_type_args_for
 
 // The same at an address, `&f[T]`, whose refusal advises writing the type on the binding instead,
 // there being no call to infer anything from.
@@ -155,6 +221,8 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
     IntLit(_, _, _) -> const_arg_at(cx, e)
     Index(head, one, _) -> applied_type_arg(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_arg(cx, anchor_of(e), head, inner, at_address)
+    // A type only the type grammar could read is already written as one.
+    TypeArg(written) -> resolve_type(cx.an, cx.scope, written, cx.subst)
     // The three the two grammars share a spelling for. `*T` and `&T` are a unary operator in an
     // expression and a qualifier in a type; a tuple is parentheses either way. Everything else has
     // no spelling here at all, which the refusal below is what says.
@@ -173,6 +241,11 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
         resolve_type(cx.an, cx.scope, type_ref(e.span, TupleType(written, false)), cx.subst)
     // A dotted path is one name to the type grammar, so `mod.Box` is read as the word it is.
     Field(_, _, _) -> dotted_type_arg(cx, e, at_address)
+    // `T::Item` and `f::Type` -- a projection off a name, which the type grammar spells the same way.
+    TypeAttr(head, member, _, _) -> *head.kind match
+        Ident(n) -> resolve_type(cx.an, cx.scope, type_ref(e.span,
+            AssocType(named_type(head.span, n), member)), cx.subst)
+        _ -> not_a_type_arg(cx, e, at_address)
     _ -> not_a_type_arg(cx, e, at_address)
 
 private not_a_type_arg(cx: &Analyzer, e: Expr, at_address: bool) -> Type
@@ -207,6 +280,7 @@ private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = 
     // An applied generic behind a pointer or a reference -- `&Box[i32]` -- nests the same way.
     Index(head, one, _) -> applied_type_ref(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_ref(cx, anchor_of(e), head, inner, at_address)
+    TypeArg(written) -> written
     _ ->
         not_a_type_arg(cx, e, at_address)
         named_type(e.span, "")
@@ -273,6 +347,7 @@ private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
             Unary(op, _) if op == "*" || op == "&" -> refs.push(written_type_ref(cx, arg, at_address))
             Index(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArgs(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
+            TypeArg(_) -> refs.push(written_type_ref(cx, arg, at_address))
             _ -> refs.push(type_ref(arg.span, ValueArgType(arg)))
 
 
@@ -290,6 +365,16 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 //
 // `nested` is the nested function the call is made to, where it is one: its instantiation is a member
 // of the environment the call is made on, which goes in front of what the reader wrote.
+// Whether a declaration asks `Debug` of one of its type parameters.
+private asks_debug(bounds: Buf[NamedBounds], tparam: string) -> bool
+    for nb in bounds
+        if nb.name == tparam
+            for b in nb.bounds
+                if b.name == "Debug" || b.name == "sysl.Debug" then return true
+
+    false
+end asks_debug
+
 generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
                   expected: Option[Type], report: bool, known: Buf[Binding],
                   nested: Option[&Nested] = None) -> TExpr
@@ -356,6 +441,20 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     if !check_param_bounds(cx.an, f.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
                            "type parameter", cx.scope) then return bad_expr(span)
 
+    // An argument meeting a `T: Debug` bound only as a placeholder -- `assert_eq` over two writer
+    // objects -- is shown as that placeholder, and the call is told so as `print` would be. A call the
+    // library makes is a part of some larger rendering, never something a program wrote.
+    val written_here = !from_library(cx.an, cx.scope)
+
+    for i in 0..<decl.tparams.len()
+        if written_here && i < targs.len() && asks_debug(decl.bounds, decl.tparams.at(i))
+            val found = placeholder_of(cx, targs.at(i))
+
+            if found.is_some() then
+                cx.an.caution(cx.scope, span, s"'$written' shows its '${decl.tparams.at(i)}' only as " +
+                              s"'${found.unwrap().0}': ${found.unwrap().1}")
+        end if
+
     val name = instantiated(cx, f, targs, nested)
     val sig = cx.an.tables.members.func_insts.get(name)
 
@@ -371,6 +470,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
     var wants: Buf[Type] = buf()
+    var unread: Buf[usize] = buf()
 
     for i in 0..<slots.len()
         val want = walk_wanted(decl.params.at(i), if i < written_params.len()
@@ -394,7 +494,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     t = prov.kept.at(i).unwrap()
 
                     if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
-                else t = argument_at(cx, decl, i, e, want)
+                else t = argument_at(cx, decl, i, e, want, not_bound(decl.tparams, known))
 
                 ts.push(t)
             // A default that was read while the solve was settling is the node the program gets:
@@ -407,11 +507,14 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     else ts.push(kept)
                 else
                     val inner = default_reader(cx, span, f.scope, name, decl.bounds)
+                    val read = default_at(inner, decl.params.at(i).default.unwrap(), want)
 
-                    ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                    if read.is_none() then unread.push(i)
+
+                    ts.push(read.unwrap_or(bad_expr(span)))
 
     val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before,
-                                   report)
+                                   report, unread)
 
     if refused.is_some() then return refused.unwrap()
 
@@ -425,6 +528,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
             ts.push(variadic_extra(cx, args.at(i), false))
 
     check_crossings(cx, decl.crossing, written, written_params, ts)
+    check_shared_result(cx, span, sig.unwrap().ret)
     cx.an.uses(name)
 
     if nested.is_none() then return TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
@@ -484,28 +588,32 @@ end not_bound
 // convert -- it *is* the type its position gives it. So it is read against the parameter it turned
 // out to have. A written-out array standing where a slice was asked for is the other: by the time
 // there is an array to coerce, the storage has been made as one.
-private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type) -> TExpr
+//
+// **A conversion never decides a type parameter**: an argument at a parameter that names one the
+// solve worked out (`solved`) is held to the type it was solved at exactly, so `max(n, l)` over an
+// `int` and a `long` is refused in either order. One whose parameters were all written out, or that
+// names none, widens as any argument does.
+private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type,
+                    solved: Buf[string]) -> TExpr
+    val widen = i >= decl.params.len() || !ref_mentions(decl.params.at(i).typ, solved)
+
     if i >= decl.params.len() || !ref_mentions(decl.params.at(i).typ, decl.tparams) ||
             is_literal(e) then
-        return type_expr(cx, e, Some(want))
+        return typed_widening(cx, e, want, widen)
 
     // **The bare reading is a probe, so what it could not answer is not a complaint.** A form with
     // no type of its own -- a nullary variant of a generic enum, `None` standing at a `T` the solve
     // has since settled -- has nothing to say with nothing expected of it, and the parameter is what
     // it should have been read against all along. The probe is rewound and that reading is the one
     // the program gets.
-    val mark = cx.an.complaints()
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val bare = type_expr(cx, e, None)
 
-    if cx.an.complaints() > mark
-        cx.an.restore_complaints(mark)
-        cx.an.closure_count = lowered
-        cx.an.closure_funcs.truncate(made)
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
+        return typed_widening(cx, e, want, widen)
 
-        return type_expr(cx, e, Some(want))
-    end if
+    keep_trial(cx)
 
     if becomes_slice(texpr_type(bare), want) then return type_expr(cx, e, Some(want))
 
@@ -515,10 +623,13 @@ private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type
 
     // What the position could not repair is read again against the parameter, and kept only where
     // that answers -- otherwise the first reading is what the complaint should name.
-    val again = type_expr(cx, e, Some(want))
+    val again = typed_widening(cx, e, want, widen)
 
     if disagree(texpr_type(again), want) then fitted else again
 end argument_at
+
+private typed_widening(cx: &Analyzer, e: Expr, want: Type, widen: bool) -> TExpr =
+    if widen then type_expr(cx, e, Some(want)) else type_expr_unwidened(cx, e, Some(want))
 
 // **An argument the solve could not read is read once more, for real, so that what it could not
 // answer is said.** The provisional reading is sandboxed, so a `null` or a `None` at a parameter
@@ -806,18 +917,14 @@ end arg_reader
 
 // One reading of an argument with everything it said put back.
 sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
-    val mark = cx.an.complaints()
     // **A reading that is thrown away lowers no closure**, because the argument is read again at the
     // parameter the solve arrived at and the second reading is the one the program gets. The counter
     // is what makes a closure's name its own, so leaving it forward here would number every closure
     // after a generic call one higher than the compilation actually lowered.
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val t = type_expr(cx, e, expected)
 
-    cx.an.restore_complaints(mark)
-    cx.an.closure_count = lowered
-    cx.an.closure_funcs.truncate(made)
+    discard_trial(cx, tried)
     t
 end sandboxed_arg
 
@@ -831,15 +938,11 @@ end sandboxed_attempt
 
 // The same bare reading, answering what it produced and whether it was refused on the way.
 sandboxed_reading(cx: &Analyzer, e: Expr) -> (TExpr, bool)
-    val mark = cx.an.complaints()
-    val lowered = cx.an.closure_count
-    val made = cx.an.closure_funcs.len()
+    val tried = begin_trial(cx)
     val t = type_expr(cx, e, None)
-    val refused = cx.an.complaints() > mark
+    val refused = refused_since(cx, tried)
 
-    cx.an.restore_complaints(mark)
-    cx.an.closure_count = lowered
-    cx.an.closure_funcs.truncate(made)
+    discard_trial(cx, tried)
     (t, refused)
 end sandboxed_reading
 
@@ -875,6 +978,7 @@ private expr_mentions(e: Expr, names: Buf[string]) -> bool = *e.kind match
     Ident(n) -> holds_string(names, n)
     LayoutOf(_, tr) -> ref_mentions(tr, names)
     OffsetOf(tr, _) -> ref_mentions(tr, names)
+    TypeArg(tr) -> ref_mentions(tr, names)
     Unary(_, operand) -> expr_mentions(operand, names)
     Binary(_, l, r) -> expr_mentions(l, names) || expr_mentions(r, names)
     Compare(operands, _) ->

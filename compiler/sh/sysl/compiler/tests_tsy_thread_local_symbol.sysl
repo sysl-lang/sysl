@@ -1,0 +1,218 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// The `#if thread_local` symbol (`reference/attributes.md § @thread_local`): true exactly where a
+// `@thread_local` is accepted -- a hosted machine, or a bare AArch64 one whose root manifest names the
+// thread pointer's register -- so one file can make a variable per-thread wherever the build has
+// thread-local storage and a plain module `var` everywhere else.
+
+private tsy_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The errno shape: one variable, per-thread where the build has thread-local storage.
+private tsy_errno() -> string =
+    "#if thread_local\n@thread_local\n#endif\nvar errno: i32 = 0\n\n" +
+    "@export(\"errno_get\")\nerrno_get() -> i32 = errno\n"
+
+// A project whose manifest carries `extra` after its `package` block, `main` being module `k`'s one
+// file.
+private tsy_project(extra: string, main: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-tsy").unwrap())
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\n$extra").unwrap()
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/k/k.sysl", s"module k\n\n$main").unwrap()
+    root
+end tsy_project
+
+// `sysl <args>` as the command line answers it, every setting it left behind put back.
+private tsy_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    use_machine_registers(no_machine_registers())
+    (code, text)
+end tsy_cli
+
+// `sysl <command>` of module `k` holding `main`, for `target` (the host where it is empty), under the
+// manifest text `extra`.
+private tsy_run(command: string, target: string, extra: string, main: string) -> (int, string)
+    val root = tsy_project(extra, main)
+    var short: [3]string = ["sysl", command, root]
+    var long: [5]string = ["sysl", command, "--target", target, root]
+    val got = if target.is_empty() then tsy_cli(short[..]) else tsy_cli(long[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end tsy_run
+
+// The line of IR text defining `@k$errno`, or the empty string.
+private tsy_errno_line(ir: string) -> string
+    val at = ir.index_of("@k$errno = ") match
+        None -> return ""
+        Some(i) -> i
+    val rest = ir[at..<ir.len]
+
+    rest[0..<rest.index_of("\n").unwrap_or(rest.len)]
+end tsy_errno_line
+
+private tsy_owned() -> string = "codegen {\n  thread_pointer = \"tpidr_el0\"\n}\n"
+
+// -- where it is true -------------------------------------------------------------------------------
+
+@test("tsy: on a hosted machine the errno shape is a thread-local")
+tsy_hosted_is_thread_local()
+    if !tsy_ready() then return
+
+    val got = tsy_run("emit-llvm", "", "", tsy_errno())
+
+    assert_eq(got.0, 0, got.1)
+    assert(tsy_errno_line(got.1).contains("thread_local"), got.1)
+
+@test("tsy: on bare AArch64 with codegen.thread_pointer the errno shape is a thread-local")
+tsy_owned_register_is_thread_local()
+    if !tsy_ready() then return
+
+    val got = tsy_run("emit-llvm", "aarch64-freestanding", tsy_owned(), tsy_errno())
+
+    assert_eq(got.0, 0, got.1)
+    assert(tsy_errno_line(got.1).contains("thread_local"), got.1)
+
+// -- where it is false ------------------------------------------------------------------------------
+
+@test("tsy: on bare AArch64 with no thread_pointer the errno shape is a plain var")
+tsy_bare_aarch64_is_plain()
+    if !tsy_ready() then return
+
+    val got = tsy_run("emit-llvm", "aarch64-freestanding", "", tsy_errno())
+    val line = tsy_errno_line(got.1)
+
+    assert_eq(got.0, 0, got.1)
+    assert(!line.is_empty(), got.1)
+    assert(!line.contains("thread_local"), line)
+
+@test("tsy: and build-lib there checks it cleanly")
+tsy_bare_aarch64_build_lib()
+    if !tsy_ready() then return
+
+    val got = tsy_run("build-lib", "aarch64-freestanding", "", tsy_errno())
+
+    assert_eq(got.0, 0, got.1)
+    assert(got.1.starts_with("checked "), got.1)
+
+@test("tsy: on a thumb board the errno shape is a plain var")
+tsy_thumb_is_plain()
+    if !tsy_ready() then return
+
+    val got = tsy_run("emit-llvm", "thumbv7em-freestanding", "", tsy_errno())
+    val line = tsy_errno_line(got.1)
+
+    assert_eq(got.0, 0, got.1)
+    assert(!line.is_empty(), got.1)
+    assert(!line.contains("thread_local"), line)
+
+// -- the negation, and the symbol beside the others --------------------------------------------------
+
+private tsy_negated() -> string =
+    "#if !thread_local\n@export(\"plain_here\")\nplain_here() -> i32 = 7\n#else\n" +
+    "@export(\"tls_here\")\ntls_here() -> i32 = 9\n#endif\n"
+
+@test("tsy: '#if !thread_local' takes the branch the positive one leaves, on each kind of machine")
+tsy_negation()
+    if !tsy_ready() then return
+
+    val board = tsy_run("emit-llvm", "thumbv7em-freestanding", "", tsy_negated())
+    val bare = tsy_run("emit-llvm", "aarch64-freestanding", "", tsy_negated())
+    val owned = tsy_run("emit-llvm", "aarch64-freestanding", tsy_owned(), tsy_negated())
+    val hosted = tsy_run("emit-llvm", "", "", tsy_negated())
+
+    assert(board.1.contains("@plain_here(") && !board.1.contains("@tls_here("), board.1)
+    assert(bare.1.contains("@plain_here(") && !bare.1.contains("@tls_here("), bare.1)
+    assert(owned.1.contains("@tls_here(") && !owned.1.contains("@plain_here("), owned.1)
+    assert(hosted.1.contains("@tls_here(") && !hosted.1.contains("@plain_here("), hosted.1)
+
+@test("tsy: the symbol is in the vocabulary, and the condition reads the registers the build owns")
+tsy_vocabulary_and_defined()
+    var known = false
+
+    for item in symbols()
+        if item == "thread_local" then known = true
+
+    assert(known, symbols_listed())
+
+    val bare = target_resolved("aarch64-freestanding").unwrap()
+    val board = target_resolved("thumbv7em-freestanding").unwrap()
+
+    assert(!dependency_condition("thread_local", dependency_defined(bare)).unwrap())
+    assert(!dependency_condition("thread_local", dependency_defined(board)).unwrap())
+
+    use_machine_registers(MachineRegisters(Some("tpidr_el0"), None))
+    assert(dependency_condition("thread_local", dependency_defined(bare)).unwrap())
+    assert(!dependency_condition("thread_local", dependency_defined(board)).unwrap())
+    use_machine_registers(no_machine_registers())
+
+    assert(dependency_condition("thread_local", dependency_defined(host_target())).unwrap())
+
+// -- a dependency's `if` sees the root's register -----------------------------------------------------
+
+// A path dependency named `name` holding module `name` with `answer`.
+private tsy_dependency(root: string, name: string)
+    make_dir_all(s"$root/$name/$name").unwrap()
+    write_text(s"$root/$name/package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$root/$name/$name/$name.sysl", s"module $name\n\nanswer() -> i32 = 42\n").unwrap()
+end tsy_dependency
+
+@test("tsy: a dependency taken 'if = thread_local' is present where the root names the register")
+tsy_dependency_if()
+    if !tsy_ready() then return
+
+    val deps = absolute_path(make_temp_dir("sysl-tsy-deps").unwrap())
+
+    tsy_dependency(deps, "tl")
+    tsy_dependency(deps, "pl")
+
+    val entries = s"dependencies {\n  tl { path = \"$deps/tl\", if = \"thread_local\" }\n" +
+                  s"  pl { path = \"$deps/pl\", if = \"!thread_local\" }\n}\n"
+    val uses_tl = "import tl.answer\n\n@export(\"which\")\nwhich() -> i32 = answer()\n"
+    val uses_pl = "import pl.answer\n\n@export(\"which\")\nwhich() -> i32 = answer()\n"
+
+    val owned = tsy_run("emit-llvm", "aarch64-freestanding", tsy_owned() + entries, uses_tl)
+    val bare = tsy_run("emit-llvm", "aarch64-freestanding", entries, uses_pl)
+    val refused = tsy_run("emit-llvm", "aarch64-freestanding", entries, uses_tl)
+
+    remove_dir_all(deps).unwrap_or(())
+    assert_eq(owned.0, 0, owned.1)
+    assert_eq(bare.0, 0, bare.1)
+    assert_eq(refused.0, 1, refused.1)
+
+// -- the error path ---------------------------------------------------------------------------------
+
+@test("tsy: a '@thread_local' with no '#if' is still refused on a board, naming why")
+tsy_refused_on_a_board()
+    if !tsy_ready() then return
+
+    val got = tsy_run("emit-llvm", "thumbv7em-freestanding", "", "@thread_local\nvar errno: i32 = 0\n")
+
+    assert_eq(got.0, 1, got.1)
+    assert(got.1.contains("'k.errno' cannot be '@thread_local' on 'thumbv7em-freestanding': there is " +
+                          "no loader and no libc on this target"), got.1)
+
+@test("tsy: and on bare AArch64 with no thread_pointer, naming the register setting")
+tsy_refused_on_bare_aarch64()
+    if !tsy_ready() then return
+
+    val got = tsy_run("build-lib", "aarch64-freestanding", "", "@thread_local\nvar errno: i32 = 0\n")
+
+    assert_eq(got.0, 1, got.1)
+    assert(got.1.contains("'k.errno' cannot be '@thread_local' on 'aarch64-freestanding' until the " +
+                          "program says which register holds the thread pointer"), got.1)

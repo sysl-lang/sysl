@@ -396,7 +396,9 @@ tcap_ceiling_library_edges()
 // take back a facility the machine does not have.
 private val tcap_thing: string = "module thing\n@no_alloc\n\nf() -> int = 1\n"
 
-private val tcap_boxing_tests: string = "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n"
+// A test that boxes: a `@test` is a root, so it is in the image a heap-less machine is asked about.
+private val tcap_boxing_tests: string =
+    "module thing\n@tests\n@requires(heap)\n\n@test(\"boxes\")\nboxes()\n    val b: &int = 1\n"
 
 @test("the tests of an allocator-free module may allocate on a machine that has an allocator")
 tcap_tests_allocate_with_heap()
@@ -418,8 +420,21 @@ tcap_tests_no_heap_on_machine()
 
     assert_eq(tcap_said(got), s"thing/tests.sysl: ${tcap_no_heap_ref()}")
 
-// `sysl build` analyzes a `@tests` file and then drops it, so a requirement checked there would
-// refuse a build over a facility only the discarded file wanted.
+// A helper in the same file that no test calls is not in the image, so the machine does not ask it.
+@test("and a helper of the tests that nothing calls is not asked")
+tcap_tests_unreached_helper_on_machine()
+    if tcap_no_std() then return
+
+    val tests = "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n\n" +
+                "@test(\"adds\")\nadds()\n    assert(2 + 2 == 4)\n"
+    val got = tcap_reported(["heap"], tcap_nothing,
+                            [("thing/a.sysl", tcap_thing), ("thing/tests.sysl", tests),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+// Only a test build analyzes a `@tests` file -- every other build drops it before analysis -- so a
+// requirement checked there would hold the module to a facility only its tests want.
 @test("the requirement itself refuses nothing, since the file it is on is about to be dropped")
 tcap_tests_requirement_refuses_nothing()
     if tcap_no_std() then return

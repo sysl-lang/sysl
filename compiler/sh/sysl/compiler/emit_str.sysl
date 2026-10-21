@@ -87,6 +87,23 @@ str_cmp(e: *Emit, av: Val, bv: Val) -> Val
     r
 end str_cmp
 
+// Whether two strings hold the same bytes, as an `i1` -- what `==` and `!=` lower to, rather than
+// `str_cmp`'s order read against zero (`str_eq_text` says why).
+str_eq(e: *Emit, av: Val, bv: Val) -> Val
+    val a = str_bytes(e, av)
+    val b = str_bytes(e, bv)
+    val fn = request_text(e, "sysl.str.eq", str_eq_text(word_llvm_of(e)))
+    val r = fresh_reg(e)
+
+    var args = str_args(e, a.0, a.1)
+
+    for item in str_args(e, b.0, b.1)
+        args.push(item)
+
+    emit(e, ir_call(Some(r), l_i1(), VGlobal(fn), args))
+    r
+end str_eq
+
 // The position of a string in a sorted constant table of `count` strings, or `count` where it is not
 // there -- one call, whose search asks `str_cmp`'s comparison, so the comparison is requested first.
 str_search(e: *Emit, table: Val, count: usize, v: Val) -> Val
@@ -414,8 +431,11 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
 
             args.push(ir_arg(LPtr, data))
             fn
+        // A zero-sized receiver -- `unit` -- has no parameter in the callee, so it has no argument.
         None ->
-            args.push(ir_arg(if big then LPtr else lty(e, texpr_type(value)), v))
+            if !zero_sized(texpr_type(value)) then
+                args.push(ir_arg(if big then LPtr else lty(e, texpr_type(value)), v))
+
             VGlobal(symbol_of(e, method))
 
     args.push(ir_arg(l_fat(), w))

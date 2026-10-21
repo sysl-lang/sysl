@@ -25,9 +25,19 @@ check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: 
 
         if im.is_some()
             check_signature(a, span, home.label, shown, tm, im.unwrap(), sig,
-                            trait_scope_of(a, block.trait_name), home.scope)
+                            trait_scope_of(a, block.trait_name), home.scope,
+                            member_key_of(home.key, im.unwrap().name))
             check_override_marking(a, home.scope, shown, tm, im.unwrap())
+            check_views_marking(a, home.scope, home.label, shown, tm, im.unwrap())
+        else if block.derived && derive_for(tr, tm.name).is_some()
+            // A block a `derives` clause wrote takes the trait's `derive` body before its default:
+            // the default is what a hand-written block inherits.
+            inherited.push(derive_for(tr, tm.name).unwrap().member)
         else if !tm.body.is_empty() then inherited.push(tm)
+        else if block.derived
+            a.fault(scope, span, s"'${home.label}' cannot derive '$shown': it declares " +
+                    s"${member_kind(tm)} '${source_member_name(tm.name)}' with neither a 'derive' " +
+                    "body nor a default, so the derivation has nothing to write it with")
         else
             a.fault(scope, span, s"'${home.label}' does not implement '$shown': ${member_kind(tm)} " +
                     s"'${source_member_name(tm.name)}' is missing")
@@ -122,6 +132,24 @@ check_override_marking(a: &Analysis, scope: Scope, trait_name: string, tm: Metho
                 "replacing anything — 'override' says a body was replaced")
 end check_override_marking
 
+// **`@views(self)` is the trait's to say, because a call through an object reads only the trait's
+// member** (`view_borrow.sysl`). An implementation marked where the trait is not hands a borrowed
+// view to every caller reaching it through a `&Trait`, and none of them is held to it, so that is
+// refused here, naming both members. The other way round is sound -- the implementation inherits
+// the mark (`hoist_impl.sysl`'s `with_trait_marks`), so a call on the type is held as one through
+// the object is.
+private check_views_marking(a: &Analysis, scope: Scope, for_type: string, trait_name: string,
+                            tm: MethodDecl, im: MethodDecl)
+    if !im.marks.views || tm.marks.views then return
+
+    val name = source_member_name(im.name)
+
+    a.fault(scope, method_anchor(im), s"'$name' of 'impl $trait_name for $for_type' is marked " +
+            s"'@views(self)', but trait '$trait_name' declares '$name' without it — a call through " +
+            s"a '&$trait_name' reads only the trait's member, so the view it answers would be held to " +
+            s"nothing. Mark '$trait_name.$name' '@views(self)' as well")
+end check_views_marking
+
 // Compares one implementing method against the trait's signature: the same receiver mode -- except that
 // a `self` may stand for the trait's `*self`, the call handing the implementation a copy of what it
 // would have handed the address of -- the same parameter types in order, and the same result.
@@ -140,7 +168,8 @@ end check_override_marking
 // anchors them: what fails is the block's promise to be the trait, and the member is named in the
 // message. Only the `override` marking is the member's own.
 check_signature(a: &Analysis, at: Span, for_type: string, trait_name: string, tm: MethodDecl,
-                im: MethodDecl, outer: Buf[Binding], trait_scope: Scope, impl_scope: Scope)
+                im: MethodDecl, outer: Buf[Binding], trait_scope: Scope, impl_scope: Scope,
+                held_key: string)
     // A message names the member the way it was **written**: a setter is filed under a name holding a
     // marker, which is not sysl and must never reach a reader.
     val name = source_member_name(im.name)
@@ -214,6 +243,16 @@ check_signature(a: &Analysis, at: Span, for_type: string, trait_name: string, tm
         want = declared_result_type(Some(resolve_result(a, trait_scope, tm.ret_type.unwrap(),
                                                       trait_own)))
 
+    // **A member that leaves its result to its body supplies the trait's**: the block is held to the
+    // trait's signature, so that is what the member hands back and what its body is read against.
+    // An `async` member's slot stands inside the task its caller receives.
+    if is_inferred_result(im.ret_type)
+        val held = if im.marks.is_async() then task_result(want).unwrap_or(want) else want
+
+        hold_trait_result(a, held_key, held)
+        return
+    end if
+
     if im.ret_type.is_some() then
         got = declared_result_type(Some(restated(a, () -> resolve_result(a, impl_scope, im.ret_type.unwrap(),
                                                                          impl_own))))
@@ -223,7 +262,7 @@ check_signature(a: &Analysis, at: Span, for_type: string, trait_name: string, tm
                 s"'$trait_name' declares ${type_show(want)}")
 end check_signature
 
-private same_receiver(x: Option[RecvMode], y: Option[RecvMode]) -> bool
+same_receiver(x: Option[RecvMode], y: Option[RecvMode]) -> bool
     if x.is_none() then return y.is_none()
     if y.is_none() then return false
 

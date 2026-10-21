@@ -1009,7 +1009,8 @@ derived_display_renders_a_variant()
               "use(s: Shape) -> string = str(s)\n"
     val out = shown(src, "Shape.display")
 
-    assert(out.contains("sysl$display_fill"), out)
+    assert(out.contains("sysl$display_padded"), out)
+    assert(out.contains("value: \"Line\""), out)
 
 @test("a simple enum is already 'Eq', so deriving one is refused at the word")
 deriving_eq_on_a_simple_enum_is_refused()
@@ -1029,9 +1030,10 @@ deriving_an_unknown_trait_is_refused()
     val said = complaints("trait Fancy\n    fancy(self) -> int\n\n" +
                           "struct P derives Fancy\n    x: int\n")
 
-    assert(says(said, "'Fancy' is not a trait the compiler knows how to write — 'derives' names " +
-                "Eq, Ord, Hash or Display, which are the four the library provides structurally " +
-                "for every tuple. A trait of your own is implemented with an 'impl' block"),
+    assert(says(said, "'Fancy' is not a trait the compiler knows how to write, and it carries no " +
+                "'derive' member — 'derives' names Eq, Ord, Hash or Display, or a trait with a " +
+                "'derive' body for its members. A trait without one is implemented with an 'impl' " +
+                "block"),
            s"${said.len()} said")
 
 // -- what the whole compiler's own sources found ---------------------------------------------------
@@ -1951,11 +1953,22 @@ two_types_that_hold_each_other()
 a_default_is_read_at_its_declaration()
     if no_library() then return
 
-    val text = "apply(g: int -> int = y -> y * 2) -> int = g(21)\n\nmain() = print(1)\n"
-    val names = declared_names(text)
+    // Counted against the same program without the default, so the closures the library lowers
+    // for itself -- whichever their numbers -- are no part of the answer.
+    val with_default = closure_calls(declared_names("apply(g: int -> int = y -> y * 2) -> int = g(21)\n\nmain() = print(1)\n"))
+    val without = closure_calls(declared_names("main() = print(1)\n"))
 
-    assert(names_hold_one(names, "$closure4.call"),
-           "the default's closure was not lowered where it was written")
+    assert_eq(with_default - without, 1)
+
+// How many closures' `call` functions a program defines.
+private closure_calls(xs: Buf[string]) -> int
+    var n = 0
+
+    for i in 0..<xs.len()
+        if xs.at(i).starts_with("$closure") && xs.at(i).ends_with(".call") then n += 1
+
+    n
+end closure_calls
 
 @test("and a call that leaves the argument out settles the type parameter from the default")
 a_default_settles_a_type_parameter()

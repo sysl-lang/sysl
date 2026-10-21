@@ -567,13 +567,13 @@ against an unfolded haystack would be looking for bytes that are not there.
 ### `str_builder`
 
 ```sysl
-str_builder() -> StrBuilder
+const str_builder() -> StrBuilder
 ```
 
 ### `str_builder_with_capacity`
 
 ```sysl
-str_builder_with_capacity(n: usize) -> StrBuilder
+const str_builder_with_capacity(n: usize) -> StrBuilder
 ```
 
 A builder that already has room for `n` bytes, for a caller who knows roughly how long the text
@@ -753,14 +753,14 @@ piece once and grows geometrically.
 |---|---|---|
 | `len` | `len -> usize` |  |
 | `is_empty` | `is_empty -> bool` |  |
-| `push` | `push(*self, s: string)` |  |
-| `push_char` | `push_char(*self, c: char)` | A character's bytes, through the library's one encoder rather than `string(c)` -- which would allocate a whole string per character only to copy its bytes back out. |
-| `push_int` | `push_int(*self, n: long)` | The numbers, rendered straight into the buffer. |
-| `push_uint` | `push_uint(*self, n: ulong)` |  |
-| `push_real` | `push_real(*self, x: real)` | The rendering `str` and `print` give a float, so that a float gathered into a builder reads the same as theirs. |
-| `push_bool` | `push_bool(*self, b: bool)` | Two immortal literals, so this allocates nothing either -- and it is here rather than left to the caller so that the set of things a builder takes without a `str` is the set `str` itself renders directly. |
-| `clear` | `clear(*self)` |  |
-| `finish` | `finish(self) -> string` | Every byte that went in came from a `string` or from `push_char`, so what is held is well-formed by construction and there is nothing left to validate. |
+| `push` | `const push(*self, s: string)` |  |
+| `push_char` | `const push_char(*self, c: char)` | A character's bytes, through the library's one encoder rather than `string(c)` -- which would allocate a whole string per character only to copy its bytes back out. |
+| `push_int` | `const push_int(*self, n: long)` | The numbers, rendered straight into the buffer. |
+| `push_uint` | `const push_uint(*self, n: ulong)` |  |
+| `push_real` | `const push_real(*self, x: real)` | The rendering `str` and `print` give a float, so that a float gathered into a builder reads the same as theirs. |
+| `push_bool` | `const push_bool(*self, b: bool)` | Two immortal literals, so this allocates nothing either -- and it is here rather than left to the caller so that the set of things a builder takes without a `str` is the set `str` itself renders directly. |
+| `clear` | `const clear(*self)` |  |
+| `finish` | `const finish(self) -> string` | Every byte that went in came from a `string` or from `push_char`, so what is held is well-formed by construction and there is nothing left to validate. |
 
 ### `Utf8Error`
 

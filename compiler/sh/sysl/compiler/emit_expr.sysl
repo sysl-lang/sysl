@@ -138,6 +138,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         val p = element_addr(e, receiver, index, x.span)
         val r = fresh_reg(e)
 
+        if read_under_union(x) then emit_union_check(e, p, ty, x.span)
+
         emit(e, InLoad(r, lty(e, ty), p, place_access(e, x), None))
         r
 
@@ -154,9 +156,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TLogical(op, l, r) -> gen_logical(e, op, l, r)
     TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
 
-    TStore(place, value, ty) -> gen_store(e, place, value, ty)
-    TUpdate(place, op, value, ty, dispatch, check) ->
-        gen_update(e, place, op, value, ty, dispatch, check)
+    TStore(place, value, ty, yields) -> yielded(yields, gen_store(e, place, value, ty))
+    TUpdate(place, op, value, ty, dispatch, check, yields) ->
+        yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
     TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
 
     TCall(name, args, ty, _) ->
@@ -166,6 +168,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TFence(ordering) -> gen_fence(e, ordering)
     TSlots(op, args, elem, ty) -> gen_slots(e, op, args, elem, ty)
     TSysOp(op, name, args) -> gen_sysop(e, op, name, args)
+    TVariantFail(asked, holds) -> variant_fail(e, asked, holds, x.span)
+    TVariantFailHeld(asked, held) -> variant_fail_held(e, asked, held, x.span)
 
     // **A call through a `*extern` pointer is a foreign call whose callee is a register.** The
     // convention is the C one on both sides -- the value came from a `&f` or from C itself and may
@@ -315,7 +319,20 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     // An empty view has no storage to make, so it is the zero value of its own representation:
     // `{owner = null, data = null, len = 0}`. It is not owned either -- there is no box for a
     // release to let go of, and a null owner is what a view that owns nothing already carries.
-    TBufLit(elems, slice_ty) -> gen_buf_lit(e, elems, slice_ty)
+    //
+    // **A literal the escape analysis framed is the other way round**: handed straight to a call
+    // that keeps nothing of it, so it is the array a `val xs: [N]T = [...]` would have been, viewed
+    // whole -- a slot of the frame and no allocation.
+    TBufLit(elems, slice_ty) ->
+        if read_only_literal(elems, slice_ty) then return static_view(e, elems, slice_ty)
+
+        if !elems.is_empty() && is_framed_lit(e, x.span)
+            val elem = element(slice_ty).unwrap_or(int_type())
+            val array = TExpr(x.span, TArrayLit(elems, Array(int(elems.len()), elem)))
+
+            return gen_slice(e, array, None, None, false, slice_ty, x.span)
+
+        gen_buf_lit(e, elems, slice_ty)
 
     // The value is generated once, above the loop, which is what makes `[tick(); n]` one call whose
     // result lands in n places -- and the reason the count may be zero and the call still happen.
@@ -328,15 +345,21 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         fill_elements(e, elem, made.1, n, v)
         buffer_view(e, slice_ty, made.0, made.1, n)
 
-    // **A view of some of what a place holds.** A whole temporary array whose view *escapes* is the
+    // **A view of some of what a place holds.** A temporary array whose view *outlives it* is the
     // one case that is not a narrowing: the value the frame just computed is written into a buffer
     // instead of into the slot it would otherwise have had, and the view counts against that buffer.
     // The two literal forms are the same case done better -- built straight into the buffer rather
     // than produced and copied -- and everything else has no such form, so the value is made and
     // moved.
     TSlice(base, lo, hi, inclusive, slice_ty) ->
-        if lo.is_none() && hi.is_none() && is_promoted_temp(e, x.span)
-            return gen_promoted_slice(e, base, slice_ty)
+        if is_promoted_temp(e, x.span)
+            val whole = gen_promoted_slice(e, base, slice_ty)
+
+            if lo.is_none() && hi.is_none() then return whole
+
+            // Part of a promoted temporary: the whole of it moved, and the part is narrowed over
+            // the buffer it moved into.
+            return gen_slice_of_view(e, whole, lo, hi, inclusive, slice_ty, x.span)
 
         gen_slice(e, base, lo, hi, inclusive, slice_ty, x.span)
 
@@ -410,9 +433,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 // are not held to its variants here. `gen_field` holds them; `E.try(s.field)` answers instead.
 bitfield_field_bits(e: *Emit, receiver: TExpr, index: int, ranges: Buf[BitRange]) -> Val
     val rty = texpr_type(receiver)
-    val acc = access_of(place_ty(receiver))
+    val acc = storage_access(receiver)
     val ct = container_lty(ranges)
-    val at_address = has_address(receiver) && (e.layout.indirect(rty) || volatile_in(place_ty(receiver)))
+    val at_address = has_address(receiver) && (e.layout.indirect(rty) || (volatile_in(place_ty(receiver)) && !in_with_copy(receiver)))
 
     val c = container_read(e, receiver, rty, ct, acc, at_address)
 
@@ -441,6 +464,16 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
 
     val rty = texpr_type(receiver)
 
+    // A C bitfield is read out of its unit, at the receiver's address -- a computed receiver is given
+    // a slot (`address`) -- and an enum one held to its variants (`emit_c_bits.sysl`).
+    c_bit_struct(rty, index) match
+        Some(d) ->
+            val bits = c_bit_load(e, d, usize(index), address(e, receiver), place_ty(receiver))
+
+            check_variant(e, ty, bits, x.span)
+            return bits
+        None -> ()
+
     bitfield_ranges_of(rty) match
         Some(ranges) ->
             val bits = bitfield_field_bits(e, receiver, index, ranges)
@@ -450,12 +483,26 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
             return bits
         None -> ()
 
-    if volatile_in(place_ty(x)) && has_address(receiver)
+    if volatile_in(place_ty(x)) && !in_with_copy(x) && has_address(receiver)
         val p = address(e, x)
         val r = fresh_reg(e)
 
+        if read_under_union(x) then emit_union_check(e, p, ty, x.span)
+
         emit(e, InLoad(r, lty(e, ty), p, AccVolatile, None))
         return r
+
+    // A field of a union, or a part of one, is read where it lies -- every field of a union is at its
+    // first byte, which no register aggregate can say -- and its bytes are checked first where they
+    // can be no value of its type (`union_fields.sysl`).
+    if read_under_union(x)
+        val p = address(e, x)
+        val r = fresh_reg(e)
+
+        emit_union_check(e, p, ty, x.span)
+        emit(e, InLoad(r, lty(e, ty), p, AccPlain, None))
+        return r
+    end if
 
     if e.layout.indirect(rty) && has_address(receiver)
         val p = address(e, x)
@@ -501,7 +548,9 @@ has_address(x: TExpr) -> bool = *x.kind match
     TLoad(_, _) -> true
     TGlobal(_, _, _) -> true
     TDeref(_, _) -> true
-    TField(receiver, _, _) -> bitfield_ranges_of(texpr_type(receiver)).is_none() && has_address(receiver)
+    TField(receiver, index, _) ->
+        bitfield_ranges_of(texpr_type(receiver)).is_none() && !c_bit_field(texpr_type(receiver), index) &&
+            has_address(receiver)
     TIndex(_, _, _) -> true
     _ -> false
 
@@ -630,6 +679,13 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
         Integer(bits, signed, _) ->
             if op == "<<" && is_ranged(texpr_type(l)) then return checked_shl(e, bits, signed, lv, rv)
             if overflow_checked(op, l, r, bits, signed) then return checked_arith(e, op, bits, signed, lv, rv)
+
+            if op == "+" && nowrap_add(e, l, r, bt)
+                val sum = fresh_reg(e)
+
+                emit(e, InBin(sum, OpAddNuw, lty(e, bt), lv, rv))
+                return sum
+            end if
         _ -> ()
 
     arith(e, op, bt, lv, rv)
@@ -823,10 +879,12 @@ dispatch_value(e: *Emit, d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val,
     val right = if d.swap then av else bv
     val right_ty = if d.swap then aty else bty
 
+    // A zero-sized operand -- `unit`'s `==` -- has no parameter in the callee's signature, so it
+    // has no argument here either, exactly as at an ordinary call.
     var args: Buf[IrArg] = buf()
 
-    args.push(operand_arg(e, left_ty, left))
-    args.push(operand_arg(e, right_ty, right))
+    if !zero_sized(left_ty) then args.push(operand_arg(e, left_ty, left))
+    if !zero_sized(right_ty) then args.push(operand_arg(e, right_ty, right))
 
     val res = gen_sysl_call(e, VGlobal(symbol_of(e, d.name)), args, result_ty)
 
@@ -844,7 +902,7 @@ end dispatch_value
 // The slot is staging and nothing more -- a fresh slot nothing else can name, so it is storage the
 // call cannot change, which is all a callee reading its parameter in place needs (`indirect_arg`).
 // It holds a count of nothing, so nothing here releases it.
-private operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
+operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
     if !e.layout.indirect(ty) then return ir_arg(lty(e, ty), v)
 
     val slot = alloca(e, fresh_reg(e), lty(e, ty))
@@ -854,6 +912,12 @@ private operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
 end operand_arg
 
 // -- writing --------------------------------------------------------------------------------------
+
+// What a write gives the expression around it: the value now in the place where it is written `:=`,
+// and nothing where it is written `=`, whose type is `unit`. The value is the one the store wrote,
+// which is what reading the place right after gives; it carries no count of its own, as a read of a
+// place does not, so whatever keeps it takes one.
+private yielded(yields: bool, v: Val) -> Val = if yields then v else VNothing
 
 private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     if zero_sized(ty)
@@ -1109,6 +1173,8 @@ end gen_enum_new
 // fields that occupy nothing skipped exactly as the layout skips them. A **bitfield** struct is one
 // integer instead, and its fields are ranges of it.
 private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
+    if !decl.c_bits.is_empty() then return c_bits_new(e, decl, args)
+
     bitfield_ranges(decl) match
         Some(ranges) ->
             var vals: Buf[Val] = buf()
@@ -1222,11 +1288,22 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
     if is_foreign(e, name)
         val form = foreign_result(e, ty)
 
+        // **An `extern` of `llvm.trap` -- the library's `trap()` -- stops where every other trap
+        // does**, through `@sysl.trap`, so it flushes what the program printed first
+        // (`trap_stop.sysl`).
+        var symbol = symbol_of(e, name)
+
+        if symbol == llvm_trap()
+            e.traps = true
+            symbol = trap_symbol(e)
+
         return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
-                                VGlobal(symbol_of(e, name)), args, ty, e.abandoning.has(name))
+                                VGlobal(symbol), args, ty, e.abandoning.has(name))
 
     var arg_vals: Buf[IrArg] = buf()
+    val mark = e.temps.len()
     val staged = staged_args(e, args, &arg_vals, name)
+    val worked_out = e.temps.len()
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -1245,6 +1322,8 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
         gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty, variadic_type_of(e, name))
     else
         gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
+
+    if e.asyncs.has(name) then move_into_task(e, mark, worked_out, args, arg_vals)
 
     // What the callee promised, said again where the caller's own code can be folded against it
     // (`contract_assume.sysl`). It goes after the call because a postcondition is about the state the
@@ -1515,7 +1594,7 @@ end cast_to
 // A Unicode scalar value is at most `0x10FFFF` and is never a surrogate; anything else traps, in
 // the same runtime-safety category as a bounds check. **The test runs at 64 bits** so that a wider
 // source cannot smuggle a value past it.
-private checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
+checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
     val wide = convert_int(e, from_bits, from_signed, 64, v)
     val i64 = LInt(64)
     val in_range = fresh_reg(e)

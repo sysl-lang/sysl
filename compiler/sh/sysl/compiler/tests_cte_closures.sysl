@@ -1,0 +1,117 @@
+module sh.sysl.compiler
+@tests
+
+// **Closures and trait objects while compiling**: a closure called where it is written, handed on as a
+// type argument or as a `&Fn`, kept in a buffer, returned and keeping state; a call through a trait
+// object, a rendering through one, and a type's identity -- each checked against the same call made
+// where the program runs -- and a closure whose body cannot run, refused by name.
+
+@test("a closure and a trait object are called while compiling as the program calls them")
+cte_closures_run_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        trait Shape
+            area(self) -> int
+
+        struct Rect
+            w: int
+
+        struct Sq
+            s: int
+
+        impl Shape for Rect
+            area(self) -> int = self.w
+
+        impl Shape for Sq
+            area(self) -> int = self.s * self.s
+
+        impl Display for Sq
+            display(self, out: *Writer, fmt: FormatSpec) = display_pad("sq".bytes, out, fmt)
+
+        apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+
+        twice(f: int -> int, x: int) -> int = f(f(x))
+
+        adder(k: int) -> &Fn(int) -> int = x -> x + k
+
+        counter() -> &Fn() -> int
+            var n = 0
+
+            () ->
+                n += 1
+                n
+
+        closures() -> int
+            val k = 3
+            val add = (x: int) -> x + k
+
+            add(1) * 100 + apply(x -> x * k, 5) * 10 + twice(x -> x + 1, 0)
+
+        stored() -> int
+            var fs = buf[&Fn(int) -> int]()
+
+            for k in 1..3
+                fs.push(adder(k))
+
+            var t = 0
+
+            for f in fs
+                t = t * 10 + f(10)
+
+            val c = counter()
+
+            c()
+            c()
+            t * 10 + c()
+
+        kinds() -> int
+            var xs: [3]*Shape = [&Rect(1), &Sq(2), &Rect(3)]
+            var rects = 0
+
+            for x in xs
+                if x::Id == Rect::Id then rects += 1
+
+            val boxed: [2]&Shape = [Sq(3), Rect(5)]
+
+            rects * 100 + xs[1].area() * 10 + boxed[0].area() + boxed[1].area()
+
+        shown() -> string
+            val d: &Display = Sq(1)
+
+            s"<${d}>"
+
+        const C: int = closures()
+        const T: int = stored()
+        const K: int = kinds()
+        const D: string = shown()
+
+        print(C, T, K, D)
+        print(C == closures(), T == stored(), K == kinds(), D == shown())
+        """), "552 12333 254 <sq>\ntrue true true true\n")
+end cte_closures_run_while_compiling
+
+@test("a closure whose body cannot run while compiling is refused, naming what it calls")
+cte_a_closure_that_prints_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+
+        noisy(x: int) -> int
+            print(x)
+            x
+
+        loud() -> int = apply(x -> noisy(x) + 1, 2)
+
+        const L: int = loud()
+
+        print(L)
+        """).0
+
+    assert(said.contains("'L' cannot be computed while compiling"), said)
+    assert(said.contains("prints, which is outside the program — nothing outside the program exists while " +
+                         "compiling"), said)
+end cte_a_closure_that_prints_is_refused

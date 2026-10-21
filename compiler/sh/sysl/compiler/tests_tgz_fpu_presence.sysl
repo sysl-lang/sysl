@@ -180,3 +180,86 @@ tgz_m33_float_still_uses_the_unit()
     assert(!tgz_calls_out("thumb-freestanding-softfp"), "softfp's unit went unused")
     assert(!tgz_calls_out("thumb-freestanding"), "the hard-float row's unit went unused")
 end tgz_m33_float_still_uses_the_unit
+
+// -- the Cortex-M7's double-precision unit -------------------------------------------------------------
+
+// The object sysl produced for a multiply of `width`, disassembled. `nm` says whether a helper is
+// called; only the instructions say which unit instruction was chosen instead.
+private tgz_disassembly(name: string, width: string) -> string
+    val t = tgz_row(name)
+    val cc = tgz_clang(t)
+    val ir = tgz_module(t, s"@export\nproduct(a: $width, b: $width) -> $width = a * b\n")
+    val root = make_temp_dir("sysl-fpu-").unwrap()
+    val obj = s"$root/p.o"
+
+    compile_object(cc, ir, obj, t, DefaultOptimization, false) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, s"$cc, ${t.triple}: $why")
+
+    val listed = capture("arm-none-eabi-objdump", ["-d", obj], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    listed match
+        Err(_) -> skip("arm-none-eabi-objdump is not available")
+        Ok(out) -> out.text
+end tgz_disassembly
+
+// `__ARM_FP` is a bit set: bit 1 is half precision, bit 2 single, bit 3 double. An `fpv4-sp-d16` sets
+// 0x6 and an `fpv5-d16` 0xE, so the macro is how a header tells the two units apart.
+private tgz_fp_bit(name: string, mask: string, expected: bool) -> Result[unit, string]
+    val t = tgz_row(name)
+    val cc = tgz_clang(t)
+    val root = make_temp_dir("sysl-fpu-").unwrap()
+    val test = if expected then s"#if !(__ARM_FP & $mask)" else s"#if (__ARM_FP & $mask)"
+
+    write_text(s"$root/probe.c", s"#ifndef __ARM_FP\n#define __ARM_FP 0\n#endif\n$test\n" +
+               "#error \"the compiler does not agree about the precision of the unit\"\n#endif\n" +
+               "int use(void) { return 0; }\n").unwrap()
+
+    val said = compile_c(cc, s"$root/probe.c", s"$root/probe.o", t, DefaultOptimization, no_probe())
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end tgz_fp_bit
+
+@test("the Cortex-M7 double row says a double-precision unit to a header, and the single-precision row does not")
+tgz_m7_dp_header_says_double()
+    tgz_fp_bit("thumbv7em-freestanding-dp", "8", true) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+
+    tgz_fp_bit("thumbv7em-freestanding", "8", false) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+
+    tgz_fp_bit("thumbv7em-freestanding-dp", "4", true) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+end tgz_m7_dp_header_says_double
+
+@test("a double multiply is one vmul.f64 on the Cortex-M7 double row")
+tgz_m7_dp_double_multiply_is_an_instruction()
+    if std_root().is_err() then return
+
+    val dp = tgz_disassembly("thumbv7em-freestanding-dp", "f64")
+
+    assert(dp.contains("vmul.f64"), s"no double multiply instruction:\n$dp")
+    assert(!tgz_calls_out("thumbv7em-freestanding-dp", "f64"), "a double went to a library routine")
+end tgz_m7_dp_double_multiply_is_an_instruction
+
+@test("and a call to the helper on the plain Armv7E-M row, whose unit is single precision")
+tgz_m7_plain_double_multiply_is_a_call()
+    if std_root().is_err() then return
+
+    val plain = tgz_disassembly("thumbv7em-freestanding", "f64")
+
+    assert(!plain.contains("vmul.f64"), s"a single-precision unit was given a double multiply:\n$plain")
+    assert(plain.contains("__aeabi_dmul"), s"no call to the double multiply routine:\n$plain")
+end tgz_m7_plain_double_multiply_is_a_call
+
+@test("the Cortex-M7 double row still uses the unit for a float")
+tgz_m7_dp_float_multiply_is_an_instruction()
+    if std_root().is_err() then return
+
+    assert(tgz_disassembly("thumbv7em-freestanding-dp", "f32").contains("vmul.f32"), "the float unit went unused")

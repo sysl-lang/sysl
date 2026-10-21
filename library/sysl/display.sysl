@@ -21,6 +21,80 @@ struct FormatSpec
 trait Display
     display(self, out: *Writer, fmt: FormatSpec)
 
+    /** What `derives Display` writes: `Size(3, 4)` -- the type's own name and its fields in order,
+     * which is the tuple's rendering with the name in front; a variant renders under its own name,
+     * `Circle(2)`, and a part-less shape as its name alone. A struct holding an anonymous `struct` or
+     * `union` block is refused at its `derives`: the block has no name to render and no `Display`.
+     *
+     * Each part is handed the **neutral** specifier: the one that arrived describes the field the
+     * whole value occupies, so a width pads the whole rendering once (`display_padded`) rather than
+     * inside it.
+     */
+    derive[T] display(self: T, out: *Writer, fmt: FormatSpec)
+        if fmt.width > 0
+            display_padded(self, out, fmt)
+            return
+        end if
+
+        val parts = FormatSpec(0, -1, false)
+
+        if const T::Kind == Kind.SimpleEnum
+            for const c in T::Variants
+                if self is c then out.write(c.name.bytes)
+        elif const T::Kind == Kind.DataEnum
+            for const c in T::Variants
+                if self is c
+                    val p = self.(c)
+                    var n = 0
+
+                    out.write(c.name.bytes)
+
+                    for const f in c::Fields
+                        out.write((if n == 0 then "(" else ", ").bytes)
+                        p.(f).display(out, parts)
+                        n += 1
+
+                    if n > 0 then out.write(")".bytes)
+                end if
+        else
+            // An anonymous `struct` or `union` block is no field, so `T::Fields` would pass over it
+            // and the rendering would quietly leave out what it holds.
+            for const m in T::Members
+                @assert(!m.anonymous, s"'${T::Name}' cannot derive Display: it holds an anonymous " +
+                        s"struct or union block, which has no Display — write 'impl Display for ${T::Name}'")
+
+            var n = 0
+
+            out.write(T::BaseName.bytes)
+
+            for const f in T::Fields
+                out.write((if n == 0 then "(" else ", ").bytes)
+                self.(f).display(out, parts)
+                n += 1
+
+            if n > 0 then out.write(")".bytes)
+    end display
+
+// `x`'s rendering in the field `fmt` describes, which is how a derived `Display` honours a width: the
+// value is rendered once into a counting sink with no width to learn how long it comes out, then
+// padded once around a second rendering. Nothing is gathered.
+private display_padded[T: Display](x: T, out: *Writer, fmt: FormatSpec)
+    val plain = FormatSpec(0, -1, false)
+    var count = Counting(0)
+    var sink: *Writer = &count
+
+    x.display(sink, plain)
+
+    var pad = fmt.width - int(count.n)
+
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+
+    x.display(out, plain)
+
+    if fmt.left then display_fill(out, 32, pad)
+end display_padded
+
 // The built-in types whose family is **closed**, each with an ordinary `impl` rather than a
 // membership the compiler hands out.
 //
@@ -112,7 +186,22 @@ trait Integer: Div + Rem + Ord + Eq + Sub + Mul
 // computing loop folds away, and what is left is the loop that was always there. It was found by a
 // factorial program in which rendering the answer was 98% of the run and the arithmetic 0.075s of it.
 
+/** Ten as a `T`, reached through a conversion because the literal `10` is refused at a width that
+ * cannot hold it. At such a width the conversion wraps and the result is not ten, which is what
+ * `holds_ten` tests; a caller that has not asked it must not use the value.
+ */
+private ten_of[T: Integer]() -> T
+    val wide: i64 = 10
+    T(wide)
+
+/** Whether `T` can hold ten, which is false for `u1` to `u3` and `i1` to `i4`. A pure function of
+ * `T` alone, so it folds and an ordinary render pays nothing for it.
+ */
+private holds_ten[T: Integer]() -> bool = u64(ten_of[T]()) == 10
+
 /** The largest power of ten that fits in both `T` and a `u64`, and how many digits that is.
+ *
+ * **Only called at a width that holds ten** (`holds_ten`); a narrower one renders through `i64`.
  *
  * **It is computed rather than written down, and it has to be.** The block below is generic over the
  * whole open integer family, so a literal `10000000000000000000` is refused at every narrow member of
@@ -130,8 +219,9 @@ trait Integer: Div + Rem + Ord + Eq + Sub + Mul
  * unconnected to the value being printed.
  */
 private chunk_of[T: Integer]() -> (T, usize)
-    val ten: T = 10
-    var c: T = 1
+    val ten = ten_of[T]()
+    val one: T = ten / ten
+    var c: T = one
     var per: usize = 0
 
     while per < 19
@@ -149,6 +239,11 @@ end chunk_of
 
 impl[T: Integer] Display for T
     display(self, out: *Writer, fmt: FormatSpec)
+        // Every width that cannot hold ten fits an `i64`, sign included.
+        if !holds_ten[T]()
+            i64(self).display(out, fmt)
+            return
+
         var buf: [sizeof(T) * 3 + 2]u8
         val zero: T = 0
         var i = buf.len

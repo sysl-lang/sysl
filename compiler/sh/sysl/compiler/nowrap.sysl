@@ -1,0 +1,412 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.math.bigint.{cmp, from_int}
+
+// **An unsigned add the body has proved cannot wrap is said to LLVM as `add nuw`.**
+//
+// Plain `+` on an unsigned integer wraps, which is the language's meaning and not something the
+// lowering may narrow. But a bounds test on `out[n + k]` can only be folded by an optimizer that knows
+// `n + k` is the arithmetic sum: a guard `n + len <= out.len` written with a wrapping add says nothing
+// about a later index, because a huge `n` wraps the guard's sum small and passes it. So the flag is
+// laid down only where the body itself proves the sum fits, and in two shapes:
+//
+// - **Both operands are bounded by half the word**: a `.len` of a view whose elements take storage
+//   (no object reaches past half the address space, so no such length does either), an integer
+//   literal at most `isize::MAX`, a narrower unsigned value widened, a bitwise `&` with one of these, a
+//   `%` by one, a right shift or a division by a literal, or an immutable local or loop variable
+//   bounded by one of them. Two such values add to less than the word's range.
+// - **A dominating guard in the non-wrapping form** `if n > L || len > L - n then <leave>`, with `L` a
+//   view's `.len` and the then-block leaving (`return`, `break`, `continue`, `become`). Past it,
+//   `n <= L` and `len <= L - n`, so `n + len` fits and so does `n + k` for a loop variable `k` running
+//   below (or up to) `len` in a loop entered past the guard. The fact holds until the first statement
+//   that writes `n`, `len` or the view; a local whose address is taken anywhere in the function never
+//   takes part.
+//
+// The guard's fact is also said again as an `llvm.assume` at the start of the fall-through, so it
+// survives the optimizer splitting the guard into copies -- which the inlined count handling of a
+// retained view does -- where no single copy dominates the loop any longer.
+
+// One guard in force: the operand `a`, the length `b` and the view `x` whose length bounds their sum,
+// the order it was established in, and whether a write since has ended it.
+struct NoWrapGuard
+    a: string
+    b: string
+    x: string
+    id: int
+    live: bool
+end NoWrapGuard
+
+// One counted loop being lowered: its variable, its upper bound, and the guard count at its entry
+// (a guard established after the loop began says nothing about the bound it was entered with).
+struct NoWrapFor
+    name: string
+    hi: TExpr
+    epoch: int
+
+// What one function's lowering knows about its unsigned adds.
+struct NoWrap
+    // Locals whose address is taken, or that a `ref`, an `asm` operand or a `va_list` reaches: any
+    // write to one can happen behind a name the body does not spell.
+    escaped: Set[string]
+
+    // Locals declared once and never written afterwards.
+    once: Set[string]
+
+    // Of those, the ones whose value is bounded by half the word, filled as their declarations are
+    // lowered.
+    bounded: Set[string]
+
+    guards: Buf[NoWrapGuard]
+    fors: Buf[NoWrapFor]
+    next_id: int
+
+    // Deferred statements are laid down at exits, out of the order the guards were proved in.
+    suspended: int
+
+    // Whether the body was scanned. One that was not (an entry point, a synthesised body) proves
+    // nothing beyond what its operands' own forms say.
+    ready: bool
+end NoWrap
+
+no_wrap_none() -> NoWrap = NoWrap(set(), set(), set(), buf(), buf(), 0, 0, false)
+
+// What a walk over a body found.
+private struct NwScan
+    escaped: Set[string]
+    written: Set[string]
+    decls: Buf[string]
+    twice: Set[string]
+
+private nw_scan() -> &NwScan = NwScan(set(), set(), buf(), set())
+
+// The local a write to `place` changes, where it changes a local's own value.
+private nw_root(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> nw_root(r)
+    TIndex(r, _, _) -> underlying(texpr_type(r)) match
+        Array(_, _) -> nw_root(r)
+        _ -> None
+    _ -> None
+
+private nw_wrote(s: &NwScan, place: TExpr)
+    val r = nw_root(place)
+
+    if r.is_some() then s.written.add(r.unwrap())
+end nw_wrote
+
+private nw_escape(s: &NwScan, place: TExpr)
+    val r = nw_root(place)
+
+    if r.is_some() then s.escaped.add(r.unwrap())
+end nw_escape
+
+private nw_on_expr(s: &NwScan, x: TExpr)
+    *x.kind match
+        TStore(place, _, _, _) -> nw_wrote(s, place)
+        TUpdate(place, _, _, _, _, _, _) -> nw_wrote(s, place)
+        TIncDec(place, _, _, _, _) -> nw_wrote(s, place)
+        TAddrOf(place, _) -> nw_escape(s, place)
+        TVaStart(ap) -> nw_escape(s, ap)
+        TVaEnd(ap) -> nw_escape(s, ap)
+        TVaArg(ap, _) -> nw_escape(s, ap)
+        TVaCopy(dst, src) ->
+            nw_escape(s, dst)
+            nw_escape(s, src)
+        _ -> ()
+end nw_on_expr
+
+private nw_on_stmt(s: &NwScan, st: TStmt)
+    st match
+        TVarDecl(name, _, _, _) ->
+            for d in s.decls
+                if d == name then s.twice.add(name)
+
+            s.decls.push(name)
+        TRefDecl(_, _, place) -> nw_escape(s, place)
+        TAsm(_, operands, _, _) ->
+            for item in operands
+                s.escaped.add(item.name)
+        _ -> ()
+end nw_on_stmt
+
+private nw_walker(s: &NwScan) -> &TWalk =
+    TWalk(true, x -> nw_on_expr(s, x), w -> nw_wrote(s, w.place), st -> nw_on_stmt(s, st))
+
+// Whether a scan saw `name` written, declared or reached by address.
+private nw_touches(s: &NwScan, name: string) -> bool
+    if s.written.has(name) || s.escaped.has(name) then return true
+
+    for d in s.decls
+        if d == name then return true
+
+    false
+end nw_touches
+
+// Sets up what is known for the function about to be lowered.
+nowrap_begin(e: *Emit, f: TFunc)
+    val s = nw_scan()
+
+    walk_block_stmts(f.body, nw_walker(s))
+    e.nowrap = no_wrap_none()
+    e.nowrap.escaped = s.escaped
+    e.nowrap.ready = true
+
+    for d in s.decls
+        if !s.twice.has(d) && !s.written.has(d) && !s.escaped.has(d) then e.nowrap.once.add(d)
+end nowrap_begin
+
+// What one statement writes, declares or takes the address of, anywhere inside it.
+private nw_writes(st: TStmt) -> &NwScan
+    val s = nw_scan()
+
+    walk_stmt(st, nw_walker(s))
+    s
+end nw_writes
+
+// Before a statement of a list: every guard it could invalidate is ended.
+nowrap_before(e: *Emit, st: TStmt)
+    var any = false
+
+    for g in e.nowrap.guards
+        if g.live then any = true
+
+    if !any then return
+
+    val w = nw_writes(st)
+
+    for i in 0..<e.nowrap.guards.len()
+        val g = e.nowrap.guards.at(i)
+
+        if g.live && (nw_touches(w, g.a) || nw_touches(w, g.b) || nw_touches(w, g.x))
+            e.nowrap.guards.set(i, NoWrapGuard(g.a, g.b, g.x, g.id, false))
+    end for
+end nowrap_before
+
+// After a statement of a list: a declaration may bound its local, and a guard proves its fact.
+nowrap_after(e: *Emit, st: TStmt)
+    st match
+        TVarDecl(name, ty, init, _) ->
+            if e.nowrap.once.has(name) && nw_word_unsigned(e, ty) && nw_half(e, init, e.word_bits)
+                e.nowrap.bounded.add(name)
+        TExprStmt(x) -> if !e.terminated then nw_guard(e, x)
+        _ -> ()
+end nowrap_after
+
+// The count of guards a list began with, which its end truncates back to.
+nowrap_mark(e: *Emit) -> usize = e.nowrap.guards.len()
+
+nowrap_release(e: *Emit, mark: usize)
+    e.nowrap.guards.truncate(mark)
+end nowrap_release
+
+nowrap_suspend(e: *Emit)
+    e.nowrap.suspended += 1
+end nowrap_suspend
+
+nowrap_resume(e: *Emit)
+    e.nowrap.suspended -= 1
+end nowrap_resume
+
+// A counted loop's body is about to be lowered: its variable runs below `hi` (or up to it), unless
+// the body writes it or takes its address. Answers whether it was recorded.
+nowrap_enter_for(e: *Emit, name: string, hi: TExpr, body: Buf[TStmt]) -> bool
+    if !e.nowrap.ready || e.nowrap.escaped.has(name) then return false
+
+    for st in body
+        if nw_touches(nw_writes(st), name) then return false
+
+    e.nowrap.fors.push(NoWrapFor(name, hi, e.nowrap.next_id))
+    true
+end nowrap_enter_for
+
+nowrap_leave_for(e: *Emit)
+    e.nowrap.fors.pop()
+end nowrap_leave_for
+
+private nw_word_unsigned(e: *Emit, t: Type) -> bool = underlying(t) match
+    Integer(bits, signed, _) -> !signed && bits == e.word_bits
+    _ -> false
+
+// Whether every value `x` can produce is at most `isize::MAX` for a `bits`-wide unsigned.
+private nw_half(e: *Emit, x: TExpr, bits: int) -> bool = *x.kind match
+    TIntLit(v, _) -> cmp(v, from_int(0)) >= 0 && cmp(v, max_of(bits, true)) <= 0
+    TLen(r, _) -> bits == e.word_bits && nw_len_half(e, texpr_type(r))
+    TCast(operand, _) -> underlying(texpr_type(operand)) match
+        Integer(b, signed, _) -> !signed && b < bits
+        Bool -> true
+        _ -> false
+    TLoad(name, _) -> e.nowrap.bounded.has(name) || nw_for_half(e, name, bits)
+    TBinary(op, l, r, _) ->
+        if op == "&" then nw_half(e, l, bits) || nw_half(e, r, bits)
+        else if op == "%" then nw_half(e, r, bits)
+        else if op == ">>" then nw_literal_at_least(r, 1)
+        else if op == "/" then nw_literal_at_least(r, 2)
+        else false
+    _ -> false
+
+private nw_literal_at_least(x: TExpr, n: long) -> bool = *x.kind match
+    TIntLit(v, _) -> cmp(v, from_int(n)) >= 0
+    _ -> false
+
+// A view's length is at most half the address space where each element takes storage.
+private nw_len_half(e: *Emit, t: Type) -> bool = underlying(t) match
+    Array(n, _) -> cmp(from_int(long(n)), max_of(e.word_bits, true)) <= 0
+    Slice(elem, _) -> e.layout.size(*elem) > 0
+    Str -> true
+    _ -> false
+
+// A loop variable runs below its bound (or up to it), so it is bounded where the bound is.
+private nw_for_half(e: *Emit, name: string, bits: int) -> bool
+    for f in e.nowrap.fors
+        if f.name == name then return nw_half(e, f.hi, bits)
+
+    false
+end nw_for_half
+
+private nw_load_name(x: TExpr) -> Option[string] = *x.kind match
+    TLoad(name, _) -> Some(name)
+    _ -> None
+
+// Whether `l + r` at `ty` is proved not to wrap.
+nowrap_add(e: *Emit, l: TExpr, r: TExpr, ty: Type) -> bool
+    if !nw_word_unsigned(e, ty) then return false
+    if nw_half(e, l, e.word_bits) && nw_half(e, r, e.word_bits) then return true
+    if e.nowrap.suspended > 0 then return false
+
+    val p = nw_load_name(l)
+    val q = nw_load_name(r)
+
+    if p.is_none() || q.is_none() then return false
+
+    for g in e.nowrap.guards
+        if g.live
+            if (p.unwrap() == g.a && q.unwrap() == g.b) || (p.unwrap() == g.b && q.unwrap() == g.a)
+                return true
+
+            if p.unwrap() == g.a && nw_runs_below(e, q.unwrap(), g) then return true
+            if q.unwrap() == g.a && nw_runs_below(e, p.unwrap(), g) then return true
+        end if
+
+    false
+end nowrap_add
+
+// Whether `k` is a loop variable bounded by the guard's length and entered after the guard.
+private nw_runs_below(e: *Emit, k: string, g: NoWrapGuard) -> bool
+    for f in e.nowrap.fors
+        if f.name == k && g.id < f.epoch
+            nw_load_name(f.hi) match
+                Some(b) -> return b == g.b
+                None -> return false
+    end for
+
+    false
+end nw_runs_below
+
+// `x > L`, or `L < x`, with `x` a local read: the local and the other side.
+private nw_greater(c: TExpr) -> Option[(TExpr, TExpr)] = *c.kind match
+    TCompare(operands, cmps) ->
+        if operands.len() != 2 || cmps.len() != 1 || cmps.at(0).dispatch.is_some()
+            None
+        else if cmps.at(0).op == ">"
+            Some((operands.at(0), operands.at(1)))
+        else if cmps.at(0).op == "<"
+            Some((operands.at(1), operands.at(0)))
+        else
+            None
+    _ -> None
+
+// `L` as `x.len` of a local view: the view's name.
+private nw_len_of(x: TExpr) -> Option[string] = *x.kind match
+    TLen(r, _) -> nw_load_name(r)
+    _ -> None
+
+// Whether a block always leaves: its last statement is a jump out.
+private nw_leaves(b: TBlock) -> bool
+    if b.result.is_some() || b.stmts.is_empty() then return false
+
+    b.stmts.at(b.stmts.len() - 1) match
+        TReturn(_) -> true
+        TBreak(_, _) -> true
+        TContinue(_) -> true
+        TBecome(_) -> true
+        _ -> false
+end nw_leaves
+
+// The two sides of the `||` of an `if` with no `else` whose then-block leaves.
+private nw_disjuncts(x: TExpr) -> Option[(TExpr, TExpr)] = *x.kind match
+    TIf(cond, then_block, else_block, _) ->
+        if else_block.is_some() || cond.len() != 1 || !nw_leaves(then_block)
+            None
+        else
+            cond.at(0) match
+                TCondTest(c) -> *c.kind match
+                    TLogical(op, c1, c2) -> if op == "||" then Some((c1, c2)) else None
+                    _ -> None
+                _ -> None
+    _ -> None
+
+// Whether `x` is `L - n`, with `L` the length of `view` and `n` the local `a`.
+private nw_room(x: TExpr, view: string, a: string) -> bool = *x.kind match
+    TBinary(op, l, r, _) ->
+        if op != "-" then false
+        else
+            val lv = nw_len_of(l)
+            val rv = nw_load_name(r)
+
+            lv.is_some() && rv.is_some() && lv.unwrap() == view && rv.unwrap() == a
+    _ -> false
+
+// `if n > L || len > L - n then <leave>`, just lowered: records the fact, and says it again as an
+// assumption at the start of the fall-through.
+private nw_guard(e: *Emit, x: TExpr)
+    if !e.nowrap.ready || e.nowrap.suspended > 0 then return
+
+    val found = nw_disjuncts(x)
+
+    if found.is_none() then return
+
+    val first = nw_greater(found.unwrap().0)
+    val second = nw_greater(found.unwrap().1)
+
+    if first.is_none() || second.is_none() then return
+
+    val a_x = first.unwrap().0
+    val len_x = first.unwrap().1
+    val b_x = second.unwrap().0
+    val a = nw_load_name(a_x)
+    val view = nw_len_of(len_x)
+    val b = nw_load_name(b_x)
+
+    if a.is_none() || view.is_none() || b.is_none() then return
+    if !nw_word_unsigned(e, texpr_type(a_x)) || !nw_word_unsigned(e, texpr_type(b_x)) then return
+
+    // The right side has to be `L - n` over the same view and the same local.
+    if !nw_room(second.unwrap().1, view.unwrap(), a.unwrap()) then return
+
+    val esc = e.nowrap.escaped
+
+    if esc.has(a.unwrap()) || esc.has(b.unwrap()) || esc.has(view.unwrap()) then return
+
+    push_temps(e)
+
+    val w = lty(e, texpr_type(a_x))
+    val av = gen_expr(e, a_x)
+    val bv = gen_expr(e, b_x)
+    val lv = gen_expr(e, len_x)
+    val sum = fresh_reg(e)
+    val fits = fresh_reg(e)
+
+    emit(e, InBin(sum, OpAddNuw, w, av, bv))
+    emit(e, InIntCmp(fits, IUle, w, sum, lv))
+    e.uses_assume = true
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i1(), fits))
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_assume()), args))
+    pop_temps(e)
+    e.nowrap.guards.push(NoWrapGuard(a.unwrap(), b.unwrap(), view.unwrap(), e.nowrap.next_id, true))
+    e.nowrap.next_id += 1
+end nw_guard

@@ -437,3 +437,78 @@ emx_links_and_branches_to_main()
     assert(table.text.contains(" main\n"), table.text)
     lbr_drop([p, out])
 end emx_links_and_branches_to_main
+
+// -- a function exported as `main` is the image's main (`exports_main`) ----------------------------
+
+// A start file calling `main`, and the program's `main` an export reading computed storage: the
+// export is the one `main`, and its thunk fills the storage first.
+private val exm_exported_main: string =
+    emx_start + "\nseed() -> u32 = 41\n\nval base: u32 = seed() + 1\n\n@export(\"main\")\n" +
+    "probe(argc: int, argv: **u8) -> int = int(base)\n"
+
+@test("an image whose main is an export defines main once, its thunk running the prologue")
+exm_image_export_is_the_one_main()
+    if !lbr_ready() then return
+
+    val p = emx_image(exm_exported_main, emx_entry_manifest("kstart"))
+    val text = emx_text(p)
+
+    assert(!text.starts_with("refused"), text)
+    assert_eq(emx_lines_with(text, "define ", "@main("), 1, text)
+    assert_eq(emx_lines_with(text, "define ", "sysl.entry_prologue"), 1, text)
+    assert(text.contains("call void @sysl.entry_prologue()"), text)
+    lbr_drop([p])
+end exm_image_export_is_the_one_main
+
+@test("and sysl build links that image, with one main in it")
+exm_image_export_links()
+    if !lbr_ready() then return
+    if !emx_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+
+    val objdump = emx_objdump()
+
+    if objdump == "" then skip("there is no llvm-objdump to read the image")
+
+    val p = emx_image(exm_exported_main, emx_entry_manifest("kstart"))
+    val out = lbr_temp("sysl-exm-elf")
+    val said = lbr_cli(["sysl", "build", "--target", emx_target, "-O0", "-o", s"$out/img.elf", p])
+
+    assert(said.0 == 0, said.1)
+
+    val table = capture(objdump, ["-t", s"$out/img.elf"], "", [], true).unwrap()
+
+    var mains = 0
+
+    for line in lines_of(table.text)
+        if line.ends_with(" main") then mains += 1
+
+    assert_eq(mains, 1, table.text)
+    assert(table.text.contains("sysl.entry_prologue"), table.text)
+    lbr_drop([p, out])
+end exm_image_export_links
+
+// A manifest naming the image's own entry writes where the program begins, so a lone headerless
+// file of bindings is the module's storage rather than a script's body -- held to a stated type where
+// it has no value.
+@test("a manifest naming an entry of its own makes a lone file of bindings module storage")
+exm_manifest_entry_names_the_beginning()
+    if !lbr_ready() then return
+
+    val p = emx_image("var n\n", emx_entry_manifest("kstart"))
+
+    assert(emx_report(p, Some(emx_target)).contains("'n' is module storage, and module storage states its type"),
+           emx_report(p, Some(emx_target)))
+    lbr_drop([p])
+end exm_manifest_entry_names_the_beginning
+
+@test("while one naming 'main', or none, leaves it a script's body")
+exm_manifest_entry_main_leaves_a_body()
+    if !lbr_ready() then return
+
+    val p = emx_image("var n = 1\n", emx_entry_manifest("main"))
+    val q = emx_image("var n = 1\n", emx_manifest(""))
+
+    assert_eq(emx_report(p, Some(emx_target)), "")
+    assert_eq(emx_report(q, Some(emx_target)), "")
+    lbr_drop([p, q])
+end exm_manifest_entry_main_leaves_a_body

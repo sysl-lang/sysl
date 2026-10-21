@@ -217,8 +217,8 @@ struct MemberTables
     // settled `T` to `int`, which the instantiated signature alone cannot say.
     func_substs: &Table[Buf[Binding]]
 
-    // The generic members the walk at their definition refused, by the key `generic` files them
-    // under. An instantiation of one still has its body typed, but what it says is dropped: the
+    // The generics the walk at their definition refused: a member by the key `generic` files it
+    // under, a free function by its module-qualified name. An instantiation of one still has its body typed, but what it says is dropped: the
     // mistake is one mistake, already reported on the line that made it, and each instantiation
     // would only add a consequence of it in terms of the type it was made at.
     bad_generics: Buf[string]
@@ -228,13 +228,35 @@ struct MemberTables
     // a free function's carries its declaration's.
     decl_spans: &Table[Span]
 
-    // Every instantiation of a generic `const` function, with the signature it was made at, by the
-    // name it goes under. **Kept apart from `pending` and `func_insts` because a trial reading takes
+    // Every instantiation of a generic function, with the signature it was made at, by the name it
+    // goes under -- any of them may be run while compiling. **Kept apart from `pending` and `func_insts` because a trial reading takes
     // those back**: a module `val` whose initializer calls `Guarded.new(...)` is typed in a trial, so
     // by the time the evaluator runs the call, the instantiation it names has been rewound -- and the
     // evaluator reads the body again from what is kept here (`const_eval.sysl`'s `trial_body`).
-    const_insts: &Table[(PendingInst, FuncSig)]
+    eval_insts: &Table[(PendingInst, FuncSig)]
+
+    // The bounds an `impl` naming no trait put on the type's parameters, by the lowered name of each
+    // member it brought. The type's own bounds are met wherever the receiver's type was made; these
+    // are not, so a call asks them of the receiver's arguments (`member_call.sysl`).
+    block_bounds: &Table[Buf[NamedBounds]]
+    // The destructor each instantiated type of a generic family runs, by the type's mangled name:
+    // the instantiation `analyze_body.sysl`'s `queue_generic_drops` made of the family's `drop`.
+    generic_drops: &Table[string]
+    // Every member a `derives` clause wrote from a trait's `derive` body, by the name the copy was
+    // lowered to (`derive_members.sysl`).
+    derived: &Table[DerivedCopy]
 end MemberTables
+
+// What a member written from a `derive` body needs beyond an inherited default: the name its body
+// gives the deriving type, the type's key (which may reach its private fields from here), and the
+// word in the `derives` clause that asked for it, which is where a refusal in the copy is told.
+struct DerivedCopy
+    param: string
+    subject: string
+    trait_key: string
+    scope: Scope
+    span: Span
+end DerivedCopy
 
 // One `some` result waiting to be settled: the lowered function whose body says what the type is,
 // the declaration to read it from, what the member **promised** about it, the trait bound and the
@@ -302,7 +324,7 @@ member_tables() -> &MemberTables =
     MemberTables(table(), table(), table(), table(), table(), table(), table(), table(), table(),
                  table(), table(), table(), table(), table(), table(), table(), table(), buf(),
                  buf(), table(), false, buf(), buf(), table(), table(), table(), buf(), table(), buf(),
-                 table(), table())
+                 table(), table(), table(), table(), table())
 
 // -- reading the tables --------------------------------------------------------------------------
 

@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The annotations a program declares: a struct marked `@annotation` is written `@Name(...)` above a
+// type declaration, a field or a variant, and reflection reads it back as `x::Annotation[Name]`.
+//
+// **A use is the construction it stands for.** `@rename("id")` is `rename("id")`, typed in the terms
+// of the file that wrote it -- so the struct is found as any type name is, through imports and
+// qualification -- and run while compiling, so what a reader gets is a literal of the struct. Its
+// arguments are therefore whatever a constant may be: a literal, a `const`, a call whose body runs.
+//
+// Every use is checked where it is written, whether or not anything reads it, and each reading types
+// the use again; a complaint is said once however often it is raised.
+
+// The annotation struct a written name reaches from `scope`: its key, its declaration and its type.
+// `None` where it is no annotation, which is said at `span` unless `quiet` -- `how` finishes the
+// sentence that tells a reader to mark it.
+annotation_struct(a: &Analysis, scope: Scope, span: Span, written: string, how: string,
+                  quiet: bool) -> Option[(string, StructDecl, Type)]
+    val key = lookup_type_key(a, scope, written)
+
+    if key.is_none()
+        if !quiet then
+            a.fault(scope, span, s"'@$written' names no annotation — nothing called '$written' is in " +
+                    "reach here, and an annotation is a struct declared with '@annotation' above it")
+
+        return None
+    end if
+
+    val decl = a.tables.types.get(key.unwrap()).unwrap()
+
+    val kind = decl.kind match
+        StructOf(sd) ->
+            if sd.annotation then
+                return Some((key.unwrap(), sd, resolve_type(a, scope, named_type(span, written),
+                                                           no_bindings())))
+
+            "a struct"
+        EnumOf(_) -> "an enum"
+        TraitOf(_) -> "a trait"
+        _ -> "a type"
+
+    if !quiet then
+        a.fault(scope, span, s"'$written' is $kind, not an annotation — an annotation is a struct " +
+                s"marked '@annotation', which is what $how")
+
+    None
+end annotation_struct
+
+// What one use comes to: the literal of its struct, or `None` where it was refused.
+annotation_value(a: &Analysis, scope: Scope, u: AnnotUse, sd: StructDecl, ty: Type) -> Option[TExpr]
+    val written = annot_written(u)
+
+    if u.parens && sd.fields.is_empty()
+        a.fault(scope, u.span, s"'$written' has no fields, so '@$written' takes no arguments — it is " +
+                "written with no parentheses")
+        return None
+    end if
+
+    annotation_image(analyzer_for(a, scope), written, u.call, ty)
+end annotation_value
+
+// The use among `annots` about `target` that names the annotation `key`, read in `scope`.
+annotation_on(a: &Analysis, scope: Scope, annots: Buf[AnnotUse], target: string,
+              key: string) -> Option[(AnnotUse, StructDecl, Type)]
+    for u in annots
+        if u.target != target then continue
+
+        val found = annotation_struct(a, scope, u.span, annot_written(u), "", true)
+
+        if found.is_some() && found.unwrap().0 == key then
+            return Some((u, found.unwrap().1, found.unwrap().2))
+
+    None
+end annotation_on
+
+// The annotations a type declaration and its parts carry, as the tables hold it: the uses, and the
+// terms they were written in. Empty for every type no declaration of a struct, an enum or a type of
+// its own makes. A payload field's uses are about `Variant.field`.
+annotations_of(a: &Analysis, key: string) -> Option[(Buf[AnnotUse], Scope)]
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        StructOf(sd) -> Some((sd.annots, decl.unwrap().scope))
+        EnumOf(ed) -> Some((ed.annots, decl.unwrap().scope))
+        TypeOf(td) -> Some((td.annots, decl.unwrap().scope))
+        _ -> None
+end annotations_of
+
+// Every use of a program's annotation in every file, checked where it is written: that it names an
+// annotation, that its arguments are constants the struct takes, and that no field, variant or type
+// carries one annotation twice.
+check_annotations(a: &Analysis, units: Buf[Program])
+    for unit in units
+        var scope: Option[Scope] = None
+
+        for j in 0..<unit.body.len()
+            var annots: Buf[AnnotUse] = buf()
+
+            *unit.body.at(j).kind match
+                StructDecl(d) -> annots = d.annots
+                EnumDecl(d) -> annots = d.annots
+                TypeDecl(d) -> annots = d.annots
+                _ -> ()
+
+            if annots.is_empty() then continue
+            if scope.is_none() then scope = Some(scope_of_unit(a, unit))
+
+            check_uses(a, scope.unwrap(), annots)
+end check_annotations
+
+private check_uses(a: &Analysis, scope: Scope, annots: Buf[AnnotUse])
+    var seen: Buf[(string, string)] = buf()
+
+    for u in annots
+        val written = annot_written(u)
+        val found = annotation_struct(a, scope, u.span, written, s"lets it be written '@$written'", false)
+
+        if found.is_none() then continue
+
+        var twice = false
+
+        for item in seen
+            if item.0 == u.target && item.1 == found.unwrap().0 then twice = true
+
+        if twice
+            val what = if u.target == "" then "one declaration" else s"'${u.target}'"
+
+            a.fault(scope, u.span, s"'@$written' is written twice above $what, and it says nothing the " +
+                    "once does not")
+            continue
+        end if
+
+        seen.push((u.target, found.unwrap().0))
+        annotation_value(a, scope, u, found.unwrap().1, found.unwrap().2)
+end check_uses

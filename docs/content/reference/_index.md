@@ -4,49 +4,40 @@ summary: The language in full, organized for looking things up rather than for r
 weight: 30
 ---
 
-The [tour](/tour/) teaches sysl in the order the ideas make sense to learn. This section is the other
-shape: every construct written down once, in its own place, with the rules complete rather than the
-ones a beginner needs first.
+The [tour](/tour/) teaches sysl in the order the ideas are easiest to learn. This section covers the
+same language for lookup: every construct is described once, in its own place, with its rules
+complete.
 
-It is meant to answer the question you actually have. What may follow `for`? Which conversions are
-implicit? What exactly does `?` do to a `&T` payload? When is a closure boxed? Those are lookups, and
-a tutorial answers them only by accident.
+It answers specific questions. What may follow `for`? Which conversions are implicit? What does `?`
+do to a `&T` payload? When is a closure boxed?
 
-**The same guarantee holds here.** Every program on these pages is compiled and run by the test
-suite, and every refusal is a refusal the compiler really makes, quoted from its own diagnostic. A
-page that drifts from the compiler fails the build. Where a rule has an edge, the edge is shown as a
-program rather than described — a sentence about what would happen is a guess, and a fenced block
-that runs is not.
+**Every example is checked.** Every program on these pages is compiled and run by the test suite,
+and every refusal shown is quoted from the compiler's own diagnostic, so a page that disagrees with
+the compiler fails the build. Where a rule has an edge case, the edge case is shown as a program.
 
-**Where a rule exists for a reason, the reason is here too.** A reference that only lists behaviour
-tells you what to type and leaves you unable to predict anything you have not looked up yet. sysl's
-rules are unusually load-bearing on one another — the memory model decides what a closure costs,
-which decides what a trait object can be, which decides what a generic can promise — so the
-connections are written down where they matter. Thorough is the point; brevity is not.
+**Rules are given with their reasons where the reason helps you predict behaviour.** sysl's rules
+depend on one another — the memory model determines what a closure costs, which determines what a
+trait object can be, which determines what a generic can promise — so those connections are stated
+where they matter.
 
 ## How this section is organized
 
-The order runs from the smallest units upward: what the compiler reads, then what a type is, then
-what an expression is, then the declarations that bind them, then the systems built on top —
-memory, traits, generics, modules, errors, async and tasks, the foreign interface, and the forms that reach into the
-compilation itself.
+The pages run from the smallest units upward: what the compiler reads, then types, then
+expressions, then the declarations that bind them, and then the systems built on top — memory,
+traits, generics, reflection, modules, errors, async and tasks, the foreign interface, and the forms
+that run during compilation.
 
-**One page is the opposite of thorough, on purpose.** [Compact reference](/reference/compact/) is the
-whole language on a single page — tables and one-line rules, plus the house idioms — for a reader who
-already programs and wants the rules without the argument, or for a tool with a budget to read them
-in. Everything on it is said in full somewhere above.
+**[Compact reference](/reference/compact/)** is the whole language on a single page: tables, one-line
+rules and the common idioms, for a reader who already programs and wants the rules without the
+explanation, or for a tool reading them on a budget. Everything on it is stated in full elsewhere in
+this section.
 
-**One page is about the project rather than the language.** [Packages](/reference/packages/) is
-what `package.hocon` says and what it means to depend on somebody else's code — a build-time
-concern rather than a rule the compiler enforces on an expression, but one that decides which
-modules a program even has.
+**[Packages](/reference/packages/)** describes `package.hocon` and dependencies on other people's
+code. It is a build-time concern rather than a rule about expressions, but it determines which
+modules a program has.
 
-**What ships beside the language is a section of its own.** The
-[standard library](/library/) is ordinary sysl — no type in it is a language feature and a program
-could have written any of it — so it is documented apart from the rules the compiler enforces.
+**The [standard library](/library/)** is documented separately. It is ordinary sysl — no type in it
+is a language feature, and a program could have written any of it.
 
-**This section is the specification.** It used to share that job with a set of numbered design
-chapters in the compiler's repository, which carried each rule's argument and the alternatives that
-were rejected; those were removed once this section had overtaken them, because two documents saying
-the same thing is one that goes stale. What is here is what the language *is*, and the reason is
-given wherever a rule would be unpredictable without it.
+**This section is the specification.** It describes what the language is, and gives the reason for
+a rule wherever the rule would otherwise be hard to predict.

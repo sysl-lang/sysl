@@ -1,0 +1,343 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A module-level `var` naming several things is module storage, one piece per name, exactly as the
+// same `val` is (`reference/declarations.md § Several at once`, `reference/modules.md § static`): a
+// list of values is shared out one each, and one value taken apart -- by a comma list or a pattern --
+// is held once and each name filled from its part. Every name may then be written on its own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mvm_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of a `main.sysl` beginning and the files of one module beside it.
+private mvm_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-mvm").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end mvm_root
+
+// What the program prints, or the report it was refused with.
+private mvm_ran(files: []const (string, string)) -> string
+    val root = mvm_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mvm_ran
+
+// The emitted module, or the report the program was refused with.
+private mvm_ir(files: []const (string, string)) -> string
+    val root = mvm_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mvm_ir
+
+// Refused with `message`, at `at` (`line:col` of `file`).
+private mvm_refused_in(files: []const (string, string), file: string, message: string, at: string)
+    if !mvm_ready() then return
+
+    val said = mvm_ir(files)
+    val place = s"error: $message\n --> $file:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+end mvm_refused_in
+
+private mvm_refused(module_text: string, message: string, at: string) =
+    mvm_refused_in([("cfg/cfg.sysl", module_text), ("main.sysl", "import cfg\n\nprint(cfg.uses())\n")],
+                   "cfg/cfg.sysl", message, at)
+
+// -- every form -----------------------------------------------------------------------------------
+
+// The forms a body takes, at module level and written with `var`: a list shared out, one value taken
+// apart (computed once), a tuple pattern, one with the whole value's type written, a struct's
+// positional form, and a part that is an array.
+private mvm_module() -> string =
+    "module cfg\n\nvar q, r = divmod(17, 5)\nvar a, b = 1, 2.5\nvar (x, y) = (3, \"s\")\n" +
+    "var (m, n): (u8, long) = (7, 1 << 40)\nvar Pt(px, py) = Pt(4, 5)\nvar (arr, k) = ([1, 2, 3], 4)\n\n" +
+    "struct Pt\n    x: int\n    y: int\n\n" +
+    "divmod(p: int, d: int) -> (int, int)\n    print(\"once\")\n    (p / d, p % d)\n"
+
+// A second file of the module, which reads and writes the first one's names.
+private mvm_other() -> string =
+    "module cfg\n\nbump()\n    q += 10\n    a += 1\n    x = 30\n    px += 1\n    arr[0] = 9\n\n" +
+    "sum() -> int = q + r + a + x + px + py + arr[0] + arr[1] + k\n\nlabel() -> string = s\"$y$b$m\"\n"
+
+@test("a module var naming several things gives each its part's type, read and written from another file and the program")
+mvm_every_form()
+    if !mvm_ready() then return
+
+    val main = "import cfg\n\nprint(cfg.q, cfg.r, cfg.a, cfg.b, cfg.x, cfg.y, cfg.m, cfg.n, cfg.sum(), cfg.label())\n" +
+               "cfg.bump()\ncfg.r = 100\ncfg.y = \"t\"\ncfg.m += 1\ncfg.n -= 1\ncfg.b = 0.5\n" +
+               "print(cfg.q, cfg.r, cfg.a, cfg.x, cfg.px, cfg.py, cfg.arr[0], cfg.n, cfg.sum(), cfg.label())\n"
+
+    assert_eq(mvm_ran([("cfg/a.sysl", mvm_module()), ("cfg/b.sysl", mvm_other()), ("main.sysl", main)]),
+              "once\n3 2 1 2.5 3 s 7 1099511627776 25 s2.57\n" +
+              "13 100 2 30 5 5 9 1099511627775 170 t0.58\n")
+end mvm_every_form
+
+@test("each name is its own storage: a write to one changes no other, and the value taken apart is read once")
+mvm_writes_independent()
+    if !mvm_ready() then return
+
+    val text = "module cfg\n\nvar (u, v) = (twice(), twice())\nvar s, t = pair()\nvar (w, z) = (base, base)\n\n" +
+                 "val base = [1, 2]\n\n" +
+                 "twice() -> [2]int = [5, 6]\n\npair() -> ([2]int, [2]int)\n    print(\"pair\")\n    ([7, 8], [7, 8])\n\n" +
+                 "show() -> string = s\"${u[0]} ${v[0]} ${s[0]} ${t[0]} ${w[0]} ${z[0]} ${base[0]}\"\n"
+    val main = "import cfg\n\nprint(cfg.show())\ncfg.u[0] = 50\ncfg.s[0] = 70\ncfg.w[0] = 10\nprint(cfg.show())\n" +
+               "cfg.v = cfg.u\ncfg.v[0] = 51\nprint(cfg.show())\n"
+
+    assert_eq(mvm_ran([("cfg/cfg.sysl", text), ("main.sysl", main)]),
+              "pair\n5 5 7 7 1 1 1\n50 5 70 7 10 1 1\n50 51 70 7 10 1 1\n")
+end mvm_writes_independent
+
+@test("a part over a constant is writable data in the object file, and parts of a call are filled")
+mvm_static_data()
+    if !mvm_ready() then return
+
+    val ir = mvm_ir([("cfg/cfg.sysl", mvm_module()),
+                     ("main.sysl", "import cfg\n\ncfg.a += 1\nprint(cfg.q, cfg.a, cfg.b, cfg.x, cfg.m, cfg.n, cfg.px, cfg.arr[0])\n")])
+
+    assert(ir.contains("@cfg$a = private global i32 1\n"), ir)
+    assert(ir.contains("@cfg$b = private global double 0x4004000000000000\n"), ir)
+    assert(ir.contains("@cfg$x = private global i32 3\n"), ir)
+    assert(ir.contains("@cfg$m = private global i8 7\n"), ir)
+    assert(ir.contains("@cfg$n = private global i64 1099511627776\n"), ir)
+    assert(ir.contains("@cfg$px = private global i32 4\n"), ir)
+    assert(ir.contains("@cfg$arr = private global [3 x i32] [i32 1, i32 2, i32 3]\n"), ir)
+    assert(ir.contains("@cfg$q = private global i32 zeroinitializer\n"), ir)
+    assert(ir.contains("@cfg$r = private global i32 zeroinitializer\n"), ir)
+    assert(!ir.contains("@cfg$a = private constant"), ir)
+end mvm_static_data
+
+// -- every spelling of module storage -------------------------------------------------------------
+
+@test("a module file's var naming several things leaves the program's beginning where it was")
+mvm_beside_a_module_line()
+    if !mvm_ready() then return
+
+    val said = mvm_ran([("cfg/cfg.sysl", "module cfg\n\nvar a, b = 1, 2\nvar (c, d) = (3, 4)\n"),
+                        ("main.sysl", "import cfg\n\ncfg.a += cfg.d\nprint(cfg.a, cfg.b, cfg.c)\n")])
+
+    assert_eq(said, "5 2 3\n")
+end mvm_beside_a_module_line
+
+@test("the entry file's static var, a private one, a thread-local one and one beside a main are each the module's")
+mvm_every_spelling()
+    if !mvm_ready() then return
+
+    val main = "static var ticks, step = 0, 2\nprivate static var (name, len) = (\"none\", 4)\n" +
+               "@thread_local static var p1, p2 = 7, 8\n@thread_local static var (p3, p4) = (9, 10)\n\n" +
+               "tick() = ticks += step\n\ntick()\ntick()\nname = \"two\"\np1 += 1\np4 += 1\n" +
+               "print(ticks, name, len, p1, p2, p3, p4)\n"
+
+    assert_eq(mvm_ran([("main.sysl", main)]), "4 two 4 8 8 9 11\n")
+    assert_eq(mvm_ran([("main.sysl", "var lo, hi = 0, 10\nvar (m, n) = (1, 2)\n\nbump() =\n    lo += 1\n" +
+                                     "    n += hi\n\nmain()\n    bump()\n    bump()\n    print(lo, hi, m, n)\n")]),
+              "2 10 1 22\n")
+end mvm_every_spelling
+
+@test("a thread-local var naming several things is a per-thread image per name, written from the module")
+mvm_thread_local()
+    if !mvm_ready() then return
+
+    val text = "module cfg\n\n@thread_local var t1, t2 = 5, 6\n@thread_local var (t3, t4) = (7, 8)\n\nbump() =\n    t1 += 1\n    t4 += 1\n\nsum() -> int = t1 + t2 + t3 + t4\n"
+    val main = "import cfg\n\ncfg.bump()\nprint(cfg.sum(), cfg.t1, cfg.t4)\n"
+    val ir = mvm_ir([("cfg/cfg.sysl", text), ("main.sysl", main)])
+
+    assert(ir.contains("@cfg$t1 = private thread_local global i32 5\n"), ir)
+    assert(ir.contains("@cfg$t2 = private thread_local global i32 6\n"), ir)
+    assert(ir.contains("@cfg$t3 = private thread_local global i32 7\n"), ir)
+    assert(ir.contains("@cfg$t4 = private thread_local global i32 8\n"), ir)
+    assert_eq(mvm_ran([("cfg/cfg.sysl", text), ("main.sysl", main)]), "28 6 9\n")
+end mvm_thread_local
+
+@test("a local var naming several things is unchanged, and a local one is refused '@thread_local'")
+mvm_local_unchanged()
+    if !mvm_ready() then return
+
+    assert_eq(mvm_ran([("main.sysl", "f()\n    var c, d = 3, 4\n    var (g, h) = (5, 6)\n\n    c += 1\n" +
+                                     "    g += h\n    print(c, d, g, h)\n\nf()\nvar lo, hi = 1, 2\nlo += hi\nprint(lo)\n")]),
+              "4 4 11 6\n3\n")
+    mvm_refused_in([("main.sysl", "f()\n    @thread_local var a, b = 1, 2\n\n    print(a, b)\n\nf()\n")], "main.sysl",
+                   "'a' is a local, and a local is already one thread's: its storage is the frame of whichever " +
+                   "call is running, and every thread has a stack of its own. '@thread_local' marks module " +
+                   "storage, which is otherwise one object the whole program shares — declare it outside every " +
+                   "function for the attribute to say anything", "2:5")
+end mvm_local_unchanged
+
+// -- a written type, exposure, a private name -----------------------------------------------------
+
+@test("a type written for the whole value governs the parts, and the value is held to it")
+mvm_written_type_governs()
+    if !mvm_ready() then return
+
+    assert_eq(mvm_ran([("cfg/cfg.sysl", "module cfg\n\nvar (lo, hi): (u8, u16) = (1, 300)\n"),
+                       ("main.sysl", "import cfg\n\ncfg.lo = 255\ncfg.hi += 1\nprint(cfg.lo, cfg.hi)\n")]), "255 301\n")
+    mvm_refused("module cfg\n\nvar (c, d): (u64, u64) = (5, \"x\")\n\nuses() -> u64 = c\n",
+                "cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)",
+                "3:1")
+    mvm_refused("module cfg\n\nval (c, d): (u64, u64) = (5, \"x\")\n\nuses() -> u64 = c\n",
+                "cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)",
+                "3:1")
+    mvm_refused_in([("cfg/cfg.sysl", "module cfg\n\nvar (lo, hi): (u8, u16) = (1, 300)\n\nuses() -> int = 1\n"),
+                    ("main.sysl", "import cfg\n\ncfg.lo = \"x\"\nprint(cfg.uses())\n")], "main.sysl",
+                   "cannot assign string to field 'lo' of type byte", "3:1")
+end mvm_written_type_governs
+
+private mvm_exposure_module(decls: string) -> string =
+    s"module cfg\n\nprivate struct P\n    x: int\n\n$decls\n\nprivate mk() -> P = P(1)\n\nuses() -> int = 1\n"
+
+@test("a public var naming several things whose part's type is private is refused, and a private one is fine")
+mvm_exposure()
+    val exposed = "'p' is public, but its type names 'cfg.P', which is private to 'cfg/cfg.sysl', the file " +
+                  "that declares it — a declaration may not be more visible than the types it names"
+
+    mvm_refused(mvm_exposure_module("var p, z = mk(), 1"), exposed, "6:1")
+    mvm_refused(mvm_exposure_module("var (p, z) = (mk(), 1)"), exposed, "6:1")
+
+    if !mvm_ready() then return
+
+    assert_eq(mvm_ran([("cfg/cfg.sysl", mvm_exposure_module("private var (p, z) = (mk(), 1)\n\nread() -> int = p.x + z")),
+                       ("main.sysl", "import cfg\n\nprint(cfg.uses(), cfg.read())\n")]), "1 2\n")
+end mvm_exposure
+
+@test("a private var naming several things is its file's, and read from another file is refused")
+mvm_private()
+    if !mvm_ready() then return
+
+    val said = mvm_ir([("cfg/a.sysl", "module cfg\n\nprivate var hid, den = 8, 9\n\nuses() -> int = hid + den\n"),
+                       ("cfg/b.sysl", "module cfg\n\nother() -> int = hid\n"),
+                       ("main.sysl", "import cfg\n\nprint(cfg.uses(), cfg.other())\n")])
+
+    assert(said.contains("error: 'cfg.hid' is private to 'cfg/a.sysl', the file that declares it\n --> cfg/b.sysl:3:18\n"),
+           said)
+end mvm_private
+
+@test("sysl doc shows a var naming several things as written, with '@thread_local' left off as above one name")
+mvm_doc_signature()
+    val r = parse(source_of("t.sysl", "module cfg\n\nvar a, b = 1, 2\n@thread_local var (c, d) = (3, 4)\n" +
+                                      "@thread_local static var e, f = 5, 6\n"))
+
+    assert(r.ok(), "the module did not parse")
+
+    var out = ""
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> out = out + t + "\n"
+            None -> ()
+
+    assert_eq(out, "var a, b = 1, 2\nvar (c, d) = (3, 4)\nstatic var e, f = 5, 6\n")
+end mvm_doc_signature
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a module var naming several things is refused as the body's is, once, at the binding")
+mvm_refusals()
+    mvm_refused("module cfg\n\nvar a, b, c = 1, 2\n\nuses() -> int = a\n",
+                "this binding names 3 things and has 2 values to give them", "3:1")
+    mvm_refused("module cfg\n\nvar d, d = 1, 2\n\nuses() -> int = d\n", "'d' is named twice in one binding", "3:1")
+    mvm_refused("module cfg\n\nvar q, r = 5\n\nuses() -> int = q\n",
+                "this binding names 2 things, and one int is not something to take apart — only a tuple is", "3:12")
+    mvm_refused("module cfg\n\nvar (x, 1) = (3, 1)\n\nuses() -> int = x\n",
+                "a binding cannot test a value — this pattern matches only some values, and a binding has no " +
+                "other arm to take when it does not match", "3:1")
+    mvm_refused("module cfg\n\nvar (e, f, g) = (1, 2)\n\nuses() -> int = e + f\n",
+                "this pattern takes 3 parts, and a (int, int) has 2 parts to give it", "3:1")
+
+    if !mvm_ready() then return
+
+    val said = mvm_ir([("cfg/cfg.sysl", "module cfg\n\nvar (e, f, g) = (1, 2)\n\nuses() -> int = e + f + g\n"),
+                       ("main.sysl", "import cfg\n\nprint(cfg.uses())\n")])
+
+    assert(said.contains("error: this pattern takes 3 parts"), said)
+    assert_eq(said.index_of("error: "), said.last_index_of("error: "))
+end mvm_refusals
+
+@test("a value reaching what it binds is refused in the binding's own word, once for the binding")
+mvm_cycle()
+    val whole = "this binding takes its parts' types from its value, and the value reaches what it binds again — " +
+                "write the type of the whole value, 'var (…): T = …'"
+
+    mvm_refused("module cfg\n\nvar q, r = two(q)\n\ntwo(n: int) -> (int, int) = (n, n)\n\nuses() -> int = q\n", whole,
+                "3:1")
+    mvm_refused("module cfg\n\nvar (e, f) = two(e)\n\ntwo(n: int) -> (int, int) = (n, n)\n\nuses() -> int = e\n", whole,
+                "3:1")
+    mvm_refused("module cfg\n\nvar a, b = b + 1, 1\nvar c, d = d, c\n\nuses() -> int = a + c\n",
+                "'cfg.c' takes its type from its value, and the value reaches 'cfg.c' again — write its type, " +
+                "'var c: T = …'", "4:1")
+
+    if !mvm_ready() then return
+
+    val said = mvm_ir([("cfg/cfg.sysl", "module cfg\n\nvar (e, f) = two(e)\n\ntwo(n: int) -> (int, int) = (n, n)\n\n" +
+                        "uses() -> int = e + f\n"), ("main.sysl", "import cfg\n\nprint(cfg.uses())\n")])
+
+    // The type is refused once for the binding, not once per name, and the loop that refusal names
+    // is not refused again for the order the storage is filled in.
+    assert_eq(said.index_of("takes its parts' types"), said.last_index_of("takes its parts' types"))
+    assert(!said.contains("cannot be initialized"), said)
+    assert_eq(said.count_of("error: "), 1, said)
+end mvm_cycle
+
+@test("a module var naming several things has an initializer, and a thread-local one's is an image")
+mvm_no_initializer_and_images()
+    mvm_refused("module cfg\n\nvar a, b\n\nuses() -> int = 1\n", "'=' expected", "3:9")
+    mvm_refused("module cfg\n\nvar (c, d): (int, int)\n\nuses() -> int = 1\n", "'=' expected", "3:23")
+    val loud = "\n\nsq(n: int) -> int\n    print(\"sq\")\n    n * n\n\nuses() -> int = t1\n"
+    val image = "'cfg.t1' is '@thread_local', so its value has to be one the compiler can write down: every " +
+                "thread gets a copy of the initial value, and the copies are made from a single image in the " +
+                "object file rather than by code that runs per thread. A literal, 'null', a 'const', the " +
+                "address of other module storage and the arrays and structs built from them are all values; " +
+                "a call is not. Leave the value off to start every thread at the type's zero, and do the " +
+                "work in each thread instead"
+
+    if !mvm_ready() then return
+
+    // Said after the analysis, where the storage is laid down, so the report carries no place.
+    for text in ["module cfg\n\n@thread_local var t1, t2 = sq(3), 1" + loud,
+                 "module cfg\n\n@thread_local var (t1, t2) = (sq(3), 1)" + loud]
+        val said = mvm_ir([("cfg/cfg.sysl", text), ("main.sysl", "import cfg\n\nprint(cfg.uses())\n")])
+
+        assert(said.contains(s"error: $image"), said)
+end mvm_no_initializer_and_images
+
+@test("an annotation about one object is still refused above a var naming several things")
+mvm_one_object_annotations()
+    mvm_refused("module cfg\n\n@main_thread\nvar a, b = 1, 2\n\nuses() -> int = a\n",
+                "'@main_thread' is a promise about one object, and a binding that names several has no one " +
+                "object for it to be about — declare them on lines of their own", "4:16")
+    mvm_refused("module cfg\n\n@thread_local\n@align(16)\nvar (a, b) = (1, 2)\n\nuses() -> int = a\n",
+                "'@align(n)' is the boundary one object's storage begins on, and a binding that names several " +
+                "has no one object for it to be about — declare them on lines of their own", "5:20")
+end mvm_one_object_annotations

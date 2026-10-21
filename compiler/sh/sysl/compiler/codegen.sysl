@@ -31,20 +31,29 @@ end codegen_module
 //
 // `imports` asks for the copies a build that optimizes wants of the precompiled functions it may
 // inline (`importable`); a module that will not be optimized, or whose text is printed, has none.
+//
+// `only`, where given, narrows the copies to the precompiled functions it names. A library's own
+// object half needs it: what it declares is partly another artifact's -- the standard module's
+// `real.zero` -- and partly its OWN functions deferred to the program (`library_build`), which read
+// storage or reach a body this half drops, and a copy of one of those is exactly the body the
+// deferral kept out of it.
 codegen_with_gaps(p: TProgram, t: Target, pr: Promotions,
-                  imports: bool = false) -> (IrModule, Buf[(string, string)])
+                  imports: bool = false,
+                  only: Option[Set[string]] = None) -> (IrModule, Buf[(string, string)])
     var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t, pr, imports)
+    codegen_into(&e, p, t, pr, imports, only)
 end codegen_with_gaps
 
 private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
-                     imports: bool = false) -> (IrModule, Buf[(string, string)])
+                     imports: bool = false,
+                     only: Option[Set[string]] = None) -> (IrModule, Buf[(string, string)])
     val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
     record_symbols(e, p)
     note_raised_types(e, p)
+    note_type_shapes(e, p)
 
     for v in p.vals
         if v.per_cpu then e.per_cpu.add(v.symbol)
@@ -93,22 +102,32 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         if f.ghost then continue
 
         if !declared_elsewhere(p, f)
-            set_promoted(e, pr.for_func(f.name))
+            set_promoted(e, pr, f.name)
 
             e.main_thread_checks = e.off_main.has(f.name)
 
             gen_function(e, f) match
-                Some(built) -> funcs.push(built)
+                Some(built) ->
+                    for item in split_disjoint(f, built)
+                        funcs.push(item)
                 None -> gaps.push((f.name, gap_text(e)))
-        elif imports && importable(f)
-            set_promoted(e, pr.for_func(f.name))
+        elif imports && importable(f) && only.map((names) -> names.has(f.name)).unwrap_or(true)
+            set_promoted(e, pr, f.name)
 
             e.main_thread_checks = e.off_main.has(f.name)
 
             gen_function(e, f) match
                 Some(built) ->
                     if keeps_import(f, built)
-                        funcs.push(built with { sig = built.sig with { linkage = LinkAvailableExternally } })
+                        val parts = split_disjoint(f, built)
+
+                        funcs.push(parts.at(0) with { sig = parts.at(0).sig with { linkage = LinkAvailableExternally } })
+
+                        // A view's body half is this unit's own `internal` copy, which is inlined
+                        // into the copy above and never linked against.
+                        for i in 1..<parts.len()
+                            funcs.push(parts.at(i))
+
                         imported.add(f.name)
                 None -> ()
 
@@ -122,13 +141,20 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // **Only this compilation's own functions get one**: a precompiled function's thunk was emitted
     // into the artifact that defined it, and a second copy here would be the duplicate symbol every
     // other cross-artifact declaration is careful to avoid.
+    //
+    // The one exported as `main` in a program is that program's entry, and its thunk runs the entry's
+    // prologue before anything else (`exports_main`).
     var thunks: Buf[IrFunc] = buf()
+    val export_entry = p.entry_point && exports_main(p)
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f)
-            gen_export_thunk(e, f, symbol_of(e, f.name)) match
+        if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f) &&
+           !overridden_weak(p, f)
+            val enters = export_entry && f.exported.unwrap() == "main"
+
+            gen_export_thunk(e, f, symbol_of(e, f.name), enters) match
                 Some(built) -> thunks.push(built)
                 None -> gaps.push((s"${f.name} thunk", gap_text(e)))
 
@@ -151,8 +177,16 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // one.
     var entry: Option[IrFunc] = None
 
-    if p.entry_point
-        set_promoted(e, pr.for_func(""))
+    // **A function exported as `main` is the entry**, so `@main` is not emitted; the prologue it would
+    // have run is, for the export's thunk to call first.
+    if export_entry
+        set_promoted(e, pr, "")
+
+        gen_entry_prologue(e, p) match
+            Some(f) -> funcs.push(f)
+            None -> gaps.push((entry_prologue_symbol(), gap_text(e)))
+    else if p.entry_point
+        set_promoted(e, pr, "")
 
         val built = if p.tests.is_empty() then gen_main(e, p) else gen_test_main(e, p)
 
@@ -169,7 +203,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     var init: Option[IrInit] = None
 
     if p.c_artifact && t.runs_initializers() && has_computed_val(p.vals)
-        set_promoted(e, pr.for_func(""))
+        set_promoted(e, pr, "")
 
         gen_module_init(e, p) match
             Some(built) -> init = Some(built)
@@ -178,7 +212,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // **A C runtime's archive fills the same storage from a function its start file calls by name**
     // (`gen_runtime_init`), a freestanding machine walking no constructor list.
     if p.c_artifact && p.c_runtime
-        set_promoted(e, pr.for_func(""))
+        set_promoted(e, pr, "")
 
         gen_runtime_init(e, p) match
             Some(built) -> funcs.push(built)
@@ -243,7 +277,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // `val`'s initializer interns its strings as it is written, and the reference writes it once the
     // helpers are finished, so a string a `val` holds is numbered after every string any body or
     // helper uses. Built earlier, the entry point's strings are numbered past them instead.
-    val vals = gen_vals(e, p.vals)
+    val vals = gen_vals(e, p.vals, p.precompiled)
 
     for i in 0..<vals.len()
         declared_globals.push(vals.at(i))
@@ -349,6 +383,9 @@ private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool,
     if e.bounds_fails && !bounds_overridden
         out.push(RtTemplate("sysl.bounds", bounds_runtime(t)))
 
+    // The stop every trap goes through, where there is output to flush first (`trap_stop.sysl`).
+    if e.traps && trap_flushes(t) then out.push(RtTemplate("sysl.trap", trap_runtime()))
+
     out
 end runtime_bundles
 
@@ -407,6 +444,38 @@ end allocates
 // it -- is a different closure's body under the same signature.
 private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
     !f.internal && holds_string(p.precompiled, f.name)
+
+// **A weak export this same compilation also exports strongly is not emitted under its symbol.** The
+// link would keep the strong one anyway, and the two in one module are two definitions of one name,
+// which LLVM refuses before any linker could choose. A weak export whose replacement is in another
+// object -- a board package's C, a precompiled artifact -- is emitted, and the linker chooses.
+private overridden_weak(p: TProgram, f: TFunc) -> bool
+    if !exported_weak(f) then return false
+
+    val symbol = f.exported.unwrap()
+
+    for g in p.funcs
+        if !g.ghost && g.exported.unwrap_or("") == symbol && !exported_weak(g) &&
+           !declared_elsewhere(p, g) then
+            return true
+
+    false
+end overridden_weak
+
+// **Whether the program's entry is a function it exports as `main`** -- the way a bare-metal root
+// file names where it starts, and on the host a program written the same way. That export is the
+// platform's `main`, so the program gets no `@main` of the compiler's own beside it (a second
+// definition of the one symbol); its thunk runs the prologue `@main` would have run
+// (`gen_entry_prologue`). Only this compilation's own definition counts, since a precompiled one's
+// thunk is in the artifact that defined it, and a test build keeps its dispatcher.
+exports_main(p: TProgram) -> bool
+    if !p.tests.is_empty() then return false
+
+    for f in p.funcs
+        if !f.ghost && f.exported.unwrap_or("") == "main" && !declared_elsewhere(p, f) then return true
+
+    false
+end exports_main
 
 // The most instructions a precompiled function's lowered body may hold and still be copied into a
 // program that calls it without being marked `@inline`. Lowered text is unoptimized -- every local a
@@ -532,6 +601,7 @@ private record_symbols(e: *Emit, p: TProgram)
             None -> ()
 
         if f.marks.abandons then e.abandoning.add(f.name)
+        if f.marks.is_async() then e.asyncs.add(f.name)
 
         // A sysl definition's tail is named the way a foreign one's is: a call to it names the whole
         // function type, since the argument list alone does not say where the declared parameters
@@ -558,7 +628,7 @@ private record_symbols(e: *Emit, p: TProgram)
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if f.variadic && f.exported.is_some()
+        if f.variadic && f.exported.is_some() && !overridden_weak(p, f)
             e.symbols.push((f.name, f.exported.unwrap()))
         else if is_displaced(e, f.name)
             e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
@@ -600,6 +670,16 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         !emits_export(p, bounds_fail_symbol())
 
     if e.traps then out.push(declared_sig(e,llvm_trap(), ir_fn_type(LVoid, no_params())))
+
+    // What the stop flushes with, at the signature the library's own `extern`s bind it at. A program
+    // exporting `fflush` itself is answered by its own definition.
+    val trap_flushes_here = e.traps && trap_flushes(e.target)
+
+    if trap_flushes_here && !emits_export(p, trap_flush_symbol())
+        var flush_params: Buf[IrParam] = buf()
+
+        flush_params.push(ir_param(LPtr))
+        out.push(declared_sig(e, trap_flush_symbol(), ir_fn_type(l_i32(), flush_params)))
 
     coro_declares(e, &out)
 
@@ -737,6 +817,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             seen.push(s)
 
     if dispatcher_marks(p) || bounds_prints then seen.push("write")
+    if trap_flushes_here then seen.push(trap_flush_symbol())
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)

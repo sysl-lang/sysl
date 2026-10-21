@@ -126,6 +126,19 @@ private changed_mode(p: *u8, mode: u32) -> int = c_chmod(p, mode & 0o7777)
 private extern "chown" c_chown(path: *u8, owner: u32, group: u32) -> int
 #endif
 
+// `utimensat` takes a pair of `struct timespec`, which is two 64-bit integers on every 64-bit POSIX C
+// library this builds for; the directory descriptor meaning "relative to the working directory" is
+// the platform's own number.
+#if posix
+private extern "utimensat" c_utimensat(dir: int, path: *u8, times: *i64, flags: int) -> int
+
+#if macos
+private const at_cwd: int = -2
+#else
+private const at_cwd: int = -100
+#endif
+#endif
+
 // -- the shims beside this file ----------------------------------------------------------------------
 
 private extern "sysl_fs_host_open" c_open(path: *u8, flags: u32, mode: u32) -> int
@@ -287,6 +300,29 @@ supply_chown(path: *u8, len: usize, owner: u32, group: u32) -> int
     UNSUPPORTED
 #endif
 end supply_chown
+
+@export("sysl_fs_set_modified")
+supply_set_modified(path: *u8, len: usize, micros: long) -> int
+#if posix
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    var secs = micros / 1000000
+    var rest = micros % 1000000
+
+    if rest < 0
+        secs -= 1
+        rest += 1000000
+
+    // The access time and the modification time, each seconds then nanoseconds.
+    var times: [4]i64 = [secs, rest * 1000, secs, rest * 1000]
+
+    status(c_utimensat(at_cwd, &c[0], &times[0], 0))
+#else
+    UNSUPPORTED
+#endif
+end supply_set_modified
 
 // -- directories -------------------------------------------------------------------------------------
 

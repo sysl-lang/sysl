@@ -17,19 +17,33 @@ import sysl.math.bigint.{BigInt, from_int, negate}
 // **Whether a result list may stand here is taken before anything below runs**, which is what
 // confines the permission to one expression: every subexpression is analyzed through this same
 // funnel and finds the flag already spent.
-type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = typed_at(cx, e, expected, true)
+
+// The same, except that a scalar is not widened to what is expected -- the reading of an operand,
+// which converts to its sibling's type rather than to its position's.
+type_expr_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr =
+    typed_at(cx, e, expected, false)
+
+private typed_at(cx: &Analyzer, e: Expr, expected: Option[Type], widen: bool) -> TExpr
     val allowed = cx.multi_ok
     val outer = cx.result_chain
 
+    val outer_tail = cx.unit_tail
+
     cx.multi_ok = false
+    cx.assign_here = cx.assign_ok && is_assignment(e)
+    cx.assign_ok = false
+    cx.unit_tail = cx.tail_carry && carries_tail(e)
+    cx.tail_carry = false
     cx.result_chain = cx.result_next
     cx.result_next = false
 
-    val raw = analyze_expected(cx, e, expected)
+    val raw = if widen then analyze_expected(cx, e, expected) else analyze_unwidened(cx, e, expected)
 
     cx.result_chain = outer
+    cx.unit_tail = outer_tail
     unwrap_results(cx, e, raw, allowed)
-end type_expr
+end typed_at
 
 // The same, with nothing expected.
 type_expr_bare(cx: &Analyzer, e: Expr) -> TExpr = type_expr(cx, e, None)
@@ -104,8 +118,11 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     IntLit(digits, base, suffix) ->
         int_literal(cx, e.span, literal_value(digits, base), suffix, expected)
     FloatLit(text, suffix) -> float_literal(cx, e.span, text, suffix, expected)
-    CharLit(cp) -> TExpr(e.span, TIntLit(from_int(long(uint(cp))), Char))
-    StrLit(v) -> TExpr(e.span, TStrLit(v))
+    CharLit(cp) -> char_literal(cx, e.span, cp, expected)
+    // Where a `[N]u8` is wanted, the literal is its UTF-8 bytes.
+    StrLit(v) -> bytes_literal(cx, e.span, v, expected) match
+        Some(bytes) -> bytes
+        None -> TExpr(e.span, TStrLit(v))
 
     // A C callee finds the end by the terminator, so an interior NUL would hide everything written
     // after it. Refused outright rather than silently truncated.
@@ -124,24 +141,36 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 
     // A minus and the literal it precedes are one unit for the range check, so a signed type's
     // minimum is writable even though its magnitude overflows the positive range.
-    Unary(op, operand) -> unary_expr(cx, e, op, operand, expected)
+    // Arithmetic over literals alone is computed exactly and held to the type it is read at
+    // (`literal_arith.sysl`).
+    Unary(op, operand) ->
+        val outermost = enter_literal_arithmetic(cx, e)
+
+        literal_arithmetic(cx, outermost, unary_expr(cx, e, op, operand, expected))
     PreIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, true)
     PostIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, false)
 
-    Binary(op, l, r) -> binary_expr(cx, e.span, op, l, r, expected)
+    Binary(op, l, r) ->
+        val outermost = enter_literal_arithmetic(cx, e)
+
+        literal_arithmetic(cx, outermost, binary_expr(cx, e.span, op, l, r, expected))
     Compare(operands, ops) -> compare_expr(cx, e.span, operands, ops)
 
     Tuple(elements) -> tuple_expr(cx, e.span, elements, expected)
 
     ArrayLit(elements) -> array_literal(cx, e.span, elements, expected)
     ArrayFill(value, count) -> array_fill(cx, e.span, value, count, expected)
-    Index(receiver, index, _) -> index_expr(cx, anchor_of(e), receiver, index, expected)
+    // `f::Annotation[rename]` -- the brackets name the annotation read, not an element.
+    Index(receiver, index, _) -> *receiver.kind match
+        TypeAttr(subject, attr, _, _) ->
+            if attr == "Annotation" then annotation_query(cx, anchor_of(receiver), subject, index)
+            else index_expr(cx, anchor_of(e), receiver, index, expected)
+        _ -> index_expr(cx, anchor_of(e), receiver, index, expected)
     // A list in brackets reaches here only where it is neither a call's nor an address's.
     TypeArgs(_, args, _) ->
         cx.err(anchor_of(e), s"a subscript takes one index, and ${args.len()} were written — a list of " +
-               "types in brackets is a type-argument list, and the only place one is written is " +
-               "at an address, as '&f[A, B]'. Everywhere else a generic's arguments are inferred, " +
-               "from the arguments at a call or from the type the result is read into")
+               "types in brackets is a type-argument list, and one is written after a generic's " +
+               "name — at a call, as 'f[A, B](x)', or at an address, as '&f[A, B]'")
 
     Field(receiver, name, name_at) -> field_expr(cx, name_at, receiver, name, expected)
 
@@ -150,10 +179,14 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     TryExpr(inner) -> try_expr(cx, e.span, inner, expected)
     AwaitExpr(inner) -> await_expr(cx, e.span, inner)
 
+    TypeArg(_) ->
+        cx.err(anchor_of(e), "this is a type, and a value is wanted here — a type between brackets is a " +
+               "type argument, written after a generic function or type: 'buf[&sync C]()'")
+
     LayoutOf(op, t) -> layout_of(cx, e.span, op, t, expected)
     OffsetOf(t, field) -> offset_of(cx, e.span, t, field, expected)
 
-    Assign(op, target, value) -> assign_expr(cx, e.span, op, target, value)
+    Assign(op, target, value) -> assign_expr(cx, e.span, op, target, value, expected)
 
     // An indented block under a binding's `=`. It is a value block like a branch's, asked the same
     // question by the same context, and its scope closes with it.
@@ -173,6 +206,10 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     CFor(label, init, cond, step, body, else_body) ->
         c_for_expr(cx, e.span, label, init, cond, step, body, else_body, expected, false)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
+    ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, expected)
+    TraitTest(subject, bounds) -> trait_test(cx, e.span, subject, bounds) match
+        Some(ConstBool(b)) -> TExpr(e.span, TBoolLit(b))
+        _ -> bad_expr(e.span)
 
     Quantifier(universal, name, iter, pred) ->
         quantifier_expr(cx, e.span, universal, name, iter, pred)
@@ -226,7 +263,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     TypeAttr(subject, attr, _, _) -> type_attr_expr(cx, anchor_of(e), subject, attr)
 
     // `lo..hi` and `lo..<hi` standing where a value is wanted, which is `sysl.Range[T]`.
-    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive)
+    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive, expected)
 
     Bad -> bad_expr(e.span)
 
@@ -242,8 +279,12 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 // **An open end stays a form.** `..`, `lo..` and `..hi` mean something in an index and nothing on
 // their own -- what an absent bound *is* depends on what is being indexed -- so they keep the
 // refusal, which names the one place they are legal rather than all four.
+//
+// **A range standing where a `Range[T]` is wanted reads its bounds at `T`**, exactly as an operator's
+// operands read the type their position wants: `total(0..<4)` at a `Range[usize]` parameter is a
+// range of `usize`, not an `int` one refused for a difference the reader never wrote.
 private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr],
-                    inclusive: bool) -> TExpr
+                    inclusive: bool, expected: Option[Type]) -> TExpr
     if lo.is_none() || hi.is_none() then
         return cx.err(span, "a range with an open end is only allowed in a slice index — as a " +
                       "value it would have to say what the missing bound is, and only the thing " +
@@ -256,7 +297,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
 
     // The same two questions the `for` header asks of its bounds, in the same order and the same
     // words: a range value and a counted loop must not come to disagree about what a range is.
-    val ts = analyze_operands(cx, ends, None)
+    val ts = analyze_operands(cx, ends, range_element(expected), true)
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -287,6 +328,15 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
             TExpr(span, TStructNew(d, fields))
         _ -> bad_expr(span)
 end range_value
+
+// The `T` of an expected `sysl.Range[T]`, where that is what the position wants.
+private range_element(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    underlying(expected.unwrap()) match
+        Struct(d) if d.base == library_key("Range") && d.targs.len() == 1 -> Some(d.targs.at(0))
+        _ -> None
+end range_element
 
 // `a, b` where a function's result list is what is being produced. It builds the aggregate the
 // caller takes apart -- the same one a tuple builds, since a result list is a tuple's layout
@@ -373,6 +423,24 @@ capture_source(cx: &Analyzer, span: Span, name: string) -> TExpr
 
     cx.capture_read(local.unique).unwrap_or(TExpr(span, TLoad(local.unique, local.ty)))
 
+// The binding holding an anonymous member that shows a field of this name, at any depth. Only a
+// clause function binds one: no program can write the name.
+private anonymous_holder_local(cx: &Analyzer, name: string) -> Option[string]
+    var i = cx.locals.len()
+
+    while i > 0
+        i = i - 1
+
+        val local = cx.locals.at(i)
+
+        if is_anonymous_field(local.name)
+            local.ty match
+                Struct(d) -> if holds_string(visible_field_names(d), name) then return Some(local.name)
+                _ -> ()
+
+    None
+end anonymous_holder_local
+
 // What a bare name reads.
 //
 // **The order is the reader's**: a name the compiler answers for itself, then `result`, then what
@@ -416,8 +484,19 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
             Weak(_) -> return TExpr(span, TZero(expected.unwrap()))
             _ -> ()
 
+    // **A local `const` is its value**, as a module one is: every use is the literal it came to.
+    if local.is_some()
+        val konst = cx.const_local(local.unwrap().unique)
+
+        if konst.is_some() then return TExpr(span, konst.unwrap().0.kind)
+    end if
+
     if local.is_some()
         note_local_reference(cx, span, local.unwrap())
+
+        // A binding whose type its first use fixes is fixed by a position that expects one.
+        if expected.is_some() && !cx.open_vars.is_empty() then
+            fixed_by_position(cx, span, local.unwrap().unique, expected.unwrap())
 
         // A capture is a binding like any other, and what it reaches is the field of the
         // environment its closure was handed rather than a slot of this frame.
@@ -431,6 +510,17 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
         return load
     end if
+
+    // **A field an anonymous member shows is the holder's own** (C11), so a struct's `invariant`
+    // clause names it bare although its function takes the member whole (`predicates.sysl`). The name
+    // reads as the member's field does, where the clause reaches it -- a union's checked read
+    // included.
+    val holder = anonymous_holder_local(cx, name)
+
+    if holder.is_some()
+        val recv = expr(span, Ident(holder.unwrap()))
+
+        return analyze_value(cx, expr(span, Field(recv, name, span)), expected)
 
     // A **value parameter**, folded into its use exactly as a declared constant is -- which is what
     // it is, a `const` whose value the instantiation supplied. The substitution holds one for it
@@ -471,7 +561,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         if !reachable_key(cx.an, vk.unwrap(), cx.scope) && !refused_at_import(cx.scope, name, vk.unwrap())
             return cx.err(span, out_of_reach(cx.an, vk.unwrap()))
 
-        return global_expr(cx, span, vk.unwrap(), a_vals(cx), writable_key(cx, vk.unwrap()))
+        return global_expr(cx, span, vk.unwrap(), a_vals(cx), is_writable_key(cx, vk.unwrap()))
     end if
 
     val v_rivals = ambiguous_value(cx, span, a_vals(cx), name)
@@ -498,7 +588,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
         val d = a_extern_vars(cx).get(ek.unwrap()).unwrap()
 
-        note_storage_reference(cx, span, d)
+        note_storage_reference(cx, span, d, value_type(cx, d))
 
         return TExpr(span, TGlobal(extern_var_symbol(d), value_type(cx, d), true))
     end if
@@ -574,6 +664,8 @@ private const_parameter(cx: &Analyzer, span: Span, name: string,
             Bool -> Some(TExpr(span, TBoolLit(v != from_int(0))))
             Char -> Some(TExpr(span, TIntLit(v, Char)))
             _ -> Some(int_literal(cx, span, v, "", Some(*ty)))
+        // The name a `for const` over a type's make-up binds, read as the descriptor it stands at.
+        Some(Descriptor(owner, v, f)) -> Some(descriptor_value(cx, span, Descriptor(*owner, v, f)))
         _ -> None
 end const_parameter
 
@@ -746,9 +838,15 @@ private loop_from(round: Buf[string], start: usize) -> string
     s"$out \u{2192} ${module_show(round.at(start))}"
 end loop_from
 
+// The type a constant is: the one it was written at, or else its value's own, read in the
+// declaration's terms -- `const step = 2` is an `int` exactly as `val step = 2` is.
+const_type(cx: &Analyzer, d: ValueDecl) -> Type =
+    if d.typ.is_some() || d.init.is_none() then value_type(cx, d)
+    else texpr_type(type_expr(analyzer_for(cx.an, d.scope), d.init.unwrap(), None))
+
 private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     val d = a_consts(cx).get(key).unwrap()
-    val ty = value_type(cx, d)
+    val ty = const_type(cx, d)
 
     if d.init.is_none() then return TExpr(span, TZero(ty))
 
@@ -796,34 +894,70 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     TExpr(span, *folded.kind)
 end const_value_expr
 
-// A settled value as the literal a use of the name reads, where there is a literal form for it.
+// A settled value as the literal a use of the name reads, where there is a literal form for it. An
+// integer folded for a float constant has none: its initializer read at the float is the value.
 private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
-    ConstInt(n) -> Some(TExpr(span, TIntLit(n, ty)))
+    ConstInt(n) -> underlying(ty) match
+        Floating(_, _) -> None
+        _ -> Some(TExpr(span, TIntLit(n, ty)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstChar(c) -> Some(TExpr(span, TIntLit(from_int(long(u32(c))), ty)))
     _ -> None
 
+// The type module storage is declared at: the one written, qualifier and all, or else -- a `val` or
+// `var` written with none -- its initializer's own, exactly as a local binding's is.
+//
+// **The type is known wherever a written one was**: a read of the name in a body analyzed before the
+// storage is, or in another `val`'s initializer, reads the initializer for its type then. That
+// reading is a trial thrown away whole -- the reading the program gets is `module_storage`'s -- so
+// it registers nothing twice, and only its answer is kept. A `val` whose value reaches itself has no
+// type to take, which `module_storage` reports at its declaration.
+storage_type(a: &Analysis, key: string, d: ValueDecl, writable: bool) -> Type
+    if d.typ.is_some() then return resolve_storage(a, d.scope, d.typ.unwrap(), d.name, writable)
+    if d.init.is_none() then return Unknown
+
+    for item in a.val_types
+        if item.0 == key then return item.1
+
+    if holds_string(a.vals_in_progress, key)
+        if !holds_string(a.val_cycles, key) then a.val_cycles.push(key)
+
+        return Unknown
+    end if
+
+    a.vals_in_progress.push(key)
+
+    val cx = analyzer_for(a, d.scope)
+    val tried = begin_trial(cx)
+    val ty = texpr_type(type_expr(cx, d.init.unwrap(), None))
+
+    discard_trial(cx, tried)
+    a.vals_in_progress.truncate(a.vals_in_progress.len() - 1)
+
+    if !holds_string(a.val_cycles, key) then a.val_types.push((key, ty))
+
+    ty
+end storage_type
+
 // Whether a name that stands for module storage is one a program may write to.
-private writable_key(cx: &Analyzer, key: string) -> bool
+is_writable_key(cx: &Analyzer, key: string) -> bool
     for item in cx.an.tables.writable
         if item == key then return true
 
     false
-end writable_key
+end is_writable_key
 
 private global_expr(cx: &Analyzer, span: Span, key: string, from: &Table[ValueDecl],
                     writable: bool) -> TExpr
     val d = from.get(key).unwrap()
+    val stored = storage_type(cx.an, key, d, writable)
 
-    note_storage_reference(cx, span, d)
+    note_storage_reference(cx, span, d, stored)
 
     // The node carries the type the storage is DECLARED at, a `volatile` included, as a field's
     // declaration does: what a read of it hands back is the plain value (`texpr_type`), and what an
     // access to it is, or what `&` of it points at, is asked of the declaration (`place_type`).
-    val stored = if d.typ.is_none() then Unknown
-    else resolve_storage(cx.an, d.scope, d.typ.unwrap(), d.name, writable)
-
     TExpr(span, TGlobal(key, stored, writable))
 end global_expr
 
@@ -842,7 +976,9 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
     val found = variant_of(cx, name, expected)
 
-    if found.is_none() && refused_is_name(cx, name) then return bad_expr(span)
+    // The part a module binding reads back is unbound only where the binding was refused, which said
+    // why (`hoist_parts`).
+    if found.is_none() && (refused_is_name(cx, name) || name == PART_LOCAL) then return bad_expr(span)
 
     if found.is_none() then
         // A generic enum nothing has instantiated yet still declares the name, and a variant of it
@@ -914,10 +1050,32 @@ private variant_in_scope(cx: &Analyzer, base: string, name: string) -> bool
     for item in im.wildcards
         if item == owner then return true
 
-    imported_variant_enum(cx, name) match
-        Some(owner) -> owner == base
-        None -> false
+    val chosen = imported_variant_enum(cx, name)
+
+    if chosen.is_some() then return chosen.unwrap() == base
+
+    // **An enum imported by name puts its variants in scope for its own expected type**
+    // (`reference/types.md § A variant belongs to its enum`): `import lib.m.Why` makes
+    // `val w: Why = Empty` and `return Err(Empty)` at a `Result[T, Why]` the enum's, as they are in
+    // its own module. A name this file already has for something else -- its own function or value
+    // of the spelling -- is still that, never re-pointed at a distant variant.
+    enum_imported_by_name(cx, base) && !names_something_else(cx, name)
 end variant_in_scope
+
+// Whether some level of this file's imports binds a name to the enum `base` itself.
+private enum_imported_by_name(cx: &Analyzer, base: string) -> bool
+    for bound in cx.scope.imports.names
+        if bound.1 == base then return true
+
+    false
+end enum_imported_by_name
+
+// Whether a bare name already reaches a binding, a function or a value here, which a variant reached
+// only through its enum's import does not take over.
+private names_something_else(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_some() || names_a_function(cx, name) || cx.nested_of(name).is_some() ||
+        value_key_of(cx, a_consts(cx), name).is_some() || value_key_of(cx, a_vals(cx), name).is_some() ||
+        value_key_of(cx, a_extern_vars(cx), name).is_some()
 
 // A nullary variant of an enum something other than the bare name already chose -- a module or a
 // type in front of a dot, or a value parameter's declared enum -- so no import of the name is asked
@@ -1024,17 +1182,11 @@ variant_homes(cx: &Analyzer, name: string) -> Buf[string]
 
     var own = false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
+    for key in enums_declaring(cx.an, name)
+        if reachable_key(cx.an, key, cx.scope) && variant_visible_here(cx, key, name) then
+            homes.push(key)
 
-        cx.an.tables.types.at(i).kind match
-            EnumOf(ed) ->
-                if declares_variant(ed, name) && reachable_key(cx.an, key, cx.scope) &&
-                        variant_visible_here(cx, key, name) then
-                    homes.push(key)
-
-                    if module_of(key) == cx.scope.module_name then own = true
-            _ -> ()
+            if module_of(key) == cx.scope.module_name then own = true
 
     if !own then return homes
 
@@ -1077,25 +1229,12 @@ private own_variant_name(cx: &Analyzer, name: string) -> bool
     if !overload_keys(cx.an, here).is_empty() || !overload_keys(cx.an, plain).is_empty() then
         return false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
-
-        cx.an.tables.types.at(i).kind match
-            EnumOf(ed) ->
-                if module_of(key) == cx.scope.module_name && declares_variant(ed, name) &&
-                        reachable_key(cx.an, key, cx.scope) then
-                    return true
-            _ -> ()
+    for key in enums_declaring(cx.an, name)
+        if module_of(key) == cx.scope.module_name && reachable_key(cx.an, key, cx.scope) then
+            return true
 
     false
 end own_variant_name
-
-private declares_variant(ed: EnumDecl, name: string) -> bool
-    for item in ed.variants
-        if item.name == name then return true
-
-    false
-end declares_variant
 
 // `'A'`, then `'A' and 'B'`, then `'A', 'B' and 'C'` -- a series a sentence can carry, with no comma
 // before the `and`.
@@ -1260,6 +1399,14 @@ private numeric_expectation(expected: Option[Type]) -> Option[Type]
     if computes_numerically(expected.unwrap()) then expected else None
 end numeric_expectation
 
+// The expectation a prefix operator's operand inherits. `-` and `~` produce the type they are
+// given, so any expected type is the operand's too; anything else keeps the numeric one.
+private operand_expectation(op: string, expected: Option[Type]) -> Option[Type]
+    if op == "-" || op == "~" then return expected
+
+    numeric_expectation(expected)
+end operand_expectation
+
 // -- operators -----------------------------------------------------------------------------------
 
 private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
@@ -1274,6 +1421,8 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
             _ -> ()
 
     if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand, e.span), Bool))
+
+    not_fixing_at(cx, operand)
     if op == "&"
         // `&f` on a declared function is C's address of it rather than the address of a place.
         val named = names_a_declared_function(cx, operand)
@@ -1298,8 +1447,10 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
     end if
     if op == "*" then return deref_expr(cx, e.span, operand)
 
-    val numeric = numeric_expectation(expected)
-    val t = type_expr(cx, operand, numeric)
+    // **`-` and `~` answer the operand's own type** -- a number's, or `Self` from `Neg` and `Not` --
+    // so the type the position wants is the type the operand has to be, and it is passed down whole:
+    // `-P.make()` at `P[int]` settles `make`'s `T` exactly as `P.make()` there does.
+    val t = type_expr(cx, operand, operand_expectation(op, expected))
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
@@ -1355,6 +1506,16 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
+
+    // A local `const` is its value, and a value has no address.
+    val named = *operand.kind match
+        Ident(n) -> cx.lookup(n)
+        _ -> None
+
+    if named.is_some() && cx.const_local(named.unwrap().unique).is_some() then
+        return cx.err(span, s"'${named.unwrap().name}' is a constant, which is its value wherever it is " +
+                      "used and has no storage of its own — so '&' has nothing to reach. A name for " +
+                      "storage is a 'var'")
 
     if is_place(t) || named_place(operand) then
         if !is_place(t) then
@@ -1446,13 +1607,22 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     if op == "&&" || op == "||" then
         return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
+    // What arithmetic settles on is not a type its operands were used at.
+    not_fixing_at(cx, l)
+    not_fixing_at(cx, r)
+
     val numeric = numeric_expectation(expected)
-    val scaled = scale_operands(cx, op, l, r, numeric)
-    val (tl, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
+    val literal_left = literal_subject_operands(cx, span, op, l, r, numeric)
+    val scaled = if literal_left.is_some() then literal_left else scale_operands(cx, op, l, r, numeric)
+    val (read_l, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
 
-    if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
+    if texpr_type(read_l) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
 
-    val dispatched = operator_call(cx, span, op, tl, tr)
+    val tl = if is_literal(l) then read_l else scalar_subject_widened(cx, span, op, l, read_l, tr)
+
+    if texpr_type(tl) == Unknown then return bad_expr(span)
+
+    val dispatched = operator_call(cx, span, op, tl, tr, r)
 
     if dispatched.is_some() then return dispatched.unwrap()
 
@@ -1466,6 +1636,78 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     produced(TExpr(span, TBinary(op, tl, tr, ty)))
 end binary_expr
 
+// `2 * p` over `impl Mul[Point, Point] for real`: an unsuffixed literal on the LEFT of an operator
+// whose right operand is a type with no instruction of its own is the receiver of the trait's
+// method, so it is read at the scalar whose implementation takes that right operand
+// (`operator_call.sysl`'s `scalar_impls_at`), where the literal fits it -- exactly, for a float.
+// Among several, `chosen_scalar` decides. Answers nothing where the shape does not apply or no
+// implementation takes the literal, which leaves the pair to the readings below and their
+// diagnostics; a literal the right operand's own type takes is that reading too.
+//
+// The right operand is read alone first, in a sandbox, since a literal contributes nothing to what
+// its neighbour is read at.
+private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
+                                 numeric: Option[Type]) -> Option[(TExpr, TExpr)]
+    val own = literal_default(l)
+
+    if own.is_none() || is_literal(r) || !selects_by_operand(cx.an, op) then return None
+
+    val read = sandboxed_reading(cx, r)
+    val rty = texpr_type(read.0)
+
+    if read.1 || rty == Unknown || literal_fits(cx, l, rty) then return None
+
+    var reached: Buf[Type] = buf()
+
+    for s in scalar_impls_at(cx.an, op, rty)
+        if literal_fits(cx, l, s) then reached.push(s)
+
+    val at = chosen_scalar(cx, span, op, l, own.unwrap(), rty, reached)
+
+    if at.is_none() then return None
+
+    var one: Buf[Expr] = buf()
+
+    one.push(r)
+
+    val tr = analyze_operands(cx, one, numeric).at(0)
+
+    if at.unwrap() == Unknown then return Some((bad_expr(l.span), tr))
+
+    Some((type_expr(cx, l, Some(at.unwrap())), tr))
+end literal_subject_operands
+
+// `k * p` with `k: int` over `impl Mul[Point, Point] for real`: a typed scalar on the left whose own
+// type implements nothing at the right operand widens to a scalar that does, losslessly, as a right
+// operand widens to an implementation's right-hand type (`operator_call.sysl`'s `widened_operand`).
+// The operand comes back as it was where its own type is one of them or none is reached, and as an
+// `Unknown` where several are and the rule leaves more than one.
+private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, tl: TExpr,
+                               tr: TExpr) -> TExpr
+    val got = texpr_type(tl)
+    val scalar = got match
+        Integer(_, _, _) -> true
+        Floating(_, _) -> true
+        Fixed(_, _, _) -> true
+        _ -> false
+
+    if !scalar then return tl
+
+    val found = scalar_impls_at(cx.an, op, texpr_type(tr))
+    var reached: Buf[Type] = buf()
+
+    for s in found
+        if type_eq(s, got) then return tl
+        if implicitly_widens(got, s) then reached.push(s)
+
+    val at = chosen_scalar(cx, span, op, expr(l.span, Ident("")), got, texpr_type(tr), reached)
+
+    if at.is_none() then return tl
+    if at.unwrap() == Unknown then return bad_expr(tl.span)
+
+    widened(tl, at)
+end scalar_subject_widened
+
 // The two operands of a binary operator, read as a pair that shares one type.
 private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
                         numeric: Option[Type]) -> (TExpr, TExpr)
@@ -1474,7 +1716,7 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     operands.push(l)
     operands.push(r)
 
-    val read = analyze_operands(cx, operands, numeric)
+    val read = analyze_operands(cx, operands, numeric, op != "<<" && op != ">>", op == "*" || op == "/")
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts.at(0)
 
@@ -1502,7 +1744,10 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
 
-        return Some((tl, operand_rhs(cx, op, tl, r, type_expr(cx, r, Some(repr(texpr_type(tl)))))))
+        val at = scale_literal_type(cx, op, texpr_type(tl), r, numeric)
+        val wl = widened(tl, Some(at))
+
+        return Some((wl, operand_rhs(cx, op, wl, r, type_expr(cx, r, Some(at)))))
     end if
 
     if op == "*" && bare_int_literal(l) && !is_literal(r)
@@ -1514,17 +1759,38 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
 
-        return Some((type_expr(cx, l, Some(repr(texpr_type(tr)))), tr))
+        val at = scale_literal_type(cx, op, texpr_type(tr), l, numeric)
+
+        return Some((type_expr(cx, l, Some(at)), widened(tr, Some(at))))
     end if
 
     None
 end scale_operands
 
+// The type an integer literal beside a scalar operand of `*` or `/` is read at: the operand's own
+// where the literal fits it, and otherwise `int`, where the operand widens to it -- the operand
+// rule of `literal_widened`, for the pairs read here rather than there. A shift's count is never
+// widened into.
+private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr, numeric: Option[Type]) -> Type
+    val own = repr(t)
+
+    if op != "*" && op != "/" || own == Char || own == Unknown || literal_fits(cx, lit, own) then return own
+
+    if reaches_position(int_type(), numeric) && literal_fits(cx, lit, int_type()) &&
+            implicitly_widens(own, int_type()) then int_type()
+    else own
+end scale_literal_type
+
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
 // scalars does, sharing each middle operand between the two comparisons that use it.
 private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[string]) -> TExpr
+    // A comparison fixes an open binding from its neighbour's own type (`compare_fixes`), never from
+    // what the pair settles on.
+    for e in operands
+        not_fixing_at(cx, e)
+
     // A fixed-point product compared with a value of another format is read at that format.
-    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None))
+    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None, true, false, true))
 
     // A comparison either side of which is a vector is one link and a mask rather than a `bool`, so
     // it is a different node and a different set of rules.
@@ -1553,7 +1819,13 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
                 val equality = op == "==" || op == "!="
                 val ok = if equality then is_equatable(a) else is_ordered(a)
 
-                if !ok then cx.fault(span, s"'$op' is not defined for ${type_show(a)}")
+                // A union's bytes are not its value -- `+0.0` and `-0.0` differ in them, and so do
+                // the bytes past a short field -- so the reader is told what to write instead.
+                if !ok && is_union(a) then
+                    cx.fault(span, s"'$op' is not defined for the union ${type_show(a)} — comparing its " +
+                             "bytes is wrong for a float and for the bytes past a short field. Write " +
+                             "'impl Eq' comparing the field you know is there")
+                else if !ok then cx.fault(span, s"'$op' is not defined for ${type_show(a)}")
 
         cmps.push(TCmp(op, dispatch))
 
@@ -1568,7 +1840,18 @@ end compare_expr
 // which is what lets `n + 1` work for an `n` of any width without the literal needing a suffix, and
 // `p == null` work for any `*T`. The operands that have a type are analyzed first precisely so it
 // is available to the ones that do not.
-analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> Buf[TExpr]
+//
+// **`widen` is the operand rule of an arithmetic or a comparison operator**: an operand converts to
+// the other's type where that holds every value of its own. The bounds of a range and the elements
+// of an unannotated array literal meet the same way; a shift's count is read without it, since the
+// count's width says nothing about the value shifted.
+//
+// **`rescales` marks a `*` or a `/`**, under which two fixed-point formats keep their own rule -- the
+// product of two formats takes the format of where it is written (`reference/fixed-point.md § Two
+// formats`) -- rather than one being widened to the other first, which would round the product at
+// the wider operand's format.
+analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
+                 widen: bool = false, rescales: bool = false, compared: bool = false) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -1586,7 +1869,11 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
             else if !refused_before && texpr_type(t.unwrap()) == Unknown then
                 cx.an.poison_quietly()
 
-    val settled = firmest(operands, own).or_else(() -> expected)
+    // **`compared` marks a comparison**, whose operand of a type of its own fixes an open binding
+    // beside it (`var_first_use.sysl`).
+    if compared && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own)
+
+    val settled = firmest(operands, own, widen, rescales).or_else(() -> expected)
     var told: Buf[Option[TExpr]] = buf()
 
     for i in 0..<operands.len()
@@ -1594,18 +1881,92 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
 
         if own.at(i).is_some() then told.push(own.at(i))
         else if is_literal(e) then told.push(None)
-        else told.push(Some(type_expr(cx, e, settled)))
+        else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
-    val ty = firmest(operands, told).or_else(() -> expected)
+    val ty = literal_widened(cx, operands, told, firmest(operands, told, widen, rescales).or_else(() -> expected),
+                             expected, widen, rescales).or_else(() -> if widen then float_among(operands) else None)
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
         told.at(i) match
-            Some(t) -> out.push(if ty.is_some() then reread(cx, t, operands.at(i), ty.unwrap()) else t)
+            Some(t) ->
+                if ty.is_some()
+                    val keeps = rescales && is_fixed(ty.unwrap()) && is_fixed(repr(texpr_type(t)))
+
+                    val widens = widen && !keeps && repr(texpr_type(t)) != Char
+
+                    out.push(reread(cx, t, operands.at(i), ty.unwrap(), widens))
+                else out.push(t)
             None -> out.push(type_expr(cx, operands.at(i), ty))
 
     out
 end analyze_operands
+
+// **A literal is read at the typed operand's type where it fits there, and otherwise at its own
+// default**, to which the typed operands then widen: `h * 0.5` over an `f32` stays `f32` and `b + 3`
+// over a `byte` stays a byte, but `1.0 / k` over an `int` is a `real` quotient and `b + 300` an `int`
+// sum. Where a typed operand does not widen losslessly to the literal's default (a `long` beside
+// `2.0`), or the literal does not fit its default either (a `byte` beside a literal no `int` holds),
+// the type settled on stands, and the literal is told it does not fit, as it always was.
+//
+// **So does a position whose type the default would not reach**: `val z: u8 = b + 300` is told the
+// literal does not fit a byte, which is the mistake, rather than that an `int` sum is no byte.
+private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]],
+                        settled: Option[Type], expected: Option[Type], widen: bool,
+                        rescales: bool) -> Option[Type]
+    if !widen || settled.is_none() || !any_typed(operands, told) then return settled
+
+    var ty = settled.unwrap()
+
+    for i in 0..<operands.len()
+        val e = operands.at(i)
+
+        if told.at(i).is_none() && is_literal(e)
+            val own = literal_default(e)
+
+            if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
+                    !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
+                    holds_every_operand(operands, told, own.unwrap(), rescales) then
+                ty = own.unwrap()
+
+    Some(ty)
+end literal_widened
+
+// **Where only literals meet and one of them is a float, the pair is that float**: `1 + 2.0` is a
+// `real` sum and `[1.5, 2]` a `[2]real`, the integer literal being read as the float where it holds
+// it exactly -- as it is beside a float operand. With nothing settled the literals would each fall
+// to their own default and disagree over a difference the reader never wrote.
+private float_among(operands: Buf[Expr]) -> Option[Type]
+    for e in operands
+        if is_literal(e) && literal_default(e).unwrap_or(Unknown) == real_type() then return Some(real_type())
+
+    None
+end float_among
+
+// Whether a literal's default type is one the position the pair stands in takes.
+private reaches_position(own: Type, expected: Option[Type]) -> bool =
+    expected.is_none() || type_eq(own, repr(expected.unwrap())) || implicitly_widens(own, repr(expected.unwrap()))
+
+// Whether any operand has a type of its own -- with none, there is nothing to widen, and the literals
+// are read at what the position asked for.
+private any_typed(operands: Buf[Expr], told: Buf[Option[TExpr]]) -> bool
+    for i in 0..<operands.len()
+        told.at(i) match
+            Some(t) -> if !adaptable(operands.at(i), t) then return true
+            None -> ()
+
+    false
+end any_typed
+
+// Whether a literal reads at a type without a complaint and as that type.
+literal_fits(cx: &Analyzer, e: Expr, ty: Type) -> bool
+    val tried = begin_trial(cx)
+    val t = type_expr(cx, e, Some(ty))
+    val refused = refused_since(cx, tried)
+
+    discard_trial(cx, tried)
+    !refused && texpr_type(t) != Unknown && !disagree(texpr_type(t), ty)
+end literal_fits
 
 // One reading of an operand for the TOP TIER, answering nothing where the reading failed.
 //
@@ -1620,31 +1981,27 @@ end analyze_operands
 // which is where a `M.one()` beside an `M[int]` gets the argument its own call could not supply --
 // and read again at nothing where the pair settled nothing, so the complaint is made for real.
 private attempt_operand(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TExpr]
-    val said = cx.an.complaints()
-    val mark = cx.an.sandboxed()
+    val tried = begin_trial(cx)
 
     // An operand is never a place a result list may stand, so one is refused here as `type_expr`
     // refuses it -- and the refusal sends the operand back to be read for real.
-    val t = unwrap_results(cx, e, analyze_expected(cx, e, expected), false)
+    val t = unwrap_results(cx, e, analyze_unwidened(cx, e, expected), false)
 
-    if cx.an.complaints() > said
-        cx.an.release(mark)
-        cx.an.restore_complaints(said)
-
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
         return None
-    end if
 
-    cx.an.keep()
+    keep_trial(cx)
     Some(t)
 end attempt_operand
 
 // One reading of an operand with everything it said put back, which is what lets the top tier come
 // back empty rather than complaining on behalf of a tier that had nothing to offer it.
 sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
-    val mark = cx.an.complaints()
+    val tried = begin_trial(cx)
     val t = analyze_expected(cx, e, expected)
 
-    cx.an.restore_complaints(mark)
+    discard_trial(cx, tried)
     t
 end sandboxed_read
 
@@ -1655,17 +2012,27 @@ end sandboxed_read
 // that succeeds can only turn a refusal into what the same expression at a *written* type would
 // already have been; one that fails changes nothing and leaves the original complaint to whoever
 // was going to report it.
-reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type) -> TExpr
+reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type, widen: bool = true) -> TExpr
     if !disagree(texpr_type(t), want) then return t
 
-    val mark = cx.an.complaints()
-    val again = analyze_expected(cx, src, Some(want))
+    // A character literal beside a byte is that byte or a mistake with its own name, so its reading
+    // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
+    // than that a `u8` cannot be compared with a `char`.
+    if is_char_literal(src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
 
-    cx.an.restore_complaints(mark)
+    val tried = begin_trial(cx)
+    val again = if widen then analyze_expected(cx, src, Some(want))
+                else analyze_unwidened(cx, src, Some(want))
 
     // A re-reading that was refused comes back `Unknown`, which agrees with everything -- kept, it
     // would carry a refusal whose complaint was just put back, and the operand would pass unreported.
-    if texpr_type(again) == Unknown || disagree(texpr_type(again), want) then t else again
+    if texpr_type(again) == Unknown || disagree(texpr_type(again), want)
+        discard_trial(cx, tried)
+        return t
+
+    cx.an.restore_complaints(tried.said)
+    keep_trial(cx)
+    again
 end reread
 
 // Which of the operands the pair takes its type from: the first that stands on its own, and only
@@ -1673,7 +2040,8 @@ end reread
 //
 // **An adaptable operand is passed over rather than dropped**, which is the whole of the difference
 // between this and taking the head.
-private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]]) -> Option[Type]
+private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]], widen: bool,
+                rescales: bool) -> Option[Type]
     var taken: Option[Type] = None
     var any: Option[Type] = None
 
@@ -1690,8 +2058,49 @@ private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]]) -> Option[Type]
 
     if chosen.is_none() then return None
 
-    Some(meet_views(chosen.unwrap(), read))
+    val met = if widen then widest_operand(operands, read, chosen.unwrap(), rescales) else chosen.unwrap()
+
+    Some(meet_views(met, read))
 end firmest
+
+// **An operand converts to the other operand's type, never to a third**: of the types the operands
+// that stand on their own were read at, the one every other of them widens to losslessly, wherever
+// it is not the one first chosen -- `b + n` over a `byte` and an `int` is an `int` sum as `n + b`
+// is. Where no operand's type holds all the others, the first choice stands and the mismatch is
+// reported as it always was.
+//
+// **A `char` operand never widens**: `c + n` is a character used as a number, which is a mistake far
+// more often than it is arithmetic, so it is written `int(c) + n`. A character still widens to an
+// integer everywhere a position asks for one -- an initializer, an argument, a return.
+private widest_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Type,
+                       rescales: bool) -> Type
+    for i in 0..<operands.len()
+        read.at(i) match
+            Some(t) ->
+                val ty = repr(texpr_type(t))
+
+                if !adaptable(operands.at(i), t) && !type_eq(ty, chosen) &&
+                        holds_every_operand(operands, read, ty, rescales) then return ty
+            None -> ()
+
+    chosen
+end widest_operand
+
+private holds_every_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], ty: Type,
+                            rescales: bool) -> bool
+    for i in 0..<operands.len()
+        read.at(i) match
+            Some(t) ->
+                val other = repr(texpr_type(t))
+
+                if other == Unknown then return false
+                if rescales && is_fixed(other) && is_fixed(ty) && !type_eq(other, ty) then return false
+                if !adaptable(operands.at(i), t) && !type_eq(other, ty) &&
+                        (other == Char || !implicitly_widens(other, ty)) then return false
+            None -> ()
+
+    true
+end holds_every_operand
 
 // The two views of one slice, met at the read-only one -- the only place a pair of operands has a
 // type to settle on that neither of them wrote.
@@ -1752,10 +2161,8 @@ private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool =
 private generic_variant_in_reach(cx: &Analyzer, name: string, carrying: bool) -> bool
     if !may_name_variant(cx, name) then return false
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
-
-        cx.an.tables.types.at(i).kind match
+    for key in enums_declaring(cx.an, name)
+        cx.an.tables.types.get(key).unwrap().kind match
             EnumOf(d) ->
                 if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
                         variant_visible_here(cx, key, name)

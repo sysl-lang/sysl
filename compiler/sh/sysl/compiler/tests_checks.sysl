@@ -237,10 +237,11 @@ an_assertion_that_is_not_a_condition()
 
 @test("and one that cannot be settled while compiling is refused for that")
 an_assertion_that_does_not_fold()
-    assert_eq(said("size() -> int = 3\n\n@assert(size() > 0)\n"),
+    assert_eq(said("var seed: int = 3\nsize() -> int = seed\n\n@assert(size() > 0)\n"),
               "'@assert' is settled while compiling, so its condition has to be a constant " +
-              "expression — a literal, a 'const', 'sizeof', 'alignof', 'offsetof', or the " +
-              "arithmetic and comparisons over them, and never a call")
+              "expression — a literal, a 'const', 'sizeof', 'alignof', 'offsetof', a call whose " +
+              "body runs while compiling, or the arithmetic and comparisons over them — and nothing " +
+              "read out of storage filled at run time")
 
 @test("an assertion inside a generic body is settled at each instantiation, and names the bindings")
 an_assertion_inside_a_generic()
@@ -732,23 +733,17 @@ a_parameter_outside_the_crossing_list()
 
 // -- a member reached where its trait cannot be named ----------------------------------------------
 
-// **Visibility and scope are two questions and only the second is what an import changes.** Every
-// trait of the standard module is public everywhere, so a rule resting on visibility lets a file
-// call `trim` without naming `sysl.text.Search` — which is the whole of what the import line is for.
+// **A member an impl gave a type is reached with no import of its trait** (`reference/traits.md §
+// Reaching a member through its trait`): the impl is one the program can see, which is the second
+// tier of the lookup, after the traits the file names.
 
-@test("a member a trait gave a type needs the trait in scope, not merely visible")
-a_trait_member_needs_the_trait_named()
+@test("a member a trait gave a type is reached where the impl is visible, with no import")
+a_trait_member_needs_no_import()
     if checks_no_library() then return
 
-    val trimmed = complaints_of("import sysl.text.split\n\nprint(\"  x  \".trim())\n")
-
-    assert(says(trimmed, "string has 'trim' from sysl.text.Search, and that trait is not in scope " +
-                "here — import it to reach the member"), listed_of(trimmed))
-
-    val rooted = complaints_of("import sysl.math.pi\n\nvar x = 2.0\n\nprint(pi, x.sqrt())\n")
-
-    assert(says(rooted, "real has 'sqrt' from sysl.math.Float, and that trait is not in scope " +
-                "here — import it to reach the member"), listed_of(rooted))
+    assert_eq(complaints_of("import sysl.text.split\n\nprint(\"  x  \".trim())\n").len(), usize(0))
+    assert_eq(complaints_of("import sysl.math.pi\n\nvar x = 2.0\n\nprint(pi, x.sqrt())\n").len(),
+              usize(0))
 
 @test("and the import is the whole of what it wanted")
 a_trait_member_with_the_trait_named()
@@ -799,8 +794,9 @@ an_impl_block_depends_on_the_standard_module()
 
     assert(reaches(with_impl, "", "sysl"), "an impl block recorded no dependency")
 
-    val without = checks_program("struct S\n    v: int\nend S\n\n" +
-                                 "trait Bounded\n    go(self)\n")
+    // No struct here: every struct is given the library's `Debug`, which is an `impl` of a library
+    // trait, so a struct alone now records the dependency too.
+    val without = checks_program("trait Bounded\n    go(self)\n")
 
     assert(!reaches(without, "", "sysl"), "a trait nobody implements recorded one")
 end an_impl_block_depends_on_the_standard_module

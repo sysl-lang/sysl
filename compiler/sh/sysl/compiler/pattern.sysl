@@ -46,10 +46,14 @@ private bind_once(cx: &Analyzer, span: Span, name: string, ty: Type) -> string
                      "stand for a different part of the value — rename it, or compare the two in " +
                      "a guard")
 
-            return cx.bind_pattern(name, ty)
+            return cx.bind_pattern(name, ty, written_name(cx, span.start, name))
 
     cx.bound_in_pattern.push(name)
-    cx.bind_pattern(name, ty)
+
+    val unique = cx.bind_pattern(name, ty, written_name(cx, span.start, name))
+
+    note_pattern_borrow(cx, unique, name, ty)
+    unique
 end bind_once
 
 private pattern_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern = *p.kind match
@@ -122,25 +126,35 @@ end range_pattern
 // is a mistake rather than a new local.
 private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> TPattern
     val name = last_segment(written)
+
+    // `x is c` -- the variant a `for const c in T::Variants` stands at in this copy.
+    val descriptor = if written == name then descriptor_bound(cx.subst, name) else None
+
+    if descriptor.is_some() then return descriptor_pattern(cx, span, name, descriptor.unwrap(), ty)
+
     val v = variant_named(ty, name)
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
 
-    val ck = lookup_value_key(cx, cx.an.tables.consts, written)
+    val ck = visible_value_key(cx, cx.an.tables.consts, written)
 
     if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
 
     // A `val` is storage read while the program runs, so there is no value here to compare against
     // -- and letting the name bind instead is precisely the trap this order is written to avoid.
-    if lookup_value_key(cx, cx.an.tables.vals, written).is_some() then
-        cx.fault(span, s"'$written' is a 'val', which is read while the program runs, so a bare " +
+    val vk = visible_value_key(cx, cx.an.tables.vals, written)
+
+    if vk.is_some()
+        val kind = if is_writable_key(cx, vk.unwrap()) then "var" else "val"
+
+        cx.fault(span, s"'$written' is a '$kind', which is read while the program runs, so a bare " +
                  s"name here would bind rather than match — write it as '`$name`' to test the " +
                  "value it holds, or bind a different name")
 
         return TWildPattern(ty)
     end if
 
-    if lookup_value_key(cx, cx.an.tables.extern_vars, written).is_some() then
+    if visible_value_key(cx, cx.an.tables.extern_vars, written).is_some() then
         cx.fault(span, s"'$written' is an 'extern' variable, which is read while the program runs, " +
                  s"so a bare name here would bind rather than match — write it as '`$name`' to " +
                  "test the value it holds, or bind a different name")
@@ -148,15 +162,49 @@ private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> T
         return TWildPattern(ty)
     end if
 
+    // A qualified name cannot bind, so one that reaches a declaration the file may not see is told
+    // that it is private rather than that it names nothing.
     if written != name then
-        cx.fault(span, s"'$written' names no variant of ${type_show(ty)} and no constant, and a " +
-                 "qualified name cannot bind — write the name a program can declare")
+        val hidden = hidden_value_key(cx, written)
+
+        if hidden.is_some()
+            cx.fault(span, out_of_reach(cx.an, hidden.unwrap()))
+        else
+            cx.fault(span, s"'$written' names no variant of ${type_show(ty)} and no constant, and a " +
+                     "qualified name cannot bind — write the name a program can declare")
 
         return TWildPattern(ty)
     end if
 
     TBindPattern(bind_once(cx, span, name, ty), ty)
 end ident_pattern
+
+// The module-level value a pattern name already means, in the terms of the file that wrote it.
+//
+// **A sibling file's file-private declaration is not one**: a bare `private` scopes the name to its
+// file (`reference/modules.md § A file-private name is scoped to its file`), so in every other file
+// the name is free and the pattern binds it. A name an import clause already refused is read as
+// reachable, as the expression resolver reads it, so the one mistake is reported once.
+private visible_value_key(cx: &Analyzer, from: &Table[ValueDecl], written: string) -> Option[string]
+    val key = lookup_value_key(cx, from, written)
+
+    if key.is_none() then return None
+    if reachable_key(cx.an, key.unwrap(), cx.scope) || refused_at_import(cx.scope, written, key.unwrap())
+        return key
+
+    None
+end visible_value_key
+
+// The declaration of a constant, `val`, `var` or `extern` variable that a name reaches but the file
+// may not see.
+private hidden_value_key(cx: &Analyzer, written: string) -> Option[string]
+    for from in [cx.an.tables.consts, cx.an.tables.vals, cx.an.tables.extern_vars]
+        val key = lookup_value_key(cx, from, written)
+
+        if key.is_some() && visible_value_key(cx, from, written).is_none() then return key
+
+    None
+end hidden_value_key
 
 // `` `name` `` -- the quoting says a reference was meant, so this never binds.
 //
@@ -262,20 +310,26 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
 
             TVariantPattern(underlying(ty), v, sub_patterns(cx, args, v.fields))
 
+        Struct(d) if d.union_layout ->
+            cx.fault(span, union_pattern_refusal(d))
+            TWildPattern(ty)
         Struct(d) ->
             if !names_this_type(cx, written, d) then
                 cx.fault(span, s"'$written(…)' does not match a ${type_show(Struct(d))} value")
 
-            if args.len() != d.fields.len() then
+            // An unnamed bitfield has no part to write: a `_` stands in for it (`c_bitfields.sysl`).
+            val parts = with_unnamed_wild(d, args)
+
+            if parts.len() != d.fields.len() then
                 cx.fault(span, s"struct '${qualified_name(d.base)}' has " +
-                         s"${quantity(d.fields.len(), "field")}, but " +
+                         s"${quantity(named_field_count(d), "field")}, but " +
                          s"${supplied(args.len(), "sub-pattern")}")
 
             // Naming every field is reading every field, so the positional pattern needs each of
             // them visible -- the same rule the positional constructor is held to.
             every_field_visible(cx, span, d, "this pattern",
                                 "match the fields it does offer by name, as 'Name{…}'")
-            TStructPattern(d, sub_patterns(cx, args, d.fields))
+            TStructPattern(d, sub_patterns(cx, parts, d.fields))
 
         Unknown -> unknown_subject(cx, args, ty)
 
@@ -287,7 +341,21 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
 // A tuple pattern is the positional struct pattern with the name off, which is why it ends as the
 // same node: a tuple's parts are its fields, and matching every one of them is what the positional
 // form already means.
+//
+// **`()` is unit's pattern**, the tuple with no parts: unit has one value, so the pattern matches
+// whatever reaches it and ends as a wildcard -- which is what lets `Ok(())` be an arm and what makes
+// it cover the variant on its own.
 private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -> TPattern
+    if args.len() == 0 then
+        underlying(ty) match
+            Unit -> return TWildPattern(ty)
+            Unknown -> ()
+            other ->
+                cx.fault(span, s"'()' matches unit, but the value is " +
+                         s"${type_show(other)}${held_behind(other)}")
+
+                return TWildPattern(ty)
+
     underlying(ty) match
         Struct(d) ->
             if !is_tuple(d)
@@ -316,6 +384,9 @@ private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -
 private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPattern],
                        ty: Type) -> TPattern
     underlying(ty) match
+        Struct(d) if d.union_layout ->
+            cx.fault(span, union_pattern_refusal(d))
+            TWildPattern(ty)
         Struct(d) ->
             if !names_this_type(cx, name, d) then
                 cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")

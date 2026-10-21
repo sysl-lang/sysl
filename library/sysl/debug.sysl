@@ -1,0 +1,297 @@
+module sysl
+
+/** How a value is shown to the person debugging it: its structure, with nothing hidden.
+ *
+ * **Every type has one, and none has to be written.** The compiler supplies a `Debug` for every
+ * struct and enum that does not write its own -- `Point(x: 1, y: 2)`, `Shape.Circle(r: 3.0)`,
+ * `Color.Red` -- each field shown through its own `Debug`, so a string inside a structure is quoted
+ * and escaped where a top-level one prints raw. The blocks below are the library's half: the scalars,
+ * and every shape the library builds out of parts.
+ *
+ * **An `impl Debug` of a program's own replaces the supplied one**, to hide a field or abbreviate a
+ * large buffer, and a structure holding the type shows it through that block.
+ *
+ * `print`, `str` and an interpolation hole reach `Display` where a value has one and this where it
+ * does not, which is what makes every value printable; `f"${x}%?"` and `debug(x)` always reach this.
+ * The shape is `Display`'s -- a sink and the field the whole value occupies -- so a debug rendering
+ * allocates nothing either.
+ */
+trait Debug
+    debug(self, out: *Writer, fmt: FormatSpec)
+
+    /** What every struct and enum is given, and what the compiler instantiates for each one that
+     * writes no `Debug` of its own: `Point(x: 1, y: 2)`, `Shape.Circle(r: 3.0)`, `Color.Red`, each part
+     * shown through the compiler's `debug part` form -- the part's own `Debug`, a pointer's address, a
+     * callable's `<fn>`. A union is its name and its bytes (`debug_union`), since nothing records which
+     * field it holds; an anonymous block shows as the word that opened it, `union(…)` or
+     * `struct(…)`, with no label in front, and an unnamed `_` bitfield is not shown.
+     *
+     * **A rendering that nests too deep writes `…` and stops** (`debug_enter`), which is what keeps a
+     * structure that refers back to itself through a `&T` from rendering for ever. A width pads the
+     * whole rendering once (`debug_padded`).
+     *
+     * The specifier's name is the compiler's mark: a member with a parameter of that name is a
+     * supplied one, typed only once something reaches it.
+     */
+    derive[T] debug(self: T, out: *Writer, `debug fmt`: FormatSpec)
+        if const T::Kind == Kind.Union
+            debug_union(T::BaseName, &self, out, `debug fmt`)
+            return
+        end if
+
+        if `debug fmt`.width > 0
+            debug_padded(self, out, `debug fmt`)
+            return
+        end if
+
+        val parts = FormatSpec(0, -1, false)
+
+        if const T::Kind == Kind.SimpleEnum
+            for const c in T::Variants
+                if self is c
+                    out.write(T::BaseName.bytes)
+                    out.write(".".bytes)
+                    out.write(c.name.bytes)
+                end if
+        elif const T::Kind == Kind.DataEnum
+            if debug_enter()
+                for const c in T::Variants
+                    if self is c
+                        val p = self.(c)
+                        var n = 0
+
+                        out.write(T::BaseName.bytes)
+                        out.write(".".bytes)
+                        out.write(c.name.bytes)
+
+                        for const f in c::Fields
+                            out.write((if n == 0 then "(" else ", ").bytes)
+                            out.write(f.name.bytes)
+                            out.write(": ".bytes)
+                            `debug part`(p.(f), out, parts)
+                            n += 1
+
+                        if n > 0 then out.write(")".bytes)
+                    end if
+            else out.write("…".bytes)
+
+            debug_leave()
+        elif const T::Members.len == 0
+            out.write(T::BaseName.bytes)
+        else
+            if debug_enter()
+                var n = 0
+
+                out.write(T::BaseName.bytes)
+
+                for const m in T::Members
+                    if const m.anonymous || m.name != "_"
+                        out.write((if n == 0 then "(" else ", ").bytes)
+
+                        if const !m.anonymous
+                            out.write(m.name.bytes)
+                            out.write(": ".bytes)
+
+                        `debug part`(self.(m), out, parts)
+                        n += 1
+                    end if
+
+                if n > 0 then out.write(")".bytes)
+            else out.write("…".bytes)
+
+            debug_leave()
+    end debug
+
+impl Debug for bool
+    debug(self, out: *Writer, fmt: FormatSpec) = display_bool(self, out, fmt)
+
+impl Debug for real
+    debug(self, out: *Writer, fmt: FormatSpec) = display_real(self, out, fmt)
+
+impl Debug for f32
+    debug(self, out: *Writer, fmt: FormatSpec) = display_f32(self, out, fmt)
+
+impl Debug for f16
+    debug(self, out: *Writer, fmt: FormatSpec) = display_f16(self, out, fmt)
+
+impl Debug for bf16
+    debug(self, out: *Writer, fmt: FormatSpec) = display_bf16(self, out, fmt)
+
+impl Debug for f128
+    debug(self, out: *Writer, fmt: FormatSpec) = display_f128(self, out, fmt)
+
+impl[T: Integer + Display] Debug for T
+    debug(self, out: *Writer, fmt: FormatSpec) = self.display(out, fmt)
+
+/** A string is shown as the literal that would write it: quoted, with every quote, backslash and
+ * control character escaped the way `reference/lexical.md` spells it. The quoting is what tells
+ * `Name(s: "a, b")` from two fields.
+ */
+impl Debug for string
+    debug(self, out: *Writer, fmt: FormatSpec) = debug_quoted(self.bytes, 34, out, fmt)
+
+/** A character is shown as its literal too, in single quotes. */
+impl Debug for char
+    debug(self, out: *Writer, fmt: FormatSpec)
+        var text: [4]u8
+
+        debug_quoted(text[0..<encode_utf8(self, text[0..<4])], 39, out, fmt)
+
+/** `text` between two `quote` bytes, escaped, in the field `fmt` describes. Measured first where a
+ * width was asked for, so nothing is gathered.
+ */
+debug_quoted(text: []const u8, quote: u8, out: *Writer, fmt: FormatSpec)
+    var pad = 0
+
+    if fmt.width > 0
+        var count = Counting(0)
+        var sink: *Writer = &count
+
+        write_quoted(text, quote, sink)
+        pad = fmt.width - int(count.n)
+
+        if pad < 0 then pad = 0
+
+    if !fmt.left then display_fill(out, 32, pad)
+
+    write_quoted(text, quote, out)
+
+    if fmt.left then display_fill(out, 32, pad)
+end debug_quoted
+
+private write_quoted(text: []const u8, quote: u8, out: *Writer)
+    val q: [1]u8 = [quote]
+
+    out.write(q[..])
+
+    var start: usize = 0
+
+    for i in 0..<text.len
+        val b = text[i]
+        val named = escape_letter(b, quote)
+
+        if named != 0 || b < 32 || b == 127
+            if i > start then out.write(text[start..<i])
+
+            start = i + 1
+
+            if named != 0
+                val esc: [2]u8 = [92, named]
+
+                out.write(esc[..])
+            else
+                val digits = "0123456789abcdef".bytes
+                val esc: [6]u8 = [92, u8('u'), u8('{'), digits[usize(b >> 4)], digits[usize(b & 15)],
+                                  u8('}')]
+
+                out.write(esc[..])
+
+    if start < text.len then out.write(text[start..<text.len])
+
+    out.write(q[..])
+end write_quoted
+
+// The letter after the backslash for an escape `reference/lexical.md` names, or 0 for a byte that
+// goes out as itself (or, below 32, as `\u{…}`). Only the quote that delimits the text is escaped.
+private escape_letter(b: u8, quote: u8) -> u8
+    if b == quote || b == 92 then return b
+    if b == 10 then return u8('n')
+    if b == 9 then return u8('t')
+    if b == 13 then return u8('r')
+    if b == 8 then return u8('b')
+    if b == 12 then return u8('f')
+    if b == 0 then return u8('0')
+
+    0
+end escape_letter
+
+/** An address, in lower-case hex with a `0x` and no padding digits -- what a raw pointer shows as,
+ * the null one as `0x0`. A pointer is shown rather than followed: what it points at may be gone.
+ */
+debug_address(a: usize, out: *Writer, fmt: FormatSpec)
+    var text: [2 + sizeof(usize) * 2]u8
+    val digits = "0123456789abcdef".bytes
+    var i = text.len
+    var rest = a
+
+    loop
+        i -= 1
+        text[i] = digits[rest & 15]
+        rest >>= 4
+
+        if rest == 0 then break
+
+    i -= 1
+    text[i] = u8('x')
+    i -= 1
+    text[i] = u8('0')
+    display_pad(text[i..<text.len], out, fmt)
+end debug_address
+
+/** A union's rendering: its name and every byte of its storage in hex, `In6(00 00 … 01)`. Nothing
+ * records which field a union holds, so no field is read, and showing one never traps whatever its
+ * bytes are. A width pads the whole rendering, whose length is known before anything is written.
+ */
+debug_union[T](name: string, x: *T, out: *Writer, fmt: FormatSpec)
+    val bytes = ptr_cast[*u8](x)
+    val n = sizeof(T)
+    val digits = "0123456789abcdef".bytes
+    val shown = name.bytes.len + 2 + (if n == 0 then 0 else n * 3 - 1)
+    var pad = fmt.width - int(shown)
+
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+
+    out.write(name.bytes)
+    out.write("(".bytes)
+
+    for i in 0..<n
+        val b = bytes[i]
+        val pair: [3]u8 = [32, digits[usize(b >> 4)], digits[usize(b & 15)]]
+
+        out.write(if i == 0 then pair[1..<3] else pair[..])
+
+    out.write(")".bytes)
+
+    if fmt.left then display_fill(out, 32, pad)
+end debug_union
+
+/** `x`'s debug rendering in the field `fmt` describes, which is how a supplied `Debug` honours a
+ * width: the value is shown once into a counting sink with no width to learn how long it comes out,
+ * then padded once around a second showing. Nothing is gathered.
+ */
+debug_padded[T: Debug](x: T, out: *Writer, fmt: FormatSpec)
+    val plain = FormatSpec(0, -1, false)
+    var count = Counting(0)
+    var sink: *Writer = &count
+
+    x.debug(sink, plain)
+
+    var pad = fmt.width - int(count.n)
+
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+
+    x.debug(out, plain)
+
+    if fmt.left then display_fill(out, 32, pad)
+end debug_padded
+
+/** How deep a supplied rendering may nest before it stops and writes `…` in place of the rest. A
+ * reference is followed like any field, so a structure that refers back to itself would otherwise
+ * render for ever; the limit is what makes every value safe to show, and it is deep enough that
+ * only a cycle or a very long chain reaches it.
+ */
+const DebugDepth: int = 32
+
+private var debug_depth: int = 0
+
+/** Entered by every supplied rendering of a value with parts; whether there is room to go one level
+ * deeper. Each call is paired with a `debug_leave`, whatever it answered.
+ */
+debug_enter() -> bool
+    debug_depth += 1
+    debug_depth <= DebugDepth
+
+debug_leave()
+    debug_depth -= 1

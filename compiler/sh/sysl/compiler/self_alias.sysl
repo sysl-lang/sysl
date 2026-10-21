@@ -133,6 +133,11 @@ struct SelfAlias
     // callee anything.
     keeps: Option[&Fn(string, usize) -> bool]
 
+    // Whether what a call answers can be made of the argument at a position, for the lent rule: a
+    // `first(*self) -> *Node = self.head` answers a pointer it read OUT of what it was handed, which
+    // is somebody else's address and not the lent one.
+    answers: Option[&Fn(string, usize) -> bool]
+
     holds(self, name: string) -> bool = holds_string(self.confined, name)
 
     ref_place(self, name: string) -> Option[TExpr]
@@ -144,7 +149,7 @@ struct SelfAlias
 end SelfAlias
 
 private check_one_self_alias(a: &Analysis, scope: Scope, f: TFunc)
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, false, false, false, "", None)
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false, false, false, false, "", None, None)
 
     st.confined.push("self")
     alias_walk(a, scope, st, f.body)
@@ -153,8 +158,9 @@ end check_one_self_alias
 // Whether a body lets any of `seeds` outlive the call it was handed them in, under the lent rule:
 // reported against the body where `quiet` is false, recorded and answered either way.
 lent_escapes(a: &Analysis, scope: Scope, seeds: Buf[string], body: TBlock, lender: string, quiet: bool,
-             keeps: &Fn(string, usize) -> bool) -> bool
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, quiet, false, lender, Some(keeps))
+             keeps: &Fn(string, usize) -> bool, answers: &Fn(string, usize) -> bool) -> bool
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, quiet, false, lender, Some(keeps),
+                                   Some(answers))
 
     for seed in seeds
         st.confined.push(seed)
@@ -162,6 +168,26 @@ lent_escapes(a: &Analysis, scope: Scope, seeds: Buf[string], body: TBlock, lende
     alias_walk(a, scope, st, body)
     st.escaped
 end lent_escapes
+
+// Whether what a body answers can carry `seed`, under the lent rule -- the question a caller asks of
+// a call it handed the pointer to, whose answer it then follows itself.
+lent_answers(seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
+             answers: &Fn(string, usize) -> bool) -> bool
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, true, false, "", Some(keeps),
+                                   Some(answers))
+
+    st.confined.push(seed)
+    confine(st, body)
+
+    walk_block_stmts(body, stmt_walk(false, s -> returns_carried(st, s)))
+
+    st.escaped || (body.result.is_some() && carries(st, body.result.unwrap()))
+end lent_answers
+
+private returns_carried(st: &SelfAlias, s: TStmt)
+    s match
+        TReturn(v) -> if v.is_some() && carries(st, v.unwrap()) then st.escaped = true
+        _ -> ()
 
 // Whether a value of this type can hold a raw pointer, which is what the lent rule follows: an
 // integer made of one, or a counted box, is a different thing from the pointer it came from.
@@ -187,6 +213,16 @@ holds_pointer(t: Type) -> bool = t match
     _ -> false
 
 private alias_walk(a: &Analysis, scope: Scope, st: &SelfAlias, body: TBlock)
+    confine(st, body)
+    walk_block_stmts(body, stmt_walk(false, s -> escaped_in(a, scope, st, s)))
+
+    if body.result.is_some()
+        returned_out(a, scope, st, body.result.unwrap())
+        written_out(a, scope, st, body.result.unwrap())
+end alias_walk
+
+// Which locals of a body hold a tracked pointer.
+private confine(st: &SelfAlias, body: TBlock)
     walk_block_stmts(body, stmt_walk(false, s -> note_ref(st, s)))
 
     // Which locals hold one is a fixpoint, because a body may pass the pointer along a chain of them
@@ -197,13 +233,7 @@ private alias_walk(a: &Analysis, scope: Scope, st: &SelfAlias, body: TBlock)
         st.changed = false
 
         walk_block_stmts(body, stmt_walk(false, s -> bind_confined(st, s)))
-
-    walk_block_stmts(body, stmt_walk(false, s -> escaped_in(a, scope, st, s)))
-
-    if body.result.is_some()
-        returned_out(a, scope, st, body.result.unwrap())
-        written_out(a, scope, st, body.result.unwrap())
-end alias_walk
+end confine
 
 private note_ref(st: &SelfAlias, s: TStmt)
     s match
@@ -221,7 +251,7 @@ private bind_confined(st: &SelfAlias, s: TStmt)
         TRefDecl(n, _, place) -> bind_one(st, n, place)
         TExprStmt(e) ->
             *e.kind match
-                TStore(place, value, _) ->
+                TStore(place, value, _, _) ->
                     *place.kind match
                         TLoad(n, _) -> bind_one(st, n, value)
                         _ -> ()
@@ -260,11 +290,12 @@ private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
     TBox(v, _) -> carries(st, v)
     TCast(v, ty) -> (!st.lent || holds_pointer(ty)) && carries(st, v)
     TFloorCast(v, ty) -> (!st.lent || holds_pointer(ty)) && carries(st, v)
-    TStore(_, v, _) -> carries(st, v)
+    TStore(_, v, _, _) -> carries(st, v)
 
     // What a call answers may be made of what it was handed, and pointer arithmetic is the same
-    // pointer moved along -- both only where the answer can hold a pointer at all.
-    TCall(_, args, ty, _) -> st.lent && holds_pointer(ty) && any_carries(st, args)
+    // pointer moved along -- both only where the answer can hold a pointer at all. A callee with a
+    // body here says which of its arguments its answer is made of.
+    TCall(name, args, ty, _) -> st.lent && holds_pointer(ty) && call_carries(st, name, args)
     TBinary(_, left, right, ty) ->
         st.lent && holds_pointer(ty) && (carries(st, left) || carries(st, right))
 
@@ -306,6 +337,14 @@ private closure_capture(st: &SelfAlias, r: TExpr) -> bool = *r.kind match
         Ptr(inner) -> is_closure_literal(*inner) && carries(st, env)
         _ -> false
     _ -> false
+
+private call_carries(st: &SelfAlias, name: string, args: Buf[TExpr]) -> bool
+    for i in 0..<args.len()
+        if carries(st, args.at(i)) && (st.answers.is_none() || st.answers.unwrap()(name, i))
+            return true
+
+    false
+end call_carries
 
 private any_carries(st: &SelfAlias, es: Buf[TExpr]) -> bool
     for item in es
@@ -431,7 +470,7 @@ end written_out
 
 private written_one(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
     *e.kind match
-        TStore(place, v, _) ->
+        TStore(place, v, _, _) ->
             *place.kind match
                 TLoad(_, _) -> ()
                 _ -> got_out(a, scope, st, v, "is stored somewhere the call does not own")

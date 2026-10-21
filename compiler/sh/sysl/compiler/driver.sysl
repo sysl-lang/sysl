@@ -135,7 +135,8 @@ private lib_root_units(t: Target, fetched: &PackageSources) -> Result[Buf[Progra
         var unparsed: Buf[string] = buf()
 
         for j in 0..<found.len()
-            val parsed = parse(found.at(j).src, t, lib_feature_symbols(fetched, given))
+            val parsed = parse(found.at(j).src, t, lib_feature_symbols(fetched, given),
+                               lib_option_lines(fetched, given))
 
             if !parsed.ok() then unparsed.push(parse_report(parsed))
             else theirs.push(parsed.program)
@@ -156,7 +157,7 @@ private lib_root_units(t: Target, fetched: &PackageSources) -> Result[Buf[Progra
         for j in 0..<theirs.len()
             var unit = theirs.at(j)
 
-            unit.pkg = Packaging("", buf(), true, manifest, name, version)
+            unit.pkg = Packaging("", buf(), true, manifest, name, version, "")
             out.push(unit)
 
     Ok(out)
@@ -272,7 +273,16 @@ end adopt_owning_package
 // **Every command reads this one compilation, `emit-typed` included**, so a dependency has the name
 // in the typed tree that it has in the build: two commands answering about one program agree about
 // what it is.
-packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
+//
+// **`keep_tests` is true for `sysl test` alone.** Every other build takes the project's own scaffolding
+// -- each `@tests` file whole, and every `@test` function and hook -- out after the parse and before
+// anything is resolved, exactly as a library's and a dependency's are: a test's imports, its dev
+// dependencies and its errors belong to the one command that runs it.
+//
+// **`extra` is one more file of the project's root module**, read as though it sat at the root: a
+// program from `tests/refused/`, compiled with the package it is about (`refused_check`).
+packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
+                        extra: Option[string] = None) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     adopt_owning_package(root)
@@ -287,9 +297,18 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
 
-    val mine = collect(path, Some(t.os)) match
+    var mine = collect(path, Some(t.os)) match
         Err(e) -> return Err(said(Refusal(e.message)))
         Ok(f) -> f
+
+    extra match
+        None -> ()
+        Some(file) ->
+            collect(file, Some(t.os)) match
+                Err(e) -> return Err(said(Refusal(e.message)))
+                Ok(f) ->
+                    for item in f
+                        mine.push(item)
 
     if mine.is_empty()
         return Err(said(Refusal(s"$path holds no sysl source files")))
@@ -313,13 +332,11 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         Err(why) -> return Err(said(Refusal(why)))
         Ok(dir) -> dir
 
-    val parsed_std = std_units(library, t) match
+    val std = std_prepared(library, t) match
         Err(why) -> return Err(said(Refusal(why)))
         Ok(u) -> u
 
-    val std = std_measured(parsed_std, t) match
-        Err(why) -> return Err(said(Refusal(why)))
-        Ok(u) -> u
+    phase_done("parse std")
 
     for item in std
         units.push(item)
@@ -345,21 +362,22 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         var unit = item
 
         unit.pkg = Packaging("", fetched.root_mounts, true, unit.pkg.manifest, unit.pkg.name,
-                             unit.pkg.version)
+                             unit.pkg.version, fetched.root_absent)
         theirs.push(unit)
 
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
     // instead is the table the graph built for it.
     val (own_manifest, own_name, own_version) = manifest_of_tree(root, manifest.name, manifest.version)
-    val mine_pkg = Packaging("", fetched.root_mounts, false, own_manifest, own_name, own_version)
+    val mine_pkg = Packaging("", fetched.root_mounts, false, own_manifest, own_name, own_version,
+                             fetched.root_absent)
 
     var own: Buf[string] = buf()
 
-    // Then the program's own files, its `@tests` files among them. A test body is analyzed like
-    // every other -- it is code somebody wrote, held to the same rules -- and what a `@tests` file
-    // declares is *marked* rather than dropped, so that an ordinary body reaching one of those names
-    // is something to report about rather than a name that was never there.
+    // Then the program's own files. In a test build its `@tests` files are among them: a test body is
+    // analyzed like every other -- it is code somebody wrote, held to the same rules -- and what a
+    // `@tests` file declares is *marked* rather than dropped, so that an ordinary body reaching one
+    // of those names is something to report about rather than a name that was never there.
     //
     // **Every file is parsed before any refusal is made**, so a syntax error in one file does not hide
     // one in another: each file's first complaint is reported, in the order the files were found.
@@ -367,7 +385,7 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     var unparsed: Buf[string] = buf()
 
     for item in mine
-        val parsed = parse(item.src, t, fetched.root_features)
+        val parsed = parse(item.src, t, fetched.root_features, fetched.root_options)
 
         if !parsed.ok() then unparsed.push(parse_report(parsed))
         else mine_units.push(parsed.program)
@@ -381,6 +399,11 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     val strayed = location_reports(mine, mine_units)
 
     if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
+
+    // Any other build drops the tests here, after the parse -- so a syntax error in one still stops
+    // it -- and before the first name is resolved, so a test's import of a dev dependency (which only
+    // `sysl test` fetches) or of anything else is never read.
+    if !keep_tests then mine_units = without_tests(mine_units)
 
     // **Before the analysis, because it is about what a CONSUMER would compile.** A dev dependency
     // is in scope for the whole of a test build, so an ordinary module importing one type-checks
@@ -583,6 +606,12 @@ typed_compilation(path: string, named_target: Option[string]) -> Result[Compilat
 
     val t = as_declared(manifest, registered)
 
+    settle_machine_registers(manifest, registered) match
+        Some(why) -> return Err(said(Refusal(why)))
+        None -> ()
+
+    use_resolution_machine(Some(t))
+
     root_floor_refusal(manifest.floor) match
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
@@ -616,11 +645,20 @@ emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
                also_auto_imported: Buf[string] = buf(),
                against: Option[Buf[string]] = None,
-               linking: bool = false) -> Result[Emitted, Failure]
+               linking: bool = false, keep_tests: bool = false) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
-    val program = packaged_compilation_of(path, t)?
+
+    phase_start()
+
+    val program = packaged_compilation_of(path, t, keep_tests)?
+
+    phase_done("parse program")
+
     val roots = if linking then roots_linked(program, path, level) else no_roots_linked()
-    val done = analyze_bodies(program.units, program.target, also_auto_imported)
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val done = analyze_bodies(program.units, program.target, also_auto_imported, image_entry_named(root, t))
+
+    phase_done("bodies")
 
     // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a
     // declaration nothing can reach is still one the program declared, and checking it is what makes
@@ -629,6 +667,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
+    phase_done("checks")
     explain_promotions(promotions, program, done.an)
 
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
@@ -639,7 +678,6 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     // **A bare image that names its own entry and has nothing for `main` to do gets no `main`**
     // (`image_emits_main`).
-    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val kept = pruned with { entry_point = pruned.entry_point && image_emits_main(root, t, pruned) }
 
     // **And one whose entry never runs `main` may not read the storage `main` fills**
@@ -669,6 +707,8 @@ emit_llvm_text(path: string, named_target: Option[string],
     // Nothing is precompiled, so the library's bodies are lowered into the text with the program's.
     // **`--no-std-lib` is the same answer asked for on purpose**: nothing is looked for, and the
     // library's bodies are lowered here while its C is compiled beside the program's.
+    phase_done("prune")
+
     var linked = StdArtifact(buf(), "")
 
     against match
@@ -679,12 +719,16 @@ emit_llvm_text(path: string, named_target: Option[string],
                 Ok(Some(found)) -> linked = found
                 Ok(None) -> ()
 
+    phase_done("std")
+
     // **A build that links and optimizes also carries a copy of each small or `@inline` function
     // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
     // a call within the program does. The text `emit-llvm` prints has none, and nor does `-O0`.
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level))
+
+    phase_done("codegen")
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -766,6 +810,12 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
+    // **Two features on at once that set one key of this machine's block** say two things about one
+    // build, refused before anything else asks the block (`target_features.sysl`).
+    feature_target_conflict(manifest, t.name) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
     root_floor_refusal(manifest.floor) match
         None -> ()
         Some(why) -> return Err(Refusal(why))
@@ -779,6 +829,16 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     if is_directory(path) && manifest.workspace.is_some() && !manifest.has_package
         return Err(Refusal(virtual_root_refusal(absolute_path(root))))
+
+    // **The machine every resolution this build makes is for**, said before the first of them (the
+    // allocator claims below resolve the graph), so a dependency's `if` is read against the machine
+    // as the project describes it -- `libc` included -- by every one of them alike. The registers
+    // the program owns come first, because `thread_local` in that `if` reads them.
+    settle_machine_registers(manifest, t) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
+    use_resolution_machine(Some(as_declared(manifest, t)))
 
     // **And the heap it allocates through**, settled here because this is the one funnel every
     // command that lowers anything comes through, and it comes through before the standard module's
@@ -833,20 +893,27 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     use_codegen_features(features)
 
-    // **And which registers the program owns** (`codegen.thread_pointer`, `codegen.per_cpu_offset`),
-    // refused where the machine is not a bare AArch64 one.
+    // The machine as the project describes it, which is what the analysis holds a module to.
+    Ok(as_declared(manifest, t))
+end target_for
+
+// **Which registers the program owns** (`codegen.thread_pointer`, `codegen.per_cpu_offset`), from
+// the ROOT manifest, refused where the machine is not a bare AArch64 one -- or why not.
+//
+// Settled before the first condition is read, by every command that reads one: `#if thread_local`
+// and a dependency's `if thread_local` read the thread pointer's register, and a dependency's `if`
+// is read as soon as the graph is first resolved.
+private settle_machine_registers(manifest: &Manifest, t: Target) -> Option[string]
     val registers = MachineRegisters(codegen_register_given(manifest, t.name, "thread_pointer"),
                                      codegen_register_given(manifest, t.name, "per_cpu_offset"))
 
     machine_register_refusal(t, registers) match
-        Some(why) -> return Err(Refusal(why))
+        Some(why) -> return Some(why)
         None -> ()
 
     use_machine_registers(registers)
-
-    // The machine as the project describes it, which is what the analysis holds a module to.
-    Ok(as_declared(manifest, t))
-end target_for
+    None
+end settle_machine_registers
 
 // The level every clang a build drives is handed: what the command line named, then the ROOT
 // manifest's `optimization`, then `DefaultOptimization`.
@@ -1097,6 +1164,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
                                    emitted.archives)
     val entry = settled_image_entry()
 
+    phase_done("link")
     settle_image("", "", "")
 
     linked match
@@ -1326,25 +1394,20 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         val is_std = root == std_tree
         var built: Buf[string] = buf()
 
-        val found = c_sources(root, Some(t.os)) match
-            Err(e) -> return Err(Refusal(e.message))
-            Ok(cs) -> cs
+        val units = tree_c_units(root, t) match
+            Err(e) ->
+                if !e.of_manifest then return Err(Refusal(e.why))
 
-        val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
-
-        carried_defines(declared, found) match
-            Err(why) ->
                 return Err(Refusal(defines_refusal(
-                    if is_directory(path) then path else parent_of(path).unwrap_or("."), root, why)))
-            Ok(_) -> ()
+                    if is_directory(path) then path else parent_of(path).unwrap_or("."), root, e.why)))
+            Ok(us) -> us
 
-        for j in 0..<found.len()
-            val obj = s"$staging/${native_member(root, found.at(j))}"
+        for unit in units
+            val obj = s"$staging/${native_member(root, unit.src)}"
 
             make_dir_all(parent_of(obj).unwrap_or("."))
 
-            compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j))) match
+            compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes) match
                 Err(why) -> return Err(Refusal(why))
                 Ok(_) -> ()
 
@@ -1462,7 +1525,7 @@ end LoweredForC
 // deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
 // carries a constructor of its own where the platform runs one.
 private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
-    val program = packaged_compilation_of(path, t)?
+    val program = packaged_compilation_of(path, t, false)?
 
     // **Told there is no entry point before a declaration is read, and that is not a detail.** A
     // file with no `module` header holding a `val` is a program's entry file, whose declarations are
@@ -1689,9 +1752,10 @@ private discard_staging(staging: Option[string])
 // assembles is discarded; what the command is run for is that the whole of it went through, which
 // for a board package is the only check it gets.
 //
-// **It compiles the tree it is given and fetches nothing**, which is the one thing about the command
-// a reader has to be told: a `dependencies` block every other command honours is refused here by
-// name, and what the tree depends on is handed over as a source root of its own.
+// **Its `dependencies` resolve as every other command's do**, through the one resolver `build-c` and
+// `test` use: a `path` dependency is read where it is, a coordinate a `--lib` root or a path
+// dependency stands in for is never fetched, and any other is fetched into the cache (or the
+// project's `vendor/`) and checked against `sysl.sum` before it is compiled.
 build_library_of(path: string, named_target: Option[string],
                  level: string = DefaultOptimization) -> Result[string, Failure]
     val t = target_for(path, named_target)?
@@ -1701,48 +1765,12 @@ build_library_of(path: string, named_target: Option[string],
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
-    if !manifest.dependencies.is_empty()
-        var labels = ""
-
-        for i in 0..<manifest.dependencies.len()
-            if i > 0 then labels = labels + ", "
-
-            labels = labels + s"'${manifest.dependencies.at(i).label}'"
-
-        return Err(said(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
-            s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
-            s"supply $labels as --lib <dir>")))
-    end if
-
-    // A source root's `dependencies` are refused on the same terms: a root is there to type-check
-    // against, and what it depends on reaches `build-lib` as a root of its own.
-    val libs = lib_roots()
-
-    for item in libs
-        if !is_directory(item) then continue
-
-        val theirs = manifest_of_package(item) match
-            Err(why) -> return Err(said(Refusal(why)))
-            Ok(got) -> got
-
-        if theirs.dependencies.is_empty() then continue
-
-        var labels = ""
-
-        for j in 0..<theirs.dependencies.len()
-            if j > 0 then labels = labels + ", "
-
-            labels = labels + s"'${theirs.dependencies.at(j).label}'"
-
-        return Err(said(Refusal(s"build-lib compiles the trees it is given and fetches nothing, so " +
-            s"the source root '${item}' has its dependencies reach it through --lib rather " +
-            s"than through 'dependencies' — supply $labels as --lib <dir> too")))
-
     // The two requirements a command line answers, asked before anything is compiled: a package
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
     // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
     val probed = supplied_or_refused(path, t, false)?
-    val c = packaged_compilation_of(path, t)?
+
+    val c = packaged_compilation_of(path, t, false)?
 
     // **A library is reached by naming its module**, so a file of the tree that declares none sits in
     // the anonymous root module: no program could write a path to what it declares, and its keys would
@@ -1857,6 +1885,27 @@ std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuil
 
     Ok(test_build_from(std_compilation_of(path, t)?, true, DefaultOptimization)?)
 end std_test_build_of
+
+// One program from a package's `tests/refused/`, compiled exactly as the package's test build is --
+// the same target, features and optimization, the package's own modules and dependencies in scope --
+// with that one file added at the root. `Ok` is that it compiled; `Err` carries everything the
+// compiler said in refusing it, as a reader would have seen it.
+//
+// **One compilation per file**, so a file that is refused for one reason cannot hide another that
+// would have compiled.
+refused_check(path: string, named_target: Option[string], level: string,
+              file: string) -> Result[unit, string]
+    val t = test_target_of(path, named_target).map_err(r -> r.message)?
+
+    headers_refused(path).map_err(r -> r.message)?
+
+    val program = packaged_compilation_of(path, t, true, Some(file)).map_err(f -> failure_text(f))?
+    val build = test_build_from(program, false, level, path).map_err(r -> r.message)?
+
+    if !build.emitted.report.is_empty() then return Err(analysis_report(build.emitted.report))
+
+    Ok(())
+end refused_check
 
 // What both ask of the machine before anything is read: it has to be this one, because a test run
 // executes what it builds, and it has to have a toolchain.
@@ -2047,25 +2096,18 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
     var n = 0
 
     for item in trees
-        val found = c_sources(item, Some(t.os)) match
-            Err(e) -> return Err(Refusal(e.message))
-            Ok(cs) -> cs
-
-        val declared: &Manifest = manifest_at(item).unwrap_or(empty_manifest())
-
-        carried_defines(declared, found) match
-            Err(why) ->
+        val units = tree_c_units(item, t) match
+            Err(e) ->
                 discard_objects(objects)
-                return Err(Refusal(defines_refusal(root, item, why)))
-            Ok(_) -> ()
+                return Err(Refusal(if e.of_manifest then defines_refusal(root, item, e.why) else e.why))
+            Ok(us) -> us
 
-        for j in 0..<found.len()
+        for unit in units
             val obj = s"$exe.$n.o"
 
             n += 1
 
-            compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j))) match
+            compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes) match
                 Err(why) ->
                     discard_objects(objects)
                     return Err(Refusal(why))

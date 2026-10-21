@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked, split}
+
+// The floating-point symbols a condition may ask: `fpu`, `fpu_dp`, `hardfloat`, `softfp`.
+//
+// **They are facts of the whole target rather than of the processor**: seven Arm rows share `thumb`
+// and differ in exactly these, and code that saves the floating-point registers -- a `setjmp`, a
+// context switch -- faults on a core that has none. The table below is every row of the registry,
+// so a new target is a failure here until somebody has said what it answers.
+
+// The floating-point symbols a target defines, in vocabulary order, or `-` where it defines none.
+private fpq_said(t: Target) -> string
+    val on = defined(t)
+    var out = ""
+
+    for item in fp_symbols()
+        if has(on, item)
+            if out != "" then out = out + " "
+
+            out = out + item
+
+    if out == "" then "-" else out
+end fpq_said
+
+private fpq_target(name: string) -> Target = target_named(name).unwrap()
+
+// What a target keeps of a text, the blank lines dropped.
+private fpq_sees(name: string, text: string) -> string
+    gate(source_of("<input>", text), fpq_target(name)) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) ->
+            var acc = ""
+
+            for line in split(from_utf8_unchecked(out.bytes), "\n")
+                val kept = line.trim()
+
+                if kept != ""
+                    if acc != "" then acc = acc + " "
+
+                    acc = acc + kept
+
+            acc
+end fpq_sees
+
+@test("fpq: every target answers each floating-point symbol, as the table says")
+fpq_every_target_answers()
+    val expected: []string = [
+        "aarch64-macos=fpu fpu_dp hardfloat",
+        "x86_64-macos=fpu fpu_dp hardfloat",
+        "aarch64-linux=fpu fpu_dp hardfloat",
+        "x86_64-linux=fpu fpu_dp hardfloat",
+        "riscv64-linux=fpu fpu_dp hardfloat",
+        "x86_64-windows=fpu fpu_dp hardfloat",
+        "aarch64-android=fpu fpu_dp hardfloat",
+        "aarch64-freestanding=fpu fpu_dp hardfloat",
+        "x86_64-freestanding=fpu fpu_dp hardfloat",
+        "riscv64-freestanding=-",
+        "thumb-freestanding=fpu hardfloat",
+        "thumb-freestanding-softfp=fpu softfp",
+        "thumb-freestanding-soft=-",
+        "thumbv6m-freestanding=-",
+        "thumbv7m-freestanding=-",
+        "thumbv7em-freestanding=fpu hardfloat",
+        "thumbv7em-freestanding-soft=-",
+        "thumbv7em-freestanding-dp=fpu fpu_dp hardfloat",
+        "riscv32-freestanding=-",
+        "wasm32-freestanding=fpu fpu_dp hardfloat",
+        "wasm32-wasi=fpu fpu_dp hardfloat",
+        "craft-freestanding=-",
+        "x86-linux=fpu fpu_dp hardfloat"]
+    val all = all_targets()
+
+    // Every row is in the table: a target added to the registry fails here until it is.
+    assert_eq(expected.len, all.len())
+
+    for t in all
+        var row = ""
+
+        for i in 0..<expected.len
+            if expected[i].starts_with(t.name + "=") then row = expected[i]
+
+        assert(row != "", s"${t.name} is not in the table")
+        assert_eq(s"${t.name}=${fpq_said(t)}", row)
+
+@test("fpq: 'fpu_dp', 'hardfloat' and 'softfp' each imply 'fpu', and the two ABIs never meet")
+fpq_the_symbols_agree()
+    val all = all_targets()
+
+    for t in all
+        val on = defined(t)
+        val fpu = has(on, "fpu")
+
+        if has(on, "fpu_dp") then assert(fpu, t.name)
+        if has(on, "hardfloat") then assert(fpu, t.name)
+        if has(on, "softfp") then assert(fpu, t.name)
+
+        // A machine with registers passes a float one way or the other, never both and never neither.
+        assert_eq(has(on, "hardfloat") || has(on, "softfp"), fpu)
+        assert(!(has(on, "hardfloat") && has(on, "softfp")), t.name)
+
+@test("fpq: the four are in the closed vocabulary, and not in a directory's")
+fpq_in_the_vocabulary()
+    val every = symbols()
+    val folders = directory_symbols()
+
+    for item in fp_symbols()
+        assert(has(every, item), item)
+        assert(!has(folders, item), s"a walk has no target to ask about '$item'")
+
+@test("fpq: '#if thumb && fpu' tells the Arm rows apart")
+fpq_if_tells_the_arm_rows_apart()
+    val text = "#if thumb && fpu_dp\ndp = 1\n#elif thumb && hardfloat\nhard = 1\n" +
+               "#elif thumb && softfp\nsoftfp = 1\n#elif thumb\nnone = 1\n#else\nother = 1\n#endif\n"
+
+    assert_eq(fpq_sees("thumbv6m-freestanding", text), "none = 1")
+    assert_eq(fpq_sees("thumbv7m-freestanding", text), "none = 1")
+    assert_eq(fpq_sees("thumb-freestanding-soft", text), "none = 1")
+    assert_eq(fpq_sees("thumbv7em-freestanding", text), "hard = 1")
+    assert_eq(fpq_sees("thumb-freestanding", text), "hard = 1")
+    assert_eq(fpq_sees("thumb-freestanding-softfp", text), "softfp = 1")
+    assert_eq(fpq_sees("thumbv7em-freestanding-dp", text), "dp = 1")
+    assert_eq(fpq_sees("aarch64-macos", text), "other = 1")
+
+@test("fpq: a floating-point word that is not one of the four is refused, the four named")
+fpq_a_misspelling_is_refused()
+    val said = fpq_sees("thumbv7em-freestanding", "#if fpu_sp\none = 1\n#endif\n")
+
+    assert(said.contains("!'fpu_sp' is not something a target says about itself — sysl knows "), said)
+    assert(said.contains("craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted"), said)
+    assert(said.contains("riscv64, softfp, thread_local, thumb"), said)
+
+// -- on the boards: which instructions were built -----------------------------------------------
+
+// An `#if` choosing a constant, and an `asm` arm whose `#if` chooses the instructions: a store of
+// the callee-saved single registers `s16`–`s31` where there are any, and none where there are not.
+private fpq_program() -> string =
+    "@export(\"fpq_kind\")\n" +
+    "fpq_kind() -> int\n" +
+    "#if fpu_dp\n" +
+    "    204\n" +
+    "#elif hardfloat\n" +
+    "    203\n" +
+    "#elif softfp\n" +
+    "    202\n" +
+    "#else\n" +
+    "    201\n" +
+    "#endif\n" +
+    "\n" +
+    "@export(\"fpq_save\")\n" +
+    "fpq_save(at: usize)\n" +
+    "    asm\n" +
+    "        [thumb]\n" +
+    "#if fpu\n" +
+    "            \"vstmia {at}, {{s16-s31}}\"\n" +
+    "            in at : reg\n" +
+    "#else\n" +
+    "            \"nop\"\n" +
+    "#endif\n" +
+    "        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable \"a board test\"\n"
+
+// Which constant the `#if` chose and whether the arm stored the registers, read off the board's
+// own disassembly.
+private fpq_built(target: string) -> string
+    val program = fpq_program()
+    val kind = fx2_board_code(program, target, "fpq_kind")
+    val save = fx2_board_code(program, target, "fpq_save")
+
+    if kind.is_none() || save.is_none() then return ""
+
+    var out = "?"
+
+    // Each fits the 8-bit immediate of the one `movs` every Arm core has, so no row reaches for a
+    // literal pool the disassembly would show as data.
+    for value in ["201", "202", "203", "204"]
+        if kind.unwrap().contains(s"#$value") then out = value
+
+    val stores = save.unwrap().contains("vstmia") || save.unwrap().contains("vstm\t")
+
+    out + (if stores then " vstm" else " none")
+end fpq_built
+
+@test("fpq: on thumbv6m there are no registers, and nothing touches them")
+fpq_on_thumbv6m()
+    val got = fpq_built("thumbv6m-freestanding")
+
+    if got != "" then assert_eq(got, "201 none")
+
+@test("fpq: on thumbv7em the unit is single precision and passes floats in its registers")
+fpq_on_thumbv7em()
+    val got = fpq_built("thumbv7em-freestanding")
+
+    if got != "" then assert_eq(got, "203 vstm")
+
+@test("fpq: on thumb-freestanding-softfp the registers are there though the ABI does not use them")
+fpq_on_softfp()
+    val got = fpq_built("thumb-freestanding-softfp")
+
+    if got != "" then assert_eq(got, "202 vstm")
+
+@test("fpq: on the Cortex-M7 double-precision target the unit holds a double")
+fpq_on_m7_dp()
+    val got = fpq_built("thumbv7em-freestanding-dp")
+
+    if got != "" then assert_eq(got, "204 vstm")

@@ -60,6 +60,19 @@ The `u64` beside each key is the hash it mixed down to. It earns its eight bytes
 rejects a wrong slot on an integer comparison without touching either key, and a rehash re-places
 every entry without hashing anything.
 
+**A map of eight entries or fewer is not a table yet: it is a list.** Its entries sit packed at the
+front of the same eight slots, in the order they were put, and a key is found by comparing it with
+each in turn — nothing is hashed. Hashing a key and then comparing it anyway costs more than
+comparing it with a handful of others: building a small map and looking keys up in it is faster as a
+list below eight entries for integer, struct and string keys alike, and no slower at eight — most so
+for long strings, whose hash reads every byte while an unequal comparison mostly stops at the
+length, where a map of eight is twice as fast as a list. The
+ninth distinct key builds the table, once, sized so that it does not grow again until it is three
+times as full. A table never turns back into a list however much is removed from it; `clear` starts
+over with a list. Nothing about this shows in what a map answers — `capacity()` says which form it
+is in (eight for a list), and a walk of a list happens to follow the order the keys were put, which
+is no more promised than the table's order is.
+
 ## The map
 
 `K: Hash + Eq` is the whole requirement, and both are [core traits](/library/core/) — so every
@@ -163,7 +176,7 @@ Some(1)
 ```
 
 **An empty map holds no table at all.** `map()` allocates only the small cell every name for the map
-shares — three words, whatever the key and value — and the first `put` makes the table. That matters
+shares — three words, whatever the key and value — and the first `put` makes its eight slots. That matters
 far more than it looks, because no caller can see that they are paying: a map built inside a loop,
 held in a struct that is usually empty, or made on a branch that turns out not to be taken would
 otherwise be a table of slots and the `free` behind it, every time. A profile of an
@@ -198,8 +211,9 @@ print(m.capacity())
 nothing between passes and one that is cleared and never used again costs no table at all.
 
 `map_with_capacity(n)` **still allocates up front**, which is the point of writing it: a caller who
-names a size is saying entries are coming. It sizes the table for `n` entries, and the table is grown
-at three quarters full, so the storage is twice `n`.
+names a size is saying entries are coming. Eight or fewer get the list's eight slots; past that it
+starts as a table sized for `n` entries, and the table is grown at three quarters full, so the storage
+is twice `n` rounded up to a power of two.
 
 A `Set` is a `Map` and inherits all of this, including the empty table and being a reference.
 

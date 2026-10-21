@@ -1,0 +1,170 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.split
+
+// **A `c"..."` literal is constant data** (`reference/ffi.md § What constant data is`): the address of
+// the literal's bytes in read-only data, a relocation the linker fills in, so a module value or an
+// exported object can start at one with no code running -- C's `char *tzname[2] = {"UTC", "UTC"};`.
+
+private csd_ready() -> bool = std_root().is_ok() && clang_available()
+
+private csd_project(main: string, lib: string) -> string
+    val root = make_temp_dir("sysl-csd").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$lib").unwrap()
+    root
+end csd_project
+
+private csd_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end csd_cli
+
+// What `emit-llvm` prints for a program reaching `lib` on `target`, or the host where it is empty.
+private csd_ir(lib: string, target: string) -> (int, string)
+    val root = csd_project("print(mylib.touch())\n", lib)
+    var hosted: [3]string = ["sysl", "emit-llvm", root]
+    var bare: [5]string = ["sysl", "emit-llvm", "--target", target, root]
+    val got = if target == "" then csd_cli(hosted[..]) else csd_cli(bare[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end csd_ir
+
+private csd_accepted(lib: string, target: string) -> string
+    val got = csd_ir(lib, target)
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end csd_accepted
+
+// The line of `ir` that defines `symbol`.
+private csd_def(ir: string, symbol: string) -> string
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with(s"@$symbol = ") then return lines[i]
+
+    ""
+end csd_def
+
+private csd_scalars() -> string =
+    "@export(\"p\")\nvar p: *u8 = c\"UTC\"\n\n" +
+    "@export(\"q\")\nval q: *u8 = c\"UTC\"\n\n" +
+    "touch() -> i32 = i32(*p) + i32(*q)\n"
+
+@test("an exported var and val starting at a c-string are accepted, as data, on a bare machine")
+csd_exported_scalars()
+    if !csd_ready() then return
+
+    val ir = csd_accepted(csd_scalars(), "thumbv7em-freestanding")
+    val p = csd_def(ir, "p")
+    val q = csd_def(ir, "q")
+
+    assert(p.contains("global ptr @.str"), ir)
+    assert(q.contains("constant ptr @.str"), ir)
+    assert(!ir.contains("llvm.global_ctors"), ir)
+end csd_exported_scalars
+
+@test("so is the same on a hosted target")
+csd_exported_scalars_hosted()
+    if !csd_ready() then return
+
+    val ir = csd_accepted(csd_scalars(), "")
+
+    assert(csd_def(ir, "p").contains("global ptr @.str"), ir)
+    assert(csd_def(ir, "q").contains("constant ptr @.str"), ir)
+    assert(!ir.contains("llvm.global_ctors"), ir)
+end csd_exported_scalars_hosted
+
+private csd_table() -> string =
+    "@export(\"tzname\")\nvar tzname: [2]*u8 = [c\"UTC\", c\"UTC\"]\n\n" +
+    "touch() -> i32 = i32(*tzname[0]) + i32(*tzname[1])\n"
+
+@test("an exported array of c-strings is accepted, as data")
+csd_exported_array()
+    if !csd_ready() then return
+
+    for target in ["thumbv7em-freestanding", ""]
+        val ir = csd_accepted(csd_table(), target)
+        val def = csd_def(ir, "tzname")
+
+        assert(def.contains("[2 x ptr] [ptr @.str"), ir)
+        assert(!ir.contains("llvm.global_ctors"), ir)
+    end for
+end csd_exported_array
+
+private csd_struct() -> string =
+    "struct Names\n    short: *u8\n    long: *u8\n\n" +
+    "@export(\"names\")\nval names: Names = Names(c\"UTC\", c\"Coordinated\")\n\n" +
+    "touch() -> i32 = i32(*names.short) + i32(*names.long)\n"
+
+@test("a c-string in a struct constructor is accepted, as data")
+csd_exported_struct()
+    if !csd_ready() then return
+
+    for target in ["thumbv7em-freestanding", ""]
+        val ir = csd_accepted(csd_struct(), target)
+
+        assert(csd_def(ir, "names").contains("{ ptr @.str"), ir)
+        assert(!ir.contains("llvm.global_ctors"), ir)
+    end for
+end csd_exported_struct
+
+@test("a module val and var that are not exported take one as data too")
+csd_module_storage()
+    if !csd_ready() then return
+
+    val lib = "val a: *u8 = c\"A\"\nvar b: *u8 = c\"B\"\nval t: [2]*u8 = [c\"x\", c\"y\"]\n\n" +
+              "touch() -> i32 = i32(*a) + i32(*b) + i32(*t[1])\n"
+    val ir = csd_accepted(lib, "thumbv7em-freestanding")
+
+    assert(csd_def(ir, "mylib$a").contains("constant ptr @.str"), ir)
+    assert(csd_def(ir, "mylib$b").contains("global ptr @.str"), ir)
+    assert(csd_def(ir, "mylib$t").contains("[2 x ptr] [ptr @.str"), ir)
+    assert(!ir.contains("llvm.global_ctors"), ir)
+end csd_module_storage
+
+@test("on the host the program reads the bytes through the exported array")
+csd_runs()
+    if !csd_ready() then return
+
+    val lib = "@export(\"tzname\")\nvar tzname: [2]*u8 = [c\"UTC\", c\"GMT\"]\n\n" +
+              "second() -> i32 = i32(*tzname[1])\n"
+    val root = csd_project("print(mylib.second())\n", lib)
+    var args: [5]string = ["sysl", "build", root, "-o", s"$root/exe"]
+    val built = csd_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$root/exe", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ran.text, "71\n")
+end csd_runs
+
+@test("an exported value a function computes is still refused, even when it returns a c-string")
+csd_computed_is_still_refused()
+    if !csd_ready() then return
+
+    val lib = "name() -> *u8 = c\"UTC\"\n\n@export(\"p\")\nvar p: *u8 = name()\n\ntouch() -> i32 = i32(*p)\n"
+    val got = csd_ir(lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'mylib.p' is exported, so C may read it before anything of this program has run"), got.1)
+end csd_computed_is_still_refused

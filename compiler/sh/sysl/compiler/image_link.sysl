@@ -107,10 +107,13 @@ end image_first_key
 
 // What the manifest says about the image of the machine of this name.
 image_for(m: &Manifest, target: string) -> Option[ImageLink]
-    for item in m.images
-        if item.target == target then return Some(item)
+    var base: Option[ImageLink] = None
 
-    None
+    for item in m.images
+        if item.target == target then base = Some(item)
+
+    // With the keys of the block's enabled features laid over it (`target_features.sysl`).
+    featured_image(m, target, base)
 end image_for
 
 // Whether a target's program is a bare ELF image, linked by `ld.lld` with nothing of the host's: a
@@ -142,8 +145,15 @@ image_refusal(root: string, m: Manifest, t: Target) -> Option[string]
         manifest_at(tree.dir) match
             Err(_) -> ()
             Ok(theirs) ->
-                if !theirs.images.is_empty()
-                    val said = theirs.images.at(0)
+                var said_images = theirs.images
+
+                // A feature's block setting an image key is the same claim, made conditionally.
+                for ft in theirs.feature_targets
+                    if ft.image.linker != "" || ft.image.script != "" || ft.image.entry != ""
+                        said_images.push(ft.image with { target = s"${ft.target}.features.${ft.feature}" })
+
+                if !said_images.is_empty()
+                    val said = said_images.at(0)
 
                     return Some(s"'${tree.who}' sets 'targets.${said.target}." +
                         s"${image_first_key(said)}' in its package.hocon, and how an image is linked " +
@@ -238,6 +248,14 @@ end settle_image
 // when nothing defines the symbol, and links an image that starts at address zero; lld has no
 // `--require-defined`, so the entry is also the value of an absolute symbol, `__sysl_entry`, and a
 // `--defsym` naming a symbol nothing defines is an error.
+//
+// **An image that names neither an entry nor a script starts at `main`**, and is told so the same
+// way. Nothing else would say where it starts: lld looks for a `_start` the program does not have,
+// and `--gc-sections` -- whose only roots in an executable are the entry and what a script keeps --
+// then drops every section, linking an empty ELF that starts at address zero, green. Such an image
+// always has a `main` (`image_emits_main`): the program's own, or a function exported as `main`.
+// A script is the author's word on the layout, its `ENTRY` included, so where there is one the
+// command line says nothing it did not ask for.
 image_link_flags() -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -250,9 +268,11 @@ image_link_flags() -> Buf[string]
         out.push("-T")
         out.push(image_script)
 
-    if image_entry != ""
-        out.push(s"-Wl,--entry=$image_entry")
-        out.push(s"-Wl,--defsym=__sysl_entry=$image_entry")
+    val entry = if image_entry == "" && image_script == "" then "main" else image_entry
+
+    if entry != ""
+        out.push(s"-Wl,--entry=$entry")
+        out.push(s"-Wl,--defsym=__sysl_entry=$entry")
 
     for line in tls_template_symbols()
         out.push(s"-Wl,--defsym=$line")
@@ -295,6 +315,9 @@ settled_image_entry() -> string = image_entry
 //   storage filled at run time -- and no `extern` naming `main`, which is a runtime written in sysl
 //   asking for it.
 //
+// **A function exported as `main` keeps the entry point whatever the image starts at**: it is the
+// program's `main` (`exports_main`), so what is emitted is its prologue rather than a `@main`.
+//
 // Then nothing would call it and nothing is in it, and an image carrying it is an unused function
 // in the one kind of program that counts its bytes. **Where there is something to do, `main` is
 // emitted whatever the entry is**, and it is the entry's to call -- a `_start` that sets the stack up
@@ -308,7 +331,7 @@ image_emits_main(root: string, t: Target, p: TProgram) -> bool
 
     if entry == "" || entry == "main" then return true
 
-    !p.main.is_empty() || p.entry.is_some() || has_computed_val(p.vals) || calls_main(p)
+    !p.main.is_empty() || p.entry.is_some() || has_computed_val(p.vals) || calls_main(p) || exports_main(p)
 end image_emits_main
 
 // Whether the program calls `main` through an `extern` naming it -- a start file written in sysl,
@@ -339,7 +362,8 @@ end image_entry_named
 // `main`. So the storage is taken to be filled -- and nothing is refused -- where any of these holds:
 //
 // - the image starts at `main`, or names no entry (the script's `ENTRY` is then the linker's affair);
-// - the program has a `main` of its own to run -- a top-level statement or a declared `main` -- since
+// - the program has a `main` of its own to run -- a top-level statement, a declared `main`, or a
+//   function exported as `main`, whose thunk fills the storage first (`gen_entry_prologue`) -- since
 //   calling it is then the entry's documented job, and the storage is filled on the way in;
 // - a module-level `asm` block names `main`, which is a start file branching to it;
 // - an `extern` names `main` and something calls it, which is the same start file written in sysl.
@@ -349,7 +373,7 @@ end image_entry_named
 // a `main` that fills what nobody reads is dead but harmless, and is emitted exactly as before.
 image_storage_unfilled(entry: string, p: TProgram) -> bool
     if entry == "" || entry == "main" then return false
-    if !p.main.is_empty() || p.entry.is_some() then return false
+    if !p.main.is_empty() || p.entry.is_some() || exports_main(p) then return false
 
     !asm_names_symbol(p.module_asm, "main") && !calls_main(p)
 end image_storage_unfilled

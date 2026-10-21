@@ -341,6 +341,48 @@ What the caller has to look at is one question with three answers:
   handed out — keeps its count in memory the call itself may write. That one costs a retain before
   the call and a release after it, and it is the only shape that does.
 
+**A call to an [async function](/reference/async/) is the one place the first answer changes.** Its
+task keeps a count of every parameter of its own, since its body runs after the call has returned, so
+a temporary handed to it **moves into the task**: the caller gives its count back as soon as the call
+returns instead of holding it to the end of the statement. What the task was handed goes when the
+task lets go of it — at its `return` — and not when the statement that made the call has run to its
+end. A local or a parameter handed to an async call is still the caller's, and keeps its count where
+it always does; a plain call keeps its temporaries to the end of the statement, as above.
+
+```sysl
+struct Noisy
+    id: int
+
+impl Drop for Noisy
+    drop(self)
+        print(s"dropped ${self.id}")
+
+async keep(n: &Noisy) -> int = n.id
+
+plain(n: &Noisy) -> int = n.id
+
+async run()
+    print(s"async ${await keep(Noisy(1))}")
+    print(s"plain ${plain(Noisy(2))}")
+
+    val named: &Noisy = Noisy(3)
+
+    print(s"named ${await keep(named)}")
+    print("end of run")
+
+block_on(run())
+```
+
+```output
+dropped 1
+async 1
+plain 2
+dropped 2
+named 3
+end of run
+dropped 3
+```
+
 The third case is not a technicality. `remember` below is handed a field of module storage and then
 assigns to that very field, so the count the argument was resting on is given back **while the callee
 is still running** — and the read on the next line would be a read of freed storage if nobody else
@@ -390,6 +432,137 @@ back:
 
 Storing a parameter is *not* one of them: an assignment takes a count for the value arriving, so
 `latest = h` above is where the new owner's share comes from, and the callee never held one.
+
+### A count that would be taken and given straight back is not taken
+
+Binding a call's result to a `val`, or returning a local through an `if` or a `match`, moves a value
+from one owner in the frame to another: the new owner takes a share and the old one gives its share
+back at the end of the statement or scope. On a `&sync T` each of those is an atomic operation on a
+count every thread shares, so a value copied up a recursive search would pay two contended atomics
+per level for a count that ends where it began. **The compiler drops such a pair.** A retain is
+cancelled against a later release of the same reference when nothing between them can give back the
+count that release would have given back:
+
+- loads and stores of the frame's own slots, arithmetic, and other retains never can;
+- the release of a different value may run a destructor, which is arbitrary code, but it cannot reach
+  a slot of this frame whose address never left it. So it may sit between the pair, unless the stretch
+  between them also writes to memory outside those slots;
+- any other call ends the stretch.
+
+Where the pair would be split by the arms of an `if` or a `match`, the releases at the end of the scope
+are given back at the end of each arm instead, so that the arm which returns a local takes no count
+for it. A count therefore never reaches zero at a different point, and **no destructor runs earlier,
+later or in a different order** than it would with every count taken. Nothing about it is visible
+except the time it saves: on a recursive search over a tree of `&sync` shapes it removes three of every
+four atomic operations.
+
+```sysl
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Hit
+    t: int
+    tag: &sync Tag
+
+probe(t: int, tag: &sync Tag) -> Option[Hit] = Some(Hit(t, tag))
+
+pick(near: bool) -> Option[Hit]
+    val x = probe(1, Tag(1))
+    val y = probe(2, Tag(2))
+    if near then x else y
+
+show(near: bool)
+    val h = pick(near)
+    print("got", h.unwrap().t)
+
+show(true)
+show(false)
+```
+
+```output
+drop 2
+got 1
+drop 1
+drop 1
+got 2
+drop 2
+```
+
+### A view of something the frame already holds takes no count
+
+A slice of a slice retains the owner, and a `val` copied out of a field retains what it refers to.
+Where the value it was read from is a **parameter or a `val`** — written once, in a slot nothing
+outside the function can reach — that value's own count already keeps the object alive, and **a
+share taken from it and given back before it is given back its own is dropped**, however far apart
+the two are: across a `for` that walks the view, or the rest of a loop's round. A view taken every
+time round a loop then costs nothing:
+
+- the parent must stay put: a `var` assigned in the loop, or one whose address is taken, keeps every
+  count;
+- a view that leaves the function, or is stored anywhere but a local, keeps its count;
+- **a count can be looked at**, so nothing between the share and its return may look: storage is let
+  go of by `slot_vacate` only where the strong count is one, and a view whose share had been dropped
+  would leave it free to give back slots the view still reads. So the stretch may hold arithmetic,
+  reads of locals and of fields and elements, and calls to functions that release nothing and write
+  nothing but their own locals; any other call, and any other release (a destructor is code too),
+  keeps the count.
+
+The parent's count holds the object from before the share is taken until after it would have been
+given back, so the object's count never reaches zero inside, nothing inside reads it, and **no
+destructor moves**. Below, `sums` takes no count at all; `label`'s `print` is a call that could, so
+`t` keeps its share there.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Shelf
+    tag: &Tag
+
+sums(src: []const u8, most: usize) -> u32
+    var t: u32 = 0
+    var i: usize = 0
+
+    while i + most <= src.len
+        val here = src[i..<i + most]
+
+        for x in here
+            t += u32(x)
+
+        i += most
+
+    t
+
+label(s: Shelf, rounds: int)
+    for k in 0..<rounds
+        val t = s.tag
+        print("round", k, t.id)
+
+var b: Buf[u8] = buf()
+
+for k in 0..<10
+    b.push(u8(k))
+
+print(sums(b.view(), 5))
+label(Shelf(Tag(7)), 2)
+print("done")
+```
+
+```output
+45
+round 0 7
+round 1 7
+drop 7
+done
+```
 
 ## `weak T` — breaking cycles
 
@@ -869,8 +1042,9 @@ print(*p, *p, calls)
 
 **The scope is the one the `&` was written in**, so a pointer carried out of that scope is stale —
 which is the raw tier behaving as advertised rather than a hole this form opens. The same pointer can
-be had by naming the local yourself and taking its address, and neither is checked — what a `*T`
-promises is spelled out above, and it is not lifetime.
+be had by naming the local yourself and taking its address, and neither is checked in general — what
+a `*T` promises is spelled out above, and it is not lifetime. The one route that is checked is the
+function's own answer, below.
 
 **A name is answered rather than copied.** `&x`, `&t.f`, `&xs[i]` and `&*p` are asking for *that
 thing's* address, so they go on meaning what they always did — and go on being refused where what
@@ -928,6 +1102,58 @@ print(p.w)
 ```output
 2
 ```
+
+### An address of the frame's own storage is not an answer
+
+A parameter passed by value — `(self)` among them — and a local `var` live in the function's frame,
+and the frame is gone the moment the function returns. So **the address of one, or of a field or an
+element of one, may not be what a function returns**: whether it is the body's value, a `return`'s,
+the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method handing out a field is
+the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
+
+```sysl
+struct Rec
+    a: int
+    b: int
+
+struct Ev
+    rec: Rec
+
+    key(self) -> *u8 = ptr_cast(&self.rec)
+```
+
+```error
+the address of 'self' is returned, but '(self)' is a copy of the receiver in this frame, and its storage ends when the function returns — return the value itself, or take '*self', so the address is of the caller's value
+```
+
+Storage reached **through** a pointer or a reference is wherever the address points, which is the
+caller's to keep alive, so `*self`, `&self`, a `*T` or `&T` parameter and an element of a `[]T` are all
+fine — as is module storage, which outlives every frame:
+
+```sysl
+struct Rec
+    a: int
+    b: int
+
+struct Ev
+    rec: Rec
+
+    key(*self) -> *int = &self.rec.b
+
+var e = Ev(Rec(1, 2))
+val p = e.key()
+
+*p = 9
+print(e.rec.b)
+```
+
+```output
+9
+```
+
+`&make()` makes a slot in the frame (§ Addressing a value), so returning it is refused the same way.
+What is checked is the result only: a pointer to a local stored into module storage or into a struct
+somewhere else is still the raw tier's bargain.
 
 **The `&` in a type is a different thing, and neither is a way of writing the other.** `&T` is a
 counted box, which owns what is in it; the operator takes an address, which owns nothing. So a box
@@ -1001,7 +1227,7 @@ end Kernel
 
 var k = Kernel([Task(0, 7); 4])
 
-k.advance(2usize)
+k.advance(2)
 
 print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].prio)
 ```
@@ -1494,6 +1720,230 @@ immortality rule string literals use, generalized.
 A `string` is then exactly an **immutable, validated `[]u8`**, and the two share one representation
 and one implementation.
 
+### A view borrowed from its receiver
+
+A null owner is exactly right for static data and exactly wrong for memory **a C library owns**: an
+object wraps the library's handle, frees it in its destructor (below), and hands out a view
+of what the handle points at. Nothing in that view keeps the object alive, so the view can be read
+after the destructor has run. **`@views(self)` on the member says so, and the compiler holds every
+caller to it:**
+
+```sysl
+extern "malloc" c_malloc(n: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self)
+        print("freed")
+        c_free(self.p)
+
+open(n: usize) -> &Column
+    val p = c_malloc(n)
+
+    for i in 0..<n do p[i] = u8(65 + i)
+
+    Column(p, n)
+
+sum(xs: []const u8) -> int
+    var t = 0
+
+    for x in xs do t += int(x)
+
+    t
+
+run()
+    val c = open(3)
+    val v = c.bytes()
+
+    print(v.len, v[0], sum(v[1..<3]))
+
+run()
+```
+
+```output
+3 65 133
+freed
+```
+
+The view is an ordinary `[]const u8` — no extra word, no count, nothing at run time. What the mark
+adds is a fact the compiler keeps about the names in one body: **the view lives no longer than the
+name it was called through**, because that name holds the count that keeps the object alive. The
+check is lexical, the same one a `ref` gets (above), and it refuses four things.
+
+**A receiver that is not a name.** A temporary is freed at the end of its statement, so a view of it
+is refused at the call, naming it:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+open() -> &Column = Column(null, 0)
+
+print(open().bytes().len)
+```
+
+```error
+'bytes' answers a view borrowed from what it is called on, and that is the value 'open' answers — a temporary, freed at the end of this statement
+```
+
+**A view leaving the function that holds its receiver.** A `return`, or what the body comes to:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+first() -> []const u8
+    val c: &Column = Column(null, 0)
+
+    c.bytes()
+```
+
+```error
+this returns a view borrowed from 'c', and nothing keeps 'c' alive once this function returns
+```
+
+Only a member that is itself marked `@views(self)` hands one back, and only one borrowed from
+`self` — which is how a wrapper passes the borrow on to its own caller. A free function handed the
+receiver as a parameter does not: the caller has no way to know its result is tied to that argument.
+
+**A view stored where it outlives the receiver.** It may go into a local bound *after* the receiver,
+or into a struct value held by one, since those close first. A local bound before it, a field
+reached through a reference or a pointer, and module storage are refused:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+run()
+    var keep: []const u8 = []
+    val c: &Column = Column(null, 0)
+
+    keep = c.bytes()
+```
+
+```error
+'keep' is bound before 'c', so it outlives it, and this stores in it a view borrowed from 'c'
+```
+
+What a view is copied into is borrowed from the same receiver — a sub-slice, a struct or `Option`
+built around it, a closure that captures it, a name a pattern binds out of it, a loop variable
+walking a view of views — so each of those is held to the same places. A value that cannot hold a
+view (`v.len`, `v[0]`, a string rendered from it, a byte a loop takes out of it) is not borrowed from
+anything:
+
+```sysl
+struct Table
+    rows: []const []const u8
+
+    @views(self)
+    all(&self) -> []const []const u8 = self.rows
+
+run()
+    var keep: []const u8 = []
+    val t: &Table = Table(["ab".bytes, "cde".bytes])
+
+    for row in t.all() do keep = row
+```
+
+```error
+'keep' is bound before 't', so it outlives it, and this stores in it a view borrowed from 't'
+```
+
+A trait member may carry the mark too, and then a call through a trait object (`&Viewer`) is held
+to it exactly as a call on the type is. An implementation of a marked member inherits the mark, so
+it need not repeat it. The other way round is refused — a call through the object reads only the
+trait's member, so a mark the trait does not carry would hold nobody to anything:
+
+```sysl
+trait Viewer
+    look(&self) -> []const u8
+
+struct S
+    n: int
+
+impl Viewer for S
+    @views(self)
+    look(&self) -> []const u8 = []
+```
+
+```error
+'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares 'look' without it
+```
+
+A marked member is only ever called on a value: `Column.bytes(c)` is refused, as every method
+reached through its type is.
+
+**Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
+`*self` call on it, and a call that may write an object of its type — which a member that frees the
+memory does, and a call through a closure or a trait object might, naming no body to ask — are
+refused for as long as a local holding the view is in scope:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Column
+    p: *u8
+    n: usize
+
+    @views(self)
+    bytes(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Column
+    drop(self) = c_free(self.p)
+
+run()
+    var c: &Column = Column(null, 0)
+    val v = c.bytes()
+
+    c = Column(null, 0)
+    print(v.len)
+```
+
+```error
+'v' is a view borrowed from 'c', and this assignment could free what it views
+```
+
+Put the view in a block that closes first, and the name is free again once it has.
+
+**This is the whole of it, and it is narrow on purpose.** The mark names only `self`, it marks only
+a member whose result is a view (`[]T`, `[]const T`, `string`), and nothing about the borrow is in a
+type: there are no lifetime parameters, and no borrow is tracked through a struct a member returns.
+A view of a `*T` region that no member marked stays the programmer's problem, as every `*T` is.
+
 ## Escape analysis
 
 The `owner` word answers "who keeps this alive" for every slice except one: a slice of a **local
@@ -1503,13 +1953,14 @@ fixed array**. That storage is a stack slot, valid until the frame returns and n
 |---|---|---|
 | a heap buffer | the buffer | yes — retained |
 | static data, a string literal | null (immortal) | yes — never freed |
-| a `*T` region | null | the programmer's problem, like every `*T` |
+| a `*T` region | null | the programmer's problem, like every `*T` — unless a `@views(self)` member hands it out, which ties it to the receiver (above) |
 | **a local fixed array** | **null** | **only while the frame lives** |
 
 The compiler finds the slices for which that matters, and **the programmer writes nothing**. There is
 no `@escaping`, no lifetime parameter, and no "this result views that argument" marker anywhere in a
 signature. Go is the precedent; Rust's lifetimes and Swift's `@escaping` are the alternative, and both
-charge the programmer for what a compiler can work out.
+charge the programmer for what a compiler can work out. (`@views(self)`, above, is about memory no
+frame owns — a C library's — which is exactly what the compiler cannot work out from a body.)
 
 ### What escapes
 
@@ -1618,6 +2069,34 @@ arguments into exactly `[a, b, c][..]`, so a `...T` member reached through a tra
 literal that has to outlive the frame. It costs an allocation there and nothing at a call whose slice
 stays put.
 
+**A literal written where a `[]T` is expected is the same temporary**, and it is laid in the frame
+on the same terms: handed straight to a call that keeps nothing of it, and whose answer could not
+carry a view of it out, it is the array `val xs: [N]T = [...]` would have been, viewed whole, and
+allocates nothing. Its elements may be anything the frame computes:
+
+```sysl
+sum(xs: []const int) -> int
+    var s = 0
+
+    for x in xs
+        s += x
+
+    s
+
+val g = 3
+
+print(sum([g, g * 2, sum([g, 1])]))
+```
+
+```output
+13
+```
+
+Everywhere else it is a buffer of its own, as before — bound to a name, returned, stored, handed to a
+callee that keeps it, to an `async` function (whose task holds its arguments until it runs), or to a
+call whose answer may be a view of it, such as `first([a, b])` answering `[]const int`. Those can
+outlive the statement that made them, and a slot cannot.
+
 A **call's answer** is the same temporary written a different way, and it is the one a reader meets
 first: a digest is a `[32]u8`, so slicing one straight into something that keeps it is a view of an
 array with no declaration behind it.
@@ -1646,8 +2125,8 @@ one frame slot, so refusing the shorter one bought nothing.
 Two roots have nowhere to be promoted to, and are diagnostics rather than promotions — an array a
 caller passed **by value**, which is the caller's layout, and an array that is a **field** of a
 **named** struct on the frame, where moving the field alone or the struct with it is the choice this
-reference leaves unspecified. A **part** of a temporary is a third: it is a different node from its
-own storage, so there is nothing whole to move.
+reference leaves unspecified. A **part** of a temporary is not one of them: the whole temporary
+moves, and the view is narrowed over the buffer it moved into.
 
 ```sysl
 first_two(a: [4]int) -> []int = a[0..<2]
@@ -1656,13 +2135,155 @@ print(first_two([1, 2, 3, 4]).len)
 ```
 
 ```error
-a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value, an array a caller passed by value, or part of an array literal, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value or an array a caller passed by value, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+```
+
+**Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it
+outlives every frame without moving anywhere: a field of a module array's element is as static as the
+array, and a slice of it goes through a trait object, or anywhere else, with nothing promoted.
+
+```sysl
+trait Sink
+    take(*self, words: []const u32)
+
+struct Count
+    n: usize
+
+impl Sink for Count
+    take(*self, words: []const u32) = self.n += words.len
+
+struct Row
+    words: [4]u32
+    len: usize
+
+var rows: [2]Row = [Row([0; 4], 0); 2]
+var sink: Count = Count(0)
+
+feed(s: *Sink, i: usize)
+    s.take(rows[i].words[0..<rows[i].len])
+
+rows[1].len = 3
+feed(&sink, 1)
+print(sink.n)
+```
+
+```output
+3
 ```
 
 **Without an allocator it is always a compile error.** Under `no alloc` there is nothing to promote
-into, so every promotion becomes a refusal reported at the view that leaves the frame. That is how
+into, so every promotion becomes a refusal reported at the view that leaves the frame — and so does
+every literal argument a callee keeps. A machine whose manifest took the heap away (`capabilities {
+heap = false }`) is held to the same line in every module it builds, without a clause written
+anywhere: the refusal names the machine, `'thumbv7em-freestanding' provides no allocator`, rather
+than leaving the link to say `undefined symbol: malloc`. That is how
 every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
 closures, and `&T` creation are all compile errors there — so it introduces no new rule.
+
+### A view that outlives its scope is promoted too
+
+Leaving the frame is the widest way for a view to outlive its storage, and not the only one. The
+rule is the same at every width: **storage whose view outlives the storage's scope is promoted**.
+
+A **temporary**'s scope is its statement. What it holds is let go of at the end of it, and the slot
+it sat in is reused, by the next statement or by the same one on the next round of a loop. A view of
+it **kept in a local** is read on later lines, so the temporary moves to the heap and the local reads
+what was written:
+
+```sysl
+id(xs: []string) -> []string = xs
+
+val s = id([str(7) + "y"][..])
+
+print(s[0])
+
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```output
+7y
+0
+```
+
+A **named array**'s scope is the block that declares it. One declared in a loop's body or an `if`'s
+branch is gone when that block closes, so a view of it kept in a local of an enclosing block moves it
+the same way. A part of either is the same case: the whole array moves, and the view names its part
+of the buffer.
+
+```sysl
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        var row = [i * 10, i]
+
+        if i == 0 then keep = row[..]
+
+    keep[0]
+
+tail() -> []string
+    var keep: []string = []
+
+    if true
+        keep = [str(1), str(2) + "b", "c"][1..<2]
+
+    keep
+
+print(first(), tail()[0])
+```
+
+```output
+0 2b
+```
+
+Nothing moves where nothing outlives anything: a view used within its own statement, and a view of
+a named array kept while that array is still in scope, stay where they are.
+
+```sysl
+id(xs: []string) -> []string = xs
+
+print(id([str(7) + "y"][..])[0])
+
+val a = [str(7) + "y"]
+val s = a[..]
+
+print(s[0])
+```
+
+```output
+7y
+7y
+```
+
+Without an allocator, each of these promotions is a compile error at the view, as an escape from the
+frame is. A machine whose manifest says `heap = false` is told that it provides no allocator, and a
+module that declared `@no_alloc` is told that it did:
+
+```sysl
+@no_alloc
+
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```error
+this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
+```
 
 ### Promotion is silent, not hidden
 
@@ -1725,6 +2346,47 @@ print(n.value, sizeof(Node), usize(n) == usize(&arena[0]))
 pointer's width, and the number that comes out cannot be dereferenced any more than the one above
 can. It is what a binding reaches for when a C library wants a callback registered through something
 that takes a number, and it is the same row of the table rather than a special case.
+
+**A number becomes a pointer only from an address-width integer**, `usize` or `isize`. A fixed width
+is not an address's width on every target, and reading a narrower one would invent the address's top
+bits. **The operand of `ptr_cast` is an address-width position**, as the initializer of a
+`val a: usize` is: a bare integer literal, or an expression made of nothing but bare integer
+literals, is a `usize` at the target's width. So the address a datasheet gives is written as it is
+printed there, and so is a base plus an offset or a bit shifted into place:
+
+```sysl
+struct Uart
+    data: u32
+    status: u32
+
+val uart: *Uart = ptr_cast(0x4000_4000)
+val status: *u32 = ptr_cast(0x4000_4000 + 4)
+val bit: *u8 = ptr_cast(1 << 20)
+val none: *Uart = ptr_cast(0)
+
+print(usize(uart), usize(status), usize(bit), usize(none))
+```
+
+```output
+1073758208 1073758212 1048576 0
+```
+
+Each literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
+machine, above `0xFFFF_FFFF` on a 32-bit one — or a negative one is refused as any literal that does
+not fit its type is, and the arithmetic over them wraps at that width as integer arithmetic does. A
+value that already has a type keeps it, so an `int`, a suffixed literal such as `16u32`, or an
+expression with either inside it is still refused, and is converted where it is meant as an address:
+
+```sysl
+var base = 0x4000_4000
+val uart: *u32 = ptr_cast(base)
+
+print(usize(uart))
+```
+
+```error
+'ptr_cast' reads an address, and int is not address-width — convert it first, as 'ptr_cast(usize(n))'
+```
 
 **The target type comes from whatever receives the result** — the same way `va_arg`, a bare `None`,
 and a bare `null` all take theirs. Where that is not where a reader wants to say it, it may be
@@ -1885,6 +2547,64 @@ tier is mostly for.
 
 `sizeof`, `alignof` and `offsetof`, which measure what is being carved, are on the
 [expressions](/reference/expressions/) page.
+
+## Slot storage: room that holds no value yet
+
+A growable container needs storage whose spare end holds **nothing** — not a fill value repeated into
+every slot, which for a counted element would keep whatever it names alive until the slot is
+overwritten. Three forms give the raw tier exactly that, and they are what
+[`sysl.buf.Buf`](/library/buf/) is written with:
+
+- **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**.
+  The element type comes from the position, the way `ptr_cast`'s does.
+- **`slot_place(xs, i, v)`** puts `v` in slot `i`. The first slot past the live ones is filled
+  without letting go of anything, and the live run grows by one; a live slot is an ordinary
+  assignment; a slot further on would leave a gap, so it **traps**.
+- **`slot_vacate(xs, n)`** lets go of every live slot from `n` on and shortens the live run to `n` —
+  but only where nothing else holds the storage. A view handed out earlier still reads those slots,
+  so while one exists the form does nothing, and the next vacate after the sharing ends catches up.
+
+```sysl
+struct Node
+    n: int
+
+var xs: []&Node = slot_storage(4)
+
+slot_place(xs, 0, Node(1))
+slot_place(xs, 1, Node(2))
+
+print(xs.len, xs[0].n + xs[1].n)
+
+slot_vacate(xs, 1)
+slot_place(xs, 1, Node(5))
+
+print(xs[0].n + xs[1].n)
+```
+
+```output
+4 3
+6
+```
+
+**The live run is the storage's own, not the slice's**: the buffer's box carries the count of live
+slots, and its destructor releases exactly those, so storage dropped with two of four slots placed
+releases two. The slice's `len` is still the whole room. **What the compiler cannot check is the one
+thing the caller owes**: nothing reads a slot past the live run, whose bytes are whatever the
+allocator left. That is the raw tier's bargain, as it is for `ptr_cast` — the forms are greppable, and
+`Buf` is what writes them so that a program does not have to.
+
+A form with no element type to make is refused at the call:
+
+```sysl
+var xs = slot_storage(4)
+```
+
+```error
+'slot_storage' makes storage for elements of some type, and nothing here says which
+```
+
+On storage that `slot_storage` did not make — an array, a frame, a view of a struct's field — the
+two writing forms are an ordinary assignment and nothing at all, since there is no live run to move.
 
 ## Device memory
 
@@ -2339,6 +3059,14 @@ print(send(c))
 '&Cell' and '&sync Cell' are distinct types, and neither converts to the other: a count is atomic or it is not from the moment the object is allocated, and a conversion would put an ordinary retain beside an atomic one. Allocate Cell as a '&sync Cell' where it is constructed
 ```
 
+Taking a share of a `&sync T` is a relaxed increment, since a count you already hold cannot reach
+zero underneath you. Giving one back is a decrement with release ordering, and the share that takes
+the count to zero acquires before destroying the object, so the thread that frees it sees every
+other thread's writes to it. The acquire is a `fence acquire` — except in a build whose
+`SYSL_EXTRA_CFLAGS` ask for `-fsanitize=thread`, where it is an acquire load of the count instead.
+The two order the same things, but ThreadSanitizer does not model a standalone fence, and with it
+every `&sync` object freed on another thread than its last user's would be reported as a race.
+
 A conversion would put an ordinary retain beside an atomic one, so the count is atomic or it is not
 from the moment the object exists. **`&sync T` makes the *reference* safe to share, not the object
 safe to mutate** — that still wants a `Mutex`.
@@ -2592,6 +3320,122 @@ iget(i: int) -> int = inodes[i].with((n) ->
 A record whose initializer is not constant — a `buf()` the heap fills, say — is still refused there,
 with the reason the call could not be run.
 
+### A frozen buffer crosses
+
+A `Buf` and a view are shared through a count that is not atomic, so neither may sit in a `&sync`
+object — which leaves read-only heap data, decoded pixels or a list of shapes, behind a lock it does
+not need. **`buf.freeze()` takes a buffer's elements and answers a `&sync Frozen[T]`**: one atomic
+count on the whole buffer, and nothing that writes it. It goes wherever a `&sync` reference goes — a
+field of a `&sync` struct, a capture of a `&sync Fn`, the state handed to `spawn`:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+struct Texture
+    width: usize
+    pixels: &sync Frozen[u8]
+
+var b: Buf[u8] = buf()
+
+for i in 0..<6
+    b.push(u8(i * 40))
+
+val tex: &sync Texture = Texture(3, b.freeze())
+
+val job: &sync Fn() -> unit = () ->
+    var sum = 0
+
+    for p in tex.pixels
+        sum += int(p)
+
+    print(tex.pixels[4], tex.pixels.len(), sum)
+
+job()
+print(b.len())
+```
+
+```output
+160 6 600
+0
+```
+
+**The buffer is left empty**, through this name and every other name of it: the elements are copied
+once into storage sized to them, so nothing that still holds the buffer — or a view taken of it
+earlier — can reach the frozen storage. What a frozen buffer offers is `len`, `is_empty`, `f[i]`
+(checked, as a `Buf`'s is), `for x in f`, and `view()`, a `[]const T`. A view keeps the buffer alive
+through a small box of its own, counted the ordinary way, which holds one atomic share — so it is kept
+and handed on like any other view, and costs one allocation where `f[i]` and `for` cost none. Nothing
+writes one:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+val f = b.freeze()
+
+f[0] = 2
+```
+
+```error
+assignment needs a variable, a field, an element, or a dereference — something with an address
+```
+
+`f.push(2)` is refused as a method `Frozen` does not have, and a store through `view()` is refused as
+a store through any `[]const T`.
+
+**Reading a local after `freeze` is refused**, since all it can find is the empty buffer: `freeze`
+is [`@consumes`](/reference/attributes/), so on every path after the call the local may not be read
+until it is assigned a new value. A field, or module storage like `b` above, is not followed, and
+reads as empty:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+pixels() -> usize
+    var b: Buf[u8] = buf()
+
+    b.push(1)
+
+    val f = b.freeze()
+
+    f.len() + b.len()
+
+print(pixels())
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
+**A frozen buffer shares exactly what its elements share.** Every thread reading one reads its
+elements, so the element type is held to the rule a `&sync` struct's fields are: a scalar, a `&sync
+U` (a `&sync` trait object among them), a raw pointer, another frozen buffer, and arrays and structs
+of those. Freezing a buffer of plain references is refused at the call, naming the element:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Cell
+    n: int
+
+var b: Buf[&Cell] = buf()
+
+b.push(Cell(1))
+
+val f = b.freeze()
+```
+
+```error
+'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+Held as a `Buf[&sync Cell]`, it freezes. A `Buf[string]` or a `Buf[Buf[u8]]` is refused the same way,
+for the count each element carries. **Freezing allocates** — the storage and the box — so a
+`@no_alloc` module may not call it, and a freestanding program freezes where it has a heap.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility
@@ -2783,6 +3627,37 @@ c.with((v) -> keep(hp, v))
 
 ```error
 and this one is passed to 'keep', which holds on to it
+```
+
+**What a call answers is followed the same way.** A callee whose answer is made of the pointer — the
+pointer itself, or the address of something inside what it points at — hands the body the lent
+pointer back, and the body is held to it. A pointer the callee **read out of** the lent value is
+somebody else's address, and is the body's to keep:
+
+```sysl
+struct Node
+    v: int
+
+struct Queue
+    head: *Node
+
+    first(*self) -> *Node = self.head
+
+struct Guard
+    q: Queue
+
+    @lends(body)
+    with[R](*self, body: *Queue -> R) -> R = body(&self.q)
+
+var n = Node(7)
+var g = Guard(Queue(&n))
+val p = g.with((q) -> q.first())
+
+print(p.v)
+```
+
+```output
+7
 ```
 
 An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed

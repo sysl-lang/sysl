@@ -37,12 +37,14 @@ tig_the_tree_carries_the_reason()
         "@test(should_trap: \"x\", ignore: \"y\")\nt() =\n    assert(true, \"r\")\n")).program, false)
 
     assert(shown.contains("        test: TestAttr\n          display: None\n          shouldTrap: true\n" +
-                          "          expected: \"x\"\n          ignored: \"y\"\n        hook: None\n"), shown)
+                          "          expected: \"x\"\n          ignored: \"y\"\n          timeout: None\n" +
+                          "        hook: None\n"), shown)
 
     val plain = emit_ast(parse(source_of("e.sysl", "@test\nt() =\n    assert(true, \"r\")\n")).program,
                          false)
 
-    assert(plain.contains("          expected: None\n          ignored: None\n        hook: None\n"), plain)
+    assert(plain.contains("          expected: None\n          ignored: None\n          timeout: None\n" +
+                          "        hook: None\n"), plain)
 
 // -- the refusals -----------------------------------------------------------------------------------
 
@@ -86,7 +88,7 @@ tig_at_ignore_is_answered()
 // is told what the order is.
 @test("the arguments out of order are told the order")
 tig_arguments_out_of_order()
-    val said = "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
+    val said = "'@test' closes what it opened — the description, 'should_trap', 'timeout' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
 
     assert_eq(pf_err("@test(ignore: \"not yet\", should_trap)\nt() = 0\n"), said)
     assert_eq(pf_at("@test(ignore: \"not yet\", should_trap)\nt() = 0\n"), "1:24")
@@ -103,13 +105,13 @@ tig_arguments_out_of_order()
 @test("the refusal for a description that is not a string mentions 'ignore' too")
 tig_a_bad_description_mentions_ignore()
     assert_eq(pf_err("@test(3)\nt() = 0\n"),
-        "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
+        "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, 'timeout: 30' for the seconds a run may take, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
     assert_eq(pf_at("@test(3)\nt() = 0\n"), "1:7")
 
 // -- the report -------------------------------------------------------------------------------------
 
 private tig_test(display: string, line: int, ignored: Option[string]) -> TTest =
-    TTest(module_qualify("m", display), display, false, None, "m.sysl", line, no_hooks(), ignored)
+    TTest(module_qualify("m", display), display, false, None, "m.sysl", line, no_hooks(), ignored, None)
 
 // Other readers parse this line — `tests_runner.sysl` pins it, and pages on the site quote it — so a
 // run that ignored nothing prints exactly what it always printed.
@@ -189,7 +191,7 @@ end tig_run
 @test("an ignored test whose body would fail is reported as ignored, with its reason")
 tig_an_ignored_test_is_not_run()
     val (text, ran) = tig_run("@test(ignore: \"the parser drops the second arm\")\nknown_bug() =\n" +
-                              "    assert(false, \"this must not run\")\n", TestOptions(None, false)) match
+                              "    assert(false, \"this must not run\")\n", TestOptions(None, false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -208,7 +210,7 @@ tig_an_ignored_should_trap_is_not_run()
     val (_, ran) = tig_run("@test(should_trap: \"past the end\", ignore: \"the check is not emitted yet\")\n" +
                            "unchecked() =\n    assert(true, \"returns\")\n\n" +
                            "@test(ignore: \"would trap\")\ntraps() =\n    val xs = [1, 2, 3]\n" +
-                           "    var i = 3\n    print(xs[i])\n", TestOptions(None, false)) match
+                           "    var i = 3\n    print(xs[i])\n", TestOptions(None, false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -226,7 +228,7 @@ tig_an_ignored_test_runs_no_hooks()
                            "@setup_all\nboot() =\n    assert(false, \"setup_all ran\")\n\n" +
                            "@teardown_all\nhalt() =\n    assert(false, \"teardown_all ran\")\n\n" +
                            "@test(ignore: \"waiting\")\nt() =\n    assert(true, \"fine\")\n",
-                           TestOptions(None, false)) match
+                           TestOptions(None, false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -239,7 +241,7 @@ tig_an_ignored_test_runs_no_hooks()
 tig_the_tests_beside_run()
     val (text, ran) = tig_run("@test\nfirst() =\n    assert(false, \"down\")\n\n" +
                               "@test(ignore: \"waiting\")\nsecond() =\n    assert(false, \"never\")\n\n" +
-                              "@test\nthird() =\n    assert(true, \"up\")\n", TestOptions(None, false)) match
+                              "@test\nthird() =\n    assert(true, \"up\")\n", TestOptions(None, false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -252,7 +254,7 @@ tig_the_tests_beside_run()
 @test("a filter selects an ignored test, and it is reported as ignored")
 tig_a_filter_selects_an_ignored_test()
     val (text, ran) = tig_run("@test(ignore: \"waiting\")\nalpha() =\n    assert(false, \"never\")\n\n" +
-                              "@test\nbeta() = 0\n", TestOptions(Some("alph"), false)) match
+                              "@test\nbeta() = 0\n", TestOptions(Some("alph"), false, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -264,7 +266,7 @@ tig_a_filter_selects_an_ignored_test()
 @test("fail-fast does not stop at an ignored test")
 tig_fail_fast_passes_an_ignored_test()
     val (_, ran) = tig_run("@test(ignore: \"waiting\")\nfirst() =\n    assert(false, \"never\")\n\n" +
-                           "@test\nsecond() = 0\n", TestOptions(None, true)) match
+                           "@test\nsecond() = 0\n", TestOptions(None, true, 1, buf())) match
         None -> return
         Some(r) -> r
 
@@ -290,8 +292,9 @@ tig_the_command_exits_clean()
 // -- still a test -----------------------------------------------------------------------------------
 
 // The point of ignoring rather than deleting: the test goes on being checked against the code it will
-// one day run on, so it cannot quietly stop compiling while it waits.
-@test("an ignored test is still checked, in a test build and in an ordinary one")
+// one day run on, so it cannot quietly stop compiling while it waits. An ordinary build drops every
+// test before analysis, so it is 'sysl test' that does the checking, and the build goes through.
+@test("an ignored test is still checked by 'sysl test', while an ordinary build drops it")
 tig_an_ignored_test_is_still_checked()
     if std_root().is_err() then return
 
@@ -309,16 +312,19 @@ tig_an_ignored_test_is_still_checked()
 
     var lines: Buf[string] = buf()
     val sink = &lines
-    val code = run_cli(["sysl", "build", file, "-o", s"$root/out"], (line) -> sink.push(line))
+    val code = run_cli(["sysl", "test", file], (line) -> sink.push(line))
     var all = ""
 
     for item in lines
         all = all + item + "\n"
 
+    val built = run_cli(["sysl", "build", file, "-o", s"$root/out"], (line) -> sink.push(line))
+
     remove_dir_all(root).unwrap_or(())
-    assert(code != 0, "an ordinary build refuses it too")
+    assert(code != 0, "sysl test refuses it")
     assert(all.contains("undefined name 'undefined_name'"), all)
     assert(all.contains("main.sysl:3:11"), all)
+    assert_eq(built, 0, "an ordinary build drops it")
 
 @test("an ignored test is still held to what a test may be")
 tig_an_ignored_test_is_still_a_test()
@@ -328,7 +334,7 @@ tig_an_ignored_test_is_still_a_test()
                                            "    assert(n > 0, \"positive\")\n")
     var lines: Buf[string] = buf()
     val sink = &lines
-    val code = run_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/out"], (line) -> sink.push(line))
+    val code = run_cli(["sysl", "test", s"$root/main.sysl"], (line) -> sink.push(line))
     var all = ""
 
     for item in lines

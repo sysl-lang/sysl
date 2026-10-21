@@ -12,12 +12,12 @@ sysl has two sequence types where many languages have one:
 | `[]T` | a **slice**: a view of elements someone owns | `{ owner, ptr, len }` — three words |
 | `[]const T` | a slice that may be read and not written | the same three words, with a bit |
 
-The split is Go's, and for Go's reason: one type for storage, one for a view, so a function that only
-reads takes the view and never has to care where the bytes live. Both carry a length, so **every
-index is checked** — which is what makes them the thing to reach for in place of a `*T`.
+As in Go, one type is storage and one is a view, so a function that only reads takes the view and
+need not care where the elements live. Both carry a length, so **every index is checked**, which
+makes them the safe choice in place of a `*T`.
 
-An array **is** its elements. A slice **names** elements that live somewhere else. Everything on
-this page follows from that one sentence, and a call is where it shows most plainly:
+An array **is** its elements. A slice **names** elements that live somewhere else. The rest of this
+page follows from that distinction, and a function call shows it most plainly:
 
 ```sysl
 scribble(a: [4]int) -> int
@@ -41,23 +41,23 @@ print(a[0])
 99
 ```
 
-`scribble` was handed four integers and wrote on its own copy of them. `set_first` was handed three
-words naming the caller's four integers, and wrote on those. Neither function said anything about
-copying; the types did.
+`scribble` receives four integers and writes to its own copy of them. `set_first` receives three
+words naming the caller's four integers, and writes to those. Neither function says anything about
+copying; the parameter types decide it.
 
 A `string` is the second row of that table with one thing added and one taken away — its bytes are
 guaranteed well-formed UTF-8, and nothing may write through it. Everything here about indexing,
 slicing, length and ownership is therefore true of a string as well, and
 [strings](/reference/strings/) is where the two differences are.
 
-A third shape sits beside these and is deliberately not on that table: `<N>T`, a
-[vector](/reference/vectors/), holds the same values an `[N]T` holds and is not storage at all. It
-lives in a register and its operators work on every lane at once, so `a + b` on two `<4>f32` is one
-instruction doing four additions. Everything on *this* page — indexing checked while the program
-runs, slicing, ownership — is about things with an address, and a vector has none.
+A third shape is deliberately not in that table: `<N>T`, a [vector](/reference/vectors/), holds the
+same values an `[N]T` holds but is not storage at all. It lives in a register and its operators work
+on every lane at once, so `a + b` on two `<4>f32` is one instruction doing four additions. Everything
+on *this* page — run-time index checks, slicing, ownership — concerns values with an address, and a
+vector has none.
 
-An array and a slice are how a vector reaches memory, though, and the two methods that move a run of
-elements between them are *theirs*: `xs.load(i)` reads the run starting at element `i` into a
+Arrays and slices are how a vector reaches memory, though, and the two methods that move a run of
+elements between them belong to the array and the slice: `xs.load(i)` reads the run starting at element `i` into a
 vector, and `xs.store(i, v)` writes one back. Both are bounds-checked like a subscript, and checked
 as a whole run — see [vectors](/reference/vectors/).
 
@@ -68,7 +68,7 @@ as a whole run — see [vectors](/reference/vectors/).
 
 ```sysl
 var primes = [2, 3, 5, 7]
-var row: [3]f64 = [1.0, 0.0, 0.0]
+var row: [3]f64 = [1, 0, 0]
 
 print(primes.len, primes[2], row[0])
 ```
@@ -88,7 +88,7 @@ var sizes = [1, 2usize, 7]
 var mixed = [1, k, 3]
 var table = [[1usize, 2], [3, 4]]
 
-var total: usize = sizes[0] + mixed[1] + table[1][1]
+var total = sizes[0] + mixed[1] + table[1][1]
 
 print(total)
 ```
@@ -97,16 +97,21 @@ print(total)
 10
 ```
 
-The bare literals are read at that type, not as an `int` first, so one that does not fit it is refused
-where it stands. Two elements that each have a type still have to agree, and an integer literal
-beside a real is not made a real:
+The bare literals are read at that type, not as an `int` first, wherever they fit it. One that does
+not takes its own default, `int` or `real`, and the typed elements widen to that where every value of
+theirs is one of its — `[1u8, 300]` is a `[2]int` — as a literal beside a typed operand does (§
+[Which conversions are implicit](/reference/expressions/#which-conversions-are-implicit)). Two elements that
+each have a type meet at the wider where one holds every value of the other, as two operands do —
+`[b, n]` over a `byte` and an `int` is a `[2]int` — and otherwise have to agree, so `[u, n]` over a
+`u32` and an `int` is refused. An integer literal beside a real is not made a real. A literal that
+not even its default holds is refused where it stands:
 
 ```sysl
-var bytes = [1u8, 300]
+var bytes = [1u8, 1_000_000_000_000]
 ```
 
 ```error
-the literal 300 does not fit byte
+the literal 1000000000000 does not fit byte
 ```
 
 **A declaration with no initializer** starts at the type's zero value. **A repeat** `[value; count]`
@@ -114,7 +119,7 @@ fills every element with one value, and is the form for an element type whose ze
 starting point — or which has no zero at all:
 
 ```sysl
-const n: usize = 6
+const n = 6
 
 var counters: [4]int
 var ones = [1; 5]
@@ -137,7 +142,7 @@ those — for the same reason an array bound is one: it *is* the bound, and the 
 without it.
 
 ```sysl
-var k: usize = 4
+var k = 4
 var buf: [4]u8 = [0; k]
 ```
 
@@ -145,7 +150,7 @@ var buf: [4]u8 = [0; k]
 an array's repeat count must be a constant, since it is the array's bound
 ```
 
-The diagnostic goes on to name the way out, and it is the section below: a count computed while
+The diagnostic goes on to name the alternative, described in a section below: a count computed while
 running makes *storage* rather than an array, and storage is written where a `[]T` is expected.
 
 **The element type comes from the value**, or from the context where the value is a bare literal.
@@ -169,9 +174,8 @@ print(three[0], three[1], three[2], c.n)
 7 7 7 1
 ```
 
-One call, three elements. That is what makes the form a construction rather than shorthand for
-writing the value out `count` times — and where the element type holds a reference, each of those
-copies is a share of its own.
+One call fills three elements, so the form is a construction rather than shorthand for writing the
+value out `count` times. Where the element type holds a reference, each copy is a share of its own.
 
 **An empty literal** has no element type of its own and takes one from the context, exactly as a
 bare `None` does:
@@ -189,8 +193,8 @@ print(empty.len)
 ### The zero-value form is not about arrays
 
 `var counters: [4]int` is a `var` with a declared type and no `=`, and it means "the zero value of
-this type" for **any** type that has one. What matters here is which types do not: a type containing
-a `&T` has no zero value, because a reference always points at something live.
+this type" for **any** type that has one. What matters here is which types have none: a type
+containing a `&T` has no zero value, because a reference always points at something live.
 
 ```sysl
 struct Node
@@ -204,15 +208,15 @@ Node has no zero value, so 'n' needs an initial value
 ```
 
 That keeps the non-null guarantee of [memory](/reference/memory/) true with no special case for
-arrays, and it is why `[Empty; 16]` is the form an array of enum values takes.
+arrays, and it is why an array of enum values is written as a repeat such as `[Empty; 16]`.
 
 ### A table written at the top of a file
 
-The same three forms written outside a function are a `val`, which is what a table somebody else
-fixed wants:
+The same three forms written outside a function make a `val`, the natural form for a fixed table such
+as a lookup order defined by a file format:
 
 ```sysl
-val order: [5]int = [16, 17, 18, 0, 8]
+val order = [16, 17, 18, 0, 8]
 
 total(xs: []const int) -> int
     var t = 0
@@ -230,12 +234,12 @@ print(order[2], total(order[1..<3]), order.len)
 
 The difference from a `const` is an **address**. A constant is folded into every use and has none, so
 it can size an array but cannot *be* one; a `val` is storage, so it may be indexed at a position only
-known while running, sliced, and iterated. What it may not be is written, and slicing one therefore
-yields a `[]const T` — which is the whole of why a `val` is sliceable at all.
+known while running, sliced, and iterated. It may not be written, so slicing one yields a
+`[]const T`.
 
-**A `val` may hold a value the program had to build.** Storage that exists for the whole run is never
-let go of, so the count it takes is never given back — which is what a static is, and is why this is
-admitted rather than refused:
+**A `val` may hold a value the program has to build.** Storage that exists for the whole run is never
+released, so the share it holds is never given back — which is what a static is, and why this is
+allowed:
 
 ```sysl
 squares(k: usize) -> []int
@@ -245,7 +249,7 @@ squares(k: usize) -> []int
 
     xs
 
-static val table: []int = squares(4)
+static val table = squares(4)
 
 print(table[0], table[3], table.len)
 ```
@@ -254,13 +258,13 @@ print(table[0], table[3], table.len)
 0 9 4
 ```
 
-What the value **is** still decides where the storage gets filled. A string literal's bytes are a
-constant in the object file and its owner word is null, so a table of them is storage all the way
-down and needs no code to run first — which is what lets a module with no allocator hold one, exactly
-as `order` above is:
+What the value **is** still decides where the storage is filled. A string literal's bytes are a
+constant in the object file and its owner word is null, so a table of them is constant data
+throughout and needs no code to run first. That lets a module with no allocator hold one, as it can
+hold `order` above:
 
 ```sysl
-val names: [3]string = ["alpha", "beta", "gamma"]
+val names = ["alpha", "beta", "gamma"]
 
 var i = 2
 
@@ -271,14 +275,84 @@ print(names[i], names[0].len)
 gamma 5
 ```
 
-That is the case a `const` could never have served: a constant is folded into its uses and has no
-address, so there is nothing to index at `i`. A raw pointer may be held for the same reason a
+A `const` would not serve here: a constant is folded into its uses and has no address, so there is
+nothing to index at `i`. A raw pointer may be held for the same reason a
 literal may — it counts nothing, so there is no release to write.
+
+### A byte array from a string literal
+
+On-disk formats are full of fixed-width text: an OEM name in eight bytes, a volume label in eleven, a
+magic number in four. **A string literal is accepted wherever a `[N]u8` is expected, when its UTF-8
+length is exactly `N`** — a binding's annotation, a field, an argument, an element of an outer array
+and a function's result:
+
+```sysl
+struct Boot
+    oem: [8]u8
+    label: [11]u8
+
+magic() -> [4]u8 = "FAT1"
+
+sum(b: [3]u8) -> int = int(b[0]) + int(b[1]) + int(b[2])
+
+val boot = Boot("MSWIN4.1", "NO NAME    ")
+val kinds: [2][3]u8 = ["FAT", "EXT"]
+
+print(boot.oem[0], boot.label[10], magic()[3], kinds[1][0], sum("abc"))
+```
+
+```output
+77 32 49 69 294
+```
+
+The literal is its bytes and nothing else: no NUL is added, and an escape counts as the bytes it
+encodes to, so a non-ASCII character takes its full UTF-8 width:
+
+```sysl
+val e: [2]u8 = "é"
+val nl: [2]u8 = "\n\0"
+
+print(e[0], e[1], nl[0], nl[1])
+```
+
+```output
+195 169 10 0
+```
+
+**It is an array literal of those bytes**, so a module `val` or `var` written this way is constant
+data: on a bare-metal target it is laid into `.rodata` or `.data` with nothing run before the first
+statement, exactly as `[77, 83, …]` would be.
+
+**The length has to match exactly, either way.** A shorter literal is not padded, because what the
+rest should hold — spaces, NULs — is the format's to say, not the language's:
+
+```sysl
+val oem: [8]u8 = "MSWIN"
+```
+
+```error
+this string literal is 5 bytes and [8]byte holds 8 — a string literal fills a byte array only when its UTF-8 length is exactly the array's
+```
+
+**Only `u8` (and a name for it) takes one.** A `[N]i8` or a `[N]char` is not a byte array the literal
+spells — a `char` is a scalar value, not a byte — so there the literal stays a `string`, and the
+position refuses it as it refuses any other mismatch:
+
+```sysl
+val a: [2]char = "ab"
+```
+
+```error
+cannot initialize 'a': declared [2]char but the value is string
+```
+
+A byte above `0x7F` that is not part of a UTF-8 character — a boot sector's `0xEB` jump — cannot be
+written in a string literal at all, since a string is valid UTF-8; that is an array literal's job.
 
 ### A file's bytes, embedded
 
-A table somebody else made is often a file — an image, a font, a program a kernel carries before it
-has a disk. **`embed("path")` is that file's bytes, read while compiling, as a `[]const u8`** over a
+Fixed data often comes as a file — an image, a font, a program a kernel carries before it has a
+disk. **`embed("path")` is that file's bytes, read while compiling, as a `[]const u8`** over a
 constant the object file carries, as `include_bytes!` is in Rust and `#embed` in C. This program is
 `main.sysl`, and embeds itself:
 
@@ -333,15 +407,15 @@ print(embed(name).len)
 
 ## Storage sized while running
 
-Every form so far fixes its length in the type, and that is the one thing a program reading a file
-cannot do: the size is in the header, and the header is read by the code that needs the buffer.
+Every form so far fixes its length in the type, which a program reading a file cannot do: the size is
+in the header, and the header is read by the code that needs the buffer.
 
-A length that is not in the type is precisely what a `[]T` is, so nothing here needs a new spelling.
+A sequence whose length is not in its type is exactly what a `[]T` is, so no new spelling is needed.
 **The expected type decides** which reading a literal or a repeat gets:
 
 ```sysl
 decode(header: []const u8) -> []u8
-    var out: []u8 = [0; usize(header[0])]
+    var out: []u8 = [0; header[0]]
 
     for i in 0..<out.len do out[i] = header[1] + u8(i)
 
@@ -357,8 +431,8 @@ print(body.len, body[0], body[2])
 3 10 12
 ```
 
-Under a `[N]T` a non-constant count is the error above; under a `[]T` a constant one is simply the
-easy case. The three spellings side by side:
+Under a `[N]T` a non-constant count is the error above; under a `[]T` a constant count is also
+accepted. The three spellings side by side:
 
 ```
 var buf: [64]u8 = [0; 64]     // an array — the count is in the type, so it is constant
@@ -369,10 +443,10 @@ var xs:  []int  = [1, 2, 3]   // likewise, with the elements written out
 **The storage is the view's own.** The `owner` word is an ordinary counted reference to the elements,
 so everything under [ownership](#what-a-view-keeps-alive) is already true of it: a sub-slice retains
 it, the last view to go releases it, and the elements are destroyed before the bytes go back. Nothing
-about indexing, slicing, `.len` or iterating tells such a view apart from one over somebody else's
-elements — which is the point, and why a second type would have been a second type for nothing.
+about indexing, slicing, `.len` or iterating tells such a view apart from one over another owner's
+elements, so a separate type would add nothing.
 
-What it adds is **leaving the frame**, which is what the program above does: a decoder that learns
+What it adds is **leaving the frame**, as the program above does: a decoder that learns
 its size from what it is decoding returns a result, instead of asking its caller to size a buffer
 whose size is in a header the caller has not read.
 
@@ -385,8 +459,7 @@ the elements are then stored through.
 ## Indexing
 
 `a[i]` reads the element, and it is a **place** — so `a[i] = v`, `a[i] += 1`, `a[i]++` and `&a[i]`
-all follow from the same machinery assignment and address-of use everywhere else, with nothing said
-about arrays in particular:
+all follow from the general rules for assignment and address-of, with nothing specific to arrays:
 
 ```sysl
 var a = [10, 20, 30, 40]
@@ -422,22 +495,21 @@ print(a[narrow], a[unsigned], a[sized])
 ```
 
 The index is widened to **the address width** and compared **unsigned** against the length. That is
-one comparison rather than two, and it rejects a negative index as a very large one — the trick a
-bounds check has always used. (It is the address width rather than a flat sixty-four because what it
-is compared against is a length, and a length is a `usize`.)
+one comparison rather than two, and it rejects a negative index as a very large one, the standard
+technique for a bounds check. (It is the address width rather than a fixed 64 bits because it is
+compared against a length, and a length is a `usize`.)
 
 An index already *wider* than an address — a `u128` anywhere, or an ordinary `int` on a 16-bit
 machine — is asked whether it fits and then narrowed, in that order. Nothing holds more than `usize`
 elements, so a value that does not fit names no element and traps like any other index out of range;
 testing before narrowing is what stops `2^64 + 5` arriving as `5` and passing on a six-element
-array. So `for i in 0..<n do a[i] …` needs no conversion on any machine, which is the whole point of
-the index being any integer type.
+array. So `for i in 0..<n do a[i] …` needs no conversion on any machine.
 
 ### A failed check traps
 
 ```sysl
 var a = [1, 2, 3]
-var i: i32 = -1
+var i = -1
 
 print("before")
 print(a[i])
@@ -445,14 +517,54 @@ print(a[i])
 
 The process stops at the index. This is the same runtime-safety category as the partial `char(u)`
 conversion and a mid-character string slice, and it gets the same treatment: a trap instruction, no
-message, and no unwinding. Output already written but not yet flushed goes with it — so `before`
-does not appear, which is worth knowing before reading a truncated log as evidence of where a program
-got to.
+message, and no unwinding. Output already written but not yet flushed is lost with it, so `before`
+does not appear; a truncated log is therefore not reliable evidence of how far a program got.
+
+### A check a guard already paid for is folded
+
+Plain `+` on an unsigned integer [wraps](/reference/types/), so a guard written as
+`n + len > out.len` proves nothing about `out[n + k]`: a huge `n` wraps the guard's sum to a small
+value, the guard passes, and only the subscript's own check stops the program. Written so that
+nothing in it can wrap, the guard does settle the subscripts after it:
+
+```sysl
+fill(out: []u8, n: usize, len: usize, v: u8) -> bool
+    if n > out.len || len > out.len - n then return false
+
+    for k in 0..<len
+        out[n + k] = v
+
+    true
+
+var buf = [u8(0); 8]
+
+print(fill(buf, 2, 3, 7), fill(buf, 6, 3, 7), fill(buf, 18446744073709551615, 3, 7))
+print(buf)
+```
+
+```output
+true false false
+[0, 0, 7, 7, 7, 0, 0, 0]
+```
+
+Past that guard `n <= out.len` and `len <= out.len - n`, so the compiler lays `n + len` and `n + k`
+(for `k` running below `len`, in a loop entered after the guard) down as additions that cannot wrap
+— LLVM's `add nuw` — and repeats the guard's conclusion as an `llvm.assume` where the fall-through
+begins. The optimizer can then see that every `out[n + k]` is inside, and the check goes. It costs
+nothing at run time: the flag and the assumption emit no code.
+
+The fact lasts until the first statement that writes `n`, `len` or `out` — a loop whose body
+writes one of them is outside it from the start — and a local whose address is taken anywhere in the
+function never takes part. The same flag goes on any unsigned add both of whose operands are bounded
+by half the word: a view's `.len` (no object reaches past half the address space), a literal no
+larger than `isize::MAX`, a narrower unsigned value widened, a `&` with one of these, a `%` by one, a
+right shift or a division by a literal, or a local never written after its declaration, or a loop
+variable, bounded by one of them.
 
 ### A raw pointer is indexed anyway
 
-A `*T` is the one receiver with nothing to check against, and it is subscripted regardless — that is
-C's subscript, the address arithmetic, unchecked. Slicing one needs the end written, because nothing
+A `*T` is the one receiver with nothing to check against, and it can be subscripted anyway: that is
+C's subscript, unchecked address arithmetic. Slicing one needs the end written, because nothing
 in the type can supply it:
 
 ```sysl
@@ -475,8 +587,8 @@ print(p[1], total(p[0..<2]))
 
 The resulting view owns nothing, since a `*T` region has nothing to keep alive. **The check is a
 property of the type, not of the syntax**: a `*[N]T`, whose length is in its type, keeps every check
-an array has. Reaching for a slice is how a program stays safe; reaching for a pointer is how it
-talks to hardware and to C, and the language supplies both rather than withholding the second.
+an array has. A slice keeps a program safe; a pointer is how it talks to hardware and to C, and the
+language supplies both.
 
 ### A type with no elements of its own is indexed through a trait
 
@@ -573,10 +685,9 @@ print(d[2..4].len, d[2..<4].len, d[2..].len, d[..<2].len, d[..].len)
 3 2 3 2 5
 ```
 
-The inclusive `..` is the odd one against C-family habit, and the alternative is worse:
-`for i in 0..<n` and `a[0..<n]` **must** mean the same thing, and a language that has already chosen
-two range operators does not get to give them different meanings in a subscript. So "the first `n`"
-is `a[..<n]`, matching the loop that walks it.
+The inclusive `..` differs from C-family habit, but the range operators mean the same thing
+everywhere: `for i in 0..<n` and `a[0..<n]` cover the same indexes. So "the first `n`" is `a[..<n]`,
+matching the loop that walks it.
 
 Both ends are optional: an omitted low end is 0, an omitted high end is the last element. Because
 "through the last" is not a question of including or excluding anything, only one spelling of the
@@ -626,22 +737,22 @@ print(total(boxed), boxed[2], boxed.len)
 10 3 4
 ```
 
-That call says `total(boxed)` rather than `total(boxed)`, which is the next section.
+The call passes `boxed` itself rather than `boxed[..]`; the next section explains why that works.
 
 ## An array where a view is asked for
 
 **A `[N]T` standing where a `[]T` is wanted is `a[..]`, written by the position instead of by hand.**
-An array is the one value that already knows both halves a view is made of — where the elements are,
-and how many — so nothing is taken on trust and no bound is guessed.
+An array already knows both halves a view is made of — where the elements are, and how many — so
+nothing is taken on trust and no bound is guessed.
 
-It matters most where a whole API is caller-supplied storage, which is how anything freestanding is
-written: the caller lends, the callee fills, and nobody allocates.
+This matters most for an API built on caller-supplied storage, the usual style of freestanding code:
+the caller lends, the callee fills, and nothing allocates.
 
 ```sysl
 fill(s: []int, v: int)
     for i in 0..<s.len do s[i] = v
 
-var a: [4]int = [0; 4]
+var a = [0; 4]
 
 fill(a, 7)
 
@@ -656,9 +767,9 @@ It happens at every position that asks for a view rather than merely requiring o
 `val` or `var` with the view's type written on it, a `return`, a parameter's default — and a `&[N]T`
 converts on the same terms, with the reference as what the view is taken over.
 
-**What it does not do is change the storage's own terms.** A view of a `val` array is a `[]const T`,
-exactly as `a[..]` would give, so a `val` array reaching a `[]T` is refused and told which half is
-missing:
+**The conversion does not change the storage's own terms.** A view of a `val` array is a
+`[]const T`, exactly as `a[..]` would give, so a `val` array passed where a `[]T` is wanted is
+refused, and the diagnostic says why:
 
 ```sysl
 fill(s: []int, v: int)
@@ -673,15 +784,16 @@ fill(a, 7)
 is a licence to write them — so the one does not become the other
 ```
 
-A `&sync [N]T` does not convert either, for the reason it cannot be sliced. And a `*[N]T` is left
-out on purpose: the raw-pointer tier is written out where it is used, and a view of pointed-at
-storage taken silently is the one case where nothing in the type says the elements are really there.
+A `&sync [N]T` does not convert either, for the same reason it cannot be sliced. A `*[N]T` is
+excluded deliberately: the raw-pointer tier is written out where it is used, and a view of
+pointed-at storage taken silently is the one case where nothing in the type says the elements are
+really there.
 
 ### An empty literal is a view of nothing, and needs no allocator
 
 **`[]` where a view is wanted is the empty view**, which is the zero value of what a view is made of —
-no elements, no length, and nobody owning them. So it makes no storage and reaches no allocator, which
-is what lets a module that has given the heap up write one.
+no elements, no length, and no owner. So it makes no storage and reaches no allocator, and a module
+without a heap may write one.
 
 ```sysl
 @no_alloc
@@ -741,8 +853,8 @@ scale(data)
 which views elements it may not write, so there is nothing to assign through
 ```
 
-The same diagnostic answers `xs[i] += 1` and `xs[i]++`, and finishes by naming the way out: elements
-you may write are elements of your own, so copy them into a `[]T` first.
+The same diagnostic answers `xs[i] += 1` and `xs[i]++`, and ends by naming the alternative: to write
+the elements, copy them into a `[]T` of your own first.
 
 **It is one type with a bit, not two types.** Both forms are the same three words, reach through the
 same instructions, and keep the same thing alive; what the bit changes is only what may be *done*
@@ -762,14 +874,14 @@ hand_over(xs: []const int) -> usize
 is a licence to write them — so the one does not become the other
 ```
 
-Giving up the ability to write is a promise the caller can always make; inventing one is the whole of
-what the type exists to stop.
+A caller can always give up the ability to write; gaining it is what the type exists to prevent.
 
 **Where two of them have to agree, they meet at the read-only view.** A pair of operands, the branches
-of an `if`, the arms of a `match`, a loop's `break` values — each is a place two types have to become
-one, and the two views are the one pair of *known* types in the language with somewhere to meet.
-Everywhere else two concrete types agree or the form is refused, since there is no subtyping to widen
-towards.
+of an `if`, the arms of a `match`, a loop's `break` values — each is a place where two types have to
+become one. Apart from the lossless numeric conversions
+(§ [Which conversions are implicit](/reference/expressions/#which-conversions-are-implicit)), the two
+views are the only pair of concrete types with a common type to meet at; any other two must agree or
+the form is refused, since there is no subtyping to widen towards.
 
 ```sysl
 var a = [1, 2, 3]
@@ -785,8 +897,8 @@ print(a[..] == c, c == a[..], k.len)
 true true 3
 ```
 
-Without it the **order** would decide: the first of the two settles the type and the second is read
-again at it, so one direction converted and its mirror was refused for the same two values.
+Without this rule the **order** would decide: the first of the two would settle the type and the
+second would be read at it, so a form and its mirror image could disagree about the same two values.
 
 **What they meet at is the read-only view**, so this is not a way of inventing a licence to write:
 
@@ -857,10 +969,10 @@ print(store[0], store[3], heap[1])
 7 8 9
 ```
 
-**What it does not refuse is `&`.** `&xs[0]` is a `*T` the moment it is written, which is the tier
-where the guarantees stop, and it is how a view reaches a C function taking a pointer and a length.
-The library's own `find_byte` is `memchr` over exactly this. A read-only view that could not yield an
-address could not do the job it was added for. This is *not* the rule for a `val` itself, where
+**A read-only view still allows `&`.** `&xs[0]` is a `*T` the moment it is written, the tier where
+the guarantees stop, and it is how a view reaches a C function taking a pointer and a length. The
+library's own `find_byte` is `memchr` over exactly this, and a read-only view that could not yield
+an address could not be passed to C at all. This is *not* the rule for a `val` itself, where
 `&k[0]` is refused: a `val` is storage whose promise is kept where it was made, and a view is a value
 whose promise is about writing through it.
 
@@ -878,8 +990,8 @@ frozen() -> int
 ```
 
 **What a view does not record** is whose elements these are, whether they outlive the program, and
-whether their owner's count is atomic. Those are properties of the *owner*, and a view can only
-report on them — which is what the [refusal below](#what-is-still-refused) is about.
+whether their owner's count is atomic. Those are properties of the *owner*, which a view cannot
+describe; the [refusal below](#what-is-still-refused) follows from that.
 
 ## Length
 
@@ -909,22 +1021,22 @@ print(xs[0], xs[1], xs[2])
 10 20 30
 ```
 
-`for x in seq` over an array or a slice binds a **copy** of each element, which is what value
-semantics mean — the first loop above multiplies three copies and throws them away. Changing the
+`for x in seq` over an array or a slice binds a **copy** of each element, as value semantics require
+— the first loop above multiplies three copies and discards them. Changing the
 sequence goes through the index form. The loop evaluates its sequence once, so a slice written
 directly in the header lives for the whole loop rather than being rebuilt each step.
 
-**Storage is walked by index, and that is why a container is not an iterator.** A `for` also accepts
-a cursor — a value implementing `Iterate` — but no built-in sequence implements it, and `Buf`
-deliberately does not: its elements are already sitting in memory, and reading them costs an index
-where a cursor would cost a call apiece. The protocol is for sequences whose elements have to be
+**Storage is walked by index, so a container is not an iterator.** A `for` also accepts a cursor — a
+value implementing `Iterate` — but no built-in sequence implements it, and `Buf` deliberately does
+not: its elements are already in memory, and reading them costs an index where a cursor would cost
+a call per element. The protocol is for sequences whose elements have to be
 *computed*, which a container's never are. What `Buf` implements instead is `Walk`, whose `walk()`
 answers the view, so `for x in b` asks for it once and then walks the slice by index.
 
 ## What a view keeps alive
 
-Taking a slice **retains the owner**; dropping one releases it. That is what makes "a slice never
-dangles" a fact rather than a hope, and it holds across a reallocation:
+Taking a slice **retains the owner**; dropping one releases it. That is what guarantees a slice never
+dangles, and it holds across a reallocation:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -946,42 +1058,74 @@ print(v.len, v[0], b.len())
 ```
 
 The pushes moved the elements to fresh storage. The view made before the move keeps the **old**
-storage alive and goes on showing what it was made from — it does not become invalid, which is the
-half of Go's behaviour sysl could not have reproduced even if it had wanted to. What it does not do
-is grow with the buffer: it is a view of some elements and it has the length it was made with. Take
-it again to see more.
+storage alive and goes on showing what it was made from; it does not become invalid. It does not grow
+with the buffer either: it is a view of some elements and keeps the length it was made with. Take it
+again to see more.
 
 Two consequences for how this is implemented:
 
 - **The owner word is null** whenever there is nothing to keep alive — a view of a string literal, of
   static storage, or of a `*T` region — so retain and release on a slice must tolerate null. The
-  `&T` path does not pay for that check: a reference is non-null by construction, so nullability is
-  the slice's problem alone and gets its own pair of runtime helpers.
-- **Release cannot be per payload type.** A `[]u8` may view a 64-byte buffer today and a 4096-byte
-  one tomorrow, so the static type of the slice does not name the type of the object its owner points
-  at. Giving back a count is therefore type-erased, through the deallocation hook every ARC object
-  carries — which is why releasing a slice's owner is the same instruction sequence as releasing any
-  other reference, with no static type in sight.
+  `&T` path does not pay for that check: a reference is non-null by construction, so only slices
+  need to handle null, and they have their own pair of runtime helpers.
+- **Release cannot be per payload type.** A `[]u8` may view a 64-byte buffer at one moment and a
+  4096-byte one at the next, so the static type of the slice does not name the type of the object its
+  owner points at. Giving back a count is therefore type-erased, through the deallocation hook every
+  ARC object carries, so releasing a slice's owner is the same instruction sequence as releasing any
+  other reference.
 
 A view that would outlive the array it was made from does not fail: the array is **promoted** to a
 buffer instead, so a program that means to return one writes the ordinary `var buf: [64]u8` and says
 nothing. [Memory](/reference/memory/#escape-analysis) is where that is settled, along with what is
 still refused — storage the body did not declare.
 
+**The one view with nothing to keep alive and something that can die is a view of memory a C
+library owns**, made over a `*T` by an object that frees it in its destructor. Its owner word is
+null, so the view cannot hold the object; instead the member that hands it out is marked
+`@views(self)`, and the compiler refuses every use of the view that could come after the object it
+was called on is freed:
+
+```sysl
+extern "free" c_free(p: *u8)
+
+struct Rows
+    p: *u8
+    n: usize
+
+    @views(self)
+    view(&self) -> []const u8 = self.p[0..<self.n]
+
+impl Drop for Rows
+    drop(self) = c_free(self.p)
+
+newest() -> []const u8
+    val r: &Rows = Rows(null, 0)
+
+    r.view()
+```
+
+```error
+this returns a view borrowed from 'r', and nothing keeps 'r' alive once this function returns
+```
+
+The view is still a plain `[]const u8` at no run-time cost. [Memory](/reference/memory/#a-view-borrowed-from-its-receiver)
+has the four places it is refused.
+
 ## Growing one
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and the methods
-over them. That it can be written at all is what the section on storage sized while running bought —
-a container does not need a [destructor](/reference/memory/) if its storage is a value that already
-has one, which the `[]T` field is.
+over them — with the one fact below, which only the compiler can pass on to the optimizer. It can be
+written in ordinary sysl because of [storage sized while running](#storage-sized-while-running): a
+container needs no [destructor](/reference/memory/) of its own when its storage is a value that
+already has one, as the `[]T` field does.
 
 It lives in [`sysl.buf`](/library/buf/), which is where the surface is documented. Nothing in the
 language reaches it: an array literal makes an array or a slice, and a `for` walks whatever
 implements `Iterate`.
 
-How a push is seen by another name for the same buffer is not a question this language has to answer,
-because it is already answered by how the buffer is held:
+Whether a push is seen through another name for the same buffer needs no special rule; it follows
+from how the buffer is held:
 
 ```
 var p: &Buf[int] = buf()
@@ -989,9 +1133,65 @@ var q = p                   // one buffer, two names: q sees every push through 
 var c = *p                  // a copy, because copying a struct is what that means
 ```
 
-Go's confusion — two slices that agree until one of them grows — comes from having one representation
-and therefore one behaviour. Held by reference, a `Buf` behaves as a `&T` behaves; held by value it
-is a value. Neither is a rule about growable arrays.
+In Go two slices can agree until one of them grows, because one representation has to serve both
+roles. Held by reference, a `Buf` behaves as any `&T` does; held by value it is a value. Neither is a
+rule specific to growable arrays.
+
+**A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
+Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
+never written — which every thread may read at once without a lock; `b` is left empty. What it may
+hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(3)
+b.push(4)
+
+val f = b.freeze()
+val v = f.view()
+
+print(f[1], f.len(), v, b.len())
+```
+
+```output
+4 2 [3, 4] 0
+```
+
+### Its elements are never its header
+
+A `Buf`'s **header** — the handle in its box, and the record behind it holding the storage view and the
+count — and its **elements** are two different allocations: the storage is made by the buffer for
+itself, and a box is never made out of a buffer's storage. So a write to an element cannot change the
+count or move the storage, and a write to the header cannot change an element. **The compiler tells
+the optimizer exactly that, and nothing more**: every access the buffer's own members make to its
+header is marked as one side, every access they make to an element as the other, and the optimizer
+may keep the header in registers across a loop that writes elements. A row operation over a matrix
+held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
+
+It is a fact about where things are, not a rule a program has to keep. Every other access is
+unmarked: a view handed out by `view()` or `elems`, a reinterpreting view over the elements, a `ptr_cast`
+of an element's address, and C given the data pointer all read and write the elements with no mark
+at all, which the optimizer must assume can touch anything. A member that grows the buffer writes
+the header, so an element read after it reads through the new storage:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: &Buf[int] = buf()
+
+b.push(1)
+
+for i in 0..<20 do b.push(b.at(usize(i)) + 1)
+
+print(b.len(), b.at(0), b.at(20), b.cap())
+```
+
+```output
+21 1 21 32
+```
 
 ## What is still refused
 
@@ -1034,7 +1234,7 @@ r.samples[3] = 40
 
 var sum = 0
 for x in r.samples
-    sum += int(x)
+    sum += x
 
 print(r.samples[3], sum)
 ```
@@ -1043,19 +1243,18 @@ print(r.samples[3], sum)
 40 72
 ```
 
-This is the one place where the read-only bit's existence does not help, and the reason is the
-asymmetry between the two properties. A `[]const T` can be *made* out of a writable view by giving
+This is the one place where a bit like the read-only one cannot help, because the two properties are
+not symmetric. A `[]const T` can be *made* out of a writable view by giving
 something up, which is why widening is safe and why the bit costs nothing at run time. An atomic
 count cannot be made out of a non-atomic one at all: it is fixed when the object is allocated, and a
-view claiming it would be reporting on somebody else's storage rather than describing itself. Rust
-reaches the same three answers with three mechanisms and splits them the same way — `&[T]` carries
-writability in the reference, `Rc<[T]>` against `Arc<[T]>` carries count discipline in the *owner's*
-type.
+view claiming it would be reporting on another object's storage rather than describing itself. Rust
+divides the same properties the same way — `&[T]` carries writability in the reference, while
+`Rc<[T]>` against `Arc<[T]>` carries count discipline in the *owner's* type.
 
-**There is no unchecked-index escape hatch** for a hot loop. A `*T` is the way to write one today.
+**There is no unchecked index** for a hot loop. A `*T` is the way to write one.
 
 **There is no rectangular multi-dimensional type.** `[3][3]f64` is an array of arrays and works;
-a distinct type with one bounds check for two indices is not planned.
+there is no distinct type with one bounds check for two indexes.
 
 ---
 

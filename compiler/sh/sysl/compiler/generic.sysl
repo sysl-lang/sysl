@@ -285,6 +285,9 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
         // A `some` result stands in an `impl` block's member, which nothing calls generically.
         SomeType(_) -> ()
 
+        // A result read off a body names nothing a call could solve from.
+        InferredResult(_) -> ()
+
         NamedType(n, arg_refs) ->
             if arg_refs.is_empty() && holds_string(tparams, n)
                 // A trait never binds a type parameter. A `f[T](p: *T)` handed a `*Writer` would
@@ -300,11 +303,29 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                 // -- and left unsolved where nothing does, which is the quiet consequence it is.
                 if bound_type(*sub, n).is_none() && !is_trait(actual) && actual != Unknown then
                     sub.push(Binding(n, unqualified(actual)))
+                else
+                    widen_view(n, actual, sub)
             else
                 // The reference is the declaration's, written in the declaration's terms, so the
                 // name it uses is matched against the resolved type by the key it names here.
                 unify_named(a, scope, n, arg_refs, actual, tparams, sub)
 end unify_nameless
+
+// A parameter first bound to a `[]T` and then handed a `[]const T` is bound to the read-only view
+// instead: it is the one type both arguments convert to, as it is the meeting point of the two
+// operands of a comparison. `assert_eq(got, want)` over a writable and a read-only view is the
+// ordinary case. The reverse order needs nothing, the read-only binding already taking both.
+private widen_view(n: string, actual: Type, sub: *Buf[Binding])
+    val held = bound_type(*sub, n)
+
+    if held.is_none() then return
+
+    held.unwrap() match
+        Slice(have, false) -> actual match
+            Slice(got, true) -> if type_eq(*have, *got) then rebind(sub, n, unqualified(actual))
+            _ -> ()
+        _ -> ()
+end widen_view
 
 private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef], actual: Type,
                     tparams: Buf[string], sub: *Buf[Binding])
@@ -554,9 +575,9 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
     // An instantiation is filed under a name no file wrote, so it belongs where its declaration
     // does: one a `@tests` file declared is scaffolding too, its body free to name the helpers
     // beside it and a call to it from an ordinary file refused.
-    if !f.tparams.is_empty() && holds_string(a.tables.test_only, base) &&
-       !holds_string(a.tables.test_only, name)
-        a.tables.test_only.push(name)
+    if !f.tparams.is_empty() && a.tables.test_only_keys.has(base) &&
+       !a.tables.test_only_keys.has(name)
+        note_test_only(a, name)
 
     if const_self then a.tables.members.const_self.put(name, true)
     if f.const_fn then a.tables.const_fns.put(name, true)
@@ -596,8 +617,7 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
     a.tables.members.func_substs.put(name, subst)
     a.tables.members.pending.push(PendingInst(name, f, subst, home))
 
-    if f.const_fn then
-        a.tables.members.const_insts.put(name, (PendingInst(name, f, subst, home), FuncSig(params, ret)))
+    a.tables.members.eval_insts.put(name, (PendingInst(name, f, subst, home), FuncSig(params, ret)))
 
     name
 end instantiate_func
@@ -668,18 +688,45 @@ end tag_of
 
 // What a declaration's own parameters mean at this instantiation, together with whatever `Self` and
 // a trait's arguments meant inside the member it was lowered from.
+// A value argument as the body reads it: at the type its parameter declared. An integer travels at
+// one width, so `rep[7]` and `rep[N]` are one instance whatever wrote them; inside the body the name
+// is the `int` (or `u8`, or `i64`) the declaration said.
+private at_declared(a: &Analysis, home: Scope, f: FuncDecl, tparam: string, targ: Type) -> Type
+    val written = binding_named(f.tvalues, tparam)
+
+    if written.is_none() then return targ
+
+    val declared = resolve_type(a, home, written.unwrap(), no_bindings())
+
+    targ match
+        ConstArg(v, ty, stood) -> underlying(declared) match
+            Integer(_, _, _) -> ConstArg(v, declared, stood)
+            _ -> targ
+        _ -> targ
+end at_declared
+
 private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Buf[Binding]
     var subst: Buf[Binding] = buf()
     val outer = a.tables.members.selves.get(f.name)
 
     val opened = a.tables.members.opened.get(f.name).unwrap_or(buf())
-
-    if outer.is_some()
-        for i in 0..<outer.unwrap().len()
-            subst.push(fixed_value(outer.unwrap().at(i), opened, f.tparams, targs))
+    var own: Buf[Binding] = buf()
 
     for i in 0..<f.tparams.len()
-        if i < targs.len() then subst.push(Binding(f.tparams.at(i), targs.at(i)))
+        if i < targs.len() then own.push(Binding(f.tparams.at(i), at_declared(a, home, f, f.tparams.at(i),
+                                                                             targs.at(i))))
+
+    // **A trait argument the block wrote at one of its own parameters is that parameter here**, at
+    // this instantiation's argument: `impl[U] Get[U] for W[U]` binds the trait's `T` to the block's
+    // `U`, so an inherited default's `-> T` is a `W[f64]` call's `f64`, not the `U` it stood at.
+    if outer.is_some()
+        for i in 0..<outer.unwrap().len()
+            val b = fixed_value(outer.unwrap().at(i), opened, f.tparams, targs)
+
+            subst.push(Binding(b.name, subst_params(a, b.ty, own)))
+
+    for item in own
+        subst.push(item)
 
     // On a generic type `Self` is the type applied to its own parameters, which is not a type until
     // the parameters are fixed -- so the receiver is kept as written and resolved here, where they
@@ -691,7 +738,7 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
 
         subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(), subst)))
 
-    subst
+    with_derive_param(a, f.name, subst)
 end self_for
 
 // A trait's value parameter a generic block fixed to one of its own -- `impl[const M: usize]

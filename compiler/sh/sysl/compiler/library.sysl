@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sh.sysl.parsing.source_of
 import sysl.text.Search
 
@@ -30,6 +31,11 @@ struct LibraryBuild
     determined: Buf[string]
 
     report: Buf[Placed]
+
+    // The functions the library reaches that are **another artifact's** -- the standard module's,
+    // another package's -- and so declared here. Its own deferred functions, declared too, are not
+    // among them. An optimized half carries a copy of the small ones (`half_of`).
+    foreign: Buf[string]
 end LibraryBuild
 
 // A library analyzed, split, and ready to lower.
@@ -123,7 +129,8 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
 
     // What a test body made would still be dropped here, had anything been left to make it.
     val whole = strip_tests(checked)
-    var defers = storage_reaching(whole)
+    val shared = shared_storage(done.an, whole.vals, own)
+    var defers = storage_reaching(whole, shared)
 
     if entries_left
         for i in 0..<whole.funcs.len()
@@ -133,6 +140,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
 
     var determined: Buf[string] = buf()
     var within: Buf[string] = buf()
+    var foreign: Buf[string] = buf()
     var kept: Buf[TFunc] = buf()
 
     for i in 0..<whole.funcs.len()
@@ -149,6 +157,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
 
         if !holds_string(own, f.declared_in)
             within.push(f.name)
+            foreign.push(f.name)
         else if holds_string(defers, f.name)
             // **A function that reads a module-level `val` is left out of the precompiled half**,
             // and this is the honest boundary of what separate compilation reaches: the storage for
@@ -172,10 +181,65 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
             // collision for them to have.
             determined.push(f.name)
 
-    val library = whole with { funcs = kept, precompiled = within, entry_point = false }
+    // **A library's constant storage is defined once, in its own half**, and named everywhere else:
+    // the half lays its own down with external linkage and advertises it, a package's half declares
+    // the standard module's as it declares a precompiled function, and a program declares whatever a
+    // half it links advertises. Copied privately into each object instead, a half and the program it
+    // links into would each have had one -- two `Buf` empty cores, two harness counters, two of a
+    // package's own tables -- which is why a function reaching any of it used to be deferred, and
+    // with it every package function that so much as indexed a `Buf` or read a lookup table.
+    var vals: Buf[TVal] = buf()
 
-    LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()))
+    for v in whole.vals
+        if !shared.has(v.symbol)
+            vals.push(v)
+        else if storage_owned(done.an, v.symbol, own)
+            vals.push(v with { shared = true })
+            determined.push(v.symbol)
+        else
+            vals.push(v)
+            within.push(v.symbol)
+
+    val library = whole with { funcs = kept, vals = vals, precompiled = within, entry_point = false }
+
+    LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()),
+                 foreign)
 end library_build_of
+
+// The storage a library build lays down once or names from the artifact that does, rather than
+// leaving every function reaching it to the program: what the object file carries as an image and
+// nothing has to fill, declared by this library (`own`) or by the standard module.
+//
+// **What is left out keeps its copy**, and each for a reason of its own: storage filled at run time
+// is filled by the program's entry point, which a library has none of; `@thread_local`, `@per_cpu`
+// and `@main_thread` storage is reached through machinery the program sets up; exported or placed
+// storage is already a symbol of the program's own, under a name or in a section somebody chose; and
+// another package's storage is laid down by that package's half only where it has one -- a root
+// compiled from source keeps its storage private to the program -- so a function reaching it is
+// still the program's to compile.
+shared_storage(a: &Analysis, vals: Buf[TVal], own: Buf[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for v in vals
+        val image = !v.computed && !v.thread_local && !v.per_cpu && !v.main_thread &&
+            v.exported.is_none() && v.section.is_none()
+
+        if !image then continue
+
+        a.tables.vals.get(v.symbol) match
+            Some(d) ->
+                if d.scope.src.name.starts_with(s"$StdPrefix/") || holds_string(own, d.scope.module_name)
+                    out.add(v.symbol)
+            None -> ()
+
+    out
+end shared_storage
+
+// Whether a library build declared this storage itself, rather than reaching it in another.
+private storage_owned(a: &Analysis, symbol: string, own: Buf[string]) -> bool =
+    a.tables.vals.get(symbol) match
+        Some(d) -> holds_string(own, d.scope.module_name)
+        None -> false
 
 // The files this compilation is producing, which is what makes it a build *of* the library rather
 // than a build against it: every body the library declares is typed, not only the ones its own

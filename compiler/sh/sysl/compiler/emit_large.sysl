@@ -1,0 +1,522 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.math.bigint.from_int
+import sysl.text.Search
+
+// **A large aggregate is copied as a block of bytes, never carried as one LLVM value.**
+//
+// The emitter reads a value out of its storage with a `load` and writes it with a `store`, whatever
+// its type. For a scalar or a small struct that is the right shape. For a struct holding a
+// thirty-kilobyte array it is a first-class aggregate as wide as the array, which LLVM takes apart
+// element by element: one such copy of `[33000]u8` took over a minute to compile, and four of them
+// held clang for twenty. The layout already calls a type over `DirectBytes` large -- it is passed by
+// address and returned through an out-pointer -- so the same line decides here.
+//
+// This pass runs over each function once it is emitted, and rewrites every load of a large type by
+// what is done with the value it read:
+//
+// - **stored somewhere** -- the store becomes a `memcpy` from where the value was read;
+// - **handed to an ownership walk** -- the walk takes the address instead (`arc.copy_at.T` /
+//   `arc.dispose_at.T`, which `emit_arc.sysl` names for exactly this);
+// - **asked for one member** -- the `extractvalue` becomes a `getelementptr` and a load of that
+//   member alone.
+//
+// When every use is one of those, the load itself is gone. A use of any other kind keeps the load
+// for that use, which is the shape it had before -- correct, only slow to compile.
+//
+// **Where the bytes are read from.** A value is what its storage held when it was loaded, and the
+// rewritten uses read the storage later. The storage is read in place when nothing between the load
+// and its last use can write it: every use is in the load's own block, and no instruction between
+// writes the storage -- judged exactly for a stack slot whose address never leaves the frame, and
+// for anything else by assuming any store or call may. Otherwise the value is first copied into a
+// slot of its own at the load, which is what the load was, made of bytes.
+lower_large_values(e: *Emit, whole: Buf[IrBlock]) -> Buf[IrBlock]
+    val blocks = members_read_in_place(e, whole)
+    var cands: Buf[LargeLoad] = buf()
+    var by_name: Map[string, usize] = map()
+
+    for bi in 0..<blocks.len()
+        val b = blocks.at(bi)
+
+        for ii in 0..<b.instrs.len()
+            b.instrs.at(ii) match
+                InLoad(VReg(n), ty, src, acc, align) ->
+                    if plain_access(acc)
+                        large_shape(e, ty) match
+                            Some(shape) ->
+                                val a = align match
+                                    Some(given) -> if given < shape.1 then given else shape.1
+                                    None -> shape.1
+
+                                by_name.put(n, cands.len())
+                                cands.push(LargeLoad(n, ty, src, shape.0, a, bi, ii, false, ii, false, src,
+                                                     false, false))
+                            None -> ()
+                _ -> ()
+
+    if cands.is_empty() && !has_value_walk(blocks) then return blocks
+
+    // Every use, sorted into the ones this pass rewrites and the ones that keep the load.
+    for bi in 0..<blocks.len()
+        val b = blocks.at(bi)
+
+        for ii in 0..<b.instrs.len()
+            note_uses(e, b.instrs.at(ii), bi, ii, &cands, by_name)
+
+        b.terminator match
+            Some(t) -> note_uses(e, t, bi, b.instrs.len(), &cands, by_name)
+            None -> ()
+
+    val private_slots = frame_private_slots(blocks)
+    var slots: Buf[Inst] = buf()
+
+    for ci in 0..<cands.len()
+        val c = cands[ci]
+
+        if c.used
+            var stable = !c.far
+
+            if stable
+                val sealed = v_is_reg(c.src) && private_slots.has(v_name(c.src))
+                val instrs = blocks.at(c.block).instrs
+
+                for k in (c.at + 1)..<c.last
+                    if may_write(instrs.at(k), c.src, sealed, c.name) then stable = false
+
+            if !stable
+                val slot = fresh_reg(e)
+
+                slots.push(InAlloca(slot, c.ty, Some(c.align)))
+                cands.set(ci, c with { backing = slot, copied = true })
+
+    var out: Buf[IrBlock] = buf()
+
+    for bi in 0..<blocks.len()
+        val b = blocks.at(bi)
+        var instrs: Buf[Inst] = buf()
+
+        for ii in 0..<b.instrs.len()
+            rewrite_inst(e, b.instrs.at(ii), cands, by_name, &instrs, &slots)
+
+        out.push(IrBlock(b.label, instrs, b.terminator))
+
+    // The slots made here go where every slot is: at the head of the entry block.
+    if !slots.is_empty()
+        var entry: Buf[Inst] = buf()
+
+        for s in slots
+            entry.push(s)
+
+        for inst in out[0].instrs
+            entry.push(inst)
+
+        out.set(0, IrBlock(out[0].label, entry, out[0].terminator))
+
+    out
+end lower_large_values
+
+// **A large member of a large value is read where it lies.** A pattern binding a variant's payload
+// loads the whole payload and then takes one member of it; where that member is itself large, it is
+// read from its own address instead -- which is the same bytes as long as nothing between the load
+// and the `extractvalue` can have written them -- and becomes a large load the main pass rewrites.
+private members_read_in_place(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
+    val sealed_slots = frame_private_slots(blocks)
+    var out: Buf[IrBlock] = buf()
+
+    for b in blocks
+        var instrs: Buf[Inst] = buf()
+        var loads: Map[string, (Val, usize)] = map()
+
+        for inst in b.instrs
+            var done = false
+
+            inst match
+                InLoad(VReg(n), ty, src, acc, _) ->
+                    if plain_access(acc) && large_shape(e, ty).is_some() then loads.put(n, (src, instrs.len()))
+                InExtract(d, ty, VReg(n), idx) ->
+                    loads.get(n) match
+                        Some(found) ->
+                            field_type(e, ty, idx) match
+                                Some(f) ->
+                                    if large_shape(e, f).is_some()
+                                        val sealed = v_is_reg(found.0) && sealed_slots.has(v_name(found.0))
+                                        var untouched = true
+
+                                        for k in (found.1 + 1)..<instrs.len()
+                                            if may_write(instrs.at(k), found.0, sealed, n) then untouched = false
+
+                                        if untouched
+                                            val at = fresh_reg(e)
+
+                                            instrs.push(InGep(at, ty, found.0, member_steps(idx)))
+                                            loads.put(v_name(d), (at, instrs.len()))
+                                            instrs.push(InLoad(d, f, at, AccPlain, None))
+                                            done = true
+                                None -> ()
+                        None -> ()
+                _ -> ()
+
+            if !done then instrs.push(inst)
+
+        out.push(IrBlock(b.label, instrs, b.terminator))
+
+    out
+end members_read_in_place
+
+// The `getelementptr` steps to the member an `extractvalue` with these indices reads.
+private member_steps(idx: Buf[int]) -> Buf[IrArg]
+    var steps: Buf[IrArg] = buf()
+
+    steps.push(ir_arg(l_i32(), VInt(from_int(0))))
+
+    for i in idx
+        steps.push(ir_arg(l_i32(), VInt(from_int(long(i)))))
+
+    steps
+end member_steps
+
+// Sorts the uses `inst` makes of large loads into the ones rewritten and the ones that keep the load.
+private note_uses(e: *Emit, inst: Inst, bi: usize, ii: usize, cands: *Buf[LargeLoad],
+                  by_name: Map[string, usize])
+    for v in all_operands(inst)
+        v match
+            VReg(n) ->
+                by_name.get(n) match
+                    Some(ci) ->
+                        var c = cands.at(ci)
+
+                        if rewritten_use(e, inst, n)
+                            c.used = true
+
+                            if bi != c.block then c.far = true
+                            else if ii > c.last then c.last = ii
+                        else c.keep = true
+
+                        cands.set(ci, c)
+                    None -> ()
+            _ -> ()
+end note_uses
+
+// One load of a large type, and what has been decided about it.
+private struct LargeLoad
+    name: string
+    ty: LType
+    src: Val
+    bytes: int
+    align: int
+    block: usize
+    at: usize
+    // Some use is rewritten; some use keeps the load; some rewritten use is in another block.
+    used: bool
+    last: usize
+    keep: bool
+    // Where the rewritten uses read the bytes, and whether that is a copy made at the load.
+    backing: Val
+    copied: bool
+    far: bool
+end LargeLoad
+
+private plain_access(acc: IrAccess) -> bool = acc match
+    AccPlain -> true
+    AccBufHeader -> true
+    AccBufElement -> true
+    _ -> false
+
+private v_is_reg(v: Val) -> bool = v match
+    VReg(_) -> true
+    _ -> false
+
+private v_name(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""
+
+private is_reg(v: Val, n: string) -> bool = v match
+    VReg(m) -> m == n
+    _ -> false
+
+private same_val(a: Val, b: Val) -> bool = v_render(a) == v_render(b)
+
+// Whether `name` is an ownership walk over a value at an address -- the helpers `emit_arc.sysl`
+// writes for a large type.
+private is_slot_walk(name: string) -> bool =
+    name.starts_with("arc.copy_at.") || name.starts_with("arc.dispose_at.")
+
+// A walk handed a large value rather than its address, which the emitter writes for this pass to
+// complete -- and which must be completed, since the helper takes a pointer.
+private value_walk(inst: Inst) -> Option[IrArg] = inst match
+    InCall(None, _, VGlobal(h), args, _, _, _, _) ->
+        if is_slot_walk(h) && args.len() == 1
+            args[0].ty match
+                LPtr -> None
+                _ -> Some(args[0])
+        else None
+    _ -> None
+
+private has_value_walk(blocks: Buf[IrBlock]) -> bool
+    for b in blocks
+        for inst in b.instrs
+            if value_walk(inst).is_some() then return true
+
+    false
+end has_value_walk
+
+// Every operand of an instruction, the addresses a load reads and a store writes among them.
+private all_operands(inst: Inst) -> Buf[Val]
+    var vs = escaping_operands(inst)
+
+    inst match
+        InLoad(_, _, p, _, _) -> vs.push(p)
+        InStore(_, _, p, _, _) -> vs.push(p)
+        _ -> ()
+
+    vs
+end all_operands
+
+// Whether this use of the large value `n` is one the pass rewrites.
+private rewritten_use(e: *Emit, inst: Inst, n: string) -> bool = inst match
+    InStore(_, v, p, acc, _) -> is_reg(v, n) && !is_reg(p, n) && plain_access(acc)
+    InCall(_, _, _, _, _, _, _, _) -> value_walk(inst) match
+        Some(a) -> is_reg(a.value, n)
+        None -> false
+    InExtract(_, ty, agg, idx) ->
+        if is_reg(agg, n)
+            field_type(e, ty, idx) match
+                Some(f) -> large_shape(e, f).is_none()
+                None -> false
+        else false
+    _ -> false
+
+// The size and the boundary of a large type, where the type is large and both are known exactly.
+private large_shape(e: *Emit, ty: LType) -> Option[(int, int)] = shape_of(e, ty) match
+    Some(s) -> if s.0 > int(DirectBytes) then Some(s) else None
+    None -> None
+
+// The size and the boundary of a value of `ty`, where they are known exactly. A boundary of one is
+// claimed for a scalar element, which is always true; a named type has the layout's own.
+private shape_of(e: *Emit, ty: LType) -> Option[(int, int)] = ty match
+    LNamed(_) -> e.shapes.get(l_render(ty)) match
+        Some(s) -> Some((s.bytes, s.align))
+        None -> None
+    LArr(n, elem) -> shape_of(e, *elem) match
+        Some(s) -> Some((n * s.0, s.1))
+        None -> None
+    LInt(bits) -> if bits == 8 || bits == 16 || bits == 32 || bits == 64 then Some((bits / 8, 1)) else None
+    LFloat(bits, _) -> if bits == 32 || bits == 64 then Some((bits / 8, 1)) else None
+    LPtr -> Some((e.word_bits / 8, 1))
+    _ -> None
+
+// The member of `ty` an `extractvalue` with these indices reads.
+private field_type(e: *Emit, ty: LType, indices: Buf[int]) -> Option[LType]
+    var at = ty
+
+    for i in indices
+        val next = at match
+            LNamed(_) -> e.shapes.get(l_render(at)) match
+                Some(s) -> if i >= 0 && usize(i) < s.fields.len() then Some(s.fields.at(usize(i))) else None
+                None -> None
+            LArr(_, elem) -> Some(*elem)
+            LStruct(fields) -> if i >= 0 && usize(i) < fields.len() then Some(fields.at(usize(i))) else None
+            _ -> None
+
+        next match
+            Some(t) -> at = t
+            None -> return None
+
+    Some(at)
+end field_type
+
+// The stack slots whose address is used only to load from, to store to, as the out-pointer of a call,
+// as either end of a copy, or by an ownership walk -- so that only those can change what they hold.
+private frame_private_slots(blocks: Buf[IrBlock]) -> Set[string]
+    var slots: Set[string] = set()
+    var escaped: Set[string] = set()
+
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InAlloca(VReg(n), _, _) -> slots.add(n)
+                _ -> ()
+
+    for b in blocks
+        for inst in b.instrs
+            for n in escaping_names(inst)
+                escaped.add(n)
+
+        b.terminator match
+            Some(t) ->
+                for n in escaping_names(t)
+                    escaped.add(n)
+            None -> ()
+
+    var out: Set[string] = set()
+
+    for s in slots
+        if !escaped.has(s) then out.add(s)
+
+    out
+end frame_private_slots
+
+// The registers an instruction lets an address escape through, by this pass's reading: a call's
+// out-pointer, a copy's two ends and an ownership walk's address are not escapes.
+private escaping_names(inst: Inst) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    inst match
+        InCall(_, _, callee, args, _, _, _, _) ->
+            val copy_or_walk = callee match
+                VGlobal(h) -> h == memcpy_symbol() || is_slot_walk(h)
+                _ -> false
+
+            if !copy_or_walk
+                for a in args
+                    var sret = false
+
+                    for at in a.attrs
+                        at match
+                            AttrSRet(_) -> sret = true
+                            _ -> ()
+
+                    if !sret then out.push(v_name(a.value))
+        _ ->
+            for v in escaping_operands(inst)
+                out.push(v_name(v))
+
+    out
+end escaping_names
+
+// Whether `inst` may change the bytes at `src`, which the load named `own` read. A store of that
+// same value writes what is already there.
+private may_write(inst: Inst, src: Val, sealed: bool, own: string) -> bool = inst match
+    InStore(_, v, p, _, _) -> !is_reg(v, own) && (!sealed || same_val(p, src))
+    InCall(_, _, callee, args, _, _, _, _) ->
+        val name = callee match
+            VGlobal(h) -> h
+            _ -> ""
+
+        if sealed
+            if name == memcpy_symbol() then same_val(args[0].value, src)
+            else if is_slot_walk(name) then false
+            else
+                var named = false
+
+                for a in args
+                    if same_val(a.value, src) then named = true
+
+                named
+        else !(name == "arc.retain" || name == "arc.retain_sync" || name == "arc.retain_maybe" ||
+               name == "arc.weak_retain" || name.starts_with("arc.copy.") ||
+               name.starts_with("arc.copy_at."))
+    InAtomicRmw(_, _, _, _, _, _) -> true
+    InCmpXchg(_, _, _, _, _, _) -> true
+    InAsm(_, _, _, _, _) -> true
+    InVaArg(_, _, _) -> true
+    InFence(_) -> true
+    _ -> false
+
+// One instruction of the function, as the decisions made about its large loads write it.
+private rewrite_inst(e: *Emit, inst: Inst, cands: Buf[LargeLoad], by_name: Map[string, usize],
+                     out: *Buf[Inst], slots: *Buf[Inst])
+    inst match
+        InLoad(VReg(n), _, _, _, _) ->
+            by_name.get(n) match
+                Some(ci) ->
+                    val c = cands[ci]
+
+                    // A load nothing uses any more -- every use was rewritten, or read a member in
+                    // place -- is dropped with the rest.
+                    if c.used && c.copied then out.push(memcpy_inst(e, c.backing, c.src, c.bytes, c.align))
+                    if c.keep then out.push(inst)
+                None -> out.push(inst)
+        InStore(_, VReg(n), p, _, _) ->
+            backing_for(cands, by_name, n) match
+                Some(c) ->
+                    if rewritten_use(e, inst, n) then out.push(memcpy_inst(e, p, c.backing, c.bytes, c.align))
+                    else out.push(inst)
+                None -> out.push(inst)
+        InExtract(d, ty, VReg(n), idx) ->
+            backing_for(cands, by_name, n) match
+                Some(c) ->
+                    if rewritten_use(e, inst, n)
+                        val at = fresh_reg(e)
+
+                        out.push(InGep(at, c.ty, c.backing, member_steps(idx)))
+                        out.push(InLoad(d, field_type(e, ty, idx).unwrap(), at, AccPlain, None))
+                    else out.push(inst)
+                None -> out.push(inst)
+        InCall(dest, ret, callee, args, attrs, fty, fast, must) ->
+            value_walk(inst) match
+                Some(a) ->
+                    val addr = a.value match
+                        VReg(n) -> backing_for(cands, by_name, n) match
+                            Some(c) -> Some(c.backing)
+                            None -> None
+                        _ -> None
+
+                    // A value that was not loaded from anywhere is given a slot to be walked in.
+                    val at = addr match
+                        Some(p) -> p
+                        None ->
+                            val slot = fresh_reg(e)
+
+                            slots.push(InAlloca(slot, a.ty, None))
+                            out.push(InStore(a.ty, a.value, slot, AccPlain, None))
+                            slot
+
+                    var walked: Buf[IrArg] = buf()
+
+                    walked.push(ir_arg(LPtr, at))
+                    out.push(InCall(dest, ret, callee, walked, attrs, fty, fast, must))
+                None -> out.push(inst)
+        _ -> out.push(inst)
+end rewrite_inst
+
+// The decisions about the large load named `n`, where it is one whose uses are rewritten.
+private backing_for(cands: Buf[LargeLoad], by_name: Map[string, usize], n: string) -> Option[LargeLoad] =
+    by_name.get(n) match
+        Some(ci) -> if cands[ci].used then Some(cands[ci]) else None
+        None -> None
+
+// Records the size, the boundary and the members of every named LLVM type the program declares, by
+// the name it is printed under -- which is what an instruction names it by.
+note_type_shapes(e: *Emit, p: TProgram)
+    for item in p.structs
+        item match
+            Struct(d) ->
+                struct_type_def(d, e.layout) match
+                    Some(def) ->
+                        e.shapes.put(l_render(struct_lty(d)),
+                                     TypeShape(int(e.layout.size(item)), int(e.layout.align(item)), def.fields))
+                    None -> ()
+            _ -> ()
+
+    for item in p.enums
+        item match
+            Enum(d) ->
+                if !d.simple
+                    val defs = enum_type_defs(d, e.layout)
+
+                    e.shapes.put(l_render(enum_lty(d)),
+                                 TypeShape(int(e.layout.size(item)), int(e.layout.align(item)),
+                                           defs.at(defs.len() - 1).fields))
+
+                    // Each variant's payload is a named type of its own, read out of the region
+                    // whole when a pattern binds it.
+                    for v in d.variants
+                        if v.carries
+                            val name = l_render(variant_lty(d, v))
+                            val both = e.layout.variant_aggregate(v)
+
+                            for def in defs
+                                if def.name == name
+                                    e.shapes.put(name, TypeShape(int(both.0), int(both.1), def.fields))
+            _ -> ()
+end note_type_shapes
+
+// What a named LLVM type is: its size and boundary as the layout computes them, and the members an
+// `extractvalue` indexes.
+struct TypeShape
+    bytes: int
+    align: int
+    fields: Buf[LType]

@@ -1,0 +1,53 @@
+module sh.sysl.compiler
+
+// **Where a program that traps stops: the one point every trap goes through.**
+//
+// A failed bounds check, an overflow, a checked read of a union or an enum, a `require` that does not
+// hold, the library's `trap()` -- each ends in the machine's trap instruction, and the process ends by
+// SIGTRAP. What the program had already printed would end with it: standard output is a C stream,
+// fully buffered when it is not a terminal, so a test that prints and then traps showed nothing.
+//
+// So on a target with a C library every trap calls `@sysl.trap` instead of `@llvm.trap` directly.
+// It flushes every open output stream (`fflush(NULL)` -- standard output by its standard name, since
+// `stdout` itself is a macro no declaration can reach) and then traps exactly as before: the
+// instruction is the same, so the exit status and `@test(should_trap)` read the same.
+//
+// **A second trap does not flush again.** A flag set before the flush sends any trap raised while it
+// runs -- or one from another thread racing it -- straight to the instruction, so a stream in a state
+// that makes flushing trap cannot loop.
+//
+// **A freestanding target has no stream to flush**: its `putchar` is whatever the board supplies, and
+// buffers nothing a trap could lose. There every trap is still `@llvm.trap` itself, and the module
+// declares no `fflush`.
+//
+// The function is private to each module, beside the other runtime pieces, and cold, so a check's
+// failure block stays one call.
+
+// Whether a trap flushes output first, which is whether the target has a C library's streams.
+trap_flushes(t: Target) -> bool = os_hosted(t.os)
+
+// What a trap calls on this module's target.
+trap_symbol(e: *Emit) -> string = if trap_flushes(e.target) then trap_stop_symbol() else llvm_trap()
+
+// The flushing stop's own name. It never returns and touches no count, so the passes that ask what a
+// call can do treat it as they treat the trap instruction (`arc_cover.sysl`).
+trap_stop_symbol() -> string = "sysl.trap"
+
+// The C function the stop flushes with.
+trap_flush_symbol() -> string = "fflush"
+
+// The stop, as the text the module carries.
+trap_runtime() -> string =
+    "@sysl.trap.busy = private global i8 0\n\n" +
+    s"define private void @${trap_stop_symbol()}() cold noinline noreturn {\n" +
+    "entry:\n" +
+    "  %was = atomicrmw xchg ptr @sysl.trap.busy, i8 1 monotonic\n" +
+    "  %first = icmp eq i8 %was, 0\n" +
+    "  br i1 %first, label %flush, label %stop\n" +
+    "flush:\n" +
+    s"  %f = call i32 @${trap_flush_symbol()}(ptr null)\n" +
+    "  br label %stop\n" +
+    "stop:\n" +
+    s"  call void @${llvm_trap()}()\n" +
+    "  unreachable\n" +
+    "}\n\n"

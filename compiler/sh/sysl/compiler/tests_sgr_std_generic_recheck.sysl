@@ -1,0 +1,70 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// The library's generic bodies are read where the library is built, not in every program.
+//
+// A generic body is checked at its definition, against its bounds, and for the library that is the
+// same text in every compilation -- so reading it again in each program is a fixed cost every build
+// pays for nothing. These pin both halves: a program compiled against a library whose generic body
+// is wrong (and which the program never calls) is not refused for it, and the library's own build --
+// the compilation that is *producing* those files, as `build-lib --std` and `--no-std-lib` are -- is.
+
+// A stand-in library: one module whose generic body asks its opaque parameter for a member no bound
+// promises, and a program's own generic, wrong the same way, for the third case.
+private sgr_stand_in() -> string
+    val root = make_temp_dir("sysl-sgr-lib").unwrap()
+
+    make_dir_all(root + "/sysl").unwrap()
+    write_text(root + "/sysl/std.sysl",
+               "module sysl\nkept(n: int) -> int = n + 1\nbroken[T](x: T) -> int = x.missing()\n").unwrap()
+    root
+end sgr_stand_in
+
+// The errors of a program analyzed against the stand-in, the library's files produced or supplied.
+private sgr_errors(main: string, producing_library: bool) -> string
+    val lib = sgr_stand_in()
+    val t = host_target()
+
+    var units = std_units(lib, t) match
+        Err(why) ->
+            remove_dir_all(lib).unwrap_or(())
+            return why
+        Ok(found) -> found
+
+    remove_dir_all(lib).unwrap_or(())
+
+    val producing = if producing_library then file_names(units) else buf()
+    val parsed = parse(source_of("main.sysl", main), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, producing)
+    val errors = errors_of(done.an.diagnostics())
+
+    if !done.reported.is_empty() then return analysis_report(done.reported)
+
+    analysis_report(errors)
+end sgr_errors
+
+@test("a program is not refused for a library generic body it never calls")
+sgr_a_program_does_not_recheck_the_library()
+    assert_eq(sgr_errors("val x: int = sysl.kept(1)\n", false), "")
+
+@test("while the library's own build still refuses the body")
+sgr_the_library_build_still_refuses_it()
+    val said = sgr_errors("val x: int = sysl.kept(1)\n", true)
+
+    assert(said.contains("missing"), s"the library's build let the broken generic through: '$said'")
+
+@test("and a program's own generic body is still read at its definition")
+sgr_a_programs_own_generic_is_still_read()
+    val said = sgr_errors("own[T](x: T) -> int = x.absent()\nval x: int = sysl.kept(1)\n", false)
+
+    assert(said.contains("absent"), s"a program's own broken generic was let through: '$said'")

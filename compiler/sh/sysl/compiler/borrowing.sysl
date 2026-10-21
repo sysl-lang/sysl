@@ -173,9 +173,9 @@ private inert_node(v: &Verdict, calls: &CallSink, locals: Set[string], x: TExpr)
     // A call that does not come back never reaches the release this is deciding about.
     TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
 
-    TStore(place, _, _) -> if !own_place(place, locals) then v.refuse()
+    TStore(place, _, _, _) -> if !own_place(place, locals) then v.refuse()
     TIncDec(place, _, _, _, _) -> if !own_place(place, locals) then v.refuse()
-    TUpdate(place, _, _, _, dispatch, _) ->
+    TUpdate(place, _, _, _, dispatch, _, _) ->
         if !own_place(place, locals) then v.refuse()
 
         if dispatch.is_some() then calls.add(dispatch.unwrap().name)
@@ -445,9 +445,9 @@ private touch_node(v: &Verdict, calls: &CallSink, roots: &TypeSink, laundered: &
     *x.kind match
         TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
 
-        TStore(place, _, _) -> touch_place(v, roots, locals, place)
+        TStore(place, _, _, _) -> touch_place(v, roots, locals, place)
         TIncDec(place, _, _, _, _) -> touch_place(v, roots, locals, place)
-        TUpdate(place, _, _, _, dispatch, _) ->
+        TUpdate(place, _, _, _, dispatch, _, _) ->
             touch_place(v, roots, locals, place)
 
             if dispatch.is_some() then calls.add(dispatch.unwrap().name)
@@ -705,8 +705,8 @@ private rebound_walk(out: &NameSink) -> &TWalk =
     TWalk(true, x -> rebound_node(out, x), w -> add_root(out, w.place), s -> rebound_stmt(out, s))
 
 private rebound_node(out: &NameSink, x: TExpr) = *x.kind match
-    TStore(place, _, _) -> add_root(out, place)
-    TUpdate(place, _, _, _, _, _) -> add_root(out, place)
+    TStore(place, _, _, _) -> add_root(out, place)
+    TUpdate(place, _, _, _, _, _, _) -> add_root(out, place)
     TIncDec(place, _, _, _, _) -> add_root(out, place)
     TAddrOf(place, _) -> add_root(out, place)
     _ -> ()
@@ -719,11 +719,15 @@ private rebound_stmt(out: &NameSink, s: TStmt) = s match
     _ -> ()
 
 // The local whose storage a place reaches, where it reaches one. **It stops at a dereference on
-// purpose**: `*p = 1` writes the pointee, and only `p = q` writes the slot.
-private add_root(out: &NameSink, place: TExpr) = *place.kind match
+// purpose**: `*p = 1` writes the pointee, and only `p = q` writes the slot. **An element of anything
+// but an array is behind a dereference too**: `v[i] = 0` through a view writes the storage the view
+// reaches, which the caller's count keeps alive, and leaves the parameter's own slot as it was.
+private add_root(out: &NameSink, place: TExpr) -> unit = *place.kind match
     TLoad(name, _) -> out.add(name)
     TField(r, _, _) -> add_root(out, r)
-    TIndex(r, _, _) -> add_root(out, r)
+    TIndex(r, _, _) -> underlying(texpr_type(r)) match
+        Array(_, _) -> add_root(out, r)
+        _ -> ()
     TLane(r, _, _) -> add_root(out, r)
     _ -> ()
 

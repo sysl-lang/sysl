@@ -74,6 +74,11 @@ struct Emit
     // the block can be reached at all.
     reached: Buf[string]
 
+    // Where each label stands in `reached`, so asking costs one lookup rather than a walk of every
+    // label the function has named. An entry is believed only while `reached` still holds that label
+    // at that position, which is what lets a rewind truncate `reached` alone.
+    reached_at: Map[string, usize]
+
     // The enclosing loops, innermost last, so a `break`/`continue` knows where to jump and what
     // result slot to store into.
     loops: Buf[GenLoop]
@@ -179,6 +184,11 @@ struct Emit
     declared: Set[string]
     relaid: Buf[(string, string)]
 
+    // The locals of an async body that live in its promise, so in the frame (`emit_async.sysl`'s
+    // `frame_locals`): each one's slot is named once, after `llvm.coro.begin`, and no other
+    // declaration may name it again.
+    frame_slots: Set[string]
+
     // The names whose array lives in a buffer rather than a slot, because a view of it gets out of
     // this frame, and the box each of those buffers is. The **temporaries** are whole-program rather
     // than per-function, since a span already says which body a node is in.
@@ -235,6 +245,11 @@ struct Emit
     src: Option[Source]
     bounds_fails: bool
     locs: Buf[string]
+    locs_at: Map[string, usize]
+
+    // The table of an enum's variant names a failed `x.(c)` reads the held one from, by the enum's
+    // LLVM type: one per enum in the module, however many sites read it (`bounds_fail.sysl`).
+    variant_names: Map[string, string]
 
     // The boundary each named LLVM type holding a raised `@align(n)` is stored on, by its name: a
     // stack slot is created from an LLVM type, and this is how it states the boundary
@@ -265,6 +280,21 @@ struct Emit
     // What each body can do to memory it does not own, and the functions found unable to change a
     // value of each type a call has asked about (`borrowing.sysl`'s `untouched_by`).
     untouched: Untouched
+
+    // The async functions: a temporary handed to one moves into the task's frame, which keeps a count
+    // of every parameter, so the caller gives its own back as soon as the call returns.
+    asyncs: Set[string]
+
+    // What the body being lowered has proved about its unsigned adds (`nowrap.sysl`).
+    nowrap: NoWrap
+
+    // Every named LLVM type of the program by its printed name: its size, its boundary and its
+    // members (`emit_large.sysl`, which copies a large one as bytes).
+    shapes: Map[string, TypeShape]
+
+    // The array literals the body being lowered lays in its frame rather than in a buffer of their
+    // own, which the escape analysis settled (`Promotions.framed_for`).
+    framed_lits: Buf[Span]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -414,13 +444,14 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
 
     Emit(t, memo_layout_for(t), int(t.pointer_bits()), globals, 0, 0, sat_decls, false, false, false,
          false, false, false, false, 0,
-         prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
+         prologue, blocks, current, None, "entry", 0, 0, false, reached, map(), loops, scratch, symbols,
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
+         defer_marks, set(), relaid, set(), promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
-         None, false, buf(), map(), set(), buf(), set(), set(), set(), false, untouched_none())
+         None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
+         no_wrap_none(), map(), buf())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -445,6 +476,7 @@ has_gap(e: *Emit) -> bool = e.gap.is_some()
 
 // Resets everything that is one function's, which is everything but the module-level lists.
 start_function(e: *Emit)
+    e.nowrap = no_wrap_none()
     e.src = None
     e.prologue.clear()
     e.blocks.clear()
@@ -455,6 +487,7 @@ start_function(e: *Emit)
     e.label = 0
     e.terminated = false
     e.reached.clear()
+    e.reached_at.clear()
     e.loops.clear()
     e.scratch.clear()
     e.ensures.clear()
@@ -472,6 +505,7 @@ start_function(e: *Emit)
     e.defers.clear()
     e.defer_marks.clear()
     e.declared.clear()
+    e.frame_slots.clear()
     e.relaid.clear()
     e.promoted_boxes.clear()
     e.ref_places.clear()
@@ -600,7 +634,11 @@ memcpy_symbol() -> string = llvm_memcpy_entry().at([LPtr, LPtr, LInt(64)])
 // The one call in the module the intrinsic is declared for, so the flag that declares it is set here
 // rather than at each site that copies -- a caller that stops copying stops declaring it, and one
 // that starts brings the declaration with it.
-emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int)
+emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int) =
+    emit(e, memcpy_inst(e, dst, src, bytes, align))
+
+// The copy itself, for a pass that places it rather than emitting it where the body is.
+memcpy_inst(e: *Emit, dst: Val, src: Val, bytes: int, align: int) -> Inst
     e.uses_memcpy = true
 
     var args: Buf[IrArg] = buf()
@@ -613,9 +651,8 @@ emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int)
     args.push(IrArg(LPtr, src, src_attrs))
     args.push(ir_arg(LInt(64), VInt(from_int(long(bytes)))))
     args.push(ir_arg(LInt(1), VBool(false)))
-    emit(e, InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None,
-                   no_fast_math(), false))
-end emit_memcpy
+    InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None, no_fast_math(), false)
+end memcpy_inst
 
 // Emits a block terminator, marks the block closed, and records wherever it sends control -- which
 // is what makes the labels it names reachable.
@@ -638,18 +675,14 @@ emit_term(e: *Emit, i: Inst)
 end emit_term
 
 private mark_reached(e: *Emit, l: string)
-    for item in e.reached
-        if item == l then return
+    if is_reached(e, l) then return
 
+    e.reached_at.put(l, e.reached.len())
     e.reached.push(l)
-end mark_reached
 
-private is_reached(e: *Emit, l: string) -> bool
-    for item in e.reached
-        if item == l then return true
-
-    false
-end is_reached
+private is_reached(e: *Emit, l: string) -> bool = e.reached_at.get(l) match
+    Some(i) -> i < e.reached.len() && e.reached[i] == l
+    None -> false
 
 // Opens a block under `l`.
 //
@@ -704,7 +737,9 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
         else
             out.push(b)
 
-    IrFunc(sig, out)
+    // The pairs are cancelled while every value is still a register, and only then is a large one
+    // turned into the bytes it is copied as.
+    IrFunc(sig, lower_large_values(e, elide_arc_pairs(out, e.inert)))
 end finish_func
 
 // -- the constants a body folds against ------------------------------------------------------------

@@ -1,0 +1,342 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `@pinned` on a struct: a value C holds pointers into, so once it is built it is never copied or
+// moved (`reference/attributes.md § @pinned on a struct`).
+//
+// **The rule is about a value whose address may have been taken.** A value that has just been built
+// -- a construction, a zero, a call that answers one -- has no address yet, so it may land anywhere
+// once: in a binding, in module storage, in a `&T` box, in a field of another pinned value, or as
+// what a function hands back. After it has landed, the only ways at it are through it: a field, an
+// address, a method taking `*self` or `&self`. Anything else that reads it whole is a copy.
+//
+// **Pinned-ness is not inferred.** A type holding a pinned value by value moves it whenever it moves
+// itself, so it is marked `@pinned` too -- the mark is the reader's notice that the type has an
+// address that matters -- and an unmarked holder is refused where it is laid out.
+
+// Whether a value of this type is pinned: a `@pinned` struct, or an array of them.
+pinned_type(a: &Analysis, t: Type) -> bool = t match
+    Struct(d) -> pinned_base(a, d.base)
+    Array(_, elem) -> pinned_type(a, *elem)
+    Volatile(inner) -> pinned_type(a, *inner)
+    _ -> false
+
+// Whether the struct filed under this key was declared `@pinned`.
+pinned_base(a: &Analysis, base: string) -> bool
+    val decl = a.tables.types.get(base)
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        StructOf(d) -> d.pinned
+        _ -> false
+end pinned_base
+
+// The one sentence every refusal is made of: what the type is, what this does to it, and what to
+// write instead.
+pinned_refusal(held: string, how: string, instead: string) -> string =
+    s"'$held' is '@pinned' — C may hold pointers into a value of it, so a value is never copied or " +
+    s"moved once it is built, and this $how. $instead"
+
+// -- where a type is laid out ---------------------------------------------------------------------
+
+// A struct holding a pinned value by value moves it whenever the struct moves, so it is pinned too and
+// says so. A container whose members move its elements (`@relocates`, as `Buf.push` growing) cannot
+// hold one at all.
+check_pinned_holder(a: &Analysis, scope: Scope, span: Span, d: StructDecl, made: &StructType)
+    for t in made.targs
+        if pinned_type(a, t) && relocates_elements(d)
+            a.fault(scope, span, pinned_refusal(type_show(t), s"makes it an element of " +
+                    s"'${type_show(Struct(made))}', whose storage moves when it grows",
+                    s"Hold '&${type_show(t)}' elements instead, or an array the program never moves"))
+            return
+        end if
+
+    if d.pinned then return
+
+    for f in made.fields
+        if pinned_type(a, f.1)
+            a.fault(scope, span, pinned_refusal(type_show(f.1), s"holds it by value in field " +
+                    s"'${f.0}' of '${type_show(Struct(made))}', which moves it whenever it moves",
+                    s"Mark '${d.name}' '@pinned' too, or hold a '&${type_show(f.1)}' or a " +
+                    s"'*${type_show(f.1)}'"))
+            return
+        end if
+end check_pinned_holder
+
+private relocates_elements(d: StructDecl) -> bool
+    for m in d.members
+        if m.marks.relocates then return true
+
+    false
+end relocates_elements
+
+// An enum is never pinned, so a variant carrying a pinned value by value would move it with every
+// move of the enum.
+check_pinned_payloads(a: &Analysis, scope: Scope, span: Span, made: &EnumType)
+    for v in made.variants
+        for f in v.fields
+            if pinned_type(a, f.1)
+                a.fault(scope, span, pinned_refusal(type_show(f.1), s"carries it by value in " +
+                        s"variant '${v.name}' of '${type_show(Enum(made))}', which moves it whenever " +
+                        "the enum moves", s"Carry a '&${type_show(f.1)}' or a '*${type_show(f.1)}' instead"))
+                return
+            end if
+end check_pinned_payloads
+
+// -- what a body does with a pinned value -----------------------------------------------------------
+
+// What the parent of a pinned expression said about it, found again by where it was written and
+// which form it is. `how` is empty where the parent may take it, and otherwise says what the parent
+// would do with the copy; `instead` is what to write.
+struct PinMark
+    start: usize
+    end: usize
+    tag: int
+    how: string
+    instead: string
+    used: bool
+end PinMark
+
+struct PinWalk
+    a: &Analysis
+    scope: Scope
+    instance: string
+    marks: Buf[PinMark]
+end PinWalk
+
+// Every function the program reaches and every piece of module storage, held to the rule. A generic
+// instantiated at a pinned type is held to it as an instance, the same way a generic's `@no_alloc` is:
+// its refusals name the instance.
+check_pinned(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
+    if !any_pinned(a) then return
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+        val origin = a.tables.members.func_origin.get(f.name)
+        val instance = if origin.is_some() then s" (instance '${qualified_name(f.name)}')" else ""
+        val st: &PinWalk = PinWalk(a, func_home(a, f.name), instance, buf())
+
+        check_pinned_params(st, f)
+        walk_stmts(f.body.stmts, pin_walk(st))
+
+        if f.body.result.is_some()
+            landing(st, f.body.result.unwrap(), "returns it by value",
+                    "Return a value built in place, or a '&T' box of it")
+            walk_texpr(f.body.result.unwrap(), pin_walk(st))
+        end if
+
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        if v.init.is_none() then continue
+
+        val st: &PinWalk = PinWalk(a, val_home(a, v.symbol), "", buf())
+
+        landing(st, v.init.unwrap(), "copies it into module storage",
+                "Build the value in place with a constructor, or take its address")
+        walk_texpr(v.init.unwrap(), pin_walk(st))
+end check_pinned
+
+private any_pinned(a: &Analysis) -> bool
+    for i in 0..<a.tables.types.len()
+        a.tables.types.at(i).kind match
+            StructOf(d) -> if d.pinned then return true
+            _ -> ()
+
+    false
+end any_pinned
+
+// A parameter is a copy the callee owns. `drop` is let through: it is handed the value as it is
+// destroyed, after which nothing is left for a pointer to point at.
+private check_pinned_params(st: &PinWalk, f: TFunc)
+    if module_bare(f.name) == "drop" || f.name.ends_with(".drop") then return
+
+    for p in f.params
+        if !pinned_type(st.a, p.1) then continue
+
+        val held = type_show(p.1)
+        val name = qualified_name(f.name)
+
+        // An instance's own name already says which instance it is.
+        if p.0 == "self"
+            st.a.fault(st.scope, f.span, pinned_refusal(held, s"receiver of '$name' is taken as " +
+                       "'(self)', which is a copy", "Take '(*self)' instead, which reaches the value " +
+                       "where it is"))
+        else
+            st.a.fault(st.scope, f.span, pinned_refusal(held, s"parameter '${p.0}' of '$name' " +
+                       "takes it by value", s"Take a '*$held' or a '&$held' instead"))
+end check_pinned_params
+
+private pin_walk(st: &PinWalk) -> &TWalk =
+    TWalk(false, e -> pin_expr(st, e), w -> pin_write(st, w), s -> pin_stmt(st, s))
+
+// Which form an expression is, as far as finding its mark again needs: two nodes written over one
+// span are never the same form here.
+private pin_tag(e: TExpr) -> int = *e.kind match
+    TLoad(_, _) -> 1
+    TGlobal(_, _, _) -> 2
+    TDeref(_, _) -> 3
+    TField(_, _, _) -> 4
+    TIndex(_, _, _) -> 5
+    TStructNew(_, _) -> 6
+    TZero(_) -> 7
+    TStructInvCheck(_, _, _) -> 8
+    TArrayLit(_, _) -> 9
+    TArrayFill(_, _) -> 10
+    TCall(_, _, _, _) -> 11
+    TVCall(_, _, _, _, _) -> 12
+    TCallPtr(_, _, _, _) -> 13
+    _ -> 0
+
+// A value with no address yet: one being built, or one a call answers.
+private fresh(e: TExpr) -> bool = pin_tag(e) >= 6
+
+private mark(st: &PinWalk, e: TExpr, how: string, instead: string)
+    if pinned_type(st.a, texpr_type(e))
+        st.marks.push(PinMark(e.span.start, e.span.end, pin_tag(e), how, instead, false))
+end mark
+
+// A place the parent reaches through, without reading it whole.
+private allow(st: &PinWalk, e: TExpr)
+    mark(st, e, "", "")
+
+// A value the parent stores somewhere: a new one lands, and a placed one would be copied.
+private landing(st: &PinWalk, e: TExpr, how: string, instead: string)
+    if fresh(e) then allow(st, e) else refuse(st, e, how, instead)
+
+private refuse(st: &PinWalk, e: TExpr, how: string, instead: string)
+    mark(st, e, how + st.instance, instead)
+
+private pin_stmt(st: &PinWalk, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) ->
+            if name.starts_with("$parts")
+                landing(st, init, "takes it apart, which reads it whole into a copy first",
+                        "Read the fields through it instead")
+            else
+                landing(st, init, s"binds a copy of it", "Take its address ('&') or name it " +
+                        "with a 'ref' instead, or build the value in place")
+        TExprStmt(e) -> allow(st, e)
+        TRefDecl(_, _, place) -> allow(st, place)
+        TReturn(value) ->
+            if value.is_some()
+                landing(st, value.unwrap(), "returns it by value",
+                        "Return a value built in place, or a '&T' box of it")
+        TBreak(value, _) ->
+            if value.is_some()
+                refuse(st, value.unwrap(), "hands it out of a loop by value",
+                       "Take its address instead")
+        TBecome(call) -> allow(st, call)
+        _ -> ()
+end pin_stmt
+
+private pin_write(st: &PinWalk, w: TWrite)
+    allow(st, w.place)
+    assigned(st, w.value)
+end pin_write
+
+// **An assignment is refused whatever it assigns.** A placed value would be copied; a new one would
+// land over a value that is already built, which C may still hold pointers into. A pinned value is
+// built once, where it lives, and changed afterwards through its own members.
+private assigned(st: &PinWalk, value: TExpr)
+    if fresh(value)
+        refuse(st, value, "assigns over a value already built, which C may still hold pointers into",
+               "Build it once where it lives, and change it through its members")
+    else
+        refuse(st, value, "assigns a copy of it", "Take its address ('&') instead")
+end assigned
+
+// The expression itself answers to what its parent said about it, then says what it does with each
+// pinned part.
+private pin_expr(st: &PinWalk, e: TExpr)
+    if pinned_type(st.a, texpr_type(e)) then judge(st, e)
+
+    *e.kind match
+        TField(receiver, _, _) -> allow(st, receiver)
+        TAddrOf(place, _) -> allow(st, place)
+        TTempAddr(value, _) -> allow(st, value)
+        TIndex(receiver, _, _) -> allow(st, receiver)
+        TLen(receiver, _) -> allow(st, receiver)
+        TStructInvCheck(value, _, _) -> allow(st, value)
+        TRecheck(after, recv, _, _) ->
+            allow(st, after)
+            allow(st, recv)
+        TStore(place, value, _, _) ->
+            allow(st, place)
+            assigned(st, value)
+        TBox(value, _) ->
+            landing(st, value, "copies it into a new box", "Box it where it is built ('&T' from a " +
+                    "constructor), or take its address")
+        TStructNew(decl, args) ->
+            for arg in args
+                if pinned_base(st.a, decl.base)
+                    landing(st, arg, "copies it into a field", "Build the field's value in place")
+                else if is_tuple(decl)
+                    refuse(st, arg, "puts it in a tuple, which moves it whenever the tuple moves",
+                           "Put a '*T' or a '&T' to it in the tuple instead")
+                else
+                    allow(st, arg)
+        TEnumNew(_, _, args) ->
+            for arg in args
+                allow(st, arg)
+        TArrayLit(elems, _) ->
+            for item in elems
+                landing(st, item, "copies it into an array", "Build each element in place")
+        TArrayFill(value, _) ->
+            landing(st, value, "copies it into an array", "Build each element in place")
+        TCall(_, args, _, _) -> passed(st, args)
+        TCallPtr(_, args, _, _) -> passed(st, args)
+        TVCall(_, _, args, _, _) -> passed(st, args)
+        TMatch(scrutinee, _, _) -> matched(st, scrutinee)
+        TIf(cond, _, _, _) -> matched_terms(st, cond)
+        TWhile(cond, _, _, _) -> matched_terms(st, cond)
+        TForEach(_, elem_ty, seq, _, _, _) ->
+            allow(st, seq)
+
+            if pinned_type(st.a, elem_ty)
+                st.a.fault(st.scope, e.span, pinned_refusal(type_show(elem_ty),
+                           s"copies each element into the loop variable${st.instance}",
+                           "Loop over the indices and reach each element where it is"))
+        _ -> ()
+end pin_expr
+
+private passed(st: &PinWalk, args: Buf[TExpr])
+    for arg in args
+        refuse(st, arg, "passes it by value", "Pass its address ('&') to a '*T' parameter instead")
+
+private matched(st: &PinWalk, subject: TExpr) =
+    refuse(st, subject, "matches on it, which reads it whole into a copy first",
+           "Match on its fields instead")
+
+private matched_terms(st: &PinWalk, cond: Buf[TCondTerm])
+    for item in cond
+        item match
+            TCondIs(subject, _, _) -> matched(st, subject)
+            _ -> ()
+end matched_terms
+
+// What the parent said about this expression, which is taken off the list as it is answered.
+private judge(st: &PinWalk, e: TExpr)
+    val tag = pin_tag(e)
+
+    for i in 0..<st.marks.len()
+        val m = st.marks.at(i)
+
+        if !m.used && m.start == e.span.start && m.end == e.span.end && m.tag == tag
+            st.marks.set(i, PinMark(m.start, m.end, m.tag, m.how, m.instead, true))
+
+            if m.how != ""
+                st.a.fault(st.scope, e.span, pinned_refusal(type_show(texpr_type(e)), m.how,
+                                                            m.instead))
+
+            return
+        end if
+
+    st.a.fault(st.scope, e.span, pinned_refusal(type_show(texpr_type(e)),
+               s"reads it whole, which is a copy${st.instance}",
+               "Reach it through a field, its address, or a method taking '*self'"))
+end judge

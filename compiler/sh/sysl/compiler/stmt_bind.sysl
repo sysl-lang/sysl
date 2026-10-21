@@ -84,6 +84,15 @@ private yields_results(t: TExpr) -> bool = *t.kind match
 // `=`. Each arm is then checked by the rule its own operator already has.
 multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
                      values: Buf[Expr]) -> Buf[TStmt]
+    // A multiple assignment is a statement, and its places yield nothing for `:=` to hand on.
+    if is_yielding_assign(op)
+        var none: Buf[TStmt] = buf()
+
+        cx.fault(span, s"'$op' yields the value it stores, and an assignment to several places is a " +
+                 s"statement with no one value to yield — write '${plain_form(op)}'")
+        return none
+    end if
+
     val taken = spread(cx, targets.len(), values,
                        s"this assignment has ${targets.len()} places on the left")
 
@@ -121,7 +130,11 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
         val part = part_at(taken, i)
         val written = value_written(taken, targets, values, i)
 
-        writes.push(one_write(cx, op, targets.at(i), place, part, written))
+        val w = one_write(cx, op, targets.at(i), place, part, written)
+
+        if op == "=" then note_view_store(cx, span, place, w.value)
+
+        writes.push(w)
 
     var out: Buf[TStmt] = buf()
 
@@ -165,8 +178,13 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
     end if
 
     val bin = op[0..<op.bytes.len - 1]
-    val tv = arm_value_at(cx, part, written, scale_expectation(bin, texpr_type(place), written,
-                                                               update_expected(cx.an, bin, texpr_type(place))))
+    val want = scale_expectation(bin, texpr_type(place), written, update_expected(cx.an, bin, texpr_type(place)))
+    val read = arm_value_at(cx, part, written, want)
+    val tv = widened_operand(cx, written.span, bin, texpr_type(place), read,
+                             if part.is_none() then Some(written) else None)
+
+    if operand_refused(read, tv) then return TWrite(place, op, tv, None, arm_checks(cx, place), None)
+
     val dispatch = update_dispatch(cx, written.span, bin, place, tv)
 
     if dispatch.is_none()
@@ -257,6 +275,7 @@ multi_decl(cx: &Analyzer, span: Span, names: Buf[string], mutable: bool,
             val ty = texpr_type(tv)
             val u = if mutable then cx.bind(names.at(i), ty) else cx.bind_read_only(names.at(i), ty)
 
+            note_view_binding(cx, span, names.at(i), u, tv)
             out.push(TVarDecl(u, ty, tv, None))
         else
             out.push(TVarDecl(cx.bind(names.at(i), Unknown), Unknown, TExpr(span, TZero(Unknown)),
@@ -298,6 +317,8 @@ pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
     // of it. Reading the value expression again per part would run its side effects once each.
     val temp = cx.bind("$parts", held)
     var out: Buf[TStmt] = buf()
+
+    note_view_binding(cx, span, "$parts", temp, tv)
 
     out.push(TVarDecl(temp, held, tv, None))
     push_all(&out, bind_pattern(cx, span, pat, TExpr(value.span, TLoad(temp, held)), mutable))
@@ -343,6 +364,11 @@ pattern_names(out: *Buf[string], p: Pattern)
             for item in fields
                 pattern_names(out, item.pat)
 
+        // `Point(x, y)`, the positional form a struct is taken apart by.
+        VariantPattern(_, args) ->
+            for arg in args
+                pattern_names(out, arg)
+
         _ -> ()
 
 // One level of a pattern binding: bind a name, ignore a wildcard, or read the parts of a tuple and
@@ -371,6 +397,9 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
         // belongs at a binding for the reason a tuple pattern does.
         VariantPattern(written, args) ->
             underlying(texpr_type(subject)) match
+                Struct(d) if d.union_layout ->
+                    cx.fault(span, union_pattern_refusal(d))
+                    buf()
                 Struct(d) -> bind_positional(cx, span, written, args, subject, mutable, d)
                 // A `?` value was refused where it was made. Its names are not bound -- the
                 // reference reports a later use of one as undefined -- and nothing is said here.
@@ -412,6 +441,7 @@ private bind_name(cx: &Analyzer, n: string, subject: TExpr, mutable: bool) -> Bu
     val ty = texpr_type(subject)
     val u = if mutable then cx.bind(n, ty) else cx.bind_read_only(n, ty)
 
+    note_view_binding(cx, subject.span, n, u, subject)
     one(TVarDecl(u, ty, subject, None))
 end bind_name
 
@@ -459,6 +489,9 @@ private refused_parts(cx: &Analyzer, span: Span, args: Buf[Pattern], subject: TE
 private bind_fields(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPattern],
                     subject: TExpr, mutable: bool) -> Buf[TStmt]
     underlying(texpr_type(subject)) match
+        Struct(d) if d.union_layout ->
+            cx.fault(span, union_pattern_refusal(d))
+            buf()
         Struct(d) ->
             if !struct_named(cx, name, d)
                 cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")
@@ -524,13 +557,16 @@ private bind_positional(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
         return buf()
     end if
 
-    if args.len() != d.fields.len()
+    // An unnamed bitfield has no part to bind: a `_` stands in for it (`c_bitfields.sysl`).
+    val parts = with_unnamed_wild(d, args)
+
+    if parts.len() != d.fields.len()
         cx.fault(span, s"struct '${qualified_name(d.base)}' has " +
-                 s"${quantity(d.fields.len(), "field")}, but ${supplied(args.len(), "sub-pattern")}")
+                 s"${quantity(named_field_count(d), "field")}, but ${supplied(args.len(), "sub-pattern")}")
         return buf()
     end if
 
-    bind_parts(cx, span, args, subject, mutable, false)
+    bind_parts(cx, span, parts, subject, mutable, false)
 end bind_positional
 
 private struct_named(cx: &Analyzer, written: string, d: &StructType) -> bool

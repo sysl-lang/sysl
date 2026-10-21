@@ -20,6 +20,12 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val span = im.span
     val key = lookup_trait_key(a, scope, im.decl.trait_name)
 
+    if key.is_none() && im.decl.derived
+        a.fault(scope, span, s"unknown trait '${im.decl.trait_name}' — 'derives' names Eq, Ord, Hash " +
+                "or Display, or a trait in scope with a 'derive' body for its members")
+        return im
+    end if
+
     if key.is_none()
         a.fault(scope, span, s"unknown trait '${im.decl.trait_name}'")
         return im
@@ -27,6 +33,18 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
     val tr = trait_decl_at(a, key.unwrap()).unwrap()
     var block = im.decl
+
+    // A `derives` clause may name any trait that says how to write it -- which is what its `derive`
+    // members are. One without any is implemented by hand.
+    if block.derived && tr.derives.is_empty()
+        val simple = im.decl.trait_name
+
+        a.fault(scope, span, s"'$simple' is not a trait the compiler knows how to write, and it " +
+                "carries no 'derive' member — 'derives' names Eq, Ord, Hash or Display, or a trait " +
+                "with a 'derive' body for its members. A trait without one is implemented with an " +
+                "'impl' block")
+        return im
+    end if
 
     // `Self` is what a block is *for*, so it cannot be what the block names; it ends here, told
     // once, since reading on would resolve `Self` again and complain about the same word.
@@ -140,7 +158,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // A **closed** trait names a family rather than a promise, so there is nothing for a block to
     // supply: it declares no member, and an `impl` of it could only be a claim to belong to the
     // family.
-    if spelling.is_some() && core_closed(spelling.unwrap())
+    if spelling.is_some() && core_settled(spelling.unwrap())
         a.fault(scope, span, s"'${qualified_name(key.unwrap())}' names a family of types the compiler " +
                 "settles, so nothing implements it — a type is one of them or it is not, and " +
                 s"'${home.label}' is not")
@@ -263,6 +281,12 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // reachable only where the trait can be named, so two traits declaring one name for one type are
     // two members a use site tells apart. The block takes the next suffix nobody else is under.
     var nth = already.len() + (if provided then 2 else 1)
+
+    // **A `Debug` the compiler supplied steps aside from the type's own name**: where the type has a
+    // field, a variant or a member of its own called `debug`, the supplied member is filed as a
+    // second implementation's would be, so `o.debug` keeps meaning the type's own while `%?`,
+    // `debug(x)` and a `T: Debug` bound reach the supplied one through the trait.
+    if nth == 1 && supplied_aside(a, home, tr, block) then nth = 2
 
     while held_by_another(a, tr, home.key, key.unwrap(), call_trait, suffix_of(nth))
         nth += 1
@@ -432,6 +456,17 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             s"${home.symbol}.${item.name}${home.alt}",
             s"${key.unwrap()}.${item.name}")
 
+    // A member a `derives` clause wrote from a `derive` body is an inherited default with three
+    // differences (`derive_members.sysl`), recorded under the name the copy lowers to.
+    if block.derived
+        for item in inherited
+            val made = derive_for(tr, item.name)
+
+            if made.is_some() then
+                a.tables.members.derived.put(s"${home.symbol}.${item.name}${home.alt}",
+                                             DerivedCopy(made.unwrap().param, home.key, key.unwrap(),
+                                                         scope, span))
+
     // A member the trait does not declare is not one the type gains: the block was told it may not
     // define it, and a member filed anyway would have its body read and answer a call by its name.
     var supplied: Buf[MethodDecl] = buf()
@@ -440,7 +475,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         if trait_method(tr, item.name).is_none() then continue
 
         refuse_impl_defaults(a, scope, block.trait_name, item)
-        supplied.push(with_trait_defaults(tr, item))
+        supplied.push(with_trait_marks(tr, with_trait_defaults(tr, item)))
 
     for item in inherited
         supplied.push(item)
@@ -456,7 +491,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // edge short is a graph the reachability walk reads differently.
     if !supplied.is_empty() then depends_on_module(a, scope, StdModule, span)
 
-    val lowered = hoist_member_list(a, home, supplied)
+    val lowered = hoist_member_list(a, home, supplied, true)
 
     // Each `some` result becomes a job for the pass that runs once every declaration is in: a body
     // cannot be read until then, and the block has to be registered before that for the body to be
@@ -482,6 +517,67 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
     Impl(block, span, scope)
 end hoist_impl
+
+// **A block naming no trait adds members to a type, and it is the type's own module's to write.**
+// `impl[F: Float] Quaternion[F]` files its members exactly where the type's body files its own -- no
+// trait recorded, so they arrive wherever the type does -- which is also what makes a name the body
+// already used a duplicate, in either order. Its header binds the type's parameters as a trait
+// block's does, and a bound it adds is carried by each member it brings, so those members are asked
+// for only where the bound holds while the type's body is unchanged.
+//
+// **Another module may not**: a type's own members are part of what its declaration promises, and
+// a block elsewhere would make the type mean something different depending on what was linked.
+hoist_inherent(a: &Analysis, im: Impl)
+    val scope = im.scope
+    val span = im.span
+    val block = im.decl
+    val written = type_text(block.for_type)
+    val key = *block.for_type.kind match
+        NamedType(n, _) -> lookup_type_key(a, scope, n)
+        _ -> None
+    val nom = if key.is_some() then nominal_of(a, key.unwrap()) else None
+
+    if nom.is_none()
+        a.fault(scope, span, s"'$written' is not a struct or an enum, so an 'impl' naming no trait " +
+                s"has no members of its own to add to it — write 'impl Trait for $written' to " +
+                "implement a trait for it")
+        return
+    end if
+
+    val label = module_show(key.unwrap())
+
+    if module_of(key.unwrap()) != scope.module_name
+        a.fault(scope, span, s"'$label' ${declaring_whose(key.unwrap())}, and an 'impl' naming no " +
+                "trait adds members to a type only in a file of the module that declares it — " +
+                s"implement a trait for it here instead: 'impl Trait for $written'")
+        return
+    end if
+
+    if block.overrides
+        a.fault(scope, span, "'override' replaces a more general implementation of a trait, and " +
+                "this block names no trait — a type's own members have nothing to replace")
+        return
+    end if
+
+    if !block.assocs.is_empty()
+        a.fault(scope, block.assocs.at(0).span, "an associated type is what a block supplies for a " +
+                "trait, and this block names no trait")
+        return
+    end if
+
+    val asked = a.complaints()
+    val target = named_target(a, scope, span, block, block.for_type, key.unwrap(), nom.unwrap())
+
+    if a.complaints() > asked then return
+
+    record_impl_members_access(a, scope, key.unwrap(), written, block.methods)
+
+    val lowered = hoist_member_list(a, target.1, block.methods)
+
+    if !block.bounds.is_empty()
+        for fd in lowered
+            a.tables.members.block_bounds.put(fd.name, block.bounds)
+end hoist_inherent
 
 // Which associated type each `some` member settles, read off the **trait's** declaration of that
 // member. A member whose trait counterpart is not a projection has already been refused by
@@ -608,6 +704,24 @@ private held_by_another(a: &Analysis, tr: TraitDecl, owner: string, trait_key: s
 
     false
 end held_by_another
+
+// Whether a block is a supplied `Debug` whose member's name the type already uses for something of
+// its own. A `Debug` somebody wrote is never moved aside: it collides as any trait's member does.
+//
+// The supplied block is written empty and marked `derived`, so what it will hold is the trait's
+// `derive` members -- the library's, which carry the supplied specifier.
+private supplied_aside(a: &Analysis, home: MemberHome, tr: TraitDecl, block: ImplDecl) -> bool
+    if !block.derived then return false
+
+    for d in tr.derives
+        val m = d.member
+
+        if supplied_debug(m.params) && (holds_string(home.taken, m.name) ||
+                                         has_member_at(a, home.key, m.name)) then
+            return true
+
+    false
+end supplied_aside
 
 // The subject as the block wrote it, for a message that names it.
 private written_subject(block: ImplDecl) -> string = type_text(block.for_type)
@@ -748,7 +862,7 @@ private defaults_mention_self(tr: TraitDecl) -> bool
 end defaults_mention_self
 
 // `a Box`, `an Option` -- the label read with its article.
-private a_or_an(label: string) -> string
+a_or_an(label: string) -> string
     if label.bytes.len == 0 then return label
 
     val c = label.bytes[0]
@@ -818,14 +932,12 @@ impl_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> (Type, M
             if nom.is_some() then return named_target(a, scope, span, block, block.for_type,
                                                       key.unwrap(), nom.unwrap())
 
-            // Both valueless types are named here rather than left to the resolution, which takes
-            // either as a type like any other -- true, and beside the point when what the block
-            // asks is whether the type can behave.
+            // The valueless type is named here rather than left to the resolution, which takes it as
+            // a type like any other -- true, and beside the point when what the block asks is whether
+            // the type can behave. `unit` is not refused: its one value still compares, hashes and
+            // prints, which is what lets a `Result[unit, E]` do the same.
             if arg_refs.is_empty() && written == "never" then
                 a.fault(scope, span, "'never' has no values, so nothing can be implemented for it")
-            else if arg_refs.is_empty() && written == "unit" then
-                a.fault(scope, span, "'unit' has one value and no behaviour — a trait for it would " +
-                        "say nothing")
 
             structural_target(a, scope, span, block, block.for_type)
         _ -> structural_target(a, scope, span, block, block.for_type)
@@ -1376,6 +1488,20 @@ private with_trait_defaults(tr: TraitDecl, im: MethodDecl) -> MethodDecl
     out.params = ps
     out
 end with_trait_defaults
+
+// One of an `impl` block's methods, carrying the trait's `@views(self)`: the view a member the trait
+// marks answers is borrowed from its receiver whichever way the member is reached, so a call on the
+// type is held to it as one through an object is, and the body may hand back a view of `self`.
+private with_trait_marks(tr: TraitDecl, im: MethodDecl) -> MethodDecl
+    val tm = trait_method(tr, im.name)
+
+    if tm.is_none() || !tm.unwrap().marks.views || im.marks.views then return im
+
+    var out = im
+
+    out.marks.views = true
+    out
+end with_trait_marks
 
 // Where an `impl` may be written: only in the module that declares the trait, or in one that
 // declares a type the block names (`reference/traits.md § Where an impl may live`).

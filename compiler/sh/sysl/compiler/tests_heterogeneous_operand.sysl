@@ -322,7 +322,8 @@ hop_at_every_width_signed_and_not()
     if !hop_ready() then return
 
     assert_eq(hop_ran(raw"""
-        print(200u8 + 100u8)
+        val big = 200u8
+        print(big + 100u8)
         print(3u8 * 4u8)
         print(-7i16 / 2i16)
         print(7u16 / 2u16)
@@ -383,9 +384,95 @@ hop_so_comparing_two_types_is_still_a_mismatch()
 hop_the_wrong_right_hand_type_names_the_trait()
     if !hop_ready() then return
 
-    val e = hop_err(hop_complex() + "print(show(C(1.0, 2.0) * 2))\n")
+    val e = hop_err(hop_complex() + "val n: long = 2\nprint(show(C(1.0, 2.0) * n))\n")
 
-    assert(e.contains("'*' between C and int needs 'sysl.Mul[int]' — it implements 'sysl.Mul[real]'"), e)
+    assert(e.contains("'*' between C and long needs 'sysl.Mul[long]' — it implements 'sysl.Mul[real]'"), e)
+
+// `a * b` is `Mul::mul(a, b)`, so the right-hand operand widens to the implementation's argument
+// exactly as the method call's argument does.
+@test("an int on the right widens to the real the implementation takes")
+hop_an_int_operand_widens_to_the_implementations_real()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        val n = 2
+        print(show(C(1.0, 2.0) * n))
+        print(show(C(1.0, 2.0).mul(n)))
+        """), "2 4\n2 4\n")
+
+@test("and does beside a second implementation at the type's own argument")
+hop_an_int_operand_widens_beside_a_second_implementation()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        val n = 2
+        print(show(C(1.0, 2.0) * n))
+        print(show(C(1.0, 2.0) * C(0.0, 1.0)))
+        """), "2 4\n-2 1\n")
+
+@test("a compound assignment widens its value the same way")
+hop_a_compound_assignment_widens_its_value()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        val n = 2
+        var c = C(1.0, 2.0)
+        c *= n
+        print(show(c))
+        """), "2 4\n")
+
+@test("and so does the operator in a body bounded by the implementation's trait")
+hop_a_bounded_body_widens_its_operand()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        twice[T: Mul[real]](x: T, k: int) -> T = x * k
+        print(show(twice(C(1.0, 2.0), 3)))
+        """), "3 6\n")
+
+// The tag says which implementation ran: `short` widens to both `int` and `long`, and `int` is the
+// narrower.
+@test("among implementations the operand widens to, the narrowest is the one meant")
+hop_the_narrowest_widening_wins()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct Tag
+            v: int
+        impl Mul[int, string] for Tag
+            mul(self, k: int) -> string = "int"
+        impl Mul[long, string] for Tag
+            mul(self, k: long) -> string = "long"
+        val s: short = 2
+        val exact: long = 2
+        print(Tag(1) * s)
+        print(Tag(1) * exact)
+        """), "int\nlong\n")
+
+@test("two widenings neither of which is narrower leave the operator refused")
+hop_two_unordered_widenings_are_refused()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct Tag
+            v: int
+        impl Mul[long, string] for Tag
+            mul(self, k: long) -> string = "long"
+        impl Mul[real, string] for Tag
+            mul(self, k: real) -> string = "real"
+        val n = 2
+        print(Tag(1) * n)
+        """)
+
+    assert(e.contains("'*' between Tag and int comes from 2 implementations of one trait on Tag, and the " +
+                      "operands do not say which was meant — it implements 'sysl.Mul[long, string]' and " +
+                      "'sysl.Mul[real, string]'"), e)
+
+@test("an integer literal on the right is the real the implementation takes")
+hop_an_integer_literal_is_the_implementations_real()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + "print(show(C(1.0, 2.0) * 2))\n"), "2 4\n")
 
 @test("a type with no implementation at all keeps the plain diagnostic")
 hop_no_implementation_keeps_the_plain_diagnostic()
@@ -503,10 +590,17 @@ hop_and_the_other_bound_reaches_the_other()
 hop_a_call_whose_argument_names_neither_is_refused()
     if !hop_ready() then return
 
-    val e = hop_err(hop_both() + "print(show(C(1.0, 2.0).mul(2)))\n")
+    val e = hop_err(hop_both() + "val n: long = 2\nprint(show(C(1.0, 2.0).mul(n)))\n")
 
-    assert(e.contains("'mul' comes from 2 implementations of one trait on C, and none of them takes (int) — " +
+    assert(e.contains("'mul' comes from 2 implementations of one trait on C, and none of them takes (long) — " +
                       "write the argument at the type of the implementation that was meant"), e)
+
+// An integer literal can be a real and cannot be a C, so exactly one implementation takes it.
+@test("an integer literal argument reaches the one implementation that can read it")
+hop_an_integer_literal_reaches_the_one_implementation()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + "print(show(C(1.0, 2.0).mul(2)))\n"), "2 4\n")
 
 // ---- a bare literal beside a type parameter
 

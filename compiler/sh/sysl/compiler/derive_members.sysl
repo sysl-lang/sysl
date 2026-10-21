@@ -1,0 +1,459 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A trait's `derive` members (`docs/design/reflection.md` § 2, row 8): `derive[T] encode(self: T, …)`
+// is the body the trait writes for `encode` over any type whose `derives` clause names it.
+//
+// The clause becomes an empty `impl` block marked `derived` (`derived_units` below), and `hoist_impl`
+// supplies each member from the trait's `derive` body exactly as it supplies an inherited default --
+// read in the trait's file, under the trait's imports. Three things set the copy apart, and they are
+// what this file answers:
+//
+// - **`T` is the deriving type**: it is bound wherever `Self` is, so `T::Fields`, `f::Type` and
+//   `self.(f)` are read at that type's own make-up.
+// - **A refusal in the copy is told at the `derives`**: the trait's body is a template, so a field it
+//   cannot handle is the deriving type's problem, said where the type asked for it.
+// - **The copy may reach the type's private fields** (row 7): the type's author opted in by naming
+//   the trait.
+
+// The bindings a member's body or signature is read under, with the `derive` body's own name for the
+// deriving type added where the member was written from one -- standing for whatever `Self` does.
+with_derive_param(a: &Analysis, name: string, subst: Buf[Binding]) -> Buf[Binding]
+    val copy = a.tables.members.derived.get(name)
+
+    if copy.is_none() then return subst
+
+    val self_ty = bound_type(subst, "Self")
+
+    if self_ty.is_none() then return subst
+
+    val param = copy.unwrap().param
+
+    // Already bound by an outer reading of the same member.
+    for item in subst
+        if item.name == param && type_eq(item.ty, self_ty.unwrap()) then return subst
+
+    // **In FRONT**, since a substitution answers with the first binding of a name: the body is the
+    // trait's, and a generic type's own parameter of the same spelling (`struct Box[T] derives Json`)
+    // means nothing there.
+    var out: Buf[Binding] = buf()
+
+    out.push(Binding(param, self_ty.unwrap()))
+
+    for item in subst
+        out.push(item)
+
+    out
+end with_derive_param
+
+// Whether `written` is the `derive` body's own name for the deriving type, in the copy being read.
+// **It answers every type attribute the type does**, as `Self` does: the copy is checked once per
+// deriving type, with the name bound to that type, so there is no reading in which it stands for
+// a type not yet known.
+names_deriving_type(cx: &Analyzer, written: string) -> bool
+    val copy = cx.an.tables.members.derived.get(cx.decl_name)
+
+    copy.is_some() && copy.unwrap().param == written
+end names_deriving_type
+
+// Every refusal said since `before`, while the body of a member written from a `derive` body was
+// read, is moved to the word in the `derives` clause that asked for the member. The message is kept
+// -- a refusal made in one copy of a field walk already names the field.
+told_at_derives(a: &Analysis, name: string, before: usize)
+    val copy = a.tables.members.derived.get(name)
+
+    if copy.is_none() then return
+
+    val site = copy.unwrap()
+    val found = a.found
+
+    for i in before..<found.len()
+        val p = found.at(i)
+        val d = p.diag
+
+        found.set(i, Placed(site.scope.src, Diagnostic(d.severity, site.span, d.message, d.label, d.note),
+                            p.at_place))
+end told_at_derives
+
+// The scope of the `derives` clause a member was written for, or nothing for any other member.
+derived_home(a: &Analysis, name: string) -> Option[Scope] =
+    a.tables.members.derived.get(name).map(c -> c.scope)
+
+// Whether the body being read is a derivation the type `base` asked for, which may reach its private
+// fields through `v.(f)`.
+in_own_derivation(cx: &Analyzer, base: string) -> bool
+    val copy = cx.an.tables.members.derived.get(cx.decl_name)
+
+    copy.is_some() && copy.unwrap().subject == base
+end in_own_derivation
+
+// The key of the trait being derived, where the body being read is a derivation and that trait
+// declares a member `name`. **A call of that name in the copy means the trait's member and no
+// other** (`docs/design/reflection.md` § 3): the body was written as if `T: Json`, so `self.(f).encode(w)`
+// is `Json`'s `encode` asked of the field's type, exactly as a bound would make it in a generic body
+// -- never another trait's member of the same name that an `impl` happened to give the type.
+//
+// **A trait the derived one requires counts the same way**, and the key answered is the trait that
+// declares the member: a bound `T: Ord` reaches `Eq`'s `eq` where `Ord: Eq`, so a derivation of
+// such an `Ord` calling `eq` means `Eq`'s, asked of the field's type.
+derived_trait_key(cx: &Analyzer, name: string) -> Option[string]
+    val copy = cx.an.tables.members.derived.get(cx.decl_name)
+
+    if copy.is_none() then return None
+
+    for item in trait_members(cx.an, Bound(copy.unwrap().trait_key, buf()), buf())
+        if item.1.name == name then return Some(item.0.name)
+
+    None
+end derived_trait_key
+
+// The `derive` body a trait carries for one of its members.
+derive_for(tr: TraitDecl, name: string) -> Option[DeriveDecl]
+    for item in tr.derives
+        if item.member.name == name then return Some(item)
+
+    None
+end derive_for
+
+// -- the clause --------------------------------------------------------------------------------------
+//
+// `derives Eq, Ord, Hash, Display` -- the four implementations every tuple already has -- and
+// `derives Json`, any trait that carries `derive` members of its own. **Every name becomes an empty
+// block marked `derived`**, which `hoist_impl` fills from the trait's `derive` bodies or refuses where
+// the trait has none; the four carry theirs in the library.
+//
+// The four are the clause's own business in one respect: what is wrong with naming one of them for
+// an opaque struct, a union or a simple enum is said here, at the word in the clause, before any
+// body is read.
+//
+// **What is built is source**, and that is the whole design: a clause becomes the `impl` block a
+// reader could have written, hoisted and analyzed by the ordinary machinery, so nothing downstream
+// learns anything about deriving. A derived body that cannot be typed is reported against the block
+// it stands in, which is positioned at the word in the clause that asked for it.
+
+// The four the clause answers for itself where the declaration cannot have them
+// (`derives_problem`), in the order a diagnostic lists them.
+private derivable() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("Eq")
+    out.push("Ord")
+    out.push("Hash")
+    out.push("Display")
+    out
+end derivable
+
+// Every unit with the blocks its `derives` clauses ask for written out after the declarations that
+// asked, which is what the rest of the compiler reads.
+derived_units(a: &Analysis, units: Buf[Program]) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    for unit in units
+        val scope = scope_of_unit(a, unit)
+        var body: Buf[Stmt] = buf()
+        var grew = false
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            body.push(s)
+
+            val made = derived_blocks(a, scope, s)
+
+            for k in 0..<made.len()
+                body.push(made.at(k))
+                grew = true
+
+        if !grew then out.push(unit)
+        else out.push(Program(body, unit.module_name, unit.capabilities, unit.links, unit.src,
+                              unit.test_only, unit.includes, unit.docs, unit.pkg))
+
+    out
+end derived_units
+
+// The blocks one declaration's clause asks for, in the order the clause wrote them, with everything
+// the clause got wrong reported at the word that is wrong.
+private derived_blocks(a: &Analysis, scope: Scope, s: Stmt) -> Buf[Stmt]
+    val clause = derives_clause(s)
+
+    if clause.is_empty() then return buf()
+
+    var out: Buf[Stmt] = buf()
+    var seen: Buf[string] = buf()
+
+    for i in 0..<clause.len()
+        val entry = clause.at(i)
+        val simple = last_dotted(entry.name)
+        val wrong = derives_problem(entry, simple, s)
+
+        if wrong.is_some() then a.fault(scope, entry.span, wrong.unwrap())
+        else if holds_string(seen, simple)
+            // Two entries naming one trait mean the reader believes something is happening twice.
+            a.fault(scope, entry.span, s"'$simple' is named twice in this 'derives' clause, and " +
+                    "one implementation is written either way — remove the second")
+        else
+            seen.push(simple)
+            out.push(derived_block(entry.span, entry.name, s))
+
+    out
+end derived_blocks
+
+// The clause as written, or nothing where the declaration has none.
+private derives_clause(s: Stmt) -> Buf[BoundRef] = *s.kind match
+    StructDecl(d) -> d.deriving
+    EnumDecl(d) -> d.deriving
+    _ -> buf()
+
+// What is wrong with one entry of a clause, or nothing where nothing is.
+//
+// It is separate from the expansion because the two answer at different moments -- every entry is
+// reported on and only the sound ones become blocks -- and because a refusal here is about the
+// **clause**, where every other refusal a derived block can raise is about the body it wrote.
+private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[string]
+    if !entry.args.is_empty() then
+        return Some(s"'${entry.name}' writes trait arguments, and a derived implementation takes " +
+                    "none — a derivation is written over a type's own fields, and there is nothing " +
+                    "for an argument to vary")
+
+    // **`Debug` is every type's already** (`debug_units` below), so the clause does not take it: the
+    // one a type is given is the library's `derive` body, and one of the type's own is an `impl`.
+    if simple == "Debug" then
+        return Some(s"'${entry.name}' is not a trait the compiler knows how to write, and it " +
+                    "carries no 'derive' member — 'derives' names Eq, Ord, Hash or Display, or a " +
+                    "trait with a 'derive' body for its members. A trait without one is implemented " +
+                    "with an 'impl' block")
+
+    // **A trait of the program's or a library's is the trait's own business**: whether it carries a
+    // `derive` body, and what that body makes of an opaque struct or a union, is asked where the
+    // trait is known (`hoist_impl.sysl`) and in the body (`T::Kind`).
+    if !holds_string(derivable(), simple) then return None
+
+    // An **opaque** struct with no fields is C's incomplete type: the storage belongs to whoever
+    // allocated it and nothing here knows its shape. Derived over no fields at all, `Eq` answers
+    // true for every pair and `Display` renders every value the same -- a wrong answer with nothing
+    // to warn the reader.
+    *s.kind match
+        StructDecl(d) ->
+            if d.opaque && d.fields.is_empty() then
+                return Some("this type is opaque and declares no fields, so a derived " +
+                            "implementation would have nothing to walk — every value would compare " +
+                            "equal and render the same. An opaque handle is reached as a pointer; " +
+                            "write an 'impl' block where one genuinely needs a trait")
+
+            // A derived implementation walks every field, and a union holds one of them -- which,
+            // nothing records. Its bytes are not its value either: `+0.0` and `-0.0` differ in them,
+            // and so do the bytes past a short field.
+            if d.union_layout then
+                return Some(s"a union has no tag to say which field it holds, so a derived " +
+                            s"'$simple' would read fields that are not there — write an 'impl' block " +
+                            "that reads the field you know is there")
+        _ -> ()
+
+    // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
+    // discriminant and there is one thing equality could mean. A derived block for one would be
+    // refused by that same rule, with a sentence telling the reader to delete a block they did not
+    // write.
+    if simple == "Eq"
+        *s.kind match
+            EnumDecl(d) ->
+                if simple_sum(d.variants) then
+                    return Some("a simple enum is already 'Eq' — no variant of it carries " +
+                                "anything, so its value is its discriminant and '==' is that " +
+                                "comparison. Remove 'Eq' from the 'derives' clause; the other " +
+                                "three are still worth deriving")
+            _ -> ()
+
+    None
+end derives_problem
+
+// Whether no variant carries anything, which is what makes the value its own discriminant.
+private simple_sum(vs: Buf[EnumVariantDecl]) -> bool
+    for item in vs
+        if !item.fields.is_empty() then return false
+
+    true
+end simple_sum
+
+// The bare name of a possibly-qualified trait.
+private last_dotted(name: string) -> string
+    val at = last_dot_in(name)
+
+    if at.is_none() then return name
+
+    name[(at.unwrap() + 1)..<name.bytes.len]
+end last_dotted
+
+// The empty block, marked `derived`, that names `trait_name` for the type `s` declares -- which
+// `hoist_impl` supplies from the trait's `derive` members, read in the trait's file with the trait's
+// `T` standing for this type.
+//
+// **A generic type derives conditionally**: every *type* parameter gains the derived trait as a bound,
+// so a `Box[int]` is `Eq` and a `Box[Unequatable]` is not, and neither needs saying. A value parameter
+// gains nothing -- it is not a type and has no membership to ask for. The type's own bounds come along
+// because the subject does not resolve without them.
+private derived_block(at: Span, trait_name: string, s: Stmt) -> Stmt
+    val tparams = declared_tparams(s)
+    val tvalues = declared_tvalues(s)
+    var bounds: Buf[NamedBounds] = buf()
+
+    for item in declared_bounds(s)
+        bounds.push(item)
+
+    for tparam in tparams
+        if !has_binding(tvalues, tparam)
+            var bs: Buf[BoundRef] = buf()
+
+            bs.push(BoundRef(at, trait_name, buf()))
+            bounds.push(NamedBounds(tparam, bs))
+
+    var targs: Buf[TypeRef] = buf()
+
+    for tparam in tparams
+        targs.push(TypeRef(at, NamedType(tparam, buf())))
+
+    val subject = TypeRef(at, NamedType(declared_name(s), targs))
+
+    stmt(at, ImplDecl(ImplDecl(trait_name, subject, buf(), tparams, bounds, buf(), buf(), false, tvalues,
+                               buf(), buf(), true)))
+end derived_block
+
+private declared_name(s: Stmt) -> string = *s.kind match
+    StructDecl(d) -> d.name
+    EnumDecl(d) -> d.name
+    _ -> ""
+
+private declared_tparams(s: Stmt) -> Buf[string] = *s.kind match
+    StructDecl(d) -> d.tparams
+    EnumDecl(d) -> d.tparams
+    _ -> buf()
+
+private declared_bounds(s: Stmt) -> Buf[NamedBounds] = *s.kind match
+    StructDecl(d) -> d.bounds
+    EnumDecl(d) -> d.bounds
+    _ -> buf()
+
+private declared_tvalues(s: Stmt) -> Buf[TypeBinding] = *s.kind match
+    StructDecl(d) -> d.tvalues
+    EnumDecl(d) -> d.tvalues
+    _ -> buf()
+
+// -- Debug, which every type has --------------------------------------------------------------------
+//
+// **Every struct and enum gets a `Debug` its compilation did not write**, so every value can be shown:
+// `Point(x: 1, y: 2)`, `Shape.Circle(r: 3.0)`, `Color.Red`. It is the move a `derives` clause makes --
+// an empty block marked `derived`, filled from the library's `derive` body for `Debug` -- made for
+// every type rather than on request, and each type parameter gains `Debug` as a bound, so a `Box[T]`
+// shows its `T` through the `T`'s own. A block the program wrote itself is the override, and the type
+// then gets none from here.
+//
+// The block names the trait by its path (`sysl.Debug`), so a program with a `Debug` of its own still
+// gets the library's.
+
+// The units with every struct and enum's supplied `Debug` written in after it, where the library
+// declares the trait at all -- a compilation given no standard module gets nothing.
+debug_units(units: Buf[Program]) -> Buf[Program]
+    if !declares_debug(units) then return units
+
+    val written = written_debug(units)
+    var out: Buf[Program] = buf()
+
+    for unit in units
+        val home = module_of_unit(unit)
+        var body: Buf[Stmt] = buf()
+        var grew = false
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            body.push(s)
+
+            val name = declared_name(s)
+
+            if name.bytes.len > 0 && !opaque_decl(s) && !holds_string(written, s"$home.$name")
+                body.push(derived_block(s.span, "sysl.Debug", s))
+
+                for item in anonymous_debug_blocks(s)
+                    body.push(item)
+
+                grew = true
+
+        if !grew then out.push(unit)
+        else out.push(Program(body, unit.module_name, unit.capabilities, unit.links, unit.src,
+                              unit.test_only, unit.includes, unit.docs, unit.pkg))
+
+    out
+end debug_units
+
+// **An opaque struct gets none**: its layout is its module's alone, and a rendering is reached from
+// wherever the value is printed. It is held through a pointer, which shows its address.
+private opaque_decl(s: Stmt) -> bool = *s.kind match
+    StructDecl(d) -> d.opaque
+    _ -> false
+
+private declares_debug(units: Buf[Program]) -> bool
+    for unit in units
+        if module_of_unit(unit) == AutoImportedModule
+            for s in unit.body
+                *s.kind match
+                    TraitDecl(d) -> if d.name == "Debug" then return true
+                    _ -> ()
+
+    false
+end declares_debug
+
+// The types an `impl Debug` was written for, each as `module.Name`: a block for a type lives in the
+// type's own module, so the module the block is in is the type's.
+private written_debug(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for unit in units
+        val home = module_of_unit(unit)
+
+        for s in unit.body
+            *s.kind match
+                ImplDecl(d) ->
+                    if last_dotted(d.trait_name) == "Debug"
+                        *d.for_type.kind match
+                            NamedType(n, _) -> out.push(s"$home.${last_dotted(n)}")
+                            _ -> ()
+                _ -> ()
+
+    out
+end written_debug
+
+// The blocks for the anonymous members a struct or union declares, at every level. Each is a type of
+// its own (`anonymous.sysl`), shown as the word that opened it -- which is what its `T::BaseName`
+// answers -- with no label in front, since its fields are the enclosing type's.
+private anonymous_debug_blocks(s: Stmt) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    *s.kind match
+        StructDecl(d) ->
+            for inner in d.anon
+                val each = stmt(s.span, StructDecl(inner))
+
+                out.push(derived_block(s.span, "sysl.Debug", each))
+
+                for item in anonymous_debug_blocks(each)
+                    out.push(item)
+        _ -> ()
+
+    out
+end anonymous_debug_blocks
+
+// **The specifier of the supplied `debug` carries a name no program can write**, a space in it, and
+// it is what marks the member as the compiler's: a supplied member is typed only once something
+// reaches it, as a library member is (`analyze_body.sysl`), so a program that declares a struct and
+// never shows it carries none of the showing. The library's `derive` body for `Debug` names its
+// specifier so.
+const SuppliedSpec: string = "debug fmt"
+
+// Whether a lowered member is the supplied `Debug`'s.
+supplied_debug(params: Buf[Param]) -> bool
+    for item in params
+        if item.name == SuppliedSpec then return true
+
+    false
+end supplied_debug

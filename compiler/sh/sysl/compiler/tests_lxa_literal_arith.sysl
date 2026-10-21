@@ -1,0 +1,304 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// Arithmetic written out of integer literals alone is computed exactly, and the value the OUTERMOST
+// such expression comes to must fit the type it is read at, as a single literal's must
+// (`literal_arith.sysl`, `reference/types.md § Arithmetic over literals is exact`). The steps between
+// are numbers rather than slots, so `65536 * 65536 - 1` is a `u32`; a division or a remainder by a
+// literal zero is refused as the constant's own mistake. A left shift is the bit operation, dropping
+// what passes the top of its type, and is refused only for a count out of range or a shifted value
+// the type does not hold. A name anywhere inside -- a `val`, a `const` -- keeps the run-time rule,
+// under which integer arithmetic wraps.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lxa_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lxa_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-lxa").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end lxa_root
+
+// What a one-file program prints on this machine, or the report it was refused with.
+private lxa_ran(text: string) -> string
+    val root = lxa_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lxa_ran
+
+// The report a one-file program is refused with on a machine (this one where none is named), its
+// locations relative to the program's directory, or nothing where it is accepted.
+private lxa_report(machine: Option[string], text: string) -> string
+    val root = lxa_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end lxa_report
+
+private lxa_prints(text: string, want: string)
+    if !lxa_ready() then return
+
+    assert_eq(lxa_ran(text), want)
+end lxa_prints
+
+// Refused on `machine` with exactly `message`, first, at `at` (`line:col`).
+private lxa_refused_on(machine: Option[string], text: string, message: string, at: string)
+    if !lxa_ready() then return
+
+    val said = lxa_report(machine, text)
+    val head = s"error: $message\n"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end lxa_refused_on
+
+private lxa_refused(text: string, message: string, at: string) = lxa_refused_on(None, text, message, at)
+
+private lxa_accepted_on(machine: string, text: string)
+    if !lxa_ready() then return
+
+    assert_eq(lxa_report(Some(machine), text), "")
+end lxa_accepted_on
+
+// A probe for a bare target: one exported function whose `usize` local is `expr`.
+private lxa_probe(expr: string) -> string =
+    s"@export(\"lxa_probe\")\nprobe() -> usize\n    val n: usize = $expr\n    n\nend probe\n"
+
+// The same, with `expr` as the address `ptr_cast` reads.
+private lxa_address_probe(expr: string) -> string =
+    s"@export(\"lxa_probe\")\nprobe() -> usize\n    val p: *u8 = ptr_cast($expr)\n    usize(p)\nend probe\n"
+
+// -- the value is the exact one -------------------------------------------------------------------
+
+@test("a step past the type is a number, not a slot, so what the expression comes to is exact")
+lxa_steps_are_exact() =
+    lxa_prints("val a: u32 = 65536 * 65536 - 1\nval g: u64 = (1 << 63) >> 1\nval h: long = (1 << 40) >> 38\n" +
+               "val f: i64 = (1 << 62) * 2 - 1\nval k: u16 = 0xFF * 0x101\nval p: u32 = 65536 * 65536 * 1024 >> 30\n" +
+               "print(a, g, h, f, k, p)\n",
+               "4294967295 4611686018427387904 4 9223372036854775807 65535 4096\n")
+
+@test("every operator over literals, at the default int")
+lxa_every_operator() =
+    lxa_prints("print(7 + 2, 7 - 9, 7 * 3, 7 / 2, -7 / 2, 7 % 3, -7 % 2, 6 & 3, 6 | 3, 6 ^ 3)\n" +
+               "print(1 << 4, -7 >> 1, -(3 - 5), ~5, ~-1, -3 << 2)\n",
+               "9 -2 21 3 -3 1 -1 2 7 5\n16 -4 2 -6 0 -12\n")
+
+@test("'~' is the complement at the type's own width, signed or not")
+lxa_complement_at_the_width() =
+    lxa_prints("val b: u32 = ~0\nval c: u8 = ~0\nval d = ~0\nval l: u128 = ~0\nval m: u8 = ~0xF0\n" +
+               "print(b, c, d, l, m)\n",
+               "4294967295 255 -1 340282366920938463463374607431768211455 15\n")
+
+@test("each width's edge values are accepted")
+lxa_edges_fit() =
+    lxa_prints("val a: i8 = -128 + 0\nval b: i8 = 100 + 27\nval c: u8 = 200 + 55\nval d: i16 = -32767 - 1\n" +
+               "val e: u16 = 0xFFFF - 0\nval f = (1 << 30) + ((1 << 30) - 1)\nval g = -2147483647 - 1\n" +
+               "val h: u64 = (1 << 63) + ((1 << 63) - 1)\nval i: i128 = (1 << 126) + ((1 << 126) - 1)\n" +
+               "print(a, b, c, d, e, f, g, h, i)\n",
+               "-128 127 255 -32768 65535 2147483647 -2147483648 18446744073709551615 " +
+               "170141183460469231731687303715884105727\n")
+
+@test("a right shift past every bit is the full shift, the bits of a left one are kept")
+lxa_shifts_past_the_width() =
+    lxa_prints("val o: i64 = -5 >> 70000\nval i: u32 = 1 >> 40\nval j = -8 >> 70\nval r: u32 = 0xffffffff >> 40\n" +
+               "print(o, i, j, r, -1 >> 100, (1 << 30) >> 29)\n",
+               "-1 0 -1 0 -1 2\n")
+
+// -- a left shift drops the bits past the top -----------------------------------------------------
+
+@test("a mask shifted left loses its top bits at u64 and at u32, suffixed or not")
+lxa_shift_mask() =
+    lxa_prints("val m: u64 = 0xffffffffffffffffu64 << 27\nval w: u32 = 0xffffffffu32 << 4\n" +
+               "val x: u64 = 0xffffffffffffffff << 27\nval y: u32 = 0xffffffff << 4\nprint(m, w, x, y)\n",
+               "18446744073575333888 4294967280 18446744073575333888 4294967280\n")
+
+@test("a one shifted into the sign bit is the signed type's minimum")
+lxa_shift_into_the_sign() =
+    lxa_prints("val a = 1 << 31\nval b: i64 = 1 << 63\nval c: long = (1 << 63)\nval d: i8 = 1 << 7\n" +
+               "print(a, b, c, d)\n",
+               "-2147483648 -9223372036854775808 -9223372036854775808 -128\n")
+
+@test("a shift's result is checked exactly by the operator around it")
+lxa_shift_then_outer_op()
+    lxa_refused("val z: u32 = (1 << 31) + (1 << 31)\n", "the value 4294967296 does not fit uint", "1:14")
+    lxa_refused("val z = (1 << 31) - 1\n", "the value -2147483649 does not fit int", "1:9")
+    lxa_refused("val z: long = -(1 << 63)\n", "the value 9223372036854775808 does not fit long", "1:15")
+    lxa_prints("val z: u32 = (1 << 31) + ((1 << 31) - 1)\nprint(z, (1 << 30) + 1)\n", "4294967295 1073741825\n")
+end lxa_shift_then_outer_op
+
+@test("a left shift by a negative count, or by the width or more, is refused")
+lxa_shift_count_refused()
+    lxa_refused("val z = 1 << -1\n", "a constant shifted by -1 places", "1:9")
+    lxa_refused("val z: u64 = 0 << 70000\n",
+                "a constant shifted by 70000 places, at or past the 64 bits of ulong", "1:14")
+    lxa_refused("val z: u8 = 1 << 8\n", "a constant shifted by 8 places, at or past the 8 bits of byte", "1:13")
+end lxa_shift_count_refused
+
+@test("a shifted value its type does not hold is refused rather than cut down")
+lxa_shifted_value_refused() =
+    lxa_refused("val z: u32 = (65536 * 65536) << 1\n", "the value 4294967296 does not fit uint", "1:15")
+
+@test("a suffixed literal is a literal, and the sum of two fits as a single one does")
+lxa_suffixed_literals_fit() =
+    lxa_prints("val m = 255u8 + 0u8\nval n = 100u8 * 2u8\nprint(m, n)\n", "255 200\n")
+
+@test("a value argument, a long parameter and an array length read the exact value")
+lxa_other_positions() =
+    lxa_prints("takes(x: long) -> long = x\nnarrow(x: u8) -> u8 = x\n" +
+               "print(takes(1 << 40), narrow((1 << 7) + 127), sizeof([(1 << 4) - 1]u8), [0u8; 2 * 3].len)\n",
+               "1099511627776 255 15 6\n")
+
+// -- a name inside keeps the run-time rule ---------------------------------------------------------
+
+@test("a const or a val inside the arithmetic wraps at the declared width, as at run time")
+lxa_a_name_wraps() =
+    lxa_prints("const A: u8 = 200\nval x: u8 = 255\nval w: u8 = x + (100 + 100)\nprint(A + 100, x + 1, w)\n",
+               "44 0 199\n")
+
+@test("a literal read as a float is not held to an integer, and its division by zero is IEEE's")
+lxa_floats_are_not_checked() =
+    lxa_prints("val r: f64 = 1 / 0\nval s: f64 = 1 / 2\nprint(r, s)\n", "inf 0.5\n")
+
+// -- what does not fit is refused ------------------------------------------------------------------
+
+@test("a sum, a difference and a negation that leave an 8- and a 16-bit type are refused")
+lxa_narrow_widths_refused()
+    lxa_refused("val z: u8 = 200 + 100\n", "the value 300 does not fit byte", "1:13")
+    lxa_refused("val z: i8 = 127 + 1\n", "the value 128 does not fit i8", "1:13")
+    lxa_refused("val z: i8 = -128 - 1\n", "the value -129 does not fit i8", "1:13")
+    lxa_refused("val z: i8 = -(-128)\n", "the value 128 does not fit i8", "1:13")
+    lxa_refused("val z: u16 = 0xFFFF + 1\n", "the value 65536 does not fit ushort", "1:14")
+    lxa_refused("val z: i16 = -32768 - 1\n", "the value -32769 does not fit short", "1:14")
+end lxa_narrow_widths_refused
+
+@test("a shift by the width, a product, a complement and a quotient that leave a 32-bit type are refused")
+lxa_word_widths_refused()
+    lxa_refused("val z: u32 = 1 << 32\n", "a constant shifted by 32 places, at or past the 32 bits of uint", "1:14")
+    lxa_refused("val z: u32 = 65536 * 65536\n", "the value 4294967296 does not fit uint", "1:14")
+    lxa_refused("val z: u32 = 0 - 1\n", "the value -1 does not fit uint", "1:14")
+    lxa_refused("val z: u32 = ~(1 << 32)\n", "a constant shifted by 32 places, at or past the 32 bits of uint",
+                "1:16")
+    lxa_refused("val z = 65536 * 32768\n", "the value 2147483648 does not fit int", "1:9")
+    lxa_refused("val z: i32 = -2147483648 / -1\n", "the value 2147483648 does not fit int", "1:14")
+end lxa_word_widths_refused
+
+@test("the 64- and 128-bit types are held to their widths too")
+lxa_wide_widths_refused()
+    lxa_refused("val z: long = 4294967296 * 2147483648\n", "the value 9223372036854775808 does not fit long",
+                "1:15")
+    lxa_refused("val z: u64 = 1 << 64\n", "a constant shifted by 64 places, at or past the 64 bits of ulong", "1:14")
+    lxa_refused("val z: u128 = 1 << 128\n",
+                "a constant shifted by 128 places, at or past the 128 bits of u128", "1:15")
+end lxa_wide_widths_refused
+
+@test("with no type from the context the value is held to int, as a single literal is")
+lxa_default_int_refused()
+    lxa_refused("val big = 1 << 40\nprint(big)\n", "a constant shifted by 40 places, at or past the 32 bits of int",
+                "1:11")
+    lxa_refused("val big = 65536 * 65536\nprint(big)\n", "the value 4294967296 does not fit int", "1:11")
+end lxa_default_int_refused
+
+@test("two suffixed literals are held to their type")
+lxa_suffixed_refused() = lxa_refused("val z = 255u8 + 1u8\n", "the value 256 does not fit byte", "1:9")
+
+@test("a value too wide to show is told by its width")
+lxa_huge_values_refused()
+    val max = "340282366920938463463374607431768211455"
+
+    lxa_refused(s"val z: u128 = $max * $max * $max\n", "the value, 384 bits wide, does not fit u128", "1:15")
+    lxa_refused("val z: u64 = 1 << 100000000\n",
+                "a constant shifted by 100000000 places, at or past the 64 bits of ulong", "1:14")
+end lxa_huge_values_refused
+
+@test("only the outermost value is checked, at the type the other operand gives it")
+lxa_outermost_only()
+    lxa_refused("val x: u8 = 1\nval z: u8 = x + (200 + 100)\n", "the value 300 does not fit byte", "2:18")
+    lxa_refused("var x: u8 = 1\nx += 200 + 100\n", "the value 300 does not fit byte", "2:6")
+    lxa_prints("val z: u32 = (65536 * 65536 * 256 - 1) >> 20\nprint(z)\n", "1048575\n")
+end lxa_outermost_only
+
+@test("an argument made of literals is held to its parameter")
+lxa_argument_refused() =
+    lxa_refused("narrow(x: u8) -> u8 = x\nprint(narrow(200 + 100))\n", "the value 300 does not fit byte", "2:14")
+
+@test("a value argument of a type is held to its parameter's type")
+lxa_value_argument()
+    lxa_prints("struct Ring[const N: u8]\n    x: int\nval r: Ring[100 + 100] = Ring(1)\nprint(r.x)\n", "1\n")
+    lxa_refused("struct Ring[const N: u8]\n    x: int\nval r: Ring[200 + 100] = Ring(1)\n",
+                "this argument does not fit byte: 300", "3:8")
+end lxa_value_argument
+
+@test("an address for ptr_cast that comes to more than a usize holds is refused")
+lxa_address_refused()
+    lxa_refused("val p = ptr_cast[*u8](65536 * 65536 * 65536 * 65536 * 16)\n",
+                "the value 295147905179352825856 does not fit usize", "1:23")
+    lxa_refused("val p = ptr_cast[*u8](1 << 70)\n",
+                "a constant shifted by 70 places, at or past the 64 bits of usize", "1:23")
+end lxa_address_refused
+
+// -- a division by a literal zero ------------------------------------------------------------------
+
+@test("a division or a remainder by a literal zero is refused, at the division")
+lxa_divided_by_zero()
+    lxa_refused("val z = 7 / 0\n", "a constant divided by zero", "1:9")
+    lxa_refused("val z = 7 % 0\n", "a constant divided by zero", "1:9")
+    lxa_refused("val z: u8 = 1 / 0\n", "a constant divided by zero", "1:13")
+    lxa_refused("val z = 1 + 10 / (3 - 3)\n", "a constant divided by zero", "1:13")
+end lxa_divided_by_zero
+
+// -- array lengths --------------------------------------------------------------------------------
+
+@test("an array length or a repeat count past what an array holds is refused, not wrapped")
+lxa_array_lengths()
+    lxa_refused("val a: [1 << 40]u8 = [0; 4]\n", "an array cannot have 1099511627776 elements", "1:8")
+    lxa_refused("val a: [4294967296]u8 = [0; 4]\n", "an array cannot have 4294967296 elements", "1:8")
+    lxa_refused("val b = [0u8; 1 << 40]\n", "an array cannot have 1099511627776 elements", "1:9")
+end lxa_array_lengths
+
+// -- the width is the target's --------------------------------------------------------------------
+
+@test("on a 32-bit target a usize holds 2^32 - 1 and not 2^32")
+lxa_on_a_32_bit_target()
+    lxa_accepted_on("thumbv7em-freestanding", lxa_probe("65536 * 65536 - 1"))
+    lxa_refused_on(Some("thumbv7em-freestanding"), lxa_probe("65536 * 65536"),
+                   "the value 4294967296 does not fit usize", "3:20")
+    lxa_accepted_on("thumbv7em-freestanding", lxa_address_probe("(1 << 31) + ((1 << 31) - 1)"))
+    lxa_refused_on(Some("thumbv7em-freestanding"), lxa_address_probe("1 << 32"),
+                   "a constant shifted by 32 places, at or past the 32 bits of usize", "3:27")
+end lxa_on_a_32_bit_target
+
+@test("on Craft's 16-bit target a usize holds 2^16 - 1 and not 2^16")
+lxa_on_craft()
+    lxa_accepted_on("craft-freestanding", lxa_probe("(1 << 15) + ((1 << 15) - 1)"))
+    lxa_refused_on(Some("craft-freestanding"), lxa_probe("1 << 16"),
+                   "a constant shifted by 16 places, at or past the 16 bits of usize", "3:20")
+    lxa_refused_on(Some("craft-freestanding"), lxa_address_probe("0x8000 * 2"),
+                   "the value 65536 does not fit usize", "3:27")
+end lxa_on_craft

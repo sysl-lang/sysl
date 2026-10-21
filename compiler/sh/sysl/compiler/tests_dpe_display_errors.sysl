@@ -341,7 +341,7 @@ dpe_a_derived_display_writes_its_parts_straight_through()
         Some(ir) ->
             assert(!ir.contains("@sysl.str.concat"), ir)
             assert(!ir.contains("@sysl.str.int"), ir)
-            assert(ir.contains("@render$20Size"), ir)
+            assert(ir.contains("@Size.display"), ir)
 end dpe_a_derived_display_writes_its_parts_straight_through
 
 // A width is measured into `Counting`, which stores nothing, rather than gathered into a buffer.
@@ -378,48 +378,33 @@ dpe_and_a_shape_with_no_parts_gets_no_renderer()
             assert(ir.contains("@sysl$display_pad"), ir)
 end dpe_and_a_shape_with_no_parts_gets_no_renderer
 
-// ---- a value with no rendering ----
+// ---- a value with no Display ----
 
-@test("names the impl that would give a struct one")
-dpe_names_the_impl_that_would_give_a_struct_one()
-    dpe_refused("struct Q\n    a: int\nprint(Q(1))\n",
-                "cannot print a Q value — write an 'impl sysl.Display for Q' to say how it renders",
-                "3:1")
+// Nothing is refused for having no `Display`: the value prints through the `Debug` every type has,
+// the one the compiler supplies for a struct or an enum (`reference/traits.md § Every type has a
+// Debug`), and what is lowered is a call to that member with the sink and the specifier.
+@test("a struct with no Display prints through its supplied Debug")
+dpe_a_struct_prints_through_its_debug()
+    dpe_ir("struct Q\n    a: int\nprint(Q(1))\nprint(str(Q(2)))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("call void @Q.debug(%struct.Q "), ir)
+            assert(ir.contains("define void @Q.debug("), ir)
 
-@test("says the same about an enum")
-dpe_says_the_same_about_an_enum()
-    dpe_refused("enum Colour\n    Red\nprint(Red)\n",
-                "cannot print a Colour value — write an 'impl sysl.Display for Colour' to say how it " +
-                "renders", "3:1")
+@test("so does an enum, a reference to one, and an array of them")
+dpe_an_enum_a_reference_and_an_array_print()
+    dpe_ir("enum Colour\n    Red\nvar c: &Colour = Red\nvar a: [2]Colour = [Red, Red]\nprint(c, a)\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("define void @Colour.debug("), ir)
 
-@test("reports 'str' in the words 'str' was asked in")
-dpe_reports_str_in_the_words_str_was_asked_in()
-    dpe_refused("struct Q\n    a: int\nprint(str(Q(1)))\n",
-                "cannot make a string of a Q value — write an 'impl sysl.Display for Q' to say how it " +
-                "renders", "3:7")
+@test("a raw pointer prints its address rather than what it points at")
+dpe_a_pointer_prints_its_address()
+    dpe_ir("var n = 1\nprint(&n)\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("@sysl$debug_address("), ir)
 
-// A pointer is deliberately not `Display` -- an address renders differently on every run -- and a
-// composed type cannot carry an `impl`, so there is none to suggest.
-@test("offers no impl for a type that could not carry one")
-dpe_offers_no_impl_for_a_type_that_could_not_carry_one()
-    dpe_refused("var n = 1\nprint(&n)\n",
-                "cannot print a *int value — it does not implement 'sysl.Display'", "2:1")
-
-@test("refuses a reference rather than reaching through it")
-dpe_refuses_a_reference_rather_than_reaching_through_it()
-    dpe_refused("struct P\n    x: int\nvar p: &P = P(1)\nprint(p)\n",
-                "cannot print a &P value — it does not implement 'sysl.Display'", "4:1")
-
-// An array renders at every length through one library block over `[N]T`, so what is refused is an
-// array whose ELEMENT does not render, and it says which.
-@test("refuses an array only when its element does not render")
-dpe_refuses_an_array_only_when_its_element_does_not_render()
-    dpe_refused("struct P\n    v: int\nvar a: [2]P = [P(1), P(2)]\nprint(a)\n",
-                "cannot print a [2]P value — the 'impl' that covers it asks 'sysl.Display' of P, which " +
-                "does not implement it", "4:1")
-
-@test("refuses a trait object, which has forgotten what it renders as")
-dpe_refuses_a_trait_object()
+@test("a trait object with no Display prints through the Debug slot its table carries")
+dpe_a_trait_object_prints_through_its_debug_slot()
     val text = raw"""
         trait Shape
             area(self) -> int
@@ -432,10 +417,10 @@ dpe_refuses_a_trait_object()
         print(s)
         """
 
-    dpe_refused(text, "cannot print a *Shape value — an object offers what its trait declares and " +
-                "what that trait requires, so write 'trait Shape: sysl.Display' to keep the rendering " +
-                "the value had before it was erased", "9:1")
-end dpe_refuses_a_trait_object
+    dpe_ir(text) match
+        None -> ()
+        Some(ir) -> assert(ir.contains("[2 x ptr] [ptr @vt.adapt.R.area, ptr @vt.adapt.R.debug]"), ir)
+end dpe_a_trait_object_prints_through_its_debug_slot
 
 // ---- a type parameter ----
 
@@ -643,9 +628,10 @@ dpe_refuses_a_numeric_conversion_on_a_type_that_renders_itself()
     dpe_refused(text, "format '%d' expects an integer, but the value has type P", "5:7")
 end dpe_refuses_a_numeric_conversion_on_a_type_that_renders_itself
 
-// A `%s` hands a value to its own rendering only where it HAS one; a type with none is a mistake in
-// the specifier, refused in the specifier's words rather than as a missing `impl`.
-@test("refuses '%s' on a type with no rendering at all")
-dpe_refuses_s_on_a_type_with_no_rendering_at_all()
-    dpe_refused("struct Q\n    a: int\nprint(f\"${Q(1)}%s\")\n",
-                "format '%s' expects a string, but the value has type Q", "3:7")
+// A `%s` hands a value to its own rendering, and every struct has one now -- its `Debug` where it
+// wrote no `Display` -- so the hole is accepted and reaches that member.
+@test("accepts '%s' on a struct with no Display, through its Debug")
+dpe_accepts_s_on_a_struct_with_no_display()
+    dpe_ir("struct Q\n    a: int\nprint(f\"${Q(1)}%s\")\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("@Q.debug("), ir)

@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.text.{Search, from_utf8_unchecked}
 
 // What a `const` function may contain.
@@ -9,8 +10,10 @@ import sysl.text.{Search, from_utf8_unchecked}
 // **A `const` function is one the compiler may run while it compiles**, so its body is held to what
 // exists at that moment: values, and code the compiler can see. What is refused is everything that
 // only exists once the program runs -- an address, the heap, module storage that is filled at
-// startup, code outside the program, and a call whose target is chosen at run time -- plus the few
-// kinds of value the compiler does not evaluate yet (vectors, the two sixteen-bit floats). A string is
+// startup, code outside the program, and a call whose target is chosen at run time -- plus the C
+// variadic arguments and atomics the compiler does not evaluate yet. A call to a
+// function that is not marked is held to the same by walking that function's body, so the refusal
+// names the chain of calls down to what cannot run. A string is
 // a value the compiler holds -- built, joined, sliced, rendered from an integer or a fixed-point value
 // -- and a slice is a view of an array or a string the evaluation holds. Each refusal is anchored where the thing was written and says which of these it is.
 //
@@ -26,16 +29,13 @@ private const_opening(f: string) -> string =
     s"'${qualified_name(f)}' is 'const', so it runs while compiling, and"
 
 // Why each kind of refusal holds, said once.
-private const_heap() -> string =
-    "a heap made while compiling has nowhere to go: the object file holds values, not a heap"
 private const_address() -> string = "an address exists only when the program runs"
 private const_outside() -> string = "nothing outside the program exists while compiling"
-private const_dispatch() -> string = "which function that is is decided when the program runs"
 
 // Holds every `const` function to what the compiler can run: its signature where it is typed
 // (`check_const_signature`), and here its body and its clauses. An instantiation of a generic one is
 // passed over, the generic having been read at its definition.
-check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], externs: Buf[TExtern])
+check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     var marked = false
 
     for i in 0..<funcs.len()
@@ -53,33 +53,114 @@ check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], externs: Buf[T
     for i in 0..<funcs.len()
         if funcs.at(i).ghost then ghosts.push(funcs.at(i).name)
 
-    var outside: Buf[string] = buf()
+    var bodies: Map[string, usize] = map()
 
-    for i in 0..<a.tables.extern_vars.len()
-        outside.push(extern_var_symbol(a.tables.extern_vars.at(i)))
+    for i in 0..<funcs.len()
+        bodies.put(funcs.at(i).name, i)
 
-    val said: &Skipped = Skipped(buf())
-    val cx: &ConstSeen = ConstSeen(ghosts, externs, vals, outside, said)
+    val cx: &ConstSeen = ConstSeen(ghosts, vals, outside_storage(a), Skipped(buf()), funcs, bodies, map(),
+                                   false, buf())
 
     for i in 0..<funcs.len()
         val f = funcs.at(i)
 
-        if f.const_fn && !a.tables.members.func_origin.has(f.name) then const_body(a, cx, f)
+        // A routine the evaluator runs itself (`const_eval.sysl`) keeps its promise there, whatever
+        // its body does with the addresses the program has.
+        if f.const_fn && !a.tables.members.func_origin.has(f.name) && !run_by_evaluator(a, f.name) then
+            const_body(a, cx, f)
 
     for f in a.tables.abstracts
-        if f.const_fn then const_body(a, cx, f)
+        if f.const_fn && !run_by_evaluator(a, f.name) then const_body(a, cx, f)
 end check_const_fns
+
+private run_by_evaluator(a: &Analysis, name: string) -> bool
+    val shown = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+
+    const_renderer(shown) || writer_routine(shown) || float_bits_routine(name) || frozen_routine(shown)
+end run_by_evaluator
 
 // What the walk over every `const` body consults, built once.
 private struct ConstSeen
     ghosts: Buf[string]
-    externs: Buf[TExtern]
     vals: Buf[TVal]
     outside: Buf[string]
     // One caret per stretch of source: a refusal covers what is inside it, so a string built inside
     // a call that is refused already is not a second mistake.
     said: &Skipped
+    // The typed bodies of the program, by name, where the walk runs over the finished program. A
+    // function not among them is typed for the question, as the evaluator types a callee.
+    funcs: Buf[TFunc]
+    bodies: Map[string, usize]
+    // What each unmarked function's body was found to hold: the reason it cannot run while
+    // compiling, or empty where it can.
+    unmarked: Map[string, string]
+    // Where the walk is asking about an unmarked body rather than refusing a marked one: the first
+    // reason found is kept in `found` instead of being reported.
+    collecting: bool
+    found: Buf[string]
 end ConstSeen
+
+// The variables the `extern` declarations name: storage outside the program.
+private outside_storage(a: &Analysis) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.tables.extern_vars.len()
+        out.push(extern_var_symbol(a.tables.extern_vars.at(i)))
+
+    out
+end outside_storage
+
+// Why a function nobody marked `const` cannot run while compiling, or `None` where its body can: the
+// question a call from a `const` body, or from a constant, asks of its callee. A function marked
+// `const` was held to it at its declaration. A body that calls back into one being asked about is
+// answered by the walk already under way.
+private unmarked_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[string]
+    val known = cx.unmarked.get(name)
+
+    if known.is_some() then return if known.unwrap() == "" then None else known
+
+    cx.unmarked.put(name, "")
+
+    val at = cx.bodies.get(name)
+    val body = if at.is_some() then Some(cx.funcs.at(at.unwrap())) else evaluation_body(a, name).map(f -> *f)
+
+    // An `extern` reached where nothing named it -- through a function's address -- is refused for
+    // what it is rather than for the body it lacks.
+    val outside = a.tables.externs.get(name).and_then(x -> extern_reason(extern_symbol(x)))
+
+    if body.is_none() || outside.is_some()
+        val why = outside.map(t -> s"it $t").unwrap_or("it has no body that can be read while compiling")
+
+        cx.unmarked.put(name, why)
+        return Some(why)
+    end if
+
+    val inner: &ConstSeen = ConstSeen(cx.ghosts, cx.vals, cx.outside, Skipped(buf()), cx.funcs, cx.bodies,
+                                      cx.unmarked, true, buf())
+
+    const_body(a, inner, body.unwrap())
+
+    val why = if inner.found.is_empty() then "" else inner.found.at(0)
+
+    cx.unmarked.put(name, why)
+
+    if why == "" then None else Some(why)
+end unmarked_refusal
+
+// The same question asked by the evaluator, about a callee it is about to run. What the walk finds is
+// kept for the rest of the compilation.
+evaluable_refusal(a: &Analysis, name: string) -> Option[string]
+    if a.tables.const_fns.has(name) then return None
+
+    val cx: &ConstSeen = ConstSeen(buf(), buf(), outside_storage(a), Skipped(buf()), buf(), map(),
+                                   a.evaluation.unmarked, true, buf())
+
+    unmarked_refusal(a, cx, name)
+end evaluable_refusal
+
+// A reason as the clause after a callee's name: "it prints, …" becomes "which prints, …", so a chain
+// of calls reads as one sentence.
+chained_reason(why: string) -> string = if why.starts_with("it ") then s"which ${why[3..]}" else why
 
 // One body, its contract and every loop clause in it -- each of which is evaluated where the body is.
 private const_body(a: &Analysis, cx: &ConstSeen, f: TFunc)
@@ -104,6 +185,13 @@ private const_refuse(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, at: 
     if cx.said.covers(at) then return
 
     cx.said.cover(at)
+
+    if cx.collecting
+        if cx.found.is_empty() then cx.found.push(what)
+
+        return
+    end if
+
     a.fault(scope, at, s"${const_opening(f)} $what")
 end const_refuse
 
@@ -140,6 +228,15 @@ end const_write
 private const_expr(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, e: TExpr)
     if cx.said.covers(e.span) then return
 
+    // `&bus` reads nothing from `bus`: the address of module storage is a constant the linker fills
+    // in, so the storage it names is not reached, whenever it is filled.
+    *e.kind match
+        TAddrOf(place, _) ->
+            val root = addressed_storage(place)
+
+            if root.is_some() then cx.said.cover(root.unwrap().span)
+        _ -> ()
+
     val form = const_form_refusal(a, cx, e)
 
     if form.is_some()
@@ -163,51 +260,42 @@ end const_expr
 
 // What a node does that the compiler cannot do while compiling, said the way a reader would say it.
 private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[string] = *e.kind match
+    // A call that never returns ends the program -- a panic -- and is a trap where it is reached.
+    TCall(_, _, Never, _) -> None
     TCall(name, _, _, _) -> const_call_refusal(a, cx, name)
-    TCallPtr(_, _, _, _) -> Some(s"it calls through a value — ${const_dispatch()}")
-    // The one trait object a `const` function meets is the writer a rendering hands its `display`.
-    TVCall(receiver, _, _, _, _) ->
-        if writes_a_rendering(texpr_type(receiver)) then None
-        else Some(s"it dispatches through a trait object — ${const_dispatch()}")
-    TErase(_, _, _) -> Some(s"it makes a trait object — ${const_dispatch()}")
-    TFuncAddr(_, _, _) ->
-        Some("it takes a function's address — which function a call through it reaches is " +
-             "decided when the program runs")
+    // A call through a function's address is the call of the function the address was taken of,
+    // which the evaluation knows by then; it refuses one whose function cannot run.
+    TCallPtr(_, _, _, _) -> None
+    // A call through a trait object -- a closure's among them -- is the call of the function its
+    // table names, which the evaluation knows by then; it refuses one whose function cannot run.
+    TVCall(_, _, _, _, _) -> None
+    TErase(_, _, _) -> None
 
-    TBox(_, _) -> Some(s"it boxes a value, which allocates — ${const_heap()}")
-    TBufLit(_, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
-    TBufFill(_, _, _) -> Some(s"it builds a buffer, which allocates — ${const_heap()}")
     // A value a type renders through its own method runs that method, which is held to what any
     // other call is; through a trait object, which method that is is not known yet.
-    TRender(_, method, _, slot) ->
-        if slot.is_some() then Some(s"it renders a value through a trait object — ${const_dispatch()}")
-        else const_call_refusal(a, cx, method)
+    TRender(_, method, _, slot) -> if slot.is_some() then None else const_call_refusal(a, cx, method)
 
+    // A reference or pointer converted to another pointer type is the same address, which the
+    // evaluation refuses to read through as another type; converted to a number, it is where storage
+    // falls in memory.
     TCast(operand, ty) ->
-        if names_an_address(ty) || names_an_address(texpr_type(operand)) then
-            Some(s"it converts a pointer — ${const_address()}")
-        else None
-    TNullLit(_) -> Some(s"it names 'null' — ${const_address()}")
+        if !names_an_address(ty) && !names_an_address(texpr_type(operand)) then None
+        else if both_point(texpr_type(operand), ty) then None
+        else Some(s"it converts a pointer — ${const_address()}")
     TCStrLit(_) -> Some(s"it takes the address of a C string — ${const_address()}")
 
     TGlobal(symbol, _, writable) -> const_global_refusal(cx, symbol, writable)
 
-    TAtomic(_, _, _, _, _, _) -> Some(s"it performs an atomic operation — ${not_yet("atomics are")}")
-    TFence(_) -> Some(s"it orders memory with a fence — ${not_yet("fences are")}")
     TSysOp(op, _, _) -> Some(s"it runs '$op' — the processor it asks exists only when the program runs")
     TVaStart(_) -> Some(variadic_walk())
     TVaEnd(_) -> Some(variadic_walk())
     TVaArg(_, _) -> Some(variadic_walk())
     TVaCopy(_, _) -> Some(variadic_walk())
     TVaPass(_) -> Some(variadic_walk())
-    TVectorLit(_, _) -> Some(vector_use())
-    TSplat(_, _) -> Some(vector_use())
-    TLane(_, _, _) -> Some(vector_use())
-    TVecCompare(_, _, _, _) -> Some(vector_use())
-    TSelect(_, _, _, _) -> Some(vector_use())
-    TReduce(_, _, _) -> Some(vector_use())
-    TVecLoad(_, _, _) -> Some(vector_use())
-    TVecStore(_, _, _) -> Some(vector_use())
+    TReduce(op, _, _) ->
+        if op == "fadd" then Some("it sums a float vector, whose lanes are added in the order the target's " +
+                                  "instructions take — so the value is known only where the program runs")
+        else None
 
     // `?` widening the error through a conversion calls that conversion.
     TTry(_, _, _, _, _, _, convert) ->
@@ -223,7 +311,7 @@ private const_form_refusal(a: &Analysis, cx: &ConstSeen, e: TExpr) -> Option[str
             if out.is_none() && d.is_some() then out = const_call_refusal(a, cx, d.unwrap().name)
 
         out
-    TUpdate(_, _, _, _, dispatch, _) ->
+    TUpdate(_, _, _, _, dispatch, _, _) ->
         if dispatch.is_some() then const_call_refusal(a, cx, dispatch.unwrap().name) else None
     _ -> None
 
@@ -232,20 +320,16 @@ private not_yet(what: string) -> string = s"$what not evaluated while compiling 
 private variadic_walk() -> string =
     s"it walks C variadic arguments — ${not_yet("C variadic arguments are")}"
 
-private vector_use() -> string = s"it uses a vector — ${not_yet("vectors are")}"
-
 // What is wrong with calling this from a `const` function, or nothing.
 private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[string]
     if a.tables.const_fns.has(name) || holds_string(cx.ghosts, name) then return None
     // Through a type parameter's bound: settled by whichever type fills the parameter.
     if names_a_bound_member(a, name) then return None
 
-    if is_closure_symbol(name) then return Some(s"it calls through a closure — ${const_dispatch()}")
 
-    for i in 0..<cx.externs.len()
-        val x = cx.externs.at(i)
+    val x = a.tables.externs.get(name)
 
-        if x.name == name then return extern_refusal(x)
+    if x.is_some() then return extern_refusal(name, extern_symbol(x.unwrap()))
 
     // An instantiation is named as the declaration it was made from, which is what a reader wrote.
     val origin = a.tables.members.func_origin.get(name).unwrap_or(name)
@@ -258,13 +342,11 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
         return Some(s"it prints, which is outside the program — ${const_outside()}")
 
     // An `f"…"` specifier's renderers are run by the compiler itself (`const_eval.sysl`).
-    if const_renderer(shown) || writer_routine(shown) then return None
+    if const_renderer(shown) || writer_routine(shown) || float_bits_routine(name) || frozen_routine(shown) then
+        return None
 
-    if std_module(module_of(origin)) then
-        return Some(s"it calls '$shown', which is not — the standard library marks nothing " +
-                    "'const' yet, so compute this at run time")
-
-    Some(s"it calls '$shown', which is not — mark '$shown' 'const' too, or compute this at run time")
+    // Any other function runs while compiling where its own body can.
+    unmarked_refusal(a, cx, name).map(why -> s"it calls '$shown', ${chained_reason(why)}")
 end const_call_refusal
 
 // Whether a call names a trait's member through a bound -- `Ord.cmp` in a body generic over `T: Ord`.
@@ -276,28 +358,30 @@ private names_a_bound_member(a: &Analysis, name: string) -> bool
     trait_decl_at(a, from_utf8_unchecked(name.bytes[0..<dot.unwrap()])).is_some()
 end names_a_bound_member
 
-private std_module(m: string) -> bool = m == "sysl" || m.starts_with("sysl.")
-
 // An `extern` a `const` function calls: one of the LLVM operations whose result is exactly
 // specified, which the compiler can compute bit for bit; one of the C library's mathematical
 // functions, whose last bit is the library's own; or anything else outside the program.
-private extern_refusal(x: TExtern) -> Option[string]
-    val parts = dotted(x.symbol)
+private extern_refusal(name: string, symbol: string) -> Option[string] =
+    extern_reason(symbol).map(why -> s"it calls '${qualified_name(name)}', which $why")
+
+// What an `extern` is that keeps it from running while compiling, said after "which", or nothing
+// where it is an operation the compiler computes itself.
+private extern_reason(symbol: string) -> Option[string]
+    val parts = dotted(symbol)
 
     if parts.len() >= 2 && parts.at(0) == "llvm"
         if exact_intrinsic(parts) then return None
     end if
 
-    val base = if parts.len() >= 2 && parts.at(0) == "llvm" then parts.at(1) else x.symbol
-    val shown = qualified_name(x.name)
+    val base = if parts.len() >= 2 && parts.at(0) == "llvm" then parts.at(1) else symbol
 
     if c_math(base)
-        return Some(s"it calls '$shown', which is the C library's '$base' — its last bit differs " +
-                    "between C libraries, and the board's would not agree with this compiler's")
+        return Some(s"is the C library's '$base' — its last bit differs between C libraries, and the " +
+                    "board's would not agree with this compiler's")
     end if
 
-    Some(s"it calls '$shown', which is outside the program — ${const_outside()}")
-end extern_refusal
+    Some(s"is outside the program — ${const_outside()}")
+end extern_reason
 
 // The LLVM operations a `const` function may reach: each has one exactly specified result.
 private exact_intrinsic(parts: Buf[string]) -> bool
@@ -341,6 +425,13 @@ private dotted(symbol: string) -> Buf[string]
     out
 end dotted
 
+// The module storage a place is in, through its fields and elements, where it is in one.
+private addressed_storage(place: TExpr) -> Option[TExpr] = *place.kind match
+    TGlobal(_, _, _) -> Some(place)
+    TField(receiver, _, _) -> addressed_storage(receiver)
+    TIndex(receiver, _, _) -> addressed_storage(receiver)
+    _ -> None
+
 // Module storage a `const` function reaches: a `val` laid into the object file is a value like any
 // other, and storage filled while the program runs -- a `var`, or a `val` computed at startup -- is
 // not there yet. A variable an `extern` names is outside the program altogether.
@@ -363,64 +454,46 @@ private const_global_refusal(cx: &ConstSeen, symbol: string, writable: bool) -> 
     None
 end const_global_refusal
 
-// Whether a type is a raw pointer or a C function pointer -- an address, under either spelling.
 // A `*Writer`: what a `display` is handed to write into.
 writes_a_rendering(t: Type) -> bool = t match
     Ptr(inner) -> writes_a_rendering(*inner)
     Trait(name, _, _) -> qualified_name(name) == "sysl.Writer"
     _ -> false
 
+// Whether a type is a raw pointer or a C function pointer -- an address, under either spelling.
 private names_an_address(t: Type) -> bool = t match
     Ptr(_) -> true
+    Ref(_, _) -> true
     CFn(_, _) -> true
     _ -> false
 
-// Whether a type holds an address anywhere in it, which is what a `const` function may not answer.
-private holds_an_address(t: Type) -> bool = t match
-    Ptr(_) -> true
-    CFn(_, _) -> true
-    Volatile(inner) -> holds_an_address(*inner)
-    Array(_, elem) -> holds_an_address(*elem)
-    Constrained(decl) -> holds_an_address(decl.base)
-    Struct(decl) -> fields_hold_an_address(decl.fields)
-    Results(parts) -> fields_hold_an_address(parts.fields)
-    Enum(decl) ->
-        for item in decl.variants
-            if fields_hold_an_address(item.fields) then return true
-
-        false
-    _ -> false
-
-private fields_hold_an_address(fields: Buf[(string, Type)]) -> bool
-    for field in fields
-        if holds_an_address(field.1) then return true
-
-    false
-end fields_hold_an_address
+// Whether both address types point at a type, which a function pointer does not.
+private both_point(a: Type, b: Type) -> bool = pointee(a).is_some() && pointee(b).is_some()
 
 // Why a value of this type cannot be held while compiling, or nothing where it can. The values a
 // `const` function works with are numbers, `bool`, `char` and `unit`, and structs, tuples, arrays and
-// enums made of them, all by value; a raw pointer is admitted too, since it may point at a local the
-// evaluation itself made. A type parameter stands for whatever fills it, and is judged there.
+// enums made of them, all by value; a raw pointer and a function pointer are admitted too, held as
+// the addresses the linker fills in and never read or called through. A type parameter stands for
+// whatever fills it, and is judged there.
 const_type_refusal(t: Type) -> Option[string] = t match
-    Floating(bits, _) ->
-        // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), so it is in.
-        if bits == 16 then Some(not_yet("'f16' and 'bf16' are")) else None
+    // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), and the two
+    // sixteen-bit formats as the `real`s their values are, rounded to the format at every operation.
+    Floating(_, _) -> None
     Slice(elem, _) -> const_type_refusal(*elem)
-    Vector(_, _) -> Some(not_yet("vectors are"))
+    Vector(_, elem) -> const_type_refusal(*elem)
     VaList -> Some(not_yet("C variadic arguments are"))
-    Ref(inner, _) -> *inner match
-        Trait(_, _, _) -> Some(trait_object())
-        _ -> Some(s"a reference is to an object on the heap, and ${const_heap()}")
-    Weak(_) -> Some(s"a reference is to an object on the heap, and ${const_heap()}")
+    // A reference is to a box the evaluation makes and holds; a weak one answers whether its object
+    // is still alive, which counts kept only when the program runs decide.
+    Ref(_, _) -> None
+    Weak(_) -> Some("a weak reference answers whether its object is still alive, which is decided by " +
+                    "counts kept only when the program runs")
     Trait(_, _, _) -> Some(trait_object())
-    CFn(_, _) ->
-        Some("which function a call through a function pointer reaches is decided when the " +
-             "program runs")
     Volatile(inner) -> const_type_refusal(*inner)
     Array(_, elem) -> const_type_refusal(*elem)
     Constrained(decl) -> const_type_refusal(decl.base)
-    Struct(decl) -> if decl.opaque then None else fields_refusal(decl.fields)
+    Struct(decl) ->
+        if decl.opaque then None
+        else fields_refusal(decl.fields)
     Results(parts) -> fields_refusal(parts.fields)
     Pack(elems) -> types_refusal(elems)
     Enum(decl) ->
@@ -454,9 +527,9 @@ private types_refusal(ts: Buf[Type]) -> Option[string]
 end types_refusal
 
 // A `const` function's signature, held to the same values its body is: each parameter's type at the
-// parameter, the result at the result. **An address may come in and may not go out** -- a pointer
-// parameter can point at a local of the evaluation that called it, but a pointer answered would
-// outlive every local it could name.
+// parameter, the result at the result. **An address may come in and go out**: the only one an
+// evaluation holds is the address of module storage or of a function, which the linker fills in
+// (`const_eval.sysl`'s `address_of`), so one answered names nothing the evaluation made.
 check_const_signature(a: &Analysis, scope: Scope, name: string, d: FuncDecl,
                       params: Buf[(string, Type)], ret: Type)
     val opening = const_opening(name)
@@ -487,7 +560,4 @@ check_const_signature(a: &Analysis, scope: Scope, name: string, d: FuncDecl,
             return
         None -> ()
 
-    if holds_an_address(ret) then
-        a.fault(scope, at, s"$opening its result is a '${type_show(ret)}' — ${const_address()}, " +
-                "and a pointer answered would outlive every local it could point at")
 end check_const_signature

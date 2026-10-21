@@ -23,9 +23,8 @@ import sysl.buf.{Buf, buf}
 // file holding only a table of constants and the functions that read it declares a lot and runs
 // nothing, and must not thereby become the file the program starts in.
 //
-// **A `var` is deliberately not one of these**, because a binding with an initializer is something
-// that runs and a file carrying one really may be a body. Whether it is *this* program's body is a
-// question about the other files too, so it is asked below rather than here.
+// **A `var` is deliberately not one of these**: a file of nothing but bindings may be a script's body.
+// Whether it is *this* program's is a question about the other files too, so it is asked below.
 private is_declaration(s: Stmt) -> bool = *s.kind match
     FuncDecl(_) -> true
     StructDecl(_) -> true
@@ -37,6 +36,9 @@ private is_declaration(s: Stmt) -> bool = *s.kind match
     ImportDecl(_) -> true
     ConstDecl(_, _, _, _) -> true
     ValDecl(_, _, _, _, _, _, _, _) -> true
+    // A `val` naming several things is one per name, and a declaration as each would be.
+    MultiDecl(_, mutable, _, _) -> !mutable
+    PatternDecl(_, mutable, _, _, _) -> !mutable
     TypeDecl(_) -> true
     StaticDecl(_) -> true
     CTypeBlock(_) -> true
@@ -54,10 +56,16 @@ private is_declaration(s: Stmt) -> bool = *s.kind match
 //
 // Everything else settles which file the program starts in on its own: a `print` runs and a `struct`
 // does not, whatever else the program contains. A `var` is the one form that does not, because both
-// readings are coherent -- a local of the body it was written in, or storage the module owns -- and
-// nothing in the line itself chooses between them.
+// readings are coherent -- a local of a script's body, or storage the module owns -- and nothing in
+// the line itself chooses between them.
+//
+// A `var` naming several things is one of these as each of its names would be, with or without the
+// `@thread_local` or `@per_cpu` that gives each its copies.
 private is_top_level_binding(s: Stmt) -> bool = *s.kind match
     VarDecl(_, _, _, _, _, _, _, _) -> true
+    MultiDecl(_, mutable, _, _) -> mutable
+    PatternDecl(_, mutable, _, _, _) -> mutable
+    CopiedDecl(_, inner) -> is_top_level_binding(inner)
     _ -> false
 
 // Whether a declaration belongs to the **module** even when it is written in the file the program
@@ -84,48 +92,54 @@ is_module_member(s: Stmt) -> bool = *s.kind match
     ModuleAsm(_, _, _) -> true
     _ -> false
 
-// Whether a file carries a statement of a kind, which is what both passes below ask.
-private carries(u: Program, binding: bool) -> bool
+// The first statement of a file that **runs** -- neither a declaration nor a binding -- which is
+// what makes it the program's beginning, and the line a reader has to move when it is a second one.
+private first_running(u: Program) -> Option[Stmt]
     for s in u.body
-        if !is_declaration(s) && is_top_level_binding(s) == binding then return true
-
-    false
-end carries
-
-// The first statement that made a file a rival, which is the line the reader has to move.
-private first_rival(u: Program, binding: bool) -> Option[Stmt]
-    for s in u.body
-        if !is_declaration(s) && is_top_level_binding(s) == binding then return Some(s)
+        if !is_declaration(s) && !is_top_level_binding(s) then return Some(s)
 
     None
-end first_rival
+end first_running
 
-// Which file of a compilation carries the statements the program runs, where one does.
+// Whether a file carries a binding and nothing that runs.
+private only_binds(u: Program) -> bool
+    for s in u.body
+        if !is_declaration(s) && is_top_level_binding(s) then return true
+
+    false
+end only_binds
+
+// Which file of a compilation carries the statements the program runs, where one does -- the one
+// ruling `refuse_stray_static` asks too, so `static` is refused in exactly the files this does not
+// choose.
 //
-// **It is two passes rather than one filter, because a `var` cannot answer on its own.** A file
-// carrying a statement that is not a binding is a beginning, and where one exists every other file's
-// top-level `var`s are the module's. So the two readings never compete, and a program that has no
-// such file falls back to the second pass, where a lone binding is a body after all -- which is what
-// keeps a one-file `var n = 1` meaning what it has always meant.
+// **A file carrying a statement that runs is the program's beginning**, and where one exists every
+// other file's top-level `var`s are the module's.
 //
-// **That fallback reaches only a file with no `module` header**, because a file that names a module
-// has no body for a binding to belong to instead. Without the condition a library was its own
-// beginning: a package is one module in files that all name it, and the moment one of them held a
-// `var` it was chosen here, after which every function touching that `var` was a nested function of
-// a body that does not exist.
+// **Where nothing runs, a lone headerless file of bindings is a script's body** -- a one-file
+// `var n = 1` means what it always did -- **unless the program's beginning is written elsewhere.**
+// Three things write it: a build with no entry point at all (a library, a C archive, whose linking
+// program supplies `main`); a declared `main`; and a function exported as `main`, which is how a
+// bare-metal root file names its entry. In each there is no body for a `var` to be a local of, so it
+// is the module's storage, laid into `.bss`/`.data`, and the functions reading it are ordinary
+// module functions -- read as a body, every one of them was nested out of reach of the entry and of
+// any method.
 //
-// **And only where this compilation HAS a beginning.** A library and a C archive emit no `main` --
-// the program linking the artifact supplies its own -- so there is no body for a `var` to be a local
-// of, and inventing one is not a smaller mistake than picking the wrong file.
+// **And only a file with no `module` header**, because a file that names a module has no body for a
+// binding to belong to instead; without that, a library holding a `var` was its own beginning.
 //
 // Several files carrying only bindings is **not** the two-beginnings mistake: a program in which
-// nothing runs has no beginning for a second one to compete with, so each of those files is holding
-// module storage and the whole thing is a library that does nothing.
+// nothing runs has no beginning for a second one to compete with, so each holds module storage.
+//
+// **A `@tests` file of bindings is never the beginning.** No build but `sysl test` keeps it, so it
+// cannot be the body a script runs; its `var`s are the module's storage, and a `@test` reading one
+// stays a test rather than being nested into a body nobody runs. One holding a statement that runs is
+// still counted above, so that statement is refused where it stands rather than quietly kept.
 entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[usize]
     var running: Buf[usize] = buf()
 
     for i in 0..<units.len()
-        if carries(units.at(i), false) then running.push(i)
+        if first_running(units.at(i)).is_some() then running.push(i)
 
     if !running.is_empty()
         val first = units.at(running.at(0))
@@ -134,41 +148,52 @@ entry_file(a: &Analysis, units: Buf[Program], has_entry_point: bool) -> Option[u
         // line, and not the winner's.
         for k in 1..<running.len()
             val u = units.at(running.at(k))
-            val at = first_rival(u, false)
 
-            if at.is_some() then
-                a.fault(scope_of_unit(a, u), at.unwrap().span,
-                        s"${first.src.name} already carries the statements this program runs, so " +
-                        s"${u.src.name} may hold declarations only")
+            a.fault(scope_of_unit(a, u), first_running(u).unwrap().span,
+                    s"${first.src.name} already carries the statements this program runs, so " +
+                    s"${u.src.name} may hold declarations only")
 
         return Some(running.at(0))
 
-    if !has_entry_point then return None
-
-    // A declared `main` is the program's beginning, so a file whose only running lines are bindings
-    // is holding the module's storage beside it rather than being a body of its own -- read as one,
-    // the `main` was refused as a second beginning and every function touching the binding was
-    // nested out of its reach.
-    if declares_main(units) then return None
+    if !has_entry_point || names_its_entry(a, units) then return None
 
     var bound: Buf[usize] = buf()
 
     for i in 0..<units.len()
-        if units.at(i).module_name.is_none() && carries(units.at(i), true) then bound.push(i)
+        val u = units.at(i)
+
+        if u.module_name.is_none() && !u.test_only && only_binds(u) then bound.push(i)
 
     if bound.len() == 1 then Some(bound.at(0)) else None
 end entry_file
 
-// Whether any file of the compilation declares a top-level `main`.
-private declares_main(units: Buf[Program]) -> bool
+// Whether the program writes where it begins somewhere other than a file's top level: a top-level
+// `main`, a function exported under that symbol, or a bare image whose manifest names an entry of its
+// own (`targets.<machine>.entry`) -- a start file is then where the program begins, and it reaches
+// whatever it runs by symbol.
+private names_its_entry(a: &Analysis, units: Buf[Program]) -> bool
+    if a.image_entry != "" && a.image_entry != "main" then return true
+
     for u in units
-        for j in 0..<u.body.len()
-            *u.body.at(j).kind match
-                FuncDecl(d) -> if d.name == "main" then return true
+        for s in u.body
+            *s.kind match
+                FuncDecl(d) -> if d.name == "main" || exported_as_main(d) then return true
                 _ -> ()
 
     false
-end declares_main
+end names_its_entry
+
+// How a refusal names a function that is a beginning of its own, and `""` for one that is not.
+private beginning_named(d: FuncDecl) -> string
+    if d.name == "main" then return "this 'main'"
+    if exported_as_main(d) then return "this function exported as 'main'"
+
+    ""
+
+// Whether a function is exported under the platform's entry symbol.
+private exported_as_main(d: FuncDecl) -> bool = d.exported match
+    Some(x) -> x.symbol.unwrap_or("") == "main"
+    None -> false
 
 // A program starts in **one** place, and statements at the top of a file and a `main` are two ways
 // of writing that place.
@@ -181,26 +206,56 @@ end declares_main
 // Reported here rather than where `main` is resolved, because it is the *cause* of whatever else
 // goes wrong: a `main` written beside statements reaches for their bindings and is told about each
 // one of them, and those complaints are consequences of a program having two beginnings.
+//
+// **A function exported as `main` is a beginning too**, being the platform's `main` itself: beside
+// statements it is refused the same way, and beside a declared `main` it is the second of two.
 refuse_two_beginnings(a: &Analysis, units: Buf[Program], entry: Option[usize])
-    if entry.is_none() then return
-
-    val first = units.at(entry.unwrap())
+    var declared: Option[string] = None
 
     for u in units
-        for j in 0..<u.body.len()
-            val s = u.body.at(j)
+        for s in u.body
+            *s.kind match
+                FuncDecl(d) -> if d.name == "main" && declared.is_none() then declared = Some(u.src.name)
+                _ -> ()
 
+    for u in units
+        for s in u.body
             *s.kind match
                 FuncDecl(d) ->
-                    if d.name == "main"
-                        // The file's name goes last so that a page quoting this can quote the
-                        // sentence and leave the name out.
-                        a.fault(scope_of_unit(a, u), s.span, "a program starts in one place, and " +
-                                "this 'main' is a second — whichever of the two the program means, " +
-                                "the other belongs inside it. The statements this program starts " +
-                                s"with are in ${first.src.name}")
+                    // The file's name goes last so that a page quoting this can quote the sentence
+                    // and leave the name out.
+                    if entry.is_some()
+                        val what = beginning_named(d)
+
+                        if what != ""
+                            a.fault(scope_of_unit(a, u), s.span, s"a program starts in one place, and $what " +
+                                    "is a second — whichever of the two the program means, the other " +
+                                    "belongs inside it. The statements this program starts with are in " +
+                                    units.at(entry.unwrap()).src.name)
+                            return
+                    else if exported_as_main(d) && d.name != "main" && declared.is_some()
+                        a.fault(scope_of_unit(a, u), s.span, "a program starts in one place, and this " +
+                                "function exported as 'main' is a second beside the declared 'main' — " +
+                                "whichever of the two the program means, the other belongs inside it. " +
+                                s"The declared 'main' is in ${declared.unwrap()}")
                         return
                 _ -> ()
+
+// A `@test` or a hook that reads one of the entry file's bindings -- itself, or through a sibling that
+// does -- would be nested into that file's body, out of the runner's reach, and so would never run.
+// **Every test either runs or is refused by name**, so this is refused rather than dropped.
+refuse_nested_tests(a: &Analysis, u: Program, captures: Buf[string])
+    for s in u.body
+        *s.kind match
+            FuncDecl(d) ->
+                if (d.test.is_some() || d.hook.is_some()) && holds_string(captures, d.name)
+                    val kind = if d.test.is_some() then "'@test'" else "hook"
+
+                    a.fault(scope_of_unit(a, u), s.span, s"'${d.name}' is a $kind that reads a " +
+                            "binding of the body of the file this program starts in, so it would be " +
+                            "nested inside that body where the test runner cannot reach it — mark " +
+                            "what it reads 'static', which makes it the module's")
+            _ -> ()
 
 // `static` is how a declaration in the entry file's body opts back into the module. Everywhere else
 // it says nothing, because everywhere else there is no body for a declaration to belong to instead
@@ -292,10 +347,11 @@ private binds_of(s: Stmt, out: *Buf[string])
         VarDecl(n, _, _, _, _, _, _, _) -> out.push(n)
         ValDecl(n, _, _, _, _, _, _, _) -> out.push(n)
         RefDecl(n, _) -> out.push(n)
-        MultiDecl(ns, _, _) ->
+        MultiDecl(ns, _, _, _) ->
             for item in ns
                 out.push(item)
-        PatternDecl(p, _, _, _) -> pattern_names(out, p)
+        PatternDecl(p, _, _, _, _) -> pattern_names(out, p)
+        CopiedDecl(_, inner) -> binds_of(inner, out)
         _ -> ()
 
 // Every name a function reads that it does not bind -- its parameters, its locals, and everything a

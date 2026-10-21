@@ -1,0 +1,220 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// A call written with its type arguments, `one[int]()`, is a constant expression wherever the same
+// call with them inferred is one: a `const`'s value, an array length, a value argument of a type or a
+// call, and an `@assert` (`reference/declarations.md § Calls where a type is read`). One type
+// argument is parsed as a subscript and two as a list, so both spellings are held to it.
+
+private var xtc_library_cache: Buf[Program] = buf()
+private var xtc_library_read: bool = false
+
+private xtc_library() -> Buf[Program]
+    if xtc_library_read then return xtc_library_cache
+
+    xtc_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> xtc_library_cache = units
+
+    xtc_library_cache
+end xtc_library
+
+private xtc_ready() -> bool
+    if xtc_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end xtc_ready
+
+// The program built and run: `<status>: <output>`, or `unbuilt: <diagnostics>`.
+private xtc_does(text: string) -> string
+    val root = make_temp_dir("sysl-xtc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            out.status match
+                Status.Exited(code) -> s"$code: ${out.text}${out.err.unwrap_or("")}"
+                _ -> s"signalled: ${out.text}"
+end xtc_does
+
+private xtc_refused(outcome: string, part: string)
+    assert(outcome.starts_with("unbuilt: "), s"expected a refusal, got: $outcome")
+    assert(outcome.index_of(part).is_some(), s"expected '$part' in: $outcome")
+end xtc_refused
+
+private xtc_head() -> string =
+    "const one[T]() -> int = 1\n" +
+    "const width[T]() -> int = int(sizeof(T))\n" +
+    "const pair[A, B]() -> int = int(sizeof(A) + sizeof(B))\n" +
+    "const pick[const N: int]() -> int = N * 10\n"
+
+private xtc_not_constant() -> string =
+    "'@assert' is settled while compiling, so its condition has to be a constant expression"
+
+private xtc_outside() -> string =
+    "cannot be computed while compiling: it calls 'f', which calls 'getpid', which is outside the program"
+
+// ---- where it stands ----
+
+@test("explicit type arguments: a const's value")
+xtc_a_consts_value()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "const X = one[int]()\nconst W = width[u64]()\nconst P = pair[u8, u32]()\n" +
+                       "print(X, W, P)\n"), "0: 1 8 5\n")
+
+@test("explicit type arguments: an array length in a field")
+xtc_an_array_length_in_a_field()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "struct S\n    items: [one[int]()]u8\n    more: [pair[u16, u32]()]u8\n" +
+                       "print(sizeof(S))\n"), "0: 7\n")
+
+@test("explicit type arguments: an array length in an alias and a local")
+xtc_an_array_length_in_an_alias_and_a_local()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "type Quad = [width[u32]()]u8\nval q: Quad = [1, 2, 3, 4]\n" +
+                       "var xs: [width[u16]()]int\nprint(q.len, xs.len)\n"), "0: 4 2\n")
+
+@test("explicit type arguments: @assert")
+xtc_assert()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "@assert(one[int]() == 1, \"one\")\n@assert(pair[u8, u16]() == 3)\n" +
+                       "@assert(width[u64]() == 8)\nprint(1)\n"), "0: 1\n")
+
+// An `@assert` that fails is still a failure: the explicit call is run, not waved through.
+@test("explicit type arguments: an @assert it falsifies")
+xtc_an_assert_it_falsifies()
+    if !xtc_ready() then return
+
+    xtc_refused(xtc_does(xtc_head() + "@assert(width[u64]() == 4, \"wide\")\nprint(1)\n"), "wide")
+
+@test("explicit type arguments: a value argument of a type")
+xtc_a_value_argument_of_a_type()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "struct Ring[const N: int]\n    items: [N]u8\n" +
+                       "val r = Ring[one[int]()]([7])\nval q: Ring[width[u32]()] = Ring([1, 2, 3, 4])\n" +
+                       "print(r.items.len, q.items.len)\n"), "0: 1 4\n")
+
+// The call answering a value argument of another explicit call: the inner one is run first.
+@test("explicit type arguments: nested in a call's value argument")
+xtc_nested_in_a_calls_value_argument()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does(xtc_head() + "const A = pick[one[int]()]()\nconst B = pick[width[u64]()]()\n" +
+                       "@assert(pick[pair[u8, u8]()]() == 20)\nprint(A, B)\n"), "0: 10 80\n")
+
+// A generic that is not `const` runs while compiling where its body can, written either way.
+@test("explicit type arguments: a plain generic")
+xtc_a_plain_generic()
+    if !xtc_ready() then return
+
+    assert_eq(xtc_does("plain[T]() -> int = int(sizeof(T)) + 1\nconst P = plain[u32]()\n" +
+                       "@assert(plain[u8]() == 2)\nstruct S\n    xs: [plain[u16]()]u8\nprint(P, sizeof(S))\n"),
+              "0: 5 3\n")
+
+// The use that found it: a layout fingerprint over a struct's fields, settled while compiling and
+// held against the same function run with the program.
+@test("explicit type arguments: a layout fingerprint over T::Fields")
+xtc_a_layout_fingerprint_over_fields()
+    if !xtc_ready() then return
+
+    val text = "struct Shared\n    a: u8\n    b: u32\n    c: u16\n\n" +
+               "const fingerprint[T]() -> u32\n" +
+               "    var h: u32 = 2166136261\n" +
+               "    for const f in T::Fields\n" +
+               "        h = (h ^ u32(f.offset)) * 16777619\n" +
+               "    (h ^ u32(sizeof(T))) * 16777619\n\n" +
+               "live[T]() -> u32\n" +
+               "    var h: u32 = 2166136261\n" +
+               "    for const f in T::Fields\n" +
+               "        h = (h ^ u32(f.offset)) * 16777619\n" +
+               "    (h ^ u32(sizeof(T))) * 16777619\n\n" +
+               "const F = fingerprint[Shared]()\n" +
+               "@assert(fingerprint[Shared]() == F, \"fingerprint\")\n" +
+               "@assert(fingerprint[Shared]() != fingerprint[(u8, u8)](), \"distinct\")\n" +
+               "var go = true\n" +
+               "if go then print(F == live[Shared](), F == fingerprint[Shared]())\n"
+
+    assert_eq(xtc_does(text), "0: true true\n")
+
+// ---- what it still refuses ----
+
+@test("explicit type arguments: a const whose call reaches outside the program")
+xtc_a_const_whose_call_reaches_outside()
+    if !xtc_ready() then return
+
+    xtc_refused(xtc_does("extern getpid() -> i32\nf[T]() -> int = int(getpid())\nconst K = f[u8]()\nprint(1)\n"),
+                "'K' " + xtc_outside())
+
+@test("explicit type arguments: an @assert whose call reaches outside the program")
+xtc_an_assert_whose_call_reaches_outside()
+    if !xtc_ready() then return
+
+    xtc_refused(xtc_does("extern getpid() -> i32\nf[T]() -> int = int(getpid())\n@assert(f[u8]() == 1)\n" +
+                         "print(1)\n"), "this value " + xtc_outside())
+
+@test("explicit type arguments: an array length whose call reaches outside the program")
+xtc_an_array_length_whose_call_reaches_outside()
+    if !xtc_ready() then return
+
+    xtc_refused(xtc_does("extern getpid() -> i32\nf[T]() -> int = int(getpid())\nstruct S\n    xs: [f[u8]()]u8\n" +
+                         "print(1)\n"), "this value " + xtc_outside())
+
+@test("explicit type arguments: an @assert over storage filled at run time")
+xtc_an_assert_over_storage()
+    if !xtc_ready() then return
+
+    xtc_refused(xtc_does("var seed: int = 3\nf[T]() -> int = seed\n@assert(f[u8]() == 3)\nprint(1)\n"),
+                xtc_not_constant())
+    xtc_refused(xtc_does("var seed: int = 3\nf[T](x: T) -> int = seed\n@assert(f(0u8) == 3)\nprint(1)\n"),
+                xtc_not_constant())
+
+// A function of the entry file reading the body's bindings is out of reach of a module-level call,
+// and says so whichever way the call is written -- one type argument parses as a subscript, and two
+// as a list, and neither may fall through to "not callable" or "undefined".
+@test("explicit type arguments: an entry-body function called from a const")
+xtc_an_entry_body_function_called_from_a_const()
+    if !xtc_ready() then return
+
+    val said = "'f' reads the entry file's body, so only the body can call it"
+
+    xtc_refused(xtc_does("var seed: int = 3\nf[T]() -> int = seed\nconst K = f[u8]()\nprint(1)\n"), said)
+    xtc_refused(xtc_does("var seed: int = 3\nf[A, B]() -> int = seed\nconst K = f[u8, u8]()\nprint(1)\n"), said)
+    assert_eq(xtc_does("var seed: int = 3\nf[T]() -> int = seed\nval k = f[u8]()\nprint(k)\n"), "0: 3\n")

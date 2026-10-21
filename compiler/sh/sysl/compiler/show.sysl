@@ -121,6 +121,8 @@ private write_type_text(out: *StrBuilder, t: TypeRef)
         AssocArgType(n, typ) ->
             out.push(s"${n} = ")
             write_type_text(out, typ)
+        // Nothing is written for a result read off the body.
+        InferredResult(_) -> ()
         SomeType(bounds) ->
             out.push("some ")
 
@@ -142,6 +144,17 @@ bound_text(b: BoundRef) -> string
     out.push_char(']')
     out.finish()
 end bound_text
+
+// Bounds joined by `+`, as they were written.
+bounds_text(bs: Buf[BoundRef]) -> string
+    var out = ""
+
+    for i in 0..<bs.len()
+        if i > 0 then out = out + " + "
+        out = out + bound_text(bs.at(i))
+
+    out
+end bounds_text
 
 // -- the tree, as a shape a test can read ---------------------------------------------------------
 
@@ -264,6 +277,7 @@ write_type(out: *StrBuilder, t: TypeRef)
             out.push(s"(= ${n} ")
             write_type(out, typ)
             out.push_char(')')
+        InferredResult(_) -> out.push("(inferred)")
         SomeType(bounds) ->
             out.push("(some")
 
@@ -459,9 +473,22 @@ write_expr(out: *StrBuilder, e: Expr)
 
             out.push_char(')')
         ImplicitMember(n) -> out.push(s"(dot ${n})")
+        TypeArg(typ) ->
+            out.push("(type ")
+            write_type(out, typ)
+            out.push_char(')')
         LayoutOf(op, typ) ->
             out.push(s"(${op} ")
             write_type(out, typ)
+            out.push_char(')')
+        TraitTest(subject, bounds) ->
+            out.push("(implements ")
+            write_type(out, subject)
+
+            for b in bounds
+                out.push_char(' ')
+                out.push(bound_text(b))
+
             out.push_char(')')
         OffsetOf(typ, field) ->
             out.push("(offsetof ")
@@ -508,6 +535,19 @@ write_expr(out: *StrBuilder, e: Expr)
             write_expr(out, count)
             out.push_char(')')
         Block(stmts) -> write_body(out, "block", stmts)
+        ConstIf(cond, then_body, else_body) ->
+            out.push("(const-if ")
+            write_expr(out, cond)
+            out.push_char(' ')
+            write_body(out, "then", then_body)
+
+            else_body match
+                Some(b) ->
+                    out.push_char(' ')
+                    write_body(out, "else", b)
+                None -> ()
+
+            out.push_char(')')
         IfExpr(cond, then_body, else_body, _) ->
             out.push("(if ")
             write_expr(out, cond)

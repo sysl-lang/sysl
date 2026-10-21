@@ -124,23 +124,24 @@ wta_a_local_shadowing_the_name()
     assert_eq(enm_ran("id[T](x: T) -> T = x\nvar id: []*extern(int) -> int = [&double]\n" +
                       "double(n: int) -> int = n * 2\nprint(id[0](3))\n"), "6\n")
 
-// The brackets read the expression grammar, so a slice fails in the parser.
-@test("a type the expression grammar cannot spell is refused")
-wta_a_slice_cannot_be_spelled()
+// A form the expression grammar cannot read is re-read by the type grammar, so the written type is the
+// one the call is checked against (`tests_psa_type_argument_forms.sysl`).
+@test("a slice written as a type argument is the type the call is checked against")
+wta_a_slice_is_read_as_written()
     if !enm_ready() then return
 
     val said = enm_err("count[T](xs: []T) -> usize = xs.len\nvar ns: [3]int = [1, 2, 3]\n" +
                        "print(count[[]int](ns[..]))\n")
 
-    assert(wta_says(said, "']' expected"), said)
+    assert(wta_says(said, "'xs' of 'count' is [][]int, but []int was given"), said)
 
-@test("a vector is one of them, and the annotation still reaches it")
-wta_a_vector_cannot_be_spelled()
+@test("and so is a vector")
+wta_a_vector_is_read_as_written()
     if !enm_ready() then return
 
-    val said = enm_err("first[T](v: T) -> T = v\nprint(first[<4>f32](1.0))\n")
+    val said = enm_err("first[T](v: T) -> T = v\nval s: string = first[<4>f32](1.0)\n")
 
-    assert(wta_says(said, "expression expected"), said)
+    assert(wta_says(said, "<4>f32"), said)
 
 // -- a special form ----------------------------------------------------------------------------------
 
@@ -185,9 +186,9 @@ wta_a_constructor_takes_the_written_arguments()
 wta_the_fields_are_checked_against_it()
     if !enm_ready() then return
 
-    val said = enm_err("struct Box[T]\n    v: T\n\nvar b = Box[real](1)\nprint(b.v)\n")
+    val said = enm_err("struct Box[T]\n    v: T\n\nvar b = Box[real](1i64)\nprint(b.v)\n")
 
-    assert(wta_says(said, "'v' of 'Box[real]' is real, but int was given"), said)
+    assert(wta_says(said, "'v' of 'Box[real]' is real, but long was given"), said)
 
 // A bare enum name is not a constructor, so it is owed the sentence about variants.
 @test("an enum name applied to arguments is not one")
@@ -215,18 +216,24 @@ wta_a_variant_carrying_nothing()
     assert_eq(enm_ran("enum Maybe[T]\n    Just(v: T)\n    Nothing\n\nval m = Maybe[string].Nothing\n" +
                       "val n = m match\n    Just(v) -> v\n    Nothing -> \"none\"\nprint(n)\n"), "none\n")
 
-// An associated function keeps the refusal: its type's parameters and its own are solved from one
-// list, and honouring the brackets would mean fixing half of it.
-@test("an associated function is still asked for on the binding")
-wta_an_associated_function_is_still_refused()
+// An associated function called off the list is reached at the instantiation it names, as it is
+// through an alias of that instantiation: the list is the type's, and the member's own parameters
+// are still solved from the call.
+@test("an associated function is called at the instantiation written on its type")
+wta_an_associated_function_takes_the_written_instantiation()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Box[T]\n    v: T\n    of(x: T) -> Self = Box(x)\n\n" +
+                      "var b = Box[u8].of(200)\nprint(b.v + 55)\n"), "255\n")
+
+@test("and the argument is held to it")
+wta_an_associated_function_holds_its_argument_to_the_list()
     if !enm_ready() then return
 
     val said = enm_err("struct Box[T]\n    v: T\n    of(x: T) -> Self = Box(x)\n\n" +
-                       "var b = Box[int].of(1)\nprint(b.v)\n")
+                       "var b = Box[string].of(1)\nprint(b.v)\n")
 
-    assert(wta_says(said, "'Box' cannot be given type arguments where 'of' is selected from it; " +
-                          "write the type on what receives the result — 'var x: Box[…] = …' — and " +
-                          "select 'of' from the plain name"), said)
+    assert(wta_says(said, "'x' of 'Box.of' is string, but int was given"), said)
 
 // -- a method ----------------------------------------------------------------------------------------
 

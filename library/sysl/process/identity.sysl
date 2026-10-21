@@ -4,6 +4,8 @@ module sysl.process
 import sysl.fs.{IoError, from_status}
 import sysl.sys.UNSUPPORTED
 import sysl.process.sys as psys
+import sysl.slices.as_mut_ptr
+import sysl.text.from_utf8
 
 // Which user and group the program runs as, and changing them.
 //
@@ -49,6 +51,19 @@ real_user() -> u32 = id_answer(psys.get_id(psys.id_real_user), "real user")
 /** The group of the user who started the program: the real group id. */
 real_group() -> u32 = id_answer(psys.get_id(psys.id_real_group), "real group")
 
+/** This program's process id: the number no other program running beside it has, which is what
+ * names a file, a directory or a cache entry this run alone owns. It is POSIX's `getpid`, and what a
+ * `Child`'s `pid` is to the program that started it.
+ *
+ * **A target that keeps no processes answers 0**, as it answers 0 for a user: there is one program, and
+ * nothing beside it to be told apart from. So does a supplier that does not know the question.
+ */
+pid() -> u32
+    val answer = psys.get_id(psys.id_process)
+
+    if answer < 0 then 0 else u32(answer)
+end pid
+
 /** The program made to act as user `id`, as POSIX's `setuid`. **It is privileged**: a program acting
  * as user 0 becomes `id` for good -- real, effective and saved ids together, so the privilege is
  * given up rather than set aside -- and any other program may only move between the ids it already
@@ -65,3 +80,23 @@ set_user(id: u32) -> Result[unit, IoError] = changed(psys.set_id(psys.id_user, i
 set_group(id: u32) -> Result[unit, IoError] = changed(psys.set_id(psys.id_group, id))
 
 private changed(code: int) -> Result[unit, IoError] = if code >= 0 then Ok(()) else Err(from_status(code))
+
+/** The name this machine calls itself, as POSIX's `gethostname`: `"build-7"`, or a fully qualified
+ * `"build-7.example.org"`, whichever the host was configured with. It is whatever the host says and
+ * is not looked up in any directory, so it need not resolve to an address.
+ *
+ * **Fails with `InvalidUtf8`** where the host's name is not valid UTF-8, and with the system's own
+ * error where the call fails. **A target with no notion of a host name** (`UNSUPPORTED` from its
+ * supplier) fails with that error too, rather than inventing one.
+ */
+hostname() -> Result[string, IoError]
+    var raw: []u8 = [0; 256]
+
+    val n = psys.hostname(as_mut_ptr(raw), raw.len)
+
+    if n < 0 then return Err(from_status(int(n)))
+
+    from_utf8(raw[0..<usize(n)]) match
+        Ok(s) -> Ok(s)
+        Err(e) -> Err(IoError.InvalidUtf8(e.offset))
+end hostname

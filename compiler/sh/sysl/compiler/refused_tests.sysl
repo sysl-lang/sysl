@@ -1,0 +1,137 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, read_bytes}
+import sysl.text.{from_utf8_unchecked, split, Search}
+import sysl.time.{monotonic, whole_millis}
+
+// A package's **refused tests**: the programs under its root's `tests/refused/`, each of which `sysl
+// test` requires the compiler to refuse.
+//
+// A `@test` function can only say what code does once it compiles; what a package promises its users
+// cannot compile -- moving a `@pinned` value, reaching a module-private name -- needs a program that
+// is refused, and a check that it stays refused. Each file is one such program. Its leading comment
+// carries one or more `// error: <text>` lines, and the file passes when compiling it fails with a
+// diagnostic **containing** every one of those texts -- the rule a documentation page's `error` block
+// is held to (`docs_refuses`).
+//
+// **Each file is compiled on its own** (`refused_check`), with the package being tested: as a file of
+// its root module, for the run's target, features and optimization, so it imports the package's
+// modules and its dependencies exactly as a consumer's program would. No build reads the directory
+// (`skipped_at_root`); only `sysl test` does.
+
+// The programs under `root`'s `tests/refused/`, in name order, each named from the root of the
+// filesystem. A root with no such directory -- or a path naming a single file -- has none.
+refused_files(root: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !is_directory(root) then return out
+
+    val dir = absolute_path(join_path(join_path(root, RefusedParent), RefusedLeaf))
+
+    if !is_directory(dir) then return out
+
+    val names = entries(dir) match
+        Err(_) -> return out
+        Ok(found) -> found
+
+    for item in sort_names(names)
+        if is_sysl_file(item) then out.push(join_path(dir, item))
+
+    out
+end refused_files
+
+// What a refused file's row is called: its path below the project root, which is what a reader
+// writes after `--filter` and what they find on disk.
+refused_display(file: string) -> string = s"$RefusedParent/$RefusedLeaf/${basename(file)}"
+
+// The texts a refused file's diagnostics must contain: every `// error:` line of its leading comment,
+// the comment being the lines before the first that is neither blank nor a `//` comment.
+//
+// **A file that names none is an error, as is an `// error:` with nothing after it**: a refused test
+// that requires nothing of the refusal passes whatever the compiler said, which is no test at all.
+refused_patterns(display: string, text: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        if line == "" then continue
+        if !line.starts_with("//") then break
+
+        val said = line[2..].trim_start()
+
+        if said.starts_with("error:")
+            val want = said[6..].trim()
+
+            if want == "" then return Err(s"$display has an empty '// error:' line — say what the " +
+                                          "refusal must contain")
+
+            out.push(want)
+        end if
+
+    if out.is_empty()
+        return Err(s"$display has no '// error: <text>' line saying what the refusal must contain")
+
+    Ok(out)
+end refused_patterns
+
+// The verdict on a refused file, given what compiling it came to: `None` for a pass, else why not.
+// `compiled` is `Ok` where the compiler accepted it, and otherwise everything it said.
+refused_verdict(display: string, patterns: Buf[string], compiled: Result[unit, string]) -> Option[string]
+    compiled match
+        Ok(_) -> Some(s"$display was expected to be refused, but it compiled")
+        Err(said) ->
+            for want in patterns
+                if !said.contains(want)
+                    return Some(s"$display was refused, but no diagnostic contains \"$want\"")
+
+            None
+end refused_verdict
+
+// The test a refused file stands for, named by its path so a row, the summary and `--filter` treat it
+// as they treat a `@test` function.
+private refused_test(file: string) -> TTest =
+    TTest("", refused_display(file), false, None, file, 1, no_hooks(), None, None)
+
+// Those of a project's refused files the filter keeps, matched against the name a row shows.
+selected_refused(files: Buf[string], filter: Option[string], within: Option[string] = None) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in files
+        val placed = within match
+            None -> true
+            Some(named) -> file_named(item, named)
+
+        if !placed then continue
+
+        filter match
+            None -> out.push(item)
+            Some(f) -> if refused_display(item).contains(f) then out.push(item)
+
+    out
+end selected_refused
+
+// One refused file, compiled and judged. Where it was refused in other words than its `// error:`
+// lines ask for, what the compiler said is the row's output, which a failing row shows.
+refused_outcome(project: string, named: Option[string], level: string, file: string) -> Outcome
+    val t = refused_test(file)
+    val started = monotonic()
+
+    val text = read_bytes(file) match
+        Err(_) -> return Outcome(t, Some(s"cannot read ${t.display}"), "", 0, None)
+        Ok(bytes) -> from_utf8_unchecked(bytes)
+
+    val patterns = refused_patterns(t.display, text) match
+        Err(why) -> return Outcome(t, Some(why), "", 0, None)
+        Ok(found) -> found
+
+    val compiled = refused_check(project, named, level, file)
+    val took = whole_millis(monotonic() - started)
+    val said = compiled match
+        Ok(_) -> ""
+        Err(message) -> message
+
+    Outcome(t, refused_verdict(t.display, patterns, compiled), said, took, None)
+end refused_outcome

@@ -1,0 +1,302 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, mod_floor, mul, or, pow, shl, shr, sub}
+
+// **Reading and writing a C bitfield** (`docs/design/bitfields.md` §5). A field written `name: T in
+// S` is bits inside a unit of `S`, at the place `c_bitfield_layout` gives it, and has no address of
+// its own -- so a read loads the unit, shifts the field down and cuts it to its width, and a write
+// loads the unit, clears the field's bits, ors the new value in and stores the unit back.
+//
+// An `iW` field *is* an LLVM `iW`, so cutting the shifted unit to the field's width lands a signed
+// value already sign-correct, as `read_bits` does for today's bitfield struct; a `bool` field is an
+// `i1`, and an enum field is checked against its variants by the caller that reads it as a value.
+//
+// **A `volatile` access is exactly the declared type's width** -- the unit, never merged with a
+// neighbour and never narrowed (the AAPCS rule for volatile bit-fields). A plain access loads the
+// same unit where the unit lies inside the struct, and the bytes the field touches where it would
+// run past the struct's end (i386 aligns a `u64` unit to four bytes, so the unit can).
+//
+// A value that is not in memory -- a call's result, a pattern's subject -- is given a slot first,
+// and the slot is read as storage is.
+
+// The struct a C bitfield `receiver.<index>` is in, where the field is one.
+c_bit_struct(receiver_ty: Type, index: int) -> Option[&StructType] = underlying(receiver_ty) match
+    Struct(d) -> if index >= 0 && d.c_bit(usize(index)).is_some() then Some(d) else None
+    _ -> None
+
+// One access to a field's unit: the byte it begins at, its width in bits, where the field begins
+// inside it, and the boundary the address is known to be on.
+private struct CAccess
+    offset: usize
+    bits: int
+    shift: int
+    align: int
+end CAccess
+
+// The access that reaches field `i`.
+private c_access(e: *Emit, d: &StructType, i: usize, volatile: bool) -> CAccess
+    val l = e.layout
+    val p = c_bitfield_layout(l, d).places.at(i)
+    var off = p.unit
+    var n = p.unit_bytes
+
+    if volatile
+        c_volatile_unit(l, d, i) match
+            Some(u) ->
+                off = u.0
+                n = u.1
+            None -> ()
+    else if off + n > l.size(Struct(d))
+        off = usize(p.bit / 8)
+        n = usize(p.bit + p.width + 7) / 8 - off
+    end if
+
+    CAccess(off, int(n) * 8, p.bit - int(off) * 8, access_align(off, l.align(Struct(d))))
+end c_access
+
+// The widest boundary an address `off` bytes past one on `whole` is still on.
+private access_align(off: usize, whole: usize) -> int
+    var a = if whole > 0 then whole else 1
+
+    while a > 1 && off % a != 0
+        a = a / 2
+
+    int(a)
+end access_align
+
+// Whether an access to field `i`'s unit is volatile: the struct is reached as `volatile`, or a field
+// sharing any byte of the unit is declared so -- the qualifier on one field of a unit qualifies every
+// access to it, as the design note says.
+private c_unit_volatile(e: *Emit, d: &StructType, i: usize, outer: Type) -> bool
+    outer match
+        Volatile(_) -> return true
+        _ -> ()
+
+    val c = c_bitfield_layout(e.layout, d)
+    val me = c.places.at(i)
+
+    for j in 0..<d.fields.len()
+        if volatile_in(d.fields.at(j).1)
+            val q = c.places.at(j)
+
+            if q.unit < me.unit + me.unit_bytes && me.unit < q.unit + q.unit_bytes then return true
+        end if
+
+    false
+end c_unit_volatile
+
+// The unit's address: `base` plus the unit's byte offset.
+private unit_addr(e: *Emit, base: Val, off: usize) -> Val
+    if off == 0 then return base
+
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(64), VInt(from_int(long(off)))))
+    emit(e, InGep(r, LInt(8), base, idx))
+    r
+end unit_addr
+
+// The bits of field `i` of the struct at `base`, as an integer of the field's width (`i1` for a
+// `bool`). `outer` is the type the struct's storage is declared at.
+c_bit_load(e: *Emit, d: &StructType, i: usize, base: Val, outer: Type) -> Val
+    val width = d.c_bit(i).unwrap().width
+
+    // `_: in S` holds nothing, and only a `_` standing in for it in a pattern ever reaches it.
+    if width == 0 then return VInt(from_int(0))
+
+    val vol = c_unit_volatile(e, d, i, outer)
+    val a = c_access(e, d, i, vol)
+    val ut = LInt(a.bits)
+    val u = fresh_reg(e)
+
+    emit(e, InLoad(u, ut, unit_addr(e, base, a.offset), if vol then AccVolatile else AccPlain, Some(a.align)))
+
+    val down =
+        if a.shift == 0 then u
+        else
+            val t = fresh_reg(e)
+
+            emit(e, InBin(t, OpLShr, ut, u, VInt(from_int(long(a.shift)))))
+            t
+
+    if width == a.bits then return down
+
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastTrunc, ut, down, LInt(width)))
+    r
+end c_bit_load
+
+// Writes `v`, a value of field `i`'s own width, into the field of the struct at `base`: one load of
+// the unit, the field's bits replaced, one store back.
+c_bit_store(e: *Emit, d: &StructType, i: usize, base: Val, outer: Type, v: Val)
+    val vol = c_unit_volatile(e, d, i, outer)
+    val a = c_access(e, d, i, vol)
+    val width = d.c_bit(i).unwrap().width
+    val ut = LInt(a.bits)
+    val acc = if vol then AccVolatile else AccPlain
+    val at = unit_addr(e, base, a.offset)
+
+    val wide =
+        if width == a.bits then v
+        else
+            val t = fresh_reg(e)
+
+            emit(e, InCast(t, CastZExt, LInt(width), v, ut))
+            t
+
+    val placed =
+        if a.shift == 0 then wide
+        else
+            val t = fresh_reg(e)
+
+            emit(e, InBin(t, OpShl, ut, wide, VInt(from_int(long(a.shift)))))
+            t
+
+    if width == a.bits
+        emit(e, InStore(ut, placed, at, acc, Some(a.align)))
+        return
+    end if
+
+    val u = fresh_reg(e)
+
+    emit(e, InLoad(u, ut, at, acc, Some(a.align)))
+
+    val full = sub(pow(from_int(2), usize(a.bits)), from_int(1))
+    val mine = mul(sub(pow(from_int(2), usize(width)), from_int(1)), pow(from_int(2), usize(a.shift)))
+    val cleared = fresh_reg(e)
+
+    emit(e, InBin(cleared, OpAnd, ut, u, VInt(sub(full, mine))))
+
+    val merged = fresh_reg(e)
+
+    emit(e, InBin(merged, OpOr, ut, cleared, placed))
+    emit(e, InStore(ut, merged, at, acc, Some(a.align)))
+end c_bit_store
+
+// Field `i` of a struct value that is not in memory: the value is given a slot, and the field read
+// out of it.
+c_bit_of_value(e: *Emit, d: &StructType, i: usize, v: Val) -> Val
+    val slot = alloca(e, fresh_reg(e), struct_lty(d))
+
+    emit(e, InStore(struct_lty(d), v, slot, AccPlain, None))
+    c_bit_load(e, d, i, slot, Struct(d))
+end c_bit_of_value
+
+// A struct with C bitfields built at `dest` from one value per field: the storage zeroed -- an
+// unnamed bitfield and every bit between fields hold zero -- then each field written where it lies,
+// in the order the fields are declared.
+c_bits_new_into(e: *Emit, d: &StructType, dest: Val, args: Buf[TExpr])
+    emit(e, InStore(struct_lty(d), VZero, dest, AccPlain, None))
+
+    for i in 0..<args.len()
+        val ft = d.fields.at(i).1
+
+        // A union is built from one field, and `()` stands at every other (`union_call`).
+        *args.at(i).kind match
+            TUnitLit -> continue
+            _ -> ()
+
+        d.c_bit(i) match
+            Some(b) ->
+                if b.width > 0 && !unnamed_c_bit(d, i) then
+                    c_bit_store(e, d, i, dest, Struct(d), gen_expr(e, args.at(i)))
+            None ->
+                if !zero_sized(ft)
+                    val p = fresh_reg(e)
+
+                    var idx: Buf[IrArg] = buf()
+
+                    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                    idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, d, d.slot(i)))))))
+                    emit(e, InGep(p, struct_lty(d), dest, idx))
+                    gen_borrowed_into(e, p, args.at(i))
+                end if
+end c_bits_new_into
+
+// The same, as a value: built in a slot and read back whole.
+c_bits_new(e: *Emit, d: &StructType, args: Buf[TExpr]) -> Val
+    val slot = alloca(e, fresh_reg(e), struct_lty(d))
+
+    c_bits_new_into(e, d, slot, args)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, struct_lty(d), slot, AccPlain, None))
+    r
+end c_bits_new
+
+// **A constant of a struct with C bitfields**, for module storage: its elements as `ir_lower.sysl`'s
+// `c_bits_elements` lays them down -- an ordinary field as its own constant, and every other element
+// (a run of bitfields, a gap) as the bytes it covers of the image the bitfields' values make.
+c_bits_constant(e: *Emit, d: &StructType, args: Buf[TExpr]) -> Val
+    val l = e.layout
+    val c = c_bitfield_layout(l, d)
+    var image = from_int(0)
+
+    for i in 0..<args.len()
+        val b = d.c_bit(i)
+
+        if b.is_some() && b.unwrap().width > 0 && !unnamed_c_bit(d, i)
+            val bits = constant_bits(constant_value(e, args.at(i)))
+            val w = b.unwrap().width
+
+            image = or(image, shl(mod_floor(bits, pow(from_int(2), usize(w))), usize(c.places.at(i).bit)))
+        end if
+
+    val laid = c_bits_elements(d, l) match
+        Some(parts) -> parts
+        None -> return VZero
+
+    var owner: Buf[int] = buf()
+
+    while owner.len() < laid.0.len()
+        owner.push(-1)
+
+    for i in 0..<laid.1.len()
+        if laid.1.at(i) >= 0 then owner.set(usize(laid.1.at(i)), int(i))
+
+    var out: Buf[IrArg] = buf()
+    var at: usize = 0
+
+    for k in 0..<laid.0.len()
+        val t = laid.0.at(k)
+        val f = owner.at(k)
+
+        if f >= 0
+            val ft = d.fields.at(usize(f)).1
+
+            out.push(ir_arg(t, constant_value(e, args.at(usize(f)))))
+            at += l.size(ft)
+            continue
+        end if
+
+        t match
+            LInt(n) ->
+                out.push(ir_arg(t, VInt(image_bytes(image, at, usize(n / 8)))))
+                at += usize(n / 8)
+            LArr(n, _) ->
+                var bytes: Buf[IrArg] = buf()
+
+                for j in 0..<n
+                    bytes.push(ir_arg(LInt(8), VInt(image_bytes(image, at + usize(j), 1))))
+
+                out.push(ir_arg(t, VArray(bytes)))
+                at += usize(n)
+            _ -> return VZero
+
+    VPackedAgg(out)
+end c_bits_constant
+
+// The `n` bytes of the image starting at byte `at`, as one integer.
+private image_bytes(image: BigInt, at: usize, n: usize) -> BigInt =
+    mod_floor(shr(image, at * 8), pow(from_int(2), n * 8))
+
+// The bits a scalar constant stands for: an integer's value, a `bool`'s bit.
+private constant_bits(v: Val) -> BigInt = v match
+    VInt(n) -> n
+    VBool(b) -> from_int(if b then 1 else 0)
+    _ -> from_int(0)

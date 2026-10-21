@@ -4,7 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{from_int, to_string, to_string_radix}
 import sysl.slices.contains
-import sysl.text.join
+import sysl.text.{from_utf8_unchecked, join}
 
 // A declaration written back out as the source line a reader of an API reference wants to see --
 // the signature `sysl doc` prints above each symbol's prose.
@@ -60,6 +60,8 @@ doc_type_text(t: TypeRef) -> string = *t.kind match
     AssocType(base, member) -> s"${doc_type_text(base)}::${member}"
     AssocArgType(name, typ) -> s"${name} = ${doc_type_text(typ)}"
     SomeType(bounds) -> s"some ${doc_bound_list(bounds, " + ")}"
+    // Nothing is written for a result read off the body, and a declaration is shown as written.
+    InferredResult(_) -> ""
 end doc_type_text
 
 private doc_type_list(ts: Buf[TypeRef]) -> string
@@ -286,9 +288,55 @@ private doc_param_list(ps: Buf[Param]) -> Buf[string]
 
 // The result clause, absent rather than `-> ()` where nothing is returned: sysl writes a procedure
 // with no arrow at all.
-private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
+private doc_ret_text(ret: Option[TypeRef]) -> string = as_written(ret) match
     Some(r) -> s" -> ${doc_type_text(r)}"
     None -> ""
+
+// What a function hands back, as its caller sees it: the `-> T` it wrote, or -- a result read off the
+// body -- the type the analysis read it as, rendered as though it had been written (`ResultSlot`'s
+// `shown`). A page documents an API, so the body is never shown. A result no analysis could read --
+// a tree that does not build, or a parse with nothing analyzed -- is ` = …`: the one thing known is
+// that the body decides it.
+private doc_result_text(ret: Option[TypeRef]) -> string = result_slot_of(ret) match
+    None -> doc_ret_text(ret)
+    Some(slot) -> slot.shown.unwrap_or(" = \u{2026}")
+
+// The result clause a function whose result was read off its body as `t` is documented with: no arrow
+// for `unit`, as a written procedure has none, and otherwise the type in the spelling an importer
+// writes, its module path left off. `None` where the reading came to nothing a signature can state.
+doc_result_of(t: Type) -> Option[string]
+    if mentions_unknown(t) || is_closure_literal(t) then return None
+
+    t match
+        Unit -> Some("")
+        _ -> Some(s" -> ${unqualified_text(type_show(t))}")
+end doc_result_of
+
+// A type's text with every module path taken off its names: `sysl.buf.Buf[sysl.Option[int]]` is
+// `Buf[Option[int]]`. A module segment is lower-case and followed by a dot, which no type name, enum
+// variant or number in a type's text is.
+private unqualified_text(text: string) -> string
+    val b = text.bytes
+    var out: Buf[u8] = buf()
+    // Where the word being read began in `out`.
+    var word: usize = 0
+
+    for c in b
+        if c == u8('.') && out.len() > word && out.at(word) >= u8('a') && out.at(word) <= u8('z')
+            out.truncate(word)
+            continue
+        end if
+
+        out.push(c)
+
+        if !is_word_byte(c) then word = out.len()
+
+    from_utf8_unchecked(out.view())
+end unqualified_text
+
+private is_word_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_')
 
 // -- declarations ---------------------------------------------------------------------------------
 
@@ -296,7 +344,7 @@ private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
 doc_func(f: FuncDecl) -> string
     val tps = doc_tparams_text(f.tparams, f.bounds, f.tvalues, f.tpacks, f.tdefaults)
 
-    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_ret_text(f.ret_type)}"
+    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_result_text(f.ret_type)}"
 
 // `const ` in front of a function the compiler may run -- part of its interface, so the page says it.
 private const_word(marked: bool) -> string = if marked then "const " else ""
@@ -317,7 +365,7 @@ private doc_method_bare(m: MethodDecl) -> string
     val tps = doc_tparams_text(m.tparams, m.bounds, m.tvalues, buf(), m.tdefaults)
 
     if m.is_property && m.params.is_empty()
-        return s"${if m.is_static then "static " else ""}${m.name}${tps}${doc_ret_text(m.ret_type)}"
+        return s"${if m.is_static then "static " else ""}${m.name}${tps}${doc_result_text(m.ret_type)}"
 
     var all: Buf[string] = buf()
 
@@ -330,7 +378,7 @@ private doc_method_bare(m: MethodDecl) -> string
     for item in ps
         all.push(item)
 
-    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_ret_text(m.ret_type)}"
+    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_result_text(m.ret_type)}"
 end doc_method_bare
 
 private doc_receiver_text(mode: RecvMode) -> string = mode match
@@ -404,15 +452,19 @@ doc_trait(t: TraitDecl) -> string
     join(lines.view(), "\n")
 end doc_trait
 
-// A module constant: `const capacity: usize = 512`.
-doc_const(name: string, typ: TypeRef, value: Expr) -> string =
-    s"const ${name}: ${doc_type_text(typ)} = ${doc_expr_text(value)}"
+// A module constant: `const capacity: usize = 512`, or `const step = 2` where the type was left to
+// the value -- written as it was declared, the value being what says the type.
+doc_const(name: string, typ: Option[TypeRef], value: Expr) -> string = typ match
+    Some(t) -> s"const ${name}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
+    None -> s"const ${name} = ${doc_expr_text(value)}"
 
 // An `impl` block's head -- the trait, its arguments, and the type it is for. Its members are
 // deliberately absent: their signatures are the trait's, already written where the trait is.
 doc_impl_head(i: ImplDecl) -> string
     val tps = doc_tparams_text(i.tparams, i.bounds, i.tvalues, buf(), i.tdefaults)
     val args = if i.trait_args.is_empty() then "" else s"[${doc_type_list(i.trait_args)}]"
+
+    if i.trait_name == "" then return s"impl${tps} ${doc_type_text(i.for_type)}"
 
     s"impl${tps} ${i.trait_name}${args} for ${doc_type_text(i.for_type)}"
 
@@ -447,6 +499,20 @@ doc_val(name: string, typ: Option[TypeRef], value: Expr) -> string = typ match
     Some(t) -> s"val ${name}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
     None -> s"val ${name} = ${doc_expr_text(value)}"
 
+// A module `var`, as written: `var count = 0`, `var limit: int = 8`, `var slots: [64]u8`.
+doc_var(name: string, typ: Option[TypeRef], init: Option[Expr]) -> string
+    val head = typ match
+        Some(t) -> s"var ${name}: ${doc_type_text(t)}"
+        None -> s"var ${name}"
+
+    init match
+        Some(v) -> s"$head = ${doc_expr_text(v)}"
+        None -> head
+end doc_var
+
+// The keyword a binding was written with.
+private doc_binder(mutable: bool) -> string = if mutable then "var" else "val"
+
 // The signature of a declaration a reference page can list, or `None` for a statement that is not
 // one. Which of these a page actually lists -- and which visibilities -- is the model's decision; a
 // declaration that is not public carries its mark in front (`private helper(n: int) -> int`,
@@ -463,4 +529,90 @@ doc_signature(s: Stmt) -> Option[string] = *s.kind match
     ExternDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_extern(d)}")
     ExternVarDecl(name, typ, _, vis, _) -> Some(s"${doc_vis_word(vis)}extern ${name}: ${doc_type_text(typ)}")
     ValDecl(name, typ, value, vis, _, _, _, _) -> Some(s"${doc_vis_word(vis)}${doc_val(name, typ, value)}")
+    VarDecl(name, typ, init, vis, _, _, _, _) -> Some(s"${doc_vis_word(vis)}${doc_var(name, typ, init)}")
+    MultiDecl(names, mutable, values, vis) ->
+        Some(s"${doc_vis_word(vis)}${doc_binder(mutable)} ${doc_names(names)} = ${doc_exprs_text(values)}")
+    PatternDecl(pat, mutable, value, typ, vis) -> Some(s"${doc_vis_word(vis)}${doc_pattern_val(pat, mutable, typ, value)}")
+    // `static` belongs to the module's binding it marks, so it leads that binding's own signature,
+    // after the visibility mark: `private static var hits = 0`.
+    StaticDecl(inner) -> doc_signature(inner) match
+        Some(sig) -> Some(doc_after_vis(sig, "static "))
+        None -> None
+    // An attribute is left off, as it is above a single `var`.
+    CopiedDecl(_, inner) -> doc_signature(inner)
     _ -> None
+
+// `word` put after the visibility mark that opens `sig`, or in front where it has none.
+private doc_after_vis(sig: string, word: string) -> string
+    if sig.starts_with("private")
+        val b = sig.bytes
+
+        for i in 0..<b.len
+            if b[i] == u8(' ') then return s"${sig[0..i]}$word${sig[i + 1..]}"
+    end if
+
+    s"$word$sig"
+end doc_after_vis
+
+// The names a binding gives, as it lists them: `q, r`.
+doc_names(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + ", "
+
+        out = out + names.at(i)
+
+    out
+end doc_names
+
+private doc_exprs_text(es: Buf[Expr]) -> string
+    var out = ""
+
+    for i in 0..<es.len()
+        if i > 0 then out = out + ", "
+
+        out = out + doc_expr_text(es.at(i))
+
+    out
+end doc_exprs_text
+
+private doc_pattern_val(pat: Pattern, mutable: bool, typ: Option[TypeRef], value: Expr) -> string = typ match
+    Some(t) -> s"${doc_binder(mutable)} ${doc_pattern_text(pat)}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
+    None -> s"${doc_binder(mutable)} ${doc_pattern_text(pat)} = ${doc_expr_text(value)}"
+
+// A pattern as it is written: `(a, b)`, `Point(x, y)`, `Point { x, y: b }`, `n @ (a, _)`.
+doc_pattern_text(p: Pattern) -> string = *p.kind match
+    LitPattern(v) -> doc_expr_text(v)
+    RangePattern(lo, hi, inclusive) ->
+        s"${doc_expr_text(lo)}${if inclusive then ".." else "..<"}${doc_expr_text(hi)}"
+    WildcardPattern -> "_"
+    IdentPattern(n) -> n
+    EqPattern(n) -> s"`$n`"
+    VariantPattern(n, args) -> s"$n(${doc_patterns_text(args)})"
+    StructPattern(n, fields) ->
+        var out = s"$n { "
+
+        for i in 0..<fields.len()
+            if i > 0 then out = out + ", "
+
+            val f = fields.at(i)
+
+            *f.pat.kind match
+                IdentPattern(b) if b == f.name -> out = out + b
+                _ -> out = out + s"${f.name}: ${doc_pattern_text(f.pat)}"
+
+        out + " }"
+    TuplePattern(args) -> s"(${doc_patterns_text(args)})"
+    BindPattern(n, inner) -> s"$n @ ${doc_pattern_text(inner)}"
+
+private doc_patterns_text(ps: Buf[Pattern]) -> string
+    var out = ""
+
+    for i in 0..<ps.len()
+        if i > 0 then out = out + ", "
+
+        out = out + doc_pattern_text(ps.at(i))
+
+    out
+end doc_patterns_text

@@ -1,7 +1,9 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file}
+import sysl.container.{Set, set}
+import sysl.fs.{entries, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_bytes, remove_dir_all, remove_file}
+import sysl.slices.sort_by
 import sysl.text.{from_utf8_unchecked, Search}
 
 // The standard module's artifact: where it is, how it is built when it is not there, and what a
@@ -55,8 +57,110 @@ std_artifact(t: Target, level: string = DefaultOptimization) -> Result[StdArtifa
     std_held = symbols
     std_held_archive = path
     std_held_ok = true
+    if std_search.is_none() && cache_directory().is_some() then note_std_use(path)
     Ok(StdArtifact(symbols, path))
 end std_artifact
+
+// --- eviction -------------------------------------------------------------------------------
+//
+// **The standard module's entries are bounded like the other caches.** Each compiler build and each
+// target, allocator pair and level leaves a directory `<cache>/sysl/<key>/std.syslib` behind -- a
+// rebuilt compiler is a new digest, so a machine that builds all day made 9,400 of them (15 GB) --
+// and nothing took one away. Now past `CacheBytes` the oldest whole directories go, sparing the last
+// hour's (`CacheFresh`) and every entry this process read or wrote, so a stage 1 and a stage 2 in use
+// together are both safe: each is in its own process's set, and a fresh one is spared by age. A
+// typical `std.syslib` is 1-4 MB, so the cache's 4 GB bound holds a couple of thousand of them and
+// they need no bound of their own.
+//
+// **One sweep per process, after its compilations** -- `sweep_std_artifacts`, which the driver calls
+// when a command line is answered, and none where another process swept in the last ten minutes.
+// **Using an entry refreshes its age** (`touch_used`, once per process), so "the last hour" is the
+// last hour it was USED and the oldest-first order is least recently used: a gate of thousands of
+// processes over one entry keeps it young however long ago it was written.
+private var std_in_use: Set[string] = set()
+private var std_pending: string = ""
+private var std_swept: bool = false
+private var std_sweeps: int = 0
+
+// How many sweeps this process has made of the standard module's entries, for a test to count.
+std_sweep_count() -> int = std_sweeps
+
+// Forget that this process swept, as a new process would not have.
+reset_std_sweep()
+    std_in_use = set()
+    std_pending = ""
+    std_swept = false
+    std_sweeps = 0
+end reset_std_sweep
+
+// An artifact this process read or wrote: spared by the sweep, and the directory to sweep.
+note_std_use(path: string)
+    std_in_use.add(path)
+    touch_used(path)
+
+    val entry = parent_of(path) match
+        Some(d) -> d
+        None -> return
+
+    parent_of(entry) match
+        Some(root) -> std_pending = root
+        None -> ()
+end note_std_use
+
+// The entries swept where this process used one and has not swept yet.
+sweep_std_artifacts()
+    if std_pending == "" || std_swept then return
+
+    val dir = std_pending
+
+    std_pending = ""
+    std_swept = true
+
+    if claim_sweep(s"$dir/std") then evict_std_entries(dir)
+end sweep_std_artifacts
+
+private struct StdEntry
+    dir: string
+    file: string
+    modified: long
+    size: long
+
+private evict_std_entries(dir: string)
+    std_sweeps += 1
+
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return
+
+    var found: Buf[StdEntry] = buf()
+    var total: long = 0
+    var now: long = 0
+
+    for n in names
+        val one = s"$dir/$n"
+        val file = s"$one/std$SyslibExtension"
+
+        metadata(file) match
+            Ok(m) ->
+                found.push(StdEntry(one, file, m.modified.us, m.size))
+                total += m.size
+
+                if m.modified.us > now then now = m.modified.us
+            Err(_) -> ()
+
+    val bound = cache_bound()
+
+    if total <= bound then return
+
+    sort_by(found.view(), (a, b) -> a.modified < b.modified)
+
+    for e in found
+        if total <= bound then return
+        if std_in_use.has(e.file) || now - e.modified < CacheFresh then continue
+
+        remove_dir_all(e.dir).unwrap_or(())
+        total -= e.size
+end evict_std_entries
 
 // Where a compilation looks for the standard module's artifact in place of the default path, which
 // is how a test routes the default somewhere of its own: the real one is shared by every build on
@@ -90,6 +194,11 @@ std_artifact_at(root: string, path: string, fingerprint: string, t: Target,
 
         // A library that cannot be used is refused on its own: the rebuild advice would recommend
         // building or compiling in the very source that just failed.
+        // A compilation of its own inside the one being timed: its phases are not the program's, so
+        // they are kept quiet and the whole build is said once, as the program's `std` phase.
+        phase_mute(true)
+        defer phase_mute(false)
+
         val units = std_usable_units(root, machine)?
 
         write_std_artifact(units, root, path, fingerprint, machine, level) match
@@ -166,6 +275,7 @@ build_std_library(root: string, t: Target, out: Option[string],
     val where = out.unwrap_or(std_search.unwrap_or(std_artifact_path(t, fingerprint, level)))
 
     write_std_artifact(std_usable_units(root, t)?, root, where, fingerprint, t, level, ar)?
+    if out.is_none() && std_search.is_none() && cache_directory().is_some() then note_std_use(where)
     Ok(where)
 end build_std_library
 
@@ -226,11 +336,26 @@ std_files(root: string, t: Target) -> Result[Buf[(string, string)], string]
     val at = absolute_path(root)
 
     for item in carried
-        val text = read_text(item) match
-            Err(_) -> return Err(s"cannot read ${item}")
+        // C is bytes, not text: a Latin-1 byte in a copyright comment is still a file to hash.
+        val bytes = read_bytes(item) match
+            Err(e) -> return Err(s"cannot read ${io_refusal(item, e)}")
             Ok(got) -> got
 
-        files.push((place_below(at, item), text))
+        files.push((place_below(at, item), from_utf8_unchecked(bytes.view())))
+
+    // A package built this way is fingerprinted with what its C is compiled with and its vendored
+    // libraries' files, as the run cache keys them; the standard module has no manifest to say any.
+    manifest_at(root) match
+        Ok(m) ->
+            val configured = c_block_text(m)
+
+            if !configured.is_empty() then files.push(("c", configured))
+
+            val vendored = c_library_inputs(root, m)
+
+            for item in vendored
+                files.push((s"c/${item.0}", item.1))
+        Err(_) -> ()
 
     Ok(files)
 end std_files
@@ -304,7 +429,8 @@ private write_artifact(units: Buf[Program], own: Buf[string], root: string, out:
                        ar: Option[string] = None) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    write_half(library_half(units, own, t, who)?, root, out, fingerprint, t, probed, level, ar)
+    write_half(library_half(units, own, t, who, None, level)?, root, out, fingerprint, t, probed,
+               level, ar)
 end write_artifact
 
 // The artifact written from a library that analyzed.
@@ -312,7 +438,7 @@ private write_built(built: LibraryBuild, root: string, out: string, fingerprint:
                     who: string, probed: PkgAnswer, level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    write_half(half_of(built, t, who)?, root, out, fingerprint, t, probed, level)
+    write_half(half_of(built, t, who, level)?, root, out, fingerprint, t, probed, level)
 end write_built
 
 // A source root's kept half (`root_artifact.sysl`): the root's object half and the metadata naming
@@ -326,7 +452,7 @@ write_root_artifact(built: LibraryBuild, out: string, key: string, t: Target,
                     level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    val half = half_of(built, t, "the source root")?
+    val half = half_of(built, t, "the source root", level)?
     val clang = find_clang(t, named_cc())?
     val archiver = find_ar(None)?
     val staging = make_temp_dir("sysl-root-") match
@@ -419,25 +545,46 @@ end std_library_half
 
 // A package root's object half for a machine, as text: what `build-lib <root>` assembles and throws
 // away, read before clang is asked anything -- which functions it defines, which it only declares,
-// and which it advertises to a program linking it.
-root_library_half(units: Buf[Program], own: Buf[string], t: Target) -> Result[LibraryHalf, string] =
-    library_half(units, own, t, "the library", Some(project_files(units)))
+// and which it advertises to a program linking it. `level` is the optimization the half is compiled
+// at, which decides whether it carries copies of what it declares (`half_of`).
+root_library_half(units: Buf[Program], own: Buf[string], t: Target,
+                  level: string = "0") -> Result[LibraryHalf, string] =
+    library_half(units, own, t, "the library", Some(project_files(units)), level)
 
 private library_half(units: Buf[Program], own: Buf[string], t: Target, who: string,
-                     producing: Option[Buf[string]] = None) -> Result[LibraryHalf, string]
+                     producing: Option[Buf[string]] = None,
+                     level: string = "0") -> Result[LibraryHalf, string]
     val built = library_build(units, own, t, producing)
 
     if !built.report.is_empty()
         return Err(s"$who does not analyze: ${first_message(built.report)}")
 
-    half_of(built, t, who)
+    half_of(built, t, who, level)
 end library_half
 
-// The object half of a library that analyzed.
-private half_of(built: LibraryBuild, t: Target, who: string) -> Result[LibraryHalf, string]
-    val first = codegen_with_gaps(built.program, t, built.promotions)
+// The object half of a library that analyzed, compiled at `level`.
+//
+// **A half compiled to be optimized carries a copy of each small or `@inline` function it declares**
+// (`codegen.sysl`'s `importable`), exactly as a program does: a package's own code calling
+// `real.zero()` -- directly, or through a bound in a generic the package instantiates -- reaches the
+// standard module's precompiled half, and with only a declaration that call stays out of line in
+// every program that links the package, however trivial the body. The copies are
+// `available_externally`, so the half still defines only what it advertises.
+//
+// **Only another artifact's functions are copied** (`built.foreign`). The half also declares its own
+// deferred functions, and those are left to the program precisely because their bodies cannot be
+// compiled here.
+private half_of(built: LibraryBuild, t: Target, who: string,
+                level: string) -> Result[LibraryHalf, string]
+    val imports = imports_bodies(level)
+    var foreign: Set[string] = set()
+
+    for name in built.foreign
+        foreign.add(name)
+
+    val first = codegen_with_gaps(built.program, t, built.promotions, imports, Some(foreign))
     val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
-                                    built.promotions)
+                                    built.promotions, imports, Some(foreign))
     val defined = advertised(built.determined, lowered.0)
     val text = ir_print_module(lowered.0)
 
@@ -467,21 +614,29 @@ private build_members(clang: string, archiver: string, staging: string, root: st
     compile_object(clang, meta_ir, smeta, t, level, false)?
     members.push(smeta)
 
-    val carried = c_sources(root, Some(t.os)) match
-        Err(e) -> return Err(e.message)
-        Ok(cs) -> cs
+    // **What every other build compiles, the same way** (`tree_c_units`): the walked shims and each
+    // vendored library's list, with the include roots and macros the manifest gives each. An
+    // artifact built from the walk alone left out the library and handed its shim no `-I`.
+    val units = tree_c_units(root, t) match
+        Err(e) -> return Err(if e.of_manifest then manifest_refusal(e.why) else e.why)
+        Ok(us) -> us
+
+    var carried: Buf[string] = buf()
+
+    for unit in units
+        carried.push(unit.src)
 
     member_collision(root, carried) match
         Some(why) -> return Err(why)
         None -> ()
 
-    for item in carried
-        val obj = s"$staging/${native_member(root, item)}"
+    for unit in units
+        val obj = s"$staging/${native_member(root, unit.src)}"
 
         // **The standard module names no installed library**, so there is nothing for a probe to
         // have answered there: its C is what a hosted target's libc already carries. A package's is
         // another matter, which is why the answer arrives as an argument.
-        compile_c(clang, item, obj, t, level, probed)?
+        compile_c(clang, unit.src, obj, t, level, probed, unit.macros, unit.includes)?
         members.push(obj)
 
     val pending = pending_name(out)
@@ -552,14 +707,23 @@ private advertised(determined: Buf[string], m: IrModule) -> Buf[string]
     var out: Buf[string] = buf()
 
     for item in determined
-        if defines(m, llvm_safe(item)) then out.push(item)
+        if defines(m, item) then out.push(item)
 
     out
 end advertised
 
+// A function's signature holds its name as the line spells it; storage holds its key, and the line
+// is spelled at printing (`global_render`).
 private defines(m: IrModule, symbol: string) -> bool
+    val spelled = llvm_safe(symbol)
+
     for i in 0..<m.funcs.len()
-        if m.funcs.at(i).sig.name == symbol then return true
+        if m.funcs.at(i).sig.name == spelled then return true
+
+    for i in 0..<m.globals.len()
+        val g = m.globals.at(i)
+
+        if g.name == symbol && g.value.is_some() && g.linkage == LinkDefault then return true
 
     false
 end defines

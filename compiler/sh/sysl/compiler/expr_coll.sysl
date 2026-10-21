@@ -19,6 +19,35 @@ private element_wanted(t: Type) -> Option[Type] = repr(t) match
     Vector(_, e) -> Some(*e)
     _ -> None
 
+// A string literal where a `[N]u8` is wanted: the literal's UTF-8 bytes, one element each, as the
+// array literal they spell. It is an array literal from here on, so it folds to constant data
+// wherever one of byte literals does. `None` when the position does not want a byte array, and the
+// literal stays a `string`.
+bytes_literal(cx: &Analyzer, span: Span, text: string, expected: Option[Type]) -> Option[TExpr]
+    if expected.is_none() then return None
+
+    val want = expected.unwrap()
+
+    repr(want) match
+        Array(n, elem) ->
+            if repr(*elem) != Integer(8, false, false) then return None
+
+            val bytes = text.bytes
+
+            if int(bytes.len) != n then
+                return Some(cx.err(span, s"this string literal is ${bytes.len} bytes and " +
+                                   s"${type_show(want)} holds $n — a string literal fills a byte " +
+                                   "array only when its UTF-8 length is exactly the array's"))
+
+            var ts: Buf[TExpr] = buf()
+
+            for b in bytes
+                ts.push(TExpr(span, TIntLit(from_int(long(b)), *elem)))
+
+            Some(TExpr(span, TArrayLit(ts, Array(n, *elem))))
+        _ -> None
+end bytes_literal
+
 array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type]) -> TExpr
     val elem_exp = expected.and_then(t -> element_wanted(t))
     var ts: Buf[TExpr] = buf()
@@ -28,8 +57,9 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
     // element that has one, wherever that element stands. So `[1usize, 2, 7]` and `[1, 2usize, 7]`
     // are both `[3]usize` -- and `[1u8, 300]` is refused at the `300` for not fitting, rather than
     // for being an `int` nobody wrote. Where the position asks for an element type, every element
-    // is read at that type and nothing here decides it.
-    if elem_exp.is_none() then ts = analyze_operands(cx, elems, None)
+    // is read at that type and nothing here decides it. Elements of two types meet at the wider, as
+    // the arms of an `if` do: `[b, n]` over a `byte` and an `int` is an `[int; 2]`.
+    if elem_exp.is_none() then ts = analyze_operands(cx, elems, None, true)
     else
         for item in elems
             ts.push(type_expr(cx, item, elem_exp))
@@ -104,7 +134,7 @@ array_fill(cx: &Analyzer, span: Span, value: Expr, count: Expr, expected: Option
                       "bound — a literal, or a 'const' naming one. A count computed while running " +
                       "makes storage instead, which is written where a '[]T' is expected")
 
-    if cmp(n.unwrap(), from_int(0)) < 0 then
+    if cmp(n.unwrap(), from_int(0)) < 0 || too_many_elements(n.unwrap()) then
         return cx.err(span, s"an array cannot have ${to_string(n.unwrap())} elements")
 
     TExpr(span, TArrayFill(tv, Array(int(n.unwrap().to_long().unwrap_or(0)), vt)))
@@ -193,10 +223,10 @@ indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
 
     if key.is_none() then return false
 
-    val mark = cx.an.complaints()
+    val tried = begin_trial(cx)
     val t = type_expr_bare(cx, receiver)
 
-    cx.an.restore_complaints(mark)
+    discard_trial(cx, tried)
 
     if texpr_type(t) == Unknown then return false
 

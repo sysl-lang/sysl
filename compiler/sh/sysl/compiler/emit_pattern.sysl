@@ -99,7 +99,7 @@ end extracted_tag
 
 // Establishes the bindings a pattern introduces, once its arm has been taken. Only binding and
 // (nested) variant patterns carry bindings; the rest do nothing.
-pattern_bind(e: *Emit, p: TPattern, value: Val) = p match
+pattern_bind(e: *Emit, p: TPattern, value: Val) -> unit = p match
     // A zero-sized binding is not a slot, exactly as a `var` of one is not. The name is still in
     // scope for the arm; every read of it yields nothing.
     //
@@ -152,6 +152,11 @@ end payload_field
 // bitfield struct, and a slot of the aggregate otherwise.
 private struct_field(e: *Emit, d: &StructType, value: Val, i: usize) -> Val
     if zero_sized(d.fields.at(i).1) then return VNothing
+
+    // A C bitfield is read out of its unit, the value given a slot to read it from. An unnamed one
+    // only ever meets the `_` standing in for it, which reads nothing.
+    if d.c_bit(i).is_some() then
+        return if unnamed_c_bit(d, i) then VInt(from_int(0)) else c_bit_of_value(e, d, i, value)
 
     bitfield_ranges(d) match
         Some(ranges) ->
@@ -485,15 +490,22 @@ end gen_tag_switch
 private every_variant(d: TagDispatch) -> bool
     if d.en.variants.is_empty() then return false
 
+    // The tags are read out once. Fewer of them than variants answers at once -- the `if x is c` a
+    // derivation writes once per variant is that case, and asking each of its copies about every
+    // variant made the derivation's lowering grow with the square of the enum.
+    var listed: Buf[BigInt] = buf()
+
+    for arm in d.arms
+        for t in arm.1
+            listed.push(t)
+
+    if listed.len() < d.en.variants.len() then return false
+
     for item in d.en.variants
-        val tag = item.tag
         var covered = false
 
-        for j in 0..<d.arms.len()
-            val tags = d.arms.at(j).1
-
-            for k in 0..<tags.len()
-                if tags.at(k) == tag then covered = true
+        for t in listed
+            if t == item.tag then covered = true
 
         if !covered then return false
 

@@ -1,0 +1,162 @@
+module sysl.buf
+
+/** A buffer that will never change again, shared by every thread that holds it.
+ *
+ * `Buf.freeze()` makes one: it takes the buffer's elements and answers a `&sync Frozen[T]`, which
+ * is one atomic count on the whole buffer. A `&sync` object may hold it, and a `&sync Fn` may
+ * capture it, so read-only heap data -- decoded pixels, a list of shapes -- is read by every thread
+ * at once with no lock and no count per element (`reference/memory.md § A frozen buffer crosses`).
+ *
+ * **Nothing writes it.** There is no `push`, no `set`, no subscript assignment and no writable view;
+ * what it has is `len`, `f[i]`, `for x in f` and `view()`, a `[]const T`.
+ *
+ * **A frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is formed only
+ * where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other frozen buffers, and the
+ * structs and arrays built of them. The compiler asks that of the type argument where the reference
+ * is formed, as it asks a struct's fields.
+ *
+ * **Its fields carry no count**, and that is what makes it safe to read from every thread: the
+ * storage is owned through a count that is not atomic, held here as the bare words of the slice that
+ * owns it, so copying the struct -- as a `(self)` member does -- takes no share of anything. Only the
+ * destructor touches that count, once, run by whichever thread lets go of the box's last share.
+ */
+struct Frozen[T]
+    private owner: usize
+    private data: *T
+    private n: usize
+
+    const len(self) -> usize = self.n
+
+    const is_empty(self) -> bool = self.n == 0
+
+    /** The element at `i`, checked against the length. */
+    const at(self, i: usize) -> T
+        if i >= self.n then frozen_past_end(i, self.n)
+
+        self.data[i]
+
+    /** The elements as a read-only slice. It keeps the frozen buffer alive through a box of its own,
+     * made here and counted the ordinary way, so the slice is as safe to keep and hand on as any
+     * other: the box holds one atomic share of the buffer and gives it back when the last copy of the
+     * slice goes. That box is the one allocation a view costs; `f[i]` and `for` cost none.
+     */
+    const view(&sync self) -> []const T
+        if self.n == 0 then return []
+
+        var pin: &FrozenPin[T] = FrozenPin(self)
+        val box: *usize = ptr_cast(&pin)
+        var words: [3]usize = [*box, usize(self.data), self.n]
+        val shaped: *[]const T = ptr_cast(&words[0])
+
+        *shaped
+    end view
+end Frozen
+
+/** The storage given back: the slice the words describe is rebuilt in a local, without a share being
+ * taken, and the local going out of scope is the one release the storage gets -- which lets go of every
+ * element it holds.
+ */
+impl[T] Drop for Frozen[T]
+    drop(self)
+        if self.owner == 0 then return
+
+        var items: []T = []
+        val raw: *[3]usize = ptr_cast(&items)
+
+        *raw = [self.owner, usize(self.data), self.n]
+    end drop
+
+/** What a view of a frozen buffer is owned by: an ordinary box holding one share of the buffer. Its
+ * own count is touched only by the thread holding the view, and letting go of it gives the share back
+ * atomically.
+ */
+private[buf] struct FrozenPin[T]
+    held: &sync Frozen[T]
+
+impl[T] Index[usize, T] for Frozen[T]
+    const index(self, i: usize) -> T = self.at(i)
+
+/** `for x in f` walks the elements by index through a cursor holding one share of the buffer, so the
+ * walk allocates nothing.
+ */
+impl[T] Walk for Frozen[T]
+    type Walker = FrozenWalk[T]
+    const walk(self) -> FrozenWalk[T] = FrozenWalk(self.data, self.n, 0)
+
+/** The cursor a `for` over a frozen buffer walks: the storage's address and length, read while the
+ * frozen buffer the `for` was handed keeps it alive.
+ */
+struct FrozenWalk[T]
+    private data: *T
+    private n: usize
+    private i: usize
+
+impl[T] Iterate for FrozenWalk[T]
+    type Item = T
+
+    const next(*self) -> Option[T]
+        if self.i >= self.n then return None
+
+        val v = self.data[self.i]
+
+        self.i += 1
+        Some(v)
+    end next
+
+/** A frozen buffer renders as the sequence it holds, as a `Buf` does. */
+impl[T: Display] Display for Frozen[T]
+    display(self, out: *Writer, fmt: FormatSpec)
+        val shown: []const T = if self.n == 0 then [] else frozen_span(self.data, self.n)
+
+        shown.display(out, fmt)
+
+/** A frozen buffer shows as the sequence it holds, as a `Buf` does. */
+impl[T: Debug] Debug for Frozen[T]
+    debug(self, out: *Writer, fmt: FormatSpec)
+        val shown: []const T = if self.n == 0 then [] else frozen_span(self.data, self.n)
+
+        shown.debug(out, fmt)
+
+/** The elements at `data` as a view with no owner, for a reader that finishes before the buffer can
+ * go -- rendering one.
+ */
+private frozen_span[T](data: *T, n: usize) -> []const T
+    var words: [3]usize = [0, usize(data), n]
+    val shaped: *[]const T = ptr_cast(&words[0])
+
+    *shaped
+end frozen_span
+
+/** The buffer's elements, taken: copied once into storage of their own, sized to them, and the
+ * buffer left empty -- for this name and every other name of the same buffer, which is what makes the
+ * result immutable. A view taken of the buffer earlier still reads the old storage, which the frozen
+ * one shares nothing with.
+ */
+freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
+    val n = b.len()
+
+    if n == 0 then return Frozen(0, null, 0)
+
+    var items: []T = slot_storage(n)
+
+    for i in 0..<n
+        slot_place(items, i, b.at(i))
+
+    b.clear()
+
+    // The storage's one share moves from the local into the words: they are read out, and the local
+    // is left naming nothing by a store that releases nothing.
+    val data: *T = &items[0]
+    val raw: *[3]usize = ptr_cast(&items)
+    val owner = (*raw)[0]
+
+    *raw = [0, 0, 0]
+    Frozen(owner, data, n)
+end freeze_buf
+
+@noinline
+@cold
+private frozen_past_end(i: usize, n: usize) -> never
+    print("panic: index", i, "past the", n, "elements of a frozen buffer")
+    exit(1)
+end frozen_past_end

@@ -55,6 +55,7 @@ private val ValueWords: []const string = ["self", "true", "false", "null"]
 // expression either, and leaving them out would make this a list to memorize instead of a rule.
 private val Continuations: []const string = [
     "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+    ":=", "+:=", "-:=", "*:=", "/:=", "%:=", "&:=", "|:=", "^:=", "<<:=", ">>:=",
     "||", "&&", "!",
     "==", "!=", "<", ">", "<=", ">=",
     "|", "^", "&", "~",
@@ -63,13 +64,20 @@ private val Continuations: []const string = [
 
 // The operator set, by width, longest first.
 //
-// **Longest match, and it is the same answer either way because the set is prefix-closed**: every
-// proper prefix of an operator is itself an operator, so `..<` wins over `..` and `<<=` over `<<`
-// without any rule about which alternative to try.
-private val Ops3: []const string = ["<<=", ">>=", "..<", "..."]
+// **Longest match**, so `..<` wins over `..` and `<<=` over `<<`. The set is prefix-closed but for
+// the assignments that yield (`+:=` and the rest), whose prefixes `+:` and `<<:` are no operator --
+// and that is harmless because the widths are tried longest first, so a `+:=` is never read in pieces
+// and a `+` followed by a `:` is never mistaken for one. Nothing in the grammar puts `=` straight
+// after a `:`, which is what lets `:=` be one token: an annotation's `:` is followed by a type.
+private val Ops4: []const string = ["<<:=", ">>:="]
+
+private val Ops3: []const string = [
+    "<<=", ">>=", "..<", "...",
+    "+:=", "-:=", "*:=", "/:=", "%:=", "&:=", "|:=", "^:=",
+]
 
 private val Ops2: []const string = [
-    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", ":=",
     "||", "&&", "==", "!=", "<=", ">=",
     "..", "<<", ">>", "++", "--",
     // **The wildcard import's tail is one token rather than a `.` and a `*`.** A `.` is otherwise
@@ -116,19 +124,31 @@ end holds
 
 // The operator standing at the cursor, consumed. Nothing is allocated: the answer is the table's own
 // spelling, which is a view over constant bytes rather than a copy of what was read.
+//
+// The first byte is compared before the rest is asked for, since nearly every operator in the tables
+// starts with some other byte and the comparison is what the lexer pays per operator it reads.
 read_operator(s: *Scanner) -> Option[string]
+    val first = s.peek() match
+        Some(c) -> c
+        None -> return None
+
+    for op in Ops4
+        if op.bytes[0] == first && s.starts_with(op.bytes)
+            s.skip(4)
+            return Some(op)
+
     for op in Ops3
-        if s.starts_with(op.bytes)
+        if op.bytes[0] == first && s.starts_with(op.bytes)
             s.skip(3)
             return Some(op)
 
     for op in Ops2
-        if s.starts_with(op.bytes)
+        if op.bytes[0] == first && s.starts_with(op.bytes)
             s.skip(2)
             return Some(op)
 
     for op in Ops1
-        if s.starts_with(op.bytes)
+        if op.bytes[0] == first && s.starts_with(op.bytes)
             s.skip(1)
             return Some(op)
 

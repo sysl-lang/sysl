@@ -8,7 +8,7 @@ module: sysl.process.sys
 
 ## Index
 
-[`ended_exited`](#ended_exited) [`ended_signalled`](#ended_signalled) [`ended_timed_out`](#ended_timed_out) [`group_inherit`](#group_inherit) [`group_new`](#group_new) [`id_group`](#id_group) [`id_real_group`](#id_real_group) [`id_real_user`](#id_real_user) [`id_user`](#id_user) [`Text`](#text)
+[`ended_exited`](#ended_exited) [`ended_signalled`](#ended_signalled) [`ended_timed_out`](#ended_timed_out) [`group_inherit`](#group_inherit) [`group_new`](#group_new) [`id_group`](#id_group) [`id_process`](#id_process) [`id_real_group`](#id_real_group) [`id_real_user`](#id_real_user) [`id_user`](#id_user) [`Text`](#text)
 
 ## Constants
 
@@ -64,6 +64,15 @@ const id_group: int = 1
 ```
 
 The group the program acts as: the effective group.
+
+### `id_process`
+
+```sysl
+const id_process: int = 4
+```
+
+The program itself: its process id, which no other program running beside it has. Only `get_id`
+is asked it; `set_id` refuses it as it refuses any `which` it does not take.
 
 ### `id_real_group`
 

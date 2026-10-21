@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
+import sysl.fs.{append_text, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
 import sysl.process.capture
 import sysl.text.{replace_all, split, str_builder, Search}
 
@@ -11,7 +11,8 @@ import sysl.text.{replace_all, split, str_builder, Search}
 //
 // **A page on sysl.sh is not a picture of a program, it is the program**, and the reference's
 // `DocsTests` proves that by compiling every `sysl` block the site shows: one followed by an
-// `output` block is run and its stdout compared, one followed by an `error` block is required to
+// `output` block is run and its stdout compared (an `output trap` block also requires the run to end
+// on a trap, and a plain one that it does not), one followed by an `error` block is required to
 // fail with the diagnostic the page quotes, and one followed by neither is a fragment nobody
 // compiles. That is 1,220 executable blocks over 73 pages, and section 7 owes every one of them.
 //
@@ -49,6 +50,10 @@ struct DocsFence
 // `target` is the machine the block is *about*, from a `target=` on the fence, and is empty for the
 // ordinary case of a block about the language rather than about a processor. `archive` is `build=c`,
 // and says the block is about the artifact a C project links rather than about a program.
+//
+// `traps` is an `output trap` block underneath: the program prints `expected` and then stops on a
+// trap, which is the claim the page makes about it -- a run that comes back is as wrong as one that
+// prints something else.
 struct DocsBlock
     page: string
     nth: int
@@ -57,6 +62,7 @@ struct DocsBlock
     expected: string
     target: string
     archive: bool
+    traps: bool
 end DocsBlock
 
 // What one page, one section or the whole site came to.
@@ -71,6 +77,9 @@ struct DocsTally
     // counted so that a reader can see the number is not zero by accident.
     attributed: int
 end DocsTally
+
+// What a shell reports for a program stopped by `SIGTRAP`: 128 + 5 (`shell_status`).
+private val DocsTrapStatus: int = 133
 
 private docs_add(a: DocsTally, b: DocsTally) -> DocsTally =
     DocsTally(a.run_ok + b.run_ok, a.run_bad + b.run_bad, a.ref_ok + b.ref_ok, a.ref_bad + b.ref_bad,
@@ -142,20 +151,32 @@ end docs_fences
 // with a `bash` block in the middle. What the rule does refuse is an `output` block belonging to a
 // *later* program: the search stops at the next `sysl` block, so a claim can never attach to the
 // wrong one.
-private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, string)
+//
+// The third answer is whether the `output` block is written ```` ```output trap ````: the word
+// `trap` on its fence says the program traps once it has printed what the block holds.
+private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, string, bool)
     var i = from
 
     while i < fences.len()
         val f = fences.at(i)
 
         if f.lang == "sysl" then break
-        if f.lang == "output" then return (DocsClaim.PagePrints, f.body)
-        if f.lang == "error" then return (DocsClaim.PageRefuses, f.body)
+        if f.lang == "output" then return (DocsClaim.PagePrints, f.body, docs_has_word(f.info, "trap"))
+        if f.lang == "error" then return (DocsClaim.PageRefuses, f.body, false)
 
         i += 1
 
-    (DocsClaim.PageShows, "")
+    (DocsClaim.PageShows, "", false)
 end docs_claim_after
+
+// Whether `word` stands on its own among a fence's words.
+private docs_has_word(info: string, word: string) -> bool
+    for each in split(info, " ")
+        for part in split(each, "\t")
+            if part == word then return true
+
+    false
+end docs_has_word
 
 // Every `sysl` block of one page, each paired with what the page claims about it.
 //
@@ -175,7 +196,7 @@ private docs_blocks(page: string, text: string) -> Buf[DocsBlock]
             val said = docs_claim_after(fences, i + 1)
 
             out.push(DocsBlock(page, nth, f.body, said.0, said.1, docs_option(f.info, "target"),
-                               docs_option(f.info, "build") == "c"))
+                               docs_option(f.info, "build") == "c", said.2))
 
     out
 end docs_blocks
@@ -224,7 +245,11 @@ private docs_compile(src: string, b: DocsBlock, archive_at: string) -> Result[un
             Ok(_) -> return Ok(())
     end if
 
-    emit_llvm_text(src, named) match
+    // A block that writes a test or a hook is about what `sysl test` says of it -- the one build that
+    // keeps them -- so it is read with them kept.
+    val tests = b.source.contains("@test") || b.source.contains("@setup") || b.source.contains("@teardown")
+
+    emit_llvm_text(src, named, DefaultOptimization, buf(), None, false, tests) match
         Err(why) -> Err(why.message)
         Ok(made) ->
             if !made.report.is_empty() then return Err(analysis_report(made.report))
@@ -234,6 +259,12 @@ end docs_compile
 
 // A block the page says prints: built, linked, run, and its standard output held against the
 // `output` block underneath it.
+//
+// **How it ended is half the claim.** An `output` block says the program comes back, and an
+// `output trap` block says it stops on a trap (`SIGTRAP`, which a shell reports as 133) once it has
+// printed what the block holds -- so a trap under a plain `output` block fails, and so does a program
+// that comes back, or dies of anything else, under an `output trap` one. The trap's own message goes
+// to standard error, which is not compared.
 private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Option[string]
     build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
         Err(why) ->
@@ -243,8 +274,17 @@ private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Op
     capture(exe, [], "", [], true) match
         Err(_) -> return Some(s"$where: expected it to run, and the program could not be started")
         Ok(said) ->
-            if !said.status.ok()
-                return Some(s"$where: expected it to run, but it exited with ${shell_status(said.status)}")
+            val ended = shell_status(said.status)
+
+            if b.traps && ended != DocsTrapStatus
+                return Some(s"$where: the page says this traps, but it exited with $ended")
+
+            if !b.traps && ended == DocsTrapStatus
+                return Some(s"$where: expected it to run, but it trapped (exit status $ended) — a block " +
+                            "that traps says so with 'output trap'")
+
+            if !b.traps && !said.status.ok()
+                return Some(s"$where: expected it to run, but it exited with $ended")
 
             val printed = docs_paged(said.text, src)
 
@@ -275,6 +315,88 @@ docs_paged_names_the_page()
     assert_eq(docs_paged(s"$src:9:adds:PASS\n", src), "<page>:9:adds:PASS\n")
     assert_eq(docs_paged("/var/folders/x/T/sysl-docsAb12/main.sysl:4:x:FAIL\n", src), "<page>:4:x:FAIL\n")
     assert_eq(docs_paged("main.sysl:4\n", src), "main.sysl:4\n")
+
+// -- a block that traps ----------------------------------------------------------------------------
+
+// A page holding one program and the fence under it, read the way the sweep reads a page.
+private rgp_block(program: string, under: string) -> DocsBlock =
+    docs_blocks("p.md", "```sysl\n" + program + "```\n\n" + under).at(0)
+
+// That block checked the way the sweep checks it, in a directory of its own.
+private rgp_checked(program: string, under: string) -> Option[string]
+    val dir = make_temp_dir("sysl-rgp").unwrap()
+    val src = s"$dir/main.sysl"
+
+    write_text(src, program).unwrap()
+
+    val said = docs_check(src, s"$dir/program", s"$dir/program.a", rgp_block(program, under))
+
+    remove_dir_all(dir).unwrap_or(())
+    said
+end rgp_checked
+
+private rgp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// Three lines, then an index one past the end.
+private rgp_trapper() -> string =
+    "main()\n    val xs = [1, 2, 3]\n    var i = 0\n\n    loop\n        print(xs[i])\n        i += 1\n"
+
+private rgp_three() -> string = "1\n2\n3\n"
+
+@test("an 'output trap' fence marks its block as trapping, and only the word 'trap' does")
+rgp_the_fence_word_is_read()
+    val program = "main()\n    print(\"hi\")\n"
+
+    assert(rgp_block(program, "```output trap\nhi\n```\n").traps, "output trap")
+    assert(rgp_block(program, "```output\ttrap\nhi\n```\n").traps, "a tab separates words too")
+    assert(!rgp_block(program, "```output\nhi\n```\n").traps, "plain output")
+    assert(!rgp_block(program, "```output trapped\nhi\n```\n").traps, "a longer word is not the word")
+    assert_eq(rgp_block(program, "```output trap\nhi\n```\n").claim, DocsClaim.PagePrints)
+    assert_eq(rgp_block(program, "```output trap\nhi\n```\n").expected, "hi\n")
+
+@test("a block under 'output trap' that prints what the page says and then traps passes")
+rgp_a_trap_that_prints_the_page_passes()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output trap\n" + rgp_three() + "```\n")
+
+    assert(said.is_none(), said.unwrap_or(""))
+
+@test("a block under 'output trap' that traps after printing something else fails, showing both")
+rgp_a_trap_that_prints_otherwise_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output trap\n1\n9\n```\n").unwrap_or("")
+
+    assert(said.contains("p.md, sysl block 1: what it printed is not what the page says"), said)
+    assert(said.contains("9"), said)
+    assert(said.contains("3"), said)
+
+@test("a block under 'output trap' that comes back fails, naming its exit status")
+rgp_a_marked_block_that_returns_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked("main()\n    print(\"hi\")\n", "```output trap\nhi\n```\n").unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: the page says this traps, but it exited with 0")
+
+@test("a block under 'output trap' that panics instead fails: a panic is status 1, not a trap")
+rgp_a_marked_block_that_panics_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked("main()\n    print(\"hi\")\n    assert(false, \"no\")\n", "```output trap\nhi\n```\n")
+        .unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: the page says this traps, but it exited with 1")
+
+@test("a block under a plain 'output' that traps fails, and says how to mark one that should")
+rgp_an_unmarked_trap_fails()
+    if !rgp_ready() then return
+
+    val said = rgp_checked(rgp_trapper(), "```output\n" + rgp_three() + "```\n").unwrap_or("")
+
+    assert_eq(said, "p.md, sysl block 1: expected it to run, but it trapped (exit status 133) — a block " +
+                    "that traps says so with 'output trap'")
 
 // A block the page says is refused: compiled, required to fail, and the diagnostic required to
 // **contain** what the page quotes.
@@ -429,7 +551,8 @@ private docs_line(name: string, t: DocsTally) -> string =
     s"failed, ${t.shown} fragments, ${t.attributed} by attribute"
 
 // Where a run leaves its report, for a reader who wants the numbers rather than a verdict: the test
-// runner shows what a passing test says to nobody.
+// runner shows what a passing test says to nobody. Each part of a sweep appends its own, so the file
+// is removed before a run that should start it afresh.
 private docs_record(report: Buf[string], named_by: string = "SYSL_DOCS_SUMMARY")
     val where = env_var(named_by)
 
@@ -441,7 +564,7 @@ private docs_record(report: Buf[string], named_by: string = "SYSL_DOCS_SUMMARY")
         b.push(report.at(i))
         b.push_char('\n')
 
-    write_text(where.unwrap(), b.finish()).unwrap_or(())
+    append_text(where.unwrap(), b.finish()).unwrap_or(())
 end docs_record
 
 private docs_first_twenty(bad: Buf[string]) -> string
@@ -458,8 +581,69 @@ private docs_first_twenty(bad: Buf[string]) -> string
     b.finish()
 end docs_first_twenty
 
-@test("every sysl block the site shows compiles here, and prints or refuses what the page says")
-the_sites_pages_run_here()
+// -- the sweeps, dealt into parts -------------------------------------------------------------------
+
+// **Each sweep is `DocsParts` tests, each checking its own share of the pages**, so that a run starting
+// several tests at once runs the site several pages at a time -- and no one process holds every
+// compilation of the site, which in one process came to sixteen gigabytes. A page is checked by
+// exactly one part (`docs_parts`). A complaint names its page, so which part found it does not matter.
+const DocsParts: usize = 24
+
+// The part each page is checked by, `parts` standing for none yet: the heaviest page first, by the sysl blocks it shows, each dealt
+// to the part holding the fewest blocks so far -- ties to the lower part, and between pages of one
+// weight to the earlier name, so the dealing is the same on every machine. No part is lighter than
+// it could be except under a page too heavy to share.
+private docs_parts(root: string, pages: Buf[string], parts: usize) -> Buf[usize]
+    var weight: Buf[usize] = buf()
+    var part: Buf[usize] = buf()
+    var load: Buf[usize] = buf()
+
+    for page in pages
+        weight.push(docs_blocks(docs_short(root, page), read_text(page).unwrap_or("")).len())
+        part.push(parts)
+
+    for _ in 0..<parts
+        load.push(0)
+
+    for _ in 0..<pages.len()
+        var pick = pages.len()
+
+        for i in 0..<pages.len()
+            if part.at(i) != parts then continue
+
+            if pick == pages.len() || weight.at(i) > weight.at(pick) ||
+               (weight.at(i) == weight.at(pick) && pages.at(i) < pages.at(pick))
+                pick = i
+
+        var lightest: usize = 0
+
+        for k in 1..<parts
+            if load.at(k) < load.at(lightest) then lightest = k
+
+        part.set(pick, lightest)
+        load.set(lightest, load.at(lightest) + weight.at(pick))
+
+    part
+end docs_parts
+
+// The pages part `part` checks, of the pages a run reads.
+private docs_pages_of_part(root: string, part: usize) -> Buf[string]
+    val pages = docs_pages(root)
+    val dealt = docs_parts(root, pages, DocsParts)
+    var out: Buf[string] = buf()
+
+    for i in 0..<pages.len()
+        if dealt.at(i) == part then out.push(pages.at(i))
+
+    out
+end docs_pages_of_part
+
+// Every sysl block on part `part`'s pages compiles here, and prints or refuses what its page says.
+//
+// The report is a line for each page and one for the part. **`SYSL_DOCS_SUMMARY` gathers every
+// part's report into one file**, each part appending its own as it finishes, so a run of the whole
+// site still leaves every complaint in one place.
+private docs_sweep_part(part: usize)
     if env_var("SYSL_DOCS").unwrap_or("") != "1"
         print("skipped: SYSL_DOCS is not set, so the site's pages were not run")
         return
@@ -477,17 +661,21 @@ the_sites_pages_run_here()
         return
     end if
 
+    val pages = docs_pages_of_part(root, part)
+
+    if pages.is_empty() then return
+
+    // One process compiles every block of its pages, so the standard module is parsed once and kept
+    // (`keep_std_units`) rather than parsed again for each block.
+    keep_std_units(true)
+
     val dir = make_temp_dir("sysl-docs").unwrap()
     val src = s"$dir/main.sysl"
     val exe = s"$dir/program"
     val archive_at = s"$dir/program.a"
 
-    val pages = docs_pages(root)
-
     var report: Buf[string] = buf()
     var bad: Buf[string] = buf()
-    var sections: Buf[string] = buf()
-    var section_tallies: Buf[DocsTally] = buf()
     var total = DocsTally(0, 0, 0, 0, 0, 0)
 
     for page in pages
@@ -516,26 +704,8 @@ the_sites_pages_run_here()
         report.push(docs_line(short, row))
         total = docs_add(total, row)
 
-        val name = docs_section(short)
-        var at = sections.len()
-
-        for k in 0..<sections.len()
-            if sections.at(k) == name then at = k
-
-        if at == sections.len()
-            sections.push(name)
-            section_tallies.push(row)
-        else
-            section_tallies.set(at, docs_add(section_tallies.at(at), row))
-
     remove_dir_all(dir).unwrap_or(())
-
-    report.push("")
-
-    for k in 0..<sections.len()
-        report.push(docs_line(s"-- ${sections.at(k)}", section_tallies.at(k)))
-
-    report.push(docs_line("-- every page", total))
+    report.push(docs_line(s"-- part ${part + 1} of $DocsParts", total))
 
     for i in 0..<report.len()
         print(report.at(i))
@@ -548,18 +718,131 @@ the_sites_pages_run_here()
         report.push(bad.at(i))
 
     docs_record(report)
+    assert(bad.is_empty(), docs_first_twenty(bad))
+end docs_sweep_part
 
-    // A floor, so that a sweep that read nothing cannot pass for one that agreed with everything. It
-    // is about the whole site, so a narrowed run states no floor -- what it is for is one page.
-    if env_var("SYSL_DOCS_ONLY").unwrap_or("") == ""
-        val compiled = total.run_ok + total.run_bad + total.ref_ok + total.ref_bad
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 1")
+the_sites_pages_run_here_1() = docs_sweep_part(0)
 
-        assert(pages.len() >= 70, s"the site showed its pages: ${pages.len()} of them")
-        assert(compiled >= 1200, s"the pages showed the blocks a compiler is owed: only $compiled")
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 2")
+the_sites_pages_run_here_2() = docs_sweep_part(1)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 3")
+the_sites_pages_run_here_3() = docs_sweep_part(2)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 4")
+the_sites_pages_run_here_4() = docs_sweep_part(3)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 5")
+the_sites_pages_run_here_5() = docs_sweep_part(4)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 6")
+the_sites_pages_run_here_6() = docs_sweep_part(5)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 7")
+the_sites_pages_run_here_7() = docs_sweep_part(6)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 8")
+the_sites_pages_run_here_8() = docs_sweep_part(7)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 9")
+the_sites_pages_run_here_9() = docs_sweep_part(8)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 10")
+the_sites_pages_run_here_10() = docs_sweep_part(9)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 11")
+the_sites_pages_run_here_11() = docs_sweep_part(10)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 12")
+the_sites_pages_run_here_12() = docs_sweep_part(11)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 13")
+the_sites_pages_run_here_13() = docs_sweep_part(12)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 14")
+the_sites_pages_run_here_14() = docs_sweep_part(13)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 15")
+the_sites_pages_run_here_15() = docs_sweep_part(14)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 16")
+the_sites_pages_run_here_16() = docs_sweep_part(15)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 17")
+the_sites_pages_run_here_17() = docs_sweep_part(16)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 18")
+the_sites_pages_run_here_18() = docs_sweep_part(17)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 19")
+the_sites_pages_run_here_19() = docs_sweep_part(18)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 20")
+the_sites_pages_run_here_20() = docs_sweep_part(19)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 21")
+the_sites_pages_run_here_21() = docs_sweep_part(20)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 22")
+the_sites_pages_run_here_22() = docs_sweep_part(21)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 23")
+the_sites_pages_run_here_23() = docs_sweep_part(22)
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says, part 24")
+the_sites_pages_run_here_24() = docs_sweep_part(23)
+
+// A floor, so that sweeps that read nothing cannot pass for sweeps that agreed with everything: the
+// pages and the blocks the parts are owed, counted without compiling any of them. It is about the
+// whole site, so a run narrowed by `SYSL_DOCS_ONLY` states none.
+@test("the site shows the pages and the blocks its sweeps are owed, and every page is in one part")
+the_sites_sweeps_are_owed_their_blocks()
+    val root = docs_root()
+
+    if root == "" || env_var("SYSL_DOCS_ONLY").unwrap_or("") != ""
+        print("skipped: no pages, or a run narrowed to some of them")
+        return
     end if
 
-    assert(bad.is_empty(), docs_first_twenty(bad))
-end the_sites_pages_run_here
+    val pages = docs_pages(root)
+    val dealt = docs_parts(root, pages, DocsParts)
+    var compiled = 0
+    var runnable = 0
+    var load: Buf[usize] = buf()
+    var heaviest: usize = 0
+
+    for _ in 0..<DocsParts
+        load.push(0)
+
+    for p in 0..<pages.len()
+        val blocks = docs_blocks(docs_short(root, pages.at(p)), read_text(pages.at(p)).unwrap_or(""))
+
+        assert(dealt.at(p) < DocsParts, s"${pages.at(p)} is in no part")
+        load.set(dealt.at(p), load.at(dealt.at(p)) + blocks.len())
+
+        if blocks.len() > heaviest then heaviest = blocks.len()
+
+        for b in blocks
+            if b.claim != DocsClaim.PageShows || b.archive then compiled += 1
+
+            if b.claim == DocsClaim.PagePrints && !b.archive && b.target == "" && !b.traps
+                runnable += 1
+
+    assert(pages.len() >= 70, s"the site showed its pages: ${pages.len()} of them")
+    assert(compiled >= 1200, s"the pages showed the blocks a compiler is owed: only $compiled")
+    assert(runnable >= 800, s"the pages showed the runnable blocks the heap count is owed: only $runnable")
+
+    // Dealt well: no part carries more than the heaviest page and an even share beside it.
+    var total: usize = 0
+
+    for k in 0..<DocsParts
+        total += load.at(k)
+
+    for k in 0..<DocsParts
+        assert(load.at(k) <= heaviest + total / DocsParts,
+               s"part ${k + 1} carries ${load.at(k)} of $total blocks")
+end the_sites_sweeps_are_owed_their_blocks
 
 // -- the heap a runnable block gives back -----------------------------------------------------------
 
@@ -588,9 +871,10 @@ docs_leak_excuses() -> Buf[DocsLeakExcuse]
     out.push(DocsLeakExcuse("reference/async.md", 26, 3, s"$held -- the timer's waker"))
     out.push(DocsLeakExcuse("reference/async.md", 27, 4, s"$held -- the two wakers 'kept' collected"))
     out.push(DocsLeakExcuse("reference/async.md", 28, 2, s"$held -- the interrupt's waker"))
-    out.push(DocsLeakExcuse("reference/modules.md", 47, 1, s"$held -- the last string 'set' made"))
-    out.push(DocsLeakExcuse("reference/memory.md", 52, 1, s"$held -- the digest 'record' made"))
-    out.push(DocsLeakExcuse("reference/memory.md", 77, 1,
+    out.push(DocsLeakExcuse("reference/async.md", 35, 2, s"$held -- the waker 'arm' stored for the read"))
+    out.push(DocsLeakExcuse("reference/modules.md", 58, 1, s"$held -- the last string 'set' made"))
+    out.push(DocsLeakExcuse("reference/memory.md", 65, 1, s"$held -- the digest 'record' made"))
+    out.push(DocsLeakExcuse("reference/memory.md", 99, 1,
                             s"$held -- the 'log' buffer 'touch' grew in the table's third record"))
 
     out
@@ -619,8 +903,8 @@ private docs_live_at_exit(src: string, exe: string) -> Result[long, string]
             Ok(alloc_count_reported(said.err.unwrap_or("")))
 end docs_live_at_exit
 
-@test("every runnable sysl block the site shows gives back every allocation it made")
-the_sites_programs_give_back_their_heap()
+// Every runnable block on part `part`'s pages gives back every allocation it made.
+private docs_heap_part(part: usize)
     val asked = env_var("SYSL_DOCS").unwrap_or("") == "1" ||
         env_var("SYSL_DOCS_LEAKS").unwrap_or("") == "1"
 
@@ -639,7 +923,13 @@ the_sites_programs_give_back_their_heap()
     val dir = make_temp_dir("sysl-leaks").unwrap()
     val src = s"$dir/main.sysl"
     val exe = s"$dir/program"
-    val pages = docs_pages(root)
+    val pages = docs_pages_of_part(root, part)
+
+    if pages.is_empty()
+        remove_dir_all(dir).unwrap_or(())
+        return
+    end if
+
     val excuses = docs_leak_excuses()
 
     var excused_found: Buf[bool] = buf()
@@ -654,6 +944,7 @@ the_sites_programs_give_back_their_heap()
     var excused = 0
     var uncounted = 0
 
+    keep_std_units(true)
     force_alloc_counting(true)
 
     for p in 0..<pages.len()
@@ -663,7 +954,8 @@ the_sites_programs_give_back_their_heap()
         for i in 0..<blocks.len()
             val b = blocks.at(i)
 
-            if b.claim != DocsClaim.PagePrints || b.archive || b.target != "" then continue
+            // A block that traps never reaches the exit where the count is reported.
+            if b.claim != DocsClaim.PagePrints || b.archive || b.target != "" || b.traps then continue
 
             val placed = docs_placed(dir, b.source)
             var at = src
@@ -716,7 +1008,7 @@ the_sites_programs_give_back_their_heap()
                      "counted there")
 
     report.push("")
-    report.push(s"-- every page: $checked counted, ${checked - leaking - excused} clean, $leaking " +
+    report.push(s"-- part ${part + 1} of $DocsParts: $checked counted, ${checked - leaking - excused} clean, $leaking " +
                 s"leaking, $excused excused, $uncounted not counted (the output sweep's to report)")
 
     for i in 0..<report.len()
@@ -729,11 +1021,80 @@ the_sites_programs_give_back_their_heap()
 
     docs_record(report, "SYSL_DOCS_LEAKS_SUMMARY")
 
-    if env_var("SYSL_DOCS_ONLY").unwrap_or("") == ""
-        assert(checked >= 800, s"the pages showed the runnable blocks the count is owed: only $checked")
-
     assert(bad.is_empty(), docs_first_twenty(bad))
-end the_sites_programs_give_back_their_heap
+end docs_heap_part
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 1")
+the_sites_programs_give_back_their_heap_1() = docs_heap_part(0)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 2")
+the_sites_programs_give_back_their_heap_2() = docs_heap_part(1)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 3")
+the_sites_programs_give_back_their_heap_3() = docs_heap_part(2)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 4")
+the_sites_programs_give_back_their_heap_4() = docs_heap_part(3)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 5")
+the_sites_programs_give_back_their_heap_5() = docs_heap_part(4)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 6")
+the_sites_programs_give_back_their_heap_6() = docs_heap_part(5)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 7")
+the_sites_programs_give_back_their_heap_7() = docs_heap_part(6)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 8")
+the_sites_programs_give_back_their_heap_8() = docs_heap_part(7)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 9")
+the_sites_programs_give_back_their_heap_9() = docs_heap_part(8)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 10")
+the_sites_programs_give_back_their_heap_10() = docs_heap_part(9)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 11")
+the_sites_programs_give_back_their_heap_11() = docs_heap_part(10)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 12")
+the_sites_programs_give_back_their_heap_12() = docs_heap_part(11)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 13")
+the_sites_programs_give_back_their_heap_13() = docs_heap_part(12)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 14")
+the_sites_programs_give_back_their_heap_14() = docs_heap_part(13)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 15")
+the_sites_programs_give_back_their_heap_15() = docs_heap_part(14)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 16")
+the_sites_programs_give_back_their_heap_16() = docs_heap_part(15)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 17")
+the_sites_programs_give_back_their_heap_17() = docs_heap_part(16)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 18")
+the_sites_programs_give_back_their_heap_18() = docs_heap_part(17)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 19")
+the_sites_programs_give_back_their_heap_19() = docs_heap_part(18)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 20")
+the_sites_programs_give_back_their_heap_20() = docs_heap_part(19)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 21")
+the_sites_programs_give_back_their_heap_21() = docs_heap_part(20)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 22")
+the_sites_programs_give_back_their_heap_22() = docs_heap_part(21)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 23")
+the_sites_programs_give_back_their_heap_23() = docs_heap_part(22)
+
+@test("every runnable sysl block the site shows gives back every allocation it made, part 24")
+the_sites_programs_give_back_their_heap_24() = docs_heap_part(23)
 
 @test("every leak excuse names a runnable block on a page that exists, a count and a reason")
 the_leak_excuses_name_real_blocks()

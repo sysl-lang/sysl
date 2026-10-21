@@ -1,0 +1,233 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A target block's keys, set again by a feature** (`reference/packages.md § Linking a freestanding
+// image`): one program built for two cores of one chip, or for a board with two memory layouts,
+// links by two scripts from one manifest, and which one is the feature the build turned on.
+//
+//     targets {
+//       thumb-freestanding {
+//         linker_script = "m7.ld"
+//         features {
+//           m4 { linker_script = "m4.ld", entry = "m4_start" }
+//         }
+//       }
+//     }
+//
+// A feature block may set any key the target block itself takes, and what it sets is laid over the
+// block while the feature is on -- the block's own keys stand for every key no enabled feature sets.
+// **Two enabled features setting one key are refused**, naming both: the manifest would be saying two
+// things about one link, and which feature was declared first is no reason for the other to lose.
+// Only the root project's apply, as only its target block's image keys and code generation do.
+
+// What one feature's block inside one target block sets. Each field is empty where it sets nothing.
+struct FeatureTarget
+    target: string
+    feature: string
+    triple: string
+
+    // The image keys, `""` each where the block does not set it (`image_link.sysl`).
+    image: ImageLink
+
+    capabilities: Buf[(string, bool)]
+    codegen: Buf[(string, bool)]
+    registers: Buf[(string, string)]
+    extensions: Option[Buf[string]]
+end FeatureTarget
+
+// The `features` block of one target block, each feature's keys read exactly as the target block's
+// own are. A key a feature block does not know is warned about as one in the target block is.
+read_feature_targets(entry: &Conf, target: string,
+                     warnings: *Buf[string]) -> Result[Buf[FeatureTarget], string]
+    var out: Buf[FeatureTarget] = buf()
+
+    val block = conf_at(entry, "features") match
+        None -> return Ok(out)
+        Some(b) -> b
+
+    val where = s"targets.$target.features"
+
+    if !conf_is_block(block)
+        return Err(s"'$where' is not a block — it names features of this package, each with the " +
+            s"target's keys it sets while it is on, as '$where { m4 { linker_script = \"m4.ld\" } }'")
+
+    for feature in conf_keys(block)
+        val sub = conf_at(block, feature).unwrap()
+        val at = s"$where.$feature"
+
+        if !conf_is_block(sub)
+            return Err(s"'$at' is not a block — it sets the keys of 'targets.$target' this feature " +
+                "changes, as 'linker_script = \"m4.ld\"'")
+
+        for key in conf_keys(sub)
+            if !feature_target_key(key) then warnings.push(unknown_key(s"$at.$key"))
+
+        val image = read_image(sub, s"$target.features.$feature")? match
+            Some(i) -> i with { target = target }
+            None -> ImageLink(target, "", "", "")
+
+        val capabilities = conf_at(sub, "capabilities") match
+            None -> buf()
+            Some(caps) -> read_capabilities(caps, s"$at.capabilities")?
+
+        val settings = conf_at(sub, "codegen") match
+            None -> (buf(), buf(), None)
+            Some(cg) -> read_codegen(cg, s"$at.codegen")?
+
+        out.push(FeatureTarget(target, feature, conf_text(sub, "triple"), image, capabilities, settings.0,
+                               settings.1, settings.2))
+
+    Ok(out)
+end read_feature_targets
+
+// The keys a feature block may set: every key a target block takes but `features` itself.
+private feature_target_key(key: string) -> bool =
+    key == "triple" || key == "linker" || key == "linker_script" || key == "entry" ||
+    key == "capabilities" || key == "codegen"
+
+// A feature block naming a feature the package does not declare, refused when the file is read: it
+// would be a block no build could ever turn on, which is what a misspelling looks like from here.
+undeclared_feature_target(m: &Manifest) -> Option[string]
+    for ft in m.feature_targets
+        if feature_named(m.features, ft.feature) then continue
+
+        var names: Buf[string] = buf()
+
+        for item in m.features
+            names.push(item.0)
+
+        val tail = if names.is_empty() then ", and it declares none"
+        else s". It declares ${quoted_names(names)}"
+
+        return Some(s"'targets.${ft.target}.features.${ft.feature}' sets keys for the feature " +
+            s"'${ft.feature}', which this package does not declare — a feature has to be declared in " +
+            s"the 'features' block before a target block can say what it changes$tail")
+
+    None
+end undeclared_feature_target
+
+// The feature blocks of one target block whose feature this build has on, in the order the file
+// wrote them. **The root's request decides**, as it decides what the root's own source compiles.
+private enabled_feature_targets(m: &Manifest, target: string) -> Buf[FeatureTarget]
+    var out: Buf[FeatureTarget] = buf()
+
+    if m.feature_targets.is_empty() then return out
+
+    val on = root_enabled(m, current_feature_request(), feature_testing()).unwrap_or(buf())
+
+    for ft in m.feature_targets
+        if ft.target == target && holds_string(on, ft.feature) then out.push(ft)
+
+    out
+end enabled_feature_targets
+
+// Every key one feature block sets, as a refusal names it.
+private keys_set(ft: &FeatureTarget) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if ft.triple != "" then out.push("triple")
+    if ft.image.linker != "" then out.push("linker")
+    if ft.image.script != "" then out.push("linker_script")
+    if ft.image.entry != "" then out.push("entry")
+
+    for item in ft.capabilities
+        out.push(s"capabilities.${item.0}")
+
+    for item in ft.codegen
+        out.push(s"codegen.${item.0}")
+
+    for item in ft.registers
+        out.push(s"codegen.${item.0}")
+
+    if ft.extensions.is_some() then out.push("codegen.extensions")
+
+    out
+end keys_set
+
+// **Two enabled features setting one key of the target being built**, refused by `target_for` before
+// anything is read. A block for another machine is not this build's business.
+feature_target_conflict(m: &Manifest, target: string) -> Option[string]
+    val on = enabled_feature_targets(m, target)
+
+    for i in 0..<on.len()
+        val mine = keys_set(on.at(i))
+
+        for j in (i + 1)..<on.len()
+            val theirs = keys_set(on.at(j))
+
+            for key in mine
+                if !holds_string(theirs, key) then continue
+
+                val a = on.at(i).feature
+                val b = on.at(j).feature
+
+                return Some(s"the features '$a' and '$b' are both on, and both set " +
+                    s"'targets.$target.$key' — 'targets.$target.features.$a' and " +
+                    s"'targets.$target.features.$b' would each lay out the same key, so turn one of the " +
+                    "two off, or set the key in only one of them")
+
+    None
+end feature_target_conflict
+
+// -- the layered answers ---------------------------------------------------------------------------
+
+// The image keys the target block and its enabled feature blocks say, the features' over the block's.
+featured_image(m: &Manifest, target: string, base: Option[ImageLink]) -> Option[ImageLink]
+    val on = enabled_feature_targets(m, target)
+
+    if on.is_empty() then return base
+
+    var img = base.unwrap_or(ImageLink(target, "", "", ""))
+
+    for ft in on
+        if ft.image.linker != "" then img.linker = ft.image.linker
+        if ft.image.script != "" then img.script = ft.image.script
+        if ft.image.entry != "" then img.entry = ft.image.entry
+
+    if img.linker == "" && img.script == "" && img.entry == "" then None else Some(img)
+end featured_image
+
+// What an enabled feature's block says about a capability of this machine, where one says anything.
+featured_capability(m: &Manifest, target: string, cap: string) -> Option[bool]
+    for ft in enabled_feature_targets(m, target)
+        for item in ft.capabilities
+            if item.0 == cap then return Some(item.1)
+
+    None
+end featured_capability
+
+// What an enabled feature's block says about a code generation flag of this machine.
+featured_codegen(m: &Manifest, target: string, setting: string) -> Option[bool]
+    for ft in enabled_feature_targets(m, target)
+        for item in ft.codegen
+            if item.0 == setting then return Some(item.1)
+
+    None
+end featured_codegen
+
+// What an enabled feature's block says about a register setting of this machine.
+featured_register(m: &Manifest, target: string, setting: string) -> Option[string]
+    for ft in enabled_feature_targets(m, target)
+        for item in ft.registers
+            if item.0 == setting then return Some(item.1)
+
+    None
+end featured_register
+
+// The extensions list an enabled feature's block gives this machine, where one gives one.
+featured_extensions(m: &Manifest, target: string) -> Option[Buf[string]]
+    for ft in enabled_feature_targets(m, target)
+        if ft.extensions.is_some() then return ft.extensions
+
+    None
+end featured_extensions
+
+// The triple an enabled feature's block names for this machine, where one names one.
+featured_triple(m: &Manifest, target: string) -> Option[string]
+    for ft in enabled_feature_targets(m, target)
+        if ft.triple != "" then return Some(ft.triple)
+
+    None
+end featured_triple

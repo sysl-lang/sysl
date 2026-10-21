@@ -4,54 +4,52 @@ summary: One mechanism for polymorphism, two ways to spend it — a bound for st
 weight: 100
 ---
 
-sysl has **one** polymorphism mechanism, and it is called `trait`. A type takes part in a trait only
-through an explicit `impl Trait for Type`; there is no structural conformance, so a type never
-satisfies a trait by coincidence of method names.
+sysl has **one** polymorphism mechanism, the `trait`. A type implements a trait only through an
+explicit `impl Trait for Type`. There is no structural conformance, so a type never satisfies a trait
+just because its method names happen to match.
 
-What varies is not the mechanism but how you spell the parameter:
+The mechanism is the same throughout; what varies is how the parameter is written:
 
-- `[T: Trait]` — a **bound** on a generic. Monomorphized, direct calls, no indirection.
-- `&Trait` / `*Trait` — a **trait object**. One copy of the code, dispatched through a table.
+- `[T: Trait]` is a **bound** on a generic: monomorphized, with direct calls and no indirection.
+- `&Trait` / `*Trait` is a **trait object**: one copy of the code, dispatched through a table.
 
-Same trait, two strategies, and no `dyn` keyword: the memory-mode sigil already says everything one
-would.
+One trait supports both strategies, and there is no `dyn` keyword: the memory-mode sigil already
+says what one would.
 
 ## A trait, and an implementation
 
 ```sysl
-trait Greet
+trait Device
     name(self) -> string
-    greet(self) -> string = "hello, " + self.name()
+    label(self) -> string = "device " + self.name()
 
-struct Cat
-    tag: string
+struct Uart
+    port: string
 
-impl Greet for Cat
-    name(self) -> string = self.tag
+impl Device for Uart
+    name(self) -> string = self.port
 
-var c = Cat("mimi")
+var u = Uart("ttyS0")
 
-print(c.greet())
+print(u.label())
 ```
 
 ```output
-hello, mimi
+device ttyS0
 ```
 
-A member written as a bare signature is one an implementation must supply. One written **with a
-body** is a default that every `impl` inherits unless it writes its own.
+A member written as a bare signature must be supplied by each implementation. A member written
+**with a body** is a default, which every `impl` inherits unless it provides its own.
 
-Defaults are what let a trait *grow*: adding a member with a default does not break the
-implementations that already exist, which is the difference between a trait a library can evolve and
-one frozen at its first release.
+Defaults let a trait *grow*: adding a member with a default does not break existing
+implementations, so a library can extend a trait after its first release.
 
-A default's body may assume of its receiver exactly what its own trait declares, and nothing more.
-That is not a restriction bolted on — it is what a default is, since the body has to serve every
-implementing type and the trait is all they have in common. It is checked once, at the trait, even
-when nothing implements the trait at all.
+A default's body may rely only on what its own trait declares about the receiver. The body must work
+for every implementing type, and the trait is all those types are known to share. This is checked
+once, at the trait, even when nothing implements it yet.
 
-Including the built-ins, which is not a convenience but a requirement — a `Show` that cannot cover
-`int` is a `Show` no library can be written against:
+Built-in types can implement traits too. This is necessary: a `Show` trait that could not cover `int`
+would be of little use to a library.
 
 ```sysl
 trait Show
@@ -63,7 +61,7 @@ impl Show for int
 impl Show for bool
     show(self) -> string = if self then "yes" else "no"
 
-var n: int = 5
+var n = 5
 
 print(n.show(), true.show())
 ```
@@ -72,11 +70,11 @@ print(n.show(), true.show())
 int 5 yes
 ```
 
-Where an `impl` may *live* is the one restriction: in the module that declares the trait, or in one
-that declares a type named in the subject. That is Rust's orphan rule, and it costs nothing —
-retrofitting still works, because `impl MyTrait for TheirType` lives with `MyTrait`. What it buys is
-that resolving a bound inspects only the modules a use site already depends on, with no global search
-and no dependency edge the source does not show.
+There is one restriction on where an `impl` may be written: in the module that declares the trait,
+or in one that declares a type named in the subject. This is Rust's orphan rule. Extending another
+library's type still works, because `impl MyTrait for TheirType` lives with `MyTrait`. In return,
+resolving a bound only inspects modules the use site already depends on, with no global search and
+no hidden dependency.
 
 ## Generics, and what an unbounded parameter may do
 
@@ -99,21 +97,20 @@ print(p.first, p.second, "/", q.first, q.second)
 1 one / one 1
 ```
 
-`Pair` asks nothing of `A` and `B`, and it does not need to. With no bound, a parameter may be
-**copied, assigned, passed, returned, and stored** — which is exactly what a container does.
+`Pair` requires nothing of `A` and `B`. A parameter with no bound may be **copied, assigned, passed,
+returned and stored**, which is everything a container needs.
 
-That baseline is bigger here than in Rust, and the memory chapter is why: every sysl value is
-copyable, since assignment copies and copying a value holding a `&T` retains it. So there is **no
-`Copy` bound to write, ever**. "Hold and hand along any `T`" is free and unmarked.
+That baseline is broader than in Rust, for the reason given in the memory chapter: every sysl value
+can be copied, because assignment copies and copying a value that holds a `&T` retains it. There is
+therefore **no `Copy` bound** to write.
 
-Type arguments are inferred, and from two directions — from the arguments (`Pair(1, "one")` gives
-`A = int, B = string`) and from the expected type, for the cases the arguments cannot settle. A
-parameter that neither direction determines is an error asking for an annotation, never a silent
-default.
+Type arguments are inferred from two directions: from the arguments (`Pair(1, "one")` gives
+`A = int, B = string`), and from the expected type where the arguments do not settle it. A parameter
+that neither determines is an error asking for an annotation, never a silent default.
 
-What an unbounded `T` may **not** do is anything that assumes structure: no operator, no method call,
-no field access, no subscript. Each of those is a capability some types have and others do not, so
-each needs a bound that guarantees it:
+An unbounded `T` may **not** be used in any way that assumes structure: no operator, method call,
+field access or subscript. Each of these is a capability some types have and others lack, so each
+needs a bound that guarantees it:
 
 ```sysl
 trait Show
@@ -124,7 +121,7 @@ impl Show for int
 
 describe[T: Show](x: T) -> string = "<" + x.show() + ">"
 
-var n: int = 7
+var n = 7
 
 print(describe(n))
 ```
@@ -133,8 +130,8 @@ print(describe(n))
 <#7>
 ```
 
-And here is the whole payoff. Drop the bound and the error lands on **the definition that is wrong**,
-not on some caller three files away that instantiated it with the wrong type:
+Remove the bound and the error is reported at **the definition that is wrong**, not at a caller in
+another file that instantiated it:
 
 ```sysl
 trait Show
@@ -147,18 +144,17 @@ describe[T](x: T) -> string = x.show()
 'show' needs 'T: Show'
 ```
 
-The diagnostic names the bound to write, which is its whole job. That is definition-checked generics — the Swift/Kotlin/Scala consensus, and the opposite of a C++
-template, whose errors arrive at instantiation wearing the callee's insides.
+The diagnostic names the bound to add. These are definition-checked generics, as in Swift, Kotlin and
+Scala, unlike C++ templates, whose errors appear at instantiation and refer to the callee's internals.
 
-Multiple bounds join with `+`: `[T: Ord + Hash]` asks for both.
+Multiple bounds are joined with `+`: `[T: Ord + Hash]` requires both.
 
-**A field is the one exception, and it proves the rule.** Every other unlicensed use names the bound
-that would allow it, because that is the diagnostic's whole job. A field names none — a trait promises
-*behaviour* and a field is *layout*, so no bound could ever supply one. Reaching a value's data
-through a generic means going through a member the bound declares, which is also what lets two types
-satisfy one bound while storing the value differently.
+**A field is the one exception.** Every other disallowed use names the bound that would allow it. A
+field access names none, because a trait describes *behaviour* and a field is *layout*, so no bound
+can provide one. Generic code reaches a value's data through a member the bound declares, which also
+lets two types satisfy one bound while storing their data differently.
 
-Which is why a bound is all it takes to write arithmetic over a parameter:
+Since operators are trait members, a bound is all that arithmetic over a parameter needs:
 
 ```sysl
 sum[T: Add](a: T, b: T) -> T = a + b
@@ -173,35 +169,34 @@ print(biggest(3, 9), biggest("apple", "pear"))
 9 pear
 ```
 
-`+` is `Add`, `<` is `Ord`, `==` is `Eq`. Nothing about generics is special-cased for operators; an
-operator on a `T` simply requires the bound that supplies it, the same as a method call does.
+`+` is `Add`, `<` is `Ord`, `==` is `Eq`. Operators are not special-cased in generics; an operator on
+a `T` requires the bound that supplies it, just as a method call does.
 
-A type's own parameters carry bounds too, in the same brackets and meaning the same thing — and that
-is where a type says what it assumes. `struct SortedList[T: Ord]` holds every application of the type
-to the promise, and lets its members be checked at their definitions rather than at each use.
+A type's own parameters take bounds in the same brackets, with the same meaning, and that is where a
+type states its assumptions. `struct SortedList[T: Ord]` requires every use of the type to satisfy
+the bound, and lets its members be checked at their definitions rather than at each use.
 
-A bound is declared **once**, at the type, and is in force everywhere its parameters appear: a
-member's signature and body, a field's type, a variant's payload. It is not restated per member.
+A bound is declared **once**, on the type, and applies everywhere its parameters appear: a member's
+signature and body, a field's type, a variant's payload. It is not repeated per member.
 
-Each distinct set of type arguments produces its own specialized function or aggregate. `sum` called
-at `int` and at `real` emits two functions; `Pair[int, string]` and `Pair[int, int]` are two layouts.
+Each distinct set of type arguments produces its own specialized function or type. `sum` called with
+`int` and with `real` emits two functions; `Pair[int, string]` and `Pair[int, int]` have two layouts.
 
-That is what lets bounds be checked once at the definition and still lower to direct, inlinable code
-with no dictionary passed at run time. The cost is code size, which is the standard trade and the
-right default for a systems language — with the dynamic path below available whenever one copy is
-what you actually want.
+This is what lets bounds be checked once at the definition and still compile to direct, inlinable
+code with no dictionary passed at run time. The cost is code size, the usual trade-off and the right
+default for a systems language; trait objects, below, provide a single shared copy when that is what
+you need.
 
-**Variance does not arise.** Variance is about when `G[A]` may stand in for `G[B]`, which needs a
-subtyping relation to be interesting, and sysl has none among concrete types. `Box[Cat]` and
-`Box[Animal]` are simply unrelated. That deletes a whole category of design difficulty, and it should
-stay deleted: polymorphism over a set of types is a bound or a trait object, never a covariant
-container.
+**There is no variance.** Variance concerns when `G[A]` may stand in for `G[B]`, which only matters
+with subtyping, and sysl has no subtyping between concrete types. `Box[Cat]` and `Box[Animal]` are
+unrelated types. Polymorphism over a set of types is expressed with a bound or a trait object, never
+a covariant container.
 
 ## Trait objects
 
-When the set of types is open or genuinely heterogeneous, monomorphizing is impossible or wasteful.
-A trait object is a **fat pointer** — two words, the method table for the type it forgot, and the
-value itself:
+When the set of types is open or the values are of mixed types, monomorphizing is impossible or
+wasteful. A trait object is a **fat pointer**: two words, the method table for the erased type and
+the value itself:
 
 ```sysl
 trait Shape
@@ -236,41 +231,39 @@ print("total:", total(shapes))
 total: 37
 ```
 
-The sigil says who owns the second word, and nothing else changes between the two. `&Shape` is an
-ARC-owned object — the data word is the reference-counted box the value sits in, and letting go of it
-needs no more knowledge of the payload than letting go of any `&T` does. `*Shape` is a raw fat
-pointer, unmanaged like every `*T`, and it is what a kernel passes around when there is no allocator.
+The sigil says who owns the data word; nothing else differs between the two forms. `&Shape` is a
+reference-counted object: the data word is the counted box holding the value, and releasing it needs
+no more knowledge of the payload than releasing any `&T`. `*Shape` is a raw fat pointer, unmanaged
+like every `*T`, which is what a kernel uses when there is no allocator.
 
-Erasure is a **coercion**, applied wherever an object type is expected — an argument, a declared
-variable, an array element, a struct field. Above, each `Rect(3, 4)` is constructed, boxed because a
-`&Shape` was expected, and then erased, which is the ordinary "write the construction and it is
-allocated" rule with one more step. Because the coercion applies per branch, an `if` or a `match`
-whose arms are different concrete types meets at one trait object — which is the point of having
-them.
+Erasure is a **coercion**, applied wherever an object type is expected: an argument, a declared
+variable, an array element, a struct field. Above, each `Rect(3, 4)` is constructed, placed in a box
+because a `&Shape` was expected, and then erased. This is the ordinary rule that a construction where
+a `&T` is expected is allocated, with one more step. Because the coercion applies to each branch, an
+`if` or a `match` whose arms produce different concrete types can yield one trait object.
 
-What an object offers is the trait's methods and nothing else. No dereference, no fields, no
-comparison, and no way back to the concrete type.
+A trait object offers the trait's methods and nothing else: no dereference, no fields, no comparison,
+and no way back to the concrete type.
 
-**But the two halves of this page's opening meet at a bound.** An object carries a table of the
-trait's members, which is exactly what a bound asks for — so a `[T: Shape]` function takes a `&Shape`
-as readily as it takes a `Rect`, with an indirect call where the other gets a direct one. The choice
-between static and dynamic is about what the *caller* holds, not about which functions it can reach,
-and a library written against bounds is not closed to a program that erased.
+**Bounds and trait objects work together.** An object carries a table of the trait's members, which
+is exactly what a bound requires, so a `[T: Shape]` function accepts a `&Shape` as readily as a
+`Rect`, making an indirect call where the other makes a direct one. The choice between static and
+dynamic dispatch depends on what the *caller* holds, not on which functions it can call, and a
+library written against bounds is usable from a program that uses trait objects.
 
-Erasure forgets the type, so a member may promise nothing that depends on knowing it. A trait can be
-made into an object when every member has a receiver and mentions `Self` nowhere but there.
+Erasure forgets the type, so no member may depend on knowing it. A trait can be used as an object
+when every member has a receiver and mentions `Self` nowhere else.
 
-That second rule excludes **every trait in the operator catalogue** — `add(self, rhs: Self) -> Self`
-first among them — and that is the right answer rather than a limitation. An operator over two values
-of one type is a question about types known while compiling, so those traits are for bounds.
+That second rule excludes **every operator trait**, starting with `add(self, rhs: Self) -> Self`. An
+operator over two values of one type is a question about types known at compile time, so those
+traits are used as bounds.
 
-`trait Reader: Fallible` says that implementing `Reader` obliges implementing `Fallible` too. The
-requirement is checked **at the `impl`**, not at the bound — so `[T: Reader]` gets both traits'
-members without having to name both, and a type that forgot one is told at its own declaration rather
-than at somebody's call.
+`trait Reader: Fallible` means that implementing `Reader` requires implementing `Fallible` too. The
+requirement is checked **at the `impl`**, not at the bound, so `[T: Reader]` gets the members of both
+traits without naming both, and a type that is missing one is told at its own declaration rather than
+at a caller.
 
-Where the required trait's members all have defaults, satisfying it is one line with no block under
-it:
+Where every member of the required trait has a default, satisfying it takes one line with no body:
 
 ```sysl
 trait Fallible
@@ -298,17 +291,16 @@ print(c.take(), c.take(), c.failed())
 1 2 false
 ```
 
-That is the shape the standard library's byte surface uses: `Reader` and `Writer` each require
-`Fallible`, so a type that is **both** carries one `failed` rather than two that nothing at a call
-site could tell apart.
+The standard library's byte I/O uses this shape: `Reader` and `Writer` each require `Fallible`, so a
+type that is **both** has a single `failed` rather than two that a call site could not distinguish.
 
-A trait may also take **type arguments** — `impl From[int] for Temp` beside `impl From[real] for
-Temp` — so one type implements it once at each argument list. That is what a conversion surface is
-built out of, and [the reference](/reference/traits/) has it.
+A trait may also take **type arguments**, as in `impl From[int] for Temp` beside
+`impl From[real] for Temp`, so one type can implement it once for each argument list. Conversion
+APIs are built this way; [the reference](/reference/traits/) covers it.
 
 ## Implementing `Display`
 
-The trait worth writing first, because it is what `print` and `str` reach:
+`Display` is usually the first trait to implement, because `print` and `str` use it:
 
 ```sysl
 struct Point
@@ -330,23 +322,22 @@ print("as text:", str(p), "padded:", f"${p}%10s")
 as text: (3, 4) padded:     (3, 4)
 ```
 
-Note the shape of the signature: a value renders itself **into a `*Writer`** rather than returning a
-string. That is what lets rendering cost no allocation — a program in a kernel supplies its own sink
-with an ordinary `impl` — and `str(x)` is then the same rendering aimed at a buffer.
+A value renders itself **into a `*Writer`** rather than returning a string. Rendering therefore needs
+no allocation, since a program in a kernel can supply its own output sink with an ordinary `impl`,
+and `str(x)` is the same rendering directed into a buffer.
 
-`Writer` is the first trait the language itself forms objects of, and `display_pad` is where an
-implementation ends up: it applies the `FormatSpec` **once, to the whole value**. That is the rule,
-and it is the only one — a specifier describes the field the whole value occupies, so the `%10s`
-above padded the point rather than its first number.
+`Writer` is the first trait the language itself forms objects of. `display_pad` applies the
+`FormatSpec` **once, to the whole value**: a specifier describes the field the entire value occupies,
+so the `%10s` above padded the whole point, not its first number.
 
-Gathering the parts into a string first, as this one does, is the shortest way to obey that rule and
-it is not how the library obeys it. `Counting` is a `Writer` that keeps the *length* of what it is
-handed and drops the bytes, so an implementation can measure what its parts came to, pad once, and
-then write them straight through — two passes and nothing allocated. That is what `[]T`, `Option`,
-`Result` and `Complex[F]` all do, and [the library's own page](/library/core/) shows the two shapes
-beside each other.
+Building the parts into a string first, as this implementation does, is the shortest way to follow
+that rule, but the library does it differently. `Counting` is a `Writer` that records the *length* of
+what it receives and discards the bytes, so an implementation can measure its output, pad once, and
+then write the parts directly: two passes and no allocation. `[]T`, `Option`, `Result` and
+`Complex[F]` all work this way, and [the library's own page](/library/core/) shows both approaches
+side by side.
 
 ---
 
-Next: [modules and the standard library](/tour/modules/) — how a program is split up, and what comes
-in the box.
+Next: [modules and the standard library](/tour/modules/): how a program is divided into files, and
+what the standard library provides.

@@ -148,12 +148,15 @@ enum TExprKind
     // The address of a value that has none, which is a slot made to hold it.
     TTempAddr(value: TExpr, ty: Type)
 
-    // A place written from a value, as an expression, which is what an assignment inside one is.
-    TStore(place: TExpr, value: TExpr, ty: Type)
+    // A place written from a value. `ty` is the place's type; the write is `unit` unless it
+    // `yields`, which is what `:=` asks for -- and then it is what reading the place right after
+    // the store gives.
+    TStore(place: TExpr, value: TExpr, ty: Type, yields: bool)
 
-    // A compound assignment: the place read, the operator applied, the result written back.
+    // A compound assignment: the place read, the operator applied, the result written back. It
+    // yields the new value where it is written `+:=` and its kin, and is `unit` otherwise.
     TUpdate(place: TExpr, op: string, value: TExpr, ty: Type, dispatch: Option[TDispatch],
-            check: Option[Type])
+            check: Option[Type], yields: bool)
 
     // `++` and `--`, before or after the place they move.
     TIncDec(place: TExpr, op: string, pre: bool, ty: Type, check: Option[Type])
@@ -177,6 +180,16 @@ enum TExprKind
     // `tlbi`, `dc`, `ic` and `at` with the operation's word. `args` is the value written or the
     // register operand, where the form takes one.
     TSysOp(op: string, name: string, args: Buf[TExpr])
+
+    // `x.(c)` reached with a value holding another variant: the failure is reported, as a failed
+    // bounds check is, naming the variant `asked` for and the one the value `holds`, and the program
+    // stops.
+    TVariantFail(asked: string, holds: string)
+
+    // The same failure with the variant held read off `held` while the program runs: one arm stands
+    // for every other variant, so `x.(c)` costs one test whatever the enum's size, rather than an
+    // arm per variant in each of the copies a `for const c in T::Variants` makes.
+    TVariantFailHeld(asked: string, held: TExpr)
 
     // `&&` and `||`, which do not evaluate their right operand unless they must.
     TLogical(op: string, left: TExpr, right: TExpr)
@@ -396,8 +409,8 @@ texpr_type(e: TExpr) -> Type = *e.kind match
     TTypeId(_, ty) -> ty
     TAddrOf(_, ty) -> ty
     TTempAddr(_, ty) -> ty
-    TStore(_, _, ty) -> ty
-    TUpdate(_, _, _, ty, _, _) -> ty
+    TStore(_, _, ty, yields) -> if yields then ty else Unit
+    TUpdate(_, _, _, ty, _, _, yields) -> if yields then ty else Unit
     TIncDec(_, _, _, ty, _) -> ty
     TBinary(_, _, _, ty) -> ty
     TUnary(_, _, ty) -> ty
@@ -406,6 +419,8 @@ texpr_type(e: TExpr) -> Type = *e.kind match
     TFence(_) -> Unit
     TSlots(_, _, _, ty) -> ty
     TSysOp(op, _, _) -> if op == "read_sysreg" || op == "at" then Integer(64, false, false) else Unit
+    TVariantFail(_, _) -> Never
+    TVariantFailHeld(_, _) -> Never
     TLogical(_, _, _) -> Bool
     TCompare(_, _) -> Bool
     TSeq(_) -> Unit

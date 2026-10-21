@@ -28,7 +28,8 @@ import sysl.text.{replace_all, Search, split}
 // override that returns -- one that only counts, say -- still stops the program where it was.
 //
 // **On a hosted target the default renders the message itself and writes it to standard error** with
-// one `write`, then traps. It renders its own digits rather than calling `snprintf`, so a program
+// one `write`, then stops through `@sysl.trap`, which flushes standard output and traps
+// (`trap_stop.sysl`). It renders its own digits rather than calling `snprintf`, so a program
 // that formats nothing still links no C formatter -- and `write` is the one thing it asks of libc.
 // **On a freestanding target it returns at once and the trap at the call site stops the program**,
 // exactly as before this existed: there is no standard error to write to. The call is kept rather
@@ -56,6 +57,7 @@ const BoundsTooWide: int = 8
 const BoundsRun: int = 9
 const BoundsCountTooWide: int = 10
 const BoundsNoVariant: int = 11
+const BoundsWrongVariant: int = 12
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -63,7 +65,8 @@ const BoundsASigned: int = 256
 const BoundsBSigned: int = 512
 
 // What each form says, in order: the text with a `%s` for each value, and which values fill them --
-// `a`, `b` or `n` (the length). The location, where there is one, follows as ` (file:line:col)`.
+// `a`, `b` or `n` (the length), or `A` or `B` where that value is the address of a NUL-terminated
+// text rather than a number. The location, where there is one, follows as ` (file:line:col)`.
 private val BoundsForms: []const (string, string) = [
     ("index %s out of bounds for length %s", "an"),
     ("range %s..<%s out of bounds for length %s", "abn"),
@@ -76,7 +79,8 @@ private val BoundsForms: []const (string, string) = [
     ("index does not fit in usize", ""),
     ("%s elements from index %s out of bounds for length %s", "ban"),
     ("count does not fit in usize", ""),
-    ("value %s is not one of the enum's variants", "a")]
+    ("value %s is not one of the enum's variants", "a"),
+    ("variant '%s' was asked for, and the value is '%s'", "AB")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -151,10 +155,95 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     args.push(ir_arg(w, n))
     args.push(ir_arg(LPtr, location_of(e, site)))
     emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
-    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
 end bounds_unless
+
+// **`x.(c)` reached with a value holding another variant** reports through the same function, the
+// two variants' names handed over as the addresses of NUL-terminated texts laid down with the
+// locations, and stops the program.
+variant_fail(e: *Emit, asked: string, holds: string, site: Span) -> Val =
+    variant_fail_at(e, asked, c_text_of(e, holds), site)
+
+// The same, the held variant's name read while the program runs: the value's tag indexes a table of
+// the enum's variant names (the analyzer chooses this form only where the tags are the positions).
+variant_fail_held(e: *Emit, asked: string, held: TExpr, site: Span) -> Val
+    val ty = texpr_type(held)
+    val d = enum_decl(ty).unwrap()
+    val v = gen_expr(e, held)
+    val w = word_lty(e)
+    val tag = fresh_reg(e)
+
+    emit(e, InExtract(tag, enum_lty(d), v, index_list(0)))
+
+    var at = tag
+
+    if e.word_bits > 32
+        at = fresh_reg(e)
+        emit(e, InCast(at, CastZExt, LInt(32), tag, w))
+    end if
+
+    val n = int(d.variants.len())
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(w, VInt(from_int(0))))
+    idx.push(ir_arg(w, at))
+
+    val slot = fresh_reg(e)
+    val name = fresh_reg(e)
+
+    emit(e, InGep(slot, LArr(n, LPtr), VGlobal(variant_name_table(e, ty, d)), idx))
+    emit(e, InLoad(name, LPtr, slot, AccPlain, None))
+    variant_fail_at(e, asked, name, site)
+end variant_fail_held
+
+// An enum's variant names in tag order, laid down once per module.
+private variant_name_table(e: *Emit, ty: Type, d: &EnumType) -> string
+    val key = l_render(enum_lty(d))
+    val known = e.variant_names.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    var names: Buf[IrArg] = buf()
+
+    for i in 0..<d.variants.len()
+        names.push(ir_arg(LPtr, c_text_of(e, descriptor_text(ty, int(i), -1))))
+
+    val name = s".variants${e.variant_names.len()}"
+
+    e.globals.push(ir_global(name, true, LArr(int(names.len()), LPtr), VArray(names)))
+    e.variant_names.put(key, name)
+    name
+end variant_name_table
+
+private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val
+    e.traps = true
+    e.bounds_fails = true
+
+    val w = word_lty(e)
+    val a = fresh_reg(e)
+    val b = fresh_reg(e)
+
+    emit(e, InCast(a, CastPtrToInt, LPtr, c_text_of(e, asked), w))
+    emit(e, InCast(b, CastPtrToInt, LPtr, holds, w))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), VInt(from_int(long(BoundsWrongVariant)))))
+    args.push(ir_arg(w, a))
+    args.push(ir_arg(w, b))
+    args.push(ir_arg(w, bounds_none()))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
+    emit_term(e, InUnreachable)
+    VNothing
+end variant_fail_at
+
+// What the default prints for it, which is also what an evaluation while compiling says.
+variant_fail_text(asked: string, holds: string) -> string =
+    s"variant '$asked' was asked for, and the value is '$holds'"
 
 // A value a form does not use.
 bounds_none() -> Val = VInt(from_int(0))
@@ -200,7 +289,7 @@ check_variant(e: *Emit, en: Type, v: Val, site: Span)
 
     val name = llvm_safe(s"sysl.enum.check.${mangle(underlying(en))}")
 
-    request_text(e, name, variant_check_text(name, d.unwrap(), bits, signed, e.word_bits))
+    request_text(e, name, variant_check_text(name, d.unwrap(), bits, signed, e.word_bits, trap_symbol(e)))
 
     var args: Buf[IrArg] = buf()
 
@@ -219,7 +308,8 @@ end every_value_a_variant
 
 // The helper: the membership test at 64 bits, as `E(n)`'s is, so a signed representation compares
 // with its sign; the report through `sysl_bounds_fail` with the value widened to the word; the trap.
-private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, word_bits: int) -> string
+private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, word_bits: int,
+                           stop: string) -> string
     val ext = if signed then "sext" else "zext"
     val word = s"i$word_bits"
 
@@ -254,7 +344,7 @@ private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, 
     val kind = bounds_kind(BoundsNoVariant, signed, false)
 
     text + s"  call void @${bounds_fail_symbol()}(i32 $kind, $word $a, $word 0, $word 0, ptr %at)\n" +
-        s"  call void @${llvm_trap()}()\n" +
+        s"  call void @$stop()\n" +
         "  unreachable\n" +
         "ok:\n" +
         "  ret void\n" +
@@ -277,9 +367,11 @@ end location_of
 // A NUL-terminated constant holding `text`, laid down with the locations and numbered among them, so
 // one text asked for twice is one constant.
 c_text_of(e: *Emit, text: string) -> Val
-    for i in 0..<e.locs.len()
-        if e.locs.at(i) == text then return VGlobal(bounds_location_name(i))
+    val known = e.locs_at.get(text)
 
+    if known.is_some() then return VGlobal(bounds_location_name(known.unwrap()))
+
+    e.locs_at.put(text, e.locs.len())
     e.locs.push(text)
     VGlobal(bounds_location_name(e.locs.len() - 1))
 end c_text_of
@@ -361,10 +453,17 @@ bounds_runtime(t: Target) -> string
 
             if j < fills.bytes.len
                 val which = fills[j..<j + 1]
-                val sign = if which == "a" then "%asg" else if which == "b" then "%bsg" else "false"
 
-                text = text + s"  %k${k}.v${j} = call ptr @sysl.bounds.num(ptr $at, $word %${which}, " +
-                    s"i1 $sign, ptr %lim)\n"
+                if which == "A" || which == "B"
+                    text = text + s"  %k${k}.t${j} = inttoptr $word %${if which == "A" then "a" else "b"} to ptr\n" +
+                        s"  %k${k}.v${j} = call ptr @sysl.bounds.put(ptr $at, ptr %k${k}.t${j}, ptr %lim)\n"
+                else
+                    val sign = if which == "a" then "%asg" else if which == "b" then "%bsg" else "false"
+
+                    text = text + s"  %k${k}.v${j} = call ptr @sysl.bounds.num(ptr $at, $word %${which}, " +
+                        s"i1 $sign, ptr %lim)\n"
+                end if
+
                 at = s"%k${k}.v${j}"
 
         text = text + "  br label %tail\n"
@@ -387,7 +486,7 @@ bounds_runtime(t: Target) -> string
         s"  %mi = ptrtoint ptr %msg to $word\n" +
         s"  %len = sub $word %fi, %mi\n" +
         s"  %w = call $word @write(i32 2, ptr %msg, $word %len)\n" +
-        "  call void @llvm.trap()\n" +
+        "  call void @sysl.trap()\n" +
         "  unreachable\n" +
         "}\n\n"
 end bounds_runtime

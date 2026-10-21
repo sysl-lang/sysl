@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`sysl.AnyBits`, and the `Buf` members it bounds** -- a type every bit pattern of whose storage
+// is a value of it (`any_bits.sysl`), whose membership the compiler settles and nothing implements.
+// `Buf.spare` and `Buf.set_len` are given only to a buffer of such a type, so the slots a length is
+// moved over hold a value whether or not anything wrote them. `library/core.md § AnyBits` and
+// `library/buf.md § Filling the spare room` are the spec.
+
+private anb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private anb_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-anb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end anb_run
+
+private anb_prints(text: string, printed: string)
+    if !anb_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = anb_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end anb_prints
+
+private anb_refused(text: string, message: string, line: int, col: int)
+    if !anb_ready() then return
+
+    val (_, _, err) = anb_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end anb_refused
+
+// A bound to ask membership through, and one type of each kind that is refused.
+private val anb_probe: string = raw"""
+    ok[T: AnyBits](x: T) -> int = 1
+
+    enum Kind
+        A
+        B
+
+    struct Node
+        n: int
+
+    struct Flagged
+        n: u32
+        on: bool
+
+    struct Cell
+        at: *u8
+        weight: f32
+        span: [2]u16
+
+    """
+
+private val anb_why: string = "storage nobody wrote would not hold a valid value of it: "
+
+private anb_not(arg: string, shown: string, why: string)
+    anb_refused(anb_probe + s"print(ok($arg))\n",
+                s"'ok' requires its type parameter 'T' to implement 'sysl.AnyBits', but $shown does " +
+                s"not — $anb_why$why", 19, 7)
+
+@test("integers of whole bytes, floats, fixed point, pointers, arrays and structs of them are AnyBits")
+anb_members()
+    anb_prints(anb_probe + raw"""
+        var x: u8 = 3
+        val p: *u8 = &x
+
+        print(ok(x) + ok(-5i64) + ok(u128(1)) + ok(1.5f32) + ok(2.5) + ok(q15(0.5)) + ok(p) +
+              ok([1u16, 2]) + ok(Node(1)) + ok(Cell(p, 1.0f32, [1u16, 2])) + ok(()))
+        """, "11\n")
+
+@test("a bool is not AnyBits")
+anb_bool_refused()
+    anb_not("true", "bool", "a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither")
+
+@test("an enum is not AnyBits")
+anb_enum_refused()
+    anb_not("Kind.A", "Kind", "'Kind' is one of its variants, and most numbers its tag can hold are none")
+
+@test("a char is not AnyBits")
+anb_char_refused()
+    anb_not("'c'", "char", "a 'char' is a Unicode scalar value, and most numbers its four bytes can " +
+            "hold are not one")
+
+@test("a string is not AnyBits")
+anb_string_refused()
+    anb_not("\"s\"", "string", "a string is an address and a length the program made")
+
+@test("an integer that is not a whole number of bytes is not AnyBits")
+anb_sub_byte_refused()
+    anb_not("u12(3)", "u12", "'u12' is not a whole number of bytes, so the bits above it in its slot " +
+            "are not its own")
+
+@test("a struct holding a bool is not AnyBits, and the field is named")
+anb_struct_with_bool_refused()
+    anb_not("Flagged(1, true)", "Flagged", "its field 'on' is bool — a 'bool' is 0 or 1, and its byte " +
+            "can hold 254 numbers that are neither")
+
+@test("a vector of members is AnyBits")
+anb_vector_member()
+    anb_prints(anb_probe + raw"""
+        val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+        val w: <8>u16 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        print(ok(v) + ok(w))
+        """, "2\n")
+
+@test("a vector of bools is not AnyBits, as a bool is not")
+anb_vector_of_bool_refused()
+    anb_refused(anb_probe + "val m: <4>bool = [true, false, true, false]\nprint(ok(m))\n",
+                s"'ok' requires its type parameter 'T' to implement 'sysl.AnyBits', but <4>bool does " +
+                s"not — ${anb_why}a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither",
+                20, 7)
+
+@test("a counted reference is not AnyBits")
+anb_ref_refused()
+    anb_refused(anb_probe + "val r: &Node = Node(2)\nprint(ok(r))\n",
+                s"'ok' requires its type parameter 'T' to implement 'sysl.AnyBits', but &Node does " +
+                s"not — ${anb_why}a counted reference names an object the program allocated", 20, 7)
+
+@test("a slice is not AnyBits")
+anb_slice_refused()
+    anb_refused(anb_probe + "var a = [1, 2]\nval s: []int = a[0..]\nprint(ok(s))\n",
+                s"'ok' requires its type parameter 'T' to implement 'sysl.AnyBits', but []int does " +
+                s"not — ${anb_why}a slice is an address and a length the program made", 21, 7)
+
+@test("nothing implements AnyBits: a type outside it is refused the block")
+anb_impl_refused()
+    anb_refused("struct B\n    flag: bool\n\nimpl AnyBits for B\n\nprint(1)\n",
+                "'sysl.AnyBits' names a family of types the compiler settles, so nothing implements " +
+                "it — a type is one of them or it is not, and 'B' is not", 4, 1)
+
+@test("nothing implements AnyBits: a member is told the compiler provides it")
+anb_impl_of_member_refused()
+    anb_refused("impl AnyBits for u8\n\nprint(1)\n",
+                "'byte' already implements 'sysl.AnyBits' — the compiler provides it", 1, 1)
+
+@test("AnyBits is not a family a blanket is written over")
+anb_blanket_refused()
+    anb_refused("trait Show\n    show(self) -> string\n\nimpl[T: AnyBits] Show for T\n" +
+                "    show(self) -> string = \"x\"\n\nprint(1)\n",
+                "'T' is a type parameter of this 'impl', so it stands for every type at once — an " +
+                "'impl' says how one kind of type behaves. A bound the compiler closes is the " +
+                "exception, since it names a family rather than every type", 4, 1)
+
+// -- the Buf members it bounds --------------------------------------------------------------------
+
+@test("a writer fills a Buf's spare slots and set_len takes them in, to cap and to zero")
+anb_set_len_happy()
+    anb_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        fill(out: []u8, n: usize) -> usize
+            for i in 0..<n
+                out[i] = u8(40 + i)
+
+            n
+
+        var b: Buf[u8] = buf()
+
+        b.push(1)
+        b.reserve(10)
+        b.set_len(b.len() + fill(b.spare(), 3))
+        print(b, b.cap() >= 11)
+
+        b.truncate(1)
+        b.set_len(4)
+        print(b)
+
+        b.set_len(b.cap())
+        print(b.len() == b.cap(), b.spare().len)
+
+        b.set_len(0)
+        print(b.len())
+        """, "[1, 40, 41, 42] true\n[1, 40, 41, 42]\ntrue 0\n0\n")
+
+@test("set_len past the capacity panics, saying so")
+anb_set_len_past_cap()
+    if !anb_ready() then return
+
+    val (state, out, _) = anb_run(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: Buf[u8] = buf()
+
+        b.reserve(1)
+        b.set_len(b.cap() + 1)
+        print("unreached")
+        """, "0")
+
+    assert_eq(out, "panic: length 9 past the 8 slots a Buf has room for\n")
+    assert(state == Status.Exited(1), s"stopped with $state")
+end anb_set_len_past_cap
+
+@test("a Buf of a type that is not AnyBits is refused set_len, with the reason")
+anb_set_len_refused()
+    anb_refused("import sysl.buf.{Buf, buf}\n\nvar b: Buf[string] = buf()\nb.set_len(0)\n",
+                "'sysl.buf.Buf.set_len' requires its type parameter 'T' to implement 'sysl.AnyBits', " +
+                s"but string does not — ${anb_why}a string is an address and a length the program made",
+                4, 3)
+
+@test("a Buf of a type that is not AnyBits is refused spare")
+anb_spare_refused()
+    anb_refused("import sysl.buf.{Buf, buf}\n\nvar b: Buf[bool] = buf()\nprint(b.spare().len)\n",
+                "'sysl.buf.Buf.spare' requires its type parameter 'T' to implement 'sysl.AnyBits', " +
+                s"but bool does not — ${anb_why}a 'bool' is 0 or 1, and its byte can hold 254 numbers " +
+                "that are neither", 4, 9)
+
+// -- what the feature needed of the language ------------------------------------------------------
+
+@test("a trait declaring nothing is written closed by its end marker")
+anb_empty_trait()
+    anb_prints("trait M\nend M\n\nf[T: M](x: T) -> int = 1\n\nimpl M for int\n\nprint(f(3))\n", "1\n")
+
+@test("a trait with no body and no end marker is still refused")
+anb_empty_trait_needs_end()
+    anb_refused("trait M\n\nprint(1)\n", "indent expected", 1, 8)
+
+// A member a conditional `impl` gave is filed under the type whatever its arguments, so the condition
+// is asked at the call: before, a `Box` of something that was not `Mark` called `show`.
+@test("a member a conditional impl gave is refused on a receiver that misses the condition")
+anb_conditional_member_refused()
+    anb_refused(raw"""
+        struct Box[T]
+            v: T
+
+        trait Show
+            show(self) -> string
+
+        trait Mark
+            m(self) -> int
+
+        impl[T: Mark] Show for Box[T]
+            show(self) -> string = "b"
+
+        struct N
+            n: int
+
+        print(Box(N(1)).show())
+        """, "'show' is a member the 'impl' of 'Show' gives 'Box[N]' only where its condition " +
+             "holds, and it asks 'Mark' of N, which does not implement it", 16, 17)
+
+@test("a member a conditional impl gave is called where the condition holds")
+anb_conditional_member_called()
+    anb_prints(raw"""
+        struct Box[T]
+            v: T
+
+        trait Show
+            show(self) -> string
+
+        trait Mark
+            m(self) -> int
+
+        impl Mark for int
+            m(self) -> int = 1
+
+        impl[T: Mark] Show for Box[T]
+            show(self) -> string = "b" + str(self.v.m())
+
+        print(Box(5).show())
+        """, "b1\n")
+
+@test("a function pointer is AnyBits: it may be null already, and calling a bad one is the raw tier")
+anb_function_pointer_member()
+    anb_prints(raw"""
+        ok[T: AnyBits](x: T) -> int = 1
+
+        var f: *extern(i32) -> i32 = null
+
+        print(ok(f), ok([f, f]))
+        """, "1 1\n")

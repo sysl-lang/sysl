@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // A module that gave the allocator up, and what that costs it.
@@ -27,10 +28,25 @@ import sysl.text.Search
 // loophole**: its files are compiled into every program, so holding them to it would report the
 // allocating half of the standard module as a mistake in source the program's author cannot change.
 // What a program does with that half is still refused, at the call in the program's own body.
-private no_alloc_here(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> bool
-    if machine_has_no_heap(a) && !from_library(a, scope) then return true
+//
+// **A dependency's module answers to the machine only where the program reaches it** (`reach`, from
+// `checks.sysl`'s `program_reach`): a package is a set of modules, and one the program never names is
+// not asked, so a board build that imports only `sh.sysl.pool.deque` is not refused over the thread
+// pool beside it. One it does name is held like the program's own.
+//
+// **And a body answers to the machine only where the program arrives at it** (`in_image`, from
+// `checks.sysl`'s `program_func_reach`): the machine is a statement about the image, and a function
+// nothing reaches -- a renderer in a module the program names for one type, a trait's default no
+// implementing type is ever called through -- is not in it. A module's own `@no_alloc` is a promise
+// about everything it wrote, so it is asked of every body whether reached or not.
+private no_alloc_here(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
+                      scaffolding: bool, in_image: bool) -> bool
+    // The file answers which module that is: a lifted closure's key names no module of its own.
+    val machine = machine_has_no_heap(a) && !from_library(a, scope)
 
-    if scaffolding then return module_tests_narrowed(a, module_name, CapHeap)
+    if machine && reached_module(reach, scope.module_name) && in_image then return true
+
+    if scaffolding then return module_tests_narrowed(a, tests_key(a, module_name, scope), CapHeap)
 
     module_narrowed(a, module_name, CapHeap)
 end no_alloc_here
@@ -43,11 +59,13 @@ private machine_has_no_heap(a: &Analysis) -> bool = a.tables.target.lacks_capabi
 // "declared 'no alloc'" when no file of it says any such thing would go looking for a clause that is
 // not there. Where the machine is what has no allocator, the thing to change is the config or the
 // target, and the message points there instead.
-private because(a: &Analysis, module_name: string, scaffolding: bool) -> string
-    if scaffolding && module_tests_own_narrowing(a, module_name, CapHeap) then
-        return "this module's '@tests' file declared '@no_alloc'"
+private because(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> string
+    val key = tests_key(a, module_name, scope)
 
-    val declared = if scaffolding then module_tests_narrowed(a, module_name, CapHeap)
+    if scaffolding && module_tests_own_narrowing(a, key, CapHeap) then
+        return s"this module's '@tests' file ${tests_file_named(scope)} declared '@no_alloc'"
+
+    val declared = if scaffolding then module_tests_narrowed(a, key, CapHeap)
     else module_narrowed(a, module_name, CapHeap)
 
     if declared then return "this module declared '@no_alloc'"
@@ -70,8 +88,11 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 
     // An **empty** buffer makes none: a view of nothing is the zero value of its own representation
     // and reaches no allocator, which is what a function answering "no results" wants to write.
-    TBufLit(elems, _) ->
-        if elems.is_empty() then None else Some("a slice with storage of its own")
+    //
+    // Nor does a `[]const T` over constant data, which is laid down (`read_only_literal`).
+    TBufLit(elems, slice_ty) ->
+        if elems.is_empty() || read_only_literal(elems, slice_ty) then None
+        else Some("a slice with storage of its own")
     TBufFill(_, _, _) -> Some("a slice with storage of its own")
     TSlots(op, _, _, _) -> if op == "slot_storage" then Some("a slice with storage of its own") else None
     TStr(_) -> Some("the string a value renders as")
@@ -98,7 +119,8 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 // clause holds each of its bodies, and its callees through the second -- so a sibling in the same
 // module may allocate, and a function under a module that already declared the clause answers to the
 // module's, the stronger of the two.
-check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable],
+               typed: TypedBodies)
     var any = machine_has_no_heap(a)
 
     for module_narrow in a.tables.module_narrows
@@ -116,6 +138,22 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     // Lazily, because building the call graph walks every body in the program: a compilation with
     // no clause anywhere -- which is almost all of them -- should pay nothing at all for this pass.
     if !any then return
+
+    val reach = program_reach(a, funcs)
+
+    // The functions in the image, asked only where the machine has no heap -- the one half of the
+    // promise that is about the image -- and the generic declarations an instance in it was made from.
+    val live = if machine_has_no_heap(a) then program_func_reach(typed) else None
+    var origins: Set[string] = set()
+
+    if live.is_some()
+        for i in 0..<funcs.len()
+            val name = funcs.at(i).name
+
+            if live.unwrap().has(name)
+                a.tables.members.func_origin.get(name) match
+                    Some(origin) -> origins.add(origin)
+                    None -> ()
 
     var seeds: Buf[string] = buf()
     var made: Buf[(string, string)] = buf()
@@ -160,12 +198,14 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // scaffolding file read as the module's own and was held to a narrowing its `@tests` file had
         // taken back.
         //
-        // **A `@test` or a hook is scaffolding wherever it is written**, so one beside what it tests
-        // answers to the tests' clause as the `@tests` file beside it does, rather than putting a
-        // seam through the middle of one module's tests.
+        // **A `@test` or a hook is scaffolding wherever it is written**, so one beside what it tests is
+        // never held to the allocator by inheritance; it answers to the module's other clauses, as the
+        // code it tests does (`tests_key`).
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        held_to(a, scope, module_name, scaffolding, f, made) match
+        val in_image = live.is_none() || live.unwrap().has(f.name)
+
+        held_to(a, reach, scope, module_name, scaffolding, in_image, f, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
@@ -179,16 +219,27 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     // place the two part company: a member of a structural type is hoisted under a bare
     // `tuple.display`, whose key names no module -- so reading the key puts the library's own tuple
     // renderer in the anonymous module, which is the program's.
+    val from = a.found.len()
+
     for f in a.tables.abstracts
         val scope = func_home(a, f.name)
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
 
-        held_to(a, scope, module_name, scaffolding, f, made) match
+        // Named by the key a call to it carries, `thing.free`, as a concrete function's refusal is.
+        var named = f
+
+        named.name = abstract_key(a, f)
+
+        val in_image = live.is_none() || origins.has(named.name)
+
+        held_to(a, reach, scope, module_name, scaffolding, in_image, named, made) match
             Some(held) ->
                 scan_allocations(a, scope, f.body, held.why)
                 blame_block(a, walk, scope, f.body, held)
             None -> ()
+
+    check_instances(a, walk, funcs, from, NoAllocWord, made, false)
 
     // The module storage is code like any other: an initializer that makes heap storage makes it in
     // the module that wrote the declaration.
@@ -200,16 +251,17 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val module_name = module_of(v.symbol)
 
         val scope = val_home(a, v.symbol)
-        val scaffolding = holds_string(a.tables.test_only, v.symbol)
+        val scaffolding = a.tables.test_only_keys.has(v.symbol)
 
-        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
+        if !no_alloc_here(a, reach, scope, module_name, scaffolding, true) then continue
 
-        val why = because(a, module_name, scaffolding)
+        val why = because(a, scope, module_name, scaffolding)
         val held = Promised(why, None, made, false)
         val skip: &Skipped = Skipped(buf())
+        val kept: &Deferred = Deferred(buf(), false)
         val said: &Counted = Counted(0)
 
-        walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+        walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, kept, e, why)))
         walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
                                           w -> blame_write(a, walk, scope, w, held, said), st -> ()))
 end check_no_alloc
@@ -236,10 +288,11 @@ struct Promised
 // The promise a body is held to, or nothing where it made none. **The module's comes first**: it
 // holds every body in the module, so a function there carrying `@no_alloc` as well says nothing the
 // module did not, and the refusal names the clause that would still hold were the annotation gone.
-private held_to(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool, f: TFunc,
+private held_to(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_name: string,
+                scaffolding: bool, in_image: bool, f: TFunc,
                 made: Buf[(string, string)]) -> Option[Promised]
-    if no_alloc_here(a, scope, module_name, scaffolding) then
-        return Some(Promised(because(a, module_name, scaffolding), None, made, false))
+    if no_alloc_here(a, reach, scope, module_name, scaffolding, in_image) then
+        return Some(Promised(because(a, scope, module_name, scaffolding), None, made, false))
 
     if !f.marks.gives_up(NoAllocWord) then return None
 
@@ -247,6 +300,56 @@ private held_to(a: &Analysis, scope: Scope, module_name: string, scaffolding: bo
 
     Some(Promised(s"'$name' declared '@no_alloc'", Some(f.name), made, false))
 end held_to
+
+// **A generic that made the promise for ITSELF keeps it at every instance** (`reference/attributes.md
+// § @no_alloc on a function`). The body it was written as is held first, and answers for everything
+// that does not depend on the type chosen; what does -- a call through a bound that one type's
+// implementation answers by allocating -- is only there to see in the instance, so each instance is
+// walked as well, its refusals naming the instance and the declaration that promised.
+//
+// **What the written body already answered for is not said again**: every span reported since `from`
+// in the declaration's file is skipped, so a `str(42)` in the body is one refusal, not one per type.
+// A module's clause is not followed here -- an instance of a generic answers to nobody's module
+// (`reference/modules.md § A generic answers for what it wrote`); only the declaration's own word is.
+check_instances(a: &Analysis, walk: &Reaches, funcs: Buf[TFunc], from: usize, word: string,
+                made: Buf[(string, string)], blocking: bool)
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+        val origin = a.tables.members.func_origin.get(f.name)
+
+        if origin.is_none() || !f.marks.gives_up(word) then continue
+
+        // Its home is the generic's: the file the body was written in, which every span in it is in.
+        val written = abstract_named(a, origin.unwrap())
+        val scope = func_home(a, if written.is_some() then written.unwrap().name else f.name)
+        val skip: &Skipped = Skipped(reported_since(a, from, scope.src.name))
+        val why = s"'${qualified_name(origin.unwrap())}' declared '@no_$word' (instance " +
+                  s"'${qualified_name(f.name)}')"
+        val held = Promised(why, Some(f.name), made, blocking)
+        val said: &Counted = Counted(0)
+        val deferred: &Deferred = Deferred(buf(), true)
+
+        if !blocking
+            walk_block_stmts(f.body, expr_walk(false, e -> scan_one(a, scope, skip, deferred, e, why)))
+
+        walk_block_stmts(f.body, TWalk(false,
+                                       e -> if !skip.covers(e.span) then blame_one(a, walk, scope, e, held, said),
+                                       w -> if !skip.covers(w.place.span) then
+                                                blame_write(a, walk, scope, w, held, said),
+                                       st -> ()))
+end check_instances
+
+// The spans of the errors reported in one file since the `from`th.
+private reported_since(a: &Analysis, from: usize, file: string) -> Buf[(usize, usize)]
+    var out: Buf[(usize, usize)] = buf()
+
+    for i in from..<a.found.len()
+        val item = a.found.at(i)
+
+        if item.src.name == file then out.push((item.diag.span.start, item.diag.span.end))
+
+    out
+end reported_since
 
 // The program's functions, and beside them every generic body a generic's own body calls at its
 // stand-ins, filed under the name that call wrote.
@@ -265,11 +368,7 @@ with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
     var keys: Buf[(string, usize)] = buf()
 
     for i in 0..<a.tables.abstracts.len()
-        val f = a.tables.abstracts.at(i)
-        val home = func_home(a, f.name).module_name
-        val key = if f.name.contains("$") then f.name else module_qualify(home, f.name)
-
-        keys.push((key + ".", i))
+        keys.push((abstract_key(a, a.tables.abstracts.at(i)) + ".", i))
 
     var named: Buf[string] = buf()
 
@@ -291,6 +390,19 @@ with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
     out
 end with_abstract_callees
 
+// The key a generic body is called by, and the one its instances name as their origin: it is filed
+// under its bare name in its own file (`free`), where every call to it says the module (`thing$free`).
+abstract_key(a: &Analysis, f: TFunc) -> string =
+    if f.name.contains("$") then f.name else module_qualify(func_home(a, f.name).module_name, f.name)
+
+// The generic body an instance was made from, by the key the instance names as its origin.
+private abstract_named(a: &Analysis, origin: string) -> Option[TFunc]
+    for f in a.tables.abstracts
+        if abstract_key(a, f) == origin then return Some(f)
+
+    None
+end abstract_named
+
 // The file a module's storage was declared in.
 val_home(a: &Analysis, symbol: string) -> Scope
     val d = a.tables.vals.get(symbol)
@@ -302,7 +414,7 @@ end val_home
 
 // What the first construction under a body that makes heap storage makes, wherever it is.
 private first_allocation(b: TBlock) -> Option[string]
-    val found: &FirstMade = FirstMade(None)
+    val found: &FirstMade = FirstMade(None, Deferred(buf(), true))
 
     walk_block_stmts(b, expr_walk(false, e -> note_allocation(found, e)))
     found.what
@@ -310,10 +422,52 @@ end first_allocation
 
 private struct FirstMade
     what: Option[string]
+    deferred: &Deferred
 
 private note_allocation(found: &FirstMade, e: TExpr)
-    if found.what.is_none() then found.what = allocates(e)
+    if found.what.is_some() || found.deferred.passes(e) then return
+
+    found.what = allocates(e)
 end note_allocation
+
+// **An array literal handed straight to a call is the escape analysis's to answer for, not this
+// pass's** (`escape.sysl`'s `literal_argument`): where the callee keeps nothing of it, it is laid in
+// the caller's frame and allocates nothing, and where the callee keeps it, that pass reports it at the
+// literal under the same rule this one states. Which of the two it is needs every callee's summary,
+// and those are not settled until the program is.
+//
+// Only a body's own walk defers. An initializer of module storage is not walked by that pass, so a
+// literal there is answered here as it always was.
+struct Deferred
+    spans: Buf[Span]
+
+    // False for a walk over module storage, which defers nothing.
+    active: bool
+
+    // Whether `e` is a literal a call above it already left to the escape analysis. The walk is
+    // outermost-first, so the call is met before its arguments are; each call notes the literal
+    // arguments it hands on.
+    passes(*self, e: TExpr) -> bool
+        if !self.active then return false
+
+        *e.kind match
+            TCall(_, args, ty, _) -> self.note(args, ty)
+            TVCall(_, _, args, ty, _) -> self.note(args, ty)
+            TBufLit(_, _) ->
+                for at in self.spans
+                    if at == e.span then return true
+            _ -> ()
+
+        false
+    end passes
+
+    note(*self, args: Buf[TExpr], ty: Type)
+        if !frames_literals(ty) then return
+
+        for arg in args
+            if literal_argument(arg) then self.spans.push(arg.span)
+    end note
+end Deferred
 
 // Walks a body, reporting the OUTERMOST allocation on each path and going no deeper into one.
 //
@@ -323,8 +477,9 @@ end note_allocation
 // is inside one already reported is one of those pieces.
 private scan_allocations(a: &Analysis, scope: Scope, b: TBlock, why: string)
     val skip: &Skipped = Skipped(buf())
+    val deferred: &Deferred = Deferred(buf(), true)
 
-    walk_block_stmts(b, expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+    walk_block_stmts(b, expr_walk(false, e -> scan_one(a, scope, skip, deferred, e, why)))
 end scan_allocations
 
 // The spans of everything inside a node that has already been reported, so that the pieces of one
@@ -343,7 +498,10 @@ struct Skipped
         self.inside.push((span.start, span.end))
 end Skipped
 
-private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, e: TExpr, why: string)
+private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, deferred: &Deferred, e: TExpr,
+                 why: string)
+    if deferred.passes(e) then return
+
     val what = allocates(e)
 
     if what.is_none() || skip.covers(e.span) then return

@@ -4,13 +4,13 @@ summary: An immutable, validated `[]u8` — the same three words, with a guarant
 weight: 70
 ---
 
-A `string` is the slice from the last chapter with one thing added and one taken away: its bytes are
-guaranteed to be well-formed UTF-8, and nothing may write through it. Everything else — the three
-words, the O(1) substring, the retain on slicing — is the slice machinery unchanged.
+A `string` is the slice from the previous chapter with one guarantee added and one operation removed:
+its bytes are always well-formed UTF-8, and nothing may write through it. Everything else, the three
+words, the O(1) substring and the retain on slicing, is the slice machinery unchanged.
 
-That guarantee is not decoration. It is what lets `char` mean "a Unicode scalar value" rather than
-"whatever these bytes turned out to be", and it is why there are no replacement characters anywhere
-in the language: there is nothing to repair.
+The guarantee is what lets `char` mean "a Unicode scalar value" rather than "whatever these bytes
+decode to", and it is why the language never produces replacement characters: invalid text cannot
+exist, so there is nothing to repair.
 
 ## Bytes and characters
 
@@ -30,15 +30,14 @@ print("bytes:", s.len, "chars:", chars, "last byte:", s[s.len - 1])
 bytes: 6 chars: 5 last byte: 101
 ```
 
-Six bytes and five characters, because `ï` takes two. `s[i]` is a `u8` — a byte, not a character —
-and `s.chars` is a cursor that decodes them one scalar value at a time.
+Six bytes and five characters, because `ï` takes two bytes. `s[i]` is a `u8`, a byte rather than a
+character, and `s.chars` is a cursor that decodes one scalar value at a time.
 
-That is Go's choice rather than Swift's, and the reason is placement: grapheme clusters need Unicode
-break tables, tables must not be in a kernel, and making them the default would put `s.len` at O(n)
-for every program that only wanted a byte offset. Grapheme clusters are a library built over this,
-not the thing underneath.
+This follows Go rather than Swift. Grapheme clusters need Unicode break tables, those tables do not
+belong in a kernel, and making clusters the default would make `s.len` O(n) for every program that
+only needs a byte offset. Grapheme clusters are provided by a library built on top of this.
 
-A substring shares its parent's bytes and costs no copy:
+A substring shares its parent's bytes, with no copy:
 
 ```sysl
 var path = "/usr/local/bin"
@@ -50,17 +49,15 @@ print("front:", path[..<4], "back:", path[11..], "whole:", path.len)
 front: /usr back: bin whole: 14
 ```
 
-Two checks happen there rather than one. The bounds are checked, as on any slice — and the ends are
-checked for landing **between characters**. Slicing through the middle of a multi-byte character
-traps, because the alternative is a `string` that is not valid UTF-8, and the whole type rests on
-that not being possible.
+Slicing a string makes two checks. The bounds are checked, as on any slice, and each end is checked
+to fall **between characters**. Slicing through the middle of a multi-byte character traps, because
+otherwise the result would be a `string` that is not valid UTF-8.
 
-The sharing has the hazard Go's has: a two-byte substring of a two-megabyte string keeps the whole
-buffer alive. The operation that copies out of it is named — `s.copy()` — and the hazard is
-documented rather than encoded in a second type.
+Sharing has the same cost as in Go: a two-byte substring of a two-megabyte string keeps the whole
+buffer alive. `s.copy()` copies the substring out when that matters.
 
-`==` and `<` compare the byte sequences, which for well-formed UTF-8 is also codepoint order.
-Normalization is **not** applied — a composed `é` does not equal a decomposed one:
+`==` and `<` compare byte sequences, which for well-formed UTF-8 is also code-point order.
+Normalization is **not** applied, so a precomposed `é` does not equal a decomposed one:
 
 ```sysl
 describe(cmd: string) -> string
@@ -69,22 +66,21 @@ describe(cmd: string) -> string
         "del" -> "removes"
         _     -> "unknown"
 
-print(describe("add"), describe("nope"), "add" < "del")
+print(describe("add"), describe("mv"), "add" < "del")
 ```
 
 ```output
 combines unknown true
 ```
 
-Swift compares by canonical equivalence, which is right for user-facing text and surprising in
-systems code, where a string is usually a path, a device name, or a protocol token that has to
-compare as the bytes it is. Normalization is a library operation, applied where it is wanted and
-visible when it costs something.
+Swift compares by canonical equivalence, which suits user-facing text but is unexpected in systems
+code, where a string is usually a path, a device name or a protocol token that must compare as its
+exact bytes. Normalization is a library operation, applied explicitly where it is needed.
 
 ## Joining
 
-`+` joins two strings and `+=` appends onto a slot. Both allocate a fresh buffer; UTF-8 is closed
-under concatenation, so nothing is re-validated.
+`+` joins two strings and `+=` appends to a variable. Both allocate a new buffer. UTF-8 is closed
+under concatenation, so the result is not re-validated.
 
 ```sysl
 var name = "sysl"
@@ -99,7 +95,7 @@ print(greeting, greeting.len)
 hello, sysl! 12
 ```
 
-`+` is **strict**. It joins a string to a string and to nothing else:
+`+` is **strict**: it joins a string only to another string.
 
 ```sysl
 print("n=" + 5)
@@ -109,8 +105,8 @@ print("n=" + 5)
 '+' needs matching types, got string and int
 ```
 
-That is the same no-implicit-conversion stance the numeric operators take. The written conversion is
-`str(x)`, which renders a value into its string form:
+This matches the numeric operators, which also convert nothing implicitly. The explicit conversion
+is `str(x)`, which renders a value as a string:
 
 ```sysl
 print("count: " + str(3 * 14))
@@ -122,17 +118,18 @@ count: 42
 true é 2.5
 ```
 
-Every case but a string allocates a fresh buffer. A `bool` renders to one of two literals and
-allocates nothing at all, and a struct or an enum renders through its `Display` implementation.
+`str` allocates a new buffer for everything except a string, which it returns as is, and a `bool`,
+which renders to one of two literals. A struct or an enum renders through its `Display`
+implementation.
 
 ## Interpolation
 
-Writing `str` at every splice gets old, so a literal may carry a prefix:
+To avoid writing `str` at every join, a literal may carry a prefix:
 
 ```sysl
 var n = 42
 var word = "left"
-var ratio = 2.0 / 3.0
+var ratio = 2.0 / 3
 
 print(s"n is $n, and twice that is ${n * 2}")
 print(f"[${n}%6d] [${word}%-6s] ${ratio}%.3f")
@@ -145,24 +142,23 @@ n is 42, and twice that is 84
 a\nb
 ```
 
-`s"…"` splices `$name` or `${ expression }`, each rendered by `str` — so `s"a${e}b"` is exactly
-`"a" + str(e) + "b"`, and interpolation is not a new kind of value. `f"…"` adds one thing: a hole may
-be followed by a printf specifier controlling width, precision and justification, checked against the
-value's type while compiling. `raw"…"` leaves a backslash as an ordinary character.
+`s"…"` inserts `$name` or `${ expression }`, each rendered by `str`, so `s"a${e}b"` is exactly
+`"a" + str(e) + "b"`; interpolation does not introduce a new kind of value. `f"…"` adds one thing:
+a hole may be followed by a printf-style specifier for width, precision and justification, checked
+against the value's type at compile time. `raw"…"` treats a backslash as an ordinary character.
 
-Note where the specifier sits — *after* the hole, not in a separate format string at the front. The
-value and the way it is formatted stay next to each other, which is the whole reason for the
-spelling.
+The specifier comes *after* the hole rather than in a separate format string at the front, so each
+value and its format stay together.
 
 A literal may also span lines. `"""` opens a block whose content starts on the next line and whose
-incidental indentation is dropped — the closing delimiter is what decides how much — so a blob of
-embedded text written inside a deeply nested body does not carry that body's indentation into its
-value. [The reference](/reference/strings/#text-blocks) has the trimming rules.
+incidental indentation is removed, by the amount the closing delimiter is indented. Embedded text
+written inside a deeply nested body therefore does not carry that body's indentation into its value.
+[The reference](/reference/strings/#text-blocks) has the trimming rules.
 
-## Building text a piece at a time
+## Building text incrementally
 
-`+=` in a loop copies everything gathered so far on every step. `StrBuilder` keeps one growable
-buffer instead:
+`+=` in a loop copies everything gathered so far on every iteration. `StrBuilder` keeps a single
+growable buffer instead:
 
 ```sysl
 import sysl.text.str_builder
@@ -182,13 +178,13 @@ print(b.finish())
 items: 1 2 3
 ```
 
-The two ways in are the two that keep the guarantee: a `push` takes a string and a `push_char` takes
-a character, and UTF-8 is closed under appending either — so `finish` hands back a plain `string`
-that nobody has to validate. That is exactly why a builder is *not* a `Writer`: a public `write`
-taking arbitrary bytes would be an unchecked constructor with a friendlier name.
+A builder accepts only input that preserves the guarantee: `push` takes a string and `push_char`
+takes a character, and UTF-8 is closed under appending either. `finish` therefore returns a plain
+`string` that needs no validation. For the same reason a builder is *not* a `Writer`: a public
+`write` that accepted arbitrary bytes would be an unchecked way to construct a string.
 
-Bytes a program computed are the one route into a string that can fail, so it is the one that returns
-a `Result`:
+Bytes computed by the program are the one source of a string that can fail, so converting them
+returns a `Result`:
 
 ```sysl
 import sysl.text.from_utf8
@@ -210,28 +206,27 @@ text: hi!
 bad at 1 truncated: false
 ```
 
-The error carries the offending offset and one distinction a caller can act on: whether the input
-merely *ended* mid-sequence, which more bytes would fix, or holds something no continuation could
-rescue.
+The error carries the offset of the invalid byte and one distinction a caller can act on: whether
+the input simply *ended* in the middle of a sequence, which more bytes would complete, or contains
+something no continuation could make valid.
 
-The bytes are copied rather than viewed, and that is deliberate — a slice is writable, so sharing
-would let a later write change something that had already been checked. Copying is what makes the
-validation mean anything afterwards.
+The bytes are copied rather than viewed. A slice is writable, so sharing it would let a later write
+change bytes that had already been validated; copying keeps the validation meaningful.
 
-A string literal is bytes in read-only data with **no owner at all** — the owner word is null, and
-retain and release both test for that and do nothing. So a literal needs no allocation, no refcount
-traffic, and not even an instruction to build.
+A string literal is bytes in read-only data with **no owner**: its owner word is null, and retain
+and release test for that and do nothing. A literal therefore needs no allocation, no reference
+counting, and no code to construct.
 
-That is what lets allocator-free code hold, pass, compare and slice strings: panic messages, device
-node names, format fragments. Anything derived from a literal by slicing is immortal too, because it
-shares the owner — which is to say it shares having none.
+This lets code that runs without an allocator hold, pass, compare and slice strings: panic messages,
+device node names, format fragments. A slice of a literal has no owner either, so it lives for the
+whole program as well.
 
-The rule for the whole type is that the *type* is not gated, the *allocating operations* are. Holding,
-passing, comparing, indexing, slicing and iterating any string are free; the ones that make new bytes
-— `+`, `str`, `copy()`, `from_utf8`, `str_builder`, `cstring` — are the ones a `no alloc` module may
-not reach.
+The type itself is never restricted; the *allocating operations* are. Holding, passing, comparing,
+indexing, slicing and iterating a string cost nothing. The operations that create new bytes, `+`,
+`str`, `copy()`, `from_utf8`, `str_builder` and `cstring`, are the ones a `no alloc` module may not
+use.
 
 ---
 
-Next: [enums and patterns](/tour/enums/) — where `Option` and `Result` come from, and what `match`
-can really do.
+Next: [enums and patterns](/tour/enums/), where `Option` and `Result` come from, and what `match`
+can do.

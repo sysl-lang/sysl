@@ -1,0 +1,835 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.testing.skip
+import sysl.text.replace_all
+
+// **`union`** -- storage its fields share, all of them at its first byte, with nothing recording which
+// was written last (`union_fields.sysl`; `reference/types.md § Unions`, `docs/design/union.md`). These
+// are the declaration, the layout C gives it on every target the design note measured, construction,
+// reads and writes, the zero value, `Debug`, and the refusals of the parser and the features.
+
+private uni_ready() -> bool = std_root().is_ok() && clang_available()
+
+private uni_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-uni").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end uni_run
+
+private uni_prints(text: string, printed: string)
+    if !uni_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = uni_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end uni_prints
+
+private uni_refused(text: string, message: string, line: int, col: int)
+    if !uni_ready() then return
+
+    val (_, _, err) = uni_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end uni_refused
+
+// What the analysis says of a program built for `target`, all the way through the lowering: empty
+// where it is accepted.
+private uni_report(text: string, target: string) -> string
+    val root = make_temp_dir("sysl-uni-t").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, Some(target)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end uni_report
+
+// The LLVM text a program lowers to on this machine, or what its analysis said.
+private uni_ir(text: string) -> string
+    val root = make_temp_dir("sysl-uni-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end uni_ir
+
+// `docs/design/union-probes/layout.c`, claim for claim, as compile-time assertions. `P` is a pointer's
+// width; an 8-byte integer and a `f64` are 8-aligned on every one of the nine targets.
+private val uni_layout: string = raw"""
+    union U1
+        a: u8
+        b: u32
+
+    union U2
+        a: [5]u8
+        b: u32
+
+    union U3
+        a: [3]u8
+        b: u16
+
+    union U4
+        c: u8
+
+    @packed
+    union UP
+        a: [5]u8
+        b: u32
+
+    @align(16)
+    union UA
+        a: [5]u8
+        b: u32
+
+    union In6
+        b8: [16]u8
+        b16: [8]u16
+        b32: [4]u32
+
+    union Epoll
+        ptr: *u8
+        fd: i32
+        u32_: u32
+        u64_: u64
+
+    union IF
+        i: u32
+        f: f32
+
+    struct N
+        tag: u8
+        v: IF
+        t: u8
+
+    @packed
+    struct PS
+        tag: u8
+        v: IF
+
+    union PI
+        p: *u8
+        n: u32
+
+    struct MouseEv
+        kind: u32
+        ts: u32
+        x: i32
+        y: i32
+
+    struct KeyEv
+        kind: u32
+        ts: u32
+        key: u8
+
+    union Event
+        kind: u32
+        m: MouseEv
+        k: KeyEv
+        padding: [128]u8
+
+    struct Holder
+        k: KeyEv
+
+    union DU
+        d: f64
+        w: [2]u32
+
+    @assert(sizeof(U1) == 4 && alignof(U1) == 4, "U1")
+    @assert(sizeof(U2) == 8 && alignof(U2) == 4, "U2 rounds 5 up to 8")
+    @assert(sizeof(U3) == 4 && alignof(U3) == 2, "U3 rounds 3 up to 4")
+    @assert(sizeof(U4) == 1 && alignof(U4) == 1, "U4 one member")
+    @assert(offsetof(U2, a) == 0 && offsetof(U2, b) == 0, "offset 0")
+    @assert(sizeof(UP) == 5 && alignof(UP) == 1, "packed U2")
+    @assert(sizeof(UA) == 16 && alignof(UA) == 16, "aligned U2")
+    @assert(sizeof(In6) == 16 && alignof(In6) == 4, "in6_addr")
+    @assert(sizeof(Epoll) == 8 && alignof(Epoll) == 8, "epoll_data")
+    @assert(offsetof(N, v) == 4 && offsetof(N, t) == 8 && sizeof(N) == 12, "nested")
+    @assert(offsetof(PS, v) == 1 && sizeof(PS) == 5, "union in packed struct")
+    @assert(sizeof(PI) == sizeof(usize) && alignof(PI) == sizeof(usize), "ptr union")
+    @assert(sizeof(Event) == 128 && offsetof(KeyEv, key) == 8, "SDL_Event's shape")
+    @assert(sizeof(DU) == 8 && alignof(DU) == 8, "double union")
+
+    main()
+        var events: [2]Event
+        events[0] = Event(kind = 1)
+    """
+
+@test("a union is laid out as C lays it out, on all nine targets the design note measured")
+uni_layout_matches_c()
+    if !uni_ready() then return
+
+    // The hosted Linux and Windows targets need their C headers to build the standard module, and
+    // a union's layout asks only the processor: their freestanding twins answer for them.
+    for target in ["aarch64-macos", "aarch64-freestanding", "x86_64-freestanding",
+                   "thumbv7em-freestanding", "thumbv7em-freestanding-soft", "riscv32-freestanding",
+                   "riscv64-freestanding", "wasm32-freestanding"]
+        assert_eq(uni_report(uni_layout, target), "")
+
+@test("the layout assertions can fail: a wrong size is refused")
+uni_layout_assertion_can_fail()
+    if !uni_ready() then return
+
+    val report = uni_report(replace_all(uni_layout, "sizeof(U2) == 8", "sizeof(U2) == 5"), "riscv32-freestanding")
+
+    assert(report.contains("U2 rounds 5 up to 8"), report)
+
+@test("a union's fields share its first byte: a write through one is read through another")
+uni_fields_share_storage()
+    uni_prints(raw"""
+        union In6
+            b8: [16]u8
+            b16: [8]u16
+            b32: [4]u32
+
+        union Word
+            whole: u32
+            f: f32
+
+        make() -> Word = Word(f = 1.0)
+
+        main()
+            var a = In6(b32 = [0, 0, 0, 0])
+            a.b8[15] = 1
+            print(a.b32[3], a.b16[7])
+            val w = Word(f = 1.0)
+            print(w.whole, make().whole)
+        """, "16777216 256\n1065353216 1065353216\n")
+
+@test("construction zero-fills the bytes past the field it names")
+uni_construction_zero_fills()
+    uni_prints(raw"""
+        union Wide
+            small: u8
+            big: u64
+
+        fill() -> u64
+            var w = Wide(big = 0xffffffffffffffff)
+            w.big
+        end fill
+
+        main()
+            print(fill())
+            print(Wide(small = 7).big)
+        """, "18446744073709551615\n7\n")
+
+@test("a write to one field leaves the bytes past it as they were")
+uni_write_leaves_the_rest()
+    uni_prints(raw"""
+        union Wide
+            small: u8
+            big: u32
+
+        main()
+            var w = Wide(big = 0x01020304)
+            w.small = 0xff
+            print(w.big)
+        """, "16909311\n")
+
+@test("a union passes by value, returns, sits in a struct and an array, and has a zero value")
+uni_by_value_and_zero()
+    uni_prints(raw"""
+        union Word
+            whole: u32
+            f: f32
+
+        struct Box
+            tag: u8
+            w: Word
+
+        bump(w: Word) -> Word = Word(whole = w.whole + 1)
+
+        main()
+            var z: Word
+            var arr: [2]Word
+            arr[1] = bump(Word(whole = 41))
+            val b = Box(1, bump(z))
+            print(z.whole, arr[1].whole, b.w.whole, arr[0].whole)
+        """, "0 42 1 0\n")
+
+@test("a generic union is built at the argument its field is given, and held to its bound")
+uni_generic()
+    uni_prints(raw"""
+        union Bits[T: AnyBits]
+            value: T
+            raw: u64
+
+        main()
+            print(Bits(value = u8(3)).raw, sizeof(Bits[u8]), Bits[u32](raw = 5).value)
+        """, "3 8 5\n")
+
+@test("a generic struct is built by name too, its arguments inferred from the named fields")
+uni_generic_struct_by_name()
+    uni_prints(raw"""
+        struct G[T]
+            value: T
+            raw: u64
+
+        main()
+            print(G(raw = 1, value = u8(3)).value, G(value = 2.5, raw = 0).value)
+        """, "3 2.5\n")
+
+@test("a union's Debug is its name and its bytes in hex, honouring a width, and never reads a field")
+uni_debug_hex()
+    uni_prints(raw"""
+        union Word
+            whole: u32
+            f: f32
+
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            print(Word(f = 1.0))
+            print(f"[${Word(whole = 1)}%20?]")
+            print(f"[${Word(whole = 1)}%-20?]")
+            print(Key(raw = 2))
+        """, "Word(00 00 80 3f)\n[   Word(01 00 00 00)]\n[Word(01 00 00 00)   ]\nKey(02)\n")
+
+@test("an impl Debug and an impl Eq of the program's own are a union's")
+uni_own_impls()
+    uni_prints(raw"""
+        union Word
+            whole: u32
+            f: f32
+
+        impl Debug for Word
+            debug(self, out: *Writer, fmt: FormatSpec)
+                out.write("w".bytes)
+
+        impl Eq for Word
+            eq(self, rhs: Word) -> bool = self.whole == rhs.whole
+
+        main()
+            print(f"${Word(whole = 1)}%?", Word(whole = 1) == Word(whole = 1), Word(whole = 1) == Word(f = 1.0))
+        """, "w true false\n")
+
+@test("a function pointer is AnyBits, so it is a union field read freely")
+uni_function_pointer_field()
+    uni_prints(raw"""
+        union F
+            f: *extern(i32) -> i32
+            n: u64
+
+        ok[T: AnyBits](x: T) -> int = 1
+
+        main()
+            val f = F(n = 0)
+            print(sizeof(F), f.f == null, ok(f))
+        """, "8 true 1\n")
+
+@test("a pointer field beside an integer is accepted, and reads the integer's bits as an address")
+uni_pointer_beside_integer()
+    uni_prints(raw"""
+        union PI
+            p: *u8
+            n: usize
+
+        main()
+            print(PI(n = 0).p == null, PI(n = 16).p == null)
+        """, "true false\n")
+
+@test("a union module 'val' is read as it was built")
+uni_module_val()
+    uni_prints(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        val g: Key = Key(down = true)
+
+        main()
+            print(g.raw)
+        """, "1\n")
+
+@test("'union' stays a function's name where no name follows it")
+uni_soft_word()
+    uni_prints(raw"""
+        union(a: int, b: int) -> int = a + b
+
+        union In
+            a: u8
+
+        main()
+            print(union(1, 2), In(a = 4).a)
+        """, "3 4\n")
+
+@test("a union declaring no fields is refused")
+uni_empty_refused()
+    uni_refused(raw"""
+        union E
+        end E
+
+        main()
+            print(1)
+        """, "'union E' declares no fields — a union is storage its fields share, and one with none has nothing to share (C refuses an empty union too). One with no layout of its own is written 'opaque union E'", 1, 8)
+
+@test("a union states no invariant")
+uni_invariant_refused()
+    uni_refused(raw"""
+        union I
+            a: u32
+            invariant a > 0
+
+        main()
+            print(1)
+        """, "a union states no 'invariant' — nothing records which of 'I''s fields was written last, so there is no field a clause could be stated over", 3, 5)
+
+// -- anonymous members ----------------------------------------------------------------------------
+
+@test("an anonymous union's fields are the struct's: read, written, measured and built by name")
+uni_anonymous_union()
+    uni_prints(raw"""
+        struct Packet
+            tag: u8
+            union
+                word: u32
+                level: f32
+            len: u16
+
+        main()
+            var p = Packet(tag = 1, word = 7, len = 2)
+
+            print(p.word, offsetof(Packet, word), offsetof(Packet, level), offsetof(Packet, len), sizeof(Packet))
+            p.word = 0x3f800000
+            print(p.level, p.tag, p.len)
+            p.level = 2.0
+            print(p.word)
+            print(p)
+        """, "7 4 4 8 12\n1 1 2\n1073741824\nPacket(tag: 1, union(00 00 00 40), len: 2)\n")
+
+@test("an anonymous struct in a union, and members nested two deep, are laid out as C lays them out")
+uni_anonymous_nested()
+    uni_prints(raw"""
+        union Split
+            all: u64
+            struct
+                lo: u32
+                hi: u32
+
+        struct Deep
+            a: u8
+            struct
+                b: u16
+                union
+                    c: u32
+                    d: [2]u16
+                end union
+            e: u8
+
+        main()
+            val s = Split(lo = 1, hi = 2)
+            val t = Split(all = 0x0000000300000004)
+
+            print(s.all, s.hi, t.lo, t.hi, offsetof(Split, hi), sizeof(Split))
+
+            var d = Deep(a = 1, b = 2, c = 0x00050006, e = 9)
+
+            print(d.d[0], d.d[1], offsetof(Deep, b), offsetof(Deep, c), offsetof(Deep, d), offsetof(Deep, e), sizeof(Deep))
+            d.d[1] = 7
+            print(d.c, d)
+        """, "8589934593 2 4 3 4 8\n6 5 4 8 8 12 16\n458758 Deep(a: 1, struct(b: 2, union(06 00 07 00)), e: 9)\n")
+
+@test("a generic struct's anonymous member is generic over the struct's parameters")
+uni_anonymous_generic()
+    uni_prints(raw"""
+        struct Cell[T: AnyBits]
+            tag: u8
+            union
+                value: T
+                raw: u64
+
+        main()
+            val c = Cell[u32](tag = 1, value = 9)
+            val d = Cell[f64](tag = 2, raw = 0x3ff0000000000000)
+
+            print(c.value, c.raw, d.value, offsetof(Cell[u32], raw), sizeof(Cell[u16]))
+        """, "9 9 1 8 16\n")
+
+@test("an anonymous member is held to the union field rule, and named by the type holding it")
+uni_anonymous_field_rule()
+    uni_refused(raw"""
+        struct P
+            tag: u8
+            union
+                name: string
+                n: u32
+
+        main()
+            print(1)
+        """, "the anonymous union in 'P' cannot hold its field 'name': a string is counted, and nothing in a union says whether one is there to release", 4, 9)
+
+@test("a name an anonymous member declares may not appear at another level")
+uni_anonymous_duplicate()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                a: u16
+                b: u32
+
+        main()
+            print(1)
+        """, "'a' is declared twice — an anonymous member's fields are its enclosing type's own, so a name appears once across the levels", 4, 9)
+
+@test("a struct with an anonymous union is built naming one of its fields")
+uni_anonymous_unnamed()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(a = 1).a)
+        """, "struct 'P' is built naming a field of its anonymous union — one of 'b' and 'c'", 8, 11)
+
+@test("an anonymous union is built from one of its fields, not two")
+uni_anonymous_two()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(a = 1, b = 2, c = 3).a)
+        """, "the anonymous union in 'P' is built from exactly one field, and 2 were named — it holds 'b' and 'c'", 8, 11)
+
+@test("a struct with an anonymous member is built by name, every value of it")
+uni_anonymous_positional()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        main()
+            print(P(1, b = 2).a)
+        """, "struct 'P' holds an anonymous member, so it is built by naming its fields — a value by position would have to count the member's fields as one or as many", 8, 13)
+
+@test("an anonymous member holds fields only")
+uni_anonymous_method()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                twice(self) -> u16 = self.b * 2
+
+        main()
+            print(1)
+        """, "an anonymous 'union' member holds fields only — a method or an 'invariant' belongs to 'P' itself", 3, 5)
+
+@test("offsetof through an anonymous member names a field it holds")
+uni_anonymous_offsetof_missing()
+    uni_refused(raw"""
+        struct P
+            a: u8
+            union
+                b: u16
+                c: u32
+
+        const at: usize = offsetof(P, d)
+
+        main()
+            print(at)
+        """, "'P' has no field 'd' — it stores 'a', 'b', 'c'", 7, 19)
+
+@test("a union is built by name: a value by position is refused")
+uni_positional_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val a = Key(1)
+        """, "union 'Key' is built from one field, named — 'Key(raw = …)': a value by position would mean another field once one is declared in front of it", 6, 17)
+
+@test("a union is built from exactly one field")
+uni_two_fields_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val a = Key(raw = 1, down = true)
+        """, "union 'Key' is built from exactly one field, named — 'Key(raw = …)' — and 2 values were given", 6, 13)
+
+@test("a union is built from a field it declares")
+uni_unknown_field_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val a = Key(nope = 1)
+        """, "union 'Key' declares no field named 'nope' — it holds 'raw' and 'down'", 6, 17)
+
+@test("a pattern cannot take a union apart, by position or by name")
+uni_destructuring_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val k = Key(raw = 1)
+            val Key(x, y) = k
+        """, "a union has no tag to match on, so 'Key' cannot be taken apart by a pattern — read the field you know is there", 7, 5)
+
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val k = Key(raw = 1)
+            k match
+                Key{raw: r} -> print(r)
+                _ -> print(2)
+        """, "a union has no tag to match on, so 'Key' cannot be taken apart by a pattern — read the field you know is there", 8, 9)
+
+@test("'==' is refused on a union, saying why")
+uni_eq_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        main()
+            val k = Key(raw = 1)
+            print(k == k)
+        """, "'==' is not defined for the union Key — comparing its bytes is wrong for a float and for the bytes past a short field. Write 'impl Eq' comparing the field you know is there", 7, 11)
+
+@test("'derives' is refused on a union")
+uni_derives_refused()
+    uni_refused(raw"""
+        union Pt derives Eq
+            x: u32
+            y: f32
+
+        main()
+            print(1)
+        """, "a union has no tag to say which field it holds, so a derived 'Eq' would read fields that are not there — write an 'impl' block that reads the field you know is there", 1, 18)
+
+@test("a union is storage, so a 'const' of one is refused and a 'val' is the spelling")
+uni_const_refused()
+    uni_refused(raw"""
+        union Key
+            raw: u8
+            down: bool
+
+        const k: Key = Key(raw = 1)
+
+        main()
+            print(k.raw)
+        """, "a constant is a scalar, and Key is storage — write 'k' as a 'val', which is laid into the object file as constant data", 5, 1)
+
+@test("'@byte_order' on a union orders every integer field: a word reads in network order")
+uni_byte_order()
+    uni_prints(raw"""
+        @byte_order(big)
+        union B
+            raw: [4]u8
+            word: u32
+
+        main()
+            val b = B(raw = [0, 0, 1, 2])
+
+            print(b.word, B(word = 3).raw[3])
+        """, "258 3\n")
+
+// -- const evaluation and static data -------------------------------------------------------------
+
+@test("a const function builds a union and reads it through the field it was built with")
+uni_const_function()
+    uni_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const pick(r: Reg) -> u32 = r.bits
+        const make(n: u32) -> Reg = Reg(bits = n)
+        const zeroed() -> Reg
+            var r: Reg
+
+            r
+        const K: u32 = pick(make(7))
+        const Z: u32 = pick(zeroed())
+
+        val made: Reg = make(9)
+
+        main()
+            print(K, Z, made.bits, made.level > 0.0)
+        """, "7 0 9 true\n")
+
+@test("a compile-time read through a field a union was not built with is refused")
+uni_const_cross_read()
+    if !uni_ready() then return
+
+    val (_, _, err) = uni_run(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        const level_of(r: Reg) -> f32 = r.level
+        const K: f32 = level_of(Reg(bits = 7))
+
+        main()
+            print(K)
+        """, "0")
+
+    assert(err.contains("error: 'K' cannot be computed while compiling: evaluation while compiling reads a union only through the field it was built with — this 'Reg' was built with 'bits', and 'level' would read its bytes as another type ("), err)
+    assert(err.contains("/main.sysl:6:16\n"), err)
+    assert_eq(err.count_of("error: "), 1)
+end uni_const_cross_read
+
+@test("a module 'val' holding unions is laid down as data, each in the literal type of its image")
+uni_static_image()
+    uni_prints(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        struct Map
+            tag: u8
+            union
+                word: u32
+                half: u16
+            len: u16
+
+        val r: Reg = Reg(level = 1.0)
+        val m: Map = Map(tag = 3, half = 0x1234, len = 9)
+        val t: [3]Reg = [Reg(bits = 5), Reg(level = 2.0), Reg(bits = 6)]
+        val f: [2]Map = [Map(tag = 1, word = 2, len = 3); 2]
+
+        main()
+            print(r.bits, m.half, m.word, m.len, m.tag, t[0].bits, t[1].level, t[2].bits, f[1].word, sizeof(Map))
+        """, "1065353216 4660 4660 9 3 5 2 6 2 12\n")
+
+    if !uni_ready() then return
+
+    val ir = uni_ir(raw"""
+        union Reg
+            bits: u32
+            level: f32
+
+        val r: Reg = Reg(level = 1.0)
+
+        main()
+            print(r.bits)
+        """)
+
+    assert(ir.contains("@r = private constant { [0 x %struct.Reg], float } { [0 x %struct.Reg] zeroinitializer, float 0x3FF0000000000000 }"), ir)
+end uni_static_image
+
+@test("a module 'val' union is data on a bare machine: its bytes are in the object's read-only data")
+uni_static_image_on_a_board()
+    if !uni_ready() then return
+
+    val root = make_temp_dir("sysl-uni-board").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        struct Map
+            ctrl: u32
+            union
+                level: f32
+                raw: u32
+            pad: u16
+
+        @export("reg_map")
+        val REG: Map = Map(ctrl = 1, level = 1.0, pad = 2)
+
+        @export("main")
+        main_entry() -> u32 = REG.raw + REG.ctrl
+        """).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "thumb-freestanding", "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    assert_eq(code, 0)
+
+    val dump = capture("/opt/homebrew/opt/llvm/bin/llvm-objdump", ["-s", "-j", ".rodata.reg_map", s"$root/probe.a"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    dump match
+        Err(_) -> skip("llvm-objdump could not be run")
+        Ok(out) -> assert(out.text.contains(" 0000 01000000 0000803f 02000000 "), out.text)
+end uni_static_image_on_a_board
+
+// -- aliasing -------------------------------------------------------------------------------------
+
+@test("a union's fields are one place: an address of one is an alias of the field a clause reads")
+uni_alias_one_place()
+    if !uni_ready() then return
+
+    val (_, _, err) = uni_run(raw"""
+        union U
+            a: u32
+            b: [4]u8
+
+        struct Guarded
+            u: U
+            invariant u.a < 100
+
+        main()
+            var g = Guarded(U(a = 1))
+            val p = &g.u.b
+
+            print(g.u.a)
+        """, "0")
+
+    assert(err.contains("/main.sysl:11:13\n"), err)
+    assert(err.contains("'u.a'"), err)
+    assert_eq(err.count_of("error: "), 1)
+end uni_alias_one_place

@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the seventeen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the eighteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,11 +10,12 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons`, one of the two an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
+| `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
@@ -35,11 +36,11 @@ with. That is a rule about directives, not the thing that distinguishes them.
 Annotations come in groups, by what they attach to — and the last of them is the empty one, which is
 as much a rule as the others.
 
-**On a function** there are seventeen, each written on its own line above the declaration. More than
+**On a function** there are eighteen, each written on its own line above the declaration. More than
 one may be stacked, and writing the same one twice is refused. `@test` and `@tailrec` are below, and
 so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@setup_all` and
-`@teardown_all` — and the three that tell the optimizer what a definition is for, `@noinline`,
-`@inline` and `@cold`; `@pure`,
+`@teardown_all` — the three that tell the optimizer what a definition is for, `@noinline`,
+`@inline` and `@cold`, and `@disjoint(...)`, which tells it which parameters never overlap; `@pure`,
 `@ghost`, `@reads` and `@writes` belong to the specification vocabulary and are on the
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
@@ -97,7 +98,11 @@ print(c.send(&n))
 Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
 `@no_alloc`, `@no_block` and `@blocks` — and `@relocates`, which says a call may move the storage its
 receiver's elements live in, so a live `ref` to one of them is refused the call
-([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)). Everything else is refused, and the line is what the annotation is **about** rather
+([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
+the view a call answers is borrowed from its receiver, so the view may not outlive it
+([memory](/reference/memory/#a-view-borrowed-from-its-receiver)), and `@consumes`, which says a call
+takes everything its receiver holds, so a local it was called on may not be read again until it is
+assigned (below). Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -372,6 +377,11 @@ for any particular type. That walk has to hand back a typed value, and `Min` and
 `string`, so admitting those would mean restating each attribute's result type a second time, in a
 second place, where the two copies could drift apart.
 
+**A `derive` body's `T` is not such a parameter.** Its body is read once for each type that names the
+trait in its `derives`, with `T` that type and never standing for itself, so it answers every attribute
+the type does — `T::Image(self)` in an arm under `if const T::Kind == Kind.SimpleEnum`
+([reflection](/reference/reflection/#writing-a-derivation)).
+
 **Nothing is asked of `T` in the signature.** A parameter given a type with no extremes is reported
 at the instantiation that gave it one, and the message names both:
 
@@ -452,11 +462,29 @@ print(Color::Nonesuch)
 'Color' has no attribute 'Nonesuch'
 ```
 
+### Reflection queries answer on every type
+
+**The sets above belong to one kind of type each. A second family answers on any type**, because it asks
+what the type is made of rather than what a value of it may do, and it is answered while compiling:
+
+| written | answers |
+|---|---|
+| `T::Kind` | a `Kind` variant — `Struct`, `DataEnum`, `Int`, `Opaque`… |
+| `T::Name`, `T::BaseName` | the type as written, with its arguments / the declared name alone |
+| `T::Fields`, `T::Members` | the named fields / every stored member of a struct, tuple or union |
+| `T::Variants` | the variants of an enum, simple or data |
+| `T::Make(c, p)` | the variant `c` of a data enum, built from a payload |
+| `T::Annotation[A]`, `f::Annotation[A]` | an `Option` of the program's own `@annotation` on a type or field |
+
+A data enum, which has no `First` or `Pos`, is walked through `T::Variants` instead. The descriptors,
+`for const f in T::Fields`, `v.(f)`, `f::Type` and the rest are on [reflection](/reference/reflection/).
+
 ## `@test` — a function with a caller nothing else has
 
 A word after `@` that is neither `test` nor `tailrec` is answered by name rather than as grammar. The
 set is closed, which is what makes a misspelling an error instead of a marker that quietly does
-nothing — annotations are deliberately *not* a general mechanism yet.
+nothing — the built-in annotations are a closed list. A program's own are declared with `@annotation`
+and read by [reflection](/reference/reflection/#annotations).
 
 The annotation goes on its own line above an ordinary function declaration, which may still be
 `private`:
@@ -482,7 +510,7 @@ print(add(2, 3))
 That program prints `5` and runs neither test, which is the whole of the arrangement: `sysl run`
 builds the program, and the tests are for `sysl test`.
 
-Five forms of the annotation:
+Six forms of the annotation:
 
 | written | means |
 |---|---|
@@ -490,12 +518,13 @@ Five forms of the annotation:
 | `@test("a sentence")` | named by the sentence instead |
 | `@test(should_trap)` | the test **passes** by stopping the program |
 | `@test(should_trap: "past the end")` | …and the run must have printed that text |
+| `@test(timeout: 30)` | the test may run for 30 seconds, whatever the run's own limit |
 | `@test(ignore: "why")` | the test is compiled and checked, and **not run** |
 
 They compose, in the order the table gives them — `@test("a sentence", should_trap: "past the end",
-ignore: "why")` is one annotation.
+timeout: 30, ignore: "why")` is one annotation.
 
-**Five, and `@test()` is not a sixth.** An empty argument list would mean what bare `@test` means, and
+**Six, and `@test()` is not a seventh.** An empty argument list would mean what bare `@test` means, and
 it is refused rather than accepted as a synonym: it is not a shorter way of saying nothing, it reads
 as a description that was going to be there and got lost, and a reader who saw it accepted could not
 tell which.
@@ -604,6 +633,47 @@ keeps_both_arms()
 Ignoring is something a *test* is, so there is no `@ignore` of its own; written above a function it
 is answered with the spelling above.
 
+### A test may be given a limit
+
+Every test `sysl test` runs has a time limit — [the run's](/getting-started/cli/#test), 300 seconds
+unless `--timeout` says otherwise — and a test that outlasts it **fails**, reading `timed out after
+Ns`, rather than holding up every test after it. `timeout` gives one test a limit of its own, in whole
+seconds, in place of the run's: longer for a test that is slow on purpose, shorter for one whose whole
+point is that it finishes quickly, and `0` for none at all.
+
+```sysl
+import sysl.time.{sleep, millis}
+
+@test(timeout: 2)
+answers_promptly()
+    sleep(millis(10))
+
+@test("a soak that is meant to take a while", timeout: 0)
+soaks()
+    sleep(millis(10))
+
+print("built")
+```
+
+```output
+built
+```
+
+**The test's own limit beats the run's in both directions**, `--timeout 0` included: a run that asked
+for no limit still stops a test that said `timeout: 5`, because the test is the one that knows. The
+limit is a whole number of seconds from `0` to `2147483`, the most milliseconds an `int` counts, and
+anything else is refused where it is written:
+
+```sysl
+@test(timeout: 1.5)
+answers_promptly()
+    assert(true, "prompt")
+```
+
+```error
+'timeout' needs the seconds the test may run, written as a whole number from 0 to 2147483 — '@test(timeout: 30)'; 0 is no limit at all
+```
+
 ### A test may find out that it cannot run
 
 `ignore` is decided before the test starts. Some tests can only find out once they are running: a
@@ -651,7 +721,7 @@ import sysl.testing.compiler
 @test
 asks_the_running_compiler_its_version()
     val answer = capture(compiler(), ["--version"]).unwrap()
-    assert(answer.status.is_ok(), "the compiler answers --version")
+    assert(answer.status.ok(), "the compiler answers --version")
 ```
 
 - **`skip` is imported, not ambient.** It lives in `sysl.testing` rather than the root module, so a
@@ -692,17 +762,41 @@ adds_two()
 
 ### What is dropped, and when
 
-`sysl run`, `sysl build` and `sysl emit-llvm` drop the tests — and drop them **after** analysis. So a
-`@test` that does not compile is an error in a build that would never have run it, and the module's
-capability rules reach its tests like they reach any other member — with the one difference that a
+**Every build but `sysl test` drops the tests after the parse and before analysis** — `sysl run`,
+`sysl build`, `sysl build-c`, `sysl emit-llvm` and `sysl build-lib` alike, for a program's own files
+exactly as for a library's and a dependency's. What goes is every `@tests` file whole, and every
+`@test` function and hook wherever it was written. A **syntax** error in a test still stops the
+build, since every file is parsed first; everything after the parse — names, imports, types,
+capabilities — is asked of a test by `sysl test` alone, which is the one command that runs it.
+
+So a test's imports are never read by the program that ships. A `@tests` file may import a
+[dev dependency](/reference/packages/#dependencies-a-test-alone-needs), which only `sysl test` fetches,
+and the program still builds:
+
+```sysl
+main()
+    print("built")
+
+@test
+checks_nothing_yet()
+    val unused: NoSuchType = 0
+```
+
+```output
+built
+```
+
+The `@test` above names a type that does not exist, and `sysl build` says nothing about it: a broken
+test is reported by `sysl test`, the build that would run it. The module's capability rules reach its
+tests there like they reach any other member — with the one difference that a
 [`@tests` file states its own](/reference/modules/#a-tests-file-states-its-own-capabilities), since
-that file is what these builds are dropping.
+that file is what every other build drops.
 
-That ordering is what lets a test sit beside what it tests: a program's tests do not run when it
-runs, and they do not stop being checked.
+This is what lets a test sit beside what it tests: a program's tests do not run when it runs, and
+nothing they need is asked of it.
 
-A helper only a test calls leaves with it, because it becomes unreachable and pruning notices; a
-helper the program also calls stays, because the program still calls it.
+An ordinary helper only a test calls leaves too, because with the test gone it is unreachable and
+pruning notices; a helper the program also calls stays, because the program still calls it.
 
 What a test build keeps regardless is the three definitions **nothing in the program names**: an
 interrupt handler, an [`@export`](/reference/ffi/), and a `@section` definition (below). Each is
@@ -728,20 +822,22 @@ release calls is kept with it.
 That matters most to a package, whose only build is its own suite. A test build dropping an export
 would link, pass, and quietly go without the surface the package exists to provide.
 
-**`sysl build-lib` is the exception, and drops them *before* analysis.** An artifact is the one
-output that outlives the compilation that made it, and analysis is not a passive reading: a test
-naming `Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary
-library function afterwards, with nothing in it recording which declaration asked for it. Dropping
-the test from the analyzed program would therefore drop the test and keep everything it caused —
-shipping instantiations no caller of the library ever asked for, and making the artifact's contents
-a fact about its tests.
+**Why the drop comes *before* analysis.** Analysis is not a passive reading: a test naming
+`Buf[int]` **creates** the whole of `Buf` at `int`, and that instantiation is an ordinary library
+function afterwards, with nothing in it recording which declaration asked for it. Dropping the test
+from an analyzed program would drop the test and keep everything it caused — shipping, in an
+artifact, instantiations no caller of the library ever asked for. And a test's imports would be
+resolved against a build that never fetched what they name.
 
 **The line falls between parsing and analysis.** Every source is parsed before the drop, so a
-**syntax** error in a `@tests` file still stops a `build-lib`. What such a file no longer gets is
+**syntax** error in a test still stops a `build` or a `build-lib`. What a test no longer gets there is
 everything after the parse — name resolution, types, visibility, capabilities, the `@test`
-well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a library
-test that is well-formed text and wrong in every other way builds clean, and its real errors are
-reported by [`sysl test --std`](/getting-started/cli/), which is where a library's tests are run.
+well-formedness rules above, generic instantiation, and the duplicate-`@export` check. So a test that
+is well-formed text and wrong in every other way builds clean, and its real errors are reported by
+[`sysl test`](/getting-started/cli/) (`sysl test --std` for the standard library's), which is where
+tests are run. The refusals this page shows for tests are `sysl test`'s. That includes an ordinary
+function calling a `@test` or naming what a `@tests` file declares: `sysl test` says why, and any
+other build reports a name that is not there — since, in that build, it is not.
 
 That last one is worth naming because it is the case where "everything after the parse" is easy to
 apply to only half of a build. An `@export` in a `@tests` file names a symbol **this** build is about
@@ -878,10 +974,69 @@ error: an 'impl' block in a file that said '@tests' has to be for a type that fi
 A closure is the one exception the compiler makes for itself, and it is not a hole: the table it
 writes is dropped with the closure.
 
+**Whatever the file writes goes with it, so whatever it writes may name its scaffolding.** A method of
+a type the file declares, written inline or in that type's `impl`, is as much the file's as a free
+function is, and may call the file's helpers:
+
+```sysl
+@tests
+
+helper() -> int = 41
+
+struct Probe
+    n: int
+
+    bumped(self) -> int = helper() + self.n
+
+impl Probe
+    twice(self) -> int = helper() + helper() + self.n
+
+@test("a stand-in's methods call the file's helper")
+probe_bumps() =
+    assert_eq(Probe(1).bumped(), 42)
+    assert_eq(Probe(0).twice(), 82)
+```
+
+**A `@tests` file of declarations and bindings is never where a program starts**, even a root file
+with no `module` header: no build but `sysl test` keeps it, so it cannot be the body a script runs.
+Its `var`s are the module's storage, and a test reading one is a test like any other:
+
+```sysl
+@tests
+
+var shared: int = 11
+
+@test("a test reads the file's storage")
+reads_it() =
+    shared += 1
+    assert_eq(shared, 12)
+```
+
+**Every test runs or is refused by name.** A `@test` or a hook written in the file a script starts in,
+reading one of that script's bindings, would be nested into the script's body where the runner cannot
+reach it — so it is refused, and marking the binding `static` makes it the module's:
+
+```sysl
+var n = 1
+print(n)
+
+@test("reads")
+reads() =
+    assert_eq(n, 1)
+```
+
+```error
+error: 'reads' is a '@test' that reads a binding of the body of the file this program starts in, so it would be nested inside that body where the test runner cannot reach it — mark what it reads 'static', which makes it the module's
+```
+
 **It stops at the package boundary.** A package is compiled from source and a library arrives as an
 artifact whose test files were never encoded, so a rule that let the reference cross would compile
 against one and fail against the other. A test-support library *meant* to be imported is therefore
 ordinary code that ships, and is a different thing from a file of scaffolding inside a package.
+
+A build that depends on a package does not read that package's `@tests` files at all — not
+analyzed, not even parsed, the header being enough to know one. One written for a newer compiler, or
+against a dev dependency the consumer never fetches, stops nothing but that package's own `sysl test`.
 
 ### The runner
 
@@ -889,6 +1044,8 @@ ordinary code that ships, and is a different thing from a file of scaffolding in
 sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --fail-fast
+sysl test <path> --jobs <n>
+sysl test <path> --timeout <seconds>
 ```
 
 **One build, one process per test.** The tree is compiled once, into a binary whose entry point takes
@@ -902,10 +1059,21 @@ them, and its `@test` functions are not — a package's tests are run in the pac
 
 The process per test is not a cost being tolerated; **it is the mechanism.** A test that fails does
 so by ending its process, so a run that shared one would report the first failure and nothing after
-it. The compile is the slow half, and there is only ever one of it.
+it. It is also what lets the tests run **several at once** — as many as the machine has processors,
+or `--jobs <n>` — with nothing shared between them that a run of one at a time did not share; the
+report waits for each row's turn, so it reads the same either way
+([the CLI](/getting-started/cli/#test)).
 
 Exit status is 0 if and only if every test that ran passed. A tree with no tests, and a filter that
 matched none of the tests there are, both exit 0 and say which happened.
+
+**A process that does not come back in time is stopped, and the run goes on.** Each test's process
+is started in a process group of its own and given its limit ([`timeout`](#a-test-may-be-given-a-limit),
+or the run's `--timeout`, 300 seconds by default); past it, the process and everything it started are
+ended, the row reads `timed out after Ns` with what the test had printed underneath — a test's output
+is written a line at a time, so a stopped test still has it — and the next test starts. In the other
+direction, a test process watches the runner that started it and ends itself and its group once the
+runner is gone, so a run stopped by hand, or killed outright, leaves nothing running behind it.
 
 **An ignored test is reported, never left out.** It starts no process — not its own, and not its
 module's `@setup` or `@teardown` — and its row says why in place of a time. The summary counts it,
@@ -1035,6 +1203,32 @@ cannot see, and the message is the whole point of it.** The message is required 
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
 
+### `trap` — the instruction without the message
+
+`trap()` is the other half: it stops the program at once with the target's trap instruction and says
+nothing. It answers `never`, so a function may end in it with no value to return; it needs no
+capability, allocates nothing and is legal under `@no_alloc` and on every freestanding target.
+Reach for it where a message cannot be written — a bare-metal `abort`, a fault handler — and for
+`assert` or `panic` everywhere a reader would want to be told what broke.
+
+```sysl
+@no_alloc
+halt() -> never = trap()
+
+pick(n: int) -> int
+    if n > 0 then return n
+    halt()
+
+print(pick(4))
+```
+
+```output
+4
+```
+
+Like a compiler-inserted check it runs no `defer` and flushes nothing, and a
+[`should_trap`](#a-test-passes-by-returning) test passes by it.
+
 ## `@assert` — a condition settled while compiling
 
 ```sysl
@@ -1051,8 +1245,23 @@ print(capacity)
 
 The condition is a [constant expression](/reference/modules/), folded by the machinery
 a `const` initializer already goes through — so it may name constants, `sizeof`, `alignof`,
-`offsetof`, and the arithmetic and comparisons over them, including a constant declared *below* it. A true one emits
-nothing at all. A false one stops the compilation, quoting the message:
+`offsetof`, and the arithmetic and comparisons over them, including a constant declared *below* it,
+and call any function whose body can run while compiling
+([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)):
+
+```sysl
+sq(n: int) -> int = n * n
+
+@assert(sq(3) == 9, "the square of three")
+
+print(sq(3))
+```
+
+```output
+9
+```
+
+A true one emits nothing at all. A false one stops the compilation, quoting the message:
 
 ```sysl
 @assert(1 == 2, "arithmetic broke")
@@ -1068,6 +1277,62 @@ The message is optional and is the reader's own, because they know what the numb
 struct matches its C counterpart, that a table is the size a protocol fixes — where the expression
 alone says only that two numbers differ.
 
+**The message is any `string` the compiler can work out while compiling**, not only a literal: an
+interpolation over constants, a call whose body runs while compiling, and — inside a generic or a
+[`derive`](/reference/traits/) body — what a type answers, `T::Name` or a field's `f.name`:
+
+```sysl
+const WIDTH: int = 3
+
+@assert(WIDTH % 2 == 0, s"a width of $WIDTH is not even")
+
+print(WIDTH)
+```
+
+```error
+assertion failed: a width of 3 is not even
+```
+
+It is worked out **only once the condition has come out false**, so a message that could not be
+computed costs nothing while the condition holds:
+
+```sysl
+const tenth(n: int) -> string = s"${10 / n}"
+
+@assert(1 == 1, tenth(0))
+
+print("the message was never worked out")
+```
+
+```output
+the message was never worked out
+```
+
+Where the condition is false and the message cannot be worked out — it traps, reads storage filled at
+run time, or is not a `string` — that is what is reported, in words that say the assertion failed:
+
+```sysl
+const tenth(n: int) -> string = s"${10 / n}"
+
+@assert(1 == 2, tenth(0))
+
+print(1)
+```
+
+```error
+the message of this failed '@assert' traps while it is being compiled: integer division by zero
+```
+
+```sysl
+@assert(1 == 2, 42)
+
+print(1)
+```
+
+```error
+the message of this failed '@assert' is of type 'int', and a message is a 'string'
+```
+
 **A failed comparison also says what each side came out as.** The compiler folded both in order to
 decide the condition, so it has the numbers at the moment it reports that one of them is wrong, and
 withholding them would leave you editing the literal and rebuilding to find out. A side you wrote as
@@ -1077,11 +1342,14 @@ comparison has nothing to add, since the thing that came out `false` is its only
 
 **It is not `require`.** A `require` is a runtime precondition: it is compiled, it branches, and it
 traps when the program reaches it. This is settled while compiling and reaches the binary as nothing.
-A condition it cannot settle is refused rather than deferred — and a call is the line, since a call
-in a constant expression would be a request for compile-time evaluation of arbitrary code:
+A condition it cannot settle is refused rather than deferred — and a call that reaches run-time
+storage, a `var` for one, is the line, since only a function holding what exists while compiling can
+run then:
 
 ```sysl
-f() -> int = 3
+var seed: int = 3
+
+f() -> int = seed
 
 @assert(f() == 3)
 
@@ -1090,6 +1358,48 @@ print(1)
 
 ```error
 has to be a constant expression
+```
+
+### In a body, per instance
+
+`@assert` may stand in a body as well, and there it is checked **for each instance** of a generic and
+in each unrolled copy of a `for const` — against the types and values that instance was given, which
+is the only moment `sizeof(T)` is a number. Inside an [`if const`](/reference/generics/) arm it is
+checked only where that arm is taken, which makes it a compile-time error that a generic raises on
+purpose:
+
+```sysl
+ring[T, const N: usize]() -> usize
+    if const N > 64
+        @assert(sizeof(T) * N <= 4096, "a ring this large belongs on the heap")
+    N
+
+print(ring[u8, 100](), ring[u64, 10]())
+print(ring[u64, 1000]())
+```
+
+```error
+assertion failed: a ring this large belongs on the heap — the left side is 8000 — where N = 1000
+```
+
+The first line compiles: `u8` times 100 is 100 bytes, and `ring[u64, 10]` never takes the arm.
+
+The message is worked out in the instance's terms too, so it can name the type that was given:
+
+```sysl
+struct Big
+    a: i64
+    b: i64
+
+fits[T]() -> int
+    @assert(sizeof(T) <= 8, s"'${T::Name}' is wider than a register")
+    1
+
+print(fits[i32]() + fits[Big]())
+```
+
+```error
+assertion failed: 'Big' is wider than a register — the left side is 16 — where T = Big
 ```
 
 ### Checking a C struct's layout
@@ -1283,7 +1593,10 @@ the string a value renders as needs an allocator, and 'shown' declared '@no_allo
 blank lines do not end it, so a file whose first declaration is the promised function has the
 module's clause instead; an `import` or another declaration above the function is what makes it the
 function's. A function in a module that already declared `@no_alloc` is held to the module's clause,
-which says everything the annotation would.
+which says everything the annotation would. **The module's clause binds its own files and never its
+`@tests` files** ([a `@tests` file states its own
+capabilities](/reference/modules/#a-tests-file-states-its-own-capabilities)): a test may use `str`,
+f-strings and `Buf`, while the module's functions stay allocator-free when a test calls them.
 
 **A method may carry it** — it lowers to a function like any other and is held the same way.
 **A function declared inside another may not**: it is a closure by another spelling, and what it
@@ -1319,6 +1632,52 @@ print(f())
 ```error
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
 ```
+
+**A generic keeps the promise twice: as it was written, and at every instance.** The body it was
+written as is held first, and what it makes whatever the type — the `str(n)` above — is refused
+once, naming the declaration, however many instances the program makes. A method of a generic
+struct and a method of a generic `impl` are held the same way:
+
+```sysl
+f() -> int = 1
+
+@no_alloc
+shown[T](x: T) -> usize = str(42).len
+
+print(shown(1), shown(true))
+```
+
+```error
+the string a value renders as needs an allocator, and 'shown' declared '@no_alloc'
+```
+
+What depends on the type is only there to see once a type is chosen: a call through a bound reaches
+a different implementation at each instance. Each instance is held to the promise as well, and the
+refusal names the instance that breaks it; the instances that keep it are not mentioned:
+
+```sysl
+trait Size
+    size(self) -> usize
+
+impl Size for int
+    size(self) -> usize = 8
+
+impl Size for bool
+    size(self) -> usize = str(self).len
+
+@no_alloc
+measured[T: Size](x: T) -> usize = x.size()
+
+print(measured(1), measured(true))
+```
+
+```error
+this reaches 'bool.size', which makes the string a value renders as, and 'measured' declared '@no_alloc' (instance 'measured.bool')
+```
+
+This is the function's own promise, not the module's: under a module's `@no_alloc` clause a generic
+still answers only for the body it was written as ([modules](/reference/modules/)), since the type an
+instance is made at is chosen by somebody else's code.
 
 ## `@no_block` and `@blocks` — a path that must never wait
 
@@ -1426,6 +1785,31 @@ A call through a trait object reaches the implementation the body erased into it
 either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
 are made of.
 
+**A generic that promises is held as `@no_alloc` holds one**: the body it was written as, and then
+each instance, so a call through a bound that one type answers by waiting is refused at that
+instance:
+
+```sysl
+trait Poll
+    poll(self) -> int
+
+impl Poll for int
+    poll(self) -> int = 0
+
+impl Poll for bool
+    @blocks
+    poll(self) -> int = 1
+
+@no_block
+ready[T: Poll](x: T) -> int = x.poll()
+
+print(ready(1), ready(true))
+```
+
+```error
+this reaches 'bool.poll', which blocks, and 'ready' declared '@no_block' (instance 'ready.bool')
+```
+
 **The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
 module's clause, and a function there answers to it; a method may promise it; a function declared
 inside another may not, being a closure. `@blocks` takes no arguments and marks a function, a method
@@ -1481,7 +1865,7 @@ print(f())
 A function whose last act is a call to itself compiles to a branch back to its own entry rather than
 a second frame, so the recursion is bounded by the arithmetic and not by the stack. That happens
 whether or not anything is written — see
-[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the two
+[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the three
 things that end a tail position.
 
 `@tailrec` asserts the jump is there:
@@ -1515,6 +1899,135 @@ calls itself nowhere the jump can replace
 
 It changes nothing about what is emitted. Write it where losing the jump silently would be a bug,
 and leave it off everywhere else.
+
+## `@consumes` — a call that takes everything its receiver holds
+
+Some members hand back what their receiver held and leave the receiver empty: `Buf.freeze()` moves a
+buffer's elements into the frozen buffer it answers ([memory](/reference/memory/#a-frozen-buffer-crosses)).
+A read of that receiver afterwards can only find nothing, so **`@consumes` above such a member makes
+the read a refusal**: once a local has been called on, it may not be read again on any path until it
+is assigned a new value.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    print(f.len(), b.len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held — 'freeze' is '@consumes', so 'b' has nothing in it on this path until it is assigned again
+```
+
+**Assigning it ends it**, and so does binding the name afresh — a `var` inside a loop body is a new
+local every turn:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val f = b.freeze()
+
+    b = buf()
+    b.push(7)
+    print(f.len(), b.len(), b[0])
+
+    for i in 0..<2
+        var c: Buf[int] = buf()
+
+        c.push(i)
+        print(c.freeze()[0])
+
+run()
+```
+
+```output
+2 1 7
+0
+1
+```
+
+**The check follows every path the body can take.** A branch that consumed on one side leaves the
+local consumed after the two sides meet, and a loop is followed round, so a read on a later turn
+counts — here the second turn's `push`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run()
+    var b: Buf[int] = buf()
+
+    for i in 0..<3
+        b.push(i)
+
+        if i == 1 then print(b.freeze().len())
+
+run()
+```
+
+```error
+'b' is read here after 'b.freeze()' took everything it held
+```
+
+A branch that consumed and then left — a `return`, a `break` past the read — never reaches it, and is
+not refused.
+
+**Only a local is followed.** A field, an element, or what a pointer or a second name reaches may be
+reached another way the body cannot see, so a call on one is accepted, and the member's own emptying
+at run time is what a later read finds:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Holder
+    b: Buf[int]
+
+val h: &Holder = Holder(buf())
+
+h.b.push(1)
+
+val f = h.b.freeze()
+
+print(f.len(), h.b.len())
+```
+
+```output
+1 0
+```
+
+**A call through a trait object is not followed either**: which body a slot dispatches to is settled
+at run time, so a trait member's `@consumes` says nothing about the object's own local. A method has
+no second spelling the check could miss — `Buf.freeze(b)` is refused as every instance method named
+through its type is.
+
+It marks a member that takes a receiver, in any mode, and takes no arguments. Above a free function,
+or a member that takes no `self`, it is refused:
+
+```sysl
+struct S
+    v: int
+
+    @consumes
+    make() -> S = S(1)
+```
+
+```error
+'@consumes' says a call to 'make' takes everything its receiver holds, and it has none — it takes no 'self'
+```
 
 ## `@noinline`, `@inline` and `@cold` — what the optimizer is told about a definition
 
@@ -1556,10 +2069,44 @@ print(push(21))
 42
 ```
 
-**It is a hint, not an instruction.** The inliner is told to spend more and then decides as it
-decides; nothing here forces a call to disappear, and a definition that is enormous is still a
-definition. That is deliberate — an instruction would make a library's opinion about one member
-override a caller's whole code size.
+**Bare, it is a hint, not an instruction.** The inliner is told to spend more and then decides as
+it decides, and a definition that is enormous is still a definition. That is the right default — an
+instruction would make a library's opinion about one member override a caller's whole code size.
+
+**`@inline(always)` is the instruction.** Every call is replaced by the body, at every optimization
+level — `-O0` included, where nothing else is inlined at all — so it is for the definition whose
+call is known to cost more than its body: a decoder's per-symbol step, a fixed-point multiply, a
+register accessor on a board built for debugging:
+
+```sysl
+@inline(always)
+symbol(bits: int) -> int = bits & 0xff
+
+print(symbol(298))
+```
+
+```output
+42
+```
+
+It lowers to LLVM's `alwaysinline` in the place `@inline`'s `inlinehint` takes, and a member, a
+generic — every instantiation — and an `@export`ed function may carry it like the bare word; the
+exported symbol is still defined for C to call. **A function that calls itself is not inlined**,
+whatever it is marked — LLVM leaves such a body out of line, as clang and rustc do with theirs, and
+the program is still right. `@tailrec` turns the self-call into a jump, and a body that no longer
+calls itself is absorbed like any other:
+
+```sysl
+@tailrec
+@inline(always)
+fact(n: int, acc: int) -> int = if n <= 1 then acc else fact(n - 1, acc * n)
+
+print(fact(5, 1))
+```
+
+```output
+120
+```
 
 `@cold` says the definition is reached rarely. The optimizer spends nothing on it and keeps its
 blocks away from the hot ones — but it is a frequency, not a prohibition, and a cold function may
@@ -1613,7 +2160,7 @@ codegen units compiled side by side. A call from one module into another is ordi
 optimizer cannot see through. **At every optimization level but `-O0`, an optimized build carries
 the body across that wall** for:
 
-- every function marked `@inline`, whatever its length, and
+- every function marked `@inline` or `@inline(always)`, whatever its length, and
 - every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
   multiply — whether marked or not.
 
@@ -1622,15 +2169,26 @@ emits it, so the program still links the package's one definition, and a call th
 out of line is the same call it always was. The copy is made from the package's source on every
 build, so an edit to the package is what the next build inlines; nothing is kept that could be stale.
 
+**A package's own archive is a calling module too.** Its calls into the standard module, or into
+another package, carry the same copies — including a call a generic reaches through a bound. A
+package whose `is_nonzero[T: Zero + Eq](x: T) = x != T.zero()` is instantiated at `real` by the
+package's own code compiles `real.zero()` to the constant `0.0` in its archive, as it would in the
+program, rather than calling the standard module's `real.zero` out of line.
+
 So the guarantee is **the same as within one file**: a call into a package, or into another unit,
 inlines exactly where the same call would inline if both functions sat side by side — the hint is
 still a hint, and the inliner still decides. What is never carried across:
 
 - a function marked `@noinline`, or `@cold` without `@inline` — the call stays a call;
 - an `async` function, an interrupt handler, one placed in a `@section`, or a variadic one;
-- a function that reaches the package's module storage, which is compiled by the program anyway
-  (the package keeps no copy of it), and so needs nothing carried;
-- a generic, which needs none of this: it is instantiated in the program that uses it, beside its
+- a function that reaches module storage filled at run time, or `@thread_local`, `@per_cpu` or
+  `@main_thread` storage, or another package's storage, which is compiled by the program anyway (the
+  package keeps no copy of it), and so needs nothing carried. Storage that is a constant image is
+  not that: the package's own, and the standard module's, is laid down once in its own archive, and
+  every other archive and the program name that one object — one address, one value — so a function
+  reaching it, one that indexes a `Buf` or reads a lookup table say, is compiled into the package's
+  archive like any other;
+- a generic, which needs none of this: it is instantiated in the module that uses it, beside its
   callers.
 
 `sysl emit-llvm` prints the program as one module and carries no copies.
@@ -1666,10 +2224,11 @@ whole of it, and `@inline` is what keeps the element type from deciding whether 
 
 They are the only three annotations a member may carry that are not about a parameter.
 
-### None of the three takes an argument
+### None of the three takes an argument but `always`
 
 Whether a call stays a call is the whole of what the first says, `@inline` raises a budget rather
-than naming one, and how rare a rare path is is not a number a program has:
+than naming one, and how rare a rare path is is not a number a program has. `always` is the one
+argument there is:
 
 ```sysl
 @noinline(2)
@@ -1690,7 +2249,20 @@ print(grow(21))
 ```
 
 ```error
-'@inline' takes no arguments
+'@inline' takes no argument but 'always'
+```
+
+The opposite request is a word of its own, so `never` is pointed at it:
+
+```sysl
+@inline(never)
+grow(n: int) -> int = n * 2
+
+print(grow(21))
+```
+
+```error
+'@inline(never)' is written '@noinline'
 ```
 
 ### What they may not mark
@@ -1709,6 +2281,20 @@ print(1)
 
 ```error
 an annotation marks a function
+```
+
+`@inline(always)` above an `extern` is the case most often tried, and it says why — the body is in
+the object the `extern` is linked from, and only that object's own compiler can put it anywhere:
+
+```sysl
+@inline(always)
+extern abs(n: i32) -> i32
+
+print(1)
+```
+
+```error
+An 'extern' has no body in this program to put anywhere
 ```
 
 `@ghost` is the one *other* annotation they contradict rather than merely have nothing to do with. A
@@ -1744,12 +2330,212 @@ print(grow(21))
 they contradict above one declaration
 ```
 
+`@inline(always)` beside `@noinline` is refused the same way, and beside a bare `@inline` it says
+one thing twice — the instruction already asks for everything the hint does:
+
+```sysl
+@inline
+@inline(always)
+grow(n: int) -> int = n * 2
+
+print(grow(21))
+```
+
+```error
+the two together say one thing twice
+```
+
 If what you meant was *keep it out of the hot path*, that is `@cold`, and it stands beside either of
 them.
 
 They stand beside everything else. `@tailrec` is about this function's call to *itself* becoming a
 jump and `@noinline` about the call into it from elsewhere staying a call — two different calls, so
 there is nothing for them to disagree about; and `@test` only says who calls the function.
+
+## `@disjoint` — parameters whose memory nothing else reaches
+
+A kernel that writes through one view and reads through another is the loop a vectorizer exists
+for, and the one it is least sure of. `axpy` below adds `a * x[i]` into `y[i]`; if `y` and `x` could
+be two views of one array, offset by an element, then a store to `y[i]` changes what a later read of
+`x` sees, and doing four elements at once would get the wrong answer. The optimizer cannot tell from
+the function, so it vectorizes the loop *and* keeps a scalar copy, choosing between them at run time
+by comparing the two address ranges on every call.
+
+`@disjoint(y, x)` is the function saying the comparison is never needed:
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [4]f64 = [1.0, 1.0, 1.0, 1.0]
+val xs: [4]f64 = [1.0, 2.0, 3.0, 4.0]
+
+axpy(ys[0..<4], xs[0..<4], 2.0)
+print(ys[3])
+```
+
+```output
+9
+```
+
+**What it promises is C's `restrict`.** While a call runs, no memory reached through one named
+parameter is reached through another named parameter, or through any other pointer the body uses.
+The parameters are named on the function, as `@lends(...)` and `@crossing(...)` name theirs — a
+parameter carries no annotation of its own.
+
+It names pointers and views: `*T`, `&T`, `[]T` and `[]const T`. A parameter of any other type
+arrives as a copy, which nothing else can reach, so naming one promises nothing and is refused:
+
+```sysl
+@disjoint(n, p)
+store(n: int, p: *int) = *p = n
+
+var v = 0
+store(42, &v)
+print(v)
+```
+
+```error
+'@disjoint' names 'n', a parameter of 'store' whose type 'int' is a value
+```
+
+A generic is held to that at each instantiation, where its parameters have types — the views and
+pointers of every instance carry the promise. A name that is not a parameter, or one written twice,
+is refused where it is written, as `@lends`' are; so is the annotation above an `async` function,
+whose body runs after the call that made the task has returned, so that there is no call for the
+parameters to be kept apart during:
+
+```sysl
+@disjoint(p)
+async fill(p: *int) -> int = 1
+
+print(1)
+```
+
+```error
+'@disjoint' marks 'fill', which is 'async'
+```
+
+**A method names its other parameters, never `self`.** What a named parameter reaches, nothing else
+the body uses reaches — the receiver included — so naming the slice a method copies from already keeps
+it apart from the storage the method writes into:
+
+```sysl
+struct Ring
+    bytes: [8]u8
+
+impl Ring
+    @disjoint(data)
+    fill(*self, data: []const u8)
+        for i in 0..<data.len
+            self.bytes[i] = data[i]
+
+var r = Ring([0; 8])
+val src: [3]u8 = [7, 8, 9]
+
+r.fill(src[..])
+print(r.bytes[2])
+```
+
+```output
+9
+```
+
+Writing the receiver into the list is refused, and says so:
+
+```sysl
+struct Ring
+    bytes: [8]u8
+
+impl Ring
+    @disjoint(self, data)
+    fill(*self, data: []const u8) = ()
+
+print(1)
+```
+
+```error
+'@disjoint' names parameters, and 'self' is the receiver — leave it out
+```
+
+**It is not `@no_overlap`**: the `@no_` words are the capabilities a module or a definition gives up — `@no_alloc`,
+`@no_block` — and every `@no_<word>` is read as one, so a promise about two parameters takes a word of
+its own.
+
+### Checked where a call shows it broken
+
+A call is refused where the arguments it hands two named parameters are provably the same storage:
+the same local twice, two slices of one array or view whose constant bounds share an element, or a
+view and the address of one of its own elements.
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [8]f64 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+axpy(ys[0..<4], ys[2..<6], 2.0)
+```
+
+```error
+'axpy' is '@disjoint' over 'y' and 'x', and this call hands them storage that overlaps — 'ys[0..<4]' and 'ys[2..<6]' overlap
+```
+
+Slices that only meet at a boundary are separate storage, and a call handing them over compiles:
+
+```sysl
+@disjoint(y, x)
+axpy(y: []f64, x: []const f64, a: f64)
+    for i in 0..<y.len
+        y[i] = y[i] + a * x[i]
+
+var ys: [8]f64 = [1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0]
+
+axpy(ys[0..<4], ys[4..<8], 2.0)
+print(ys[3])
+```
+
+```output
+9
+```
+
+**Where the call cannot settle it, the promise is trusted, as C trusts `restrict`.** Two views a
+caller was itself handed, a bound or an index computed at run time, a pointer read out of a field —
+none of these is refused, and none is checked when the program runs. **A call that breaks the promise
+anyway is undefined behaviour**: the optimizer has been told the loads and stores through the two
+parameters never touch the same memory, and the code it makes is free to read a value before the
+store that should have changed it, or after.
+
+### What the back end is told
+
+A pointer `@disjoint` names carries LLVM's `noalias` on the function's definition. A view is two
+pointers and a count in one value, and `noalias` attaches only to a pointer parameter, so a function
+naming a view is emitted as two: the function with the signature every caller already uses, taking
+each named view apart, and an `internal`, always-inlined body taking the parts, its element address
+`noalias`. Its callers, function pointers and exports are unchanged.
+
+The body is inlined into the function at every optimization level, and LLVM's inliner turns each
+`noalias` parameter into the scoped alias metadata it uses for an inlined `restrict` — the form that
+survives the function being inlined further, into a caller and a loop unrolled around it. `axpy`
+above, built at `-O2`, is a vector loop with no run-time comparison of the two ranges; the same
+function without the annotation keeps both copies of its loop and the comparison between them.
+
+An `@export` of one is the same function behind a C entry point. An `extern` may not carry it — its
+body is C, which never reads the sysl declaration, so the promise is made on the C side, as
+`restrict`:
+
+```sysl
+@disjoint(d, s)
+extern "memcpy" c_memcpy(d: *u8, s: *u8, n: usize) -> *u8
+```
+
+```error
+an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'
+```
 
 ## `@packed` and `@align(n)` — where a struct's fields sit
 
@@ -1923,9 +2709,9 @@ print((e with { iss = 7 }).bits)
 
 **The integer is the struct's own: unsigned, and as wide as its container** — the fields' widths
 added and rounded up to whole bytes, so `Esr` is a `u64` and a struct of 3 and 21 bits a `u24`. A
-literal takes that type from where it sits; a value of any other width or signedness is refused
-rather than widened, narrowed or reinterpreted, since that would be a second conversion hidden inside
-the first:
+literal takes that type from where it sits, and a narrower unsigned value
+[widens](/reference/expressions/#which-conversions-are-implicit) to it as any argument does, so a
+32-bit register read decodes into `Esr` directly:
 
 ```sysl
 @packed
@@ -1936,13 +2722,34 @@ struct Esr
     iss2: u5
     res0: u27
 
-val low: u32 = 0x3c
+val low: u32 = 0xF2000000
 
 print(Esr::Bits(low).ec)
 ```
 
+```output
+60
+```
+
+A value that would have to be narrowed, or change its sign, is refused, and the conversion is
+written:
+
+```sysl
+@packed
+struct Esr
+    iss: u25
+    il: u1
+    ec: u6
+    iss2: u5
+    res0: u27
+
+val word: int = 0x3c
+
+print(Esr::Bits(word).ec)
+```
+
 ```error
-'Esr::Bits' takes the ulong 'Esr' is stored as, not uint
+'Esr::Bits' takes the ulong 'Esr' is stored as, not int
 ```
 
 `Esr(raw)` is not the spelling because it is already the constructor, which takes one value per
@@ -2070,7 +2877,7 @@ struct Reg
     mode: volatile u3
     prescale: volatile u4
 
-var block: [4]u8 = [0u8; 4]
+var block: [4]u8 = [0; 4]
 var r: *Reg = ptr_cast(&block[0])
 
 r.enable = 1
@@ -2095,7 +2902,7 @@ struct Ctrl
     a: u3
     b: u5
 
-var p: *volatile Ctrl = ptr_cast(4096usize)
+var p: *volatile Ctrl = ptr_cast(4096)
 
 print(p.a)
 ```
@@ -2149,12 +2956,12 @@ describe(class: Option[Ec]) -> string = class match
     Some(c) -> Ec::Image(c)
     None -> "a class this kernel does not know"
 
-var raw: u64 = u64(0x2a) << 26
+var raw: u64 = 0x2a << 26
 val e: *Esr = ptr_cast(&raw)
 
 print(describe(Ec.try(e.ec)))
 
-raw = u64(0x3c) << 26
+raw = 0x3c << 26
 print(describe(Ec.try(e.ec)))
 ```
 
@@ -2204,7 +3011,144 @@ It has no address either, which is the packed rule above and needs no separate r
 bitfield struct. Those are different things on some machines, and it is C's own doing: MSVC allocates
 `unsigned a:1` into a four-byte unit where the Itanium ABI packs it into a byte, so a C bitfield
 struct of the same fields need not even be the same *size* everywhere. A sysl bitfield struct is one
-integer on every target.
+integer on every target. Where the point is to match a C header's bitfields, the fields are written
+as C writes them — the next section.
+
+### C bitfields — `name: uW in T`, laid out as C lays it out
+
+**A field written `name: uW in T` is C's `T name : W;`**: `W` bits allocated in a unit of `T`, the
+type C declares the field with, by the target's own C rule. A struct with any such field is an
+ordinary struct whose other fields sit where C puts them after a bitfield, so its size, its boundary
+and every offset are what the C compiler for that target gives the same declaration. There are three
+rules: **Itanium** (Linux, macOS, the BSDs, RISC-V, WebAssembly, i386 and CRAFT), **AAPCS** (Arm
+outside Apple's platforms: an unnamed or zero-width field raises the struct's boundary too) and
+**MSVC** (Windows: a run of bitfields shares a unit only while their declared types have one size, and
+no field ever straddles a unit).
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+    count: u12 in u32
+    tag: u8
+
+var s = Status(true, 5, 4000, 7)
+
+s.mode = 6
+s.count += 1
+print(sizeof(Status), alignof(Status), offsetof(Status, tag), s.ready, s.mode, s.count, s.tag)
+```
+
+```output
+4 4 2 true 6 4001 7
+```
+
+The field's value type is an integer of `W` bits, a simple enum whose underlying type is `W` bits
+wide, or `bool` (`bool in bool` is C's `_Bool b : 1`). `T` is an integer type of 8, 16, 32 or 64 bits
+or `bool`, `W` fits in it, and the value's signedness is `T`'s — `i3 in u32` is refused, because C's
+read of the same field would disagree with sysl's.
+
+**A read loads the unit, shifts the field down and cuts it to its width**, so a signed field comes
+back with its sign; **a write is a read-modify-write of the unit**, so the fields beside it — in the
+unit, in the next unit, and the ordinary fields around them — keep what they held. Compound
+assignment reads the field, computes at its type and writes it back. An enum field is checked where it
+is read, as any enum read from storage is, and `E.try(s.field)` answers instead of trapping:
+
+```sysl
+struct Range
+    lo: i3 in i32
+    hi: i3 in i32
+    rest: u8
+
+var r = Range(-4, 3, 255)
+
+r.lo += 1
+r.hi = -4
+print(r.lo, r.hi, r.rest)
+```
+
+```output
+-3 -4 255
+```
+
+**An unnamed field, `_: uW in T`, and a zero-width one, `_: in T`**, only move the fields after them —
+C's `T : W;` and `T : 0;`. As in C, nothing initializes them: a construction and a positional pattern
+name every field but these, and a value built field by field holds zero in their bits. A derived
+`Eq`, `Ord`, `Hash` or `Display` reads every named field:
+
+```sysl
+struct Reg derives Eq, Display
+    lo: i8 in i32
+    _: u4 in u32
+    hi: u8 in u32
+    _: in u32
+    next: u16 in u32
+
+val r = Reg(-3, 200, 9)
+val Reg(lo, hi, next) = r
+val s = r with { hi = 7 }
+
+print(sizeof(Reg), lo, hi, next, s, r == s)
+```
+
+```output
+8 -3 200 9 Reg(-3, 7, 9) false
+```
+
+A module `val` of one is laid down as data, its bits where C puts them, as any constant struct is.
+
+**`volatile` makes every access to the field's unit exactly the declared type's width** — one load of
+the whole unit, and for a write one load and one store of it, never merged with a neighbour and never
+narrowed. That is the AAPCS rule for volatile bitfields, and what a peripheral register needs: a
+device may ignore, or fault on, an access narrower than its register. As with today's bitfields, the
+qualifier on any field of a unit qualifies every access to that unit, and nothing diagnoses what a
+read-modify-write costs a register whose read clears it. Under `@packed` a volatile field that lies
+across two units of its declared type has no single access to make, and is refused.
+
+`@packed` on such a struct is GNU's `packed` (MSVC's `pack(1)`): the fields abut bit for bit, and
+`@align(n)` raises it as it raises any struct. The two kinds of bitfield do not mix in one struct — a
+`@packed` struct with an `in` field may not also hold today's narrow fields — and `@byte_order` is
+refused on one, there being no portable C spelling of a bitfield stored the other way round.
+
+**A C bitfield has no address**: it is bits inside a unit and begins on no byte, so `&`, `ref` and
+`offsetof` refuse it, and the struct is reached instead:
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+
+var s = Status(true, 5)
+val p = &s.mode
+
+print(p[0])
+```
+
+```error
+'&' here would reach 'Status.mode', a C bitfield — it is bits inside a unit of its declared type and has no address of its own
+```
+
+**What carries a count stays out**: a struct with C bitfields is laid out as C lays its counterpart
+out, so a string, a slice or a reference among its fields is refused.
+
+**Not built in this release**: passing one by value to an `extern` or returning one from an
+`@export` — how C passes one differs from an ordinary struct on WebAssembly and on RISC-V's `lp64d`,
+so it crosses as a pointer — and its declaration in a generated header, which writes it as an
+incomplete type C reaches through a pointer:
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+
+extern apply(s: Status)
+
+apply(Status(true, 5))
+```
+
+```error
+'Status' has C bitfields, and passing it by value to the 'extern' 'apply' is not built in this release — pass its address, as a '*Status'
+```
 
 ### `@align(n)` — where the aggregate begins
 
@@ -2537,7 +3481,30 @@ The ranges are taken from the integer, as they are for any bitfield struct, so `
 `0x4000` and the wire holds `0x40 0x00`. A bitfield struct with no order of its own is refused as a
 field of one that has an order, its integer being in the machine's.
 
-The order is one of two words, and the attribute marks a struct and nothing else:
+**A union takes one too**, and it orders every integer of every field — the bytes are shared, so a
+word written through one field reads back in network order through another, and building the union
+from that field stores it in the stated order. An anonymous member's fields are the enclosing type's,
+so the order above the type reaches them as well. Each field is held to the rule above:
+
+```sysl
+@byte_order(big)
+union Wire
+    raw: [4]u8
+    word: u32
+
+var w = Wire(word = 0x01020304)
+
+print(w.raw[0], w.raw[3])
+w.raw = [0, 0, 1, 2]
+print(w.word)
+```
+
+```output
+1 4
+258
+```
+
+The order is one of two words, and the attribute marks a struct or a union and nothing else:
 
 ```sysl
 @byte_order(middle)
@@ -2566,6 +3533,125 @@ A value that is not in a struct is put in an order with
 [`sysl.math.ByteOrder`](/library/math/)'s `to_be` and `from_be`, and a byte-ordered struct is read
 out of bytes, every `bool` and enum in it checked, with
 [`sysl.encoding.Plain`](/library/encoding/)'s `decode`.
+
+## `@pinned` on a struct — a value C holds pointers into
+
+Some C state points into itself. littlefs's `lfs_t` keeps a pointer to its configuration and a list of
+open files threaded through its own storage; a USB stack's device struct is handed to interrupt
+handlers by address. Copy one, and C goes on writing through pointers into the copy that is gone.
+**`@pinned` above a struct says a value of it is never copied or moved once it is built.**
+
+A new value has no address yet, so it may land once — in a binding, in module storage, in a `&T`
+box, in a field of another pinned value, or as what a function hands back, where it is built in the
+caller's slot. After that it is reached only **through** it: a field, `&`, or a method taking `*self`.
+
+```sysl
+struct Config
+    block: int
+
+@pinned
+struct Fs
+    cfg: *Config
+    open: int
+
+    mount(*self, cfg: *Config)
+        self.cfg = cfg
+        self.open = 1
+
+    size(*self) -> int = self.open * self.cfg.block
+
+// A constructor hands back a value it has just built, and the caller's storage is where it lands.
+filesystem(open: int) -> Fs = Fs(null, open)
+
+var cfg: Config = Config(512)
+var fs: Fs = filesystem(0)
+
+main()
+    fs.mount(&cfg)
+
+    val boxed: &Fs = filesystem(2)
+
+    boxed.mount(&cfg)
+    print(fs.size(), boxed.open, fs.cfg.block)
+```
+
+```output
+512 1 512
+```
+
+Everything that would read the value whole is refused, each with what it does to the value:
+
+```sysl
+@pinned
+struct Fs
+    open: int
+
+var fs: Fs = Fs(0)
+
+main()
+    var b = fs
+    print(b.open)
+```
+
+```error
+'Fs' is '@pinned' — C may hold pointers into a value of it, so a value is never copied or moved once it is built, and this binds a copy of it. Take its address ('&') or name it with a 'ref' instead, or build the value in place
+```
+
+The same sentence ends differently for each form:
+
+| written | refused because this… |
+|---|---|
+| `var b = fs`, `val p: &Fs = fs` | binds a copy of it / copies it into a new box |
+| `c = fs`, `fs = Fs(2)` | assigns a copy of it / assigns over a value already built, which C may still hold pointers into |
+| `take(f: Fs)`, `take(fs)` | parameter 'f' of 'take' takes it by value / passes it by value |
+| `peek(self)` in the struct | receiver of 'Fs.peek' is taken as '(self)', which is a copy |
+| `give() -> Fs = fs` | returns it by value — only a value built right there may be handed back |
+| `() -> here.open` over a local | captures 'here' by value in a closure |
+| `val Fs(n) = fs`, `fs match` | takes it apart / matches on it, which reads it whole into a copy first |
+| `(Fs(3), 1)`, `Option[Fs]` | puts it in a tuple / carries it by value in variant 'Some' |
+| `for item in all` over `[2]Fs` | copies each element into the loop variable |
+| `Buf[Fs]` | makes it an element of a buffer whose storage moves when it grows |
+
+**Assignment is refused even of a new value**: the one already there may be what C points into. A
+pinned value is built once, where it lives, and changed afterwards through its own members.
+
+### A type holding one is pinned too, and says so
+
+A struct holding a pinned value by value moves it whenever the struct moves, so it is pinned as well —
+and it is **marked**, not inferred, so the reader of the outer declaration sees that its address
+matters:
+
+```sysl
+@pinned
+struct Fs
+    open: int
+
+struct Holder
+    fs: Fs
+
+var h: Holder = Holder(Fs(1))
+
+main()
+    print(h.fs.open)
+```
+
+```error
+and this holds it by value in field 'fs' of 'Holder', which moves it whenever it moves. Mark 'Holder' '@pinned' too, or hold a '&Fs' or a '*Fs'
+```
+
+An array of pinned values is pinned the same way, and a `[]Fs` view, a `*Fs` and a `&Fs` are all
+fine: none of them is the value.
+
+### A generic is held to it at the instance
+
+A generic instantiated at a pinned type is checked as the instance, the way an instance is held to its
+declaration's `@no_alloc`: `addr[T](x: *T) -> *T` is fine at `Fs`, and `first[T](x: *T) -> T = *x`
+is refused, the refusal naming `first.Fs`. A container is refused at the type when any of its members
+is `@relocates`, since that member moves its elements — which is why `Buf[Fs]` is.
+
+A `drop` is the one member taking `self` that a pinned struct may have: it is handed the value as the
+value is destroyed. And `@pinned` marks a struct beside `@packed`, `@align(n)` and `@export(...)`;
+above a function it is still the per-core promise of [`@per_cpu`](#per-cpu-one-copy-per-processor-core).
 
 ## `@section("...")` — where a symbol lands
 
@@ -2681,8 +3767,9 @@ address of other module storage, or an array or struct built from those — or l
 every thread at the type's zero. That is
 the one rule the attribute adds, and it follows from what a per-thread copy is: the copies are made
 from a single image in the object file, because a thread started halfway through a run never passes
-through the prologue an ordinary module `var` is filled by. A call as an initializer would fill exactly
-one copy and leave every other thread reading zeroes, so it is refused where it is written.
+through the prologue an ordinary module `var` is filled by. A call that has to run when the program
+does — one that prints, or reads a `var` — would fill exactly one copy and leave every other thread
+reading zeroes, so it is refused where it is written.
 
 It marks a `var` and nothing else. A `val` and a `const` never change, so the one copy each already has
 is every thread's.
@@ -2736,7 +3823,9 @@ for its count to be torn by, and reaching it is not crossing a concurrency domai
 ### What it may not take as an initializer
 
 ```sysl
-next() -> int = 42
+next() -> int
+    print("next")
+    42
 
 @thread_local static var n: int = next()
 
@@ -2865,6 +3954,43 @@ print(n)
 ```error
 cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
 ```
+
+### One file for every machine: `#if thread_local`
+
+A library that runs both where there are threads and on a board — a C library's `errno` is the usual
+case — wants one variable that is per-thread wherever the build has thread-local storage and a plain
+module `var` everywhere else. The `#if` symbol `thread_local` (`§ #if`) is true exactly where the
+attribute is accepted, so the attribute line is gated by it and the declaration is written once:
+
+```sysl
+import sysl.threads.*
+
+#if thread_local
+@thread_local
+#endif
+static var errno: int = 0
+
+fail(state: *int)
+    errno = 22
+    print(errno)
+
+var t = spawn(&fail, null).unwrap()
+t.join()
+
+print(errno)
+```
+
+```output
+22
+0
+```
+
+On this hosted machine `errno` is one per thread, so the worker's `22` never reaches main. On a board,
+and on `aarch64-freestanding` with no `codegen.thread_pointer`, the same file builds with a plain
+module `var` the scheduler answers for; on `aarch64-freestanding` with the register named it is a
+thread-local again. **`thread_local` is the one `#if` symbol the target alone does not settle**: it
+also reads the root manifest's `codegen.thread_pointer`, which is why the register is the root's to
+name and why it is read before any condition is.
 
 ## `@main_thread` — storage only the main thread reaches
 
@@ -3300,9 +4426,12 @@ disturbs nothing.
 | operating system | `macos`, `linux`, `windows`, `freestanding`, `android`, `wasi` |
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
+| floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
+| storage | `thread_local` (a `@thread_local` is accepted on this build) |
 
-That is the whole vocabulary. There is **no `#define`**, nothing a project can add, and no dependence
-on a project config. A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
+That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
+symbol depends on a project config: `thread_local`, which also reads the root manifest's
+`codegen.thread_pointer` (below). A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
 than `||`.
 
 `posix` is a name for the commonest disjunction rather than a replacement for writing it — `#if linux
@@ -3322,12 +4451,74 @@ is 66 against 39, `ENAMETOOLONG` is 63 against 36, and `mode_t` is sixteen bits 
 Every one of those is a *libc* fact with nothing about any particular system in it, which is why the
 standard library's own gates for them say `bsd` and not `macos`.
 
+**`fma` and `fma_dp` are C's `FP_FAST_FMAF` and `FP_FAST_FMA`**: whether `llvm.fma`
+(`reference/ffi.md`) is a single instruction at that width, so that a fused multiply-add is no slower
+than a multiply and an add. They are facts about the unit, not the calling convention: AArch64 and a
+hosted RISC-V machine have both, every Arm unit sysl targets has `fma`, and only the Cortex-M7's
+double-precision one (`thumbv7em-freestanding-dp`) has `fma_dp` as well. The x86 rows ask for no
+processor past the baseline, which has no FMA, and WebAssembly has none. Where a symbol is false the
+operation is still exact — it is a call rather than an instruction.
+
+**`thread_local` is true exactly where a `@thread_local` would be accepted** (`§ @thread_local`): on
+every hosted machine, and on bare AArch64 when the root manifest says which register holds the thread
+pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and on bare AArch64 with
+no such setting. It is the one symbol the target alone does not settle, because the register is the
+program's to name; the compiler reads it before the first condition, a dependency's `if` included.
+
 That distinction is worth making before it is needed rather than after. macOS is the only BSD sysl
 targets today, so `#if macos` and `#if bsd` select identically — and a second BSD would route into
 the glibc branch at every one of those sites, where exactly one of them says anything: the `errno`
 accessor fails at the link, while a wrong `ENOTEMPTY` merely stops matching and a `mode_t` at the
 wrong width appears to work. **A symbol that means what it says costs nothing today and is the whole
 of the fix later.**
+
+**The floating-point four are facts of the whole target, not of the processor.** Seven Arm targets
+are all `thumb`, and they differ in exactly this: a Cortex-M0+ has no floating-point registers, a
+Cortex-M4F has single-precision ones, a Cortex-M7 double-precision ones, and a core with a unit may
+still be built to pass a float in an integer register. Code that *saves* those registers — a
+`setjmp`, a context switch — has to know, because an instruction naming `s16` faults on a core with
+none:
+
+| target | `fpu` | `fpu_dp` | `hardfloat` | `softfp` |
+|---|---|---|---|---|
+| every hosted target, `aarch64-freestanding`, `x86_64-freestanding`, both `wasm32` | yes | yes | yes | no |
+| `thumb-freestanding`, `thumbv7em-freestanding` | yes | no | yes | no |
+| `thumb-freestanding-softfp` | yes | no | no | yes |
+| `thumbv7em-freestanding-dp` | yes | yes | yes | no |
+| `thumbv6m-`, `thumbv7m-`, `thumb-freestanding-soft`, `thumbv7em-freestanding-soft`, both RISC-V freestanding, `craft-freestanding` | no | no | no | no |
+
+`fpu` asks about the **registers**, whichever ABI passes a value, so a soft-float-ABI build of a core
+that has them still answers yes — the registers are there and a context switch must save them. A
+machine with registers is exactly one of `hardfloat` and `softfp`; one without is neither, and `!fpu`
+is how a condition says *soft float throughout*. Every hosted machine answers yes, which is what this
+host says:
+
+```sysl
+#if fpu && fpu_dp && hardfloat
+print("floating-point registers, doubles in them, and floats passed in them")
+#else
+print("something else")
+#endif
+```
+
+```output
+floating-point registers, doubles in them, and floats passed in them
+```
+
+Inside an `asm` statement the arm is still chosen by processor, and what differs between the cores
+of one processor is gated by `#if` inside its arm — a `setjmp` saving the callee-saved single
+registers only where there are any:
+
+```sysl
+save_fp(at: usize)
+    asm
+        [thumb]
+#if fpu
+            "vstmia {at}, {{s16-s31}}"
+            in at : reg
+#endif
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "not this example"
+```
 
 **A symbol nobody knows is an error, not false:**
 
@@ -3342,7 +4533,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, freestanding, hosted, linux, macos, posix, riscv32, riscv64, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to
@@ -3399,12 +4590,100 @@ finds that is a build for each target — a thing to *run*, not a thing to desig
 conditions themselves are the part that is checked everywhere, and they are the part where a mistake
 would otherwise be silent.
 
-**The gate runs before anything knows what a string or a comment is**, so a line that begins at the
-margin with a directive word is a directive even inside a text block or a block comment. Recognizing
-those would mean a second copy of the lexer's rules about literals, in a place where the two could
-drift with nothing to notice — a worse defect than this one. The margin rule is what keeps it rare: a
-text block written anywhere but the top level is indented in the source, whatever its value turns out
-to be.
+**Inside a text block, a condition sysl can read gates the block's lines, and every other margin
+line is the block's text.** A text block carrying C — a header to compile, a template — has its
+`#define`, `#if` and `#include` at column 1, and they belong to the string; a text block a program
+assembles may also want some of its lines only on some machines, or only with a feature on. The two
+are told apart by the condition: an `#if` or `#elif` whose condition reads as sysl's, over the
+symbols a condition may name here — the target's and the package's `feature_` ones — gates exactly
+as it does in live code, down to its own `#else` and `#endif`. Anything else is text: `#define`,
+`#include`, `#ifdef`, `#pragma` and every other word, an `#if` whose condition is not sysl's
+(`#if LIMIT > 2`, `#if defined(X)`, `#if NDEBUG`), and that `#if`'s own `#elif`, `#else` and
+`#endif`, so a C conditional stays whole with a sysl group around it or inside it.
+
+```sysl
+import sysl.text.Search
+
+val header = raw"""
+    #include <stddef.h>
+#if posix
+    #include <unistd.h>
+#else
+    #include <windows.h>
+#endif
+    """
+
+print(header.contains("<unistd.h>"), header.contains("<windows.h>"), header.starts_with("#include"))
+```
+
+```output
+true false true
+```
+
+The directive lines go as they do everywhere, leaving blank lines, and the block's incidental
+indentation is reckoned from what is left — the gated text, not the text as written. A condition
+over a C macro is the block's text whatever else is around it:
+
+```sysl
+import sysl.text.Search
+
+val header = raw"""
+#define LIMIT 4
+#if LIMIT > 2
+#include <stdio.h>
+#endif
+"""
+
+#if posix
+val kind = "posix"
+#else
+val kind = "other"
+#endif
+
+print(kind, header.contains("#if LIMIT > 2\n#include <stdio.h>\n#endif"))
+```
+
+```output
+posix true
+```
+
+**`#if posix` in a block of C gates**, since `posix` is a symbol sysl knows; a C header that means
+its own macro of that name writes it as `#ifdef posix`, which is text. A `feature_` name the manifest
+does not declare is false, as it is in live code, so a misspelled one gates its lines out rather than
+passing into the text. **A group opened inside a text block closes inside it**: one whose `#endif`
+is below the block's closing delimiter is refused at its `#if`, naming the line the block ends on.
+
+```sysl
+val s = raw"""
+#if posix
+    on a posix machine
+    """
+#endif
+```
+
+```error
+this '#if' opens a group inside the text block that ends on line 4, and the group has to close inside the block — add its '#endif' before line 4
+```
+
+**A block comment is all text.** Nothing reads a comment's lines, so there is nothing for a condition
+in one to gate, and a C fragment quoted in a comment stays as written. The gate asks the lexer itself
+where a literal opened in live code ends, and which kind it is, with the same scans a token is read
+with, so there is one set of rules about strings and comments rather than two that could drift. A
+branch not taken is not read this way, since it need not lex at all — a text block that opens inside
+one does not hide the `#endif` that closes it.
+
+```sysl
+/*
+#if windows
+The quoted condition is the comment's, and so is the '#endif' below it.
+#endif
+*/
+print("a comment's lines are its own")
+```
+
+```output
+a comment's lines are its own
+```
 
 ### The library is subject to it too
 
@@ -3423,7 +4702,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@export("...")` on a module binding, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@disjoint(...)`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@export("...")` on a module binding, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
 | `@naked`, a function with no frame | code that must run before there is a stack — a reset entry, a vector table — is an [`asm` block at the top of a file](/reference/inline-assembly/), which is not a function and so has no frame to leave out |
 | bitfield syntax | there is nothing to write: inside `@packed` an `iN` field already occupies exactly N bits, so a five-bit register field is `u5` and needs no `: 5` beside it. The open integer family does the work C's declarator syntax was invented for |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |

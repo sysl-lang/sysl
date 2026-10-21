@@ -27,12 +27,16 @@ check_value_defaults(a: &Analysis)
         val covered = enter_signature(a, f.decl.needs)
 
         read_defaults(a, f.scope, shown, a.tables.access.get(key), f.decl.tparams, f.decl.bounds,
-                      f.decl.tvalues, f.decl.tpacks, f.decl.params)
+                      f.decl.tvalues, f.decl.tpacks, f.decl.params, buf())
         leave_reaching(a, covered)
 
     val lowered = a.tables.members.lowered
 
     // A member is held to its **type's** reach, the way a member's signature is.
+    //
+    // **And it is read under the bindings its body is read under**: a default inherited from a
+    // generic trait names the trait's parameters, which the `impl` fixed (`impl Pad[f64] for A`
+    // makes the trait's `T` the `f64` it wrote), exactly as the copy's body sees them.
     for m in lowered
         val home = a.tables.members.decl_scope.get(m.name)
         val shown = module_show(m.name)
@@ -40,8 +44,27 @@ check_value_defaults(a: &Analysis)
         if home.is_some()
             check_default_shape(a, home.unwrap(), shown, m.params, m.variadic)
             read_defaults(a, home.unwrap(), shown, a.tables.access.get(member_owner(m.name)),
-                          m.tparams, m.bounds, m.tvalues, m.tpacks, m.params)
+                          m.tparams, m.bounds, m.tvalues, m.tpacks, m.params,
+                          a.tables.members.selves.get(m.name).unwrap_or(buf()))
         end if
+
+    // **A trait's defaults are read at the trait as well**, under what the trait itself promises: its
+    // parameters standing for themselves under their bounds, as its default bodies are read. A copy
+    // reads `T.zero()` at the `f64` an `impl` fixed, which has a `zero` whatever the trait said;
+    // only here is a `T` with no `Zero` among its bounds held to the bound it is missing.
+    val types = a.tables.types
+
+    for i in 0..<types.len()
+        val decl = types.at(i)
+
+        decl.kind match
+            TraitOf(td) ->
+                for m in td.methods
+                    val d = trait_default_decl(td, m)
+
+                    read_defaults(a, decl.scope, module_show(d.name), None, d.tparams, d.bounds,
+                                  d.tvalues, d.tpacks, m.params, buf())
+            _ -> ()
 end check_value_defaults
 
 // The type a lowered member belongs to: its name up to the last dot.
@@ -96,7 +119,7 @@ end check_default_shape
 // bound promises and to nothing more.
 private read_defaults(a: &Analysis, scope: Scope, shown: string, reach: Option[Access],
                       tparams: Buf[string], bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
-                      tpacks: Buf[string], params: Buf[Param])
+                      tpacks: Buf[string], params: Buf[Param], outer: Buf[Binding])
     var any = false
 
     for item in params
@@ -104,7 +127,8 @@ private read_defaults(a: &Analysis, scope: Scope, shown: string, reach: Option[A
 
     if !any then return
 
-    val subst = abstract_subst(a, scope, tparams, bounds, tvalues, tpacks, buf())
+    val subst = joined_bindings(outer, abstract_subst(a, scope, tparams, bounds, tvalues, tpacks,
+                                                      outer))
 
     for p in params
         if p.default.is_none() then continue
