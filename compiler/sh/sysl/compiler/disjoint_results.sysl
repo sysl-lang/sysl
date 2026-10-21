@@ -298,9 +298,31 @@ end dr_upper
 
 private dr_bound(body: &DrBody, x: TExpr, direct: bool) -> DrBound = dr_literal(x) match
     Some(v) -> DrAt(v)
-    None -> *x.kind match
-        TLoad(name, _) -> if direct || dr_steady(body, name) then DrName(name) else DrUnknown
-        _ -> DrUnknown
+    None -> dr_key(body, x, direct) match
+        Some(k) -> DrName(k)
+        None -> DrUnknown
+
+// A bound computed from names and literals by arithmetic, spelled so that two computations of one
+// value spell the same: `xs.len / 2` read twice is one bound.
+private dr_key(body: &DrBody, x: TExpr, direct: bool) -> Option[string] = *x.kind match
+    TIntLit(v, _) -> Some(s"$v")
+    TLoad(name, _) -> if direct || dr_steady(body, name) then Some(name) else None
+    TLen(receiver, _) -> dr_key(body, receiver, direct) match
+        Some(k) -> Some(s"$k.len")
+        None -> None
+    TBinary(op, left, right, _) -> dr_pair_key(body, op, left, right, direct)
+    _ -> None
+
+private dr_pair_key(body: &DrBody, op: string, left: TExpr, right: TExpr, direct: bool) -> Option[string]
+    if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" then return None
+
+    val l = dr_key(body, left, direct)
+    val r = dr_key(body, right, direct)
+
+    if l.is_none() || r.is_none() then return None
+
+    Some(s"(${l.unwrap()} $op ${r.unwrap()})")
+end dr_pair_key
 
 private dr_literal(x: TExpr) -> Option[long] = *x.kind match
     TIntLit(v, _) -> v.to_long()
@@ -349,7 +371,10 @@ private dr_answer(v: DrCheck, e: TExpr)
                                   s"${dr_text(x)} and ${dr_text(y)} may share an element")
                         return
                     end if
-        TCall(callee, _, _, _) -> dr_handed_on(v, e.span, dr_callee_parts(v.cx, callee), s"'$callee'")
+        TCall(callee, _, _, _) ->
+            val named = qualified_name(v.a.tables.members.func_origin.get(callee).unwrap_or(callee))
+
+            dr_handed_on(v, e.span, dr_callee_parts(v.cx, callee), s"'$named'")
         TLoad(name, _) ->
             val held = if dr_steady(v.body, name) then v.body.calls.get(name) else None
 
@@ -420,4 +445,6 @@ private dr_opt_text(x: Option[TExpr], mark: string) -> string =
 private dr_bound_text(x: TExpr) -> string = *x.kind match
     TIntLit(v, _) -> s"$v"
     TLoad(name, _) -> name
+    TLen(receiver, _) -> s"${dr_bound_text(receiver)}.len"
+    TBinary(op, left, right, _) -> s"${dr_bound_text(left)} $op ${dr_bound_text(right)}"
     _ -> "..."

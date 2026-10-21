@@ -1,0 +1,369 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `@disjoint(result.0, result.1)` (`reference/attributes.md § Over a function's result`): the parts
+// of a result it names share no element. The body is checked, never trusted -- every answer shows the
+// parts apart as slices of one storage whose bounds meet, or as parts of one call of a function making
+// the same promise -- and a caller may rely on it: the pieces, destructured, are apart storage.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private dsr_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-dsr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end dsr_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private dsr_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = dsr_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end dsr_prints
+
+// The build is refused with exactly this message, anchored at this `line:column` of `main.sysl`.
+private dsr_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = dsr_outcome(text)
+
+    assert(!said.1, said.0)
+    assert(said.0.contains(s"error: $message\n"), said.0)
+    assert(said.0.contains(s"/main.sysl:$at\n"), said.0)
+end dsr_refused
+
+// -- what a body may answer ----------------------------------------------------------------------
+
+@test("slices meeting at a name, a literal, or one computation written twice are shown apart, in a tuple or a result list")
+dsr_meeting_slices_accepted()
+    dsr_prints(raw"""
+        @disjoint(result.0, result.1)
+        at(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+        @disjoint(result.0, result.1)
+        halves(xs: []int) -> ([]int, []int) = (xs[..<xs.len / 2], xs[xs.len / 2..])
+
+        @disjoint(result.0, result.2)
+        three(xs: []int) -> []int, []int, []int = xs[0..<2], xs[1..<3], xs[2..<4]
+
+        @disjoint(result.0, result.1)
+        traced(xs: []int, n: usize) -> ([]int, []int)
+            val m = n
+            val l = xs[..<m]
+
+            (l, xs[m..])
+
+        @disjoint(result.0, result.1)
+        early(xs: []int, n: usize) -> ([]int, []int)
+            if n == 0 then return (xs[..<0], xs)
+
+            (xs[..<n], xs[n..])
+
+        var v: [6]int = [1, 2, 3, 4, 5, 6]
+        val (a, b) = at(v[..], 2)
+        val (c, d) = halves(v[..])
+        val e, k, f = three(v[..])
+        val (g, h) = traced(v[..], 1)
+        val (i, j) = early(v[..], 0)
+
+        print(a.len, b.len, c.len, d.len, e.len, k.len, f.len, g.len, h.len, i.len, j.len)
+        """, "2 4 3 3 2 2 2 1 5 0 6\n")
+
+@test("parts of one call making the promise are apart, destructured or read off the tuple, and so is a slice of one")
+dsr_pieces_of_pieces_accepted()
+    dsr_prints(raw"""
+        import sysl.slices.split_at
+
+        @disjoint(result.0, result.1)
+        quarter(xs: []int) -> ([]int, []int)
+            val (l, r) = split_at(xs, 2)
+
+            (l[..<1], r)
+
+        @disjoint(result.0, result.1)
+        tail_pair(xs: []int) -> ([]int, []int)
+            val p = split_at(xs, 3)
+
+            (p.1, p.0)
+
+        @disjoint(result.0, result.1)
+        handed(xs: []int) -> ([]int, []int) = split_at(xs, 1)
+
+        var v: [6]int = [1, 2, 3, 4, 5, 6]
+        val (a, b) = quarter(v[..])
+        val (c, d) = tail_pair(v[..])
+        val (e, f) = handed(v[..])
+
+        print(a.len, b.len, c.len, d.len, e.len, f.len)
+        """, "1 4 3 3 1 5\n")
+
+@test("a recursive halving writes both halves through pieces, and hands two pieces to a '@disjoint' function")
+dsr_recursive_halving_writes_both_halves()
+    dsr_prints(raw"""
+        import sysl.slices.split_at
+
+        number(xs: []usize, from: usize)
+            if xs.len == 1
+                xs[0] = from
+            else if xs.len > 1
+                val (l, r) = split_at(xs, xs.len / 2)
+
+                number(l, from)
+                number(r, from + l.len)
+
+        @disjoint(y, x)
+        add_into(y: []usize, x: []const usize)
+            for i in 0..<y.len
+                y[i] = y[i] + x[i]
+
+        var v: [8]usize = [0; 8]
+
+        number(v[..], 10)
+
+        val (lo, hi) = split_at(v[..], 4)
+
+        add_into(lo, hi)
+        print(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7])
+        """, "24 26 28 30 14 15 16 17\n")
+
+@test("a list may name parameters and parts together, each kind keeping its own promise")
+dsr_parameters_and_parts_together()
+    dsr_prints(raw"""
+        @disjoint(dst, src, result.0, result.1)
+        copy_split(dst: []int, src: []const int, n: usize) -> ([]int, []int)
+            for i in 0..<dst.len
+                dst[i] = src[i]
+
+            (dst[..<n], dst[n..])
+
+        var a: [4]int = [0, 0, 0, 0]
+        val b: [4]int = [5, 6, 7, 8]
+        val (l, r) = copy_split(a[..], b[..], 1)
+
+        print(l[0], r[0], r.len)
+        """, "5 6 3\n")
+
+// -- what a body may not answer ------------------------------------------------------------------
+
+private dsr_tail() -> string =
+    "; a body shows it with slices of one view that meet at a bound, as '(xs[..<n], xs[n..])', or " +
+    "with parts of one call of a function '@disjoint' over its result"
+
+@test("slices whose bounds are not shown to meet are refused, quoting both")
+dsr_unmet_bounds_refused()
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        cut(xs: []int, n: usize, m: usize) -> ([]int, []int) = (xs[..<n], xs[m..])
+
+        var v: [4]int = [1, 2, 3, 4]
+        val (a, b) = cut(v[..], 2, 2)
+        print(a.len + b.len)
+        """, "'cut' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show them " +
+        "apart — 'xs[..<n]' and 'xs[m..]' may share an element" + dsr_tail(), "2:56")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        same(xs: []int) -> ([]int, []int) = (xs, xs[1..])
+
+        var v: [4]int = [1, 2, 3, 4]
+        val (a, b) = same(v[..])
+        print(a.len + b.len)
+        """, "'same' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'xs' and 'xs[1..]' may share an element" + dsr_tail(), "2:37")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        lits(xs: []int) -> ([]int, []int) = (xs[0..<3], xs[2..<4])
+
+        var v: [4]int = [1, 2, 3, 4]
+        val (a, b) = lits(v[..])
+        print(a.len + b.len)
+        """, "'lits' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'xs[0..<3]' and 'xs[2..<4]' may share an element" + dsr_tail(), "2:37")
+
+@test("a name traced through a part has to hold one value: a 'var' assigned after its slice is refused")
+dsr_a_moved_bound_refused()
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        moved(xs: []int, n: usize) -> ([]int, []int)
+            var m = n
+            val l = xs[..<m]
+
+            m = 0
+            (l, xs[m..])
+
+        var v: [4]int = [1, 2, 3, 4]
+        val (a, b) = moved(v[..], 2)
+        print(a.len + b.len)
+        """, "'moved' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'l' and 'xs[m..]' may share an element" + dsr_tail(), "7:5")
+
+@test("one 'return' that does not show the parts apart is refused at that 'return', the others passing")
+dsr_one_return_refused()
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        early(xs: []int, n: usize) -> ([]int, []int)
+            if n == 0 then return (xs, xs)
+
+            (xs[..<n], xs[n..])
+
+        var v: [4]int = [1, 2, 3, 4]
+        val (a, b) = early(v[..], 1)
+        print(a.len + b.len)
+        """, "'early' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'xs' and 'xs' may share an element" + dsr_tail(), "3:27")
+
+@test("two parts of one piece, parts of two calls, and a tuple handed on from a function not making the promise are refused")
+dsr_pieces_refused()
+    dsr_refused(raw"""
+        import sysl.slices.split_at
+
+        @disjoint(result.0, result.1)
+        twice(xs: []int) -> ([]int, []int)
+            val (l, r) = split_at(xs, 2)
+            val (m, s) = split_at(xs, 3)
+
+            (l, s)
+
+        var v: [6]int = [1, 2, 3, 4, 5, 6]
+        val (a, b) = twice(v[..])
+        print(a.len + b.len)
+        """, "'twice' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'l' and 's' may share an element" + dsr_tail(), "8:5")
+
+    dsr_refused(raw"""
+        plain(xs: []int) -> ([]int, []int) = (xs, xs)
+
+        @disjoint(result.0, result.1)
+        handed(xs: []int) -> ([]int, []int) = plain(xs)
+
+        var v: [6]int = [1, 2, 3, 4, 5, 6]
+        val (a, b) = handed(v[..])
+        print(a.len + b.len)
+        """, "'handed' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show " +
+        "them apart — 'plain' is not '@disjoint' over 'result.0'" + dsr_tail(), "4:39")
+
+// -- what the list may name ----------------------------------------------------------------------
+
+@test("one part alone, a part that is a value, a part the result lacks, and a result that is no tuple are refused")
+dsr_names_refused()
+    dsr_refused(raw"""
+        @disjoint(result.0)
+        cut(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+        print(1)
+        """, "'@disjoint' names 'result.0' and no other part of 'cut''s result, and a part is kept " +
+        "apart from the other parts named — name two, as '@disjoint(result.0, result.1)'", "1:1")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        count(xs: []int) -> ([]int, usize) = (xs, xs.len)
+
+        val v: [2]int = [1, 2]
+        val (a, n) = count(v[..])
+        print(a.len + n)
+        """, "'@disjoint' names 'result.1', a part of 'count''s result whose type 'usize' is a value — " +
+        "the promise is about memory a part reaches, so it names a pointer ('*T', '&T') or a view " +
+        "('[]T', '[]const T'), and a value is a copy nothing else reaches", "1:1")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.2)
+        cut(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+        var v: [2]int = [1, 2]
+        val (a, b) = cut(v[..], 1)
+        print(a.len + b.len)
+        """, "'@disjoint' names 'result.2', and 'cut''s result '([]int, []int)' has 2 parts — " +
+        "'result.0' to 'result.1'", "1:1")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.1)
+        whole(xs: []int) -> []int = xs
+
+        var v: [2]int = [1, 2]
+        print(whole(v[..]).len)
+        """, "'@disjoint' names 'result.0', and 'whole''s result '[]int' is one value — the parts of " +
+        "a result are named where it answers a tuple or a result list, as '-> ([]T, []T)'", "1:1")
+
+@test("'result' alone, a part twice, and a part not written by position are refused where they are written")
+dsr_spelling_refused()
+    dsr_refused(raw"""
+        @disjoint(result, xs)
+        f(xs: []int) -> ([]int, []int) = (xs, xs)
+
+        print(1)
+        """, "'@disjoint' names 'result', which is not a parameter of 'f' — a part of the result is " +
+        "named by its position, 'result.0'", "1:1")
+
+    dsr_refused(raw"""
+        @disjoint(result.0, result.0)
+        f(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+        print(1)
+        """, "'@disjoint' names 'result.0' twice, and a part of the result is kept apart from the " +
+        "others or it is not — the second says nothing the first does not", "1:1")
+
+    dsr_refused(raw"""
+        @disjoint(result.first, result.1)
+        f(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+        print(1)
+        """, "'@disjoint' names a part of the result by its position, as a tuple's part is selected " +
+        "— 'result.0', 'result.1'", "1:18")
+
+// -- what a caller is held to --------------------------------------------------------------------
+
+@test("one part handed to two '@disjoint' parameters is refused, read off the tuple as destructured")
+dsr_one_piece_twice_refused()
+    dsr_refused(raw"""
+        import sysl.slices.split_at
+
+        @disjoint(y, x)
+        add_into(y: []int, x: []const int) = ()
+
+        var v: [4]int = [1, 2, 3, 4]
+        val p = split_at(v[..], 2)
+
+        add_into(p.0, p.0)
+        """, "'add_into' is '@disjoint' over 'y' and 'x', and this call hands them storage that " +
+        "overlaps — 'p.0' and 'p.0' are the same memory, and a body told they never do may keep a " +
+        "value it read through one after the other has written it", "9:1")
+
+    dsr_prints(raw"""
+        import sysl.slices.split_at
+
+        @disjoint(y, x)
+        add_into(y: []int, x: []const int)
+            for i in 0..<y.len
+                y[i] = y[i] + x[i]
+
+        var v: [4]int = [1, 2, 3, 4]
+        val p = split_at(v[..], 2)
+
+        add_into(p.0, p.1)
+        print(v[0], v[1])
+        """, "4 6\n")
