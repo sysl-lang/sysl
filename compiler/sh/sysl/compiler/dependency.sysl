@@ -55,11 +55,15 @@ struct Dependency
     // The machines the dependency is taken on, as the condition its `if` wrote -- `#if`'s language
     // over `dependency_symbols` -- or the empty string where it is taken on every machine.
     condition: string
+
+    // The options of the dependency this entry sets, each by name with the value as written
+    // (`options.sysl`). Held to the dependency's own declarations once its manifest is read.
+    options: Buf[(string, &Conf)]
 end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
 plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
-    Dependency(label, origin, mount, false, buf(), true, buf(), "")
+    Dependency(label, origin, mount, false, buf(), true, buf(), "", buf())
 
 // **The machine a graph is resolved for**, which decides the dependencies an `if` leaves out. Module
 // storage for the reason `features.sysl` gives for the feature request: it is written by the one
@@ -306,8 +310,8 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', 'path', " +
-                "'rev', 'version', 'workspace'")
+                "'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', " +
+                "'options', 'path', 'rev', 'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
     val origin = read_origin(sub, where)?
@@ -332,7 +336,9 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
                 for dir in dirs
                     c_include.push(inside_package(s"$where.c_include", "", dir)?)
 
-    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, condition))
+    val options = read_option_settings(sub, where)?
+
+    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, condition, options))
 end read_dependency
 
 // An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
@@ -355,7 +361,27 @@ end read_condition_key
 private known_dependency_key(key: string) -> bool =
     key == "git" || key == "version" || key == "rev" || key == "path" || key == "mount" || key == "optional" ||
     key == "features" || key == "default_features" || key == "workspace" || key == "c_include" ||
-    key == "if"
+    key == "if" || key == "options"
+
+// An entry's `options`: each option of the dependency this consumer sets, by name, with the value as
+// written. What the value may be is the dependency's manifest's to say, so it is held to that once the
+// manifest is read (`settle_options`); here only the shape is.
+private read_option_settings(sub: &Conf, where: string) -> Result[Buf[(string, &Conf)], string]
+    var out: Buf[(string, &Conf)] = buf()
+
+    val block = conf_at(sub, "options") match
+        None -> return Ok(out)
+        Some(b) -> b
+
+    if !conf_is_block(block)
+        return Err(s"'$where.options' is not a block — it sets the package's options by name, as " +
+            "'options = { slots = 8 }'")
+
+    for name in conf_keys(block)
+        out.push((name, conf_at(block, name).unwrap()))
+
+    Ok(out)
+end read_option_settings
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.

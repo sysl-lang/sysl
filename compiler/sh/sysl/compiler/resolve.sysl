@@ -74,6 +74,10 @@ struct Graph
     // and unselected, and every resolution of the same manifests reads it again. So it is the set a
     // `sysl.sum` has to cover for a build to add nothing to it, which is what `sysl tidy` keeps.
     read: Buf[(string, Release)]
+
+    // Each package's options as settled (`settle_options`): the declarations its files are read
+    // with, keyed as `features` is. A package missing from it declares none.
+    options: Buf[(string, Buf[string])]
 end Graph
 
 // What the selecting pass carries: the version floors, who asked for them, the manifests read so
@@ -198,6 +202,10 @@ resolve_graph(root: string, written: &Manifest, sums: Sums, cache: string,
 
         if same_enabled(next, enabled)
             built.features = enabled
+
+            // **Options are settled once the graph is**: a value decides what a package's source
+            // computes, never which packages are in the build.
+            built.options = settle_options(built.packages, pruned_roots(root_packages()?, enabled))?
 
             shared match
                 None -> ()
@@ -373,7 +381,7 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     for had in state.manifests
         read.push((had.coordinate, had.version.unwrap()))
 
-    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read))
+    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read, buf()))
 end resolve_once
 
 // What the root calls itself when it is the one asking, since it has no coordinate to be named by.
@@ -1260,10 +1268,24 @@ struct PackageSources
     // What a `no module is called` refusal in the project's own files adds, where its manifest names
     // dependencies the machine being built for leaves out (`absent_note`).
     root_absent: string
+
+    // The option declarations the project's own files are read with, and each `--lib` root's, keyed
+    // as `lib_features` is (`options.sysl`).
+    root_options: Buf[string]
+    lib_options: Buf[(string, Buf[string])]
 end PackageSources
 
 // A project that depends on nothing, which is what an empty `dependencies` block means.
-no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf(), buf(), "")
+no_package_sources() -> PackageSources =
+    PackageSources(buf(), buf(), buf(), buf(), buf(), buf(), "", buf(), buf())
+
+// The option declarations one `--lib` root's files are read with.
+lib_option_lines(s: &PackageSources, dir: string) -> Buf[string]
+    for item in s.lib_options
+        if item.0 == dir then return item.1
+
+    buf()
+end lib_option_lines
 
 // The project's manifest as this build resolves it (`reference/packages.md § Dependencies a test
 // alone needs`): under `sysl test` its `dev_dependencies` join its `dependencies` in the one graph,
@@ -1352,6 +1374,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         var none = no_package_sources()
 
         none.root_features = feature_symbols(mine)
+        none.root_options = default_option_lines(m)
 
         // With no graph nothing names a root's coordinate, so each has its `default` on.
         val roots = root_packages() match
@@ -1365,6 +1388,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
             asked.push("default")
             none.lib_features.push((dir, feature_symbols(feature_closure(theirs.features, asked,
                                                                          theirs.dependencies))))
+            none.lib_options.push((dir, default_option_lines(theirs)))
 
         return Ok(none)
     end if
@@ -1390,11 +1414,13 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
     for item in libs
         out.lib_features.push((item,
                                feature_symbols(enabled_of(graph.features, lib_root_key(item)))))
+        out.lib_options.push((item, option_lines_of(graph.options, lib_root_key(item))))
 
     for p in graph.packages
         if is_root_package(p)
             out.root_mounts = p.imports
             out.root_features = feature_symbols(enabled_of(graph.features, ""))
+            out.root_options = option_lines_of(graph.options, "")
             continue
 
         out.roots.push(p.root)
@@ -1413,6 +1439,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         val (manifest, name, version) = manifest_of_tree(p.root, p.manifest.name, p.manifest.version)
         val theirs = Packaging(p.canonical, p.imports, true, manifest, name, version, left_out)
         val gated = feature_symbols(enabled_of(graph.features, p.canonical))
+        val valued = option_lines_of(graph.options, p.canonical)
 
         // **A package's `@tests` files are its own `sysl test`'s and no consumer's**, so they are left
         // unread: one that would not even parse -- written against a newer compiler, or against a
@@ -1422,7 +1449,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
             if header_says_tests(src) then continue
 
-            val parsed = parse(src, t, gated)
+            val parsed = parse(src, t, gated, valued)
 
             if parsed.program.test_only then continue
             if !parsed.ok() then return Err(Reported(parse_report(parsed)))

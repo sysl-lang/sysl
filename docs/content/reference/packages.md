@@ -2095,6 +2095,125 @@ package.hocon: the features here turn each other on — 'server' turns on 'tls',
 All four are read when the manifest is, so they stop a build before anything is fetched — which is
 the same point as the pruning: what a feature decides is decided before the network is touched.
 
+## Options
+
+A feature turns a part of a package on. **An option sizes or tunes a part that is always there** — how
+many tasks a kernel schedules, how deep a queue is, whether a driver logs — and it has a value rather
+than being on or off. A package declares each of its options with a type and a default:
+
+```hocon
+package { name = "kernel", version = "0.1.0" }
+
+options {
+  max_tasks { type = usize, default = 16, range = [2, 256], doc = "how many tasks may exist at once" }
+  trace     { type = bool,  default = false }
+}
+```
+
+| key | says | |
+|---|---|---|
+| `type` | an integer type (`usize`, `u8`, `int`, `i64`, any `iN` or `uN`), `bool` or `string` | required |
+| `default` | the value the package is built with where no consumer sets one | required |
+| `range` | `[low, high]`, both ends included; integer options only | optional |
+| `doc` | what the option is for | optional |
+
+**The package's own files read each option as a constant, `option_<name>`, of the declared type.**
+It is a constant in every sense the language has: it can size an array, appear in an `@assert`, and
+fold wherever a literal would:
+
+```text
+module kernel
+
+val tasks: [option_max_tasks]u32 = [0; option_max_tasks]
+
+@assert(option_max_tasks % 2 == 0, "max_tasks must be even")
+
+capacity() -> usize = tasks.len
+tracing() -> bool = option_trace
+```
+
+As with a feature's `feature_x`, **the name is visible in the package that declared the option and
+nowhere else**. A consumer that writes `option_max_tasks` is told that no such name exists, because
+the constant belongs to the package's files rather than to its interface.
+
+### What a consumer sets
+
+A dependency entry sets values by name:
+
+```hocon
+dependencies {
+  kernel { path = "../kernel", options = { max_tasks = 8 } }
+}
+```
+
+```text
+print(kernel.capacity(), kernel.tracing())
+```
+
+```
+8 false
+```
+
+The entry sets only what it names; `trace` keeps its default. **A package's own manifest gives
+defaults and never values** — `options` in its own file is a declaration, and the only place a value
+is chosen is a consumer's entry.
+
+### The project being built decides
+
+A package is compiled once per build, so each option has one value across the whole graph. **The root
+project's entry wins** wherever it sets one. An intermediate package's value applies only where the
+root sets none, and where two intermediate packages set different values with the root silent, the
+build is refused and both are named:
+
+```
+'github.com.e.mid_a' sets the option 'slots' of 'kern' to 4, and 'github.com.e.mid_b' sets it to 6 —
+a package is built once, with one value for each option, so this project decides: set it in this
+project's own entry for 'kern'
+```
+
+**The root configures a package it does not import directly by giving it an ordinary dependency
+entry.** The entry is matched to the package by its coordinate, or by the directory a `path` names —
+never by the label — so `kernel2 { git = "github.com/e/kernel", version = "0.1.0", options = { … } }`
+configures the same package a dependency reaches as `kernel`.
+
+### What is refused
+
+Everything is checked when the manifests are read, before anything is compiled. A value is held to
+the declaration: **a name the package does not declare**,
+
+```
+this project sets the option 'max_task' of 'kernel', which 'kernel' does not declare — a consumer
+may only set an option that package's own manifest names. It declares 'max_tasks', 'trace'
+```
+
+**a value of the wrong type** — an integer is a decimal number without quotes, a `bool` is `true` or
+`false`, a `string` is quoted — and **a value outside the range**:
+
+```
+this project sets the option 'max_tasks' of 'kernel' to 512, outside the option's range [2, 256]
+```
+
+A declaration is held to itself the same way: a type an option cannot be, a default its type cannot
+hold or that falls outside its range, a range on a non-integer, and a range whose low end is above its
+high end are all refused, naming the key. A key an option does not know (`defualt`) is refused rather
+than ignored, as one in a dependency entry is: somebody who wrote it believes they set a default.
+
+A value inside the range can still be one the package does not accept, and the package says so in its
+own words — the range is the manifest's check, and an `@assert` is the source's:
+
+```
+error: assertion failed: max_tasks must be even — the left side is 1
+```
+
+### Values and the caches
+
+Two builds of one tree with two values are two programs. The run cache and a source root's kept
+artifact each keep one entry per value, so changing a value rebuilds, and changing it back replays the
+entry already made.
+
+Options are set only through dependency entries. The root project's own options always take their
+defaults: there is no command-line flag that sets them.
+
 ## What a dependency's modules are called
 
 A package is a tree of modules, and **its modules come in under their own names**. A module is a
