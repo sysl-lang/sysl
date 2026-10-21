@@ -374,10 +374,12 @@ binding with nothing to take apart names nothing. The right side is produced bef
 bound, so a value there still means whatever the enclosing scope calls it — the binding does not
 shadow itself half way through its own right-hand side.
 
-**A module takes it too**, since a module `val` takes its type as a local does: each name is a module
-`val` of its part's type, read from the module's functions, its other files and the modules that
-import it like any other. A list of values is shared out one each, so a part over a constant is
-constant data; one value taken apart is computed once, however many names it gives.
+**A module takes it too**, since module storage takes its type as a local does: each name is a module
+`val` — or, written with `var`, module storage — of its part's type, read from the module's
+functions, its other files and the modules that import it like any other. A list of values is shared
+out one each, so a part over a constant is constant data; one value taken apart is computed once,
+however many names it gives. Each name a `var` binds is storage of its own, written without touching
+the others.
 
 ```sysl
 static val width, height = 640, 480
@@ -500,19 +502,22 @@ show()
 cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
 ```
 
-Like the comma form, it **is a module `val` per name** at the top of a file, and a type written for
-the whole value governs there as it does here:
+Like the comma form, it **is a module `val` per name** at the top of a file — module storage per name,
+written with `var` — and a type written for the whole value governs there as it does here:
 
 ```sysl
 static val (lo, hi): (u8, u16) = (1, 300)
+static var (count, limit): (u8, u16) = (0, 2)
 
 span() -> u16 = hi - u16(lo)
 
-print(lo, hi, span())
+count += 1
+limit *= 100
+print(lo, hi, span(), count, limit)
 ```
 
 ```output
-1 300 299
+1 300 299 1 200
 ```
 
 The same pattern stands in a
@@ -585,10 +590,54 @@ A generic function's result is the body's type in terms of its parameters, so `p
 `(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
 initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
 
+**A body that is an assignment is `unit`**, plain or compound, to a variable, a field or an element:
+the store is what the function is for. The value an
+[assignment yields](/reference/expressions/#assignment) belongs to the expression around it, and a
+body has none, so `bump() = count += 1` is `bump()`, not an `int` function. A function that hands the
+stored value back says so with `-> T`.
+
+```sysl
+var count = 0
+
+struct Light
+    on: bool
+
+    switch_on(*self) = self.on = true
+
+bump() = count += 1
+reset_to(v: int) -> int = count = v
+
+var lamp = Light(false)
+
+bump()
+lamp.switch_on()
+print(count, lamp.on, bump() == (), reset_to(10), count)
+```
+
+```output
+1 true true 10 10
+```
+
+Using such a call as a value is refused, since there is none:
+
+```sysl
+var count = 0
+
+bump() = count += 1
+
+val next: int = bump()
+```
+
+```error
+cannot initialize 'next': declared int but the value is unit
+```
+
 **The result is known wherever a written one would be.** A call above the declaration, in another
-file of the module, in another module, or through a library reads it, in any order; `sysl doc` shows
-the declaration as written, `= value` and all, and an editor's hover shows it at the type it was read
-as.
+file of the module, in another module, or through a library reads it, in any order. `sysl doc` and an
+editor's hover show the declaration at the type it was read as, exactly as though `-> T` were written
+— `twice(x: int) -> int`, and `shout(word: string)` with no arrow for a `unit` one — and never show
+the body. A signature whose result could not be read, in a tree that does not compile, is shown as
+`twice(x: int) = …`.
 
 **A body that reaches its own function before the result is known has no type to take**, directly or
 through another function that does the same, and is refused at the declaration. Writing the result on
@@ -2548,6 +2597,60 @@ can fail takes the list, and its parentheses are the warning. Note that `self` i
 a *method* at all — a parameter list with no receiver in it declares an **associated function**,
 reached through the type rather than through a value. A property has no parameter list to write one
 in, which is what [`static`](#a-static-property) is for.
+
+**A property written `= value` with no `->` takes the value's type**, exactly as a
+[function's result](#the-result-type) does: `count = self.n` is `count -> int`. It is read the same
+way wherever the property is used — above its declaration, through a generic type's parameters, in an
+`impl` block — and a body whose value is `unit` makes a unit property. A setter beside it takes that
+type for its value. `sysl doc` and an editor's hover show the type, never the body:
+
+```sysl
+struct Counter
+    n: int
+
+    count = self.n
+    doubled = self.count * 2
+    label = s"#${self.n}"
+
+    set count(v)
+        self.n = v
+
+struct Box[T]
+    v: T
+
+    get = self.v
+
+var c = Counter(4)
+
+c.count = 20
+print(c.count + 1, c.doubled, c.label, Box("lid").get, Box(2.5).get * 2)
+```
+
+```output
+21 40 #20 lid 5
+```
+
+The function's rules come with it. A body that reaches the property again before its type is known
+has no type to take, and is told to write one:
+
+```sysl
+struct P
+    x: int
+
+    a = self.b + 1
+    b = self.a * 2
+
+print(P(1).a)
+```
+
+```error
+'P.a' takes its result type from its body, and the body reaches 'P.a' again through 'P.b' — write its result type, 'P.a -> T'
+```
+
+A public property may not hand back a type its readers cannot name, as a written `->` may not. A
+trait's property is a signature every implementation is held to, so it writes its type; an `impl`
+member supplying one may leave it off and takes the trait's. In an enum's body `name = value` is a
+variant and its discriminant, so an enum's inferred property is written in an `impl` block.
 
 ### A property may be settable
 

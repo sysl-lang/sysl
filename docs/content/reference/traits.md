@@ -716,7 +716,7 @@ impl Mul[Point, Point] for real
 
 val p = Point(1, 2)
 val a = p * 2
-val b = 2.0 * p
+val b = 2 * p
 
 print(a.x, a.y, b.x, b.y)
 ```

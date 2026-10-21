@@ -108,7 +108,7 @@ Put back what `raw` or `hidden` changed, and only what they changed -- `sysl.tty
 ### `flush`
 
 ```sysl
-flush()
+flush() -> unit
 ```
 
 Push out everything the C library is holding, on every stream.

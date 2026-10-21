@@ -677,7 +677,8 @@ be reviewed as a diff in a commit, which generated HTML cannot.
 **A page lists every public declaration of its module**, each group under its own heading:
 constants, values (`val`), variables (`var` and `static var`), functions, externs, types, aliases,
 traits and implementations. A declaration's signature is shown as it was written, and its doc
-comment beneath it. A variable is listed because storage a caller may write is as much a part of a
+comment beneath it; a function whose result is [read off its body](/reference/declarations/#the-result-type)
+is shown at that result, `-> T` and all, and its body is never shown. A variable is listed because storage a caller may write is as much a part of a
 module's API as storage it may only read.
 
 | Flag | Means |

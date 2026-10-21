@@ -49,6 +49,11 @@ struct ResultSite
     closure: bool
     library: bool
     member: bool
+    // A property, which a refusal tells to write `name -> T` rather than a function's `name(…) -> T`.
+    property: bool
+    // The type whose own body (or inherent `impl`) declares this member, whose reach the member's
+    // starts from; empty for a free function and for a member supplying a trait's.
+    owner: string
 end ResultSite
 
 // Every result read off a body, and the reading under way.
@@ -71,7 +76,7 @@ result_sites() -> &ResultSites = ResultSites(false, table(), buf(), table(), "")
 // settled already (`held`), it is that.
 note_result_site(a: &Analysis, key: string, label: string, scope: Scope, span: Span, d: FuncDecl,
                  member: bool, held: Option[Type] = None, frame: Option[&NestedFrame] = None,
-                 outer: Buf[Binding] = buf())
+                 outer: Buf[Binding] = buf(), property: bool = false, owner: string = "")
     val slot = result_slot_of(d.ret_type)
 
     if slot.is_none() then return
@@ -81,7 +86,7 @@ note_result_site(a: &Analysis, key: string, label: string, scope: Scope, span: S
     val state = if held.is_some() then 2 else 0
     val site = ResultSite(key, label, scope, span, d, d.vis, frame, outer, state,
                           held.unwrap_or(Unknown), false, false, false, buf(), false,
-                          from_library(a, scope), member)
+                          from_library(a, scope), member, property, owner)
 
     a.results.sites.put(key, site)
 end note_result_site
@@ -121,6 +126,19 @@ settled_result_of(a: &Analysis, key: string) -> Option[Type]
     settle_result(a, found.unwrap())
     Some(found.unwrap().ty)
 end settled_result_of
+
+// A member's signature as a call or a property read finds it. **A result left to the body is settled
+// first** -- a setter's, its property's -- so the call is a reading of the site like any other: one above the declaration gets the
+// type, and one inside the member's own body -- `count = self.count + 1`, `m(self) = self.m()` -- is
+// the loop the site is refused for, rather than a call to a result nobody read.
+member_sig(a: &Analysis, fname: string) -> Option[FuncSig]
+    // A setter's value is its property's result, so a write reads the property's site.
+    a.results.sites.get(source_member_name(fname)) match
+        Some(s) -> if s.member && a.results.open then settle_result(a, s)
+        None -> ()
+
+    a.tables.members.func_insts.get(fname)
+end member_sig
 
 // Reads one declaration's body for its type, once.
 //
@@ -168,9 +186,26 @@ settle_result(a: &Analysis, s: &ResultSite)
             val ret = declared_result_type(Some(resolve_result(a, s.scope, s.decl.ret_type.unwrap(), terms)))
 
             a.tables.members.func_insts.put(s.key, FuncSig(sig.unwrap().params, ret))
+            correct_setter(a, s.key, ret)
         end if
     end if
 end settle_result
+
+// **A setter's value is its property's type**, so a setter paired with a property whose type is read
+// off its body was filed with that value not known yet; it takes the type the property settled on.
+private correct_setter(a: &Analysis, property: string, ty: Type)
+    val key = property + SetterSuffix
+    val found = a.tables.members.func_insts.get(key)
+
+    if found.is_none() || mentions_unknown(ty) then return
+
+    var params: Buf[(string, Type)] = buf()
+
+    for item in found.unwrap().params
+        params.push(if mentions_unknown(item.1) then (item.0, ty) else item)
+
+    a.tables.members.func_insts.put(key, FuncSig(params, found.unwrap().ret))
+end correct_setter
 
 private read_result(a: &Analysis, s: &ResultSite) -> Type
     val got = if s.frame.is_some() then nested_result_type(a, s.frame.unwrap(), s.key, s.decl, s.outer)
@@ -257,15 +292,30 @@ end body_result_type
 
 // A body read for the type it produces: its trailing expression with nothing expected, as a `val`'s
 // initializer is read. A body that gave up comes to `Unknown`.
+//
+// **A body that is an assignment is written for its effect**, so it declares `unit`: `set(*self) =
+// self.v = true` stores and hands nothing back, as the same store written on the line below the
+// signature does. The value an assignment yields is there for the expression around it -- `a = b = 0`,
+// `while (c = next()) != 0` -- and a body has nothing around it to take it.
 own_result_block(cx: &Analyzer, rest: Buf[Stmt]) -> TBlock
     val outer = cx.an.open_region()
-    val block = type_value_block(cx, rest, None, false)
+    val block = type_value_block(cx, rest, None, ends_in_assignment(rest))
     val gave_up = cx.an.poison.is_some()
 
     cx.an.close_region(outer)
 
     if gave_up then TBlock(block.stmts, block.result, Unknown) else block
 end own_result_block
+
+// The body's last statement is an assignment, plain or compound, to whatever place.
+private ends_in_assignment(rest: Buf[Stmt]) -> bool
+    if rest.len() == 0 then return false
+
+    *rest[rest.len() - 1].kind match
+        ExprStmt(e) -> *e.kind match
+            Assign(_, _, _) -> true
+            _ -> false
+        _ -> false
 
 // Every function that leaves its result to its body filed -- a member was filed as it was hoisted --
 // and bodies from here on readable: every declaration is in.
@@ -312,13 +362,13 @@ told_of_result(a: &Analysis, s: &ResultSite)
             via = via + (if i == 0 then " through " else ", ") + s"'${s.through.at(i)}'"
 
         a.fault(s.scope, s.span, s"'${s.label}' takes its result type from its body, and the body " +
-                s"reaches '${s.label}' again$via — write its result type, '${s.decl.name}(…) -> T'")
+                s"reaches '${s.label}' again$via — write its result type, ${written_form(s, "T")}")
         return
     end if
 
     if s.closure
         a.fault(s.scope, s.span, s"'${s.label}' would hand back a closure, whose type has no name for " +
-                s"a signature to state — write its result type, '${s.decl.name}(…) -> &Fn(…) -> R'")
+                s"a signature to state — write its result type, ${written_form(s, "&Fn(…) -> R")}")
         return
     end if
 
@@ -330,9 +380,21 @@ told_of_result(a: &Analysis, s: &ResultSite)
         val shown = if s.decl.exported.is_some() then "'@export'" else "'@convention'"
 
         a.fault(s.scope, s.span, s"'${s.label}' is $shown, so C reads what it hands back, and its " +
-                s"body yields ${type_show(s.ty)} — write its result type, '${s.decl.name}(…) -> T'")
+                s"body yields ${type_show(s.ty)} — write its result type, ${written_form(s, "T")}")
         return
     end if
 
     if !s.member then check_exposed_result(a, s.scope, s.label, s.vis, s.ty, s.span)
+
+    // **A member reaches as far as its type unless it says less**, and a result read off its body is
+    // held to that reach exactly as a written one is (`analyze.sysl:check_exposed_members`).
+    if s.member && s.owner != ""
+        a.tables.access.get(s.owner) match
+            Some(acc) -> check_exposed_result(a, s.scope, s.label, member_reach(acc.vis, s.vis), s.ty, s.span)
+            None -> ()
 end told_of_result
+
+// The signature a refusal tells the declaration to write: `count -> T` for a property, which has no
+// parameter list, and `count(…) -> T` for a function.
+private written_form(s: &ResultSite, result: string) -> string =
+    if s.property then s"'${s.decl.name} -> $result'" else s"'${s.decl.name}(…) -> $result'"

@@ -4,7 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{from_int, to_string, to_string_radix}
 import sysl.slices.contains
-import sysl.text.join
+import sysl.text.{from_utf8_unchecked, join}
 
 // A declaration written back out as the source line a reader of an API reference wants to see --
 // the signature `sysl doc` prints above each symbol's prose.
@@ -292,17 +292,51 @@ private doc_ret_text(ret: Option[TypeRef]) -> string = as_written(ret) match
     Some(r) -> s" -> ${doc_type_text(r)}"
     None -> ""
 
-// What a function hands back as it was written: its `-> T`, or -- a result read off the body -- the
-// `= value` it is read from, as an inferred module `val` shows its initializer. A value too long to
-// show is `…`.
-private doc_result_text(ret: Option[TypeRef], body: Buf[Stmt]) -> string
-    if ret.is_none() || !is_inferred_result(ret) then return doc_ret_text(ret)
-    if body.len() != 1 then return " = \u{2026}"
+// What a function hands back, as its caller sees it: the `-> T` it wrote, or -- a result read off the
+// body -- the type the analysis read it as, rendered as though it had been written (`ResultSlot`'s
+// `shown`). A page documents an API, so the body is never shown. A result no analysis could read --
+// a tree that does not build, or a parse with nothing analyzed -- is ` = …`: the one thing known is
+// that the body decides it.
+private doc_result_text(ret: Option[TypeRef]) -> string = result_slot_of(ret) match
+    None -> doc_ret_text(ret)
+    Some(slot) -> slot.shown.unwrap_or(" = \u{2026}")
 
-    *body.at(0).kind match
-        ExprStmt(e) -> s" = ${doc_expr_text(e)}"
-        _ -> " = \u{2026}"
-end doc_result_text
+// The result clause a function whose result was read off its body as `t` is documented with: no arrow
+// for `unit`, as a written procedure has none, and otherwise the type in the spelling an importer
+// writes, its module path left off. `None` where the reading came to nothing a signature can state.
+doc_result_of(t: Type) -> Option[string]
+    if mentions_unknown(t) || is_closure_literal(t) then return None
+
+    t match
+        Unit -> Some("")
+        _ -> Some(s" -> ${unqualified_text(type_show(t))}")
+end doc_result_of
+
+// A type's text with every module path taken off its names: `sysl.buf.Buf[sysl.Option[int]]` is
+// `Buf[Option[int]]`. A module segment is lower-case and followed by a dot, which no type name, enum
+// variant or number in a type's text is.
+private unqualified_text(text: string) -> string
+    val b = text.bytes
+    var out: Buf[u8] = buf()
+    // Where the word being read began in `out`.
+    var word: usize = 0
+
+    for c in b
+        if c == u8('.') && out.len() > word && out.at(word) >= u8('a') && out.at(word) <= u8('z')
+            out.truncate(word)
+            continue
+        end if
+
+        out.push(c)
+
+        if !is_word_byte(c) then word = out.len()
+
+    from_utf8_unchecked(out.view())
+end unqualified_text
+
+private is_word_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_')
 
 // -- declarations ---------------------------------------------------------------------------------
 
@@ -310,7 +344,7 @@ end doc_result_text
 doc_func(f: FuncDecl) -> string
     val tps = doc_tparams_text(f.tparams, f.bounds, f.tvalues, f.tpacks, f.tdefaults)
 
-    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_result_text(f.ret_type, f.body)}"
+    s"${const_word(f.const_fn)}${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_result_text(f.ret_type)}"
 
 // `const ` in front of a function the compiler may run -- part of its interface, so the page says it.
 private const_word(marked: bool) -> string = if marked then "const " else ""
@@ -331,7 +365,7 @@ private doc_method_bare(m: MethodDecl) -> string
     val tps = doc_tparams_text(m.tparams, m.bounds, m.tvalues, buf(), m.tdefaults)
 
     if m.is_property && m.params.is_empty()
-        return s"${if m.is_static then "static " else ""}${m.name}${tps}${doc_ret_text(m.ret_type)}"
+        return s"${if m.is_static then "static " else ""}${m.name}${tps}${doc_result_text(m.ret_type)}"
 
     var all: Buf[string] = buf()
 
@@ -344,7 +378,7 @@ private doc_method_bare(m: MethodDecl) -> string
     for item in ps
         all.push(item)
 
-    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_result_text(m.ret_type, m.body)}"
+    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_result_text(m.ret_type)}"
 end doc_method_bare
 
 private doc_receiver_text(mode: RecvMode) -> string = mode match
@@ -504,6 +538,8 @@ doc_signature(s: Stmt) -> Option[string] = *s.kind match
     StaticDecl(inner) -> doc_signature(inner) match
         Some(sig) -> Some(doc_after_vis(sig, "static "))
         None -> None
+    // An attribute is left off, as it is above a single `var`.
+    CopiedDecl(_, inner) -> doc_signature(inner)
     _ -> None
 
 // `word` put after the visibility mark that opens `sig`, or in front where it has none.

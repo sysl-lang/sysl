@@ -206,15 +206,15 @@ It is the type's own `abs` and nothing more. What the trait adds is that a gener
 the `sh.sysl.linalg` package pivots on exactly this, which is what lets one Gaussian elimination run over the
 reals and over the plane.
 
-**A scalar may be on either side.** `2.0 * z` and `z * 2.0` are the same product, and `1.0 - z` and
-`2.0 / z` are the ones that are not the mirror of anything:
+**A scalar may be on either side.** `2 * z` and `z * 2` are the same product, and `1 - z` and
+`2 / z` are the ones that are not the mirror of anything:
 
 ```sysl
 import sysl.math.complex.Complex
 
 var z = Complex(3.0, 4.0)
 
-print(2.0 * z, 1.0 + z, 1.0 - z, 2.0 / z)
+print(2 * z, 1 + z, 1 - z, 2 / z)
 ```
 
 ```output

@@ -153,15 +153,35 @@ note_func_reference(cx: &Analyzer, at: Span, key: string)
     val home = f.unwrap().scope
     val d = f.unwrap().decl
 
-    // A result read off the body is shown at the type it was read as, as an inferred `val` is.
-    val shown = settled_result_of(cx.an, key) match
-        Some(t) -> if is_inferred_result(d.ret_type) && !mentions_unknown(t) then
-                       s"${doc_func(d with { ret_type = None })} -> ${type_show(t)}"
-                   else doc_func(d)
+    // A result read off the body is shown at the type it was read as, as an inferred `val` is, and
+    // as `sysl doc` shows it: no arrow for `unit`.
+    val clause = if is_inferred_result(d.ret_type) then settled_result_of(cx.an, key).and_then(doc_result_of)
+    else None
+    val shown = clause match
+        Some(c) -> s"${doc_func(d with { ret_type = None })}$c"
         None -> doc_func(d)
 
     note_reference(cx, at, home.src, f.unwrap().span, declared_name(home, d.name), shown)
 end note_func_reference
+
+// A reference to a member -- a method called, a property read -- filed under `fname`, the function
+// it lowers to. Shown as `sysl doc` shows the member, with a result read off its body at that result.
+note_member_reference(cx: &Analyzer, at: Span, fname: string, m: MethodDecl)
+    if cx.an.index.is_none() then return
+
+    val home = cx.an.tables.members.decl_scope.get(fname)
+    val declared = cx.an.tables.members.decl_spans.get(fname)
+
+    if home.is_none() || declared.is_none() then return
+
+    val clause = if is_inferred_result(m.ret_type) then settled_result_of(cx.an, fname).and_then(doc_result_of)
+    else None
+    val shown = clause match
+        Some(c) -> s"${doc_method(m with { ret_type = None })}$c"
+        None -> doc_method(m)
+
+    note_reference(cx, at, home.unwrap().src, declared.unwrap(), m.name, shown)
+end note_member_reference
 
 // A reference to module storage -- a `val`, a module `var` or an `extern` variable -- shown at the
 // type it is stored at, which for a `val` written with none is its initializer's.

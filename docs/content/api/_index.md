@@ -20,7 +20,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |
-| [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order, read, written in place or appended. |
+| [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
 | [`sysl.encoding.json`](sysl-encoding-json/) | JSON, read and written: a document parsed into a value tree that owns itself, and a value tree written back out compactly or for a person to read. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
@@ -52,6 +52,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.process.hosted`](sysl-process-hosted/) |  |
 | [`sysl.process.sys`](sysl-process-sys/) |  |
 | [`sysl.rand`](sysl-rand/) | Pseudo-random numbers: a named, seedable, reproducible generator, and the distributions that are easy to get wrong. |
+| [`sysl.reflect`](sysl-reflect/) |  |
 | [`sysl.regex`](sysl-regex/) | Matching text against a pattern: compile one, then find, replace or split with it. |
 | [`sysl.seq`](sysl-seq/) | What a sequence of values can be asked, in one trait, so that a slice and a `Buf` answer the same names. |
 | [`sysl.signal`](sysl-signal/) | Signals as flags: a program asks to be told that one arrived, and asks again later whether it has. |

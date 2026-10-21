@@ -1309,6 +1309,7 @@ private parse_member_named(p: *Parser, start: Span, site: MemberSite,
     end if
 
     if p.at_kw("->") then return Some(parse_property_tail(p, start, name, signatures))
+    if p.at_kw("=") && !signatures then return Some(parse_inferred_property(p, start, name, false))
 
     p.want(if site == InType then "':'" else "'->'")
     None
@@ -1404,6 +1405,8 @@ private parse_static_member(p: *Parser, start: Span, signatures: bool) -> Method
         return bad
     end if
 
+    if p.at_kw("=") && !signatures then return parse_inferred_property(p, start, name, true)
+
     p.expect_kw("->")
 
     var decl = blank_method(start, name)
@@ -1490,6 +1493,22 @@ private parse_property_tail(p: *Parser, start: Span, name: string,
     decl.span = start.to(p.just_taken())
     decl
 end parse_property_tail
+
+// `count = self.n` -- a property whose type is its body's, read exactly as a function's `= value` is
+// (`inferred_unless_written`). **Only where a body is owed**: a trait's property is a signature every
+// implementation is held to, so there the line is still a property missing its `->`. An enum's body
+// never reaches here with `name = value`, which is a variant and its discriminant.
+private parse_inferred_property(p: *Parser, start: Span, name: string, is_static: bool) -> MethodDecl
+    var decl = blank_method(start, name)
+
+    decl.is_property = true
+    decl.is_static = is_static
+    decl.ret_type = inferred_unless_written(p, None)
+    decl.body = parse_func_body(p)
+    accept_end_name(p, name)
+    decl.span = start.to(p.just_taken())
+    decl
+end parse_inferred_property
 
 // `sync self` after the `&`, which is the receiver a synchronized method takes.
 private at_sync_self(p: *Parser) -> bool = p.peek_at(1) match
