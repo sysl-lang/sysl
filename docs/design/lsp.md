@@ -2,7 +2,7 @@
 
 The Language Server Protocol, served by the compiler itself over standard input and output. Every
 semantic answer comes from the analysis `sysl build` makes; nothing re-implements the language.
-Status: stage 2 — the slice, the VS Code client (`editors/vscode`), diagnostics for every file an
+Status: stage 2 — the slice, the VS Code client (`sysl-lang/vscode-extension`), diagnostics for every file an
 analysis touches, each binding's name recorded where it is written, and the standard module kept
 across analyses. The questions at the end are answered (Q2–Q5 by the user; Q1 is the move to
 `sysl.encoding.json`, a release after it ships).
@@ -82,15 +82,13 @@ one more reason to keep exactly one analysis running at a time.
 
 ## Editor plugins are thin clients
 
-- **VS Code first — built, `editors/vscode`:** `extension.js` (plain JavaScript, so there is no build
-  step) runs `sysl lsp --stdio` through `vscode-languageclient`; the TextMate grammar is the site's
-  (`docs/grammars/sysl.tmLanguage.json`), copied in by `scripts/grammar.js` before packaging so the
-  two never drift; settings `sysl.path`, `sysl.lib` (→ `SYSL_LIB`), `sysl.trace.server`; a
-  restart command. No language logic in the extension. `npm test` runs `test/session.js`: a real
-  `sysl lsp --stdio` process driven through `vscode-jsonrpc`, the client's own JSON-RPC layer —
-  initialize, didOpen, diagnostics for the document and an unopened sibling, hover, definition into
-  the sibling, the sibling mended and cleared, shutdown, exit 0. The `lsv` suite runs the same
-  binary through a pipe when `SYSL_STAGE2` names one.
+- **VS Code first — built, `sysl-lang/vscode-extension`:** runs `sysl lsp --stdio` through
+  `vscode-languageclient`; the TextMate grammar is a copy of this repository's
+  (`docs/grammars/sysl.tmLanguage.json`) taken from a named sysl commit, which its README records;
+  settings `sysl.server.path`, `sysl.lib` (→ `SYSL_LIB`), `sysl.trace.server`; a restart command.
+  No language logic in the extension. Its `npm test` drives a real `sysl lsp --stdio` process
+  through `vscode-jsonrpc`, the client's own JSON-RPC layer, and tokenizes with `vscode-textmate`.
+  The `lsv` suite runs the same binary through a pipe when `SYSL_STAGE2` names one.
 - **Zed second:** an extension declaring the language server command and using the tree-sitter grammar
   (`sysl-lang/tree-sitter`) for highlighting, indentation and folding — Zed's own model.
 - tree-sitter serves *syntax* (colour, outline before analysis, folding); every *semantic* answer comes

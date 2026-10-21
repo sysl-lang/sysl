@@ -33,8 +33,9 @@
 #      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
 #      is stage 2 having miscompiled itself. Stage 1 against stage 2 is logged and does not decide:
 #      built over two libraries, the two may differ honestly
-#   6. package `sysl-<version>-darwin-arm64.tar.gz`: `bin/sysl` and `share/sysl/library`, which is a
-#      prefix (the binary finds its library beside itself), and its sha256
+#   6. package `sysl-<version>-darwin-arm64.tar.gz`: `bin/sysl`, `share/sysl/library`, and the TextMate
+#      grammar at `share/sysl/editors/sysl.tmLanguage.json` -- a prefix (the binary finds its library
+#      beside itself) -- and its sha256
 #   7. unpack it to a scratch prefix and, with that prefix's binary and no `SYSL_LIB`: `--version`;
 #      build and run a hello program; `sysl test` a small org package; `sysl test <library> --std`
 #   8. write a release-notes skeleton into `<out>`, and print the manual steps that remain
@@ -322,9 +323,10 @@ say "report only -- stage 1 vs stage 2 emit-llvm: $stage12"
 package() {
     local stage=$out/stage
     rm -rf $stage $tarball
-    mkdir -p $stage/bin $stage/share/sysl || return 1
+    mkdir -p $stage/bin $stage/share/sysl/editors || return 1
     cp $out/stage2 $stage/bin/sysl || return 1
     cp -R $library $stage/share/sysl/library || return 1
+    cp $repo/docs/grammars/sysl.tmLanguage.json $stage/share/sysl/editors/sysl.tmLanguage.json || return 1
 
     # No AppleDouble files: `-C stage .` makes the tarball a prefix, and brew installs all of it.
     COPYFILE_DISABLE=1 tar -czf $tarball -C $stage . || return 1
