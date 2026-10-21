@@ -1,0 +1,130 @@
+module sh.sysl.compiler
+@tests
+
+// **A value argument is of its parameter's declared type** (`reference/generics.md § Which values`):
+// `true` at a `usize` is not 1, `1` or `'a'` at a `bool` is not `true`, `65` at a `char` is not `'A'`,
+// and `1` at an enum is not its second variant. Each is refused as a call's argument mismatch is,
+// naming the parameter and its type or function; so is a string, float or tuple, which reads as a
+// value of the wrong type rather than as something that is not a constant. An integer of any width
+// at an integer parameter is still read at it, fit-checked.
+
+// The first diagnostic line and its position, as `file:line:col`.
+private vat_says(src: string, message: string, at: string)
+    val said = enm_outcome(src).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+    assert(!said.contains("must be a constant"), said)
+end vat_says
+
+private vat_types() -> string = raw"""
+    enum Level
+        Low
+        High
+
+    struct Ring[const N: usize]
+        data: [N]byte
+
+    struct Flag[const B: bool]
+        v: int
+
+    struct Ch[const C: char]
+        v: int
+
+    struct G[const L: Level]
+        v: int
+
+    """
+
+@test("a bool at a usize parameter is refused, in a type and in a call")
+vat_bool_at_an_integer()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "var r: Ring[true] = Ring([0; 1])\n", "'N' of 'Ring' is usize, but bool was given",
+             "17:13")
+    vat_says("twice[const N: usize]() -> usize = N * 2\n\nprint(twice[true]())\n",
+             "'N' of 'twice' is usize, but bool was given", "3:13")
+end vat_bool_at_an_integer
+
+@test("an integer or a char at a bool parameter is refused")
+vat_integer_and_char_at_a_bool()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "val f: Flag[1] = Flag(1)\n", "'B' of 'Flag' is bool, but int was given", "17:13")
+    vat_says(vat_types() + "val f: Flag['a'] = Flag(1)\n", "'B' of 'Flag' is bool, but char was given", "17:13")
+end vat_integer_and_char_at_a_bool
+
+@test("an integer or a bool at a char parameter is refused")
+vat_integer_and_bool_at_a_char()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "val c: Ch[65] = Ch(1)\n", "'C' of 'Ch' is char, but int was given", "17:11")
+    vat_says(vat_types() + "val c: Ch[true] = Ch(1)\n", "'C' of 'Ch' is char, but bool was given", "17:11")
+end vat_integer_and_bool_at_a_char
+
+@test("an integer at an enum parameter is not read as a variant, in a type and in a call")
+vat_integer_at_an_enum()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "val g: G[1] = G(1)\n", "'L' of 'G' is Level, but int was given", "17:10")
+    vat_says(vat_types() + "pick[const L: Level]() -> int = if L == High then 1 else 0\n\nprint(pick[1]())\n",
+             "'L' of 'pick' is Level, but int was given", "19:12")
+end vat_integer_at_an_enum
+
+@test("a string, a float and a tuple name the mismatch rather than asking for a constant")
+vat_other_literals_name_the_type()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "var r: Ring[\"ab\"] = Ring([0; 1])\n", "'N' of 'Ring' is usize, but string was given",
+             "17:13")
+    vat_says(vat_types() + "var r: Ring[1.5] = Ring([0; 1])\n", "'N' of 'Ring' is usize, but real was given",
+             "17:13")
+    vat_says(vat_types() + "var r: Ring[(1, 2)] = Ring([0; 1])\n",
+             "'N' of 'Ring' is usize, but (int, int) was given", "17:13")
+end vat_other_literals_name_the_type
+
+@test("a const of the wrong type is refused, and so is an enclosing value parameter of the wrong type")
+vat_named_constants_of_the_wrong_type()
+    if !enm_ready() then return
+
+    vat_says(vat_types() + "const On = true\n\nvar r: Ring[On] = Ring([0; 1])\n",
+             "'N' of 'Ring' is usize, but bool was given", "19:13")
+    vat_says(vat_types() + "wrap[const N: usize]() -> int\n    val f: Flag[N] = Flag(1)\n    f.v\n\n" +
+             "print(wrap[1]())\n", "'B' of 'Flag' is bool, but usize was given", "18:17")
+end vat_named_constants_of_the_wrong_type
+
+@test("a default of the wrong type is refused in the default's own words")
+vat_default_of_the_wrong_type()
+    if !enm_ready() then return
+
+    vat_says("struct D[const B: bool = 1]\n    v: int\n\nval d: D = D(1)\nprint(d.v)\n",
+             "the default for 'B' is bool, but int was given", "1:26")
+end vat_default_of_the_wrong_type
+
+@test("every argument of the parameter's own type is still accepted")
+vat_the_right_kinds_still_read()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(vat_types() + raw"""
+        pick[const L: Level]() -> int = if L == High then 1 else 0
+
+        wrap[const B: bool, const N: usize]() -> int
+            val f: Flag[B] = Flag(1)
+            val r: Ring[N] = Ring([0; N])
+            f.v + int(r.data.len)
+
+        const On = true
+        const Base = 2
+        const Small: u8 = 3
+
+        val a: G[High] = G(1)
+        val b: G[Level.Low] = G(2)
+        val c: Flag[On] = Flag(3)
+        val d: Ch['z'] = Ch(4)
+        val e: Ring[Base + 1] = Ring([0; 3])
+        val f: Flag[1 < 2] = Flag(5)
+        val g: Ring[Small] = Ring([0; 3])
+
+        print(a.v, b.v, c.v, d.v, e.data.len, f.v, g.data.len, pick[High](), pick[Level.Low](), wrap[true, 3]())
+        """), "1 2 3 4 3 5 3 1 0 4\n")
+end vat_the_right_kinds_still_read
