@@ -678,6 +678,60 @@ it is laid out by the linker's own defaults, which say nothing about a board's f
 board is to run names its `linker_script` too. Where there is a script and no `entry`, the script's
 `ENTRY` decides and the command line names none.
 
+### A feature may set a target's keys again
+
+One program built for two cores of one chip, or for two memory layouts of one board, links by two
+scripts from one manifest. **A `features` block inside a target block sets that block's keys again
+while a feature is on**:
+
+```hocon
+features { m7 = [], m4 = [] }
+
+targets {
+  thumb-freestanding {
+    linker_script = "m7.ld"
+    features {
+      m7 { linker_script = "m7.ld" }
+      m4 { linker_script = "m4.ld", entry = "m4_reset" }
+    }
+  }
+}
+```
+
+`sysl build --target thumb-freestanding --features m4 .` links by `m4.ld` and starts at `m4_reset`;
+`--features m7`, or no feature at all, links by `m7.ld`. A feature's block sets only what it names,
+and the target block's own keys stand for every key no enabled feature sets.
+
+A feature block may set **every key a target block takes**: `triple`, `linker`, `linker_script`,
+`entry`, `capabilities` and `codegen` (a capability or a code generation setting each counting as one
+key). What it may not do is be ambiguous:
+
+- **two enabled features that set the same key are refused**, naming both, since the build would be
+  told two things about one link:
+
+  ```
+  the features 'm7' and 'm4' are both on, and both set 'targets.thumb-freestanding.linker_script' —
+  'targets.thumb-freestanding.features.m7' and 'targets.thumb-freestanding.features.m4' would each
+  lay out the same key, so turn one of the two off, or set the key in only one of them
+  ```
+
+  Only the block for the machine being built is held to this, so `sysl test`, which turns every
+  feature on and builds for the host, is not refused over a board's block;
+- **a block for a feature the package does not declare is refused** when the file is read, as a
+  misspelling would otherwise configure nothing:
+
+  ```
+  'targets.thumb-freestanding.features.m5' sets keys for the feature 'm5', which this package does
+  not declare — a feature has to be declared in the 'features' block before a target block can say
+  what it changes. It declares 'm7', 'm4'
+  ```
+
+As with the target block itself, **only the root project's feature blocks apply**, and a dependency
+whose feature block names a linker, script or entry is refused as its target block would be.
+
+This spelling is provisional: the manifest's syntax is reviewed as a whole in 0.4.0, and a feature's
+target keys may be respelled there.
+
 ### When the image has a `main`
 
 A program's `main` is where its computed module storage is filled, its top-level statements run and
