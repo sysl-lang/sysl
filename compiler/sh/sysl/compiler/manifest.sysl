@@ -142,6 +142,14 @@ struct Manifest
 
     // The `test` block: how this package's own suite is run where the command line does not say.
     tests: TestSettings
+
+    // The `options` block: each valued option this package declares, its type, default and range
+    // (`options.sysl`).
+    options: Buf[PackageOption]
+
+    // The `features` block inside each `targets.<name>` block: the keys of that block each feature
+    // sets while it is on (`target_features.sysl`). Only the root project's apply.
+    feature_targets: Buf[FeatureTarget]
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -165,7 +173,7 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings())
+             buf(), buf(), no_test_settings(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -202,6 +210,10 @@ end manifest_provides
 
 // The triple a machine the `targets` block describes names, where it describes that machine.
 declared_triple(m: &Manifest, target: string) -> Option[string]
+    val featured = featured_triple(m, target)
+
+    if featured.is_some() then return featured
+
     for i in 0..<m.targets.len()
         if m.targets.at(i).0 == target then return Some(m.targets.at(i).1)
 
@@ -276,6 +288,10 @@ private standing(t: Target, cap: string) -> bool = !holds_string(machine_lacks(t
 // project's, and `otherwise` -- what the machine has by being the machine it is -- where neither
 // says anything.
 private capability_given(m: &Manifest, target: string, cap: string, otherwise: bool) -> bool
+    val featured = featured_capability(m, target, cap)
+
+    if featured.is_some() then return featured.unwrap()
+
     for row in m.target_capabilities
         if row.0 == target && row.1 == cap then return row.2
 
@@ -498,6 +514,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     var target_codegen_registers: Buf[(string, string, string)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
+    var feature_targets: Buf[FeatureTarget] = buf()
 
     conf_at(root, "targets") match
         None -> ()
@@ -513,6 +530,14 @@ read_manifest(text: string) -> Result[Manifest, string]
                     return Err(s"'targets.${named.at(i)}' is not a block describing a target")
 
                 targets.push((named.at(i), conf_text(entry, "triple")))
+
+                // A key the block does not know is said and skipped, as a top-level one is -- a block
+                // nested under a name this compiler has never heard of included.
+                for key in conf_keys(entry)
+                    if !known_target_key(key) then warnings.push(unknown_key(s"targets.${named.at(i)}.$key"))
+
+                for ft in read_feature_targets(entry, named.at(i), &warnings)?
+                    feature_targets.push(ft)
 
                 val image = read_image(entry, named.at(i))?
 
@@ -552,6 +577,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
     val tests = read_test_settings(root, &warnings)?
+    val options = read_options(root)?
 
     val codegen_read = conf_at(root, "codegen") match
         None -> (buf(), buf(), None)
@@ -571,11 +597,16 @@ read_manifest(text: string) -> Result[Manifest, string]
     for i in 0..<keys.len()
         if !known_top_key(keys.at(i)) then warnings.push(unknown_key(keys.at(i)))
 
-    Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
+    val made = Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
-                codegen_read.1, target_codegen_registers, tests))
+                codegen_read.1, target_codegen_registers, tests, options, feature_targets)
+    val unnamed = undeclared_feature_target(made)
+
+    if unnamed.is_some() then return Err(unnamed.unwrap())
+
+    Ok(made)
 end read_manifest
 
 // The `test` block: `jobs`, `timeout` and `alone`, each what the command line would otherwise say.
@@ -657,7 +688,7 @@ end read_bounds_locations
 // **A register setting names its register as text** (`thread_pointer = "tpidr_el1"`), checked here
 // against the registers there are; whether the machine has them is the driver's question. Beside the
 // settings and the registers, the `extensions` list, or `None` where the block names none.
-private read_codegen(block: &Conf,
+read_codegen(block: &Conf,
                      where: string) -> Result[(Buf[(string, bool)], Buf[(string, string)],
                                                Option[Buf[string]]), string]
     if !conf_is_block(block)
@@ -733,6 +764,10 @@ end read_extensions
 // What the manifest says about one code generation setting on the machine `target`: the target's
 // own `codegen` block over the project's, and off where neither says anything.
 codegen_given(m: &Manifest, target: string, setting: string) -> bool
+    val featured = featured_codegen(m, target, setting)
+
+    if featured.is_some() then return featured.unwrap()
+
     for row in m.target_codegen
         if row.0 == target && row.1 == setting then return row.2
 
@@ -745,6 +780,10 @@ end codegen_given
 // What the manifest says about one register setting on the machine `target`: the target's own
 // `codegen` block over the project's, and nothing where neither names one.
 codegen_register_given(m: &Manifest, target: string, setting: string) -> Option[string]
+    val featured = featured_register(m, target, setting)
+
+    if featured.is_some() then return featured
+
     for row in m.target_codegen_registers
         if row.0 == target && row.1 == setting then return Some(row.2)
 
@@ -784,7 +823,7 @@ end read_workspace
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
 // are understood, and a refusal would make every key ever added a break with every compiler before
 // it.
-private unknown_key(path: string) -> string =
+unknown_key(path: string) -> string =
     s"$ManifestName: '$path' is not something this sysl understands, and is ignored — either it " +
     "is a misspelling, or it was added by a newer compiler"
 
@@ -808,7 +847,7 @@ private not_a_capability(written: string, where: string) -> string =
 // A `capabilities` block, the project's or one target's: each name one of the three, and each value
 // a flag. **A misspelled name is refused rather than ignored**, since a `treads = false` that did
 // nothing would leave the writer believing the machine had been described.
-private read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
     var out: Buf[(string, bool)] = buf()
     val keys = conf_keys(block)
 
@@ -1743,8 +1782,16 @@ private known_package_key(key: string) -> bool =
     key == "name" || key == "version" || key == "sysl" || key == "description" ||
     key == "license" || key == "authors" || key == "repository" || key == "keywords"
 
+// What a `targets.<name>` block says: the machine's triple, how its image is linked
+// (`image_link.sysl`), the `capabilities` and `codegen` blocks layered over the project's, and the
+// `features` that set any of those again (`target_features.sysl`).
+private known_target_key(key: string) -> bool =
+    key == "triple" || key == "linker" || key == "linker_script" || key == "entry" ||
+    key == "capabilities" || key == "codegen" || key == "features"
+
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c" || key == "test"
+    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c" || key == "test" ||
+    key == "options"

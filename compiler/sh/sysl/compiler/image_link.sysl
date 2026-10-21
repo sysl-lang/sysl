@@ -107,10 +107,13 @@ end image_first_key
 
 // What the manifest says about the image of the machine of this name.
 image_for(m: &Manifest, target: string) -> Option[ImageLink]
-    for item in m.images
-        if item.target == target then return Some(item)
+    var base: Option[ImageLink] = None
 
-    None
+    for item in m.images
+        if item.target == target then base = Some(item)
+
+    // With the keys of the block's enabled features laid over it (`target_features.sysl`).
+    featured_image(m, target, base)
 end image_for
 
 // Whether a target's program is a bare ELF image, linked by `ld.lld` with nothing of the host's: a
@@ -142,8 +145,15 @@ image_refusal(root: string, m: Manifest, t: Target) -> Option[string]
         manifest_at(tree.dir) match
             Err(_) -> ()
             Ok(theirs) ->
-                if !theirs.images.is_empty()
-                    val said = theirs.images.at(0)
+                var said_images = theirs.images
+
+                // A feature's block setting an image key is the same claim, made conditionally.
+                for ft in theirs.feature_targets
+                    if ft.image.linker != "" || ft.image.script != "" || ft.image.entry != ""
+                        said_images.push(ft.image with { target = s"${ft.target}.features.${ft.feature}" })
+
+                if !said_images.is_empty()
+                    val said = said_images.at(0)
 
                     return Some(s"'${tree.who}' sets 'targets.${said.target}." +
                         s"${image_first_key(said)}' in its package.hocon, and how an image is linked " +
