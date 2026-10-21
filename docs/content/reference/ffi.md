@@ -1158,7 +1158,9 @@ storage — `val start: i32 = counter()` below is storage because `counter` read
 could differ it is not laid down.** An integer operation whose result its type does not hold, a
 division by zero, a shift by the operand's width or more: each of these leaves the initializer as code, run before the program's
 statements like any other computed one — so on a freestanding archive it is refused below rather
-than given a value the program would never have computed. A `f32` is rounded after every operation,
+than given a value the program would never have computed. (Arithmetic written out of literals alone
+never gets this far: [it is exact](/reference/types/#arithmetic-over-literals-is-exact), and one
+whose value does not fit, or that divides by a literal zero, is refused.) A `f32` is rounded after every operation,
 as the machine rounds it, so `val g: f32 = 16777216.0 + 1.0 + 1.0` holds `16777216`.
 
 **A conversion to a constrained type is constant data when what it converts is.** A `new` type, or

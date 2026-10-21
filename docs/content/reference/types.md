@@ -104,6 +104,69 @@ print(small + 10)
 
 Overflow is therefore **not** a trap source. See [errors and traps](/reference/errors/) for what is.
 
+### Arithmetic over literals is exact
+
+An expression written out of integer literals alone — `1 << 32`, `(1 << 16) - 1`, `200 + 100` — is
+a constant the compiler computes with no width at all, and **the value it comes to must fit the type
+it is read at**, exactly as a single literal's must. Wrapping is what happens to a value held in a
+variable; a value nobody has stored yet has nothing to wrap in, so a constant that does not fit is a
+mistake in what was written.
+
+```sysl
+val b: u32 = 1 << 32
+```
+
+```error
+the value 4294967296 does not fit uint
+```
+
+Only the **whole** expression is held to the type. The steps on the way are plain numbers, so a step
+may pass the type's range provided the result comes back inside it, and a division or a right shift
+works on the exact value rather than a wrapped one:
+
+```sysl
+val mask: u32 = (1 << 32) - 1
+val top: u32 = ((1 << 40) - 1) >> 20
+val low: u8 = ~0xF0
+
+print(mask, top, low)
+```
+
+```output
+4294967295 1048575 15
+```
+
+`~` is the complement at the type's own width, so `~0` is a `u32`'s largest value rather than the
+`-1` that has no place in an unsigned type. Suffixed literals are literals too: `255u8 + 1u8` is
+refused as the value 256. A literal with no type from its context is an `int` here as well, so
+`val big = 1 << 40` is refused as `int`, and is written `val big: long = 1 << 40`.
+
+A division or a remainder by a literal zero has no value at all, and is refused where it is written:
+
+```sysl
+val z = 1 + 10 / (3 - 3)
+```
+
+```error
+a constant divided by zero
+```
+
+**A name anywhere in the expression makes it ordinary arithmetic**, which wraps. A `const` is a
+name, so the arithmetic built on it is the arithmetic of its type:
+
+```sysl
+const Base: u8 = 200
+
+print(Base + 100)
+```
+
+```output
+44
+```
+
+A literal read as a float is not an integer constant at all: `val r: f64 = 1 / 0` is IEEE 754's
+division, and is infinity.
+
 ### Storage is not `N / 8`
 
 An integer's alignment rounds up to the smallest width the target names, and its stride rounds up to

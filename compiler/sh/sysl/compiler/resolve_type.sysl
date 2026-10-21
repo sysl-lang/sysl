@@ -425,6 +425,15 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Unknown
     end if
 
+    // So is one past what an array's type can carry, where reading it as a length would leave some
+    // other number of elements -- `[1 << 32]u8` would otherwise be an array of none.
+    val oversized = oversized_extent(a, scope, written, subst)
+
+    if oversized.is_some()
+        a.fault(scope, span, s"an array cannot have ${to_string(oversized.unwrap())} elements")
+        return Unknown
+    end if
+
     Array(int(const_extent(a, scope, span, written, subst)), addressable(a, scope, span, e, "an array"))
 end resolve_array
 
@@ -483,6 +492,20 @@ private negative_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]
 
     if n < from_int(0) then Some(n) else None
 end negative_extent
+
+// A written length that folds to more elements than an array's type holds, literal or not.
+private oversized_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
+
+    if folded.is_none() || !too_many_elements(folded.unwrap()) then None else folded
+end oversized_extent
 
 // The names a substitution binds to a value -- a value parameter, or the loop variable of a
 // `for const`.

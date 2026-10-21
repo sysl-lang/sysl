@@ -188,7 +188,9 @@ unsigned value is written as the subtraction it actually is. Unary `~` is define
 type, signed or not.
 
 Integer arithmetic **wraps** at the declared width; see [types](/reference/types/). Integer division
-by zero traps.
+by zero traps. Arithmetic written out of literals alone is the exception to both: it is computed
+exactly, a value that does not fit its type is refused, and so is a division by a literal zero —
+see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exact).
 
 ### Shifting by the width or more
 
@@ -225,6 +227,18 @@ left shift is the exception and does trap**, on its own terms and not the shift 
 
 The amount is **not masked**, as it is in C, in Java, and by the bare instruction. Masking makes
 `x >> 64` equal `x`, which is almost never what a program intends.
+
+A shift of a **literal** by a literal is a constant, computed exactly: `1 >> 40` is `0` at any
+width, and `1 << 40` is 1099511627776, which a `long` holds and an `int` does not.
+
+```sysl
+val wide: long = 1 << 40
+val narrow: int = 1 << 40
+```
+
+```error
+the value 1099511627776 does not fit int
+```
 
 ### Equality reaches further than ordering
 
