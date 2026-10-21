@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A property written `name = value`, with no `-> T`, takes the value's type, exactly as a function
+// whose body is `= value` does (`reference/declarations.md § A property`). The rules are the
+// function's: a body that reaches the property before its type is known is refused, a public one may
+// not expose a private type, a trait's own property writes its type, and `sysl doc` and an editor's
+// hover show the type it was read as. In an enum's body `name = value` stays a variant with its
+// discriminant.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ipr_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program of the files given, `main.sysl` among them.
+private ipr_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-ipr").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end ipr_root
+
+// What the program prints, or the report it was refused with.
+private ipr_ran(files: []const (string, string)) -> string
+    val root = ipr_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ipr_ran
+
+// The report a program was refused with, empty where it was not.
+private ipr_report(files: []const (string, string)) -> string
+    val root = ipr_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ipr_report
+
+private ipr_prints(text: string, want: string)
+    if !ipr_ready() then return
+
+    assert_eq(ipr_ran([("main.sysl", text)]), want)
+
+// Refused with exactly `message`, first, at `at` (`file:line:col`).
+private ipr_refused_in(files: []const (string, string), message: string, at: string)
+    if !ipr_ready() then return
+
+    val said = ipr_report(files)
+    val head = s"error: $message"
+    val place = s"--> $at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at $place\ngot\n$said")
+end ipr_refused_in
+
+private ipr_refused(text: string, message: string, at: string) =
+    ipr_refused_in([("main.sysl", text)], message, s"main.sysl:$at")
+
+// -- the type the body gives ----------------------------------------------------------------------
+
+@test("a property written '= value' is read at the value's type: an int, a string, a property of a property")
+ipr_reads_at_type() =
+    ipr_prints("struct Counter\n    n: int\n\n    count = self.n\n    doubled = self.count * 2\n" +
+               "    label = s\"#${self.n}\"\n    half = real(self.n) / 8\n\n" +
+               "val c = Counter(4)\n\nprint(c.count + 1, c.doubled, c.label + \"!\", c.half)\n",
+               "5 8 #4! 0.5\n")
+
+@test("a property is read off its body in an inherent impl block, on an enum, and as a static property")
+ipr_impl_enum_static() =
+    ipr_prints("struct P\n    n: int\n\n    static origin = P(0)\n\nimpl P\n    tripled = self.n * 3\n\n" +
+               "enum Light\n    Red\n    Green\n\nimpl Light\n    next = self match\n        " +
+               "Red -> Light.Green\n        Green -> Light.Red\n\n" +
+               "print(P(2).tripled, P.origin.n, Light.Red.next == Light.Green)\n",
+               "6 0 true\n")
+
+@test("a property read above its declaration, and one that reads a later one, get the type in either order")
+ipr_any_order() =
+    ipr_prints("struct P\n    n: int\n\n    first = self.second + 1\n    second = self.n * 10\n\n" +
+               "print(P(1).first, P(1).second)\n",
+               "11 10\n")
+
+@test("a generic owner's property is its body's type in terms of the type's parameters, fixed per value")
+ipr_generic_owner() =
+    ipr_prints("struct Box[T]\n    v: T\n\n    get = self.v\n    pair = (self.v, self.get)\n\n" +
+               "print(Box(3).get + 1, Box(\"s\").get + \"!\", Box(2.5).pair.1)\n",
+               "4 s! 2.5\n")
+
+@test("a property whose body is unit is a unit property, read for its effect")
+ipr_unit_body() =
+    ipr_prints("struct P\n    n: int\n\n    show = print(\"n\", self.n)\n\nval u = P(7).show\nprint(u == ())\n",
+               "n 7\ntrue\n")
+
+@test("a setter paired with a property read off its body takes that type for its value")
+ipr_setter() =
+    ipr_prints("struct Counter\n    n: int\n\n    count = self.n\n\n    set count(v)\n        self.n = v\n\n" +
+               "var c = Counter(1)\n\nc.count = 41\nprint(c.count + 1)\n",
+               "42\n")
+
+@test("a setter written to before its property is read anywhere still takes the property's type")
+ipr_setter_first() =
+    ipr_prints("struct Counter\n    n: int\n\n    set count(v)\n        self.n = v\n\n    count = self.n\n\n" +
+               "var c = Counter(1)\n\nc.count = 9\nprint(c.n)\n",
+               "9\n")
+
+@test("an impl member supplying a trait's property hands back the trait's type, its body read against it")
+ipr_trait_impl() =
+    ipr_prints("trait Sized\n    size -> u8\n\nstruct M\n    v: int\n\nimpl Sized for M\n    size = 255\n\n" +
+               "print(M(1).size + u8(0))\n",
+               "255\n")
+
+@test("in an enum's body 'name = value' is a variant and its discriminant, not a property")
+ipr_enum_body_is_a_variant() =
+    ipr_prints("enum E\n    A\n    count = 3\n\nprint(E.count == E.count, E.A == E.A)\n", "true true\n")
+
+@test("the parser reads 'name = value' in a struct's body as a property whose result is left to the body")
+ipr_parse_shape()
+    val r = parse(source_of("t.sysl", "struct S\n    x: int\n\n    c = self.x\n    d -> int = 1\n" +
+                                        "    static z = S(0)\n"))
+
+    assert(r.ok(), "the file did not parse")
+
+    var shapes = ""
+
+    for item in r.program.body
+        *item.kind match
+            StructDecl(d) ->
+                for m in d.members
+                    val shape = if is_inferred_result(m.ret_type) then "inferred"
+                    else if m.ret_type.is_some() then "written" else "none"
+
+                    shapes = shapes + s"${m.name}:${m.is_property}:${m.is_static}:$shape "
+            _ -> ()
+
+    assert_eq(shapes, "c:true:false:inferred d:true:false:written z:true:true:inferred ")
+end ipr_parse_shape
+
+// -- what has no type to take ---------------------------------------------------------------------
+
+@test("a trait's own property writes its type, so 'name = value' there is still a property missing its '->'")
+ipr_trait_property_refused() =
+    ipr_refused("trait T\n    f(self) -> int\n    y = 3\n\nprint(1)\n", "'->' expected", "3:7")
+
+@test("a property whose body reads the property itself is refused as calling itself")
+ipr_self_read_refused() =
+    ipr_refused("struct P\n    x: int\n\n    again = self.again + 1\n\nprint(P(1).again)\n",
+                "'again' reads the property it is defining, so it calls itself — the value a property " +
+                "computes is not the property", "4:18")
+
+@test("two properties that reach each other are refused, told to write 'name -> T', in either order")
+ipr_loop_refused()
+    ipr_refused("struct P\n    x: int\n\n    a = self.b + 1\n    b = self.a * 2\n\nprint(P(1).a)\n",
+                "'P.a' takes its result type from its body, and the body reaches 'P.a' again through " +
+                "'P.b' — write its result type, 'P.a -> T'", "4:5")
+    ipr_refused("struct P\n    x: int\n\n    b = self.a * 2\n    a = self.b + 1\n\nprint(P(1).a)\n",
+                "'P.b' takes its result type from its body, and the body reaches 'P.b' again through " +
+                "'P.a' — write its result type, 'P.b -> T'", "4:5")
+end ipr_loop_refused
+
+@test("a method that reaches itself before its result is known is refused, not miscompiled")
+ipr_method_recursion_refused()
+    ipr_refused("struct P\n    x: int\n\n    m(self) = self.m() + 1\n\nprint(P(1).m())\n",
+                "'P.m' takes its result type from its body, and the body reaches 'P.m' again — write its " +
+                "result type, 'P.m(…) -> T'", "4:5")
+    ipr_prints("struct P\n    x: int\n\n    m(self, k: int) -> int = if k == 0 then self.x else self.m(k - 1) + 1\n\n" +
+               "print(P(1).m(3))\n",
+               "4\n")
+end ipr_method_recursion_refused
+
+@test("a property whose body hands back a closure is refused, its type having no name to state")
+ipr_closure_refused() =
+    ipr_refused("struct P\n    n: int\n\n    f = (x: int) -> x + 1\n\nprint(1)\n",
+                "'P.f' would hand back a closure, whose type has no name for a signature to state — write " +
+                "its result type, 'P.f -> &Fn(…) -> R'", "4:5")
+
+@test("a public property or method whose type is private is refused as one written is; a private one is not")
+ipr_exposure()
+    val head = "module cfg\n\nprivate struct Hid\n    x: int\n\nprivate mk() -> Hid = Hid(1)\n\n"
+    val main = "import cfg\n\nprint(cfg.Open(1).fine)\n"
+
+    ipr_refused_in([("cfg/cfg.sysl", head + "struct Open\n    x: int\n\n    leak = mk()\n    fine = 1\n"),
+                    ("main.sysl", main)],
+                   "'cfg.Open.leak' is public, but its result names 'cfg.Hid', which is private to " +
+                   "'cfg/cfg.sysl', the file that declares it — a declaration may not be more visible than " +
+                   "the types it names", "cfg/cfg.sysl:11:5")
+    ipr_refused_in([("cfg/cfg.sysl", head + "struct Open\n    x: int\n\n    leak(self) = mk()\n    fine = 1\n"),
+                    ("main.sysl", main)],
+                   "'cfg.Open.leak' is public, but its result names 'cfg.Hid'", "cfg/cfg.sysl:11:5")
+
+    if !ipr_ready() then return
+
+    assert_eq(ipr_ran([("cfg/cfg.sysl", head + "struct Open\n    x: int\n\n    private hidden = mk()\n" +
+                                        "    fine = self.hidden.x + 1\n"),
+                       ("main.sysl", main)]), "2\n")
+end ipr_exposure
+
+// -- sysl doc and hover ---------------------------------------------------------------------------
+
+// Every signature `sysl doc` writes for a one-file module `demo`, members indented under their type.
+private ipr_documented(src: string) -> string
+    val root = ipr_root([("demo/demo.sysl", s"module demo\n\n$src")])
+    val modules = read_doc_tree(root, true, (_) -> ())
+
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for m in modules.unwrap()
+        for sym in m.symbols
+            out = s"$out${sym.signature}\n"
+
+            for member in sym.members
+                out = s"$out  ${member.signature}\n"
+
+    out
+end ipr_documented
+
+@test("sysl doc shows a property read off its body at its type, as though written, and never the body")
+ipr_doc()
+    if !ipr_ready() then return
+
+    val out = ipr_documented("struct Box[T]\n    v: T\n    n: int\n\n    get = self.v\n    count = self.n\n" +
+                             "    label = \"box\"\n    show = print(self.n)\n    static empty = 0\n")
+
+    assert(out.contains("  get -> T\n"), out)
+    assert(out.contains("  count -> int\n"), out)
+    assert(out.contains("  label -> string\n"), out)
+    assert(out.contains("  show\n"), out)
+    assert(out.contains("  static empty -> int\n"), out)
+    assert(!out.contains(" = "), out)
+end ipr_doc
+
+@test("an editor's hover shows a property read off its body, and a method's result, at that type")
+ipr_hover()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ipr-hover").unwrap()
+
+    write_text(s"$root/t.sysl", "struct C\n    n: int\n\n    count = self.n\n    twice(self) = self.n * 2\n" +
+                                "    written -> int = 1\n\nval c = C(3)\n\n" +
+                                "print(c.count, c.twice(), c.written)\n").unwrap()
+
+    val ix = indexed_file(s"$root/t.sysl").unwrap()
+    var out = ""
+
+    for item in ix.references
+        if item.at_file.ends_with("/t.sysl") && item.detail != "" then out = s"$out${item.detail};"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains("count -> int;"), out)
+    assert(out.contains("twice(self) -> int;"), out)
+    assert(out.contains("written -> int;"), out)
+end ipr_hover

@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.text.{repeat}
@@ -198,7 +199,12 @@ sst_struct_name_missing_colon()
     sst_expect("struct P\n    x: int\n    y 5\n\nprint(1)\n", "':' expected", 3, 7, "    y 5")
     sst_expect("struct P\n    x: int\n    y \"s\"\n\nprint(1)\n", "':' expected", 3, 7, "    y \"s\"", 3)
     sst_expect("struct P\n    x: int\n    y int\n\nprint(1)\n", "':' expected", 3, 7, "    y int", 3)
-    sst_expect("struct P\n    x: int\n    y = 3\n\nprint(1)\n", "':' expected", 3, 7, "    y = 3")
+
+@test("a name followed by '=' under a struct's fields is a property whose type is its value's")
+sst_struct_name_equals_is_property()
+    val r = parse(source_of("t.sysl", "struct P\n    x: int\n    y = 3\n\nprint(1)\n"))
+
+    assert(r.ok(), "'y = 3' in a struct's body did not parse")
 
 @test("the first line of a struct's body is read the same way")
 sst_struct_first_name_missing_colon()
@@ -237,9 +243,22 @@ sst_impl_name_missing_arrow()
                "    y \"s\"", 3)
     sst_expect(s"${head}    f(self) -> int = 1\n    y int\n\nprint(1)\n", "'->' expected", 7, 7,
                "    y int", 3)
-    sst_expect(s"${head}    f(self) -> int = 1\n    y = 3\n\nprint(1)\n", "'->' expected", 7, 7,
-               "    y = 3")
     sst_expect(s"${head}    y 5\n\nprint(1)\n", "'->' expected", 6, 7, "    y 5")
+
+@test("a name followed by '=' in an impl block's body is a property, refused where the trait has none")
+sst_impl_name_equals_is_property()
+    val head = "trait T\n    f(self) -> int\nstruct P\n    x: int\nimpl T for P\n"
+    val r = parse(source_of("t.sysl", s"${head}    f(self) -> int = 1\n    y = 3\n\nprint(1)\n"))
+
+    assert(r.ok(), "'y = 3' in an impl block's body did not parse")
+
+    if !sst_ready() then return
+
+    val (out, _, code) = sst_run(s"${head}    f(self) -> int = 1\n    y = 3\n\nprint(1)\n")
+
+    assert_eq(code, 1)
+    assert(out.starts_with("error: trait 'T' declares no property 'y', so this 'impl' cannot define it\n"),
+           out)
 
 @test("a variant followed by a value is where an enum's body ended")
 sst_enum_variant_then_value()

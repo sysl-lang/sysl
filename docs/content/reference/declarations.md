@@ -2598,6 +2598,60 @@ a *method* at all — a parameter list with no receiver in it declares an **asso
 reached through the type rather than through a value. A property has no parameter list to write one
 in, which is what [`static`](#a-static-property) is for.
 
+**A property written `= value` with no `->` takes the value's type**, exactly as a
+[function's result](#the-result-type) does: `count = self.n` is `count -> int`. It is read the same
+way wherever the property is used — above its declaration, through a generic type's parameters, in an
+`impl` block — and a body whose value is `unit` makes a unit property. A setter beside it takes that
+type for its value. `sysl doc` and an editor's hover show the type, never the body:
+
+```sysl
+struct Counter
+    n: int
+
+    count = self.n
+    doubled = self.count * 2
+    label = s"#${self.n}"
+
+    set count(v)
+        self.n = v
+
+struct Box[T]
+    v: T
+
+    get = self.v
+
+var c = Counter(4)
+
+c.count = 20
+print(c.count + 1, c.doubled, c.label, Box("lid").get, Box(2.5).get * 2)
+```
+
+```output
+21 40 #20 lid 5
+```
+
+The function's rules come with it. A body that reaches the property again before its type is known
+has no type to take, and is told to write one:
+
+```sysl
+struct P
+    x: int
+
+    a = self.b + 1
+    b = self.a * 2
+
+print(P(1).a)
+```
+
+```error
+'P.a' takes its result type from its body, and the body reaches 'P.a' again through 'P.b' — write its result type, 'P.a -> T'
+```
+
+A public property may not hand back a type its readers cannot name, as a written `->` may not. A
+trait's property is a signature every implementation is held to, so it writes its type; an `impl`
+member supplying one may leave it off and takes the trait's. In an enum's body `name = value` is a
+variant and its discriminant, so an enum's inferred property is written in an `impl` block.
+
 ### A property may be settable
 
 **A property may be written as well as read**, by declaring a setter beside it. `set` is a contextual
