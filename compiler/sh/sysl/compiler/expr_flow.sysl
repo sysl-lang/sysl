@@ -19,9 +19,20 @@ type_expr_discarded(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: b
 
     val allowed = cx.multi_ok
 
-    cx.multi_ok = false
+    val outer_tail = cx.unit_tail
 
-    analyze_discarded(cx, e)
+    cx.multi_ok = false
+    cx.assign_ok = false
+    cx.tail_carry = false
+
+    // A statement owes nothing, so every block it is made of may end in an assignment -- an
+    // `if const` branch included, which is read as a value block.
+    cx.unit_tail = true
+
+    val t = analyze_discarded(cx, e)
+
+    cx.unit_tail = outer_tail
+    t
 end type_expr_discarded
 
 // A discarded expression is by definition one nothing was expected of, so there is no context to
@@ -42,7 +53,9 @@ private analyze_discarded(cx: &Analyzer, e: Expr) -> TExpr = *e.kind match
         c_for_expr(cx, e.span, label, init, cond, step, body, else_body, None, true)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
     ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, None)
-    _ -> analyze_value(cx, e, None)
+    _ ->
+        cx.assign_here = is_assignment(e)
+        analyze_value(cx, e, None)
 
 // -- `if` ------------------------------------------------------------------------------------------
 
@@ -924,6 +937,19 @@ end loop_expr
 c_for_expr(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
            cond: Option[Expr], step: Option[Stmt], body: Buf[Stmt], else_body: Option[Buf[Stmt]],
            expected: Option[Type], discarded: bool) -> TExpr
+    // The init's binding is the loop's, so a use anywhere in the loop may fix its type.
+    var head: Buf[Stmt] = buf()
+
+    if init.is_some() then head.push(init.unwrap())
+
+    first_use_read(cx, head, () -> c_for_once(cx, span, label, init, cond, step, body, else_body,
+                                              expected, discarded))
+end c_for_expr
+
+// One reading of a three-clause `for`.
+private c_for_once(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
+                   cond: Option[Expr], step: Option[Stmt], body: Buf[Stmt],
+                   else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
     cx.enter()
 
     var tinit: Buf[TStmt] = buf()
@@ -953,7 +979,7 @@ c_for_expr(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
     val ty = c_for_type(cx, span, ctx, tcond, telse)
 
     checked_loop(ctx, span, TExpr(span, TCFor(tinit, tcond, tstep, tbody, telse, ty)))
-end c_for_expr
+end c_for_once
 
 // With no condition a three-clause `for` cannot finish on its own, so its type is what its breaks
 // carry, exactly as `loop`'s is.

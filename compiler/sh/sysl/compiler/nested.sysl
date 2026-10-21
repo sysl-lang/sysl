@@ -354,6 +354,7 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
 
     inner.body = fname
     inner.owner = f.owner
+    inner.var_fix_log = f.fix_log
 
     // A generic one's bounds say which trait's member a name on its parameters meant, as a top-level
     // generic's do -- beside whatever the frame's own signature promised.
@@ -399,6 +400,13 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
 
         // A by-name parameter of the frame is one in the nested function too: a read calls it.
         if f.by_name.at(i) then inner.by_name.push(reached.0)
+
+        // So is a binding whose type its first use fixes: a use here is one of its uses.
+        if f.locals.at(i).is_some()
+            for o in f.open
+                if o.unique == f.locals.at(i).unwrap().unique then
+                    inner.open_vars.push(OpenVar(reached.0, o.at, o.init, o.since))
+        end if
 
         inner.captured.push(reached)
 
@@ -463,6 +471,11 @@ struct NestedFrame
     siblings: Buf[(string, &Nested)]
     outer_nested: Buf[string]
     declares: Buf[BlockBind]
+
+    // The frame's bindings still waiting for the use that fixes their type, and the log a use in
+    // the nested body files its fix in -- the frame's own (`var_first_use.sysl`).
+    open: Buf[OpenVar]
+    fix_log: Buf[VarFix]
 end NestedFrame
 
 private nested_frame(cx: &Analyzer, span: Span, st: &StructType, captured: Buf[string],
@@ -485,7 +498,8 @@ private nested_frame(cx: &Analyzer, span: Span, st: &StructType, captured: Buf[s
         tbounds.push(nb)
 
     NestedFrame(span, cx.scope, tbounds, cx.func_name, cx.decl_name, nested_owner(cx), st,
-                captured, locals, by_name, siblings, outer_nested_of(cx, siblings), declares)
+                captured, locals, by_name, siblings, outer_nested_of(cx, siblings), declares,
+                cx.open_vars.copy(), cx.var_fix_log)
 end nested_frame
 
 // A generic nested function, kept until a call settles its type parameters: the declaration, what

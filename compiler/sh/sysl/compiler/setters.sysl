@@ -91,7 +91,10 @@ setter_assign(cx: &Analyzer, span: Span, op: string, receiver: Expr, name: strin
     // temporary holding its address — after that there is no `self` left to recognize.
     check_not_own_setter(cx, span, receiver, name)
 
-    if op == "="
+    val yields = is_yielding_assign(op)
+    val plain = if yields then plain_form(op) else op
+
+    if plain == "=" && !yields
         var args: Buf[Expr] = buf()
 
         args.push(value)
@@ -99,20 +102,33 @@ setter_assign(cx: &Analyzer, span: Span, op: string, receiver: Expr, name: strin
     end if
 
     if !addressable_receiver(cx, receiver)
-        cx.fault(span, s"'$op' reads '$name' and writes it back, so it needs a receiver it can " +
+        val does = if plain == "=" then s"writes '$name' and reads it back" else s"reads '$name' and writes it back"
+
+        cx.fault(span, s"'$op' $does, so it needs a receiver it can " +
                  "reach twice — this one is computed, and has no address. Bind it to a 'var' first")
+    end if
 
     val tmp = s"${ModuleSep}recv"
-    val bin = op[0..<(op.bytes.len - 1)]
 
     var stmts: Buf[Stmt] = buf()
 
     stmts.push(Stmt(span, ValDecl(tmp, None, Expr(span, Unary("&", receiver)), File, None, None, OneCopy,
                                   None)))
-    stmts.push(Stmt(span, ExprStmt(Expr(span, Assign("=", through_temp(span, tmp, name),
-                                                     Expr(span, Binary(bin,
-                                                                       through_temp(span, tmp, name),
-                                                                       value)))))))
+
+    val written = if plain == "=" then value
+    else Expr(span, Binary(plain[0..<(plain.bytes.len - 1)], through_temp(span, tmp, name), value))
+
+    stmts.push(Stmt(span, ExprStmt(Expr(span, Assign("=", through_temp(span, tmp, name), written)))))
+
+    // **What `:=` yields is the property read back**, through its getter, from the receiver whose
+    // address was taken once -- reading the place right after the store, which for a property is a
+    // call. There is always a getter to call: a setter is refused a declaration where its property
+    // has none, on a type and in a trait alike.
+    //
+    // Written `+=`, the block ends in `()`, so the write stays a statement and the block is `unit`.
+    val tail = if yields then through_temp(span, tmp, name) else Expr(span, UnitLit)
+
+    stmts.push(Stmt(span, ExprStmt(tail)))
 
     type_expr(cx, Expr(span, Block(stmts)), expected)
 end setter_assign

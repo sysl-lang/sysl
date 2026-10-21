@@ -167,11 +167,78 @@ print(Limit)
 'Limit' is a 'const', so its value is folded into every use of it
 ```
 
+### A literal binding takes its type from its first use
+
+A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
+its type from its **first use that fixes one**: a comparison with an operand that has a type of its
+own, an assignment of such a value or into a typed place, an argument, an index, a `return` or the
+body's result. A counter compared with a length is a `usize`, and an index read with it needs no
+conversion:
+
+```sysl
+val xs = [10, 20, 30]
+val first = 0
+var i = 0
+
+while i < xs.len
+    print(xs[i])
+    i += 1
+
+print(first < xs.len, i)
+```
+
+```output
+10
+20
+30
+true 3
+```
+
+**Arithmetic fixes nothing.** In `sum + b` the binding keeps its default and the typed operand widens
+to it, exactly as though the default had been written. Nor does a conversion: `u8(n)` converts `n`
+from what it is rather than deciding it. A binding no use fixes has the literal's
+default: `int`, or `real` for a float literal. A use whose type cannot hold the literal — `300` handed
+to a `u8` — fixes nothing either, and is refused as it would be with `int` written. An integer
+literal is fixed at a float type where it holds the value exactly. A use inside a closure or a nested
+function is a use like any other.
+
+```sysl
+half(x: f32) -> f32 = x / 2
+
+var sum = 250
+val b: u8 = 10
+var h = 3
+
+print(sum + b, half(h), h / 2)
+```
+
+```output
+260 1.5 1.5
+```
+
+**The first such use decides**, and a later use that disagrees is told exactly as it would be had the
+type been written on the declaration:
+
+```sysl
+wide(n: usize) -> usize = n
+narrow(n: u8) -> u8 = n
+
+var i = 0
+
+print(wide(i))
+print(narrow(i))
+```
+
+```error
+'n' of 'narrow' is byte, but usize was given
+```
+
 ### A module member takes its type as a local does
 
-A **member of a module** may leave its type off exactly as a local may: `val limit = 10` is an `int`
+A **member of a module** may leave its type off as a local may: `val limit = 10` is an `int`
 wherever it is declared, `val name = "sysl"` a `string`, and `val area = square(6)` whatever `square`
-returns. Where the type is written it governs, and the value is read against it — `val ratio: real =
+returns. A module member's literal is its default, `int` or `real`: its uses are spread across the
+module, so no one of them is first. Where the type is written it governs, and the value is read against it — `val ratio: real =
 3` is a `real` three. A `const` follows the same rule, and so does module storage written with `var`
 — `static var ticks = 0` is an `int` the program may write. Only a `var` with **no initializer**
 states its type, since there is no value to read one off and it starts at its type's zero.
@@ -223,6 +290,10 @@ print(a)
 ```error
 'a' takes its type from its value, and the value reaches 'a' again — write its type, 'val a: T = …'
 ```
+
+A loop is one mistake and is reported once, at the declaration it is named by: storage refused a
+type for it is not refused again for the order it would run in, and a binding that names several
+things is reported once for the binding, however many of its names the value reaches.
 
 **A module-level `val` may hold a counted value, and never releases it.** Storage that exists for the
 whole run is never let go of, so the one release with nowhere to go is the one at exit — and not
@@ -590,11 +661,10 @@ A generic function's result is the body's type in terms of its parameters, so `p
 `(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
 initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
 
-**A body that is an assignment is `unit`**, plain or compound, to a variable, a field or an element:
-the store is what the function is for. The value an
-[assignment yields](/reference/expressions/#assignment) belongs to the expression around it, and a
-body has none, so `bump() = count += 1` is `bump()`, not an `int` function. A function that hands the
-stored value back says so with `-> T`.
+**A body that is an assignment written `=` is `unit`**, plain or compound, to a variable, a field or
+an element, because [that assignment is](/reference/expressions/#assignment): the store is what the
+function is for, so `bump() = count += 1` is `bump()`, not an `int` function. A body written `:=`
+hands back what it stored, and takes its type.
 
 ```sysl
 var count = 0
@@ -605,17 +675,17 @@ struct Light
     switch_on(*self) = self.on = true
 
 bump() = count += 1
-reset_to(v: int) -> int = count = v
+reset_to(v: int) = count := v
 
 var lamp = Light(false)
 
 bump()
 lamp.switch_on()
-print(count, lamp.on, bump() == (), reset_to(10), count)
+print(count, lamp.on, bump() == (), reset_to(10) + 1, count)
 ```
 
 ```output
-1 true true 10 10
+1 true true 11 10
 ```
 
 Using such a call as a value is refused, since there is none:
@@ -1194,11 +1264,10 @@ print(box(3), box(2, 2), box(2, fill = "#"))
 *** **** ##
 ```
 
-`name = value` is also a legal expression — assignment yields the value stored — so the two readings
-collide, and the named argument is the one taken. It applies only where the name is a bare
-identifier: `p.x = 1` and `b[i] = v` are stores as they always were, since neither is a name a
-parameter list could have written. A store to a plain variable is still reachable in an argument by
-parenthesizing it.
+An assignment written `=` yields nothing, so it is never an argument, and `name = value` there is
+always the named argument. A store whose value is passed on is written
+[`:=`](/reference/expressions/#assignment), which reads as no parameter's name: `f(n := 1)` stores to
+`n` and passes what it stored.
 
 A default is read at **the type its parameter declares**, so a value that says nothing about its own
 type needs no annotation beside it: written where an `Option[int]` is wanted, `None` is that
@@ -2686,10 +2755,11 @@ have nowhere to take its value's type from. Visibility is the ordinary modifier,
 is a property the world reads and only the type writes.
 
 **A write is a call rather than a store**, which is what a property computing rather than naming
-storage amounts to. Three things follow, and they are the same three that follow for an element
-reached through [`Index`](/reference/expressions/): the expression yields `unit` rather than the
-value assigned, the write cannot be one place of a multiple assignment, and `&t.f` is refused because
-there is no address.
+storage amounts to. Two things follow, and they are the same two that follow for an element
+reached through [`Index`](/reference/expressions/): the write cannot be one place of a multiple
+assignment, and `&t.f` is refused because there is no address. Written
+[`:=`](/reference/expressions/#assignment), the write yields what the getter reads back once the
+setter has run.
 
 The compound forms do work, and that is where a property differs from an element: there is no index
 to evaluate twice, and the receiver's address is taken once for the pair of calls.

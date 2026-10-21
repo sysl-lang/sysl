@@ -280,8 +280,8 @@ private note_read_only(a: &Analysis, base: string, reads_only: bool)
 
 private note_env_write(seen: &EnvWrites, e: TExpr)
     val hit = *e.kind match
-        TStore(place, _, _) -> reaches_self(place)
-        TUpdate(place, _, _, _, _, _) -> reaches_self(place)
+        TStore(place, _, _, _) -> reaches_self(place)
+        TUpdate(place, _, _, _, _, _, _) -> reaches_self(place)
         TIncDec(place, _, _, _, _) -> reaches_self(place)
         TVecStore(recv, _, _) -> reaches_self(recv)
         _ -> false
@@ -319,6 +319,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     inner.body = fname
     inner.owner = nested_owner(cx)
+    inner.var_fix_log = cx.var_fix_log
 
     val self_ty = Ptr(Struct(st))
 
@@ -343,6 +344,10 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
                                                          Struct(st))), int(st.slot(i)), stored))
 
         val unique = inner.bind(captured.at(i), stored)
+        val outer = cx.lookup(captured.at(i))
+
+        // A capture of a binding whose type its first use fixes is that binding, for the use.
+        if outer.is_some() then carry_open(cx, inner, outer.unwrap().unique, unique)
 
         // A by-name parameter captured is still one: the field holds the callable, and a read of
         // the name calls it.
@@ -368,9 +373,15 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // A closure whose result the context did not fix is analyzed with nothing expected, so what its
     // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
     // all.
+    val was = inner.unit_tail
+
+    inner.unit_tail = result.is_none()
+
     val block = if result.is_some() && result.unwrap() == Unit then
         type_value_block(inner, rest, None, true)
     else type_value_block(inner, rest, result, false)
+
+    inner.unit_tail = was
 
     check_consumes(inner, block)
 

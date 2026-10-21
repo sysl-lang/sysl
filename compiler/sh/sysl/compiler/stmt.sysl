@@ -26,13 +26,20 @@ type_value_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
     // the statements themselves, rather than by looking ahead from the one being read. What the
     // block declares is given back at its end for the same reason its scope is: an inner block's
     // nested functions are not the outer block's.
-    val group = open_group(cx, stmts)
-    val b = type_block_body(cx, stmts, expected, discarded)
+    val b = first_use_read(cx, stmts, () -> grouped_block(cx, stmts, expected, discarded))
 
-    close_group(cx, group)
     cx.leave()
     b
 end type_value_block
+
+// One reading of a value block, its nested functions with it.
+private grouped_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type], discarded: bool) -> TBlock
+    val group = open_group(cx, stmts)
+    val b = block_body_once(cx, stmts, expected, discarded)
+
+    close_group(cx, group)
+    b
+end grouped_block
 
 // What a block took over from the one around it, so that its end can give it back.
 struct BlockGroup
@@ -171,7 +178,16 @@ end settle_needs
 // The body of a value block, in whatever scope the caller has established -- a match arm runs this
 // after declaring its pattern bindings, so they are visible to the body.
 type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
-                discarded: bool) -> TBlock
+                discarded: bool) -> TBlock =
+    first_use_read(cx, stmts, () -> block_body_once(cx, stmts, expected, discarded))
+
+// One reading of a value block's body.
+private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
+                        discarded: bool) -> TBlock
+    val tail_ok = cx.unit_tail
+
+    cx.unit_tail = false
+
     val last = trailing_kind(stmts)
 
     if last == TrailingValue
@@ -192,9 +208,10 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 
         // A block whose value *is* the enclosing function's result is the third place a result list
         // may stand, which is what lets a branch or a nested block forward one.
-        val tr = trailing_value(cx, e, expected, discarded)
+        val tr = trailing_value(cx, e, expected, discarded, tail_ok)
 
         cx.bind_site = site
+        cx.unit_tail = tail_ok
         val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
 
         return TBlock(init, Some(tr), ty)
@@ -205,14 +222,23 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
     for item in stmts
         push_all(&out, recover_stmt(cx, item))
 
+    cx.unit_tail = tail_ok
     TBlock(out, None, if last == TrailingJump then Never else Unit)
-end type_block_body
+end block_body_once
 
 // A block's trailing expression. A block whose value *is* the enclosing function's result is the
 // third place a result list may stand, which is what lets a branch or a nested block forward one.
-private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr
+private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool,
+                       tail_ok: bool) -> TExpr
     if wants_results(cx, expected) then
         return if cx.result_chain then type_results(cx, e, expected) else type_expr_multi(cx, e, expected)
+
+    // A block's last line may be an assignment written for its effect where the block owes nothing
+    // -- `unit` is asked for, or it is a body whose result is read off it, which is then `unit`. A
+    // branch whose value is bound is neither, and an assignment there is refused rather than giving
+    // the binding a `unit` nobody wrote.
+    cx.assign_ok = tail_ok || (expected.is_some() && expected.unwrap() == Unit)
+    cx.tail_carry = tail_ok
 
     type_expr_discarded(cx, e, expected, discarded)
 end trailing_value
@@ -260,7 +286,11 @@ end type_stmts
 // what lets one read the loop variable and stops one reading a local declared under it. The split
 // is by position, exactly as a function's contract block is -- so a clause that reaches
 // `recover_stmt` is one written somewhere it may not be, and says so there.
-loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
+loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt] =
+    first_use_read(cx, stmts, () -> loop_stmts_once(cx, stmts))
+
+// One reading of a loop body.
+private loop_stmts_once(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
     // A loop body is a block, so its nested functions are its own. The caller opened the scope, and
     // this is where the statements are, which is what the group is read from.
     val group = open_group(cx, stmts)
@@ -284,7 +314,7 @@ loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
     cx.pending_variant = slot
     close_group(cx, group)
     out
-end loop_stmts
+end loop_stmts_once
 
 private is_loop_clause(s: Stmt) -> bool = *s.kind match
     Invariant(_, _) -> true
@@ -666,12 +696,16 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
                             boundary(cx, name, align)))
     end if
 
-    val ti = type_expr(cx, init.unwrap(), declared)
+    // A bare literal is read at the type a use fixed, where an earlier reading found one.
+    val fixed = fixed_type(cx, span, name, typ, init.unwrap())
+    val ti = type_expr(cx, init.unwrap(), if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, span, name, declared, decl_ty, ti)
 
     val unique = cx.bind(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    if fixed.is_none() then open_binding(cx, span, typ, init.unwrap(), unique)
 
     note_view_binding(cx, span, name, unique, ti)
     one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))
@@ -687,12 +721,15 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
         if section.is_none() then no_thread_local(cx, span, name, copies)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
-    val ti = type_expr(cx, value, declared)
+    val fixed = fixed_type(cx, span, name, typ, value)
+    val ti = type_expr(cx, value, if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, span, name, declared, decl_ty, ti)
 
     val unique = cx.bind_read_only(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    if fixed.is_none() then open_binding(cx, span, typ, value, unique)
 
     note_view_binding(cx, span, name, unique, ti)
     one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))

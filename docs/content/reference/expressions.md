@@ -4,8 +4,8 @@ summary: The precedence ladder, every operator's meaning, evaluation order, and 
 weight: 30
 ---
 
-Almost everything in sysl is an expression. Assignment yields the value assigned, `++` yields a
-value, and `if`, `match` and the loops all yield the branch they took. Only a short list of forms
+Almost everything in sysl is an expression. An assignment written `:=` yields the value it stored,
+`++` yields a value, and `if`, `match` and the loops all yield the branch they took. Only a short list of forms
 are *not* expressions — a declaration, a multiple assignment, and `defer` — and each is pointed out
 where it comes up.
 
@@ -20,7 +20,7 @@ operator symbols, and no facility to add one.
 
 | Prec | Operators | Role | Associativity |
 |---|---|---|---|
-| 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | assignment | right |
+| 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=`, and `:=` `+:=` … `>>:=` | assignment | right |
 | 2 | `\|\|` | logical or | left |
 | 3 | `&&` | logical and | left |
 | 4 | `is`, `is not` | pattern test | non-associative |
@@ -511,42 +511,119 @@ names, and this is the only place either reads as a keyword.
 
 ## Assignment
 
-Assignment is an **expression** yielding the value assigned, lowest precedence and
-right-associative.
+An assignment written with `=` is a **statement**: it stores, and it yields nothing. Its type is
+`unit`, so it stands where a value is nobody's: on a line of its own, or as the last line of a block
+that owes none — a block in [statement position](#statement-position-discards-a-block-s-value), one
+where `unit` is wanted, or a function or closure body whose result is read off it, which is then
+`unit`. Anywhere a value is wanted it is refused, a branch whose value is bound included, and the
+message names the spelling that does yield:
 
 ```sysl
 var a = 0
 var b = 0
-var c = 0
 
-a = b = c = 7
-
-print(a, b, c)
-```
-
-```output
-7 7 7
-```
-
-That makes the capture idioms available — `while (c = next()) != 0`, `if (p = find(k)) != null`.
-C's classic `if (x = 0)` bug comes not from this but from C also letting any integer serve as a
-truth value. sysl has a distinct `bool` with no such coercion, so the mistake is a type error and
-needs no special rule in the grammar:
-
-```sysl
-var x = 1
-
-if x = 0
-    print("never")
+a = b = 7
 ```
 
 ```error
-condition must be bool, got int
+'=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' to assign and use the value
+```
+
+**`:=` assigns and yields.** It stores exactly as `=` does, and its value is what reading the place
+right after the store gives. It has assignment's precedence — the lowest — and is right-associative,
+so a chain stores every place, and the capture idioms read as written:
+
+```sysl
+next(n: *int) -> int
+    *n -= 1
+    *n
+
+var a = 0
+var b = 0
+var c = 0
+
+a = b := c := 7
+
+var n = 3
+var k = 0
+
+while (k := next(&n)) != 0
+    print(k)
+
+print(a, b, c, k)
+```
+
+```output
+2
+1
+7 7 7 0
+```
+
+Keeping the yield to its own spelling is what closes C's `if (x = 0)` mistake for every type, `bool`
+included: the one form a reader could take for a comparison is the one with no value.
+
+```sysl
+var on = false
+val yes = true
+
+if on = yes
+    print("set")
+```
+
+```error
+'=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' to assign and use the value
 ```
 
 The compound forms `+=`, `-=`, `&=` and the rest are **not separate operators with their own
 traits**: `a += b` is defined as `a = a + b` and requires exactly what `+` requires. There is no
-`AddAssign`.
+`AddAssign`. Each has a yielding spelling too — `+:=`, `-:=`, `*:=`, `/:=`, `%:=`, `&:=`, `|:=`,
+`^:=`, `<<:=`, `>>:=` — whose value is the place's **new** value:
+
+```sysl
+var x = 5
+
+print(x +:= 2, x *:= 3, x >>:= 1, x)
+```
+
+```output
+7 21 10 10
+```
+
+**What `:=` yields is a read of the place, with a read's ownership.** A value type is copied, as
+reading any place copies it. A `&T` is a counted share, exactly as reading a `&T` place is: whatever
+keeps the value takes a count of its own, so the place and every name holding the yield each own
+one, and the object lives until the last of them lets go. The value has the place's type, so one
+that arrived narrower is widened by the store:
+
+```sysl
+struct Res
+    id: int
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.id}")
+
+main()
+    var a: &Res = Res(1)
+    val b = (a := Res(2))
+
+    a = Res(3)
+    print(b.id, a.id)
+```
+
+```output
+drop 1
+2 3
+drop 2
+drop 3
+```
+
+A settable [property](/reference/declarations/#a-property-may-be-settable) yields what its getter
+reads back once the setter has run, from a receiver whose address is taken once; a setter always has
+its getter beside it, so there is always a read to give. `:=` is refused wherever that read would
+be: on an element written through [`IndexSet`](#operator-dispatch), where reading it
+back would evaluate the receiver and the index a second time, and on a place a computed receiver
+names, which has no address to read twice. An assignment to several places is a statement whatever
+its spelling, so `a, b := 1, 2` is refused too.
 
 ### Statement position discards a block's value
 
@@ -614,10 +691,10 @@ A place's own subexpressions are evaluated **exactly once**, before the assignme
 `xs[f()], xs[g()] = xs[g()], xs[f()]` each of `f` and `g` runs once.
 
 **A multiple assignment is a statement, not an expression**, which keeps it simple. A single
-assignment yields the value assigned; a multiple one would have to yield several, which could only
-be a tuple — a product value built for a form whose purpose is to change several places at once. So
-it does not nest, does not appear in a condition, and has no value to discard. A binding takes the
-same list: `val a, b = 1, 2`.
+`:=` yields the value it stored; a multiple one would have to yield several, which could only be a
+tuple — a product value built for a form whose purpose is to change several places at once. So it
+does not nest, does not appear in a condition, and has no `:=` spelling. A binding takes the same
+list: `val a, b = 1, 2`.
 
 A multiple assignment accepts fewer places than a single `=` does: it refuses a place that is really
 a **call**, of which there are two kinds — an element reached through a user type's `Index`, where `b[i] = v` calls
@@ -625,8 +702,8 @@ a **call**, of which there are two kinds — an element reached through a user t
 setter. Neither has an address for the locating phase to find, and the call both reads and writes, so
 there is nothing to split into the two halves the ordering rule is about.
 
-Those two are also the exception to *"a single assignment yields the value assigned"* above: a call
-yields what the call yields, which for both of these is `unit`.
+Written `:=`, the element is refused, since reading it back is a second call through the receiver
+and the index; the property yields what its getter reads back.
 
 ## `++` and `--`
 

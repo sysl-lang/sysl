@@ -1194,7 +1194,8 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
             out.push(open.unwrap())
         elif written.is_some()
             val ty = resolve_type(a, home, written.unwrap(), no_bindings())
-            val v = value_arg(a, scope, span, arg, ty, subst)
+            val v = value_arg(a, scope, span, arg, ty, subst,
+                              subject = s"'${pair.0.at(i)}' of '${generic_type_name(a, key)}'")
 
             if v.is_none() then return None
 
@@ -1219,8 +1220,13 @@ end read_args_for
 // **The value has to be one the declared type holds** -- a value argument is the declaration's
 // parameter, so `Buf[-1]` is refused at the argument rather than at the array it would have sized.
 // `what` is the subject that sentence is about: the argument, or the default standing in for one.
+//
+// **And it has to be of the declared type**, before any of that: `true` at a `usize` is not 1, `1` at
+// a `bool` or an enum is not `true` or a variant, and a string is not a constant of the wrong kind but
+// a value of the wrong type. That refusal is a call's argument mismatch in a call's words, naming the
+// parameter -- `subject` is `'N' of 'Ring'` where the caller knows them.
 private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type,
-                  subst: Buf[Binding], what: string = "this argument") -> Option[Type]
+                  subst: Buf[Binding], what: string = "this argument", subject: string = "") -> Option[Type]
     val written = *arg.kind match
         ValueArgType(e) -> Some(e)
         NamedType(n, targs) -> if targs.is_empty() then Some(expr(arg.span, Ident(n))) else None
@@ -1233,10 +1239,24 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     end if
 
     val e = written.unwrap()
+
+    // A variant is read against the enum the parameter names before anything is folded: a bare
+    // `High` is that enum's, whatever else the name might mean.
+    val tag = variant_tag(a, scope, e, ty)
+
+    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
+
     val refusals = a.const_refusals
     val folded = const_arg_value(a, scope, e, subst)
 
     if folded.is_some()
+        val read = value_arg_reading(a, scope, e, ty, subst)
+
+        if read.1.is_some()
+            a.fault(scope, e.span, value_arg_mismatch(ty, read.1.unwrap(), what, subject))
+            return None
+        end if
+
         ty match
             Integer(bits, signed, _) ->
                 if !fits(folded.unwrap(), bits, signed)
@@ -1247,10 +1267,6 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
 
         return Some(ConstArg(folded.unwrap(), ty, names_stand_in(e, subst)))
     end if
-
-    val tag = variant_tag(a, scope, e, ty)
-
-    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
 
     if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
 
@@ -1302,21 +1318,22 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     // `Ring[double(Base)]` over an `int` `Base` and a `usize` parameter is a constant expression, and
     // what is wrong with it is the parameter it is handed to. Only an argument whose every name is a
     // constant is read so: one naming storage is not a constant, and that is what is wrong with it.
+    // A literal of another type -- a string, a float, a tuple -- reads without a complaint and is
+    // refused as the mismatch it is.
     val reader = analyzer_for(a, scope)
 
     reader.subst = subst
 
     if names_only_constants(reader, e)
-        val trial = begin_trial(reader)
+        val read = value_arg_reading(a, scope, e, ty, subst)
 
-        type_expr(reader, e, Some(ty))
+        if read.0.is_some()
+            a.fault_again(read.0.unwrap())
+            return None
+        end if
 
-        val said = if a.complaints() > trial.said then Some(a.found.at(trial.said)) else None
-
-        discard_trial(reader, trial)
-
-        if said.is_some()
-            a.fault_again(said.unwrap())
+        if read.1.is_some()
+            a.fault(scope, e.span, value_arg_mismatch(ty, read.1.unwrap(), what, subject))
             return None
         end if
     end if
@@ -1324,6 +1341,49 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
 end value_arg
+
+// A value argument read once, as an ordinary expression, at the type its parameter declared -- in a
+// trial, so nothing it registers or says outlives the question. It answers the first complaint the
+// reading made, and the type it read as where that is not the parameter's: an integer of any width
+// agrees with an integer parameter, since a value argument is fit-checked by its value, not its
+// width. A parameter whose type is open (a type parameter's) is not asked.
+private value_arg_reading(a: &Analysis, scope: Scope, e: Expr, ty: Type,
+                          subst: Buf[Binding]) -> (Option[Placed], Option[Type])
+    if !value_arg_kind_known(ty) then return (None, None)
+
+    val reader = analyzer_for(a, scope)
+
+    reader.subst = subst
+
+    val trial = begin_trial(reader)
+    val got = texpr_type(type_expr(reader, e, Some(ty)))
+    val said = if a.complaints() > trial.said then Some(a.found.at(trial.said)) else None
+
+    discard_trial(reader, trial)
+
+    if integral(got) && integral(ty) then return (said, None)
+
+    (said, if disagree(got, ty) then Some(got) else None)
+end value_arg_reading
+
+// Whether a value parameter's declared type is one of the kinds a value argument is checked
+// against: an integer, a `char`, a `bool` or a simple enum, under any name.
+private value_arg_kind_known(ty: Type) -> bool = repr(ty) match
+    Integer(_, _, _) -> true
+    Char -> true
+    Bool -> true
+    Enum(_) -> true
+    Constrained(d) -> value_arg_kind_known(d.base)
+    _ -> false
+
+private integral(ty: Type) -> bool = repr(ty) match
+    Integer(_, _, _) -> true
+    Constrained(d) -> integral(d.base)
+    _ -> false
+
+// The refusal of a value argument of the wrong type, in the words a call's argument mismatch uses.
+private value_arg_mismatch(ty: Type, got: Type, what: string, subject: string) -> string =
+    s"${if subject.is_empty() then what else subject} is ${type_show(ty)}, but ${type_show(got)} was given"
 
 // Whether every name a value argument reads as a value is a constant: a `const`, a value parameter,
 // a variant. A callee is not read as a value, and neither is the name a member is called on.
@@ -1362,8 +1422,10 @@ private names_only_constants(cx: &Analyzer, e: Expr) -> bool = *e.kind match
 
 // A value argument written as an expression -- `f[High]()` on a generic function -- at the simple
 // enum its parameter was declared as.
-enum_value_arg(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding]) -> Type =
-    value_arg(a, scope, span, type_ref(e.span, ValueArgType(e)), ty, subst).unwrap_or(Unknown)
+// `subject` names the parameter and its function, as a refusal of the argument says them.
+enum_value_arg(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding],
+               subject: string) -> Type =
+    value_arg(a, scope, span, type_ref(e.span, ValueArgType(e)), ty, subst, subject = subject).unwrap_or(Unknown)
 
 // A value parameter's default, read as the argument it stands in for -- at the type the declaration
 // wrote for the parameter, under the arguments already fixed to its left.
@@ -1450,6 +1512,16 @@ private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBind
             EnumOf(ed) -> (ed.tparams, ed.tvalues)
             TraitOf(td) -> (td.tparams, td.tvalues)
             _ -> (buf(), buf())
+
+// The name a generic type was declared with, as a refusal of one of its arguments names it.
+generic_type_name(a: &Analysis, key: string) -> string =
+    a.tables.types.get(key) match
+        None -> key
+        Some(d) -> d.kind match
+            StructOf(sd) -> sd.name
+            EnumOf(ed) -> ed.name
+            TraitOf(td) -> td.name
+            _ -> key
 
 // A type that takes no arguments, told so where any were written.
 private plain_type(a: &Analysis, scope: Scope, span: Span, name: string, targs: Buf[Type],

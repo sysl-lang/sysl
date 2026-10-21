@@ -28,13 +28,20 @@ private typed_at(cx: &Analyzer, e: Expr, expected: Option[Type], widen: bool) ->
     val allowed = cx.multi_ok
     val outer = cx.result_chain
 
+    val outer_tail = cx.unit_tail
+
     cx.multi_ok = false
+    cx.assign_here = cx.assign_ok && is_assignment(e)
+    cx.assign_ok = false
+    cx.unit_tail = cx.tail_carry && carries_tail(e)
+    cx.tail_carry = false
     cx.result_chain = cx.result_next
     cx.result_next = false
 
     val raw = if widen then analyze_expected(cx, e, expected) else analyze_unwidened(cx, e, expected)
 
     cx.result_chain = outer
+    cx.unit_tail = outer_tail
     unwrap_results(cx, e, raw, allowed)
 end typed_at
 
@@ -179,7 +186,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     LayoutOf(op, t) -> layout_of(cx, e.span, op, t, expected)
     OffsetOf(t, field) -> offset_of(cx, e.span, t, field, expected)
 
-    Assign(op, target, value) -> assign_expr(cx, e.span, op, target, value)
+    Assign(op, target, value) -> assign_expr(cx, e.span, op, target, value, expected)
 
     // An indented block under a binding's `=`. It is a value block like a branch's, asked the same
     // question by the same context, and its scope closes with it.
@@ -486,6 +493,10 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     if local.is_some()
         note_local_reference(cx, span, local.unwrap())
+
+        // A binding whose type its first use fixes is fixed by a position that expects one.
+        if expected.is_some() && !cx.open_vars.is_empty() then
+            fixed_by_position(cx, span, local.unwrap().unique, expected.unwrap())
 
         // A capture is a binding like any other, and what it reaches is the field of the
         // environment its closure was handed rather than a slot of this frame.
@@ -1410,6 +1421,8 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
             _ -> ()
 
     if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand, e.span), Bool))
+
+    not_fixing_at(cx, operand)
     if op == "&"
         // `&f` on a declared function is C's address of it rather than the address of a place.
         val named = names_a_declared_function(cx, operand)
@@ -1594,6 +1607,10 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     if op == "&&" || op == "||" then
         return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
+    // What arithmetic settles on is not a type its operands were used at.
+    not_fixing_at(cx, l)
+    not_fixing_at(cx, r)
+
     val numeric = numeric_expectation(expected)
     val literal_left = literal_subject_operands(cx, span, op, l, r, numeric)
     val scaled = if literal_left.is_some() then literal_left else scale_operands(cx, op, l, r, numeric)
@@ -1767,8 +1784,13 @@ end scale_literal_type
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
 // scalars does, sharing each middle operand between the two comparisons that use it.
 private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[string]) -> TExpr
+    // A comparison fixes an open binding from its neighbour's own type (`compare_fixes`), never from
+    // what the pair settles on.
+    for e in operands
+        not_fixing_at(cx, e)
+
     // A fixed-point product compared with a value of another format is read at that format.
-    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None, true))
+    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None, true, false, true))
 
     // A comparison either side of which is a vector is one link and a mask rather than a `bool`, so
     // it is a different node and a different set of rules.
@@ -1829,7 +1851,7 @@ end compare_expr
 // formats`) -- rather than one being widened to the other first, which would round the product at
 // the wider operand's format.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
-                 widen: bool = false, rescales: bool = false) -> Buf[TExpr]
+                 widen: bool = false, rescales: bool = false, compared: bool = false) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -1846,6 +1868,10 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
             if t.is_none() then refused_before = true
             else if !refused_before && texpr_type(t.unwrap()) == Unknown then
                 cx.an.poison_quietly()
+
+    // **`compared` marks a comparison**, whose operand of a type of its own fixes an open binding
+    // beside it (`var_first_use.sysl`).
+    if compared && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own)
 
     val settled = firmest(operands, own, widen, rescales).or_else(() -> expected)
     var told: Buf[Option[TExpr]] = buf()
@@ -1933,7 +1959,7 @@ private any_typed(operands: Buf[Expr], told: Buf[Option[TExpr]]) -> bool
 end any_typed
 
 // Whether a literal reads at a type without a complaint and as that type.
-private literal_fits(cx: &Analyzer, e: Expr, ty: Type) -> bool
+literal_fits(cx: &Analyzer, e: Expr, ty: Type) -> bool
     val tried = begin_trial(cx)
     val t = type_expr(cx, e, Some(ty))
     val refused = refused_since(cx, tried)

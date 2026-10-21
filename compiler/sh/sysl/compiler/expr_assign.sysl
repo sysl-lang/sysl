@@ -5,25 +5,49 @@ import sysl.buf.{Buf, buf}
 
 // Assignment, which is an expression in the tree and a statement everywhere a reader writes one.
 //
+// **An assignment written `=` -- or `+=` and the rest -- yields nothing**: its type is `unit`, and it
+// stands only where a value is nobody's, which is a statement or the last line of a block that owes
+// no other type. **`:=` and its compound forms (`+:=` …) assign and yield**, and what they yield is
+// what reading the place right after the store gives. Splitting the two is what keeps `if a = b`
+// from compiling for two `bool`s: the one spelling a reader would mistake for a comparison is the
+// one that has no value.
+//
 // **What has to hold is that the result can be stored back.** A constrained place is the one case
 // where the arithmetic's type and the place's legitimately differ -- a transparent subtype computes
 // at its base -- so the test is on the representation the two share, and what the difference costs
 // is the check the constraint asks for.
 
-assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) -> TExpr
+assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Expr,
+            expected: Option[Type]) -> TExpr
+    // Taken before anything inside the assignment is read, since every subexpression goes through
+    // the funnel that sets it.
+    val bare = cx.assign_here
+
+    cx.assign_here = false
+
+    val yields = is_yielding_assign(written)
+
+    if !yields && (!bare || wants_a_value(expected))
+        return cx.err(span, s"'$written' assigns and yields nothing, so it cannot stand where a value " +
+                      s"is wanted — write '${yielding_form(written)}' to assign and use the value")
+
+    // The write itself is the one `=` would make; `yields` is all `:=` adds.
+    val op = if yields then plain_form(written) else written
+
     // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a **call** rather
     // than a store because a trait's method gives back a value and never an address -- so there is
     // no place for the ordinary path to write through, and the trait says as much by taking the
     // value. The compound forms would have to read the element and write it back, which means
-    // evaluating the receiver and the index twice, and a container's subscript is a call.
+    // evaluating the receiver and the index twice, and a container's subscript is a call. Reading
+    // it back after the store is the same second evaluation, so `:=` is refused there too.
     *target.kind match
         Index(receiver, index, _) ->
             if indexes_written(cx, "IndexSet", receiver)
-                if op != "=" then
-                    return cx.err(span, s"'$op' on an element read through " +
+                if op != "=" || yields then
+                    return cx.err(span, s"'$written' on an element read through " +
                                   s"'${qualified_name(library_key("Index"))}' would evaluate " +
                                   "the receiver and the index twice — write it out as " +
-                                  s"'b[i] = b[i] ${op[0..<op.bytes.len - 1]} …'")
+                                  index_set_longhand(written))
 
                 var args: Buf[Expr] = buf()
 
@@ -38,7 +62,7 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
         // place for a store to write through, and the setter takes the value instead.
         Field(receiver, name, _) ->
             if settable(cx, receiver, name)
-                return setter_assign(cx, span, op, receiver, name, value, None)
+                return setter_assign(cx, span, written, receiver, name, value, expected)
 
             // A property with **no** setter. The ordinary path would report an expression with no
             // address, which is true and is not what the reader needs to know: what is missing is
@@ -56,6 +80,9 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
         _ -> ()
 
     if op == "="
+        // An open binding assigned a value of a type of its own takes that type.
+        if !cx.open_vars.is_empty() then assigned_fix(cx, target, value)
+
         val place = analyze_place(cx, target, "assignment", span)
 
         if texpr_type(place) == Unknown then return bad_expr(span)
@@ -70,14 +97,18 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
 
         note_view_store(cx, span, place, tv)
 
-        return rechecked(cx, span, place, TExpr(span, TStore(place, tv, texpr_type(place))))
+        return rechecked(cx, span, place, TExpr(span, TStore(place, tv, texpr_type(place), yields)))
     end if
 
-    val place = analyze_place(cx, target, s"'$op'", span)
+    val place = analyze_place(cx, target, s"'$written'", span)
 
     if texpr_type(place) == Unknown then return bad_expr(span)
 
     val bin = op[0..<op.bytes.len - 1]
+
+    // A compound assignment is arithmetic, and fixes nothing.
+    not_fixing_at(cx, value)
+
     val want = scale_expectation(bin, texpr_type(place), value, update_expected(cx.an, bin, texpr_type(place)))
     val read = type_expr(cx, value, want)
     val tv = widened_operand(cx, span, bin, texpr_type(place), read, Some(value))
@@ -96,13 +127,51 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
         else arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
 
         if disagree(got, texpr_type(place)) then
-            cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
+            cx.fault(span, s"'$written' would change the type of ${describe_target(target)}")
     end if
 
     rechecked(cx, span, place,
               TExpr(span, TUpdate(place, op, tv, texpr_type(place), dispatch,
-                                  constraint_of(texpr_type(place)))))
+                                  constraint_of(texpr_type(place)), yields)))
 end assign_expr
+
+// Whether a form hands a block's "owes nothing" on to the blocks it is made of: the branches of an
+// `if` or a `match`, and a block written as a value.
+carries_tail(e: Expr) -> bool = *e.kind match
+    IfExpr(_, _, _, _) -> true
+    MatchExpr(_, _) -> true
+    Block(_) -> true
+    _ -> false
+
+// Whether an expression is an assignment, written whichever way.
+is_assignment(e: Expr) -> bool = *e.kind match
+    Assign(_, _, _) -> true
+    _ -> false
+
+// A position that has a type of its own to ask for, which an assignment that yields nothing cannot
+// give it. `unit` asks for nothing, and an expectation already gone wrong says nothing more.
+private wants_a_value(expected: Option[Type]) -> bool = expected match
+    Some(t) -> t != Unit && t != Unknown
+    None -> false
+
+// `=` for `:=`, `+=` for `+:=`.
+plain_form(op: string) -> string = op[0..<op.bytes.len - 2] + "="
+
+// `:=` for `=`, `+:=` for `+=`.
+private yielding_form(op: string) -> string = op[0..<op.bytes.len - 1] + ":="
+
+// The two statements an element written through `IndexSet` takes for what `op` would have done.
+private index_set_longhand(op: string) -> string
+    if is_yielding_assign(op)
+        val plain = plain_form(op)
+
+        if plain == "=" then return "'b[i] = v' and read 'b[i]' after it"
+
+        return s"'b[i] = b[i] ${plain[0..<plain.bytes.len - 1]} …' and read 'b[i]' after it"
+    end if
+
+    s"'b[i] = b[i] ${op[0..<op.bytes.len - 1]} …'"
+end index_set_longhand
 
 // A write with the invariant re-checks it owes wrapped around it, innermost first.
 //
