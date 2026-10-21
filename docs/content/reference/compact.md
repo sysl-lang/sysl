@@ -68,6 +68,7 @@ file that belongs to no package. Written as a **default argument** the location 
 
 ```
 =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=      ||  &&  !
+:=  +:=  -:=  *:=  /:=  %:=  &:=  |:=  ^:=  <<:=  >>:=
 ==  !=  <  >  <=  >=      ..  ..<  ...      |  ^  &  ~
 +  -  *  /  %  <<  >>      ++  --      (  )  [  ]  {  }  .  ?  .*
 ,  ::  :  ->      #  ;      @

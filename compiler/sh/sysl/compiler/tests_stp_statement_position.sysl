@@ -4,8 +4,8 @@ module sh.sysl.compiler
 import sysl.text.{Search, str_builder}
 
 // Statement position -- a block written for effect has no value (`reference/expressions.md § Statement
-// position discards a block's value`). Assignment yields the value it assigned, so a branch that merely
-// does something would otherwise claim whatever its last expression yields, and two branches each
+// position discards a block's value`). An assignment written `:=` and a call both yield a value, so a
+// branch that merely does something would otherwise claim whatever its last expression yields, and two branches each
 // plainly written for effect would be made to agree on a value nobody asked for. Where a block's own
 // value is unused it has none, and that reaches the branches of an `if` and the arms of a `match`; a
 // block that does not *arrive* keeps `never`, that being reachability rather than a value.
@@ -274,33 +274,43 @@ stp_unit_function_body_fine()
         """, "9\n")
 end stp_unit_function_body_fine
 
-// -- assignment still yields its value wherever one is wanted (`reference/expressions.md § Assignment`)
+// -- an assignment written ':=' yields its value wherever one is wanted (`reference/expressions.md § Assignment`)
 
 @test("chained, as the reference writes it")
 stp_chained_assignment()
     if xvr_no_library() then return
 
-    stp_prints("var a = 0\nvar b = 0\nvar c = 0\na = b = c = 7\nprint(str(a + b + c))\n", "21\n")
+    stp_prints("var a = 0\nvar b = 0\nvar c = 0\na = b := c := 7\nprint(str(a + b + c))\n", "21\n")
 
 @test("captured in a condition")
 stp_assignment_in_a_condition()
     if xvr_no_library() then return
 
-    stp_prints("var xs = [3, 2, 0, 9]\nvar i = 0\nvar v = 0\nwhile (v = xs[i]) != 0\n    i += 1\nprint(str(i))\n",
+    stp_prints("var xs = [3, 2, 0, 9]\nvar i = 0\nvar v = 0\nwhile (v := xs[i]) != 0\n    i += 1\nprint(str(i))\n",
                "2\n")
 
-// An assignment ending the body of a function that owes a value is still that value.
+// An assignment ending the body of a function that owes a value is that value where it is written `:=`.
 @test("as the body of a function that returns one")
 stp_assignment_as_a_function_body()
     if xvr_no_library() then return
 
-    stp_prints("set(p: *int) -> int = *p = 5\nvar n = 0\nprint(str(set(&n) + n))\n", "10\n")
+    stp_prints("set(p: *int) -> int = *p := 5\nvar n = 0\nprint(str(set(&n) + n))\n", "10\n")
 
 @test("and as a branch's value when the 'if' is bound to something")
 stp_assignment_as_a_bound_branch_value()
     if xvr_no_library() then return
 
-    stp_prints("var a = 0\nvar b = 0\nvar x = if true then a = 4 else b = 5\nprint(str(x))\n", "4\n")
+    stp_prints("var a = 0\nvar b = 0\nvar x = if true then a := 4 else b := 5\nprint(str(x))\n", "4\n")
+
+// Written `=`, an assignment has no value to give, and a branch whose value is bound is refused one
+// rather than giving the binding a `unit` nobody wrote.
+@test("but an assignment written '=' is refused as a bound branch's value")
+stp_plain_assignment_refused_as_a_bound_branch_value()
+    if xvr_no_library() then return
+
+    stp_refused("var a = 0\nvar b = 0\nvar x = if true then a = 4 else b = 5\nprint(str(x))\n",
+                "'=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' " +
+                "to assign and use the value", "3:22")
 
 // -- a loop's 'else' is a block too ---------------------------------------------------------------
 
