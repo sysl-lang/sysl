@@ -23,7 +23,7 @@ private val imc_header: string = raw"""
     #include <stdint.h>
     #include <stdbool.h>
     #include <stdio.h>
-    #include <time.h>
+    #include "fx_other.h"
 
     #define FX_VERSION 3
     #define FX_MASK (1u << 4)
@@ -60,9 +60,23 @@ private val imc_header: string = raw"""
 
     typedef union fx_word { uint32_t u; float f; } fx_word;
 
-    struct fx_bits { unsigned a : 3; unsigned b : 5; };
+    struct fx_bits { unsigned a : 3; unsigned : 2; unsigned b : 5; unsigned : 0; int c : 4; };
 
     struct fx_holder { int kind; union { int i; double d; } v; };
+
+    struct fx_pair { int tag; union { int n; float x; }; };
+
+    union fx_alt { uint32_t u; long double ld; };
+
+    struct __attribute__((aligned(16))) fx_al { int x; };
+
+    struct __attribute__((aligned)) fx_al_max { int x; };
+
+    struct fx_lbits { long l : 3; };
+
+    #pragma pack(push, 2)
+    struct fx_pk { char a; int b; };
+    #pragma pack(pop)
 
     struct __attribute__((packed)) fx_packed { uint8_t a; uint32_t b; };
 
@@ -75,20 +89,32 @@ private val imc_header: string = raw"""
     double fx_scale(float f, double d);
     int fx_log(fx_ctx *ctx, const char *fmt, ...);
     static inline int fx_twice(int x) { return x * 2; }
+    static inline unsigned fx_bits_a(struct fx_bits b) { return b.a; }
+    static inline int fx_none(const char *fmt, ...) { return 0; }
     uint16_t fx_bytes(uint8_t *out, int16_t *in, ssize_t n);
+    char fx_sign(char c);
     #define FX_BAD fx_nothing_declared
+    #define FX_SUM_OF(p) fx_point_sum(p)
+    #define FX_LOGV(c, ...) fx_log(c, __VA_ARGS__)
 
     typedef struct { int16_t lo; int16_t hi; } fx_span;
     typedef enum { FX_RED, FX_BLUE } fx_colour;
     typedef uint16_t fx_sym;
     typedef int fx_fn(int);
     struct fx_blob { uint32_t len; uint8_t data[]; };
+    struct fx_tagged { char code[4]; const char *label; };
     extern int fx_level;
 
     fx_span fx_widen(fx_span s, fx_colour c, fx_sym y);
     int fx_apply(fx_fn *f, int x);
     void fx_dump(FILE *out, struct fx_blob *b);
-    int fx_wait(struct timespec t);
+    int fx_wait(struct fx_far t);
+    """
+
+// The other header the fixture includes: a record it takes by value, laid out only under `--follow`.
+private val imc_other: string = raw"""
+    #include <stdint.h>
+    struct fx_far { int32_t a; double b; };
     """
 
 private val imc_expected: string = raw"""
@@ -114,17 +140,52 @@ private val imc_expected: string = raw"""
         at: [2]Point
         user: *u8
 
-    // `fx_word` is a C union, which sysl has no spelling for.
-    // Opaque here: its storage is SIZEOF_WORD bytes, aligned to ALIGNOF_WORD.
-    opaque struct Word
+    union Word
+        u: u32
+        f: f32
 
-    // `struct fx_bits` has a bitfield ('a'), whose layout C leaves to the implementation.
-    // Opaque here: its storage is SIZEOF_BITS bytes, aligned to ALIGNOF_BITS.
-    opaque struct Bits
+    struct Bits
+        a: u3 in u32
+        _: u2 in u32
+        b: u5 in u32
+        _: in u32
+        c: i4 in i32
 
-    // `struct fx_holder` has a field ('v') that is an anonymous struct or union, which has no name to give it.
-    // Opaque here: its storage is SIZEOF_HOLDER bytes, aligned to ALIGNOF_HOLDER.
-    opaque struct Holder
+    struct Holder
+        kind: i32
+        v: HolderV
+
+    union HolderV
+        i: i32
+        d: f64
+
+    struct Pair
+        tag: i32
+        union
+            n: i32
+            x: f32
+
+    // `union fx_alt.ld` is 'long double', whose format is the machine's -- see `c type`: here it is its bytes, as '_ld'.
+    @align(ALIGNOF_ALT)
+    union Alt
+        u: u32
+        _ld: [SIZEOF_ALT_LD]u8
+
+    @align(16)
+    struct Al
+        x: i32
+
+    // `struct fx_al_max` carries an alignment attribute whose value is not a literal.
+    // Opaque here: its storage is SIZEOF_AL_MAX bytes, aligned to ALIGNOF_AL_MAX.
+    opaque struct AlMax
+
+    // `struct fx_lbits` has a bitfield ('l') declared 'long', and a bitfield's unit is an integer of 8, 16, 32 or 64 bits.
+    // Opaque here: its storage is SIZEOF_LBITS bytes, aligned to ALIGNOF_LBITS.
+    opaque struct Lbits
+
+    // `struct fx_pk` is laid out under '#pragma pack'.
+    // Opaque here: its storage is SIZEOF_PK bytes, aligned to ALIGNOF_PK.
+    opaque struct Pk
 
     @packed
     struct Packed
@@ -138,6 +199,10 @@ private val imc_expected: string = raw"""
     // `struct fx_blob` has a field ('data') that is a flexible array member, whose length is the allocation's.
     // Opaque here: its storage is SIZEOF_BLOB bytes, aligned to ALIGNOF_BLOB.
     opaque struct Blob
+
+    struct Tagged
+        code: [4]i8
+        label: *u8
 
     type Cb = *extern(*Ctx, i32, *u8) -> unit
     type Sym = u16
@@ -174,10 +239,35 @@ private val imc_expected: string = raw"""
         OFFSETOF_REC_USER: usize = "__builtin_offsetof(struct fx_rec, user)"
         SIZEOF_WORD: usize = "sizeof(fx_word)"
         ALIGNOF_WORD: usize = "_Alignof(fx_word)"
+        OFFSETOF_WORD_U: usize = "__builtin_offsetof(fx_word, u)"
+        OFFSETOF_WORD_F: usize = "__builtin_offsetof(fx_word, f)"
         SIZEOF_BITS: usize = "sizeof(struct fx_bits)"
         ALIGNOF_BITS: usize = "_Alignof(struct fx_bits)"
         SIZEOF_HOLDER: usize = "sizeof(struct fx_holder)"
-        ALIGNOF_HOLDER: usize = "_Alignof(struct fx_holder)"
+        OFFSETOF_HOLDER_KIND: usize = "__builtin_offsetof(struct fx_holder, kind)"
+        OFFSETOF_HOLDER_V: usize = "__builtin_offsetof(struct fx_holder, v)"
+        SIZEOF_HOLDER_V: usize = "sizeof(((struct fx_holder *)0)->v)"
+        ALIGNOF_HOLDER_V: usize = "__alignof__(((struct fx_holder *)0)->v)"
+        OFFSETOF_HOLDER_V_I: usize = "__builtin_offsetof(struct fx_holder, v.i) - __builtin_offsetof(struct fx_holder, v)"
+        OFFSETOF_HOLDER_V_D: usize = "__builtin_offsetof(struct fx_holder, v.d) - __builtin_offsetof(struct fx_holder, v)"
+        SIZEOF_PAIR: usize = "sizeof(struct fx_pair)"
+        OFFSETOF_PAIR_TAG: usize = "__builtin_offsetof(struct fx_pair, tag)"
+        OFFSETOF_PAIR_N: usize = "__builtin_offsetof(struct fx_pair, n)"
+        OFFSETOF_PAIR_X: usize = "__builtin_offsetof(struct fx_pair, x)"
+        SIZEOF_ALT: usize = "sizeof(union fx_alt)"
+        ALIGNOF_ALT: usize = "_Alignof(union fx_alt)"
+        OFFSETOF_ALT_U: usize = "__builtin_offsetof(union fx_alt, u)"
+        SIZEOF_ALT_LD: usize = "sizeof(((union fx_alt *)0)->ld)"
+        OFFSETOF_ALT_LD: usize = "__builtin_offsetof(union fx_alt, ld)"
+        SIZEOF_AL: usize = "sizeof(struct fx_al)"
+        ALIGNOF_AL: usize = "_Alignof(struct fx_al)"
+        OFFSETOF_AL_X: usize = "__builtin_offsetof(struct fx_al, x)"
+        SIZEOF_AL_MAX: usize = "sizeof(struct fx_al_max)"
+        ALIGNOF_AL_MAX: usize = "_Alignof(struct fx_al_max)"
+        SIZEOF_LBITS: usize = "sizeof(struct fx_lbits)"
+        ALIGNOF_LBITS: usize = "_Alignof(struct fx_lbits)"
+        SIZEOF_PK: usize = "sizeof(struct fx_pk)"
+        ALIGNOF_PK: usize = "_Alignof(struct fx_pk)"
         SIZEOF_PACKED: usize = "sizeof(struct fx_packed)"
         OFFSETOF_PACKED_A: usize = "__builtin_offsetof(struct fx_packed, a)"
         OFFSETOF_PACKED_B: usize = "__builtin_offsetof(struct fx_packed, b)"
@@ -186,6 +276,9 @@ private val imc_expected: string = raw"""
         OFFSETOF_SPAN_HI: usize = "__builtin_offsetof(fx_span, hi)"
         SIZEOF_BLOB: usize = "sizeof(struct fx_blob)"
         ALIGNOF_BLOB: usize = "_Alignof(struct fx_blob)"
+        SIZEOF_TAGGED: usize = "sizeof(struct fx_tagged)"
+        OFFSETOF_TAGGED_CODE: usize = "__builtin_offsetof(struct fx_tagged, code)"
+        OFFSETOF_TAGGED_LABEL: usize = "__builtin_offsetof(struct fx_tagged, label)"
 
     @assert(sizeof(Point) == SIZEOF_POINT, "Point must match fx_point")
     @assert(offsetof(Point, x) == OFFSETOF_POINT_X, "fx_point.x moved")
@@ -196,12 +289,39 @@ private val imc_expected: string = raw"""
     @assert(offsetof(Rec, name) == OFFSETOF_REC_NAME, "struct fx_rec.name moved")
     @assert(offsetof(Rec, at) == OFFSETOF_REC_AT, "struct fx_rec.at moved")
     @assert(offsetof(Rec, user) == OFFSETOF_REC_USER, "struct fx_rec.user moved")
+    @assert(sizeof(Word) == SIZEOF_WORD, "Word must match fx_word")
+    @assert(alignof(Word) == ALIGNOF_WORD, "Word must be aligned as fx_word is")
+    @assert(offsetof(Word, u) == OFFSETOF_WORD_U, "fx_word.u moved")
+    @assert(offsetof(Word, f) == OFFSETOF_WORD_F, "fx_word.f moved")
+    @assert(sizeof(Bits) == SIZEOF_BITS, "Bits must match struct fx_bits")
+    @assert(alignof(Bits) == ALIGNOF_BITS, "Bits must be aligned as struct fx_bits is")
+    @assert(sizeof(Holder) == SIZEOF_HOLDER, "Holder must match struct fx_holder")
+    @assert(offsetof(Holder, kind) == OFFSETOF_HOLDER_KIND, "struct fx_holder.kind moved")
+    @assert(offsetof(Holder, v) == OFFSETOF_HOLDER_V, "struct fx_holder.v moved")
+    @assert(sizeof(HolderV) == SIZEOF_HOLDER_V, "HolderV must match struct fx_holder.v")
+    @assert(alignof(HolderV) == ALIGNOF_HOLDER_V, "HolderV must be aligned as struct fx_holder.v is")
+    @assert(offsetof(HolderV, i) == OFFSETOF_HOLDER_V_I, "struct fx_holder.v.i moved")
+    @assert(offsetof(HolderV, d) == OFFSETOF_HOLDER_V_D, "struct fx_holder.v.d moved")
+    @assert(sizeof(Pair) == SIZEOF_PAIR, "Pair must match struct fx_pair")
+    @assert(offsetof(Pair, tag) == OFFSETOF_PAIR_TAG, "struct fx_pair.tag moved")
+    @assert(offsetof(Pair, n) == OFFSETOF_PAIR_N, "struct fx_pair.n moved")
+    @assert(offsetof(Pair, x) == OFFSETOF_PAIR_X, "struct fx_pair.x moved")
+    @assert(sizeof(Alt) == SIZEOF_ALT, "Alt must match union fx_alt")
+    @assert(alignof(Alt) == ALIGNOF_ALT, "Alt must be aligned as union fx_alt is")
+    @assert(offsetof(Alt, u) == OFFSETOF_ALT_U, "union fx_alt.u moved")
+    @assert(offsetof(Alt, _ld) == OFFSETOF_ALT_LD, "union fx_alt.ld moved")
+    @assert(sizeof(Al) == SIZEOF_AL, "Al must match struct fx_al")
+    @assert(alignof(Al) == ALIGNOF_AL, "Al must be aligned as struct fx_al is")
+    @assert(offsetof(Al, x) == OFFSETOF_AL_X, "struct fx_al.x moved")
     @assert(sizeof(Packed) == SIZEOF_PACKED, "Packed must match struct fx_packed")
     @assert(offsetof(Packed, a) == OFFSETOF_PACKED_A, "struct fx_packed.a moved")
     @assert(offsetof(Packed, b) == OFFSETOF_PACKED_B, "struct fx_packed.b moved")
     @assert(sizeof(Span) == SIZEOF_SPAN, "Span must match fx_span")
     @assert(offsetof(Span, lo) == OFFSETOF_SPAN_LO, "fx_span.lo moved")
     @assert(offsetof(Span, hi) == OFFSETOF_SPAN_HI, "fx_span.hi moved")
+    @assert(sizeof(Tagged) == SIZEOF_TAGGED, "Tagged must match struct fx_tagged")
+    @assert(offsetof(Tagged, code) == OFFSETOF_TAGGED_CODE, "struct fx_tagged.code moved")
+    @assert(offsetof(Tagged, label) == OFFSETOF_TAGGED_LABEL, "struct fx_tagged.label moved")
 
     extern "fx_open" open(path: *u8, len: usize) -> *Ctx
     extern "fx_close" close(ctx: *Ctx)
@@ -212,6 +332,7 @@ private val imc_expected: string = raw"""
     extern "fx_scale" scale(f: f32, d: f64) -> f64
     extern "fx_log" log(ctx: *Ctx, fmt: *u8, ...) -> i32
     extern "fx_bytes" bytes(out: *u8, `in`: *i16, n: isize) -> u16
+    extern "fx_sign" sign(c: i8) -> i8
     extern "fx_widen" widen(s: Span, c: Colour, y: Sym) -> Span
     extern "fx_apply" apply(f: *extern(i32) -> i32, x: i32) -> i32
     extern "fx_dump" dump(out: *FILE, b: *Blob)
@@ -219,23 +340,55 @@ private val imc_expected: string = raw"""
 
     // Not generated:
     //
-    // - fx_word is a C union, which sysl has no spelling for -- an opaque struct here, sized by SIZEOF_WORD and aligned by ALIGNOF_WORD
-    // - struct fx_bits has a bitfield ('a'), whose layout C leaves to the implementation -- an opaque struct here, sized by SIZEOF_BITS and aligned by ALIGNOF_BITS
-    // - struct fx_holder has a field ('v') that is an anonymous struct or union, which has no name to give it -- an opaque struct here, sized by SIZEOF_HOLDER and aligned by ALIGNOF_HOLDER
+    // - union fx_alt.ld is 'long double', whose format is the machine's -- see `c type` -- its bytes here, as '_ld'
+    // - struct fx_al_max carries an alignment attribute whose value is not a literal -- an opaque struct here, sized by SIZEOF_AL_MAX and aligned by ALIGNOF_AL_MAX
+    // - struct fx_lbits has a bitfield ('l') declared 'long', and a bitfield's unit is an integer of 8, 16, 32 or 64 bits -- an opaque struct here, sized by SIZEOF_LBITS and aligned by ALIGNOF_LBITS
+    // - struct fx_pk is laid out under '#pragma pack' -- an opaque struct here, sized by SIZEOF_PK and aligned by ALIGNOF_PK
     // - struct fx_blob has a field ('data') that is a flexible array member, whose length is the allocation's -- an opaque struct here, sized by SIZEOF_BLOB and aligned by ALIGNOF_BLOB
-    // - fx_twice: a 'static inline' function has no symbol to link against -- a '.c' shim beside the module reaches it
-    // - fx_wait: 'struct timespec' by value, and it is declared by another header
+    // - fx_twice: a 'static inline' function has no symbol to link against -- '--shim <file.c>' writes the wrapper that reaches it
+    // - fx_bits_a: 'struct fx_bits' has C bitfields, which cross a C boundary only by address -- as a '*Bits'
+    // - fx_none: a 'static inline' function that takes '...', whose arguments a wrapper cannot pass on
+    // - fx_wait: 'struct fx_far' by value, and it is declared by another header -- '--follow fx_other.h' lays it out
     // - FX_NAME: a string, and a 'c const' measures numbers only
     // - FX_BAD: not a constant expression C can evaluate
-    // - FX_TWICE: a function-like macro, which has no value of its own
+    // - FX_TWICE: a function-like macro whose parameters ('x') no function it calls gives a type
+    // - FX_SUM_OF: a function-like macro has no symbol to link against -- '--shim <file.c>' writes the wrapper that reaches it
+    // - FX_LOGV: a function-like macro that takes '...'
     """
 
-// The C half of the fixture: two functions, one handing a struct back by value and one taking it.
+// What `--shim` adds: the two wrappers, and their `extern`s where the module declares its functions.
+private val imc_shim: string = raw"""
+    /* Generated by `sysl import-c` from fx.h: a C wrapper for each 'static' function and
+     * function-like macro the module reaches, which have no symbol of their own. It is compiled
+     * where it sits, in the module's directory. Regenerate it rather than editing it. */
+    #include "fx.h"
+
+    int sysl_fx_twice(int x) {
+        return fx_twice(x);
+    }
+
+    int sysl_FX_SUM_OF(fx_point p) {
+        return FX_SUM_OF(p);
+    }
+    """
+
+// The C half of the fixture: a struct handed back by value and one taken, and a `char` both ways.
 private val imc_c: string = raw"""
     #include "fx.h"
     fx_point fx_origin(void) { fx_point p = {3, 4}; return p; }
     int fx_point_sum(fx_point p) { return p.x + p.y; }
+    char fx_sign(char c) { return (char)-c; }
     """
+
+// What the fixture's program prints: sizes the layout checks have already held to C's, numbers
+// read back, a union and a bitfield written and read, and calls across both ways.
+private val imc_print: string =
+    "print(sizeof(Point), sizeof(Rec), sizeof(Packed), MODE_ON, LOW, BIG, HALF, SIZEOF_WORD, " +
+    "point_sum(origin()), sign(5))\n" +
+    "var b = Bits(5, 17, -3)\n" +
+    "b.c += 1\n" +
+    "print(Word(f = 1.0).u, sizeof(Holder), sizeof(Pair), sizeof(Bits), alignof(Al), b.a, b.b, b.c, " +
+    "Pair(tag = 1, n = 9).n)\n"
 
 private imc_ready() -> bool
     if std_root().is_err()
@@ -256,18 +409,27 @@ private imc_fixture() -> string
     val dir = make_temp_dir("sysl-imc").unwrap()
 
     write_text(s"$dir/fx.h", imc_header).unwrap()
+    write_text(s"$dir/fx_other.h", imc_other).unwrap()
     dir
 
-private imc_generated(dir: string) -> IcOutput =
-    import_c_generate(s"$dir/fx.h", IcOptions("fx_", "", "", "", None)).unwrap()
+private imc_options(follow: Buf[string], shim: string) -> IcOptions = IcOptions("fx_", "", "", "", None, follow, shim)
 
-// A project beside the fixture: the generated module as its root, a line using it, and the C.
-private imc_project(dir: string, module_text: string) -> string
+private imc_generated(dir: string) -> IcOutput = import_c_generate(s"$dir/fx.h", imc_options(buf(), "")).unwrap()
+
+// A project beside the fixture: the generated module as its root, lines using it, and the C.
+private imc_project(dir: string, module_text: string, uses: string) -> string
     write_text(s"$dir/fx.c", imc_c).unwrap()
     write_text(s"$dir/package.hocon", "package {\n  name = \"fx\"\n  version = \"0.0.1\"\n}\n").unwrap()
-    write_text(s"$dir/main.sysl", module_text + "\nprint(sizeof(Point), sizeof(Rec), sizeof(Packed), " +
-               "MODE_ON, LOW, BIG, HALF, SIZEOF_WORD, point_sum(origin()))\n").unwrap()
+    write_text(s"$dir/main.sysl", module_text + "\n" + uses).unwrap()
     dir
+
+// The project built and run: what it printed, or the build's complaint.
+private imc_built(root: string) -> Result[string, string]
+    val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/fx"])
+
+    if code != Fine then return Err(err)
+
+    Ok(capture(s"$root/fx", [], "", [], true).unwrap().text)
 
 // The text with its first `old` replaced, for a case that breaks one line on purpose.
 private imc_once(text: string, old: string, new: string) -> string = text.index_of(old) match
@@ -310,15 +472,10 @@ imc_fixture_runs()
     if !imc_ready() then return
 
     val dir = imc_fixture()
-    val root = imc_project(dir, imc_generated(dir).text)
-    val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/fx"])
-
-    assert_eq(code, Fine, err)
-
-    val ran = capture(s"$root/fx", [], "", [], true)
+    val ran = imc_built(imc_project(dir, imc_generated(dir).text, imc_print))
 
     remove_dir_all(dir).unwrap_or(())
-    assert_eq(ran.unwrap().text, "8 48 5 4 -1 4294967296 0.5 4 7\n")
+    assert_eq(ran, Ok("8 48 5 4 -1 4294967296 0.5 4 7 -5\n1065353216 16 8 8 16 5 17 -2 9\n"))
 end imc_fixture_runs
 
 // The check the others lean on: a record laid out differently from C must not build.
@@ -328,12 +485,88 @@ imc_layout_check_can_fail()
 
     val dir = imc_fixture()
     val broken = imc_once(imc_generated(dir).text, "    y: i32\n", "    y: i64\n")
-    val (code, _, err) = clx_ran(["sysl", "run", imc_project(dir, broken)])
+    val (code, _, err) = clx_ran(["sysl", "run", imc_project(dir, broken, imc_print)])
 
     remove_dir_all(dir).unwrap_or(())
     assert(code != Fine, "a widened field built")
     assert(err.contains("assertion failed: Point must match fx_point — the left side is 16 and the right side is 8"), err)
 end imc_layout_check_can_fail
+
+// The same checks hold a union, a C bitfield and an aligned record to C: each one broken on purpose
+// fails at its own record's check.
+@test("a union member, a bitfield or an alignment that disagrees with C fails the build at its check")
+imc_union_bits_checks_can_fail()
+    if !imc_ready() then return
+
+    val cases = [("    f: f32\n", "    f: f64\n", "Word must match fx_word — the left side is 8 and the right side is 4"),
+                 ("    b: u5 in u32\n", "    b: u30 in u32\n", "Bits must match struct fx_bits — the left side is 12"),
+                 ("@align(16)\nstruct Al", "@align(8)\nstruct Al", "Al must match struct fx_al — the left side is 8")]
+
+    for c in cases
+        val dir = imc_fixture()
+        val broken = imc_once(imc_generated(dir).text, c.0, c.1)
+
+        assert(broken != imc_generated(dir).text, c.0)
+
+        val (code, _, err) = clx_ran(["sysl", "run", imc_project(dir, broken, imc_print)])
+
+        remove_dir_all(dir).unwrap_or(())
+        assert(code != Fine, s"'${c.1.trim()}' built")
+        assert(err.contains(c.2), err)
+end imc_union_bits_checks_can_fail
+
+// `--follow` lays out a record another header declares where the header's own declarations use it
+// by value, under the same checks; without it the same declaration is refused (the fixture's text).
+@test("'--follow' lays out another header's record that is used by value, and the result runs")
+imc_follow_lays_out()
+    if !imc_ready() then return
+
+    val dir = imc_fixture()
+    var follow: Buf[string] = buf()
+
+    follow.push("fx_other.h")
+
+    val out = import_c_generate(s"$dir/fx.h", imc_options(follow, "")).unwrap()
+
+    assert(out.text.contains("// Declared by a header '--follow' named.\nstruct Far\n    a: i32\n    b: f64\n\n"), out.text)
+    assert(out.text.contains("    OFFSETOF_FAR_B: usize = \"__builtin_offsetof(struct fx_far, b)\"\n"), out.text)
+    assert(out.text.contains("@assert(sizeof(Far) == SIZEOF_FAR, \"Far must match struct fx_far\")\n"), out.text)
+    assert(out.text.contains("extern \"fx_wait\" wait(t: Far) -> i32\n"), out.text)
+    assert(!join(out.refused.view(), "\n").contains("fx_wait"), join(out.refused.view(), "\n"))
+
+    val ran = imc_built(imc_project(dir, out.text, "print(sizeof(Far), Far(1, 0.5).b)\n"))
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(ran, Ok("16 0.5\n"))
+end imc_follow_lays_out
+
+// `--shim`: a wrapper per `static inline` function and per function-like macro a function types,
+// their `extern`s in the module, and the pair compiles, links and calls through.
+@test("'--shim' writes a C wrapper for each typed static inline function and macro, and they link and run")
+imc_shim_runs()
+    if !imc_ready() then return
+
+    val dir = imc_fixture()
+    val out = import_c_generate(s"$dir/fx.h", imc_options(buf(), "shim.c")).unwrap()
+    val refused = join(out.refused.view(), "\n")
+
+    assert_eq(out.shim, imc_shim)
+    assert(out.text.contains("extern \"fx_log\" log(ctx: *Ctx, fmt: *u8, ...) -> i32\n" +
+                             "extern \"sysl_fx_twice\" twice(x: i32) -> i32\n"), out.text)
+    assert(out.text.contains("extern \"fx_level\" level: i32\nextern \"sysl_FX_SUM_OF\" sum_of(p: Point) -> i32\n"),
+           out.text)
+    assert(!refused.contains("fx_twice") && !refused.contains("FX_SUM_OF"), refused)
+    assert(refused.contains("FX_TWICE: a function-like macro whose parameters ('x') no function it calls gives a type"),
+           refused)
+    assert(refused.contains("fx_none: a 'static inline' function that takes '...'"), refused)
+
+    write_text(s"$dir/shim.c", out.shim).unwrap()
+
+    val ran = imc_built(imc_project(dir, out.text, "print(twice(21), sum_of(origin()))\n"))
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(ran, Ok("42 7\n"))
+end imc_shim_runs
 
 // ## The command
 
@@ -348,31 +581,48 @@ imc_command_prints()
     assert_eq(code, Fine, err)
     assert_eq(out, imc_expected[0..<imc_expected.len - 1])
     assert(err.contains("sysl: note: not generated: FX_NAME: a string, and a 'c const' measures numbers only"), err)
-    assert(err.contains("sysl: note: not generated: fx_wait: 'struct timespec' by value, and it is declared " +
-                        "by another header"), err)
+    assert(err.contains("sysl: note: not generated: fx_wait: 'struct fx_far' by value, and it is declared " +
+                        "by another header -- '--follow fx_other.h' lays it out"), err)
 end imc_command_prints
 
-@test("'--module' and '--link-lib' head the module, and '-o' writes it")
+@test("'--module' and '--link-lib' head the module, '-o' writes it, and '--shim' writes the wrappers")
 imc_command_writes()
     if !imc_ready() then return
 
     val dir = imc_fixture()
     val (code, _, err) = clx_ran(["sysl", "import-c", s"$dir/fx.h", "--prefix", "fx_", "--module", "fx.c",
-                                  "--link-lib", "fx", "-o", s"$dir/out.sysl"])
+                                  "--link-lib", "fx", "--follow", "fx_other.h", "--shim", s"$dir/fx_shim.c",
+                                  "-o", s"$dir/out.sysl"])
     val text = read_text(s"$dir/out.sysl").unwrap_or("")
+    val shim = read_text(s"$dir/fx_shim.c").unwrap_or("")
 
     remove_dir_all(dir).unwrap_or(())
     assert_eq(code, Fine, err)
     assert(err.contains(s"wrote $dir/out.sysl"), err)
+    assert(err.contains(s"wrote $dir/fx_shim.c"), err)
     assert(text.contains("module above this one.\n\nmodule fx.c\n\n@link(\"fx\")\n\n@include(\"fx.h\")\n"), text)
+    assert(text.contains("extern \"fx_wait\" wait(t: Far) -> i32\n"), text)
+    assert_eq(shim, imc_shim)
 end imc_command_writes
+
+@test("'--shim' and '--follow' without a value are misuses, said with the usage")
+imc_command_flag_needs_value()
+    val (code, _, err) = clx_ran(["sysl", "import-c", "fx.h", "--shim"])
+
+    assert_eq(code, Misused)
+    assert(err.contains("--shim") && err.contains(import_c_usage()), err)
+
+    val (code2, _, err2) = clx_ran(["sysl", "import-c", "fx.h", "--follow"])
+
+    assert_eq(code2, Misused)
+    assert(err2.contains("--follow") && err2.contains(import_c_usage()), err2)
 
 @test("with no prefix, nothing is taken off a name")
 imc_no_prefix()
     if !imc_ready() then return
 
     val dir = imc_fixture()
-    val out = import_c_generate(s"$dir/fx.h", IcOptions("", "", "", "", None)).unwrap()
+    val out = import_c_generate(s"$dir/fx.h", IcOptions("", "", "", "", None, buf(), "")).unwrap()
 
     remove_dir_all(dir).unwrap_or(())
     assert(out.text.contains("struct FxPoint\n"), out.text)
@@ -475,7 +725,7 @@ imc_tree_sitter_agrees()
         return
     end if
 
-    val out = import_c_generate(header, IcOptions("ts_", "", "", "tree_sitter/api.h", None)).unwrap()
+    val out = import_c_generate(header, IcOptions("ts_", "", "", "tree_sitter/api.h", None, buf(), "")).unwrap()
 
     assert(out.refused.is_empty(), join(out.refused.view(), "\n"))
 

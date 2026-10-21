@@ -27,26 +27,41 @@ import sysl.text.{Search, parse_long, split, str_builder}
 // macro is a `c const` naming it: every number comes from the C compiler at build time, so the file
 // is not a snapshot of one machine.
 
-// What a command line asked for, beyond the header.
+// What a command line asked for, beyond the header. `follow` names the other headers whose records
+// are laid out where they are used by value; `shim` is the C file the wrappers are written to, empty
+// where none was asked for.
 struct IcOptions
     prefix: string
     module_name: string
     link: string
     include_as: string
     target: Option[string]
+    follow: Buf[string]
+    shim: string
 
-// What a header became: the module's text, and every declaration that was not generated with why.
+// What a header became: the module's text, every declaration that was not generated with why, and
+// the C of the wrappers (empty where `--shim` was not given or nothing needed one).
 struct IcOutput
     text: string
     refused: Buf[string]
+    shim: string
 
+// One member of a record. `width` is a bitfield's, `-1` for an ordinary member; `inner` is the id
+// of the unnamed record a member is declared with (`union { … };` or `struct { … } v;`), and empty
+// otherwise; `aligned` is a member written with an alignment attribute of its own.
 struct IcField
     name: string
     qual: string
     bitfield: bool
+    width: long
+    inner: string
+    aligned: bool
 
 // One `struct` or `union`, keyed by its tag (or clang's id where it has none). `why` is the reason
-// its layout is withheld, empty while it is laid out; `named` is the typedef that names it.
+// its layout is withheld, empty while it is laid out; `named` is the typedef that names it; `file`
+// the header declaring it. `nested` is an unnamed record written inside another, which is laid out
+// as part of it. `align` is a literal `aligned(n)`, zero where there is none. `followed` is a record
+// of a header named with `--follow`, and `reached` says something generated here uses it.
 struct IcRecord
     id: string
     tag: string
@@ -58,6 +73,11 @@ struct IcRecord
     why: string
     named: string
     sysl: string
+    file: string
+    nested: bool
+    align: long
+    followed: bool
+    reached: bool
 
 struct IcEnum
     id: string
@@ -73,13 +93,23 @@ struct IcTypedef
     owned: string
     main: bool
     sysl: string
+    followed: bool
 
+// A function: its parameters' names and their types as clang spells them, which a wrapper declares
+// its own parameters with.
 struct IcFunc
     name: string
     qual: string
     params: Buf[string]
     storage: string
     inline: bool
+    param_quals: Buf[string]
+
+// A function-like `#define`: its parameters and what it expands to.
+struct IcMacro
+    name: string
+    params: Buf[string]
+    body: string
 
 struct IcModel
     header: string
@@ -95,6 +125,9 @@ struct IcModel
     used: Buf[string]
     clong: bool
     culong: bool
+    follow: Buf[string]
+    fmacros: Buf[IcMacro]
+    reach_on: bool
 
 // The file clang's JSON is talking about. It writes a location's `file` only where it differs from
 // the location written before it, so the walk has to visit every location in document order to know
@@ -104,14 +137,14 @@ struct IcWalk
 
 import_c_usage() -> string =
     "usage: sysl import-c [-I <dir>] [-D <macro>] [--prefix <p>] [--module <name>] [--link-lib <lib>] " +
-    "[--include-as <path>] [--target <name>] [-o <path>] <header.h>"
+    "[--include-as <path>] [--follow <header>] [--shim <file.c>] [--target <name>] [-o <path>] <header.h>"
 
 // `sysl import-c <header.h>` -- the sysl declarations for a C header, on standard output or `-o`'s
 // file. What could not be generated is said on standard error, one line each, and in the file's
 // closing comment; the command still succeeds, because a header with one unbindable macro is still
 // worth the rest.
 import_c_command(args: []string, say: string -> unit, note: string -> unit) -> int
-    var opts = IcOptions("", "", "", "", None)
+    var opts = IcOptions("", "", "", "", None, buf(), "")
     var header = ""
     var output: Option[string] = None
     var mistakes: Buf[string] = buf()
@@ -127,7 +160,7 @@ import_c_command(args: []string, say: string -> unit, note: string -> unit) -> i
 
         val arg = args[i]
         val valued = arg == "--prefix" || arg == "--module" || arg == "--link-lib" || arg == "--include-as" ||
-            arg == "--target" || arg == "-o" || arg == "-I"
+            arg == "--target" || arg == "-o" || arg == "-I" || arg == "--follow" || arg == "--shim"
 
         if took > 0
             if took == 2 then i += 1
@@ -147,6 +180,8 @@ import_c_command(args: []string, say: string -> unit, note: string -> unit) -> i
                 "--link-lib" -> opts.link = v
                 "--include-as" -> opts.include_as = v
                 "--target" -> opts.target = Some(v)
+                "--follow" -> opts.follow.push(v)
+                "--shim" -> opts.shim = v
                 "-o" -> output = Some(v)
                 _ -> add_include_path(v)
         else if arg.starts_with("-I") && arg.len > 2
@@ -176,6 +211,13 @@ import_c_command(args: []string, say: string -> unit, note: string -> unit) -> i
 
     for item in made.refused
         note(s"sysl: note: not generated: $item")
+
+    // The wrappers go to their own file, which is compiled where it sits beside the module.
+    if opts.shim != ""
+        val wrote = literate_write(opts.shim, made.shim, note)
+
+        if wrote != Fine then return wrote
+    end if
 
     output match
         None ->
@@ -231,7 +273,7 @@ import_c_generate(header: string, opts: IcOptions) -> Result[IcOutput, string]
     if !expanded.status.ok()
         return Err(s"the C compiler could not read $header:\n${expanded.err.unwrap_or("").trim()}")
 
-    val (candidates, macro_refusals) = ic_macros(expanded.text, full)
+    val (candidates, fmacros) = ic_macros(expanded.text, full)
 
     // Then the declarations, from a probe giving each candidate macro a line of its own: what clang
     // deduces for `__auto_type` is the macro's type, and a line it refuses is a macro that is not a
@@ -290,20 +332,34 @@ import_c_generate(header: string, opts: IcOptions) -> Result[IcOutput, string]
         Ok(d) -> d
         Err(_) -> return Err("clang's AST dump is not JSON this reader understands")
 
+    // A followed header is matched by its path, or by the end of one: `--follow sys/_timespec.h`.
+    var follow: Buf[string] = buf()
+
+    for f in opts.follow
+        follow.push(f)
+        canonicalize(f) match
+            Ok(c) -> follow.push(c)
+            Err(_) -> ()
+
     var m = IcModel(full, probe, opts.prefix, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(),
-                    false, false)
+                    false, false, follow, fmacros, false)
 
     ic_collect(doc, &m)
 
     var refused: Buf[string] = buf()
+    var shim = str_builder()
     val spelled = ic_include_spelling(full, opts.include_as)
-    val rendered = ic_render(&m, spelled, opts, candidates, bad_lines, &refused)
+    val rendered = ic_render(&m, spelled, opts, candidates, bad_lines, &refused, &shim)
 
-    for item in macro_refusals
-        refused.push(item)
-
-    Ok(IcOutput(ic_finish(rendered, refused), refused))
+    Ok(IcOutput(ic_finish(rendered, refused), refused, shim.finish()))
 end import_c_generate
+
+// Whether a declaration's file is one `--follow` named.
+private ic_is_followed(file: string, follow: Buf[string]) -> bool
+    for f in follow
+        if file == f || file.ends_with("/" + f) then return true
+
+    false
 
 // How the module's `@include` names the header: as asked, or relative to the first `-I` that holds
 // it, or by its file name alone.
@@ -323,12 +379,12 @@ private ic_include_spelling(full: string, asked: string) -> string
     parts[parts.len - 1]
 end ic_include_spelling
 
-// **The header's own object-like `#define`s**, from `clang -E -dD`: the names to probe, and why each
-// of the rest is not one. A line marker says which file the lines after it are from, so only the
-// header's own macros are taken -- not every one its includes defined.
-private ic_macros(text: string, header: string) -> (Buf[string], Buf[string])
+// **The header's own `#define`s**, from `clang -E -dD`: the object-like names to probe, and the
+// function-like macros with their parameters and bodies. A line marker says which file the lines
+// after it are from, so only the header's own macros are taken -- not every one its includes defined.
+private ic_macros(text: string, header: string) -> (Buf[string], Buf[IcMacro])
     var names: Buf[string] = buf()
-    var refusals: Buf[string] = buf()
+    var funcs: Buf[IcMacro] = buf()
     var cur = ""
 
     for line in split(text, "\n")
@@ -357,6 +413,13 @@ private ic_macros(text: string, header: string) -> (Buf[string], Buf[string])
                 if n != gone then kept.push(n)
 
             names = kept
+
+            var kept_funcs: Buf[IcMacro] = buf()
+
+            for f in funcs
+                if f.name != gone then kept_funcs.push(f)
+
+            funcs = kept_funcs
             continue
         end if
 
@@ -370,7 +433,18 @@ private ic_macros(text: string, header: string) -> (Buf[string], Buf[string])
         val name = rest[0..<k]
 
         if k < rest.len && rest.bytes[k] == u8('(')
-            refusals.push(s"$name: a function-like macro, which has no value of its own")
+            val after = rest[k + 1..<rest.len]
+
+            after.index_of(")") match
+                Some(close) ->
+                    var params: Buf[string] = buf()
+
+                    for p in split(after[0..<close], ",")
+                        if p.trim() != "" then params.push(p.trim())
+
+                    funcs.push(IcMacro(name, params, after[close + 1..<after.len].trim()))
+                None -> ()
+
             continue
         end if
 
@@ -379,7 +453,7 @@ private ic_macros(text: string, header: string) -> (Buf[string], Buf[string])
 
         names.push(name)
 
-    (names, refusals)
+    (names, funcs)
 end ic_macros
 
 private ic_name_byte(c: u8) -> bool =
@@ -399,6 +473,44 @@ private ic_flag(j: Json, key: string) -> bool = j.get(key) match
 private ic_qual(j: Json) -> string = j.get("type") match
     Some(t) -> ic_str(t, "qualType")
     None -> ""
+
+// The node's first child, where it has one.
+private ic_first(j: Json) -> Option[Json] = j.get("inner") match
+    Some(inner) -> inner.at(0)
+    None -> None
+
+// Whether one of the node's children is of `kind`.
+private ic_has_kind(j: Json, kind: string) -> bool
+    j.get("inner") match
+        Some(inner) ->
+            for k in 0..<inner.len()
+                if ic_str(inner.at(k).unwrap(), "kind") == kind then return true
+        None -> ()
+
+    false
+
+// An attribute's argument where it is written as an integer literal (`aligned(16)`, or a macro
+// that is one), and `0` where it is anything else or absent.
+private ic_literal(attr: Json) -> long
+    val c = ic_first(attr) match
+        Some(found) -> found
+        None -> return 0
+
+    val lit = ic_first(c) match
+        Some(found) -> found
+        None -> return 0
+
+    if ic_str(c, "kind") != "ConstantExpr" || ic_str(lit, "kind") != "IntegerLiteral" then return 0
+
+    parse_long(ic_str(c, "value")).unwrap_or(0)
+
+// A bitfield's width, which clang has already evaluated; `-1` for an ordinary member.
+private ic_width(f: Json) -> long
+    if !ic_flag(f, "isBitfield") then return -1
+
+    ic_first(f) match
+        Some(c) -> parse_long(ic_str(c, "value")).unwrap_or(-1)
+        None -> -1
 
 private ic_track(j: Json, w: *IcWalk)
     if j.is_object()
@@ -440,12 +552,13 @@ private ic_collect(doc: Json, m: *IcModel)
 
         if ic_flag(d, "isImplicit") then continue
 
-        ic_decl(d, file == m.header, file == m.probe, m)
+        ic_decl(d, file, file == m.header, file == m.probe, m)
 end ic_collect
 
-private ic_decl(d: Json, main: bool, probe: bool, m: *IcModel)
+private ic_decl(d: Json, file: string, main: bool, probe: bool, m: *IcModel)
     val kind = ic_str(d, "kind")
     val name = ic_str(d, "name")
+    val followed = !main && ic_is_followed(file, m.follow)
 
     if kind == "TypedefDecl"
         var owned = ""
@@ -464,9 +577,9 @@ private ic_decl(d: Json, main: bool, probe: bool, m: *IcModel)
         for t in m.typedefs
             if t.name == name && t.main == main then return
 
-        m.typedefs.push(IcTypedef(name, ic_qual(d), owned, main, ""))
+        m.typedefs.push(IcTypedef(name, ic_qual(d), owned, main, "", followed))
     else if kind == "RecordDecl"
-        ic_record(d, main, m)
+        ic_record(d, file, main, followed, false, m)
     else if kind == "EnumDecl"
         var consts: Buf[string] = buf()
 
@@ -484,16 +597,19 @@ private ic_decl(d: Json, main: bool, probe: bool, m: *IcModel)
             if f.name == name then return
 
         var params: Buf[string] = buf()
+        var quals: Buf[string] = buf()
 
         d.get("inner") match
             Some(inner) ->
                 for k in 0..<inner.len()
                     val p = inner.at(k).unwrap()
 
-                    if ic_str(p, "kind") == "ParmVarDecl" then params.push(ic_str(p, "name"))
+                    if ic_str(p, "kind") == "ParmVarDecl"
+                        params.push(ic_str(p, "name"))
+                        quals.push(ic_qual(p))
             None -> ()
 
-        m.funcs.push(IcFunc(name, ic_qual(d), params, ic_str(d, "storageClass"), ic_flag(d, "inline")))
+        m.funcs.push(IcFunc(name, ic_qual(d), params, ic_str(d, "storageClass"), ic_flag(d, "inline"), quals))
     else if kind == "VarDecl"
         if probe && name.starts_with("__sysl_import_c_")
             parse_long(name[16..<name.len]) match
@@ -511,15 +627,18 @@ private ic_has_enum(m: *IcModel, tag: string) -> bool
 
     false
 
-// A record, and the named records C hoists out of it. A second declaration of a tag already seen
-// completes it where it is the definition.
-private ic_record(d: Json, main: bool, m: *IcModel)
+// A record, and the records C hoists out of it: a named one as a record of its own, an unnamed one
+// as `nested`, which the member declared with it points at. A second declaration of a tag already
+// seen completes it where it is the definition.
+private ic_record(d: Json, file: string, main: bool, followed: bool, nested: bool, m: *IcModel)
     val tag = ic_str(d, "name")
     val id = ic_str(d, "id")
     val complete = ic_flag(d, "completeDefinition")
     var fields: Buf[IcField] = buf()
     var packed = false
+    var align: long = 0
     var why = ""
+    var unnamed = ""
 
     d.get("inner") match
         Some(inner) ->
@@ -528,18 +647,29 @@ private ic_record(d: Json, main: bool, m: *IcModel)
                 val kind = ic_str(f, "kind")
 
                 if kind == "FieldDecl"
-                    fields.push(IcField(ic_str(f, "name"), ic_qual(f), ic_flag(f, "isBitfield")))
+                    val qual = ic_qual(f)
+                    val anon = qual.contains("(anonymous") || qual.contains("(unnamed")
+
+                    fields.push(IcField(ic_str(f, "name"), qual, ic_flag(f, "isBitfield"), ic_width(f),
+                                        if anon then unnamed else "", ic_has_kind(f, "AlignedAttr")))
                 else if kind == "RecordDecl"
-                    if ic_str(f, "name") != "" then ic_record(f, main, m)
+                    if ic_str(f, "name") != ""
+                        ic_record(f, file, main, followed, false, m)
+                    else
+                        unnamed = ic_str(f, "id")
+                        ic_record(f, file, main, followed, true, m)
                 else if kind == "PackedAttr"
                     packed = true
                 else if kind == "AlignedAttr"
-                    why = "carries an alignment attribute"
+                    align = ic_literal(f)
+
+                    if align <= 0 then why = "carries an alignment attribute whose value is not a literal"
                 else if kind == "MaxFieldAlignmentAttr"
                     why = "is laid out under '#pragma pack'"
         None -> ()
 
-    val rec = IcRecord(id, tag, ic_str(d, "tagUsed") == "union", complete, main, fields, packed, why, "", "")
+    val rec = IcRecord(id, tag, ic_str(d, "tagUsed") == "union", complete, main, fields, packed, why, "", "",
+                       file, nested, align, followed, false)
 
     if tag != ""
         for k in 0..<m.records.len()
@@ -550,8 +680,11 @@ private ic_record(d: Json, main: bool, m: *IcModel)
                     had.complete = true
                     had.fields = fields
                     had.packed = packed
+                    had.align = align
                     had.why = why
                     had.id = id
+                    had.file = file
+                    had.followed = followed
                 end if
 
                 if main then had.main = true

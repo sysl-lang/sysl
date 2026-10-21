@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{Search, join, str_builder, to_lower, to_upper}
+import sysl.slices.contains as ic_contains
+import sysl.text.{Search, StrBuilder, join, split, str_builder, to_lower, to_upper}
 
 // **What `sysl import-c` writes for what it read** (`import_c.sysl` reads it): the names, the type
 // mapping, which records can be laid out, and the module's text.
@@ -133,8 +134,10 @@ end ic_unique
 
 // ## Types
 
+// A plain `char` is `i8` as a value -- it is signed on the machines most C is built for, and a value
+// is where the sign is extended -- and `u8` behind a pointer, where it is bytes (`ic_map_named`).
 private ic_builtin(spec: string) -> Option[string] = spec match
-    "char" -> Some("u8")
+    "char" -> Some("i8")
     "signed char" -> Some("i8")
     "unsigned char" -> Some("u8")
     "short" -> Some("i16")
@@ -243,29 +246,100 @@ private ic_func_of(t: IcType, m: *IcModel, depth: int) -> Option[IcType]
         Some(k) -> ic_func_of(ic_parse(m.typedefs.at(k).qual), m, depth + 1)
         None -> None
 
-private ic_record_ref(spec: string, kind: string, tag: string, pos: int, m: *IcModel) -> Result[string, string]
+// The last part of a path: what `--follow` is told to name a header by.
+private ic_base_name(file: string) -> string
+    val parts = split(file, "/")
+
+    parts[parts.len - 1]
+
+// Whether a record has C bitfields of its own, or in a member with no name of its own -- what
+// decides that it crosses a C boundary only by address.
+private ic_has_bits(m: *IcModel, r: IcRecord) -> bool
+    for f in r.fields
+        if f.bitfield then return true
+
+        if f.inner != "" && f.name == ""
+            ic_find_record(m, "", f.inner) match
+                Some(k) ->
+                    if ic_has_bits(m, m.records.at(k)) then return true
+                None -> ()
+        end if
+
+    false
+
+// A record of a followed header that something generated here uses: named the first time, and
+// written out once everything that could reach it has been (`ic_render`). Before that -- while the
+// layouts are being settled -- only whether it can be used matters.
+private ic_reach(m: *IcModel, k: usize, alias: string) -> string
+    if !m.reach_on then return "?"
+
+    var r = m.records.at(k)
+
+    if r.sysl == ""
+        val base = if r.named != "" then r.named else if alias != "" then alias else r.tag
+
+        r.sysl = ic_unique(&m.used, ic_type_name(base, m.prefix))
+    end if
+
+    r.reached = true
+    m.records.set(k, r)
+    r.sysl
+
+// **A record named in a declaration, as sysl writes it there**, or why it cannot be. `shown` is the
+// C spelling a refusal quotes, and `alias` the typedef another header names the record by, which a
+// record only pointed at is named for.
+private ic_record_ref(shown: string, tag: string, alias: string, pos: int, m: *IcModel) -> Result[string, string]
     if tag.starts_with("(") || tag.contains("::(")
         return Err("an anonymous struct or union, which has no name to give it")
 
-    ic_find_record(m, tag, "") match
+    val found = ic_find_record(m, tag, "")
+    val crossing = pos == IcAtParam || pos == IcAtResult
+
+    found match
         Some(k) ->
             val r = m.records.at(k)
+            val usable = r.complete && r.why == ""
 
             if r.main && r.sysl != ""
-                if pos == IcAtPointee || (r.complete && r.why == "" && !r.is_union) then return Ok(r.sysl)
+                if pos == IcAtPointee then return Ok(r.sysl)
+                if !usable then return Err(s"'$shown' by value, whose layout is not generated here")
+                if crossing && ic_has_bits(m, r) then return Err(ic_bits_by_value(shown, r.sysl))
 
-                return Err(s"'$spec' by value, whose layout is not generated here")
+                return Ok(r.sysl)
+            end if
+
+            if r.followed && (r.named != "" || alias != "" || r.tag != "")
+                if pos != IcAtPointee && !usable then return Err(s"'$shown' by value, whose layout is not generated here")
+                if crossing && ic_has_bits(m, r) then return Err(ic_bits_by_value(shown, "the record"))
+
+                return Ok(ic_reach(m, k, alias))
             end if
         None -> ()
 
-    if pos == IcAtPointee then return Ok(ic_foreign(m, tag))
+    if pos == IcAtPointee then return Ok(ic_foreign(m, if alias != "" then alias else tag))
 
-    Err(s"'$spec' by value, and it is declared by another header")
+    found match
+        Some(k) ->
+            val r = m.records.at(k)
+
+            if r.complete && r.file != ""
+                return Err(s"'$shown' by value, and it is declared by another header -- " +
+                           s"'--follow ${ic_base_name(r.file)}' lays it out")
+        None -> ()
+
+    Err(s"'$shown' by value, and it is declared by another header")
 end ic_record_ref
+
+// Why a record with C bitfields cannot be generated crossing a C boundary by value: the language
+// passes one only by address (`attributes.md § C bitfields`).
+private ic_bits_by_value(shown: string, name: string) -> string =
+    s"'$shown' has C bitfields, which cross a C boundary only by address -- as a '*$name'"
 
 private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[string, string]
     if spec == "void"
         return if pos == IcAtResult then Ok("") else Err("'void' where a value has to be")
+
+    if spec == "char" && pos == IcAtPointee then return Ok("u8")
 
     ic_builtin(spec) match
         Some(s) ->
@@ -280,7 +354,7 @@ private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[
 
     val (kind, tag) = ic_tagged(spec)
 
-    if kind == "struct" || kind == "union" then return ic_record_ref(spec, kind, tag, pos, m)
+    if kind == "struct" || kind == "union" then return ic_record_ref(spec, tag, "", pos, m)
 
     if kind == "enum"
         ic_find_enum(m, tag, "") match
@@ -296,24 +370,19 @@ private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[
     ic_find_typedef(m, spec) match
         Some(k) ->
             val t = m.typedefs.at(k)
+            val under = ic_parse(t.qual)
+
+            // A typedef over a record answers to what the record can be where it is used; one over a
+            // record another header declares is named for the typedef a program writes.
+            if under.kind == IcNamed
+                val (k2, tag) = ic_tagged(under.name)
+
+                if k2 == "struct" || k2 == "union" then return ic_record_ref(spec, tag, if t.main then "" else spec, pos, m)
+            end if
 
             if t.main && t.sysl != "" then return Ok(t.sysl)
 
             if depth > 32 then return Err(s"'$spec', a typedef chain too long to follow")
-
-            val under = ic_parse(t.qual)
-
-            // A record another header declares is named for the typedef a program writes, and is
-            // only ever pointed at.
-            if !t.main && under.kind == IcNamed
-                val (k2, _) = ic_tagged(under.name)
-
-                if k2 == "struct" || k2 == "union"
-                    if pos == IcAtPointee then return Ok(ic_foreign(m, spec))
-
-                    return Err(s"'$spec' by value, and it is declared by another header")
-                end if
-            end if
 
             ic_map(under, pos, m, depth + 1)
         None -> Err(s"'$spec', which no header read here declares")
@@ -367,28 +436,81 @@ private ic_fnptr(f: IcType, m: *IcModel, depth: int) -> Result[string, string]
 private ic_c_record(r: IcRecord) -> string =
     if r.named != "" then r.named else s"${if r.is_union then "union" else "struct"} ${r.tag}"
 
-// Why a record's layout is withheld before its fields' types are looked at, or nothing.
-private ic_first_why(r: IcRecord) -> string
-    if r.is_union then return "is a C union, which sysl has no spelling for"
+// How a member is named in a reason: by its name, or by what it is where it has none.
+private ic_member_shown(f: IcField, m: *IcModel) -> string
+    if f.name != "" then return s"'${f.name}'"
+    if f.inner == "" then return "an unnamed bitfield"
+
+    ic_find_record(m, "", f.inner) match
+        Some(k) -> if m.records.at(k).is_union then "an anonymous union" else "an anonymous struct"
+        None -> "an anonymous member"
+
+// **A C bitfield as sysl declares it**: `T name : W` is `name: uW in T` (or `iW` where `T` is signed),
+// an unnamed one `_: uW in T`, a zero-width one `_: in T`, and `_Bool b : 1` is `bool in bool`. Its
+// unit has to be an integer of 8, 16, 32 or 64 bits, or `bool` (`attributes.md § C bitfields`).
+private ic_bit_type(f: IcField, m: *IcModel) -> Result[string, string]
+    val shown = ic_member_shown(f, m)
+    val unit = ic_map(ic_parse(f.qual), IcAtField, m, 0) match
+        Ok(t) -> t
+        Err(why) -> return Err(s"has a bitfield ($shown) that is $why")
+
+    if unit == "bool" then return Ok(if f.width == 0 then "in bool" else "bool in bool")
+
+    val signed = unit == "i8" || unit == "i16" || unit == "i32" || unit == "i64"
+    val unsigned = unit == "u8" || unit == "u16" || unit == "u32" || unit == "u64"
+
+    if !signed && !unsigned
+        return Err(s"has a bitfield ($shown) declared '${f.qual}', and a bitfield's unit is an integer of " +
+                   "8, 16, 32 or 64 bits")
+
+    if f.width == 0 then return Ok(s"in $unit")
+
+    Ok(s"${if signed then "i" else "u"}${f.width} in $unit")
+end ic_bit_type
+
+// **Why a record's layout is withheld, or nothing.** `alone` is a record declared as a type of its
+// own -- a named one, or the type of a named member -- rather than an anonymous member written in
+// place: a union of that kind maps a member it cannot express as its bytes (`ic_emit_fields`), since
+// it can carry the `@align` that keeps the union C's size and boundary.
+private ic_why(m: *IcModel, r: IcRecord, alone: bool) -> string
     if r.why != "" then return r.why
     if r.fields.is_empty() then return "has no fields"
 
     for f in r.fields
-        if f.name == "" then return "has an anonymous member"
-        if f.bitfield then return s"has a bitfield ('${f.name}'), whose layout C leaves to the implementation"
+        val shown = ic_member_shown(f, m)
+
+        if f.aligned then return s"has a member ($shown) with an alignment attribute of its own"
+
+        if f.inner != ""
+            val k = ic_find_record(m, "", f.inner) match
+                Some(found) -> found
+                None -> return s"has a member ($shown) whose declaration was not found"
+
+            val why = ic_why(m, m.records.at(k), f.name != "")
+
+            if why != "" then return s"has a member ($shown) that $why"
+
+            continue
+        end if
+
+        if f.bitfield
+            ic_bit_type(f, m) match
+                Ok(_) -> ()
+                Err(why) -> return why
+
+            continue
+        end if
+
+        ic_map(ic_parse(f.qual), IcAtField, m, 0) match
+            Ok(_) -> ()
+            Err(why) -> if !(r.is_union && alone) then return s"has a field ($shown) that is $why"
 
     ""
+end ic_why
 
 // **Which records are laid out.** A field holding a record by value needs that record laid out too,
 // so withholding one can withhold another: this runs until nothing changes.
 private ic_settle_layouts(m: *IcModel)
-    for k in 0..<m.records.len()
-        var r = m.records.at(k)
-
-        if r.main && r.complete then r.why = ic_first_why(r)
-
-        m.records.set(k, r)
-
     var changed = true
 
     while changed
@@ -397,14 +519,10 @@ private ic_settle_layouts(m: *IcModel)
         for k in 0..<m.records.len()
             var r = m.records.at(k)
 
-            if !r.main || !r.complete || r.why != "" || r.sysl == "" then continue
+            if (!r.main && !r.followed) || !r.complete || r.nested || r.why != "" then continue
+            if r.main && r.sysl == "" then continue
 
-            for f in r.fields
-                ic_map(ic_parse(f.qual), IcAtField, m, 0) match
-                    Ok(_) -> ()
-                    Err(why) ->
-                        r.why = s"has a field ('${f.name}') that is $why"
-                        break
+            r.why = ic_why(m, r, true)
 
             if r.why != ""
                 m.records.set(k, r)
@@ -412,16 +530,144 @@ private ic_settle_layouts(m: *IcModel)
             end if
 end ic_settle_layouts
 
+// Where a record's storage is, as C is asked about it: `c` spells the named record it belongs to
+// and `path` the members from there down to it, empty for that record itself.
+struct IcPlace
+    c: string
+    path: string
+
+private ic_size_of(p: IcPlace) -> string =
+    if p.path == "" then s"sizeof(${p.c})" else s"sizeof(((${p.c} *)0)->${p.path})"
+
+private ic_align_of(p: IcPlace) -> string =
+    if p.path == "" then s"_Alignof(${p.c})" else s"__alignof__(((${p.c} *)0)->${p.path})"
+
+private ic_offset_of(p: IcPlace, member: string) -> string =
+    if p.path == "" then s"__builtin_offsetof(${p.c}, $member)"
+    else s"__builtin_offsetof(${p.c}, ${p.path}.$member) - __builtin_offsetof(${p.c}, ${p.path})"
+
+private ic_place_shown(p: IcPlace) -> string = if p.path == "" then p.c else s"${p.c}.${p.path}"
+
+private ic_member_of(p: IcPlace, member: string) -> string = if p.path == "" then member else s"${p.path}.$member"
+
+// Where a record's text goes: its declaration, its numbers, the checks on them.
+struct IcSinks
+    records: *StrBuilder
+    layout: *StrBuilder
+    asserts: *StrBuilder
+    refused: *Buf[string]
+
+// **One laid-out record**: `@packed`/`@align(n)` where C has them, the declaration, `SIZEOF_` (and
+// `ALIGNOF_` where the boundary is not simply the fields') with a check each, and an offset and a
+// check per member that has an address. The type of a named member declared with an unnamed record
+// is a record of its own, written after this one.
+private ic_emit_record(m: *IcModel, r: IcRecord, name: string, place: IcPlace, out: IcSinks)
+    val upper = ic_screaming(name)
+    var body = str_builder()
+    var notes = str_builder()
+    var members_layout = str_builder()
+    var members_asserts = str_builder()
+    var after: Buf[(IcRecord, string, IcPlace)] = buf()
+    val members = IcSinks(out.records, &members_layout, &members_asserts, out.refused)
+
+    val bytes = ic_emit_fields(m, r, name, upper, place, "    ", &body, &notes, &after, members)
+    val aligned = r.is_union || r.align > 0 || bytes || ic_has_bits(m, r)
+
+    out.records.push(notes.finish())
+
+    if r.packed then out.records.push("@packed\n")
+
+    if r.align > 0
+        out.records.push(s"@align(${r.align})\n")
+    else if bytes
+        out.records.push(s"@align(ALIGNOF_$upper)\n")
+    end if
+
+    out.records.push(s"${if r.is_union then "union" else "struct"} $name\n")
+    out.records.push(body.finish())
+    out.records.push("\n")
+    out.layout.push(s"    SIZEOF_$upper: usize = \"${ic_size_of(place)}\"\n")
+
+    if aligned then out.layout.push(s"    ALIGNOF_$upper: usize = \"${ic_align_of(place)}\"\n")
+
+    out.layout.push(members_layout.finish())
+    out.asserts.push(s"@assert(sizeof($name) == SIZEOF_$upper, \"$name must match ${ic_place_shown(place)}\")\n")
+
+    if aligned
+        out.asserts.push(s"@assert(alignof($name) == ALIGNOF_$upper, \"$name must be aligned as " +
+                         s"${ic_place_shown(place)} is\")\n")
+    end if
+
+    out.asserts.push(members_asserts.finish())
+
+    for item in after
+        ic_emit_record(m, item.0, item.1, item.2, out)
+end ic_emit_record
+
+// The members of `r`, written at `indent` into `body`: an anonymous member in place as a `union` or
+// `struct` block, whose fields are the outer record's own, so their offsets are asked of it. Answers
+// whether a union member was mapped as its bytes, which needs the union's boundary said outright.
+private ic_emit_fields(m: *IcModel, r: IcRecord, name: string, upper: string, place: IcPlace, indent: string,
+                       body: *StrBuilder, notes: *StrBuilder, after: *Buf[(IcRecord, string, IcPlace)],
+                       out: IcSinks) -> bool
+    var bytes = false
+
+    for f in r.fields
+        val field_const = s"OFFSETOF_${upper}_${to_upper(f.name)}"
+        var sysl_name = ic_ident(f.name)
+
+        if f.inner != ""
+            val inner = m.records.at(ic_find_record(m, "", f.inner).unwrap())
+
+            if f.name == ""
+                body.push(s"$indent${if inner.is_union then "union" else "struct"}\n")
+
+                if ic_emit_fields(m, inner, name, upper, place, indent + "    ", body, notes, after, out)
+                    bytes = true
+                continue
+            end if
+
+            val made = ic_unique(&m.used, name + ic_type_name(f.name, ""))
+
+            body.push(s"$indent$sysl_name: $made\n")
+            after.push((inner, made, IcPlace(place.c, ic_member_of(place, f.name))))
+        else if f.bitfield
+            body.push(s"$indent${if f.name == "" then "_" else sysl_name}: ${ic_bit_type(f, m).unwrap_or("?")}\n")
+            continue
+        else
+            ic_map(ic_parse(f.qual), IcAtField, m, 0) match
+                Ok(ty) -> body.push(s"$indent$sysl_name: $ty\n")
+                Err(why) ->
+                    // Only a union reaches here (`ic_why`): the member is its storage, and no more.
+                    val size_const = s"SIZEOF_${upper}_${to_upper(f.name)}"
+                    val shown = s"${ic_place_shown(place)}.${f.name}"
+
+                    sysl_name = s"_${f.name}"
+                    bytes = true
+                    body.push(s"$indent$sysl_name: [$size_const]u8\n")
+                    notes.push(s"// `$shown` is $why: here it is its bytes, as '$sysl_name'.\n")
+                    out.layout.push(s"    $size_const: usize = \"sizeof(((${place.c} *)0)->" +
+                                    s"${ic_member_of(place, f.name)})\"\n")
+                    out.refused.push(s"$shown is $why -- its bytes here, as '$sysl_name'")
+
+        out.layout.push(s"    $field_const: usize = \"${ic_offset_of(place, f.name)}\"\n")
+        out.asserts.push(s"@assert(offsetof($name, $sysl_name) == $field_const, " +
+                         s"\"${ic_place_shown(place)}.${f.name} moved\")\n")
+
+    bytes
+end ic_emit_fields
+
 // ## The module
 
 // The names the header's declarations take, decided before anything is mapped so that a use can
 // come before its declaration.
 private ic_name_everything(m: *IcModel)
-    // A typedef names the record or enum it is written over, the first one doing so.
+    // A typedef names the record or enum it is written over, the first one doing so -- a followed
+    // header's typedef too, which is how one of its records is named.
     for k in 0..<m.typedefs.len()
         val t = m.typedefs.at(k)
 
-        if !t.main then continue
+        if !t.main && !t.followed then continue
 
         val q = ic_parse(t.qual)
 
@@ -438,7 +684,7 @@ private ic_name_everything(m: *IcModel)
                     var r = m.records.at(i)
 
                     if r.named == "" then r.named = t.name
-                    if anon then r.main = true
+                    if anon && t.main then r.main = true
 
                     m.records.set(i, r)
                 None -> ()
@@ -448,7 +694,7 @@ private ic_name_everything(m: *IcModel)
                     var e = m.enums.at(i)
 
                     if e.named == "" then e.named = t.name
-                    if anon then e.main = true
+                    if anon && t.main then e.main = true
 
                     m.enums.set(i, e)
                 None -> ()
@@ -457,7 +703,7 @@ private ic_name_everything(m: *IcModel)
         var r = m.records.at(k)
         val base = if r.named != "" then r.named else r.tag
 
-        if r.main && base != "" && !base.starts_with("(")
+        if r.main && !r.nested && base != "" && !base.starts_with("(")
             r.sysl = ic_unique(&m.used, ic_type_name(base, m.prefix))
             m.records.set(k, r)
         end if
@@ -509,17 +755,23 @@ end ic_name_everything
 
 // **The module's text**, every declaration that could not be generated pushed onto `refused`.
 ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], bad_lines: Buf[long],
-          refused: *Buf[string]) -> string
+          refused: *Buf[string], shim: *StrBuilder) -> string
     ic_name_everything(m)
     ic_settle_layouts(m)
+
+    // From here on, a followed header's record that is used is named and kept.
+    m.reach_on = true
 
     var records = str_builder()
     var consts = str_builder()
     var layout = str_builder()
     var asserts = str_builder()
+    val sinks = IcSinks(&records, &layout, &asserts, refused)
 
-    for r in m.records
-        if !r.main || r.sysl == "" then continue
+    for k in 0..<m.records.len()
+        val r = m.records.at(k)
+
+        if !r.main || r.sysl == "" || r.nested then continue
 
         val c = ic_c_record(r)
         val upper = ic_screaming(r.sysl)
@@ -534,21 +786,7 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
             layout.push(s"    ALIGNOF_$upper: usize = \"_Alignof($c)\"\n")
             refused.push(s"$c ${r.why} -- an opaque struct here, sized by SIZEOF_$upper and aligned by ALIGNOF_$upper")
         else
-            if r.packed then records.push("@packed\n")
-
-            records.push(s"struct ${r.sysl}\n")
-            layout.push(s"    SIZEOF_$upper: usize = \"sizeof($c)\"\n")
-            asserts.push(s"@assert(sizeof(${r.sysl}) == SIZEOF_$upper, \"${r.sysl} must match $c\")\n")
-
-            for f in r.fields
-                val ty = ic_map(ic_parse(f.qual), IcAtField, m, 0).unwrap_or("?")
-                val field_const = s"OFFSETOF_${upper}_${to_upper(f.name)}"
-
-                records.push(s"    ${ic_ident(f.name)}: $ty\n")
-                layout.push(s"    $field_const: usize = \"__builtin_offsetof($c, ${f.name})\"\n")
-                asserts.push(s"@assert(offsetof(${r.sysl}, ${ic_ident(f.name)}) == $field_const, \"$c.${f.name} moved\")\n")
-
-            records.push("\n")
+            ic_emit_record(m, r, r.sysl, IcPlace(c, ""), sinks)
 
     // The aliases: a callback's signature, and a typedef over a scalar or a pointer.
     var aliases = str_builder()
@@ -579,17 +817,12 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
             Ok(ty) -> aliases.push(s"type ${t.sysl} = $ty\n")
             Err(why) -> refused.push(s"${t.name}: the typedef is $why")
 
-    // The entry points.
+    // The entry points: an `extern` per function with a symbol, and through a wrapper in the shim
+    // per `static` one.
     var externs = str_builder()
+    var wrappers = str_builder()
 
     for f in m.funcs
-        if f.storage == "static"
-            val what = if f.inline then "a 'static inline' function" else "a 'static' function"
-
-            refused.push(s"${f.name}: $what has no symbol to link against -- a '.c' shim beside the module reaches it")
-            continue
-        end if
-
         val q = ic_parse(f.qual)
 
         if q.kind != IcFunc
@@ -597,8 +830,26 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
             continue
         end if
 
-        ic_extern(f, q, m) match
-            Ok(line) -> externs.push(line + "\n")
+        val name = ic_ident(ic_value_name(f.name, m.prefix))
+
+        if f.storage != "static"
+            ic_extern(name, f.name, f.params, q, m) match
+                Ok(line) -> externs.push(line + "\n")
+                Err(why) -> refused.push(s"${f.name}: $why")
+
+            continue
+        end if
+
+        val what = if f.inline then "a 'static inline' function" else "a 'static' function"
+        var call_params: Buf[(string, string)] = buf()
+
+        for i in 0..<f.param_quals.len()
+            call_params.push((f.param_quals.at(i), ic_param_name(f.params, i)))
+
+        ic_wrapped(name, f.name, what, f.qual, q, call_params, f.name, opts, m) match
+            Ok((line, c)) ->
+                externs.push(line + "\n")
+                wrappers.push(c)
             Err(why) -> refused.push(s"${f.name}: $why")
 
     for v in m.vars
@@ -667,6 +918,67 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
 
         macro_lines.push(s"    $cname: $ty = \"$name\"\n")
 
+    // A function-like macro has no type of its own; one that is a call of a declared function, with
+    // each of its parameters one whole argument, takes that function's types.
+    for mac in m.fmacros
+        val (callee, slots) = ic_macro_call(mac, m) match
+            Ok(found) -> found
+            Err(why) ->
+                refused.push(s"${mac.name}: a function-like macro $why")
+                continue
+
+        val cq = ic_parse(callee.qual)
+        var parts: Buf[IcType] = buf()
+        var call_params: Buf[(string, string)] = buf()
+
+        parts.push(cq.parts.at(0))
+
+        for i in 0..<slots.len()
+            parts.push(cq.parts.at(slots.at(i) + 1))
+            call_params.push((callee.param_quals.at(slots.at(i)), mac.params.at(i)))
+
+        val stripped = ic_value_name(mac.name, m.prefix)
+        val name = ic_ident(if to_upper(stripped) == stripped then to_lower(stripped) else stripped)
+        val q = IcType(IcFunc, "", 0, parts, false)
+
+        ic_wrapped(name, mac.name, "a function-like macro", callee.qual, q, call_params, mac.name, opts, m) match
+            Ok((line, c)) ->
+                externs.push(line + "\n")
+                wrappers.push(c)
+            Err(why) -> refused.push(s"${mac.name}: $why")
+
+    // The wrappers' file, which includes the header as the module does.
+    if opts.shim != ""
+        shim.push(s"/* Generated by `sysl import-c` from $spelled: a C wrapper for each 'static' function and\n")
+        shim.push(" * function-like macro the module reaches, which have no symbol of their own. It is compiled\n")
+        shim.push(" * where it sits, in the module's directory. Regenerate it rather than editing it. */\n")
+        shim.push(s"#include \"$spelled\"\n")
+        shim.push(wrappers.finish())
+    end if
+
+    // The followed headers' records that something above uses, each laid out where it can be; laying
+    // one out can reach another, so this runs until nothing new is reached.
+    var followed = str_builder()
+    var written: Buf[string] = buf()
+    val followed_sinks = IcSinks(&followed, &layout, &asserts, refused)
+    var more = true
+
+    while more
+        more = false
+
+        for k in 0..<m.records.len()
+            val r = m.records.at(k)
+
+            if !r.reached || ic_contains(written.view(), r.id) then continue
+
+            written.push(r.id)
+            more = true
+
+            if r.complete && r.why == ""
+                ic_emit_record(m, r, r.sysl, IcPlace(ic_c_record(r), ""), followed_sinks)
+            else
+                followed.push(s"opaque struct ${r.sysl}\n\n")
+
     // Only now, since a macro's type may be the first to need one.
     if m.clong then ctypes.push("    CLong = \"long\"\n")
     if m.culong then ctypes.push("    CULong = \"unsigned long\"\n")
@@ -691,6 +1003,13 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
             out.push(s"opaque struct ${f.0}\n")
 
         out.push("\n")
+    end if
+
+    val followed_text = followed.finish()
+
+    if followed_text != ""
+        out.push("// Declared by a header '--follow' named.\n")
+        out.push(followed_text)
     end if
 
     out.push(records.finish())
@@ -723,24 +1042,219 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
     out.finish()
 end ic_render
 
-private ic_extern(f: IcFunc, q: IcType, m: *IcModel) -> Result[string, string]
+// A parameter's name as the header wrote it, or `p<i>` where it wrote none.
+private ic_param_name(params: Buf[string], i: usize) -> string =
+    if i < params.len() && params.at(i) != "" then params.at(i) else s"p$i"
+
+// The `extern` declaring `name`, linked to the symbol `link`, of the function type `q`.
+private ic_extern(name: string, link: string, params: Buf[string], q: IcType, m: *IcModel) -> Result[string, string]
     var ps: Buf[string] = buf()
 
     for k in 1..<q.parts.len()
-        val i = k - 1
-        val pname = if i < f.params.len() && f.params.at(i) != "" then f.params.at(i) else s"p$i"
-        val ty = ic_map(q.parts.at(k), IcAtParam, m, 0)?
-
-        ps.push(s"${ic_ident(pname)}: $ty")
+        ps.push(s"${ic_ident(ic_param_name(params, k - 1))}: ${ic_map(q.parts.at(k), IcAtParam, m, 0)?}")
 
     if q.variadic then ps.push("...")
 
     val r = ic_map(q.parts.at(0), IcAtResult, m, 0)?
-    val name = ic_ident(ic_value_name(f.name, m.prefix))
-    val linked = if name == f.name then "" else s"\"${f.name}\" "
+    val linked = if name == link then "" else s"\"$link\" "
     val result = if r == "" then "" else s" -> $r"
 
     Ok(s"extern $linked$name(${join(ps.view(), ", ")})$result")
+
+// **The `extern` and the C wrapper for what has no symbol of its own** -- a `static` function, or a
+// function-like macro typed by the function it calls. The wrapper is `sysl_<name>`, declared with
+// the types clang gave (`call_params` is each parameter's type as clang spells it and its name) and
+// calling `callee` with them. Without `--shim` nothing is written, and what would have been is said.
+private ic_wrapped(name: string, c_name: string, what: string, qual: string, q: IcType, call_params: Buf[(string, string)],
+                   callee: string, opts: IcOptions, m: *IcModel) -> Result[(string, string), string]
+    if q.variadic then return Err(s"$what that takes '...', whose arguments a wrapper cannot pass on")
+
+    val result = ic_result_text(qual) match
+        Some(r) -> r
+        None -> return Err(s"$what returning a function pointer, which its wrapper's declaration does not spell")
+
+    var names: Buf[string] = buf()
+
+    for p in call_params
+        names.push(p.1)
+
+    val link = s"sysl_$c_name"
+    val line = ic_extern(name, link, names, q, m)?
+
+    if opts.shim == ""
+        return Err(s"$what has no symbol to link against -- '--shim <file.c>' writes the wrapper that reaches it")
+
+    var decls: Buf[string] = buf()
+
+    for p in call_params
+        decls.push(ic_c_param(p.0, p.1))
+
+    val args = join(names.view(), ", ")
+    val ret = if result == "void" then "" else "return "
+    val declared = if decls.is_empty() then "void" else join(decls.view(), ", ")
+
+    Ok((line, s"\n$result $link($declared) {\n    $ret$callee($args);\n}\n"))
+end ic_wrapped
+
+// A function type's result as C spells it: `int (int)` is `int`. A result that is itself a function
+// pointer is written around the parameters (`void (*(int))(void)`), and has no spelling here.
+private ic_result_text(qual: string) -> Option[string]
+    if !qual.ends_with(")") then return None
+
+    var depth = 0
+    var k = qual.len
+
+    while k > 0
+        k -= 1
+
+        val c = qual.bytes[k]
+
+        if c == u8(')') then depth += 1
+
+        if c == u8('(')
+            depth -= 1
+
+            if depth == 0 then break
+        end if
+
+    val r = qual[0..<k].trim()
+
+    if r == "" || r.contains("(") then None else Some(r)
+end ic_result_text
+
+// A parameter declared from clang's spelling of its type: `int x`, `const char *path`, and
+// `__typeof__(void (*)(int)) cb` where the name would have to go inside the declarator.
+private ic_c_param(qual: string, name: string) -> string =
+    if qual.contains("(") || qual.contains("[") then s"__typeof__($qual) $name"
+    else if qual.ends_with("*") then qual + name
+    else s"$qual $name"
+
+// `text` with the parentheses around the whole of it taken off, as often as they are there.
+private ic_unwrapped(text: string) -> string
+    var t = text.trim()
+
+    while t.starts_with("(") && ic_closing(t, 0) == t.len - 1
+        t = t[1..<t.len - 1].trim()
+
+    t
+
+// Where the bracket opened at `open` closes, or the text's length where it does not.
+private ic_closing(text: string, open: usize) -> usize
+    var depth = 0
+
+    for k in open..<text.len
+        val c = text.bytes[k]
+
+        if c == u8('(') then depth += 1
+
+        if c == u8(')')
+            depth -= 1
+
+            if depth == 0 then return k
+        end if
+
+    text.len
+end ic_closing
+
+// The arguments of a call's parenthesised list, split at its own commas.
+private ic_arguments(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var depth = 0
+    var start: usize = 0
+
+    for k in 0..<text.len
+        val c = text.bytes[k]
+
+        if c == u8('(') || c == u8('[') then depth += 1
+        if c == u8(')') || c == u8(']') then depth -= 1
+
+        if c == u8(',') && depth == 0
+            out.push(text[start..<k].trim())
+            start = k + 1
+        end if
+
+    if text.trim() != "" then out.push(text[start..<text.len].trim())
+
+    out
+end ic_arguments
+
+// Whether `word` appears in `text` as a whole identifier.
+private ic_mentions(text: string, word: string) -> bool
+    var k: usize = 0
+
+    while k < text.len
+        val c = text.bytes[k]
+
+        if ic_word_byte(c)
+            var e = k
+
+            while e < text.len && ic_word_byte(text.bytes[e]) do e += 1
+
+            if text[k..<e] == word then return true
+
+            k = e
+        else
+            k += 1
+
+    false
+end ic_mentions
+
+private ic_word_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_')
+
+// **What types a function-like macro**: a body that is one call of a function the header declares,
+// each of the macro's parameters one whole argument of it and no other argument naming one. Answers
+// the function and, per macro parameter, which of its parameters that is.
+private ic_macro_call(mac: IcMacro, m: *IcModel) -> Result[(IcFunc, Buf[usize]), string]
+    for p in mac.params
+        if p == "..." || p.ends_with("...") then return Err("that takes '...'")
+
+    val untyped = s"whose parameters ('${join(mac.params.view(), "', '")}') no function it calls gives a type"
+    val body = ic_unwrapped(mac.body)
+    var k: usize = 0
+
+    while k < body.len && ic_word_byte(body.bytes[k]) do k += 1
+
+    val callee = body[0..<k]
+    val rest = body[k..<body.len].trim()
+
+    if callee == "" || !rest.starts_with("(") || ic_closing(rest, 0) != rest.len - 1 then return Err(untyped)
+
+    var called: Option[IcFunc] = None
+
+    for f in m.funcs
+        if f.name == callee then called = Some(f)
+
+    val f = called match
+        Some(found) -> found
+        None -> return Err(untyped)
+
+    val args = ic_arguments(rest[1..<rest.len - 1])
+    var slots: Buf[usize] = buf()
+
+    if args.len() > f.param_quals.len() then return Err(untyped)
+
+    for p in mac.params
+        var slot: Option[usize] = None
+
+        for i in 0..<args.len()
+            val a = ic_unwrapped(args.at(i))
+
+            if a == p
+                if slot.is_some() then return Err(untyped)
+
+                slot = Some(i)
+            else if ic_mentions(a, p)
+                return Err(untyped)
+            end if
+
+        slot match
+            Some(i) -> slots.push(i)
+            None -> return Err(untyped)
+
+    Ok((f, slots))
+end ic_macro_call
 
 // The text, with what was not generated said at its foot.
 ic_finish(text: string, refused: Buf[string]) -> string
