@@ -2743,7 +2743,7 @@ struct Esr
     iss2: u5
     res0: u27
 
-val word = 0x3c
+val word: int = 0x3c
 
 print(Esr::Bits(word).ec)
 ```

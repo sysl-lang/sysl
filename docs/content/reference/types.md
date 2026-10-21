@@ -106,14 +106,14 @@ Overflow is therefore **not** a trap source. See [errors and traps](/reference/e
 
 ### Arithmetic over literals is exact
 
-An expression written out of integer literals alone — `1 << 32`, `(1 << 16) - 1`, `200 + 100` — is
-a constant the compiler computes with no width at all, and **the value it comes to must fit the type
-it is read at**, exactly as a single literal's must. Wrapping is what happens to a value held in a
-variable; a value nobody has stored yet has nothing to wrap in, so a constant that does not fit is a
-mistake in what was written.
+An expression written out of integer literals alone — `65536 * 65536`, `(1 << 16) - 1`,
+`200 + 100` — is a constant the compiler computes with no width at all, and **the value it comes to
+must fit the type it is read at**, exactly as a single literal's must. Wrapping is what happens to a
+value held in a variable; a value nobody has stored yet has nothing to wrap in, so a constant that
+does not fit is a mistake in what was written.
 
 ```sysl
-val b: u32 = 1 << 32
+val b: u32 = 65536 * 65536
 ```
 
 ```error
@@ -125,8 +125,8 @@ may pass the type's range provided the result comes back inside it, and a divisi
 works on the exact value rather than a wrapped one:
 
 ```sysl
-val mask: u32 = (1 << 32) - 1
-val top: u32 = ((1 << 40) - 1) >> 20
+val mask: u32 = 65536 * 65536 - 1
+val top: u32 = (65536 * 65536 * 256 - 1) >> 20
 val low: u8 = ~0xF0
 
 print(mask, top, low)
@@ -139,7 +139,36 @@ print(mask, top, low)
 `~` is the complement at the type's own width, so `~0` is a `u32`'s largest value rather than the
 `-1` that has no place in an unsigned type. Suffixed literals are literals too: `255u8 + 1u8` is
 refused as the value 256. A literal with no type from its context is an `int` here as well, so
-`val big = 1 << 40` is refused as `int`, and is written `val big: long = 1 << 40`.
+`val big = 65536 * 65536` is refused as `int`, and is written `val big: long = 65536 * 65536`.
+
+**A left shift is a bit operation**, as in C and Rust: the bits shifted past the top of its type are
+dropped. The type is the one the shift is read at, which for an unsuffixed literal is the type of the
+whole expression, so a mask shifted left stays a mask and a one shifted into the sign bit is the
+signed type's minimum. What the shift comes to is then an ordinary step, and the operator around it
+is held to the type as any other:
+
+```sysl
+val hi: u64 = 0xffffffffffffffff << 27
+val min = 1 << 31
+val max: u32 = (1 << 31) + ((1 << 31) - 1)
+
+print(hi, min, max)
+```
+
+```output
+18446744073575333888 -2147483648 4294967295
+```
+
+A shift has no value by a count below zero or at or past the width of its type, and one of a value
+the type does not hold would hide that value's mistake by dropping it; all three are refused:
+
+```sysl
+val big = 1 << 40
+```
+
+```error
+a constant shifted by 40 places, at or past the 32 bits of int
+```
 
 A division or a remainder by a literal zero has no value at all, and is refused where it is written:
 

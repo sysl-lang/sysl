@@ -228,8 +228,10 @@ left shift is the exception and does trap**, on its own terms and not the shift 
 The amount is **not masked**, as it is in C, in Java, and by the bare instruction. Masking makes
 `x >> 64` equal `x`, which is almost never what a program intends.
 
-A shift of a **literal** by a literal is a constant, computed exactly: `1 >> 40` is `0` at any
-width, and `1 << 40` is 1099511627776, which a `long` holds and an `int` does not.
+A shift of a **literal** by a literal is a constant. A right one is computed exactly, so `1 >> 40`
+is `0` at any width. A left one is a bit operation at the type it is read at, so the bits shifted
+past the top are dropped — `1 << 31` is an `int`'s minimum — and its amount must be below that
+type's width: `1 << 40` is 1099511627776 as a `long`, and has no value as an `int`.
 
 ```sysl
 val wide: long = 1 << 40
@@ -237,7 +239,7 @@ val narrow: int = 1 << 40
 ```
 
 ```error
-the value 1099511627776 does not fit int
+a constant shifted by 40 places, at or past the 32 bits of int
 ```
 
 ### Equality reaches further than ordering

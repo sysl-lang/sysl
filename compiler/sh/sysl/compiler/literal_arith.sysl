@@ -6,12 +6,12 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, sub, 
                          bit_length as big_bits, shl as big_shl, shr as big_shr}
 
 // **Arithmetic written out of integer literals alone is computed exactly, and its value must fit the
-// type it is read at**, as a single literal's must. `val b: u32 = 1 << 32` is refused as the value
-// 4294967296 that does not fit `u32`, where reading it at the machine's width would make it zero,
-// and a division or a remainder by a literal zero anywhere inside is refused as the constant's own
-// mistake. The steps between are numbers rather than slots, so `(1 << 32) - 1` is the `u32` it comes
-// to, and what is accepted is folded to that one literal -- a quotient or a right shift of a step
-// past the type is the exact one, not the wrapped one.
+// type it is read at**, as a single literal's must. `val b: u32 = 65536 * 65536` is refused as the
+// value 4294967296 that does not fit `u32`, where reading it at the machine's width would make it
+// zero, and a division or a remainder by a literal zero anywhere inside is refused as the constant's
+// own mistake. The steps between are numbers rather than slots, so `65536 * 65536 - 1` is the `u32`
+// it comes to, and what is accepted is folded to that one literal -- a quotient or a right shift of a
+// step past the type is the exact one, not the wrapped one.
 //
 // **The outermost such expression is the one checked**: `enter_literal_arithmetic` marks the
 // analyzer while it is read, so the operators inside it type as before and say nothing of their own.
@@ -19,9 +19,13 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, sub, 
 // rule, under which integer arithmetic wraps at the declared width (`reference/types.md`).
 //
 // `~` is the complement at the type's own width -- `~0` at `u32` is 4294967295 -- since that is what
-// the operator means on an unsigned value. A right shift by a count at or past the width is the
-// defined full shift (`reference/expressions.md`); a left one is the exact product, and so does not
-// fit unless what is shifted is zero.
+// the operator means on an unsigned value. **A left shift is a bit operation, as in C and Rust**: the
+// bits shifted past the top of the shifted value's type are dropped, so `0xffffffffffffffffu64 << 27`
+// is a mask and `1 << 31` at `int` is its minimum. Its count must be below that type's width and not
+// negative, and what is shifted must fit the type; the type is the one the shift is read at, which
+// for an unsuffixed literal is the one the whole expression is. A right shift is the exact floor
+// division it is, and by a count at or past the width the defined full shift
+// (`reference/expressions.md`).
 enter_literal_arithmetic(cx: &Analyzer, e: Expr) -> bool
     if cx.in_literal_arithmetic || !literals_only(e) then return false
 
@@ -37,6 +41,10 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
     val zero = zero_divisor(t)
 
     if zero.is_some() then return cx.err(zero.unwrap(), "a constant divided by zero")
+
+    val shift = bad_shift(t)
+
+    if shift.is_some() then return cx.err(shift.unwrap().0, shift.unwrap().1)
 
     val node = node_of(t)
     val ty = texpr_type(node)
@@ -77,8 +85,46 @@ private zero_divisor(t: TExpr) -> Option[Span] = *t.kind match
         else None
     _ -> None
 
+// The first left shift inside that has no value at the type it is read at: a count below zero or at
+// or past the width, or a shifted value the type does not hold, which dropping bits would hide.
+private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
+    TConstrainedCheck(inner, _) -> bad_shift(inner)
+    TCast(inner, _) -> bad_shift(inner)
+    TUnary(_, x, _) -> bad_shift(x)
+    TBinary(op, l, r, ty) ->
+        val left = bad_shift(l)
+
+        if left.is_some() then return left
+
+        val right = bad_shift(r)
+
+        if right.is_some() || op != "<<" then return right
+
+        val count = exact_value(r)
+
+        if count.is_none() then return None
+
+        val n = count.unwrap()
+
+        if cmp(n, from_int(0)) < 0 then return Some((t.span, s"a constant shifted by ${to_string(n)} places"))
+
+        underlying(ty) match
+            Integer(bits, signed, _) ->
+                if cmp(n, from_int(long(bits))) >= 0 then
+                    return Some((t.span, s"a constant shifted by ${to_string(n)} places, " +
+                                         s"at or past the $bits bits of ${type_show(ty)}"))
+
+                val x = exact_value(l)
+
+                if x.is_some() && !fits(x.unwrap(), bits, signed) then
+                    return Some((l.span, s"the value${shown(x.unwrap())} does not fit ${type_show(ty)}"))
+
+                None
+            _ -> None
+    _ -> None
+
 // Whether an expression is integer literals and the integer operators over them, and nothing else.
-// Parentheses are not a node, so `(1 << 32) - 1` is one.
+// Parentheses are not a node, so `(1 << 31) - 1` is one.
 literals_only(e: Expr) -> bool = *e.kind match
     IntLit(_, _, _) -> true
     Unary(op, operand) -> (op == "-" || op == "~") && literals_only(operand)
@@ -141,33 +187,44 @@ private binary_value(op: string, x: BigInt, y: BigInt, ty: Type) -> Option[BigIn
         return Some(if op == "/" then q.0 else q.1)
     end if
 
-    if op == "<<" || op == ">>" then shifted_exactly(op, x, y) else None
+    if op == "<<" then return shifted_left(x, y, ty)
+    if op == ">>" then shifted_right(x, y) else None
 end binary_value
 
-// A shift as the exact multiplication or floor division by a power of two it is. A right shift past
-// every bit leaves the sign whatever the count, so the count is held to one place past them; a left
-// shift of anything but zero past the widest type is `beyond()`. A negative count is not a literal
-// shift this check reads.
-private shifted_exactly(op: string, x: BigInt, count: BigInt) -> Option[BigInt]
+// A left shift at the width of its type, with the bits past the top dropped and the result read back
+// as that type's value. `bad_shift` has refused a count out of range and a value the type does not
+// hold, so only a shift with a value at a type reaches here.
+private shifted_left(x: BigInt, count: BigInt, ty: Type) -> Option[BigInt] = underlying(ty) match
+    Integer(bits, signed, _) ->
+        if cmp(count, from_int(0)) < 0 || cmp(count, from_int(long(bits))) >= 0 then return None
+
+        Some(wrapped(big_shl(x, usize(count.to_long().unwrap())), bits, signed))
+    _ -> None
+
+// A value brought into `bits` bits, two's complement where the type is signed.
+private wrapped(v: BigInt, bits: int, signed: bool) -> BigInt
+    val m = big_shl(from_int(1), usize(bits))
+    var r = div_rem(v, m).1
+
+    if cmp(r, from_int(0)) < 0 then r = add(r, m)
+    if signed && cmp(r, big_shl(from_int(1), usize(bits - 1))) >= 0 then r = sub(r, m)
+
+    r
+end wrapped
+
+// A right shift as the exact floor division by a power of two it is. Past every bit it leaves the
+// sign whatever the count, so the count is held to one place past them. A negative count is not a
+// literal shift this check reads.
+private shifted_right(x: BigInt, count: BigInt) -> Option[BigInt]
     if cmp(count, from_int(0)) < 0 then return None
     if x.is_zero() then return Some(x)
 
-    if op == ">>"
-        val reach = big_bits(x) + 1
+    val reach = big_bits(x) + 1
 
-        if cmp(count, from_int(long(reach))) > 0 then return Some(big_shr(x, reach))
+    if cmp(count, from_int(long(reach))) > 0 then return Some(big_shr(x, reach))
 
-        return Some(big_shr(x, usize(count.to_long().unwrap())))
-    end if
-
-    if cmp(count, from_int(long(ceiling()))) > 0 then return Some(beyond())
-
-    val n = usize(count.to_long().unwrap())
-
-    if big_bits(x) + n > ceiling() then return Some(beyond())
-
-    Some(big_shl(x, n))
-end shifted_exactly
+    Some(big_shr(x, usize(count.to_long().unwrap())))
+end shifted_right
 
 // The most bits a step may take and still come to a value some integer type holds: the widest
 // type's, and one more, which is the step before `- 1` at it.
