@@ -1410,6 +1410,24 @@ print(r.data.len)
 'n' of 'double' is usize, but int was given
 ```
 
+**An argument is of its parameter's type.** An integer of any width is read at an integer parameter,
+and nothing else stands in for another kind: `true` is not `1`, `65` is not `'A'`, and `1` is not an
+enum's second variant. An argument of another type is refused as a call's argument is, naming the
+parameter:
+
+```sysl
+struct Flag[const B: bool]
+    v: int
+
+var on: Flag[1] = Flag(1)
+
+print(on.v)
+```
+
+```error
+'B' of 'Flag' is bool, but int was given
+```
+
 A **member** reads the parameter as an ordinary value of its declared type, and each length gets its
 own body:
 

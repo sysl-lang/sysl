@@ -2308,6 +2308,10 @@ What it protects against is the class of change a version number cannot describe
 point at different commits, a repository rewritten, a mirror serving something other than what the
 author published. In all three the version number is exactly what it was.
 
+The hash covers every file of the package except a `.git` anywhere in it and the root's own `.sysl/`,
+which is what building the package leaves beside it: a package that has been built hashes the same as
+one that has not. A `.sysl` further down is an ordinary directory and is covered.
+
 It is **not a lockfile**: version selection is already a function of the manifests, so there is
 nothing to record about which versions were chosen. The first time a package is seen it is trusted
 and recorded; reviewing the line that appears is the part a person does. A `path` dependency gets no

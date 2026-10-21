@@ -43,10 +43,11 @@ private val DigestBatch: usize = 256
 // are relative to `root` and separated by `/` whatever the platform writes, so a package hashes to
 // the same value wherever it was unpacked and on whichever machine.
 //
-// **What is in it is every file except a `.git` anywhere in the path.** The repository's own
-// bookkeeping is not the package: it holds timestamps, packing choices and remote names that differ
-// between two clones of the very same commit, so including it would make the hash of an honest fetch
-// depend on how it was fetched.
+// **What is in it is every file except a `.git` anywhere in the path and the root's own `.sysl/`.**
+// The repository's own bookkeeping is not the package: it holds timestamps, packing choices and
+// remote names that differ between two clones of the very same commit, so including it would make the
+// hash of an honest fetch depend on how it was fetched. `.sysl/` is what building the package leaves
+// beside it, so a package that has been built would otherwise hash differently from the same one fresh.
 tree_hash(root: string) -> Result[string, string]
     val paths = hashed_files(root)?
     val digests = digests_of(paths)?
@@ -68,7 +69,8 @@ hashed_files(root: string) -> Result[Buf[string], string]
         item match
             Err(_) -> return Err(s"cannot read $root")
             Ok(entry) ->
-                if !entry.is_dir() && !under_git(root, entry.path) then found.push(entry.path)
+                if !entry.is_dir() && !under_git(root, entry.path) && !under_local_dir(root, entry.path)
+                    found.push(entry.path)
 
     // A name holding a newline would be indistinguishable from two entries once the listing is a
     // text file, and the digest utility's own output has the same problem one step earlier. Refused
@@ -89,6 +91,15 @@ private under_git(root: string, path: string) -> bool
 
     false
 end under_git
+
+// Whether a file sits under the package root's own `.sysl/`: build output, which differs between a
+// package that has been built and one that has not. Only the root's, as in the project walk (`LocalDir`
+// is that walk's name for it); a `.sysl` further down is an ordinary directory and is hashed.
+private under_local_dir(root: string, path: string) -> bool
+    val parts = split(relative_to(root, path), "/")
+
+    parts.len > 1 && parts[0] == LocalDir
+end under_local_dir
 
 // A file's path as the listing spells it: relative to the package root, `/` separated.
 relative_to(root: string, path: string) -> string

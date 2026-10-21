@@ -211,12 +211,12 @@ stamp() {
     local text old new
 
     text=$(< $main_file)
-    old=$(print -r -- $text | grep -m1 '^const Version: string = "') || { print "no 'const Version' in $main_file"; return 1 }
+    old=$(grep -m1 '^const Version: string = "' <<< $text) || { print "no 'const Version' in $main_file"; return 1 }
     new="const Version: string = \"$version\""
     [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $main_file
 
     text=$(< $manifest)
-    old=$(print -r -- $text | grep -m1 '^  version = "') || { print "no package.version in $manifest"; return 1 }
+    old=$(grep -m1 '^  version = "' <<< $text) || { print "no package.version in $manifest"; return 1 }
     new="  version = \"$version\""
     [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $manifest
 
@@ -243,7 +243,8 @@ say "release commit: $release_commit"
 
 # --- 3-5. the stages -----------------------------------------------------------------------------
 
-seed_version=$($seed --version 2>&1 | head -1)
+seed_version=$($seed --version 2>&1)
+seed_version=${seed_version%%$'\n'*}
 say "seed: $seed ($seed_version)"
 say "seed library: $seed_lib"
 say "compiler project: $proj"
