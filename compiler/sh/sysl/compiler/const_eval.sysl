@@ -175,6 +175,8 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             if !reflects(e) then return None
 
             true
+        // An `if` or a `match` comes to the branch its settled condition chooses.
+        IfExpr(_, _, _, _) | MatchExpr(_, _) -> true
         _ -> return None
 
     val ev = cx.an.evaluation
@@ -582,6 +584,8 @@ mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
             if mentions_const_call(a, item) then return true
 
         false
+    // An `if` or a `match` is run as a call is, whatever its branches hold.
+    IfExpr(_, _, _, _) | MatchExpr(_, _) -> true
     _ -> false
 
 // Whether a typed tree has anything in it the evaluator runs rather than the fold settles: a call to
@@ -644,8 +648,30 @@ private typed_call(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TEx
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
     a.closure_funcs.truncate(closures)
 
-    if clean then Some(t) else None
+    if !clean then return None
+
+    // A mistake already said where the same text was typed before is not said again, so a reading can
+    // come back quiet holding the node a mistake leaves. There is nothing in it to run, and the fold
+    // stopped at something that has been said, so it is counted as a refusal.
+    if holds_mistake(t)
+        a.const_refusals += 1
+        return None
+    end if
+
+    Some(t)
 end typed_call
+
+// Whether a typed tree holds the node a reading leaves where it complained (`bad_expr`).
+private holds_mistake(t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TZero(Unknown) -> sink.push(true)
+        _ -> ()))
+
+    !found.is_empty()
+end holds_mistake
 
 // The closures' bodies and the tables a trial made, kept for the values made from them, which the
 // run may still call once the trial is taken back.

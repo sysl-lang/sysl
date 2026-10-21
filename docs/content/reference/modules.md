@@ -1831,7 +1831,8 @@ const n: Even = 4
 ```
 
 **A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
-arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
+arithmetic, bitwise, shift, or comparison operator applied to constant expressions; an **`if` or
+`match`** whose condition or scrutinee is a constant expression; or **a call to
 a function whose body can run while compiling**, with arguments that are constant expressions. No
 mark is needed for that: a
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is one that
@@ -1852,6 +1853,34 @@ print(called)
 
 ```output
 4
+```
+
+**An `if` or a `match` over constants is one too**, in every position a constant is read: a
+`const`, an array length, an `@assert`, a value argument. It is typed whole, and only the branch its
+condition chooses is computed, so a branch that would trap if it ran is harmless when it is not
+taken:
+
+```sysl
+const lanes = 4
+const divisor = 0
+const level = 2
+
+const width = if lanes > 8 then 64 elif lanes > 2 then 32 else 16
+const share = if divisor == 0 then 0 else 100 / divisor
+
+struct Block
+    bytes: [level match
+        1 -> 64
+        2 -> 16
+        _ -> 8]u8
+
+@assert((if lanes > 2 then width else 0) == 32, "four lanes are 32 bits wide")
+
+print(width, share, sizeof(Block))
+```
+
+```output
+32 0 16
 ```
 
 **A call whose body reaches something that exists only when the program runs is refused**, and

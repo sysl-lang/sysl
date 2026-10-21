@@ -565,7 +565,27 @@ private awaits_instantiation(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Bin
             Ident(_) ->
                 args.len() == 1 && awaits_instantiation(a, scope, args.at(0), subst)
             _ -> false
+        // A choice waits where what it tests, or what a branch comes to, does.
+        IfExpr(cond, then_body, else_body, _) ->
+            awaits_instantiation(a, scope, cond, subst) || branch_awaits(a, scope, then_body, subst) ||
+                (else_body.is_some() && branch_awaits(a, scope, else_body.unwrap(), subst))
+        MatchExpr(scrutinee, arms) ->
+            if awaits_instantiation(a, scope, scrutinee, subst) then return true
+
+            for arm in arms
+                if branch_awaits(a, scope, arm.body, subst) then return true
+
+            false
         _ -> false
+
+private branch_awaits(a: &Analysis, scope: Scope, body: Buf[Stmt], subst: Buf[Binding]) -> bool
+    for s in body
+        *s.kind match
+            ExprStmt(inner) -> if awaits_instantiation(a, scope, inner, subst) then return true
+            _ -> ()
+
+    false
+end branch_awaits
 
 // Whether a measurement's subject is a type parameter standing for itself, which is what makes
 // `sizeof(T)` a number this walk cannot have.

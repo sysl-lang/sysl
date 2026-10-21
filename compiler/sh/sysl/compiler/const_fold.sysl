@@ -166,6 +166,11 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
         else if mentions_const_call(cx.an, receiver) then const_call(cx, e)
         else None
 
+    // An `if` (an `elif` chain is one `if` inside the last one's `else`) or a `match` is typed and run
+    // whole, as it is inside a `const` function's body: the condition or scrutinee is settled, and
+    // only the branch it chooses is run, so a branch not taken is typed and never computed.
+    IfExpr(_, _, _, _) | MatchExpr(_, _) -> const_call(cx, e)
+
     // A conversion is written, so what it does while compiling is what it does while running: a
     // narrowing wraps and a float-to-integer truncates toward zero.
     //
@@ -716,8 +721,9 @@ check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[Expr])
             if !awaits_instantiation(cx, cond) && !const_refused_since(cx.an, refusals) then
                 cx.fault(span, "'@assert' is settled while compiling, so its condition has to be " +
                          "a constant expression — a literal, a 'const', 'sizeof', 'alignof', " +
-                         "'offsetof', a call whose body runs while compiling, or the arithmetic and " +
-                         "comparisons over them — and nothing read out of storage filled at run time")
+                         "'offsetof', a call whose body runs while compiling, an 'if' or 'match' " +
+                         "that chooses between them, or the arithmetic and comparisons over them — " +
+                         "and nothing read out of storage filled at run time")
 end check_assert
 
 // What a failed **comparison** adds: the value each side folded to, for a side the reader did not
@@ -851,7 +857,27 @@ private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
         operands.len() == 2 && (awaits_instantiation(cx, operands.at(0)) ||
                                 awaits_instantiation(cx, operands.at(1)))
     Call(callee, args) -> args.len() == 1 && is_bare_name(callee) && awaits_instantiation(cx, args.at(0))
+    // A choice waits where what it tests, or what a branch comes to, does.
+    IfExpr(cond, then_body, else_body, _) ->
+        awaits_instantiation(cx, cond) || branch_awaits(cx, then_body) ||
+            (else_body.is_some() && branch_awaits(cx, else_body.unwrap()))
+    MatchExpr(scrutinee, arms) ->
+        if awaits_instantiation(cx, scrutinee) then return true
+
+        for arm in arms
+            if branch_awaits(cx, arm.body) then return true
+
+        false
     _ -> false
+
+private branch_awaits(cx: &Analyzer, body: Buf[Stmt]) -> bool
+    for s in body
+        *s.kind match
+            ExprStmt(inner) -> if awaits_instantiation(cx, inner) then return true
+            _ -> ()
+
+    false
+end branch_awaits
 
 private is_bare_name(e: Expr) -> bool = *e.kind match
     Ident(_) -> true
