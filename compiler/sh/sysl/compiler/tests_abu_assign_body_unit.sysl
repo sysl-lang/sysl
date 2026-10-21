@@ -7,10 +7,10 @@ import sysl.process.capture
 import sysl.text.replace_all
 
 // A function whose `= value` body is an assignment, plain or compound, and that writes no result
-// type, is a `unit` function: the store is what it is written for (`reference/declarations.md § The
-// result type`). The value an assignment yields stays the expression's own -- `a = b = 0` still
-// stores twice, and a written result still takes it -- and a caller that uses the call as a value is
-// told it is `unit`.
+// type, is a `unit` function: an assignment written `=` is `unit`, so the body is too
+// (`reference/declarations.md § The result type`). One written `:=` yields what it stored, so a body
+// that is one takes that type, and a chain written `a = b := 0` still stores twice. A caller that uses
+// a unit body's call as a value is told it is `unit`.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -131,12 +131,24 @@ abu_nested() =
                "    grow()\n    val u = bump()\n\n    if u == () then n else 0\nend outer\n\nprint(outer())\n",
                "3\n")
 
-@test("an assignment keeps its value inside the body: a chain stores every place, and a written result takes it")
+@test("an assignment written ':=' yields inside the body: a chain stores every place, and a written result takes it")
 abu_value_kept() =
-    abu_prints("var a = 0\nvar b = 0\n\nboth() = a = b = 4\nset_to(v: int) -> int = a = v\n" +
-               "check() = if (b = 6) == 6 then print(\"six\")\n\n" +
+    abu_prints("var a = 0\nvar b = 0\n\nboth() = a = b := 4\nset_to(v: int) -> int = a := v\n" +
+               "check() = if (b := 6) == 6 then print(\"six\")\n\n" +
                "val u = both()\nprint(a, b, u == ())\nprint(set_to(8), a)\ncheck()\n",
                "4 4 true\n8 8\nsix\n")
+
+@test("a body that is ':=' takes the type of what it stores")
+abu_walrus_body_infers() =
+    abu_prints("var n = 0\nvar s = \"a\"\n\nput(v: int) = n := v\ngrow() = s +:= \"b\"\n\n" +
+               "val got = put(5) + 1\nprint(got, n, grow(), s)\n",
+               "6 5 ab ab\n")
+
+@test("a written result is refused a body that is an assignment written '='")
+abu_refused_written_store() =
+    abu_refused("var a = 0\n\nset_to(v: int) -> int = a = v\n\nmain()\n    print(set_to(1))\n",
+                "'=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' " +
+                "to assign and use the value", "3:25")
 
 // -- using the call as a value --------------------------------------------------------------------
 

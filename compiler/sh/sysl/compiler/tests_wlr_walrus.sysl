@@ -1,0 +1,278 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// Assignment yields nothing, and `:=` yields what it stored (`reference/expressions.md § Assignment`).
+// `=` and every compound form are `unit`, and stand only where a value is nobody's: a statement, or
+// the last line of a block that owes no other type. `:=` and its compound forms assign and yield what
+// reading the place right after the store gives -- a copy of a value, a counted share of a `&T` --
+// at the precedence assignment has, so `a = b := 7` and `while (c := next()) != 0` read as written.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private wlr_ready() -> bool = std_root().is_ok() && clang_available()
+
+private wlr_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-wlr").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end wlr_root
+
+// What the program prints on standard output and on standard error, or the report it was refused
+// with; `counted` builds it over the counted heap.
+private wlr_run(text: string, counted: bool) -> (string, string)
+    val root = wlr_root(text)
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, "")
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", "")
+        Ok(out) -> (out.text, out.err.unwrap_or(""))
+end wlr_run
+
+private wlr_prints(text: string, want: string)
+    if !wlr_ready() then return
+
+    assert_eq(wlr_run(text, false).0, want)
+
+// The program prints `want` over the counted heap, and ends with nothing live.
+private wlr_balanced(text: string, want: string)
+    if !wlr_ready() then return
+
+    val ran = wlr_run(text, true)
+
+    assert_eq(ran.0, want)
+    assert(!ran.1.contains("still live"), ran.1)
+
+// Refused with exactly `message`, first and alone, at `main.sysl:<at>`.
+private wlr_refused(text: string, message: string, at: string)
+    if !wlr_ready() then return
+
+    val root = wlr_root(text)
+
+    val said = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = replace_all(said, s"$root/", "")
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(out.starts_with(head) && out.contains(place) &&
+           !out[head.bytes.len..<out.bytes.len].contains("error: "),
+           s"expected one report starting\n$head\nlocated at $place\ngot\n$out")
+end wlr_refused
+
+// The sentence an assignment written `op` earns where a value is wanted.
+private wlr_unit(op: string, walrus: string) -> string =
+    s"'$op' assigns and yields nothing, so it cannot stand where a value is wanted — write " +
+    s"'$walrus' to assign and use the value"
+
+// -- what `:=` yields -----------------------------------------------------------------------------
+
+@test("':=' yields what it stored, and a chain of them stores every place")
+wlr_chain() =
+    wlr_prints("var a = 0\nvar b = 0\nvar c = 0\n\na = b := c := 7\n\nprint(a, b, c)\n", "7 7 7\n")
+
+@test("every compound form has a ':=' spelling, and each yields the new value")
+wlr_every_compound_form() =
+    wlr_prints("var x = 5\n\nprint(x +:= 2, x -:= 1, x *:= 3, x /:= 2, x %:= 5, x <<:= 2, x >>:= 1, " +
+               "x &:= 7, x |:= 8, x ^:= 1)\nprint(x)\n",
+               "7 6 18 9 4 16 8 0 8 9\n9\n")
+
+@test("the capture idiom: a loop condition reads ':=' at assignment's precedence")
+wlr_capture_in_a_condition() =
+    wlr_prints("next(n: *int) -> int\n    *n -= 1\n    *n\n\nvar n = 4\nvar k = 0\n\n" +
+               "while (k := next(&n)) != 0\n    print(k)\n\nprint(k)\n",
+               "3\n2\n1\n0\n")
+
+@test("a bool written with ':=' is the one 'if' may test, and it is the stored value")
+wlr_bool_condition() =
+    wlr_prints("var on = false\nval yes = true\n\nif on := yes\n    print(\"set\", on)\n", "set true\n")
+
+@test("':=' yields the place's type, so a narrower value arrives widened")
+wlr_place_type() =
+    wlr_prints("var w: i64 = 0\nval small: i32 = 2147483647\nval got = (w := small)\n\n" +
+               "print(got + got, w)\n", "4294967294 2147483647\n")
+
+@test("a field and an array element yield through ':=' as a local does")
+wlr_field_and_index() =
+    wlr_prints("struct P\n    a: int\n    b: int\n\nvar p = P(a = 1, b = 2)\nvar arr = [1, 2, 3]\n\n" +
+               "print(p.a := 10, p.b +:= 5, p.a, p.b)\nprint(arr[1] := 20, arr[2] *:= 4, arr[1], arr[2])\n",
+               "10 7 10 7\n20 12 20 12\n")
+
+@test("a settable property yields what its getter reads back after the setter ran")
+wlr_property() =
+    wlr_prints("struct Temp\n    c: int\n\n    f -> int = self.c * 9 / 5 + 32\n\n    set f(v)\n" +
+               "        self.c = (v - 32) * 5 / 9\nend Temp\n\nvar t = Temp(0)\n\n" +
+               "print(t.f := 212, t.c, t.f +:= 9, t.c)\n",
+               "212 100 221 105\n")
+
+@test("a property reached through a trait object and through a bound yields the same way")
+wlr_property_through_a_trait() =
+    wlr_prints("trait W\n    f -> int\n    set f(v)\n\nstruct T\n    c: int\n\nimpl W for T\n" +
+               "    f -> int = self.c\n    set f(v)\n        self.c = v\n\nvar t = T(0)\nvar w: *W = &t\n\n" +
+               "g[X: W](x: *X) -> int = x.f := 40\n\nprint(w.f := 3, w.f +:= 1, t.c)\nprint(g(&t), t.c)\n",
+               "3 4 4\n40 40\n")
+
+@test("a body that is ':=' takes the type of what it stores")
+wlr_body() =
+    wlr_prints("var n = 0\n\nput(v: int) = n := v\n\nprint(put(5) + 1, n)\n", "6 5\n")
+
+// -- ownership ------------------------------------------------------------------------------------
+
+@test("a '&T' yielded by ':=' is a counted share: every name keeps it, and the heap ends empty")
+wlr_counted_share() =
+    wlr_balanced("struct Node\n    v: int\n\nstruct Holder\n    r: &Node\n\nkeep(r: &Node) -> int = r.v\n\n" +
+                 "main()\n    var a: &Node = Node(1)\n    val b = (a := Node(2))\n" +
+                 "    print(b.v, a.v, keep(a := Node(3)), b.v)\n    var h = Holder(Node(4))\n" +
+                 "    val c = (h.r := Node(5))\n    print(c.v, h.r.v)\n" +
+                 "    var rs: [2]&Node = [Node(6), Node(7)]\n    print((rs[0] := Node(8)).v, rs[0].v)\n" +
+                 "    var s = \"x\"\n    val t = (s +:= \"y\")\n    print(t, s)\n",
+                 "2 2 3 2\n5 5\n8 8\nxy xy\n")
+
+@test("a struct with Drop is dropped once, when the last name holding it lets go")
+wlr_drop() =
+    wlr_balanced("struct Res\n    id: int\n\nimpl Drop for Res\n    drop(self) = print(s\"drop ${self.id}\")\n\n" +
+                 "main()\n    var a: &Res = Res(1)\n    val b = (a := Res(2))\n    print(b.id, a.id)\n" +
+                 "    a = Res(3)\n    print(b.id, a.id)\n",
+                 "drop 1\n2 2\n2 3\ndrop 2\ndrop 3\n")
+
+// -- where `=` still stands -----------------------------------------------------------------------
+
+@test("'=' stands as a statement, a branch, an arm, a closure's body, a 'for' step, a '= body' and its 'match' arms")
+wlr_statement_positions() =
+    wlr_prints("var x = 0\nvar hits = 0\n\nput() = x = 1\nbump(v: int) = hits += v\n\n" +
+               "each(n: int, f: &Fn(int) -> unit)\n    for i in 0..<n\n        f(i)\n\n" +
+               "if x == 0 then x = 2 else x = 3\nval k = 1\nk match\n    1 -> x += 10\n    _ -> x = 0\n" +
+               "val cell = &hits\neach(3, i -> *cell += i)\nfor var i = 0; i < 3; i += 1\n    hits += 1\n" +
+               "put()\nbump(2)\n\nprint(x, hits)\n\nmark(n: int) = n match\n    1 -> x = 5\n    _ -> ()\n\n" +
+               "mark(1)\nprint(x)\n",
+               "1 8\n5\n")
+
+@test("named arguments and annotated bindings read as they did beside ':='")
+wlr_lexing_neighbours() =
+    wlr_prints("struct P\n    a: int\n    b: int\n\nval q: P = P(a = 1, b = 2)\nvar n: int=3\nvar m:int = 4\n\n" +
+               "print(q.a, q.b, n, m, n := m)\n",
+               "1 2 3 4 4\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a chain of '=' is refused at the inner assignment, which names ':='")
+wlr_refused_chain() =
+    wlr_refused("var a = 0\nvar b = 0\n\nmain()\n    a = b = 7\n", wlr_unit("=", ":="), "5:9")
+
+@test("'if a = b' over two bools is refused, as every condition that is an assignment is")
+wlr_refused_bool_condition() =
+    wlr_refused("var a = false\nval b = true\n\nmain()\n    if a = b\n        print(1)\n",
+                wlr_unit("=", ":="), "5:8")
+
+@test("an assignment as a comparison's operand is refused")
+wlr_refused_operand() =
+    wlr_refused("var c = 0\n\nmain()\n    while (c = 3) != 0\n        break\n", wlr_unit("=", ":="), "4:12")
+
+@test("a compound assignment as an argument is refused, and the fix names its ':=' form")
+wlr_refused_argument() =
+    wlr_refused("var x = 1\n\nmain()\n    print(x += 1)\n", wlr_unit("+=", "+:="), "4:11")
+
+@test("every compound form's refusal names its own ':=' form")
+wlr_refused_every_compound_form()
+    for op in ["-", "*", "/", "%", "&", "|", "^", "<<", ">>"]
+        wlr_refused(s"var x = 1\n\nmain()\n    val y = (x $op= 1)\n", wlr_unit(s"$op=", s"$op:="), "4:14")
+
+@test("an assignment as a binding's value is refused")
+wlr_refused_binding() =
+    wlr_refused("var x = 1\n\nmain()\n    val y = x = 2\n", wlr_unit("=", ":="), "4:13")
+
+@test("an assignment returned is refused")
+wlr_refused_return() =
+    wlr_refused("var x = 1\n\nf() -> int\n    return x = 2\n\nmain()\n    print(f())\n",
+                wlr_unit("=", ":="), "4:12")
+
+@test("an assignment as the last line of a body with a written result is refused")
+wlr_refused_written_result() =
+    wlr_refused("var x = 1\n\nf() -> int\n    x = 3\n\nmain()\n    print(f())\n", wlr_unit("=", ":="), "4:5")
+
+@test("an assignment as a closure's body where an int is wanted is refused")
+wlr_refused_closure_result() =
+    wlr_refused("var x = 0\n\nrun(f: &Fn() -> int) -> int = f()\n\nmain()\n    print(run(() -> x = 1))\n",
+                wlr_unit("=", ":="), "6:21")
+
+@test("':=' over several places is refused: the statement has no one value")
+wlr_refused_multi() =
+    wlr_refused("var a = 0\nvar b = 0\n\nmain()\n    a, b := 1, 2\n",
+                "':=' yields the value it stores, and an assignment to several places is a statement " +
+                "with no one value to yield — write '='", "5:5")
+
+@test("':=' on an element written through IndexSet is refused: the read back would evaluate it twice")
+wlr_refused_index_set()
+    val row = "struct Row\n    a: int\n\nimpl Index[usize, int] for Row\n    index(self, i: usize) -> int = self.a\n\n" +
+              "impl IndexSet[usize, int] for Row\n    index_set(*self, i: usize, v: int) = self.a = v\n\n" +
+              "main()\n    var r = Row(1)\n"
+
+    wlr_refused(row + "    print(r[0usize] := 2)\n",
+                "':=' on an element read through 'sysl.Index' would evaluate the receiver and the index " +
+                "twice — write it out as 'b[i] = v' and read 'b[i]' after it", "12:11")
+    wlr_refused(row + "    print(r[0usize] +:= 2)\n",
+                "'+:=' on an element read through 'sysl.Index' would evaluate the receiver and the index " +
+                "twice — write it out as 'b[i] = b[i] + …' and read 'b[i]' after it", "12:11")
+
+@test("':=' through a property needs a receiver it can reach twice")
+wlr_refused_computed_receiver() =
+    wlr_refused("struct C\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.v = x\n" +
+                "end C\n\nmk() -> C = C(1)\n\nmain()\n    print(mk().count := 2)\n",
+                "':=' writes 'count' and reads it back, so it needs a receiver it can reach twice — this one " +
+                "is computed, and has no address. Bind it to a 'var' first", "13:11")
+
+@test("':=' on a property with no setter is refused as '=' is")
+wlr_refused_read_only_property() =
+    wlr_refused("struct C\n    v: int\n\n    count -> int = self.v\n\nmain()\n    var c = C(1)\n" +
+                "    print(c.count := 2)\n",
+                "'count' is a property of 'C', which computes rather than naming storage, so there is " +
+                "nothing to assign through — write 'set count(…)' on 'C' to give it a setter", "8:11")
+
+@test("':=' on a 'val' is refused as '=' is")
+wlr_refused_val() =
+    wlr_refused("val x = 1\n\nmain()\n    print(x := 2)\n",
+                "a 'val' is written once, so assignment has nothing to write through", "4:11")
+
+// A setter with no property is refused where it is declared, so no write-only place reaches `:=`:
+// there is always a getter to read the value back by.
+@test("a write-only property cannot be declared, on a type or in a trait, so ':=' always has a read")
+wlr_refused_write_only()
+    if !wlr_ready() then return
+
+    val said = "error: 'set f' writes a property called 'f', and 'T' declares none — a property is read as " +
+               "well as written, and its result is where the value's type comes from\n --> main.sysl:4:5\n"
+    val trait_said = "error: 'set f' writes a property called 'f', and 'W' declares none"
+
+    assert(wlr_run("struct T\n    c: int\n\n    set f(v)\n        self.c = v\nend T\n\nmain()\n    var t = T(0)\n" +
+                "    print(t.f := 3)\n", false).0.starts_with(said), said)
+    assert(wlr_run("trait W\n    set f(v)\n\nmain()\n    print(1)\n", false).0.starts_with(trait_said),
+           trait_said)
+end wlr_refused_write_only
