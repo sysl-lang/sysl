@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{Search, from_utf8}
+import sysl.text.{Search, from_utf8, from_utf8_unchecked, str_builder}
 
 // A whole file: what its header may say, what it imports, and the run of statements under both.
 //
@@ -193,8 +193,10 @@ end parse_header_attr
 // sits at the margin, and in a literate document the margin is prose. So the gate reads the program
 // the tangle produced, which is where a `#if` written four columns in has arrived at column 1.
 //
-// `features` are the `#if` symbols the enabled features of the file's own package define.
-parse(src: Source, target: Target = host_target(), features: Buf[string] = buf()) -> Parsed
+// `features` are the `#if` symbols the enabled features of the file's own package define, and
+// `options` the declarations its options are read as (`options.sysl`).
+parse(src: Source, target: Target = host_target(), features: Buf[string] = buf(),
+      options: Buf[string] = buf()) -> Parsed
     not_utf8(src) match
         Some(d) -> return refused(src, d, 0, false)
         None -> ()
@@ -204,8 +206,27 @@ parse(src: Source, target: Target = host_target(), features: Buf[string] = buf()
         Ok(text) ->
             gate(text, target, features) match
                 Err(d) -> refused(text, d, literate_shift(src), true)
-                Ok(gated) -> parse_tangled(src, gated)
+                Ok(gated) -> parse_tangled(src, with_options(gated, options))
 end parse
+
+// **A package's options are file-private constants after the file's own text**, so every line the
+// file wrote keeps its number, and each file of the package has its own copy -- two files of one
+// module declaring one `private` name is two names.
+private with_options(src: Source, options: Buf[string]) -> Source
+    if options.is_empty() then return src
+
+    var b = str_builder()
+
+    b.push(from_utf8_unchecked(src.bytes))
+
+    if !src.bytes.is_empty() && src.bytes[src.bytes.len - 1] != u8('\n') then b.push("\n")
+
+    for line in options
+        b.push(line)
+        b.push("\n")
+
+    source_of(src.name, b.finish())
+end with_options
 
 // A source that is not UTF-8, refused at its first byte that begins no character.
 //

@@ -348,23 +348,13 @@ piece_view(piece: []u32, lo: usize)
 
 The inner loops are instruction for instruction the same — `lsr`, `add …lsl #1`, `tst`, `csinc`,
 `add w, #1`, `cmp`, `b.ne` — and the store is `str w9, [x0, x1, lsl #2]` against `str w11, [x1, x8,
-lsl #2]`; the bounds check is gone, the loop bound being the length. What `piece_view` has beyond
-that is the owner word's count:
-
-```
-cbz  x0, LBB4_2          ; owner null?
-ldr  x8, [x0]            ; non-atomic retain
-add  x8, x8, #1
-str  x8, [x0]
-…
-cbz  x0, LBB4_11         ; and the release on the way out
-```
-
-That increment is the race the crossing rule refuses a view for — and with the owner word nulled at
-the capture, both `cbz` are taken, so the scoped form runs the raw form's loop plus two not-taken
-branches. (A writable view *parameter* takes a share in the callee; a `[]const` one does not —
-`zero(v: []u32)` retains on entry, `total(v: []const u32)` does not. `reference/memory.md` § Passing
-a reference to a call says the callee reads through the caller's count; open question Q5.)
+lsl #2]`; the bounds check is gone, the loop bound being the length. `piece_view` touches the owner
+word not at all: a view parameter, writable or `[]const`, is read through the count its caller holds
+for the length of the call (`reference/memory.md` § Passing a reference to a call), and the callee
+takes a count only where it keeps the view — stores it, returns it, captures it, or reassigns the
+parameter. The count a child *would* take where it keeps a captured view is a non-atomic increment,
+which is the race the crossing rule refuses a view for; nulling the owner word at the capture makes
+that path a not-taken branch.
 
 ## 4. Evidence: Rust, Zig, and what sysl has instead
 
@@ -434,8 +424,6 @@ a helper that takes `*Scope`), which pool's `split` would then have to inline.
 - **Q4. Does `sysl.threads` grow a `scope` (one OS thread per spawn), or is the pool the only
   provider?** Recommend yes: the standard library should have the safe form beside `spawn(&f, &st)`,
   and it is the reference implementation the docs run.
-- **Q5. A writable view parameter takes a share in the callee** (`zero(v: []u32)` retains on entry;
-  `total(v: []const u32)` does not), which `reference/memory.md` § Passing a reference to a call
-  usually costs nothing does not describe. The owner-nulling here makes it harmless for scoped
-  captures; whether it is a divergence to fix in its own right is the compiler's question, not this
-  design's.
+- **Q5. Settled: a view parameter takes no share in the callee**, writable or not — `zero(v: []u32)`
+  and `total(v: []const u32)` both read through the caller's count, as `reference/memory.md` §
+  Passing a reference to a call says (`tests_vps_view_param_share.sysl`).

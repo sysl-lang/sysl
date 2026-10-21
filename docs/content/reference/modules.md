@@ -1985,8 +1985,8 @@ print(SQUARES[3], SQUARES[7])
 **A table the run builds on its heap is frozen into the object file**, where it is answered through a
 type that says nothing writes it: a `[]const T` is laid down as an array of its own with a view of
 it, and a frozen buffer (`b.freeze()`) as its box and its elements — both constant data on a board
-too. A whole `Buf` or `Map`, a reference, or a writable `[]T` answered this way stays code, computed
-when the program starts, and a board build says which of these it is and what to answer instead:
+too. A whole `Buf` or `Map`, or a writable `[]T`, answered this way stays code, computed when the
+program starts, and a board build says which of these it is and what to answer instead:
 
 ```sysl
 import sysl.buf.{Buf, buf, Frozen}
@@ -2021,6 +2021,42 @@ print(PRIMES.len, PRIMES[24], SQ.at(5))
 ```output
 25 97 25
 ```
+
+**A reference is laid down as the object it names.** A module `val` holding a `&T` known while
+compiling — a call's answer, or a box written out — is that object in the object file. The object is
+writable data, because a reference is written through, and the `val` holds it for good, so nothing
+ever frees it. Every use reads and writes the one object, and a board needs no allocator for it:
+
+```sysl
+struct Counter
+    hits: int
+    name: string
+
+counter(name: string) -> &Counter = Counter(0, name)
+
+static val REQUESTS: &Counter = counter("requests")
+
+record()
+    REQUESTS.hits += 1
+
+record()
+record()
+
+val same = REQUESTS
+
+print(REQUESTS.name, REQUESTS.hits, same == REQUESTS)
+```
+
+```output
+requests 2 true
+```
+
+Three answers of reference type stay code, built when the program starts:
+
+- **a `var`**, which gives its object back when it is assigned;
+- **an answer that reaches one object from two places** — laid down, each place would hold an
+  object of its own;
+- **a box of a type with a `Drop`**, which is not made while compiling at all.
 
 **A table of records is laid down the same way**: a struct as the constructor over the literals its
 fields came to, an enum value as its variant — one that carries fields with its payload written as
