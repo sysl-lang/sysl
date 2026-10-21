@@ -729,17 +729,46 @@ installed, `sysl doc` says so and where to get it.
 
 ```bash
 sysl import-c /opt/homebrew/include/tree_sitter/api.h --prefix ts_ --include-as tree_sitter/api.h
-sysl import-c -I vendor/include vendor/include/fx.h --prefix fx_ --module sh.sysl.fx.c -o sh/sysl/fx/c/c.sysl
+sysl import-c -I vendor/include vendor/include/fx.h --prefix fx_ --module sh.sysl.fx.c \
+    --shim sh/sysl/fx/c/shim.c -o sh/sysl/fx/c/c.sysl
 ```
 
 `import-c [-I <dir>] [-D <macro>] [--prefix <p>] [--module <name>] [--link-lib <lib>] [--include-as <path>]
-[--target <name>] [-o <path>] <header.h>`. The raw layer of a binding, read out of the header rather
-than transcribed from it: an `opaque struct` for each handle, a `struct` for each record with a
-complete definition, an `extern` for each function and variable, a `type` alias for each callback
-and scalar typedef, and every number in a `c const` block — each enum a `c type` with its
-enumerators at it, each `#define` of a number by name. **The pleasant layer above it is still
-written by hand**: who owns what, which pointer may be null, and what a callback's trampoline looks
-like are decisions the header does not record.
+[--follow <header>] [--shim <file.c>] [--target <name>] [-o <path>] <header.h>`. The raw layer of a
+binding, read out of the header rather than transcribed from it, as one module: an `opaque struct`
+for each handle, a `struct` or `union` for each record with a complete definition, an `extern` for
+each function and variable, a `type` alias for each callback and scalar typedef, and every number in
+a `c const` block — each enum a `c type` with its enumerators at it, each `#define` of a number by
+name. **The pleasant layer above it is still written by hand**: who owns what, which pointer may be
+null, and what a callback's trampoline looks like are decisions the header does not record.
+
+**Records are written as C declares them.** A C `union` is a sysl [`union`](/reference/types/#unions),
+an anonymous member is an anonymous `union`/`struct` block in place, and a named member of an
+unnamed record type (`union { … } v;`) gets a type of its own named for both (`HolderV`). A bitfield
+`T name : W` is a [C bitfield](/reference/attributes/#c-bitfields--name-uw-in-t-laid-out-as-c-lays-it-out),
+`name: uW in T`; `__attribute__((packed))` is `@packed` and `__attribute__((aligned(16)))` is
+`@align(16)`. A union member sysl cannot express (a `long double`, a record withheld here) is kept as
+its bytes, `_ld: [SIZEOF_ALT_LD]u8`, with the union's boundary said by `@align(ALIGNOF_ALT)`. A plain
+`char` is `i8` as a value and `u8` behind a pointer.
+
+**`--follow <header>`** lays out the records another header declares where this header uses them by
+value — `struct timespec` passed to a function, say — with the same checks as its own; a header is
+matched by its path or by the end of it (`--follow _timespec.h`). Only what is used is written. Without
+it such a declaration is refused, and the refusal names the `--follow` that would lay it out.
+
+**`--shim <file.c>`** writes a C wrapper for each `static inline` function and each function-like
+macro, which have no symbol to link against, and an `extern` for it in the module:
+
+```c
+int sysl_fx_twice(int x) {
+    return fx_twice(x);
+}
+```
+
+A function-like macro is wrapped when its body is one call of a function the header declares, each
+of its parameters one whole argument — that function's types are the macro's; any other is refused
+by name, as is a function or macro taking `...`. Put the file in the module's directory: a `.c` file
+beside a module is compiled with it, so the pair builds with nothing more said.
 
 **clang is the front end.** The header is compiled twice — once with `-E -dD` for its own
 `#define`s, once with `-ast-dump=json` for its declarations — for the target `--target` names (the
@@ -747,10 +776,12 @@ host by default) and with every `-I`, `--include-path` and `-D` on the command l
 flags a `c const` is measured with. A header clang cannot compile is refused in clang's own words.
 
 **What it writes checks itself on every build.** A record that is laid out carries an `@assert` for
-its size and for each field's offset, against `c const`s holding clang's `sizeof` and
-`__builtin_offsetof` for the target being built — so a layout that differs on another machine stops
-the build at that record, naming it, instead of reading the wrong bytes. C's `long` is a `c type`
-(`CLong`) for the same reason: it is four bytes on one machine and eight on the next.
+its size and for each field's offset — and for its boundary, where that is not simply its fields'
+(a union, an `@align`, C bitfields) — against `c const`s holding clang's `sizeof`, `_Alignof` and
+`__builtin_offsetof` for the target being built, so a layout that differs on another machine stops
+the build at that record, naming it, instead of reading the wrong bytes. A bitfield has no offset to
+check; its record's size and boundary are. C's `long` is a `c type` (`CLong`) for the same reason: it
+is four bytes on one machine and eight on the next.
 
 `--prefix` is taken off every name, ignoring case: with `ts_`, `ts_parser_new` is `parser_new`,
 `TSNode` is `Node` and `TSQuantifierZero` is `QUANTIFIER_ZERO`. A type is UpperCamel with any `_t`
@@ -760,11 +791,13 @@ the first `-I` holding it, or its file name. `--module` and `--link-lib` put a `
 `@link` at the top.
 
 **What cannot be generated is said, not guessed** — on stderr as `sysl: note: not generated: …`, and
-again in a comment at the foot of the module. A union, a record with a bitfield or an anonymous
-member, and one with a flexible array member stay `opaque`, with `SIZEOF_`/`ALIGNOF_` constants so a
-caller can still allocate one. A `static inline` function, a function-like macro, a string macro and
-a record from another header passed by value are refused by name. The command still succeeds: a
-header with one unbindable macro is worth the rest.
+again in a comment at the foot of the module. A record with a flexible array member, one laid out
+under `#pragma pack`, one with an `aligned` whose value is not a literal, and one with a bitfield
+whose unit is not an integer of 8 to 64 bits (`long x : 3`) stay `opaque`, with `SIZEOF_`/`ALIGNOF_`
+constants so a caller can still allocate one. A string macro, a record from another header passed by
+value without `--follow`, and a record with C bitfields passed by value (it crosses only by address)
+are refused by name. The command still succeeds: a header with one unbindable macro is worth the
+rest.
 
 ### `targets`
 

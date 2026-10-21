@@ -3286,12 +3286,73 @@ A pointer, a struct and an array each already have an answer here — an address
 an `opaque struct` — and each is better than a same-width integer standing in for it and losing what
 it was.
 
+## `sysl import-c` — the declarations, read out of the header
+
+Everything above is written by hand, and for a large header most of it is transcription:
+an `opaque struct` per handle, a `struct` per record, an `extern` per function, a `c const` per
+number. [`sysl import-c`](/getting-started/cli/#import-c) writes that layer from the header itself,
+asking clang what each declaration is, and nothing in what it writes is a number read off the machine
+it ran on — every size, offset, enumerator and macro is a `c const` or `c type`, measured when the
+module is built:
+
+```c
+typedef union fx_word { uint32_t u; float f; } fx_word;
+struct fx_bits { unsigned a : 3; unsigned : 2; unsigned b : 5; };
+static inline int fx_twice(int x) { return x * 2; }
+```
+
+becomes, with `--prefix fx_ --shim shim.c`,
+
+```sysl
+union Word
+    u: u32
+    f: f32
+
+struct Bits
+    a: u3 in u32
+    _: u2 in u32
+    b: u5 in u32
+
+c const
+    SIZEOF_WORD: usize = "sizeof(fx_word)"
+    ALIGNOF_WORD: usize = "_Alignof(fx_word)"
+    OFFSETOF_WORD_U: usize = "__builtin_offsetof(fx_word, u)"
+    OFFSETOF_WORD_F: usize = "__builtin_offsetof(fx_word, f)"
+    SIZEOF_BITS: usize = "sizeof(struct fx_bits)"
+    ALIGNOF_BITS: usize = "_Alignof(struct fx_bits)"
+
+@assert(sizeof(Word) == SIZEOF_WORD, "Word must match fx_word")
+@assert(alignof(Word) == ALIGNOF_WORD, "Word must be aligned as fx_word is")
+@assert(offsetof(Word, u) == OFFSETOF_WORD_U, "fx_word.u moved")
+@assert(offsetof(Word, f) == OFFSETOF_WORD_F, "fx_word.f moved")
+@assert(sizeof(Bits) == SIZEOF_BITS, "Bits must match struct fx_bits")
+@assert(alignof(Bits) == ALIGNOF_BITS, "Bits must be aligned as struct fx_bits is")
+
+extern "sysl_fx_twice" twice(x: i32) -> i32
+```
+
+and `shim.c`, compiled where it sits beside the module, holds the wrapper `fx_twice` needs, having no
+symbol of its own:
+
+```c
+int sysl_fx_twice(int x) {
+    return fx_twice(x);
+}
+```
+
+**The checks are the point.** Built for a target where `fx_word` or `struct fx_bits` is laid out
+otherwise, the module stops at that record's `@assert`, naming it, rather than reading the wrong
+bytes. What the generator cannot express it says, by name, on stderr and at the foot of the module —
+a flexible array member, a record under `#pragma pack`, a macro whose parameters nothing types —
+and it never guesses. The pleasant layer above, which decides ownership, nullability and callbacks,
+is still a person's.
+
 ## What is deliberately absent
 
 | absent | instead |
 |---|---|
 | an `fn(int) -> int` type for sysl's own callables | the `Fn` trait; `*extern` exists only where the representation is somebody else's to choose |
-| a header parser in the language | [`sysl import-c`](/getting-started/cli/#import-c) asks clang for a header's declarations and writes the `extern`s, records and `c const`s; a `.c` shim for what a header hides |
+| a C header parser in the compiler | [`sysl import-c`](#sysl-import-c--the-declarations-read-out-of-the-header) asks clang for a header's declarations and writes the module of `extern`s, records and `c const`s, with `--shim` for the wrappers a `static inline` function or a function-like macro needs; nothing reads C at build time but clang, through `c const` and `c type` |
 | a calling convention on an export | open — `@export` implies C's, and `interrupt` already built the shape a second one would take |
 | a capability gate on an extern | open — an extern reaching libc plausibly needs `os`, and does not yet say so |
 
