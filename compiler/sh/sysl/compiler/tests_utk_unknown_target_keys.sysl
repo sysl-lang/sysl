@@ -1,0 +1,62 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **A key inside a `targets.<name>` block that this compiler does not know is reported and ignored**
+// (`reference/packages.md § A key this compiler does not know is reported and ignored`), in the
+// words a top-level one gets -- a misspelt key and a nested block alike, in the project's own
+// manifest and in a dependency's.
+
+private utk_warnings(body: string) -> string =
+    join(read_manifest(s"package { name = \"app\", version = \"0.1.0\" }\n$body").unwrap().warnings.view(),
+         "\n")
+
+private utk_said(path: string) -> string =
+    s"package.hocon: '$path' is not something this sysl understands, and is ignored — either it is a " +
+    "misspelling, or it was added by a newer compiler"
+
+@test("a misspelt key in a target block is reported, and the block's other keys still take effect")
+utk_misspelt_key()
+    val m = read_manifest("package { name = \"app\", version = \"0.1.0\" }\n" +
+        "targets {\n  aarch64-freestanding {\n    linker_scrpt = \"link.ld\"\n    entry = \"_start\"\n  }\n}\n")
+        .unwrap()
+
+    assert_eq(join(m.warnings.view(), "\n"), utk_said("targets.aarch64-freestanding.linker_scrpt"))
+    assert_eq(image_for(m, "aarch64-freestanding").unwrap().entry, "_start")
+    assert_eq(image_for(m, "aarch64-freestanding").unwrap().script, "")
+
+@test("an unknown nested block in a target block is reported as one key")
+utk_unknown_nested_block()
+    assert_eq(utk_warnings("targets {\n  thumb-freestanding {\n    boot { stack = 4096, heap = 0 }\n  }\n}\n"),
+              utk_said("targets.thumb-freestanding.boot"))
+
+@test("every unknown key of every target block is reported, in the order the file wrote them")
+utk_every_key_reported()
+    assert_eq(utk_warnings("targets {\n  default = \"aarch64-freestanding\"\n" +
+                           "  aarch64-freestanding { entri = \"_start\", linker_script = \"a.ld\" }\n" +
+                           "  thumb-freestanding { flash = 4, capabilities { libc = true } }\n}\n"),
+              utk_said("targets.aarch64-freestanding.entri") + "\n" + utk_said("targets.thumb-freestanding.flash"))
+
+@test("the keys a target block does know draw nothing")
+utk_known_keys_are_silent()
+    assert_eq(utk_warnings("targets {\n  aarch64-freestanding {\n    triple = \"aarch64-none-elf\"\n" +
+                           "    linker = \"ld.lld\"\n    linker_script = \"link.ld\"\n    entry = \"_start\"\n" +
+                           "    capabilities { posix = false }\n    codegen { general_regs_only = true }\n" +
+                           "  }\n}\n"), "")
+
+@test("a dependency's target block is held to the same keys, and its warning carried with its manifest")
+utk_dependency_manifest()
+    val dir = absolute_path(make_temp_dir("sysl-utk").unwrap())
+
+    make_dir_all(s"$dir/dep").unwrap()
+    write_text(s"$dir/package.hocon", "package { name = \"dep\", version = \"1.0.0\" }\n" +
+               "targets {\n  aarch64-freestanding { linker_scrpt = \"link.ld\" }\n}\n").unwrap()
+    write_text(s"$dir/dep/dep.sysl", "module dep\n").unwrap()
+
+    val m = manifest_of_package(dir)
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(join(m.unwrap().warnings.view(), "\n"), utk_said("targets.aarch64-freestanding.linker_scrpt"))

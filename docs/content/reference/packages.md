@@ -258,6 +258,14 @@ released compiler, which for a format whose consumers pin coordinates is a promi
 **Ignoring silently** is the failure that reads as success: a mistyped `dependencis` block does
 nothing and says nothing.
 
+**A key inside a `targets.<name>` block is held to the same rule**, a misspelling and a block nested
+under a name this compiler does not know alike, and the path says which block it was in:
+
+```
+package.hocon: 'targets.aarch64-freestanding.linker_scrpt' is not something this sysl understands,
+               and is ignored — either it is a misspelling, or it was added by a newer compiler
+```
+
 A **dependency's** unknown keys are reported with the package root in front of them, because that is
 the case a manifest cannot report for itself — a package written against a newer sysl, being built by
 an older one:
