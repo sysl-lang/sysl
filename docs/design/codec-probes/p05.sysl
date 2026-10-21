@@ -1,0 +1,150 @@
+// P5: encoding the shapes a codec meets: data enums (x is c / x.(c) / c::Fields), Option, Buf,
+// Map, &T (recursive), tuples, arrays, fixed point, and flatten (walking f::Type::Fields).
+import sysl.buf.{Buf, buf}
+import sysl.container.Map
+
+@annotation
+struct flatten
+end flatten
+
+trait Encoder
+    begin(*self, open: string)
+    sep(*self)
+    end_(*self, close: string)
+    key(*self, k: string)
+    int(*self, v: long)
+    real(*self, v: real)
+    str(*self, v: string)
+    absent(*self)
+
+trait Encode
+    encode[E: Encoder](self, e: *E)
+
+struct Text
+    out: string
+
+impl Encoder for Text
+    begin(*self, open: string) = self.out = self.out + open
+    sep(*self) = self.out = self.out + ","
+    end_(*self, close: string) = self.out = self.out + close
+    key(*self, k: string) = self.out = self.out + s"\"$k\":"
+    int(*self, v: long) = self.out = self.out + s"$v"
+    real(*self, v: real) = self.out = self.out + s"$v"
+    str(*self, v: string) = self.out = self.out + s"\"$v\""
+    absent(*self) = self.out = self.out + "null"
+
+impl Encode for int
+    encode[E: Encoder](self, e: *E) = e.int(self)
+
+impl Encode for string
+    encode[E: Encoder](self, e: *E) = e.str(self)
+
+impl Encode for q15
+    encode[E: Encoder](self, e: *E) = e.real(real(self))
+
+impl[T: Encode] Encode for Option[T]
+    encode[E: Encoder](self, e: *E) = self match
+        Some(v) -> v.encode(e)
+        None -> e.absent()
+
+impl[T: Encode] Encode for Buf[T]
+    encode[E: Encoder](self, e: *E)
+        e.begin("[")
+        for i in 0..<self.len()
+            if i > 0 then e.sep()
+            self.at(i).encode(e)
+        e.end_("]")
+
+
+impl[A: Encode, B: Encode] Encode for (A, B)
+    encode[E: Encoder](self, e: *E)
+        e.begin("[")
+        self.0.encode(e)
+        e.sep()
+        self.1.encode(e)
+        e.end_("]")
+
+fields[T, E: Encoder](v: T, e: *E, first: bool) -> bool
+    var first_ = first
+
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_some()
+            first_ = fields(v.(f), e, first_)
+        else
+            if !first_ then e.sep()
+            first_ = false
+            e.key(f.name)
+            v.(f).encode(e)
+
+    first_
+
+encode_struct[T, E: Encoder](v: T, e: *E)
+    e.begin("{")
+    fields(v, e, true)
+    e.end_("}")
+
+// externally tagged: {"Circle":{"r":5}}, a unit variant as "Dot"
+encode_enum[T, E: Encoder](v: T, e: *E)
+    for const c in T::Variants
+        if v is c
+            if const c::Fields.len == 0
+                e.str(c.name)
+            else
+                e.begin("{")
+                e.key(c.name)
+                e.begin("{")
+                val p = v.(c)
+                for const f in c::Fields
+                    if f.index > 0 then e.sep()
+                    e.key(f.name)
+                    if const c::Fields.len == 1
+                        p.encode(e)
+                    else
+                        p.(f).encode(e)
+                e.end_("}")
+                e.end_("}")
+
+enum Shape
+    Dot
+    Circle(r: int)
+    Rect(w: int, h: int)
+
+impl Encode for Shape
+    encode[E: Encoder](self, e: *E) = encode_enum(self, e)
+
+enum Expr
+    Lit(n: int)
+    Add(a: &Expr, b: &Expr)
+
+impl Encode for Expr
+    encode[E: Encoder](self, e: *E) = encode_enum(self, e)
+
+struct Meta
+    rev: int
+    tag: string
+
+struct Doc
+    title: string
+    @flatten meta: Meta
+    shapes: Buf[Shape]
+    note: Option[string]
+    pair: (int, string)
+    gain: q15
+    tree: &Expr
+
+impl Encode for Doc
+    encode[E: Encoder](self, e: *E) = encode_struct(self, e)
+
+var shapes: Buf[Shape] = buf()
+shapes.push(Shape.Dot)
+shapes.push(Shape.Circle(5))
+shapes.push(Shape.Rect(2, 3))
+
+val tree: &Expr = Expr.Add(Expr.Lit(1), Expr.Add(Expr.Lit(2), Expr.Lit(3)))
+val doc = Doc("t", Meta(4, "x"), shapes, None, (1, "one"), q15(0.5), tree)
+var out = Text("")
+doc.encode(&out)
+print(out.out)
+print(Kind::Image(Option[int]::Kind), Kind::Image(Buf[int]::Kind), Kind::Image(Map[string, int]::Kind), Kind::Image(q15::Kind), Kind::Image(RE::Kind))
+
+type RE = &Expr

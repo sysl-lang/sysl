@@ -1,0 +1,68 @@
+// P1: a format-neutral Encode whose derive member is generic over the format.
+trait Encoder
+    begin_struct(*self, name: string, n: usize)
+    field(*self, key: string)
+    end_struct(*self)
+    int(*self, v: long)
+    str(*self, v: string)
+
+trait Encode
+    encode[E: Encoder](self, e: *E)
+
+    derive[T] encode[E: Encoder](self: T, e: *E)
+        if const T::Kind == Kind.Struct
+            e.begin_struct(T::BaseName, T::Fields.len)
+
+            for const f in T::Fields
+                e.field(f.name)
+                self.(f).encode(e)
+
+            e.end_struct()
+        else
+            @assert(false, s"Encode cannot derive for ${T::Name}")
+
+impl Encode for int
+    encode[E: Encoder](self, e: *E) = e.int(self)
+
+impl Encode for string
+    encode[E: Encoder](self, e: *E) = e.str(self)
+
+struct Json
+    out: string
+
+impl Encoder for Json
+    begin_struct(*self, name: string, n: usize) = self.out = self.out + "{"
+    field(*self, key: string)
+        if !self.out.ends_with("{") then self.out = self.out + ","
+        self.out = self.out + s"\"$key\":"
+    end_struct(*self) = self.out = self.out + "}"
+    int(*self, v: long) = self.out = self.out + s"$v"
+    str(*self, v: string) = self.out = self.out + s"\"$v\""
+
+struct Debugish
+    out: string
+
+impl Encoder for Debugish
+    begin_struct(*self, name: string, n: usize) = self.out = self.out + s"$name("
+    field(*self, key: string)
+        if !self.out.ends_with("(") then self.out = self.out + ", "
+        self.out = self.out + s"$key="
+    end_struct(*self) = self.out = self.out + ")"
+    int(*self, v: long) = self.out = self.out + s"$v"
+    str(*self, v: string) = self.out = self.out + v
+
+struct Inner derives Encode
+    z: int
+
+struct User derives Encode
+    id: int
+    name: string
+    inner: Inner
+
+val u = User(7, "ann", Inner(3))
+var j = Json("")
+u.encode(&j)
+print(j.out)
+var d = Debugish("")
+u.encode(&d)
+print(d.out)

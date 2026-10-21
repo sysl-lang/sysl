@@ -1,0 +1,159 @@
+// P3: decoding a struct generically: receiverless decode, var out: T, out.(f) = ...?,
+// key matching per unrolled copy, a seen-array sized by T::Fields.len, annotations in if const,
+// Option defaulting, and an error carrying the path.
+import sysl.buf.{Buf, buf}
+
+@annotation
+struct rename
+    name: string
+
+@annotation
+struct skip
+end skip
+
+enum Tok
+    Begin
+    End
+    Key(k: string)
+    Int(n: long)
+    Str(s: string)
+
+struct Fail
+    path: string
+    what: string
+
+trait Decoder
+    begin_struct(*self) -> Result[unit, Fail]
+    next_key(*self) -> Result[Option[string], Fail]
+    int(*self) -> Result[long, Fail]
+    str(*self) -> Result[string, Fail]
+    skip_value(*self) -> Result[unit, Fail]
+    is_null(*self) -> bool
+
+trait Decode
+    decode[D: Decoder](d: *D) -> Result[Self, Fail]
+
+struct Toks
+    t: Buf[Tok]
+    at: usize
+
+impl Decoder for Toks
+    begin_struct(*self) -> Result[unit, Fail]
+        val t = self.t.at(self.at)
+        self.at += 1
+        t match
+            Begin -> Ok(())
+            _ -> Err(Fail("", "an object expected"))
+    next_key(*self) -> Result[Option[string], Fail]
+        val t = self.t.at(self.at)
+        self.at += 1
+        t match
+            End -> Ok(None)
+            Key(k) -> Ok(Some(k))
+            _ -> Err(Fail("", "a key expected"))
+    int(*self) -> Result[long, Fail]
+        val t = self.t.at(self.at)
+        self.at += 1
+        t match
+            Int(n) -> Ok(n)
+            _ -> Err(Fail("", "an integer expected"))
+    str(*self) -> Result[string, Fail]
+        val t = self.t.at(self.at)
+        self.at += 1
+        t match
+            Str(s) -> Ok(s)
+            _ -> Err(Fail("", "a string expected"))
+    skip_value(*self) -> Result[unit, Fail]
+        self.at += 1
+        Ok(())
+    is_null(*self) -> bool = false
+
+impl Decode for int
+    decode[D: Decoder](d: *D) -> Result[int, Fail] = Ok(int(d.int()?))
+
+impl Decode for string
+    decode[D: Decoder](d: *D) -> Result[string, Fail] = d.str()
+
+impl[T: Decode] Decode for Option[T]
+    decode[D: Decoder](d: *D) -> Result[Option[T], Fail] = Ok(Some(T.decode(d)?))
+
+decode_as[V: Decode, D: Decoder](d: *D) -> Result[V, Fail] = V.decode(d)
+
+within(e: Fail, name: string) -> Fail =
+    Fail(if e.path == "" then name else s"$name.${e.path}", e.what)
+
+decode_struct[T, D: Decoder](d: *D) -> Result[T, Fail]
+    var out: T
+    var seen: [T::Fields.len]bool
+
+    d.begin_struct()?
+
+    loop
+        val k = d.next_key()?
+        if k.is_none() then break
+
+        val key = k.unwrap()
+        var known = false
+
+        for const f in T::Fields
+            if const f::Annotation[skip].is_none()
+                val name = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                if key == name
+                    known = true
+                    seen[f.index] = true
+                    out.(f) = decode_as[f::Type, D](d) match
+                        Ok(v) -> v
+                        Err(e) -> return Err(within(e, name))
+
+        if !known then d.skip_value()?
+
+    for const f in T::Fields
+        if const f::Annotation[skip].is_none() && f::Type::Kind != Kind.DataEnum
+            if !seen[f.index] then return Err(Fail(f.name, "missing"))
+
+    Ok(out)
+end decode_struct
+
+struct Inner
+    z: int
+
+impl Decode for Inner
+    decode[D: Decoder](d: *D) -> Result[Inner, Fail] = decode_struct(d)
+
+struct Opaque
+    p: int
+
+struct User
+    @rename("id") user_id: int
+    name: string
+    inner: Inner
+    @skip cache: Opaque
+
+impl Decode for User
+    decode[D: Decoder](d: *D) -> Result[User, Fail] = decode_struct(d)
+
+toks(xs: []const Tok) -> Toks
+    var b: Buf[Tok] = buf()
+    b.extend(xs)
+    Toks(b, 0)
+
+var ok = toks([Tok.Begin, Tok.Key("id"), Tok.Int(7), Tok.Key("extra"), Tok.Int(0), Tok.Key("name"), Tok.Str("ann"),
+    Tok.Key("inner"), Tok.Begin, Tok.Key("z"), Tok.Int(3), Tok.End, Tok.End])
+
+User.decode(&ok) match
+    Ok(u) -> print(u.user_id, u.name, u.inner.z, u.cache.p)
+    Err(e) -> print("error at", e.path, e.what)
+
+var bad = toks([Tok.Begin, Tok.Key("id"), Tok.Int(7), Tok.Key("inner"), Tok.Begin, Tok.Key("z"), Tok.Str("x"),
+    Tok.End, Tok.End])
+
+User.decode(&bad) match
+    Ok(u) -> print(u.user_id)
+    Err(e) -> print("error at", e.path, e.what)
+
+var short = toks([Tok.Begin, Tok.Key("id"), Tok.Int(7), Tok.End])
+
+User.decode(&short) match
+    Ok(u) -> print(u.user_id)
+    Err(e) -> print("error at", e.path, e.what)
