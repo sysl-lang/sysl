@@ -591,9 +591,11 @@ A generic function's result is the body's type in terms of its parameters, so `p
 initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
 
 **The result is known wherever a written one would be.** A call above the declaration, in another
-file of the module, in another module, or through a library reads it, in any order; `sysl doc` shows
-the declaration as written, `= value` and all, and an editor's hover shows it at the type it was read
-as.
+file of the module, in another module, or through a library reads it, in any order. `sysl doc` and an
+editor's hover show the declaration at the type it was read as, exactly as though `-> T` were written
+— `twice(x: int) -> int`, and `shout(word: string)` with no arrow for a `unit` one — and never show
+the body. A signature whose result could not be read, in a tree that does not compile, is shown as
+`twice(x: int) = …`.
 
 **A body that reaches its own function before the result is known has no type to take**, directly or
 through another function that does the same, and is refused at the declaration. Writing the result on

@@ -201,7 +201,7 @@ ifr_library_export()
         Ok(out) -> assert_eq(out.text, "17 demo 2.5 7\n")
 end ifr_library_export
 
-@test("sysl doc shows a result read off the body as the '= value' it was written with")
+@test("a signature with nothing analyzed never shows the body: a result read off it is ' = …'")
 ifr_doc_signature()
     val r = parse(source_of("t.sysl", "module m\n\ntwice(x: int) = x * 2\nlong(x: int) =\n    val y = x\n\n" +
                                       "    y\n\nwritten(x: int) -> int = x\n\nstruct W\n    v: int\n    " +
@@ -222,11 +222,103 @@ ifr_doc_signature()
                     out = out + doc_method(m) + "\n"
             _ -> ()
 
-    assert(out.contains("twice(x: int) = x * 2\n"), out)
+    assert(out.contains("twice(x: int) = \u{2026}\n"), out)
     assert(out.contains("long(x: int) = \u{2026}\n"), out)
     assert(out.contains("written(x: int) -> int\n"), out)
-    assert(out.contains("twice(self) = self.v * 2"), out)
+    assert(out.contains("twice(self) = \u{2026}"), out)
+    assert(!out.contains("x * 2"), out)
 end ifr_doc_signature
+
+// Every signature `sysl doc` writes for a one-file module `demo`, members indented under their type.
+private ifr_documented(src: string) -> string
+    val root = ifr_root([("demo/demo.sysl", s"module demo\n\n$src")])
+    val modules = read_doc_tree(root, true, (_) -> ())
+
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for m in modules.unwrap()
+        for sym in m.symbols
+            out = s"$out${sym.signature}\n"
+
+            for member in sym.members
+                out = s"$out  ${member.signature}\n"
+
+    out
+end ifr_documented
+
+@test("sysl doc shows a result read off the body at its type, as though written, and never the body")
+ifr_doc_resolved()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("twice(x: int) = x * 2\nname() = \"demo\"\npair(x: int) = (x, x > 0)\n" +
+                             "maybe(x: int) = if x > 0 then Some(x) else None\n")
+
+    assert(out.contains("twice(x: int) -> int\n"), out)
+    assert(out.contains("name() -> string\n"), out)
+    assert(out.contains("pair(x: int) -> (int, bool)\n"), out)
+    assert(out.contains("maybe(x: int) -> Option[int]\n"), out)
+    assert(!out.contains(" = "), out)
+end ifr_doc_resolved
+
+@test("a unit result read off the body is shown with no arrow, as a written procedure is")
+ifr_doc_unit()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("var n = 0\n\nadd(k: int)\n    n += k\n\nbump() = add(1)\nsay(s: string) = print(s)\n")
+
+    assert(out.contains("bump()\n"), out)
+    assert(out.contains("say(s: string)\n"), out)
+    assert(!out.contains("->"), out)
+    assert(!out.contains(") = "), out)
+end ifr_doc_unit
+
+@test("a generic result read off the body is shown in terms of the type parameters")
+ifr_doc_generic()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("id[T](x: T) = x\nboth[A, B](a: A, b: B) = (b, a)\n")
+
+    assert(out.contains("id[T](x: T) -> T\n"), out)
+    assert(out.contains("both[A, B](a: A, b: B) -> (B, A)\n"), out)
+end ifr_doc_generic
+
+@test("a member's result read off the body is shown at its type: a method, a command and an enum's method")
+ifr_doc_member()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("struct Box[T]\n    v: T\n    n: int\n\n    get(self) = self.v\n    " +
+                             "show(self) = print(self.n)\n    twice(*self) = self.n * 2\n\n" +
+                             "enum Light\n    Red\n    Green\n\n    next(self) = self match\n        " +
+                             "Red -> Light.Green\n        Green -> Light.Red\n")
+
+    assert(out.contains("  get(self) -> T\n"), out)
+    assert(out.contains("  show(self)\n"), out)
+    assert(out.contains("  twice(*self) -> int\n"), out)
+    assert(out.contains("  next(self) -> Light\n"), out)
+    assert(!out.contains(" = "), out)
+end ifr_doc_member
+
+@test("a function whose result is read through a nested function's is shown at that result")
+ifr_doc_nested()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("outer(x: int) =\n    inner(y: int) = y > 1\n\n    inner(x)\n")
+
+    assert(out.contains("outer(x: int) -> bool\n"), out)
+    assert(!out.contains("inner"), out)
+end ifr_doc_nested
+
+@test("a tree that does not compile still documents, and a result it could not read is ' = …'")
+ifr_doc_unbuilt()
+    if !ifr_ready() then return
+
+    val out = ifr_documented("twice(x: int) = x * 2\nbroken() = missing_name()\n")
+
+    assert(out.contains("broken() = \u{2026}\n"), out)
+    assert(!out.contains("missing_name"), out)
+end ifr_doc_unbuilt
 
 @test("an editor's hover shows a function whose result is read off its body at that result")
 ifr_hover()
@@ -234,7 +326,8 @@ ifr_hover()
 
     val root = make_temp_dir("sysl-ifr-hover").unwrap()
 
-    write_text(s"$root/t.sysl", "twice(x: int) = x * 2\nid[T](x: T) = x\n\nprint(twice(2), id(\"s\"))\n").unwrap()
+    write_text(s"$root/t.sysl", "twice(x: int) = x * 2\nid[T](x: T) = x\nsay(s: string) = print(s)\n\n" +
+                                "say(\"x\")\nprint(twice(2), id(\"s\"))\n").unwrap()
 
     val ix = indexed_file(s"$root/t.sysl").unwrap()
     var out = ""
@@ -245,6 +338,7 @@ ifr_hover()
     remove_dir_all(root).unwrap_or(())
     assert(out.contains("twice(x: int) -> int;"), out)
     assert(out.contains("id[T](x: T) -> T;"), out)
+    assert(out.contains("say(s: string);"), out)
 end ifr_hover
 
 @test("a test and a hook return nothing whatever their '= value' is, and the parser reads the rest as inferred")

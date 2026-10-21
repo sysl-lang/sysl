@@ -130,7 +130,7 @@ one to write.
 | `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock can be taken without waiting: `Some` of what `body` answered, or `None`. |
 | `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting however `L` waits, and answers the address of the record. |
 | `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it can without waiting, and answers the record's address where it did. |
-| `unlock_raw` | `unlock_raw(*self) = self.lock.release()` | Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through the address to whoever takes it next. |
+| `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took, publishing everything written through the address to whoever takes it next. |
 
 ### `IrqLock`
 

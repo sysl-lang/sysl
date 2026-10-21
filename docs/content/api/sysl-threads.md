@@ -312,7 +312,7 @@ program reaches for, and the one that picks the lock for it.
 | `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. |
 | `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting until it is free, and answers the address of what it protects. |
 | `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it is free, and answers what it protects where it did. |
-| `unlock_raw` | `unlock_raw(*self) = self.inner.unlock_raw()` | Releases the lock a `lock_raw` or `try_lock_raw` took. |
+| `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took. |
 
 ### `SleepLock`
 

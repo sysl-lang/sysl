@@ -181,7 +181,7 @@ it widens, exactly, and is `%g`'s.
 ### `display_bool`
 
 ```sysl
-display_bool(b: bool, out: *Writer, fmt: FormatSpec) = display_str(…, out, fmt)
+display_bool(b: bool, out: *Writer, fmt: FormatSpec)
 ```
 
 ### `display_char`
@@ -348,7 +348,7 @@ ones.
 ### `eprints`
 
 ```sysl
-eprints(s: string) = eputbytes(s.bytes)
+eprints(s: string)
 ```
 
 ### `eputbytes`
@@ -377,7 +377,7 @@ that reports failure ends the loop, because there is nowhere left to report *tha
 ### `flush`
 
 ```sysl
-flush() = fd_flush(1)
+flush() -> int
 ```
 
 Push everything `putbytes` has been holding out to wherever standard output is going, right now
@@ -483,13 +483,13 @@ Caught by the `@no_alloc` test that already existed.
 ### `printb`
 
 ```sysl
-printb(b: bool) = prints(…)
+printb(b: bool)
 ```
 
 ### `printbf16`
 
 ```sysl
-printbf16(x: bf16) = plain_bf16(x, sink, FormatSpec(0, -1, false))
+printbf16(x: bf16)
 ```
 
 ### `printc`
@@ -504,13 +504,13 @@ point.
 ### `printf16`
 
 ```sysl
-printf16(x: f16) = plain_f16(x, sink, FormatSpec(0, -1, false))
+printf16(x: f16)
 ```
 
 ### `printf32`
 
 ```sysl
-printf32(x: f32) = plain_f32(x, sink, FormatSpec(0, -1, false))
+printf32(x: f32)
 ```
 
 ### `printi`
@@ -527,7 +527,7 @@ here is formatting by C, so a target with no C library prints a float exactly as
 ### `printq`
 
 ```sysl
-printq(x: f128) = plain_quad(x, sink, FormatSpec(0, -1, false))
+printq(x: f128)
 ```
 
 An `f128`, in the fewest digits that read back as the same `f128` -- rendered at its own width, so
@@ -536,13 +536,13 @@ it allocates nothing and asks for no C library either.
 ### `printr`
 
 ```sysl
-printr(x: real) = plain_real(x, sink, FormatSpec(0, -1, false))
+printr(x: real)
 ```
 
 ### `prints`
 
 ```sysl
-prints(s: string) = putbytes(s.bytes)
+prints(s: string)
 ```
 
 ### `printu`

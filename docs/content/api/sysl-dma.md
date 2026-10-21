@@ -86,8 +86,8 @@ sees at `device`.
 | `part` | `part(self, from: usize, len: usize) -> Region` | `len` bytes of this region from byte `from`. |
 | `bus_of` | `bus_of[T](self, p: *T) -> u64` | Where the device sees the `T` at `p`, which has to lie wholly inside the region -- a field of a struct laid over it, an element of a ring in it. |
 | `at` | `at[T](self, offset: usize) -> *T` | The `T` laid over the region at byte `offset` -- a queue's shared structure, a descriptor table. |
-| `to_device` | `to_device(self) = handover(self)` | Hand the region to the device: whatever the processor wrote reaches memory, and no line of it stays cached to be written back over what the device writes later. |
-| `from_device` | `from_device(self) = handover(self)` | Take the region back from the device: whatever the processor reads next comes from memory, not from a line cached while the device was writing. |
+| `to_device` | `to_device(self)` | Hand the region to the device: whatever the processor wrote reaches memory, and no line of it stays cached to be written back over what the device writes later. |
+| `from_device` | `from_device(self)` | Take the region back from the device: whatever the processor reads next comes from memory, not from a line cached while the device was writing. |
 
 ## Traits
 

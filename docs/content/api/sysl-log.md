@@ -79,7 +79,7 @@ target, and nowhere at all on one with no operating system.
 ### `debug`
 
 ```sysl
-debug(message: string, fields: []const Field) = log(Level.Debug, message, fields)
+debug(message: string, fields: []const Field)
 ```
 
 What a program is doing, in detail nobody wants by default.
@@ -100,7 +100,7 @@ if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
 ### `error`
 
 ```sysl
-error(message: string, fields: []const Field) = log(Level.Error, message, fields)
+error(message: string, fields: []const Field)
 ```
 
 Something that did not work.
@@ -108,7 +108,7 @@ Something that did not work.
 ### `info`
 
 ```sysl
-info(message: string, fields: []const Field) = log(Level.Info, message, fields)
+info(message: string, fields: []const Field)
 ```
 
 Something worth knowing that is not a problem.
@@ -152,7 +152,7 @@ What the threshold is now.
 ### `log`
 
 ```sysl
-log(l: Level, message: string, fields: []const Field) = log_at(now(), l, message, fields)
+log(l: Level, message: string, fields: []const Field)
 ```
 
 A record at `l`, timestamped now.
@@ -193,7 +193,7 @@ message with fields starts at the first field rather than at a space.
 ### `set_level`
 
 ```sysl
-set_level(l: Level) = atomic_store(&threshold, i32(…(l)), Ordering.Relaxed)
+set_level(l: Level)
 ```
 
 Records below this level are discarded before anything is built. `Level.Info` to begin with,
@@ -260,7 +260,7 @@ format promises.
 ### `warn`
 
 ```sysl
-warn(message: string, fields: []const Field) = log(Level.Warn, message, fields)
+warn(message: string, fields: []const Field)
 ```
 
 Something that will be a problem if it keeps happening.

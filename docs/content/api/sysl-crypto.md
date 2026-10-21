@@ -351,7 +351,7 @@ An MD5 hash in progress. **MD5 is broken** -- see `md5` for what that does and d
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ### `Sha1`
@@ -366,7 +366,7 @@ rule out.
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ### `Sha224`
@@ -378,7 +378,7 @@ struct Sha224
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ### `Sha256`
@@ -390,7 +390,7 @@ struct Sha256
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ### `Sha384`
@@ -402,7 +402,7 @@ struct Sha384
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ### `Sha512`
@@ -414,7 +414,7 @@ struct Sha512
 
 | Member | Signature | Description |
 |---|---|---|
-| `update` | `update(*self, data: []const u8) = self.inner.update(data)` |  |
+| `update` | `update(*self, data: []const u8)` |  |
 | `finish` | `finish(*self, digest: []u8) -> Result[unit, Fault]` |  |
 
 ## Implementations

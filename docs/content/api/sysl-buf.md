@@ -123,7 +123,7 @@ asks on purpose.
 | `cap` | `const cap(self) -> usize` |  |
 | `is_empty` | `const is_empty(self) -> bool` |  |
 | `at` | `const at(self, i: usize) -> T` |  |
-| `set` | `const set(self, i: usize, v: T) = self.reading().set(i, v)` |  |
+| `set` | `const set(self, i: usize, v: T)` |  |
 | `push` | `const push(self, v: T)` |  |
 | `extend` | `const extend(self, xs: []const T)` |  |
 | `pop` | `const pop(self) -> Option[T]` |  |
@@ -135,7 +135,7 @@ asks on purpose.
 | `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
 | `freeze` | `const freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
 | `view` | `const view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
-| `release` | `release(*self) = forget(self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
+| `release` | `release(*self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
 
 ### `ByteSink`
 

@@ -366,7 +366,7 @@ is left alone rather than swapped with itself.
 ### `sort`
 
 ```sysl
-const sort[T: Ord](xs: []T) = sort_by(xs, …)
+const sort[T: Ord](xs: []T)
 ```
 
 The slice in order, in place, using no extra storage.

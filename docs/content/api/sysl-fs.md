@@ -881,7 +881,7 @@ is still an `Err`, since that is a path the caller named rather than one the wal
 | Member | Signature | Description |
 |---|---|---|
 | `bottom_up` | `bottom_up(self) -> Walk` | The same walk, reporting a directory *after* everything under it. |
-| `skip_dir` | `skip_dir(*self) = …` | Do not descend into the directory just reported. |
+| `skip_dir` | `skip_dir(*self) -> unit` | Do not descend into the directory just reported. |
 | `matching` | `matching(self, pattern: string) -> Matching` | The same walk, reporting only the entries whose path matches a glob. |
 
 ## Implementations

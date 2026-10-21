@@ -80,7 +80,7 @@ stands for itself, since JSON text is UTF-8.
 ### `write_pretty`
 
 ```sysl
-write_pretty(j: Json, step: usize, out: *Writer) = laid_out(j, out, step, 0, true)
+write_pretty(j: Json, step: usize, out: *Writer)
 ```
 
 `pretty`'s rendering, written into a sink rather than gathered into a string.

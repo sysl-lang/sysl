@@ -100,7 +100,7 @@ can be asked without a terminal, which is what makes it answerable in a test.
 ### `cooked`
 
 ```sysl
-cooked() = modes.cooked()
+cooked()
 ```
 
 Put back what `raw` or `hidden` changed, and only what they changed -- `sysl.tty.cooked`.
@@ -108,7 +108,7 @@ Put back what `raw` or `hidden` changed, and only what they changed -- `sysl.tty
 ### `flush`
 
 ```sysl
-flush() = c_fflush(null)
+flush() -> unit
 ```
 
 Push out everything the C library is holding, on every stream.

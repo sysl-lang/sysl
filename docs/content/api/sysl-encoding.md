@@ -236,13 +236,13 @@ The same, gathered into a string. Every byte emitted is ASCII, so the result is 
 ### `push_u16_be`
 
 ```sysl
-push_u16_be(out: Buf[u8], v: u16) = out.extend([u8(v >> 8), u8(v)])
+push_u16_be(out: Buf[u8], v: u16)
 ```
 
 ### `push_u16_le`
 
 ```sysl
-push_u16_le(out: Buf[u8], v: u16) = out.extend([u8(v), u8(v >> 8)])
+push_u16_le(out: Buf[u8], v: u16)
 ```
 
 ### `push_u32_be`

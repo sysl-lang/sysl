@@ -197,7 +197,7 @@ the clock a person and an `ntpd` are both allowed to set. Use it to stamp someth
 ### `sleep`
 
 ```sysl
-sleep(d: Duration) = sysl.time.sleep(d)
+sleep(d: Duration)
 ```
 
 Wait for `d`, however many attempts that takes -- `sysl.time.sleep`, which waits through the seam
