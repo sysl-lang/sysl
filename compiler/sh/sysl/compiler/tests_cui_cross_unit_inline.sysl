@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// **Which functions a program cut into codegen units copies into the units that call them** is
+// decided by what the body will cost the optimizer, not by how long its text is
+// (`codegen_units.sysl`'s `body_cost`). Emitted text spells every local as a stack slot and every
+// read as a load, and repeats a struct's full type name at each of them, so a slab test of a dozen
+// statements is ~4 KB of text whose optimized body is a few dozen instructions -- one any inliner
+// takes, and one a text limit would leave a call across the cut. What is inlined is asked of clang's
+// `-O2` output of the unit, as `tests_xin_cross_inline.sysl` does.
+
+// A ray against an axis-aligned box: the raytracer's `Aabb.hit`, whose text is past 2 KB, called from
+// eight `@noinline` probes whose names spread them over the units. `MARK` is replaced with what the
+// box's `hit` is marked, or with nothing.
+private cui_program(mark: string) -> string
+    val text = raw"""
+        struct Interval
+            lo: real
+            hi: real
+
+        struct Vector
+            x: real
+            y: real
+            z: real
+
+        impl Vector
+            axis(self, a: int) -> real = match a
+                0 -> self.x
+                1 -> self.y
+                _ -> self.z
+
+        struct Ray
+            origin: Vector
+            direction: Vector
+
+        struct BoundingBox
+            x: Interval
+            y: Interval
+            z: Interval
+
+        impl BoundingBox
+            axis(self, a: int) -> Interval = match a
+                0 -> self.x
+                1 -> self.y
+                _ -> self.z
+
+            MARK
+            hit(self, r: Ray, t: Interval) -> bool
+                var lo = t.lo
+                var hi = t.hi
+
+                for a in 0..<3
+                    val ax = self.axis(a)
+                    val inv = 1.0 / r.direction.axis(a)
+                    val t0 = (ax.lo - r.origin.axis(a)) * inv
+                    val t1 = (ax.hi - r.origin.axis(a)) * inv
+
+                    if t0 < t1
+                        if t0 > lo then lo = t0
+                        if t1 < hi then hi = t1
+                    else
+                        if t1 > lo then lo = t1
+                        if t0 < hi then hi = t0
+
+                    if hi <= lo then return false
+
+                true
+
+        @noinline
+        probe_alpha(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 100.0))
+
+        @noinline
+        probe_bravo(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 1.0))
+
+        @noinline
+        probe_charlie(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 2.0))
+
+        @noinline
+        probe_delta(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 3.0))
+
+        @noinline
+        probe_echo(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 4.0))
+
+        @noinline
+        probe_foxtrot(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 5.0))
+
+        @noinline
+        probe_golf(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 6.0))
+
+        @noinline
+        probe_hotel(b: BoundingBox, r: Ray) -> bool = b.hit(r, Interval(0.0, 7.0))
+
+        val b = BoundingBox(Interval(-1.0, 1.0), Interval(-1.0, 1.0), Interval(-1.0, 1.0))
+        val r = Ray(Vector(0.001, 0.002, -5.0), Vector(0.0, 0.0, 1.0))
+        var n = 0
+
+        if probe_alpha(b, r) then n += 1
+        if probe_bravo(b, r) then n += 1
+        if probe_charlie(b, r) then n += 1
+        if probe_delta(b, r) then n += 1
+        if probe_echo(b, r) then n += 1
+        if probe_foxtrot(b, r) then n += 1
+        if probe_golf(b, r) then n += 1
+        if probe_hotel(b, r) then n += 1
+
+        print(n)
+        """
+
+    replace_all(text, "MARK", mark)
+end cui_program
+
+private const CuiHit: string = "@BoundingBox.hit("
+
+// The text a linking `-O2` build of `cui_program(mark)` hands clang.
+private cui_text(mark: string) -> string
+    val dir = absolute_path(make_temp_dir("sysl-cui").unwrap())
+
+    write_text(s"$dir/main.sysl", cui_program(mark)).unwrap()
+
+    val text = emit_llvm_text(dir, None, "2", buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    remove_dir_all(dir).unwrap_or(())
+    text
+end cui_text
+
+private cui_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end cui_lines
+
+private cui_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end cui_calls
+
+// The length of the definition of `name` in `text`, from `define` to its closing brace.
+private cui_define_length(text: string, name: string) -> usize
+    var n: usize = 0
+    var inside = false
+
+    for line in lines_of(text)
+        if line.starts_with("define ") && line.contains(name) then inside = true
+
+        if inside
+            n += line.bytes.len + 1
+
+            if line == "}" then return n
+
+    n
+end cui_define_length
+
+// `text` through clang at `-O2`, as LLVM text.
+private cui_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-cui-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end cui_optimized
+
+@test("a function of more than 2 KB of text but a few dozen instructions is copied into the other unit that calls it, and inlined there")
+cui_a_long_text_cheap_body_inlines_across_units()
+    if std_root().is_err() || !clang_available() then return
+
+    val text = cui_text("")
+
+    assert(!text.starts_with("refused"), text)
+    assert(cui_define_length(text, CuiHit) > 2048,
+           s"the body is ${cui_define_length(text, CuiHit)} bytes of text, which a 2 KB text limit refused")
+
+    val parts = split_module(text, 2).unwrap()
+    var homes = 0
+    var copies = 0
+
+    for p in parts
+        val home = cui_lines(p, "define zeroext i1 ", CuiHit)
+        val copy = cui_lines(p, "define available_externally zeroext i1 ", CuiHit)
+
+        homes += home
+        copies += copy
+
+        if cui_calls(p, CuiHit) && home == 0
+            assert_eq(copy, 1)
+            assert_eq(cui_lines(p, "declare ", CuiHit), 0)
+
+            val out = cui_optimized(p)
+
+            assert(!cui_calls(out, CuiHit), "the copy was inlined: no call is left")
+            assert_eq(cui_lines(out, "define", CuiHit), 0)
+
+    assert_eq(homes, 1)
+    assert_eq(copies, 1)
+end cui_a_long_text_cheap_body_inlines_across_units
+
+@test("the same body marked '@noinline', or '@cold', is never copied: the other unit declares it and calls it")
+cui_noinline_and_cold_are_never_copied()
+    if std_root().is_err() || !clang_available() then return
+
+    for mark in ["@noinline", "@cold"]
+        val text = cui_text(mark)
+
+        assert(!text.starts_with("refused"), text)
+
+        val parts = split_module(text, 2).unwrap()
+        var callers_elsewhere = 0
+
+        for p in parts
+            assert_eq(cui_lines(p, "define available_externally ", CuiHit), 0)
+
+            if cui_calls(p, CuiHit) && cui_lines(p, "define zeroext i1 ", CuiHit) == 0
+                callers_elsewhere += 1
+                assert_eq(cui_lines(p, "declare ", CuiHit), 1)
+                assert(cui_calls(cui_optimized(p), CuiHit), s"$mark: the call is still a call")
+
+        assert_eq(callers_elsewhere, 1)
+end cui_noinline_and_cold_are_never_copied
+
+@test("a body of two hundred instructions stays one definition, declared in the units that call it")
+cui_a_costly_short_body_is_not_copied()
+    var text = "define i32 @costly(i32 %x) {\nentry:\n  %v0 = add i32 %x, 1\n"
+
+    for i in 1..<200
+        text = text + s"  %v$i = mul i32 %v${i - 1}, 3\n"
+
+    text = text + "  ret i32 %v199\n}\n"
+
+    for k in 0..<16
+        text = text + s"define i32 @c$k(i32 %x) {\nentry:\n  %r = call i32 @costly(i32 %x)\n  ret i32 %r\n}\n"
+
+    val parts = split_module(text, 4).unwrap()
+    var declared = 0
+
+    for p in parts
+        assert_eq(cui_lines(p, "define available_externally ", "@costly("), 0)
+
+        if cui_calls(p, "@costly(") && cui_lines(p, "define i32 @costly(", "") == 0
+            declared += cui_lines(p, "declare i32 @costly(", "")
+
+    assert(declared >= 1, "a unit calls '@costly' from outside its home")
+end cui_a_costly_short_body_is_not_copied
+
+@test("slot traffic costs nothing: a body of a few real instructions among hundreds of slot loads and stores is copied")
+cui_slot_traffic_is_free()
+    var text = "define i32 @cheap(i32 %x.param) {\nentry:\n  %x.addr = alloca i32\n  store i32 %x.param, ptr %x.addr\n"
+
+    for i in 0..<200
+        text = text + s"  %l$i = load i32, ptr %x.addr\n  store i32 %l$i, ptr %x.addr\n"
+
+    text = text + "  %r = load i32, ptr %x.addr\n  %s = add i32 %r, 1\n  ret i32 %s\n}\n"
+
+    for k in 0..<16
+        text = text + s"define i32 @c$k(i32 %x) {\nentry:\n  %r = call i32 @cheap(i32 %x)\n  ret i32 %r\n}\n"
+
+    val parts = split_module(text, 4).unwrap()
+    var copies = 0
+
+    for p in parts
+        if cui_calls(p, "@cheap(") && cui_lines(p, "define i32 @cheap(", "") == 0
+            assert_eq(cui_lines(p, "define available_externally i32 @cheap(", ""), 1)
+            copies += 1
+
+    assert(copies >= 1, "a unit calls '@cheap' from outside its home")
+end cui_slot_traffic_is_free
