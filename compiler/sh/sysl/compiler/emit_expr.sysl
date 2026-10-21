@@ -156,9 +156,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TLogical(op, l, r) -> gen_logical(e, op, l, r)
     TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
 
-    TStore(place, value, ty) -> gen_store(e, place, value, ty)
-    TUpdate(place, op, value, ty, dispatch, check) ->
-        gen_update(e, place, op, value, ty, dispatch, check)
+    TStore(place, value, ty, yields) -> yielded(yields, gen_store(e, place, value, ty))
+    TUpdate(place, op, value, ty, dispatch, check, yields) ->
+        yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
     TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
 
     TCall(name, args, ty, _) ->
@@ -912,6 +912,12 @@ operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
 end operand_arg
 
 // -- writing --------------------------------------------------------------------------------------
+
+// What a write gives the expression around it: the value now in the place where it is written `:=`,
+// and nothing where it is written `=`, whose type is `unit`. The value is the one the store wrote,
+// which is what reading the place right after gives; it carries no count of its own, as a read of a
+// place does not, so whatever keeps it takes one.
+private yielded(yields: bool, v: Val) -> Val = if yields then v else VNothing
 
 private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     if zero_sized(ty)

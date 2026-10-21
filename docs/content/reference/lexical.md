@@ -1011,10 +1011,12 @@ Reserved words rather than library constants. `null` exists for `*T` and only fo
 ## Operators and delimiters
 
 The operator set is **closed** — there are no user-defined operator symbols, and no way to add one.
-Operators are tokenized by longest match, so `..<` wins over `..`, and `<<=` over `<<`.
+Operators are tokenized by longest match, so `..<` wins over `..`, `<<=` over `<<`, and `+:=` is
+one token rather than `+` and `:=`.
 
 ```
 =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
+:=  +:=  -:=  *:=  /:=  %:=  &:=  |:=  ^:=  <<:=  >>:=
 ||  &&  !
 ==  !=  <  >  <=  >=
 ..  ..<  ...
