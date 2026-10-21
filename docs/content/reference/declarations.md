@@ -224,6 +224,10 @@ print(a)
 'a' takes its type from its value, and the value reaches 'a' again — write its type, 'val a: T = …'
 ```
 
+A loop is one mistake and is reported once, at the declaration it is named by: storage refused a
+type for it is not refused again for the order it would run in, and a binding that names several
+things is reported once for the binding, however many of its names the value reaches.
+
 **A module-level `val` may hold a counted value, and never releases it.** Storage that exists for the
 whole run is never let go of, so the one release with nowhere to go is the one at exit — and not
 taking it is what a static *is*. A `&T`, a `weak T`, a slice and a `string` the program **builds**
