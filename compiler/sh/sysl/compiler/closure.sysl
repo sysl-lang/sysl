@@ -314,6 +314,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     inner.at_definition = cx.at_definition
     inner.func_name = cx.func_name
     inner.decl_name = cx.decl_name
+    inner.body_called = Some("")
     inner.bind_site = Some(span)
     note_body_covers(cx.an, fname)
 
@@ -550,7 +551,15 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
         Return(value) -> read_opt(keep, value, *bound, found)
         Become(call) -> read_expr(keep, call, *bound, found)
         Break(_, value) -> read_opt(keep, value, *bound, found)
-        Defer(inner) -> read_stmt(keep, inner, bound, found)
+        // An `errdefer`'s binder is a name of the deferred statement's own, so a read of it there
+        // captures nothing.
+        Defer(inner, when) -> when match
+            FailureExit(Some(name)) ->
+                var here = copied(*bound)
+
+                here.push(name)
+                read_stmt(keep, inner, &here, found)
+            _ -> read_stmt(keep, inner, bound, found)
         StaticDecl(inner) -> read_stmt(keep, inner, bound, found)
         CopiedDecl(_, inner) -> read_stmt(keep, inner, bound, found)
         Require(cond, _) -> read_expr(keep, cond, *bound, found)

@@ -122,7 +122,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
     // at each edge that leaves the block. Registering here rather than at the top of the block is
     // what makes a `defer` control never reached schedule nothing.
-    TDefer(stmts) -> defer_stmts(e, stmts)
+    TDefer(stmts, when) -> defer_stmts(e, stmts, when)
 
     // A loop's `invariant` is a condition that traps on false, which is every other clause the
     // verification chapter states -- unless it names a `@ghost` function, in which case it states a
@@ -576,13 +576,17 @@ private gen_return(e: *Emit, opt: Option[TExpr])
             retain_value(e, ty, v)
             emit_ensures(e, Some(v))
 
+            val exit = exit_returning(e, Some(t), v, ty)
+
             // An async body's result goes into its task rather than back to a caller.
             if e.coro.is_some()
+                e.exit = exit
                 coro_deliver(e, v)
+                e.exit = Leaving
                 return
             end if
 
-            release_all(e)
+            release_all_as(e, exit)
             emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
         None ->
             emit_ensures(e, None)
