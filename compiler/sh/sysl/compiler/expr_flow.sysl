@@ -19,9 +19,20 @@ type_expr_discarded(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: b
 
     val allowed = cx.multi_ok
 
-    cx.multi_ok = false
+    val outer_tail = cx.unit_tail
 
-    analyze_discarded(cx, e)
+    cx.multi_ok = false
+    cx.assign_ok = false
+    cx.tail_carry = false
+
+    // A statement owes nothing, so every block it is made of may end in an assignment -- an
+    // `if const` branch included, which is read as a value block.
+    cx.unit_tail = true
+
+    val t = analyze_discarded(cx, e)
+
+    cx.unit_tail = outer_tail
+    t
 end type_expr_discarded
 
 // A discarded expression is by definition one nothing was expected of, so there is no context to
@@ -42,7 +53,9 @@ private analyze_discarded(cx: &Analyzer, e: Expr) -> TExpr = *e.kind match
         c_for_expr(cx, e.span, label, init, cond, step, body, else_body, None, true)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
     ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, None)
-    _ -> analyze_value(cx, e, None)
+    _ ->
+        cx.assign_here = is_assignment(e)
+        analyze_value(cx, e, None)
 
 // -- `if` ------------------------------------------------------------------------------------------
 

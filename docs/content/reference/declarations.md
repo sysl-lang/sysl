@@ -657,11 +657,10 @@ A generic function's result is the body's type in terms of its parameters, so `p
 `(T, T)` and each call fixes `T`. A literal body takes the literal's own type, as a `val`'s
 initializer does — `byte() = 255` is an `int`; a function that wants a `u8` writes `-> u8`.
 
-**A body that is an assignment is `unit`**, plain or compound, to a variable, a field or an element:
-the store is what the function is for. The value an
-[assignment yields](/reference/expressions/#assignment) belongs to the expression around it, and a
-body has none, so `bump() = count += 1` is `bump()`, not an `int` function. A function that hands the
-stored value back says so with `-> T`.
+**A body that is an assignment written `=` is `unit`**, plain or compound, to a variable, a field or
+an element, because [that assignment is](/reference/expressions/#assignment): the store is what the
+function is for, so `bump() = count += 1` is `bump()`, not an `int` function. A body written `:=`
+hands back what it stored, and takes its type.
 
 ```sysl
 var count = 0
@@ -672,17 +671,17 @@ struct Light
     switch_on(*self) = self.on = true
 
 bump() = count += 1
-reset_to(v: int) -> int = count = v
+reset_to(v: int) = count := v
 
 var lamp = Light(false)
 
 bump()
 lamp.switch_on()
-print(count, lamp.on, bump() == (), reset_to(10), count)
+print(count, lamp.on, bump() == (), reset_to(10) + 1, count)
 ```
 
 ```output
-1 true true 10 10
+1 true true 11 10
 ```
 
 Using such a call as a value is refused, since there is none:
@@ -1261,11 +1260,10 @@ print(box(3), box(2, 2), box(2, fill = "#"))
 *** **** ##
 ```
 
-`name = value` is also a legal expression — assignment yields the value stored — so the two readings
-collide, and the named argument is the one taken. It applies only where the name is a bare
-identifier: `p.x = 1` and `b[i] = v` are stores as they always were, since neither is a name a
-parameter list could have written. A store to a plain variable is still reachable in an argument by
-parenthesizing it.
+An assignment written `=` yields nothing, so it is never an argument, and `name = value` there is
+always the named argument. A store whose value is passed on is written
+[`:=`](/reference/expressions/#assignment), which reads as no parameter's name: `f(n := 1)` stores to
+`n` and passes what it stored.
 
 A default is read at **the type its parameter declares**, so a value that says nothing about its own
 type needs no annotation beside it: written where an `Option[int]` is wanted, `None` is that
@@ -2753,10 +2751,11 @@ have nowhere to take its value's type from. Visibility is the ordinary modifier,
 is a property the world reads and only the type writes.
 
 **A write is a call rather than a store**, which is what a property computing rather than naming
-storage amounts to. Three things follow, and they are the same three that follow for an element
-reached through [`Index`](/reference/expressions/): the expression yields `unit` rather than the
-value assigned, the write cannot be one place of a multiple assignment, and `&t.f` is refused because
-there is no address.
+storage amounts to. Two things follow, and they are the same two that follow for an element
+reached through [`Index`](/reference/expressions/): the write cannot be one place of a multiple
+assignment, and `&t.f` is refused because there is no address. Written
+[`:=`](/reference/expressions/#assignment), the write yields what the getter reads back once the
+setter has run.
 
 The compound forms do work, and that is where a property differs from an element: there is no index
 to evaluate twice, and the receiver's address is taken once for the pair of calls.

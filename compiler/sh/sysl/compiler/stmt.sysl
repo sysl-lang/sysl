@@ -184,6 +184,10 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 // One reading of a value block's body.
 private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
                         discarded: bool) -> TBlock
+    val tail_ok = cx.unit_tail
+
+    cx.unit_tail = false
+
     val last = trailing_kind(stmts)
 
     if last == TrailingValue
@@ -204,9 +208,10 @@ private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 
         // A block whose value *is* the enclosing function's result is the third place a result list
         // may stand, which is what lets a branch or a nested block forward one.
-        val tr = trailing_value(cx, e, expected, discarded)
+        val tr = trailing_value(cx, e, expected, discarded, tail_ok)
 
         cx.bind_site = site
+        cx.unit_tail = tail_ok
         val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
 
         return TBlock(init, Some(tr), ty)
@@ -217,14 +222,23 @@ private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
     for item in stmts
         push_all(&out, recover_stmt(cx, item))
 
+    cx.unit_tail = tail_ok
     TBlock(out, None, if last == TrailingJump then Never else Unit)
 end block_body_once
 
 // A block's trailing expression. A block whose value *is* the enclosing function's result is the
 // third place a result list may stand, which is what lets a branch or a nested block forward one.
-private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr
+private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool,
+                       tail_ok: bool) -> TExpr
     if wants_results(cx, expected) then
         return if cx.result_chain then type_results(cx, e, expected) else type_expr_multi(cx, e, expected)
+
+    // A block's last line may be an assignment written for its effect where the block owes nothing
+    // -- `unit` is asked for, or it is a body whose result is read off it, which is then `unit`. A
+    // branch whose value is bound is neither, and an assignment there is refused rather than giving
+    // the binding a `unit` nobody wrote.
+    cx.assign_ok = tail_ok || (expected.is_some() && expected.unwrap() == Unit)
+    cx.tail_carry = tail_ok
 
     type_expr_discarded(cx, e, expected, discarded)
 end trailing_value
