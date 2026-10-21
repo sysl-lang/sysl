@@ -302,6 +302,10 @@ cross(n: int) -> Result[int, string]
 '?' may only be used in a function returning sysl.Option, not sysl.Result[int, string]
 ```
 
+**An early return by `?` runs the block's deferred statements**, as any `return` does, and is a
+failure: an [`errdefer`](/reference/statements/#errdefer) written above it runs too, undoing the
+steps the function had already taken.
+
 ### A `?` converts through `From`
 
 **Where the two error types differ, `?` converts through [`From`](/library/core/).** A function with

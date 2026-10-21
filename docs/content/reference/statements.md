@@ -932,6 +932,207 @@ body acquired. Each covers what the other cannot: `defer` covers every site a pr
 a destructor covers the deaths it cannot — a resource inside a container, or inside a struct inside
 a container, dies at a point with no expression in the source.
 
+## `errdefer`
+
+A function that builds something in steps needs the other half of `defer`: when a later step fails,
+the steps already taken are undone, and when every step succeeds they are kept. **`errdefer
+<statement>` runs that statement on the way out of its block only if the function is failing.**
+
+```sysl
+step(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("step")
+
+build(ok: bool) -> Result[int, string]
+    val f = step(true)?
+    errdefer print("undo", f)
+
+    step(ok)?
+    Ok(f)
+
+print(build(true))
+print(build(false))
+```
+
+```output
+Ok(1)
+undo 1
+Err(step)
+```
+
+### What counts as failing
+
+**A function fails when it returns its failure variant**: `Err` from a function returning a
+`Result`, `None` from one returning an `Option`. Every way of returning it counts — a `?` taking its
+failure arm, a `return`, or the body's last value — and so does a computed result that holds the
+failure, which is told apart by its tag where it leaves:
+
+```sysl
+lookup(key: int) -> Option[int]
+    errdefer print("no entry for", key)
+
+    if key < 0 then return None
+
+    val found: Option[int] = if key % 2 == 0 then Some(key * 10) else None
+    found
+
+print(lookup(4))
+print(lookup(3))
+```
+
+```output
+Some(40)
+no entry for 3
+None
+```
+
+**It belongs to its block, as a `defer` does.** It runs when the function fails while control is
+inside that block; leaving the block any other way — its end, a `break`, a `continue` — discards it.
+A loop body's `errdefer` therefore undoes only the iteration that failed:
+
+```sysl
+check(n: int) -> Result[int, string] = if n < 3 then Ok(n) else Err(s"item $n")
+
+fill(count: int) -> Result[int, string]
+    errdefer print("fill failed")
+
+    for i in 0..<count
+        print("take", i)
+        errdefer print("give back", i)
+
+        check(i)?
+
+    Ok(count)
+
+print(fill(2))
+print(fill(5))
+```
+
+```output
+take 0
+take 1
+Ok(2)
+take 0
+take 1
+take 2
+take 3
+give back 3
+fill failed
+Err(item 3)
+```
+
+**The innermost function decides.** An `errdefer` in a closure or a nested function runs when that
+body fails, not when the function around it does; an `async` body's runs when its task ends in
+failure. In a `main` that returns a `Result`, it runs before the error is reported.
+
+**A trap runs nothing**, as it runs no `defer`, and neither does a call to an
+[`@abandons`](/reference/declarations/) function: the frame it leaves did not fail.
+
+### Beside `defer`
+
+**`defer` and `errdefer` share one stack**: in a block holding both, the last written runs first,
+whichever kind it is. The undo of a later step therefore runs before the release of an earlier one:
+
+```sysl
+step(ok: bool) -> Result[unit, string] = if ok then Ok(()) else Err("declined")
+
+transfer(debit_ok: bool, credit_ok: bool) -> Result[unit, string]
+    print("lock")
+    defer print("unlock")
+
+    step(debit_ok)?
+    errdefer e ->
+        print("credit back")
+        print(s"transfer rolled back: $e")
+
+    step(credit_ok)?
+    Ok(())
+
+print(transfer(true, false))
+print(transfer(false, true))
+```
+
+```output
+lock
+credit back
+transfer rolled back: declined
+unlock
+Err(declined)
+lock
+unlock
+Err(declined)
+```
+
+When the debit fails, the `errdefer` below it was never reached, so only the `unlock` runs. Every
+rule of a deferred statement applies to it unchanged: it may not `return`, `break` or `continue` out
+of itself or use `?`, and it reads every name at the exit rather than where it is written.
+
+### Seeing the error
+
+**`errdefer e -> <statement>` binds the error being returned** to `e`, read-only, for the statement
+after the arrow — one line, or a block under it, as a `match` arm takes. The error is in the
+function's own error type, after any conversion a `?` made through `From`:
+
+```sysl
+struct Failure
+    reason: string
+
+impl From[string] for Failure
+    from(s: string) -> Failure = Failure(s"parse: $s")
+
+parse(text: string) -> Result[usize, string] =
+    if text == "" then Err("empty") else Ok(text.len)
+
+load(text: string) -> Result[usize, Failure]
+    errdefer e -> print("load failed:", e.reason)
+
+    val n = parse(text)?
+    Ok(n)
+
+print(load("abc").is_ok())
+print(load("").is_ok())
+```
+
+```output
+true
+load failed: parse: empty
+false
+```
+
+The binder reads the error the returned value already holds: it takes no reference count and
+allocates nothing, and like `defer`, `errdefer` is available under `no alloc`.
+
+### Where it is refused
+
+**A function that cannot fail is refused an `errdefer`**, which would never run:
+
+```sysl
+count(n: int) -> int
+    errdefer print("never")
+    n
+
+print(count(1))
+```
+
+```error
+'errdefer' runs when 'count' fails, and 'count' returns int, which cannot fail — use 'defer'
+```
+
+**An `Option` has no error to bind**, so the binder is refused there:
+
+```sysl
+pick(n: int) -> Option[int]
+    errdefer e -> print(e)
+    Some(n)
+
+print(pick(1))
+```
+
+```error
+'errdefer' binds the error 'pick' fails with, and 'pick' returns sysl.Option[int], whose 'None' carries none — leave the binder out
+```
+
+A closure whose result its context does not fix has no result to ask yet, so an `errdefer` in one is
+refused until the result type is stated — as a `?` in one is.
+
 ---
 
 Next: [declarations](/reference/declarations/).
