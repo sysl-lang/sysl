@@ -48,7 +48,7 @@ around statement blocks. `;` is a separator only inside a three-clause `for` hea
 | labels | `'name` — told from a `char` by having no closing quote |
 | words | `true`, `false`, `null`. `null` exists for `*T` and only for `*T` |
 
-**Forty reserved words**: `alignof as break const continue defer do elif else ensure enum extern
+**Forty-one reserved words**: `alignof as break const continue defer do elif else ensure enum errdefer extern
 false for if impl import in loop match module null offsetof override private ref require return self
 sizeof static struct then trait true type val var weak while`.
 
@@ -267,6 +267,11 @@ finishes normally, and a value-carrying `break` without one is refused. Loops ta
 **`defer <statement>` runs on the way out of its block** by any ordinary route — falling off the end,
 `return`, `break`, `continue`, or a `?` taking its failure arm — in reverse order. A **trap runs no
 deferred statement**.
+
+**`errdefer <statement>` runs only when the function fails** — returns `Err` (a `Result`) or `None`
+(an `Option`), by `?`, `return` or its last value — and is discarded on every other way out of its
+block. It shares `defer`'s stack, so the two interleave last-written-first. `errdefer e -> …` binds
+the error being returned, in the function's own error type. Refused in a function that cannot fail.
 
 **Patterns**, one table:
 

@@ -1732,14 +1732,18 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
     // **A large result leaves through the caller's storage, and `?` is a `return` like any other.**
     // The convention has already made this function `void` and given it an out-pointer, so handing
     // the value back directly would emit a `ret` of an aggregate out of a `void` function.
+    //
+    // Every `errdefer` waiting runs on this edge, which is a failure by construction: no tag is asked.
     if e.coro.is_some()
+        e.exit = Failing(failed, ret_enum)
         coro_deliver(e, failed)
+        e.exit = Leaving
     else if e.layout.indirect(ret_enum)
         emit(e, InStore(lty(e, ret_enum), failed, sret_param(), AccPlain, None))
-        release_all(e)
+        release_all_as(e, Failing(failed, ret_enum))
         emit_term(e, InRet(None, None))
     else
-        release_all(e)
+        release_all_as(e, Failing(failed, ret_enum))
         emit_term(e, InRet(Some(lty(e, ret_enum)), Some(failed)))
 
     emit_label(e, ok_l)
