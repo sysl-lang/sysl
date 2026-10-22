@@ -12,7 +12,7 @@ docs/design/shuffle-probes/run.sh <out dir>` re-runs all of them.
 
 ## 1. Decisions
 
-| # | question | recommendation | why, in one line |
+| # | question | decision | why, in one line |
 |---|---|---|---|
 | 1 | the general form | a **vector method**, `a.shuffle([3, 2, 1, 0])` / `a.shuffle(b, [0, 4, 1, 5])` | it sits beside `select`, `sum` and `load`, which are all methods the compiler supplies |
 | 2 | numbering of the second input | lanes of `b` are **`N` to `2N − 1`** | LLVM, clang, GCC and Rust all number them this way; Zig's `~i` is the outlier |
@@ -25,7 +25,7 @@ docs/design/shuffle-probes/run.sh <out dir>` re-runs all of them.
 | 9 | inputs of different widths | **refused** — `a` and `b` are one type | `shufflevector` requires it; widen first with a shuffle |
 | 10 | don't-care lanes | **not in 0.4.0** | LLVM rarely gains from one, and it adds a spelling (`_`) to a list of integers |
 
-Questions for the user are in §8; the recommendation is §7.
+The user accepted every row (2026-10-22, §8); the recommendation is §7.
 
 ## 2. What exists today (sysl 0.3.13)
 
@@ -351,7 +351,13 @@ and thumbv6m ([`proposed.ll`](shuffle-probes/ll/proposed.ll)); the arm64 and x86
 - The lane write (`v[i] = x`, `v.y = x`) closes a gap the swizzle store exposes anyway.
 - A run-time permutation, don't-care lanes and hex/colour swizzle names stay out until asked for.
 
-## 8. Questions for the user
+## 8. Decided (user, 2026-10-22)
+
+**The user accepted every recommendation below**: Q1 a method; Q2 the second input's lanes are
+`N..2N − 1`; Q3 a non-constant list is refused (a run-time permutation is a separate, later item);
+Q4 a named list is a `const` function; Q5 yes to the width-generic lists in `sysl.vectors`; Q6 `xyzw`
+only, one to four letters, one letter a scalar; Q7 `v.xy = …` and `v[i] = x` are both allowed; Q8
+different widths are refused; Q9 no don't-care lanes. The questions as they were put:
 
 1. **Spelling of the general form** — `a.shuffle(b, [0, 4, 1, 5])` (a method, like `select`), or a free
    `shuffle(a, b, [0, 4, 1, 5])` (like clang and Zig)? *Recommend the method.*
