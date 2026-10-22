@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{cstring, Search}
+
+// **A module `val` known while compiling reaches every codegen unit as its value**
+// (`codegen_units.sysl`'s `external_global`). Such a `val` is a `constant` laid down as data; a unit
+// that only declared it loaded it at every use, where the one-module build folded it to an
+// immediate. Every unit that reads it and does not define it carries an `available_externally` copy:
+// the value for its optimizer, no definition for the link, so the program still holds one object.
+//
+// `SYSL_CODEGEN_UNITS` is part of what is under test and `sysl.env` sets nothing, so a case sets it
+// through libc and unsets it before it returns.
+
+private extern "setenv" vcc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" vcc_c_unsetenv(name: *u8) -> int
+
+private vcc_units(n: string)
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring(n)
+
+    vcc_c_setenv(k.ptr, v.ptr, 1)
+end vcc_units
+
+private vcc_units_default()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+
+    vcc_c_unsetenv(k.ptr)
+end vcc_units_default
+
+// Eight public functions, spread over the units by their names, each reading a private scalar
+// constant, an element of a private array constant and a field of a private struct constant, and
+// writing a private counter. `@ref` is a constant naming another symbol, and `@count` is storage:
+// neither has a value a copy could promise.
+private vcc_module() -> string
+    var text = "target triple = \"arm64-apple-macosx\"\n\n%pair = type { i32, i32 }\n\n" +
+               "@cell = private constant i64 8\n" +
+               "@table = private constant [4 x i32] [i32 11, i32 22, i32 33, i32 44]\n" +
+               "@pair = private constant %pair { i32 5, i32 9 }\n" +
+               "@count = private global i64 0\n" +
+               "@ref = private constant ptr @cell\n\n"
+
+    for i in 0..<8
+        text = text + s"define i64 @f$i(i64 %a) noinline {\nentry:\n" +
+               "  %c = load i64, ptr @cell\n" +
+               "  %tp = getelementptr [4 x i32], ptr @table, i64 0, i64 2\n  %t = load i32, ptr %tp\n" +
+               "  %pp = getelementptr %pair, ptr @pair, i32 0, i32 1\n  %p = load i32, ptr %pp\n" +
+               "  %r = load ptr, ptr @ref\n  %rv = load i64, ptr %r\n" +
+               "  %t64 = sext i32 %t to i64\n  %p64 = sext i32 %p to i64\n" +
+               "  %s1 = add i64 %a, %c\n  %s2 = add i64 %s1, %t64\n  %s3 = add i64 %s2, %p64\n" +
+               "  %s4 = add i64 %s3, %rv\n" +
+               "  %n = load i64, ptr @count\n  %n1 = add i64 %n, 1\n  store i64 %n1, ptr @count\n" +
+               "  ret i64 %s4\n}\n\n"
+
+    text = text + "define i32 @main() {\nentry:\n"
+
+    for i in 0..<8
+        text = text + s"  %r$i = call i64 @f$i(i64 0)\n"
+
+    // Each call answers 8 + 33 + 9 + 8 = 58; eight of them, less 400, is the exit status.
+    text = text + "  %s0 = add i64 %r0, %r1\n  %s1 = add i64 %s0, %r2\n  %s2 = add i64 %s1, %r3\n" +
+           "  %s3 = add i64 %s2, %r4\n  %s4 = add i64 %s3, %r5\n  %s5 = add i64 %s4, %r6\n" +
+           "  %s6 = add i64 %s5, %r7\n  %d = sub i64 %s6, 400\n  %x = trunc i64 %d to i32\n  ret i32 %x\n}\n"
+    text
+end vcc_module
+
+private vcc_count(text: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.contains(part) then n += 1
+
+    n
+end vcc_count
+
+@test("a unit reading a constant another unit defines carries its value; storage and a constant naming a symbol are declared")
+vcc_units_carry_constant_values()
+    val parts = split_module(vcc_module(), 4).unwrap()
+
+    assert(parts.len() >= 2, s"${parts.len()} units")
+
+    var homes = 0
+    var copies: usize = 0
+
+    for p in parts
+        homes += vcc_count(p, "@\"sysl.cgu:cell\" = hidden constant i64 8")
+        copies += usize(vcc_count(p, "@\"sysl.cgu:cell\" = available_externally hidden constant i64 8"))
+
+        if p.contains("@\"sysl.cgu:table\" = available_externally")
+            assert(p.contains("@\"sysl.cgu:table\" = available_externally hidden constant [4 x i32] " +
+                              "[i32 11, i32 22, i32 33, i32 44]\n"), p)
+
+        if p.contains("@\"sysl.cgu:pair\" = available_externally")
+            assert(p.contains("@\"sysl.cgu:pair\" = available_externally hidden constant %pair " +
+                              "{ i32 5, i32 9 }\n"), p)
+
+        assert_eq(vcc_count(p, "@\"sysl.cgu:count\" = available_externally"), 0)
+        assert_eq(vcc_count(p, "@\"sysl.cgu:ref\" = available_externally"), 0)
+
+    assert_eq(homes, 1)
+    assert_eq(copies, parts.len() - 1)
+
+@test("a constant whose initializer names a symbol, or is too long to copy, is declared and not copied")
+vcc_what_is_not_copied()
+    var big = "["
+
+    for i in 0..<400
+        big = big + (if i == 0 then "" else ", ") + s"i32 $i"
+
+    var text = s"@big = private constant [400 x i32] ${big}]\n@w = weak constant i64 3\n\n"
+
+    for i in 0..<8
+        text = text + s"define i32 @g$i(i64 %k) noinline {\n  %p = getelementptr [400 x i32], ptr @big, i64 0, i64 %k\n" +
+               "  %v = load i32, ptr %p\n  %w = load i64, ptr @w\n  %w32 = trunc i64 %w to i32\n" +
+               "  %s = add i32 %v, %w32\n  ret i32 %s\n}\n"
+
+    for p in split_module(text, 4).unwrap()
+        assert_eq(vcc_count(p, "available_externally"), 0)
+
+@test("each unit's copy folds to an immediate under clang -O2, and the units link to the one program")
+vcc_copies_fold_and_link()
+    if !clang_available() || host_target().triple != "arm64-apple-macosx" then return
+
+    val parts = split_module(vcc_module(), 4).unwrap()
+    val dir = make_temp_dir("sysl-vcc-units").unwrap()
+    var args: Buf[string] = buf()
+
+    for i in 0..<parts.len()
+        val file = s"$dir/u$i.ll"
+
+        write_text(file, parts.at(i)).unwrap()
+
+        val opt = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+        assert(opt.status.ok(), s"clang refused the unit:\n${opt.err.unwrap_or("")}")
+
+        // What is left is the counter and the pointer read through `@ref`, never the three values.
+        assert_eq(vcc_count(opt.text, "load i64, ptr @\"sysl.cgu:cell\""), 0)
+        assert_eq(vcc_count(opt.text, "@\"sysl.cgu:table\""), vcc_count(opt.text, "@\"sysl.cgu:table\" ="))
+        assert_eq(vcc_count(opt.text, "@\"sysl.cgu:pair\""), vcc_count(opt.text, "@\"sysl.cgu:pair\" ="))
+        args.push(file)
+
+    args.push("-O2")
+    args.push("-o")
+    args.push(s"$dir/prog")
+
+    val built = capture("clang", args.view(), "", [], true).unwrap()
+
+    assert(built.status.ok(), s"the units did not link:\n${built.err.unwrap_or("")}")
+
+    val ran = capture(s"$dir/prog", [], "", [], true).unwrap()
+
+    assert(ran.status == Status.Exited(64), "the program returned 8 * 58 - 400")
+    remove_dir_all(dir).unwrap_or(())
+
+// A module `m` of eight `@noinline` functions, each reading a scalar `val`, an element of an array
+// `val` and a field of a struct `val`. (A `val`'s address is not taken in sysl; that the link still
+// holds one object is `vcc_copies_fold_and_link`'s, where a second definition would not link.)
+private vcc_program(root: string)
+    make_dir_all(s"$root/m").unwrap()
+
+    var m = "module m\n\nval CELL: usize = sizeof(isize)\nval TABLE: [4]u32 = [11, 22, 33, 44]\n\n" +
+            "struct Pair\n    a: int\n    b: int\n\nval PAIR = Pair(5, 9)\n\n"
+
+    for i in 0..<8
+        m = m + s"@noinline\nf$i(x: usize) -> usize = x + 2 * CELL + usize(TABLE[2]) + usize(PAIR.b)\n\n"
+
+    write_text(s"$root/m/m.sysl", m).unwrap()
+    write_text(s"$root/main.sysl",
+               "import m.{f0, f1, f2, f3, f4, f5, f6, f7}\n\n" +
+               "print(f0(1) + f1(1) + f2(1) + f3(1) + f4(1) + f5(1) + f6(1) + f7(1))\n").unwrap()
+end vcc_program
+
+@test("a program in four units reads a module val as an immediate in every function")
+vcc_program_folds_in_every_unit()
+    if std_root().is_err() || !clang_available() || host_target().triple != "arm64-apple-macosx" then return
+
+    val root = absolute_path(make_temp_dir("sysl-vcc").unwrap())
+    val cache = make_temp_dir("sysl-vcc-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    clear_unit_object_counts()
+    vcc_program(root)
+    vcc_units("4")
+
+    val exe = s"$root/four"
+
+    build_native_program(root, None, None, "2", Some(exe)) match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    vcc_units_default()
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+    assert_eq(capture(exe, []).unwrap().text, "472\n")
+
+    for i in 0..<8
+        val dis = capture("objdump", ["-d", "--no-show-raw-insn", s"--disassemble-symbols=_m$$f$i", exe],
+                          "", [], true).unwrap()
+
+        assert(dis.status.ok() && dis.text.contains(s"<_m$$f$i>:"), dis.text)
+        assert(dis.text.contains("#0x3a"), s"f$i adds 58 as one immediate:\n${dis.text}")
+        assert(!dis.text.contains("ldr"), s"f$i loads nothing:\n${dis.text}")
+
+    use_c_object_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
