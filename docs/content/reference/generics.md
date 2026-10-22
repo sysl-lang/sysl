@@ -563,6 +563,21 @@ print(b.v)
 `Self` in the signature is the type applied to its own parameters, so writing `-> Self` and writing
 `-> Box[T]` infer alike.
 
+**A type reached through its module infers exactly as its imported name does**, a dotted path being
+one name, so what receives `complex.Complex.i()` settles its arguments as it would `Complex.i()`'s:
+
+```sysl
+import sysl.math.complex
+
+val z: complex.Complex[f32] = complex.Complex.i()
+
+print(z.re, z.im)
+```
+
+```output
+0 1
+```
+
 **A type parameter that stands for a generic type brings that type's arguments with it**, so there
 is nothing to infer: when `T` is `Box[int]`, `T.origin()` calls `Box[int].origin`, not `Box.origin`
 with its argument still to be found. A generic body therefore reaches an associated function of a
