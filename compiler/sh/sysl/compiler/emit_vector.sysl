@@ -94,6 +94,25 @@ gen_select(e: *Emit, mask: TExpr, when_true: TExpr, when_false: TExpr, ty: Type)
     r
 end gen_select
 
+// Lanes rearranged: one `shufflevector`, whose list of constant lane numbers is the instruction's own
+// operand -- so it is the one instruction at every optimisation level, chosen by instruction
+// selection rather than recovered by a pass. A one-input shuffle hands `poison` as the second
+// vector, which no lane of the list names.
+gen_shuffle(e: *Emit, receiver: TExpr, second: Option[TExpr], lanes: Buf[int]) -> Val
+    val a = gen_expr(e, receiver)
+    val b = if second.is_some() then gen_expr(e, second.unwrap()) else VPoison
+    var picks: Buf[IrArg] = buf()
+
+    for lane in lanes
+        picks.push(ir_arg(l_i32(), VInt(from_int(long(lane)))))
+
+    val r = fresh_reg(e)
+
+    emit(e, InShuffle(r, lty(e, texpr_type(receiver)), a, b,
+                      ir_arg(LVec(int(lanes.len()), l_i32()), VVector(picks))))
+    r
+end gen_shuffle
+
 // A vector folded to one lane.
 //
 // **The float sum takes a starting accumulator and the others do not**, which is not a symmetry LLVM

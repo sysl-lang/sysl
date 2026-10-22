@@ -202,9 +202,10 @@ irp_typed_clean_file()
 // -- every typed node kind is reachable -------------------------------------------------------------
 
 // The reference's 107 -- its `TExpr` (86), `TStmt` (12), `TPattern` (7) and `TCondTerm` (2) -- and the
-// nine this tree adds: `TStrView`, `TSlots`, a write as a statement of its own (`TWrite`), the five
-// `async` lowers through (`TAwait`, `TBlockOn`, `TYieldNow`, `TStep`, `TPark`), and AArch64's
-// system registers and barriers (`TSysOp`), all decided additions the reference has not got.
+// ten this tree adds: `TStrView`, `TSlots`, a write as a statement of its own (`TWrite`), the five
+// `async` lowers through (`TAwait`, `TBlockOn`, `TYieldNow`, `TStep`, `TPark`), AArch64's system
+// registers and barriers (`TSysOp`), and a vector's lanes rearranged (`TShuffle`), all decided
+// additions the reference has not got.
 private irp_typed_kinds() -> []const string = [
     "TIntLit", "TFloatLit", "TStrLit", "TBoolLit", "TUnitLit", "TNullLit", "TBox", "TDowngrade",
     "TUpgrade", "TZero", "TArrayLit", "TArrayFill", "TVectorLit", "TSplat", "TLane", "TVecCompare",
@@ -222,7 +223,8 @@ private irp_typed_kinds() -> []const string = [
     "TWildPattern", "TBindPattern", "TAtPattern", "TLitPattern", "TRangePattern", "TVariantPattern",
     "TStructPattern",
     "TCondTest", "TCondIs",
-    "TStrView", "TSlots", "TWrite", "TAwait", "TBlockOn", "TYieldNow", "TStep", "TPark", "TSysOp"]
+    "TStrView", "TSlots", "TWrite", "TAwait", "TBlockOn", "TYieldNow", "TStep", "TPark", "TSysOp",
+    "TShuffle"]
 
 private irp_t(k: TExprKind) -> TExpr = TExpr(Span(0, 0), k)
 
@@ -243,6 +245,13 @@ private irp_body() -> Buf[TStmt]
     out.push(TExprStmt(irp_x()))
     out
 end irp_body
+
+private irp_lanes() -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(0)
+    out
+end irp_lanes
 
 private irp_blk() -> TBlock = TBlock(irp_body(), Some(irp_x()), irp_int())
 
@@ -289,7 +298,8 @@ private irp_every_expr() -> Buf[TExpr]
     for k in [TIntLit(from_int(1), i), TFloatLit(0, Floating(64, false)), TStrLit("s"), TBoolLit(true),
               TUnitLit, TNullLit(Ptr(i)), TBox(x, i), TDowngrade(x, i), TUpgrade(x, i, v, v), TZero(i),
               TArrayLit(irp_xs(), i), TArrayFill(x, i), TVectorLit(irp_xs(), i), TSplat(x, i),
-              TLane(x, 0, i), TVecCompare("<", x, x, i), TSelect(x, x, x, i), TReduce("add", x, i),
+              TLane(x, 0, i), TVecCompare("<", x, x, i), TSelect(x, x, x, i),
+              TShuffle(x, Some(x), irp_lanes(), i), TReduce("add", x, i),
               TVecLoad(x, x, i), TVecStore(x, x, x), TBufLit(irp_xs(), i), TBufFill(x, x, i),
               TIndex(x, x, i), TLen(x, i), TBytes(x), TSlice(x, Some(x), None, false, i), TCast(x, i),
               TConstrainedCheck(x, i), TConstrainedValid(x, i), TConstrainedStep(x, i, true, i),
@@ -363,8 +373,8 @@ end irp_typed_coverage
 irp_typed_reference_count()
     val kinds = irp_typed_kinds()
 
-    // 107 of the reference's and the nine this tree adds, every one named once.
-    assert_eq(kinds.len, 116)
+    // 107 of the reference's and the ten this tree adds, every one named once.
+    assert_eq(kinds.len, 117)
 
     for i in 0..<kinds.len
         for j in (i + 1)..<kinds.len

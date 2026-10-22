@@ -78,3 +78,4 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.tty.hosted`](sysl-tty-hosted/) |  |
 | [`sysl.tty.sys`](sysl-tty-sys/) |  |
 | [`sysl.unicode`](sysl-unicode/) | What the Unicode Character Database says about a character, and the operations over text that only that database can answer. |
+| [`sysl.vectors`](sysl-vectors/) | Lane lists for a vector's `shuffle`: the rearrangements SIMD code reaches for, at every width. |

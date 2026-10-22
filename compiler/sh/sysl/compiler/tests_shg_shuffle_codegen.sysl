@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What `shuffle` lowers to: **one `shufflevector`**, whose list of lane numbers is the instruction's
+// own constant operand -- and so one machine instruction where the machine has it, at every
+// optimisation level, chosen by instruction selection rather than recovered by a pass. The IR is
+// pinned here; the instructions are read back out of the host's own disassembly.
+
+private shg_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private shg_pair() -> string = raw"""
+    val a: <4>f32 = [1, 2, 3, 4]
+    val b: <4>f32 = [10, 20, 30, 40]
+    """
+
+@test("a two-input shuffle is one shufflevector with the list as its mask")
+shg_two_input_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(shg_pair() + "val z = a.shuffle(b, [0, 4, 1, 5])\nprint(z[1])\n"), "main")
+
+    assert(main.contains("shufflevector <4 x float> %"), main)
+    assert(main.contains("<4 x i32> <i32 0, i32 4, i32 1, i32 5>"), main)
+    assert_eq(shg_count(main, "shufflevector"), 1)
+
+@test("a one-input shuffle hands poison as the second vector")
+shg_one_input_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(shg_pair() + "val r = a.shuffle([3, 2, 1, 0])\nprint(r[1])\n"), "main")
+
+    assert(main.contains("<4 x float> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>"), main)
+    assert_eq(shg_count(main, "shufflevector"), 1)
+
+@test("the result's width is the list's: an <8 x i32> mask over two <4 x float>")
+shg_widening_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(shg_pair() +
+                               "val w = a.shuffle(b, [0, 1, 2, 3, 4, 5, 6, 7])\nprint(w[7])\n"), "main")
+
+    assert(main.contains("shufflevector <4 x float> %"), main)
+    assert(main.contains("<8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>"), main)
+
+@test("a mask shuffles as <N x i1>")
+shg_mask_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(shg_pair() + "val m = (a < b).shuffle([3, 2, 1, 0])\nprint(m[0])\n"), "main")
+
+    assert(main.contains("shufflevector <4 x i1> %"), main)
+
+@test("a const function's list is folded into the instruction, not called")
+shg_const_list_ir()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        const zip_lo_mask[const W: usize]() -> [W]usize
+            var m: [W]usize
+
+            for i in 0..<W / 2
+                m[2 * i] = i
+                m[2 * i + 1] = W + i
+
+            m
+
+        zip_lo[const W: usize](a: <W>int, b: <W>int) -> <W>int = a.shuffle(b, zip_lo_mask[W]())
+
+        val a8: <8>int = [0, 1, 2, 3, 4, 5, 6, 7]
+        print(zip_lo(a8, a8)[1])
+        """)
+
+    assert(ir.contains("<8 x i32> <i32 0, i32 8, i32 1, i32 9, i32 2, i32 10, i32 3, i32 11>"), ir)
+    assert(!ir.contains("zip_lo_mask"), ir)
+
+// -- the instructions ------------------------------------------------------------------------------
+
+private shg_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end shg_objdump
+
+// The host archive's disassembly at optimisation level `level`, or nothing where the host is not
+// AArch64.
+private shg_host_code(program: string, level: string) -> Option[string]
+    if !host_target().name.starts_with("aarch64-")
+        print("skipped: the instructions asserted are AArch64's and this machine is not one")
+        return None
+    end if
+
+    val tool = shg_objdump()
+
+    assert(tool.is_some(), "this test reads the host's code and there is no llvm-objdump on this machine")
+
+    val root = replace_all(make_temp_dir("sysl-shg").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, s"-O$level", "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    val dis = capture(tool.unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    dis match
+        Ok(out) -> Some(out.text)
+        Err(_) -> None
+end shg_host_code
+
+// The instructions of `symbol` -- the exported thunk and the definition it calls, whichever of them
+// the optimizer kept.
+private shg_code_of(dis: string, symbol: string) -> string
+    val lines = split(dis, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val label = lines[i]
+
+        if label.starts_with("<") then inside = label == s"<_$symbol>:" || label.starts_with(s"<_$symbol" + "$")
+        else if inside then out = out + label + "\n"
+
+    out
+end shg_code_of
+
+private shg_kernels() -> string = raw"""
+    @export("zip")
+    zip(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, [0, 4, 1, 5]) + *b
+    @export("rev")
+    rev(a: *<4>f32, out: *<4>f32) = *out = (*a).shuffle([1, 0, 3, 2])
+    @export("rot")
+    rot(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, [1, 2, 3, 4])
+
+    print(1)
+    """
+
+@test("on AArch64 at the default level each shuffle is the one instruction")
+shg_aarch64_default()
+    if !enm_ready() then return
+
+    val dis = shg_host_code(shg_kernels(), DefaultOptimization)
+
+    if dis.is_none() then return
+
+    val text = dis.unwrap()
+
+    assert(shg_code_of(text, "zip").contains("zip1.4s"), shg_code_of(text, "zip"))
+    assert(shg_code_of(text, "rev").contains("rev64.4s"), shg_code_of(text, "rev"))
+    assert(shg_code_of(text, "rot").contains("ext.16b"), shg_code_of(text, "rot"))
+
+@test("on AArch64 each list sysl.vectors names is the permute its documentation names")
+shg_aarch64_library_lists()
+    if !enm_ready() then return
+
+    val dis = shg_host_code(raw"""
+        import sysl.vectors.{zip_lo, zip_hi, unzip_even, unzip_odd, reverse, rotate}
+
+        @export("zl")
+        zl(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, zip_lo[4]()) + *b
+        @export("zh")
+        zh(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, zip_hi[4]()) + *b
+        @export("ue")
+        ue(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, unzip_even[4]()) + *b
+        @export("uo")
+        uo(a: *<4>f32, b: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(*b, unzip_odd[4]()) + *b
+        @export("rv")
+        rv(a: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(reverse[4]()) + *a
+        @export("rt")
+        rt(a: *<4>f32, out: *<4>f32) = *out = (*a).shuffle(rotate[4, 1]()) + *a
+
+        print(1)
+        """, DefaultOptimization)
+
+    if dis.is_none() then return
+
+    val text = dis.unwrap()
+
+    for (symbol, want) in [("zl", "zip1.4s"), ("zh", "zip2.4s"), ("ue", "uzp1.4s"), ("uo", "uzp2.4s"),
+                           ("rv", "rev64.4s"), ("rt", "ext.16b")]
+        assert(shg_code_of(text, symbol).contains(want), s"$symbol: ${shg_code_of(text, symbol)}")
+
+@test("on AArch64 with nothing optimised each shuffle is still the one instruction")
+shg_aarch64_unoptimised()
+    if !enm_ready() then return
+
+    val dis = shg_host_code(shg_kernels(), "0")
+
+    if dis.is_none() then return
+
+    val text = dis.unwrap()
+
+    assert(shg_code_of(text, "zip").contains("zip1.4s"), shg_code_of(text, "zip"))
+    assert(shg_code_of(text, "rev").contains("rev64.4s"), shg_code_of(text, "rev"))
+    assert(shg_code_of(text, "rot").contains("ext.16b"), shg_code_of(text, "rot"))
+    // Not a lane at a time: no lane moves, which is what the literal of lane reads is at -O0.
+    assert(!shg_code_of(text, "zip").contains("mov.s"), shg_code_of(text, "zip"))
