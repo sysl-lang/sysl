@@ -4429,6 +4429,7 @@ disturbs nothing.
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
 | floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
 | storage | `thread_local` (a `@thread_local` is accepted on this build) |
+| address width | `ptr32` (an address is 32 bits), `ptr64` (it is 64 bits) |
 
 That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
 symbol depends on a project config: `thread_local`, which also reads the root manifest's
@@ -4523,6 +4524,62 @@ save_fp(at: usize)
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "not this example"
 ```
 
+**`ptr32` and `ptr64` say how wide an address is** — the width of `usize` and `isize`. `ptr32` is
+true on `thumb`, `riscv32`, `wasm32` and `x86`, `ptr64` on `aarch64`, `x86_64` and `riscv64`, and
+`craft`, whose addresses are sixteen bits, answers neither. They are for a type defined by its
+relation to the machine's word rather than by one processor: a Forth double cell is twice the width
+of a cell, so it is an `i64` where a cell is 32 bits and an `i128` where it is 64, and one condition
+says so for every machine at once. This host's addresses are 64 bits:
+
+```sysl
+#if ptr32
+type DCell = i64
+#else
+type DCell = i128
+#endif
+
+@assert(sizeof(DCell) == 2 * sizeof(isize), "a double cell is two cells")
+
+print(sizeof(DCell))
+```
+
+```output
+16
+```
+
+On a 32-bit board the same lines choose the narrower type, and an `@assert` the build checks says
+so:
+
+```sysl build=c target=thumb-freestanding
+#if ptr32
+type DCell = i64
+#else
+type DCell = i128
+#endif
+
+@assert(sizeof(DCell) == 8, "a double cell on a 32-bit board is eight bytes")
+
+@export("dcell_mul")
+dcell_mul(a: isize, b: isize) -> DCell = DCell(a) * DCell(b)
+```
+
+and on a 64-bit one the wider:
+
+```sysl build=c target=riscv64-freestanding
+#if ptr32
+type DCell = i64
+#else
+type DCell = i128
+#endif
+
+@assert(sizeof(DCell) == 16, "a double cell on a 64-bit machine is sixteen bytes")
+
+@export("dcell_mul")
+dcell_mul(a: isize, b: isize) -> DCell = DCell(a) * DCell(b)
+```
+
+Like `fma`, the two are facts about the machine, so a directory cannot select on them.
+
 **A symbol nobody knows is an error, not false:**
 
 ```sysl
@@ -4536,7 +4593,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr32, ptr64, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to

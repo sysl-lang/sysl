@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join}
+import sysl.fs.{remove_dir_all}
+
+// The address-width symbols a condition may ask: `ptr32` and `ptr64`.
+//
+// They let a type be chosen by its relation to the machine's word -- a Forth double cell is twice an
+// `isize` -- without naming every processor. Every row of the registry answers the one its
+// `pointer_bits` says, and a machine whose addresses are neither width answers neither.
+
+private ptw_said(t: Target) -> string
+    val on = defined(t)
+    val p32 = has(on, "ptr32")
+    val p64 = has(on, "ptr64")
+
+    if p32 && p64 then "both" else if p32 then "ptr32" else if p64 then "ptr64" else "-"
+end ptw_said
+
+@test("ptw: every target answers the address width the table says")
+ptw_every_target_answers()
+    val expected: []string = [
+        "aarch64-macos=ptr64",
+        "x86_64-macos=ptr64",
+        "aarch64-linux=ptr64",
+        "x86_64-linux=ptr64",
+        "riscv64-linux=ptr64",
+        "x86_64-windows=ptr64",
+        "aarch64-android=ptr64",
+        "aarch64-freestanding=ptr64",
+        "x86_64-freestanding=ptr64",
+        "riscv64-freestanding=ptr64",
+        "thumb-freestanding=ptr32",
+        "thumb-freestanding-softfp=ptr32",
+        "thumb-freestanding-soft=ptr32",
+        "thumbv6m-freestanding=ptr32",
+        "thumbv7m-freestanding=ptr32",
+        "thumbv7em-freestanding=ptr32",
+        "thumbv7em-freestanding-soft=ptr32",
+        "thumbv7em-freestanding-dp=ptr32",
+        "riscv32-freestanding=ptr32",
+        "wasm32-freestanding=ptr32",
+        "wasm32-wasi=ptr32",
+        "craft-freestanding=-",
+        "x86-linux=ptr32"]
+    val all = all_targets()
+
+    // Every row is in the table: a target added to the registry fails here until it is.
+    assert_eq(expected.len, all.len())
+
+    for t in all
+        var row = ""
+
+        for i in 0..<expected.len
+            if expected[i].starts_with(t.name + "=") then row = expected[i]
+
+        assert(row != "", s"${t.name} is not in the table")
+        assert_eq(s"${t.name}=${ptw_said(t)}", row)
+
+@test("ptw: the symbol a target answers is its pointer width, and never both")
+ptw_follows_pointer_bits()
+    val all = all_targets()
+
+    for t in all
+        val on = defined(t)
+
+        assert_eq(has(on, "ptr32"), t.pointer_bits() == 32)
+        assert_eq(has(on, "ptr64"), t.pointer_bits() == 64)
+
+@test("ptw: the two are in the closed vocabulary, and not in a directory's")
+ptw_in_the_vocabulary()
+    val every = symbols()
+    val folders = directory_symbols()
+
+    for item in ["ptr32", "ptr64"]
+        assert(has(every, item), item)
+        assert(!has(folders, item), s"a walk has no target to ask about '$item'")
+
+@test("ptw: an unknown symbol's refusal names both")
+ptw_the_refusal_names_both()
+    val said = gate(source_of("<input>", "#if ptr16\n#endif\n"), host_target()) match
+        Err(d) -> d.message
+        Ok(_) -> "accepted"
+
+    assert(said.contains("'ptr16' is not something a target says about itself — sysl knows "), said)
+    assert(said.contains(", posix, ptr32, ptr64, riscv32, "), said)
+
+// -- built: which type the `#if` chose --------------------------------------------------------------
+
+private ptw_program(bytes: int) -> string =
+    "#if ptr32\n" +
+    "type DCell = i64\n" +
+    "#else\n" +
+    "type DCell = i128\n" +
+    "#endif\n" +
+    "\n" +
+    s"@assert(sizeof(DCell) == $bytes, \"the double cell\")\n" +
+    "\n" +
+    "@export(\"ptw_mul\")\n" +
+    "ptw_mul(a: isize, b: isize) -> DCell = DCell(a) * DCell(b)\n"
+
+// Builds the archive for a target with the size the `@assert` insists on, and answers the exit
+// status and what the build said.
+private ptw_archive(target: string, bytes: int) -> (int, string)
+    val root = runner_project("main.sysl", ptw_program(bytes))
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    (code, join(lines.view(), "\n"))
+end ptw_archive
+
+private ptw_ready(target: string) -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+    end if
+
+    assert(find_backend_clang(target_named(target).unwrap()).is_ok(),
+           s"no clang here has the back end '$target' needs")
+    true
+end ptw_ready
+
+@test("ptw: built for thumb-freestanding, '#if ptr32' chooses the eight-byte double cell")
+ptw_on_thumb()
+    if !ptw_ready("thumb-freestanding") then return
+
+    val narrow = ptw_archive("thumb-freestanding", 8)
+
+    assert_eq(narrow.0, Fine, narrow.1)
+
+    // The assertion can fail: insisting on the wide cell is refused on this board.
+    val wide = ptw_archive("thumb-freestanding", 16)
+
+    assert(wide.0 != Fine, wide.1)
+    assert(wide.1.contains("assertion failed: the double cell — the left side is 8"), wide.1)
+
+@test("ptw: built for the host, '#else' chooses the sixteen-byte double cell")
+ptw_on_the_host()
+    val host = host_target()
+
+    if host.pointer_bits() != 64 then return
+    if !ptw_ready(host.name) then return
+
+    val wide = ptw_archive(host.name, 16)
+
+    assert_eq(wide.0, Fine, wide.1)
+
+    val narrow = ptw_archive(host.name, 8)
+
+    assert(narrow.0 != Fine, narrow.1)
+    assert(narrow.1.contains("assertion failed: the double cell — the left side is 16"), narrow.1)
