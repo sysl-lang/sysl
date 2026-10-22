@@ -1,0 +1,78 @@
+module sysl.vectors
+@no_alloc
+
+/** Lane lists for a vector's `shuffle`: the rearrangements SIMD code reaches for, at every width.
+ *
+ * `reference/vectors.md § Rearranging lanes` describes `shuffle` itself.
+ *
+ * **Each is a `const` function answering an array of lane numbers**, which is the form `shuffle`
+ * folds while compiling: `a.shuffle(b, zip_lo[W]())` is one `shufflevector` whose list is the
+ * instruction's own operand, so a kernel generic in its width interleaves at four lanes and at
+ * sixteen from one body, and the list costs nothing at run time. They are lists rather than methods
+ * because a list is what may be named, combined and handed on; the method that applies one is the
+ * compiler's.
+ *
+ * **`W` is always the width of the vectors being shuffled**, never the width of the answer, and the
+ * second vector's lanes are numbered `W` to `2W - 1` as `shuffle` numbers them. The lists that take a
+ * pair say so; the rest pick from one vector.
+ */
+
+/** The low halves of two vectors, interleaved: `[a0, b0, a1, b1, …]`, `W` lanes from a pair of `W`.
+ * `zip1` on AArch64, `unpcklps` on x86. */
+const zip_lo[const W: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W / 2
+        m[2 * i] = i
+        m[2 * i + 1] = W + i
+
+    m
+
+/** The high halves of two vectors, interleaved: `[a(W/2), b(W/2), …]`, `W` lanes from a pair of `W`.
+ * `zip2` on AArch64. */
+const zip_hi[const W: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W / 2
+        m[2 * i] = W / 2 + i
+        m[2 * i + 1] = W + W / 2 + i
+
+    m
+
+/** Every even lane of a pair, in order: `[a0, a2, …, b0, b2, …]` -- the inverse of the two zips.
+ * `uzp1` on AArch64. */
+const unzip_even[const W: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W
+        m[i] = 2 * i
+
+    m
+
+/** Every odd lane of a pair, in order: `[a1, a3, …, b1, b3, …]`. `uzp2` on AArch64. */
+const unzip_odd[const W: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W
+        m[i] = 2 * i + 1
+
+    m
+
+/** One vector's lanes back to front. `rev64` and an `ext` on AArch64. */
+const reverse[const W: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W
+        m[i] = W - 1 - i
+
+    m
+
+/** One vector's lanes moved `K` toward lane zero, the ones that fall off coming round at the top:
+ * lane `i` of the answer is lane `(i + K) % W`. `ext` on AArch64. */
+const rotate[const W: usize, const K: usize]() -> [W]usize
+    var m: [W]usize
+
+    for i in 0..<W
+        m[i] = (i + K) % W
+
+    m

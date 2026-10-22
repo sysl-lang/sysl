@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.from_int
+import sysl.math.bigint.{BigInt, from_int, to_string}
 
 // The six methods a vector answers to, the two a run of them in memory does, and the comparison
 // that yields a mask.
@@ -16,8 +16,8 @@ import sysl.math.bigint.from_int
 // complaint, which names the type and says no member of that name exists -- rather than being caught
 // here and answered with a list.
 is_vector_method(name: string) -> bool =
-    name == "select" || name == "sum" || name == "min" || name == "max" || name == "any" ||
-        name == "all"
+    name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
+        name == "any" || name == "all"
 
 // The two names a slice or an array answers with a vector's lanes. They are the *receiver's* methods
 // and not the vector's, because what a load needs is an address and a length and a vector has
@@ -135,6 +135,8 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     val lane = underlying(elem)
     val is_mask = lane == Bool
 
+    if name == "shuffle" then return vector_shuffle(cx, span, v, parts.0, elem, tr, args)
+
     if name == "select"
         if !is_mask then
             return cx.err(span, s"'select' chooses between two vectors lane by lane, so it is " +
@@ -231,6 +233,153 @@ private vector_select(cx: &Analyzer, span: Span, v: Type, lanes: int, tr: TExpr,
 
     TExpr(span, TSelect(tr, pair.0, pair.1, texpr_type(pair.0)))
 end vector_select
+
+// `a.shuffle([3, 2, 1, 0])` and `a.shuffle(b, [0, 4, 1, 5])` -- lanes picked by number, the second
+// vector's numbered after the receiver's, into a vector as wide as the list is long.
+//
+// **The list is folded here or refused.** A lane number is part of the instruction exactly as a lane
+// index is, so the list is held to what `v[k]` holds its index to: a literal of constants, or what a
+// `const` function answers -- which is what lets one kernel be generic in its width. A list read at
+// run time would be a different instruction (`tbl`, `pshufb`) with its own answer for a lane out of
+// range, and lowering it to a loop would hide the very cost a shuffle exists to avoid.
+//
+// **The two inputs are one type**, as `shufflevector` requires. A scalar second argument is refused
+// rather than splatted: `a.shuffle(0, …)` is far likelier a missing vector than a broadcast.
+private vector_shuffle(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, tr: TExpr,
+                       args: Buf[Expr]) -> TExpr
+    if args.len() != 1 && args.len() != 2 then
+        return cx.err(span, "'shuffle' takes the list of lanes to pick, after the second vector to " +
+                      "pick from where there is one — 'a.shuffle([3, 2, 1, 0])' or " +
+                      s"'a.shuffle(b, [0, 4, 1, 5])' — and ${quantity(args.len(), "argument")} " +
+                      "were given")
+
+    var second: Option[TExpr] = None
+
+    if args.len() == 2
+        val arg = args.at(0)
+
+        // A written list of lanes is read as the vector it stands beside, as it would be bound to
+        // one; anything else is read as itself, so a scalar stays a scalar and is told so.
+        val literal = *arg.kind match
+            ArrayLit(_) | ArrayFill(_, _) -> true
+            _ -> false
+
+        val tb = type_expr(cx, arg, if literal then Some(v) else None)
+        val bt = repr(texpr_type(tb))
+
+        if bt == Unknown then return bad_expr(span)
+
+        if !type_eq(repr(v), bt) then
+            return cx.err(arg.span, s"'shuffle' takes two vectors of one type, got ${type_show(v)} " +
+                          s"and ${type_show(texpr_type(tb))}")
+
+        second = Some(tb)
+    end if
+
+    val lanes = shuffle_list(cx, args.at(args.len() - 1), v, n, elem, second.is_some())
+
+    if lanes.is_none() then return bad_expr(span)
+
+    TExpr(span, TShuffle(tr, second, lanes.unwrap(), Vector(int(lanes.unwrap().len()), elem)))
+end vector_shuffle
+
+// A shuffle's list, folded to lane numbers and each checked against the lanes there are to pick
+// from. `None` having said why.
+//
+// A written literal is folded element by element, so a refusal points at the element that is not a
+// constant or not a lane. Anything else has to be what a `const` function answers, run now in the
+// shuffle's own terms -- inside a generic, the instance's.
+private shuffle_list(cx: &Analyzer, list: Expr, v: Type, n: int, elem: Type,
+                     two: bool) -> Option[Buf[int]]
+    val mark = cx.an.complaints()
+    var found: Buf[(BigInt, Span)] = buf()
+
+    *list.kind match
+        ArrayLit(items) ->
+            for item in items
+                val ti = type_expr(cx, item, None)
+
+                repr(texpr_type(ti)) match
+                    Integer(_, _, _) -> ()
+                    other ->
+                        if other != Unknown then
+                            cx.fault(item.span, s"a lane number must be an integer, not ${type_show(other)}")
+
+                        return None
+
+                val k = const_int(cx, item)
+
+                if k.is_none()
+                    cx.fault(item.span, lanes_not_constant(n, elem))
+                    return None
+                end if
+
+                found.push((k.unwrap(), item.span))
+        _ ->
+            val got = const_lanes_of_call(cx, list)
+
+            if got.is_none()
+                if cx.an.complaints() != mark then return None
+
+                // Read for real, so a mistake in the expression is said where it is.
+                val tl = type_expr(cx, list, None)
+
+                if cx.an.complaints() != mark then return None
+
+                if is_lane_list(texpr_type(tl)) then cx.fault(list.span, lanes_not_constant(n, elem))
+                else cx.fault(list.span, not_a_lane_list(texpr_type(tl)))
+
+                return None
+            end if
+
+            for c in got.unwrap().0
+                c match
+                    ConstInt(k) -> found.push((k, list.span))
+                    _ ->
+                        cx.fault(list.span, not_a_lane_list(got.unwrap().1))
+                        return None
+
+    if found.is_empty()
+        cx.fault(list.span, "'shuffle' picks at least one lane — a vector has at least one, so the " +
+                 "list cannot be empty")
+        return None
+    end if
+
+    val top = if two then 2 * n else n
+    var out: Buf[int] = buf()
+
+    for pair in found
+        val k = pair.0.to_long().unwrap_or(-1)
+
+        if k < 0 || k >= long(top)
+            val said = if two then s"'shuffle' picks from lanes 0 to ${top - 1} — 0 to ${n - 1} of " +
+                s"the receiver and $n to ${top - 1} of the second vector — and this is ${to_string(pair.0)}"
+            else s"${type_show(v)} has lanes 0 to ${n - 1}, and this is ${to_string(pair.0)}"
+
+            cx.fault(pair.1, said)
+            return None
+        end if
+
+        out.push(int(k))
+
+    Some(out)
+end shuffle_list
+
+private lanes_not_constant(n: int, elem: Type) -> string =
+    "a shuffle's lanes are part of the instruction, so the list has to be a constant — a literal, " +
+        s"or a 'const' function's result. To pick lanes by a computed number, keep the values in a " +
+        s"'[$n]${type_show(elem)}'"
+
+private not_a_lane_list(t: Type) -> string =
+    "'shuffle' picks lanes by number, so its list is an array of integers, as in '[3, 2, 1, 0]' — " +
+        s"and this is ${type_show(t)}"
+
+// Whether a type is what a list of lane numbers is held in: an array of integers.
+private is_lane_list(t: Type) -> bool = repr(t) match
+    Array(_, e) -> repr(*e) match
+        Integer(_, _, _) -> true
+        _ -> false
+    _ -> false
 
 // A string is a view of bytes that are valid UTF-8, and a run of them is bytes rather than lanes of
 // anything the string promises -- so the answer is where a program says it wants the bytes, not a

@@ -285,6 +285,26 @@ assert_message(cx: &Analyzer, span: Span, e: Expr) -> Option[string]
             None
 end assert_message
 
+// What a call written as a shuffle's list comes to -- `zip_lo_mask[W]()`, typed in a trial and run in
+// the shuffle's own terms, so inside a generic it is the instance's list -- with the type it was read
+// at. `None` where nothing in it runs while compiling, where the reading complained (taken back, for
+// the caller to read again for real), or where it did not come to an array; where running it failed,
+// why has been said.
+const_lanes_of_call(cx: &Analyzer, e: Expr) -> Option[(Buf[Const], Type)]
+    if !mentions_const_call(cx.an, e) then return None
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return None
+
+    evaluate(cx.an, cx.scope, "this shuffle's list", typed.unwrap()) match
+        EvValue(Some(ConstArray(xs))) -> Some((xs, texpr_type(typed.unwrap())))
+        EvFail(message, _) ->
+            cx.fault(e.span, message)
+            None
+        _ -> None
+end const_lanes_of_call
+
 private unworkable_message(head: string) -> string =
     s"$head cannot be computed while compiling — it has to be a 'string' made of constants, what a " +
         "type answers and calls whose bodies run while compiling, and nothing read out of storage " +
@@ -1691,6 +1711,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TLane(receiver, lane, _) -> lane_read(r, receiver, lane)
         TVecCompare(op, l, r2, ty) -> vector_compare(r, e.span, op, l, r2, ty)
         TSelect(mask, when_true, when_false, _) -> select_lanes(r, mask, when_true, when_false)
+        TShuffle(receiver, second, lanes, _) -> shuffle_lanes(r, receiver, second, lanes)
         TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
         TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
         TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
@@ -2233,6 +2254,29 @@ private select_lanes(r: &EvRun, mask: TExpr, when_true: TExpr, when_false: TExpr
 
     EvGave(ConstArray(out))
 end select_lanes
+
+// `a.shuffle(b, [0, 4, 1, 5])`: both inputs computed, then each listed lane taken from the receiver
+// below its width and from the second vector at and above it. The analyzer has checked every lane.
+@noinline
+private shuffle_lanes(r: &EvRun, receiver: TExpr, second: Option[TExpr], lanes: Buf[int]) -> Flow
+    val a = eval_value(r, receiver) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    var b: Buf[Const] = buf()
+
+    if second.is_some()
+        eval_value(r, second.unwrap()) match
+            Ok(v) -> b = lanes_of(v)
+            Err(f) -> return f
+
+    var out: Buf[Const] = buf()
+
+    for lane in lanes
+        out.push(if usize(lane) < a.len() then a.at(usize(lane)) else b.at(usize(lane) - a.len()))
+
+    EvGave(ConstArray(out))
+end shuffle_lanes
 
 // A vector's lanes folded into one value, by the reduction the analyzer chose (`vectors.sysl`).
 //

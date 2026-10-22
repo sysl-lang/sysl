@@ -1,0 +1,445 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **A struct with C bitfields crosses a C boundary by value** (`docs/design/bitfields.md` §6): as an
+// `extern` argument and result, as an `@export` parameter and result, and through a `*extern`
+// pointer in both directions, at any depth -- a struct holding one, an array of them. `cabi.sysl`
+// classifies one by its members, each named bitfield an integer of its own; what each convention
+// makes of that is checked against clang on every machine by `tests_abc_abi_against_clang.sysl`.
+// Here the C is compiled and run beside the sysl, and every field is read back on both sides.
+
+private bbv_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The program built and run with the C beside it: its status, what it printed, and the build's
+// complaint.
+private bbv_run(text: string, c: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bbv").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bbv_run
+
+// The twelve shapes of `bitfield-probes/abi.c`, an unnamed bitfield, a struct holding one and an
+// array of them. Each crosses three ways: sysl hands it to C (`c_x`), which doubles every float and
+// adds one to every integer and hands it back; C builds the same value and hands it to sysl's export
+// (`s_x`), which does the same, and C hands sysl's answer back (`back_x`). So each line is printed
+// twice, and the two agree only if all four crossings carried every field.
+private val bbv_types: string = raw"""
+    struct B1
+        a: u3 in u32
+
+    struct Bfx
+        f: f32
+        a: u3 in u32
+        b: u3 in u32
+
+    struct Bfc
+        f: f32
+        a: u3 in u8
+
+    struct B4
+        a: u3 in u32
+        b: u29 in u32
+
+    struct B8
+        a: u3 in u32
+        b: u30 in u32
+
+    struct B2
+        a: u3 in u16
+        b: u9 in u16
+
+    struct B16
+        a: u40 in u64
+        b: u40 in u64
+
+    struct B24
+        a: u40 in u64
+        b: u40 in u64
+        c: u40 in u64
+
+    struct Bf
+        f: f32
+        a: u3 in u32
+
+    struct Bd
+        d: f64
+        a: u3 in u32
+
+    struct Bff
+        f: f32
+        a: u3 in u32
+        g: f32
+
+    struct Bz
+        f: f32
+        _: in i32
+        g: f32
+
+    struct Bu
+        f: f32
+        _: u4 in u32
+        g: f32
+
+    struct H
+        x: f32
+        b: B1
+
+    struct Ha
+        cells: [2]Bfc
+
+    """
+
+private val bbv_sysl: string = bbv_types + raw"""
+    extern c_b1(v: B1) -> B1
+    extern c_bfx(v: Bfx) -> Bfx
+    extern c_bfc(v: Bfc) -> Bfc
+    extern c_b4(v: B4) -> B4
+    extern c_b8(v: B8) -> B8
+    extern c_b2(v: B2) -> B2
+    extern c_b16(v: B16) -> B16
+    extern c_b24(v: B24) -> B24
+    extern c_bf(v: Bf) -> Bf
+    extern c_bd(v: Bd) -> Bd
+    extern c_bff(v: Bff) -> Bff
+    extern c_bz(v: Bz) -> Bz
+    extern c_bu(v: Bu) -> Bu
+    extern c_h(v: H) -> H
+    extern c_ha(v: Ha) -> Ha
+
+    extern back_b1() -> B1
+    extern back_bfx() -> Bfx
+    extern back_bfc() -> Bfc
+    extern back_b4() -> B4
+    extern back_b8() -> B8
+    extern back_b2() -> B2
+    extern back_b16() -> B16
+    extern back_b24() -> B24
+    extern back_bf() -> Bf
+    extern back_bd() -> Bd
+    extern back_bff() -> Bff
+    extern back_bz() -> Bz
+    extern back_bu() -> Bu
+    extern back_h() -> H
+    extern back_ha() -> Ha
+
+    @export("s_b1")
+    s_b1(v: B1) -> B1 = B1(v.a + 1)
+
+    @export("s_bfx")
+    s_bfx(v: Bfx) -> Bfx = Bfx(v.f * 2.0, v.a + 1, v.b + 1)
+
+    @export("s_bfc")
+    s_bfc(v: Bfc) -> Bfc = Bfc(v.f * 2.0, v.a + 1)
+
+    @export("s_b4")
+    s_b4(v: B4) -> B4 = B4(v.a + 1, v.b + 1)
+
+    @export("s_b8")
+    s_b8(v: B8) -> B8 = B8(v.a + 1, v.b + 1)
+
+    @export("s_b2")
+    s_b2(v: B2) -> B2 = B2(v.a + 1, v.b + 1)
+
+    @export("s_b16")
+    s_b16(v: B16) -> B16 = B16(v.a + 1, v.b + 1)
+
+    @export("s_b24")
+    s_b24(v: B24) -> B24 = B24(v.a + 1, v.b + 1, v.c + 1)
+
+    @export("s_bf")
+    s_bf(v: Bf) -> Bf = Bf(v.f * 2.0, v.a + 1)
+
+    @export("s_bd")
+    s_bd(v: Bd) -> Bd = Bd(v.d * 2.0, v.a + 1)
+
+    @export("s_bff")
+    s_bff(v: Bff) -> Bff = Bff(v.f * 2.0, v.a + 1, v.g * 2.0)
+
+    @export("s_bz")
+    s_bz(v: Bz) -> Bz = Bz(v.f * 2.0, v.g * 2.0)
+
+    @export("s_bu")
+    s_bu(v: Bu) -> Bu = Bu(v.f * 2.0, v.g * 2.0)
+
+    @export("s_h")
+    s_h(v: H) -> H = H(v.x * 2.0, B1(v.b.a + 1))
+
+    @export("s_ha")
+    s_ha(v: Ha) -> Ha = Ha([s_bfc(v.cells[0]), s_bfc(v.cells[1])])
+
+    q(x: f32) -> i64 = i64(x * 4.0)
+
+    show_b1(v: B1) = print("b1", v.a)
+    show_bfx(v: Bfx) = print("bfx", q(v.f), v.a, v.b)
+    show_bfc(v: Bfc) = print("bfc", q(v.f), v.a)
+    show_b4(v: B4) = print("b4", v.a, v.b)
+    show_b8(v: B8) = print("b8", v.a, v.b)
+    show_b2(v: B2) = print("b2", v.a, v.b)
+    show_b16(v: B16) = print("b16", v.a, v.b)
+    show_b24(v: B24) = print("b24", v.a, v.b, v.c)
+    show_bf(v: Bf) = print("bf", q(v.f), v.a)
+    show_bd(v: Bd) = print("bd", i64(v.d * 4.0), v.a)
+    show_bff(v: Bff) = print("bff", q(v.f), v.a, q(v.g))
+    show_bz(v: Bz) = print("bz", q(v.f), q(v.g))
+    show_bu(v: Bu) = print("bu", q(v.f), q(v.g))
+    show_h(v: H) = print("h", q(v.x), v.b.a)
+    show_ha(v: Ha) = print("ha", q(v.cells[0].f), v.cells[0].a, q(v.cells[1].f), v.cells[1].a)
+
+    main()
+        show_b1(c_b1(B1(5)))
+        show_b1(back_b1())
+        show_bfx(c_bfx(Bfx(1.5, 2, 5)))
+        show_bfx(back_bfx())
+        show_bfc(c_bfc(Bfc(2.5, 4)))
+        show_bfc(back_bfc())
+        show_b4(c_b4(B4(3, 100000)))
+        show_b4(back_b4())
+        show_b8(c_b8(B8(6, 1000000)))
+        show_b8(back_b8())
+        show_b2(c_b2(B2(1, 300)))
+        show_b2(back_b2())
+        show_b16(c_b16(B16(1099511627000, 7)))
+        show_b16(back_b16())
+        show_b24(c_b24(B24(11, 22, 33)))
+        show_b24(back_b24())
+        show_bf(c_bf(Bf(0.5, 6)))
+        show_bf(back_bf())
+        show_bd(c_bd(Bd(2.25, 3)))
+        show_bd(back_bd())
+        show_bff(c_bff(Bff(1.25, 1, 3.5)))
+        show_bff(back_bff())
+        show_bz(c_bz(Bz(0.75, 1.5)))
+        show_bz(back_bz())
+        show_bu(c_bu(Bu(1.0, 2.0)))
+        show_bu(back_bu())
+        show_h(c_h(H(1.5, B1(2))))
+        show_h(back_h())
+        show_ha(c_ha(Ha([Bfc(1.0, 1), Bfc(2.0, 2)])))
+        show_ha(back_ha())
+    """
+
+private val bbv_c_types: string = raw"""
+    struct b1 { unsigned a : 3; };
+    struct bfx { float f; unsigned a : 3, b : 3; };
+    struct bfc { float f; unsigned char a : 3; };
+    struct b4 { unsigned a : 3; unsigned b : 29; };
+    struct b8 { unsigned a : 3; unsigned b : 30; };
+    struct b2 { unsigned short a : 3; unsigned short b : 9; };
+    struct b16 { unsigned long long a : 40; unsigned long long b : 40; };
+    struct b24 { unsigned long long a : 40, b : 40, c : 40; };
+    struct bf { float f; unsigned a : 3; };
+    struct bd { double d; unsigned a : 3; };
+    struct bff { float f; unsigned a : 3; float g; };
+    struct bz { float f; int : 0; float g; };
+    struct bu { float f; unsigned : 4; float g; };
+    struct h { float x; struct b1 b; };
+    struct ha { struct bfc cells[2]; };
+    """
+
+private val bbv_c: string = bbv_c_types + raw"""
+    struct b1 c_b1(struct b1 v) { v.a += 1; return v; }
+    struct bfx c_bfx(struct bfx v) { v.f *= 2; v.a += 1; v.b += 1; return v; }
+    struct bfc c_bfc(struct bfc v) { v.f *= 2; v.a += 1; return v; }
+    struct b4 c_b4(struct b4 v) { v.a += 1; v.b += 1; return v; }
+    struct b8 c_b8(struct b8 v) { v.a += 1; v.b += 1; return v; }
+    struct b2 c_b2(struct b2 v) { v.a += 1; v.b += 1; return v; }
+    struct b16 c_b16(struct b16 v) { v.a += 1; v.b += 1; return v; }
+    struct b24 c_b24(struct b24 v) { v.a += 1; v.b += 1; v.c += 1; return v; }
+    struct bf c_bf(struct bf v) { v.f *= 2; v.a += 1; return v; }
+    struct bd c_bd(struct bd v) { v.d *= 2; v.a += 1; return v; }
+    struct bff c_bff(struct bff v) { v.f *= 2; v.a += 1; v.g *= 2; return v; }
+    struct bz c_bz(struct bz v) { v.f *= 2; v.g *= 2; return v; }
+    struct bu c_bu(struct bu v) { v.f *= 2; v.g *= 2; return v; }
+    struct h c_h(struct h v) { v.x *= 2; v.b.a += 1; return v; }
+    struct ha c_ha(struct ha v) { v.cells[0] = c_bfc(v.cells[0]); v.cells[1] = c_bfc(v.cells[1]); return v; }
+
+    struct b1 s_b1(struct b1); struct bfx s_bfx(struct bfx); struct bfc s_bfc(struct bfc);
+    struct b4 s_b4(struct b4); struct b8 s_b8(struct b8); struct b2 s_b2(struct b2);
+    struct b16 s_b16(struct b16); struct b24 s_b24(struct b24); struct bf s_bf(struct bf);
+    struct bd s_bd(struct bd); struct bff s_bff(struct bff); struct bz s_bz(struct bz);
+    struct bu s_bu(struct bu); struct h s_h(struct h); struct ha s_ha(struct ha);
+
+    struct b1 back_b1(void) { struct b1 v = {5}; return s_b1(v); }
+    struct bfx back_bfx(void) { struct bfx v = {1.5f, 2, 5}; return s_bfx(v); }
+    struct bfc back_bfc(void) { struct bfc v = {2.5f, 4}; return s_bfc(v); }
+    struct b4 back_b4(void) { struct b4 v = {3, 100000}; return s_b4(v); }
+    struct b8 back_b8(void) { struct b8 v = {6, 1000000}; return s_b8(v); }
+    struct b2 back_b2(void) { struct b2 v = {1, 300}; return s_b2(v); }
+    struct b16 back_b16(void) { struct b16 v = {1099511627000ull, 7}; return s_b16(v); }
+    struct b24 back_b24(void) { struct b24 v = {11, 22, 33}; return s_b24(v); }
+    struct bf back_bf(void) { struct bf v = {0.5f, 6}; return s_bf(v); }
+    struct bd back_bd(void) { struct bd v = {2.25, 3}; return s_bd(v); }
+    struct bff back_bff(void) { struct bff v = {1.25f, 1, 3.5f}; return s_bff(v); }
+    struct bz back_bz(void) { struct bz v = {0.75f, 1.5f}; return s_bz(v); }
+    struct bu back_bu(void) { struct bu v = {1.0f, 2.0f}; return s_bu(v); }
+    struct h back_h(void) { struct h v = {1.5f, {2}}; return s_h(v); }
+    struct ha back_ha(void) { struct ha v = {{{1.0f, 1}, {2.0f, 2}}}; return s_ha(v); }
+    """
+
+private val bbv_expected: string = raw"""
+    b1 6
+    b1 6
+    bfx 12 3 6
+    bfx 12 3 6
+    bfc 20 5
+    bfc 20 5
+    b4 4 100001
+    b4 4 100001
+    b8 7 1000001
+    b8 7 1000001
+    b2 2 301
+    b2 2 301
+    b16 1099511627001 8
+    b16 1099511627001 8
+    b24 12 23 34
+    b24 12 23 34
+    bf 4 7
+    bf 4 7
+    bd 18 4
+    bd 18 4
+    bff 10 2 28
+    bff 10 2 28
+    bz 6 12
+    bz 6 12
+    bu 8 16
+    bu 8 16
+    h 12 3
+    h 12 3
+    ha 8 2 16 3
+    ha 8 2 16 3
+    """
+
+@test("every bitfield shape crosses by value to C and back, as an 'extern' and as an '@export'")
+bbv_every_shape_round_trips()
+    if !bbv_ready() then return
+
+    val (state, out, err) = bbv_run(bbv_sysl, bbv_c)
+
+    assert_eq(err, "")
+    assert_eq(out, bbv_expected)
+    assert(state == Status.Exited(0), s"stopped with $state")
+end bbv_every_shape_round_trips
+
+// **A `*extern` pointer is a foreign callee like any other**: one C handed over is called with the
+// struct by value, and a sysl function's address handed to C is called by C the same way.
+private val bbv_pointer_sysl: string = bbv_types + raw"""
+    type BdFn = *extern(Bd) -> Bd
+    type HFn = *extern(H) -> H
+
+    extern pick_bd() -> BdFn
+    extern pick_h() -> HFn
+    extern apply_bd(f: BdFn, v: Bd) -> Bd
+    extern apply_h(f: HFn, v: H) -> H
+
+    @export("twice_bd")
+    twice_bd(v: Bd) -> Bd = Bd(v.d * 2.0, v.a + 1)
+
+    @export("twice_h")
+    twice_h(v: H) -> H = H(v.x * 2.0, B1(v.b.a + 1))
+
+    main()
+        val f = pick_bd()
+        val g = pick_h()
+        val r = f(Bd(2.25, 3))
+        val s = g(H(1.5, B1(2)))
+
+        print("bd", i64(r.d * 4.0), r.a)
+        print("h", i64(s.x * 4.0), s.b.a)
+
+        val t = apply_bd(&twice_bd, Bd(2.25, 3))
+        val u = apply_h(&twice_h, H(1.5, B1(2)))
+
+        print("bd", i64(t.d * 4.0), t.a)
+        print("h", i64(u.x * 4.0), u.b.a)
+    """
+
+private val bbv_pointer_c: string = bbv_c_types + raw"""
+    static struct bd c_bd(struct bd v) { v.d *= 2; v.a += 1; return v; }
+    static struct h c_h(struct h v) { v.x *= 2; v.b.a += 1; return v; }
+    struct bd (*pick_bd(void))(struct bd) { return c_bd; }
+    struct h (*pick_h(void))(struct h) { return c_h; }
+    struct bd apply_bd(struct bd (*f)(struct bd), struct bd v) { return f(v); }
+    struct h apply_h(struct h (*f)(struct h), struct h v) { return f(v); }
+    """
+
+@test("a bitfield struct crosses by value through a '*extern' pointer, either side calling")
+bbv_through_a_function_pointer()
+    if !bbv_ready() then return
+
+    val (state, out, err) = bbv_run(bbv_pointer_sysl, bbv_pointer_c)
+
+    assert_eq(err, "")
+    assert_eq(out, "bd 18 4\nh 12 3\nbd 18 4\nh 12 3\n")
+    assert(state == Status.Exited(0), s"stopped with $state")
+end bbv_through_a_function_pointer
+
+// A call through a `*extern` pointer names the same coerced shape a named `extern` does, on the
+// machines where a bitfield struct's shape is not its plain twin's: System V's whole-register second
+// eightbyte, RISC-V's narrow integer beside a float, wasm's single bitfield as its declared type and
+// two bitfields in memory.
+private bbv_pointer_ir(target: string) -> string = cab_ir_for(target, raw"""
+    struct Bd
+        d: f64
+        a: u3 in u32
+
+    struct B1
+        a: u3 in u32
+
+    struct B4
+        a: u3 in u32
+        b: u29 in u32
+
+    type BdFn = *extern(Bd) -> Bd
+    type B1Fn = *extern(B1) -> B1
+    type B4Fn = *extern(B4) -> B4
+
+    extern pick_bd() -> BdFn
+    extern pick_b1() -> B1Fn
+    extern pick_b4() -> B4Fn
+
+    val f = pick_bd()
+    val g = pick_b1()
+    val h = pick_b4()
+    val r = f(Bd(2.25, 3))
+    val s = g(B1(5))
+    val t = h(B4(3, 9))
+
+    print(r.a, s.a, t.b)
+    """)
+
+@test("a call through a '*extern' pointer coerces a bitfield struct as a named 'extern' does")
+bbv_pointer_call_is_classified()
+    val x86 = bbv_pointer_ir("x86_64-linux")
+
+    assert(x86.contains("call { double, i64 } %"), x86)
+    assert(x86.contains("(double %"), x86)
+
+    val rv = bbv_pointer_ir("riscv64-linux")
+
+    assert(rv.contains("call { double, i8 } %"), rv)
+
+    val wasm = bbv_pointer_ir("wasm32-wasi")
+
+    assert(wasm.contains("call i32 %"), wasm)
+    assert(wasm.contains("sret(%struct.B4)"), wasm)
+end bbv_pointer_call_is_classified

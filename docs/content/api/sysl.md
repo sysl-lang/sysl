@@ -809,8 +809,8 @@ Like `Option` this is an ordinary generic enum; `?` reaches it through `Library.
 | `is_ok` | `is_ok(self) -> bool` |  |
 | `is_err` | `is_err(self) -> bool` |  |
 | `unwrap_or` | `unwrap_or(self, default: T) -> T` |  |
-| `unwrap` | `unwrap(self) -> T` |  |
-| `expect` | `expect(self, msg: string) -> T` |  |
+| `unwrap` | `unwrap(self) -> T` | The success's value, or -- on an `Err` -- a panic that names the error and prints where it came from (`sysl.debug`'s error return trace) before the program exits with status 1. |
+| `expect` | `expect(self, msg: string) -> T` | `unwrap` with the panic line saying `msg`, the error after it. |
 | `unwrap_err` | `unwrap_err(self) -> E` |  |
 | `unwrap_or_else` | `unwrap_or_else(self, f: E -> T) -> T` | The failure computed rather than passed, for a default that costs something to make. |
 | `map` | `map[U](self, f: T -> U) -> Result[U, E]` | The success transformed, the failure carried through. |

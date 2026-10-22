@@ -6,7 +6,12 @@ bitfield, whose layout C leaves to the implementation", `import_c_render.sysl`).
 
 C's standard does leave the allocation to the implementation — but every platform ABI sysl targets
 pins it, and clang follows them. This note measures those rules on every sysl target, chooses a
-surface, and plans the work. Nothing here is built yet.
+surface, and plans the work.
+
+**Status: built except §7.** A struct with C bitfields is spelled, laid out, read and written by the
+target's C rule, mapped by `import-c`, and passed by value at a C boundary as clang passes it (§6,
+`cabi.sysl`, checked against clang on every machine by `tests_abc_abi_against_clang.sysl`). Its
+declaration in a generated header (§7) is not written yet: the header gives it as an incomplete type.
 
 ## 1. Decisions
 
@@ -275,6 +280,26 @@ the wasm single-element rule and the RISC-V flattening rule both consume, and on
 convention it reduces to the size-and-alignment answer the ordinary struct gets. The `:0` case follows
 clang; GCC's treatment of a zero-width bitfield in the flattening rule has changed between releases and was
 not measured here, so the two compilers may disagree on lp64d; sysl follows clang, its oracle (Q6).
+
+Building it against clang on more shapes than the twelve refined the rule per convention (the shapes
+are `tests_abc_abi_against_clang.sysl`'s `abc_bit_shapes`):
+
+- **The member's width rounds up to a power-of-two number of bytes**, not to a byte: `a:20` is an
+  `i32`, `a:40` an `i64` (RISC-V's `(float, i32)` for `{ float f; unsigned a:20; }`).
+- **An unnamed bitfield is a member to AAPCS and RISC-V** (`{ float f; unsigned :4; float g; }` is no
+  HFA, and three members on lp64d) **and nothing to System V's classification or wasm's single
+  element**; a `:0` is no member to any of them but RISC-V, which gives up flattening where one
+  precedes the second member within its struct (`{ float f; float g; int :0; }` still flattens).
+- **wasm's single element is the bitfield's declared type**: `{ unsigned a:3; }` is an `i32`,
+  `{ unsigned char a:3; }` an `i8`, `{ _Bool on:1; }` an `i1`.
+- **System V names an integer eightbyte by its first member only where no bitfield's declared type,
+  counted from the bit it begins at, reaches past that member** — named, unnamed or `:0` — which is
+  why `{ double d; unsigned a:3; }` is `(double, i64)` and `{ double d; unsigned short a:12; }` is
+  `(double, i16)`. And where the first eightbyte's piece is short of eight bytes and the second's
+  alignment would put it at byte four, the first widens (`float` → `double`, integer → `i64`):
+  `{ float f; long long :0; float g; }` is `(double, float)`.
+- **An HFA has no padding**: on AAPCS `{ float f; long long :0; float g; }` is sixteen bytes and
+  travels as `[2 x i64]`.
 
 ## 7. The header
 

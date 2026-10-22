@@ -1,0 +1,72 @@
+module sysl.vectors
+@tests
+@requires(heap)
+
+// What `sysl.vectors` claims, asserted in sysl: each list read off as numbers at two widths, and
+// applied through `shuffle` to show the lanes land where the name says. The lists are `const`
+// functions, so every value here was worked out while compiling.
+
+// -- the lists, as numbers -------------------------------------------------------------------------
+
+@test("zip_lo interleaves the low halves of a pair")
+zip_lo_numbers()
+    assert_eq(zip_lo[4]()[..], [0, 4, 1, 5][..])
+    assert_eq(zip_lo[8]()[..], [0, 8, 1, 9, 2, 10, 3, 11][..])
+
+@test("zip_hi interleaves the high halves of a pair")
+zip_hi_numbers()
+    assert_eq(zip_hi[4]()[..], [2, 6, 3, 7][..])
+    assert_eq(zip_hi[8]()[..], [4, 12, 5, 13, 6, 14, 7, 15][..])
+
+@test("unzip_even and unzip_odd take every other lane of a pair")
+unzip_numbers()
+    assert_eq(unzip_even[4]()[..], [0, 2, 4, 6][..])
+    assert_eq(unzip_odd[4]()[..], [1, 3, 5, 7][..])
+    assert_eq(unzip_odd[2]()[..], [1, 3][..])
+
+@test("reverse runs one vector's lanes back to front")
+reverse_numbers()
+    assert_eq(reverse[4]()[..], [3, 2, 1, 0][..])
+    assert_eq(reverse[2]()[..], [1, 0][..])
+
+@test("rotate moves the lanes toward zero and brings the fallen ones round")
+rotate_numbers()
+    assert_eq(rotate[4, 1]()[..], [1, 2, 3, 0][..])
+    assert_eq(rotate[4, 3]()[..], [3, 0, 1, 2][..])
+    assert_eq(rotate[4, 0]()[..], [0, 1, 2, 3][..])
+    assert_eq(rotate[4, 5]()[..], [1, 2, 3, 0][..])
+
+// -- the lists, applied -----------------------------------------------------------------------------
+
+@test("a zip and its unzip are inverses")
+zip_then_unzip()
+    val a: <4>int = [0, 1, 2, 3]
+    val b: <4>int = [10, 11, 12, 13]
+    val lo = a.shuffle(b, zip_lo[4]())
+    val hi = a.shuffle(b, zip_hi[4]())
+    val even = lo.shuffle(hi, unzip_even[4]())
+    val odd = lo.shuffle(hi, unzip_odd[4]())
+
+    assert_eq((lo[0], lo[1], lo[2], lo[3]), (0, 10, 1, 11))
+    assert_eq((hi[0], hi[1], hi[2], hi[3]), (2, 12, 3, 13))
+    assert_eq((even[0], even[3], odd[0], odd[3]), (0, 3, 10, 13))
+
+@test("one generic body interleaves at every width")
+generic_zip()
+    val a2: <2>int = [1, 2]
+    val b2: <2>int = [3, 4]
+    val a8: <8>int = [0, 1, 2, 3, 4, 5, 6, 7]
+    val b8: <8>int = [10, 11, 12, 13, 14, 15, 16, 17]
+
+    assert_eq(interleaved(a2, b2)[1], 3)
+    assert_eq(interleaved(a8, b8)[7], 13)
+
+@test("reverse and rotate apply to one vector")
+one_vector()
+    val v: <4>int = [5, 6, 7, 8]
+    val r = v.shuffle(reverse[4]())
+    val t = v.shuffle(rotate[4, 1]())
+
+    assert_eq((r[0], r[3], t[0], t[3]), (8, 5, 6, 5))
+
+private interleaved[const W: usize](a: <W>int, b: <W>int) -> <W>int = a.shuffle(b, zip_lo[W]())
