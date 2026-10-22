@@ -1,0 +1,112 @@
+module sh.sysl.compiler
+
+// **Floating-point contraction: a multiply whose result feeds an add or a subtract directly, in the
+// same expression, is one fused multiply-add, rounded once** -- clang's `-ffp-contract=on`, and the
+// shapes clang contracts are the ones contracted here (`reference/expressions.md`). It happens only at
+// a width the target fuses in one instruction, which is the `#if` symbols `fma` (binary32) and
+// `fma_dp` (binary64); everywhere else -- `f16`, `bf16`, `f128`, fixed point, a machine without the
+// unit at that width -- the multiply and the add stay two operations and round twice.
+//
+// **One reading of the rule serves all three places that compute floats**: the lowering emits
+// `llvm.fmuladd` for exactly the shapes `contracted_binary` and `contracted_update` answer, and the two
+// compile-time evaluators (`const_fold_typed`, `const_eval`) compute those same shapes with one
+// rounding, so a value is the same whether the compiler or the machine worked it out.
+//
+// What keeps a product apart is anything between it and the sum: a `val` it was bound to, a call it
+// passed through, an explicit conversion. That is how a program asks for two roundings.
+
+// The widths a machine fuses a multiply-add at.
+struct Fusing
+    single: bool
+    double: bool
+
+fusing_of(t: Target) -> Fusing = Fusing(t.fused_single(), t.fused_double())
+
+// Whether a float of `ty`, or a vector of them, is contracted: binary32 and binary64 alone, each where
+// the unit fuses at that width.
+contracts_at(f: Fusing, ty: Type) -> bool = vector_lane_of(ty) match
+    Floating(bits, brain) -> !brain && ((bits == 32 && f.single) || (bits == 64 && f.double))
+    _ -> false
+
+// `±(a * b) ± c`: the two factors, which of the two is negated, and whether the product is written
+// before the addend -- the order the three operands are evaluated in. An update's addend is the
+// place's own value, read before anything on the right.
+struct Contraction
+    a: TExpr
+    b: TExpr
+    negate_product: bool
+    negate_addend: bool
+    product_first: bool
+end Contraction
+
+// `l op r` at `ty` as a contraction, and its addend. clang's order of preference: a product on the
+// left, then on the right, then a negated product on the left, then on the right. A negated product
+// is a negated first factor, and a product subtracted is one too, so `c - a * b` is
+// `fmuladd(-a, b, c)` and `a * b - c` is `fmuladd(a, b, -c)`.
+contracted_binary(f: Fusing, op: string, l: TExpr, r: TExpr, ty: Type) -> Option[(Contraction, TExpr)]
+    if (op != "+" && op != "-") || !contracts_at(f, ty) then return None
+    if !same_float(texpr_type(l), ty) || !same_float(texpr_type(r), ty) then return None
+
+    val sub = op == "-"
+
+    product_at(l, ty) match
+        Some((a, b)) -> return Some((Contraction(a, b, false, sub, true), r))
+        None -> ()
+
+    product_at(r, ty) match
+        Some((a, b)) -> return Some((Contraction(a, b, sub, false, false), l))
+        None -> ()
+
+    negated_product_at(l, ty) match
+        Some((a, b)) -> return Some((Contraction(a, b, true, sub, true), r))
+        None -> ()
+
+    negated_product_at(r, ty).map(p -> (Contraction(p.0, p.1, !sub, false, false), l))
+end contracted_binary
+
+// `place += a * b` or `place -= a * b` at the place's type `ty`, the place's value being the addend.
+contracted_update(f: Fusing, op: string, ty: Type, value: TExpr) -> Option[Contraction]
+    if (op != "+=" && op != "-=") || !contracts_at(f, ty) || !same_float(texpr_type(value), ty) then
+        return None
+
+    val sub = op == "-="
+
+    product_at(value, ty) match
+        Some((a, b)) -> return Some(Contraction(a, b, sub, false, false))
+        None -> ()
+
+    negated_product_at(value, ty).map(p -> Contraction(p.0, p.1, !sub, false, false))
+end contracted_update
+
+// `a * b` written at `ty` itself, its factors at `ty` too.
+private product_at(x: TExpr, ty: Type) -> Option[(TExpr, TExpr)] = *x.kind match
+    TBinary(op, a, b, pty) ->
+        if op == "*" && same_float(pty, ty) && same_float(texpr_type(a), ty) && same_float(texpr_type(b), ty) then
+            Some((a, b))
+        else
+            None
+    _ -> None
+
+// `-(a * b)`, the negation written directly over the product.
+private negated_product_at(x: TExpr, ty: Type) -> Option[(TExpr, TExpr)] = *x.kind match
+    TUnary(op, inner, uty) -> if op == "-" && same_float(uty, ty) then product_at(inner, ty) else None
+    _ -> None
+
+private same_float(a: Type, b: Type) -> bool = type_eq(underlying(a), underlying(b))
+
+// -- the one rounding, while compiling ---------------------------------------------------------------
+
+// `a * b + c` rounded once at a binary width, by the machine the compiler runs on: `llvm.fma` is
+// exactly specified at both widths, an instruction where the unit fuses and C's correctly rounded
+// `fma`/`fmaf` where it does not. A binary32 one is computed at binary32, never at binary64 and rounded
+// again, which would round twice.
+fused_at(bits: int, a: real, b: real, c: real) -> real =
+    if bits == 32 then real(host_fmaf(f32(a), f32(b), f32(c))) else host_fma(a, b, c)
+
+// The two-operand forms around it: a negated factor or addend is the sign flipped, as `fneg` flips it.
+fused_parts(k: Contraction, bits: int, a: real, b: real, c: real) -> real =
+    fused_at(bits, if k.negate_product then -a else a, b, if k.negate_addend then -c else c)
+
+private extern "llvm.fma" host_fma(a: real, b: real, c: real) -> real
+
+private extern "llvm.fma" host_fmaf(a: f32, b: f32, c: f32) -> f32

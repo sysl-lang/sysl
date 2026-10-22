@@ -2440,7 +2440,7 @@ private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] 
             Array(n, el) -> (long(n), *el)
             _ -> return None
 
-        val at = const_fold_typed(index, cx.an.tables.layout.little_endian) match
+        val at = const_fold_typed(index, fold_machine(cx.an.tables)) match
             Some(ConstInt(n)) -> n.to_long()
             _ -> None
 
@@ -2482,7 +2482,7 @@ private device_address(cx: &Analyzer, t: TExpr, at: long, ty: Type) -> TExpr =
 private leaf_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr]
     if laid_down(t) then return Some(t)
 
-    val folded = scalar_image(t, cx.an.tables.layout.little_endian)
+    val folded = scalar_image(t, fold_machine(cx.an.tables))
 
     if folded.is_some() then folded else const_val_image(cx, name, t)
 end leaf_image
@@ -2516,7 +2516,7 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
             Array(n, _) -> long(n)
             _ -> return None
 
-        val at = const_fold_typed(index, cx.an.tables.layout.little_endian) match
+        val at = const_fold_typed(index, fold_machine(cx.an.tables)) match
             Some(ConstInt(n)) -> n.to_long()
             _ -> None
 
@@ -2545,7 +2545,7 @@ private constrained_image(cx: &Analyzer, name: string, t: TExpr, value: TExpr,
     if inner.is_none() then return None
 
     if d.lo.is_some() || d.hi.is_some()
-        val v = const_fold_typed(inner.unwrap(), cx.an.tables.layout.little_endian)
+        val v = const_fold_typed(inner.unwrap(), fold_machine(cx.an.tables))
 
         if v.is_none() then return None
 
@@ -2566,7 +2566,7 @@ end constrained_image
 // converted is imaged first**, so a conversion over arithmetic, over another conversion or over a
 // `const` call folds as one over a literal does.
 private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type) -> Option[TExpr]
-    val little = cx.an.tables.layout.little_endian
+    val m = fold_machine(cx.an.tables)
     val pointerish = to match
         Ptr(_) -> true
         CFn(_, _) -> true
@@ -2576,16 +2576,16 @@ private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type
 
     if from.is_none() then return None
 
-    if pointerish then return address_image(t, inner, from.unwrap(), to, little)
+    if pointerish then return address_image(t, inner, from.unwrap(), to, m)
 
     if is_fixed(to) then return fixed_image(t, from.unwrap(), to)
 
-    scalar_image(TExpr(t.span, TCast(from.unwrap(), to)), little)
+    scalar_image(TExpr(t.span, TCast(from.unwrap(), to)), m)
 end cast_image
 
 // A device address: the integer folded, the conversion kept.
-private address_image(t: TExpr, inner: TExpr, from: TExpr, to: Type, little: bool) -> Option[TExpr] =
-    const_fold_typed(from, little) match
+private address_image(t: TExpr, inner: TExpr, from: TExpr, to: Type, m: FoldMachine) -> Option[TExpr] =
+    const_fold_typed(from, m) match
         Some(ConstInt(n)) -> Some(TExpr(t.span, TCast(TExpr(inner.span, TIntLit(n, texpr_type(inner))), to)))
         _ -> None
 
@@ -2629,8 +2629,8 @@ private static_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf
 end static_images
 
 // A scalar initializer as the literal it folds to.
-private scalar_image(t: TExpr, little: bool) -> Option[TExpr]
-    val v = const_fold_typed(t, little)
+private scalar_image(t: TExpr, m: FoldMachine) -> Option[TExpr]
+    val v = const_fold_typed(t, m)
 
     if v.is_none() then return None
 

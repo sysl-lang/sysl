@@ -498,6 +498,32 @@ checked_shl(e: *Emit, bits: int, signed: bool, lv: Val, sh: Val) -> Val
     r
 end checked_shl
 
+// `a * b + c` as one `llvm.fmuladd` at `ty`, a float or a vector of them -- a contracted expression
+// (`fp_contract.sysl`), reached only at a width the target fuses. Where the back end would split an
+// `llvm.fmuladd` back into two operations although the unit fuses, it is `llvm.fma`, which it cannot.
+fmuladd(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
+    val lt = lty(e, ty)
+    val fn = (if e.target.fuses_muladd() then llvm_fmuladd_entry() else llvm_fma_entry()).at([lt])
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(lt))
+    params.push(ir_param(lt))
+    params.push(ir_param(lt))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(lt, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(lt, a))
+    args.push(ir_arg(lt, b))
+    args.push(ir_arg(lt, c))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), lt, VGlobal(fn), args))
+    r
+end fmuladd
+
 // Declares an intrinsic once, under the overload-mangled name that carries its width.
 request_intrinsic(e: *Emit, sig: IrFuncSig)
     for sat_decl in e.sat_decls
