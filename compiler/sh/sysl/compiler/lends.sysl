@@ -58,6 +58,75 @@ check_lends_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: st
                     s"written as one, '${ls.at(i)}: *T -> R'")
 end check_lends_names
 
+// What `@scoped` may name, and what it may stand above (`docs/design/scope.md § 1`): a method whose
+// receiver is `*self` -- the pointer a `@lends` call lent the body that calls it -- and, once each, a
+// parameter that is a call. The call is usually a `&sync Fn`, since what is named crosses into another
+// domain; a bare arrow and a type parameter bounded by a call trait are calls too, and the crossing
+// rule `@scoped` implies decides what may be passed there. A free function and a field are refused
+// by the parser, before a declaration exists.
+check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val ss = d.marks.scoped
+
+    if ss.is_empty() then return
+
+    val ps = d.params
+    val receiver = scoped_receiver(ps)
+
+    if receiver != ""
+        a.fault(scope, span, s"'@scoped' promises that what '$shown' runs finishes before the " +
+                "'@lends' call that lent its receiver returns, so the receiver is the pointer that " +
+                s"call lent, written '*self' — this one $receiver")
+
+    for i in 0..<ss.len()
+        var found: Option[Param] = None
+
+        for item in ps
+            if item.name == ss.at(i) then found = Some(item)
+
+        var twice = false
+
+        for j in 0..<i
+            if ss.at(j) == ss.at(i) then twice = true
+
+        if found.is_none()
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a parameter of " +
+                    s"'$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}' twice, and a parameter is waited " +
+                    "for or it is not — the second says nothing the first does not")
+        else if !callable_param(d, found.unwrap()) && !erased_call(found.unwrap())
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a call — what a " +
+                    "scoped member promises is that a body it runs in another domain finishes " +
+                    "before the scope does, so the parameter is written as one, " +
+                    s"'${ss.at(i)}: &sync Fn() -> R'")
+end check_scoped_names
+
+// What is wrong with a scoped member's receiver, as the end of a sentence, or nothing where it is the
+// `*self` the promise is about.
+private scoped_receiver(ps: Buf[Param]) -> string
+    if ps.is_empty() || ps.at(0).name != "self" then return "has no receiver"
+
+    *ps.at(0).typ.kind match
+        PtrType(_) -> ""
+        RefType(_, _) -> "takes '&self', a share of a value rather than the pointer a call lends"
+        _ -> "takes 'self' by value, a copy rather than the pointer a call lends"
+end scoped_receiver
+
+// A call behind a reference, `&Fn(…)` or `&sync Fn(…)`: one body chosen at run time, which is what a
+// member that hands its parameter to another domain usually holds.
+private erased_call(p: Param) -> bool = *p.typ.kind match
+    RefType(inner, _) -> *inner.kind match
+        FnType(_, _, _) -> true
+        _ -> false
+    _ -> false
+
 // A bare arrow, before the declaration's rewrite or after it: a type parameter of this declaration
 // bounded by a call trait.
 private callable_param(d: FuncDecl, p: Param) -> bool = *p.typ.kind match
@@ -103,8 +172,9 @@ struct Lending
         None -> None
 end Lending
 
-// Holds every body handed to a `@lends` parameter, anywhere in the program, to the rule.
-check_lent_bodies(a: &Analysis, funcs: Buf[TFunc])
+// Holds every body handed to a `@lends` parameter, anywhere in the program, to the rule -- a module
+// `val`'s initializer included, which is a call like any other and is run by no function here.
+check_lent_bodies(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     var any = false
 
     for f in funcs
@@ -124,6 +194,13 @@ check_lent_bodies(a: &Analysis, funcs: Buf[TFunc])
         val scope = func_home(a, f.name)
 
         walk_block_stmts(f.body, expr_walk(false, e -> lent_call(an, cx, scope, e)))
+
+    for v in vals
+        if v.init.is_some()
+            val scope = val_home(a, v.symbol)
+
+            walk_texpr(v.init.unwrap(), expr_walk(false, e -> lent_call(an, cx, scope, e)))
+        end if
 end check_lent_bodies
 
 private lent_call(a: &Analysis, cx: &Lending, scope: Scope, e: TExpr)
@@ -182,8 +259,9 @@ private lent_argument(a: &Analysis, cx: &Lending, scope: Scope, shown: string, l
     val an = a
     val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
     val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
+    val scoped: &Fn(string, usize) -> bool = (n, j) -> lent_scoped(cx, n, j)
 
-    lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, shown, false, keeps, answers)
+    lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, shown, false, keeps, answers, scoped)
 end lent_argument
 
 // Where `name` keeps the pointer it is handed at parameter `i`, by storing it, returning it, or passing
@@ -203,9 +281,31 @@ borrowed_pointer_kept(a: &Analysis, funcs: Buf[TFunc], name: string, i: usize) -
     val an = a
     val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
     val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
+    val scoped: &Fn(string, usize) -> bool = (n, j) -> lent_scoped(cx, n, j)
 
-    lent_kept_at(a, func_home(a, name), f.unwrap().params.at(i).0, f.unwrap().body, keeps, answers)
+    lent_kept_at(a, func_home(a, name), f.unwrap().params.at(i).0, f.unwrap().body, keeps, answers,
+                 scoped)
 end borrowed_pointer_kept
+
+// Whether the parameter of `name` at a position is one its `@scoped` names -- the one place a closure
+// boxed at the call does not outlive it.
+private lent_scoped(cx: &Lending, name: string, i: usize) -> bool
+    val f = cx.find(name)
+
+    if f.is_none() || i >= f.unwrap().params.len() then return false
+
+    holds_string(f.unwrap().marks.scoped, f.unwrap().params.at(i).0)
+end lent_scoped
+
+// Whether a call of `f` lets go of the argument at a position by `f`'s `@scoped` promise: the
+// receiver, and each parameter the annotation names.
+private scoped_at(f: TFunc, i: usize) -> bool
+    if f.marks.scoped.is_empty() then return false
+
+    val name = f.params.at(i).0
+
+    (i == 0 && name == "self") || holds_string(f.marks.scoped, name)
+end scoped_at
 
 // Whether a callee lets the argument at a position outlive the call. A function with no body here --
 // an `extern` -- may do anything with it.
@@ -222,6 +322,12 @@ private lent_keeps(a: &Analysis, cx: &Lending, name: string, i: usize) -> bool
 
     if f.is_none() || i >= f.unwrap().params.len() then return true
 
+    // **A `@scoped` member keeps neither its receiver nor what it runs.** Its body does keep both --
+    // the scope queues a job that holds them -- but the promise is that the job finishes before the
+    // `@lends` call that lent the receiver returns, which is exactly as long as the pointer is good
+    // for. The promise is the library's to keep, as `@crossing`'s is.
+    if scoped_at(f.unwrap(), i) then return false
+
     cx.busy.push(key)
 
     var seeds: Buf[string] = buf()
@@ -231,7 +337,9 @@ private lent_keeps(a: &Analysis, cx: &Lending, name: string, i: usize) -> bool
     val an = a
     val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
     val answers: &Fn(string, usize) -> bool = (n, j) -> lent_answered(an, cx, n, j)
-    val out = lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, "", true, keeps, answers)
+    val scoped: &Fn(string, usize) -> bool = (n, j) -> lent_scoped(cx, n, j)
+    val out = lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, "", true, keeps, answers,
+                           scoped)
 
     cx.busy.truncate(cx.busy.len() - 1)
     cx.kept.put(key, out)

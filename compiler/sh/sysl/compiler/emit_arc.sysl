@@ -133,6 +133,21 @@ view_owner(e: *Emit, ty: Type, v: Val) -> Val
     o
 end view_owner
 
+// The value field `i` of `decl` is built from: as it was read, or -- for a view a scoped child
+// borrowed -- with its owner word set to null. **Null is the form of a view of a frame's own array**,
+// which every view operation already handles, so the child takes no share of the caller's count and
+// gives none back, and nothing else about the view changes (`borrowed_capture`).
+captured_value(e: *Emit, decl: &StructType, i: usize, v: Val) -> Val
+    val fty = decl.fields.at(i).1
+
+    if !borrowed_capture(decl, fty) then return v
+
+    val r = fresh_reg(e)
+
+    emit(e, InInsert(r, lty(e, fty), v, LPtr, VNull, index_list(0)))
+    r
+end captured_value
+
 // Takes a share of everything the value **at an address** refers to, and gives one back.
 //
 // The pair exists for a type the layout calls large, which never becomes a first-class value: there
@@ -245,12 +260,15 @@ end rarely
 // A zero-sized field holds no reference, so it is skipped by the test already -- but the index has
 // to be the slot it landed in rather than the one it was written at, or a field after one would be
 // walked at the wrong offset.
+//
+// `holder` is the struct the fields are a struct's own, and nothing for a variant's: a view a scoped
+// child borrowed is a field of its closure that holds no share (`borrowed_capture`).
 private each_value(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, gaps: Option[Gaps], value: Val,
-                   retain: bool)
+                   retain: bool, holder: Option[&StructType])
     for i in 0..<fields.len()
         val fty = fields.at(i).1
 
-        if contains_counted(fty)
+        if walked_field(holder, fty)
             val f = fresh_reg(e)
 
             emit(e, InExtract(f, aggregate, value, index_list(llvm_index(gaps, field_slot(fields, i)))))
@@ -260,11 +278,11 @@ end each_value
 // The same over an aggregate at an address, reaching each member with `getelementptr` instead of
 // lifting it out of an aggregate the caller would have had to materialize first.
 private each_slot(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, gaps: Option[Gaps], base: Val,
-                  retain: bool)
+                  retain: bool, holder: Option[&StructType])
     for i in 0..<fields.len()
         val fty = fields.at(i).1
 
-        if contains_counted(fty)
+        if walked_field(holder, fty)
             val f = fresh_reg(e)
 
             var idx: Buf[IrArg] = buf()
@@ -275,9 +293,16 @@ private each_slot(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, gaps:
             walk_at(e, fty, f, retain)
 end each_slot
 
+// Whether a walk takes or gives back a share of a field of this type.
+private walked_field(holder: Option[&StructType], fty: Type) -> bool
+    if !contains_counted(fty) then return false
+
+    holder.is_none() || !borrowed_capture(holder.unwrap(), fty)
+end walked_field
+
 // The body of `arc.copy.T` / `arc.dispose.T`: the walk over a value of `T` held in `%v`.
 private walk_value(e: *Emit, ty: Type, v: Val, retain: bool) = underlying(ty) match
-    Struct(d) -> each_value(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), v, retain)
+    Struct(d) -> each_value(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), v, retain, Some(d))
 
     // An array is walked with a loop rather than an unrolled chain: the element count is a
     // compile-time constant, but it can be very large, and the code for one element is not.
@@ -297,7 +322,7 @@ private walk_value(e: *Emit, ty: Type, v: Val, retain: bool) = underlying(ty) ma
 
 // The body of `arc.copy_at.T` / `arc.dispose_at.T`: the walk over a `T` at `%p`.
 private walk_slot(e: *Emit, ty: Type, p: Val, retain: bool) = underlying(ty) match
-    Struct(d) -> each_slot(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), p, retain)
+    Struct(d) -> each_slot(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), p, retain, Some(d))
 
     Array(n, elem) -> arc_array(e, *elem, p, VInt(from_int(long(n))), retain, false)
 
@@ -373,9 +398,9 @@ private arc_enum(e: *Emit, d: &EnumType, tag: Val, value: Val, p: Val, retain: b
             val gaps = variant_gaps(e.layout, variant)
 
             if at then each_slot(e, variant.fields, variant_lty(d, variant), gaps, payload_ptr(e, d, p),
-                                 retain)
+                                 retain, None)
             else each_value(e, variant.fields, variant_lty(d, variant), gaps,
-                            enum_payload(e, d, variant, value), retain)
+                            enum_payload(e, d, variant, value), retain, None)
 
             emit_term(e, InBr(end_l))
             emit_label(e, next_l)

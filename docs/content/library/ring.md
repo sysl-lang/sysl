@@ -200,6 +200,47 @@ six slots gets six. So wrapping is a compare and a subtract instead of a mask.
 **A cursor holds the storage rather than the ring**, so pushing while one is live leaves it reading
 the run it started on.
 
+## A popped value is given up at the pop
+
+A ring moves values rather than copying them: a push moves the value into its slot with
+[`slot_put`](/reference/memory/#moving-one-value-through-a-raw-pointer) and a pop moves
+it out with `slot_take`, leaving the slot **empty**. So a popped reference carries the one share the
+slot held, with no retain on the way out, and **its destructor runs when the caller lets go of it** —
+not later, when a push reuses the slot. `ring(slots)` and `clear()` empty slots the same way.
+
+```sysl
+import sysl.container.ring.ring
+
+struct Job
+    id: int
+
+impl Drop for Job
+    drop(self) = print("job", self.id, "let go")
+
+var slots: [2]&Job = [Job(0); 2]
+var r = ring(slots[..])
+
+r.push_back(Job(1))
+r.push_back(Job(2))
+
+r.pop_front() match
+    Some(j) -> print("ran", j.id)
+    None -> ()
+
+print("popped")
+r.clear()
+print("cleared")
+```
+
+```output
+job 0 let go
+ran 1
+job 1 let go
+popped
+job 2 let go
+cleared
+```
+
 ## The storage is a pointer, and that is the crossing rule
 
 The slots are held as a `*T` and a count rather than as a `[]T`, and it is not a preference. **A

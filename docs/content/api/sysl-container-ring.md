@@ -40,6 +40,14 @@ region something else owns. It is the same contract `channel(slots[..])` already
 caller's number rather than one this file chose -- a program that asked for six slots gets six.
 So wrapping is a compare and a subtract instead of a mask, which is what `seat` below is.
 
+**A value is moved in and out, never copied.** A push puts the value into an empty slot with
+`slot_put` and a pop takes it back out with `slot_take`, so the share a counted value carries goes
+in with it and comes out with it, and the slot it leaves is empty again. A value popped is the
+caller's alone: its destructor runs when the caller lets it go, not when the slot is next reused,
+and the next push into that slot gives nothing back -- which matters most in a channel, where that
+push is on another thread. `ring(...)` empties every slot first, giving back whatever the storage
+was filled with, so a slot outside the live run is always an empty one.
+
 ## Index
 
 [`ring`](#ring) [`Ring`](#ring-1) [`RingCursor`](#ringcursor) [Index for Ring[T]](#index-for-ringt) [IndexSet for Ring[T]](#indexset-for-ringt) [Iterate for RingCursor[T]](#iterate-for-ringcursort) [Walk for Ring[T]](#walk-for-ringt)
@@ -60,6 +68,10 @@ there is no receiver for it to be read off: `ring(slots[..])` says everything, w
 
 **The slice is read here and not kept**, for the reason the `slots` field gives: what is stored is
 its address and its length.
+
+**Every slot is emptied here**, giving back whatever the storage was filled with, so that every push
+after it moves a value into a slot that holds nothing. Over storage of plain values that is no work
+at all.
 
 ## Types
 
@@ -89,10 +101,10 @@ it.
 | `last` | `last(self) -> Option[T]` |  |
 | `push_back` | `push_back(*self, v: T) -> bool` | Adds to the back, and answers whether there was room. |
 | `push_front` | `push_front(*self, v: T) -> bool` | Adds to the front, stepping `head` backwards into the space behind it. |
-| `pop_front` | `pop_front(*self) -> Option[T]` | Takes from the front. |
-| `pop_back` | `pop_back(*self) -> Option[T]` | Takes from the back. |
+| `pop_front` | `pop_front(*self) -> Option[T]` | Takes from the front, moving the value out and leaving its slot empty. |
+| `pop_back` | `pop_back(*self) -> Option[T]` | Takes from the back, moving the value out and leaving its slot empty. |
 | `overwrite` | `overwrite(*self, v: T) -> Option[T]` | Adds to the back, **dropping the oldest value to make room** where the ring is full, and answers whatever was dropped. |
-| `clear` | `clear(*self)` | Forgets every value. |
+| `clear` | `clear(*self)` | Lets go of every value, there and then, leaving every slot empty. |
 
 ### `RingCursor`
 

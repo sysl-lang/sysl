@@ -1,0 +1,56 @@
+// Where today's spellings stop: a width-generic interleave, an irregular byte permutation, and a
+// permutation chosen at run time. Run with `sysl run today_limits.sysl`; run.sh keeps the assembly.
+
+// An irregular permutation of sixteen bytes, written as a literal of lane reads. arm64 has one
+// `tbl` for it, x86 one `pshufb`.
+@noinline
+bytes_irregular(a: <16>u8) -> <16>u8 =
+    [a[3], a[0], a[9], a[7], a[15], a[1], a[1], a[4], a[12], a[2], a[8], a[6], a[10], a[14], a[5], a[13]]
+
+// Interleaving the low halves at ANY width. A lane index must be constant, and `i` in a loop is not,
+// so the lanes go through memory: store both vectors, gather, load the run.
+@noinline
+zip_lo[const W: usize](a: <W>f32, b: <W>f32) -> <W>f32
+    var xa: [W]f32
+    var xb: [W]f32
+    var out: [W]f32
+
+    xa.store(0, a)
+    xb.store(0, b)
+
+    for i in 0..<W / 2
+        out[2 * i] = xa[i]
+        out[2 * i + 1] = xb[i]
+
+    out.load(0)
+
+// A permutation whose indices arrive at run time: a table lookup. arm64 could do it in one `tbl`.
+@noinline
+permute(a: <4>f32, idx: <4>u32) -> <4>f32
+    var xa: [4]f32
+    var xi: [4]u32
+    var out: [4]f32
+
+    xa.store(0, a)
+    xi.store(0, idx)
+
+    for i in 0..<4 do out[i] = xa[xi[i] & 3]
+
+    out.load(0)
+
+val bytes: <16>u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+val p = bytes_irregular(bytes)
+
+val a4: <4>f32 = [1, 2, 3, 4]
+val b4: <4>f32 = [10, 20, 30, 40]
+val a8: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+val b8: <8>f32 = [10, 20, 30, 40, 50, 60, 70, 80]
+
+val z4 = zip_lo(a4, b4)
+val z8 = zip_lo(a8, b8)
+val idx: <4>u32 = [3, 3, 0, 1]
+val q = permute(a4, idx)
+
+print(p[0], p[2], p[15])
+print(z4[0], z4[1], z4[2], z4[3], z8[6], z8[7])
+print(q[0], q[1], q[2], q[3])

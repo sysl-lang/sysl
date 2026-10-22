@@ -39,10 +39,24 @@ import sysl.math.bigint.from_int
 // They are the raw tier's bargain, like `ptr_cast` and the atomics: greppable, and the caller owes
 // the one thing the compiler cannot check -- that nothing reads a slot of `[]T` past the live prefix.
 // `sysl.buf.Buf` is what writes them, so that no program has to.
+//
+// Two more move a value through a `*T` one slot at a time, for storage that is not a prefix -- a
+// ring's live run wraps, so a vacated slot can sit between two live ones:
+//
+// - `slot_take(p) -> T` moves the value out. The share the slot held becomes the result's, so no
+//   count is taken or given back, and the slot is left **empty**: zeroed when the element holds a
+//   count, which is the state zeroed storage starts in, so whatever owns the storage gives back
+//   nothing for it when it lets the slot go. A slot of an element that holds no count is only read.
+// - `slot_put(p, v)` moves `v` into an empty slot: the value's share becomes the slot's, and nothing
+//   that was there is given back.
+//
+// Both are unchecked: the caller promises that a taken slot is live and a put one is empty. Rust's
+// `ptr::read` and `ptr::write` are the same pair.
 
-// The three names, whatever claims them.
+// The five names, whatever claims them.
 slot_form_word(name: string) -> bool =
-    name == "slot_storage" || name == "slot_place" || name == "slot_vacate"
+    name == "slot_storage" || name == "slot_place" || name == "slot_vacate" ||
+        name == "slot_take" || name == "slot_put"
 
 // Whether a name in call position is one of these forms. Like the atomics, a function or a local of
 // the name is what a call reaches, and the form applies only where nothing else claims it.
@@ -52,9 +66,55 @@ slot_form(cx: &Analyzer, name: string) -> bool =
 // One of the forms, analyzed.
 slot_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], expected: Option[Type]) -> TExpr
     if name == "slot_storage" then return slot_storage_call(cx, span, args, expected)
+    if name == "slot_take" || name == "slot_put" then return slot_move_call(cx, span, name, args)
 
     slot_write_call(cx, span, name, args)
 end slot_call
+
+// `slot_take(p)` and `slot_put(p, v)` -- the element type is the pointer's.
+private slot_move_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    val take = name == "slot_take"
+    val want: usize = if take then 1 else 2
+
+    if args.len() != want then
+        return cx.err(span, s"'$name' takes ${quantity(want, "argument")} — " +
+                      s"${if take then "the pointer to the slot" else "the pointer to the slot and the value"}" +
+                      s" — but ${supplied(args.len(), "argument")}")
+
+    val p = type_expr_bare(cx, args.at(0))
+    val pt = texpr_type(p)
+
+    if pt == Unknown then return bad_expr(span)
+
+    val elem = underlying(pt) match
+        Ptr(inner) ->
+            if is_trait(*inner) then
+                return cx.err(args.at(0).span, s"'$name' moves a whole value through a '*T', and a " +
+                              "pointer to a trait is two words — the address and the table of the " +
+                              "type it was erased from")
+
+            *inner
+        _ ->
+            return cx.err(args.at(0).span, s"'$name' moves a value through a raw pointer, which is " +
+                          s"a '*T' — this is ${type_show(pt)}")
+
+    var all: Buf[TExpr] = buf()
+
+    all.push(p)
+
+    if !take then
+        val v = coerce(cx, type_expr(cx, args.at(1), Some(elem)), elem)
+        val vt = texpr_type(v)
+
+        if vt != Unknown && !type_eq(vt, elem) && !type_eq(underlying(vt), underlying(elem)) then
+            cx.fault(args.at(1).span, s"'slot_put' puts a ${type_show(elem)} into the slot " +
+                     s"${type_show(pt)} points at, and this is a ${type_show(vt)}")
+
+        all.push(v)
+    end if
+
+    TExpr(span, TSlots(name, all, elem, if take then elem else Unit))
+end slot_move_call
 
 // `slot_storage(n)` -- the element type comes from the position, the way `ptr_cast`'s does.
 private slot_storage_call(cx: &Analyzer, span: Span, args: Buf[Expr],
@@ -156,8 +216,10 @@ end one_texpr
 // One of the forms, lowered.
 gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
     if op == "slot_storage" then return gen_slot_storage(e, args.at(0), elem, ty)
+    if op == "slot_take" then return gen_slot_take(e, args.at(0), elem)
 
-    if op == "slot_place" then gen_slot_place(e, args.at(0), args.at(1), args.at(2), elem)
+    if op == "slot_put" then gen_slot_put(e, args.at(0), args.at(1), elem)
+    else if op == "slot_place" then gen_slot_place(e, args.at(0), args.at(1), args.at(2), elem)
     else gen_slot_vacate(e, args.at(0), args.at(1), elem)
 
     VNothing
@@ -176,6 +238,36 @@ private gen_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> 
 
     buffer_view(e, slice_ty, made.0, made.1, n)
 end gen_slot_storage
+
+// The value at `p`, which arrives owning the share the slot held -- registered as a temporary, as a
+// call's result is -- and the slot zeroed behind it where the element holds a count, so nothing that
+// lets the storage go later gives that share back a second time.
+private gen_slot_take(e: *Emit, at: TExpr, elem: Type) -> Val
+    val p = gen_expr(e, at)
+
+    if zero_sized(elem) then return zero_of(e, elem)
+
+    val v = fresh_reg(e)
+
+    emit(e, InLoad(v, lty(e, elem), p, AccPlain, None))
+
+    if !contains_counted(elem) then return v
+
+    emit(e, InStore(lty(e, elem), zero_of(e, elem), p, AccPlain, None))
+    own_temp(e, v, elem)
+end gen_slot_take
+
+// `v` stored at `p` with a share of its own and nothing at `p` given back: the slot was empty.
+private gen_slot_put(e: *Emit, at: TExpr, value: TExpr, elem: Type)
+    val p = gen_expr(e, at)
+    val v = gen_expr(e, value)
+
+    if zero_sized(elem) then return
+
+    if contains_counted(elem) then retain_value(e, elem, v)
+
+    emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+end gen_slot_put
 
 private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Type)
     val view = slot_view(e, xs)

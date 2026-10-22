@@ -73,8 +73,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
-`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, six: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
+`@scoped`, `@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -151,6 +151,219 @@ The `@` is also read **inside a pattern**, where it binds a name to what a sub-p
 ([patterns](/reference/patterns/)). The two never compete: an annotation's `@` is a prefix at the
 start of a line above a declaration, and a pattern's is infix between a name and a pattern, in a
 position no declaration may stand.
+
+### `@scoped(f)` — a member that finishes what it starts before its scope closes
+
+**`@scoped(f)` above a method promises that `f` runs in another concurrency domain and finishes before
+the `@lends` call that lent the method's `*self` returns.** It is how a scheduler's `spawn` says its
+children are joined by the scope that handed out the receiver, and it implies `@crossing(f)`: what is
+passed at `f` is held to the [crossing rule](/reference/memory/), exactly as if both were written.
+The compiler cannot see the join — that is the library's promise to keep, as `@crossing`'s boundary
+is — so what it changes is what a lent body may do with the scope: a call of the member on the lent
+pointer does not keep it, and a closure written straight at `f` is not counted as put on the heap,
+though it captures the scope.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn(*Scope) -> unit)
+        val s = self
+
+        self.jobs.push(() -> f(s))
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+print(Runner(0).scope((s) ->
+    s.spawn((t) -> print(usize(s) == usize(t)))
+    17))
+```
+
+```output
+true
+17
+```
+
+Without `@scoped` the same body is refused twice over: `spawn` keeps the receiver in the job it
+queues, and the closure capturing `s` is boxed onto the heap. Only the box written at the argument
+is spared — one made earlier and held in a local could be handed anywhere — and what `spawn` answers
+is still followed as made of the scope, so a handle built around `self` may not be returned from the
+body or stored outside it.
+
+**A closure written straight at `f` may capture a view.** Everything a `&sync Fn` may capture it may
+capture too — scalars, arrays, `&sync T`, raw pointers, the lent scope — and also a view, `[]T` or
+`[]const T`, whose elements may themselves be shared. The view is lent to the child rather than shared
+with it: it is stored with a null owner, the form a view of a frame's own array has, so neither
+building the child nor letting it go touches the count of the storage it was taken from, and the
+caller is held inside the scope call until the child is done.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+total(v: []int) -> int
+    Runner(0).scope((s) ->
+        s.spawn(() -> print(v[0] + v[1] + v[2]))
+        int(v.len))
+
+var b: Buf[int] = buf()
+
+b.push(3)
+b.push(4)
+b.push(5)
+print(total(b.view()))
+```
+
+```output
+12
+3
+```
+
+Only a closure written at the argument borrows; the same capture anywhere else — a `&sync Fn`
+parameter, a member that is only `@crossing`, a closure made earlier and handed in — is refused as it
+always was. So are a `&T`, a `string`, a `Buf`, and a view whose elements cannot be shared:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+first(ws: []string) -> int
+    Runner(0).scope((s) ->
+        s.spawn(() -> print(ws[0]))
+        0)
+```
+
+```error
+but the 'ws' it captures reaches a '[]string', which owns its elements through a count that is not atomic
+```
+
+**What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent:
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(v)
+    run(*self, v: *int) -> int = v[0]
+```
+
+```error
+'@scoped' names 'v', which is not a call
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(g)
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+'@scoped' names 'g', which is not a parameter of 'Chan.run'
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(f, f)
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+'@scoped' names 'f' twice
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(f)
+    run(self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+so the receiver is the pointer that call lent, written '*self' — this one takes 'self' by value
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped()
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+There is no empty form
+```
+
+**It stands above a method and nowhere else.** A free function has no receiver for a `@lends` call to
+have lent, and a field is never called:
+
+```sysl
+@scoped(f)
+run(f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+a free function has no receiver for a '@lends' call to have lent
+```
+
+```sysl
+struct Chan
+    @scoped(f)
+    f: int
+```
+
+```error
+a field and a variant are never called, and have no parameter to run
+```
 
 ## `::` — what a type's own name answers
 
@@ -3280,31 +3493,35 @@ print(p[0])
 **What carries a count stays out**: a struct with C bitfields is laid out as C lays its counterpart
 out, so a string, a slice or a reference among its fields is refused.
 
-**Not built in this release**: crossing a C boundary by value — as an `extern`'s argument or
-result, or an `@export`'s parameter or result — and its declaration in a generated header, which
-writes it as an incomplete type C reaches through a pointer. C passes a bitfield as its declared
-type, which is not how an ordinary struct of the same fields travels on x86-64, WebAssembly or
-RISC-V's `lp64d`, so it crosses as a pointer:
+**It crosses a C boundary by value as C's own struct does** — as an `extern`'s argument or result,
+an `@export`'s parameter or result, and through a `*extern` pointer either way. A C compiler
+classifies such a struct by its fields, each named bitfield an integer of its own, and that is not
+always how an ordinary struct of the same size travels: on x86-64 `{ double d; unsigned a:3; }`
+comes back in a whole second register, WebAssembly passes one bitfield directly but two through
+memory, and RISC-V's `lp64d` gives a float beside one bitfield a register of each but a float beside
+two bitfields a single integer register. sysl follows clang on every machine it builds for:
 
 ```sysl
 struct Status
     ready: bool in u32
     mode: u3 in u32
 
-extern apply(s: Status)
+@export("next")
+next(s: Status) -> Status = Status(!s.ready, s.mode + 1)
 
-apply(Status(true, 5))
+val step: *extern(Status) -> Status = &next
+val s = step(Status(true, 5))
+
+print(s.ready, s.mode)
 ```
 
-```error
-'Status' has C bitfields, and passing it by value to the 'extern' 'apply' is not built in this release — pass its address, as a '*Status'
+```output
+false 6
 ```
 
 **The same holds for anything holding one by value**, at any depth: a struct whose field is one, an
 array of them, a union over one, a struct holding any of those, and a struct with an anonymous
-member that declares bitfields — which are the struct's own, as in C — or holds such a struct. The
-refusal names the struct with the bitfields and where it lies. Every one of them crosses by address,
-and a pointer to one is an ordinary pointer:
+member that declares bitfields — which are the struct's own, as in C:
 
 ```sysl
 struct Status
@@ -3315,14 +3532,20 @@ struct Device
     id: u16
     states: [2]Status
 
-extern report(d: Device)
+@export("modes")
+modes(d: Device) -> u32 = u32(d.id) * 100 + u32(d.states[0].mode) * 10 + u32(d.states[1].mode)
 
-report(Device(1, [Status(true, 5), Status(false, 2)]))
+val report: *extern(Device) -> u32 = &modes
+
+print(report(Device(1, [Status(true, 5), Status(false, 2)])))
 ```
 
-```error
-'Device' holds 'Status', which has C bitfields, at 'Device.states[0]', and passing it by value to the 'extern' 'report' is not built in this release — pass its address, as a '*Device'
+```output
+152
 ```
+
+**Not built in this release**: its declaration in a generated header, which writes it as an
+incomplete type C reaches through a pointer.
 
 ### `@align(n)` — where the aggregate begins
 

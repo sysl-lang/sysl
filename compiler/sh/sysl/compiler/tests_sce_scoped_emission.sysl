@@ -1,0 +1,361 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A view captured by a closure written at a `@scoped` parameter (`docs/design/scope.md` § 2, "What a
+// scoped closure may capture"; `reference/attributes.md § @scoped`). The child may capture a view
+// whose elements may be shared, which a `&sync Fn` elsewhere may not (`sharing.sysl`'s `unlent`), and
+// the view is stored with a null owner word, so neither building the closure nor letting it go
+// touches the caller's count (`closure.sysl`'s `lending_closure_base`, `type_queries.sysl`'s
+// `borrowed_capture`, `emit_arc.sysl`'s `captured_value`). The scopes here are test-local structs: one
+// that runs its jobs when the lender's body is done, and one that runs each on a thread of its own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private sce_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-sce").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end sce_outcome
+
+private sce_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sce_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end sce_prints
+
+private sce_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sce_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end sce_refused
+
+// The text of the one function whose `define` line holds `name`, or "" where there is none.
+private sce_define(ir: string, name: string) -> string
+    var rest = ir
+
+    loop
+        val at = rest.index_of("define ")
+
+        if at.is_none() then return ""
+
+        rest = rest[at.unwrap()..<rest.len]
+
+        val end_at = rest.index_of("\n}").unwrap_or(rest.len)
+        val body = rest[0..<end_at]
+        val line_end = body.index_of("\n").unwrap_or(body.len)
+
+        if body[0..<line_end].index_of(name).is_some() then return body
+
+        rest = rest[end_at..<rest.len]
+end sce_define
+
+// A scope that queues each job and runs them once the lender's body is done, a second member that is
+// only `@crossing`, and a lender. `marks` is the annotation above `spawn`.
+private sce_scope(marks: string) -> string = replace_all(raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Scope
+        jobs: Buf[&sync Fn() -> unit]
+
+        MARK
+        spawn(*self, f: &sync Fn(*Scope) -> unit)
+            val s = self
+            self.jobs.push(() -> f(s))
+
+        @crossing(f)
+        handed(*self, f: &sync Fn(*Scope) -> unit) = f(self)
+
+    struct Runner
+        n: int
+
+        @lends(body)
+        scope[R](self, body: *Scope -> R) -> R
+            var s = Scope(buf())
+            val r = body(&s)
+
+            for j in s.jobs do j()
+            r
+
+    struct Thing
+        n: int
+
+    """, "MARK", marks)
+
+private sce_head(what: string) -> string =
+    "a closure shared between two domains may be called from either, so every count it captures " +
+    s"has to be atomic — but the $what"
+
+private sce_view_tail() -> string =
+    ", which owns its elements through a count that is not atomic. A literal's elements are " +
+    "immortal and would be safe to share, but nothing in the type says whether these are, so a " +
+    "shared object holds no view at all ('06')"
+
+// The child below reads a view of a heap buffer the caller made.
+private sce_reader() -> string = sce_scope("@scoped(f)") + raw"""
+    total(v: []int) -> int
+        Runner(0).scope((s) ->
+            s.spawn((t) -> print(v[0] + v[1] + int(v.len)))
+            0)
+
+    var b: Buf[int] = buf()
+
+    b.push(3)
+    b.push(4)
+    b.push(5)
+    print(total(b.view()))
+    """
+
+// -- what is emitted ------------------------------------------------------------------------------
+
+@test("a view captured at a scoped parameter is stored with a null owner word")
+sce_owner_stored_null()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", sce_reader())])
+    val body = sce_define(ir, "@$closure0.call(")
+
+    assert(ir.index_of("%struct.$closure1borrows = type { { ptr, ptr, i64 } }").is_some(), ir)
+    assert(body.index_of("insertvalue { ptr, ptr, i64 } ").is_some(), body)
+    assert(body.index_of(", ptr null, 0\n").is_some(), body)
+    assert(body.index_of("insertvalue %struct.$closure1borrows undef").is_some(), body)
+    assert(body.index_of("store ptr @arc.drop.plain").is_some(), body)
+    assert(body.index_of("retain_maybe").is_none(), body)
+
+@test("the child's body takes and gives back no share of the borrowed view")
+sce_child_counts_nothing()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", sce_reader())])
+    val body = sce_define(ir, "@$closure1borrows.call(")
+
+    assert(body != "", ir)
+    assert(body.index_of("retain_maybe").is_none(), body)
+    assert(body.index_of("release_maybe").is_none(), body)
+
+@test("the scoped child's closure has no copy or dispose walk, and its box no drop of its own")
+sce_no_walk_for_the_closure()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", sce_reader())])
+
+    assert(ir.index_of("@arc.copy.$closure1borrows").is_none(), ir)
+    assert(ir.index_of("@arc.dispose.$closure1borrows").is_none(), ir)
+    assert(ir.index_of("@arc.drop.$closure1borrows").is_none(), ir)
+
+// The disagreement half: the lender's own closure captures the same view without being a scoped
+// child, and keeps its owner and the count traffic that goes with it.
+@test("a view captured by a closure that is not a scoped child is still counted")
+sce_unscoped_view_counted()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", sce_reader())])
+    val copy = sce_define(ir, "@arc.copy.$closure0(")
+
+    assert(copy.index_of("call void @arc.retain_maybe").is_some(), copy)
+
+// -- what runs ------------------------------------------------------------------------------------
+
+@test("a scoped child reads a view of the caller's buffer")
+sce_child_reads_a_view()
+    sce_prints(sce_reader(), "10\n0\n")
+
+@test("a scoped child captures two views and a value, and the caller's buffer is intact after")
+sce_two_views_and_a_value()
+    sce_prints(sce_scope("@scoped(f)") + raw"""
+        dot(a: []int, b: []int, k: int) -> int
+            Runner(0).scope((s) ->
+                s.spawn((t) ->
+                    var n = 0
+
+                    for i in 0..<a.len do n += a[i] * b[i]
+
+                    print(n * k))
+                0)
+
+        var x: Buf[int] = buf()
+        var y: Buf[int] = buf()
+
+        for i in 1..3
+            x.push(i)
+            y.push(i + 1)
+
+        print(dot(x.view(), y.view(), 2))
+        print(x.view()[2] + y.view()[2])
+        """, "40\n0\n7\n")
+
+@test("a read-only view of a frame's array is captured as a writable one is")
+sce_read_only_view()
+    sce_prints(sce_scope("@scoped(f)") + raw"""
+        first(v: []const int) -> int
+            Runner(0).scope((s) ->
+                s.spawn((t) -> print(v[0]))
+                0)
+
+        val xs: [3]int = [8, 9, 10]
+
+        print(first(xs[0..<3]))
+        """, "8\n0\n")
+
+// Each child runs on a thread of its own, and the scope joins them before the lender returns -- the
+// shape the borrow is sound for. The children write disjoint elements through raw pointers.
+@test("scoped children on real threads read one borrowed view")
+sce_threads_read_a_view()
+    sce_prints(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.threads.{Thread, spawn}
+
+        struct Job
+            f: Option[&sync Fn() -> unit]
+
+        run_job(j: *Job) -> unit = j.f.unwrap()()
+
+        struct Scope
+            jobs: [4]Job
+            threads: Buf[Thread]
+
+            @scoped(f)
+            spawn(*self, f: &sync Fn() -> unit)
+                val i = self.threads.len()
+
+                self.jobs[i] = Job(Some(f))
+                self.threads.push(spawn(&run_job, &self.jobs[i]).unwrap())
+
+        struct Runner
+            n: int
+
+            @lends(body)
+            scope[R](self, body: *Scope -> R) -> R
+                var s = Scope([Job(None); 4], buf())
+                val r = body(&s)
+
+                for t in s.threads do t.join()
+                r
+
+        sum_halves(v: []int) -> int
+            var sums: [2]int = [0, 0]
+            val p = &sums[0]
+            val q = &sums[1]
+
+            Runner(0).scope((s) ->
+                s.spawn(() ->
+                    for i in 0..<v.len / 2 do *p += v[i])
+                s.spawn(() ->
+                    for i in v.len / 2..<v.len do *q += v[i])
+                0)
+
+            sums[0] + sums[1]
+
+        var b: Buf[int] = buf()
+
+        for i in 1..100 do b.push(i)
+
+        print(sum_halves(b.view()))
+        print(b.len())
+        """, "5050\n100\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("the same view captured for a plain '&sync Fn' parameter is refused")
+sce_view_at_sync_fn_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        keep(f: &sync Fn() -> int) -> int = f()
+
+        a(v: []int) -> int = keep(() -> v[0])
+        """, sce_head("'v' it captures reaches a '[]int'") + sce_view_tail())
+
+@test("the same view captured at a parameter that is only '@crossing' is refused")
+sce_view_at_crossing_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        b(v: []int) -> int
+            Runner(0).scope((s) ->
+                s.handed((t) -> print(v[0]))
+                0)
+        """, sce_head("'v' it captures reaches a '[]int'") + sce_view_tail())
+
+@test("a closure made before the call and handed to a scoped parameter does not borrow")
+sce_closure_value_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        b(v: []int) -> int
+            Runner(0).scope((s) ->
+                val g = (t: *Scope) -> print(v[0])
+
+                s.spawn(g)
+                0)
+        """, sce_head("'v' it captures reaches a '[]int'") + sce_view_tail())
+
+@test("a scoped child capturing a '&T' is refused as a '&sync Fn' is")
+sce_ref_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        c(t: &Thing) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(t.n))
+                0)
+        """, sce_head("'t' it captures reaches a '&Thing', whose count is not. Hold it as a " +
+                      "'&sync Thing' ('06')"))
+
+@test("a scoped child capturing a string is refused")
+sce_string_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        d(w: string) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(w))
+                0)
+        """, sce_head("'w' it captures reaches a 'string', which owns its bytes through a count " +
+                      "that is not atomic. A literal's bytes are immortal and would be safe to " +
+                      "share, but nothing in the type says whether these are, so a shared object " +
+                      "holds no view at all ('06')"))
+
+@test("a scoped child capturing a Buf is refused")
+sce_buf_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        e(k: Buf[int]) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(k.len()))
+                0)
+        """, sce_head("'k' it captures is a 'sysl.buf.Buf[int]', which is shared through a count " +
+                      "that is not atomic, and no spelling of it can cross into a '&sync' ('06')"))
+
+@test("a scoped child capturing a view of references is refused")
+sce_view_of_refs_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        f(ts: []&Thing) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(ts[0].n))
+                0)
+        """, sce_head("'ts' it captures reaches a '[]&Thing'") + sce_view_tail())
+
+@test("a scoped child capturing a view of strings is refused")
+sce_view_of_strings_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        g(ws: []string) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(ws[0]))
+                0)
+        """, sce_head("'ws' it captures reaches a '[]string'") + sce_view_tail())

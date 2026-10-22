@@ -28,7 +28,7 @@ between the two; only what it costs does.
 
 ## Index
 
-[`INSERTION_LIMIT`](#insertion_limit) [`align_up`](#align_up) [`as_mut_ptr`](#as_mut_ptr) [`as_ptr`](#as_ptr) [`binary_search`](#binary_search) [`binary_search_by`](#binary_search_by) [`contains`](#contains) [`copy`](#copy) [`copy`](#copy-1) [`copy_exact`](#copy_exact) [`copy_exact`](#copy_exact-1) [`ends_with`](#ends_with) [`equal`](#equal) [`fill`](#fill) [`index_of`](#index_of) [`index_of_from`](#index_of_from) [`is_aligned`](#is_aligned) [`is_sorted`](#is_sorted) [`is_sorted_by`](#is_sorted_by) [`last_index_of`](#last_index_of) [`last_index_of_from`](#last_index_of_from) [`max_index`](#max_index) [`min_index`](#min_index) [`reverse`](#reverse) [`sort`](#sort) [`sort_by`](#sort_by) [`sort_stable`](#sort_stable) [`sort_stable_by`](#sort_stable_by) [`starts_with`](#starts_with) [`swap`](#swap)
+[`INSERTION_LIMIT`](#insertion_limit) [`align_up`](#align_up) [`as_mut_ptr`](#as_mut_ptr) [`as_ptr`](#as_ptr) [`binary_search`](#binary_search) [`binary_search_by`](#binary_search_by) [`contains`](#contains) [`copy`](#copy) [`copy`](#copy-1) [`copy_exact`](#copy_exact) [`copy_exact`](#copy_exact-1) [`ends_with`](#ends_with) [`equal`](#equal) [`fill`](#fill) [`index_of`](#index_of) [`index_of_from`](#index_of_from) [`is_aligned`](#is_aligned) [`is_sorted`](#is_sorted) [`is_sorted_by`](#is_sorted_by) [`last_index_of`](#last_index_of) [`last_index_of_from`](#last_index_of_from) [`max_index`](#max_index) [`min_index`](#min_index) [`reverse`](#reverse) [`sort`](#sort) [`sort_by`](#sort_by) [`sort_stable`](#sort_stable) [`sort_stable_by`](#sort_stable_by) [`split_at`](#split_at) [`starts_with`](#starts_with) [`swap`](#swap)
 
 ## Constants
 
@@ -407,6 +407,21 @@ O(log n) frames for the same result.
 ```sysl
 const sort_stable_by[T](xs: []T, scratch: []T, lt: (T, T) -> bool) -> bool
 ```
+
+### `split_at`
+
+```sysl
+split_at[T](xs: []T, n: usize) -> ([]T, []T)
+```
+
+The slice cut in two at `n`: its first `n` elements, and the rest. A cut past the end traps, as
+any other slice bound does.
+
+**The two pieces never share an element, and the signature says so** --
+`@disjoint(result.0, result.1)`, which the compiler checks against the body rather than taking on
+trust. A caller may write through each piece independently, hand them to a function `@disjoint`
+over two parameters, or cut each again, which is how a recursive halving reaches every element
+exactly once.
 
 ### `starts_with`
 

@@ -1,0 +1,256 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `slot_take(p)` and `slot_put(p, v)` (`slots.sysl`) move a value out of, and into, a slot of raw
+// `*T` storage. The claims are three. What they lower to: a pure load or store for a value that holds
+// no count. What they refuse. And what a container built on them does: a `Ring` gives a popped value
+// up AT the pop, and a counted heap comes back to where it started after any number of cycles.
+
+private struct StkRun
+    ok: bool
+    out: string
+    err: string
+
+private stk_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end stk_ready
+
+// A program built with the heap counted and run.
+private stk_run(text: string) -> StkRun
+    val root = make_temp_dir("sysl-stk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return StkRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> StkRun(false, "could not be started", "")
+        Ok(o) -> StkRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end stk_run
+
+private stk_clean(run: StkRun, expected: string)
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end stk_clean
+
+private stk_job() -> string = raw"""
+    import sysl.container.ring.ring
+
+    struct Job
+        id: int
+
+    impl Drop for Job
+        drop(self) = print(f"job ${self.id} let go")
+
+    """
+
+// -- what they lower to ----------------------------------------------------------------------------------
+
+@test("taking a plain value is a load, and the slot is left as it was")
+stk_take_scalar_is_a_load()
+    val ir = emit_func_text("take(p: *int) -> int = slot_take(p)\n", "take")
+
+    assert(ir.starts_with("define"), ir)
+    assert(ir.contains("load i32, ptr %t1"), ir)
+    assert(!ir.contains("call"), ir)
+    assert_eq(ir.count_of("store "), 1)
+
+@test("putting a plain value is a store")
+stk_put_scalar_is_a_store()
+    val ir = emit_func_text("put(p: *int, v: int) = slot_put(p, v)\n", "put")
+
+    assert(ir.starts_with("define"), ir)
+    assert(ir.contains("store i32 %t2, ptr %t1"), ir)
+    assert(!ir.contains("call"), ir)
+
+@test("taking a counted value neither retains nor releases it")
+stk_take_counted_takes_no_count()
+    val ir = emit_func_text("struct N\n    v: int\n\ntake(p: *&N) -> &N = slot_take(p)\n", "take")
+
+    assert(ir.starts_with("define"), ir)
+    assert(!ir.contains("@arc.retain"), ir)
+    assert(!ir.contains("@arc.release"), ir)
+    assert(!ir.contains("@arc.copy"), ir)
+    assert(!ir.contains("@arc.dispose"), ir)
+
+@test("putting a borrowed counted value takes the one share the slot keeps, and releases nothing")
+stk_put_counted_releases_nothing()
+    val ir = emit_func_text("struct N\n    v: int\n\nput(p: *&N, v: &N) = slot_put(p, v)\n", "put")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(ir.count_of("@arc.retain("), 1)
+    assert(!ir.contains("@arc.release"), ir)
+    assert(!ir.contains("@arc.dispose"), ir)
+
+// -- what they refuse ------------------------------------------------------------------------------------
+
+@test("slot_take of something that is not a pointer is refused")
+stk_take_needs_a_pointer()
+    assert_eq(emit_func_text("f(n: int) -> int = slot_take(n)\n", "f"),
+              "'slot_take' moves a value through a raw pointer, which is a '*T' — this is int")
+
+@test("slot_put of something that is not a pointer is refused")
+stk_put_needs_a_pointer()
+    assert_eq(emit_func_text("f(n: int) = slot_put(n, 1)\n", "f"),
+              "'slot_put' moves a value through a raw pointer, which is a '*T' — this is int")
+
+@test("slot_take with the wrong number of arguments is refused")
+stk_take_arity()
+    assert_eq(emit_func_text("f(p: *int) -> int = slot_take(p, 1)\n", "f"),
+              "'slot_take' takes 1 argument — the pointer to the slot — but 2 arguments were given")
+
+@test("slot_put with the wrong number of arguments is refused")
+stk_put_arity()
+    assert_eq(emit_func_text("f(p: *int) = slot_put(p)\n", "f"),
+              "'slot_put' takes 2 arguments — the pointer to the slot and the value — but 1 argument was given")
+
+@test("slot_put of a value of another type is refused")
+stk_put_wrong_type()
+    val said = emit_func_text("f(p: *int) = slot_put(p, \"x\")\n", "f")
+
+    assert(said.contains("'slot_put' puts a int into the slot") || said.contains("puts a int"), said)
+
+// -- what a container built on them does -----------------------------------------------------------------
+
+@test("a value popped from a Ring is dropped at the pop, not when its slot is next used")
+stk_ring_drops_at_the_pop()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(stk_job() + raw"""
+        var slots: [2]&Job = [Job(0); 2]
+        var r = ring(slots[..])
+
+        print("made")
+        r.push_back(Job(1))
+        r.push_back(Job(2))
+
+        r.pop_front() match
+            Some(j) -> print(f"ran ${j.id}")
+            None -> ()
+
+        print("popped")
+        r.push_back(Job(3))
+        print("pushed")
+        r.clear()
+        print("cleared")
+        """), "job 0 let go\nmade\nran 1\njob 1 let go\npopped\npushed\njob 2 let go\njob 3 let go\ncleared\n")
+
+@test("pop_back drops at the pop too, and a popped value nobody keeps is released there")
+stk_ring_pop_back_drops()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(stk_job() + raw"""
+        var slots: [3]&Job = [Job(0); 3]
+        var r = ring(slots[..])
+
+        r.push_back(Job(1))
+        r.push_back(Job(2))
+        r.pop_back()
+        print("after")
+        """), "job 0 let go\njob 2 let go\nafter\njob 1 let go\n")
+
+@test("overwrite hands back the evicted value, which is dropped when the caller lets it go")
+stk_ring_overwrite_evicts()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(stk_job() + raw"""
+        var slots: [1]&Job = [Job(0); 1]
+        var r = ring(slots[..])
+
+        r.push_back(Job(1))
+        r.overwrite(Job(2))
+        print("after")
+        r.clear()
+        """), "job 0 let go\njob 1 let go\nafter\njob 2 let go\n")
+
+@test("push and pop cycles of a reference, a string and a byte slice leave no live allocation")
+stk_ring_cycles_are_clean()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(stk_job() + raw"""
+        var slots: [2]&Job = [Job(0); 2]
+        var rj = ring(slots[..])
+
+        for i in 0..<5
+            rj.push_back(Job(10 + i))
+            rj.push_front(Job(20 + i))
+            rj.pop_front()
+            rj.pop_back()
+
+        var strs: [3]string = [""; 3]
+        var rs = ring(strs[..])
+
+        for i in 0..<10
+            rs.push_back(f"s$i")
+            rs.push_back(f"t$i")
+            rs.pop_front()
+            rs.pop_front()
+
+        var bytes: [2][]u8 = [[]; 2]
+        var rb = ring(bytes[..])
+
+        for i in 0..<10
+            rb.push_back([u8(i), 1, 2])
+            rb.pop_back()
+
+        rb.push_back([1, 2, 3])
+        rs.push_back("kept")
+        print(rj.len(), rs.len(), rb.len())
+        """), "job 0 let go\n"
+        + "job 20 let go\njob 10 let go\njob 21 let go\njob 11 let go\njob 22 let go\njob 12 let go\n"
+        + "job 23 let go\njob 13 let go\njob 24 let go\njob 14 let go\n0 1 1\n")
+
+@test("slot_take then slot_put moves a string through a slot with no copy and no leak")
+stk_move_string_through_a_slot()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(raw"""
+        import sysl.slices.as_mut_ptr
+
+        var slots: [2]string = ["", ""]
+        val p = as_mut_ptr(slots[..])
+
+        slot_put(&p[0], f"hello ${1 + 1}")
+        val s = slot_take(&p[0])
+        slot_put(&p[1], s)
+        print(slot_take(&p[1]))
+        """), "hello 2\n")
+
+@test("slot_take and slot_put on a plain value read and write it")
+stk_scalar_round_trip()
+    if !stk_ready() then return
+
+    stk_clean(stk_run(raw"""
+        var x = 5
+        val p = &x
+
+        print(slot_take(p))
+        slot_put(p, 9)
+        print(x)
+        """), "5\n9\n")

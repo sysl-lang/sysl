@@ -346,7 +346,7 @@ private val imc_expected: string = raw"""
     // - struct fx_pk is laid out under '#pragma pack' -- an opaque struct here, sized by SIZEOF_PK and aligned by ALIGNOF_PK
     // - struct fx_blob has a field ('data') that is a flexible array member, whose length is the allocation's -- an opaque struct here, sized by SIZEOF_BLOB and aligned by ALIGNOF_BLOB
     // - fx_twice: a 'static inline' function has no symbol to link against -- '--shim <file.c>' writes the wrapper that reaches it
-    // - fx_bits_a: 'struct fx_bits' has C bitfields, which cross a C boundary only by address -- as a '*Bits'
+    // - fx_bits_a: a 'static inline' function has no symbol to link against -- '--shim <file.c>' writes the wrapper that reaches it
     // - fx_none: a 'static inline' function that takes '...', whose arguments a wrapper cannot pass on
     // - fx_wait: 'struct fx_far' by value, and it is declared by another header -- '--follow fx_other.h' lays it out
     // - FX_NAME: a string, and a 'c const' measures numbers only
@@ -365,6 +365,10 @@ private val imc_shim: string = raw"""
 
     int sysl_fx_twice(int x) {
         return fx_twice(x);
+    }
+
+    unsigned int sysl_fx_bits_a(struct fx_bits b) {
+        return fx_bits_a(b);
     }
 
     int sysl_FX_SUM_OF(fx_point p) {
@@ -552,7 +556,8 @@ imc_shim_runs()
 
     assert_eq(out.shim, imc_shim)
     assert(out.text.contains("extern \"fx_log\" log(ctx: *Ctx, fmt: *u8, ...) -> i32\n" +
-                             "extern \"sysl_fx_twice\" twice(x: i32) -> i32\n"), out.text)
+                             "extern \"sysl_fx_twice\" twice(x: i32) -> i32\n" +
+                             "extern \"sysl_fx_bits_a\" bits_a(b: Bits) -> u32\n"), out.text)
     assert(out.text.contains("extern \"fx_level\" level: i32\nextern \"sysl_FX_SUM_OF\" sum_of(p: Point) -> i32\n"),
            out.text)
     assert(!refused.contains("fx_twice") && !refused.contains("FX_SUM_OF"), refused)
@@ -562,10 +567,11 @@ imc_shim_runs()
 
     write_text(s"$dir/shim.c", out.shim).unwrap()
 
-    val ran = imc_built(imc_project(dir, out.text, "print(twice(21), sum_of(origin()))\n"))
+    // `bits_a` takes a struct with C bitfields by value, through the wrapper.
+    val ran = imc_built(imc_project(dir, out.text, "print(twice(21), sum_of(origin()), bits_a(Bits(5, 17, -3)))\n"))
 
     remove_dir_all(dir).unwrap_or(())
-    assert_eq(ran, Ok("42 7\n"))
+    assert_eq(ran, Ok("42 7 5\n"))
 end imc_shim_runs
 
 // ## The command
@@ -631,9 +637,9 @@ imc_no_prefix()
 end imc_no_prefix
 
 // A record holding a record with C bitfields by value -- in a field, through a typedef, as an array's
-// element, as a union's member, or as a named member of an unnamed type -- crosses only by address,
-// as the language has it; an anonymous member's bitfields are its record's own. A record holding
-// none, and any of them by address, are generated.
+// element, as a union's member, or as a named member of an unnamed type -- crosses by value as C's
+// own does, so a function taking or returning one is generated like any other; an anonymous member's
+// bitfields are its record's own.
 private val imc_holders: string = raw"""
     struct fh_bits { unsigned a : 3; unsigned b : 5; };
     struct fh_wrap { struct fh_bits b; int n; };
@@ -654,7 +660,7 @@ private val imc_holders: string = raw"""
     int fh_wrap_at(struct fh_wrap *w);
     """
 
-@test("a record holding C bitfields by value at any depth crosses only by address, as the language has it")
+@test("a record holding C bitfields by value at any depth crosses by value, as the language has it")
 imc_bitfield_holders()
     if !imc_ready() then return
 
@@ -665,21 +671,13 @@ imc_bitfield_holders()
     val out = import_c_generate(s"$dir/fh.h", IcOptions("fh_", "", "", "", None, buf(), "")).unwrap()
 
     remove_dir_all(dir).unwrap_or(())
-    assert_eq(join(out.refused.view(), "\n"),
-              "fh_wrap_n: 'struct fh_wrap' holds 'struct fh_bits', which has C bitfields, and so crosses a " +
-              "C boundary only by address -- as a '*Wrap'\n" +
-              "fh_deep_make: 'struct fh_deep' holds 'struct fh_bits', which has C bitfields, and so " +
-              "crosses a C boundary only by address -- as a '*Deep'\n" +
-              "fh_row_sum: 'struct fh_row' holds 'struct fh_bits', which has C bitfields, and so crosses " +
-              "a C boundary only by address -- as a '*Row'\n" +
-              "fh_either_u: 'union fh_either' holds 'struct fh_bits', which has C bitfields, and so " +
-              "crosses a C boundary only by address -- as a '*Either'\n" +
-              "fh_anon_x: 'struct fh_anon' has C bitfields, which cross a C boundary only by address -- " +
-              "as a '*Anon'\n" +
-              "fh_named_a: 'struct fh_named' holds an unnamed struct, which has C bitfields, and so " +
-              "crosses a C boundary only by address -- as a '*Named'")
-    assert(out.text.contains("extern \"fh_plain_x\" plain_x(p: Plain) -> i32\n"), out.text)
-    assert(out.text.contains("extern \"fh_wrap_at\" wrap_at(w: *Wrap) -> i32\n"), out.text)
+    assert_eq(join(out.refused.view(), "\n"), "")
+
+    for line in ["extern \"fh_wrap_n\" wrap_n(w: Wrap) -> i32\n", "extern \"fh_deep_make\" deep_make() -> Deep\n",
+                 "extern \"fh_row_sum\" row_sum(r: Row) -> i32\n", "extern \"fh_either_u\" either_u(e: Either) -> u32\n",
+                 "extern \"fh_anon_x\" anon_x(a: Anon) -> i32\n", "extern \"fh_named_a\" named_a(n: Named) -> i32\n",
+                 "extern \"fh_plain_x\" plain_x(p: Plain) -> i32\n", "extern \"fh_wrap_at\" wrap_at(w: *Wrap) -> i32\n"]
+        assert(out.text.contains(line), s"$line\nin\n${out.text}")
 end imc_bitfield_holders
 
 @test("no header is the usage, and a header that is not there is said so")
