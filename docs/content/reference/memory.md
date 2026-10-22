@@ -3661,7 +3661,72 @@ print(p.v)
 ```
 
 An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed
-to one is refused as kept. Converting the pointer to an integer is not following it: `usize(p)` is
+to one is refused as kept:
+
+```sysl
+trait Bump
+    bump(*self, n: *int)
+
+struct Adder
+    by: int
+
+impl Bump for Adder
+    bump(*self, n: *int)
+        *n += self.by
+
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+var c = Cell(1)
+var a = Adder(5)
+var b: *Bump = &a
+
+c.with((v) -> b.bump(v))
+```
+
+```error
+is passed through a trait object, which may hold on to it
+```
+
+**A trait method that [promises to borrow](/reference/traits/#a-method-may-promise-to-borrow) the
+parameter is the exception**: every implementation of the promise is checked to let the pointer go,
+so the same call is accepted once the trait says `@borrows(n)`:
+
+```sysl
+trait Bump
+    @borrows(n)
+    bump(*self, n: *int)
+
+struct Adder
+    by: int
+
+impl Bump for Adder
+    bump(*self, n: *int)
+        *n += self.by
+
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+var c = Cell(1)
+var a = Adder(5)
+var b: *Bump = &a
+
+c.with((v) -> b.bump(v))
+
+print(c.v)
+```
+
+```output
+6
+```
+
+Converting the pointer to an integer is not following it: `usize(p)` is
 an address as a number, which is the raw tier's to answer for.
 
 **What is passed there has to be a body the compiler can read** — a closure written at the call, one

@@ -75,6 +75,10 @@ private const MinUnitBytes: usize = 65536
 // at 128, 45% and 8.7%, with no further gain on the raytracer.
 private const CopyCost: usize = 32
 
+// A constant's initializer at most this long is copied into the units that use it
+// (`copyable_initializer`), as an `available_externally` copy they can fold.
+private const CopyInitLimit: usize = 2048
+
 // What a promoted local is renamed to, in front of its own name.
 private const Promoted: string = "sysl.cgu:"
 
@@ -717,6 +721,7 @@ private external_global(line: string, e: Entity, hidden: bool) -> string
     var kind = ""
     var preemption = ""
     var own_hidden = false
+    var replaceable = false
 
     loop
         if at >= b.len then return ""
@@ -732,6 +737,13 @@ private external_global(line: string, e: Entity, hidden: bool) -> string
 
         if word.starts_with("thread_local") then tls = s"$word "
 
+        // A definition the link may replace, or one with no initializer here, has no value a copy
+        // could promise.
+        if word == "weak" || word == "weak_odr" || word == "linkonce" || word == "linkonce_odr" ||
+                word == "common" || word == "extern_weak" || word == "external" ||
+                word == "externally_initialized"
+            replaceable = true
+
         // A definition bound inside the image is declared so in the units that only read it, or
         // they would reach it through the GOT.
         if word == "dso_local" then preemption = "dso_local "
@@ -742,9 +754,28 @@ private external_global(line: string, e: Entity, hidden: bool) -> string
     val ty_end = type_end(b, at)
     val name = if hidden then spelled(e.name) else e.name
     val vis = if hidden || own_hidden then "hidden " else ""
+    val rest = line[at..].trim_end()
+
+    // **A constant's value goes with it**: a module `val` known while compiling is a `constant`, and
+    // a unit that only declared it would load it at every use where the one module folded it to an
+    // immediate. An `available_externally` copy gives this unit the value and defines nothing, so
+    // the link still has one object and `&` of it still names that one.
+    if kind == "constant" && tls == "" && !replaceable && copyable_initializer(line[ty_end..])
+        return s"@$name = available_externally $preemption$vis$kind $rest\n"
 
     s"@$name = external $preemption$vis$tls$kind ${line[at..<ty_end]}\n"
 end external_global
+
+// Whether a constant's initializer, with what follows it on the line, can be copied into a unit that
+// does not define it: present, at most `CopyInitLimit` long, placed in no section of its own, and naming
+// no other symbol -- a copy that did would need that symbol declared too, which the unit may not.
+// A `@` inside a string's bytes is refused with the rest: the test is conservative, never wrong.
+private copyable_initializer(text: string) -> bool
+    val init = text.trim()
+
+    !init.is_empty() && !init.starts_with(",") && init.len <= CopyInitLimit && !init.contains("@") &&
+        !init.contains(" section ") && !init.contains(" comdat") && !init.contains(" partition ")
+end copyable_initializer
 
 private word_stop(b: []const u8, from: usize) -> usize
     var i = from

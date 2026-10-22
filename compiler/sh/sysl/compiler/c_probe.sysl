@@ -284,6 +284,14 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     for item in probed
         args.push(item)
 
+    // **Which headers the answer was read from**, so the caches that keep code compiled against it
+    // key on their bytes (`note_files_read`) -- a header outside every tree they walk included.
+    args.push("-v")
+    args.push("-MD")
+    args.push("-MT")
+    args.push("probe")
+    args.push("-MF")
+    args.push(join_path(dir, "probe.d"))
     args.push("-o")
     args.push("-")
     args.push(src)
@@ -294,10 +302,25 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
             return probe_fault(a, unit, where,s"cannot run '$clang'")
         Ok(got) -> got
 
+    // The probe's own source is a temporary and is no input of the build -- named by its directory's
+    // prefix, since clang may spell the temporary directory through a link the path here does not.
+    var read: Buf[string] = buf()
+
+    for f in depended_on(read_text(join_path(dir, "probe.d")).unwrap_or(""))
+        if f != src && !f.starts_with(s"$dir/") && !f.contains("/sysl-cprobe") then read.push(f)
+
+    // And where each header would have been found ahead of where it was (`shadow_records`, over the
+    // search list `-v` printed), the probe's own temporary being nowhere anything is added.
+    val shadows = shadow_records(read, "", search_list(said.err.unwrap_or("")))
+
+    for r in shadows
+        read.push(r)
+
+    note_files_read(read)
     remove_dir_all(dir).unwrap_or(())
 
     if !said.status.ok()
-        val complaint = said.err.unwrap_or("")
+        val complaint = after_search_list(said.err.unwrap_or(""))
 
         // **Pointed at the entry whose expression clang refused**, not the block's first: a block of
         // forty constants with one wrong is otherwise a hunt. A refusal no entry owns -- a header

@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.slices.sort_by
+import sysl.text.{join, str_builder, StrBuilder}
+
+// **What a package's configuration contributes to a cache key, by construction rather than by list.**
+//
+// Every cache that keeps compiled code for a tree -- the run cache (`run_cache.sysl`) and a source
+// root's kept half (`root_artifact.sysl`) -- has to miss whenever anything that can reach that code
+// changes. A key assembled from hand-picked parts of a manifest misses exactly the part nobody
+// picked: a dependency entry's `features` was such a part, so a feature turned on only by an
+// intermediate package and then turned off replayed the binary built with it.
+//
+// So a tree's manifest reaches a key **whole**: every key the file wrote, in a canonical spelling, less
+// only the keys `ManifestExempt` names, each with the reason it cannot change a byte. A key added to
+// the reader later is in every cache key the day it is added, and leaving one out is a line in that
+// table with a reason a reviewer can read.
+//
+// **And the graph reaches it as resolved** (`resolved_config_part`): each package the build takes, the
+// version selection settled on, the features it has on and the option values it is built with. They
+// are functions of the manifests already in the key and of the feature request, so this part never
+// tells two builds apart that the manifests did not -- it is the same fact said as the compilation
+// will see it, so that a key can never depend on WHICH manifest said a value.
+
+// The manifest keys no cache key holds, as their dotted place in the file and why. Nothing compiled
+// reads any of them: `tests_ckg_cache_key.sysl` builds a program each way and holds the output equal.
+val ManifestExempt: []const (string, string) = [
+    ("package.description", "prose for a reader of the package; no build reads it"),
+    ("package.license", "the terms the package is offered under; no build reads it"),
+    ("package.authors", "who wrote the package; no build reads it"),
+    ("package.keywords", "what a search for the package matches; no build reads it"),
+    ("test", "how a suite is run (its jobs, its timeout and which tests run alone) is read from the " +
+     "manifest on every run, replayed or not, and no byte of a test binary depends on it")]
+
+// The reason a manifest key is left out of every cache key, or `None` where it is in them.
+manifest_exemption(place: string) -> Option[string]
+    for i in 0..<ManifestExempt.len
+        if ManifestExempt[i].0 == place then return Some(ManifestExempt[i].1)
+
+    None
+end manifest_exemption
+
+// A tree's manifest as one part of a key: every key it wrote, canonically, less the exempt ones. A
+// tree with no manifest is the empty part; one that does not read is its text, so a build that is
+// about to refuse it still keys on what is there.
+manifest_config_part(dir: string) -> string
+    val text = read_text(join_path(dir, ManifestName)) match
+        Err(_) -> return ""
+        Ok(t) -> t
+
+    read_conf(text) match
+        Err(_) -> s"unread:$text"
+        Ok(c) -> conf_canonical(c)
+end manifest_config_part
+
+// A manifest's tree in one spelling: a block's keys sorted, every value tagged with its kind and
+// prefixed with its length. **Sorted**, because the order a file writes its keys in is not part of what
+// it says -- a reordered `capabilities` block is the same program. **Tagged**, because `3` and `"3"`
+// are different answers to some keys. **Length-prefixed**, so no value can spell the join of two.
+// A list keeps its order, which is part of what it says.
+conf_canonical(c: &Conf) -> string
+    var out = str_builder()
+
+    canonical_into(&out, c, "")
+    out.finish()
+end conf_canonical
+
+private canonical_into(out: *StrBuilder, c: &Conf, place: string)
+    *c match
+        Block(pairs) ->
+            var kept: Buf[(string, &Conf)] = buf()
+
+            for pair in pairs
+                if manifest_exemption(joined_place(place, pair.0)).is_none() then kept.push(pair)
+
+            sort_by(kept.view(), (a, b) -> a.0 < b.0)
+            out.push(s"{${kept.len()}")
+
+            for pair in kept
+                out.push(s"k${pair.0.len}:${pair.0}=")
+                canonical_into(out, pair.1, joined_place(place, pair.0))
+
+            out.push("}")
+        Text(s) -> out.push(s"t${s.len}:$s")
+        Word(s) -> out.push(s"w${s.len}:$s")
+        Flag(b) -> out.push(if b then "f1" else "f0")
+        Items(values) ->
+            out.push(s"[${values.len()}")
+
+            for item in values
+                canonical_into(out, item, place)
+
+            out.push("]")
+end canonical_into
+
+private joined_place(place: string, key: string) -> string = if place.is_empty() then key else s"$place.$key"
+
+// The graph a build of `root` takes, as resolved: each package by its canonical name, the version
+// selection settled on (or its directory, for one that is not fetched), the features it has on and the
+// option values it is built with. Empty where the project has no graph, or where it will not resolve
+// -- the build is about to say why.
+resolved_config_part(root: string, m: &Manifest) -> string
+    if !wants_graph(m) then return ""
+
+    val graph = resolved_graph(root, m) match
+        Err(_) -> return ""
+        Ok(g) -> g
+
+    var lines: Buf[string] = buf()
+
+    for p in graph.packages
+        val at = p.version match
+            Some(v) -> release_tag(v)
+            None -> if is_root_package(p) then "" else absolute_path(p.root)
+
+        lines.push(s"${p.canonical}@$at features=${join(enabled_of(graph.features, p.canonical).view(), ",")} " +
+            s"options=${join(option_lines_of(graph.options, p.canonical).view(), ";")}")
+
+    join(lines.view(), "\n")
+end resolved_config_part
+
+// -- what the command line and the environment contribute ------------------------------------------
+
+// Every flag a command takes, and how the caches answer for it: `keyed` where it is in the key of every
+// cache it can reach, with the part that holds it; `exempt` where it is in none, with why it cannot
+// change what a cached entry holds. `tests_ckg_cache_key.sysl` reads every flag out of `sysl --help`
+// and fails on one this table does not classify.
+val FlagCacheClass: []const (string, string) = [
+    ("--target", "keyed: the target's name (toolchain_parts)"),
+    ("--cc", "keyed: the C compiler named (toolchain_parts)"),
+    ("-O", "keyed: the level (toolchain_parts)"),
+    ("--optimize", "keyed: the level (toolchain_parts)"),
+    ("--lib", "keyed: each root's files, path and manifest (program_fingerprint, root_key)"),
+    ("--no-std-lib", "keyed: std:from-source (toolchain_parts)"),
+    ("--link-path", "keyed: the link search flags (settings_parts)"),
+    ("--include-path", "keyed: the supplied C flags (settings_parts)"),
+    ("-D", "keyed: the supplied C flags (settings_parts)"),
+    ("--define", "keyed: the supplied C flags (settings_parts)"),
+    ("--lto", "keyed: the pipeline (settings_parts)"),
+    ("--profile-generate", "keyed: the pipeline (settings_parts)"),
+    ("--profile-use", "keyed: the pipeline, by the profile's bytes (settings_parts)"),
+    ("--link", "keyed: the link mode (settings_parts)"),
+    ("--no-bounds-locations", "keyed: bounds_locations (settings_parts)"),
+    ("--no-error-traces", "keyed: error_traces (settings_parts)"),
+    ("--const-steps", "keyed: the evaluation limit (settings_parts)"),
+    ("--features", "keyed: the feature request and the resolved features (settings_parts, " +
+     "resolved_config_part)"),
+    ("--no-default-features", "keyed: the feature request and the resolved features"),
+    ("--all-features", "keyed: the feature request and the resolved features"),
+    ("-p", "keyed: the member's directory is the tree keyed (run_cache_parts)"),
+    ("--std", "keyed: a --std suite is the command 'test --std' (test_project)"),
+    ("--version", "exempt: prints the compiler's build and builds nothing"),
+    ("--help", "exempt: prints the usage and builds nothing"),
+    ("-v", "exempt: reports what the build decided on standard error; the build is the same"),
+    ("--verbose", "exempt: reports what the build decided on standard error; the build is the same"),
+    ("--explain-escapes", "exempt: a report on standard error, and a run that asks for it compiles " +
+     "rather than replaying"),
+    ("-o", "exempt: where the product is written, which no byte of it records"),
+    ("--header", "exempt: where build-c writes the header beside the archive; neither is cached"),
+    ("--filter", "exempt: selects among the tests a binary holds, applied to a replayed list as to " +
+     "a fresh one"),
+    ("--file", "exempt: selects among the tests a binary holds, as --filter does"),
+    ("--fail-fast", "exempt: how the runner stops, not what it runs"),
+    ("--jobs", "exempt: how many tests run at once, not what they are"),
+    ("--timeout", "exempt: how long a test may run, read by the runner"),
+    ("--", "exempt: the program's own arguments, handed to the binary at each run"),
+    ("--gaps", "exempt: emit-llvm, which keeps nothing"),
+    ("--no-spans", "exempt: emit-ast and emit-typed, which keep nothing"),
+    ("--tables", "exempt: emit-typed, which keeps nothing"),
+    ("--emit-whyml", "exempt: prove, which keeps nothing"),
+    ("--overflow", "exempt: prove, which keeps nothing"),
+    ("-t", "exempt: sysl doc, which keeps nothing"),
+    ("-n", "exempt: sysl doc, which keeps nothing"),
+    ("-w", "exempt: sysl doc, which keeps nothing"),
+    ("-V", "exempt: sysl doc, which keeps nothing"),
+    ("--private", "exempt: sysl doc, which keeps nothing"),
+    ("--check", "exempt: sysl doc and sysl tidy, which keep nothing"),
+    ("--stdio", "exempt: sysl lsp, which keeps nothing"),
+    ("-I", "exempt: import-c, which keeps nothing"),
+    ("--prefix", "exempt: import-c, which keeps nothing"),
+    ("--module", "exempt: import-c, which keeps nothing"),
+    ("--link-lib", "exempt: import-c, which keeps nothing"),
+    ("--include-as", "exempt: import-c, which keeps nothing"),
+    ("--follow", "exempt: import-c, which keeps nothing"),
+    ("--shim", "exempt: import-c, which keeps nothing")]
+
+// How the caches answer for a flag, or `None` for one nobody classified.
+flag_cache_class(flag: string) -> Option[string]
+    for i in 0..<FlagCacheClass.len
+        if FlagCacheClass[i].0 == flag then return Some(FlagCacheClass[i].1)
+
+    None
+end flag_cache_class
+
+// Every environment variable the compiler reads, classified as the flags are. A variable a package's
+// `headers` block names is not here by name -- it is the package's -- and is keyed as the include path
+// it supplies (`answer_headers_from_env`, then `settings_parts`).
+val EnvironmentCacheClass: []const (string, string) = [
+    ("SYSL_EXTRA_CFLAGS", "keyed: build_environment"),
+    ("SYSL_COUNT_ALLOCS", "keyed: build_environment"),
+    ("WASI_SDK_PATH", "keyed: build_environment"),
+    ("ANDROID_NDK_ROOT", "keyed: build_environment"),
+    ("ANDROID_NDK_HOME", "keyed: build_environment"),
+    ("ANDROID_HOME", "keyed: build_environment"),
+    ("ANDROID_SDK_ROOT", "keyed: build_environment"),
+    ("SYSL_LIB", "exempt: names where the library is; the key holds the library's contents " +
+     "(toolchain_parts), so two copies of one library share entries"),
+    ("SYSL_NO_CACHE", "exempt: turns the caches off rather than choosing an entry"),
+    ("SYSL_CODEGEN_UNITS", "exempt: how many pieces clang compiles the program in; the pieces link " +
+     "into the same program"),
+    ("SYSL_TIMINGS", "exempt: a report on standard error"),
+    ("HOME", "exempt: where the caches are, not what is in them"),
+    ("XDG_CACHE_HOME", "exempt: where the caches are, not what is in them"),
+    ("PATH", "exempt: where the toolchain's programs are looked for -- which clang and which linker " +
+     "run, not what the program says; a C object is keyed on its clang's own version " +
+     "(c_object_cache.sysl)")]
+
+// How the caches answer for an environment variable, or `None` for one nobody classified.
+environment_cache_class(name: string) -> Option[string]
+    for i in 0..<EnvironmentCacheClass.len
+        if EnvironmentCacheClass[i].0 == name then return Some(EnvironmentCacheClass[i].1)
+
+    None
+end environment_cache_class

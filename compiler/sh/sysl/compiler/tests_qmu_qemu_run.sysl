@@ -306,6 +306,40 @@ qmu_reports_a_fault_as_a_status_of_its_own()
     qmu_verdict(bad, ran)
 end qmu_reports_a_fault_as_a_status_of_its_own
 
+// One division on a board, `a / b` written as quotient and remainder in decimal. Each case is its
+// own program because a board's allocator is an 8 KB arena that never frees. **The micro:bit is
+// excluded**: its arena is 2 KB, and parsing, dividing and rendering these values allocates more
+// than that -- it stops partway through the answer, out of memory rather than wrong.
+private qmu_divides(a: string, b: string, want: string)
+    qmu_sweep((brd) -> brd.name != "microbit", (brd) -> qmu_boarded(brd, raw"""
+        import board.*
+        import sysl.math.bigint.{parse, to_string, div_rem, from_u64, add, one}
+
+        val w = console()
+        """ + s"val (q, r) = div_rem(parse(\"$a\").unwrap(), parse(\"$b\").unwrap())\n" + raw"""
+
+        w.write(s"L${add(from_u64(18446744073709551615), one()).limbs()} ".bytes)
+        w.write(to_string(q).bytes)
+        w.write(" ".bytes)
+        w.write(to_string(r).bytes)
+        """), want)
+
+// `sysl.math.bigint` on a machine whose limb is 32 bits, where the host's is 64: the same source
+// selects its limb by `#if ptr64`, so only a run on a 32-bit machine executes the other half. `L3`
+// is `2^64` taking three limbs. The divisions are the cases whose path depends on the limb width --
+// the add-back of Knuth's algorithm D forced for a 32-bit limb and for a 64-bit one, and a divisor
+// whose top limb is 1, the widest normalization shift. Each answer is written in decimal, which does
+// not depend on the width, so the expected text is the host's.
+@test("runs the big-integer arithmetic on a machine whose limbs are 32 bits")
+qmu_runs_bigint_on_32_bit_limbs()
+    qmu_divides("2596108815186156682096451392634880", "39614081257132168796771975169",
+                "L3 65534 39614081257132168796771909634")
+    qmu_divides("57896044618658097708646941636650613544717097621216448811677614281724547563520",
+                "3138550867693340381917894711603833208051177722232017256449",
+                "L3 18446744073709551614 3138550867693340381917894711603833208032730978158307704834")
+    qmu_divides("515377520732011331036461129765621272702107522001", "18446744073709551621",
+                "L3 27938671381391989319502288001 15167969264789122380")
+
 // The Cortex-M7's double-precision unit, on the one board that has it. `thumbv7em-freestanding-dp`
 // lowers an `f64` multiply, divide, compare and conversion to `vmul.f64`, `vdiv.f64`, `vcmp.f64` and
 // `vcvt`; a part, or an emulator, without the unit takes a usage fault at the first, which the

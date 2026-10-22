@@ -2,7 +2,8 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_bytes, write_text}
+import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, read_bytes, remove_dir_all, remove_file, write_bytes,
+                write_text}
 import sysl.process.capture
 import sysl.text.{cstring, Search}
 
@@ -447,12 +448,11 @@ coc_a_half_entry_is_removed()
     coc_end(dirs)
 end coc_a_half_entry_is_removed
 
-// The limitation `c_object_cache.sysl` states, shown rather than described: a header added to a
-// directory searched ahead of the one the last compilation found it in changes nothing the key reads,
-// so the next build hits and links the object made from the header it no longer includes.
-// `SYSL_NO_CACHE=1` sees the new one.
-@test("a header added ahead of the one found last time is not noticed -- the stated limitation, and its escape hatch")
-coc_a_header_added_earlier_on_the_path_is_not_noticed()
+// A header added to a directory searched ahead of the one the last compilation found it in changes
+// nothing that compilation read -- but its shadow record names that path (`header_shadows.sysl`), so
+// the next compilation misses and reads the new header; taken away again, the object is the first's.
+@test("a header added ahead of the one found last time is a miss, and the object reads it")
+coc_a_header_added_earlier_on_the_path_is_noticed()
     if !clang_available() then return
 
     val dirs = coc_begin()
@@ -468,13 +468,14 @@ coc_a_header_added_earlier_on_the_path_is_not_noticed()
 
     write_text(s"${dirs.0}/early/n.h", "#define COC_N 9\n").unwrap()
     coc_compile(a, s"${dirs.0}/two.o").unwrap()
-    assert_eq(c_object_counts(), (1, 1))
-    assert(coc_same(s"${dirs.0}/one.o", s"${dirs.0}/two.o"), "the object of the header found last time")
 
-    coc_setenv("SYSL_NO_CACHE", "1")
+    val after_adding = c_object_counts()
+
+    remove_file(s"${dirs.0}/early/n.h").unwrap()
     coc_compile(a, s"${dirs.0}/three.o").unwrap()
-    coc_unsetenv("SYSL_NO_CACHE")
     coc_unsetenv("SYSL_EXTRA_CFLAGS")
-    assert(!coc_same(s"${dirs.0}/one.o", s"${dirs.0}/three.o"), "with the cache off, the new header is read")
+    assert_eq(after_adding, (0, 2))
+    assert(!coc_same(s"${dirs.0}/one.o", s"${dirs.0}/two.o"), "the new header was read")
+    assert(coc_same(s"${dirs.0}/one.o", s"${dirs.0}/three.o"), "taken away, the first header is read again")
     coc_end(dirs)
-end coc_a_header_added_earlier_on_the_path_is_not_noticed
+end coc_a_header_added_earlier_on_the_path_is_noticed

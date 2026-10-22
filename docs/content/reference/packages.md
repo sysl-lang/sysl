@@ -1979,8 +1979,8 @@ something else. Writing the bare name says exactly that:
 
 ```
 'server' is not something a target says about itself — sysl knows aarch64, android, bsd, craft,
-fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, riscv32, riscv64,
-softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
+fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32,
+ptr64, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
 declares is named 'feature_server'
 ```
 
@@ -2285,7 +2285,11 @@ error: assertion failed: max_tasks must be even — the left side is 1
 
 Two builds of one tree with two values are two programs. The run cache and a source root's kept
 artifact each keep one entry per value, so changing a value rebuilds, and changing it back replays the
-entry already made.
+entry already made. **The key is over the values as the graph settled them, and over every manifest
+in the graph whole**, so it does not matter which manifest set a value: one an intermediate package
+sets with the root silent moves the key exactly as one the root sets, and so do the features a
+dependency entry asks for anywhere in the graph and the version selection settles on. The complete
+list is in [the command line § run](/getting-started/cli/).
 
 Options are set only through dependency entries. The root project's own options always take their
 defaults: there is no command-line flag that sets them.

@@ -48,11 +48,11 @@ to_string_radix(x: BigInt, base: int) -> string
     // the loop, whether this is the last chunk.
     while mag.len > 0
         val (q, r) = short_divide(mag, chunk)
-        var value = if r.len == 0 then 0u64 else u64(r[0])
+        var value: Limb = if r.len == 0 then 0 else r[0]
 
         for _ in 0..<per
-            digits.push(alphabet[usize(value % u64(base))])
-            value = value / u64(base)
+            digits.push(alphabet[usize(value % Limb(base))])
+            value = value / Limb(base)
 
         mag = q
 
@@ -106,15 +106,15 @@ parse_radix(s: string, base: int) -> Option[BigInt]
     var mag = empty()
 
     while i < b.len
-        var acc: u32 = 0
-        var mult: u32 = 1
+        var acc: Limb = 0
+        var mult: Limb = 1
         var k = 0
 
         while k < per && i < b.len
             val d = b[i].digit_value(base)?
 
-            acc = acc * u32(base) + u32(d)
-            mult = mult * u32(base)
+            acc = acc * Limb(base) + Limb(d)
+            mult = mult * Limb(base)
             i += 1
             k += 1
 
@@ -128,33 +128,32 @@ end parse_radix
  * It is computed rather than tabled because a table of thirty-five entries is a table to get wrong,
  * and this runs once per conversion against a loop that runs once per chunk.
  */
-private chunk_of(base: int) -> (u32, int)
-    var chunk = u64(base)
+private chunk_of(base: int) -> (Limb, int)
+    val radix = Wide(1) << limb_bits
+    var chunk = Wide(base)
     var per = 1
 
-    while chunk * u64(base) < 0x100000000u64
-        chunk = chunk * u64(base)
+    while chunk * Wide(base) < radix
+        chunk = chunk * Wide(base)
         per += 1
 
-    (u32(chunk), per)
+    (Limb(chunk), per)
 end chunk_of
 
 /** `mag * m + add`, both of which fit a limb -- the one operation reading a number needs and the
  * only place in this module where a magnitude grows by arithmetic rather than by a full multiply.
  */
-private mul_add_small(mag: []const u32, m: u32, add: u32) -> []const u32
-    var out: Buf[u32] = buf()
-    var carry = u64(add)
+private mul_add_small(mag: []const Limb, m: Limb, add: Limb) -> []const Limb
+    var out: Buf[Limb] = buf()
+    var carry = Wide(add)
 
     for i in 0..<mag.len
-        val t = u64(mag[i]) * u64(m) + carry
+        val t = Wide(mag[i]) * Wide(m) + carry
 
-        out.push(u32(t & 0xffffffffu64))
-        carry = t >> 32
+        out.push(Limb(t))
+        carry = t >> limb_bits
 
-    while carry != 0
-        out.push(u32(carry & 0xffffffffu64))
-        carry = carry >> 32
+    if carry != 0 then out.push(Limb(carry))
 
     trimmed(out)
 end mul_add_small
