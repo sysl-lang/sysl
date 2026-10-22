@@ -1,0 +1,698 @@
+module sh.sysl.compiler
+
+import sh.sysl.json.{Json, parse as json_parse}
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{canonicalize, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, parse_long, split, str_builder}
+
+// **`sysl import-c`: the raw layer of a binding, read out of the header rather than transcribed.**
+//
+// Every org binding's `c.sysl` is the same kind of text -- an `opaque struct` per handle, a struct
+// per record handed over by value, an `extern` per entry point, and the numbers in a `c const` block
+// -- and every one of them was typed by hand from the header, which is the transcription `c const`
+// was invented to abolish for numbers. This generates that layer. The pleasant layer above it, which
+// decides who owns what, stays a person's.
+//
+// **The front end is clang itself**, asked twice: `-E -dD` for the header's `#define`s, then
+// `-ast-dump=json` over a probe that includes the header and gives each macro a line of its own.
+// clang is already what a `c const` is measured with, so nothing new is needed on the machine, and
+// what clang says a declaration is is the only answer that matters at the boundary.
+//
+// **What it emits checks itself.** A record laid out here carries an `@assert` per field against a
+// `c const` holding clang's `__builtin_offsetof`, and its size the same way, so a layout that is
+// wrong for the target being built -- not the one the header was read on -- fails to compile rather
+// than reading the wrong bytes. An enum is a `c type` and its enumerators `c const`s at it, and a
+// macro is a `c const` naming it: every number comes from the C compiler at build time, so the file
+// is not a snapshot of one machine.
+
+// What a command line asked for, beyond the header. `follow` names the other headers whose records
+// are laid out where they are used by value; `shim` is the C file the wrappers are written to, empty
+// where none was asked for.
+struct IcOptions
+    prefix: string
+    module_name: string
+    link: string
+    include_as: string
+    target: Option[string]
+    follow: Buf[string]
+    shim: string
+
+// What a header became: the module's text, every declaration that was not generated with why, and
+// the C of the wrappers (empty where `--shim` was not given or nothing needed one).
+struct IcOutput
+    text: string
+    refused: Buf[string]
+    shim: string
+
+// One member of a record. `width` is a bitfield's, `-1` for an ordinary member; `inner` is the id
+// of the unnamed record a member is declared with (`union { … };` or `struct { … } v;`), and empty
+// otherwise; `aligned` is a member written with an alignment attribute of its own.
+struct IcField
+    name: string
+    qual: string
+    bitfield: bool
+    width: long
+    inner: string
+    aligned: bool
+
+// One `struct` or `union`, keyed by its tag (or clang's id where it has none). `why` is the reason
+// its layout is withheld, empty while it is laid out; `named` is the typedef that names it; `file`
+// the header declaring it. `nested` is an unnamed record written inside another, which is laid out
+// as part of it. `align` is a literal `aligned(n)`, zero where there is none. `followed` is a record
+// of a header named with `--follow`, and `reached` says something generated here uses it.
+struct IcRecord
+    id: string
+    tag: string
+    is_union: bool
+    complete: bool
+    main: bool
+    fields: Buf[IcField]
+    packed: bool
+    why: string
+    named: string
+    sysl: string
+    file: string
+    nested: bool
+    align: long
+    followed: bool
+    reached: bool
+
+struct IcEnum
+    id: string
+    tag: string
+    main: bool
+    consts: Buf[string]
+    named: string
+    sysl: string
+
+struct IcTypedef
+    name: string
+    qual: string
+    owned: string
+    main: bool
+    sysl: string
+    followed: bool
+
+// A function: its parameters' names and their types as clang spells them, which a wrapper declares
+// its own parameters with.
+struct IcFunc
+    name: string
+    qual: string
+    params: Buf[string]
+    storage: string
+    inline: bool
+    param_quals: Buf[string]
+
+// A function-like `#define`: its parameters and what it expands to.
+struct IcMacro
+    name: string
+    params: Buf[string]
+    body: string
+
+struct IcModel
+    header: string
+    probe: string
+    prefix: string
+    records: Buf[IcRecord]
+    enums: Buf[IcEnum]
+    typedefs: Buf[IcTypedef]
+    funcs: Buf[IcFunc]
+    vars: Buf[(string, string)]
+    macro_types: Buf[(int, string)]
+    foreign: Buf[(string, string)]
+    used: Buf[string]
+    clong: bool
+    culong: bool
+    follow: Buf[string]
+    fmacros: Buf[IcMacro]
+    reach_on: bool
+
+// The file clang's JSON is talking about. It writes a location's `file` only where it differs from
+// the location written before it, so the walk has to visit every location in document order to know
+// where any one declaration is.
+struct IcWalk
+    file: string
+
+import_c_usage() -> string =
+    "usage: sysl import-c [-I <dir>] [-D <macro>] [--prefix <p>] [--module <name>] [--link-lib <lib>] " +
+    "[--include-as <path>] [--follow <header>] [--shim <file.c>] [--target <name>] [-o <path>] <header.h>"
+
+// `sysl import-c <header.h>` -- the sysl declarations for a C header, on standard output or `-o`'s
+// file. What could not be generated is said on standard error, one line each, and in the file's
+// closing comment; the command still succeeds, because a header with one unbindable macro is still
+// worth the rest.
+import_c_command(args: []string, say: string -> unit, note: string -> unit) -> int
+    var opts = IcOptions("", "", "", "", None, buf(), "")
+    var header = ""
+    var output: Option[string] = None
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            mistakes.push(missing_value(args[i]))
+            break
+        end if
+
+        val arg = args[i]
+        val valued = arg == "--prefix" || arg == "--module" || arg == "--link-lib" || arg == "--include-as" ||
+            arg == "--target" || arg == "-o" || arg == "-I" || arg == "--follow" || arg == "--shim"
+
+        if took > 0
+            if took == 2 then i += 1
+        else if valued
+            if i + 1 >= args.len
+                mistakes.push(missing_value(arg))
+                break
+            end if
+
+            i += 1
+
+            val v = args[i]
+
+            arg match
+                "--prefix" -> opts.prefix = v
+                "--module" -> opts.module_name = v
+                "--link-lib" -> opts.link = v
+                "--include-as" -> opts.include_as = v
+                "--target" -> opts.target = Some(v)
+                "--follow" -> opts.follow.push(v)
+                "--shim" -> opts.shim = v
+                "-o" -> output = Some(v)
+                _ -> add_include_path(v)
+        else if arg.starts_with("-I") && arg.len > 2
+            add_include_path(arg[2..<arg.len])
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then header = arg else i += taken - 1
+
+        i += 1
+
+    if mistakes.len() > 0
+        note(misused(mistakes, import_c_usage()))
+        return Misused
+    end if
+
+    if header == ""
+        note(import_c_usage())
+        return Misused
+    end if
+
+    val made = import_c_generate(header, opts) match
+        Ok(out) -> out
+        Err(why) ->
+            note(refused(why))
+            return Failed
+
+    for item in made.refused
+        note(s"sysl: note: not generated: $item")
+
+    // The wrappers go to their own file, which is compiled where it sits beside the module.
+    if opts.shim != ""
+        val wrote = literate_write(opts.shim, made.shim, note)
+
+        if wrote != Fine then return wrote
+    end if
+
+    output match
+        None ->
+            say(if made.text.ends_with("\n") then made.text[0..<made.text.len - 1] else made.text)
+            Fine
+        Some(to) -> literate_write(to, made.text, note)
+end import_c_command
+
+// **The whole of it, short of the command line**: the header read through clang and rendered.
+import_c_generate(header: string, opts: IcOptions) -> Result[IcOutput, string]
+    val full = canonicalize(header) match
+        Ok(p) -> p
+        Err(_) -> return Err(s"cannot read $header")
+
+    val t = opts.target match
+        Some(name) ->
+            target_resolved(name) match
+                Ok(found) -> found
+                Err(why) -> return Err(why)
+        None -> host_target()
+
+    val clang = find_clang(t, None)?
+
+    var flags: Buf[string] = buf()
+
+    flags.push(s"--target=${t.triple}")
+    flags.push("-x")
+    flags.push("c")
+
+    val machine = machine_flags(t)
+
+    for item in machine
+        flags.push(item)
+
+    if t.short_enums then flags.push("-fshort-enums")
+
+    val supplied = supplied_cflags()
+
+    for item in supplied
+        flags.push(item)
+
+    // The macros first: which `#define`s the header itself writes, in order.
+    var pre = flags.copy()
+
+    pre.push("-E")
+    pre.push("-dD")
+    pre.push(full)
+
+    val expanded = capture(clang, pre.view(), "", [], true) match
+        Err(_) -> return Err(s"cannot run '$clang'")
+        Ok(got) -> got
+
+    if !expanded.status.ok()
+        return Err(s"the C compiler could not read $header:\n${expanded.err.unwrap_or("").trim()}")
+
+    val (candidates, fmacros) = ic_macros(expanded.text, full)
+
+    // Then the declarations, from a probe giving each candidate macro a line of its own: what clang
+    // deduces for `__auto_type` is the macro's type, and a line it refuses is a macro that is not a
+    // constant.
+    val dir = make_temp_dir("sysl-import-c") match
+        Err(_) -> return Err("cannot make a directory to write a C probe in")
+        Ok(made) -> made
+
+    val probe = s"$dir/probe.c"
+    var text = str_builder()
+
+    text.push(s"#include \"$full\"\n")
+
+    for k in 0..<candidates.len()
+        text.push(s"static const __auto_type __sysl_import_c_$k = (${candidates.at(k)});\n")
+
+    write_text(probe, text.finish()) match
+        Err(_) ->
+            remove_dir_all(dir).unwrap_or(())
+            return Err(s"cannot write $probe")
+        Ok(_) -> ()
+
+    var dump = flags.copy()
+
+    for item in ["-fsyntax-only", "-w", "-ferror-limit=0", "-Xclang", "-ast-dump=json", probe]
+        dump.push(item)
+
+    val said = capture(clang, dump.view(), "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    val got = said match
+        Err(_) -> return Err(s"cannot run '$clang'")
+        Ok(g) -> g
+
+    // An error on a probe line is a macro that is no constant; one anywhere else is the header's.
+    var bad_lines: Buf[long] = buf()
+    val complaint = got.err.unwrap_or("")
+
+    for line in split(complaint, "\n")
+        if !line.contains(" error: ") then continue
+
+        if line.starts_with(probe + ":")
+            val rest = line[probe.len + 1..<line.len]
+
+            rest.index_of(":") match
+                Some(at) ->
+                    parse_long(rest[0..<at]) match
+                        Ok(n) -> bad_lines.push(n)
+                        Err(_) -> ()
+                None -> ()
+        else
+            return Err(s"the C compiler could not read $header:\n${complaint.trim()}")
+
+    val doc = json_parse(source_of("clang.json", got.text)) match
+        Ok(d) -> d
+        Err(_) -> return Err("clang's AST dump is not JSON this reader understands")
+
+    // A followed header is matched by its path, or by the end of one: `--follow sys/_timespec.h`.
+    var follow: Buf[string] = buf()
+
+    for f in opts.follow
+        follow.push(f)
+        canonicalize(f) match
+            Ok(c) -> follow.push(c)
+            Err(_) -> ()
+
+    var m = IcModel(full, probe, opts.prefix, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(),
+                    false, false, follow, fmacros, false)
+
+    ic_collect(doc, &m)
+
+    var refused: Buf[string] = buf()
+    var shim = str_builder()
+    val spelled = ic_include_spelling(full, opts.include_as)
+    val rendered = ic_render(&m, spelled, opts, candidates, bad_lines, &refused, &shim)
+
+    Ok(IcOutput(ic_finish(rendered, refused), refused, shim.finish()))
+end import_c_generate
+
+// Whether a declaration's file is one `--follow` named.
+private ic_is_followed(file: string, follow: Buf[string]) -> bool
+    for f in follow
+        if file == f || file.ends_with("/" + f) then return true
+
+    false
+
+// How the module's `@include` names the header: as asked, or relative to the first `-I` that holds
+// it, or by its file name alone.
+private ic_include_spelling(full: string, asked: string) -> string
+    if asked != "" then return asked
+
+    val dirs = include_flags()
+
+    for flag in dirs
+        canonicalize(flag[2..<flag.len]) match
+            Ok(d) ->
+                if full.starts_with(d + "/") then return full[d.len + 1..<full.len]
+            Err(_) -> ()
+
+    val parts = split(full, "/")
+
+    parts[parts.len - 1]
+end ic_include_spelling
+
+// **The header's own `#define`s**, from `clang -E -dD`: the object-like names to probe, and the
+// function-like macros with their parameters and bodies. A line marker says which file the lines
+// after it are from, so only the header's own macros are taken -- not every one its includes defined.
+private ic_macros(text: string, header: string) -> (Buf[string], Buf[IcMacro])
+    var names: Buf[string] = buf()
+    var funcs: Buf[IcMacro] = buf()
+    var cur = ""
+
+    for line in split(text, "\n")
+        if line.starts_with("# ")
+            val q = line.index_of("\"")
+
+            q match
+                Some(at) ->
+                    val rest = line[at + 1..<line.len]
+
+                    rest.index_of("\"") match
+                        Some(end_at) -> cur = rest[0..<end_at]
+                        None -> ()
+                None -> ()
+
+            continue
+        end if
+
+        if cur != header then continue
+
+        if line.starts_with("#undef ")
+            val gone = line[7..<line.len].trim()
+            var kept: Buf[string] = buf()
+
+            for n in names
+                if n != gone then kept.push(n)
+
+            names = kept
+
+            var kept_funcs: Buf[IcMacro] = buf()
+
+            for f in funcs
+                if f.name != gone then kept_funcs.push(f)
+
+            funcs = kept_funcs
+            continue
+        end if
+
+        if !line.starts_with("#define ") then continue
+
+        val rest = line[8..<line.len]
+        var k: usize = 0
+
+        while k < rest.len && ic_name_byte(rest.bytes[k]) do k += 1
+
+        val name = rest[0..<k]
+
+        if k < rest.len && rest.bytes[k] == u8('(')
+            val after = rest[k + 1..<rest.len]
+
+            after.index_of(")") match
+                Some(close) ->
+                    var params: Buf[string] = buf()
+
+                    for p in split(after[0..<close], ",")
+                        if p.trim() != "" then params.push(p.trim())
+
+                    funcs.push(IcMacro(name, params, after[close + 1..<after.len].trim()))
+                None -> ()
+
+            continue
+        end if
+
+        // An empty body is a flag or an include guard, which there is nothing to bind.
+        if rest[k..<rest.len].trim() == "" then continue
+
+        names.push(name)
+
+    (names, funcs)
+end ic_macros
+
+private ic_name_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_')
+
+// ## Reading clang's JSON
+
+private ic_str(j: Json, key: string) -> string = j.get(key) match
+    Some(v) -> v.as_str().unwrap_or("")
+    None -> ""
+
+private ic_flag(j: Json, key: string) -> bool = j.get(key) match
+    Some(v) -> v.as_bool().unwrap_or(false)
+    None -> false
+
+private ic_qual(j: Json) -> string = j.get("type") match
+    Some(t) -> ic_str(t, "qualType")
+    None -> ""
+
+// The node's first child, where it has one.
+private ic_first(j: Json) -> Option[Json] = j.get("inner") match
+    Some(inner) -> inner.at(0)
+    None -> None
+
+// Whether one of the node's children is of `kind`.
+private ic_has_kind(j: Json, kind: string) -> bool
+    j.get("inner") match
+        Some(inner) ->
+            for k in 0..<inner.len()
+                if ic_str(inner.at(k).unwrap(), "kind") == kind then return true
+        None -> ()
+
+    false
+
+// An attribute's argument where it is written as an integer literal (`aligned(16)`, or a macro
+// that is one), and `0` where it is anything else or absent.
+private ic_literal(attr: Json) -> long
+    val c = ic_first(attr) match
+        Some(found) -> found
+        None -> return 0
+
+    val lit = ic_first(c) match
+        Some(found) -> found
+        None -> return 0
+
+    if ic_str(c, "kind") != "ConstantExpr" || ic_str(lit, "kind") != "IntegerLiteral" then return 0
+
+    parse_long(ic_str(c, "value")).unwrap_or(0)
+
+// A bitfield's width, which clang has already evaluated; `-1` for an ordinary member.
+private ic_width(f: Json) -> long
+    if !ic_flag(f, "isBitfield") then return -1
+
+    ic_first(f) match
+        Some(c) -> parse_long(ic_str(c, "value")).unwrap_or(-1)
+        None -> -1
+
+private ic_track(j: Json, w: *IcWalk)
+    if j.is_object()
+        for k in 0..<j.len()
+            val m = j.member(k).unwrap()
+
+            if m.key == "includedFrom" then continue
+
+            if m.key == "file"
+                w.file = m.value.as_str().unwrap_or(w.file)
+            else
+                ic_track(m.value, w)
+    else if j.is_array()
+        for k in 0..<j.len()
+            ic_track(j.at(k).unwrap(), w)
+end ic_track
+
+// Every top-level declaration, sorted by kind, with whether it is the header's own.
+private ic_collect(doc: Json, m: *IcModel)
+    val inner = doc.get("inner") match
+        Some(found) -> found
+        None -> return
+
+    var w = IcWalk("")
+
+    for k in 0..<inner.len()
+        val d = inner.at(k).unwrap()
+
+        d.get("loc") match
+            Some(loc) -> ic_track(loc, &w)
+            None -> ()
+
+        val file = w.file
+
+        for j in 0..<d.len()
+            val mm = d.member(j).unwrap()
+
+            if mm.key != "loc" then ic_track(mm.value, &w)
+
+        if ic_flag(d, "isImplicit") then continue
+
+        ic_decl(d, file, file == m.header, file == m.probe, m)
+end ic_collect
+
+private ic_decl(d: Json, file: string, main: bool, probe: bool, m: *IcModel)
+    val kind = ic_str(d, "kind")
+    val name = ic_str(d, "name")
+    val followed = !main && ic_is_followed(file, m.follow)
+
+    if kind == "TypedefDecl"
+        var owned = ""
+
+        d.get("inner") match
+            Some(inner) ->
+                inner.at(0) match
+                    Some(first) ->
+                        first.get("ownedTagDecl") match
+                            Some(o) -> owned = ic_str(o, "id")
+                            None -> ()
+                    None -> ()
+            None -> ()
+
+        // C11 lets a typedef be declared again with the same type; the first is the one.
+        for t in m.typedefs
+            if t.name == name && t.main == main then return
+
+        m.typedefs.push(IcTypedef(name, ic_qual(d), owned, main, "", followed))
+    else if kind == "RecordDecl"
+        ic_record(d, file, main, followed, false, m)
+    else if kind == "EnumDecl"
+        var consts: Buf[string] = buf()
+
+        d.get("inner") match
+            Some(inner) ->
+                for k in 0..<inner.len()
+                    val c = inner.at(k).unwrap()
+
+                    if ic_str(c, "kind") == "EnumConstantDecl" then consts.push(ic_str(c, "name"))
+            None -> ()
+
+        if main || !ic_has_enum(m, name) then m.enums.push(IcEnum(ic_str(d, "id"), name, main, consts, "", ""))
+    else if kind == "FunctionDecl" && main
+        for f in m.funcs
+            if f.name == name then return
+
+        var params: Buf[string] = buf()
+        var quals: Buf[string] = buf()
+
+        d.get("inner") match
+            Some(inner) ->
+                for k in 0..<inner.len()
+                    val p = inner.at(k).unwrap()
+
+                    if ic_str(p, "kind") == "ParmVarDecl"
+                        params.push(ic_str(p, "name"))
+                        quals.push(ic_qual(p))
+            None -> ()
+
+        m.funcs.push(IcFunc(name, ic_qual(d), params, ic_str(d, "storageClass"), ic_flag(d, "inline"), quals))
+    else if kind == "VarDecl"
+        if probe && name.starts_with("__sysl_import_c_")
+            parse_long(name[16..<name.len]) match
+                Ok(n) -> m.macro_types.push((int(n), ic_qual(d)))
+                Err(_) -> ()
+        else if main
+            m.vars.push((name, ic_qual(d)))
+end ic_decl
+
+private ic_has_enum(m: *IcModel, tag: string) -> bool
+    if tag == "" then return false
+
+    for e in m.enums
+        if e.tag == tag then return true
+
+    false
+
+// A record, and the records C hoists out of it: a named one as a record of its own, an unnamed one
+// as `nested`, which the member declared with it points at. A second declaration of a tag already
+// seen completes it where it is the definition.
+private ic_record(d: Json, file: string, main: bool, followed: bool, nested: bool, m: *IcModel)
+    val tag = ic_str(d, "name")
+    val id = ic_str(d, "id")
+    val complete = ic_flag(d, "completeDefinition")
+    var fields: Buf[IcField] = buf()
+    var packed = false
+    var align: long = 0
+    var why = ""
+    var unnamed = ""
+
+    d.get("inner") match
+        Some(inner) ->
+            for k in 0..<inner.len()
+                val f = inner.at(k).unwrap()
+                val kind = ic_str(f, "kind")
+
+                if kind == "FieldDecl"
+                    val qual = ic_qual(f)
+                    val anon = qual.contains("(anonymous") || qual.contains("(unnamed")
+
+                    fields.push(IcField(ic_str(f, "name"), qual, ic_flag(f, "isBitfield"), ic_width(f),
+                                        if anon then unnamed else "", ic_has_kind(f, "AlignedAttr")))
+                else if kind == "RecordDecl"
+                    if ic_str(f, "name") != ""
+                        ic_record(f, file, main, followed, false, m)
+                    else
+                        unnamed = ic_str(f, "id")
+                        ic_record(f, file, main, followed, true, m)
+                else if kind == "PackedAttr"
+                    packed = true
+                else if kind == "AlignedAttr"
+                    align = ic_literal(f)
+
+                    if align <= 0 then why = "carries an alignment attribute whose value is not a literal"
+                else if kind == "MaxFieldAlignmentAttr"
+                    why = "is laid out under '#pragma pack'"
+        None -> ()
+
+    val rec = IcRecord(id, tag, ic_str(d, "tagUsed") == "union", complete, main, fields, packed, why, "", "",
+                       file, nested, align, followed, false)
+
+    if tag != ""
+        for k in 0..<m.records.len()
+            var had = m.records.at(k)
+
+            if had.tag == tag && had.is_union == rec.is_union
+                if complete && !had.complete
+                    had.complete = true
+                    had.fields = fields
+                    had.packed = packed
+                    had.align = align
+                    had.why = why
+                    had.id = id
+                    had.file = file
+                    had.followed = followed
+                end if
+
+                if main then had.main = true
+
+                m.records.set(k, had)
+                return
+            end if
+    end if
+
+    m.records.push(rec)
+end ic_record

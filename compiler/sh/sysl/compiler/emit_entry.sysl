@@ -320,7 +320,19 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
                 emit_mark(e, setup_mark())
             None -> ()
 
-        emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, t.func)), no_ir_args()))
+        // A test answering with a `Result` is called for its answer, which is handed to the library's
+        // reporter as `main`'s is: an `Err` is said, with its error return trace, and exits 1.
+        p.test_reporters.get(t.func) match
+            Some(reported) ->
+                val (reporter, ty) = reported
+                val r = fresh_reg(e)
+
+                var args: Buf[IrArg] = buf()
+
+                emit(e, ir_call(Some(r), lty(e, ty), VGlobal(symbol_of(e, t.func)), no_ir_args()))
+                args.push(ir_arg(lty(e, ty), r))
+                emit(e, ir_call(None, LVoid, VGlobal(reporter), args))
+            None -> emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, t.func)), no_ir_args()))
 
         // `@teardown` runs here only where the test **returned**, which is the whole of what the
         // mark records. A test that trapped took this process with it, so the runner starts a fresh

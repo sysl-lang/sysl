@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.Map
 import sysl.math.bigint.BigInt
 
 // The typed statements, and every declaration a lowered program is made of.
@@ -45,13 +46,21 @@ enum TStmt
     TBreak(value: Option[TExpr], depth: int)
     TContinue(depth: int)
 
-    // Statements held back until the frame leaves, in the reverse of the order they were written.
-    TDefer(stmts: Buf[TStmt])
+    // Statements held back until the frame leaves, in the reverse of the order they were written --
+    // on every way out, or only on the function failing.
+    TDefer(stmts: Buf[TStmt], when: TDeferWhen)
 
     // Inline assembly: the template, the operands bound to locals, what it clobbers, and where the
     // block was written -- which is where a rule refusing any 'asm' at all points.
     TAsm(lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[string], span: Span)
 end TStmt
+
+// Which ways out of its block a deferred statement runs on. An `errdefer` runs only where the
+// function returns its failure variant, and its binder -- the local's unique name and the
+// function's error type -- is written with the failure's payload before the statement runs.
+enum TDeferWhen
+    TEveryExit
+    TFailureExit(binder: Option[(string, Type)])
 
 // One place written from one value.
 //
@@ -389,4 +398,9 @@ struct TProgram
     // Whether the machine divides 32-bit integers itself; where it does not (Armv6-M), the integer
     // runtime is kept in every build, since LLVM calls it for operations no source spells.
     divider: bool
+
+    // The library function each `@test` answering with a `Result[unit, E]` is handed its answer by --
+    // `sysl.test_result` at its `E` -- and the result's type, by the test's key (`program.sysl`'s
+    // `declared_test_reporters`).
+    test_reporters: Map[string, (string, Type)]
 end TProgram

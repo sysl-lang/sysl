@@ -1,0 +1,345 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, parse_long, replace_all}
+
+// **A C type as clang spells it, read back into a tree** -- the half of `sysl import-c` that turns
+// `void (*)(uv_handle_t *)` or `const struct fx_rec *` into something a mapping can walk.
+//
+// clang's JSON dump carries a declaration's type as text: a parameter is `{"qualType": "fx_ctx *"}`
+// and a function is `"fx_ctx *(const char *, size_t)"`, with no structured form beside either. So
+// the declarator is parsed here, inside out the way C reads it: the pointers, then a parenthesised
+// inner declarator if there is one, then the array and function suffixes, which bind tighter than
+// the pointers before them and looser than the declarator inside the parentheses.
+//
+// Qualifiers are dropped -- `const`, `volatile`, `restrict` and Apple's nullability words change
+// nothing about what crosses the boundary. A spelling the reader does not understand comes back as
+// `IcBad` holding the text, so a declaration that names one is refused by name rather than guessed
+// at.
+
+enum IcKind
+    IcNamed
+    IcPtr
+    IcArr
+    IcFunc
+    IcBad
+
+// One C type. `name` is a named type's specifiers with the qualifiers dropped (`unsigned long`,
+// `struct fx_rec`, `size_t`) or a bad one's text; `count` is an array's length, `-1` for `[]`;
+// `parts` is the pointee or element, or a function's result followed by its parameters.
+struct IcType
+    kind: IcKind
+    name: string
+    count: long
+    parts: Buf[IcType]
+    variadic: bool
+
+ic_named(name: string) -> IcType = IcType(IcNamed, name, 0, buf(), false)
+
+ic_bad(why: string) -> IcType = IcType(IcBad, why, 0, buf(), false)
+
+ic_wrap(kind: IcKind, inner: IcType, count: long) -> IcType
+    var parts: Buf[IcType] = buf()
+
+    parts.push(inner)
+    IcType(kind, "", count, parts, false)
+
+// The first `IcBad` anywhere in a type, or nothing where the whole of it was understood.
+ic_bad_part(t: IcType) -> Option[string]
+    if t.kind == IcBad then return Some(t.name)
+
+    for item in t.parts
+        ic_bad_part(item) match
+            Some(why) -> return Some(why)
+            None -> ()
+
+    None
+
+// The words that qualify a type without changing what it is.
+private val IcQualifiers: []const string = ["const", "volatile", "restrict", "__restrict",
+    "_Nullable", "_Nonnull", "_Null_unspecified", "__unsafe_unretained", "_Atomic"]
+
+private ic_qualifier(word: string) -> bool
+    for q in IcQualifiers
+        if q == word then return true
+
+    false
+
+private ic_ident_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_')
+
+// The tokens of a spelling: words, numbers, `...`, `::`, and every other byte alone.
+private ic_tokens(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val b = text.bytes
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8(' ')
+            i += 1
+        else if ic_ident_byte(c)
+            val start = i
+
+            while i < b.len && ic_ident_byte(b[i]) do i += 1
+
+            out.push(text[start..<i])
+        else if c == u8('.') && i + 2 < b.len && b[i + 1] == u8('.') && b[i + 2] == u8('.')
+            out.push("...")
+            i += 3
+        else if c == u8(':') && i + 1 < b.len && b[i + 1] == u8(':')
+            out.push("::")
+            i += 2
+        else
+            out.push(text[i..<i + 1])
+            i += 1
+
+    out
+end ic_tokens
+
+struct IcParser
+    toks: Buf[string]
+    pos: usize
+
+private ic_peek(p: *IcParser) -> string = if p.pos < p.toks.len() then p.toks.at(p.pos) else ""
+
+private ic_peek_at(p: *IcParser, k: usize) -> string =
+    if p.pos + k < p.toks.len() then p.toks.at(p.pos + k) else ""
+
+private ic_take(p: *IcParser) -> string
+    val t = ic_peek(p)
+
+    if p.pos < p.toks.len() then p.pos += 1
+
+    t
+
+// The tokens of one balanced parenthesised group, the parentheses themselves left out. The caller
+// is on the `(`.
+private ic_group(p: *IcParser) -> Buf[string]
+    var out: Buf[string] = buf()
+    var depth = 0
+
+    ic_take(p)
+
+    while p.pos < p.toks.len()
+        val t = ic_take(p)
+
+        if t == "(" then depth += 1
+
+        if t == ")"
+            if depth == 0 then return out
+
+            depth -= 1
+        end if
+
+        out.push(t)
+
+    out
+end ic_group
+
+// **The specifiers**: every word up to the declarator, qualifiers dropped. A tag type whose name
+// clang made up -- `struct (unnamed struct at fx.h:3:9)`, `union fx_holder::(unnamed at ...)` --
+// keeps its text, which names nothing a header declared and is refused where it is used.
+private ic_specifiers(p: *IcParser) -> string
+    var words: Buf[string] = buf()
+
+    loop
+        val t = ic_peek(p)
+
+        if t == "" || t == "*" || t == ")" || t == "," || t == "[" || t == "^" then break
+
+        if t == "("
+            // A tag's made-up name is a group straight after the tag word or its `::`.
+            val last = if words.is_empty() then "" else words.at(words.len() - 1)
+
+            if last == "struct" || last == "union" || last == "enum" || last == "::"
+                val inner = ic_group(p)
+
+                words.push(s"(${join(inner.view(), " ")})")
+                continue
+            end if
+
+            break
+        end if
+
+        ic_take(p)
+
+        if !ic_qualifier(t) then words.push(t)
+
+    // `struct fx_holder :: (unnamed ...)` rejoined without the spaces the tokens lost.
+    replace_all(join(words.view(), " "), " :: ", "::")
+end ic_specifiers
+
+private ic_skip_qualifiers(p: *IcParser)
+    while ic_qualifier(ic_peek(p)) do ic_take(p)
+
+// `(params)` on the parser's `(`: the parameter types, and whether there is a `...`. `(void)` is no
+// parameters at all.
+private ic_params(p: *IcParser, result: IcType) -> IcType
+    val inner = ic_group(p)
+    var parts: Buf[IcType] = buf()
+    var variadic = false
+
+    parts.push(result)
+
+    if inner.len() == 1 && inner.at(0) == "void"
+        return IcType(IcFunc, "", 0, parts, false)
+
+    var one: Buf[string] = buf()
+    var depth = 0
+
+    for k in 0..<inner.len() + 1
+        val t = if k < inner.len() then inner.at(k) else ","
+
+        if t == "(" || t == "[" then depth += 1
+        if t == ")" || t == "]" then depth -= 1
+
+        if t == "," && depth == 0
+            if one.len() == 1 && one.at(0) == "..."
+                variadic = true
+            else if !one.is_empty()
+                parts.push(ic_parse_tokens(one))
+
+            one = buf()
+        else
+            one.push(t)
+
+    IcType(IcFunc, "", 0, parts, variadic)
+end ic_params
+
+// The suffixes after a declarator, applied to `base` innermost first: `T [2][3]` is an array of two
+// arrays of three.
+private ic_suffixes(p: *IcParser, base: IcType) -> IcType
+    var kinds: Buf[(bool, long)] = buf()
+    var funcs: Buf[IcParser] = buf()
+
+    loop
+        val t = ic_peek(p)
+
+        if t == "["
+            ic_take(p)
+
+            val n = ic_peek(p)
+            var count: long = -1
+
+            if n != "]"
+                parse_long(n) match
+                    Ok(v) -> count = v
+                    Err(_) -> return ic_bad(s"an array bound clang left as '$n'")
+
+                ic_take(p)
+            end if
+
+            if ic_take(p) != "]" then return ic_bad("an array bound that does not close")
+
+            kinds.push((false, count))
+        else if t == "("
+            // The function's parameters, kept unread until the result they apply to is known.
+            val start = p.pos
+
+            ic_group(p)
+
+            var sub: Buf[string] = buf()
+
+            for k in start..<p.pos
+                sub.push(p.toks.at(k))
+
+            funcs.push(IcParser(sub, 0))
+            kinds.push((true, -1))
+        else
+            break
+
+    var out = base
+    var fi = funcs.len()
+    var k = kinds.len()
+
+    while k > 0
+        k -= 1
+
+        val (is_func, count) = kinds.at(k)
+
+        if is_func
+            fi -= 1
+
+            var sub = funcs.at(fi)
+
+            out = ic_params(&sub, out)
+        else
+            out = ic_wrap(IcArr, out, count)
+
+    out
+end ic_suffixes
+
+// A declarator over `base`: its pointers, then either a parenthesised inner declarator or nothing,
+// then its suffixes. `T (*)(int)` is a pointer to a function, which is why the inner declarator is
+// applied last -- to whatever the suffixes made of the base.
+private ic_declarator(p: *IcParser, base: IcType) -> IcType
+    var t = base
+
+    loop
+        val next = ic_peek(p)
+
+        if next == "*"
+            ic_take(p)
+            ic_skip_qualifiers(p)
+            t = ic_wrap(IcPtr, t, 0)
+        else if next == "^"
+            return ic_bad("a block pointer ('^'), which is Apple's closure extension to C")
+        else
+            break
+
+    // `(` opens an inner declarator when what follows is one -- a pointer, a block or another group
+    // -- and a parameter list otherwise.
+    if ic_peek(p) == "(" && (ic_peek_at(p, 1) == "*" || ic_peek_at(p, 1) == "^" || ic_peek_at(p, 1) == "(")
+        val inner = ic_group(p)
+        val outer = ic_suffixes(p, t)
+        var sub = IcParser(inner, 0)
+
+        // Held before it is returned: as a self tail call handing over `&sub`, alpha.12 disposes
+        // `sub` before the jump and the inner declarator reads a freed buffer.
+        val made = ic_declarator(&sub, outer)
+
+        return made
+    end if
+
+    ic_suffixes(p, t)
+end ic_declarator
+
+private ic_parse_tokens(toks: Buf[string]) -> IcType
+    var p = IcParser(toks, 0)
+    val spec = ic_specifiers(&p)
+
+    if spec == "" then return ic_bad(s"a type with no name in '${join(toks.view(), " ")}'")
+
+    val t = ic_declarator(&p, ic_named(spec))
+
+    if t.kind == IcBad then return t
+
+    if p.pos < p.toks.len()
+        return ic_bad(s"'${join(toks.view(), " ")}', which this reader does not follow past " +
+                      s"'${p.toks.at(p.pos)}'")
+
+    t
+end ic_parse_tokens
+
+// **A type as clang printed it**, read into a tree.
+ic_parse(text: string) -> IcType = ic_parse_tokens(ic_tokens(text))
+
+// The spelling a tree came from, near enough to quote in a message: what `ic_parse` read, written
+// back in C's order.
+ic_show(t: IcType) -> string = t.kind match
+    IcNamed -> t.name
+    IcBad -> t.name
+    IcPtr -> s"${ic_show(t.parts.at(0))} *"
+    IcArr -> s"${ic_show(t.parts.at(0))}[${if t.count < 0 then "" else str(t.count)}]"
+    IcFunc ->
+        var ps: Buf[string] = buf()
+
+        for k in 1..<t.parts.len()
+            ps.push(ic_show(t.parts.at(k)))
+
+        if t.variadic then ps.push("...")
+
+        s"${ic_show(t.parts.at(0))} (${join(ps.view(), ", ")})"

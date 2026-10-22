@@ -544,9 +544,10 @@ argument list left open are told what `@test` wanted rather than being blamed on
 
 ### What a test may be
 
-**A test is an ordinary function with a caller nothing else has**: no parameters, no result, not
-generic. All three are the same requirement from different sides, since the runner calls it with
-nothing and reads the answer off whether it returned. They are checked **at the annotation**, because
+**A test is an ordinary function with a caller nothing else has**: no parameters, no result other
+than a `Result[unit, E]`, not generic. All three are the same requirement from different sides, since
+the runner calls it with nothing and reads the answer off whether it returned — or, for a test that
+answers with a `Result`, whether it answered `Ok`. They are checked **at the annotation**, because
 the function is a perfectly good function and it is `@test` that made a promise about it:
 
 ```sysl
@@ -575,7 +576,7 @@ gives_back() -> int = 1
 ```
 
 ```error
-a '@test' function returns nothing, and 'gives_back' returns 'int' — a test's result is whether it came back, so there is nothing to read a value with
+a '@test' function returns nothing or a 'Result[unit, E]', and 'gives_back' returns 'int' — a test's result is whether it came back or failed, so there is nothing to read a value with
 ```
 
 ### A test passes by returning
@@ -583,6 +584,35 @@ a '@test' function returns nothing, and 'gives_back' returns 'int' — a test's 
 That is the whole protocol, and it is what lets a test assert **in the language it is testing**
 rather than in a framework. A broken `require`, a bounds violation, an `unwrap` of a `None` — each
 ends the process, and none of them had to know it was running under a test.
+
+**A test may answer with a `Result[unit, E]`**, so the fallible code it exercises is called with `?`
+just as the program calls it. An `Ok` passes. An `Err` fails the test: the run says the error —
+through its `Display`, or its `Debug` where it has only that — and the
+[error return trace](/reference/errors/#where-a-failure-came-from) under it, and exits with status 1:
+
+```sysl
+parse(s: string) -> Result[usize, string] = if s == "" then Err("empty input") else Ok(s.len)
+
+check(s: string) -> Result[unit, string]
+    val n = parse(s)?
+    assert(n > 0)
+    Ok(())
+
+@test
+reads_a_word() -> Result[unit, string]
+    check("port")?
+    Ok(())
+```
+
+Given `check("")` instead, the report under the failed test reads
+
+```text
+error: empty input
+error return trace (origin first):
+  main.sysl:1:61 in parse
+  main.sysl:4:21 in check
+  main.sysl:10:14 in reads_a_word
+```
 
 `should_trap` inverts the reading, for a test whose subject *is* the check. With a string it
 additionally requires that the run printed it, which is what tells a trap from the **right** trap. A
@@ -2509,6 +2539,124 @@ none of these is refused, and none is checked when the program runs. **A call th
 anyway is undefined behaviour**: the optimizer has been told the loads and stores through the two
 parameters never touch the same memory, and the code it makes is free to read a value before the
 store that should have changed it, or after.
+
+### Over a function's result
+
+A function that cuts storage into pieces can promise the pieces never share an element. The parts of
+its result are named by position, as a tuple's part is selected and by the name an `ensure` gives the
+result — `result.0`, `result.1`:
+
+```sysl
+@disjoint(result.0, result.1)
+halves(xs: []int) -> ([]int, []int) = (xs[..<xs.len / 2], xs[xs.len / 2..])
+
+var v: [6]int = [1, 2, 3, 4, 5, 6]
+val (l, r) = halves(v[..])
+l[0] = 10
+r[0] = 40
+print(v[0], v[3])
+```
+
+```output
+10 40
+```
+
+The standard library's `sysl.slices.split_at(xs, n)` is the general form, `(xs[..<n], xs[n..])`, and
+makes the same promise. A result list (`-> []int, []int`) names its parts the same way.
+
+**What the caller may rely on**: two parts of one call's result that the function names share no
+element, after they are destructured, and so does every slice of either. Handed on to a function
+`@disjoint` over two parameters, they are storage the call knows is apart rather than storage it
+takes on trust. A part is **not** promised apart from the function's parameters — `split_at`'s pieces
+are its parameter, cut in two.
+
+That is what lets a recursive halving hand each half to a different writer. Every level cuts its own
+piece, and the two it makes are apart, so every element is written exactly once:
+
+```sysl
+import sysl.slices.split_at
+
+number(xs: []usize, from: usize)
+    if xs.len == 1
+        xs[0] = from
+    else if xs.len > 1
+        val (l, r) = split_at(xs, xs.len / 2)
+
+        number(l, from)
+        number(r, from + l.len)
+
+@disjoint(y, x)
+add_into(y: []usize, x: []const usize)
+    for i in 0..<y.len
+        y[i] = y[i] + x[i]
+
+var v: [8]usize = [0; 8]
+
+number(v[..], 10)
+
+val (lo, hi) = split_at(v[..], 4)
+
+add_into(lo, hi)
+print(v[0], v[3], v[4], v[7])
+```
+
+```output
+24 30 14 17
+```
+
+**What the function must show — it is checked, never trusted.** Every value the body answers, the
+trailing one and each `return`'s, shows the named parts apart in one of two ways: slices of one
+storage whose bounds meet, where one ends at the very bound the other begins at — the same literal,
+or the same names and arithmetic, as `xs.len / 2` written twice — or two runs of literal bounds that share no element; or parts of one call of a
+function that makes the same promise, which is how a function answers pieces of pieces. Slicing
+traps past the end, so two slices that meet at a bound can never both reach one element. A name the
+check traces a part through holds one value for the whole body: declared once, never assigned, its
+address never taken. Anything else is refused where it is answered:
+
+```sysl
+@disjoint(result.0, result.1)
+cut(xs: []int, n: usize, m: usize) -> ([]int, []int) = (xs[..<n], xs[m..])
+
+var v: [4]int = [1, 2, 3, 4]
+val (a, b) = cut(v[..], 2, 2)
+print(a.len + b.len)
+```
+
+```error
+'cut' is '@disjoint' over 'result.0' and 'result.1', and this answer does not show them apart — 'xs[..<n]' and 'xs[m..]' may share an element; a body shows it with slices of one view that meet at a bound, as '(xs[..<n], xs[n..])', or with parts of one call of a function '@disjoint' over its result
+```
+
+A generic's body is checked at each instantiation, as its parameters' types are. The promise
+changes nothing the back end is told: it is a fact the compiler has checked, for the checks that
+need to tell two pieces of one storage apart.
+
+A part is held to what a parameter is: it reaches memory, it is a part the result has, and the
+promise is about two of them, so one alone is refused:
+
+```sysl
+@disjoint(result.0)
+cut(xs: []int, n: usize) -> ([]int, []int) = (xs[..<n], xs[n..])
+
+print(1)
+```
+
+```error
+'@disjoint' names 'result.0' and no other part of 'cut''s result, and a part is kept apart from the other parts named — name two, as '@disjoint(result.0, result.1)'
+```
+
+```sysl
+@disjoint(result.0, result.1)
+count(xs: []int) -> ([]int, usize) = (xs, xs.len)
+
+print(1)
+```
+
+```error
+'@disjoint' names 'result.1', a part of 'count''s result whose type 'usize' is a value
+```
+
+A list may name parameters and parts together, and each keeps its own promise: the parameters are
+kept apart while a call runs, the parts from each other once it has returned.
 
 ### What the back end is told
 

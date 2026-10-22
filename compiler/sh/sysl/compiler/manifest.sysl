@@ -143,6 +143,10 @@ struct Manifest
     // The `test` block: how this package's own suite is run where the command line does not say.
     tests: TestSettings
 
+    // Whether failures record the error return trace (`error_trace.sysl`). Root project only, as
+    // `bounds_locations` is.
+    error_traces: Option[bool]
+
     // The `options` block: each valued option this package declares, its type, default and range
     // (`options.sysl`).
     options: Buf[PackageOption]
@@ -173,7 +177,7 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), buf(), buf())
+             buf(), buf(), no_test_settings(), None, buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -576,6 +580,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val link = read_link(root)?
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
+    val error_traces = read_error_traces(root)?
     val tests = read_test_settings(root, &warnings)?
     val options = read_options(root)?
 
@@ -601,7 +606,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
-                codegen_read.1, target_codegen_registers, tests, options, feature_targets)
+                codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets)
     val unnamed = undeclared_feature_target(made)
 
     if unnamed.is_some() then return Err(unnamed.unwrap())
@@ -679,6 +684,20 @@ private read_bounds_locations(root: &Conf) -> Result[Option[bool], string]
     Err("'bounds_locations' says whether a failed bounds check names the file, line and column it " +
         "was written at, so it is true or false")
 end read_bounds_locations
+
+// The `error_traces` key: `true`, the default, or `false` to record no error return trace at all.
+private read_error_traces(root: &Conf) -> Result[Option[bool], string]
+    val value = conf_at(root, "error_traces") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    *value match
+        Flag(on) -> return Ok(Some(on))
+        _ -> ()
+
+    Err("'error_traces' says whether a failure records where it was made and each '?' that handed " +
+        "it on, so it is true or false")
+end read_error_traces
 
 // A `codegen` block, at the top of the file or inside a `targets.<name>` block: each setting
 // `codegen_features.sysl` knows, `true` or `false`. **A name it does not know is refused rather than
@@ -1793,5 +1812,5 @@ private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace" || key == "codegen" || key == "c" || key == "test" ||
-    key == "options"
+    key == "bounds_locations" || key == "error_traces" || key == "workspace" || key == "codegen" ||
+    key == "c" || key == "test" || key == "options"

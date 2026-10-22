@@ -53,6 +53,27 @@ vps_recursion_takes_no_share()
     assert(ir.starts_with("define"), ir)
     assert_eq(vps_retains(ir), 0, ir)
 
+@test("a view handed down through two other functions takes no share in either")
+vps_two_calls_down_take_no_share()
+    val source = raw"""
+        fill(v: []u32)
+            for i in 0..<v.len do v[i] = u32(i + 100)
+
+        middle(v: []u32)
+            v[0] = 1
+            fill(v)
+
+        outer(v: []u32)
+            middle(v)
+            v[1] += 1
+        """
+
+    for name in ["middle", "outer"]
+        val ir = emit_func_text(source, name)
+
+        assert(ir.starts_with("define"), ir)
+        assert_eq(vps_retains(ir), 0, ir)
+
 @test("a parameter reassigned inside the callee still keeps a count of its own")
 vps_reassigned_parameter_owns()
     val ir = emit_func_text(raw"""
@@ -162,6 +183,16 @@ private vps_program() -> string = raw"""
         v[0] = 2
         v[0]
 
+    fill(v: []u32)
+        for i in 0..<v.len do v[i] = u32(i + 100)
+
+    middle(v: []u32)
+        fill(v)
+
+    outer(v: []u32)
+        middle(v)
+        v[1] += 1
+
     down(v: []u32, n: int)
         if n == 0 then return
         v[n - 1] = u32(n * 10)
@@ -203,9 +234,13 @@ private vps_program() -> string = raw"""
 
     val c: &Keeper = Keeper(fresh(2).view())
     print(s"${clobber(c, c.held)}")
+
+    val p = fresh(2)
+    outer(p.view())
+    print(s"${p.view()[0]} ${p.view()[1]}")
     """
 
-private vps_want() -> string = "0\n7 2\n8 2\n9\n2 2\n11 21 31 41\n7\n"
+private vps_want() -> string = "0\n7 2\n8 2\n9\n2 2\n11 21 31 41\n7\n100 102\n"
 
 @test("a view stored, returned, captured, reassigned, recursed with or outliving its Buf gives every allocation back")
 vps_kept_views_count_to_zero()

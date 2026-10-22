@@ -6,8 +6,9 @@ file it opened when the header it then writes cannot be written, give back the b
 that would have kept it gives up. Written by hand, that is a flag set before the last `Ok` and a
 `defer if !done then …`. Zig spells it `errdefer`; sysl takes it for 0.3.0.
 
-Nothing here is built. Every block marked **proposed** is syntax or a diagnostic that does not
-exist; every other block is the installed `sysl 0.2.5`'s real output.
+**Decided** (user, 2026-10-19, as written) and built; the specification is
+[`reference/statements.md § errdefer`](/reference/statements/#errdefer). The blocks below marked
+**proposed** were written before it existed; every other block is `sysl 0.2.5`'s output.
 
 ## 1. What exists, and the gaps (0.2.5)
 
@@ -138,16 +139,17 @@ binder after a `From` conversion sees the converted value. Refusals: a non-faili
 in an `Option` function, `return`/`?`/`break` inside. A counted-heap run (`SYSL_COUNT_ALLOCS=1`)
 showing the binder takes no count. A `thumb-freestanding` build under `no alloc`.
 
-## 6. Decisions for the user
+## 6. Decided (user, 2026-10-19)
 
-1. **Spell it `errdefer`.** Recommend yes; the alternatives are `defer on error` and D's
-   `scope(failure)`.
-2. **`None` counts as a failure exit in an `Option` function.** Recommend yes; Zig has no optional
-   case to copy, and `?`'s symmetry argues for it.
-3. **The binder, spelled `errdefer e -> stmt`.** Recommend yes, in 0.3.0. The alternative is to ship
-   without it and add it later; the spelling is the open part.
-4. **A computed return is tag-tested at the edge (decision 4).** Recommend yes — the alternative,
-   counting only statically visible failures, silently skips the rollback on `return r`.
-5. **Refuse `errdefer` in a function that cannot fail.** Recommend yes.
-6. **Block scope, discarded on a non-failing exit from the block (decision 10).** Recommend yes —
-   Zig's rule, and the one that matches `defer`.
+All six as recommended:
+
+1. **Spelled `errdefer`**, a reserved word beside `defer`.
+2. **`None` counts as a failure exit in an `Option` function.**
+3. **The binder is spelled `errdefer e -> stmt`**; what follows the arrow is one line or a block, as
+   a `match` arm's body is.
+4. **A computed return is tag-tested at the edge (decision 4).**
+5. **`errdefer` is refused in a function that cannot fail.**
+6. **Block scope, discarded on a non-failing exit from the block (decision 10).**
+
+A closure whose result its context does not fix has no result to ask where the `errdefer` is read,
+and is refused one until the result is stated — the rule a `?` in such a closure already follows.

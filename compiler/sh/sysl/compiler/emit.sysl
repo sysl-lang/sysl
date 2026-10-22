@@ -295,6 +295,23 @@ struct Emit
     // The array literals the body being lowered lays in its frame rather than in a buffer of their
     // own, which the escape analysis settled (`Promotions.framed_for`).
     framed_lits: Buf[Span]
+
+    // How the function is being left while a way out lays its deferred statements down, which is
+    // what decides whether an `errdefer` among them runs (`emit_arc.sysl`'s `run_deferrals`).
+    exit: ExitMode
+
+    // The error return trace (`error_trace.sysl`): whether this module records into it, so it declares
+    // the three functions it calls; the function being lowered, as a site names it; the `Err(...)`
+    // constructors that are its results; and the trace's length saved by each statement being lowered
+    // that handles a failure, outermost first.
+    traces: bool
+    trace_fn: string
+    trace_origins: Set[string]
+    trace_marks: Buf[Val]
+
+    // The function each closure of the program was written in, by key, which is what a site in a
+    // closure is named after.
+    trace_owners: Map[string, string]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -394,6 +411,10 @@ struct GenLoop
     // body runs there is nothing of the test left outstanding for the loop to give back.
     owned_depth: usize
     temp_depth: usize
+
+    // How many statements handling a failure were open when the loop was entered: a `break` or a
+    // `continue` completes every one opened since, so it puts the trace back to the first of them.
+    trace_depth: usize
 end GenLoop
 
 // An emitter for one module, with no function open, and no program behind it -- which is what a
@@ -451,7 +472,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          defer_marks, set(), relaid, set(), promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
-         no_wrap_none(), map(), buf())
+         no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -514,6 +535,10 @@ start_function(e: *Emit)
     e.temp_slots = set()
     e.gap = None
     e.coro = None
+    e.exit = Leaving
+    e.trace_fn = ""
+    e.trace_origins = set()
+    e.trace_marks = buf()
 end start_function
 
 // A register nothing else in this function uses.

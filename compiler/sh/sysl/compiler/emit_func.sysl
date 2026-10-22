@@ -31,6 +31,10 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     e.self_name = f.name
     e.src = f.src
 
+    // What a site of the error return trace names, and which `Err(...)` constructors are this body's
+    // results and so the origins it records (`error_trace.sysl`).
+    trace_function(e, f)
+
     for item in f.params
         e.self_params.push(item)
 
@@ -162,7 +166,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
                     retain_value(e, f.ret_ty, v)
                     emit_ensures(e, Some(v))
-                    release_all(e)
+                    release_all_as(e, exit_returning(e, Some(r), v, f.ret_ty))
                     emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
                 else
                     gen_expr(e, r)
@@ -237,7 +241,10 @@ private coro_result(e: *Emit, f: TFunc)
 
                 retain_value(e, result, v)
                 emit_ensures(e, Some(v))
+
+                e.exit = exit_returning(e, Some(r), v, result)
                 coro_deliver(e, v)
+                e.exit = Leaving
             else
                 gen_expr(e, r)
                 emit_ensures(e, None)
@@ -325,11 +332,24 @@ gen_indirect_return(e: *Emit, r: TExpr)
         emit_ensures(e, Some(v))
     else emit_ensures(e, None)
 
+    // An `errdefer` waiting asks the value's tag, and its binder the failure's payload, both read
+    // back out of the storage -- a load only a function with one pays for.
+    var exit = Leaving
+
+    if errdefer_pending(e)
+        val v = fresh_reg(e)
+
+        emit(e, InLoad(v, lty_of(e, r), dest, AccPlain, None))
+        exit = exit_returning(e, Some(r), v, texpr_type(r))
+    end if
+
     if e.coro.is_some()
+        e.exit = exit
         coro_deliver(e, VNothing)
+        e.exit = Leaving
         return
     end if
 
-    release_all(e)
+    release_all_as(e, exit)
     emit_term(e, InRet(None, None))
 end gen_indirect_return

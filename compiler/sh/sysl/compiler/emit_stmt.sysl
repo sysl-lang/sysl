@@ -10,7 +10,13 @@ import sysl.math.bigint.from_int
 // before.
 gen_stmt(e: *Emit, s: TStmt)
     push_temps(e)
+
+    // A statement that handles a failure puts the error return trace back as it found it when it
+    // completes (`error_trace.sysl`).
+    val mark = trace_enter(e, s)
+
     gen_stmt_body(e, s)
+    trace_leave(e, mark)
     pop_temps(e)
 end gen_stmt
 
@@ -105,6 +111,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
                 emit(e, InStore(lty_of(e, t), v, enclosing.slot, AccPlain, None))
             None -> ()
 
+        trace_unwind(e, enclosing.trace_depth)
         release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
         emit_term(e, InBr(enclosing.break_label))
 
@@ -116,13 +123,14 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
 
         val enclosing = loop_at(e, depth)
 
+        trace_unwind(e, enclosing.trace_depth)
         release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
         emit_term(e, InBr(enclosing.continue_label))
 
     // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
     // at each edge that leaves the block. Registering here rather than at the top of the block is
     // what makes a `defer` control never reached schedule nothing.
-    TDefer(stmts) -> defer_stmts(e, stmts)
+    TDefer(stmts, when) -> defer_stmts(e, stmts, when)
 
     // A loop's `invariant` is a condition that traps on false, which is every other clause the
     // verification chapter states -- unless it names a `@ghost` function, in which case it states a
@@ -376,6 +384,8 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                                                                                            variant.slot(i)))))))
                                     emit(e, InGep(p, variant_lty(d, variant), base, idx))
                                     gen_borrowed_into(e, p, args.at(i))
+
+                        trace_origin(e, x)
                 None -> store_through_value(e, dest, x, ty)
 
         // The value is generated once, above the loop, exactly as the value form does -- every
@@ -576,13 +586,17 @@ private gen_return(e: *Emit, opt: Option[TExpr])
             retain_value(e, ty, v)
             emit_ensures(e, Some(v))
 
+            val exit = exit_returning(e, Some(t), v, ty)
+
             // An async body's result goes into its task rather than back to a caller.
             if e.coro.is_some()
+                e.exit = exit
                 coro_deliver(e, v)
+                e.exit = Leaving
                 return
             end if
 
-            release_all(e)
+            release_all_as(e, exit)
             emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
         None ->
             emit_ensures(e, None)
