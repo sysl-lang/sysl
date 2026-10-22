@@ -68,6 +68,15 @@ everything that can affect its bytes:
   one a package's `headers` variable or a `pkg-config` path reached, the SDK's own — by its bytes, as
   each C compilation and each `c const` block reported reading it. Editing such a header rebuilds;
   putting it back runs the binary the first text built;
+- **every header that would now be found first**: for each header read, every place clang searches
+  ahead of where it was found (`-iquote`, `-I`, `-isystem`, the SDK, frameworks, and the directory of
+  the file including it). A file appearing at one of them rebuilds; taking it away runs the binary
+  built without it;
+- **every file the linker loaded** — the objects, archives, shared libraries and SDK stubs it reports
+  under `-t` (ld64 on macOS, GNU ld or lld on Linux) — by its bytes, and every library that would now
+  be found ahead of one it loaded in a `--link-path` or `pkg-config` directory. A shared library is
+  also loaded again at every run, which is where its code comes from; keying the bytes the link read
+  means a rebuilt one relinks rather than replays;
 - **every manifest in the build, whole** — the project's and every package's, every key but the
   four that are prose about a package (`description`, `license`, `authors`, `keywords`) and the
   `test` block, which is read afresh on every run;
@@ -92,10 +101,9 @@ that asks for the report compiles again), `SYSL_TIMINGS`, `SYSL_CODEGEN_UNITS` (
 program is compiled in, not what it is), and where the caches and the library are (`HOME`,
 `XDG_CACHE_HOME`, `PATH`, the spelling of `SYSL_LIB` — the library's contents are keyed).
 
-**Two inputs the key still cannot see**, and `SYSL_NO_CACHE` is for them: a header *added* to a
-directory searched ahead of the one a header was found in last time (nothing the last build read has
-changed), and the bytes of a library the linker takes from a `--link-path` directory, which is keyed
-by where it is rather than by what it holds.
+**What the key does not watch is the toolchain's own installation**: a library added to the
+linker's built-in directories ahead of another one there. That is an install of the toolchain or the
+SDK, and `SYSL_NO_CACHE` is for it.
 
 This saves most of what `run` costs, because compilation usually dominates. In a 9,600-line module
 with three git dependencies, a program whose body is `print("hi")` takes 9.2 seconds to compile and

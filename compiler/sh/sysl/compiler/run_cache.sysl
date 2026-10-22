@@ -530,28 +530,71 @@ end run_cache_dir
 // `<key>.reads` lists every file the last build under it read through C (`note_files_read`: each
 // compilation's and each `c const` probe's `-MD` list), wherever the file is. A lookup reads each of
 // those files again and keys on their bytes (`files_key`), and the program is kept under that second
-// key. So an edit to a header in an `--include-path` directory, or the SDK, misses; putting it back
-// finds the entry the first text built; and a file that has gone is a miss.
+// key. So an edit to a header in an `--include-path` directory, or the SDK, misses; a file that has
+// gone is a miss; and a header that would now be found ahead of one read is a miss (the list's shadow
+// records, `header_shadows.sysl`). The libraries the link loaded are on the list too.
+//
+// **The file keeps the last few lists, newest first**, not only the last: two builds under one first
+// key that read different files -- a header added on the search path and then taken away -- each find
+// their own entry again, so putting things back replays rather than rebuilds.
 
-// The list of files beside a first key.
+// The lists of files beside a first key.
 const ReadsSuffix: string = ".reads"
 
-// Where the program built for this key is kept, as the files it read now say: nothing where there is
-// no cache, no list beside the key, or a file on the list is gone.
+// How many lists a first key keeps.
+private const ListsKept: usize = 8
+
+// The line between two lists in one file.
+private const ListBreak: string = "\n=\n"
+
+// The lists in a file of them, newest first; none where there is no file.
+read_lists(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    read_text(file) match
+        Err(_) -> ()
+        Ok(text) ->
+            val parts = split(text, ListBreak)
+
+            for i in 0..<parts.len
+                out.push(parts[i])
+
+    out
+end read_lists
+
+// `newest` written first in a file of lists, an equal older one dropped and the oldest past
+// `ListsKept` with it.
+keep_list(file: string, newest: string)
+    var lists: Buf[string] = buf()
+
+    lists.push(newest)
+
+    for item in read_lists(file)
+        if item != newest && lists.len() < ListsKept then lists.push(item)
+
+    write_text_atomic(file, join(lists.view(), ListBreak)).unwrap_or(())
+end keep_list
+
+// Where the program built for this key is kept, as the files it read now say: the entry the first
+// list whose files are all there and unshadowed comes to, where that entry exists; nothing where
+// there is no cache or no list finds one.
 private run_cache_slot(key: string) -> Option[string]
     val dir = run_cache_dir() match
         Some(d) -> d
         None -> return None
 
-    val listed = read_text(s"$dir/$key$ReadsSuffix") match
-        Ok(text) -> text
-        Err(_) -> return None
+    val file = s"$dir/$key$ReadsSuffix"
+    val lists = read_lists(file)
 
-    touch_used(s"$dir/$key$ReadsSuffix")
+    for listed in lists
+        files_key(key, listed_files(listed)) match
+            None -> ()
+            Some(second) ->
+                if is_file(s"$dir/$second")
+                    touch_used(file)
+                    return Some(s"$dir/$second")
 
-    files_key(key, listed_files(listed)) match
-        Some(second) -> Some(s"$dir/$second")
-        None -> None
+    None
 end run_cache_slot
 
 // How many lookups found an entry, and how many builds reserved a slot for one, since the last
@@ -649,7 +692,7 @@ settle_run_entry(pending: string, slot: string) -> Result[string, string]
         Some(second) -> s"$dir/$second"
         None -> slot
 
-    if settled != slot then write_text_atomic(s"$dir/$key$ReadsSuffix", join(read.view(), "\n")).unwrap_or(())
+    if settled != slot then keep_list(s"$dir/$key$ReadsSuffix", join(read.view(), "\n"))
 
     publish_file(pending, settled) match
         Err(_) -> return Err(settled)

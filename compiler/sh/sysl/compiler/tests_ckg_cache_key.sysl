@@ -557,6 +557,122 @@ ckg_outside_header_edit_reaches_a_root()
     assert_eq(kept, "4 | 5 | 4 | miss miss hit")
 end ckg_outside_header_edit_reaches_a_root
 
+// -- a header that would be found first ----------------------------------------------------------------
+
+// The seam over a `ckg.h` saying 9 added to `early`, searched ahead of the directory the build found
+// its `ckg.h` (saying 4) in, and taken away again.
+private ckg_shadow_seam(root: string, early: string, late: string) -> string =
+    ckg_seam(root, s"--include-path $early --include-path $late", s"--include-path $early --include-path $late",
+             () -> remove_file(s"$early/ckg.h").unwrap_or(()), () -> ckg_put(early, "ckg.h", "#define CKG_H 9\n"))
+
+@test("a header added in an --include-path directory searched first is a miss, and taking it away a hit")
+ckg_shadowing_header()
+    if !ckg_ready() then return
+
+    val early = lbr_temp("sysl-ckg-early")
+    val late = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val root = ckg_c_project(true)
+
+    assert_eq(ckg_shadow_seam(root, early, late), "4 | 9 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, early, late])
+end ckg_shadowing_header
+
+@test("a header added ahead of the one a dependency's C read is a miss, and taking it away a hit")
+ckg_shadowing_header_through_a_dependency()
+    if !ckg_ready() then return
+
+    val early = lbr_temp("sysl-ckg-early")
+    val late = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val dep = ckg_tree([("package.hocon", ckg_manifest("cdep", "")),
+                        ("cdep/cdep.sysl", "module cdep\n\nextern \"cdep_value\" value() -> int\n"),
+                        ("cdep/cdep.c", "#include \"ckg.h\"\nint cdep_value(void) { return CKG_H; }\n")])
+    val root = ckg_project(ckg_manifest("app", s"dependencies { cdep { path = \"$dep\" } }\n"), "import cdep",
+                           "cdep.value()", [])
+
+    assert_eq(ckg_shadow_seam(root, early, late), "4 | 9 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, dep, early, late])
+end ckg_shadowing_header_through_a_dependency
+
+// -- what the linker loaded -----------------------------------------------------------------------------
+
+// A project calling `ckgl_value` from a library named `ckgl`.
+private ckg_linking() -> string =
+    ckg_project(ckg_manifest("app", ""), "import cl", "cl.value()",
+                [("cl/cl.sysl", "module cl\n@link(\"ckgl\")\n\nextern \"ckgl_value\" value() -> int\n")])
+
+// The bytes of a file copied over another, so putting the first back is the same bytes again. The old
+// file is removed first: macOS remembers a signed image's signature by the file, and new bytes written
+// into the same file are refused at load.
+private ckg_copy(from: string, to: string)
+    remove_file(to).unwrap_or(())
+    write_bytes(to, read_bytes(from).unwrap()).unwrap()
+
+@test("a static library in a --link-path directory, rebuilt with another value, is a miss; the first back, a hit")
+ckg_static_library_bytes()
+    if !ckg_ready() then return
+
+    val two = ckg_archive(2)
+    val nine = ckg_archive(9)
+    val dir = lbr_temp("sysl-ckg-libdir")
+    val root = ckg_linking()
+
+    val got = ckg_seam(root, s"--link-path $dir", s"--link-path $dir",
+                       () -> ckg_copy(s"$two/libckgl.a", s"$dir/libckgl.a"),
+                       () -> ckg_copy(s"$nine/libckgl.a", s"$dir/libckgl.a"))
+
+    lbr_drop([root, two, nine, dir])
+    assert_eq(got, "2 | 9 | 2 | miss miss hit | different bytes")
+end ckg_static_library_bytes
+
+@test("a library added in a --link-path directory searched first is a miss, and taking it away a hit")
+ckg_shadowing_library()
+    if !ckg_ready() then return
+
+    val late = ckg_archive(2)
+    val nine = ckg_archive(9)
+    val early = lbr_temp("sysl-ckg-early")
+    val root = ckg_linking()
+
+    val got = ckg_seam(root, s"--link-path $early --link-path $late", s"--link-path $early --link-path $late",
+                       () -> remove_file(s"$early/libckgl.a").unwrap_or(()),
+                       () -> ckg_copy(s"$nine/libckgl.a", s"$early/libckgl.a"))
+
+    lbr_drop([root, late, nine, early])
+    assert_eq(got, "2 | 9 | 2 | miss miss hit | different bytes")
+end ckg_shadowing_library
+
+// A directory holding `libckgl.dylib`, whose `ckgl_value` answers `n`, named for where it will be
+// copied to so the program finds it there.
+private ckg_shared_library(n: int, at: string) -> string
+    val dir = lbr_temp("sysl-ckg-dylib")
+    val clang = find_clang(host_target(), None).unwrap()
+
+    write_text(s"$dir/ckgl.c", s"int ckgl_value(void) { return $n; }\n").unwrap()
+    capture(clang, ["-dynamiclib", s"$dir/ckgl.c", "-o", s"$dir/libckgl.dylib", "-install_name",
+                    s"$at/libckgl.dylib"], "", [], true).unwrap()
+    dir
+end ckg_shared_library
+
+// **A shared library is read twice**: by the link, which records what it exports, and by the loader at
+// every run, which is where its code comes from. The key holds the bytes the link read, so a rebuilt
+// library is a relink -- and the run that follows loads the new one either way.
+@test("a shared library in a --link-path directory, rebuilt with another value, is a miss; the first back, a hit")
+ckg_shared_library_bytes()
+    if !ckg_ready() || host_target().os != MacOS then return
+
+    val dir = lbr_temp("sysl-ckg-libdir")
+    val two = ckg_shared_library(2, dir)
+    val nine = ckg_shared_library(9, dir)
+    val root = ckg_linking()
+
+    val got = ckg_seam(root, s"--link-path $dir", s"--link-path $dir",
+                       () -> ckg_copy(s"$two/libckgl.dylib", s"$dir/libckgl.dylib"),
+                       () -> ckg_copy(s"$nine/libckgl.dylib", s"$dir/libckgl.dylib"))
+
+    lbr_drop([root, two, nine, dir])
+    assert(got.starts_with("2 | 9 | 2 | miss miss hit | "), got)
+end ckg_shared_library_bytes
+
 @test("the manifest's defines block keys the run cache")
 ckg_defines_block()
     if !ckg_ready() then return

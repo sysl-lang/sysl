@@ -159,25 +159,22 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
     // **The second key** (`run_cache.sysl` explains the two steps): the first, and the bytes of every
     // file the root's last build read through C -- the headers each `c const` block was measured
     // against, wherever they are. A file gone from that list is a miss.
-    val known = read_text(listed) match
-        Ok(text) -> files_key(first, listed_files(text))
-        Err(_) -> None
+    // **A hit**: the entry one of the kept lists comes to, whole, read back and held to it.
+    for text in read_lists(listed)
+        files_key(first, listed_files(text)) match
+            None -> ()
+            Some(key) ->
+                val place = s"$dir/$key$SyslibExtension"
 
-    // **A hit**: the entry at the key, whole, read back and held to it.
-    known match
-        Some(key) ->
-            val place = s"$dir/$key$SyslibExtension"
-
-            root_entry_matching(place, key, t) match
-                Ok(symbols) ->
-                    root_hits += 1
-                    in_use(place)
-                    touch_used(listed)
-                    trace(s"source root ${libs.at(at)}: linked from $place")
-                    take(out, symbols, place)
-                    return Ok(())
-                Err(_) -> ()
-        None -> ()
+                root_entry_matching(place, key, t) match
+                    Ok(symbols) ->
+                        root_hits += 1
+                        in_use(place)
+                        touch_used(listed)
+                        trace(s"source root ${libs.at(at)}: linked from $place")
+                        take(out, symbols, place)
+                        return Ok(())
+                    Err(_) -> ()
 
     // **A miss**: the root analyzed with only what it can see -- every unit of this compilation but
     // the project's -- and every body of its own typed.
@@ -203,7 +200,7 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
         None -> return Err("a file its C read was gone before it could be kept")
 
     make_dir_all(dir).unwrap_or(())
-    write_text_atomic(listed, join(read.view(), "\n")).unwrap_or(())
+    keep_list(listed, join(read.view(), "\n"))
 
     val place = s"$dir/$key$SyslibExtension"
     val symbols = write_root_artifact(built, place, key, t, level)?

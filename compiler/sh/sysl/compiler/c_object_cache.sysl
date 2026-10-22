@@ -53,20 +53,19 @@ import sysl.text.{from_utf8_unchecked, join, split, Search}
 // writes, a disk that filled, a file somebody truncated: each is a miss and a recompilation rather than
 // a broken link or, worse, a link that succeeds with the wrong code.
 //
-// ==What it does not cover, stated rather than hidden==
+// ==A header added ahead of one read==
 //
-// A header **added** to a directory searched before the one the file was found in last time: nothing
-// the previous compilation read has changed, so the lookup hits. `SYSL_NO_CACHE=1` is the escape
-// hatch, as it is for the run cache. This is ccache's direct mode's limitation too, and it is left
-// rather than closed because closing it exactly means replaying clang's search -- the including
-// file's own directory, `-iquote`, `-I`, `-isystem`, the sysroot, frameworks, `#include_next` -- for
-// every header a file reads, and an approximation of that is a key that looks complete and is not.
-// `coc_a_header_added_earlier_on_the_path_is_not_noticed` shows it.
+// A header **added** to a directory searched before the one a file was found in last time changes
+// nothing the previous compilation read -- ccache's direct mode misses it. Here the compilation is
+// run with `-v`, whose search list says, for every header read, every path at which a file would
+// have been found ahead of it; the list of files beside the first key carries one shadow record per
+// header (`header_shadows.sysl`), and a record one of whose paths now names a file is a miss.
+// `coc_a_header_added_earlier_on_the_path_is_noticed` shows it.
 
 private const CacheOff: string = "SYSL_NO_CACHE"
 
 // Bumped when what an entry holds changes shape, so an old entry reads as a miss.
-private const Format: string = "cobj-1"
+private const Format: string = "cobj-2"
 
 // A directory a test keeps its entries in, in place of the machine's cache. Empty is none.
 private var c_object_home: string = ""
@@ -143,13 +142,31 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
     val before = file_digest(src)
 
     c_object_compiled += 1
-    told(cc, with_io(args, src, obj, Some(made)))?
 
-    val read = read_text(made) match
+    // `-v` prints the header search list, which is what says where each header was found ahead of
+    // what (`shadow_records`).
+    var verbose = with_io(args, src, obj, Some(made))
+
+    verbose.push("-v")
+
+    val said = told_saying(cc, verbose)?
+
+    val found = read_text(made) match
         Ok(text) -> depended_on(text)
         Err(_) -> buf()
 
     remove_file(made).unwrap_or(())
+
+    // The files read, then a shadow record for each header -- the second key holds both, so a header
+    // that would now be found ahead of one read last time is a miss here as an edit is.
+    var read: Buf[string] = buf()
+
+    for f in found
+        read.push(f)
+
+    for r in shadow_records(found, src, search_list(said))
+        read.push(r)
+
     note_files_read(read)
 
     // **A file edited while clang was reading it is not kept**: the object may be of either text,
@@ -460,6 +477,15 @@ private second_key(first: string, files: Buf[string]) -> Option[string]
 
     for f in files
         if f == "" then continue
+
+        // A shadow record (`header_shadows.sysl`): a miss where a header would now be found ahead of
+        // the one read, and otherwise part of the key as it is written.
+        if f.starts_with("?")
+            if record_shadowed(f) then return None
+
+            parts.push(f)
+            continue
+        end if
 
         val digest = file_digest(f)
 
