@@ -745,7 +745,7 @@ null, and what a callback's trampoline looks like are decisions the header does 
 **Records are written as C declares them.** A C `union` is a sysl [`union`](/reference/types/#unions),
 an anonymous member is an anonymous `union`/`struct` block in place, and a named member of an
 unnamed record type (`union { … } v;`) gets a type of its own named for both (`HolderV`). A bitfield
-`T name : W` is a [C bitfield](/reference/attributes/#c-bitfields--name-uw-in-t-laid-out-as-c-lays-it-out),
+`T name : W` is a [C bitfield](/reference/attributes/#c-bitfields-name-uw-in-t-laid-out-as-c-lays-it-out),
 `name: uW in T`; `__attribute__((packed))` is `@packed` and `__attribute__((aligned(16)))` is
 `@align(16)`. A union member sysl cannot express (a `long double`, a record withheld here) is kept as
 its bytes, `_ld: [SIZEOF_ALT_LD]u8`, with the union's boundary said by `@align(ALIGNOF_ALT)`. A plain

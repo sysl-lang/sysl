@@ -3353,7 +3353,7 @@ is still a person's.
 | absent | instead |
 |---|---|
 | an `fn(int) -> int` type for sysl's own callables | the `Fn` trait; `*extern` exists only where the representation is somebody else's to choose |
-| a C header parser in the compiler | [`sysl import-c`](#sysl-import-c--the-declarations-read-out-of-the-header) asks clang for a header's declarations and writes the module of `extern`s, records and `c const`s, with `--shim` for the wrappers a `static inline` function or a function-like macro needs; nothing reads C at build time but clang, through `c const` and `c type` |
+| a C header parser in the compiler | [`sysl import-c`](#sysl-import-c-the-declarations-read-out-of-the-header) asks clang for a header's declarations and writes the module of `extern`s, records and `c const`s, with `--shim` for the wrappers a `static inline` function or a function-like macro needs; nothing reads C at build time but clang, through `c const` and `c type` |
 | a calling convention on an export | open — `@export` implies C's, and `interrupt` already built the shape a second one would take |
 | a capability gate on an extern | open — an extern reaching libc plausibly needs `os`, and does not yet say so |
 
