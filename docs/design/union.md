@@ -20,7 +20,7 @@ mechanical, and lists what the user still has to decide.
 | 3b | ownership | a field holding `&T`, `weak T`, `string`, a slice, a `Buf`, a closure, a data enum, or a struct of any of those: **refused** | no tag, so nothing knows which field to release, or whether one is there to release |
 | 3c | writes | a write stores that field's bytes and **leaves the rest as they were** (stronger than C11's "unspecified") | it is what a store of the field's width does; nothing has to be added |
 | 4 | construction | `U(f = v)`: **exactly one argument, and it is named**; the bytes past the field are **zero** | the name is the only thing that says which field; zero-fill makes a union's bytes deterministic |
-| 4b | zero value | all-zero bytes, present when **every field has a zero value** (as a struct's) | consistent with structs; a sysl enum field (no zero value) takes it away |
+| 4b | zero value | all-zero bytes, present when **every field has a zero value** (as a struct's) | consistent with structs; a field of a sysl enum with no variant written `= 0` takes it away |
 | 4c | pattern | destructuring a union **refused**; binding one whole is fine | no tag to test |
 | 4d | `==` / `Debug` | **no supplied `Eq`** (an `impl Eq` of the program's own is fine); the supplied **`Debug` prints the name and the bytes in hex** | equality of bytes is wrong for floats and for the bytes past a short field; Debug must never trap, and every type has one |
 | 5 | header | `typedef union { … } name;` with `__attribute__((packed))` / `__attribute__((aligned(n)))` when the union has them; an anonymous member as an anonymous `union {…};` / `struct {…};` | — and the same attributes are **missing today for `@packed`/`@align` structs**: a bug, §8 |
@@ -235,7 +235,7 @@ integer to a pointer without `ptr_cast(n)`. Making that pointer is harmless — 
   built by name (`Packet(tag = 1, word = 7, len = 2)`), naming at most one field per anonymous
   union.
 - **Zero value**: all-zero bytes, present exactly when every field has a zero value — the struct rule
-  (probed: a struct with a sysl enum field has none, `S has no zero value, so 'z' needs an initial
+  (probed: a struct with a field of a sysl enum that has no variant written `= 0` has none, `S has no zero value, so 'z' needs an initial
   value`). Every `AnyBits` field's zero value is zero bytes; `false` is.
 - **Patterns**: `match u` / `val U(f = x) = u` destructuring is refused ("a union has no tag to
   match on — read the field you know is there"). Binding a union whole is fine.

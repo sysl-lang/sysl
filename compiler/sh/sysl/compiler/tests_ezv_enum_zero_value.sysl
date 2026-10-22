@@ -1,0 +1,280 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+
+// An enum's zero value (`reference/declarations.md § Enums`): a simple enum with a variant whose
+// value is WRITTEN `= 0` has a zero, and it is that variant -- in a binding with no initializer, a
+// struct's field, an array's elements, module storage on a board (`.bss`) and a `const` function's
+// evaluation. An enum with no written `= 0` -- the first variant taking 0 by position included -- or
+// one that carries data still has none.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ezv_root(main: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ezv").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end ezv_root
+
+// What the program printed and the status it left with; a failure to build is its message and `-1`.
+private ezv_outcome(main: string) -> (string, int)
+    val root = ezv_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end ezv_outcome
+
+private ezv_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = ezv_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// Everything the analysis said about the program, or its LLVM text where it said nothing.
+private ezv_said(main: string) -> string
+    val root = ezv_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ezv_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private ezv_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = ezv_said(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end ezv_refused
+
+// -- the zero is the variant written `= 0` ----------------------------------------------------------
+
+@test("ezv: a binding with no initializer starts at the variant written '= 0'")
+ezv_a_binding_starts_at_the_written_zero() = ezv_prints(raw"""
+    enum Outcome: u8
+        Idle = 0
+        Waiting = 1
+
+    var o: Outcome
+
+    print(o == Idle, int(o))
+    o = Waiting
+    print(o == Waiting, int(o))
+    """, "true 0\ntrue 1\n")
+
+@test("ezv: the written zero need not be the first variant")
+ezv_the_zero_need_not_come_first() = ezv_prints(raw"""
+    enum Outcome: u8
+        Waiting = 1
+        Done = 2
+        Idle = 0
+
+    var o: Outcome
+
+    print(o == Idle, o == Waiting)
+    """, "true false\n")
+
+@test("ezv: a signed enum's zero sits among negative and positive values")
+ezv_a_signed_enum_has_its_zero() = ezv_prints(raw"""
+    enum Sign: i8
+        Minus = -1
+        Zero = 0
+        Plus = 1
+
+    var s: Sign
+    var below: Sign = Minus
+
+    print(s == Zero, int(s), int(below))
+    """, "true 0 -1\n")
+
+@test("ezv: a constant written after the '=' counts as written")
+ezv_a_constant_zero_is_written() = ezv_prints(raw"""
+    const NONE = 0
+
+    enum Level: u8
+        Off = NONE
+        On = 1
+
+    var l: Level
+
+    print(l == Off)
+    """, "true\n")
+
+@test("ezv: a struct holding one has a zero, and its field starts at the written variant")
+ezv_a_struct_field_starts_at_the_zero() = ezv_prints(raw"""
+    enum Outcome: u8
+        Idle = 0
+        Waiting = 1
+
+    struct W
+        o: Outcome
+        n: int
+
+    var w: W
+
+    print(w.o == Idle, w.n)
+    """, "true 0\n")
+
+@test("ezv: an array of them, and a struct nested in a struct, start at it too")
+ezv_arrays_and_nested_structs_start_at_the_zero() = ezv_prints(raw"""
+    enum Outcome: u8
+        Waiting = 1
+        Idle = 0
+
+    struct W
+        o: Outcome
+
+    struct Outer
+        inner: W
+        all: [3]Outcome
+
+    var xs: [4]Outcome
+    var outer: Outer
+
+    print(xs[3] == Idle, outer.inner.o == Idle, outer.all[2] == Idle)
+    """, "true true true\n")
+
+@test("ezv: module storage with no initializer starts at it")
+ezv_module_storage_starts_at_the_zero() = ezv_prints(raw"""
+    enum Outcome: u8
+        Idle = 0
+        Waiting = 1
+
+    struct W
+        o: Outcome
+
+    static var state: Outcome
+    static var w: W
+
+    print(state == Idle, w.o == Idle)
+    """, "true true\n")
+
+@test("ezv: a 'const' function's evaluation gives the same zero")
+ezv_a_const_function_gives_the_zero() = ezv_prints(raw"""
+    enum Outcome: u8
+        Waiting = 1
+        Idle = 0
+
+    struct W
+        o: Outcome
+
+    const fresh() -> W
+        var w: W
+        w
+
+    val k = fresh()
+
+    print(k.o == Idle)
+    """, "true\n")
+
+// On a board, storage starting at its zero is `.bss`: no initializer runs, and no bytes ship.
+@test("ezv: on a board, module storage of a struct holding one lands in .bss")
+ezv_board_storage_lands_in_bss()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = ezv_root(raw"""
+        enum Outcome: u8
+            Waiting = 1
+            Idle = 0
+
+        struct W
+            o: Outcome
+            n: u32
+
+        var watch: W
+
+        @export("poll")
+        poll() -> u32
+            if watch.o == Idle then watch.o = Waiting
+            watch.n + u32(u8(watch.o))
+        """)
+    val target = "thumbv7m-freestanding"
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+    val tool = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+    assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-objdump")
+
+    val table = capture(tool, ["-t", s"$root/app.a"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+
+    var placed = false
+
+    for line in split(table, "\n")
+        if line.contains("watch") && line.contains(".bss") then placed = true
+
+    assert(placed, table)
+end ezv_board_storage_lands_in_bss
+
+// -- what still has no zero -----------------------------------------------------------------------
+
+@test("ezv: an enum with no variant written '= 0' has none")
+ezv_no_written_zero_has_none() = ezv_refused("enum Level: u8\n    Low = 1\n    High = 2\nvar l: Level\nprint(1)\n",
+                                             "Level has no zero value, so 'l' needs an initial value", "4:1")
+
+@test("ezv: a first variant taking 0 by position is not a written zero")
+ezv_the_implicit_first_variant_is_not_a_zero() = ezv_refused("enum Color\n    Red\n    Green\nvar c: Color\nprint(1)\n",
+                                                             "Color has no zero value, so 'c' needs an initial value",
+                                                             "4:1")
+
+@test("ezv: nor when a later variant's value is written")
+ezv_an_implicit_zero_beside_written_values_is_not_a_zero() = ezv_refused(
+    "enum Mode: u8\n    Off\n    On = 1\nvar m: Mode\nprint(1)\n",
+    "Mode has no zero value, so 'm' needs an initial value", "4:1")
+
+@test("ezv: an enum that carries data has none")
+ezv_a_data_enum_has_none() = ezv_refused("enum Shape\n    Dot\n    Circle(r: int)\nvar s: Shape\nprint(1)\n",
+                                         "Shape has no zero value, so 's' needs an initial value", "4:1")
+
+@test("ezv: and cannot write '= 0' on a variant to get one")
+ezv_a_data_enum_cannot_write_a_zero() = ezv_refused("enum Shape\n    Dot = 0\n    Circle(r: int)\nprint(1)\n",
+    "'Shape' carries data, so its variant 'Dot' cannot have an explicit value — only a simple enum's " +
+    "variants are numbered", "1:1")
+
+@test("ezv: a struct holding an enum with no zero has none, nor does an array of them")
+ezv_a_struct_of_one_with_no_zero_has_none()
+    ezv_refused("enum Color\n    Red\n    Green\nstruct P\n    c: Color\nvar p: P\nprint(1)\n",
+                "P has no zero value, so 'p' needs an initial value", "6:1")
+    ezv_refused("enum Color\n    Red\n    Green\nvar cs: [2]Color\nprint(1)\n",
+                "[2]Color has no zero value, so 'cs' needs an initial value", "4:1")
+
+@test("ezv: module storage of one is told an enum needs a written '= 0'")
+ezv_module_storage_of_one_is_told() = ezv_refused("enum Color\n    Red\n    Green\nstatic var c: Color\nprint(1)\n",
+    "'c' needs a value: storage with no initializer starts at its type's zero, and Color has none — the " +
+    "same rule a local with no initializer is held to. A 'string' and a slice both start empty and need no " +
+    "value written; a reference needs one, and so does an enum with no variant written '= 0'", "4:8")
