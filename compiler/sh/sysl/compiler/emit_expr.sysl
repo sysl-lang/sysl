@@ -654,6 +654,10 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
             if op == "-" then return gen_ptr_diff(e, l, r, lt)
         _ -> ()
 
+    contracted_binary(fusing_of(e.target), op, l, r, ty) match
+        Some((k, addend)) -> return gen_contracted(e, k, addend, ty)
+        None -> ()
+
     // `acc + (x * y).sum()`, either way round, is one dual multiply-accumulate on a DSP core.
     if op == "+" && is_fixed(ty)
         fixed_dot_pair(e, r) match
@@ -694,6 +698,47 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
 
     arith(e, op, bt, lv, rv)
 end gen_binary
+
+// A contracted `±(a * b) ± c` (`fp_contract.sysl`): its three operands in the order they are
+// written, a negated factor or addend negated on its own, and one `llvm.fmuladd` -- clang's shape for
+// each form.
+private gen_contracted(e: *Emit, k: Contraction, addend: TExpr, ty: Type) -> Val
+    if !k.product_first then return contracted_onto(e, k, ty, gen_expr(e, addend))
+
+    val a = gen_expr(e, k.a)
+    val b = gen_expr(e, k.b)
+
+    fused_of(e, k, ty, a, b, gen_expr(e, addend))
+end gen_contracted
+
+// The same where the addend is already in hand -- the place an update reads.
+private contracted_onto(e: *Emit, k: Contraction, ty: Type, c: Val) -> Val
+    val a = gen_expr(e, k.a)
+    val b = gen_expr(e, k.b)
+
+    fused_of(e, k, ty, a, b, c)
+end contracted_onto
+
+private fused_of(e: *Emit, k: Contraction, ty: Type, a: Val, b: Val, c: Val) -> Val =
+    fmuladd(e, ty, if k.negate_product then fneg(e, ty, a) else a, b, if k.negate_addend then fneg(e, ty, c) else c)
+
+private fneg(e: *Emit, ty: Type, v: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InNeg(r, lty(e, ty), v))
+    r
+end fneg
+
+// `place += a * b` or `place -= a * b`, with the place already read as `cur`: one `llvm.fmuladd`
+// where the target fuses at the place's width, or nothing. An operator reached through an
+// implementation is that implementation's call, never a contraction.
+fused_update(e: *Emit, op: string, ty: Type, dispatch: Option[TDispatch], cur: Val, value: TExpr) -> Option[Val]
+    if dispatch.is_some() then return None
+
+    contracted_update(fusing_of(e.target), op, ty, value) match
+        Some(k) -> Some(contracted_onto(e, k, ty, cur))
+        None -> None
+end fused_update
 
 // `p - q`, C's `ptrdiff_t`. The bytes between the two addresses, divided by the pointee's size so
 // the answer counts elements. The divide is skipped for a one-byte pointee.
@@ -943,13 +988,20 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
     // taken first would then name the storage the growth gave up. A fused dot product reads the
     // accumulator first by its own rule, so it keeps the written order.
     val first = reaches_through_call(place) && fixed_dot_pair(e, value).is_none()
-    val early = if first then Some(gen_expr(e, value)) else None
+
+    // A contracted update (`s += a * b`) reads the product's factors where the value would be read.
+    val k = if dispatch.is_some() then None else contracted_update(fusing_of(e.target), op, ty, value)
+    val early_a = if first && k.is_some() then Some(gen_expr(e, k.unwrap().a)) else None
+    val early_b = if first && k.is_some() then Some(gen_expr(e, k.unwrap().b)) else None
+    val early = if first && k.is_none() then Some(gen_expr(e, value)) else None
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
-    val dot = if early.is_some() then None else fixed_dot_update(e, op, cur, value)
+    val dot = if first || k.is_some() then None else fixed_dot_update(e, op, cur, value)
     var updated: Val = VPoison
 
-    if dot.is_some() then updated = dot.unwrap()
+    if early_a.is_some() then updated = fused_of(e, k.unwrap(), ty, early_a.unwrap(), early_b.unwrap(), cur)
+    else if k.is_some() then updated = contracted_onto(e, k.unwrap(), ty, cur)
+    else if dot.is_some() then updated = dot.unwrap()
     else updated = combine(e, op, ty, texpr_type(value), dispatch, cur,
                            if early.is_some() then early.unwrap() else gen_expr(e, value))
 

@@ -310,7 +310,7 @@ const_byte_order(cx: &Analyzer, e: Expr) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), cx.an.tables.layout.little_endian)
+        TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), fold_machine(cx.an.tables))
         _ -> None
 end const_byte_order
 
@@ -338,10 +338,17 @@ const_float_bits(cx: &Analyzer, e: Expr) -> Option[Const]
         TCall(name, args, _, _) ->
             if !float_bits_routine(name) || args.len() != 1 then return None
 
-            const_fold_typed(args.at(0), cx.an.tables.layout.little_endian)
+            const_fold_typed(args.at(0), fold_machine(cx.an.tables))
                 .and_then(c -> float_bits_folded(name, c))
         _ -> None
 end const_float_bits
+
+// A float operator written into a constant, typed in a trial and folded at the widths it is written
+// at: a `f32` rounded at every step, and a contracted `a * b + c` rounded once exactly where the
+// target fuses it (`fp_contract.sysl`). The untyped fold holds every float as a `real` and knows
+// neither, so it asks this first and keeps its own answer only where this has none.
+const_float_operator(cx: &Analyzer, e: Expr) -> Option[Const] =
+    typed_call(cx, e, None).and_then(t -> const_fold_typed(t, fold_machine(cx.an.tables)))
 
 // A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
 // constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
@@ -3059,6 +3066,10 @@ end unary_value
 
 @noinline
 private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
+    contracted_binary(fusing_of(r.a.tables.target), op, l, rt, ty) match
+        Some((k, addend)) -> return ev_contracted(r, at, k, Some(addend), ConstUnset, ty)
+        None -> ()
+
     val x = eval_value(r, l) match
         Ok(v) -> v
         Err(f) -> return f
@@ -3076,6 +3087,57 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
 
     operate(r, at, op, texpr_type(l), x, y, checked_op(op, l, rt))
 end binary
+
+// A contracted `±(a * b) ± c` (`fp_contract.sysl`), rounded once as the machine's fused instruction
+// rounds it, lane by lane over a vector. The operands are read in the order they are written; an
+// update's addend is the place's value, `held`, read before either factor.
+@noinline
+private ev_contracted(r: &EvRun, at: Span, k: Contraction, addend: Option[TExpr], held: Const, ty: Type) -> Flow
+    var c = held
+
+    if addend.is_some() && !k.product_first
+        c = eval_value(r, addend.unwrap()) match
+            Ok(v) -> v
+            Err(f) -> return f
+
+    val x = eval_value(r, k.a) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val y = eval_value(r, k.b) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    if addend.is_some() && k.product_first
+        c = eval_value(r, addend.unwrap()) match
+            Ok(v) -> v
+            Err(f) -> return f
+
+    val bits = vector_lane_of(ty) match
+        Floating(n, _) -> n
+        _ -> 0
+
+    underlying(ty) match
+        Vector(_, _) ->
+            val xs = lanes_of(x)
+            val ys = lanes_of(y)
+            val cs = lanes_of(c)
+            var out: Buf[Const] = buf()
+
+            for i in 0..<xs.len()
+                fused_const(k, bits, xs.at(i), ys.at(i), cs.at(i)) match
+                    Some(v) -> out.push(v)
+                    None -> return refuse_form(r, at, s"a fused multiply-add on ${type_show(ty)}")
+
+            EvGave(ConstArray(out))
+        _ -> fused_const(k, bits, x, y, c) match
+            Some(v) -> EvGave(v)
+            None -> refuse_form(r, at, s"a fused multiply-add on ${type_show(ty)}")
+end ev_contracted
+
+private fused_const(k: Contraction, bits: int, x: Const, y: Const, z: Const) -> Option[Const] = (x, y, z) match
+    (ConstFloat(a), ConstFloat(b), ConstFloat(c)) -> Some(ConstFloat(fused_parts(k, bits, a, b, c)))
+    _ -> None
 
 // Whether an operator is fixed-point arithmetic: one of its operands or its result is fixed-point,
 // and it is not a comparison, which is on the raw values of one format.
@@ -4293,6 +4355,12 @@ private combined(r: &EvRun, at: Span, op: string, place_ty: Type, value_ty: Type
     val fixed = fixed_arith_op(bin, place_ty, value_ty, place_ty)
     val out = if fixed then fixed_operate(r, at, bin, place_ty, value_ty, place_ty, cur, v) else operate(r, at, bin, place_ty, cur, v, checked)
 
+    held_to(r, at, out, check)
+end combined
+
+// The check a constrained place owes a compound assignment's result.
+@noinline
+private held_to(r: &EvRun, at: Span, out: Flow, check: Option[Type]) -> Flow
     if check.is_none() then return out
 
     val nv = ev_value_of(out)
@@ -4311,7 +4379,7 @@ private combined(r: &EvRun, at: Span, op: string, place_ty: Type, value_ty: Type
 
             out
         _ -> out
-end combined
+end held_to
 
 @noinline
 private update(r: &EvRun, at: Span, place: TExpr, op: string, value: TExpr, ty: Type,
@@ -4327,11 +4395,7 @@ private update(r: &EvRun, at: Span, place: TExpr, op: string, value: TExpr, ty: 
         Ok(x) -> x
         Err(f) -> return f
 
-    val v = eval_value(r, value) match
-        Ok(x) -> x
-        Err(f) -> return f
-
-    val out = combined(r, at, op, ty, texpr_type(value), cur, v, check)
+    val out = updated_value(r, at, op, ty, value, cur, check)
 
     ev_value_of(out) match
         Some(nv) -> slot_write(r, slot, nv)
@@ -4339,6 +4403,22 @@ private update(r: &EvRun, at: Span, place: TExpr, op: string, value: TExpr, ty: 
 
     out
 end update
+
+// What a compound assignment makes of the place's value `cur` and the value on the right: one
+// rounding for a contracted `+= a * b` or `-= a * b`, the operator's own arithmetic otherwise.
+@noinline
+private updated_value(r: &EvRun, at: Span, op: string, ty: Type, value: TExpr, cur: Const,
+                      check: Option[Type]) -> Flow
+    contracted_update(fusing_of(r.a.tables.target), op, ty, value) match
+        Some(k) -> return held_to(r, at, ev_contracted(r, at, k, None, cur, ty), check)
+        None -> ()
+
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    combined(r, at, op, ty, texpr_type(value), cur, v, check)
+end updated_value
 
 @noinline
 private ev_inc_dec(r: &EvRun, at: Span, place: TExpr, op: string, pre: bool, ty: Type,
@@ -4396,6 +4476,25 @@ private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
         val slot = slot_of(r, w.place) match
             Ok(s) -> s
             Err(f) -> return f
+
+        // A contracted arm reads its place, then the product's factors, as the lowering does.
+        val k = if w.op == "=" || w.dispatch.is_some() then None
+        else contracted_update(fusing_of(r.a.tables.target), w.op, texpr_type(w.place), w.value)
+
+        if k.is_some()
+            val cur = slot_value(r, w.place.span, slot) match
+                Ok(x) -> x
+                Err(f) -> return f
+
+            val out = held_to(r, w.value.span, ev_contracted(r, w.value.span, k.unwrap(), None, cur,
+                                                             texpr_type(w.place)), w.constraint)
+
+            ev_value_of(out) match
+                Some(nv) -> landing.push((slot, nv))
+                None -> return out
+
+            continue
+        end if
 
         // Copied now, so a value read from a place another write in the list changes is the value
         // it had before any of them landed.

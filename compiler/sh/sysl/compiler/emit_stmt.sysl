@@ -455,10 +455,18 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
         else curs.push(held_for_statement(e, load_place(e, w.place, addrs.at(i)),
                                           texpr_type(w.place)))
 
+    // A contracted arm (`s += a * b`) is its updated value already: the place was read above, and the
+    // product's factors are read here in the right side's turn.
     var vals: Buf[Val] = buf()
+    var fused: Buf[bool] = buf()
 
-    for w in writes
-        vals.push(held_for_statement(e, gen_expr(e, w.value), texpr_type(w.value)))
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+        val f = if w.op == "=" || nowhere(addrs.at(i)) then None
+        else fused_update(e, w.op, texpr_type(w.place), w.dispatch, curs.at(i), w.value)
+
+        fused.push(f.is_some())
+        vals.push(if f.is_some() then f.unwrap() else held_for_statement(e, gen_expr(e, w.value), texpr_type(w.value)))
 
     for i in 0..<writes.len()
         val w = writes.at(i)
@@ -468,8 +476,8 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
             if w.op == "="
                 store_place(e, w.place, p, vals.at(i))
             else
-                val updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), w.dispatch,
-                                      curs.at(i), vals.at(i))
+                val updated = if fused.at(i) then vals.at(i)
+                else combine(e, w.op, texpr_type(w.place), texpr_type(w.value), w.dispatch, curs.at(i), vals.at(i))
 
                 w.constraint match
                     Some(c) -> emit_constraint_checks(e, updated, c)
@@ -560,7 +568,10 @@ private gen_write(e: *Emit, w: TWrite)
     val dot = fixed_dot_update(e, w.op, cur, w.value)
     var updated: Val = VPoison
 
+    val fused = if dot.is_some() then None else fused_update(e, w.op, texpr_type(w.place), w.dispatch, cur, w.value)
+
     if dot.is_some() then updated = dot.unwrap()
+    else if fused.is_some() then updated = fused.unwrap()
     else updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), w.dispatch, cur,
                            gen_expr(e, w.value))
 

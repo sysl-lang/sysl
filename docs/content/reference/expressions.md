@@ -192,6 +192,69 @@ by zero traps. Arithmetic written out of literals alone is the exception to both
 exactly, a value that does not fit its type is refused, and so is a division by a literal zero —
 see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exact).
 
+### A multiply feeding an add is fused where the machine fuses
+
+**A float multiply whose result is added or subtracted in the same expression is one fused
+multiply-add, rounded once**, wherever the machine has a fused instruction at that width. The
+product is never rounded on its own, so the answer is the more accurate one and costs one instruction
+instead of two. The forms are the ones C contracts under clang's default `-ffp-contract=on`:
+`a * b + c`, `c + a * b`, `a * b - c`, `c - a * b`, a negated product `-(a * b) - c`, any of them in
+parentheses, and the compound assignments `s += a * b` and `s -= a * b`. Of two products added, the
+left one is fused and the right one is the addend.
+
+Which machines fuse is what the `#if` symbols `fma` (at `f32`) and `fma_dp` (at `f64`) say
+([attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)):
+AArch64 and a hosted RISC-V at both widths, an Arm unit at `f32`, and the Cortex-M7's
+double-precision unit at `f64` as well. A vector of `f32` or `f64` lanes follows its lane's width.
+Everywhere else — `f16`, `bf16`, `f128`, fixed point, a machine without the unit — the multiply and
+the add are two operations, each rounded.
+
+**A product is kept apart by anything written between it and the sum**: a `val` it is bound to, a
+call it is passed through, an explicit conversion. That is how a program asks for two roundings, and
+`llvm.fma` ([ffi](/reference/ffi/)) is how it asks for one on every machine:
+
+```sysl
+val x = 1.0 + 1.0 / 1073741824.0
+val c = -(1.0 + 1.0 / 536870912.0)
+val p = x * x
+
+#if fma_dp
+val fused = 1.0
+#else
+val fused = 0.0
+#endif
+
+print((x * x + c) * 1152921504606846976.0 == fused, (p + c) * 1152921504606846976.0)
+```
+
+```output
+true 0
+```
+
+`x * x` is `1 + 2^-29 + 2^-60`, and a double cannot hold the `2^-60` beside the one. Fused, `c`
+cancels everything else and the `2^-60` is the answer; rounded first, as the `val` rounds it, it is
+gone and the answer is zero.
+
+**A value worked out while compiling is the one the machine would have worked out.** A `const`, a
+module `val` laid down as data and a `const` function's result are each computed with one rounding
+exactly where the target fuses, and with two where it does not, so an answer never depends on
+whether the compiler or the program computed it, nor on the optimization level:
+
+```sysl
+const X = 1.0 + 1.0 / 1073741824.0
+const C = -(1.0 + 1.0 / 536870912.0)
+const positive = X * X + C > 0.0
+
+var x = X
+var c = C
+
+print(positive == (x * x + c > 0.0))
+```
+
+```output
+true
+```
+
 ### Shifting by the width or more
 
 **A shift amount at or past the operand's width is defined**, and gives the result of shifting all

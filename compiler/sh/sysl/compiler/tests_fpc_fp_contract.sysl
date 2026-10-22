@@ -1,0 +1,519 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Floating-point contraction (`fp_contract.sysl`): a multiply feeding an add or a subtract in the same
+// expression is one `llvm.fmuladd`, in the shape clang gives the same C at `-ffp-contract=on` -- read
+// out of `clang -O0 -S -emit-llvm` for each form -- and only at a width the target fuses. The three
+// places that compute a float agree about it: the lowering, the typed fold that lays a module `val`
+// down as data, and the evaluator that runs a `const` function.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fpc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fpc_ready
+
+private fpc_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-fpc").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    root
+end fpc_root
+
+// The LLVM text of a project for `target`, or what it had to say for itself.
+private fpc_ir_of(files: []const (string, string), target: Option[string]) -> string
+    val root = fpc_root(files)
+
+    val out = emit_llvm_text(root, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fpc_ir_of
+
+private fpc_ir(text: string, target: Option[string] = None) -> string = fpc_ir_of([("main.sysl", text)], target)
+
+// The body of the function `name` in `ir`.
+private fpc_body(ir: string, name: string) -> string
+    val parts = split(ir, "\n}\n")
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        for j in 0..<lines.len
+            if lines[j].starts_with("define") && lines[j].contains("@" + name + "(") then return parts[i]
+
+    assert(false, ir)
+    ""
+end fpc_body
+
+private fpc_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+// The forms, one function each, every one called so it is lowered.
+private val fpc_forms: string = raw"""
+    pa(a: f64, b: f64, c: f64) -> f64 = a * b + c
+    ap(a: f64, b: f64, c: f64) -> f64 = c + a * b
+    sp(a: f64, b: f64, c: f64) -> f64 = c - a * b
+    ps(a: f64, b: f64, c: f64) -> f64 = a * b - c
+    nps(a: f64, b: f64, c: f64) -> f64 = -(a * b) - c
+    npa(a: f64, b: f64, c: f64) -> f64 = -(a * b) + c
+    snp(a: f64, b: f64, c: f64) -> f64 = c - -(a * b)
+    par(a: f64, b: f64, c: f64) -> f64 = ((a * b)) + c
+    two(a: f64, b: f64, c: f64, d: f64) -> f64 = a * b + c * d
+    pa32(a: f32, b: f32, c: f32) -> f32 = a * b + c
+    lanes(a: <4>f32, b: <4>f32, c: <4>f32) -> <4>f32 = a * b + c
+
+    upd(a: f64, b: f64, c: f64) -> f64
+        var s = c
+        s += a * b
+        s
+
+    dwn(a: f64, b: f64, c: f64) -> f64
+        var s = c
+        s -= a * b
+        s
+
+    both(a: f64, b: f64, c: f64, d: f64) -> f64
+        var s = c
+        var t = d
+        s, t += a * b, a * a
+        s + t
+
+    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+
+    print(pa(1.0, 2.0, 3.0), ap(1.0, 2.0, 3.0), sp(1.0, 2.0, 3.0), ps(1.0, 2.0, 3.0), nps(1.0, 2.0, 3.0))
+    print(npa(1.0, 2.0, 3.0), snp(1.0, 2.0, 3.0), par(1.0, 2.0, 3.0), two(1.0, 2.0, 3.0, 4.0))
+    print(pa32(1.0, 2.0, 3.0), lanes(v, v, v).sum(), upd(1.0, 2.0, 3.0), dwn(1.0, 2.0, 3.0), both(1.0, 2.0, 3.0, 4.0))
+    """
+
+// Every form, lowered for a machine that fuses at both widths whatever this one is: what the
+// registry's census reaches `llvm.fmuladd` through (`tests_irp_llvm_registry.sysl`).
+fpc_every_form_ir() -> string = fpc_ir(fpc_forms, Some("aarch64-macos"))
+
+// -- the shapes -----------------------------------------------------------------------------------
+
+@test("each form a multiply feeds an add or a subtract is one llvm.fmuladd, in clang's shape")
+fpc_each_form_is_one_fmuladd()
+    if !fpc_ready() then return
+
+    val ir = fpc_ir(fpc_forms)
+    val call = "call double @llvm.fmuladd.f64"
+
+    // The factors are `%t1` and `%t2` and the addend `%t3` where the product is written first; where
+    // the addend is, it is `%t1`. A negated factor or addend is negated on its own, as clang does it.
+    val forms = [("pa", s"%t4 = $call(double %t1, double %t2, double %t3)", 0),
+                 ("ap", s"%t4 = $call(double %t2, double %t3, double %t1)", 0),
+                 ("sp", s"%t5 = $call(double %t4, double %t3, double %t1)", 1),
+                 ("ps", s"%t5 = $call(double %t1, double %t2, double %t4)", 1),
+                 ("nps", s"%t6 = $call(double %t4, double %t2, double %t5)", 2),
+                 ("npa", s"%t5 = $call(double %t4, double %t2, double %t3)", 1),
+                 ("snp", s"%t4 = $call(double %t2, double %t3, double %t1)", 0),
+                 ("par", s"%t4 = $call(double %t1, double %t2, double %t3)", 0)]
+
+    for i in 0..<forms.len
+        val body = fpc_body(ir, forms[i].0)
+
+        assert(body.contains(forms[i].1), body)
+        assert_eq(fpc_count(body, "fneg double"), usize(forms[i].2))
+        assert(!body.contains(" = fmul ") && !body.contains(" = fadd ") && !body.contains(" = fsub "), body)
+
+    // `c - a * b` negates the first factor, `a * b - c` the addend: what `fmsub` and `fnmsub` compute.
+    assert(fpc_body(ir, "sp").contains("%t4 = fneg double %t2"), fpc_body(ir, "sp"))
+    assert(fpc_body(ir, "ps").contains("%t4 = fneg double %t3"), fpc_body(ir, "ps"))
+end fpc_each_form_is_one_fmuladd
+
+@test("of two products the left one is fused and the right one is the addend, as clang chooses")
+fpc_two_products_fuse_the_left()
+    if !fpc_ready() then return
+
+    val body = fpc_body(fpc_ir(fpc_forms), "two")
+
+    assert(body.contains("%t5 = fmul double %t3, %t4"), body)
+    assert(body.contains("%t6 = call double @llvm.fmuladd.f64(double %t1, double %t2, double %t5)"), body)
+end fpc_two_products_fuse_the_left
+
+@test("a compound assignment of a product is fused onto the place's value")
+fpc_compound_assignment_fuses()
+    if !fpc_ready() then return
+
+    val ir = fpc_ir(fpc_forms)
+    val up = fpc_body(ir, "upd")
+    val down = fpc_body(ir, "dwn")
+    val both = fpc_body(ir, "both")
+
+    assert(up.contains("%t5 = call double @llvm.fmuladd.f64(double %t3, double %t4, double %t2)"), up)
+    assert(!up.contains(" = fadd "), up)
+    assert(down.contains("%t5 = fneg double %t3"), down)
+    assert(down.contains("%t6 = call double @llvm.fmuladd.f64(double %t5, double %t4, double %t2)"), down)
+    assert(!down.contains(" = fsub "), down)
+    assert_eq(fpc_count(both, "@llvm.fmuladd.f64("), 2)
+    assert_eq(fpc_count(both, " = fmul "), 0)
+end fpc_compound_assignment_fuses
+
+@test("f32 and a vector of f32 lanes are contracted at their own width")
+fpc_single_and_lanes()
+    if !fpc_ready() then return
+
+    val ir = fpc_ir(fpc_forms)
+
+    assert(fpc_body(ir, "pa32").contains("call float @llvm.fmuladd.f32(float %t1, float %t2, float %t3)"), ir)
+    assert(fpc_body(ir, "lanes").contains("call <4 x float> @llvm.fmuladd.v4f32(<4 x float> %t1, " +
+                                          "<4 x float> %t2, <4 x float> %t3)"), ir)
+    assert(ir.contains("declare double @llvm.fmuladd.f64(double, double, double)"), ir)
+    assert(ir.contains("declare <4 x float> @llvm.fmuladd.v4f32(<4 x float>, <4 x float>, <4 x float>)"), ir)
+end fpc_single_and_lanes
+
+// -- what keeps a product apart -------------------------------------------------------------------
+
+@test("a product bound to a val, passed through a call or converted is rounded on its own")
+fpc_blocking_forms_round_twice()
+    if !fpc_ready() then return
+
+    val ir = fpc_ir(raw"""
+        held(a: f64, b: f64, c: f64) -> f64
+            val p = a * b
+            p + c
+
+        id(x: f64) -> f64 = x
+
+        called(a: f64, b: f64, c: f64) -> f64 = id(a * b) + c
+        converted(a: f32, b: f32, c: real) -> real = real(a * b) + c
+        half(a: f16, b: f16, c: f16) -> f16 = a * b + c
+        quad(a: f128, b: f128, c: f128) -> f128 = a * b + c
+        ratio(a: f64, b: f64, c: f64) -> f64 = a / b + c
+
+        print(held(1.0, 2.0, 3.0), called(1.0, 2.0, 3.0), converted(1.0, 2.0, 3.0), half(1.0, 2.0, 3.0))
+        print(quad(1.0, 2.0, 3.0), ratio(1.0, 2.0, 3.0))
+        """)
+
+    for name in ["held", "called", "converted", "half", "ratio"]
+        val body = fpc_body(ir, name)
+
+        assert(body.contains(" = fadd "), body)
+
+    // An `f128` has no fused instruction anywhere, so its sum is whatever binary128 addition is here.
+    assert(!fpc_body(ir, "quad").contains("fmuladd"), fpc_body(ir, "quad"))
+    assert(!ir.contains("@llvm.fmuladd"), ir)
+end fpc_blocking_forms_round_twice
+
+@test("an Armv6-M fuses at neither width, a Cortex-M4 at f32 alone, through llvm.fma")
+fpc_boards_fuse_where_the_unit_does()
+    if !fpc_ready() then return
+
+    val text = raw"""
+        wide(a: f64, b: f64, c: f64) -> f64 = a * b + c
+        narrow(a: f32, b: f32, c: f32) -> f32 = a * b + c
+
+        @export("main")
+        boot() -> i32 = i32(wide(1.0, 2.0, 3.0) + real(narrow(1.0, 2.0, 3.0)))
+        """
+    val v6m = fpc_ir(text, Some("thumbv6m-freestanding"))
+    val m4 = fpc_ir(text, Some("thumbv7em-freestanding"))
+    val m7 = fpc_ir(text, Some("thumbv7em-freestanding-dp"))
+
+    // Arm's back end never fuses an `llvm.fmuladd` -- clang's own `a * b + c` is a `vmul` and a `vadd`
+    // on these cores -- so where the unit fuses, the contraction is the exact `llvm.fma`, one `vfma`.
+    assert(!v6m.contains("fmuladd") && !v6m.contains("@llvm.fma."), v6m)
+    assert(fpc_body(v6m, "wide").contains("fmul double") && fpc_body(v6m, "narrow").contains("fmul float"), v6m)
+    assert(fpc_body(m4, "wide").contains("fmul double"), m4)
+    assert(fpc_body(m4, "narrow").contains("call float @llvm.fma.f32(float %t1, float %t2, float %t3)"), m4)
+    assert(!m4.contains("fmuladd"), m4)
+    assert(fpc_body(m7, "wide").contains("@llvm.fma.f64(") && fpc_body(m7, "narrow").contains("@llvm.fma.f32("), m7)
+end fpc_boards_fuse_where_the_unit_does
+
+// -- the instructions ------------------------------------------------------------------------------
+
+private fpc_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end fpc_objdump
+
+// The host archive's disassembly of every exported function, by Mach-O name.
+private fpc_host_code(program: string) -> Option[string]
+    if !host_target().name.starts_with("aarch64-")
+        print("skipped: the instructions asserted are AArch64's and this machine is not one")
+        return None
+    end if
+
+    val tool = fpc_objdump()
+
+    assert(tool.is_some(), "this test reads the host's code and there is no llvm-objdump on this machine")
+
+    val root = fpc_root([("main.sysl", program)])
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    val dis = capture(tool.unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    dis match
+        Ok(out) -> Some(out.text)
+        Err(_) -> None
+end fpc_host_code
+
+// The instructions labelled `symbol`, up to the next label.
+private fpc_code_of(dis: string, symbol: string) -> string
+    val lines = split(dis, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("<") then inside = lines[i] == s"<$symbol>:" || lines[i] == s"<_$symbol>:"
+        else if inside then out = out + lines[i] + "\n"
+
+    out
+end fpc_code_of
+
+@test("on AArch64 each form is the one instruction clang gives it, at -O1")
+fpc_aarch64_instructions()
+    if !fpc_ready() then return
+
+    val dis = fpc_host_code(raw"""
+        @export("pa")
+        pa(a: f64, b: f64, c: f64) -> f64 = a * b + c
+        @export("sp")
+        sp(a: f64, b: f64, c: f64) -> f64 = c - a * b
+        @export("ps")
+        ps(a: f64, b: f64, c: f64) -> f64 = a * b - c
+        @export("nps")
+        nps(a: f64, b: f64, c: f64) -> f64 = -(a * b) - c
+        @export("upd")
+        upd(a: f64, b: f64, c: f64) -> f64
+            var s = c
+            s += a * b
+            s
+        @export("pa32")
+        pa32(a: f32, b: f32, c: f32) -> f32 = a * b + c
+        @export("held")
+        held(a: f64, b: f64, c: f64) -> f64
+            val p = a * b
+            p + c
+
+        print(pa(1.0, 2.0, 3.0))
+        """)
+
+    if dis.is_none() then return
+
+    val forms = [("pa", "fmadd\td0, d0, d1, d2"), ("sp", "fmsub\td0, d0, d1, d2"), ("ps", "fnmsub\td0, d0, d1, d2"),
+                 ("nps", "fnmadd\td0, d0, d1, d2"), ("upd", "fmadd\td0, d0, d1, d2"), ("pa32", "fmadd\ts0, s0, s1, s2")]
+
+    for i in 0..<forms.len
+        val code = fpc_code_of(dis.unwrap(), forms[i].0)
+
+        assert(code.contains(forms[i].1), s"${forms[i].0}:\n$code")
+        assert(!code.contains("fmul"), s"${forms[i].0}:\n$code")
+
+    val held = fpc_code_of(dis.unwrap(), "held")
+
+    assert(held.contains("fmul\td0, d0, d1") && held.contains("fadd\td0, d0, d2"), held)
+end fpc_aarch64_instructions
+
+@test("a Cortex-M4 fuses a f32 contraction in one vfma and leaves a f64 one unfused")
+fpc_m4_instructions()
+    val program = raw"""
+        @export("narrow")
+        narrow(a: f32, b: f32, c: f32) -> f32 = a * b + c
+
+        @export("wide")
+        wide(a: f64, b: f64, c: f64) -> f64 = a * b + c
+
+        @export("main")
+        boot() -> i32 = 0
+        """
+    val narrow = fx2_board_code(program, "thumbv7em-freestanding", "narrow")
+    val wide = fx2_board_code(program, "thumbv7em-freestanding", "wide")
+
+    if narrow.is_none() || wide.is_none() then return
+
+    assert(narrow.unwrap().contains("vfma.f32"), narrow.unwrap())
+    assert(!wide.unwrap().contains("vfma"), wide.unwrap())
+    assert(wide.unwrap().contains("\tbl\t") || wide.unwrap().contains("\tb.w\t"), wide.unwrap())
+end fpc_m4_instructions
+
+// -- one answer, compile time and run time ---------------------------------------------------------
+
+// `x * x` is `1 + 2^-29 + 2^-60`, and `c` cancels all but the `2^-60`: fused, the answer is `2^-60`
+// (times `2^60` is 1); rounded first, it is 0. The `f32` twin is `(1 + 2^-12)^2 - (1 + 2^-11)`, which is
+// `2^-24`.
+private val fpc_witness: string = raw"""
+    module witness
+
+    const X = 1.0 + 1.0 / 1073741824.0
+    const C = -(1.0 + 1.0 / 536870912.0)
+    const Y = 1.0f32 + 1.0f32 / 4096.0f32
+    const D = -(1.0f32 + 1.0f32 / 2048.0f32)
+
+    val image = X * X + C
+    val image32 = Y * Y + D
+    val updated = accumulated(X, C)
+    val ran = accumulated(X, C) > 0.0
+    const K = X * X + C
+    const B = X * X + C > 0.0
+    const B32 = Y * Y + D > 0.0f32
+    const N = if X * X + C > 0.0 then 1 else 0
+    val flag = B
+    val flag32 = B32
+    val count: i32 = N
+
+    const accumulated(x: f64, c: f64) -> f64
+        var s = c
+        s += x * x
+        s
+    """
+
+private val fpc_witness_main: string = raw"""
+    import witness.{image, image32, updated, ran, K, B, B32, N, X, C, Y, D}
+
+    var x = X
+    var c = C
+    var y = Y
+    var d = D
+
+    print(image * 1152921504606846976.0, image32 * 16777216.0f32, updated * 1152921504606846976.0, ran)
+    print(K * 1152921504606846976.0, B, B32, N)
+    print((x * x + c) * 1152921504606846976.0, (y * y + d) * 16777216.0f32)
+
+    val p = x * x
+
+    print((p + c) * 1152921504606846976.0)
+    """
+
+@test("the precision witness is fused at run time and in every constant, on a machine that fuses")
+fpc_witness_agrees_on_aarch64()
+    if !fpc_ready() then return
+
+    if !host_target().fused_double()
+        print("skipped: this machine does not fuse at binary64")
+        return
+    end if
+
+    for level in ["0", "1", "2"]
+        val root = fpc_root([("main.sysl", fpc_witness_main), ("witness/witness.sysl", fpc_witness)])
+        val exe = s"$root/built"
+
+        build_native_program(root, None, None, level, Some(exe)) match
+            Err(why) -> assert(false, failure_text(why))
+            Ok(_) -> ()
+
+        val said = capture(exe, [], "", [], true)
+
+        remove_dir_all(root).unwrap_or(())
+
+        said match
+            Err(_) -> assert(false, "the program that was built could not be run")
+            Ok(out) -> assert_eq(out.text, "1 1 1 true\n1 true true 1\n1 1\n0\n")
+end fpc_witness_agrees_on_aarch64
+
+@test("a module val over the witness is laid down fused where the target fuses and unfused where not")
+fpc_witness_images_per_target()
+    if !fpc_ready() then return
+
+    val files = [("main.sysl", fpc_witness_main), ("witness/witness.sysl", fpc_witness)]
+
+    // 2^-60 and 2^-24, each written as LLVM writes a float: the double pattern.
+    val fused = "0x3C30000000000000"
+    val fused32 = "0x3E70000000000000"
+    val zero = "0x0000000000000000"
+
+    // What each image comes to on each machine: f64 fused, f32 fused.
+    val machines = [("aarch64-macos", true, true), ("thumbv6m-freestanding", false, false),
+                    ("thumbv7em-freestanding", false, true), ("thumbv7em-freestanding-dp", true, true)]
+
+    for i in 0..<machines.len
+        val (name, wide, narrow) = machines[i]
+        val ir = fpc_ir_of(files, Some(name))
+        val at = "@witness$"
+        val w = if wide then 1 else 0
+        val n = if narrow then 1 else 0
+
+        for line in [s"${at}image = private constant double ${if wide then fused else zero}",
+                     s"${at}image32 = private constant float ${if narrow then fused32 else zero}",
+                     s"${at}updated = private constant double ${if wide then fused else zero}",
+                     s"${at}ran = private constant i1 $w", s"${at}flag = private constant i1 $w",
+                     s"${at}flag32 = private constant i1 $n", s"${at}count = private constant i32 $w"]
+            assert(ir.contains(line), s"$name: $line\n$ir")
+end fpc_witness_images_per_target
+
+// The same witness booted on the boards: what the machine computed and what the compiler laid down
+// beside it, one letter pair each -- `D` and `S` the run-time sums at f64 and f32, `I` the module
+// image, `B` the `const` comparison. The Armv6-M fuses at neither width, the Cortex-M4 at f32 alone,
+// and the Cortex-M7 with a double-precision unit at both.
+@test("on a board the witness is fused at the widths the unit fuses, at run time and in its constants")
+fpc_witness_on_the_boards()
+    if !fpc_ready() then return
+
+    val program = raw"""
+        import board.*
+        import witness.{image, image32, B, B32, X, C, Y, D}
+
+        var x = X
+        var c = C
+        var y = Y
+        var d = D
+
+        val w = console()
+
+        w.write(if x * x + c > 0.0 then "D1".bytes else "D0".bytes)
+        w.write(if y * y + d > 0.0f32 then "S1".bytes else "S0".bytes)
+        w.write(if image > 0.0 then "I1".bytes else "I0".bytes)
+        w.write(if image32 > 0.0f32 then "J1".bytes else "J0".bytes)
+        w.write(if B then "B1".bytes else "B0".bytes)
+        w.write(if B32 then "C1".bytes else "C0".bytes)
+        w.write(".".bytes)
+        """
+    val boards = [("microbit", "thumbv6m-freestanding", "D0S0I0J0B0C0."),
+                  ("mps2-an386", "thumbv7em-freestanding", "D0S1I0J1B0C1."),
+                  ("mps2-an500", "thumbv7em-freestanding-dp", "D1S1I1J1B1C1.")]
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        for i in 0..<boards.len
+            if b.name != boards[i].0 || b.target != boards[i].1 then continue
+
+            var files: Buf[(string, string)] = buf()
+
+            files.push(("p.sysl", program))
+            files.push(("board/board.sysl", qemu_board_module(b)))
+            files.push(("witness/witness.sysl", fpc_witness))
+            ran += 1
+
+            qemu_boot(b, files) match
+                Err(why) -> bad.push(s"${b.name}: $why")
+                Ok(r) ->
+                    if !r.status.ok() || !r.out.contains(boards[i].2) then
+                        bad.push(s"${b.target} wanted '${boards[i].2}': ${qemu_said(b, r)}")
+    end for
+
+    assert_eq(ran, boards.len)
+    assert(bad.is_empty(), join(bad.view(), "\n"))
+end fpc_witness_on_the_boards

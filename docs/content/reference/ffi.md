@@ -218,7 +218,7 @@ print(bogus(1.0))
 ```
 
 **`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
-result can differ from writing the two operations — exactly where the product's low bits matter,
+result can differ from rounding the product first — exactly where the product's low bits matter,
 which is what it is for (an error term, a compensated sum, a polynomial evaluated with one rounding
 per step):
 
@@ -227,8 +227,9 @@ extern "llvm.fma" fma(a: f64, b: f64, c: f64) -> f64
 
 val x = 1.0 + 1.0 / 1073741824.0
 val c = -(1.0 + 1.0 / 536870912.0)
+val p = x * x
 
-print(fma(x, x, c) * 1152921504606846976.0, x * x + c)
+print(fma(x, x, c) * 1152921504606846976.0, p + c)
 ```
 
 ```output
@@ -236,7 +237,10 @@ print(fma(x, x, c) * 1152921504606846976.0, x * x + c)
 ```
 
 `x * x` is `1 + 2^-29 + 2^-60`, and the `2^-60` is below what a double holds beside a one: rounded
-first, it is gone before `c` cancels the rest; fused, it is the whole answer.
+first, as the `val` rounds it, it is gone before `c` cancels the rest; fused, it is the whole answer.
+`llvm.fma` fuses on every machine, at the price of a library call where the unit has no fused
+instruction. Written as one expression, `x * x + c` is fused too — but only where the machine fuses
+at that width ([expressions](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses)).
 
 The other six round or compare and nothing more. `llvm.rint` and `llvm.nearbyint` round to the
 nearest integer with a tie to the even one — sysl never changes the rounding mode, so the two

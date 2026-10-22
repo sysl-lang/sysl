@@ -4631,7 +4631,9 @@ than a multiply and an add. They are facts about the unit, not the calling conve
 hosted RISC-V machine have both, every Arm unit sysl targets has `fma`, and only the Cortex-M7's
 double-precision one (`thumbv7em-freestanding-dp`) has `fma_dp` as well. The x86 rows ask for no
 processor past the baseline, which has no FMA, and WebAssembly has none. Where a symbol is false the
-operation is still exact — it is a call rather than an instruction.
+operation is still exact — it is a call rather than an instruction. The same two symbols say where a
+written `a * b + c` is contracted into one rounding
+([expressions](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses)).
 
 **`thread_local` is true exactly where a `@thread_local` would be accepted** (`§ @thread_local`): on
 every hosted machine, and on bare AArch64 when the root manifest says which register holds the thread
