@@ -37,6 +37,14 @@ import sysl.slices.as_mut_ptr
  * **The length is not rounded to a power of two**, unlike `Deque`'s, because the capacity is the
  * caller's number rather than one this file chose -- a program that asked for six slots gets six.
  * So wrapping is a compare and a subtract instead of a mask, which is what `seat` below is.
+ *
+ * **A value is moved in and out, never copied.** A push puts the value into an empty slot with
+ * `slot_put` and a pop takes it back out with `slot_take`, so the share a counted value carries goes
+ * in with it and comes out with it, and the slot it leaves is empty again. A value popped is the
+ * caller's alone: its destructor runs when the caller lets it go, not when the slot is next reused,
+ * and the next push into that slot gives nothing back -- which matters most in a channel, where that
+ * push is on another thread. `ring(...)` empties every slot first, giving back whatever the storage
+ * was filled with, so a slot outside the live run is always an empty one.
  */
 
 /** The ring itself: where the caller's storage is, how much of it there is, and the live run inside
@@ -114,7 +122,7 @@ struct Ring[T]
     push_back(*self, v: T) -> bool
         if self.live == self.room then return false
 
-        self.slots[self.seat(self.live)] = v
+        slot_put(&self.slots[self.seat(self.live)], v)
         self.live += 1
         true
     end push_back
@@ -126,28 +134,32 @@ struct Ring[T]
         if self.live == self.room then return false
 
         self.head = if self.head == 0 then self.room - 1 else self.head - 1
-        self.slots[self.head] = v
+        slot_put(&self.slots[self.head], v)
         self.live += 1
         true
     end push_front
 
-    /** Takes from the front. Nothing moves but `head`, which is the whole point of a ring. */
+    /** Takes from the front, moving the value out and leaving its slot empty. Nothing else moves but
+     * `head`, which is the whole point of a ring.
+     */
     pop_front(*self) -> Option[T]
         if self.live == 0 then return None
 
-        val v = self.slots[self.head]
+        val v = slot_take(&self.slots[self.head])
 
         self.head = self.seat(1)
         self.live -= 1
         Some(v)
     end pop_front
 
-    /** Takes from the back. Nothing moves but `live`. */
+    /** Takes from the back, moving the value out and leaving its slot empty. Nothing else moves but
+     * `live`.
+     */
     pop_back(*self) -> Option[T]
         if self.live == 0 then return None
 
         self.live -= 1
-        Some(self.slots[self.seat(self.live)])
+        Some(slot_take(&self.slots[self.seat(self.live)]))
 
     /** Adds to the back, **dropping the oldest value to make room** where the ring is full, and
      * answers whatever was dropped.
@@ -167,21 +179,24 @@ struct Ring[T]
         var out: Option[T] = None
 
         if self.live == self.room
-            out = Some(self.slots[self.head])
+            out = Some(slot_take(&self.slots[self.head]))
             self.head = self.seat(1)
             self.live -= 1
 
-        self.slots[self.seat(self.live)] = v
+        slot_put(&self.slots[self.seat(self.live)], v)
         self.live += 1
         out
     end overwrite
 
-    /** Forgets every value. The storage is the caller's and is left exactly as it was -- what is
-     * reset is where the ring believes its elements are, which is the whole of its state.
+    /** Lets go of every value, there and then, leaving every slot empty. A destructor behind a value
+     * runs here rather than when its slot is next reused.
      */
     clear(*self)
+        while self.live > 0
+            self.pop_front()
+
         self.head = 0
-        self.live = 0
+    end clear
 end Ring
 
 /** `for x in r` walks a ring from the front to the back, through the cursor `walk` answers. */
@@ -206,8 +221,19 @@ impl[T] IndexSet[usize, T] for Ring[T]
  *
  * **The slice is read here and not kept**, for the reason the `slots` field gives: what is stored is
  * its address and its length.
+ *
+ * **Every slot is emptied here**, giving back whatever the storage was filled with, so that every push
+ * after it moves a value into a slot that holds nothing. Over storage of plain values that is no work
+ * at all.
  */
-ring[T](slots: []T) -> Ring[T] = Ring(as_mut_ptr(slots), slots.len, 0, 0)
+ring[T](slots: []T) -> Ring[T]
+    val at = as_mut_ptr(slots)
+
+    for i in 0..<slots.len
+        slot_take(&at[i])
+
+    Ring(at, slots.len, 0, 0)
+end ring
 
 // The report an out-of-range index makes. It is written out of `prints` and `printi` rather than
 // through an f-string because building a string makes heap storage, which is exactly what this
