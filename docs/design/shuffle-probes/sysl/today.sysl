@@ -1,0 +1,51 @@
+// What sysl 0.3.13 can write today to rearrange lanes, and what each form lowers to.
+// Build: sysl emit-llvm today.sysl, then clang -O2 -S on the IR (see ../run.sh)
+//
+// The three spellings available without a shuffle:
+//   1. a literal of lane reads   -- [a[0], b[0], a[1], b[1]]
+//   2. a scratch array and a load (the gather the reference page describes)
+//   3. a generic kernel whose lane indices come from a value parameter
+
+// Interleave the low halves: NEON zip1, SSE unpcklps.
+@noinline
+zip_lo_literal(a: <4>f32, b: <4>f32) -> <4>f32 = [a[0], b[0], a[1], b[1]]
+
+// Reverse the lanes: NEON rev64 + ext, SSE shufps.
+@noinline
+reverse_literal(a: <4>f32) -> <4>f32 = [a[3], a[2], a[1], a[0]]
+
+// Rotate by one lane across two vectors: NEON ext #4.
+@noinline
+rotate_literal(a: <4>f32, b: <4>f32) -> <4>f32 = [a[1], a[2], a[3], b[0]]
+
+// Concatenate two halves into a wider vector.
+@noinline
+concat_literal(a: <4>i32, b: <4>i32) -> <8>i32 = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
+
+// The gather as the reference page describes it: write the lanes into an array, load the run.
+@noinline
+zip_lo_gather(a: <4>f32, b: <4>f32) -> <4>f32
+    var scratch: [4]f32
+
+    scratch[0] = a[0]
+    scratch[1] = b[0]
+    scratch[2] = a[1]
+    scratch[3] = b[1]
+
+    scratch.load(0)
+
+// A lane index taken from a value parameter: constant per instantiation.
+pick[const K: usize](v: <4>f32) -> f32 = v[K]
+
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <4>f32 = [10, 20, 30, 40]
+
+val z = zip_lo_literal(a, b)
+val r = reverse_literal(a)
+val t = rotate_literal(a, b)
+val c = concat_literal([1, 2, 3, 4], [5, 6, 7, 8])
+val g = zip_lo_gather(a, b)
+
+print(z[0], z[1], z[2], z[3])
+print(r[0], r[3], t[0], t[3], c[0], c[7], g[1])
+print(pick[2](a))
