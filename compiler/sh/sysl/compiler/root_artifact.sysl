@@ -3,8 +3,8 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Set, set}
 import sysl.env.get as env_var
-import sysl.fs.{entries, is_file, metadata, read_bytes, read_text, remove_file, write_text_atomic}
-import sysl.text.{from_utf8_unchecked, Search}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text_atomic}
+import sysl.text.{from_utf8_unchecked, join, Search}
 
 // A `--lib` source root's compiled sysl, kept: the mechanism the standard module's artifact already is
 // (`std_artifact.sysl`), pointed at a root. The root's determined functions are lowered and compiled
@@ -153,18 +153,31 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
             if holds_string(modules, name)
                 return Err(s"another file declares into its module '$name'")
 
-    val key = root_key(program, project, root, level)?
-    val place = s"$dir/$key$SyslibExtension"
+    val first = root_key(program, project, root, level)?
+    val listed = s"$dir/$first.reads"
+
+    // **The second key** (`run_cache.sysl` explains the two steps): the first, and the bytes of every
+    // file the root's last build read through C -- the headers each `c const` block was measured
+    // against, wherever they are. A file gone from that list is a miss.
+    val known = read_text(listed) match
+        Ok(text) -> files_key(first, listed_files(text))
+        Err(_) -> None
 
     // **A hit**: the entry at the key, whole, read back and held to it.
-    root_entry_matching(place, key, t) match
-        Ok(symbols) ->
-            root_hits += 1
-            in_use(place)
-            trace(s"source root ${libs.at(at)}: linked from $place")
-            take(out, symbols, place)
-            return Ok(())
-        Err(_) -> ()
+    known match
+        Some(key) ->
+            val place = s"$dir/$key$SyslibExtension"
+
+            root_entry_matching(place, key, t) match
+                Ok(symbols) ->
+                    root_hits += 1
+                    in_use(place)
+                    touch_used(listed)
+                    trace(s"source root ${libs.at(at)}: linked from $place")
+                    take(out, symbols, place)
+                    return Ok(())
+                Err(_) -> ()
+        None -> ()
 
     // **A miss**: the root analyzed with only what it can see -- every unit of this compilation but
     // the project's -- and every body of its own typed.
@@ -174,6 +187,7 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
         if !holds_string(program.own, module_written(item))
             alone.push(item)
 
+    val mark = files_read_mark()
     val built = library_build(alone, modules, t, Some(files), true)
 
     // **Closed**: the root analyzes without the project.
@@ -181,6 +195,17 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
         return Err(s"it does not analyze without the program: " +
             s"${built.report.at(0).render().trim_end()}")
 
+    // What its analysis read through C decides the second key, and is written beside the first.
+    val read = files_read_sorted(mark)
+
+    val key = files_key(first, read) match
+        Some(k) -> k
+        None -> return Err("a file its C read was gone before it could be kept")
+
+    make_dir_all(dir).unwrap_or(())
+    write_text_atomic(listed, join(read.view(), "\n")).unwrap_or(())
+
+    val place = s"$dir/$key$SyslibExtension"
     val symbols = write_root_artifact(built, place, key, t, level)?
 
     keep_sum(place)?
@@ -295,8 +320,9 @@ end keep_sum
 // stands is in it too**, the absolute path being what `__FILE__` and every record carry out of its
 // files, and what keeps two roots from ever sharing an entry.
 //
-// What it cannot see is what the run cache cannot: a header outside every hashed tree, found on the
-// system's search path. `SYSL_NO_CACHE=1` is the answer there.
+// This is the first key. A header outside every tree it walks -- an `--include-path` directory, the
+// SDK -- reaches the second, which `root_linked` makes from the files the root's `c const` probes
+// read.
 root_key(program: Compilation, project: string, root: string, level: string) -> Result[string, string]
     val t = program.target
     var parts: Buf[string] = buf()

@@ -4,8 +4,8 @@ import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.seq.Sequence
 import sysl.container.{Map, map, Set, set}
-import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text,
-                write_text_atomic}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, publish_file, read_bytes, read_text, remove_file,
+                write_text, write_text_atomic}
 import sysl.slices.sort_by
 import sysl.text.{cstring, from_utf8_unchecked, join, split, str_builder, Search, StrBuilder}
 
@@ -48,17 +48,22 @@ import sysl.text.{cstring, from_utf8_unchecked, join, split, str_builder, Search
 // and `sysl run p -- b` are one binary run twice, which is the point; a filter selects among the
 // tests a binary already holds, so it is applied to a cached list exactly as it is to a fresh one.
 //
+//   - **every file the build's C read**, wherever it is -- an `--include-path` header, one a
+//     package's `headers` variable or a `pkg-config` `-I` reached, the SDK's -- by its bytes, as the
+//     second step of the key (`run_cache_slot`, below).
+//
 // ==What it does not cover, stated rather than hidden==
 //
-// An **`#include`d header** outside the trees this reads. `SYSL_NO_CACHE` is the escape hatch. (The
-// C object cache beneath it does cover one: `c_object_cache.sysl` keys an object on every file clang
-// read, so a `build` after that edit recompiles the file, but a `run` never gets that far.)
+// What the C object cache does not: a header **added** to a directory searched before the one a file
+// was found in last time (`c_object_cache.sysl` says why that is left). And a library the linker takes
+// from a `--link-path` directory is keyed by where it is, not by its bytes. `SYSL_NO_CACHE` is the
+// escape hatch for both.
 //
 // **`sysl build` never consults this**, which is the reference's rule and not an omission here: a
 // build writes a binary somebody named and is expected to have built it.
 
 // The variable that turns the cache off -- for timing a compilation, or for anything that reaches the
-// bytes and is outside what the key covers (an `#include`d header, above).
+// bytes and is outside what the key covers (above).
 private const CacheOff: string = "SYSL_NO_CACHE"
 
 // A directory a test keeps its entries in, in place of the machine's cache. Empty is none.
@@ -506,15 +511,46 @@ end build_environment
 
 // --- the slot -------------------------------------------------------------------------
 
-// Where a built program is kept, or nothing where this machine has no cache directory -- the same
+// Where built programs are kept, or nothing where this machine has no cache directory -- the same
 // condition the standard module's own path falls back on, and the same answer: behave as though there
 // were no cache.
-private run_cache_slot(key: string) -> Option[string]
+private run_cache_dir() -> Option[string]
     if env_var(CacheOff).unwrap_or("") != "" then return None
-    if run_cache_home != "" then return Some(s"$run_cache_home/sysl/run/$key")
+    if run_cache_home != "" then return Some(s"$run_cache_home/sysl/run")
 
     cache_directory() match
-        Some(dir) -> Some(s"$dir/sysl/run/$key")
+        Some(dir) -> Some(s"$dir/sysl/run")
+        None -> None
+end run_cache_dir
+
+// ==The files the build's C read, and the second key==
+//
+// **Which headers a build reads is known only once it has compiled**, so -- as the C object cache
+// finds an object -- an entry is found in two steps. The key above is the first; beside it,
+// `<key>.reads` lists every file the last build under it read through C (`note_files_read`: each
+// compilation's and each `c const` probe's `-MD` list), wherever the file is. A lookup reads each of
+// those files again and keys on their bytes (`files_key`), and the program is kept under that second
+// key. So an edit to a header in an `--include-path` directory, or the SDK, misses; putting it back
+// finds the entry the first text built; and a file that has gone is a miss.
+
+// The list of files beside a first key.
+const ReadsSuffix: string = ".reads"
+
+// Where the program built for this key is kept, as the files it read now say: nothing where there is
+// no cache, no list beside the key, or a file on the list is gone.
+private run_cache_slot(key: string) -> Option[string]
+    val dir = run_cache_dir() match
+        Some(d) -> d
+        None -> return None
+
+    val listed = read_text(s"$dir/$key$ReadsSuffix") match
+        Ok(text) -> text
+        Err(_) -> return None
+
+    touch_used(s"$dir/$key$ReadsSuffix")
+
+    files_key(key, listed_files(listed)) match
+        Some(second) -> Some(s"$dir/$second")
         None -> None
 end run_cache_slot
 
@@ -547,7 +583,7 @@ run_cache_hit(key: string) -> Option[string]
 
     read_text(s"$path$SealSuffix") match
         Err(_) -> return None
-        Ok(seal) -> if seal != entry_seal(key, path) then return None
+        Ok(seal) -> if seal != entry_seal(basename(path), path) then return None
 
     // A hit is a use: the entry, its test list and its seal are as young as this run.
     touch_used(path)
@@ -576,18 +612,16 @@ seal_run_entry(slot: string)
     write_text_atomic(s"$slot$SealSuffix", seal).unwrap_or(())
 end seal_run_entry
 
-// Where to link, for a build that is about to happen: a path in the cache with the directory already
-// made, or nothing where there is no cache to write into.
+// Where to link, for a build that is about to happen: a path in the cache under the first key, with
+// the directory already made, or nothing where there is no cache to write into. It is where the link
+// is staged; `settle_run_entry` moves what was linked to the second key once the build has said which
+// files it read.
 //
 // **The build links beside the slot and renames onto it** (`link_into_cache`), rather than into the
 // slot itself -- another run may be starting the binary already there -- or into a temporary copied
 // afterwards, which would have to reproduce the executable bit. A rename keeps the linker's mode.
 run_cache_reserve(key: string) -> Option[string]
-    val path = run_cache_slot(key) match
-        Some(p) -> p
-        None -> return None
-
-    val dir = parent_of(path) match
+    val dir = run_cache_dir() match
         Some(d) -> d
         None -> return None
 
@@ -595,10 +629,39 @@ run_cache_reserve(key: string) -> Option[string]
         Err(_) -> return None
         Ok(_) -> ()
 
+    val path = s"$dir/$key"
+
     sweep_run_cache(path)
     run_reserved += 1
     Some(path)
 end run_cache_reserve
+
+// A program linked at `pending` for the key `slot` was reserved under, kept: the list of files the
+// build's C read written beside the first key, the program published under the second key those files
+// come to, and sealed. The path it can be started from is the answer -- the first key's own slot where
+// a file the build read has already gone, which keeps nothing a lookup would find.
+settle_run_entry(pending: string, slot: string) -> Result[string, string]
+    val dir = parent_of(slot).unwrap_or(".")
+    val key = basename(slot)
+    val read = files_read_sorted(0)
+
+    val settled = files_key(key, read) match
+        Some(second) -> s"$dir/$second"
+        None -> slot
+
+    if settled != slot then write_text_atomic(s"$dir/$key$ReadsSuffix", join(read.view(), "\n")).unwrap_or(())
+
+    publish_file(pending, settled) match
+        Err(_) -> return Err(settled)
+        Ok(_) -> ()
+
+    // Sealed after it is published, so a seal never describes a file that is not yet there; a
+    // second build publishing onto the slot in between leaves a seal that does not match it, which
+    // is a miss (`run_cache_hit`).
+    if settled != slot then seal_run_entry(settled)
+
+    Ok(settled)
+end settle_run_entry
 
 // The test list beside a cached test binary, which is the one thing `sysl test` needs that the
 // executable does not carry: what to call, what to report it as, whether it should trap and what it
@@ -615,10 +678,12 @@ run_cache_tests(key: string) -> Option[string] = run_cache_slot(key) match
 //
 // **Published, never written in place**: a list read half-written decodes, at a line boundary, to a
 // shorter list, and a suite reporting fewer tests than it has is a silent failure.
-write_test_list(key: string, tests: Buf[TTest])
-    run_cache_tests(key) match
-        Some(path) -> write_text_atomic(path, encode_test_list(tests)).unwrap_or(())
-        None -> ()
+//
+// **Beside the binary the build just kept**, named by its path rather than looked up by key: where a
+// file the build read had gone before it was kept, the key resolves to no entry, and a list written
+// by lookup would land beside some other build's binary.
+write_test_list_at(exe: string, tests: Buf[TTest]) =
+    write_text_atomic(s"$exe.tests", encode_test_list(tests)).unwrap_or(())
 
 // The list read back, or nothing where there is none or it will not read -- which is a rebuild.
 read_test_list(key: string) -> Option[Buf[TTest]] = run_cache_tests(key) match

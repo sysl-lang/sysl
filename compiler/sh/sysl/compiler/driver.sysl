@@ -1666,6 +1666,9 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             None -> ()
         None -> ()
 
+    // What this build's C reads is gathered afresh: it is part of where the program is kept.
+    clear_files_read()
+
     val emitted = emit_llvm_text(path, named_target, level, buf(), None, true)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
@@ -1677,9 +1680,10 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
         None -> None
 
     slot match
-        Some(kept) ->
-            link_into_cache(path, emitted.text, t, cc, level, kept, false, emitted.links,
-                            emitted.archives).map_err(said)?
+        Some(reserved) ->
+            val kept = link_into_cache(path, emitted.text, t, cc, level, reserved, false, emitted.links,
+                                       emitted.archives).map_err(said)?
+
             started(kept, args, None).map_err(said)
         None ->
             val dir = make_temp_dir("sysl-run-") match
@@ -1706,7 +1710,7 @@ end run_native_program
 // executable bit -- a rename moves a name and leaves the mode the linker gave the file alone.
 private link_into_cache(path: string, text: string, t: Target, cc: Option[string], level: string,
                         slot: string, standalone: bool, links: Buf[string],
-                        archives: Buf[string]) -> Result[unit, Refusal]
+                        archives: Buf[string]) -> Result[string, Refusal]
     val pending = pending_name(slot)
 
     link_lowered_text(path, text, t, cc, level, pending, standalone, links, archives) match
@@ -1715,15 +1719,8 @@ private link_into_cache(path: string, text: string, t: Target, cc: Option[string
             return Err(why)
         Ok(_) -> ()
 
-    publish_file(pending, slot) match
-        Err(_) -> return Err(Refusal(s"cannot put the program it built at $slot"))
-        Ok(_) -> ()
-
-    // Sealed after it is published, so a seal never describes a file that is not yet there; a
-    // second build publishing onto the slot in between leaves a seal that does not match it, which
-    // is a miss (`run_cache_hit`).
-    seal_run_entry(slot)
-    Ok(())
+    // Kept under the key the files the build read come to (`settle_run_entry`), and sealed.
+    settle_run_entry(pending, slot).map_err((at) -> Refusal(s"cannot put the program it built at $at"))
 end link_into_cache
 
 // The child, with whatever this run has to take away once it has ended.
@@ -1999,9 +1996,10 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
         None -> None
 
     slot match
-        Some(exe) ->
-            link_into_cache(path, build.emitted.text, build.target, cc, level, exe,
-                            build.standalone, build.emitted.links, build.emitted.archives)?
+        Some(reserved) ->
+            val exe = link_into_cache(path, build.emitted.text, build.target, cc, level, reserved,
+                                      build.standalone, build.emitted.links, build.emitted.archives)?
+
             Ok((exe, true))
         None ->
             val made = build_test_binary(path, build, cc, level)?

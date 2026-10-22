@@ -159,7 +159,8 @@ private ckg_entries(cache: string) -> Buf[string]
         Err(_) -> ()
         Ok(names) ->
             for item in names
-                if !item.ends_with(".tests") && !item.ends_with(SealSuffix) && !item.starts_with(".")
+                if !item.ends_with(".tests") && !item.ends_with(SealSuffix) && !item.ends_with(ReadsSuffix) &&
+                        !item.starts_with(".")
                     out.push(s"$cache/sysl/run/$item")
 
     out
@@ -491,6 +492,70 @@ ckg_header_variable()
     assert_eq(got, "4 | 5 | 4 | miss miss hit | different bytes")
     lbr_drop([root, four, five])
 end ckg_header_variable
+
+// -- a header outside every tree, by what the build's C read -------------------------------------------
+
+// The seam over an edit to `ckg.h` in `dir`: `CKG_H` 4, then 5, then 4 again.
+private ckg_header_seam(root: string, dir: string, flags: string) -> string =
+    ckg_seam(root, flags, flags, () -> ckg_put(dir, "ckg.h", "#define CKG_H 4\n"),
+             () -> ckg_put(dir, "ckg.h", "#define CKG_H 5\n"))
+
+@test("a header edited in an --include-path directory outside the project keys the run cache")
+ckg_outside_header_edit()
+    if !ckg_ready() then return
+
+    val dir = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val root = ckg_c_project(true)
+
+    assert_eq(ckg_header_seam(root, dir, s"--include-path $dir"), "4 | 5 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, dir])
+end ckg_outside_header_edit
+
+@test("a header outside every tree that a dependency's C includes, edited, keys the run cache")
+ckg_outside_header_edit_through_a_dependency()
+    if !ckg_ready() then return
+
+    val dir = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val dep = ckg_tree([("package.hocon", ckg_manifest("cdep", "")),
+                        ("cdep/cdep.sysl", "module cdep\n\nextern \"cdep_value\" value() -> int\n"),
+                        ("cdep/cdep.c", "#include \"ckg.h\"\nint cdep_value(void) { return CKG_H; }\n")])
+    val root = ckg_project(ckg_manifest("app", s"dependencies { cdep { path = \"$dep\" } }\n"), "import cdep",
+                           "cdep.value()", [])
+
+    assert_eq(ckg_header_seam(root, dir, s"--include-path $dir"), "4 | 5 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, dep, dir])
+end ckg_outside_header_edit_through_a_dependency
+
+// A module whose answer is a `c const` measured from `ckg.h`, wherever the include path finds it.
+private ckg_measured(module_name: string) -> string =
+    s"module $module_name\n@include(\"ckg.h\")\n\nc const\n    H: int = \"CKG_H\"\n\nvalue() -> int = H\n"
+
+@test("a header outside every tree that a c const block was measured from, edited, keys the run cache")
+ckg_outside_header_edit_through_c_const()
+    if !ckg_ready() then return
+
+    val dir = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val root = ckg_project(ckg_manifest("app", ""), "import cm", "cm.value()", [("cm/cm.sysl", ckg_measured("cm"))])
+
+    assert_eq(ckg_header_seam(root, dir, s"--include-path $dir"), "4 | 5 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, dir])
+end ckg_outside_header_edit_through_c_const
+
+@test("a header outside every tree that a --lib root's c const was measured from, edited, misses its kept half")
+ckg_outside_header_edit_reaches_a_root()
+    if !ckg_ready() then return
+
+    val dir = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val lib = ckg_tree([("geo/geo.sysl", ckg_measured("geo"))])
+    val root = ckg_project(ckg_manifest("app", ""), "import geo", "geo.value()", [])
+
+    val kept = ckg_root_seam(root, lib, s"--include-path $dir", s"--include-path $dir",
+                             () -> ckg_put(dir, "ckg.h", "#define CKG_H 4\n"),
+                             () -> ckg_put(dir, "ckg.h", "#define CKG_H 5\n"))
+
+    lbr_drop([root, lib, dir])
+    assert_eq(kept, "4 | 5 | 4 | miss miss hit")
+end ckg_outside_header_edit_reaches_a_root
 
 @test("the manifest's defines block keys the run cache")
 ckg_defines_block()
@@ -1413,7 +1478,7 @@ ckg_error_raced_publish()
     val before = run_cache_counts()
     val again = ckg_ran(root, "")
     val verdict = ckg_run_verdict(before, run_cache_counts())
-    val sealed = run_cache_hit(basename(plain_entry)).is_some()
+    val sealed = run_cache_hit(run_cache_key_for("run", root, None, DefaultOptimization, None).unwrap()).is_some()
 
     ckg_done(cache, [root])
     assert_eq(s"$plain $again $verdict $sealed", "1 1 miss true")

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Set, set}
 import sysl.env.get as env_var
+import sysl.slices.sort
 import sysl.process.capture
 import sysl.fs.{current_dir, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
                 write_bytes_atomic, write_text_atomic}
@@ -131,6 +132,10 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
             if reuse(s"$dir/$second.o", obj)
                 c_object_hits += 1
                 in_use(s"$dir/$second.o", listed)
+
+                // The files the kept object was compiled from are this build's inputs as surely as
+                // if clang had just read them.
+                note_files_read(split_lines(read_text(listed).unwrap_or("")))
                 return Ok(())
         None -> ()
 
@@ -145,6 +150,7 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
         Err(_) -> buf()
 
     remove_file(made).unwrap_or(())
+    note_files_read(read)
 
     // **A file edited while clang was reading it is not kept**: the object may be of either text,
     // and the key would claim the second.
@@ -162,6 +168,75 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
     c_objects_pending = dir
     Ok(())
 end cached_c_compile
+
+// --- what a build's C read ---------------------------------------------------------------
+//
+// **Every file a C compilation of this build read, wherever it is** -- a header in an
+// `--include-path` directory, one a package's `headers` variable named, one a `pkg-config` probe's
+// `-I` reached, the SDK's own -- as clang's `-MD` list named them, for an object compiled now or
+// taken from here, and for every `c const` probe (`c_probe.sysl`). The run cache and a source root's
+// kept half key on these files' bytes the way this cache keys an object on them (`second_key`), so
+// a header outside every tree the keys walk is an input like any other.
+
+private var files_read: Buf[string] = buf()
+private var files_read_seen: Set[string] = set()
+
+// Files a compilation read, added to this build's list once each.
+note_files_read(files: Buf[string])
+    for f in files
+        if f != "" && !files_read_seen.has(f)
+            files_read_seen.add(f)
+            files_read.push(f)
+end note_files_read
+
+// Where the list stands now, so a compilation inside the build can ask what it alone added.
+files_read_mark() -> usize = files_read.len()
+
+// What the build's C has read since `mark`.
+files_read_since(mark: usize) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in mark..<files_read.len()
+        out.push(files_read.at(i))
+
+    out
+end files_read_since
+
+// A key over `first` and the bytes of every file a list names, as an object's second key is; nothing
+// where one of them is gone, which is a miss.
+files_key(first: string, files: Buf[string]) -> Option[string] = second_key(first, files)
+
+// A list of files as it is kept on disk, one to a line, read back.
+listed_files(text: string) -> Buf[string] = split_lines(text)
+
+// What a compilation inside the build read, taken back off the list -- one whose product is keyed on
+// its own (the standard module's artifact), so that the list is the same whether or not this build
+// happened to make it.
+drop_files_read_since(mark: usize)
+    var kept: Buf[string] = buf()
+    var seen: Set[string] = set()
+
+    for i in 0..<mark
+        kept.push(files_read.at(i))
+        seen.add(files_read.at(i))
+
+    files_read = kept
+    files_read_seen = seen
+end drop_files_read_since
+
+// The list so far, sorted -- one order for one set of files, whatever order the compilations ran in.
+files_read_sorted(mark: usize) -> Buf[string]
+    var out = files_read_since(mark)
+
+    sort(out.view())
+    out
+end files_read_sorted
+
+// A new build starts a new list.
+clear_files_read()
+    files_read = buf()
+    files_read_seen = set()
+end clear_files_read
 
 // --- codegen units -----------------------------------------------------------------------
 //

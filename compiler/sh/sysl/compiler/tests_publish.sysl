@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, is_dir, make_dir_all, make_temp_dir, pending_name, publish_dir, read_text, remove_dir_all, remove_file, write_text}
-import sysl.text.Search
+import sysl.text.{join, Search}
 
 // **What a cache writer is held to is that a reader never sees a partial entry**, and that is a
 // claim about names: the bytes go to a pending name nobody reads and reach the trusted one in one
@@ -15,20 +15,21 @@ private scratch() -> string = make_temp_dir("atc-").unwrap()
 
 @test("atc: the run cache's test list is published whole, and nothing else is left beside it")
 atc_the_run_cache_test_list_is_published_whole()
-    // A key nothing else will ever ask for: the name the system gave a fresh temporary directory.
-    val tmp = scratch()
-    val key = s"atc-${basename(tmp)}"
+    // A cache of the case's own, and an entry kept the way a build keeps one: linked at a pending
+    // name, settled under the key the files it read come to (none, here), sealed.
+    val cache = scratch()
+    val key = "atc"
 
-    remove_dir_all(tmp).unwrap_or(())
+    use_run_cache_dir(Some(cache))
+    clear_files_read()
 
-    // No cache on this machine, or the cache turned off: there is nothing to publish into.
-    val list = run_cache_tests(key) match
-        Some(p) -> p
-        None -> return
+    val slot = run_cache_reserve(key).unwrap()
+    val pending = pending_name(slot)
 
-    val dir = parent_of(list).unwrap()
+    write_text(pending, "binary").unwrap()
 
-    make_dir_all(dir).unwrap()
+    val exe = settle_run_entry(pending, slot).unwrap()
+    val dir = parent_of(exe).unwrap()
 
     var tests: Buf[TTest] = buf()
 
@@ -36,21 +37,28 @@ atc_the_run_cache_test_list_is_published_whole()
                      None, None))
     tests.push(TTest(module_qualify("m", "two"), "two plus two", false, None, "m/t.sysl", 9,
                      no_hooks(), None, None))
-    write_test_list(key, tests)
+    write_test_list_at(exe, tests)
 
     val read = read_test_list(key).unwrap()
 
     assert_eq(read.len(), 2)
     assert_eq(read.at(1).display, "two plus two")
 
+    // The entry, its seal, its list and the list of files beside the first key: no pending name left.
     var mine: Buf[string] = buf()
 
     for name in entries(dir).unwrap().view()
-        if name.starts_with(key) then mine.push(name)
+        mine.push(name)
 
-    remove_file(list).unwrap_or(())
-    assert_eq(mine.len(), 1)
-    assert_eq(mine.at(0), s"$key.tests")
+    use_run_cache_dir(None)
+    remove_dir_all(cache).unwrap_or(())
+
+    val shown = join(mine.view(), " ")
+    val second = basename(exe)
+
+    assert_eq(mine.len(), 4, shown)
+    assert(shown.contains(s"$second.tests") && shown.contains(s"$second.seal") && shown.contains("atc.reads"),
+           shown)
 
 @test("atc: the second fetch of one package succeeds and leaves the first one's tree alone")
 atc_the_loser_of_a_fetch_race_is_harmless()

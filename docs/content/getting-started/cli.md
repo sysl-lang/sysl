@@ -64,6 +64,10 @@ everything that can affect its bytes:
   and `--cc`;
 - every source file of the program, of every package and of every `--lib` root, the C and headers
   beside them, and where each tree is;
+- **every file the build's C read, wherever it is** — a header in an `--include-path` directory,
+  one a package's `headers` variable or a `pkg-config` path reached, the SDK's own — by its bytes, as
+  each C compilation and each `c const` block reported reading it. Editing such a header rebuilds;
+  putting it back runs the binary the first text built;
 - **every manifest in the build, whole** — the project's and every package's, every key but the
   four that are prose about a package (`description`, `license`, `authors`, `keywords`) and the
   `test` block, which is read afresh on every run;
@@ -87,6 +91,11 @@ rather than run.
 that asks for the report compiles again), `SYSL_TIMINGS`, `SYSL_CODEGEN_UNITS` (how many pieces the
 program is compiled in, not what it is), and where the caches and the library are (`HOME`,
 `XDG_CACHE_HOME`, `PATH`, the spelling of `SYSL_LIB` — the library's contents are keyed).
+
+**Two inputs the key still cannot see**, and `SYSL_NO_CACHE` is for them: a header *added* to a
+directory searched ahead of the one a header was found in last time (nothing the last build read has
+changed), and the bytes of a library the linker takes from a `--link-path` directory, which is keyed
+by where it is rather than by what it holds.
 
 This saves most of what `run` costs, because compilation usually dominates. In a 9,600-line module
 with three git dependencies, a program whose body is `print("hi")` takes 9.2 seconds to compile and
