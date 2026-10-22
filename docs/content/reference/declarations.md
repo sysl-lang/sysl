@@ -3400,6 +3400,29 @@ print(Circle(1.0))
 only a simple enum has an underlying integer type — 'Shape' carries data
 ```
 
+**A variant written `= 0` is the enum's zero value.** A `var` with no initializer, a struct field and
+an array element all start at the type's zero, and a simple enum has one exactly when the program
+wrote a variant's value as 0. A first variant numbered 0 by position does not count, and a data enum
+has none ([module storage](/reference/modules/) has the rule in full):
+
+```sysl
+enum Phase: u8
+    Running = 1
+    Stopped = 0
+
+struct Motor
+    phase: Phase
+    rpm: int
+
+var m: Motor
+
+print(m.phase == Stopped, m.rpm)
+```
+
+```output
+true 0
+```
+
 `Option[T]` and `Result[T, E]` are ordinary data enums declared in the standard library, with no
 compiler privileges.
 

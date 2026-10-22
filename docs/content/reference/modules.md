@@ -1621,10 +1621,9 @@ back takes an address and an opaque word, so a binding offering a sysl closure h
 the trampoline finds it again, and module storage is the only storage that outlives the call.
 
 **What is refused instead is a type with no zero and no initializer**, which is a narrower rule about
-a different thing. A `&T` has no zero, because there is no such thing as a reference to nothing; an
-enum has none either, since a zeroed tag names no variant in particular. A `string` and a slice both
-zero to the empty one and need nothing written. It is the same question a **local** declared with no
-initializer is already held to.
+a different thing. A `&T` has no zero, because there is no such thing as a reference to nothing. A
+`string` and a slice both zero to the empty one and need nothing written. It is the same question a
+**local** declared with no initializer is already held to.
 
 ```sysl
 struct Cell
@@ -1634,7 +1633,49 @@ static var cell: &Cell
 ```
 
 ```error
-'cell' needs a value: storage with no initializer starts at its type's zero, and &Cell has none — the same rule a local with no initializer is held to. A 'string' and a slice both start empty and need no value written; a reference and an enum need one
+'cell' needs a value: storage with no initializer starts at its type's zero, and &Cell has none — the same rule a local with no initializer is held to. A 'string' and a slice both start empty and need no value written; a reference needs one, and so does an enum with no variant written '= 0'
+```
+
+**An enum has a zero only where one of its variants is written `= 0`**, and that variant is it. A
+simple enum's value is its tag, so the variant numbered 0 is exactly what all-zero bytes hold; writing
+the `= 0` is what says that variant is the state storage is meant to start in. A struct holding such an
+enum, an array of them and module storage on a board all start there, and on a board that storage is
+`.bss`, which costs nothing in the image:
+
+```sysl
+enum Outcome: u8
+    Waiting = 1
+    Done = 2
+    Idle = 0
+
+struct Watch
+    state: Outcome
+    polls: int
+
+static var watch: Watch
+static var history: [3]Outcome
+
+print(watch.state == Idle, history[2] == Idle, watch.polls)
+```
+
+```output
+true true 0
+```
+
+A variant that takes 0 only by being first is not a zero: `enum Color` with `Red` first numbers `Red`
+0, but nothing in the declaration says a fresh slot should be red, and an enum whose variants carry
+data has no number to write. Both need a value:
+
+```sysl
+enum Color
+    Red
+    Green
+
+var c: Color
+```
+
+```error
+Color has no zero value, so 'c' needs an initial value
 ```
 
 A [destructor](/reference/memory/) takes the same ruling and for the same reason: a value in module
