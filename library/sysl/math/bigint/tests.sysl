@@ -15,10 +15,11 @@ import sysl.rand.{Rng, rng}
 // **What generated pairs do NOT reach is the add-back, and this was measured rather than assumed.**
 // Knuth's algorithm D corrects an over-large digit guess twice: a loop that tightens it, and an
 // add-back for the one case the loop still gets wrong. The add-back fires about twice in every
-// `2^32` digits, so two hundred pairs of a few limbs each have a chance of about one in three
-// million of entering it -- and deleting the branch outright leaves all two hundred green. It is
+// `2^w` digits for a `w`-bit limb, so two hundred pairs of a few limbs each essentially never enter
+// it -- and deleting the branch outright leaves all two hundred green. It is
 // `div_correction_vectors` that reaches it, with an input constructed to, and that case fails the
-// moment the branch is removed.
+// moment the branch is removed. The inputs that force it depend on the limb width, so there is one
+// for a 32-bit limb and one for a 64-bit limb, and each is checked on both.
 //
 // The general lesson is the compiler's own: a fixture drawn from the common case exercises the
 // common path, and a rare branch needs an input built for it.
@@ -28,10 +29,10 @@ import sysl.rand.{Rng, rng}
  * it.
  */
 private random_big(g: *Rng, limbs: usize, minus: bool) -> BigInt
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
 
     for _ in 0..<limbs
-        out.push(g.next_u32())
+        out.push(Limb(g.next_u64()))
 
     val mag = trimmed(out)
 
@@ -199,12 +200,33 @@ div_correction_vectors()
     assert_eq(to_string(div(a2, b2)), "4294967295")
     assert_eq(to_string(rem(a2, b2)), "9223372036854775807")
 
-    // The add-back case. Delete the branch and this one alone goes red.
+    // The add-back case for a 32-bit limb. Delete the branch and on a 32-bit target this one goes red.
     val a3 = parse("2596108815186156682096451392634880").unwrap()
     val b3 = parse("39614081257132168796771975169").unwrap()
 
     assert_eq(to_string(div(a3, b3)), "65534")
     assert_eq(to_string(rem(a3, b3)), "39614081257132168796771909634")
+
+    // The same three vectors with the base raised to `2^64`: `(B/2)B^2 / ((B/2)B + 1)` and its
+    // sibling run the tightening loop on a 64-bit limb, and the third forces its add-back.
+    val a4 = parse("3138550867693340381917894711603833208051177722232017256448").unwrap()
+    val b4 = parse("170141183460469231731687303715884105729").unwrap()
+
+    assert_eq(to_string(div(a4, b4)), "18446744073709551615")
+    assert_eq(to_string(rem(a4, b4)), "170141183460469231713240559642174554113")
+
+    val a5 = parse("3138550867693340382258177078524771671477658841516366364672").unwrap()
+    val b5 = parse("170141183460469231750134047789593657343").unwrap()
+
+    assert_eq(to_string(div(a5, b5)), "18446744073709551615")
+    assert_eq(to_string(rem(a5, b5)), "170141183460469231731687303715884105727")
+
+    // The add-back case for a 64-bit limb, with the divisor's top bit already set -- a shift of 0.
+    val a6 = parse("57896044618658097708646941636650613544717097621216448811677614281724547563520").unwrap()
+    val b6 = parse("3138550867693340381917894711603833208051177722232017256449").unwrap()
+
+    assert_eq(to_string(div(a6, b6)), "18446744073709551614")
+    assert_eq(to_string(rem(a6, b6)), "3138550867693340381917894711603833208032730978158307704834")
 end div_correction_vectors
 
 @test("multiplication and division undo each other over generated pairs")
@@ -546,9 +568,10 @@ real_round_trip()
     var g = rng(577215, 5)
 
     for n in 0..<40
-        // One limb plus a low bit, which keeps every value inside 53 bits so the conversion out is
-        // exact and the conversion back has something to be exact about.
-        val x = random_big(&g, 1, n % 2 == 0)
+        // Thirty-two random bits, which keeps every value inside 53 bits even shifted by twenty, so
+        // the conversion out is exact and the conversion back has something to be exact about.
+        val m = from_u64(u64(g.next_u32()))
+        val x = if n % 2 == 0 then negate(m) else m
 
         assert_eq(from_real(to_real(x)).unwrap(), x)
         assert_eq(from_real(to_real(mul(x, two_pow(20)))).unwrap(), mul(x, two_pow(20)))
@@ -752,3 +775,129 @@ mixed_long_named_values()
     assert_eq(q, from_int(-3))
     assert_eq(r, -1)
 end mixed_long_named_values
+
+// -- the limb boundaries ---------------------------------------------------------------------------
+//
+// A limb is a machine word, so `2^32` and `2^64` are the values where one run of limbs ends and the
+// next begins -- `2^64` on a 64-bit target and both of them on a 32-bit one. Every value below is
+// written out in decimal, which does not depend on the width, so the same assertions hold on either.
+
+@test("the limb count is the machine word's")
+limb_count_is_the_words()
+    val word_max = from_u64(18446744073709551615)
+
+#if ptr64
+    assert_eq(limb_bits, 64)
+    assert_eq(word_max.limbs(), 1)
+    assert_eq(two_pow(64).limbs(), 2)
+    assert_eq(two_pow(128).limbs(), 3)
+#else
+    assert_eq(limb_bits, 32)
+    assert_eq(word_max.limbs(), 2)
+    assert_eq(two_pow(64).limbs(), 3)
+    assert_eq(two_pow(128).limbs(), 5)
+#endif
+    assert_eq(bit_length(word_max), 64)
+    assert_eq(bit_length(two_pow(64)), 65)
+end limb_count_is_the_words
+
+@test("2^64 - 1 and 2^64 cross the conversions to and from a u64 and a long")
+word_boundary_conversions()
+    val word_max = from_u64(18446744073709551615)
+    val word = add(word_max, one())
+
+    assert_eq(to_string(word_max), "18446744073709551615")
+    assert_eq(to_string(word), "18446744073709551616")
+    assert_eq(word, two_pow(64))
+    assert_eq(to_u64(word_max).unwrap(), 18446744073709551615)
+    assert(to_u64(word).is_none())
+    assert(word_max.to_long().is_none())
+    assert(!fits_long(negate(word)))
+    assert_eq(sub(word, one()), word_max)
+    assert_eq(from_real(18446744073709551616.0).unwrap(), word)
+    assert_eq(to_real(word), 18446744073709551616.0)
+    assert_eq(to_string_radix(word, 16), "10000000000000000")
+    assert_eq(parse_radix("ffffffffffffffff", 16).unwrap(), word_max)
+    assert_eq(mul_long(word_max, -1), negate(word_max))
+    assert_eq(cmp_long(word_max, 9223372036854775807), 1)
+end word_boundary_conversions
+
+@test("2^128 - 1 and 2^128 + 1 multiply and divide back exactly")
+two_word_boundary()
+    val below = parse("340282366920938463463374607431768211455").unwrap()
+    val above = parse("340282366920938463463374607431768211457").unwrap()
+    val product = mul(below, above)
+
+    assert_eq(below, sub(two_pow(128), one()))
+    assert_eq(above, add(two_pow(128), one()))
+    assert_eq(to_string(product),
+              "115792089237316195423570985008687907853269984665640564039457584007913129639935")
+    assert_eq(product, sub(two_pow(256), one()))
+    assert_eq(div(product, below), above)
+    assert_eq(rem(product, below), zero())
+    assert_eq(div(product, above), below)
+    assert_eq(add(below, from_int(2)), above)
+    assert_eq(shr(above, 64), two_pow(64))
+    assert_eq(shl(below, 64), sub(two_pow(192), two_pow(64)))
+end two_word_boundary
+
+@test("a carry ripples through every limb of a run of ones, and a borrow ripples back")
+carries_and_borrows_ripple()
+    val ones = parse("4562440617622195218641171605700291324893228507248559930579192517899275167208677386505912811317371399778642309573594407310688704721375437998252661319722214188251994674360264950082874192246603775").unwrap()
+    val power = add(ones, one())
+
+    // `2^640` is ten 64-bit limbs of ones carried into an eleventh, and twenty at 32 bits.
+    assert_eq(to_string(power), "4562440617622195218641171605700291324893228507248559930579192517899275167208677386505912811317371399778642309573594407310688704721375437998252661319722214188251994674360264950082874192246603776")
+    assert_eq(power, two_pow(640))
+    assert_eq(bit_length(power), 641)
+
+    // And back: one taken from `2^640` borrows through every limb below the top.
+    assert_eq(sub(power, one()), ones)
+    assert_eq(bit_length(ones), 640)
+    assert_eq(add(ones, ones), sub(two_pow(641), from_int(2)))
+
+    // Every partial product of a run of ones carries the most a limb can.
+    val square = mul(ones, ones)
+
+    assert_eq(to_string(square), "20815864389328798163850480654728171077230524494533409610638224700807216119346720596024478883464648369684843227908562015582767132496646929816279813211354641525848259018778440691546366699323167091821037605850989185141044142894514307947467988271756659425079661972071987239722060158230888574589650106497218456505321823028871599302520874472143276613327725235483025080899541255363021844250625")
+    val (q, r) = div_rem(add(square, from_int(12345)), ones)
+
+    assert_eq(q, ones)
+    assert_eq(r, from_int(12345))
+    assert_eq(and(negate(two_pow(64)), from_u64(18446744073709551615)), zero())
+    assert_eq(xor(from_int(-1), from_u64(18446744073709551615)), negate(two_pow(64)))
+    assert_eq(shr(negate(add(two_pow(64), one())), 64), from_int(-2))
+end carries_and_borrows_ripple
+
+@test("division whose divisor's top limb is 1 normalizes by the whole width less one")
+divide_with_the_largest_shift()
+    // `2^64 + 5` has a top limb of 1 at either width: a shift of 63 on a 64-bit limb, 31 on a
+    // 32-bit one. The shift of 0 is `div_correction_vectors`' last case.
+    val a = parse("515377520732011331036461129765621272702107522001").unwrap()
+    val b = add(two_pow(64), from_int(5))
+    val (q, r) = div_rem(a, b)
+
+    assert_eq(to_string(q), "27938671381391989319502288001")
+    assert_eq(to_string(r), "15167969264789122380")
+    assert_eq(add(mul(q, b), r), a)
+
+    val (nq, nr) = div_rem(negate(a), b)
+
+    assert_eq(nq, negate(q))
+    assert_eq(nr, negate(r))
+end divide_with_the_largest_shift
+
+@test("no route produces a negative zero")
+no_negative_zero()
+    val word = two_pow(64)
+    val routes = [add(negate(word), word), sub(word, word), mul(negate(word), zero()),
+                  mul_long(negate(word), 0), div(from_int(-3), word), rem(negate(word), word),
+                  from_real(-0.0).unwrap(), from_real(-0.5).unwrap(), and(negate(word), one()),
+                  shr(word, 65), negate(sub(word, word))]
+
+    for z in routes
+        assert_eq(z.sign(), 0)
+        assert(z.is_zero())
+        assert_eq(to_string(z), "0")
+        assert_eq(z.hash(), zero().hash())
+end no_negative_zero

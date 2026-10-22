@@ -36,7 +36,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.io.sys`](sysl-io-sys/) |  |
 | [`sysl.log`](sysl-log/) | Structured logging: a level, a message, a few named fields, and somewhere for them to go. |
 | [`sysl.math`](sysl-math/) | Mathematics on the numeric types: the float functions, the integer ones, and the traits that let a program write both at whichever width it is already using. |
-| [`sysl.math.bigint`](sysl-math-bigint/) | Integers with no width: sign and magnitude, the magnitude a run of 32-bit limbs. |
+| [`sysl.math.bigint`](sysl-math-bigint/) | Integers with no width: sign and magnitude, the magnitude a run of machine-word limbs. |
 | [`sysl.math.complex`](sysl-math-complex/) | Complex numbers, at whichever floating-point width the program is already using. |
 | [`sysl.math.decimal`](sysl-math-decimal/) | Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`. |
 | [`sysl.math.rational`](sysl-math-rational/) | Exact fractions: a numerator and a denominator, both `BigInt`s, so a third is a third. |

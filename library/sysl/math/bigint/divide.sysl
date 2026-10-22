@@ -27,118 +27,114 @@ import sysl.math.Bits
  * The remainder is always less than `b`, which for magnitudes is the whole of what division
  * promises. Signs are the caller's business and are applied by `div_rem` above this.
  */
-private[bigint] divmod_mag(a: []const u32, b: []const u32) -> ([]const u32, []const u32)
+private[bigint] divmod_mag(a: []const Limb, b: []const Limb) -> ([]const Limb, []const Limb)
     if cmp_mag(a, b) < 0 then return (empty(), a)
     if b.len == 1 then return short_divide(a, b[0])
 
     val n = b.len
     val m = a.len - n
-    val shift = int(b[n - 1].leading_zeros())
+    val shift = usize(b[n - 1].leading_zeros())
     var v = shifted_left(b, shift, n)
     var u = shifted_left(a, shift, a.len + 1)
-    var q: Buf[u32] = buf()
+    var q: Buf[Limb] = buf()
 
     for i in 0..<(m + 1)
         q.push(0)
 
-    val vn1 = u64(v.at(n - 1))
-    val vn2 = u64(v.at(n - 2))
+    // One past the largest limb, `2^w`, as a double-width value.
+    val radix = Wide(1) << limb_bits
+    val vn1 = Wide(v.at(n - 1))
+    val vn2 = Wide(v.at(n - 2))
     var j = m + 1
 
     while j > 0
         j -= 1
 
-        val top = u64(u.at(j + n)) << 32 | u64(u.at(j + n - 1))
+        val top = Wide(u.at(j + n)) << limb_bits | Wide(u.at(j + n - 1))
         var qhat = top / vn1
         var rhat = top % vn1
 
         // Tighten the estimate. The first test is the one that matters when the top limbs happen to
-        // be equal, where the division above answers `2^32` exactly; the second is the two-limb
+        // be equal, where the division above answers `2^w` exactly; the second is the two-limb
         // refinement, and it is written second so that the first has already ruled out the overflow
         // its own multiplication would otherwise have.
         loop
-            if qhat >= 0x100000000u64 || qhat * vn2 > (rhat << 32 | u64(u.at(j + n - 2)))
+            if qhat >= radix || qhat * vn2 > (rhat << limb_bits | Wide(u.at(j + n - 2)))
                 qhat -= 1
                 rhat += vn1
 
-                if rhat < 0x100000000u64 then continue
+                if rhat < radix then continue
 
             break
 
         // Multiply the divisor by the guess and take it off the running remainder, one limb at a
-        // time, carrying the product and borrowing the difference in the same pass.
-        var borrow: u64 = 0
-        var carry: u64 = 0
+        // time, carrying the product and borrowing the difference in the same pass. A difference
+        // that goes below zero wraps at the double width, and its low half is the limb.
+        var borrow: Wide = 0
+        var carry: Wide = 0
 
         for i in 0..<n
-            val p = qhat * u64(v.at(i)) + carry
+            val p = qhat * Wide(v.at(i)) + carry
 
-            carry = p >> 32
+            carry = p >> limb_bits
 
-            val take = (p & 0xffffffffu64) + borrow
-            val cur = u64(u.at(j + i))
+            val take = Wide(Limb(p)) + borrow
+            val cur = Wide(u.at(j + i))
 
-            if cur >= take
-                u.set(j + i, u32(cur - take))
-                borrow = 0
-            else
-                u.set(j + i, u32(cur + 0x100000000u64 - take))
-                borrow = 1
+            u.set(j + i, Limb(cur - take))
+            borrow = if cur >= take then 0 else 1
 
         val take = carry + borrow
-        val cur = u64(u.at(j + n))
-        var overshot = false
+        val cur = Wide(u.at(j + n))
+        val overshot = cur < take
 
-        if cur >= take
-            u.set(j + n, u32(cur - take))
-        else
-            u.set(j + n, u32(cur + 0x100000000u64 - take))
-            overshot = true
+        u.set(j + n, Limb(cur - take))
 
         // The one case the estimate can still get wrong, and it is rare -- Knuth puts it at about
-        // two in `2^32`. The subtraction went below zero, so the guess was one too large: put the
+        // two in `2^w`. The subtraction went below zero, so the guess was one too large: put the
         // divisor back and count one less.
         if overshot
             qhat -= 1
 
-            var c: u64 = 0
+            var c: Wide = 0
 
             for i in 0..<n
-                val s = u64(u.at(j + i)) + u64(v.at(i)) + c
+                val s = Wide(u.at(j + i)) + Wide(v.at(i)) + c
 
-                u.set(j + i, u32(s & 0xffffffffu64))
-                c = s >> 32
+                u.set(j + i, Limb(s))
+                c = s >> limb_bits
 
-            u.set(j + n, u32((u64(u.at(j + n)) + c) & 0xffffffffu64))
+            u.set(j + n, Limb(Wide(u.at(j + n)) + c))
 
-        q.set(j, u32(qhat & 0xffffffffu64))
+        q.set(j, Limb(qhat))
 
     (trimmed(q), shifted_right(u, shift, n))
 end divmod_mag
 
 /** Division by one limb, which is the ordinary short division and is not worth normalizing for:
- * every partial dividend fits a `u64` on its own.
+ * every partial dividend fits a `Wide` on its own.
  */
-private[bigint] short_divide(a: []const u32, d: u32) -> ([]const u32, []const u32)
-    var q: Buf[u32] = buf()
+private[bigint] short_divide(a: []const Limb, d: Limb) -> ([]const Limb, []const Limb)
+    var q: Buf[Limb] = buf()
 
     for i in 0..<a.len
         q.push(0)
 
-    var rem: u64 = 0
+    val dw = Wide(d)
+    var rem: Wide = 0
     var i = a.len
 
     while i > 0
         i -= 1
 
-        val cur = rem << 32 | u64(a[i])
+        val cur = rem << limb_bits | Wide(a[i])
 
-        q.set(i, u32(cur / u64(d)))
-        rem = cur % u64(d)
+        q.set(i, Limb(cur / dw))
+        rem = cur % dw
 
-    var r: Buf[u32] = buf()
+    var r: Buf[Limb] = buf()
 
-    if rem != 0 then r.push(u32(rem))
+    if rem != 0 then r.push(Limb(rem))
 
     (trimmed(q), r.view())
 end short_divide
@@ -146,18 +142,19 @@ end short_divide
 /** `x` shifted left by `shift` bits into `width` limbs, which is more limbs than `x` has where the
  * shift needs somewhere to go.
  *
- * A shift of zero is the case to be careful about rather than the fast path: `>> (32 - shift)` at
- * zero is a shift by the whole width, which is undefined. The guard is what the `if` is for.
+ * A shift of zero is the case the guard is for: the bits carried up from the limb below are taken
+ * with `>> (limb_bits - shift)`, a shift by the whole width there, which leaves zero -- the guard
+ * says so rather than leaning on it.
  */
-private shifted_left(x: []const u32, shift: int, width: usize) -> Buf[u32]
-    var out: Buf[u32] = buf()
+private shifted_left(x: []const Limb, shift: usize, width: usize) -> Buf[Limb]
+    var out: Buf[Limb] = buf()
 
     for i in 0..<width
-        var low: u32 = 0
-        var high: u32 = 0
+        var low: Limb = 0
+        var high: Limb = 0
 
-        if i < x.len then low = x[i] << u32(shift)
-        if shift > 0 && i > 0 && i - 1 < x.len then high = x[i - 1] >> u32(32 - shift)
+        if i < x.len then low = x[i] << shift
+        if shift > 0 && i > 0 && i - 1 < x.len then high = x[i - 1] >> (limb_bits - shift)
 
         out.push(low | high)
 
@@ -167,13 +164,13 @@ end shifted_left
 /** The first `n` limbs of `u` shifted back down by `shift`, which undoes what normalization did to
  * the remainder. The quotient needs no such undoing -- scaling both operands leaves it alone.
  */
-private shifted_right(u: Buf[u32], shift: int, n: usize) -> []const u32
-    var out: Buf[u32] = buf()
+private shifted_right(u: Buf[Limb], shift: usize, n: usize) -> []const Limb
+    var out: Buf[Limb] = buf()
 
     for i in 0..<n
-        var low = u.at(i) >> u32(shift)
+        var low = u.at(i) >> shift
 
-        if shift > 0 && i + 1 < n then low = low | u.at(i + 1) << u32(32 - shift)
+        if shift > 0 && i + 1 < n then low = low | u.at(i + 1) << (limb_bits - shift)
 
         out.push(low)
 
@@ -184,8 +181,8 @@ end shifted_right
  * literal is not a constant expression and a module-level `val` would be storage a freestanding
  * program has to have filled.
  */
-private[bigint] empty() -> []const u32
-    var out: Buf[u32] = buf()
+private[bigint] empty() -> []const Limb
+    var out: Buf[Limb] = buf()
 
     out.view()
 

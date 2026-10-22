@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.math.bigint
-summary: "Integers with no width: sign and magnitude, the magnitude a run of 32-bit limbs."
+summary: "Integers with no width: sign and magnitude, the magnitude a run of machine-word limbs."
 ---
 
 **A general-purpose language without arbitrary precision makes a whole class of program wrong in
@@ -15,15 +15,20 @@ standard library is where a type everybody has to agree on belongs.
 
 ## The representation
 
-A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of `u32` limbs written
-**least significant first** with no leading zeros. Zero is the empty magnitude and a clear sign,
-so there is exactly one representation of it and nothing has to remember whether it is negative.
+A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of limbs written **least
+significant first** with no leading zeros. Zero is the empty magnitude and a clear sign, so there
+is exactly one representation of it and nothing has to remember whether it is negative.
 
-**Limbs are 32 bits and the arithmetic is done in 64.** That is what makes every carry, borrow and
-partial product exact without asking the language for a wider type or a carry flag: a product of
-two limbs is at most `(2^32 - 1)^2`, which fits a `u64` with room for two more limbs of carry.
-Sixty-four-bit limbs would halve the work and would need a 128-bit product, which is a different
-conversation.
+**A limb is a machine word, and the arithmetic is done in a type twice as wide.** On a 64-bit
+target a limb is a `u64` and every carry, borrow and partial product is a `u128`; on a 32-bit or
+16-bit target (`#if ptr32`, `#if ptr16`) a limb is a `u32` and the double is a `u64`. sysl has
+`uN` at any width, so the double-width type is an ordinary integer rather than a carry flag or a
+compiler intrinsic, and the back end lowers a `u128` product to the machine's own high-half
+multiply (`mul` and `umulh` on AArch64). That is what makes every step exact: a product of two
+limbs is at most `(2^w - 1)^2`, which fits the double width with room for two more limbs of carry.
+The algorithms are written once, over the two names `Limb` and `Wide`, and a word-sized limb
+halves the number of limbs -- and so quarters the inner steps of a multiply -- against a limb of
+half a word.
 
 ## What it costs
 
@@ -139,8 +144,8 @@ cmp_long(a: BigInt, n: long) -> int
 That is the whole reason it is here rather than left to `cmp(a, from_int(n))`. A comparison is
 what a loop tests and what a sort calls, so it is the operation most often on a hot path and the
 one where building a value to throw away is least defensible. The signs decide it where they
-differ, a magnitude of more than two limbs is past anything a `long` holds, and what is left is
-two `u64`s.
+differ, a magnitude of more limbs than a `u64` takes is past anything a `long` holds, and what is
+left is two `u64`s.
 
 ### `div`
 
@@ -612,7 +617,7 @@ Zero, which is the empty magnitude.
 ```sysl
 struct BigInt
     private[bigint] minus: bool
-    private[bigint] mag: []const u32
+    private[bigint] mag: []const Limb
 ```
 
 An integer of no fixed width.
@@ -626,7 +631,7 @@ change.
 |---|---|---|
 | `is_zero` | `is_zero(self) -> bool` | Whether this is zero, which is the one value with an empty magnitude. |
 | `sign` | `sign(self) -> int` | `-1`, `0` or `1`, which is the comparison against zero written as a number -- what a caller switching on the three cases wants, and what `cmp` answers for a pair. |
-| `limbs` | `limbs(self) -> usize` | How many limbs the magnitude takes, which is the closest thing to a size this type has. |
+| `limbs` | `limbs(self) -> usize` | How many machine words the magnitude takes, which is the closest thing to a size this type has. |
 | `to_long` | `to_long(self) -> Option[long]` | The value as a `long`, or `None` where it does not fit. |
 
 ## Implementations
@@ -724,7 +729,7 @@ impl Ord for BigInt
 *Written out, and it stays written out now that an array has `Ord` -- a `BigInt` is not
 structurally ordered.** Its fields are a sign and a little-endian limb view, so a derived
 comparison would take the sign first, putting every positive before every negative, and then
-compare limbs from the *least* significant end, making `2^32` less than `1`. The numeric order
+compare limbs from the *least* significant end, making `2^64` less than `1`. The numeric order
 needs the magnitudes' lengths first and their limbs from the top, which is `cmp_mag`.
 
 It could not be derived in any case: `bool` has no `Ord`, so `derives Ord` on this shape is

@@ -33,7 +33,7 @@ and(a: BigInt, b: BigInt) -> BigInt
     val w = complement_width(a, b)
     val x = twos(a, w)
     val y = twos(b, w)
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
 
     for i in 0..<w
         out.push(x.at(i) & y.at(i))
@@ -50,7 +50,7 @@ or(a: BigInt, b: BigInt) -> BigInt
     val w = complement_width(a, b)
     val x = twos(a, w)
     val y = twos(b, w)
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
 
     for i in 0..<w
         out.push(x.at(i) | y.at(i))
@@ -67,7 +67,7 @@ xor(a: BigInt, b: BigInt) -> BigInt
     val w = complement_width(a, b)
     val x = twos(a, w)
     val y = twos(b, w)
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
 
     for i in 0..<w
         out.push(x.at(i) ^ y.at(i))
@@ -144,7 +144,7 @@ bit_length(x: BigInt) -> usize
 
     val top = x.mag[x.mag.len - 1]
 
-    (x.mag.len - 1) * 32 + usize(32 - top.leading_zeros())
+    x.mag.len * limb_bits - usize(top.leading_zeros())
 end bit_length
 
 /** How many low bits are clear, which is how many times two divides the value.
@@ -162,7 +162,7 @@ trailing_zeros(x: BigInt) -> usize
     while x.mag[i] == 0
         i += 1
 
-    i * 32 + usize(x.mag[i].trailing_zeros())
+    i * limb_bits + usize(x.mag[i].trailing_zeros())
 end trailing_zeros
 
 /** Whether bit `i` is set, on the two's-complement reading -- so every bit of `-1` is set, and every
@@ -189,8 +189,8 @@ is_odd(x: BigInt) -> bool = !is_even(x)
 
 /** How many limbs the pair is complemented into: one more than the longer magnitude needs.
  *
- * The extra limb is not slack. It is what makes the top limb of each operand a pure sign -- `0` or
- * `0xffffffff` -- so that the sign of the result can be read off the top bit of the top limb without
+ * The extra limb is not slack. It is what makes the top limb of each operand a pure sign -- no bits
+ * set or every bit set -- so that the sign of the result can be read off the top bit of the top limb without
  * knowing which operand it came from.
  */
 private complement_width(a: BigInt, b: BigInt) -> usize =
@@ -199,77 +199,73 @@ private complement_width(a: BigInt, b: BigInt) -> usize =
 /** `x` written into `width` limbs in two's complement, least significant first.
  *
  * A non-negative value is its magnitude zero-padded; a negative one is that inverted with one added,
- * carried in 64 bits so the add cannot overflow a limb. `width` is always at least one more than the
- * magnitude needs, so the carry cannot run off the top.
+ * carried in the double width so the add cannot overflow a limb. `width` is always at least one more
+ * than the magnitude needs, so the carry cannot run off the top.
  */
-private twos(x: BigInt, width: usize) -> Buf[u32]
-    var out: Buf[u32] = buf()
+private twos(x: BigInt, width: usize) -> Buf[Limb]
+    var out: Buf[Limb] = buf()
 
     for i in 0..<width
         out.push(if i < x.mag.len then x.mag[i] else 0)
 
-    if x.minus
-        var carry: u64 = 1
-
-        for i in 0..<width
-            val t = u64(~out.at(i)) + carry
-
-            out.set(i, u32(t & 0xffffffffu64))
-            carry = t >> 32
+    if x.minus then complement(out)
 
     out
 end twos
+
+/** `t` negated in place in two's complement: every limb inverted, and one added. */
+private complement(t: Buf[Limb])
+    var b = t
+    var carry: Wide = 1
+
+    for i in 0..<b.len()
+        val v = Wide(~b.at(i)) + carry
+
+        b.set(i, Limb(v))
+        carry = v >> limb_bits
+end complement
 
 /** The value a run of two's-complement limbs names, with the sign taken from the top bit.
  *
  * A negative one is complemented back the same way it was written, in place -- the buffer belongs to
  * the operator that filled it and nothing else can see it change.
  */
-private from_twos(t: Buf[u32]) -> BigInt
-    var b = t
-    val n = b.len()
+private from_twos(t: Buf[Limb]) -> BigInt
+    val n = t.len()
 
-    if n == 0 || b.at(n - 1) >> 31 == 0 then return normalized(false, trimmed(b))
+    if n == 0 || t.at(n - 1) >> (limb_bits - 1) == 0 then return normalized(false, trimmed(t))
 
-    var carry: u64 = 1
-
-    for i in 0..<n
-        val v = u64(~b.at(i)) + carry
-
-        b.set(i, u32(v & 0xffffffffu64))
-        carry = v >> 32
-
-    normalized(true, trimmed(b))
+    complement(t)
+    normalized(true, trimmed(t))
 end from_twos
 
 /** Bit `i` of a magnitude, and `false` for every index past its top limb. */
-private[bigint] bit_of(mag: []const u32, i: usize) -> bool
-    val limb = i / 32
+private[bigint] bit_of(mag: []const Limb, i: usize) -> bool
+    val limb = i / limb_bits
 
     if limb >= mag.len then return false
 
-    mag[limb] >> u32(i % 32) & 1 == 1
+    mag[limb] >> (i % limb_bits) & 1 == 1
 end bit_of
 
 /** `mag << n`, growing by as many limbs as the shift needs.
  *
- * The bits carried between limbs are taken with `>> (32 - bit)`, which is a shift by the whole width
- * when `bit` is zero and is undefined there -- so the limb-aligned case is guarded rather than
- * folded in.
+ * The bits carried between limbs are taken with `>> (limb_bits - bit)`, which is a shift by the
+ * whole width when `bit` is zero -- so the limb-aligned case is guarded rather than folded in.
  */
-private[bigint] shl_mag(mag: []const u32, n: usize) -> []const u32
-    val whole = n / 32
-    val bit = u32(n % 32)
-    var out: Buf[u32] = buf()
+private[bigint] shl_mag(mag: []const Limb, n: usize) -> []const Limb
+    val whole = n / limb_bits
+    val bit = n % limb_bits
+    var out: Buf[Limb] = buf()
 
     for _ in 0..<whole
         out.push(0)
 
-    var carry: u32 = 0
+    var carry: Limb = 0
 
     for i in 0..<mag.len
         out.push(mag[i] << bit | carry)
-        carry = if bit == 0 then 0 else mag[i] >> (32 - bit)
+        carry = if bit == 0 then 0 else mag[i] >> (limb_bits - bit)
 
     if carry != 0 then out.push(carry)
 
@@ -279,9 +275,9 @@ end shl_mag
 /** `mag >> n`, and whether any set bit was discarded -- which is what a caller flooring a negative
  * number needs and cannot recover afterwards.
  */
-private[bigint] shr_mag(mag: []const u32, n: usize) -> ([]const u32, bool)
-    val whole = n / 32
-    val bit = u32(n % 32)
+private[bigint] shr_mag(mag: []const Limb, n: usize) -> ([]const Limb, bool)
+    val whole = n / limb_bits
+    val bit = n % limb_bits
 
     if whole >= mag.len then return (empty(), mag.len > 0)
 
@@ -290,14 +286,14 @@ private[bigint] shr_mag(mag: []const u32, n: usize) -> ([]const u32, bool)
     for i in 0..<whole
         if mag[i] != 0 then lost = true
 
-    if bit != 0 && mag[whole] << (32 - bit) != 0 then lost = true
+    if bit != 0 && mag[whole] << (limb_bits - bit) != 0 then lost = true
 
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
 
     for i in whole..<mag.len
         var v = mag[i] >> bit
 
-        if bit != 0 && i + 1 < mag.len then v = v | mag[i + 1] << (32 - bit)
+        if bit != 0 && i + 1 < mag.len then v = v | mag[i + 1] << (limb_bits - bit)
 
         out.push(v)
 
@@ -307,5 +303,5 @@ end shr_mag
 /** A sign and a magnitude as a value, with the one rule the representation has: zero is never
  * negative, so a cancelled magnitude drops the sign it was carrying.
  */
-private[bigint] normalized(minus: bool, mag: []const u32) -> BigInt =
+private[bigint] normalized(minus: bool, mag: []const Limb) -> BigInt =
     if mag.len == 0 then zero() else BigInt(minus, mag)

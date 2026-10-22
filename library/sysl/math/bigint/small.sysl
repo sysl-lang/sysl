@@ -47,9 +47,10 @@ mul_long(a: BigInt, n: long) -> BigInt
     val w = if n < 0 then 0u64 - u64(n) else u64(n)
     val negative = a.minus != (n < 0)
 
-    if w > 0xffffffffu64 then return mul(a, from_int(n))
+    // A full-width shift leaves zero, so on a 64-bit target every `n` fits a limb.
+    if w >> limb_bits != 0 then return mul(a, from_int(n))
 
-    normalized(negative, mul_mag_small(a.mag, u32(w)))
+    normalized(negative, mul_mag_small(a.mag, Limb(w)))
 end mul_long
 
 /** `-1`, `0` or `1` as `a` is below, equal to or above `n`. **Allocates nothing.**
@@ -57,8 +58,8 @@ end mul_long
  * That is the whole reason it is here rather than left to `cmp(a, from_int(n))`. A comparison is
  * what a loop tests and what a sort calls, so it is the operation most often on a hot path and the
  * one where building a value to throw away is least defensible. The signs decide it where they
- * differ, a magnitude of more than two limbs is past anything a `long` holds, and what is left is
- * two `u64`s.
+ * differ, a magnitude of more limbs than a `u64` takes is past anything a `long` holds, and what is
+ * left is two `u64`s.
  */
 cmp_long(a: BigInt, n: long) -> int
     val sa = a.sign()
@@ -66,7 +67,7 @@ cmp_long(a: BigInt, n: long) -> int
 
     if sa != sn then return if sa < sn then -1 else 1
     if sa == 0 then return 0
-    if a.mag.len > 2 then return if a.minus then -1 else 1
+    if a.mag.len > u64_limbs then return if a.minus then -1 else 1
 
     val m = low_u64(a.mag)
     val w = if n < 0 then 0u64 - u64(n) else u64(n)
@@ -91,12 +92,12 @@ div_rem_long(a: BigInt, n: long) -> (BigInt, long)
     val w = if n < 0 then 0u64 - u64(n) else u64(n)
     val negative = a.minus != (n < 0)
 
-    if w > 0xffffffffu64
+    if w >> limb_bits != 0
         val (q, r) = div_rem(a, from_int(n))
 
         return (q, r.to_long().unwrap())
 
-    val (qm, rm) = short_divide(a.mag, u32(w))
+    val (qm, rm) = short_divide(a.mag, Limb(w))
     val rest = if rm.len == 0 then 0 else long(rm[0])
 
     (normalized(negative, qm), if a.minus then -rest else rest)
@@ -105,19 +106,17 @@ end div_rem_long
 /** `mag * m`, the operand fitting a limb -- the multiply written for the case where one side is a
  * single digit, which is a pass over the limbs rather than the quadratic loop.
  */
-private mul_mag_small(mag: []const u32, m: u32) -> []const u32
-    var out: Buf[u32] = buf()
-    var carry: u64 = 0
+private mul_mag_small(mag: []const Limb, m: Limb) -> []const Limb
+    var out: Buf[Limb] = buf()
+    var carry: Wide = 0
 
     for i in 0..<mag.len
-        val t = u64(mag[i]) * u64(m) + carry
+        val t = Wide(mag[i]) * Wide(m) + carry
 
-        out.push(u32(t & 0xffffffffu64))
-        carry = t >> 32
+        out.push(Limb(t))
+        carry = t >> limb_bits
 
-    while carry != 0
-        out.push(u32(carry & 0xffffffffu64))
-        carry = carry >> 32
+    if carry != 0 then out.push(Limb(carry))
 
     trimmed(out)
 end mul_mag_small

@@ -1,6 +1,6 @@
 ---
 title: The bigint module
-summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over 32-bit limbs, schoolbook multiply, Knuth's algorithm D, bit operations on an infinite two's complement, and text in any base."
+summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over machine-word limbs, schoolbook multiply, Knuth's algorithm D, bit operations on an infinite two's complement, and text in any base."
 weight: 63
 ---
 
@@ -30,14 +30,19 @@ print(to_string(pow(from_int(2), 128)))
 
 ## Sign and magnitude, and the magnitude is limbs
 
-A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of `u32` limbs written
-least significant first with no leading zeros. Zero is the empty magnitude and a clear sign, so there
-is exactly one representation of it and nothing has to remember whether it is negative — which is
-what makes `Eq`, `Ord` and `Hash` straightforward rather than careful.
+A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of limbs written least
+significant first with no leading zeros. Zero is the empty magnitude and a clear sign, so there is
+exactly one representation of it and nothing has to remember whether it is negative — which is what
+makes `Eq`, `Ord` and `Hash` straightforward rather than careful.
 
-**Limbs are 32 bits and the arithmetic is done in 64.** That is what makes every carry, borrow and
-partial product exact without asking the language for a wider type or a carry flag: a product of two
-limbs is at most `(2^32 - 1)^2`, which fits a `u64` with room for two more limbs of carry.
+**A limb is a machine word, and the arithmetic is done in a type twice as wide.** On a 64-bit target
+a limb is a `u64` and every carry, borrow and partial product is a `u128`; on a 32-bit or 16-bit
+target (`#if ptr32`, `#if ptr16`) a limb is a `u32` and the double is a `u64`. sysl has `uN` at
+[any width](/reference/types/#where-the-width-stops), so the double-width type is an ordinary
+integer rather than a carry flag or an intrinsic, and a `u128` product compiles to the machine's own
+high-half multiply. A product of two limbs is at most `(2^w - 1)^2`, which fits the double width with
+room for two more limbs of carry, and that is what makes every step exact. `x.limbs()` counts machine
+words, so it answers differently on the two kinds of target; `bit_length(x)` does not.
 
 **The magnitude is a view, so copying a `BigInt` costs a retain rather than a copy of its limbs.**
 That is what makes passing one around cheap, and it is why the limbs are never written through: every
@@ -122,9 +127,9 @@ work somebody does when a program is slow rather than decisions this module had 
 
 The one thing worth knowing about algorithm D is that its quotient digit is a *guess* that has to be
 corrected twice — a loop that tightens it, and an add-back for the one case the loop still gets wrong.
-The add-back fires about twice in every `2^32` digits, which is rare enough that a suite of generated
-inputs never enters it: the library's own tests use inputs constructed to force it, because two
-hundred random pairs left the branch green with it deleted.
+The add-back fires about twice in every `2^w` digits for a `w`-bit limb, which is rare enough that a
+suite of generated inputs never enters it: the library's own tests use inputs constructed to force
+it, one for each limb width, because two hundred random pairs left the branch green with it deleted.
 
 ## The bit operations read a value as infinitely wide two's complement
 
@@ -213,9 +218,9 @@ decrease is the one that has arrived. It is the exact floor, so `isqrt(2)` is `1
 ## Text in any base from 2 to 36
 
 Both directions work a chunk at a time rather than a digit at a time, the chunk being the largest
-power of the base that fits in a limb — `10^9` for base ten, `2^31` for binary. So rendering divides
-the whole magnitude by a billion and gets nine digits out of the remainder with ordinary machine
-arithmetic.
+power of the base that fits in a limb — on a 64-bit target `10^19` for base ten and `2^63` for
+binary. So rendering divides the whole magnitude by `10^19` and gets nineteen digits out of the
+remainder with ordinary machine arithmetic.
 
 ```sysl
 import sysl.math.bigint.{parse, parse_radix, to_string_radix}
