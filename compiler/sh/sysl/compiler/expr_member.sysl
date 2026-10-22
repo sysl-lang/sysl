@@ -74,6 +74,25 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if in_module.is_some() then return in_module.unwrap()
 
+    // **A name a module does not declare, reached through the module**, is undefined THERE -- the
+    // head is a module and not a value, so reading it as one would report the module as the undefined
+    // name, which is the one part the reader got right (`m.Nope.new()`, `lib.m.limit`). Told at the
+    // name, as a call's `undefined function` is, with the edge into the module made all the same.
+    val head = dotted_name_written(cx, receiver)
+
+    if head.is_some()
+        val owner = module_owner(cx, head.unwrap(), name)
+
+        if owner.is_some()
+            val named_at = Span(span.end - name.bytes.len, span.end)
+
+            depends_on_module(cx.an, cx.scope, owner.unwrap(), named_at)
+
+            return cx.err_whatever_the_types(named_at,
+                s"undefined name '${qualified_name(module_qualify(owner.unwrap(), name))}'")
+        end if
+    end if
+
     val outer = type_expr_bare(cx, receiver)
 
     if texpr_type(outer) == Unknown then return outer
@@ -856,6 +875,16 @@ end module_owner
 dotted_name_written(cx: &Analyzer, e: Expr) -> Option[string] = *e.kind match
     Ident(head) -> if cx.lookup(head).is_none() && !own_storage(cx, head) then Some(head) else None
     Field(inner, name, _) -> dotted_name_written(cx, inner).map(head -> s"$head.$name")
+    _ -> None
+
+// **The type a call names in front of its dot, as it was written** -- `Q` in `Q.new()`, or the whole
+// path in `m.Q.new()` and `a.b.Q.new()`. A dotted path is one name to the type grammar, so every
+// reading that asks which type the receiver names (a generic one's inferred instantiation, a generic
+// enum's variant) accepts both spellings alike; reading only the bare one sent the qualified call on
+// to the receiver's value reading, which reported the module as an undefined name.
+written_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind match
+    Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+    Field(_, _, _) -> dotted_name_written(cx, receiver)
     _ -> None
 
 // Whether the reader's own module declares storage of this spelling the reader may reach -- this
