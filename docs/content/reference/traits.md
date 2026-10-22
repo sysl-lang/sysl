@@ -2910,6 +2910,27 @@ print(take([1][..]))
 '@borrows' is about a call whose body the compiler cannot see
 ```
 
+**So is it on any method written with its body** — a type's own, or one implementing a trait. Its
+body is as visible as a free function's, and an implementation that could write the promise would be
+granting itself an exemption its trait never gave; the trait's declaration is the one place it goes.
+
+```sysl
+struct Counter
+    n: usize
+
+    @borrows(bytes)
+    put(*self, bytes: []const u8)
+        self.n += bytes.len
+
+var c = Counter(0)
+
+print(c.n)
+```
+
+```error
+A method declared with its body — a type's own, or one implementing a trait — is read the way a free function is
+```
+
 ## Reaching a trait's members without a value
 
 A trait may declare a member with **no receiver**, an associated function, reached through the

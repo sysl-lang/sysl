@@ -1,0 +1,164 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.join
+
+// **A trait's `@borrows` is read off the trait, so every command that checks a body agrees on it.**
+// The promise used to be read off a method TABLE for the trait, and a compilation holds a table only
+// for a type it saw made into an object -- so a library whose implementations are its consumers' had
+// none, and `build-lib` refused, as a view passed "through a trait object, which may hold on to it",
+// the very call the promise was written to allow. Each claim here is put to `build-lib` and
+// `build-c` over the same `@no_alloc` module, which declares no implementation at all.
+//
+// And `@borrows` above a method that has its body -- a type's own or an implementation's -- is
+// refused as it is above a free function: the body is right there to be read.
+
+private brw_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end brw_run
+
+// `src` written as module `demo` under a fresh root, put to `build-lib` and then to `build-c`.
+private brw_both(src: string) -> ((int, string), (int, string))
+    val root = lbr_temp("sysl-brw-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", src).unwrap()
+
+    val lib = brw_run(["sysl", "build-lib", root])
+    val c = brw_run(["sysl", "build-c", "-o", s"$root/demo.a", "--header", s"$root/demo.h", root])
+
+    remove_dir_all(root).unwrap_or(())
+    (lib, c)
+end brw_both
+
+// Both commands accept `src`.
+private brw_accepted(src: string)
+    val (lib, c) = brw_both(src)
+
+    assert_eq(lib.0, Fine, s"build-lib: ${lib.1}")
+    assert_eq(c.0, Fine, s"build-c: ${c.1}")
+end brw_accepted
+
+// Both commands refuse `src`, each saying `part`.
+private brw_refused(src: string, part: string)
+    val (lib, c) = brw_both(src)
+
+    assert(lib.0 != Fine, "build-lib accepted it")
+    assert(lib.1.contains(part), s"build-lib said: ${lib.1}")
+    assert(c.0 != Fine, "build-c accepted it")
+    assert(c.1.contains(part), s"build-c said: ${c.1}")
+end brw_refused
+
+private val brw_kept: string = "is passed through a trait object, which may hold on to it"
+
+// A sink declared with or without the promise, and a body passing it a view of its own stack.
+private brw_sink(promise: bool) -> string =
+    "module demo\n@no_alloc\n\ntrait Sink\n" + (if promise then "    @borrows(bytes)\n" else "") +
+    "    put(*self, bytes: []const u8)\n\n" +
+    "go(s: *Sink)\n    var buf: [8]u8 = [0; 8]\n    s.put(buf[0..<4])\n"
+
+@test("a view passed to a @borrows method of a trait with no implementation in sight is accepted by build-lib and build-c")
+brw_promise_without_a_table()
+    if !rng_ready() then return
+
+    brw_accepted(brw_sink(true))
+
+@test("without the promise both refuse it, the view having nowhere to go under @no_alloc")
+brw_no_promise_refused_by_both()
+    if !rng_ready() then return
+
+    brw_refused(brw_sink(false), brw_kept)
+
+@test("std's Writer promises to borrow what 'write' is passed, and both commands hear it")
+brw_std_writer()
+    if !rng_ready() then return
+
+    brw_accepted("module demo\n@no_alloc\n\n" +
+                 "go(w: *Writer)\n    var buf: [8]u8 = [0; 8]\n    w.write(buf[0..<4])\n")
+
+@test("a generic trait's promise holds at the instance an object names")
+brw_generic_trait()
+    if !rng_ready() then return
+
+    val head = "module demo\n@no_alloc\n\ntrait Sink[T]\n"
+    val body = "    put(*self, xs: []const T)\n\n" +
+        "go(s: *Sink[u8])\n    var buf: [8]u8 = [0; 8]\n    s.put(buf[0..<4])\n"
+
+    brw_accepted(head + "    @borrows(xs)\n" + body)
+    brw_refused(head + body, brw_kept)
+
+// The promise is per parameter, by position: one parameter borrowed says nothing about its neighbour.
+@test("a parameter the promise does not name is still refused a view, beside one it does")
+brw_only_the_named_parameter()
+    if !rng_ready() then return
+
+    val src = "module demo\n@no_alloc\n\ntrait Sink\n    @borrows(bytes)\n" +
+        "    put(*self, kept: []const u8, bytes: []const u8)\n\n" +
+        "go(s: *Sink, other: []const u8)\n    var buf: [8]u8 = [0; 8]\n"
+
+    brw_accepted(src + "    s.put(other, buf[0..<4])\n")
+    brw_refused(src + "    s.put(buf[0..<4], other)\n", brw_kept)
+
+// A slot past the trait's own members: the promise of a required trait's method is that trait's.
+@test("a promise on a required trait's method holds through an object of the requiring trait")
+brw_required_trait()
+    if !rng_ready() then return
+
+    brw_accepted("module demo\n@no_alloc\n\ntrait Sink\n    @borrows(bytes)\n" +
+                 "    put(*self, bytes: []const u8)\n\ntrait Named: Sink\n    name(self) -> u8\n\n" +
+                 "go(s: *Named)\n    var buf: [8]u8 = [0; 8]\n    s.put(buf[0..<4])\n")
+
+// -- @borrows above a method with a body ---------------------------------------------------------
+
+private val brw_refusal: string =
+    "error: '@borrows' is about a call whose body the compiler cannot see, so it says something " +
+    "only on a trait's method. A method declared with its body"
+
+@test("@borrows above a struct's own method is refused, as above a free function")
+brw_refused_on_a_struct_method()
+    if !rng_ready() then return
+
+    azc_refuses("struct Counter\n    n: usize\n\n    @borrows(bytes)\n    put(*self, bytes: []const u8)\n" +
+                "        self.n += bytes.len\n\nvar c = Counter(0)\nvar buf: [8]u8\n" +
+                "c.put(buf[0..<4])\nprint(c.n)\n", brw_refusal)
+
+@test("and above a method in a type's own impl block")
+brw_refused_in_an_inherent_impl()
+    if !rng_ready() then return
+
+    azc_refuses("struct Counter\n    n: usize\n\nimpl Counter\n    @borrows(bytes)\n" +
+                "    put(*self, bytes: []const u8)\n        self.n += bytes.len\n\n" +
+                "var c = Counter(0)\nprint(c.n)\n", brw_refusal)
+
+@test("and above an implementation's method, the promise being the trait's to make")
+brw_refused_on_an_implementation()
+    if !rng_ready() then return
+
+    azc_refuses("trait Sink\n    put(*self, bytes: []const u8)\n\nstruct Counter\n    n: usize\n\n" +
+                "impl Sink for Counter\n    @borrows(bytes)\n    put(*self, bytes: []const u8)\n" +
+                "        self.n += bytes.len\n\nvar c = Counter(0)\nprint(c.n)\n", brw_refusal)
+
+@test("and above an enum's method")
+brw_refused_on_an_enum_method()
+    if !rng_ready() then return
+
+    azc_refuses("enum Light\n    On\n    Off\n\n    @borrows(xs)\n    count(self, xs: []const u8) -> usize = xs.len\n\n" +
+                "print(Light.On.count([1u8][..]))\n", brw_refusal)
+
+@test("a trait's own declaration still takes it, and a program through it runs")
+brw_trait_declaration_still_takes_it()
+    if !rng_ready() then return
+
+    val got = azc_cli(["emit-llvm"], [("main.sysl",
+        "trait Sink\n    @borrows(bytes)\n    put(*self, bytes: []const u8)\n\n" +
+        "struct Counter\n    n: usize\n\nimpl Sink for Counter\n    put(*self, bytes: []const u8)\n" +
+        "        self.n += bytes.len\n\nvar c = Counter(0)\nvar s: *Sink = &c\nvar buf: [8]u8\n" +
+        "s.put(buf[0..<4])\nprint(c.n)\n")])
+
+    assert(got.ok, got.said())

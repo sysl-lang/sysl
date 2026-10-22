@@ -109,8 +109,9 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
 end parse_attr_list
 
 // The annotations a member may carry: the ones about a parameter, and the three about the function
-// the member lowers to.
-parse_member_attrs(p: *Parser) -> Buf[Attr]
+// the member lowers to. `in_trait` is whether the member is a trait's own declaration, the one place
+// `@borrows` says anything.
+parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
     var out: Buf[Attr] = buf()
 
     loop
@@ -118,6 +119,19 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 
         val at = p.here()
         val word = attr_name(p)
+
+        // **`@borrows` above a method that has its body is the free function's case again**: the
+        // body is right here and the analysis reads the answer out of it. An implementation's is
+        // refused too, because the promise is the trait's to make -- an implementation that could
+        // write one would be granting itself the exemption its trait never gave. Refused at the
+        // argument list, as the free function's is.
+        if word == "borrows" && !p.at_kw("#") && !in_trait
+            p.bump()
+            p.bump()
+            p.fault(p.here(), "'@borrows' is about a call whose body the compiler cannot see, so it says something only on a trait's method. A method declared with its body — a type's own, or one implementing a trait — is read the way a free function is: the analysis takes the answer out of the body, and a promise written above it would restate what the compiler already knows and go stale the moment the body changed. A trait's promise is written once, on the trait's declaration, and every implementation is checked against it")
+            skip_line(p)
+            break
+        end if
 
         // An indented '#' never reaches the directive pass, so whatever word follows it, the member
         // rule answers -- and names the sigil, since '@' is what the reader writes in any case.
