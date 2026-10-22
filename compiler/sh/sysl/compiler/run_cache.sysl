@@ -407,6 +407,10 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
     // binary, which is the reason the project's own path is in the key.
     manifest_at(root) match
         Ok(m) ->
+            // The graph as resolved: which version of each package, with which features and option
+            // values (`config_key.sysl`).
+            files.push(("graph", resolved_config_part(root, m)))
+
             val roots = handed_trees(root, m)
 
             for i in 0..<roots.len()
@@ -423,35 +427,19 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
             Err(e) -> return Err(Refusal(e.message))
             Ok(f) -> f
 
-        // A tree's `features` block, because it decides which of the files' lines are compiled at all
-        // -- an edit to it alone changes the program. **What it declares goes in, not how the file
-        // spelled it**: the rest of the manifest reaches the key as what it means (what the target
-        // provides, where the trees are), so a reordered block is the same program.
         val tree_root = if i == 0 then root else trees.at(i)
 
-        // Its `name` and `version` too, which `__NAME__` and `__VERSION__` fold into the program as
-        // literals -- and the manifest is not one of the files hashed below, so without them a
-        // renamed package in an unchanged tree replayed a binary still printing the old name.
+        // **The tree's manifest, whole** (`manifest_config_part`): its features, its options and the
+        // values and features its dependency entries set, its name and version (`__NAME__` and
+        // `__VERSION__` fold into the program), its C configuration -- every key but the few
+        // `ManifestExempt` names with a reason. Canonically spelled, so a reordered block is the same
+        // program; whole, so a key nobody thought to list is in it anyway.
+        files.push((s"$i/manifest", manifest_config_part(tree_root)))
+
         manifest_at(tree_root) match
             Ok(m) ->
-                if !m.features.is_empty() then files.push((s"$i/features", features_part(m.features)))
-
-                // Its options and the values its entries set, which decide what a package's source
-                // computes (`options.sysl`): one tree under two values is two programs.
-                val valued = options_part(m)
-
-                if !valued.is_empty() then files.push((s"$i/options", valued))
-                if !m.name.is_empty() then files.push((s"$i/name", m.name))
-                if !m.version.is_empty() then files.push((s"$i/version", m.version))
-
-                // What the tree's C is compiled with (`defines`, `c`), and each vendored library's
-                // files with every header under the roots it reads -- an upstream tree's headers sit
-                // where nothing else here hashes them, and a configuration is as much the program as
-                // a file is.
-                val configured = c_block_text(m)
-
-                if !configured.is_empty() then files.push((s"$i/c", configured))
-
+                // Each vendored library's files with every header under the roots it reads -- an
+                // upstream tree's headers sit where nothing else here hashes them.
                 val vendored = c_library_inputs(tree_root, m)
 
                 for item in vendored
@@ -481,21 +469,14 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
 
             files.push((s"$i/${relative_to(trees.at(i), item)}", from_utf8_unchecked(bytes.view())))
 
+        // And every header in the tree, wherever it sits: a `.c` file's `#include` reads one the
+        // walk above never lists, and an edit to it alone is a different object.
+        if is_directory(trees.at(i))
+            for item in carried_headers(trees.at(i))
+                files.push((s"$i/h/${item.0}", item.1))
+
     Ok(library_fingerprint(files))
 end program_fingerprint
-
-// A `features` block as what it declares: each feature and what it turns on, one to a line.
-private features_part(features: Buf[(string, Buf[string])]) -> string
-    var out = str_builder()
-
-    for item in features
-        out.push(item.0)
-        out.push(" = [")
-        out.push(join(item.1.view(), ", "))
-        out.push("]\n")
-
-    out.finish()
-end features_part
 
 // A file's place: the module directories it was found under, then its own name.
 private found_place(found: Found) -> string
@@ -537,7 +518,26 @@ private run_cache_slot(key: string) -> Option[string]
         None -> None
 end run_cache_slot
 
-// The program built for this key, where one is there and is still executable.
+// How many lookups found an entry, and how many builds reserved a slot for one, since the last
+// `clear_run_cache_counts` -- what a test observes rather than a clock.
+private var run_hits: int = 0
+private var run_reserved: int = 0
+
+run_cache_counts() -> (int, int) = (run_hits, run_reserved)
+
+clear_run_cache_counts()
+    run_hits = 0
+    run_reserved = 0
+end clear_run_cache_counts
+
+// The program built for this key, where one is there, is still executable, and is the very file its
+// seal (`seal_run_entry`) describes.
+//
+// **The seal is what makes a hit safe.** The slot's name is the key, but a name says nothing about
+// what is in the file: one truncated or damaged on disk, one copied over the slot from another key's,
+// or one a second build published onto the slot between this build's link and its seal would all be
+// started as though they were this program. Each is a miss here, and the build that follows writes a
+// whole entry and a seal that names it.
 run_cache_hit(key: string) -> Option[string]
     val path = run_cache_slot(key) match
         Some(p) -> p
@@ -545,11 +545,36 @@ run_cache_hit(key: string) -> Option[string]
 
     if !is_file(path) || !is_executable(path) then return None
 
-    // A hit is a use: the entry and its test list are as young as this run.
+    read_text(s"$path$SealSuffix") match
+        Err(_) -> return None
+        Ok(seal) -> if seal != entry_seal(key, path) then return None
+
+    // A hit is a use: the entry, its test list and its seal are as young as this run.
     touch_used(path)
     touch_used(s"$path.tests")
+    touch_used(s"$path$SealSuffix")
+    run_hits += 1
     Some(path)
 end run_cache_hit
+
+// The file beside an entry that says which key it was built under and what its bytes come to.
+const SealSuffix: string = ".seal"
+
+// What an entry's seal says: the key, then the executable's length and digest. Empty where the file
+// will not read, which no written seal ever is.
+private entry_seal(key: string, exe: string) -> string = read_bytes(exe) match
+    Err(_) -> ""
+    Ok(bytes) -> s"$key\n${bytes.len}:${bytes_fingerprint(bytes)}\n"
+
+// The seal for the entry just published at `slot`, written whole or not at all. A build that cannot
+// write it has still built its program; the next run is a miss.
+seal_run_entry(slot: string)
+    val seal = entry_seal(basename(slot), slot)
+
+    if seal.is_empty() then return
+
+    write_text_atomic(s"$slot$SealSuffix", seal).unwrap_or(())
+end seal_run_entry
 
 // Where to link, for a build that is about to happen: a path in the cache with the directory already
 // made, or nothing where there is no cache to write into.
@@ -571,6 +596,7 @@ run_cache_reserve(key: string) -> Option[string]
         Ok(_) -> ()
 
     sweep_run_cache(path)
+    run_reserved += 1
     Some(path)
 end run_cache_reserve
 
@@ -661,7 +687,7 @@ private evict_around(dir: string, fresh: string)
         Some(f) -> f
         None -> return
 
-    val spared = (one: string) -> one == fresh || one == s"$fresh.tests"
+    val spared = (one: string) -> one == fresh || one == s"$fresh.tests" || one == s"$fresh$SealSuffix"
     var gone: Set[string] = set()
     var now: long = 0
 

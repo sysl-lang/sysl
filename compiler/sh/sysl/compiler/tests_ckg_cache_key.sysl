@@ -1,0 +1,1474 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_get
+import sysl.fs.{entries, is_file, make_dir_all, read_bytes, read_text, remove_dir_all, remove_file, write_bytes,
+                write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, split, Search}
+
+// **Every setting that can change what a build makes keys every cache that keeps what it made**
+// (`config_key.sysl`, `run_cache.sysl`, `root_artifact.sysl`).
+//
+// Each seam case builds a real project through the command line three times -- under one setting,
+// under another, and under the first again -- and reads back what the program wrote and what the cache
+// did: the second build must print what its setting says and must miss, and the third must hit the
+// first's entry. A setting that cannot change the output (`-O`, `--lto`) is held to a miss onto an
+// entry whose bytes differ. An exempt one is held to the opposite: the output is the same, and the
+// entry is replayed.
+//
+// The graph cases do the same over real packages -- path dependencies, a `--lib` root standing in for
+// a coordinate, and packages vendored at two versions -- because a key is only as good as what the
+// build that consults it would have produced.
+//
+// Every case keeps its entries in directories of its own; nothing here reads or leaves an entry in the
+// machine's run, root or C object caches.
+
+private extern "setenv" ckg_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" ckg_c_unsetenv(name: *u8) -> int
+
+private ckg_setenv(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    ckg_c_setenv(n.ptr, v.ptr, 1)
+end ckg_setenv
+
+private ckg_unsetenv(name: string)
+    val n = cstring(name)
+
+    ckg_c_unsetenv(n.ptr)
+end ckg_unsetenv
+
+private ckg_ready() -> bool = std_root().is_ok() && clang_available()
+
+// -- trees ------------------------------------------------------------------------------------------
+
+private ckg_put(root: string, at: string, text: string)
+    make_dir_all(parent_of(s"$root/$at").unwrap()).unwrap()
+    write_text(s"$root/$at", text).unwrap()
+end ckg_put
+
+// A fresh directory holding these files.
+private ckg_tree(files: []const (string, string)) -> string
+    val root = lbr_temp("sysl-ckg")
+
+    for f in files
+        ckg_put(root, f.0, f.1)
+
+    root
+end ckg_tree
+
+// A program whose answer is `expr`, written to `out.txt` beside it rather than printed -- `sysl run`
+// hands its child this process's own standard output.
+private ckg_main(root: string, head: string, expr: string) -> string =
+    s"import sysl.fs.write_text\n$head\n\nwrite_text(\"$root/out.txt\", str($expr)).unwrap_or(())\n"
+
+// A project at a fresh directory: its manifest, its main file over `expr`, and any other files.
+private ckg_project(manifest: string, head: string, expr: string, files: []const (string, string)) -> string
+    val root = ckg_tree(files)
+
+    ckg_put(root, "package.hocon", manifest)
+    ckg_put(root, "main.sysl", ckg_main(root, head, expr))
+    root
+end ckg_project
+
+private ckg_manifest(name: string, rest: string) -> string =
+    s"package { name = \"$name\", version = \"1.0.0\" }\n$rest"
+
+// -- the command line ---------------------------------------------------------------------------------
+
+private ckg_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+
+    (code, join(said.view(), "\n"))
+end ckg_cli
+
+// `sysl <command> <path> <flags>`, the flags written as one string separated by spaces.
+private ckg_args(command: string, path: string, flags: string) -> Buf[string]
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push(path)
+
+    for item in split(flags, " ")
+        if !item.is_empty() then args.push(item)
+
+    args
+end ckg_args
+
+// What the program `sysl run` built wrote, or `refused` where the command failed.
+private ckg_ran(root: string, flags: string) -> string
+    remove_file(s"$root/out.txt").unwrap_or(())
+
+    val args = ckg_args("run", root, flags)
+
+    if ckg_cli(args.view()).0 != 0 then return "refused"
+
+    read_text(s"$root/out.txt").unwrap_or("nothing written")
+end ckg_ran
+
+// What the program `sysl build` made writes when it is run, or `refused`.
+private ckg_built(root: string, flags: string, exe: string) -> string
+    remove_file(s"$root/out.txt").unwrap_or(())
+
+    val args = ckg_args("build", root, s"-o $exe $flags")
+
+    if ckg_cli(args.view()).0 != 0 then return "refused"
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> "could not run"
+        Ok(_) -> read_text(s"$root/out.txt").unwrap_or("nothing written")
+end ckg_built
+
+// -- the caches -----------------------------------------------------------------------------------
+
+// Every cache this process consults, in a directory of the case's own, with the counts cleared.
+private ckg_caches() -> string
+    val cache = lbr_temp("sysl-ckg-cache")
+
+    use_run_cache_dir(Some(cache))
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_run_cache_counts()
+    clear_root_artifact_counts()
+    cache
+end ckg_caches
+
+private ckg_done(cache: string, trees: []string)
+    use_run_cache_dir(None)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    reset_feature_request()
+    remove_dir_all(cache).unwrap_or(())
+
+    for t in trees
+        remove_dir_all(t).unwrap_or(())
+end ckg_done
+
+// The executables a run cache holds, without their test lists and seals.
+private ckg_entries(cache: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    entries(s"$cache/sysl/run") match
+        Err(_) -> ()
+        Ok(names) ->
+            for item in names
+                if !item.ends_with(".tests") && !item.ends_with(SealSuffix) && !item.starts_with(".")
+                    out.push(s"$cache/sysl/run/$item")
+
+    out
+end ckg_entries
+
+// Whether two executables are one program. **The linker's ad-hoc signature is set aside first**: it
+// names the file the link wrote, which is a fresh pending name each time, so two links of one program
+// differ there and nowhere else.
+private ckg_same(a: string, b: string) -> bool
+    val dir = lbr_temp("sysl-ckg-cmp")
+
+    write_bytes(s"$dir/a", read_bytes(a).unwrap()).unwrap()
+    write_bytes(s"$dir/b", read_bytes(b).unwrap()).unwrap()
+    capture("/usr/bin/codesign", ["--remove-signature", s"$dir/a"], "", [], true).unwrap()
+    capture("/usr/bin/codesign", ["--remove-signature", s"$dir/b"], "", [], true).unwrap()
+
+    val same = ckg_same_bytes(s"$dir/a", s"$dir/b")
+
+    remove_dir_all(dir).unwrap_or(())
+    same
+end ckg_same
+
+private ckg_same_bytes(a: string, b: string) -> bool
+    val x = read_bytes(a).unwrap()
+    val y = read_bytes(b).unwrap()
+
+    if x.len != y.len then return false
+
+    // The one difference two links of one program have once the signature is gone is the 16-byte
+    // `LC_UUID` the linker draws afresh; any difference outside one such window is a different program.
+    var first: usize = x.len
+
+    for i in 0..<x.len
+        if x[i] != y[i]
+            if first == x.len then first = i
+            if i >= first + 16 then return false
+
+    true
+end ckg_same_bytes
+
+// What the run cache did between two counts.
+// A slot reserved is a build, whatever the lookup before it found.
+private ckg_run_verdict(before: (int, int), after: (int, int)) -> string =
+    if after.1 > before.1 then "miss" else if after.0 > before.0 then "hit" else "none"
+
+// What the root cache did between two counts.
+private ckg_root_verdict(before: (int, int, int), after: (int, int, int)) -> string =
+    if after.0 > before.0 then "hit" else if after.1 > before.1 then "miss"
+    else if after.2 > before.2 then "source" else "none"
+
+private ckg_nothing() = ()
+
+// **The seam, through `sysl run`**: the first setting, the second, the first again. It reads
+// `first | second | back | verdicts | entries`, the last saying whether the two entries' bytes differ.
+private ckg_seam(root: string, a: string, b: string, to_a: () -> unit, to_b: () -> unit) -> string
+    val cache = ckg_caches()
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<3
+        if step == 1 then to_b() else to_a()
+
+        val before = run_cache_counts()
+
+        said.push(ckg_ran(root, if step == 1 then b else a))
+        how.push(ckg_run_verdict(before, run_cache_counts()))
+
+    val bytes = ckg_entries_compared(ckg_entries(cache))
+
+    ckg_done(cache, [])
+    s"${said.at(0)} | ${said.at(1)} | ${said.at(2)} | ${join(how.view(), " ")} | $bytes"
+end ckg_seam
+
+// Two entries' bytes compared, or how many entries there were where there were not two.
+private ckg_entries_compared(made: Buf[string]) -> string
+    if made.len() != 2 then return s"${made.len()} entries"
+
+    if ckg_same(made.at(0), made.at(1)) then "same bytes" else "different bytes"
+end ckg_entries_compared
+
+// The same seam over flags alone.
+private ckg_flags_seam(root: string, a: string, b: string) -> string =
+    ckg_seam(root, a, b, () -> ckg_nothing(), () -> ckg_nothing())
+
+// The same seam over a manifest: `a`'s text, `b`'s, `a`'s again.
+private ckg_manifest_seam(root: string, a: string, b: string) -> string =
+    ckg_seam(root, "", "", () -> ckg_put(root, "package.hocon", a), () -> ckg_put(root, "package.hocon", b))
+
+// **The seam, through `sysl build` and a `--lib` root's kept half**: `first | second | back |
+// verdicts`, each verdict the root cache's.
+private ckg_root_seam(root: string, lib: string, a: string, b: string, to_a: () -> unit,
+                      to_b: () -> unit) -> string
+    val cache = ckg_caches()
+    val exe = s"$cache/program"
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<3
+        if step == 1 then to_b() else to_a()
+
+        val before = root_artifact_counts()
+
+        said.push(ckg_built(root, s"--lib $lib ${if step == 1 then b else a}", exe))
+        how.push(ckg_root_verdict(before, root_artifact_counts()))
+
+    ckg_done(cache, [])
+    s"${said.at(0)} | ${said.at(1)} | ${said.at(2)} | ${join(how.view(), " ")}"
+end ckg_root_seam
+
+// -- the feature request and the manifest's features -------------------------------------------------
+
+private ckg_featured(features: string) -> string =
+    ckg_project(ckg_manifest("app", s"features { $features }\n"),
+                "#if feature_fancy\nval v = 2\n#else\nval v = 1\n#endif", "v", [])
+
+@test("--features keys the run cache: a feature turned on is a miss, and off again a hit")
+ckg_features_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "--features fancy"), "1 | 2 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_features_flag
+
+@test("--no-default-features keys the run cache")
+ckg_no_default_features_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("default = [fancy], fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "--no-default-features"), "2 | 1 | 2 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_no_default_features_flag
+
+@test("--all-features keys the run cache")
+ckg_all_features_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "--all-features"), "1 | 2 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_all_features_flag
+
+@test("the manifest's default features key the run cache")
+ckg_default_features_in_the_manifest()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_manifest_seam(root, ckg_manifest("app", "features { fancy = [] }\n"),
+                                ckg_manifest("app", "features { default = [fancy], fancy = [] }\n")),
+              "1 | 2 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_default_features_in_the_manifest
+
+// -- a dependency's options and features, set by the root -------------------------------------------
+
+// A package `leaf` with an option `n` and a feature `fancy` (its default where `default` is true):
+// `value()` is `n`, plus 100 with `fancy` on.
+private ckg_leaf(default_on: bool) -> string =
+    ckg_tree([("package.hocon", ckg_manifest("leaf", "options { n { type = int, default = 1 } }\n" +
+               (if default_on then "features { default = [fancy], fancy = [] }\n" else "features { fancy = [] }\n"))),
+              ("leaf/leaf.sysl", "module leaf\n\nvalue() -> int\n    var v = option_n\n#if feature_fancy\n" +
+               "    v += 100\n#endif\n    v\n")])
+
+// A project depending on `leaf` at `dir` through an entry carrying `extra`.
+private ckg_on_leaf(dir: string, extra: string) -> string =
+    ckg_project(ckg_manifest("app", s"dependencies { leaf { path = \"$dir\"$extra } }\n"), "import leaf",
+                "leaf.value()", [])
+
+private ckg_leaf_entry(dir: string, extra: string) -> string =
+    ckg_manifest("app", s"dependencies { leaf { path = \"$dir\"$extra } }\n")
+
+@test("an option value the root's entry sets keys the run cache")
+ckg_root_sets_an_option()
+    if !ckg_ready() then return
+
+    val leaf = ckg_leaf(false)
+    val root = ckg_on_leaf(leaf, "")
+
+    assert_eq(ckg_manifest_seam(root, ckg_leaf_entry(leaf, ", options = { n = 2 }"),
+                                ckg_leaf_entry(leaf, ", options = { n = 3 }")),
+              "2 | 3 | 2 | miss miss hit | different bytes")
+    lbr_drop([root, leaf])
+end ckg_root_sets_an_option
+
+@test("the features the root's entry asks of a dependency key the run cache")
+ckg_root_asks_a_feature()
+    if !ckg_ready() then return
+
+    val leaf = ckg_leaf(false)
+    val root = ckg_on_leaf(leaf, "")
+
+    assert_eq(ckg_manifest_seam(root, ckg_leaf_entry(leaf, ""), ckg_leaf_entry(leaf, ", features = [\"fancy\"]")),
+              "1 | 101 | 1 | miss miss hit | different bytes")
+    lbr_drop([root, leaf])
+end ckg_root_asks_a_feature
+
+@test("default_features = false in the root's entry keys the run cache")
+ckg_root_turns_defaults_off()
+    if !ckg_ready() then return
+
+    val leaf = ckg_leaf(true)
+    val root = ckg_on_leaf(leaf, "")
+
+    assert_eq(ckg_manifest_seam(root, ckg_leaf_entry(leaf, ""), ckg_leaf_entry(leaf, ", default_features = false")),
+              "101 | 1 | 101 | miss miss hit | different bytes")
+    lbr_drop([root, leaf])
+end ckg_root_turns_defaults_off
+
+// -- targets.<t>.features ----------------------------------------------------------------------------
+
+@test("a root's targets.<t>.features block keys the run cache: taking os away under a feature refuses")
+ckg_root_target_feature_block()
+    if !ckg_ready() then return
+
+    val host = host_target().name
+    val root = ckg_featured("lean = []")
+    val plain = ckg_manifest("app", "features { lean = [] }\n")
+    val lean = ckg_manifest("app", s"features { lean = [] }\ntargets { $host { features { lean { " +
+                             "capabilities { os = false } } } } }\n")
+
+    assert_eq(ckg_seam(root, "--features lean", "--features lean", () -> ckg_put(root, "package.hocon", plain),
+                       () -> ckg_put(root, "package.hocon", lean)),
+              "1 | refused | 1 | miss none hit | 1 entries")
+    remove_dir_all(root).unwrap_or(())
+end ckg_root_target_feature_block
+
+@test("a dependency's targets.<t>.features block is not applied, and changing it still misses rather than replay")
+ckg_dependency_target_feature_block()
+    if !ckg_ready() then return
+
+    val host = host_target().name
+    val leaf = ckg_leaf(false)
+    val root = ckg_on_leaf(leaf, "")
+    val plain = ckg_manifest("leaf", "options { n { type = int, default = 1 } }\nfeatures { fancy = [] }\n")
+    val blocked = plain + s"targets { $host { features { fancy { capabilities { os = false } } } } }\n"
+
+    // The root turns `fancy` on, so the block would bite if a dependency's applied.
+    ckg_put(root, "package.hocon", ckg_leaf_entry(leaf, ", features = [\"fancy\"]"))
+
+    assert_eq(ckg_seam(root, "", "", () -> ckg_put(leaf, "package.hocon", plain),
+                       () -> ckg_put(leaf, "package.hocon", blocked)),
+              "101 | 101 | 101 | miss miss hit | same bytes")
+    lbr_drop([root, leaf])
+end ckg_dependency_target_feature_block
+
+// -- the C a build compiles ---------------------------------------------------------------------------
+
+// A project whose answer comes from the C beside its module `cv`, which reads `CKG_D`, `CKG_X` and the
+// header `ckg.h` where each is there.
+private ckg_c_project(header: bool) -> string =
+    ckg_project(ckg_manifest("app", ""), "import cv", "cv.value()",
+                [("cv/cv.sysl", "module cv\n\nextern \"ckg_value\" value() -> int\n"),
+                 ("cv/cv.c", (if header then "#include \"ckg.h\"\n" else "") +
+                  "int ckg_value(void) {\n#if defined(CKG_H)\n  return CKG_H;\n#elif defined(CKG_D)\n" +
+                  "  return CKG_D;\n#elif defined(CKG_X)\n  return CKG_X;\n#else\n  return 1;\n#endif\n}\n")])
+
+@test("-D keys the run cache")
+ckg_define_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_c_project(false)
+
+    // One macro against another of the same name, so only the value tells the two keys apart.
+    assert_eq(ckg_flags_seam(root, "-D CKG_D=5", "-D CKG_D=6"), "5 | 6 | 5 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_define_flag
+
+@test("--include-path keys the run cache: the same header name in two directories is two programs")
+ckg_include_path_flag()
+    if !ckg_ready() then return
+
+    val four = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val five = ckg_tree([("ckg.h", "#define CKG_H 5\n")])
+    val root = ckg_c_project(true)
+
+    assert_eq(ckg_flags_seam(root, s"--include-path $four", s"--include-path $five"),
+              "4 | 5 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, four, five])
+end ckg_include_path_flag
+
+@test("SYSL_EXTRA_CFLAGS keys the run cache")
+ckg_extra_cflags()
+    if !ckg_ready() then return
+
+    val root = ckg_c_project(false)
+    val got = ckg_seam(root, "", "", () -> ckg_unsetenv("SYSL_EXTRA_CFLAGS"),
+                       () -> ckg_setenv("SYSL_EXTRA_CFLAGS", "-DCKG_X=7"))
+
+    ckg_unsetenv("SYSL_EXTRA_CFLAGS")
+    assert_eq(got, "1 | 7 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_extra_cflags
+
+@test("a header edited inside a dependency keys the run cache")
+ckg_dependency_header_edit()
+    if !ckg_ready() then return
+
+    val dep = ckg_tree([("package.hocon", ckg_manifest("cdep", "")),
+                        ("cdep/cdep.sysl", "module cdep\n\nextern \"cdep_value\" value() -> int\n"),
+                        ("cdep/cdep.c", "#include \"cdep.h\"\nint cdep_value(void) { return CDEP; }\n"),
+                        ("cdep/cdep.h", "#define CDEP 3\n")])
+    val root = ckg_project(ckg_manifest("app", s"dependencies { cdep { path = \"$dep\" } }\n"), "import cdep",
+                           "cdep.value()", [])
+
+    assert_eq(ckg_seam(root, "", "", () -> ckg_put(dep, "cdep/cdep.h", "#define CDEP 3\n"),
+                       () -> ckg_put(dep, "cdep/cdep.h", "#define CDEP 8\n")),
+              "3 | 8 | 3 | miss miss hit | different bytes")
+    lbr_drop([root, dep])
+end ckg_dependency_header_edit
+
+@test("a header requirement answered from the variable a package names keys the run cache")
+ckg_header_variable()
+    if !ckg_ready() then return
+
+    val four = ckg_tree([("ckg.h", "#define CKG_H 4\n")])
+    val five = ckg_tree([("ckg.h", "#define CKG_H 5\n")])
+    val root = ckg_c_project(true)
+
+    ckg_put(root, "package.hocon", ckg_manifest("app", "requires { headers { ckg = { note = \"the ckg " +
+            "headers\", env = \"CKG_SDK_ROOT\" } } }\n"))
+
+    val got = ckg_seam(root, "", "", () -> ckg_setenv("CKG_SDK_ROOT", four), () -> ckg_setenv("CKG_SDK_ROOT", five))
+
+    ckg_unsetenv("CKG_SDK_ROOT")
+    assert_eq(got, "4 | 5 | 4 | miss miss hit | different bytes")
+    lbr_drop([root, four, five])
+end ckg_header_variable
+
+@test("the manifest's defines block keys the run cache")
+ckg_defines_block()
+    if !ckg_ready() then return
+
+    val root = ckg_c_project(false)
+
+    assert_eq(ckg_manifest_seam(root, ckg_manifest("app", ""),
+                                ckg_manifest("app", "defines {\n  \"cv/cv.c\" {\n    CKG_D = 6\n  }\n}\n")),
+              "1 | 6 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_defines_block
+
+// -- linking ---------------------------------------------------------------------------------------
+
+// A directory holding `libckgl.a`, whose `ckgl_value` answers `n`.
+private ckg_archive(n: int) -> string
+    val dir = lbr_temp("sysl-ckg-lib")
+    val clang = find_clang(host_target(), None).unwrap()
+
+    write_text(s"$dir/ckgl.c", s"int ckgl_value(void) { return $n; }\n").unwrap()
+    capture(clang, ["-c", s"$dir/ckgl.c", "-o", s"$dir/ckgl.o"], "", [], true).unwrap()
+    capture("/usr/bin/ar", ["rcs", s"$dir/libckgl.a", s"$dir/ckgl.o"], "", [], true).unwrap()
+    dir
+end ckg_archive
+
+@test("--link-path keys the run cache: one library name found in two directories is two programs")
+ckg_link_path_flag()
+    if !ckg_ready() then return
+
+    val two = ckg_archive(2)
+    val nine = ckg_archive(9)
+    val root = ckg_project(ckg_manifest("app", ""), "import cl", "cl.value()",
+                           [("cl/cl.sysl", "module cl\n@link(\"ckgl\")\n\nextern \"ckgl_value\" value() -> int\n")])
+
+    assert_eq(ckg_flags_seam(root, s"--link-path $two", s"--link-path $nine"),
+              "2 | 9 | 2 | miss miss hit | different bytes")
+    lbr_drop([root, two, nine])
+end ckg_link_path_flag
+
+@test("--link keys the run cache, though a program with no pkg_config library links the same either way")
+ckg_link_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val got = ckg_flags_seam(root, "", "--link static")
+
+    assert(got.starts_with("1 | 1 | 1 | miss miss hit | "), got)
+    remove_dir_all(root).unwrap_or(())
+end ckg_link_flag
+
+// -- what is asked of the compiler -------------------------------------------------------------------
+
+@test("-O keys the run cache: the same output from an entry whose bytes differ")
+ckg_level_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "-O2"), "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_level_flag
+
+@test("the manifest's optimization keys the run cache")
+ckg_level_in_the_manifest()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_manifest_seam(root, ckg_manifest("app", "features { fancy = [] }\n"),
+                                ckg_manifest("app", "features { fancy = [] }\noptimization = 2\n")),
+              "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_level_in_the_manifest
+
+@test("--lto keys the run cache")
+ckg_lto_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "--lto thin"), "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_lto_flag
+
+@test("--profile-generate keys the run cache")
+ckg_profile_generate_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val profiles = lbr_temp("sysl-ckg-prof")
+
+    assert_eq(ckg_flags_seam(root, "", s"--profile-generate $profiles"), "1 | 1 | 1 | miss miss hit | different bytes")
+    lbr_drop([root, profiles])
+end ckg_profile_generate_flag
+
+// A project whose `main` takes its arguments and writes what `expr` (over `args`) comes to.
+private ckg_with_args(head: string, expr: string) -> string
+    val root = ckg_project(ckg_manifest("app", ""), "", "0", [])
+
+    ckg_put(root, "main.sysl", s"import sysl.fs.write_text\n\n$head\n\nmain(args: []string)\n" +
+            s"    write_text(\"$root/out.txt\", str($expr)).unwrap_or(())\n")
+    root
+end ckg_with_args
+
+// A program with a bounds check the optimizer cannot remove: the index arrives as an argument.
+private ckg_checked() -> string = ckg_with_args("val xs: [3]int = [1, 2, 3]", "xs[args.len]")
+
+@test("--no-bounds-locations keys the run cache")
+ckg_bounds_locations_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_checked()
+
+    assert_eq(ckg_flags_seam(root, "", "--no-bounds-locations"), "2 | 2 | 2 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_bounds_locations_flag
+
+@test("the manifest's bounds_locations keys the run cache")
+ckg_bounds_locations_in_the_manifest()
+    if !ckg_ready() then return
+
+    val root = ckg_checked()
+
+    assert_eq(ckg_manifest_seam(root, ckg_manifest("app", ""), ckg_manifest("app", "bounds_locations = false\n")),
+              "2 | 2 | 2 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_bounds_locations_in_the_manifest
+
+@test("--const-steps keys the run cache: a limit too low refuses, and the default replays")
+ckg_const_steps_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_project(ckg_manifest("app", ""),
+                           "const count(n: int) -> int\n    var t = 0\n    for i in 0..<n\n        t += i\n    t\n\n" +
+                           "const k: int = count(1000)", "k", [])
+
+    assert_eq(ckg_flags_seam(root, "", "--const-steps 50"), "499500 | refused | 499500 | miss none hit | 1 entries")
+    remove_dir_all(root).unwrap_or(())
+end ckg_const_steps_flag
+
+@test("--no-std-lib keys the run cache")
+ckg_no_std_lib_flag()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_flags_seam(root, "", "--no-std-lib"), "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_no_std_lib_flag
+
+@test("--cc keys the run cache: the same clang named by another path is a second entry")
+ckg_cc_flag()
+    if !ckg_ready() then return
+
+    val clang = find_clang(host_target(), None).unwrap()
+    val dir = lbr_temp("sysl-ckg-cc")
+
+    // A wrapper rather than a link: clang finds its own headers beside the path it was started as.
+    write_text(s"$dir/clang", "#!/bin/sh\nexec " + clang + " \"$@\"\n").unwrap()
+    capture("/bin/chmod", ["+x", s"$dir/clang"], "", [], true).unwrap()
+
+    val root = ckg_featured("fancy = []")
+    val got = ckg_flags_seam(root, s"--cc $clang", s"--cc $dir/clang")
+
+    assert(got.starts_with("1 | 1 | 1 | miss miss hit | "), got)
+    lbr_drop([root, dir])
+end ckg_cc_flag
+
+@test("SYSL_COUNT_ALLOCS keys the run cache")
+ckg_count_allocs()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val got = ckg_seam(root, "", "", () -> ckg_unsetenv("SYSL_COUNT_ALLOCS"),
+                       () -> ckg_setenv("SYSL_COUNT_ALLOCS", "1"))
+
+    ckg_unsetenv("SYSL_COUNT_ALLOCS")
+    assert_eq(got, "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_count_allocs
+
+@test("the cross-toolchain variables key the run cache, though no host build reads them")
+ckg_cross_toolchain_variables()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val names = ["WASI_SDK_PATH", "ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"]
+
+    for i in 0..<names.len
+        val plain = run_cache_key_for("run", root, None, DefaultOptimization, None)
+
+        ckg_setenv(names[i], "/ckg/elsewhere")
+
+        val set_one = run_cache_key_for("run", root, None, DefaultOptimization, None)
+
+        ckg_unsetenv(names[i])
+        assert(plain.is_some() && set_one.is_some())
+        assert(plain.unwrap() != set_one.unwrap(), names[i])
+
+    remove_dir_all(root).unwrap_or(())
+end ckg_cross_toolchain_variables
+
+// -- which trees ------------------------------------------------------------------------------------
+
+@test("--lib keys the run cache: two roots offering one module are two programs")
+ckg_lib_flag()
+    if !ckg_ready() then return
+
+    val two = ckg_tree([("geo/geo.sysl", "module geo\n\nvalue() -> int = 2\n")])
+    val six = ckg_tree([("geo/geo.sysl", "module geo\n\nvalue() -> int = 6\n")])
+    val root = ckg_project(ckg_manifest("app", ""), "import geo", "geo.value()", [])
+
+    assert_eq(ckg_flags_seam(root, s"--lib $two", s"--lib $six"), "2 | 6 | 2 | miss miss hit | different bytes")
+    lbr_drop([root, two, six])
+end ckg_lib_flag
+
+@test("-p keys the run cache: two members of one workspace are two programs")
+ckg_member_flag()
+    if !ckg_ready() then return
+
+    val ws = lbr_temp("sysl-ckg-ws")
+
+    ckg_put(ws, "package.hocon", "workspace = [\"a\", \"b\"]\n")
+    ckg_put(ws, "a/package.hocon", ckg_manifest("a", ""))
+    ckg_put(ws, "a/main.sysl", ckg_main(ws, "", "1"))
+    ckg_put(ws, "b/package.hocon", ckg_manifest("b", ""))
+    ckg_put(ws, "b/main.sysl", ckg_main(ws, "", "2"))
+
+    assert_eq(ckg_flags_seam(ws, "-p a", "-p b"), "1 | 2 | 1 | miss miss hit | different bytes")
+    remove_dir_all(ws).unwrap_or(())
+end ckg_member_flag
+
+@test("a package's name and version key the run cache, through __NAME__ and __VERSION__")
+ckg_name_and_version()
+    if !ckg_ready() then return
+
+    val root = ckg_project(ckg_manifest("app", ""), "", "__NAME__ + \" \" + __VERSION__", [])
+
+    assert_eq(ckg_manifest_seam(root, "package { name = \"app\", version = \"1.0.0\" }\n",
+                                "package { name = \"app\", version = \"1.0.1\" }\n"),
+              "app 1.0.0 | app 1.0.1 | app 1.0.0 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_name_and_version
+
+@test("the manifest's capabilities key the run cache: taking posix away refuses, and back replays")
+ckg_capabilities_block()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+
+    assert_eq(ckg_manifest_seam(root, ckg_manifest("app", ""), ckg_manifest("app", "capabilities { os = false }\n")),
+              "1 | refused | 1 | miss none hit | 1 entries")
+    remove_dir_all(root).unwrap_or(())
+end ckg_capabilities_block
+
+// -- the target, through the root cache --------------------------------------------------------------
+
+// The CPU type a Mach-O executable names.
+private ckg_cpu(exe: string) -> int
+    val b = read_bytes(exe).unwrap()
+
+    int(b[4]) | (int(b[5]) << 8) | (int(b[6]) << 16) | (int(b[7]) << 24)
+end ckg_cpu
+
+@test("--target keys a root's kept half: an x86_64 build is a second entry, and the host build replays")
+ckg_target_flag()
+    if !ckg_ready() || host_target().name != "aarch64-macos" then return
+
+    val lib = ckg_tree([("geo/geo.sysl", "module geo\n\nvalue() -> int = 3\n")])
+    val root = ckg_project(ckg_manifest("app", ""), "import geo", "geo.value()", [])
+    val cache = ckg_caches()
+    val host_exe = s"$cache/host"
+    val other_exe = s"$cache/other"
+    var how: Buf[string] = buf()
+
+    for step in 0..<3
+        val before = root_artifact_counts()
+        val args = ckg_args("build", root, s"--lib $lib -o ${if step == 1 then other_exe else host_exe}" +
+                            (if step == 1 then " --target x86_64-macos" else ""))
+
+        assert_eq(ckg_cli(args.view()).0, 0)
+        how.push(ckg_root_verdict(before, root_artifact_counts()))
+
+    val cpus = s"${ckg_cpu(host_exe)} ${ckg_cpu(other_exe)}"
+
+    ckg_done(cache, [root, lib])
+    assert_eq(join(how.view(), " "), "miss miss hit")
+    assert_eq(cpus, "16777228 16777223")
+end ckg_target_flag
+
+// -- the graph -------------------------------------------------------------------------------------
+
+// `leaf` as a `--lib` root standing in for the coordinate `github.com/e/leaf`, `mid` a path dependency
+// whose entry for it carries `mid_extra`, and the project depending on `mid` alone.
+private ckg_chain(mid_extra: string) -> (string, string, string)
+    val leaf = ckg_leaf(false)
+    val mid = ckg_tree([("package.hocon", ckg_mid_manifest(mid_extra)),
+                        ("mid/mid.sysl", "module mid\n\nimport leaf\n\nshow() -> int = leaf.value()\n")])
+    val root = ckg_project(ckg_manifest("app", s"dependencies { mid { path = \"$mid\" } }\n"), "import mid",
+                           "mid.show()", [])
+
+    (root, mid, leaf)
+end ckg_chain
+
+private ckg_mid_manifest(extra: string) -> string =
+    ckg_manifest("mid", s"dependencies { leaf { git = \"github.com/e/leaf\", version = \"1.0.0\"$extra } }\n")
+
+@test("root → mid → leaf: an option only the intermediate package sets, changed, misses both caches")
+ckg_graph_option_set_by_an_intermediate()
+    if !ckg_ready() then return
+
+    val g = ckg_chain("")
+    val two = ckg_mid_manifest(", options = { n = 2 }")
+    val three = ckg_mid_manifest(", options = { n = 3 }")
+
+    val ran = ckg_seam(g.0, s"--lib ${g.2}", s"--lib ${g.2}", () -> ckg_put(g.1, "package.hocon", two),
+                       () -> ckg_put(g.1, "package.hocon", three))
+    val kept = ckg_root_seam(g.0, g.2, "", "", () -> ckg_put(g.1, "package.hocon", two),
+                             () -> ckg_put(g.1, "package.hocon", three))
+
+    lbr_drop([g.0, g.1, g.2])
+    assert_eq(ran, "2 | 3 | 2 | miss miss hit | different bytes")
+    assert_eq(kept, "2 | 3 | 2 | miss miss hit")
+end ckg_graph_option_set_by_an_intermediate
+
+@test("root → mid → leaf: a feature only the intermediate package turns on, turned off, misses both caches")
+ckg_graph_feature_set_by_an_intermediate()
+    if !ckg_ready() then return
+
+    val g = ckg_chain("")
+    val on = ckg_mid_manifest(", features = [\"fancy\"]")
+    val off = ckg_mid_manifest("")
+
+    val ran = ckg_seam(g.0, s"--lib ${g.2}", s"--lib ${g.2}", () -> ckg_put(g.1, "package.hocon", on),
+                       () -> ckg_put(g.1, "package.hocon", off))
+    val kept = ckg_root_seam(g.0, g.2, "", "", () -> ckg_put(g.1, "package.hocon", on),
+                             () -> ckg_put(g.1, "package.hocon", off))
+
+    lbr_drop([g.0, g.1, g.2])
+    assert_eq(ran, "101 | 1 | 101 | miss miss hit | different bytes")
+    assert_eq(kept, "101 | 1 | 101 | miss miss hit")
+end ckg_graph_feature_set_by_an_intermediate
+
+@test("two projects sharing a --lib leaf with different option values keep two entries and never cross")
+ckg_graph_two_projects_share_a_leaf()
+    if !ckg_ready() then return
+
+    val leaf = ckg_leaf(false)
+    val entry = (n: int) -> ckg_manifest("app", "dependencies { leaf { git = \"github.com/e/leaf\", " +
+                                         s"version = \"1.0.0\", options = { n = $n } } }\n")
+    val first = ckg_project(entry(4), "import leaf", "leaf.value()", [])
+    val second = ckg_project(entry(5), "import leaf", "leaf.value()", [])
+    val cache = ckg_caches()
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+    val order = [first, second, first, second]
+
+    for i in 0..<order.len
+        val before = root_artifact_counts()
+
+        said.push(ckg_built(order[i], s"--lib $leaf", s"$cache/p$i"))
+        how.push(ckg_root_verdict(before, root_artifact_counts()))
+
+    ckg_done(cache, [first, second, leaf])
+    assert_eq(join(said.view(), " "), "4 5 4 5")
+    assert_eq(join(how.view(), " "), "miss miss hit hit")
+end ckg_graph_two_projects_share_a_leaf
+
+// `shared` at `version`, vendored into `root`: `value()` is `answer`, and `tag()` its `__VERSION__`.
+private ckg_vendor_shared(root: string, version: string, answer: int)
+    val dir = s"$root/vendor/github.com/e/shared/@v$version"
+
+    ckg_put(dir, "package.hocon", s"package { name = \"shared\", version = \"$version\" }\n")
+    ckg_put(dir, "shared/shared.sysl", s"module shared\n\nconst Answer: int = $answer\n\n" +
+            "value() -> int = Answer\ntag() -> string = __VERSION__\n")
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end ckg_vendor_shared
+
+// A diamond: the project depends on `a` and `b`, each of which depends on `shared`; `b` asks for
+// `b_wants`. `a.answer()` reads `shared` through `a`, which never changes.
+private ckg_diamond(answer_1_1: int) -> (string, string)
+    val root = lbr_temp("sysl-ckg-dia")
+    val entry = (v: string) -> s"dependencies { shared { git = \"github.com/e/shared\", version = \"$v\" } }\n"
+
+    ckg_vendor_shared(root, "1.0.0", 10)
+    ckg_vendor_shared(root, "1.1.0", answer_1_1)
+    ckg_put(root, "a/package.hocon", ckg_manifest("a", entry("1.0.0")))
+    ckg_put(root, "a/a/a.sysl", "module a\n\nimport shared\n\nanswer() -> string = str(shared.value()) + " +
+            "\" \" + shared.tag()\n")
+    ckg_put(root, "b/package.hocon", ckg_manifest("b", entry("1.0.0")))
+    ckg_put(root, "b/b/b.sysl", "module b\n\nimport shared\n\nunused() -> int = shared.value()\n")
+    ckg_put(root, "package.hocon", ckg_manifest("app", "dependencies { a { path = \"a\" }, b { path = \"b\" } }\n"))
+    ckg_put(root, "main.sysl", ckg_main(root, "import a", "a.answer()"))
+    (root, entry("1.1.0"))
+end ckg_diamond
+
+@test("a diamond: a second consumer bumping the shared package moves a constant the first reads, and it misses")
+ckg_graph_diamond_bump_changes_a_constant()
+    if !ckg_ready() then return
+
+    val d = ckg_diamond(11)
+    val low = ckg_manifest("b", "dependencies { shared { git = \"github.com/e/shared\", version = \"1.0.0\" } }\n")
+    val high = ckg_manifest("b", d.1)
+
+    val ran = ckg_seam(d.0, "", "", () -> ckg_put(d.0, "b/package.hocon", low),
+                       () -> ckg_put(d.0, "b/package.hocon", high))
+
+    remove_dir_all(d.0).unwrap_or(())
+    assert_eq(ran, "10 1.0.0 | 11 1.1.0 | 10 1.0.0 | miss miss hit | different bytes")
+end ckg_graph_diamond_bump_changes_a_constant
+
+@test("a diamond: a bump to a release whose source is unchanged still misses, its version folding in")
+ckg_graph_diamond_bump_same_source()
+    if !ckg_ready() then return
+
+    val d = ckg_diamond(10)
+    val low = ckg_manifest("b", "dependencies { shared { git = \"github.com/e/shared\", version = \"1.0.0\" } }\n")
+    val high = ckg_manifest("b", d.1)
+
+    val ran = ckg_seam(d.0, "", "", () -> ckg_put(d.0, "b/package.hocon", low),
+                       () -> ckg_put(d.0, "b/package.hocon", high))
+
+    remove_dir_all(d.0).unwrap_or(())
+    assert_eq(ran, "10 1.0.0 | 10 1.1.0 | 10 1.0.0 | miss miss hit | different bytes")
+end ckg_graph_diamond_bump_same_source
+
+@test("a diamond: a --lib root reading the shared package misses its kept half when the bump moves a constant")
+ckg_graph_diamond_bump_reaches_a_root()
+    if !ckg_ready() then return
+
+    val d = ckg_diamond(11)
+    val lib = ckg_tree([("user/user.sysl", "module user\n\nimport shared\n\nseen() -> int = shared.Answer\n")])
+    val low = ckg_manifest("b", "dependencies { shared { git = \"github.com/e/shared\", version = \"1.0.0\" } }\n")
+    val high = ckg_manifest("b", d.1)
+
+    ckg_put(d.0, "main.sysl", ckg_main(d.0, "import user", "user.seen()"))
+
+    val kept = ckg_root_seam(d.0, lib, "", "", () -> ckg_put(d.0, "b/package.hocon", low),
+                             () -> ckg_put(d.0, "b/package.hocon", high))
+
+    lbr_drop([d.0, lib])
+    assert_eq(kept, "10 | 11 | 10 | miss miss hit")
+end ckg_graph_diamond_bump_reaches_a_root
+
+// -- what is exempt, held to changing nothing --------------------------------------------------------
+
+@test("description, license, authors and keywords are in no key, and change no output")
+ckg_exempt_package_prose()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val said = ckg_manifest("app", "features { fancy = [] }\n")
+    val prose = "package { name = \"app\", version = \"1.0.0\", description = \"other words\", " +
+        "license = \"MIT\", authors = [\"someone\"], keywords = [\"k\"] }\nfeatures { fancy = [] }\n"
+
+    assert_eq(ckg_manifest_seam(root, said, prose), "1 | 1 | 1 | miss hit hit | 1 entries")
+
+    // And compiled from scratch each way, the program answers the same.
+    ckg_setenv("SYSL_NO_CACHE", "1")
+    ckg_put(root, "package.hocon", said)
+    assert_eq(ckg_ran(root, ""), "1")
+    ckg_put(root, "package.hocon", prose)
+    assert_eq(ckg_ran(root, ""), "1")
+    ckg_unsetenv("SYSL_NO_CACHE")
+    remove_dir_all(root).unwrap_or(())
+end ckg_exempt_package_prose
+
+@test("the test block is in no key: a suite under another timeout replays the binary and still passes")
+ckg_exempt_test_block()
+    if !ckg_ready() then return
+
+    val root = ckg_tree([("package.hocon", ckg_manifest("app", "")),
+                         ("main.sysl", "@test\none()\n    assert_eq(1, 1)\n")])
+    val cache = ckg_caches()
+    var codes: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<2
+        if step == 1 then ckg_put(root, "package.hocon", ckg_manifest("app", "test { timeout = 77, jobs = 1 }\n"))
+
+        val before = run_cache_counts()
+        val args = ckg_args("test", root, "")
+
+        codes.push(s"${ckg_cli(args.view()).0}")
+        how.push(ckg_run_verdict(before, run_cache_counts()))
+
+    ckg_done(cache, [root])
+    assert_eq(join(codes.view(), " "), "0 0")
+    assert_eq(join(how.view(), " "), "miss hit")
+end ckg_exempt_test_block
+
+@test("SYSL_CODEGEN_UNITS is in no key: a program split four ways is the program split one way")
+ckg_exempt_codegen_units()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val cache = ckg_caches()
+
+    ckg_setenv("SYSL_CODEGEN_UNITS", "1")
+
+    val one = ckg_ran(root, "")
+
+    ckg_setenv("SYSL_CODEGEN_UNITS", "4")
+
+    val before = run_cache_counts()
+    val replayed = ckg_ran(root, "")
+    val verdict = ckg_run_verdict(before, run_cache_counts())
+
+    ckg_setenv("SYSL_NO_CACHE", "1")
+
+    val four = ckg_ran(root, "")
+
+    ckg_unsetenv("SYSL_NO_CACHE")
+    ckg_unsetenv("SYSL_CODEGEN_UNITS")
+    ckg_done(cache, [root])
+    assert_eq(s"$one $replayed $four $verdict", "1 1 1 hit")
+end ckg_exempt_codegen_units
+
+@test("SYSL_TIMINGS, -v and --explain-escapes change no output; the first two replay")
+ckg_exempt_reports()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val cache = ckg_caches()
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<4
+        if step == 1 then ckg_setenv("SYSL_TIMINGS", "1") else ckg_unsetenv("SYSL_TIMINGS")
+
+        val before = run_cache_counts()
+
+        said.push(ckg_ran(root, if step == 2 then "-v" else if step == 3 then "--explain-escapes" else ""))
+        how.push(ckg_run_verdict(before, run_cache_counts()))
+
+    ckg_unsetenv("SYSL_TIMINGS")
+    ckg_done(cache, [root])
+    assert_eq(join(said.view(), " "), "1 1 1 1")
+    // `--explain-escapes` compiles again, since a replay could not report, and relinks the same slot.
+    assert_eq(join(how.view(), " "), "miss hit hit miss")
+end ckg_exempt_reports
+
+@test("--filter, --file, --jobs, --timeout and --fail-fast choose among a binary's tests: each replays it")
+ckg_exempt_runner_flags()
+    if !ckg_ready() then return
+
+    val root = ckg_tree([("package.hocon", ckg_manifest("app", "")),
+                         ("main.sysl", "@test\none()\n    assert_eq(1, 1)\n\n@test\ntwo()\n    assert_eq(2, 2)\n")])
+    val cache = ckg_caches()
+    val flags = ["", "--filter one", "--file main.sysl", "--jobs 1", "--timeout 30", "--fail-fast"]
+    var how: Buf[string] = buf()
+
+    for i in 0..<flags.len
+        val before = run_cache_counts()
+        val args = ckg_args("test", root, flags[i])
+
+        assert_eq(ckg_cli(args.view()).0, 0)
+        how.push(ckg_run_verdict(before, run_cache_counts()))
+
+    ckg_done(cache, [root])
+    assert_eq(join(how.view(), " "), "miss hit hit hit hit hit")
+end ckg_exempt_runner_flags
+
+@test("a program's own arguments are in no key: one binary, run with two")
+ckg_exempt_program_arguments()
+    if !ckg_ready() then return
+
+    val root = ckg_with_args("", "args.len")
+    val cache = ckg_caches()
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<2
+        val before = run_cache_counts()
+
+        said.push(ckg_ran(root, if step == 1 then "-- x y" else ""))
+        how.push(ckg_run_verdict(before, run_cache_counts()))
+
+    ckg_done(cache, [root])
+    assert_eq(join(said.view(), " "), "1 3")
+    assert_eq(join(how.view(), " "), "miss hit")
+end ckg_exempt_program_arguments
+
+@test("-o is in no key: a second build writing elsewhere replays the root's kept half and runs the same")
+ckg_exempt_output_path()
+    if !ckg_ready() then return
+
+    val lib = ckg_tree([("geo/geo.sysl", "module geo\n\nvalue() -> int = 3\n")])
+    val root = ckg_project(ckg_manifest("app", ""), "import geo", "geo.value()", [])
+    val cache = ckg_caches()
+    var said: Buf[string] = buf()
+    var how: Buf[string] = buf()
+
+    for step in 0..<2
+        val before = root_artifact_counts()
+
+        said.push(ckg_built(root, s"--lib $lib", s"$cache/out$step"))
+        how.push(ckg_root_verdict(before, root_artifact_counts()))
+
+    ckg_done(cache, [root, lib])
+    assert_eq(join(said.view(), " "), "3 3")
+    assert_eq(join(how.view(), " "), "miss hit")
+end ckg_exempt_output_path
+
+@test("where the caches and the library are is in no key: HOME, XDG_CACHE_HOME, PATH and SYSL_LIB's spelling")
+ckg_exempt_locations()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val plain = run_cache_key_for("run", root, None, DefaultOptimization, None)
+    val home = env_get("HOME").unwrap_or("")
+    val search = env_get("PATH").unwrap_or("")
+    val library = std_root().unwrap()
+
+    ckg_setenv("HOME", "/ckg/elsewhere")
+    ckg_setenv("XDG_CACHE_HOME", "/ckg/elsewhere")
+    ckg_setenv("PATH", s"/ckg/elsewhere:$search")
+    ckg_setenv("SYSL_LIB", s"$library/../${basename(library)}/.")
+
+    val moved = run_cache_key_for("run", root, None, DefaultOptimization, None)
+
+    ckg_unsetenv("XDG_CACHE_HOME")
+    ckg_setenv("PATH", search)
+    ckg_setenv("SYSL_LIB", library)
+    ckg_setenv("HOME", home)
+    remove_dir_all(root).unwrap_or(())
+    assert(plain.is_some() && moved.is_some())
+    assert_eq(moved.unwrap(), plain.unwrap())
+end ckg_exempt_locations
+
+@test("the commands that keep nothing leave every cache empty, whatever flags they take")
+ckg_exempt_commands_keep_nothing()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val docs = lbr_temp("sysl-ckg-doc")
+    val cache = ckg_caches()
+    val lines = [s"emit-llvm --gaps $root", s"emit-typed --tables --no-spans $root",
+                 s"emit-ast --no-spans $root/main.sysl", s"doc -o $docs -t T -n N -w 80 -V 1.0.0 --private $root",
+                 s"tidy --check $root", "--version", "--help"]
+
+    for i in 0..<lines.len
+        var args: Buf[string] = buf()
+
+        args.push("sysl")
+
+        for item in split(lines[i], " ")
+            args.push(item)
+
+        ckg_cli(args.view())
+
+    val run_left = ckg_entries(cache).len()
+    val root_left = root_artifact_counts()
+
+    ckg_done(cache, [root, docs])
+    assert_eq(run_left, 0)
+    assert_eq(root_left.1, 0)
+end ckg_exempt_commands_keep_nothing
+
+// -- the census --------------------------------------------------------------------------------------
+
+// Every flag `sysl --help` names: each word that starts with a dash, cut at its argument.
+private ckg_help_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in lines_of(help_text())
+        for word in split(line, " ")
+            var w = word
+
+            while w.starts_with("[") || w.starts_with("(")
+                w = w[1..]
+
+            if !w.starts_with("-") || w.len < 2 then continue
+
+            var end_at = w.len
+
+            for i in 1..<w.len
+                val c = w.bytes[i]
+
+                if c == u8('<') || c == u8(']') || c == u8('|') || c == u8(',') || c == u8('=')
+                    end_at = i
+                    break
+
+            val flag = w[0..<end_at]
+
+            if !holds_string(out, flag) then out.push(flag)
+
+    out
+end ckg_help_flags
+
+@test("the census: every flag sysl --help names is classified for the caches, and every classified flag exists")
+ckg_census_flags()
+    val named = ckg_help_flags()
+    var unclassified: Buf[string] = buf()
+
+    for flag in named
+        if flag_cache_class(flag).is_none() then unclassified.push(flag)
+
+    assert_eq(join(unclassified.view(), " "), "")
+
+    var stale: Buf[string] = buf()
+
+    for i in 0..<FlagCacheClass.len
+        val flag = FlagCacheClass[i].0
+
+        if !holds_string(named, flag) && flag != "--" then stale.push(flag)
+
+    assert_eq(join(stale.view(), " "), "")
+
+    for i in 0..<FlagCacheClass.len
+        val how = FlagCacheClass[i].1
+
+        assert(how.starts_with("keyed: ") || how.starts_with("exempt: "), FlagCacheClass[i].0)
+end ckg_census_flags
+
+// Whether a manifest holding one key at `place` (a dotted path) keeps it in its canonical part: the key
+// is given a block holding `ckg_probe`, which survives only where nothing on the way is exempt.
+private ckg_keeps(place: string) -> bool
+    val parts = split(place, ".")
+    var text = "ckg_probe = 1"
+    var i = parts.len
+
+    while i > 0
+        i -= 1
+        text = s"${parts[i]} { $text }"
+
+    read_conf(text) match
+        Ok(c) -> conf_canonical(c).contains("ckg_probe")
+        Err(why) -> panic(why)
+end ckg_keeps
+
+@test("the census: every key the manifest reader accepts is in the key unless the exempt table names it")
+ckg_census_manifest_keys()
+    var places: Buf[string] = buf()
+
+    for i in 0..<TopKeys.len
+        places.push(TopKeys[i])
+
+    for i in 0..<PackageKeys.len
+        places.push(s"package.${PackageKeys[i]}")
+
+    for i in 0..<TargetKeys.len
+        places.push(s"targets.t.${TargetKeys[i]}")
+
+    for i in 0..<DependencyKeys.len
+        places.push(s"dependencies.d.${DependencyKeys[i]}")
+
+    var wrong: Buf[string] = buf()
+
+    for place in places
+        val keyed = ckg_keeps(place)
+        val exempt = manifest_exemption(place).is_some()
+
+        if keyed == exempt then wrong.push(place)
+
+    assert_eq(join(wrong.view(), " "), "")
+
+    // And every exemption names a key the reader accepts.
+    for i in 0..<ManifestExempt.len
+        assert(holds_string(places, ManifestExempt[i].0), ManifestExempt[i].0)
+end ckg_census_manifest_keys
+
+// Every environment variable the compiler's own source reads: each upper-case literal on a line that
+// asks the environment or declares a constant, among the source files beside this one.
+private ckg_source_variables() -> Buf[string]
+    var out: Buf[string] = buf()
+    val dir = parent_of(__FILE__).unwrap()
+
+    for name in entries(dir).unwrap()
+        if !name.ends_with(".sysl") || name.starts_with("tests_") then continue
+
+        for line in lines_of(read_text(s"$dir/$name").unwrap())
+            val asks = line.contains("env_var(") || line.contains("get(\"") ||
+                (line.contains("const ") && line.contains("_"))
+
+            if !asks then continue
+
+            val pieces = split(line, "\"")
+
+            for i in 0..<pieces.len
+                if i % 2 == 1 && ckg_shouts(pieces[i]) && !holds_string(out, pieces[i]) then out.push(pieces[i])
+
+    out
+end ckg_source_variables
+
+private ckg_shouts(text: string) -> bool
+    if text.len < 4 then return false
+
+    for i in 0..<text.len
+        val c = text.bytes[i]
+
+        if !((c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) || c == u8('_')) then return false
+
+    true
+end ckg_shouts
+
+@test("the census: every environment variable the compiler reads is classified for the caches")
+ckg_census_environment()
+    val read = ckg_source_variables()
+    var unclassified: Buf[string] = buf()
+
+    for name in read
+        if environment_cache_class(name).is_none() then unclassified.push(name)
+
+    assert_eq(join(unclassified.view(), " "), "")
+    assert(read.len() >= 10, s"the scan found only ${join(read.view(), " ")}")
+
+    // Every variable `build_environment` keys is classified as keyed.
+    for i in 0..<EnvironmentCacheClass.len
+        val how = EnvironmentCacheClass[i].1
+
+        assert(how.starts_with("keyed: ") || how.starts_with("exempt: "), EnvironmentCacheClass[i].0)
+end ckg_census_environment
+
+// -- the entries themselves: damaged, misplaced, raced --------------------------------------------------
+
+// One run, so the cache holds one entry; then `damage` done to it; then a second run, which must
+// print the same and must not have replayed what `damage` left.
+private ckg_after_damage(damage: (string, string) -> unit) -> string
+    val root = ckg_featured("fancy = []")
+    val cache = ckg_caches()
+    val first = ckg_ran(root, "")
+    val made = ckg_entries(cache)
+
+    damage(made.at(0), cache)
+
+    val before = run_cache_counts()
+    val second = ckg_ran(root, "")
+    val verdict = ckg_run_verdict(before, run_cache_counts())
+    val third_before = run_cache_counts()
+    val third = ckg_ran(root, "")
+    val third_verdict = ckg_run_verdict(third_before, run_cache_counts())
+
+    ckg_done(cache, [root])
+    s"$first $second $verdict $third $third_verdict"
+end ckg_after_damage
+
+private ckg_truncate(entry: string, cache: string)
+    val bytes = read_bytes(entry).unwrap()
+
+    write_bytes(entry, bytes[0..<bytes.len / 2]).unwrap()
+end ckg_truncate
+
+private ckg_flip(entry: string, cache: string)
+    val bytes = read_bytes(entry).unwrap()
+    var changed: Buf[u8] = buf()
+
+    for i in 0..<bytes.len
+        changed.push(if i == bytes.len / 2 then bytes[i] ^ 0xff else bytes[i])
+
+    write_bytes(entry, changed.view()).unwrap()
+end ckg_flip
+
+@test("a truncated run-cache entry is rebuilt, never started")
+ckg_error_truncated_entry()
+    if !ckg_ready() then return
+
+    assert_eq(ckg_after_damage((e, c) -> ckg_truncate(e, c)), "1 1 miss 1 hit")
+end ckg_error_truncated_entry
+
+@test("a run-cache entry damaged in place, at its own length, is rebuilt")
+ckg_error_damaged_entry()
+    if !ckg_ready() then return
+
+    assert_eq(ckg_after_damage((e, c) -> ckg_flip(e, c)), "1 1 miss 1 hit")
+end ckg_error_damaged_entry
+
+@test("an entry with no seal -- one an older compiler left -- is rebuilt")
+ckg_error_unsealed_entry()
+    if !ckg_ready() then return
+
+    assert_eq(ckg_after_damage((e, c) -> remove_file(s"$e$SealSuffix").unwrap_or(())), "1 1 miss 1 hit")
+end ckg_error_unsealed_entry
+
+@test("another key's entry copied over this one's slot, seal and all, is rebuilt rather than run")
+ckg_error_entry_under_another_key()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val cache = ckg_caches()
+    val plain = ckg_ran(root, "")
+    val plain_entry = ckg_entries(cache).at(0)
+    val fancy = ckg_ran(root, "--features fancy")
+    var fancy_entry = ""
+
+    for e in ckg_entries(cache)
+        if e != plain_entry then fancy_entry = e
+
+    write_bytes(plain_entry, read_bytes(fancy_entry).unwrap()).unwrap()
+    write_text(s"$plain_entry$SealSuffix", read_text(s"$fancy_entry$SealSuffix").unwrap()).unwrap()
+
+    val before = run_cache_counts()
+    val again = ckg_ran(root, "")
+    val verdict = ckg_run_verdict(before, run_cache_counts())
+
+    ckg_done(cache, [root])
+    assert_eq(s"$plain $fancy $again $verdict", "1 2 1 miss")
+end ckg_error_entry_under_another_key
+
+@test("two builds racing on one key: a binary published over the slot after the seal is not replayed")
+ckg_error_raced_publish()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val cache = ckg_caches()
+    val plain = ckg_ran(root, "")
+    val plain_entry = ckg_entries(cache).at(0)
+
+    ckg_ran(root, "--features fancy")
+
+    var fancy_entry = ""
+
+    for e in ckg_entries(cache)
+        if e != plain_entry then fancy_entry = e
+
+    // The other build's binary lands on the slot; the seal is still the first build's.
+    write_bytes(plain_entry, read_bytes(fancy_entry).unwrap()).unwrap()
+
+    val before = run_cache_counts()
+    val again = ckg_ran(root, "")
+    val verdict = ckg_run_verdict(before, run_cache_counts())
+    val sealed = run_cache_hit(basename(plain_entry)).is_some()
+
+    ckg_done(cache, [root])
+    assert_eq(s"$plain $again $verdict $sealed", "1 1 miss true")
+end ckg_error_raced_publish
+
+// The archive of the one kept half in a cache.
+private ckg_root_entries(cache: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    entries(s"$cache/sysl/roots") match
+        Err(_) -> ()
+        Ok(names) ->
+            for item in names
+                if item.ends_with(SyslibExtension) then out.push(s"$cache/sysl/roots/$item")
+
+    out
+end ckg_root_entries
+
+@test("a root's kept half that is truncated, or another key's copied over it, is rebuilt and links right")
+ckg_error_root_entries()
+    if !ckg_ready() then return
+
+    val leaf = ckg_leaf(false)
+    val entry = (n: int) -> ckg_manifest("app", "dependencies { leaf { git = \"github.com/e/leaf\", " +
+                                         s"version = \"1.0.0\", options = { n = $n } } }\n")
+    val root = ckg_project(entry(4), "import leaf", "leaf.value()", [])
+    val cache = ckg_caches()
+
+    val four = ckg_built(root, s"--lib $leaf", s"$cache/a")
+    val four_entry = ckg_root_entries(cache).at(0)
+
+    ckg_put(root, "package.hocon", entry(5))
+
+    val five = ckg_built(root, s"--lib $leaf", s"$cache/b")
+    var five_entry = ""
+
+    for e in ckg_root_entries(cache)
+        if e != four_entry then five_entry = e
+
+    // Another key's archive and sidecar over the first entry.
+    write_bytes(four_entry, read_bytes(five_entry).unwrap()).unwrap()
+    write_bytes(s"$four_entry.sum", read_bytes(s"$five_entry.sum").unwrap()).unwrap()
+    ckg_put(root, "package.hocon", entry(4))
+
+    val before = root_artifact_counts()
+    val copied = ckg_built(root, s"--lib $leaf", s"$cache/c")
+    val copied_verdict = ckg_root_verdict(before, root_artifact_counts())
+
+    // And the entry just rebuilt, truncated.
+    ckg_truncate(four_entry, cache)
+
+    val again = root_artifact_counts()
+    val truncated = ckg_built(root, s"--lib $leaf", s"$cache/d")
+    val truncated_verdict = ckg_root_verdict(again, root_artifact_counts())
+
+    ckg_done(cache, [root, leaf])
+    assert_eq(s"$four $five $copied $copied_verdict $truncated $truncated_verdict", "4 5 4 miss 4 miss")
+end ckg_error_root_entries

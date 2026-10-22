@@ -319,7 +319,7 @@ root_key(program: Compilation, project: string, root: string, level: string) -> 
     // The C and the headers of the root and of every tree beside it, and each tree's manifest.
     val dir = if is_directory(project) then project else parent_of(project).unwrap_or(".")
 
-    read_into(&files, join_path(dir, "package.hocon"))
+    manifest_into(&files, dir)
     carried_into(&files, root)
 
     val libs = lib_roots()
@@ -329,6 +329,10 @@ root_key(program: Compilation, project: string, root: string, level: string) -> 
 
     manifest_at(dir) match
         Ok(m) ->
+            // The graph as resolved -- each package's selected version, its features and its option
+            // values, wherever in the graph they were decided (`config_key.sysl`).
+            files.push(("graph", resolved_config_part(dir, m)))
+
             val trees = handed_trees(dir, m)
 
             for item in trees
@@ -344,9 +348,14 @@ end root_key
 // tree. A directory whose name starts with a dot is passed over, `.git` being where a tree changes
 // most without its source changing at all.
 private carried_into(out: *Buf[(string, string)], tree: string)
-    read_into(out, join_path(tree, "package.hocon"))
+    manifest_into(out, tree)
     walk_carried(out, tree, 0)
 end carried_into
+
+// A tree's manifest, whole but for the keys `ManifestExempt` names (`manifest_config_part`), under the
+// tree's path.
+private manifest_into(out: *Buf[(string, string)], tree: string) =
+    out.push((s"manifest:${absolute_path(tree)}", manifest_config_part(tree)))
 
 // Deep enough for any tree a person lays out, and a stop for a directory that links back above itself.
 private const CarriedDepth: usize = 32
@@ -369,8 +378,27 @@ private walk_carried(out: *Buf[(string, string)], dir: string, depth: usize)
             read_into(out, one)
 end walk_carried
 
-// A file's text under its path, or the absence of one: a manifest that is not there is a fact about
-// the tree as much as one that is.
+// Every header below a tree -- `.h` and `.inc`, however deep, dot directories passed over -- as its
+// place inside the tree and its text. The run cache keys a tree on these (`program_fingerprint`): a
+// header a package's C includes changes the object compiled from it whether or not a `.c` file moved.
+carried_headers(tree: string) -> Buf[(string, string)]
+    var found: Buf[(string, string)] = buf()
+
+    walk_carried(&found, tree, 0)
+
+    val base = absolute_path(tree)
+    var out: Buf[(string, string)] = buf()
+
+    for item in found
+        val file = item.0[5..]
+
+        if file.ends_with(".h") || file.ends_with(".inc")
+            out.push((if file.starts_with(s"$base/") then file[base.len + 1..] else file, item.1))
+
+    out
+end carried_headers
+
+// A file's text under its path, or the absence of one.
 private read_into(out: *Buf[(string, string)], file: string)
     read_bytes(file) match
         Ok(bytes) -> out.push((s"file:${absolute_path(file)}", from_utf8_unchecked(bytes.view())))
