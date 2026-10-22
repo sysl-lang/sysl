@@ -67,8 +67,13 @@ private const MinSplitBytes: usize = 524288
 // Each unit gets at least this much text, so a program just past the threshold makes fewer units.
 private const MinUnitBytes: usize = 65536
 
-// A local function at most this long is copied into every partition that calls it.
-private const CopyLimit: usize = 2048
+// A function whose body costs at most this (`body_cost`) is copied into the partitions that call
+// it: a local one as itself, an external one as an `available_externally` copy. Measured: the
+// raytracer's `Aabb.hit`, a three-axis slab test of ~4 KB of text, costs 26, and left a call from
+// `BvhNode.hit` that cost ~15% of a render while the limit was 2 KB of text. Against that limit, the
+// compiler's own build at 32 spends ~3% more CPU and its binary is 1% larger; at 64, 13% and 5.5%;
+// at 128, 45% and 8.7%, with no further gain on the raytracer.
+private const CopyCost: usize = 32
 
 // What a promoted local is renamed to, in front of its own name.
 private const Promoted: string = "sysl.cgu:"
@@ -132,6 +137,7 @@ private struct Entity
     end: usize        // past the entity's last newline
     name: string      // the symbol as written after '@', quotes included
     local: bool       // private or internal
+    cost: usize       // a definition's `body_cost`; nothing else has one
 
 // The module cut into its top-level pieces, with what each one names -- the whole of what the
 // partitioning reads.
@@ -166,20 +172,21 @@ private read_module(text: string) -> Option[Module]
 
                 close = if e < b.len then e + 1 else e
 
-            items.push(Entity(PieceDefine, at, close, symbol_after(line, "@"), is_local_define(line)))
+            items.push(Entity(PieceDefine, at, close, symbol_after(line, "@"), is_local_define(line),
+                              body_cost(text, next, close)))
             at = close
         elif line.starts_with("declare ")
-            items.push(Entity(PieceDeclare, at, next, symbol_after(line, "@"), false))
+            items.push(Entity(PieceDeclare, at, next, symbol_after(line, "@"), false, 0))
             at = next
         elif line.starts_with("@")
             if !plain_global(line) then return None
 
-            items.push(Entity(PieceGlobal, at, next, symbol_after(line, ""), is_local_global(line)))
+            items.push(Entity(PieceGlobal, at, next, symbol_after(line, ""), is_local_global(line), 0))
             at = next
         elif line.starts_with("module asm") || line.starts_with("$")
             return None
         else
-            items.push(Entity(PieceLine, at, next, "", false))
+            items.push(Entity(PieceLine, at, next, "", false, 0))
             at = next
 
     var named: Map[string, usize] = map()
@@ -265,8 +272,8 @@ private is_copy(m: Module, i: usize) -> bool =
 // **Whether a function one partition defines is copied into another that calls it**, as an
 // `available_externally` definition its calls can inline -- the cut would otherwise be a wall no
 // inlining crosses. One marked `inlinehint` (`@inline`) or `alwaysinline` (`@inline(always)`) is
-// copied whatever its length; any other at
-// most `CopyLimit` long, as a small local is. Never one marked `noinline`, or `cold` without
+// copied whatever its length; any other whose body costs at most `CopyCost`, as a small local is.
+// Never one marked `noinline`, or `cold` without
 // `inlinehint` (`@inline @cold` asks to be absorbed), nor one placed in
 // a section, given a calling convention, or written with a linkage of its own (`weak`, `weak_odr`):
 // only the plain external definition the link resolves to one body.
@@ -294,8 +301,54 @@ private importable_define(m: Module, i: usize) -> bool
     if head.contains(" noinline") || (head.contains(" cold") && !hinted) || head.contains(" section ")
         return false
 
-    hinted || e.end - e.start <= CopyLimit
+    hinted || e.cost <= CopyCost
 end importable_define
+
+// **What the body between `from` and `to` costs the optimizer, counted the way LLVM will see it once its stack
+// slots are registers**: one for each instruction, and nothing for a block's label, an unconditional
+// branch, a slot's `alloca`, a load or store of a slot (a `%name.addr`), or the `extractvalue` and
+// `insertvalue` an aggregate is taken apart and put together with -- each of which the first passes
+// remove. Counting text bytes instead would charge a body for its long types and mangled names, and
+// emission spells every local as a slot, so an unoptimized body is mostly lines that cost nothing.
+private body_cost(text: string, from: usize, to: usize) -> usize
+    val b = text.bytes
+    var at = from
+    var cost: usize = 0
+
+    while at < to
+        val eol = line_end(b, at)
+        val line = text[at..<eol]
+
+        at = eol + 1
+
+        // A label and the closing brace start in the first column; an instruction is indented.
+        if !line.starts_with("  ") then continue
+
+        val inst = line[2..]
+
+        if inst.starts_with("br label ") || inst.contains(" = alloca ") then continue
+        if inst.contains(" = extractvalue ") || inst.contains(" = insertvalue ") then continue
+        if (inst.contains(" = load ") || inst.starts_with("store ")) && slot_access(inst) then continue
+
+        cost += 1
+
+    cost
+end body_cost
+
+// Whether a load or a store's pointer -- its last `ptr` operand -- is one of the stack slots emission
+// gives a local (`%name.addr`).
+private slot_access(inst: string) -> bool
+    val at = inst.last_index_of("ptr %") match
+        Some(k) -> k + 4
+        None -> return false
+
+    var stop = at
+
+    while stop < inst.bytes.len && inst.bytes[stop] != u8(',') && inst.bytes[stop] != u8(' ')
+        stop += 1
+
+    inst[at..<stop].ends_with(".addr")
+end slot_access
 
 // Whether item `i` is a function marked `@inline` (`inlinehint`) or `@inline(always)`
 // (`alwaysinline`). A local one is copied into every partition that calls it whatever its length,
@@ -463,7 +516,7 @@ split_module(text: string, n: int) -> Option[Buf[string]]
                     work.push((p, r))
                 elif it.piece == PieceDeclare || !it.local
                     needed.set(p * count + r, true)
-                elif it.piece == PieceDefine && (it.end - it.start <= CopyLimit || marked_inline(m, r))
+                elif it.piece == PieceDefine && (it.cost <= CopyCost || marked_inline(m, r))
                     member.set(p * count + r, true)
                     work.push((p, r))
                 elif home.at(r) < 0

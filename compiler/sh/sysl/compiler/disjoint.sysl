@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.text.Search
 
 // `@disjoint(a, b)` -- a function's promise that, while a call runs, no memory reached through one
 // named parameter is reached through another named one or through any other pointer the body uses.
@@ -37,8 +38,12 @@ check_disjoint_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
         return
     end if
 
+    var parts: Buf[string] = buf()
+
     for i in 0..<ns.len()
-        var declared = false
+        var declared = is_result_part(ns.at(i))
+
+        if declared then parts.push(ns.at(i))
 
         for item in ps
             if item.name == ns.at(i) then declared = true
@@ -54,14 +59,39 @@ check_disjoint_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
             for j in 0..<ps.len()
                 listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
 
-            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+            var tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            if ns.at(i) == "result" then tail = " — a part of the result is named by its position, 'result.0'"
 
             a.fault(scope, span, s"'@disjoint' names '${ns.at(i)}', which is not a parameter of " +
                     s"'$shown'$tail")
         else if twice
-            a.fault(scope, span, s"'@disjoint' names '${ns.at(i)}' twice, and a parameter is kept " +
+            val what = if is_result_part(ns.at(i)) then "a part of the result" else "a parameter"
+
+            a.fault(scope, span, s"'@disjoint' names '${ns.at(i)}' twice, and $what is kept " +
                     "apart from the others or it is not — the second says nothing the first does not")
+    end for
+
+    // A part of a result is kept apart from the other parts the list names, so one alone is kept
+    // apart from nothing.
+    if parts.len() == 1
+        a.fault(scope, span, s"'@disjoint' names '${parts.at(0)}' and no other part of " +
+                s"'$shown''s result, and a part is kept apart from the other parts named — name two, " +
+                "as '@disjoint(result.0, result.1)'")
 end check_disjoint_names
+
+// Whether a name `@disjoint` holds is a part of the result (`result.0`) rather than a parameter.
+is_result_part(n: string) -> bool = n.starts_with("result.")
+
+// The position a result part names.
+result_part_index(n: string) -> usize
+    var k: usize = 0
+
+    for b in n.bytes[7..]
+        k = k * 10 + usize(b - u8('0'))
+
+    k
+end result_part_index
 
 // Whether a parameter of this type reaches memory other than its own copy: a pointer, a counted
 // reference, or a view. Everything else arrives as a value nothing else can reach.
@@ -106,6 +136,9 @@ check_disjoint(a: &Analysis, funcs: Buf[TFunc])
         disjoint_types(a, cx, f)
 
     for f in funcs
+        disjoint_answers(a, cx, f)
+
+    for f in funcs
         val scope = func_home(a, f.name)
 
         walk_block_stmts(f.body, expr_walk(false, e -> disjoint_call(an, cx, scope, e)))
@@ -115,6 +148,11 @@ end check_disjoint
 // refused rather than let read like a promise about the value's contents.
 private disjoint_types(a: &Analysis, cx: &Disjoints, f: TFunc)
     for name in f.marks.disjoint
+        if is_result_part(name)
+            disjoint_part_type(a, cx, f, name)
+            continue
+        end if
+
         for p in f.params
             if p.0 == name && !disjoint_reaches(p.1)
                 val shown = qualified_name(a.tables.members.func_origin.get(f.name).unwrap_or(f.name))
@@ -127,6 +165,56 @@ private disjoint_types(a: &Analysis, cx: &Disjoints, f: TFunc)
                     cx.said.push(said)
                     a.fault(func_home(a, f.name), f.span, said)
 end disjoint_types
+
+// A named part of the result is held to what a named parameter is: there, and reaching memory.
+private disjoint_part_type(a: &Analysis, cx: &Disjoints, f: TFunc, name: string)
+    val shown = qualified_name(a.tables.members.func_origin.get(f.name).unwrap_or(f.name))
+    val said = part_refusal(shown, f.ret_ty, name)
+
+    if said != "" && !holds_string(cx.said, said)
+        cx.said.push(said)
+        a.fault(func_home(a, f.name), f.span, said)
+    end if
+end disjoint_part_type
+
+private part_refusal(shown: string, ret: Type, name: string) -> string
+    val k = result_part_index(name)
+    val parts = result_parts(ret)
+
+    if parts.is_none()
+        return s"'@disjoint' names '$name', and '$shown''s result '${type_show(ret)}' is one value " +
+               "— the parts of a result are named where it answers a tuple or a result list, as " +
+               "'-> ([]T, []T)'"
+    end if
+
+    val ts = parts.unwrap()
+
+    if k >= ts.len()
+        return s"'@disjoint' names '$name', and '$shown''s result '${type_show(ret)}' has " +
+               s"${ts.len()} parts — 'result.0' to 'result.${ts.len() - 1}'"
+    end if
+
+    if disjoint_reaches(ts.at(k)) then return ""
+
+    s"'@disjoint' names '$name', a part of '$shown''s result whose type '${type_show(ts.at(k))}' " +
+        "is a value — the promise is about memory a part reaches, so it names a pointer ('*T', " +
+        "'&T') or a view ('[]T', '[]const T'), and a value is a copy nothing else reaches"
+end part_refusal
+
+// The types of a result's parts, where the result is a tuple or a result list.
+result_parts(t: Type) -> Option[Buf[Type]] = underlying(t) match
+    Struct(d) -> if is_tuple(d) then Some(field_types(d)) else None
+    Results(d) -> Some(field_types(d))
+    _ -> None
+
+private field_types(d: &StructType) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in d.fields
+        out.push(item.1)
+
+    out
+end field_types
 
 private disjoint_call(a: &Analysis, cx: &Disjoints, scope: Scope, e: TExpr)
     *e.kind match
@@ -219,6 +307,8 @@ end dj_overlaps
 private dj_region(x: TExpr) -> Option[DjRegion] = *x.kind match
     TConstView(arg) -> dj_region(arg)
     TLoad(name, ty) -> if disjoint_reaches(ty) then Some(DjRegion(dj_root(name, ty), s"'$name'", DjWhole)) else None
+    // A part of a tuple a local holds -- the pieces a `@disjoint`-result call answered, kept whole.
+    TField(receiver, i, ty) -> dj_tuple_part(receiver, i, ty)
     TSlice(base, lo, hi, inclusive, _) -> dj_slice(base, lo, hi, inclusive)
     TAddrOf(place, _) -> *place.kind match
         TLoad(name, _) -> Some(DjRegion(name, s"'&$name'", DjWhole))
@@ -229,6 +319,16 @@ private dj_region(x: TExpr) -> Option[DjRegion] = *x.kind match
             _ -> None
         _ -> None
     _ -> None
+
+private dj_tuple_part(receiver: TExpr, i: int, ty: Type) -> Option[DjRegion]
+    *receiver.kind match
+        TLoad(name, held) ->
+            if disjoint_reaches(ty) && result_parts(held).is_some()
+                return Some(DjRegion(s"*$name.$i", s"'$name.$i'", DjWhole))
+        _ -> ()
+
+    None
+end dj_tuple_part
 
 // The storage a local's name stands for when it is indexed or sliced: a view, a pointer or a counted
 // reference reaches storage elsewhere (`*name`); anything else is its own storage (`name`), which is

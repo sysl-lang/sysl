@@ -10,7 +10,13 @@ import sysl.math.bigint.from_int
 // before.
 gen_stmt(e: *Emit, s: TStmt)
     push_temps(e)
+
+    // A statement that handles a failure puts the error return trace back as it found it when it
+    // completes (`error_trace.sysl`).
+    val mark = trace_enter(e, s)
+
     gen_stmt_body(e, s)
+    trace_leave(e, mark)
     pop_temps(e)
 end gen_stmt
 
@@ -105,6 +111,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
                 emit(e, InStore(lty_of(e, t), v, enclosing.slot, AccPlain, None))
             None -> ()
 
+        trace_unwind(e, enclosing.trace_depth)
         release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
         emit_term(e, InBr(enclosing.break_label))
 
@@ -116,6 +123,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
 
         val enclosing = loop_at(e, depth)
 
+        trace_unwind(e, enclosing.trace_depth)
         release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
         emit_term(e, InBr(enclosing.continue_label))
 
@@ -376,6 +384,8 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                                                                                            variant.slot(i)))))))
                                     emit(e, InGep(p, variant_lty(d, variant), base, idx))
                                     gen_borrowed_into(e, p, args.at(i))
+
+                        trace_origin(e, x)
                 None -> store_through_value(e, dest, x, ty)
 
         // The value is generated once, above the loop, exactly as the value form does -- every

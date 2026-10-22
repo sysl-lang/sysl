@@ -5,9 +5,12 @@ that reported it: the site that made the `Err`, and every `?` that handed it one
 Zig prints one when `main` returns an error, and it is the thing a `Result`-based language most
 lacks next to exceptions — the report says *what* went wrong but not *where*. sysl takes it for 0.3.0.
 
-Nothing here is built. The note settles what the language says and lists what the user decides.
-Every block below marked **proposed** is syntax or output that does not exist; every other block is
-the installed `sysl 0.2.5`'s real output.
+**Decided** (user, 2026-10-19: "as written", with traces on at every optimization level and an
+opt-out, § 2 row 6) and **built** for 0.4.0. Two findings decided the same day are part of it: **a
+`@test` may answer with a `Result[unit, E]`**, whose `Err` fails the test with the error and its
+trace, and **`unwrap`/`expect` of an `Err` show the error** (its `Display`, else its `Debug`) as well
+as the trace. The reference is `reference/errors.md` § "Where a failure came from"; § 1 below is the
+state before it, and § 5 records how it was built.
 
 ## 1. What exists, and the gaps (0.2.5)
 
@@ -59,13 +62,13 @@ prints `load: defer` and `main: defer` on stdout, `error: missing port` on stder
 | 11 | closures, nested functions | **Ordinary functions**: a `?` in a closure body records, named `<enclosing>.<closure>` in the table | no special case |
 | 12 | `async` | **The ring of the thread running the task.** `await t?` is a hop at the await site; entries from another task's handled error may interleave and are pruned by 5 | a per-task ring is 132 bytes a `Task` for a rare case (decision 4 below) |
 | 13 | printing at the top | **`sysl.main_result` prints the trace under its `error:` line**, origin first | the one place that knows the program is over |
-| 14 | printing on a forcing member | **`unwrap`/`expect` of an `Err` print the trace after the panic line** | tests cannot return a `Result`, so this is how a test that fails on an `Err` shows where it came from |
+| 14 | printing on a forcing member | **`unwrap`/`expect` of an `Err` print the trace after the panic line** | a test that fails on an `Err` shows where it came from; a `@test` answering with a `Result` reports its `Err` the same way |
 | 15 | explicit access | **`sysl.debug.error_trace() -> ErrorTrace`** (a copy: `len`, `dropped`, an iterator of `(file, line, col, function)`), **`print_error_trace(w: *Writer)`** and **`clear_error_trace()`** | a server loop logs and clears per request; a board writes it to a UART |
 | 16 | freestanding output | **`sysl_error_trace_report`, a weak function**, as `sysl_bounds_fail` is; the default on a freestanding target writes nothing | the board decides where text goes |
 
 ## 3. How it reads
 
-The program in § 1, built with traces on (**proposed output**, stderr):
+The program in § 1, built with traces on (stderr; the line numbers are the abridged listing's):
 
 ```text
 error: missing port
@@ -75,7 +78,7 @@ error return trace (origin first):
   main.sysl:20:25 in main
 ```
 
-A loop that handles each failure and logs the trace (**proposed API**):
+A loop that handles each failure and logs the trace:
 
 ```sysl
 import sysl.debug.{print_error_trace, clear_error_trace}
@@ -99,12 +102,30 @@ for req in queue
 | **Swift** | nothing for `throws` | — | — |
 | **Go** | nothing; `fmt.Errorf("…: %w", err)` builds the chain by hand | — | the wrapped message |
 | **C++** | `std::stacktrace::current()` (C++23) where the program asks | always available | by hand |
-| **sysl (proposed)** | a static site id at the origin and each `?` hop; pruned when handled | every level, unless switched off | `main_result`, `unwrap`/`expect`, `sysl.debug` |
+| **sysl** | a static site id at the origin and each `?` hop; pruned when handled | every level, unless switched off | `main_result`, `unwrap`/`expect`, `sysl.debug` |
 
 sysl takes Zig's *what* (every hop, not one capture point) and the bounds locations' *how* (static
 strings, not addresses), because the second must work on a Pico with nothing to symbolize against.
 
 ## 5. Implementation plan
+
+**As built**, three things differ from the plan below, none of them in what a program sees:
+
+- **A record is the address of the site's constant**, not a `u32` index into a per-module table:
+  an index would have to be numbered across the standard module's artifact and every codegen unit,
+  and the address is already unique. The constant is the one the bounds locations lay down
+  (`c_text_of`). The ring is therefore 32 pointers and a count — 132 bytes on a 32-bit board, 264 on
+  a 64-bit host.
+- **The ring is C** (`library/sysl/sys/trace.c`): `_Thread_local` on a hosted target, a plain object
+  on a freestanding one (`__STDC_HOSTED__`), with `sysl_error_trace_push`/`_mark`/`_reset` called by
+  the emitted code and `_len`/`_site`/`_clear`/`_report` read by the library. With traces off the
+  compiler answers each library read where it is called (`trace_seam_off`), so the C is never linked.
+- **Pruning is two calls per handling statement** (mark before, reset after), not an inline load and
+  store: a call reaches the right thread's ring inside a coroutine resumed on another thread, which a
+  thread-local address cached across an `await` would not. `break` and `continue` reset to the first
+  mark opened inside the loop they leave.
+
+The plan as it was written:
 
 1. **Table and ring.** A `site_id` per recorded edge, interned per module into one rodata array of
    strings; the ring and count in `library/sysl/debug/trace.sysl`, `@thread_local` where the target
@@ -126,6 +147,8 @@ a pruned handled error followed by a fresh one (only the second shows); overflow
 report and a module with no `error_trace` symbol (`nm`); a `thumb-freestanding` build linking no TLS.
 
 ## 6. Decisions for the user
+
+All seven were decided as recommended (2026-10-19); 6 also lets a `@test` answer with a `Result`.
 
 1. **Static site ids, not return addresses.** Recommend yes — they print on a board and survive
    inlining; the cost is one string per `?` site in the image, which `error_traces = false` removes.

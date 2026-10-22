@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, sub as big_sub}
 import sysl.math.decimal.{Decimal, rescale, Rounding}
@@ -364,7 +365,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         gen_slice(e, base, lo, hi, inclusive, slice_ty, x.span)
 
     TTry(operand, ok, fail, ret_enum, ret_fail, _, convert) ->
-        gen_try(e, operand, ok, fail, ret_enum, ret_fail, convert)
+        gen_try(e, operand, ok, fail, ret_enum, ret_fail, convert, x.span)
 
     // The task forms (`emit_async.sysl`).
     TAwait(operand, ty) -> gen_await(e, operand, ty)
@@ -388,7 +389,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TEnumNew(enum_ty, variant, args) ->
         if e.layout.indirect(enum_ty) then return through_slot(e, x)
 
-        gen_enum_new(e, enum_ty, variant, args)
+        val made = gen_enum_new(e, enum_ty, variant, args)
+
+        trace_origin(e, x)
+        made
 
     TEnumFromInt(value, en) -> gen_enum_from_int(e, value, en)
 
@@ -1297,6 +1301,12 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
             e.traps = true
             symbol = trap_symbol(e)
 
+        // The library's reads of the error return trace, in a build that records none: each is
+        // answered here, and the C that would have answered it is never linked.
+        val untraced = trace_seam_off(symbol)
+
+        if untraced.is_some() then return untraced.unwrap()
+
         return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
                                 VGlobal(symbol), args, ty, e.abandoning.has(name))
 
@@ -1682,7 +1692,7 @@ end end_value
 // returns immediately with the failure re-wrapped in its own return type, carrying the error payload
 // across unchanged.
 private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, ret_enum: Type,
-                ret_fail: EnumVariant, convert: Option[string]) -> Val
+                ret_fail: EnumVariant, convert: Option[string], site: Span) -> Val
     val d = enum_decl(texpr_type(operand))
     val rd = enum_decl(ret_enum)
 
@@ -1728,6 +1738,10 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
 
             made.push(gen_conversion(e, fn, payload.at(0), from_ty, to_ty))
             enum_value(e, ret_enum, rd.unwrap(), ret_fail, made)
+
+    // The hop, recorded in the error return trace once the failure is the function's own -- after
+    // the conversion, which is part of the hop rather than a frame of its own.
+    trace_hop(e, ret_enum, site)
 
     // **A large result leaves through the caller's storage, and `?` is a `return` like any other.**
     // The convention has already made this function `void` and given it an out-pointer, so handing

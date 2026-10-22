@@ -1,0 +1,451 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `@disjoint(result.0, result.1)` -- a function's promise that the parts of its result it names share
+// no element, so a caller may hand each to a different writer (`reference/attributes.md § @disjoint`).
+//
+// **The promise is checked in the body, never trusted.** Every value the function answers -- its
+// trailing value, and each `return` -- has to show the named parts apart, in one of two ways:
+//
+// - **slices of one storage whose bounds meet**: `(xs[..<n], xs[n..])`, where the first ends at the
+//   very bound the second begins at -- the same literal, or the same name read once -- or two runs of
+//   literal bounds that share no element. Slicing traps past the end, so a pair of slices that meet
+//   at a bound can never both reach one element;
+// - **parts of one call of a function that makes the same promise**: after
+//   `val (l, r) = split_at(xs, n)`, `l` and `r`, and any slice of either, are apart. That is the whole
+//   of what a caller may rely on, and it is what a body answering pieces of pieces rests on.
+//
+// A name a part is traced through has to hold one value for the whole body: declared once and never
+// written, its address never taken, never bound by a `ref`. Anything the walk cannot see into is not
+// shown apart, and the answer is refused where it is written.
+
+// Which part of the program's storage an answered value covers, as far as the body shows.
+enum DrPlace
+    // Part `part` of the tuple one call answered, the call numbered within the body. Every slice of
+    // it lies inside it.
+    DrPiece(call: int, part: usize)
+
+    // The elements `lo` up to but not including `hi` of the storage `root` names.
+    DrRange(root: string, lo: DrBound, hi: DrBound)
+
+    // Somewhere the body does not settle.
+    DrOpaque
+end DrPlace
+
+// One bound of a run of elements.
+enum DrBound
+    // A literal.
+    DrAt(v: long)
+
+    // A name that holds one value for the whole body, or, inside one answer, one read of a name.
+    DrName(n: string)
+
+    // The end of the storage.
+    DrEnd
+
+    // Computed some way the walk does not follow.
+    DrUnknown
+end DrBound
+
+// A local holding the tuple a call of a `@disjoint`-result function answered.
+struct DrCall
+    id: int
+    apart: Buf[usize]
+end DrCall
+
+// What the walk of one body knows of its names.
+struct DrBody
+    declared: Map[string, int]
+    written: Buf[string]
+    places: Map[string, DrPlace]
+    calls: Map[string, DrCall]
+    previous: string
+    next_call: int
+end DrBody
+
+// The parts of a result `@disjoint` names, as positions, where every one of them is a part that
+// reaches memory -- a list `disjoint_types` refused is not checked a second time.
+disjoint_parts(f: TFunc) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    val parts = result_parts(f.ret_ty)
+
+    if parts.is_none() then return out
+
+    for n in f.marks.disjoint
+        if is_result_part(n)
+            val k = result_part_index(n)
+
+            if k >= parts.unwrap().len() || !disjoint_reaches(parts.unwrap().at(k)) then return buf()
+
+            out.push(k)
+        end if
+
+    out
+end disjoint_parts
+
+// Every value a function `@disjoint` over its result answers, held to showing the named parts apart.
+disjoint_answers(a: &Analysis, cx: &Disjoints, f: TFunc)
+    val group = disjoint_parts(f)
+
+    if group.len() < 2 then return
+
+    val body: &DrBody = DrBody(map(), buf(), map(), map(), "", 0)
+
+    for p in f.params
+        dr_declare(body, p.0)
+
+    walk_block_stmts(f.body, TWalk(true, e -> dr_expr_writes(body, e), w -> dr_mark(body, w.place),
+                                   s -> dr_count(body, s)))
+    walk_block_stmts(f.body, stmt_walk(true, s -> dr_bind(cx, body, s)))
+
+    val shown = qualified_name(a.tables.members.func_origin.get(f.name).unwrap_or(f.name))
+    val scope = func_home(a, f.name)
+    val v = DrCheck(a, cx, body, scope, shown, group)
+
+    if f.body.result.is_some() then dr_answer(v, f.body.result.unwrap())
+
+    walk_block_stmts(f.body, stmt_walk(true, s -> dr_return(v, s)))
+end disjoint_answers
+
+// What checking one function's answers carries.
+struct DrCheck
+    a: &Analysis
+    cx: &Disjoints
+    body: &DrBody
+    scope: Scope
+    shown: string
+    group: Buf[usize]
+end DrCheck
+
+private dr_return(v: DrCheck, s: TStmt)
+    s match
+        TReturn(value) -> if value.is_some() then dr_answer(v, value.unwrap())
+        _ -> ()
+end dr_return
+
+// -- what a name holds ---------------------------------------------------------------------------
+
+private dr_declare(body: &DrBody, name: string) =
+    body.declared.put(name, body.declared.get(name).unwrap_or(0) + 1)
+
+private dr_count(body: &DrBody, s: TStmt)
+    s match
+        TVarDecl(name, _, _, _) -> dr_declare(body, name)
+        TRefDecl(name, _, place) ->
+            dr_declare(body, name)
+            dr_mark(body, place)
+        _ -> ()
+end dr_count
+
+// A name whose own storage an expression writes, or hands out the address of.
+private dr_expr_writes(body: &DrBody, e: TExpr)
+    *e.kind match
+        TStore(place, _, _, _) -> dr_mark(body, place)
+        TUpdate(place, _, _, _, _, _, _) -> dr_mark(body, place)
+        TIncDec(place, _, _, _, _) -> dr_mark(body, place)
+        TAddrOf(place, _) -> dr_mark(body, place)
+        _ -> ()
+end dr_expr_writes
+
+// The binding a write lands in: a field of a local is the local. An element reached by an index is
+// not -- it changes what a view holds, never which storage the view covers.
+private dr_mark(body: &DrBody, place: TExpr)
+    *place.kind match
+        TLoad(name, _) -> body.written.push(name)
+        TField(receiver, _, _) -> dr_mark(body, receiver)
+        _ -> ()
+end dr_mark
+
+private dr_steady(body: &DrBody, name: string) -> bool =
+    body.declared.get(name).unwrap_or(0) == 1 && !holds_string(body.written, name)
+
+// Each declaration's value, recorded in the order the body declares them.
+private dr_bind(cx: &Disjoints, body: &DrBody, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) ->
+            dr_bind_one(cx, body, name, init)
+            body.previous = name
+        _ -> body.previous = ""
+end dr_bind
+
+private dr_bind_one(cx: &Disjoints, body: &DrBody, name: string, init: TExpr)
+    *init.kind match
+        TCall(callee, _, _, _) ->
+            val apart = dr_callee_parts(cx, callee)
+
+            if apart.len() >= 2
+                body.calls.put(name, DrCall(body.next_call, apart))
+                body.next_call = body.next_call + 1
+                return
+            end if
+        // A destructuring binds a temporary to the tuple and each name to one part of it, in the
+        // statements right after; the temporary's name is reused by the next one, so it is read
+        // here, while it still holds this tuple.
+        TField(receiver, i, _) ->
+            val piece = dr_destructured(body, receiver, usize(i))
+
+            if piece.is_some()
+                body.places.put(name, piece.unwrap())
+                return
+            end if
+        _ -> ()
+
+    body.places.put(name, dr_place(body, init, false))
+end dr_bind_one
+
+private dr_destructured(body: &DrBody, receiver: TExpr, i: usize) -> Option[DrPlace]
+    val t = *receiver.kind match
+        TLoad(n, _) -> n
+        _ -> ""
+
+    if t == "" || holds_string(body.written, t) || !(dr_steady(body, t) || t == body.previous)
+        return None
+
+    body.calls.get(t) match
+        Some(c) -> if holds_index(c.apart, i) then Some(DrPiece(c.id, i)) else None
+        None -> None
+end dr_destructured
+
+// The parts a callee keeps apart, where it is `@disjoint` over its result.
+private dr_callee_parts(cx: &Disjoints, callee: string) -> Buf[usize] = cx.find(callee) match
+    Some(g) -> disjoint_parts(g)
+    None -> buf()
+
+private holds_index(xs: Buf[usize], k: usize) -> bool
+    for x in xs
+        if x == k then return true
+
+    false
+end holds_index
+
+// -- what an expression covers -------------------------------------------------------------------
+
+// The storage a value covers. `direct` is an answer's own part, whose names are each read once
+// within one expression -- a bound read twice there is one value whatever the name is; a name a
+// declaration was traced through has to hold its one value for the whole body.
+private dr_place(body: &DrBody, e: TExpr, direct: bool) -> DrPlace = *e.kind match
+    TConstView(arg) -> dr_place(body, arg, direct)
+    TLoad(name, ty) -> dr_load(body, name, ty, direct)
+    TField(receiver, i, _) -> dr_part_of(body, receiver, usize(i))
+    TSlice(base, lo, hi, inclusive, _) -> dr_slice(body, base, lo, hi, inclusive, direct)
+    TAddrOf(place, _) -> dr_address(body, place, direct)
+    _ -> DrOpaque
+
+// `p.1`, where `p` holds the tuple one call of a `@disjoint`-result function answered.
+private dr_part_of(body: &DrBody, receiver: TExpr, i: usize) -> DrPlace
+    val held = *receiver.kind match
+        TLoad(t, _) -> if dr_steady(body, t) then body.calls.get(t) else None
+        _ -> None
+
+    held match
+        Some(c) -> if holds_index(c.apart, i) then DrPiece(c.id, i) else DrOpaque
+        None -> DrOpaque
+end dr_part_of
+
+// `&a[k]`: the one element a literal index names.
+private dr_address(body: &DrBody, place: TExpr, direct: bool) -> DrPlace
+    *place.kind match
+        TIndex(receiver, index, _) -> *receiver.kind match
+            TLoad(name, _) ->
+                val k = dr_literal(index)
+
+                if k.is_some() && (direct || dr_steady(body, name))
+                    return DrRange(name, DrAt(k.unwrap()), DrAt(k.unwrap() + 1))
+            _ -> ()
+        _ -> ()
+
+    DrOpaque
+end dr_address
+
+private dr_load(body: &DrBody, name: string, ty: Type, direct: bool) -> DrPlace
+    if dr_steady(body, name)
+        body.places.get(name) match
+            Some(p) -> return p
+            None -> ()
+    end if
+
+    if !disjoint_reaches(ty) || (!direct && !dr_steady(body, name)) then return DrOpaque
+
+    DrRange(name, DrAt(0), DrEnd)
+end dr_load
+
+// A slice lies inside whatever its base covers; a slice of the whole of a storage is the run its
+// bounds say.
+private dr_slice(body: &DrBody, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
+                 direct: bool) -> DrPlace
+    val within = dr_place(body, base, direct)
+
+    within match
+        DrRange(root, DrAt(0), DrEnd) ->
+            val from = if lo.is_none() then DrAt(0) else dr_bound(body, lo.unwrap(), direct)
+
+            DrRange(root, from, dr_upper(body, hi, inclusive, direct))
+        _ -> within
+end dr_slice
+
+// Where a slice ends: the end of its storage when it is open, one past an inclusive bound.
+private dr_upper(body: &DrBody, hi: Option[TExpr], inclusive: bool, direct: bool) -> DrBound
+    if hi.is_none() then return DrEnd
+
+    if !inclusive then return dr_bound(body, hi.unwrap(), direct)
+
+    dr_literal(hi.unwrap()) match
+        Some(h) -> DrAt(h + 1)
+        None -> DrUnknown
+end dr_upper
+
+private dr_bound(body: &DrBody, x: TExpr, direct: bool) -> DrBound = dr_literal(x) match
+    Some(v) -> DrAt(v)
+    None -> dr_key(body, x, direct) match
+        Some(k) -> DrName(k)
+        None -> DrUnknown
+
+// A bound computed from names and literals by arithmetic, spelled so that two computations of one
+// value spell the same: `xs.len / 2` read twice is one bound.
+private dr_key(body: &DrBody, x: TExpr, direct: bool) -> Option[string] = *x.kind match
+    TIntLit(v, _) -> Some(s"$v")
+    TLoad(name, _) -> if direct || dr_steady(body, name) then Some(name) else None
+    TLen(receiver, _) -> dr_key(body, receiver, direct) match
+        Some(k) -> Some(s"$k.len")
+        None -> None
+    TBinary(op, left, right, _) -> dr_pair_key(body, op, left, right, direct)
+    _ -> None
+
+private dr_pair_key(body: &DrBody, op: string, left: TExpr, right: TExpr, direct: bool) -> Option[string]
+    if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" then return None
+
+    val l = dr_key(body, left, direct)
+    val r = dr_key(body, right, direct)
+
+    if l.is_none() || r.is_none() then return None
+
+    Some(s"(${l.unwrap()} $op ${r.unwrap()})")
+end dr_pair_key
+
+private dr_literal(x: TExpr) -> Option[long] = *x.kind match
+    TIntLit(v, _) -> v.to_long()
+    _ -> None
+
+// Whether two places provably share no element.
+dr_apart(x: DrPlace, y: DrPlace) -> bool = x match
+    DrPiece(c1, p1) -> y match
+        DrPiece(c2, p2) -> c1 == c2 && p1 != p2
+        _ -> false
+    DrRange(r1, lo1, hi1) -> y match
+        DrRange(r2, lo2, hi2) -> r1 == r2 &&
+            (dr_empty(lo1, hi1) || dr_empty(lo2, hi2) || dr_at_most(hi1, lo2) || dr_at_most(hi2, lo1))
+        _ -> false
+    DrOpaque -> false
+
+// Whether a run of elements is provably empty: it ends where it begins.
+private dr_empty(lo: DrBound, hi: DrBound) -> bool = dr_at_most(hi, lo)
+
+// Whether bound `x` is provably no greater than bound `y`.
+private dr_at_most(x: DrBound, y: DrBound) -> bool = x match
+    DrAt(a) -> y match
+        DrAt(b) -> a <= b
+        _ -> a == 0
+    DrName(m) -> y match
+        DrName(n) -> m == n
+        DrEnd -> true
+        _ -> false
+    _ -> false
+
+// -- the answers ---------------------------------------------------------------------------------
+
+// One answered value, held to showing every pair of the named parts apart.
+private dr_answer(v: DrCheck, e: TExpr)
+    *e.kind match
+        TStructNew(_, args) ->
+            if args.len() <= dr_last(v.group) then return
+
+            for i in 0..<v.group.len()
+                for j in 0..<i
+                    val x = args.at(v.group.at(j))
+                    val y = args.at(v.group.at(i))
+
+                    if !dr_apart(dr_place(v.body, x, true), dr_place(v.body, y, true))
+                        dr_refuse(v, e.span, v.group.at(j), v.group.at(i),
+                                  s"${dr_text(x)} and ${dr_text(y)} may share an element")
+                        return
+                    end if
+        TCall(callee, _, _, _) ->
+            val named = qualified_name(v.a.tables.members.func_origin.get(callee).unwrap_or(callee))
+
+            dr_handed_on(v, e.span, dr_callee_parts(v.cx, callee), s"'$named'")
+        TLoad(name, _) ->
+            val held = if dr_steady(v.body, name) then v.body.calls.get(name) else None
+
+            held match
+                Some(c) -> dr_handed_on(v, e.span, c.apart, s"'$name'")
+                None -> dr_refuse(v, e.span, v.group.at(0), v.group.at(1),
+                                  s"'$name' is not a tuple the body shows the parts of")
+        TIf(_, then_block, else_block, _) ->
+            dr_block_answer(v, then_block)
+
+            if else_block.is_some() then dr_block_answer(v, else_block.unwrap())
+        TMatch(_, arms, _) ->
+            for arm in arms
+                dr_block_answer(v, arm.body)
+        TBlockExpr(block) -> dr_block_answer(v, block)
+        _ -> dr_refuse(v, e.span, v.group.at(0), v.group.at(1),
+                       "the answer is not a tuple the body builds")
+end dr_answer
+
+private dr_block_answer(v: DrCheck, b: TBlock) = if b.result.is_some() then dr_answer(v, b.result.unwrap())
+
+// A tuple another call answered is handed on whole: it shows the parts apart where that callee keeps
+// every one of them apart.
+private dr_handed_on(v: DrCheck, at: Span, apart: Buf[usize], what: string)
+    for k in v.group
+        if !holds_index(apart, k)
+            dr_refuse(v, at, v.group.at(0), v.group.at(1),
+                      s"$what is not '@disjoint' over 'result.$k'")
+            return
+        end if
+end dr_handed_on
+
+private dr_last(xs: Buf[usize]) -> usize
+    var top: usize = 0
+
+    for x in xs
+        if x > top then top = x
+
+    top
+end dr_last
+
+private dr_refuse(v: DrCheck, at: Span, i: usize, j: usize, why: string)
+    val said = s"'${v.shown}' is '@disjoint' over 'result.$i' and 'result.$j', and this answer does " +
+        s"not show them apart — $why; a body shows it with slices of one view that meet at a bound, " +
+        "as '(xs[..<n], xs[n..])', or with parts of one call of a function '@disjoint' over its result"
+
+    if holds_string(v.cx.said, said) then return
+
+    v.cx.said.push(said)
+    v.a.fault(v.scope, at, said)
+end dr_refuse
+
+// How a part is written, for a refusal to quote.
+private dr_text(e: TExpr) -> string = *e.kind match
+    TConstView(arg) -> dr_text(arg)
+    TLoad(name, _) -> s"'$name'"
+    TField(receiver, i, _) -> *receiver.kind match
+        TLoad(t, _) -> s"'$t.$i'"
+        _ -> "a part"
+    TSlice(base, lo, hi, inclusive, _) -> *base.kind match
+        TLoad(name, _) -> s"'$name[${dr_opt_text(lo, "")}..${dr_opt_text(hi, if inclusive then "=" else "<")}]'"
+        _ -> "a slice"
+    _ -> "a part"
+
+private dr_opt_text(x: Option[TExpr], mark: string) -> string =
+    if x.is_none() then "" else mark + dr_bound_text(x.unwrap())
+
+private dr_bound_text(x: TExpr) -> string = *x.kind match
+    TIntLit(v, _) -> s"$v"
+    TLoad(name, _) -> name
+    TLen(receiver, _) -> s"${dr_bound_text(receiver)}.len"
+    TBinary(op, left, right, _) -> s"${dr_bound_text(left)} $op ${dr_bound_text(right)}"
+    _ -> "..."
