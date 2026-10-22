@@ -20,6 +20,18 @@ manifest**: it reads, writes and validates `package.hocon`, and never produces a
 Generated files are build outputs. They live in the build directory, are covered by the run
 cache's keying, are never checked in, and are inspected with `sysl build --emit <what>` (§ 8.6).
 
+**Decided by the user, beyond the questions below:**
+
+- **The manifest is renamed `sysl.hocon`**, pairing with `sysl.sum`. A `package.hocon` is refused
+  with a fix-it naming the new file, and `sysl config fix` renames it. Where this note says
+  `package.hocon`, read `sysl.hocon`.
+- **`sysl build`, `run` and `test` default their path to `.`.** A directory, named or implied, with
+  no manifest is refused, and there is no upward search. A single named `x.sysl` still builds, runs
+  and tests with no manifest.
+- **An empty manifest is legal.** It marks a project, and the executable is named after the
+  directory when there is no `name`. `name` and `version` are required only when a package is
+  depended on or released.
+
 **Configuring an operating system is a first-class case**: FreeRTOS (vendored C), skiff (sysl), keel,
 Zephyr. Its shape — tunable values, on/off subsystems, a port per chip, an application overriding
 the OS package's defaults, and the values reaching both C and sysl — is the test the grammar is
