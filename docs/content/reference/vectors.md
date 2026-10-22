@@ -187,6 +187,158 @@ f() -> unit
 compare two vectors at a time and combine the masks with '&'
 ```
 
+## Rearranging lanes
+
+**`shuffle` picks lanes by number.** Given a list, it builds a vector whose lane `i` is the lane the
+list names at `i`. Given a second vector as well, it picks from both, numbering the second vector's
+lanes after the first's: lanes `0` to `N - 1` are the receiver's and `N` to `2N - 1` the second's.
+
+```sysl
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <4>f32 = [10, 20, 30, 40]
+
+val zipped = a.shuffle(b, [0, 4, 1, 5])
+val turned = a.shuffle([3, 2, 1, 0])
+val rolled = a.shuffle(b, [1, 2, 3, 4])
+
+print(zipped[0], zipped[1], zipped[2], zipped[3])
+print(turned[0], turned[3], rolled[0], rolled[3])
+```
+
+```output
+1 10 2 20
+4 1 2 10
+```
+
+Each `shuffle` is **one `shufflevector` instruction**, with the list as its constant operand, and
+the back end turns it into the machine's own permutes at every optimisation level: on AArch64 the
+three above are `zip1`, `rev64` with an `ext`, and `ext`; on x86 they are `unpcklps`, `shufps`, and
+`blendps` with a `shufps`. A literal of lane reads, such as `[a[0], b[0], a[1], b[1]]`, usually
+reaches the same instructions once LLVM's optimiser has folded it, but `shuffle` reaches them
+without the optimiser.
+
+**The result is as wide as the list is long**, so a shuffle also widens, narrows and repeats. A list
+may name a lane more than once:
+
+```sysl
+val a: <4>f32 = [1, 2, 3, 4]
+val b: <4>f32 = [10, 20, 30, 40]
+
+val wide = a.shuffle(b, [0, 1, 2, 3, 4, 5, 6, 7])
+val upper = wide.shuffle([4, 5, 6, 7])
+val third = a.shuffle([2, 2, 2, 2])
+
+print(wide.len, upper.len, upper[0], third[3])
+```
+
+```output
+8 4 10 3
+```
+
+Joining two `<4>` vectors into an `<8>`, or taking either half of one, costs nothing at run time: the
+eight lanes already sit in the pair of registers the two halves occupy.
+
+### The list is a constant
+
+A lane number is part of the instruction, just as a [lane index](#writing-a-vector) is, so the list must be
+known while compiling. It may be an array literal of constants — literals, `const`s, value
+parameters, and arithmetic on them — or the result of a `const` function. Anything else is refused:
+
+```sysl
+f(a: <4>f32, k: usize) -> <4>f32 = a.shuffle([k, 0, 1, 2])
+```
+
+```error
+a shuffle's lanes are part of the instruction, so the list has to be a constant
+```
+
+Picking lanes by numbers computed at run time is a different instruction (`tbl` on AArch64,
+`pshufb` on x86), with its own rules for an index out of range. Where the indices are only known at
+run time, keep the values in an array and index it.
+
+A lane outside the vectors is refused while compiling, with both ranges named:
+
+```sysl
+f(a: <4>f32, b: <4>f32) -> <4>f32 = a.shuffle(b, [0, 8, 1, 5])
+```
+
+```error
+'shuffle' picks from lanes 0 to 7 — 0 to 3 of the receiver and 4 to 7 of the second vector — and this is 8
+```
+
+The two vectors must be **one type**, at the same width with the same lanes. A scalar is not
+broadcast here: a `shuffle` with a scalar where the second vector belongs is almost always a
+mistake, and a broadcast is spelled `[0; 4]` or as a typed binding.
+
+```sysl
+f(a: <4>f32, b: <8>f32) -> <4>f32 = a.shuffle(b, [0, 1, 2, 3])
+```
+
+```error
+'shuffle' takes two vectors of one type, got <4>f32 and <8>f32
+```
+
+### Lists for every width
+
+A `const` function computes a list once per width, so one kernel shuffles at every width.
+[`sysl.vectors`](/api/sysl-vectors/) provides the common lists, each taking the width `W` of the
+vectors being shuffled:
+
+| list | lanes at `W = 4` | AArch64 |
+|---|---|---|
+| `zip_lo[W]()` | `[0, 4, 1, 5]` | `zip1` |
+| `zip_hi[W]()` | `[2, 6, 3, 7]` | `zip2` |
+| `unzip_even[W]()` | `[0, 2, 4, 6]` | `uzp1` |
+| `unzip_odd[W]()` | `[1, 3, 5, 7]` | `uzp2` |
+| `reverse[W]()` | `[3, 2, 1, 0]` | `rev64` + `ext` |
+| `rotate[W, K]()` | `[1, 2, 3, 0]` at `K = 1` | `ext` |
+
+```sysl
+import sysl.vectors.{zip_lo, zip_hi}
+
+interleave[const W: usize](a: <W>int, b: <W>int) -> (<W>int, <W>int) =
+    (a.shuffle(b, zip_lo[W]()), a.shuffle(b, zip_hi[W]()))
+
+val a4: <4>int = [0, 1, 2, 3]
+val b4: <4>int = [10, 11, 12, 13]
+val a8: <8>int = [0, 1, 2, 3, 4, 5, 6, 7]
+val b8: <8>int = [10, 11, 12, 13, 14, 15, 16, 17]
+
+val (lo, hi) = interleave(a4, b4)
+val (lo8, hi8) = interleave(a8, b8)
+
+print(lo[1], hi[0], lo8[7], hi8[1])
+```
+
+```output
+10 2 13 14
+```
+
+At `W = 4` the kernel is `zip1` and `zip2`, and at `W = 8` it is two of each. A list of your own is
+written the same way — a `const` function with a value parameter, returning `[W]usize`. A width that
+makes a lane fall outside the vectors is refused for that instantiation only, in the words above.
+
+### Shuffling a mask
+
+A mask is a vector, and shuffles like one:
+
+```sysl
+val a: <4>f32 = [1, 5, 3, 7]
+val b: <4>f32 = [4, 2, 6, 0]
+
+val m = (a < b).shuffle([3, 2, 1, 0])
+
+print(m[0], m[3])
+```
+
+```output
+false true
+```
+
+It is correct, but not free. On AArch64 a comparison's lanes are narrowed to be shuffled and widened
+again afterwards, so `(a < b).shuffle(lanes)` costs several instructions more than
+`a.shuffle(lanes) < b.shuffle(lanes)`. The two are the same mask; prefer shuffling the operands.
+
 ## Reductions
 
 A reduction collapses a vector to one scalar. `sum`, `min` and `max` apply to a numeric vector; `any`
@@ -408,17 +560,41 @@ print(four[0], four[9], eight[0], eight[9])
 Ten elements is not a multiple of either width, so both instantiations run the tail loop, and the two
 results agree.
 
-**`by` is a vector rather than an `f32`, because that is where `W` comes from.** A written type
-argument at a call is refused, so a kernel whose parameters are all slices cannot be given its
-width. In practice a SIMD kernel's constants are broadcast across the lanes anyway, but design the
-signature with this in mind.
+**`by` is a vector, and that is where `W` comes from.** A kernel whose parameters are all slices
+has nothing to infer the width from, so the call writes it, and a scalar `by` broadcasts across the
+lanes where it meets a vector:
+
+```sysl
+scale_by[const W: usize](xs: []const f32, out: []f32, by: f32)
+    var i: usize = 0
+
+    while i + W <= xs.len
+        val v: <W>f32 = xs.load(i)
+
+        out.store(i, v * by)
+        i += W
+
+    while i < xs.len
+        out[i] = xs[i] * by
+        i += 1
+
+val src: [10]f32 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+var out: [10]f32
+
+scale_by[4](src[..], out[..], 3)
+
+print(out[0], out[4], out[9])
+```
+
+```output
+3 15 30
+```
 
 ## What a vector does not have
 
-**Shuffles and swizzles.** There is no way to rearrange lanes in one step. A gather is a loop that
-writes the elements into a scratch array followed by one `load` of the whole run — correct on every
-target, but not the single instruction a shuffle would be. Gathers are where hand-written SIMD
-variants for different instruction sets differ most, and they do not generalize over a width.
+**A lane written in place.** `v[1] = 9` is refused, since a lane has no address. Build the new
+vector instead, with a literal or a [`shuffle`](#rearranging-lanes) of the old one and a vector
+holding the new value.
 
 **A masked load or store.** A run that would reach past the end traps rather than reading only the
 lanes that exist. Write a scalar tail, as the kernel above does.

@@ -5,7 +5,8 @@ one, rotate across a pair, broadcast a lane, take a half, permute bytes. Today
 [`reference/vectors.md` § "What a vector does not have"](/reference/vectors/#what-a-vector-does-not-have)
 says there is no such operation and that a gather is a loop.
 
-Nothing here is built. This note records what exists, what other languages do (checked by running them
+Item 1 of §9 — `shuffle` and the `sysl.vectors` lists — is built; item 2, swizzles and lane writes,
+is not. This note records what exists, what other languages do (checked by running them
 where a toolchain is installed), the options for sysl in real sysl, and the questions the user decides.
 Every claim cites a probe under [`shuffle-probes/`](shuffle-probes/); `zsh
 docs/design/shuffle-probes/run.sh <out dir>` re-runs all of them.
@@ -402,6 +403,13 @@ module `val`); **`shx_`** errors (non-constant, out of range one- and two-input,
 mismatched types, scalar second argument, an out-of-range lane only in one instantiation);
 **`shg_`** codegen (the `shufflevector` text and its mask; arm64 `zip1`/`ext`/`tbl` read from the
 assembly at `-O0`, as `fx2_` reads disassembly). Each fix row goes in `scripts/fix_tests.tsv`.
+
+**As built, item 1 ships six of Q5's nine lists**: `zip_lo`, `zip_hi`, `unzip_even`, `unzip_odd`,
+`reverse` and `rotate[W, K]`. `concat`, `low_half` and `high_half` answer `[2 * W]usize` or
+`[W / 2]usize`, and a type may name a value parameter but not compute with one ("this length does
+arithmetic on 'W' … type-level arithmetic, which is a separate feature"). Spelling them by the
+answer's width instead (`low_half[H]`) would make `concat[N]` and `low_half[H]` the same list, so
+they wait on that feature or on the user's choice of spelling.
 
 **Item 2 — swizzles and lane writes (option b).** About 200 lines of compiler, 200 of tests, 60 of docs.
 

@@ -1,0 +1,166 @@
+module sh.sysl.compiler
+@tests
+
+// What `shuffle` refuses, and what the reader is told instead (`reference/vectors.md § Rearranging
+// lanes`). A lane number is part of the instruction, as a lane index is, so the list is held to a
+// constant and checked against the lanes there are -- per instantiation, inside a generic.
+
+// The compilation said `want`, at `at` (`line:column` in main.sysl); otherwise the test fails showing
+// all of it.
+private shx_says(text: string, want: string, at: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+    assert(said.contains(s"main.sysl:$at\n"), s"expected it at $at\nit said: $said")
+
+private shx_not_constant() -> string =
+    "a shuffle's lanes are part of the instruction, so the list has to be a constant — a literal, or " +
+        "a 'const' function's result. To pick lanes by a computed number, keep the values in a '[4]f32'"
+
+@test("a list element that is not a constant is refused, at the element")
+shx_element_not_constant()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, k: usize) -> <4>f32 = a.shuffle([k, 0, 1, 2])\nprint(1)\n",
+             shx_not_constant(), "1:47")
+
+@test("a list held in a variable is refused, however constant it looks")
+shx_list_in_a_variable()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, m: [4]usize) -> <4>f32 = a.shuffle(m)\nprint(1)\n", shx_not_constant(),
+             "1:49")
+
+@test("a two-input lane past the pair names both ranges")
+shx_two_input_out_of_range()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, b: <4>f32) -> <4>f32 = a.shuffle(b, [0, 8, 1, 5])\nprint(1)\n",
+             "'shuffle' picks from lanes 0 to 7 — 0 to 3 of the receiver and 4 to 7 of the second " +
+                 "vector — and this is 8", "1:54")
+
+@test("a one-input lane past the vector is told as v[4] is")
+shx_one_input_out_of_range()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle([0, 4, 1, 2])\nprint(1)\n",
+             "<4>f32 has lanes 0 to 3, and this is 4", "1:40")
+
+@test("a negative lane is out of range")
+shx_negative_lane()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle([0, -1, 1, 2])\nprint(1)\n",
+             "<4>f32 has lanes 0 to 3, and this is -1", "1:40")
+
+@test("an empty list is refused")
+shx_empty_list()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle([])\nprint(1)\n",
+             "'shuffle' picks at least one lane — a vector has at least one, so the list cannot be empty",
+             "1:36")
+
+@test("two vectors of different widths are refused")
+shx_mixed_widths()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, b: <8>f32) -> <4>f32 = a.shuffle(b, [0, 1, 2, 3])\nprint(1)\n",
+             "'shuffle' takes two vectors of one type, got <4>f32 and <8>f32", "1:47")
+
+@test("two vectors of different lane types are refused")
+shx_mixed_lanes()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, b: <4>f64) -> <4>f32 = a.shuffle(b, [0, 1, 2, 3])\nprint(1)\n",
+             "'shuffle' takes two vectors of one type, got <4>f32 and <4>real", "1:47")
+
+@test("a scalar second argument is refused rather than splatted")
+shx_scalar_second()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle(0, [0, 4, 1, 5])\nprint(1)\n",
+             "'shuffle' takes two vectors of one type, got <4>f32 and int", "1:36")
+
+@test("a list of floats is refused, at the element")
+shx_float_lanes()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle([0.0, 1.0, 1.0, 2.0])\nprint(1)\n",
+             "a lane number must be an integer, not real", "1:37")
+
+@test("a vector where the list belongs is told what a list is")
+shx_vector_as_list()
+    if !enm_ready() then return
+
+    shx_says("f(a: <4>f32, m: <4>f32) -> <4>f32 = a.shuffle(m)\nprint(1)\n",
+             "'shuffle' picks lanes by number, so its list is an array of integers, as in " +
+                 "'[3, 2, 1, 0]' — and this is <4>f32", "1:47")
+
+@test("a const function answering floats is not a list of lanes")
+shx_const_function_of_floats()
+    if !enm_ready() then return
+
+    shx_says("const floats() -> [4]f32 = [0, 1, 2, 3]\n" +
+                 "f(a: <4>f32) -> <4>f32 = a.shuffle(floats())\nprint(1)\n",
+             "'shuffle' picks lanes by number, so its list is an array of integers, as in " +
+                 "'[3, 2, 1, 0]' — and this is [4]f32", "2:36")
+
+@test("no list, or one argument too many, is told both spellings")
+shx_arity()
+    if !enm_ready() then return
+
+    val want = "'shuffle' takes the list of lanes to pick, after the second vector to pick from where " +
+        "there is one — 'a.shuffle([3, 2, 1, 0])' or 'a.shuffle(b, [0, 4, 1, 5])' — and "
+
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle()\nprint(1)\n", want + "0 arguments were given",
+             "1:28")
+    shx_says("f(a: <4>f32) -> <4>f32 = a.shuffle(a, a, [0])\nprint(1)\n",
+             want + "3 arguments were given", "1:28")
+
+@test("a lane out of range in only one instantiation is refused there")
+shx_one_instantiation()
+    if !enm_ready() then return
+
+    val prog = raw"""
+        const halves[const W: usize]() -> [4]usize = [0, W / 2, 1, W / 2 + 1]
+
+        pick[const W: usize](a: <W>f32) -> <4>f32 = a.shuffle(halves[W]())
+
+        val v2: <2>f32 = [1, 2]
+        val v8: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+        print(pick(v8)[1])
+        print(pick(v2)[1])
+        """
+
+    shx_says(prog, "<2>f32 has lanes 0 to 1, and this is 2", "3:55")
+
+    // The wider instantiation alone is a program.
+    assert_eq(enm_err(raw"""
+        const halves[const W: usize]() -> [4]usize = [0, W / 2, 1, W / 2 + 1]
+
+        pick[const W: usize](a: <W>f32) -> <4>f32 = a.shuffle(halves[W]())
+
+        val v8: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+        print(pick(v8)[1])
+        """), "")
+
+@test("a const function that fails while compiling says why, at the list")
+shx_const_function_fails()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        const bad() -> [4]usize
+            var m: [4]usize
+            var k: usize = 5
+            m[k] = 1
+            m
+
+        f(a: <4>f32) -> <4>f32 = a.shuffle(bad())
+        print(1)
+        """)
+
+    assert(said.contains("this shuffle's list traps while it is being compiled: index 5 is out of bounds"),
+           said)
+    assert(said.contains("main.sysl:7:36\n"), said)
+    assert(!said.contains("has to be a constant"), said)
