@@ -2801,7 +2801,7 @@ reachable from C and from nothing else, and each blocks an ordinary POSIX interf
 |---|---|
 | **a caller-allocated opaque type** | `regcomp` wants a `regex_t` the caller supplies, and its size is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows |
 | **a macro** | `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is nothing for a linker to resolve and nothing for `extern` to name |
-| **a shape with no sysl spelling** | an inline function. A **C bitfield struct is spelled** field for field — `mode: u3 in u32` — and laid out by the target's C rule ([attributes](/reference/attributes/)); only a bitfield struct under `#pragma pack(n)` for `n` other than 1 has no spelling. Passing one **by value** across the boundary — or anything holding one by value — and its declaration in a generated header, come in a later release: until then it crosses as a pointer |
+| **a shape with no sysl spelling** | an inline function. A **C bitfield struct is spelled** field for field — `mode: u3 in u32` — and laid out by the target's C rule ([attributes](/reference/attributes/)); only a bitfield struct under `#pragma pack(n)` for `n` other than 1 has no spelling. One crosses **by value** as C's own does, and so does anything holding one; its declaration in a generated header comes in a later release |
 
 Each becomes an ordinary function in three lines of C:
 
@@ -3369,9 +3369,8 @@ int sysl_fx_twice(int x) {
 **The checks are the point.** Built for a target where `fx_word` or `struct fx_bits` is laid out
 otherwise, the module stops at that record's `@assert`, naming it, rather than reading the wrong
 bytes. What the generator cannot express it says, by name, on stderr and at the foot of the module —
-a flexible array member, a record under `#pragma pack`, a macro whose parameters nothing types, a
-function taking or returning by value a record with C bitfields or one holding such a record
-([attributes](/reference/attributes/)) — and it never guesses. The pleasant layer above, which decides ownership, nullability and callbacks,
+a flexible array member, a record under `#pragma pack`, a macro whose parameters nothing types — and
+it never guesses. The pleasant layer above, which decides ownership, nullability and callbacks,
 is still a person's.
 
 ## What is deliberately absent

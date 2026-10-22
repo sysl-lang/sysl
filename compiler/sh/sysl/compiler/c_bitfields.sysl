@@ -159,57 +159,6 @@ c_bit_field(receiver: Type, index: int) -> bool = underlying(receiver) match
     Struct(d) -> index >= 0 && d.c_bit(usize(index)).is_some()
     _ -> false
 
-// -- what is not built in this release ------------------------------------------------------------------
-//
-// A struct with C bitfields crossing a C boundary by value, or anything holding one by value: how C
-// passes one is not built in this release (C classifies a bitfield by its declared type, which
-// differs from an ordinary struct's on x86-64, wasm32 and riscv64's lp64d), so it crosses as an
-// address. A holder's refusal names the struct with the bitfields and where it lies.
-c_bits_by_value(t: Type, what: string) -> string
-    val shown = type_show(t)
-    val tail = s"$what is not built in this release — pass its address, as a '*$shown'"
-
-    c_bits_at(t) match
-        Some((at, owner)) ->
-            if at == "" then return s"'$shown' has C bitfields, and $tail"
-
-            s"'$shown' holds '${type_show(owner)}', which has C bitfields, at '$shown$at', and $tail"
-        None -> what
-end c_bits_by_value
-
-// Whether the type is a struct with C bitfields, or holds one by value at any depth.
-has_c_bits(t: Type) -> bool = c_bits_at(t).is_some()
-
-// Where a struct with C bitfields lies inside `t` by value -- in a field, an array's element, a
-// union's member or an anonymous member -- and which struct it is. The place is written as a reader
-// reaches it from `t` (`.h.b`, `[0]` for an element) and is empty for `t` itself. An anonymous
-// member adds no step, and its bitfields are its enclosing type's own, as they are in C.
-c_bits_at(t: Type) -> Option[(string, Type)]
-    underlying(t) match
-        Struct(d) ->
-            if !d.c_bits.is_empty() then return Some(("", t))
-
-            for field in d.stored()
-                c_bits_at(field.1) match
-                    Some((at, owner)) ->
-                        if is_anonymous_field(field.0)
-                            return Some((at, if anonymous_struct(owner) then t else owner))
-
-                        return Some((s".${field.0}$at", owner))
-                    None -> ()
-        Array(n, elem) if n > 0 ->
-            c_bits_at(*elem) match
-                Some((at, owner)) -> return Some((s"[0]$at", owner))
-                None -> ()
-        _ -> ()
-
-    None
-end c_bits_at
-
-private anonymous_struct(t: Type) -> bool = underlying(t) match
-    Struct(d) -> is_anonymous_type(d)
-    _ -> false
-
 // -- the layout ------------------------------------------------------------------------------------
 
 // Where one field of a struct with C bitfields lands. `bit` is where it begins, counted from the

@@ -3280,31 +3280,35 @@ print(p[0])
 **What carries a count stays out**: a struct with C bitfields is laid out as C lays its counterpart
 out, so a string, a slice or a reference among its fields is refused.
 
-**Not built in this release**: crossing a C boundary by value — as an `extern`'s argument or
-result, or an `@export`'s parameter or result — and its declaration in a generated header, which
-writes it as an incomplete type C reaches through a pointer. C passes a bitfield as its declared
-type, which is not how an ordinary struct of the same fields travels on x86-64, WebAssembly or
-RISC-V's `lp64d`, so it crosses as a pointer:
+**It crosses a C boundary by value as C's own struct does** — as an `extern`'s argument or result,
+an `@export`'s parameter or result, and through a `*extern` pointer either way. A C compiler
+classifies such a struct by its fields, each named bitfield an integer of its own, and that is not
+always how an ordinary struct of the same size travels: on x86-64 `{ double d; unsigned a:3; }`
+comes back in a whole second register, WebAssembly passes one bitfield directly but two through
+memory, and RISC-V's `lp64d` gives a float beside one bitfield a register of each but a float beside
+two bitfields a single integer register. sysl follows clang on every machine it builds for:
 
 ```sysl
 struct Status
     ready: bool in u32
     mode: u3 in u32
 
-extern apply(s: Status)
+@export("next")
+next(s: Status) -> Status = Status(!s.ready, s.mode + 1)
 
-apply(Status(true, 5))
+val step: *extern(Status) -> Status = &next
+val s = step(Status(true, 5))
+
+print(s.ready, s.mode)
 ```
 
-```error
-'Status' has C bitfields, and passing it by value to the 'extern' 'apply' is not built in this release — pass its address, as a '*Status'
+```output
+false 6
 ```
 
 **The same holds for anything holding one by value**, at any depth: a struct whose field is one, an
 array of them, a union over one, a struct holding any of those, and a struct with an anonymous
-member that declares bitfields — which are the struct's own, as in C — or holds such a struct. The
-refusal names the struct with the bitfields and where it lies. Every one of them crosses by address,
-and a pointer to one is an ordinary pointer:
+member that declares bitfields — which are the struct's own, as in C:
 
 ```sysl
 struct Status
@@ -3315,14 +3319,20 @@ struct Device
     id: u16
     states: [2]Status
 
-extern report(d: Device)
+@export("modes")
+modes(d: Device) -> u32 = u32(d.id) * 100 + u32(d.states[0].mode) * 10 + u32(d.states[1].mode)
 
-report(Device(1, [Status(true, 5), Status(false, 2)]))
+val report: *extern(Device) -> u32 = &modes
+
+print(report(Device(1, [Status(true, 5), Status(false, 2)])))
 ```
 
-```error
-'Device' holds 'Status', which has C bitfields, at 'Device.states[0]', and passing it by value to the 'extern' 'report' is not built in this release — pass its address, as a '*Device'
+```output
+152
 ```
+
+**Not built in this release**: its declaration in a generated header, which writes it as an
+incomplete type C reaches through a pointer.
 
 ### `@align(n)` — where the aggregate begins
 
