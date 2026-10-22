@@ -7,7 +7,7 @@ import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text
 import sysl.process.capture
 
 // An arithmetic operator on a user type is read as its body for contraction (`fp_operators.sysl`):
-// `a + d * k` on a vector type is `a.x + d.x * k, ...`, one `llvm.fmuladd` a field, where the body of
+// `a + d * k` on a vector type is `a.x + d.x * k, ...`, one `llvm.fma` a field, where the body of
 // each operator is one expression. What still keeps a product apart is what keeps it apart from a
 // scalar: a `val`, a call of anything that is not such an operator, a body of statements, a trait
 // object. The lowering and the evaluator read it alike, so a constant agrees with the program.
@@ -115,7 +115,7 @@ private val fpo_vec: string = raw"""
 
 // -- the shapes -----------------------------------------------------------------------------------
 
-@test("each operator form on a user vector is one llvm.fmuladd a field, and no call")
+@test("each operator form on a user vector is one llvm.fma a field, and no call")
 fpo_each_operator_form_fuses()
     if !fpo_ready() then return
 
@@ -145,7 +145,7 @@ fpo_each_operator_form_fuses()
     for name in ["ad", "sb", "ng", "lf", "dv", "up", "dn"]
         val body = fpo_body(ir, name)
 
-        assert_eq(fpo_count(body, "call double @llvm.fmuladd.f64("), 3)
+        assert_eq(fpo_count(body, "call double @llvm.fma.f64("), 3)
         assert(!body.contains("@V.add(") && !body.contains("@V.sub(") && !body.contains("@V.mul("), body)
 
     // A subtracted product negates its first factor, as clang's `c - a * b` does.
@@ -176,8 +176,38 @@ fpo_generic_vector_both_widths()
         print(wide(G(1.0, 2.0), G(1.0, 2.0), 0.5).x, narrow(G(1.0f32, 2.0f32), G(1.0f32, 2.0f32), 0.5f32).y)
         """)], Some("aarch64-macos"))
 
-    assert_eq(fpo_count(fpo_body(ir, "wide"), "call double @llvm.fmuladd.f64("), 2)
-    assert_eq(fpo_count(fpo_body(ir, "narrow"), "call float @llvm.fmuladd.f32("), 2)
+    assert_eq(fpo_count(fpo_body(ir, "wide"), "call double @llvm.fma.f64("), 2)
+    assert_eq(fpo_count(fpo_body(ir, "narrow"), "call float @llvm.fma.f32("), 2)
+
+    // A `const` reads the instance's body as the lowering does: the witness `(1 + 2^-30)^2 - (1 +
+    // 2^-29)` is `2^-60` fused and `0` rounded twice.
+    if !host_target().fused_double() then return
+
+    val out = fpo_run([("main.sysl", raw"""
+        import sysl.math.Float
+
+        struct G[F]
+            x: F
+            y: F
+
+        impl[F: Float] Add for G[F]
+            add(self, rhs: G[F]) -> G[F] = G(self.x + rhs.x, self.y + rhs.y)
+
+        impl[F: Float] Mul[F] for G[F]
+            mul(self, k: F) -> G[F] = G(self.x * k, self.y * k)
+
+        const X = 1.0 + 1.0 / 1073741824.0
+        const C = -(1.0 + 1.0 / 536870912.0)
+
+        const fused(x: real, c: real) -> real = (G(c, c) + G(x, x) * x).y
+        const K = fused(X, C)
+
+        var x = X
+
+        print(K * 1152921504606846976.0, fused(x, C) * 1152921504606846976.0)
+        """)], "0")
+
+    assert_eq(out, "1 1\n")
 end fpo_generic_vector_both_widths
 
 private val fpo_geo: string = raw"""
@@ -208,7 +238,7 @@ fpo_operator_from_another_module()
 
     val ir = fpo_ir_of([("main.sysl", fpo_geo_main), ("geo/geo.sysl", fpo_geo)], Some("aarch64-macos"))
 
-    assert_eq(fpo_count(fpo_body(ir, "step"), "call double @llvm.fmuladd.f64("), 2)
+    assert_eq(fpo_count(fpo_body(ir, "step"), "call double @llvm.fma.f64("), 2)
 end fpo_operator_from_another_module
 
 @test("an operator a dependency declares is read as its body too")
@@ -227,7 +257,7 @@ fpo_operator_from_a_package()
     remove_dir_all(app).unwrap_or(())
     remove_dir_all(dep).unwrap_or(())
 
-    assert_eq(fpo_count(fpo_body(ir, "step"), "call double @llvm.fmuladd.f64("), 2)
+    assert_eq(fpo_count(fpo_body(ir, "step"), "call double @llvm.fma.f64("), 2)
 end fpo_operator_from_a_package
 
 // -- what keeps a product apart ---------------------------------------------------------------------
@@ -272,11 +302,11 @@ fpo_blocking_forms_stay_calls()
         val a = V(1.0, 2.0, 3.0)
 
         print(statements(W(1.0), W(2.0), 0.5).x, held(a, a, 0.5).x, named(a, a, 0.5).x)
-        print(dynamic(&Plain(1), a, a, 0.5).x)
+        print(dynamic(Plain(1), a, a, 0.5).x)
         """)
 
     for name in ["statements", "held", "named", "dynamic"]
-        assert(!fpo_body(ir, name).contains("fmuladd"), fpo_body(ir, name))
+        assert(!fpo_body(ir, name).contains("@llvm.fma."), fpo_body(ir, name))
 
     assert(fpo_body(ir, "statements").contains("@W.add("), fpo_body(ir, "statements"))
     assert(fpo_body(ir, "held").contains("@V.add("), fpo_body(ir, "held"))
@@ -297,7 +327,7 @@ fpo_non_fusing_target_unchanged()
     val body = fpo_body(ir, "step")
 
     assert(body.contains("@V.add(") && body.contains("@V.mul("), body)
-    assert(!ir.contains("fmuladd") && !ir.contains("@llvm.fma."), ir)
+    assert(!ir.contains("@llvm.fma."), ir)
 end fpo_non_fusing_target_unchanged
 
 // -- evaluated once ----------------------------------------------------------------------------------
@@ -359,6 +389,61 @@ fpo_witness_agrees()
     for level in ["0", "2"]
         assert_eq(fpo_run([("main.sysl", fpo_vec + fpo_witness)], level), "1 1 1 1\n")
 end fpo_witness_agrees
+
+// A gravity loop the way orbits writes it. Its sums are where an optimizer that may choose per site
+// (`llvm.fmuladd`) splits some fused operations back into two once it vectorizes: that printed
+// `...466 ...095` at `-O2` against `...468 ...092` at `-O0`.
+private val fpo_gravity: string = raw"""
+    pull(p: []V, m: []real, a: []V)
+        for i in 0..<p.len
+            val pi = p[i]
+            var ai = a[i]
+
+            for j in i + 1..<p.len
+                val d = p[j] - pi
+                val r2 = d.x * d.x + d.y * d.y + d.z * d.z
+                val inv = 1.0 / (r2 * r2.sqrt())
+
+                ai = ai + d * (m[j] * inv)
+                a[j] = a[j] - d * (m[i] * inv)
+
+            a[i] = ai
+
+    var p: Buf[V] = buf()
+    var a: Buf[V] = buf()
+    var m: Buf[real] = buf()
+
+    for i in 0..<64
+        val r = real(i)
+
+        p.push(V(r * 0.1 + 0.3, 1.0 / (r + 0.7), r * r * 0.013))
+        a.push(V(0.0, 0.0, 0.0))
+        m.push(1.0 / (r + 1.3))
+
+    pull(p.view(), m.view(), a.view())
+
+    var sx = 0.0
+    var sy = 0.0
+
+    for i in 0..<a.len()
+        sx = sx + a[i].x
+        sy = sy + a[i].y
+
+    print(sx, sy)
+    """
+
+@test("a vectorizable loop of operators prints the same at -O0, -O2 and -O3")
+fpo_every_level_agrees()
+    if !fpo_ready() then return
+
+    if !host_target().fused_double()
+        print("skipped: this machine does not fuse at binary64")
+        return
+    end if
+
+    for level in ["0", "2", "3"]
+        assert_eq(fpo_run([("main.sysl", "import sysl.buf.{Buf, buf}\n" + fpo_vec + fpo_gravity)], level), "-14.688183897708468 13.046083343299092\n")
+end fpo_every_level_agrees
 
 // -- the instructions ------------------------------------------------------------------------------
 
