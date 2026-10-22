@@ -369,7 +369,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "byte_order" then return parse_byte_order_attr(p)
     if word == "export" then return Some(parse_export_attr(p, at))
     if word == "section" then return Some(parse_section_attr(p))
-    if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
+    if word == "crossing" then return Some(parse_crossing_attr(p))
     if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
@@ -514,6 +514,15 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
         p.peek() match
             // `@disjoint` may also name a part of the function's result, by position as a tuple's
             // part is selected and by the name an `ensure` gives the result: `result.0`.
+            // `@crossing(copy value)`: the word in front of a name says the call copies what that
+            // parameter holds. It is a word only there -- a parameter may itself be called `copy`.
+            Ident(n) if word == "crossing" && n == "copy" && names_at(p, 1) ->
+                p.bump()
+                p.peek() match
+                    Ident(m) -> out.push(s"copy $m")
+                    QuotedIdent(m) -> out.push(s"copy $m")
+                    _ -> ()
+                p.bump()
             Ident(n) if word == "disjoint" && n == "result" && p.kw_at(1, ".") ->
                 p.bump()
                 p.bump()
@@ -543,6 +552,30 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     p.expect_kw(")")
     out
 end parse_named_list
+
+// Whether the token `n` ahead is a name.
+private names_at(p: *Parser, n: usize) -> bool = p.peek_at(n) match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+// `@crossing(state)` and `@crossing(copy value)`: every name is a parameter that reaches another
+// domain, and one written after `copy` is also one the call copies.
+private parse_crossing_attr(p: *Parser) -> Attr
+    var names: Buf[string] = buf()
+    var copies: Buf[string] = buf()
+
+    for item in parse_named_list(p, "crossing")
+        if item.starts_with("copy ")
+            val name = item[5..]
+
+            names.push(name)
+            copies.push(name)
+        else
+            names.push(item)
+
+    Crossing(names, copies)
+end parse_crossing_attr
 
 // `@views(self)`: what a member's returned view is borrowed from. **Only the receiver may be named**
 // -- a view borrowed from another parameter would need the caller to know which argument it was,
@@ -924,7 +957,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
                 f.exported = Some(e)
                 f.marks.weak_export = e.weakly
             Section(s) -> f.section = Some(s)
-            Crossing(ns) -> f.crossing = ns
+            Crossing(ns, cs) ->
+                f.crossing = ns
+                f.marks.copies = cs
             Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
             Lends(ns) -> f.marks.lends = ns
@@ -945,7 +980,9 @@ end apply_func_attrs
 apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
     for attr in attrs
         attr match
-            Crossing(ns) -> m.crossing = ns
+            Crossing(ns, cs) ->
+                m.crossing = ns
+                m.marks.copies = cs
             Borrows(ns) -> m.borrows = ns
             Lends(ns) -> m.marks.lends = ns
             Disjoint(ns) -> m.marks.disjoint = ns

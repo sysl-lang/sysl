@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **What a `@crossing(copy value)` parameter is handed: the argument with every view in it copied.**
+//
+// A view owns its elements through a count that is not atomic, so the view the caller holds may not
+// reach another domain. A copy of the elements in storage of its own, made on this side with one
+// count, is a different object that nothing here holds -- so handing it over shares nothing
+// (`reference/memory.md § Crossing a concurrency domain`).
+//
+// **The copy is deep.** A view's elements are copied, and a view among them is copied in turn, so a
+// `[][]u8`, a `[]string` or a struct holding a view comes across with no storage the sender still
+// reaches. What is not a view is copied as a value is: a `&sync T` takes a share, a scalar is itself.
+// A field a struct guards (`@guards`) and a frozen buffer's elements are left shared, as the rule
+// leaves them (`sharing.sysl`).
+//
+// The argument is written into a slot of the frame, a share of everything in it is taken as a copy
+// takes one, and `cross.copy.T` replaces each view in the slot with its copy, giving back the share
+// the slot held of the old one. What is left is a value the statement owns, as a call's result is.
+
+// Whether a value of `t` holds a view the copy replaces.
+holds_view(t: Type) -> bool = t match
+    Str -> true
+    Slice(_, _) -> true
+    Array(_, elem) -> holds_view(*elem)
+    Constrained(d) -> holds_view(d.base)
+    Struct(d) -> d.base != frozen_base() && fields_hold_view(copied_fields(d))
+    Enum(d) -> variants_hold_view(d.variants)
+    _ -> false
+
+private fields_hold_view(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if holds_view(item.1) then return true
+
+    false
+end fields_hold_view
+
+private variants_hold_view(variants: Buf[EnumVariant]) -> bool
+    for item in variants
+        if fields_hold_view(item.fields) then return true
+
+    false
+end variants_hold_view
+
+// A struct's fields less the ones it guards, which the copy leaves shared.
+private copied_fields(d: &StructType) -> Buf[(string, Type)]
+    if d.guarded.is_empty() then return d.fields
+
+    var out: Buf[(string, Type)] = buf()
+
+    for item in d.fields
+        if !holds_string(d.guarded, item.0) then out.push(item)
+
+    out
+end copied_fields
+
+// The copy of `arg` a `copy` parameter is handed, owned by the statement.
+gen_cross_copy(e: *Emit, arg: TExpr, ty: Type) -> Val
+    val v = gen_expr(e, arg)
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+    emit(e, InStore(lty(e, ty), v, slot, AccPlain, None))
+    retain_at(e, ty, slot)
+    fresh_views_call(e, ty, slot)
+
+    val w = fresh_reg(e)
+
+    emit(e, InLoad(w, lty(e, ty), slot, AccPlain, None))
+    own_temp(e, w, ty)
+end gen_cross_copy
+
+// Calls `cross.copy.T` on the `T` at `p`.
+private fresh_views_call(e: *Emit, ty: Type, p: Val)
+    val name = request_helper(e, s"cross.copy.${mangle(ty)}", HrCross(ty))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, p))
+    emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end fresh_views_call
+
+// The body of `cross.copy.T`: every view in the `T` at `p` replaced by a copy of its own.
+fresh_views_at(e: *Emit, ty: Type, p: Val) = underlying(ty) match
+    Str -> fresh_string(e, p)
+    Slice(elem, _) -> fresh_view(e, ty, *elem, p)
+    Array(n, elem) ->
+        if holds_view(*elem)
+            val ep = each_element_begin(e, *elem, p, VInt(from_int(long(n))))
+
+            fresh_views_call(e, *elem, ep.0)
+            each_element_end(e, ep.1, ep.2, ep.3)
+    Struct(d) ->
+        if d.base != frozen_base()
+            fresh_fields(e, d.fields, d.guarded, struct_lty(d), struct_gaps(e.layout, d), p)
+    Enum(d) -> fresh_variants(e, d, p)
+    _ -> ()
+
+// Each field that holds a view, at its address.
+private fresh_fields(e: *Emit, fields: Buf[(string, Type)], guarded: Buf[string], aggregate: LType,
+                     gaps: Option[Gaps], base: Val)
+    for i in 0..<fields.len()
+        val fty = fields.at(i).1
+
+        if holds_string(guarded, fields.at(i).0) || !holds_view(fty) then continue
+
+        val f = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(llvm_index(gaps, field_slot(fields, i)))))))
+        emit(e, InGep(f, aggregate, base, idx))
+        fresh_views_call(e, fty, f)
+end fresh_fields
+
+// The variant the tag names, where it is one holding a view.
+private fresh_variants(e: *Emit, d: &EnumType, p: Val)
+    val tag = fresh_reg(e)
+    val end_l = fresh_label(e, "cross.done")
+
+    emit(e, InLoad(tag, l_i32(), p, AccPlain, None))
+
+    for variant in d.variants
+        if !fields_hold_view(variant.fields) then continue
+
+        val hit_l = fresh_label(e, "cross.variant")
+        val next_l = fresh_label(e, "cross.next")
+        val is = fresh_reg(e)
+
+        emit(e, InIntCmp(is, IEq, l_i32(), tag, VInt(variant.tag)))
+        emit_term(e, InCondBr(is, hit_l, next_l))
+        emit_label(e, hit_l)
+
+        var none: Buf[string] = buf()
+
+        fresh_fields(e, variant.fields, none, variant_lty(d, variant), variant_gaps(e.layout, variant),
+                     payload_ptr(e, d, p))
+        emit_term(e, InBr(end_l))
+        emit_label(e, next_l)
+
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+end fresh_variants
+
+// The string at `p`, copied into one that owns its bytes -- the copy `string(bytes)` makes.
+private fresh_string(e: *Emit, p: Val)
+    e.heap = true
+
+    val st = lty(e, Str)
+    val old = fresh_reg(e)
+
+    emit(e, InLoad(old, st, p, AccPlain, None))
+
+    val data = fresh_reg(e)
+
+    emit(e, InExtract(data, st, old, index_list(1)))
+
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, st, old, index_list(2)))
+
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, data))
+    args.push(ir_arg(word_lty(e), n))
+    emit(e, ir_call(Some(r), st, VGlobal(request_from_bytes(e)), args))
+    release_value(e, Str, old)
+    emit(e, InStore(st, r, p, AccPlain, None))
+end fresh_string
+
+// One view at `p`: a buffer of its length, every element copied into it with a share taken -- and
+// its own views copied in turn -- then the share the slot held of the old one given back and the new
+// view written in its place. A view of a frame's array or of a literal is copied as well, which is
+// what lets it outlive the storage it was taken of.
+private fresh_view(e: *Emit, ty: Type, elem: Type, p: Val)
+    val vt = lty(e, ty)
+    val old = fresh_reg(e)
+
+    emit(e, InLoad(old, vt, p, AccPlain, None))
+
+    val data = fresh_reg(e)
+
+    emit(e, InExtract(data, vt, old, index_list(1)))
+
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, vt, old, index_list(2)))
+
+    val made = gen_buffer(e, elem, n)
+    val ep = each_element_begin(e, elem, made.1, n)
+    val from = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), ep.2))
+    emit(e, InGep(from, lty(e, elem), data, idx))
+
+    val x = fresh_reg(e)
+
+    emit(e, InLoad(x, lty(e, elem), from, AccPlain, None))
+    emit(e, InStore(lty(e, elem), x, ep.0, AccPlain, None))
+    retain_at(e, elem, ep.0)
+
+    if holds_view(elem) then fresh_views_call(e, elem, ep.0)
+
+    each_element_end(e, ep.1, ep.2, ep.3)
+    release_value(e, ty, old)
+    e.maybe_heap = true
+
+    val with_owner = fresh_reg(e)
+
+    emit(e, InInsert(with_owner, vt, VZero, LPtr, made.0, index_list(0)))
+
+    val with_ptr = fresh_reg(e)
+
+    emit(e, InInsert(with_ptr, vt, with_owner, LPtr, made.1, index_list(1)))
+
+    val whole = fresh_reg(e)
+
+    emit(e, InInsert(whole, vt, with_ptr, word_lty(e), n, index_list(2)))
+    emit(e, InStore(vt, whole, p, AccPlain, None))
+end fresh_view

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set}
+import sysl.text.Search
 
 // What an object reached through an atomic reference may contain.
 //
@@ -32,30 +33,37 @@ struct Unshareable
 end Unshareable
 
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
-unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false)
+unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false)
+
+// The same question of a value **handed over as a copy** (`@crossing(copy value)`): every view in it,
+// at any depth, is copied into storage with a count of its own, so a view and a string are not in the
+// way -- what their elements hold still is. A guarded field and a frozen buffer's elements are not
+// copied, so they are asked as they always are.
+copied_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, true)
 
 // The same question of storage **laid down as data**, whose every view and string is a literal's
 // and whose every reference is its type's empty one: no owner, so no count to keep. What can still come to hold one is a view written through -- a
 // `[]T` in a `val` -- since a store into it puts there whatever the program made, so its elements
 // are asked as ordinary values are.
-laid_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, true)
+laid_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, true, false)
 
 private share_walk(t: Type, path: Buf[string], holder: Option[Type],
-                   laid: bool) -> Option[Unshareable] = t match
+                   laid: bool, copied: bool) -> Option[Unshareable] = t match
     Ref(_, sync) -> if sync || laid then None else Some(Unshareable(path, t, holder))
     Ptr(_) -> None
     Weak(_) -> if laid then None else Some(Unshareable(path, t, holder))
     Slice(elem, read_only) ->
-        if !laid then Some(Unshareable(path, t, holder))
+        if copied then share_walk(*elem, path, holder, false, true)
+        else if !laid then Some(Unshareable(path, t, holder))
         else if read_only then None
-        else share_walk(*elem, path, holder, false)
-    Str -> if laid then None else Some(Unshareable(path, t, holder))
+        else share_walk(*elem, path, holder, false, false)
+    Str -> if laid || copied then None else Some(Unshareable(path, t, holder))
 
     // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
     // since naming the element is what the reported type already does.
-    Array(_, elem) -> share_walk(*elem, path, holder, laid)
+    Array(_, elem) -> share_walk(*elem, path, holder, laid, copied)
 
-    Constrained(d) -> share_walk(d.base, path, holder, laid)
+    Constrained(d) -> share_walk(d.base, path, holder, laid, copied)
 
     // **A guarded field is not shared by sharing its struct**: `@guards(value)` promises that the
     // struct's own members are the only way to it, and those hold whatever leaves through them to
@@ -66,11 +74,11 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // the destructor of the one atomically counted box touches it, once. So the walk asks the
     // element type in place of the fields, and nothing about the storage.
     Struct(d) ->
-        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs.at(0), path, Some(t), laid)
-        else share_walk_fields(unguarded(d), path, "", t, laid)
+        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs.at(0), path, Some(t), laid, false)
+        else share_walk_fields(unguarded(d), path, "", t, laid, copied)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
-    Enum(d) -> share_walk_variants(d.variants, path, t, laid)
+    Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied)
 
     // A type parameter promises nothing about its counts, and nothing is decided here: the
     // instantiation resolves this type again with an argument in its place, and that is where the
@@ -101,12 +109,12 @@ check_shared_result(cx: &Analyzer, span: Span, ret: Type)
 end check_shared_result
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
-                          prefix: string, holder: Type, laid: bool) -> Option[Unshareable]
+                          prefix: string, holder: Type, laid: bool, copied: bool) -> Option[Unshareable]
     for item in fields
         // An anonymous member's fields are named as the holder's own, so the step into it is not
         // a step of the path a reader would write.
         if is_anonymous_field(item.0)
-            val inner = share_walk(item.1, path, Some(holder), laid)
+            val inner = share_walk(item.1, path, Some(holder), laid, copied)
 
             if inner.is_some() then return inner
 
@@ -114,7 +122,7 @@ private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
         end if
 
         val named = if prefix == "" then item.0 else s"$prefix(${item.0})"
-        val found = share_walk(item.1, extended_path(path, named), Some(holder), laid)
+        val found = share_walk(item.1, extended_path(path, named), Some(holder), laid, copied)
 
         if found.is_some() then return found
 
@@ -147,7 +155,7 @@ guarded_unshareable(d: &StructType) -> Option[Unshareable]
                 _ -> None
 
             val found = if nested.is_some() then guarded_unshareable(nested.unwrap())
-            else share_walk(item.1, just_field(item.0), None, false)
+            else share_walk(item.1, just_field(item.0), None, false, false)
 
             if found.is_some() then return found
 
@@ -161,9 +169,9 @@ private just_field(name: string) -> Buf[string]
     out
 
 private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
-                            holder: Type, laid: bool) -> Option[Unshareable]
+                            holder: Type, laid: bool, copied: bool) -> Option[Unshareable]
     for item in variants
-        val found = share_walk_fields(item.fields, path, item.name, holder, laid)
+        val found = share_walk_fields(item.fields, path, item.name, holder, laid, copied)
 
         if found.is_some() then return found
 
@@ -307,9 +315,11 @@ end settle_shared_checks
 // something this walk can see. Everything after it is the same sentence a `&sync T` gets, and
 // deliberately so: the question is the same one, and the answer a reader needs is the spelling that
 // would have been sound.
-crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -> Option[string]
-    val part = unshareable(crossed)
+crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -> Option[string] =
+    complaint_about(subject, crossed, unshareable(crossed), a, scope)
 
+private complaint_about(subject: string, crossed: Type, part: Option[Unshareable], a: &Analysis,
+                        scope: Scope) -> Option[string]
     if part.is_none() then return None
 
     val p = part.unwrap()
@@ -319,7 +329,7 @@ crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -
     if sealed.is_some() then return Some(head + sealed_where(p, sealed.unwrap(), crossed, false))
 
     Some(share_remedy(head + s"${share_where(p, crossed)}, ", p.ty))
-end crossing_complaint
+end complaint_about
 
 // Which part is in the way, said three ways: the object itself, something it holds directly, and
 // something a named path inside it reaches.
@@ -356,16 +366,58 @@ private share_view_remedy(what: string) -> string =
 // Reported at the **argument**, that being the thing that could have been written differently. A
 // receiver among the parameters is skipped by construction: `@crossing` names a member's own
 // parameters and `self` is not one of them.
-check_crossings(cx: &Analyzer, crossing: Buf[string], shown: string, params: Buf[(string, Type)],
-                args: Buf[TExpr])
+//
+// **A parameter written `copy` is handed a copy of every view it holds** (`copies`), so a view
+// crosses there: what the rule asks of it is what is left once the views are copied.
+check_crossings(cx: &Analyzer, crossing: Buf[string], copies: Buf[string], shown: string,
+                params: Buf[(string, Type)], args: Buf[TExpr])
     if crossing.is_empty() then return
 
     for i in 0..<params.len()
         if i >= args.len() then break
         if !holds_string(crossing, params.at(i).0) then continue
 
-        check_crossing(cx, args.at(i), params.at(i).0, shown, params.at(i).1)
+        val pname = params.at(i).0
+        val pty = params.at(i).1
+
+        if holds_string(copies, pname) && !is_pointer(pty)
+            if check_copied_crossing(cx, args.at(i), pname, shown, pty) && holds_view(pty)
+                args.set(i, TExpr(args.at(i).span, TCrossCopy(args.at(i), pty,
+                                                              s"'$pname' of ${callee_said(shown)}", true)))
+
+            continue
+        end if
+
+        check_crossing(cx, args.at(i), pname, shown, pty)
 end check_crossings
+
+// The callee as a sentence names it. A free function arrives as its bare name and is quoted here; a
+// member or a generic arrives already said -- `method 'Channel[int].send'` -- and quoting it again
+// would put a quote inside a quote.
+private callee_said(shown: string) -> string = if shown.contains("'") then shown else s"'$shown'"
+
+private is_pointer(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+// A `copy` parameter: what is left once every view is copied has to be shareable, and whether it is.
+//
+// **The copy is made where the body reads the parameter** (`copied_read`), not here: a share the
+// caller held of the copy until its statement ended would be given back after the callee had
+// published it, by a count another domain may be touching by then. What the call gets is a marker
+// (`TCrossCopy` at the call) that makes nothing and is where an allocator-free module is told.
+private check_copied_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, pty: Type) -> bool
+    val subject = s"'$pname' of ${callee_said(shown)}"
+    val why = complaint_about(subject, pty, copied_unshareable(pty), cx.an, cx.scope)
+
+    if why.is_some()
+        cx.fault(arg.span, why.unwrap())
+        return false
+    end if
+
+    note_task_crossing(cx, arg.span, CrossArg(subject), arg)
+    true
+end check_copied_crossing
 
 // **A task in what crosses is noted rather than answered**: what its frame holds is read off the
 // body of the async function that made it, which need not be typed yet (`task_domains.sysl`). The
@@ -373,8 +425,8 @@ end check_crossings
 // about which function made the one it is handed.
 private check_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, pty: Type)
     val subject = pty match
-        Ptr(_) -> s"what '$pname' of '$shown' points at"
-        _ -> s"'$pname' of '$shown'"
+        Ptr(_) -> s"what '$pname' of ${callee_said(shown)} points at"
+        _ -> s"'$pname' of ${callee_said(shown)}"
 
     val why = pty match
         Ptr(inner) -> crossing_complaint(subject, *inner, cx.an, cx.scope)

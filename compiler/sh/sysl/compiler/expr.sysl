@@ -406,6 +406,23 @@ end null_literal
 
 // -- names ---------------------------------------------------------------------------------------
 
+// **A read of a `@crossing(copy …)` parameter is a copy of every view it holds** (`emit_cross.sysl`):
+// the body stores what it reads into storage another domain takes from, and the copy has one count,
+// which the statement it was read in gives back before anything that follows -- so the store holds
+// the only share by the time the value can be seen from the other side. A parameter whose type holds
+// no view is read as itself, and so is one in a generic body until its instantiation says what it is.
+private copied_read(cx: &Analyzer, load: TExpr, name: string) -> TExpr
+    val ty = texpr_type(load)
+
+    if !holds_string(cx.copied, load_name(load)) || !holds_view(ty) then return load
+
+    TExpr(load.span, TCrossCopy(load, ty, s"'$name'", false))
+end copied_read
+
+private load_name(x: TExpr) -> string = *x.kind match
+    TLoad(n, _) -> n
+    _ -> ""
+
 // Whether `name` is, here, a by-name parameter (`x: -> T`) -- one the body reads by calling it.
 reads_by_name(cx: &Analyzer, name: string) -> bool
     val local = cx.lookup(name)
@@ -508,7 +525,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         if holds_string(cx.by_name, local.unwrap().unique) then
             return call_member(cx, span, load, "call", buf(), expected)
 
-        return load
+        return copied_read(cx, load, name)
     end if
 
     // **A field an anonymous member shows is the holder's own** (C11), so a struct's `invariant`
