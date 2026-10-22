@@ -1154,6 +1154,28 @@ is needed; a [`const` function](/reference/declarations/#a-const-function-runs-w
 one that promises it. A call that reaches storage filled at run time, I/O or the heap is module
 storage — `val start: i32 = counter()` below is storage because `counter` reads a `var`.
 
+**A member is called while compiling exactly as a free function is**, whether its type is generic or
+not and whether it is written in the struct's body or in an `impl`. A constructor a type supplies is
+the usual case, and on a freestanding target the storage it fills is laid down like any other:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+struct Uart
+    base: usize
+    baud: u32
+    const new(base: usize, baud: u32) -> Uart = Uart(base, baud)
+
+impl Uart
+    const divisor(self, clock: u32) -> u32 = clock / (16 * self.baud)
+
+var console: Uart = Uart.new(0x4000_c000, 115200)
+val divisor: u32 = Uart.new(0x4000_c000, 115200).divisor(48_000_000)
+
+@export
+baud() -> u32 = console.baud + divisor
+```
+
 **The value laid down is the value the same initializer computes at run time, and where the two
 could differ it is not laid down.** An integer operation whose result its type does not hold, a
 division by zero, a shift by the operand's width or more: each of these leaves the initializer as code, run before the program's

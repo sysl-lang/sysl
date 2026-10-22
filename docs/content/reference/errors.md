@@ -1018,8 +1018,9 @@ out (`f64(p)`, `int(p)`) is the base's own conversion applied to the value it ho
 **A `new` type's own `From` takes precedence.** Where the type implements `From[X]` and the value is
 an `X`, `N(x)` calls that `from`, whatever the base conversion would have produced; a value of any
 other type still takes the base's conversion. Inside that `from` itself, `N(x)` is the base's
-conversion, so the impl may be written in terms of it. A value made through a `from` is a call, not
-a constant:
+conversion, so the impl may be written in terms of it. A value made through a `from` is what that
+call answers, in a `const` as anywhere else — there the `from` is run while compiling, as any
+function a constant calls is:
 
 ```sysl
 type Phase = new real
@@ -1027,13 +1028,14 @@ type Phase = new real
 impl From[int] for Phase
     from(n: int) -> Phase = Phase(n) * 2
 
+const P: Phase = Phase(3)
 val i = 3
 
-print(f64(Phase(i)), f64(Phase(i8(3))), f64(Phase(1.5)))
+print(f64(P), f64(Phase(i)), f64(Phase(i8(3))), f64(Phase(1.5)))
 ```
 
 ```output
-6 3 1.5
+6 6 3 1.5
 ```
 
 The payoff is a specific bug. A table-driven program has several small integers that index different

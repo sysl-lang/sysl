@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A call to a member is run while compiling exactly as a call to a free function is**: `S.new(3)`
+// on a concrete type initializes module storage as constant data, as `G.new(3)` on a generic type and
+// a free `mk(3)` with the same body do -- whether the member is written in the struct's body or in an
+// `impl`, and whether the storage is a `val` or a `var`. So a freestanding image carries it in the
+// object file and nothing runs before `main` to fill it in. A member whose body reads storage filled
+// at run time is still code, and a freestanding archive still refuses it.
+
+private cnf_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end cnf_library_for
+
+private cnf_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end cnf_first_of
+
+// A C archive for `t`, as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to.
+private cnf_archive(t: Target, text: string) -> string
+    var units = cnf_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = cnf_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = cnf_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end cnf_archive
+
+private cnf_thumb() -> Target = target_named("thumb-freestanding-softfp").unwrap()
+
+private cnf_thumb_ir(text: string) -> string = cnf_archive(cnf_thumb(), text)
+
+private cnf_host_ir(text: string) -> string = cnf_archive(host_target(), text)
+
+private cnf_skip() -> bool
+    if cnf_library_for(cnf_thumb()).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end cnf_skip
+
+// Every global is laid down as the constant the object file carries, and nothing runs to fill one.
+private cnf_laid_down(out: string, globals: []const string)
+    for g in globals
+        assert(out.contains(g), out)
+
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end cnf_laid_down
+
+private val cnf_types: string =
+    "struct S\n    n: u32\n    const new(n: u32) -> S = S(n)\n    const twice(self) -> u32 = self.n * 2\n\n" +
+    "struct T\n    n: u32\n\nimpl T\n    const new(n: u32) -> T = T(n)\n" +
+    "    const of(a: u32, b: u32) -> T = T(a + b)\n\n"
+
+private val cnf_main: string = "\n\n@export(\"main\")\nprobe() -> i32 = "
+
+private val cnf_body: string =
+    "private var d: S = S.new(3)\nprivate val e: S = S.new(4)\n" +
+    "private val k: u32 = S.new(5).twice()\nprivate var t: T = T.of(1, 2)\nprivate val u: T = T.new(6)" +
+    cnf_main + "i32(d.n + e.n + k + t.n + u.n)\n"
+
+private val cnf_globals: []const string = ["@d = private global %struct.S { i32 3 }\n",
+                                           "@e = private constant %struct.S { i32 4 }\n",
+                                           "@k = private constant i32 10\n",
+                                           "@t = private global %struct.T { i32 3 }\n",
+                                           "@u = private constant %struct.T { i32 6 }\n"]
+
+@test("a 'const' member of a concrete type, in its body or an 'impl', is constant data on a freestanding target")
+cnf_concrete_members_fold_on_thumb()
+    if cnf_skip() then return
+
+    cnf_laid_down(cnf_thumb_ir(cnf_types + cnf_body), cnf_globals)
+end cnf_concrete_members_fold_on_thumb
+
+@test("and the same storage is constant data on the host")
+cnf_concrete_members_fold_on_the_host()
+    if cnf_skip() then return
+
+    cnf_laid_down(cnf_host_ir(cnf_types + cnf_body), cnf_globals)
+end cnf_concrete_members_fold_on_the_host
+
+@test("a concrete type's 'new', a generic type's and a free function's with one body all fold alike")
+cnf_concrete_generic_and_free_alike()
+    if cnf_skip() then return
+
+    cnf_laid_down(cnf_thumb_ir(cnf_types + "struct G[X]\n    n: X\n    const new(n: X) -> G[X] = G(n)\n\n" +
+                               "const mk(n: u32) -> S = S(n)\n\nprivate var d: S = S.new(3)\n" +
+                               "private var f: G[u32] = G.new(3)\nprivate var h: S = mk(3)" + cnf_main +
+                               "i32(d.n + f.n + h.n)\n"),
+                  ["@d = private global %struct.S { i32 3 }\n", "@f = private global %struct.G.uint { i32 3 }\n",
+                   "@h = private global %struct.S { i32 3 }\n"])
+end cnf_concrete_generic_and_free_alike
+
+private cnf_refusal(name: string) -> string =
+    s"'probe' is exported and reaches '$name', which is module storage an initializer fills " +
+    "before the program's own statements run. This artifact has no entry point to fill it in, and " +
+    "'thumb-freestanding-softfp' is freestanding — there is no loader to run a constructor either, so " +
+    "the function would read whatever the image left. Build for a hosted target, where the storage " +
+    "is filled before any export can run, or make the initializer constant data, which is laid " +
+    "straight into the object file"
+
+@test("a member whose body reads storage filled at run time is still refused on a freestanding target")
+cnf_a_member_over_storage_is_refused()
+    if cnf_skip() then return
+
+    assert_eq(cnf_thumb_ir("var base: u32 = 1\n\nstruct S\n    n: u32\n    make(n: u32) -> S = S(n + base)\n\n" +
+                           "private val d: S = S.make(3)" + cnf_main + "i32(d.n)\n"),
+              cnf_refusal("d") + ". 'd' cannot be computed while compiling: 'base' is filled when the " +
+              "program runs (main.sysl:5:31) — inside 'S.make(3)', called at main.sysl:7:22")
+end cnf_a_member_over_storage_is_refused
+
+@test("and so is one in an 'impl' that a 'var' calls")
+cnf_an_impl_member_over_storage_is_refused()
+    if cnf_skip() then return
+
+    val said = cnf_thumb_ir("var base: u32 = 1\n\nstruct T\n    n: u32\n\nimpl T\n    make(n: u32) -> T = T(n + base)\n\n" +
+                            "private var d: T = T.make(3)" + cnf_main + "i32(d.n)\n")
+
+    assert(said.starts_with(cnf_refusal("d")), said)
+    assert(said.contains("'d' cannot be computed while compiling: 'base' is filled when the program runs"), said)
+end cnf_an_impl_member_over_storage_is_refused
