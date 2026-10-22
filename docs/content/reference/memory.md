@@ -2606,6 +2606,51 @@ var xs = slot_storage(4)
 On storage that `slot_storage` did not make — an array, a frame, a view of a struct's field — the
 two writing forms are an ordinary assignment and nothing at all, since there is no live run to move.
 
+### Moving one value through a raw pointer
+
+Storage whose live slots are not a prefix — a ring's run wraps, so a vacated slot can sit between two
+live ones — cannot use the three forms above, which count a run. Two more move a single value through
+a raw pointer, one slot at a time:
+
+- **`slot_take(p)`** moves the value out of the slot `p` points at. The share the slot held becomes the
+  result's, so **no count is taken or given back**, and the slot is left **empty**. Over an element
+  that holds a count the slot is zeroed, which is the state zeroed storage starts in; over a plain
+  value it is only read.
+- **`slot_put(p, v)`** moves `v` into an **empty** slot. Nothing that was there is given back, so a
+  slot that was not empty keeps its old share for ever.
+
+**This is the raw tier's bargain again, and the caller owes the compiler's missing check**: a taken
+slot must be live, a put slot must be empty, and nothing reads or lets go of a slot while it is empty.
+Rust's `ptr::read` and `ptr::write` are the same pair. A container written with them gives a value up
+at the moment it hands it over — `Ring`'s `pop_front` returns the value with its destructor still to
+run in the caller, rather than leaving a second share behind in the slot for the next push to release.
+
+```sysl
+var x = 5
+val p = &x
+
+print(slot_take(p))
+slot_put(p, 9)
+print(x)
+```
+
+```output
+5
+9
+```
+
+Both refuse what is not a pointer:
+
+```sysl
+val n = 3
+
+print(slot_take(n))
+```
+
+```error
+'slot_take' moves a value through a raw pointer, which is a '*T' — this is int
+```
+
 ## Device memory
 
 `ptr_cast` gets a driver to the register block. It does not get it a *correct* driver, and the missing
