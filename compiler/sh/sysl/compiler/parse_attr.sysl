@@ -97,6 +97,17 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
             break
         end if
 
+        // **`@scoped` is about a member's receiver**: the promise is that what the member runs
+        // finishes before the `@lends` call that lent its `*self` returns, and a free function has no
+        // receiver for that call to have lent. Refused at the argument list, as `@borrows` is.
+        if p.at_kw("@") && attr_name(p) == "scoped"
+            p.bump()
+            p.bump()
+            p.fault(p.here(), scoped_on_free_function())
+            skip_line(p)
+            break
+        end if
+
         parse_attribute(p) match
             Some(a) -> out.push(a)
             None -> break
@@ -164,6 +175,14 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
     out
 end parse_member_attrs
 
+// `@scoped` anywhere but above a method: the promise is about the method's receiver and a callable
+// parameter, so a declaration without the two has nothing for it to be about.
+scoped_on_free_function() -> string =
+    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a '@lends' call to have lent"
+
+scoped_on_field() -> string =
+    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a field and a variant are never called, and have no parameter to run"
+
 private member_attr_refusal() -> string =
     "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
@@ -185,7 +204,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint"]
+                 "relocates", "views", "consumes", "disjoint", "scoped"]
         if word == w then return true
 
     false
@@ -235,7 +254,7 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "borrows", "lends", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks"]
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped"]
         if word == w then return true
 
     false
@@ -373,6 +392,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
+    if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -656,6 +676,8 @@ private named_list_refusal(word: string) -> string
     if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
 
     if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
+
+    if word == "scoped" then return "'@scoped' names the callable parameters a member runs in another concurrency domain and finishes before the '@lends' call that lent its receiver returns, in parentheses — '@scoped(f)'. There is no empty form: a member that waits for nothing it starts says so by not writing the annotation"
 
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
@@ -948,6 +970,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Crossing(ns) -> m.crossing = ns
             Borrows(ns) -> m.borrows = ns
             Lends(ns) -> m.marks.lends = ns
+            Scoped(ns) -> m.marks.scoped = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
@@ -964,6 +987,21 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
             _ -> ()
+
+    // **`@scoped(f)` implies `@crossing(f)`**: what a scoped member runs runs in another domain, so
+    // the crossing rule asks of it what it asks of any parameter marked crossing. A name both list
+    // is crossing once.
+    if !m.marks.scoped.is_empty()
+        var crossing: Buf[string] = buf()
+
+        for name in m.crossing
+            crossing.push(name)
+
+        for name in m.marks.scoped
+            if !holds_string(crossing, name) then crossing.push(name)
+
+        m.crossing = crossing
+    end if
 end apply_member_attrs
 
 // -- routing a declaration to the thing its annotations describe -----------------------------------
