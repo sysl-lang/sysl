@@ -28,6 +28,12 @@ cache's keying, are never checked in, and are inspected with `sysl build --emit 
 - **`sysl build`, `run` and `test` default their path to `.`.** A directory, named or implied, with
   no manifest is refused, and there is no upward search. A single named `x.sysl` still builds, runs
   and tests with no manifest.
+- **Both `sysl init` and `sysl config` (settles Q22).** `init` is the basic one: non-interactive, it
+  writes a minimal `sysl.hocon` named after the directory and a starter `main.sysl` if none exists,
+  and it is what the no-manifest refusal tells you to run. `config` does everything after that, and
+  in a directory with no manifest it offers to create one, then opens the menu. Both create the
+  manifest through the same code: `init` is `config`'s creation step with its defaults and no
+  questions.
 - **An empty manifest is legal.** It marks a project, and the executable is named after the
   directory when there is no `name`. `name` and `version` are required only when a package is
   depended on or released.
