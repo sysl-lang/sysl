@@ -1275,8 +1275,9 @@ print(capacity)
 
 The condition is a [constant expression](/reference/modules/), folded by the machinery
 a `const` initializer already goes through — so it may name constants, `sizeof`, `alignof`,
-`offsetof`, and the arithmetic and comparisons over them, including a constant declared *below* it,
-and call any function whose body can run while compiling
+`offsetof`, the arithmetic and comparisons over them, and an `if` or `match` that chooses between
+them, including a constant declared *below* it, and call any function whose body can run while
+compiling
 ([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)):
 
 ```sysl

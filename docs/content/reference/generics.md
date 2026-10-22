@@ -1366,8 +1366,8 @@ print(buf.data.len, on.v)
 `Buf[2]` and `Buf[4]` are two types with two layouts, and neither is accepted where the other is
 expected.
 
-**An argument may be any constant expression** (a `const`, arithmetic over one, or a call evaluated
-at compile time), in a type and in a call alike
+**An argument may be any constant expression** (a `const`, arithmetic over one, an `if` or `match`
+over one, or a call evaluated at compile time), in a type and in a call alike
 ([declarations.md § Calls where a type is read](/reference/declarations/#calls-where-a-type-is-read)):
 
 ```sysl

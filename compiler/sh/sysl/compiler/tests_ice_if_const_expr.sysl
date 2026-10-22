@@ -1,0 +1,240 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// An `if` or a `match` whose condition or scrutinee is constant is a constant expression wherever one
+// is read: a `const`'s value, an array length, an `@assert`, a value argument of a type, `if const`
+// and `for const` (`reference/modules.md § const — a value`). It is typed and run whole, as it
+// is inside a `const` function's body, so a branch not taken is typed and never computed.
+
+private var ice_library_cache: Buf[Program] = buf()
+private var ice_library_read: bool = false
+
+private ice_library() -> Buf[Program]
+    if ice_library_read then return ice_library_cache
+
+    ice_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ice_library_cache = units
+
+    ice_library_cache
+end ice_library
+
+private ice_ready() -> bool
+    if ice_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ice_ready
+
+// The program built and run: `<status>: <output>`, or `unbuilt: <diagnostics>`.
+private ice_does(text: string) -> string
+    val root = make_temp_dir("sysl-ice").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            out.status match
+                Status.Exited(code) -> s"$code: ${out.text}${out.err.unwrap_or("")}"
+                _ -> s"signalled: ${out.text}"
+end ice_does
+
+private ice_refused(outcome: string, part: string)
+    assert(outcome.starts_with("unbuilt: "), s"expected a refusal, got: $outcome")
+    assert(outcome.index_of(part).is_some(), s"expected '$part' in: $outcome")
+end ice_refused
+
+private ice_head() -> string =
+    "enum Mode\n    Fast\n    Slow\n\nconst N = 2\nconst Z = 0\n"
+
+// ---- a const's value ----
+
+@test("if/match constant: a const's value from an if")
+ice_const_if()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const A = if N > 1 then N else 0\nconst B = if N > 5 then N else 9\n" +
+                       "print(A, B)\n"), "0: 2 9\n")
+
+@test("if/match constant: a const's value from an elif chain")
+ice_const_elif()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const A = if N > 5 then 1 elif N > 1 then 2 else 3\n" +
+                       "const B = if N > 5 then 1 elif N > 3 then 2 else 3\nprint(A, B)\n"), "0: 2 3\n")
+
+@test("if/match constant: a const's value from a match")
+ice_const_match()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const A = N match\n    1 -> 10\n    2 -> 20\n    _ -> 30\n" +
+                       "const B = Mode.Slow match\n    Fast -> 1\n    Slow -> 2\n" +
+                       "const C = N match\n    n if n > 1 -> n * 3\n    _ -> 0\n" +
+                       "const D = 7 match\n    1 -> 10\n    _ -> 30\nprint(A, B, C, D)\n"), "0: 20 2 6 30\n")
+
+// The branch not taken is never computed, so one that would trap does not.
+@test("if/match constant: a dead branch that would trap is not run")
+ice_dead_branch()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const A = if Z == 0 then 0 else 10 / Z\n" +
+                       "const B = Z match\n    0 -> 1\n    _ -> 10 / Z\nprint(A, B)\n"), "0: 0 1\n")
+
+// The taken branch is run, and a trap in it is refused at the constant.
+@test("if/match constant: a taken branch that traps is refused")
+ice_taken_branch_traps()
+    if !ice_ready() then return
+
+    ice_refused(ice_does(ice_head() + "const A = if Z == 0 then 10 / Z else 0\nprint(A)\n"),
+                "'A' traps while it is being compiled: integer division by zero")
+
+@test("if/match constant: nested inside arithmetic")
+ice_in_arithmetic()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const A = 1 + (if N > 1 then 4 else 5) * 2\n" +
+                       "const B = (N match\n    2 -> 3\n    _ -> 0) << 2\nprint(A, B)\n"), "0: 9 12\n")
+
+// A float constant is run at its own width, the branch it takes as well.
+@test("if/match constant: a float constant")
+ice_float()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const G: f32 = if N > 1 then 1.5 else 2.5\nprint(G)\n"), "0: 1.5\n")
+
+@test("if/match constant: a local const")
+ice_local_const()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "main()\n    const k = if N > 1 then 7 else 8\n    print(k)\n"), "0: 7\n")
+
+// ---- an array length ----
+
+@test("if/match constant: an array length in a field, an alias and a local")
+ice_array_length()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "struct S\n    xs: [if N > 1 then N else 0]u8\n" +
+                       "    ys: [N match\n        2 -> 3\n        _ -> 1]u8\n" +
+                       "    zs: [if N > 5 then 1 elif N > 1 then 5 else 9]u8\n" +
+                       "type Pair = [if N == 2 then 2 else 1]int\nval p: Pair = [1, 2]\n" +
+                       "var ws: [if Z == 0 then 4 else 10 / Z]int\nprint(sizeof(S), p.len, ws.len)\n"),
+              "0: 10 2 4\n")
+
+// A type may name a value parameter but not compute with one, and a choice over one computes.
+@test("if/match constant: a length choosing over a value parameter is refused")
+ice_value_param_length()
+    if !ice_ready() then return
+
+    val outcome = ice_does("struct R[const M: usize]\n    xs: [if M > 2 then M else 2]u8\nprint(1)\n")
+
+    ice_refused(outcome, "this length does arithmetic on 'M'")
+    assert(outcome.index_of("must be a constant").is_none(), s"a second complaint: $outcome")
+    ice_refused(ice_does("struct R[const M: usize]\n    xs: [M match\n        1 -> 2\n        _ -> 3]u8\n" +
+                         "print(1)\n"), "this length does arithmetic on 'M'")
+
+// ---- @assert ----
+
+@test("if/match constant: @assert")
+ice_assert()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "@assert((if N > 1 then N else 0) == 2, \"a\")\n" +
+                       "@assert(if N > 5 then false elif N > 1 then true else false)\n" +
+                       "@assert((N match\n    2 -> true\n    _ -> false), \"m\")\nprint(1)\n"), "0: 1\n")
+
+@test("if/match constant: an @assert it falsifies")
+ice_assert_falsified()
+    if !ice_ready() then return
+
+    ice_refused(ice_does(ice_head() + "@assert((if Z == 0 then 1 else 2) == 2, \"chose\")\nprint(1)\n"),
+                "assertion failed: chose — the left side is 1")
+    ice_refused(ice_does(ice_head() + "@assert((N match\n    2 -> false\n    _ -> true), \"m\")\nprint(1)\n"),
+                "assertion failed: m")
+
+// ---- a value argument, `if const`, `for const` ----
+
+@test("if/match constant: a value argument of a type")
+ice_value_argument()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "struct Ring[const K: usize]\n    items: [K]int\n" +
+                       "val r = Ring[if N > 1 then 3 else 1]([1, 2, 3])\n" +
+                       "val q: Ring[N match\n    2 -> 1\n    _ -> 4] = Ring([9])\nprint(r.items.len, q.items.len)\n"),
+              "0: 3 1\n")
+
+@test("if/match constant: if const and for const")
+ice_if_const_for_const()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "show[const M: int]() -> int\n    if const (if M > 1 then true else false)\n" +
+                       "        return 1\n    0\n\nmain()\n    print(show[2](), show[1]())\n" +
+                       "    for const i in 0..<(if N > 1 then 3 else 1)\n        print(i)\n"), "0: 1 0\n0\n1\n2\n")
+
+// ---- what is still refused ----
+
+// A condition read out of storage filled at run time is refused as the same read in a `const`
+// function's body is.
+@test("if/match constant: a condition that is not constant is refused")
+ice_not_constant()
+    if !ice_ready() then return
+
+    val head = "var seed: int = 3\n"
+
+    ice_refused(ice_does(head + "const A = if seed > 1 then 1 else 0\nmain()\n    print(A)\n"),
+                "'A' cannot be computed while compiling: 'seed' is filled when the program runs")
+    ice_refused(ice_does(head + "const A = seed match\n    3 -> 1\n    _ -> 0\nmain()\n    print(A)\n"),
+                "'A' cannot be computed while compiling: 'seed' is filled when the program runs")
+    ice_refused(ice_does(head + "struct S\n    xs: [if seed > 1 then 2 else 1]u8\nmain()\n    print(sizeof(S))\n"),
+                "'seed' is filled when the program runs")
+    ice_refused(ice_does(head + "@assert((if seed > 1 then 1 else 0) == 1)\nmain()\n    print(1)\n"),
+                "'seed' is filled when the program runs")
+
+// An `if` with no `else` has no value to be.
+@test("if/match constant: an if without an else is refused")
+ice_no_else()
+    if !ice_ready() then return
+
+    ice_refused(ice_does(ice_head() + "const K = if N > 1 then 3\nprint(K)\n"),
+                "a constant is a scalar, and unit is not — 'K'")
+
+// A mistake in the condition is said once, as itself, and the run is not attempted over it.
+@test("if/match constant: an undefined name in the condition is said once")
+ice_undefined_name()
+    if !ice_ready() then return
+
+    val outcome = ice_does("const R = if nothing > 1 then 1 else 0\nprint(R)\n")
+
+    ice_refused(outcome, "undefined name 'nothing'")
+    assert(outcome.index_of("cannot be computed").is_none(), s"a second complaint: $outcome")
