@@ -4,18 +4,10 @@ module sh.sysl.compiler
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
 
-// **A struct holding a struct with C bitfields by value crosses a C boundary only by address**, as
-// the bitfield struct itself does (`c_bitfields.sysl`'s `c_bits_at`; `attributes.md § C bitfields`).
-// A holder at any depth -- a field, an array's element, a union's member, an anonymous member -- is
-// refused by value as an `extern` argument or result and as an `@export` parameter or result, and the
-// refusal names the struct with the bitfields and where it lies.
-//
-// The refusal stands on clang's own answer. Lowered as an ordinary aggregate, a holder disagrees with
-// `clang -S -emit-llvm` for the same C: on x86-64 System V a holder of `{ unsigned a : 3; }` travels
-// as an `i8` where C passes an `i32`; on wasm32 the same holder goes by address where C passes an
-// `i32`; on riscv64 `lp64d` a holder of `{ unsigned a : 3; float f; }` is `{ i8, float }` where C's
-// is `{ i32, float }`, and a holder of two bitfields is an `i32` where C's is a whole `i64`. C names
-// a bitfield by its declared type, and an ordinary aggregate's leaves are its fields' own types.
+// **A struct holding a struct with C bitfields, by address**: a holder at any depth -- a field, an
+// array's element, a union's member, an anonymous member -- handed to C and back as a pointer, C
+// reading and writing the bitfields sysl built and sysl reading what C wrote. The same holders cross
+// by value in `tests_bbv_bitfield_by_value.sysl`.
 
 private cbh_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -45,78 +37,8 @@ private cbh_run(text: string, c: string) -> (Status, string, string)
         Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
 end cbh_run
 
-private cbh_refused(text: string, message: string, line: int, col: int)
-    if !cbh_ready() then return
-
-    val (_, _, err) = cbh_run(text, "")
-    val head = s"error: $message\n"
-    val at = s"/main.sysl:$line:$col\n"
-
-    assert(err.contains(head), s"expected\n$head\nin\n$err")
-    assert(err.contains(at), s"expected\n$at\nin\n$err")
-    assert_eq(err.count_of("error: "), 1)
-end cbh_refused
-
-// Lines 1 to 3: a struct with two C bitfields in one unit.
-private val cbh_bits: string = "struct B\n    a: u3 in u32\n    b: u5 in u32\n\n"
-
-private cbh_tail(what: string, shown: string) -> string =
-    s"$what is not built in this release — pass its address, as a '*$shown'"
-
-@test("a struct holding a bitfield struct is refused by value as an 'extern' argument, one level down and two")
-cbh_held_by_a_field()
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\nextern take(h: H1)\n\nmain()\n    var h: H1\n    take(h)\n",
-                "'H1' holds 'B', which has C bitfields, at 'H1.b', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "H1"), 8, 1)
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\nstruct H2\n    n: u8\n    h: H1\n\n" +
-                "extern take(h: H2)\n\nmain()\n    var h: H2\n    take(h)\n",
-                "'H2' holds 'B', which has C bitfields, at 'H2.h.b', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "H2"), 12, 1)
-
-@test("an array of them, an array of their holders and a union over one are refused too")
-cbh_held_by_an_array_or_union()
-    cbh_refused(cbh_bits + "struct HA\n    cells: [2]B\n\nextern take(h: HA)\n\nmain()\n    var h: HA\n    take(h)\n",
-                "'HA' holds 'B', which has C bitfields, at 'HA.cells[0]', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "HA"), 8, 1)
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\nstruct HA\n    rows: [3]H1\n\n" +
-                "extern take(h: HA)\n\nmain()\n    var h: HA\n    take(h)\n",
-                "'HA' holds 'B', which has C bitfields, at 'HA.rows[0].b', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "HA"), 11, 1)
-    cbh_refused(cbh_bits + "union HU\n    b: B\n    u: u32\n\nextern take(h: HU)\n\n" +
-                "main()\n    var h = HU(u = 0)\n    take(h)\n",
-                "'HU' holds 'B', which has C bitfields, at 'HU.b', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "HU"), 9, 1)
-
-// An anonymous member's fields are its enclosing type's, so bitfields declared in one are the outer
-// struct's own, as in C; a bitfield struct held in one is reached by its field's own name.
-@test("an anonymous member's bitfields are the struct's own, and a bitfield struct in one is named by its field")
-cbh_held_by_an_anonymous_member()
-    cbh_refused("struct HN\n    x: u8\n    struct\n        a: u3 in u32\n\nextern take(h: HN)\n\n" +
-                "main()\n    var h: HN\n    take(h)\n",
-                "'HN' has C bitfields, and " + cbh_tail("passing it by value to the 'extern' 'take'", "HN"),
-                6, 1)
-    cbh_refused(cbh_bits + "struct HM\n    union\n        b: B\n        u: u32\n\nextern take(h: HM)\n\n" +
-                "main()\n    var h: HM\n    take(h)\n",
-                "'HM' holds 'B', which has C bitfields, at 'HM.b', and " +
-                cbh_tail("passing it by value to the 'extern' 'take'", "HM"), 10, 1)
-
-@test("a holder is refused as an 'extern' result and as an '@export' parameter or result")
-cbh_held_in_every_direction()
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\nextern give() -> H1\n\nmain()\n    val h = give()\n" +
-                "    print(sizeof(H1))\n",
-                "'H1' holds 'B', which has C bitfields, at 'H1.b', and " +
-                cbh_tail("returning it by value from the 'extern' 'give'", "H1"), 8, 1)
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\n@export(\"take\")\ntake(h: H1) -> u32 = u32(h.b.a)\n\n" +
-                "main()\n    print(sizeof(H1))\n",
-                "'H1' holds 'B', which has C bitfields, at 'H1.b', and " +
-                cbh_tail("passing it by value to the exported 'take'", "H1"), 8, 1)
-    cbh_refused(cbh_bits + "struct H1\n    b: B\n\n@export(\"give\")\ngive() -> H1\n    var h: H1\n    h\n\n" +
-                "main()\n    print(sizeof(H1))\n",
-                "'H1' holds 'B', which has C bitfields, at 'H1.b', and " +
-                cbh_tail("returning it by value from the exported 'give'", "H1"), 8, 1)
-
-// What the refusal advises: each holder by address, C reading and writing the bitfields sysl built
-// and sysl reading what C wrote, in both directions across an `extern` and an `@export`.
+// Each holder by address, C reading and writing the bitfields sysl built and sysl reading what C
+// wrote, in both directions across an `extern` and an `@export`.
 private val cbh_by_address_sysl: string =
     "struct B\n    a: u3 in u32\n    b: u5 in u32\n\n" +
     "struct H1\n    b: B\n\nstruct H2\n    n: u8\n    h: H1\n\nstruct HA\n    cells: [2]B\n\n" +
