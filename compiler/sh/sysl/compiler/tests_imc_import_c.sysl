@@ -630,6 +630,58 @@ imc_no_prefix()
     assert(out.text.contains("    FX_MODE_ON: FxMode = \"FX_MODE_ON\"\n"), out.text)
 end imc_no_prefix
 
+// A record holding a record with C bitfields by value -- in a field, through a typedef, as an array's
+// element, as a union's member, or as a named member of an unnamed type -- crosses only by address,
+// as the language has it; an anonymous member's bitfields are its record's own. A record holding
+// none, and any of them by address, are generated.
+private val imc_holders: string = raw"""
+    struct fh_bits { unsigned a : 3; unsigned b : 5; };
+    struct fh_wrap { struct fh_bits b; int n; };
+    typedef struct fh_wrap fh_wrap_t;
+    struct fh_deep { fh_wrap_t w; };
+    struct fh_row { struct fh_bits cells[2]; };
+    union fh_either { struct fh_bits b; unsigned u; };
+    struct fh_anon { int x; struct { unsigned a : 3; }; };
+    struct fh_named { struct { unsigned a : 3; } inner; };
+    struct fh_plain { int x; };
+    int fh_wrap_n(struct fh_wrap w);
+    struct fh_deep fh_deep_make(void);
+    int fh_row_sum(struct fh_row r);
+    unsigned fh_either_u(union fh_either e);
+    int fh_anon_x(struct fh_anon a);
+    int fh_named_a(struct fh_named n);
+    int fh_plain_x(struct fh_plain p);
+    int fh_wrap_at(struct fh_wrap *w);
+    """
+
+@test("a record holding C bitfields by value at any depth crosses only by address, as the language has it")
+imc_bitfield_holders()
+    if !imc_ready() then return
+
+    val dir = make_temp_dir("sysl-imc").unwrap()
+
+    write_text(s"$dir/fh.h", imc_holders).unwrap()
+
+    val out = import_c_generate(s"$dir/fh.h", IcOptions("fh_", "", "", "", None, buf(), "")).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(join(out.refused.view(), "\n"),
+              "fh_wrap_n: 'struct fh_wrap' holds 'struct fh_bits', which has C bitfields, and so crosses a " +
+              "C boundary only by address -- as a '*Wrap'\n" +
+              "fh_deep_make: 'struct fh_deep' holds 'struct fh_bits', which has C bitfields, and so " +
+              "crosses a C boundary only by address -- as a '*Deep'\n" +
+              "fh_row_sum: 'struct fh_row' holds 'struct fh_bits', which has C bitfields, and so crosses " +
+              "a C boundary only by address -- as a '*Row'\n" +
+              "fh_either_u: 'union fh_either' holds 'struct fh_bits', which has C bitfields, and so " +
+              "crosses a C boundary only by address -- as a '*Either'\n" +
+              "fh_anon_x: 'struct fh_anon' has C bitfields, which cross a C boundary only by address -- " +
+              "as a '*Anon'\n" +
+              "fh_named_a: 'struct fh_named' holds an unnamed struct, which has C bitfields, and so " +
+              "crosses a C boundary only by address -- as a '*Named'")
+    assert(out.text.contains("extern \"fh_plain_x\" plain_x(p: Plain) -> i32\n"), out.text)
+    assert(out.text.contains("extern \"fh_wrap_at\" wrap_at(w: *Wrap) -> i32\n"), out.text)
+end imc_bitfield_holders
+
 @test("no header is the usage, and a header that is not there is said so")
 imc_command_misused()
     val (code, out, err) = clx_ran(["sysl", "import-c"])

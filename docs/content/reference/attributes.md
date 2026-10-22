@@ -3280,10 +3280,11 @@ print(p[0])
 **What carries a count stays out**: a struct with C bitfields is laid out as C lays its counterpart
 out, so a string, a slice or a reference among its fields is refused.
 
-**Not built in this release**: passing one by value to an `extern` or returning one from an
-`@export` — how C passes one differs from an ordinary struct on WebAssembly and on RISC-V's `lp64d`,
-so it crosses as a pointer — and its declaration in a generated header, which writes it as an
-incomplete type C reaches through a pointer:
+**Not built in this release**: crossing a C boundary by value — as an `extern`'s argument or
+result, or an `@export`'s parameter or result — and its declaration in a generated header, which
+writes it as an incomplete type C reaches through a pointer. C passes a bitfield as its declared
+type, which is not how an ordinary struct of the same fields travels on x86-64, WebAssembly or
+RISC-V's `lp64d`, so it crosses as a pointer:
 
 ```sysl
 struct Status
@@ -3297,6 +3298,30 @@ apply(Status(true, 5))
 
 ```error
 'Status' has C bitfields, and passing it by value to the 'extern' 'apply' is not built in this release — pass its address, as a '*Status'
+```
+
+**The same holds for anything holding one by value**, at any depth: a struct whose field is one, an
+array of them, a union over one, a struct holding any of those, and a struct with an anonymous
+member that declares bitfields — which are the struct's own, as in C — or holds such a struct. The
+refusal names the struct with the bitfields and where it lies. Every one of them crosses by address,
+and a pointer to one is an ordinary pointer:
+
+```sysl
+struct Status
+    ready: bool in u32
+    mode: u3 in u32
+
+struct Device
+    id: u16
+    states: [2]Status
+
+extern report(d: Device)
+
+report(Device(1, [Status(true, 5), Status(false, 2)]))
+```
+
+```error
+'Device' holds 'Status', which has C bitfields, at 'Device.states[0]', and passing it by value to the 'extern' 'report' is not built in this release — pass its address, as a '*Device'
 ```
 
 ### `@align(n)` — where the aggregate begins

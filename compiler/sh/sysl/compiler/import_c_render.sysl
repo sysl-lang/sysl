@@ -267,6 +267,60 @@ private ic_has_bits(m: *IcModel, r: IcRecord) -> bool
 
     false
 
+// **Where the C bitfields are that keep a record from crossing a C boundary by value**: `""` for its
+// own (`ic_has_bits`), or the C spelling of a record it holds by value with bitfields, in a field or
+// an array's element at any depth. Nothing where it holds none. The language refuses both by value
+// (`attributes.md § C bitfields`).
+private ic_bits_in(m: *IcModel, r: IcRecord, depth: int) -> Option[string]
+    if ic_has_bits(m, r) then return Some("")
+    if depth > 32 then return None
+
+    for f in r.fields
+        ic_field_record(m, f) match
+            Some(k) ->
+                val held = m.records.at(k)
+
+                ic_bits_in(m, held, depth + 1) match
+                    Some(inner) ->
+                        if inner != "" then return Some(inner)
+                        if f.name != "" then return Some(ic_record_shown(held))
+                    None -> ()
+            None -> ()
+
+    None
+end ic_bits_in
+
+// The record a field holds by value -- its own type, or its array's element -- where it is one.
+private ic_field_record(m: *IcModel, f: IcField) -> Option[usize]
+    if f.inner != "" then return ic_find_record(m, "", f.inner)
+
+    ic_held_record(m, ic_parse(f.qual), 0)
+
+private ic_held_record(m: *IcModel, t: IcType, depth: int) -> Option[usize]
+    if depth > 32 then return None
+
+    t.kind match
+        IcArr -> ic_held_record(m, t.parts.at(0), depth + 1)
+        IcNamed ->
+            val (kind, tag) = ic_tagged(t.name)
+
+            if kind == "struct" || kind == "union" then return ic_find_record(m, tag, "")
+
+            ic_find_typedef(m, t.name) match
+                Some(k) -> ic_held_record(m, ic_parse(m.typedefs.at(k).qual), depth + 1)
+                None -> None
+        _ -> None
+end ic_held_record
+
+// A record as a refusal quotes it.
+private ic_record_shown(r: IcRecord) -> string
+    val kind = if r.is_union then "union" else "struct"
+
+    if r.tag != "" then return s"'$kind ${r.tag}'"
+    if r.named != "" then return s"'${r.named}'"
+
+    s"an unnamed $kind"
+
 // A record of a followed header that something generated here uses: named the first time, and
 // written out once everything that could reach it has been (`ic_render`). Before that -- while the
 // layouts are being settled -- only whether it can be used matters.
@@ -303,14 +357,20 @@ private ic_record_ref(shown: string, tag: string, alias: string, pos: int, m: *I
             if r.main && r.sysl != ""
                 if pos == IcAtPointee then return Ok(r.sysl)
                 if !usable then return Err(s"'$shown' by value, whose layout is not generated here")
-                if crossing && ic_has_bits(m, r) then return Err(ic_bits_by_value(shown, r.sysl))
+                if crossing
+                    ic_bits_in(m, r, 0) match
+                        Some(inner) -> return Err(ic_bits_by_value(shown, r.sysl, inner))
+                        None -> ()
 
                 return Ok(r.sysl)
             end if
 
             if r.followed && (r.named != "" || alias != "" || r.tag != "")
                 if pos != IcAtPointee && !usable then return Err(s"'$shown' by value, whose layout is not generated here")
-                if crossing && ic_has_bits(m, r) then return Err(ic_bits_by_value(shown, "the record"))
+                if crossing
+                    ic_bits_in(m, r, 0) match
+                        Some(inner) -> return Err(ic_bits_by_value(shown, "the record", inner))
+                        None -> ()
 
                 return Ok(ic_reach(m, k, alias))
             end if
@@ -330,10 +390,13 @@ private ic_record_ref(shown: string, tag: string, alias: string, pos: int, m: *I
     Err(s"'$shown' by value, and it is declared by another header")
 end ic_record_ref
 
-// Why a record with C bitfields cannot be generated crossing a C boundary by value: the language
-// passes one only by address (`attributes.md § C bitfields`).
-private ic_bits_by_value(shown: string, name: string) -> string =
-    s"'$shown' has C bitfields, which cross a C boundary only by address -- as a '*$name'"
+// Why a record with C bitfields, or one holding such a record by value, cannot be generated crossing
+// a C boundary by value: the language passes either only by address (`attributes.md § C bitfields`).
+// `inner` is the held record's spelling, empty where the bitfields are the record's own.
+private ic_bits_by_value(shown: string, name: string, inner: string) -> string
+    if inner == "" then return s"'$shown' has C bitfields, which cross a C boundary only by address -- as a '*$name'"
+
+    s"'$shown' holds $inner, which has C bitfields, and so crosses a C boundary only by address -- as a '*$name'"
 
 private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[string, string]
     if spec == "void"
