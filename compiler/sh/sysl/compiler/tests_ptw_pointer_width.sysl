@@ -6,18 +6,24 @@ import sysl.buf.{Buf, buf}
 import sysl.text.{Search, join}
 import sysl.fs.{remove_dir_all}
 
-// The address-width symbols a condition may ask: `ptr32` and `ptr64`.
+// The address-width symbols a condition may ask: `ptr16`, `ptr32` and `ptr64`.
 //
 // They let a type be chosen by its relation to the machine's word -- a Forth double cell is twice an
-// `isize` -- without naming every processor. Every row of the registry answers the one its
-// `pointer_bits` says, and a machine whose addresses are neither width answers neither.
+// `isize` -- without naming every processor. Every row of the registry answers exactly the one its
+// `pointer_bits` says.
 
+// The address-width symbols a target defines, in vocabulary order, or `-` where it defines none.
 private ptw_said(t: Target) -> string
     val on = defined(t)
-    val p32 = has(on, "ptr32")
-    val p64 = has(on, "ptr64")
+    var out = ""
 
-    if p32 && p64 then "both" else if p32 then "ptr32" else if p64 then "ptr64" else "-"
+    for item in ["ptr16", "ptr32", "ptr64"]
+        if has(on, item)
+            if out != "" then out = out + " "
+
+            out = out + item
+
+    if out == "" then "-" else out
 end ptw_said
 
 @test("ptw: every target answers the address width the table says")
@@ -44,7 +50,7 @@ ptw_every_target_answers()
         "riscv32-freestanding=ptr32",
         "wasm32-freestanding=ptr32",
         "wasm32-wasi=ptr32",
-        "craft-freestanding=-",
+        "craft-freestanding=ptr16",
         "x86-linux=ptr32"]
     val all = all_targets()
 
@@ -60,33 +66,39 @@ ptw_every_target_answers()
         assert(row != "", s"${t.name} is not in the table")
         assert_eq(s"${t.name}=${ptw_said(t)}", row)
 
-@test("ptw: the symbol a target answers is its pointer width, and never both")
+@test("ptw: the symbol a target answers is its pointer width, and exactly one")
 ptw_follows_pointer_bits()
     val all = all_targets()
 
     for t in all
         val on = defined(t)
+        var count = 0
 
+        for item in ["ptr16", "ptr32", "ptr64"]
+            if has(on, item) then count += 1
+
+        assert_eq(count, 1)
+        assert_eq(has(on, "ptr16"), t.pointer_bits() == 16)
         assert_eq(has(on, "ptr32"), t.pointer_bits() == 32)
         assert_eq(has(on, "ptr64"), t.pointer_bits() == 64)
 
-@test("ptw: the two are in the closed vocabulary, and not in a directory's")
+@test("ptw: the three are in the closed vocabulary, and not in a directory's")
 ptw_in_the_vocabulary()
     val every = symbols()
     val folders = directory_symbols()
 
-    for item in ["ptr32", "ptr64"]
+    for item in ["ptr16", "ptr32", "ptr64"]
         assert(has(every, item), item)
         assert(!has(folders, item), s"a walk has no target to ask about '$item'")
 
-@test("ptw: an unknown symbol's refusal names both")
-ptw_the_refusal_names_both()
-    val said = gate(source_of("<input>", "#if ptr16\n#endif\n"), host_target()) match
+@test("ptw: an unknown symbol's refusal names all three")
+ptw_the_refusal_names_all_three()
+    val said = gate(source_of("<input>", "#if ptr128\n#endif\n"), host_target()) match
         Err(d) -> d.message
         Ok(_) -> "accepted"
 
-    assert(said.contains("'ptr16' is not something a target says about itself — sysl knows "), said)
-    assert(said.contains(", posix, ptr32, ptr64, riscv32, "), said)
+    assert(said.contains("'ptr128' is not something a target says about itself — sysl knows "), said)
+    assert(said.contains(", posix, ptr16, ptr32, ptr64, riscv32, "), said)
 
 // -- built: which type the `#if` chose --------------------------------------------------------------
 
