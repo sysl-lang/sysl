@@ -1,0 +1,73 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`return f()` from a unit function, where `f` gives back unit, is the call and then the bare
+// `return`** (`stmt.sysl`'s `return_stmt`), as `g() = f()` already was. A unit expression is no
+// value to hand back, so nothing is returned that the function has no type for; a value of any other
+// type still is, and is refused with the words it always had.
+
+private ruc_prints(text: string) -> string
+    if std_root().is_err() || !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-ruc").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ruc_prints
+
+private ruc_expect(text: string, printed: string)
+    val got = ruc_prints(text)
+
+    if got == "skipped"
+        print("skipped: the standard module's source or clang is not on this machine")
+    else
+        assert_eq(got, printed)
+
+private val ruc_say = "say(n: int)\n    print(n)\n\n"
+
+@test("'return f()' from a unit function runs the call and leaves, in a branch and at the end")
+ruc_return_a_unit_call()
+    ruc_expect(ruc_say + "relay(n: int)\n    if n > 0 then return say(n)\n\n    print(\"none\")\n\n" +
+               "relay(1)\nrelay(0)\n", "1\nnone\n")
+    ruc_expect(ruc_say + "last(n: int)\n    print(\"first\")\n    return say(n)\n\nlast(7)\n", "first\n7\n")
+
+@test("'return f()' from a match arm, and a unit method's call returned")
+ruc_return_from_match_arm()
+    ruc_expect(ruc_say + "pick(n: int)\n    n match\n        0 -> return say(10)\n" +
+               "        _ -> return say(n)\n\n    print(\"unreached\")\n\npick(0)\npick(3)\n", "10\n3\n")
+
+@test("the call runs before what is deferred, as the order it is written in says")
+ruc_call_before_defer()
+    ruc_expect(ruc_say + "both()\n    defer print(\"deferred\")\n\n    return say(2)\n\nboth()\n",
+               "2\ndeferred\n")
+
+@test("'return ()' from a unit function is the bare 'return'")
+ruc_return_unit_literal()
+    ruc_expect("f(n: int)\n    if n > 0 then return ()\n\n    print(\"zero\")\n\nf(1)\nf(0)\n", "zero\n")
+
+@test("'return' of a call that never comes back is accepted from a unit function")
+ruc_return_never()
+    ruc_expect("quit(n: int)\n    if n > 5 then return exit(0)\n\n    print(\"stay\")\n\nquit(1)\nquit(9)\n" +
+               "print(\"unreached\")\n", "stay\n")
+
+@test("a value from a unit function is still refused, and a unit call is not")
+ruc_value_still_refused()
+    assert_eq(stmt_diagnostics("f()\n    return 3\n").at(0),
+              "cannot return a value from a function with no return type")
+    assert_eq(stmt_diagnostics("g() -> int = 1\n\nf()\n    return g()\n").at(0),
+              "cannot return a value from a function with no return type")
+    assert_eq(stmt_diagnostics("g()\n    ()\n\nf()\n    return g()\n").len(), 0)
