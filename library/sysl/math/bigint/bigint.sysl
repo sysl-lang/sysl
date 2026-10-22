@@ -2,7 +2,7 @@ module sysl.math.bigint
 
 import sysl.buf.{Buf, buf}
 
-/** Integers with no width: sign and magnitude, the magnitude a run of 32-bit limbs.
+/** Integers with no width: sign and magnitude, the magnitude a run of machine-word limbs.
  *
  * **A general-purpose language without arbitrary precision makes a whole class of program wrong in
  * the same way** -- a hash reduced modulo something, a factorial, a cryptographic exponent, an
@@ -12,15 +12,20 @@ import sysl.buf.{Buf, buf}
  *
  * ## The representation
  *
- * A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of `u32` limbs written
- * **least significant first** with no leading zeros. Zero is the empty magnitude and a clear sign,
- * so there is exactly one representation of it and nothing has to remember whether it is negative.
+ * A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of limbs written **least
+ * significant first** with no leading zeros. Zero is the empty magnitude and a clear sign, so there
+ * is exactly one representation of it and nothing has to remember whether it is negative.
  *
- * **Limbs are 32 bits and the arithmetic is done in 64.** That is what makes every carry, borrow and
- * partial product exact without asking the language for a wider type or a carry flag: a product of
- * two limbs is at most `(2^32 - 1)^2`, which fits a `u64` with room for two more limbs of carry.
- * Sixty-four-bit limbs would halve the work and would need a 128-bit product, which is a different
- * conversation.
+ * **A limb is a machine word, and the arithmetic is done in a type twice as wide.** On a 64-bit
+ * target a limb is a `u64` and every carry, borrow and partial product is a `u128`; on a 32-bit or
+ * 16-bit target (`#if ptr32`, `#if ptr16`) a limb is a `u32` and the double is a `u64`. sysl has
+ * `uN` at any width, so the double-width type is an ordinary integer rather than a carry flag or a
+ * compiler intrinsic, and the back end lowers a `u128` product to the machine's own high-half
+ * multiply (`mul` and `umulh` on AArch64). That is what makes every step exact: a product of two
+ * limbs is at most `(2^w - 1)^2`, which fits the double width with room for two more limbs of carry.
+ * The algorithms are written once, over the two names `Limb` and `Wide`, and a word-sized limb
+ * halves the number of limbs -- and so quarters the inner steps of a multiply -- against a limb of
+ * half a word.
  *
  * ## What it costs
  *
@@ -57,6 +62,22 @@ import sysl.buf.{Buf, buf}
  * here needs one, and a wrong answer from a primality test is the expensive kind.
  */
 
+// One digit of a magnitude, and the type every step on two of them is done in: a machine word and
+// its double. Nothing below names a width; it asks `limb_bits`.
+#if ptr64
+private[bigint] type Limb = u64
+private[bigint] type Wide = u128
+#else
+private[bigint] type Limb = u32
+private[bigint] type Wide = u64
+#endif
+
+/** How many bits a limb holds. */
+private[bigint] val limb_bits: usize = sizeof(Limb) * 8
+
+/** How many limbs a `u64` takes, which is how many a value that fits a machine integer can have. */
+private[bigint] val u64_limbs: usize = 64 / limb_bits
+
 /** An integer of no fixed width.
  *
  * **The magnitude is a view, so a `BigInt` costs a retain to copy rather than a copy of its limbs.**
@@ -66,7 +87,7 @@ import sysl.buf.{Buf, buf}
  */
 struct BigInt
     private[bigint] minus: bool
-    private[bigint] mag: []const u32
+    private[bigint] mag: []const Limb
 
     /** Whether this is zero, which is the one value with an empty magnitude. */
     is_zero(self) -> bool = self.mag.len == 0
@@ -83,7 +104,11 @@ struct BigInt
             1
     end sign
 
-    /** How many limbs the magnitude takes, which is the closest thing to a size this type has.
+    /** How many machine words the magnitude takes, which is the closest thing to a size this type has.
+     *
+     * **A limb is a machine word**, so the count depends on the target: `2^64` takes two limbs on a
+     * 64-bit machine and three on a 32-bit one. A program that wants a size independent of the
+     * target asks `bit_length`.
      *
      * It is here because a program deciding whether a value still fits somewhere has no other way to
      * ask, and because a test asserting that a result was normalized has to be able to see the
@@ -100,11 +125,9 @@ struct BigInt
      */
     to_long(self) -> Option[long]
         if self.mag.len == 0 then return Some(0)
-        if self.mag.len > 2 then return None
+        if self.mag.len > u64_limbs then return None
 
-        var m = u64(self.mag[0])
-
-        if self.mag.len == 2 then m = m | u64(self.mag[1]) << 32
+        val m = low_u64(self.mag)
 
         if self.minus
             // `-(2^63)` has magnitude `2^63`, which is one past what a positive `long` holds.
@@ -135,15 +158,7 @@ from_int(n: long) -> BigInt
     if n == 0 then return zero()
 
     val negative = n < 0
-    val m = if negative then 0u64 - u64(n) else u64(n)
-    var out: Buf[u32] = buf()
-
-    out.push(u32(m & 0xffffffffu64))
-
-    if m >> 32 != 0 then out.push(u32(m >> 32))
-
-    BigInt(negative, out.view())
-end from_int
+    BigInt(negative, mag_of_u64(if negative then 0u64 - u64(n) else u64(n)))
 
 impl From[long] for BigInt
     from(value: long) -> BigInt = from_int(value)
@@ -189,7 +204,7 @@ impl Eq for BigInt
 /** **Written out, and it stays written out now that an array has `Ord` -- a `BigInt` is not
  * structurally ordered.** Its fields are a sign and a little-endian limb view, so a derived
  * comparison would take the sign first, putting every positive before every negative, and then
- * compare limbs from the *least* significant end, making `2^32` less than `1`. The numeric order
+ * compare limbs from the *least* significant end, making `2^64` less than `1`. The numeric order
  * needs the magnitudes' lengths first and their limbs from the top, which is `cmp_mag`.
  *
  * It could not be derived in any case: `bool` has no `Ord`, so `derives Ord` on this shape is
@@ -203,7 +218,7 @@ impl Hash for BigInt
      * run of bytes.
      *
      * **Written out because the magnitude is a SLICE, and a slice deliberately has no `Hash`** --
-     * `derives Hash` here is refused with `type '[]const uint' has no method 'hash'`. An array is
+     * `derives Hash` here is refused with `type '[]const ulong' has no method 'hash'`. An array is
      * hashable and a view is not, for the reason `ops.sysl` gives: a view's storage stays writable
      * by whoever owns it, so a key made from one can change under the table holding it. This type
      * never writes through its magnitude, which is what makes hashing it sound where the general
@@ -211,7 +226,9 @@ impl Hash for BigInt
      *
      * **Equal values hash alike because the representation is canonical**: leading zeros are trimmed
      * and zero is never negative, so two `BigInt`s that compare equal hold identical limbs and an
-     * identical sign. Nothing here has to normalize first.
+     * identical sign. Nothing here has to normalize first. The limbs are a machine word, so one
+     * value hashes differently on a 64-bit and a 32-bit target: a hash is for a table in memory,
+     * never for storing.
      */
     hash(self) -> u64
         var h = if self.minus then 0xcbf29ce484222326u64 else 0xcbf29ce484222325u64
@@ -291,14 +308,15 @@ end pow
 
 // -- the magnitude, which is where the arithmetic actually is --------------------------------------
 //
-// Everything below works on `[]const u32` in little-endian limb order with no leading zeros, and
+// Everything below works on `[]const Limb` in little-endian limb order with no leading zeros, and
 // knows nothing about signs. Keeping the two apart is what makes each half readable: a sign rule is
-// three lines of case analysis and a carry loop is a carry loop.
+// three lines of case analysis and a carry loop is a carry loop. A carry or a product is a `Wide`,
+// whose low half is the limb (`Limb(t)` truncates) and whose high half is `t >> limb_bits`.
 
 /** `-1`, `0` or `1` as `a` is below, equal to or above `b`, both being normalized -- so the longer
  * is the larger, and equal lengths are decided from the top limb down.
  */
-private[bigint] cmp_mag(a: []const u32, b: []const u32) -> int
+private[bigint] cmp_mag(a: []const Limb, b: []const Limb) -> int
     if a.len != b.len then return if a.len < b.len then -1 else 1
 
     var i = a.len
@@ -311,22 +329,22 @@ private[bigint] cmp_mag(a: []const u32, b: []const u32) -> int
     0
 end cmp_mag
 
-/** `a + b`, carrying in 64 bits so that the sum of two limbs and a carry cannot overflow. */
-private[bigint] add_mag(a: []const u32, b: []const u32) -> []const u32
+/** `a + b`, carrying in the double width so that the sum of two limbs and a carry cannot overflow. */
+private[bigint] add_mag(a: []const Limb, b: []const Limb) -> []const Limb
     val long_side = if a.len >= b.len then a else b
     val short_side = if a.len >= b.len then b else a
-    var out: Buf[u32] = buf()
-    var carry: u64 = 0
+    var out: Buf[Limb] = buf()
+    var carry: Wide = 0
 
     for i in 0..<long_side.len
-        var s = u64(long_side[i]) + carry
+        var s = Wide(long_side[i]) + carry
 
-        if i < short_side.len then s += u64(short_side[i])
+        if i < short_side.len then s += Wide(short_side[i])
 
-        out.push(u32(s & 0xffffffffu64))
-        carry = s >> 32
+        out.push(Limb(s))
+        carry = s >> limb_bits
 
-    if carry != 0 then out.push(u32(carry))
+    if carry != 0 then out.push(Limb(carry))
 
     trimmed(out)
 end add_mag
@@ -334,58 +352,83 @@ end add_mag
 /** `a - b`, where `a >= b`. The caller is what guarantees that, which is why this is private: a
  * borrow out of the top would wrap silently and produce a number rather than a complaint.
  */
-private[bigint] sub_mag(a: []const u32, b: []const u32) -> []const u32
-    var out: Buf[u32] = buf()
-    var borrow: u64 = 0
+private[bigint] sub_mag(a: []const Limb, b: []const Limb) -> []const Limb
+    var out: Buf[Limb] = buf()
+    var borrow: Wide = 0
 
     for i in 0..<a.len
         // The borrow is folded into what is being taken away rather than applied afterwards, so the
-        // two cases below are one comparison each and nothing can go below zero mid-expression --
-        // these are unsigned, and `x - y` where `y` is the larger wraps rather than complaining.
-        val take = (if i < b.len then u64(b[i]) else 0u64) + borrow
-        val cur = u64(a[i])
+        // two cases below are one comparison each. Where the limb is the smaller, the difference
+        // wraps at the double width and its low half is the limb `cur + 2^w - take` would give.
+        val take = (if i < b.len then Wide(b[i]) else 0) + borrow
+        val cur = Wide(a[i])
 
-        if cur >= take
-            out.push(u32(cur - take))
-            borrow = 0
-        else
-            out.push(u32(cur + 0x100000000u64 - take))
-            borrow = 1
+        out.push(Limb(cur - take))
+        borrow = if cur >= take then 0 else 1
 
     trimmed(out)
 end sub_mag
 
 /** `a * b`, one limb of `b` against all of `a` at a time.
  *
- * The accumulator is 64 bits, which is exactly enough: a limb times a limb is at most
- * `(2^32 - 1)^2`, and adding the running carry and the limb already sitting in the answer keeps it
- * under `2^64`. That is the whole reason limbs are half a word.
+ * The accumulator is a `Wide`, which is exactly enough: a limb times a limb is at most
+ * `(2^w - 1)^2`, and adding the running carry and the limb already sitting in the answer keeps it
+ * under `2^(2w)`. That is the whole reason the arithmetic is done at twice the limb's width.
  */
-private[bigint] mul_mag(a: []const u32, b: []const u32) -> []const u32
-    var out: Buf[u32] = buf()
+private[bigint] mul_mag(a: []const Limb, b: []const Limb) -> []const Limb
+    var out: Buf[Limb] = buf()
 
     for i in 0..<(a.len + b.len)
         out.push(0)
 
     for i in 0..<a.len
-        var carry: u64 = 0
+        val ai = Wide(a[i])
+        var carry: Wide = 0
 
         for j in 0..<b.len
             val at = i + j
-            val t = u64(a[i]) * u64(b[j]) + u64(out.at(at)) + carry
+            val t = ai * Wide(b[j]) + Wide(out.at(at)) + carry
 
-            out.set(at, u32(t & 0xffffffffu64))
-            carry = t >> 32
+            out.set(at, Limb(t))
+            carry = t >> limb_bits
 
-        out.set(i + b.len, u32(carry))
+        out.set(i + b.len, Limb(carry))
 
     trimmed(out)
 end mul_mag
 
+/** The magnitude of `n`: one limb on a 64-bit target, up to two on a 32-bit one. */
+private[bigint] mag_of_u64(n: u64) -> []const Limb
+    var out: Buf[Limb] = buf()
+    var m = n
+
+    // A shift by the whole width of `m` is a full shift and leaves zero, so on a 64-bit target the
+    // loop takes one limb and stops.
+    while m != 0
+        out.push(Limb(m))
+        m = m >> limb_bits
+
+    out.view()
+end mag_of_u64
+
+/** The low 64 bits of a magnitude, which is the whole of it wherever a caller has already checked
+ * that it fits.
+ */
+private[bigint] low_u64(mag: []const Limb) -> u64
+    var v: u64 = 0
+    var i = if mag.len < u64_limbs then mag.len else u64_limbs
+
+    while i > 0
+        i -= 1
+        v = v << limb_bits | u64(mag[i])
+
+    v
+end low_u64
+
 /** The buffer as a magnitude, with the leading zeros dropped -- the one invariant every function
  * here relies on and the one place it is established.
  */
-private[bigint] trimmed(b: Buf[u32]) -> []const u32
+private[bigint] trimmed(b: Buf[Limb]) -> []const Limb
     var n = b.len()
 
     while n > 0 && b.at(n - 1) == 0

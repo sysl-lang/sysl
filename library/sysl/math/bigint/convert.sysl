@@ -26,17 +26,7 @@ import sysl.math.Float
 /** The value `n` names, `n` being unsigned -- so the whole 64-bit range, where `from_int` stops at
  * the largest positive `long`.
  */
-from_u64(n: u64) -> BigInt
-    if n == 0 then return zero()
-
-    var out: Buf[u32] = buf()
-
-    out.push(u32(n & 0xffffffffu64))
-
-    if n >> 32 != 0 then out.push(u32(n >> 32))
-
-    BigInt(false, out.view())
-end from_u64
+from_u64(n: u64) -> BigInt = if n == 0 then zero() else BigInt(false, mag_of_u64(n))
 
 impl From[u64] for BigInt
     from(value: u64) -> BigInt = from_u64(value)
@@ -50,7 +40,7 @@ impl From[u64] for BigInt
  * and gets a value that says what it is.
  */
 to_u64(x: BigInt) -> Option[u64]
-    if x.minus || x.mag.len > 2 then return None
+    if x.minus || x.mag.len > u64_limbs then return None
 
     Some(low_u64(x.mag))
 
@@ -119,41 +109,30 @@ from_real(f: real) -> Option[BigInt]
     if t == 0.0 then return Some(zero())
 
     var a = t.abs()
-    var out: Buf[u32] = buf()
+    var out: Buf[Limb] = buf()
+    val radix = scale_pow2(1.0, limb_bits)
 
     // A limb at a time, off the bottom. Both operations are exact: `a` is a whole number, dividing
     // by a power of two and truncating is exact, and the difference of two whole `real`s that fits
-    // 32 bits is exact.
+    // a limb is exact.
     while a >= 1.0
-        val hi = (a / 4294967296.0).trunc()
+        val hi = (a / radix).trunc()
 
-        out.push(u32(a - hi * 4294967296.0))
+        out.push(Limb(a - hi * radix))
         a = hi
 
     Some(normalized(t < 0.0, trimmed(out)))
 end from_real
 
-/** The low 64 bits of a magnitude, which is the whole of it wherever a caller has already checked
- * that it fits.
- */
-private[bigint] low_u64(mag: []const u32) -> u64
-    var v: u64 = 0
-
-    if mag.len > 0 then v = u64(mag[0])
-    if mag.len > 1 then v = v | u64(mag[1]) << 32
-
-    v
-end low_u64
-
 /** Whether any bit below index `k` is set, which is the sticky bit a correct rounding needs. */
-private any_below(mag: []const u32, k: usize) -> bool
-    val whole = k / 32
-    val bit = u32(k % 32)
+private any_below(mag: []const Limb, k: usize) -> bool
+    val whole = k / limb_bits
+    val bit = k % limb_bits
 
     for i in 0..<whole
         if i < mag.len && mag[i] != 0 then return true
 
-    bit != 0 && whole < mag.len && mag[whole] << (32 - bit) != 0
+    bit != 0 && whole < mag.len && mag[whole] << (limb_bits - bit) != 0
 end any_below
 
 /** `v * 2^e`, by multiplications that are each exact until the product leaves the range -- where it
