@@ -73,8 +73,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
-`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, six: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
+`@scoped`, `@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -151,6 +151,140 @@ The `@` is also read **inside a pattern**, where it binds a name to what a sub-p
 ([patterns](/reference/patterns/)). The two never compete: an annotation's `@` is a prefix at the
 start of a line above a declaration, and a pattern's is infix between a name and a pattern, in a
 position no declaration may stand.
+
+### `@scoped(f)` — a member that finishes what it starts before its scope closes
+
+**`@scoped(f)` above a method promises that `f` runs in another concurrency domain and finishes before
+the `@lends` call that lent the method's `*self` returns.** It is how a scheduler's `spawn` says its
+children are joined by the scope that handed out the receiver, and it implies `@crossing(f)`: what is
+passed at `f` is held to the [crossing rule](/reference/memory/), exactly as if both were written.
+The compiler cannot see the join — that is the library's promise to keep, as `@crossing`'s boundary
+is — so what it changes is what a lent body may do with the scope: a call of the member on the lent
+pointer does not keep it, and a closure written straight at `f` is not counted as put on the heap,
+though it captures the scope.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn(*Scope) -> unit)
+        val s = self
+
+        self.jobs.push(() -> f(s))
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+print(Runner(0).scope((s) ->
+    s.spawn((t) -> print(usize(s) == usize(t)))
+    17))
+```
+
+```output
+true
+17
+```
+
+Without `@scoped` the same body is refused twice over: `spawn` keeps the receiver in the job it
+queues, and the closure capturing `s` is boxed onto the heap. Only the box written at the argument
+is spared — one made earlier and held in a local could be handed anywhere — and what `spawn` answers
+is still followed as made of the scope, so a handle built around `self` may not be returned from the
+body or stored outside it.
+
+**What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent:
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(v)
+    run(*self, v: *int) -> int = v[0]
+```
+
+```error
+'@scoped' names 'v', which is not a call
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(g)
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+'@scoped' names 'g', which is not a parameter of 'Chan.run'
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(f, f)
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+'@scoped' names 'f' twice
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped(f)
+    run(self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+so the receiver is the pointer that call lent, written '*self' — this one takes 'self' by value
+```
+
+```sysl
+struct Chan
+    open: bool
+
+    @scoped()
+    run(*self, f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+There is no empty form
+```
+
+**It stands above a method and nowhere else.** A free function has no receiver for a `@lends` call to
+have lent, and a field is never called:
+
+```sysl
+@scoped(f)
+run(f: &sync Fn() -> int) -> int = f()
+```
+
+```error
+a free function has no receiver for a '@lends' call to have lent
+```
+
+```sysl
+struct Chan
+    @scoped(f)
+    f: int
+```
+
+```error
+a field and a variant are never called, and have no parameter to run
+```
 
 ## `::` — what a type's own name answers
 

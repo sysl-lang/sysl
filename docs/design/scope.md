@@ -3,7 +3,7 @@
 Structured fork-join whose tasks may borrow the caller's storage, the compiler checking that no
 borrow outlives the join. It is what Rust's `std::thread::scope` and rayon's `scope` give, done with
 what sysl already has (`@lends`, escape analysis, the crossing rule) rather than with lifetimes.
-Status: design only, nothing built. The origin is finding 5 of the `sysl-lang/pool` README; the
+Status: being built: item (a) landed. The origin is finding 5 of the `sysl-lang/pool` README; the
 probes below were run with the installed 0.1.3.
 
 ## Decisions
