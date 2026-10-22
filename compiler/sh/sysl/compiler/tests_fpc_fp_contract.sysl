@@ -7,7 +7,7 @@ import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text
 import sysl.process.capture
 
 // Floating-point contraction (`fp_contract.sysl`): a multiply feeding an add or a subtract in the same
-// expression is one `llvm.fmuladd`, in the shape clang gives the same C at `-ffp-contract=on` -- read
+// expression is one `llvm.fma`, in the shape clang gives the same C at `-ffp-contract=on` -- read
 // out of `clang -O0 -S -emit-llvm` for each form -- and only at a width the target fuses. The three
 // places that compute a float agree about it: the lowering, the typed fold that lays a module `val`
 // down as data, and the evaluator that runs a `const` function.
@@ -108,17 +108,17 @@ private val fpc_forms: string = raw"""
     """
 
 // Every form, lowered for a machine that fuses at both widths whatever this one is: what the
-// registry's census reaches `llvm.fmuladd` through (`tests_irp_llvm_registry.sysl`).
+// registry's census reaches `llvm.fma` through (`tests_irp_llvm_registry.sysl`).
 fpc_every_form_ir() -> string = fpc_ir(fpc_forms, Some("aarch64-macos"))
 
 // -- the shapes -----------------------------------------------------------------------------------
 
-@test("each form a multiply feeds an add or a subtract is one llvm.fmuladd, in clang's shape")
-fpc_each_form_is_one_fmuladd()
+@test("each form a multiply feeds an add or a subtract is one llvm.fma, in clang's shape")
+fpc_each_form_is_one_fma()
     if !fpc_ready() then return
 
     val ir = fpc_ir(fpc_forms)
-    val call = "call double @llvm.fmuladd.f64"
+    val call = "call double @llvm.fma.f64"
 
     // The factors are `%t1` and `%t2` and the addend `%t3` where the product is written first; where
     // the addend is, it is `%t1`. A negated factor or addend is negated on its own, as clang does it.
@@ -141,7 +141,7 @@ fpc_each_form_is_one_fmuladd()
     // `c - a * b` negates the first factor, `a * b - c` the addend: what `fmsub` and `fnmsub` compute.
     assert(fpc_body(ir, "sp").contains("%t4 = fneg double %t2"), fpc_body(ir, "sp"))
     assert(fpc_body(ir, "ps").contains("%t4 = fneg double %t3"), fpc_body(ir, "ps"))
-end fpc_each_form_is_one_fmuladd
+end fpc_each_form_is_one_fma
 
 @test("of two products the left one is fused and the right one is the addend, as clang chooses")
 fpc_two_products_fuse_the_left()
@@ -150,7 +150,7 @@ fpc_two_products_fuse_the_left()
     val body = fpc_body(fpc_ir(fpc_forms), "two")
 
     assert(body.contains("%t5 = fmul double %t3, %t4"), body)
-    assert(body.contains("%t6 = call double @llvm.fmuladd.f64(double %t1, double %t2, double %t5)"), body)
+    assert(body.contains("%t6 = call double @llvm.fma.f64(double %t1, double %t2, double %t5)"), body)
 end fpc_two_products_fuse_the_left
 
 @test("a compound assignment of a product is fused onto the place's value")
@@ -162,12 +162,12 @@ fpc_compound_assignment_fuses()
     val down = fpc_body(ir, "dwn")
     val both = fpc_body(ir, "both")
 
-    assert(up.contains("%t5 = call double @llvm.fmuladd.f64(double %t3, double %t4, double %t2)"), up)
+    assert(up.contains("%t5 = call double @llvm.fma.f64(double %t3, double %t4, double %t2)"), up)
     assert(!up.contains(" = fadd "), up)
     assert(down.contains("%t5 = fneg double %t3"), down)
-    assert(down.contains("%t6 = call double @llvm.fmuladd.f64(double %t5, double %t4, double %t2)"), down)
+    assert(down.contains("%t6 = call double @llvm.fma.f64(double %t5, double %t4, double %t2)"), down)
     assert(!down.contains(" = fsub "), down)
-    assert_eq(fpc_count(both, "@llvm.fmuladd.f64("), 2)
+    assert_eq(fpc_count(both, "@llvm.fma.f64("), 2)
     assert_eq(fpc_count(both, " = fmul "), 0)
 end fpc_compound_assignment_fuses
 
@@ -177,11 +177,11 @@ fpc_single_and_lanes()
 
     val ir = fpc_ir(fpc_forms)
 
-    assert(fpc_body(ir, "pa32").contains("call float @llvm.fmuladd.f32(float %t1, float %t2, float %t3)"), ir)
-    assert(fpc_body(ir, "lanes").contains("call <4 x float> @llvm.fmuladd.v4f32(<4 x float> %t1, " +
+    assert(fpc_body(ir, "pa32").contains("call float @llvm.fma.f32(float %t1, float %t2, float %t3)"), ir)
+    assert(fpc_body(ir, "lanes").contains("call <4 x float> @llvm.fma.v4f32(<4 x float> %t1, " +
                                           "<4 x float> %t2, <4 x float> %t3)"), ir)
-    assert(ir.contains("declare double @llvm.fmuladd.f64(double, double, double)"), ir)
-    assert(ir.contains("declare <4 x float> @llvm.fmuladd.v4f32(<4 x float>, <4 x float>, <4 x float>)"), ir)
+    assert(ir.contains("declare double @llvm.fma.f64(double, double, double)"), ir)
+    assert(ir.contains("declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)"), ir)
 end fpc_single_and_lanes
 
 // -- what keeps a product apart -------------------------------------------------------------------
@@ -213,8 +213,8 @@ fpc_blocking_forms_round_twice()
         assert(body.contains(" = fadd "), body)
 
     // An `f128` has no fused instruction anywhere, so its sum is whatever binary128 addition is here.
-    assert(!fpc_body(ir, "quad").contains("fmuladd"), fpc_body(ir, "quad"))
-    assert(!ir.contains("@llvm.fmuladd"), ir)
+    assert(!fpc_body(ir, "quad").contains("@llvm.fma."), fpc_body(ir, "quad"))
+    assert(!ir.contains("@llvm.fma."), ir)
 end fpc_blocking_forms_round_twice
 
 @test("an Armv6-M fuses at neither width, a Cortex-M4 at f32 alone, through llvm.fma")
@@ -232,15 +232,34 @@ fpc_boards_fuse_where_the_unit_does()
     val m4 = fpc_ir(text, Some("thumbv7em-freestanding"))
     val m7 = fpc_ir(text, Some("thumbv7em-freestanding-dp"))
 
-    // Arm's back end never fuses an `llvm.fmuladd` -- clang's own `a * b + c` is a `vmul` and a `vadd`
-    // on these cores -- so where the unit fuses, the contraction is the exact `llvm.fma`, one `vfma`.
-    assert(!v6m.contains("fmuladd") && !v6m.contains("@llvm.fma."), v6m)
+    // Where the unit fuses, the contraction is the exact `llvm.fma`, one `vfma`; where it does not,
+    // the multiply and the add stay two instructions.
+    assert(!v6m.contains("@llvm.fma."), v6m)
     assert(fpc_body(v6m, "wide").contains("fmul double") && fpc_body(v6m, "narrow").contains("fmul float"), v6m)
     assert(fpc_body(m4, "wide").contains("fmul double"), m4)
     assert(fpc_body(m4, "narrow").contains("call float @llvm.fma.f32(float %t1, float %t2, float %t3)"), m4)
-    assert(!m4.contains("fmuladd"), m4)
     assert(fpc_body(m7, "wide").contains("@llvm.fma.f64(") && fpc_body(m7, "narrow").contains("@llvm.fma.f32("), m7)
 end fpc_boards_fuse_where_the_unit_does
+
+@test("a program's own extern llvm.fma beside a contraction is declared once")
+fpc_extern_fma_declared_once()
+    if !fpc_ready() then return
+
+    val text = raw"""
+        extern "llvm.fma" hard(a: f64, b: f64, c: f64) -> f64
+
+        mix(a: f64, b: f64, c: f64) -> f64 = a * b + c
+
+        @export("main")
+        boot() -> i32 = i32(hard(2.0, 3.0, 1.0) + mix(2.0, 3.0, 1.0))
+        """
+
+    for target in ["aarch64-macos", "thumbv7em-freestanding-dp"]
+        val ir = fpc_ir(text, Some(target))
+
+        assert_eq(fpc_count(ir, "declare double @llvm.fma.f64("), 1)
+        assert(fpc_body(ir, "mix").contains("call double @llvm.fma.f64("), ir)
+end fpc_extern_fma_declared_once
 
 // -- the instructions ------------------------------------------------------------------------------
 

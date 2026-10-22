@@ -210,7 +210,8 @@ Everywhere else — `f16`, `bf16`, `f128`, fixed point, a machine without the un
 the add are two operations, each rounded.
 
 **A product is kept apart by anything written between it and the sum**: a `val` it is bound to, a
-call it is passed through, an explicit conversion. That is how a program asks for two roundings, and
+call it is passed through (other than an [arithmetic operator](#an-arithmetic-operator-is-read-as-its-body)),
+an explicit conversion. That is how a program asks for two roundings, and
 `llvm.fma` ([ffi](/reference/ffi/)) is how it asks for one on every machine:
 
 ```sysl
@@ -254,6 +255,57 @@ print(positive == (x * x + c > 0.0))
 ```output
 true
 ```
+
+The fused instruction is asked for exactly, never left to the optimizer to choose site by site, so a
+program prints the same bits at `-O0` and at `-O3`, vectorized loops included.
+
+#### An arithmetic operator is read as its body
+
+**A call of an `Add`, `Sub`, `Mul`, `Div` or `Neg` method whose body is one expression is read, for
+fusing, as that expression written where the call is.** On a vector type, `a + d * k` is
+`V(a.x + d.x * k, a.y + d.y * k)`: each field is a product meeting a sum, and each is fused as the
+same sum written on floats would be. A field of a constructor is the constructor's argument, so
+nothing is built only to be taken apart. It holds for a generic type's instances, for an operator
+another module or package declares, for a unary minus, and for `+=` and `-=` through an operator:
+
+```sysl
+struct V
+    x: real
+    y: real
+
+impl Add for V
+    add(self, rhs: V) -> V = V(self.x + rhs.x, self.y + rhs.y)
+
+impl Mul[real] for V
+    mul(self, k: real) -> V = V(self.x * k, self.y * k)
+
+val x = 1.0 + 1.0 / 1073741824.0
+val c = -(1.0 + 1.0 / 536870912.0)
+val p = V(x, x) * x
+
+#if fma_dp
+val fused = 1.0
+#else
+val fused = 0.0
+#endif
+
+print((V(c, c) + V(x, x) * x).y * 1152921504606846976.0 == fused, (V(c, c) + p).y * 1152921504606846976.0)
+```
+
+```output
+true 0
+```
+
+**What the call means is unchanged**: each argument is evaluated once, in the order it is written,
+however often the body reads it, and an argument that is a call, an element or anything else that
+could trap or write is evaluated before the rest. Only the rounding moves, and only where a product
+now meets a sum. A `const` and a module `val` read the operator the same way.
+
+**What still keeps a product apart**, through an operator as on floats: a `val` or `var` the
+program binds it to, a call of any function or method that is not such an operator, an explicit
+conversion, and an operator whose body is more than one expression (a body of statements). A call
+through a trait object is a call too, and so is any operator on a machine that does not fuse at the
+width. `s, t += …` through an operator is not read this way.
 
 ### Shifting by the width or more
 

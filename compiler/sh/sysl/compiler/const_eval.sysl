@@ -1496,9 +1496,55 @@ private unary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
     _ -> EvStop
 
 @noinline
-private binary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
-    TBinary(op, l, r2, ty) -> binary(r, e.span, op, l, r2, ty)
-    _ -> EvStop
+private binary_node(r: &EvRun, e: TExpr) -> Flow
+    val ex = ev_expansion(r, e)
+
+    if ex.is_some() then return eval(r, ex.unwrap())
+
+    *e.kind match
+        TBinary(op, l, r2, ty) -> binary(r, e.span, op, l, r2, ty)
+        _ -> EvStop
+end binary_node
+
+// `e` with the operator calls in its reach read as their bodies, exactly where the lowering reads
+// them so (`fp_operators.sysl`), so a value comes out with the roundings the machine gives it.
+@noinline
+private ev_expansion(r: &EvRun, e: TExpr) -> Option[TExpr]
+    val body_of: &Fn(string) -> Option[TFunc] = n -> ev_operator(r, e.span, n)
+
+    if !reaches_operator(body_of, e) then return None
+
+    val drops = drops_declared(r.a)
+
+    val found = operator_expansion(fusing_of(r.a.tables.target), body_of, t -> holds_string(drops, owner_key(t)), 0, e)
+
+    found.map(p -> p.0)
+end ev_expansion
+
+// The body of an arithmetic operator method, typed where it was not yet -- nothing for any other
+// function, and nothing for one this evaluation cannot run, which the call then says so about.
+private ev_operator(r: &EvRun, at: Span, name: string) -> Option[TFunc]
+    val f = r.a.tables.funcs.get(name)
+    val inst = r.a.tables.members.eval_insts.get(name)
+    val marked = if f.is_some() then f.unwrap().decl.marks.operator
+    else if inst.is_some() then inst.unwrap().0.decl.marks.operator
+    else lowered_operator(r.a, name)
+
+    if !marked || holds_string(r.a.evaluation.typing, name) then return None
+
+    if r.a.evaluation.bodies.get(name).is_none() && evaluable_refusal(r.a, name).is_some() then return None
+
+    callee(r, at, name).map(b -> *b)
+end ev_operator
+
+// Whether `name` is a method an `impl` lowered to a function of its own -- where every method of a
+// non-generic `impl` is, `V.add` among them -- and an arithmetic operator's.
+private lowered_operator(a: &Analysis, name: string) -> bool
+    for item in a.tables.members.lowered
+        if item.name == name then return item.marks.operator
+
+    false
+end lowered_operator
 
 @noinline
 private logical_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
@@ -1511,12 +1557,18 @@ private compare_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
     _ -> EvStop
 
 @noinline
-private call_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
-    // **A call that never returns ends the program** -- a library's panic, which says why and exits --
-    // so reaching one while compiling is a trap, as reaching it is where the program runs.
-    TCall(name, _, Never, _) -> ends_the_program(r, e.span, name)
-    TCall(name, args, _, results) -> call(r, e.span, name, args, results)
-    _ -> EvStop
+private call_node(r: &EvRun, e: TExpr) -> Flow
+    val ex = ev_expansion(r, e)
+
+    if ex.is_some() then return eval(r, ex.unwrap())
+
+    *e.kind match
+        // **A call that never returns ends the program** -- a library's panic, which says why and
+        // exits -- so reaching one while compiling is a trap, as reaching it is where the program runs.
+        TCall(name, _, Never, _) -> ends_the_program(r, e.span, name)
+        TCall(name, args, _, results) -> call(r, e.span, name, args, results)
+        _ -> EvStop
+end call_node
 
 @noinline
 private ends_the_program(r: &EvRun, at: Span, name: string) -> Flow =

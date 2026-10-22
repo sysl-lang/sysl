@@ -69,15 +69,15 @@ private hop_err(text: string) -> string
     out
 end hop_err
 
-// The LLVM text of a program that must compile.
-private hop_ir(text: string) -> string
+// The LLVM text of a program that must compile, for `target` or this machine.
+private hop_ir(text: string, target: Option[string] = None) -> string
     val root = make_temp_dir("sysl-hetero").unwrap()
     val src = s"$root/main.sysl"
 
     make_dir_all(root).unwrap()
     write_text(src, text).unwrap()
 
-    val out = emit_llvm_text(src, None) match
+    val out = emit_llvm_text(src, target) match
         Err(why) -> s"did not compile: ${why.message}"
         Ok(made) ->
             if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
@@ -562,7 +562,9 @@ hop_and_so_does_the_named_call()
 hop_each_implementation_is_a_function_of_its_own()
     if !hop_ready() then return
 
-    val out = hop_ir(hop_both() + "print(show(C(1.0, 2.0) * C(3.0, 4.0) * 2.5))\n")
+    // On a machine that fuses, both bodies are read at the call for contraction
+    // (`tests_fpo_fp_operators.sysl`); x86-64 does not fuse, so the two calls stay calls.
+    val out = hop_ir(hop_both() + "print(show(C(1.0, 2.0) * C(3.0, 4.0) * 2.5))\n", Some("x86_64-macos"))
 
     assert(out.contains("define %struct.C @C.mul(%struct.C %self.param, double %k.param)"), out)
     assert(out.contains("define %struct.C @C.mul.2(%struct.C %self.param, %struct.C %o.param)"), out)

@@ -498,12 +498,13 @@ checked_shl(e: *Emit, bits: int, signed: bool, lv: Val, sh: Val) -> Val
     r
 end checked_shl
 
-// `a * b + c` as one `llvm.fmuladd` at `ty`, a float or a vector of them -- a contracted expression
-// (`fp_contract.sysl`), reached only at a width the target fuses. Where the back end would split an
-// `llvm.fmuladd` back into two operations although the unit fuses, it is `llvm.fma`, which it cannot.
-fmuladd(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
+// `a * b + c` as one `llvm.fma` at `ty`, a float or a vector of them -- a contracted expression
+// (`fp_contract.sysl`), reached only at a width the target fuses. It is the exactly specified `fma`
+// rather than `llvm.fmuladd`, which the back end may split per site (Arm's always does, and an
+// AArch64 vectorized loop does for some lanes), so every `-O` level rounds the same as compile time.
+fused_mul_add(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
     val lt = lty(e, ty)
-    val fn = (if e.target.fuses_muladd() then llvm_fmuladd_entry() else llvm_fma_entry()).at([lt])
+    val fn = llvm_fma_entry().at([lt])
 
     var params: Buf[IrParam] = buf()
 
@@ -522,7 +523,7 @@ fmuladd(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
 
     emit(e, ir_call(Some(r), lt, VGlobal(fn), args))
     r
-end fmuladd
+end fused_mul_add
 
 // Declares an intrinsic once, under the overload-mangled name that carries its width.
 request_intrinsic(e: *Emit, sig: IrFuncSig)

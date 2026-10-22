@@ -236,6 +236,14 @@ gen_into(e: *Emit, dest: Val, x: TExpr)
                 return
             end if
 
+            // An operator call read as its body is built from the body (`fp_operators.sysl`).
+            val ex = expansion_at(e, x)
+
+            if ex.is_some()
+                gen_into(e, dest, ex.unwrap())
+                return
+            end if
+
             // A result already arrives with its count taken, and the out-pointer is what says where.
             // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's
             // work straight into `k`'s slot, and no aggregate is ever an LLVM value.
@@ -555,6 +563,16 @@ private gen_write(e: *Emit, w: TWrite)
     if zero_sized(texpr_type(w.place))
         gen_expr(e, w.value)
         return
+
+    // `v += w * k` through an operator method may be read as its body (`fp_operators.sysl`).
+    if w.op != "=" && w.constraint.is_none() && w.check.is_empty()
+        val ex = update_expansion_at(e, w.place.span, w.place, w.value, texpr_type(w.place), w.dispatch, false)
+
+        if ex.is_some()
+            gen_expr(e, ex.unwrap())
+            return
+        end if
+    end if
 
     val p = place_addr(e, w.place)
 
