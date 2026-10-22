@@ -1,0 +1,456 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **An arithmetic operator on a user type is read as its body, for contraction.** `ai + d * k` on a
+// `Vec3` is `Vec3.add(ai, Vec3.mul(d, k))`, and a call keeps a product apart from a sum
+// (`fp_contract.sysl`) -- so a vector type's `a + b * k` rounded twice where C's `a.x += b.x * k` rounds
+// once. Here a call of an `Add`, `Sub`, `Mul`, `Div` or `Neg` method whose body is ONE expression is
+// read as that expression written where the call is: `Vec3(ai.x + d.x * k, ai.y + d.y * k, ...)`, a
+// field of a constructor being the constructor's argument, and each sum then contracts by the one
+// rule. It is the compiler's own reading and not the optimizer's, so a program computes the same bits
+// at every `-O` level and while compiling: the lowering and the evaluator both ask this file.
+//
+// **What the call meant is kept**:
+//
+//   - Every argument is evaluated once, in the order it was written. What is not arithmetic on floats,
+//     a literal or a local's value -- an element, a call, anything that could trap or write -- is
+//     bound to a name of its own (`$op.<n>`) before anything else, in that order. Where one of those
+//     may write, every local read is bound too, so nothing is read after a write it preceded.
+//   - Arithmetic on floats is pure, so it is substituted. A parameter the body reads more than once is
+//     bound rather than computed again, except that a product it holds stays a product where the body
+//     adds it, so the product still reaches the sum -- the binding is the factors, not the product.
+//   - Only a body built from its parameters, their fields, constructors of plain structs, literals,
+//     float arithmetic and other such operator calls is read this way, and only over plain types --
+//     numbers, and structs of numbers with no destructor -- so dropping the fields a projection does
+//     not want drops nothing that could be observed.
+//
+// Nothing changes where the reading finds no sum to contract: the call is a call, on a machine that
+// does not fuse, and for a body with statements, a recursive operator, a trait object, `@noinline`, a
+// contract clause, or a conversion in the body.
+
+// Whether `key` is one of the five arithmetic operator traits.
+arithmetic_operator_trait(key: string) -> bool
+    for spelling in ["Add", "Sub", "Mul", "Div", "Neg"]
+        if library_key(spelling) == key then return true
+
+    false
+end arithmetic_operator_trait
+
+// One reading in progress: what the bodies are, what is bound so far, and what was found.
+struct Expanding
+    fusing: Fusing
+    body_of: &Fn(string) -> Option[TFunc]
+    dropped: &Fn(Type) -> bool
+    binds: Buf[TStmt]
+    next: int
+    open: Buf[string]
+    // Bind every local read as well, because a bound argument may write.
+    all: bool
+    writes: bool
+    expanded: bool
+end Expanding
+
+// `x` read with every operator call in reach expanded, and the counter after the names it took --
+// or nothing, where no expansion leaves a product meeting a sum.
+//
+// `body_of` answers the body of a marked operator method and nothing for any other name; `dropped`
+// says whether a type has a destructor.
+operator_expansion(fusing: Fusing, body_of: &Fn(string) -> Option[TFunc], dropped: &Fn(Type) -> bool,
+                   next: int, x: TExpr) -> Option[(TExpr, int)]
+    if !reaches_operator(body_of, x) then return None
+
+    var cx = Expanding(fusing, body_of, dropped, buf(), next, buf(), false, false, false)
+    var tree = purified(&cx, x, true)
+
+    if tree.is_some() && cx.writes
+        cx = Expanding(fusing, body_of, dropped, buf(), next, buf(), true, false, false)
+        tree = purified(&cx, x, true)
+    end if
+
+    if tree.is_none() || !cx.expanded || !contracts_in(fusing, tree.unwrap()) then return None
+
+    if cx.binds.is_empty() then return Some((tree.unwrap(), cx.next))
+
+    Some((TExpr(x.span, TBlockExpr(TBlock(cx.binds, tree, texpr_type(x)))), cx.next))
+end operator_expansion
+
+// `place op= value` through an operator method, read as `ref $op = place; $op = $op op value` with
+// the right side expanded: the place is walked once, before anything else, as the update walks it.
+update_expansion(fusing: Fusing, body_of: &Fn(string) -> Option[TFunc], dropped: &Fn(Type) -> bool,
+                 next: int, span: Span, place: TExpr, value: TExpr, d: TDispatch, ty: Type,
+                 yields: bool) -> Option[(TExpr, int)]
+    if d.swap || d.negate || body_of(d.name).is_none() then return None
+
+    val held = "$op." + s"$next"
+    val cur = TExpr(place.span, TLoad(held, ty))
+    var args: Buf[TExpr] = buf()
+
+    args.push(cur)
+    args.push(value)
+
+    val inner = operator_expansion(fusing, body_of, dropped, next + 1, TExpr(span, TCall(d.name, args, ty, false)))
+
+    if inner.is_none() then return None
+
+    var stmts: Buf[TStmt] = buf()
+
+    stmts.push(TRefDecl(held, ty, place))
+
+    val store = TExpr(span, TStore(cur, inner.unwrap().0, ty, yields))
+
+    Some((TExpr(span, TBlockExpr(TBlock(stmts, Some(store), if yields then ty else Unit))), inner.unwrap().1))
+end update_expansion
+
+// Whether an operator call is within the float arithmetic `x` is made of -- the quick answer that
+// keeps every other expression from being read twice.
+reaches_operator(body_of: &Fn(string) -> Option[TFunc], x: TExpr) -> bool = *x.kind match
+    TCall(name, _, _, false) -> body_of(name).is_some()
+    TBinary(op, l, r, ty) -> float_arith(op, ty) && (reaches_operator(body_of, l) || reaches_operator(body_of, r))
+    TUnary(op, o, ty) -> op == "-" && is_float(ty) && reaches_operator(body_of, o)
+    _ -> false
+
+// -- the arguments ----------------------------------------------------------------------------------
+
+// An expression the program wrote (`fresh`) or one a substitution built, as a tree of pure arithmetic
+// over literals, locals and bound names. Nothing where a value that has to be bound cannot be.
+private purified(cx: *Expanding, x: TExpr, fresh: bool) -> Option[TExpr] = *x.kind match
+    TCall(name, args, _, false) ->
+        val f = cx.body_of(name)
+
+        if f.is_some()
+            val mark = cx.binds.len()
+            val was = cx.expanded
+            val got = expanded_call(cx, f.unwrap(), args, x.span, fresh)
+
+            if got.is_some() then return got
+
+            cx.binds.truncate(mark)
+            cx.expanded = was
+        end if
+
+        bound(cx, x)
+    TBinary(op, l, r, ty) ->
+        if !float_arith(op, ty) then return bound(cx, x)
+
+        val pl = purified(cx, l, fresh)
+
+        if pl.is_none() then return None
+
+        val pr = purified(cx, r, fresh)
+
+        if pr.is_none() then return None
+
+        Some(TExpr(x.span, TBinary(op, pl.unwrap(), pr.unwrap(), ty)))
+    TUnary(op, o, ty) ->
+        if op != "-" || !is_float(ty) then return bound(cx, x)
+
+        purified(cx, o, fresh).map(p -> TExpr(x.span, TUnary(op, p, ty)))
+    TStructNew(decl, args) ->
+        if !plain(cx, Struct(decl)) then return bound(cx, x)
+
+        var out: Buf[TExpr] = buf()
+
+        for item in args
+            val p = purified(cx, item, fresh)
+
+            if p.is_none() then return None
+
+            out.push(p.unwrap())
+
+        Some(TExpr(x.span, TStructNew(decl, out)))
+    TField(recv, i, ty) ->
+        if trivial(x) then return if fresh && cx.all then bound(cx, x) else Some(x)
+
+        if !reaches_operator(cx.body_of, recv) && !is_struct_new(recv) then return bound(cx, x)
+
+        purified(cx, recv, fresh).map(p -> projected(p, i, ty, x.span))
+    TFloatLit(_, _) -> Some(x)
+    TIntLit(_, _) -> Some(x)
+    TBoolLit(_) -> Some(x)
+    _ -> if trivial(x) && !(fresh && cx.all) then Some(x) else bound(cx, x)
+
+// `x` evaluated here, once, into a name of its own.
+private bound(cx: *Expanding, x: TExpr) -> Option[TExpr]
+    val ty = texpr_type(x)
+
+    if !plain(cx, ty) then return None
+
+    val name = "$op." + s"${cx.next}"
+
+    cx.next += 1
+
+    if !reads_only(x) then cx.writes = true
+
+    cx.binds.push(TVarDecl(name, ty, x, None))
+    Some(TExpr(x.span, TLoad(name, ty)))
+end bound
+
+// A call of the operator `f` at `args`, read as its body.
+private expanded_call(cx: *Expanding, f: TFunc, args: Buf[TExpr], span: Span, fresh: bool) -> Option[TExpr]
+    if holds_string(cx.open, f.name) || !expandable(cx, f, args.len()) then return None
+
+    val body = f.body.result.unwrap()
+    var env: Buf[(string, TExpr)] = buf()
+
+    for i in 0..<args.len()
+        val a = purified(cx, args.at(i), fresh)
+
+        if a.is_none() then return None
+
+        val s = settled(cx, body, f.params.at(i).0, a.unwrap())
+
+        if s.is_none() then return None
+
+        env.push((f.params.at(i).0, s.unwrap()))
+
+    cx.open.push(f.name)
+
+    val out = substituted(cx, body, env, span)
+
+    cx.open.truncate(cx.open.len() - 1)
+
+    if out.is_some() then cx.expanded = true
+
+    out
+end expanded_call
+
+// A body read this way is one expression over plain parameters, with nothing a call would have
+// checked or kept.
+private expandable(cx: *Expanding, f: TFunc, arity: usize) -> bool
+    if !f.marks.operator || f.marks.noinline || f.ghost || f.variadic || f.conv.is_some() then return false
+
+    if !f.body.stmts.is_empty() || f.body.result.is_none() || f.params.len() != arity then return false
+
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !plain(cx, f.ret_ty) then return false
+
+    for item in f.params
+        if !plain(cx, item.1) then return false
+
+    true
+end expandable
+
+// What a parameter is replaced by: the argument itself where the body reads it once, and a name
+// where it reads it more -- the factors of a product it adds, so the product still meets the sum.
+// A constructor is settled field by field, since a body reads its fields one at a time.
+private settled(cx: *Expanding, body: TExpr, p: string, a: TExpr) -> Option[TExpr]
+    if trivial(a) then return Some(a)
+
+    *a.kind match
+        TStructNew(decl, fields) ->
+            var out: Buf[TExpr] = buf()
+
+            for j in 0..<fields.len()
+                val field = int(j)
+                val s = held_once(cx, fields.at(j), uses_of(body, p, field), added_at(body, p, field, true))
+
+                if s.is_none() then return None
+
+                out.push(s.unwrap())
+
+            Some(TExpr(a.span, TStructNew(decl, out)))
+        _ -> held_once(cx, a, uses_of(body, p, -1), added_at(body, p, -1, true))
+end settled
+
+private held_once(cx: *Expanding, a: TExpr, uses: int, added: bool) -> Option[TExpr]
+    if trivial(a) || uses <= 1 then return Some(a)
+
+    if added
+        *a.kind match
+            TBinary(op, l, r, ty) ->
+                if op == "*"
+                    val hl = if trivial(l) then Some(l) else bound(cx, l)
+                    val hr = if trivial(r) then Some(r) else bound(cx, r)
+
+                    if hl.is_none() || hr.is_none() then return None
+
+                    return Some(TExpr(a.span, TBinary(op, hl.unwrap(), hr.unwrap(), ty)))
+                end if
+            _ -> ()
+    end if
+
+    bound(cx, a)
+end held_once
+
+// How many times the body reads parameter `p` -- its field `j`, where `j` is not negative. A read of
+// the whole value counts for every field.
+private uses_of(x: TExpr, p: string, j: int) -> int = *x.kind match
+    TLoad(n, _) -> if n == p then 1 else 0
+    TField(recv, i, _) -> *recv.kind match
+        TLoad(n, _) -> if n == p && (j < 0 || i == j) then 1 else 0
+        _ -> uses_of(recv, p, j)
+    TBinary(_, l, r, _) -> uses_of(l, p, j) + uses_of(r, p, j)
+    TUnary(_, o, _) -> uses_of(o, p, j)
+    TStructNew(_, args) -> uses_in(args, p, j)
+    TCall(_, args, _, _) -> uses_in(args, p, j)
+    _ -> 0
+
+private uses_in(xs: Buf[TExpr], p: string, j: int) -> int
+    var n = 0
+
+    for item in xs
+        n += uses_of(item, p, j)
+
+    n
+end uses_in
+
+// Whether the body may add what parameter `p` (or its field `j`) holds: anywhere but a factor or a
+// divisor, a constructor's argument and the body's own value included, since the caller may add those.
+private added_at(x: TExpr, p: string, j: int, sum: bool) -> bool = *x.kind match
+    TLoad(n, _) -> n == p && sum
+    TField(recv, i, _) -> *recv.kind match
+        TLoad(n, _) -> n == p && (j < 0 || i == j) && sum
+        _ -> added_at(recv, p, j, sum)
+    TBinary(op, l, r, _) ->
+        val s = op == "+" || op == "-"
+
+        added_at(l, p, j, s) || added_at(r, p, j, s)
+    TUnary(_, o, _) -> added_at(o, p, j, sum)
+    TStructNew(_, args) -> added_in(args, p, j, sum)
+    TCall(_, args, _, _) -> added_in(args, p, j, true)
+    _ -> false
+
+private added_in(xs: Buf[TExpr], p: string, j: int, sum: bool) -> bool
+    for item in xs
+        if added_at(item, p, j, sum) then return true
+
+    false
+end added_in
+
+// -- the body ---------------------------------------------------------------------------------------
+
+// The body with every parameter replaced, every field of a constructor projected, and every nested
+// operator call expanded in turn. Every node it builds is placed at the call, which is what a
+// diagnostic or a debugger names. Nothing for a form the reading does not take.
+private substituted(cx: *Expanding, x: TExpr, env: Buf[(string, TExpr)], span: Span) -> Option[TExpr] = *x.kind match
+    TLoad(n, _) ->
+        for item in env
+            if item.0 == n then return Some(item.1)
+
+        None
+    TField(recv, i, ty) -> substituted(cx, recv, env, span).map(s -> projected(s, i, ty, span))
+    TStructNew(decl, args) ->
+        if !plain(cx, Struct(decl)) then return None
+
+        val out = substituted_all(cx, args, env, span)
+
+        if out.is_none() then return None
+
+        Some(TExpr(span, TStructNew(decl, out.unwrap())))
+    TBinary(op, l, r, ty) ->
+        if !float_arith(op, ty) then return None
+
+        val sl = substituted(cx, l, env, span)
+
+        if sl.is_none() then return None
+
+        substituted(cx, r, env, span).map(sr -> TExpr(span, TBinary(op, sl.unwrap(), sr, ty)))
+    TUnary(op, o, ty) ->
+        if op != "-" || !is_float(ty) then return None
+
+        substituted(cx, o, env, span).map(so -> TExpr(span, TUnary(op, so, ty)))
+    TFloatLit(_, _) -> Some(x)
+    TIntLit(_, _) -> Some(x)
+    TBoolLit(_) -> Some(x)
+    TCall(name, args, _, false) ->
+        val f = cx.body_of(name)
+
+        if f.is_none() then return None
+
+        val out = substituted_all(cx, args, env, span)
+
+        if out.is_none() then return None
+
+        expanded_call(cx, f.unwrap(), out.unwrap(), span, false)
+    _ -> None
+
+private substituted_all(cx: *Expanding, xs: Buf[TExpr], env: Buf[(string, TExpr)], span: Span) -> Option[Buf[TExpr]]
+    var out: Buf[TExpr] = buf()
+
+    for item in xs
+        val s = substituted(cx, item, env, span)
+
+        if s.is_none() then return None
+
+        out.push(s.unwrap())
+
+    Some(out)
+end substituted_all
+
+// Field `i` of `s`: a constructor's argument where `s` is one.
+private projected(s: TExpr, i: int, ty: Type, span: Span) -> TExpr = *s.kind match
+    TStructNew(_, args) -> args.at(usize(i))
+    _ -> TExpr(span, TField(s, i, ty))
+
+// -- what the reading takes ---------------------------------------------------------------------------
+
+// Whether the tree holds a product that meets a sum, which is the only reason to read it this way.
+private contracts_in(f: Fusing, x: TExpr) -> bool = *x.kind match
+    TBinary(op, l, r, ty) -> contracted_binary(f, op, l, r, ty).is_some() || contracts_in(f, l) || contracts_in(f, r)
+    TUnary(_, o, _) -> contracts_in(f, o)
+    TField(recv, _, _) -> contracts_in(f, recv)
+    TStructNew(_, args) ->
+        for item in args
+            if contracts_in(f, item) then return true
+
+        false
+    _ -> false
+
+// A value read again costs nothing and changes nothing: a literal, a local, a field of one.
+private trivial(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    TFloatLit(_, _) -> true
+    TIntLit(_, _) -> true
+    TBoolLit(_) -> true
+    TField(recv, _, _) -> trivial(recv)
+    _ -> false
+
+// Whether evaluating `x` can write anything: a read, an element, a dereference and arithmetic cannot,
+// though an element may trap.
+private reads_only(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TFloatLit(_, _) -> true
+    TIntLit(_, _) -> true
+    TBoolLit(_) -> true
+    TField(recv, _, _) -> reads_only(recv)
+    TIndex(recv, i, _) -> reads_only(recv) && reads_only(i)
+    TDeref(o, _) -> reads_only(o)
+    TLen(recv, _) -> reads_only(recv)
+    TCast(o, _) -> reads_only(o)
+    TUnary(_, o, _) -> reads_only(o)
+    TBinary(_, l, r, _) -> reads_only(l) && reads_only(r)
+    TStructNew(_, args) ->
+        for item in args
+            if !reads_only(item) then return false
+
+        true
+    _ -> false
+
+private is_struct_new(x: TExpr) -> bool = *x.kind match
+    TStructNew(_, _) -> true
+    _ -> false
+
+private float_arith(op: string, ty: Type) -> bool = is_float(ty) && (op == "+" || op == "-" || op == "*" || op == "/")
+
+private is_float(ty: Type) -> bool = ty match
+    Floating(_, _) -> true
+    _ -> false
+
+// A number, or a struct of numbers laid out field after field with no destructor: a value whose copy
+// is a copy and whose unread fields are nothing.
+private plain(cx: *Expanding, t: Type) -> bool = t match
+    Floating(_, _) -> true
+    Integer(_, _, _) -> true
+    Bool -> true
+    Char -> true
+    Struct(d) ->
+        if d.union_layout || !d.c_bits.is_empty() || d.opaque || d.big_endian.is_some() || cx.dropped(t) then
+            return false
+
+        for item in d.fields
+            if !plain(cx, item.1) then return false
+
+        true
+    _ -> false

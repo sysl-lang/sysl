@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, sub as big_sub}
 import sysl.math.decimal.{Decimal, rescale, Rounding}
@@ -151,19 +152,27 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         VNothing
 
-    TBinary(op, l, r, ty) -> gen_binary(e, op, l, r, ty)
+    TBinary(op, l, r, ty) -> expansion_at(e, x) match
+        Some(t) -> gen_expr(e, t)
+        None -> gen_binary(e, op, l, r, ty)
     TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty)
     TLogical(op, l, r) -> gen_logical(e, op, l, r)
     TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
 
     TStore(place, value, ty, yields) -> yielded(yields, gen_store(e, place, value, ty))
     TUpdate(place, op, value, ty, dispatch, check, yields) ->
-        yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
+        val ex = if check.is_some() then None else update_expansion_at(e, x.span, place, value, ty, dispatch, yields)
+
+        if ex.is_some() then gen_expr(e, ex.unwrap())
+        else yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
     TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
 
     TCall(name, args, ty, _) ->
-        if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then gen_tail_self_call(e, args)
-        else gen_call(e, name, args, ty)
+        if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then return gen_tail_self_call(e, args)
+
+        expansion_at(e, x) match
+            Some(t) -> gen_expr(e, t)
+            None -> gen_call(e, name, args, ty)
     TAtomic(op, addr, ops, ordering, at, ty) -> gen_atomic(e, op, addr, ops, ordering, at, ty)
     TFence(ordering) -> gen_fence(e, ordering)
     TSlots(op, args, elem, ty) -> gen_slots(e, op, args, elem, ty)
@@ -735,6 +744,36 @@ fused_update(e: *Emit, op: string, ty: Type, dispatch: Option[TDispatch], cur: V
         Some(k) -> Some(contracted_onto(e, k, ty, cur))
         None -> None
 end fused_update
+
+// `x` with the arithmetic operator calls in its reach read as their bodies, where that leaves a
+// product meeting a sum (`fp_operators.sysl`) -- or nothing, and `x` is lowered as it was written.
+expansion_at(e: *Emit, x: TExpr) -> Option[TExpr]
+    if e.operators.is_empty() then return None
+
+    val ops = e.operators
+
+    operator_expansion(fusing_of(e.target), n -> ops.get(n), t -> destructor_of(e, t).is_some(), e.op_temps, x) match
+        Some((t, next)) ->
+            e.op_temps = next
+            Some(t)
+        None -> None
+end expansion_at
+
+// The same for `place op= value` through an operator method. A place a container's call reaches is
+// left to the update, which addresses it after the value.
+update_expansion_at(e: *Emit, span: Span, place: TExpr, value: TExpr, ty: Type, dispatch: Option[TDispatch],
+                    yields: bool) -> Option[TExpr]
+    if e.operators.is_empty() || dispatch.is_none() || reaches_through_call(place) then return None
+
+    val ops = e.operators
+
+    update_expansion(fusing_of(e.target), n -> ops.get(n), t -> destructor_of(e, t).is_some(), e.op_temps, span,
+                     place, value, dispatch.unwrap(), ty, yields) match
+        Some((t, next)) ->
+            e.op_temps = next
+            Some(t)
+        None -> None
+end update_expansion_at
 
 // `p - q`, C's `ptrdiff_t`. The bytes between the two addresses, divided by the pointee's size so
 // the answer counts elements. The divide is skipped for a one-byte pointee.
