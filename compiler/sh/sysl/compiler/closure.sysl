@@ -23,6 +23,29 @@ import sysl.text.str_builder
 // and no module name may, so nothing a program can write collides with one.
 closure_base(n: usize) -> string = s"${ModuleSep}closure$n"
 
+// The name a **scoped child's** closure is filed under: one written as the argument of a `@scoped`
+// parameter that captures a view. Such a view is borrowed from the frame blocked in the scope call
+// rather than shared with the child, so it is stored with a null owner and never counted
+// (`type_queries.sysl`'s `borrowed_capture`). The difference is in the name because it is a fact
+// about the struct, read wherever the struct is -- the share walk, the construction, the ARC walks --
+// and none of those is handed anything but the type.
+lending_closure_base(n: usize) -> string = closure_base(n) + borrowing_closure_suffix()
+
+// Where an argument was written, as `Analysis.scoped_args` holds it: the file and the two ends.
+scoped_arg_key(cx: &Analyzer, span: Span) -> string = s"${cx.scope.src.name}:${span.start}:${span.end}"
+
+// Whether the closure written at `span` with these captures is a scoped child that borrows a view.
+private borrows_its_views(cx: &Analyzer, span: Span, fields: Buf[(string, Type)]) -> bool
+    if !cx.an.scoped_args.has(scoped_arg_key(cx, span)) then return false
+
+    for item in fields
+        item.1 match
+            Slice(_, _) -> return true
+            _ -> ()
+
+    false
+end borrows_its_views
+
 // What a trailing block calls the one value it is passed.
 closure_it() -> string = "it"
 
@@ -229,7 +252,8 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     for item in captured
         fields.push((item, cx.lookup(item).unwrap().ty))
 
-    val base = closure_base(cx.an.closure_count)
+    val base = if borrows_its_views(cx, span, fields) then lending_closure_base(cx.an.closure_count)
+    else closure_base(cx.an.closure_count)
 
     cx.an.closure_count += 1
 

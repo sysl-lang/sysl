@@ -202,6 +202,85 @@ is spared — one made earlier and held in a local could be handed anywhere — 
 is still followed as made of the scope, so a handle built around `self` may not be returned from the
 body or stored outside it.
 
+**A closure written straight at `f` may capture a view.** Everything a `&sync Fn` may capture it may
+capture too — scalars, arrays, `&sync T`, raw pointers, the lent scope — and also a view, `[]T` or
+`[]const T`, whose elements may themselves be shared. The view is lent to the child rather than shared
+with it: it is stored with a null owner, the form a view of a frame's own array has, so neither
+building the child nor letting it go touches the count of the storage it was taken from, and the
+caller is held inside the scope call until the child is done.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+total(v: []int) -> int
+    Runner(0).scope((s) ->
+        s.spawn(() -> print(v[0] + v[1] + v[2]))
+        int(v.len))
+
+var b: Buf[int] = buf()
+
+b.push(3)
+b.push(4)
+b.push(5)
+print(total(b.view()))
+```
+
+```output
+12
+3
+```
+
+Only a closure written at the argument borrows; the same capture anywhere else — a `&sync Fn`
+parameter, a member that is only `@crossing`, a closure made earlier and handed in — is refused as it
+always was. So are a `&T`, a `string`, a `Buf`, and a view whose elements cannot be shared:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+struct Runner
+    n: int
+
+    @lends(body)
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+first(ws: []string) -> int
+    Runner(0).scope((s) ->
+        s.spawn(() -> print(ws[0]))
+        0)
+```
+
+```error
+but the 'ws' it captures reaches a '[]string', which owns its elements through a count that is not atomic
+```
+
 **What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent:
 
 ```sysl

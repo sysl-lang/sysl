@@ -227,9 +227,16 @@ contains_counted(t: Type) -> bool = t match
     Str -> true
     Array(_, elem) -> contains_counted(*elem)
     // A task holds a share of its coroutine's frame, which is freed when the last share goes.
-    Struct(d) -> d.base == TaskBase || fields_counted(d.fields)
+    Struct(d) -> d.base == TaskBase || struct_fields_counted(d)
     Enum(d) -> variants_counted(d.variants)
     _ -> false
+
+private struct_fields_counted(d: &StructType) -> bool
+    for item in d.fields
+        if contains_counted(item.1) && !borrowed_capture(d, item.1) then return true
+
+    false
+end struct_fields_counted
 
 private fields_counted(fields: Buf[(string, Type)]) -> bool
     for item in fields
@@ -237,6 +244,23 @@ private fields_counted(fields: Buf[(string, Type)]) -> bool
 
     false
 end fields_counted
+
+// What ends the name of a closure that borrows the views it captures (`closure.sysl`'s
+// `lending_closure_base`). It follows the counter, so it cannot be mistaken for more digits of it.
+borrowing_closure_suffix() -> string = "borrows"
+
+// Whether a field of `d` is a view a scoped child **borrowed**: `d` is a closure written at a
+// `@scoped` parameter, and the field is a view it captured. Such a view is stored with a null owner,
+// since the frame it was taken from is blocked in the scope call until the child has finished; so it
+// is not counted -- no share is taken when the closure is built or copied and none is given back when
+// it is let go -- and it is not shared with the child either (`sharing.sysl`).
+borrowed_capture(d: &StructType, fty: Type) -> bool
+    if !is_closure_literal(Struct(d)) || !d.base.ends_with(borrowing_closure_suffix()) then return false
+
+    fty match
+        Slice(_, _) -> true
+        _ -> false
+end borrowed_capture
 
 private variants_counted(vs: Buf[EnumVariant]) -> bool
     for item in vs
