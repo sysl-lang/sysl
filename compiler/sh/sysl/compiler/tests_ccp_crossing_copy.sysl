@@ -1,0 +1,239 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// `@crossing(copy value)` (`reference/memory.md § Crossing a concurrency domain`): a parameter
+// written `copy` is handed a fresh copy of every view it holds, at any depth, so a view crosses
+// there -- a channel's `send` and `try_send` are the library's case. What the rule asks of the value
+// is what is left once the views are copied; the copy allocates, so an `@no_alloc` module is told at
+// the call. The run claims are made on the counted heap and under ThreadSanitizer.
+
+private extern "setenv" ccp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" ccp_c_unsetenv(name: *u8) -> int
+
+private struct CcpRun
+    ok: bool
+    out: string
+    err: string
+
+private ccp_ch(body: string) -> string = "import sysl.threads.*\n\n" + body
+
+// The program built -- with the counted heap, or under `flags` where they are given -- and run.
+private ccp_run(text: string, flags: string) -> CcpRun
+    val root = make_temp_dir("sysl-ccp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/package.hocon", "").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags == "" then force_alloc_counting(true) else ccp_c_setenv(name.ptr, value.ptr, 1)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    if flags == "" then force_alloc_counting(false) else ccp_c_unsetenv(name.ptr)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CcpRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", s"$root/built"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> ""
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    if flags != "" && !undefined.contains("__tsan_write") then return CcpRun(false, "not instrumented", undefined)
+
+    said match
+        Err(_) -> CcpRun(false, "could not be started", "")
+        Ok(o) -> CcpRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ccp_run
+
+// --- what crosses ------------------------------------------------------------------------------------
+
+@test("a view of a frame array crosses as a copy, which the sender's later stores do not reach")
+ccp_frame_view_is_copied()
+    if !azd_ready() then return
+
+    twp_prints(ccp_ch("var slots: [2][]u8 = [[]; 2]\nvar ch = channel(slots[..])\nvar mine: [3]u8 = [1, 2, 3]\n\n" +
+                      "print(ch.try_send(mine[..]))\nmine[0] = 9\n\nval got = ch.try_receive().unwrap()\n\n" +
+                      "print(got.len, got[0], got[2])\n"), "true\n3 1 3\n")
+
+@test("a view of a heap buffer of ints crosses, and outlives the buffer it was taken from")
+ccp_heap_view_outlives_its_buffer()
+    if !azd_ready() then return
+
+    twp_prints(ccp_ch("import sysl.buf.{Buf, buf}\n\nfill(n: int) -> []int\n    var b: Buf[int] = buf()\n\n" +
+                      "    for i in 0..<n\n        b.push(i * 10)\n\n    b.view()\n\n" +
+                      "var slots: [2][]int = [[]; 2]\nvar ch = channel(slots[..])\n\nprint(ch.try_send(fill(4)))\n\n" +
+                      "val back = ch.try_receive().unwrap()\n\nprint(back.len, back[3])\n"), "true\n4 30\n")
+
+@test("a string crosses as a copy of its bytes")
+ccp_string_is_copied()
+    if !azd_ready() then return
+
+    twp_prints(ccp_ch("var slots: [2]string = [\"\", \"\"]\nvar ch = channel(slots[..])\nvar text = \"hello world\"\n\n" +
+                      "print(ch.try_send(text[0..<5]))\ntext = \"gone\"\nprint(ch.try_receive().unwrap())\n"),
+               "true\nhello\n")
+
+// The outer view is copied and so is every view it holds: a store into an inner array after the send,
+// and a store of another view into the outer one, are both invisible to the receiver.
+@test("a view of views is copied all the way down")
+ccp_nested_view_is_deep_copied()
+    if !azd_ready() then return
+
+    twp_prints(ccp_ch("var rows: [2][][]u8 = [[]; 2]\nvar ch = channel(rows[..])\nvar a: [2]u8 = [1, 2]\n" +
+                      "var b: [3]u8 = [3, 4, 5]\nvar outer: [2][]u8 = [a[..], b[..]]\n\n" +
+                      "print(ch.try_send(outer[..]))\na[0] = 9\nouter[1] = a[..]\n\n" +
+                      "val got = ch.try_receive().unwrap()\n\nprint(got.len, got[0][0], got[0][1], got[1].len, got[1][2])\n"),
+               "true\n2 1 2 3 5\n")
+
+@test("a free function's own '@crossing(copy grid)' copies a view of views as the channel does")
+ccp_free_function_copies()
+    if !azd_ready() then return
+
+    twp_prints("@crossing(copy words)\ncount(words: []string) -> usize = words.len\n\n" +
+               "@crossing(copy grid)\nfirst(grid: [][]u8) -> u8 = grid[1][0]\n\n" +
+               "var w: [2]string = [\"a\", \"b\"]\nvar a: [1]u8 = [7]\nvar b: [1]u8 = [8]\n" +
+               "var g: [2][]u8 = [a[..], b[..]]\n\nprint(count(w[..]), first(g[..]))\n", "2 8\n")
+
+@test("the copies are given back: nothing is left on the counted heap")
+ccp_copies_do_not_leak()
+    if !azd_ready() then return
+
+    val run = ccp_run(ccp_ch("var rows: [2][][]u8 = [[]; 2]\nvar ch = channel(rows[..])\nvar a: [2]u8 = [1, 2]\n" +
+                             "var outer: [2][]u8 = [a[..], a[..]]\n\nfor k in 0..<5\n    ch.try_send(outer[..])\n" +
+                             "    val got = ch.try_receive().unwrap()\n\n    print(got[1][1])\n"), "")
+
+    assert(run.ok, run.out)
+    assert(run.out == "2\n2\n2\n2\n2\n", run.out)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+
+// --- several threads ---------------------------------------------------------------------------------
+
+// Each producer sends a view of a buffer it then zeroes and drops; the receiver keeps every copy and
+// reads them only once both producers are done, so a copy that shared the sender's storage would read
+// zeros or freed memory.
+private ccp_threads() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.threads.*
+
+    struct Feed
+        ch: *Channel[[]u8]
+        seed: u8
+
+    producer(f: *Feed)
+        for k in 0..<40
+            var mine: Buf[u8] = buf()
+
+            for i in 0..<4
+                mine.push(f.seed)
+
+            f.ch.send(mine.view())
+
+            for i in 0..<mine.len()
+                mine.set(i, 0)
+
+    var slots: [4][]u8 = [[]; 4]
+    var ch = channel(slots[..])
+    var a = Feed(&ch, 1)
+    var b = Feed(&ch, 2)
+    val ta = spawn(&producer, &a).unwrap()
+    val tb = spawn(&producer, &b).unwrap()
+    var kept: Buf[[]u8] = buf()
+
+    for k in 0..<80
+        kept.push(ch.receive().unwrap())
+
+    ta.join()
+    tb.join()
+
+    var total = 0
+    var torn = 0
+
+    for got in kept
+        for i in 0..<4
+            total += int(got[i])
+
+        if got[1] != got[0] || got[2] != got[0] || got[3] != got[0] then torn += 1
+
+    print(total, torn)
+    """
+
+@test("two senders' copies outlive their buffers, whole and not leaked")
+ccp_threads_counted()
+    if !azd_ready() then return
+
+    val run = ccp_run(ccp_threads(), "")
+
+    assert(run.ok, run.out)
+    assert(run.out == "480 0\n", run.out)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+
+@test("and the same run is clean under ThreadSanitizer")
+ccp_threads_tsan()
+    if !azd_ready() then return
+
+    val run = ccp_run(ccp_threads(), "-fsanitize=thread -g")
+
+    assert(run.ok, run.out + run.err)
+    assert(run.out == "480 0\n", run.out)
+    assert(!run.err.contains("ThreadSanitizer"), run.err)
+
+// --- what is still refused ---------------------------------------------------------------------------
+
+@test("a view of counted references is refused: copying the view does not make their counts atomic")
+ccp_view_of_counted_refused()
+    if !azd_ready() then return
+
+    val said = azd_err(ccp_ch("struct Node\n    n: int\n\nvar slots: [2][]&Node = [[]; 2]\nvar ch = channel(slots[..])\n" +
+                              "var nodes: [1]&Node = [Node(1)]\n\nprint(ch.try_send(nodes[..]))\n"))
+
+    assert(said.contains("error: 'value' of method 'sysl.threads.Channel[[]&Node].try_send' reaches another " +
+                         "concurrency domain, so every count inside it has to be atomic — but it holds a '&Node', " +
+                         "whose count is not. Hold it as a '&sync Node'"), said)
+    assert(said.contains("main.sysl:10:24"), said)
+
+@test("a view of '&sync' references crosses, since the copy shares only atomic counts")
+ccp_view_of_sync_crosses()
+    if !azd_ready() then return
+
+    assert_eq(azd_err(ccp_ch("struct Node\n    n: int\n\nvar slots: [2][]&sync Node = [[]; 2]\n" +
+                             "var ch = channel(slots[..])\nvar nodes: [1]&sync Node = [Node(1)]\n\n" +
+                             "print(ch.try_send(nodes[..]))\n")), "")
+
+@test("'copy' alone is a parameter's name, and that parameter is crossing without a copy")
+ccp_copy_alone_is_a_name()
+    if !azd_ready() then return
+
+    val said = azd_err("@crossing(copy)\nkeep(copy: []u8) -> usize = copy.len\n\nvar b: [3]u8 = [1, 2, 3]\n\nprint(keep(b[..]))\n")
+
+    assert(said.contains("error: 'copy' of 'keep' reaches another concurrency domain"), said)
+    assert(said.contains("it is a '[]byte', which owns its elements through a count that is not atomic"), said)
+
+@test("an '@no_alloc' module is told at the call that the copy needs an allocator")
+ccp_no_alloc_refused()
+    if !azd_ready() then return
+
+    val said = azd_err("@no_alloc\n\n" + ccp_ch("var slots: [2][]u8 = [[]; 2]\nvar ch = channel(slots[..])\n" +
+                                                 "var bytes: [2]u8 = [1, 2]\n\nprint(ch.try_send(bytes[..]))\n"))
+
+    assert(said.contains("error: handing 'value' of method 'sysl.threads.Channel[[]byte].try_send' a copy of every " +
+                         "view in it needs an allocator, and this module declared '@no_alloc'"), said)
+    assert(said.contains("main.sysl:9:24"), said)
+
+@test("an '@no_alloc' module may still send a scalar, which copies nothing")
+ccp_no_alloc_scalar_is_fine()
+    if !azd_ready() then return
+
+    assert_eq(azd_err("@no_alloc\n\n" + ccp_ch("var slots: [2]int = [0; 2]\nvar ch = channel(slots[..])\n\nprint(ch.try_send(7))\n")), "")

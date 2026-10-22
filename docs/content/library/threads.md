@@ -656,10 +656,10 @@ true 15
 
 Five values go through a ring of two, so the producer really does fill it and really is woken.
 
-### `@crossing(value)` is written on `send`, and marking the way in is the whole check
+### `@crossing(copy value)` is written on `send`, and marking the way in is the whole check
 
 `send` and `try_send` are the two operations that put a value in, so they carry
-[`@crossing(value)`](/reference/memory/) — which is what holds a caller to the rule about what may
+[`@crossing(copy value)`](/reference/memory/) — which is what holds a caller to the rule about what may
 reach another domain. `receive` carries nothing and needs nothing: **nothing can be taken out that
 was not put in**, so a channel whose sends are held to the rule can hold nothing that breaks it.
 
@@ -705,10 +705,40 @@ what is left in this file is the lock and the closed flag; the wrapping arithmet
 tested there. The pointer-and-count shape travelled with it for exactly the reason this section
 gives, which is why a channel can embed one.
 
-**The copying half of the crossing rule is still not written.** [The memory
-model](/reference/memory/) allows a channel to take a heap-backed view *because it copies the bytes*,
-and this one assigns a slot — the same share the sender held. So a view is refused here exactly as it
-is at `spawn`.
+### A view goes in as a copy
+
+The `copy` in `@crossing(copy value)` says the call hands `send` **a fresh copy of every view the
+value holds, at every depth** — a `[]u8`, a `string`, a `[][]u8`, a struct with views in it — so the
+receiver gets storage of its own and the sender's count never crosses. The sender may go on writing
+to what it sent, or drop it, and the receiver sees the bytes as they were at the `send`:
+
+```sysl
+import sysl.threads.*
+
+var rows: [2][][]u8 = [[]; 2]
+var ch = channel(rows[..])
+var a: [2]u8 = [1, 2]
+var b: [3]u8 = [3, 4, 5]
+var outer: [2][]u8 = [a[..], b[..]]
+
+print(ch.try_send(outer[..]))
+a[0] = 9
+outer[1] = a[..]
+
+val got = ch.try_receive().unwrap()
+
+print(got[0][0], got[1].len)
+```
+
+```output
+true
+1 3
+```
+
+What the elements hold is still asked: a view of `&Node`s is copied as a view, but the copy holds the
+same `&Node`s, whose counts are not atomic, so it is refused in the words above. A view of `&sync
+Node`s crosses. **The copy allocates**, so a module that declared `@no_alloc` is told so at the call,
+and sends values that hold no view.
 
 ## `yield_now` and `current`
 

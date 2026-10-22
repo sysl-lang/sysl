@@ -44,8 +44,9 @@ so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@
 `@ghost`, `@reads` and `@writes` belong to the specification vocabulary and are on the
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
-a parameter hands a value to another concurrency domain and is on the
-[memory](/reference/memory/) page, beside the crossing rule it asks; `@no_alloc`, the one header word a
+a parameter hands a value to another concurrency domain — `@crossing(copy value)` that the call
+hands it a copy of every view in it — and is on the [memory](/reference/memory/) page, beside the
+crossing rule it asks; `@no_alloc`, the one header word a
 function may also carry, holds that one definition to making no heap storage and is below; and
 `@abandons` says a call to the function never comes back while the program goes on, so the caller's
 frame is given back first — it marks an `extern` too, and is on the

@@ -212,10 +212,11 @@ loop
 **A waiter sleeps**: a full `send` waits on one `Condvar` and an empty `receive` on the other, each
 woken by the transfer that makes room or brings a value, and both woken by `close`.
 
-**The copying half of the crossing rule is NOT built.** `reference/memory.md § Crossing a
-concurrency domain` allows a channel to take a heap-backed view *because it copies the bytes*, and
-this one does not copy: a slot is assigned, which is the same share the sender held. So a view is
-refused here exactly as it is at `spawn`, and the relaxation waits on something that copies.
+**A view goes in as a copy.** `send` and `try_send` are `@crossing(copy value)`, so a `[]u8`, a
+`string`, a `[][]u8` or a struct holding views is copied at the call into storage of its own, at
+every depth, and the receiver is handed bytes nothing on the sending side still reaches
+(`reference/memory.md § Crossing a concurrency domain`). The sender may go on writing to what it
+sent. The copy allocates, so a module that gave the allocator up sends values with no view in them.
 
 | Member | Signature | Description |
 |---|---|---|

@@ -3564,6 +3564,52 @@ the only annotations a member may carry are the ones about a parameter
 The three are refused above a **field** and above a **variant** for a different reason, which the
 sentence says: neither has parameters for one of them to name.
 
+### `@crossing(copy value)` — a view crosses as a copy
+
+**A name written after the word `copy` is a parameter the call hands a copy of every view it holds**,
+at every depth: a `[]T`, a `string`, a `[][]u8`, a struct or an enum with views in it. The copy is
+storage with a count of its own, made where the callee reads the parameter, so the caller's count
+never reaches the other domain and the caller may go on writing to what it handed over, or drop it.
+What the rule then asks is what is left once the views are copied — the elements are still the
+elements, so a view of `&T`s is refused as a `&T` is, and a view of `&sync T`s crosses:
+
+```sysl
+@crossing(copy grid)
+first(grid: [][]u8) -> u8 = grid[1][0]
+
+var a: [1]u8 = [7]
+var b: [1]u8 = [8]
+var g: [2][]u8 = [a[..], b[..]]
+
+print(first(g[..]))
+```
+
+```output
+8
+```
+
+`copy` is a word only in front of a name: `@crossing(copy)` names a parameter called `copy`, crossing
+without one. A `*T` parameter is looked through as before and never copied. **The copy allocates**,
+so a call that hands a view to a `copy` parameter is refused in a module that declared `@no_alloc`:
+
+```sysl
+@no_alloc
+
+@crossing(copy v)
+take(v: []u8) -> usize = v.len
+
+var b: [2]u8 = [1, 2]
+
+print(take(b[..]))
+```
+
+```error
+handing 'v' of 'take' a copy of every view in it needs an allocator, and this module declared '@no_alloc'
+```
+
+`sysl.threads.Channel[T]`'s `send` and `try_send` are `@crossing(copy value)`, which is how a channel
+[takes a view](/library/threads/#a-view-goes-in-as-a-copy).
+
 `sysl.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
 taking the channel by address, because the annotation had to be written on a wrapper a caller went
 through; they are methods now, so a channel's transfers and its queries read alike.
