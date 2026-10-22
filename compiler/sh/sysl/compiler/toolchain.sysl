@@ -1124,7 +1124,31 @@ private link_objects(cc: string, first: string, objects: Buf[string], exe: strin
     for i in 1..<command.len()
         args.push(command.at(i))
 
-    as_tool(told(command.at(0), args), command.at(0))
+    // **Every file the link loads is an input of the program** (`linked_inputs`): ld64, GNU ld and lld
+    // each list them under `-t`. A Windows or WebAssembly link names its inputs no such way and is
+    // never replayed by the run cache, which runs only what this machine can.
+    if target.os != MacOS && target.os != Linux then return as_tool(told(command.at(0), args), command.at(0))
+
+    args.push("-Wl,-t")
+
+    val said = told_saying(command.at(0), args) match
+        Ok(text) -> text
+        Err(f) -> return as_tool(Err(f), command.at(0))
+
+    var made: Buf[string] = buf()
+
+    made.push(absolute_path(first))
+
+    for item in objects
+        made.push(absolute_path(item))
+
+    val loaded = linked_inputs(said, made)
+
+    note_files_read(loaded)
+
+    // And where each library would have been found ahead of where it was (`library_records`).
+    note_files_read(library_records(loaded, command))
+    Ok(())
 end link_objects
 
 // What clang is told to turn one codegen unit's text into an object: everything the link command
@@ -1172,6 +1196,19 @@ end ir_object_args
 // leaves the status the only thing there is to go on.
 told(program: string, args: Buf[string]) -> Result[unit, ToolFault] =
     told_by(program, capture(program, args.view(), "", [], true))
+
+// `told`, answering with what the tool printed where it succeeded: its standard output and its error
+// stream, joined -- what `-v` and `-Wl,-t` say is a build's input, not a failure.
+told_saying(program: string, args: Buf[string]) -> Result[string, ToolFault]
+    val ran = capture(program, args.view(), "", [], true)
+
+    ran match
+        Ok(out) -> if out.status.ok() then return Ok(s"${out.text}\n${out.err.unwrap_or("")}")
+        Err(_) -> ()
+
+    // A failure is reported in the tool's words as they read without `-v`.
+    told_by(program, ran).map((u) -> "").map_err((f) -> ToolFault(f.code, after_search_list(f.said), f.unrun))
+end told_saying
 
 // What one run of `program` came to, read the way `told` reads it: a run that could not start, or
 // one that exited other than cleanly, with what it wrote to its error stream.

@@ -3,8 +3,8 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Set, set}
 import sysl.env.get as env_var
-import sysl.fs.{entries, is_file, metadata, read_bytes, read_text, remove_file, write_text_atomic}
-import sysl.text.{from_utf8_unchecked, Search}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_bytes, read_text, remove_file, write_text_atomic}
+import sysl.text.{from_utf8_unchecked, join, Search}
 
 // A `--lib` source root's compiled sysl, kept: the mechanism the standard module's artifact already is
 // (`std_artifact.sysl`), pointed at a root. The root's determined functions are lowered and compiled
@@ -153,18 +153,28 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
             if holds_string(modules, name)
                 return Err(s"another file declares into its module '$name'")
 
-    val key = root_key(program, project, root, level)?
-    val place = s"$dir/$key$SyslibExtension"
+    val first = root_key(program, project, root, level)?
+    val listed = s"$dir/$first.reads"
 
-    // **A hit**: the entry at the key, whole, read back and held to it.
-    root_entry_matching(place, key, t) match
-        Ok(symbols) ->
-            root_hits += 1
-            in_use(place)
-            trace(s"source root ${libs.at(at)}: linked from $place")
-            take(out, symbols, place)
-            return Ok(())
-        Err(_) -> ()
+    // **The second key** (`run_cache.sysl` explains the two steps): the first, and the bytes of every
+    // file the root's last build read through C -- the headers each `c const` block was measured
+    // against, wherever they are. A file gone from that list is a miss.
+    // **A hit**: the entry one of the kept lists comes to, whole, read back and held to it.
+    for text in read_lists(listed)
+        files_key(first, listed_files(text)) match
+            None -> ()
+            Some(key) ->
+                val place = s"$dir/$key$SyslibExtension"
+
+                root_entry_matching(place, key, t) match
+                    Ok(symbols) ->
+                        root_hits += 1
+                        in_use(place)
+                        touch_used(listed)
+                        trace(s"source root ${libs.at(at)}: linked from $place")
+                        take(out, symbols, place)
+                        return Ok(())
+                    Err(_) -> ()
 
     // **A miss**: the root analyzed with only what it can see -- every unit of this compilation but
     // the project's -- and every body of its own typed.
@@ -174,6 +184,7 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
         if !holds_string(program.own, module_written(item))
             alone.push(item)
 
+    val mark = files_read_mark()
     val built = library_build(alone, modules, t, Some(files), true)
 
     // **Closed**: the root analyzes without the project.
@@ -181,6 +192,17 @@ private root_linked(program: Compilation, project: string, libs: Buf[string], at
         return Err(s"it does not analyze without the program: " +
             s"${built.report.at(0).render().trim_end()}")
 
+    // What its analysis read through C decides the second key, and is written beside the first.
+    val read = files_read_sorted(mark)
+
+    val key = files_key(first, read) match
+        Some(k) -> k
+        None -> return Err("a file its C read was gone before it could be kept")
+
+    make_dir_all(dir).unwrap_or(())
+    keep_list(listed, join(read.view(), "\n"))
+
+    val place = s"$dir/$key$SyslibExtension"
     val symbols = write_root_artifact(built, place, key, t, level)?
 
     keep_sum(place)?
@@ -295,8 +317,9 @@ end keep_sum
 // stands is in it too**, the absolute path being what `__FILE__` and every record carry out of its
 // files, and what keeps two roots from ever sharing an entry.
 //
-// What it cannot see is what the run cache cannot: a header outside every hashed tree, found on the
-// system's search path. `SYSL_NO_CACHE=1` is the answer there.
+// This is the first key. A header outside every tree it walks -- an `--include-path` directory, the
+// SDK -- reaches the second, which `root_linked` makes from the files the root's `c const` probes
+// read.
 root_key(program: Compilation, project: string, root: string, level: string) -> Result[string, string]
     val t = program.target
     var parts: Buf[string] = buf()
@@ -319,7 +342,7 @@ root_key(program: Compilation, project: string, root: string, level: string) -> 
     // The C and the headers of the root and of every tree beside it, and each tree's manifest.
     val dir = if is_directory(project) then project else parent_of(project).unwrap_or(".")
 
-    read_into(&files, join_path(dir, "package.hocon"))
+    manifest_into(&files, dir)
     carried_into(&files, root)
 
     val libs = lib_roots()
@@ -329,6 +352,10 @@ root_key(program: Compilation, project: string, root: string, level: string) -> 
 
     manifest_at(dir) match
         Ok(m) ->
+            // The graph as resolved -- each package's selected version, its features and its option
+            // values, wherever in the graph they were decided (`config_key.sysl`).
+            files.push(("graph", resolved_config_part(dir, m)))
+
             val trees = handed_trees(dir, m)
 
             for item in trees
@@ -344,9 +371,14 @@ end root_key
 // tree. A directory whose name starts with a dot is passed over, `.git` being where a tree changes
 // most without its source changing at all.
 private carried_into(out: *Buf[(string, string)], tree: string)
-    read_into(out, join_path(tree, "package.hocon"))
+    manifest_into(out, tree)
     walk_carried(out, tree, 0)
 end carried_into
+
+// A tree's manifest, whole but for the keys `ManifestExempt` names (`manifest_config_part`), under the
+// tree's path.
+private manifest_into(out: *Buf[(string, string)], tree: string) =
+    out.push((s"manifest:${absolute_path(tree)}", manifest_config_part(tree)))
 
 // Deep enough for any tree a person lays out, and a stop for a directory that links back above itself.
 private const CarriedDepth: usize = 32
@@ -369,8 +401,27 @@ private walk_carried(out: *Buf[(string, string)], dir: string, depth: usize)
             read_into(out, one)
 end walk_carried
 
-// A file's text under its path, or the absence of one: a manifest that is not there is a fact about
-// the tree as much as one that is.
+// Every header below a tree -- `.h` and `.inc`, however deep, dot directories passed over -- as its
+// place inside the tree and its text. The run cache keys a tree on these (`program_fingerprint`): a
+// header a package's C includes changes the object compiled from it whether or not a `.c` file moved.
+carried_headers(tree: string) -> Buf[(string, string)]
+    var found: Buf[(string, string)] = buf()
+
+    walk_carried(&found, tree, 0)
+
+    val base = absolute_path(tree)
+    var out: Buf[(string, string)] = buf()
+
+    for item in found
+        val file = item.0[5..]
+
+        if file.ends_with(".h") || file.ends_with(".inc")
+            out.push((if file.starts_with(s"$base/") then file[base.len + 1..] else file, item.1))
+
+    out
+end carried_headers
+
+// A file's text under its path, or the absence of one.
 private read_into(out: *Buf[(string, string)], file: string)
     read_bytes(file) match
         Ok(bytes) -> out.push((s"file:${absolute_path(file)}", from_utf8_unchecked(bytes.view())))

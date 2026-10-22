@@ -43,9 +43,10 @@ private rcp_done(dirs: []string)
     for d in dirs
         remove_dir_all(d).unwrap_or(())
 
-// How many entries the cache holds, the test lists beside the binaries included.
+// How many entries the cache holds, the test lists beside the binaries included and the seals and the
+// lists of files read left out (one of each per binary, so they add nothing a count could tell apart).
 private rcp_entries(cache: string) -> usize = entries(s"$cache/sysl/run") match
-    Ok(names) -> names.len()
+    Ok(names) -> names.filter((n) -> !n.ends_with(SealSuffix) && !n.ends_with(ReadsSuffix)).len
     Err(_) -> 0
 
 // `sysl <args>` as the command line answers it: the status, and everything it said.
@@ -694,9 +695,9 @@ rcp_a_reader_sees_one_whole_version()
     assert_eq(seen.len(), 0, if seen.len() > 0 then seen.at(0) else "")
 end rcp_a_reader_sees_one_whole_version
 
-// A kept test build is the two steps the driver takes: the link published onto the slot, then the
-// list written beside it.
-@test("a kept test build puts the binary in its slot and the list beside it")
+// A kept test build is the three steps the driver takes: the link published onto the slot, sealed,
+// then the list written beside it.
+@test("a kept test build puts the binary in its slot, the seal and the list beside it")
 rcp_a_kept_test_build_has_both()
     val cache = rcp_cache()
     val slot = run_cache_reserve("k").unwrap()
@@ -705,9 +706,12 @@ rcp_a_kept_test_build_has_both()
 
     suite.push(TTest("m$t", "a test", false, None, "m.sysl", 1, no_hooks(), None, None))
     write_text(linked, "binary").unwrap()
-    assert(publish_file(linked, slot).is_ok(), "the publish failed")
-    write_test_list("k", suite)
-    assert_eq(read_text(slot).unwrap(), "binary")
+    clear_files_read()
+
+    val exe = settle_run_entry(linked, slot).unwrap()
+
+    write_test_list_at(exe, suite)
+    assert_eq(read_text(exe).unwrap(), "binary")
 
     val back = read_test_list("k").unwrap()
 
@@ -715,11 +719,14 @@ rcp_a_kept_test_build_has_both()
     assert_eq(rcp_shown(back.at(0)), rcp_shown(suite.at(0)))
 
     var names = rcp_names(s"$cache/sysl/run").view()
+    val second = basename(exe)
 
     sort(names)
-    assert_eq(names.len, 2)
-    assert_eq(names[0], "k")
-    assert_eq(names[1], "k.tests")
+    assert_eq(names.len, 4)
+    assert_eq(names[0], second)
+    assert_eq(names[1], s"$second.seal")
+    assert_eq(names[2], s"$second.tests")
+    assert_eq(names[3], "k.reads")
     rcp_done([cache])
 end rcp_a_kept_test_build_has_both
 

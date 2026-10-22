@@ -1,0 +1,285 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.text.{join, split, Search}
+
+// **What a build reads that is not named in what it was told**, so the caches that key on what a
+// build read can key on it too (`c_object_cache.sysl`'s second key, which the run cache and a source
+// root's kept half reuse).
+//
+// ==A header that would be found first==
+//
+// The bytes of every header a C compilation read are in the key, but a header is found by a SEARCH:
+// a file that appears under the same name in a directory searched ahead of the one it was found in
+// changes the program without changing a byte of anything read last time. So beside each header read,
+// the key keeps a **shadow record** -- every path at which a file would be found ahead of it -- and a
+// record one of whose paths now names a file is a miss (`record_shadowed`).
+//
+// The places searched are clang's own, as `-v` prints them for that very command line: `-iquote`,
+// `-I`, `-isystem`, the resource and SDK directories, and the framework directories (a framework's
+// `Headers/` and `PrivateHeaders/` answer `Name/file.h`). A quoted include also looks beside the file
+// that includes it; that is the compiled source's own directory, and the directories of the headers
+// that belong to the build rather than to the toolchain.
+
+// One place clang searches for headers, in the order it searches them.
+struct SearchDir
+    dir: string
+    frameworks: bool
+end SearchDir
+
+private const FrameworkMark: string = " (framework directory)"
+
+// The search list clang's `-v` printed on its error stream: every directory between the first
+// "search starts here:" and "End of search list.", in order.
+search_list(said: string) -> Buf[SearchDir]
+    var out: Buf[SearchDir] = buf()
+    var inside = false
+
+    for line in lines_of(said)
+        if line.contains("search starts here:")
+            inside = true
+            continue
+
+        if line.starts_with("End of search list.") then break
+
+        if inside && line.starts_with(" ")
+            val d = line.trim()
+
+            if d.ends_with(FrameworkMark) then out.push(SearchDir(d[0..<d.len - FrameworkMark.len], true))
+            else out.push(SearchDir(d, false))
+
+    out
+end search_list
+
+// What clang said after its `-v` preamble -- the diagnostics a failed compilation is reported with,
+// as they would read without `-v`. A preamble that never reached its search list (clang refused the
+// command line itself) is returned whole.
+after_search_list(said: string) -> string
+    val mark = "End of search list.\n"
+
+    said.index_of(mark) match
+        Some(at) -> said[at + mark.len..]
+        None -> said
+end after_search_list
+
+// A shadow record for each header a compilation read: `?` and every path, tab-separated, at which a
+// file would be found ahead of it. `src` is the file compiled (empty where it is a temporary, whose
+// directory nothing lives in); `own` the directories a quoted include may also look in.
+shadow_records(read: Buf[string], src: string, dirs: Buf[SearchDir]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var beside: Buf[string] = buf()
+
+    // Where a quoted include also looks: beside the compiled file, and beside every header read
+    // that no system directory holds -- the build's own, which are what include each other by quotes.
+    if !src.is_empty()
+        parent_of(src) match
+            Some(p) -> beside.push(p)
+            None -> ()
+
+    for f in read
+        if f == src then continue
+
+        if !under_system(f, dirs)
+            parent_of(f) match
+                Some(p) -> if !holds_string(beside, p) then beside.push(p)
+                None -> ()
+
+    for f in read
+        if f == src then continue
+
+        shadow_record(f, beside, dirs) match
+            Some(r) -> out.push(r)
+            None -> ()
+
+    out
+end shadow_records
+
+// The record for one header: nothing where no search directory holds it (it was found beside its
+// includer, which is searched first) or nothing is searched ahead of where it was found.
+private shadow_record(file: string, beside: Buf[string], dirs: Buf[SearchDir]) -> Option[string]
+    for i in 0..<dirs.len()
+        name_in(dirs.at(i), file) match
+            None -> ()
+            Some(name) ->
+                var ahead: Buf[string] = buf()
+
+                for p in beside
+                    if p != dirs.at(i).dir && !dirs.at(i).frameworks then ahead.push(join_path(p, name))
+
+                for j in 0..<i
+                    path_in(dirs.at(j), name) match
+                        Some(c) -> ahead.push(c)
+                        None -> ()
+
+                if ahead.is_empty() then return None
+
+                return Some("?" + join(ahead.view(), "\t"))
+
+    None
+end shadow_record
+
+// The name a file was found by in one search directory, or nothing where the directory does not hold
+// it. A framework directory holds `Name.framework/Headers/file.h` under the name `Name/file.h`.
+private name_in(d: SearchDir, file: string) -> Option[string]
+    val prefix = s"${d.dir}/"
+
+    if !file.starts_with(prefix) then return None
+
+    val rest = file[prefix.len..]
+
+    if !d.frameworks then return Some(rest)
+
+    val parts = split(rest, "/")
+
+    if parts.len < 3 || !parts[0].ends_with(".framework") then return None
+    if parts[1] != "Headers" && parts[1] != "PrivateHeaders" then return None
+
+    var tail: Buf[string] = buf()
+
+    for k in 2..<parts.len
+        tail.push(parts[k])
+
+    Some(s"${parts[0][0..<parts[0].len - 10]}/${join(tail.view(), "/")}")
+end name_in
+
+// Where a file of that name would be in one search directory: nothing for a framework directory and a
+// name with no framework part.
+private path_in(d: SearchDir, name: string) -> Option[string]
+    if !d.frameworks then return Some(join_path(d.dir, name))
+
+    val parts = split(name, "/")
+
+    if parts.len < 2 then return None
+
+    var tail: Buf[string] = buf()
+
+    for k in 1..<parts.len
+        tail.push(parts[k])
+
+    Some(s"${d.dir}/${parts[0]}.framework/Headers/${join(tail.view(), "/")}")
+end path_in
+
+// Whether a file sits in a directory the toolchain searches on its own -- one no `-I` named, the
+// resource and SDK directories. Read as: any search directory but the build's own, which are the
+// ones holding a header the build's own files read.
+private under_system(file: string, dirs: Buf[SearchDir]) -> bool
+    for d in dirs
+        if file.starts_with(s"${d.dir}/") && (d.frameworks || d.dir.contains(".sdk/") || d.dir.contains("/lib/clang/") ||
+                                             d.dir.starts_with("/usr/"))
+            return true
+
+    false
+end under_system
+
+// Whether a shadow record's paths now name a file: a header would be found ahead of the one read.
+record_shadowed(record: string) -> bool
+    val paths = split(record[1..], "\t")
+
+    for i in 0..<paths.len
+        if is_file(paths[i]) then return true
+
+    false
+end record_shadowed
+
+// ==What the linker read==
+//
+// A library the link takes -- an archive or a shared library from a `--link-path` directory, the
+// SDK's stubs, the toolchain's runtime -- reaches the program as surely as a header does, so the link
+// is run with `-Wl,-t` (ld64, GNU ld and lld each print every file they load) and what it names is
+// added to what the build read. The forms read: a path; `archive(member)` (ld64, lld); `(archive)member`
+// (GNU ld); `-lname (path)` (GNU ld). What the build made itself -- the text and the objects it hands
+// the link -- is keyed already and is left out.
+
+// The files a link's `-t` output names that exist and are not among `made`, each once.
+linked_inputs(said: string, made: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in lines_of(said)
+        val l = line.trim()
+
+        if l.is_empty() then continue
+
+        val named = linked_name(l)
+
+        if named.is_empty() || named.contains(": ") then continue
+
+        val full = absolute_path(named)
+
+        if !is_file(full) || holds_string(made, full) || holds_string(made, named) then continue
+        if !holds_string(out, full) then out.push(full)
+
+    out
+end linked_inputs
+
+// **A library is found by a search too**, through the link's `-L` directories in order and then the
+// linker's own, and in each directory a stub or shared library ahead of an archive (ld64 and lld look
+// for `.tbd`, `.dylib`/`.so`, then `.a`). So each `lib*` file the link loaded gets a shadow record as a
+// header does: the same library under every name a search would have taken first -- in each `-L`
+// directory ahead of the one it was found in, and in its own directory under a name taken ahead of
+// its own. One found in the linker's own directories is behind every `-L` one.
+library_records(loaded: Buf[string], command: Buf[string]) -> Buf[string]
+    var dirs: Buf[string] = buf()
+
+    for arg in command
+        if arg.starts_with("-L") && arg.len > 2 then dirs.push(absolute_path(arg[2..]))
+
+    val kinds: []const string = [".tbd", ".dylib", ".so", ".a"]
+    var out: Buf[string] = buf()
+
+    for f in loaded
+        val base = basename(f)
+
+        if !base.starts_with("lib") then continue
+
+        val stem = base.index_of(".") match
+            Some(at) -> base[0..<at]
+            None -> continue
+
+        val own = parent_of(f).unwrap_or("")
+        var at = dirs.len()
+
+        for i in 0..<dirs.len()
+            if dirs.at(i) == own && at == dirs.len() then at = i
+
+        var ahead: Buf[string] = buf()
+
+        for j in 0..<at
+            for k in 0..<kinds.len
+                ahead.push(s"${dirs.at(j)}/$stem${kinds[k]}")
+
+        // In its own directory, a name searched ahead of its own.
+        for k in 0..<kinds.len
+            if base == s"$stem${kinds[k]}" then break
+
+            ahead.push(s"$own/$stem${kinds[k]}")
+
+        if !ahead.is_empty() then out.push("?" + join(ahead.view(), "\t"))
+
+    out
+end library_records
+
+// The file one line of `-t` output names, or empty.
+private linked_name(l: string) -> string
+    // `(archive)member`
+    if l.starts_with("(")
+        val close = l.index_of(")") match
+            Some(at) -> at
+            None -> return ""
+
+        return l[1..<close]
+
+    if !l.ends_with(")") then return l
+
+    val open = l.last_index_of("(") match
+        Some(at) -> at
+        None -> return l
+
+    val outer = l[0..<open].trim()
+
+    // `-lname (path)`
+    if outer.starts_with("-l") || outer.is_empty() then return l[open + 1..<l.len - 1]
+
+    // `archive(member)`
+    outer
+end linked_name

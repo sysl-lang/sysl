@@ -468,12 +468,25 @@ cev_run_entry_hit_now_survives()
 
     make_dir_all(run).unwrap()
 
-    for i in 0..<10
-        write_text(s"$run/k${i}", repeat("x", 1000)).unwrap()
-        write_text(s"$run/k${i}.tests", "t").unwrap()
-        cev_date(run, s"k${i}*", s"20200101010${i}")
+    // The first key `k0`'s program is kept under the second key its (empty) list of files read
+    // comes to, as a build keeps it.
+    val kept = files_key("k0", buf()).unwrap()
 
-    capture("/bin/chmod", ["+x", s"$run/k0"]).unwrap()
+    write_text(s"$run/k0.reads", "").unwrap()
+
+    for i in 0..<10
+        val name = if i == 0 then kept else s"k${i}"
+
+        write_text(s"$run/$name", repeat("x", 1000)).unwrap()
+        write_text(s"$run/$name.tests", "t").unwrap()
+
+    capture("/bin/chmod", ["+x", s"$run/$kept"]).unwrap()
+    seal_run_entry(s"$run/$kept")
+
+    for i in 0..<10
+        cev_date(run, if i == 0 then s"$kept*" else s"k${i}*", s"20200101010${i}")
+
+    cev_date(run, "k0.reads", "202001010100")
     forget_touched()
     assert(run_cache_hit("k0").is_some(), "the entry is a hit")
 
@@ -481,7 +494,7 @@ cev_run_entry_hit_now_survives()
     use_cache_bound(Some(4000))
     run_cache_reserve("zz").unwrap()
 
-    assert(is_file(s"$run/k0") && is_file(s"$run/k0.tests"),
+    assert(is_file(s"$run/$kept") && is_file(s"$run/$kept.tests"),
         "the entry hit just now stayed, though it was written in 2020")
     assert(!is_file(s"$run/k1"), "an unused entry went")
     cev_end(dirs)

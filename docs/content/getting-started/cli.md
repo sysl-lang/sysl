@@ -58,20 +58,63 @@ sysl run hello.sysl
 runs the binary.
 
 **Running an unchanged program a second time builds nothing.** The executable is kept, keyed on
-everything that can affect its bytes: the compiler's version, the target, the allocator, the
-optimization level, every source file of the program and the C files beside it, every `--lib`
-artifact, the standard module, and the search and link paths. With nothing changed, the same binary
-runs again; change a byte of any input and the key changes, so a kept binary cannot be stale. **The
-program's own arguments are not part of the key**: `sysl run p -- a` and `sysl run p -- b` run one
-binary twice.
+everything that can affect its bytes:
+
+- the compiler's build, the target, what the target provides, the allocator, the optimization level
+  and `--cc`;
+- every source file of the program, of every package and of every `--lib` root, the C and headers
+  beside them, and where each tree is;
+- **every file the build's C read, wherever it is** — a header in an `--include-path` directory,
+  one a package's `headers` variable or a `pkg-config` path reached, the SDK's own — by its bytes, as
+  each C compilation and each `c const` block reported reading it. Editing such a header rebuilds;
+  putting it back runs the binary the first text built;
+- **every header that would now be found first**: for each header read, every place clang searches
+  ahead of where it was found (`-iquote`, `-I`, `-isystem`, the SDK, frameworks, and the directory of
+  the file including it). A file appearing at one of them rebuilds; taking it away runs the binary
+  built without it;
+- **every file the linker loaded** — the objects, archives, shared libraries and SDK stubs it reports
+  under `-t` (ld64 on macOS, GNU ld or lld on Linux) — by its bytes, and every library that would now
+  be found ahead of one it loaded in a `--link-path` or `pkg-config` directory. A shared library is
+  also loaded again at every run, which is where its code comes from; keying the bytes the link read
+  means a rebuilt one relinks rather than replays;
+- **every manifest in the build, whole** — the project's and every package's, every key but the
+  four that are prose about a package (`description`, `license`, `authors`, `keywords`) and the
+  `test` block, which is read afresh on every run;
+- **the graph as resolved**: the version selection settled on for each package, and the features
+  and option values each one is built with — so a value set by a package between yours and the one
+  that reads it is in the key as surely as one you set;
+- the feature request (`--features`, `--no-default-features`, `--all-features`), `-D`,
+  `--include-path` (and any path a package's `headers` variable supplied), `--link-path`, `--link`,
+  `--lto`, `--profile-generate`, `--profile-use` (by the profile's bytes), `--no-bounds-locations`,
+  `--const-steps` and `--no-std-lib`;
+- the standard module, and the environment that reaches the toolchain: `SYSL_EXTRA_CFLAGS`,
+  `SYSL_COUNT_ALLOCS`, `WASI_SDK_PATH` and the four Android variables.
+
+With nothing changed, the same binary runs again; change any of these and the key changes, so a kept
+binary cannot be stale. **A kept binary is also sealed**: a file beside it records the key and the
+binary's digest, so one that was truncated, damaged, or copied from another key's entry is rebuilt
+rather than run.
+
+**What is deliberately not in the key** cannot change the binary: the program's own arguments
+(`sysl run p -- a` and `sysl run p -- b` run one binary twice), `-o`, `-v`, `--explain-escapes` (a run
+that asks for the report compiles again), `SYSL_TIMINGS`, `SYSL_CODEGEN_UNITS` (how many pieces the
+program is compiled in, not what it is), and where the caches and the library are (`HOME`,
+`XDG_CACHE_HOME`, `PATH`, the spelling of `SYSL_LIB` — the library's contents are keyed).
+
+**What the key does not watch is the toolchain's own installation**: a library added to the
+linker's built-in directories ahead of another one there. That is an install of the toolchain or the
+SDK, and `SYSL_NO_CACHE` is for it.
 
 This saves most of what `run` costs, because compilation usually dominates. In a 9,600-line module
 with three git dependencies, a program whose body is `print("hi")` takes 9.2 seconds to compile and
 almost no time to run; with the binary kept, only the run remains.
 
 **`test` keeps its binary the same way**, which matters most for a suite you run repeatedly while
-working. `--filter` selects from the list of tests rather than changing what is compiled, so it is
-not part of the key.
+working. `--filter`, `--file`, `--jobs`, `--timeout` and `--fail-fast` choose among the tests or how
+they run rather than changing what is compiled, so they are not part of the key. **A `--lib` root's
+compiled half is kept under the same key**, so a value or feature that reaches the root from anywhere
+in the graph — your manifest, an intermediate package's, a version a second consumer bumped — gives
+it a new entry rather than another build's.
 
 **`SYSL_NO_CACHE`**, set to any non-empty value, compiles every time. It is meant for working *on
 the compiler*, where the version in the key stays the same while the code it produces changes — the
