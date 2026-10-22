@@ -13,11 +13,11 @@ alone. The [modules reference](/reference/modules/) describes the rule in full.
 
 | | what it does |
 |---|---|
-| `sysl run <path>` | compile and execute |
-| `sysl build <path> -o <exe>` | compile to a native executable |
+| `sysl run [<path>]` | compile and execute |
+| `sysl build [<path>] -o <exe>` | compile to a native executable |
 | `sysl build-lib <path>` | check a library for one machine, writing nothing |
 | `sysl build-c <path> -o <archive>` | compile to a static archive and a C header, for a C project |
-| `sysl test <path>` | run the `@test` functions |
+| `sysl test [<path>]` | run the `@test` functions |
 | `sysl emit-llvm <path>` | print the generated LLVM IR |
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
@@ -33,6 +33,22 @@ alone. The [modules reference](/reference/modules/) describes the rule in full.
 | `sysl targets` | list the machines sysl can build for |
 | `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
 | `sysl lsp` | serve the Language Server Protocol to an editor, on standard input and output |
+
+**`run`, `build` and `test` take their path from the working directory when none is given**, so
+`sysl run`, `sysl build -o app` and `sysl test` in a project's directory mean `sysl run .`, and
+`sysl run -- a b` passes `a` and `b` to the program. **A directory, named or implied, must hold a
+`package.hocon`**: there is no searching upward for one, and a directory without it is refused,
+with status 1, on stderr:
+
+```text
+sysl: error: there is no package.hocon in '/home/me/scratch' — 'sysl init' creates one there, or name a .sysl file to use it without a manifest
+```
+
+A single named `.sysl` file needs no manifest, and an empty `package.hocon` is a manifest. A program
+in a package's `examples/` directory is a project of that package and needs none of its own, and
+`sysl test --std` takes the standard module's tree, which is no project. This is a
+behaviour change: a bare directory of `.sysl` files that `sysl run <dir>` used to build now needs a
+`package.hocon` beside it.
 
 A subcommand is required. Run with none, sysl says so on stderr, prints its usage, and exits 2.
 

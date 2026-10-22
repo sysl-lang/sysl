@@ -1,0 +1,147 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{current_dir, make_dir_all, make_temp_dir, remove_dir_all, set_current_dir, write_text}
+
+// `sysl build`, `run` and `test` default their path to the working directory, and **a directory --
+// named or implied -- holding no manifest is refused**. A single named `.sysl` file needs no manifest,
+// and an empty manifest is a manifest.
+
+// `body` run with a fresh directory as the working directory, which is removed afterwards. The library
+// root found from `compiler/` is named outright before leaving it. Every test runs in a process of its
+// own, so neither the variable nor the directory goes further than this one.
+private cpd_standing_in(manifest: string, body: string -> unit)
+    val here = current_dir().unwrap()
+    val there = absolute_path(make_temp_dir("sysl-cpd-").unwrap())
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    set_current_dir(there).unwrap()
+    if manifest != "" then write_text(s"$there/package.hocon", manifest).unwrap()
+    body(there)
+    set_current_dir(here).unwrap()
+    remove_dir_all(there).unwrap_or(())
+end cpd_standing_in
+
+private cpd_refusal(dir: string) -> string =
+    s"sysl: error: there is no package.hocon in '$dir' — 'sysl init' creates one there, or name a " +
+    ".sysl file to use it without a manifest"
+
+@test("build with no path builds the working directory")
+cpd_build_defaults_to_here()
+    if !clx_ready() then return
+
+    cpd_standing_in("package { name = \"cpdbuild\", version = \"0.1.0\" }\n", (there) ->
+        write_text(s"$there/main.sysl", "print(\"built\")\n").unwrap()
+
+        val (code, _, err) = clx_ran(["sysl", "build"])
+
+        assert_eq(code, Fine, err)
+        assert(err.starts_with("wrote "), err)
+        assert(err.contains("cpdbuild"), err))
+end cpd_build_defaults_to_here
+
+@test("run with no path runs the working directory")
+cpd_run_defaults_to_here()
+    if !clx_ready() then return
+
+    cpd_standing_in("package { name = \"cpdrun\", version = \"0.1.0\" }\n", (there) ->
+        write_text(s"$there/main.sysl", "main()\n    exit(17)\n").unwrap()
+
+        val (code, _, err) = clx_ran(["sysl", "run"])
+
+        assert_eq(code, 17, err))
+end cpd_run_defaults_to_here
+
+@test("run with no path passes what follows -- to the program")
+cpd_run_args_without_a_path()
+    if !clx_ready() then return
+
+    cpd_standing_in("package { name = \"cpdargs\", version = \"0.1.0\" }\n", (there) ->
+        write_text(s"$there/main.sysl", "main(args: []string)\n" +
+            "    if args.len != 3 then exit(3)\n" +
+            "    if args[1] != \"a\" || args[2] != \"b\" then exit(4)\n").unwrap()
+
+        val (code, _, err) = clx_ran(["sysl", "run", "--", "a", "b"])
+
+        assert_eq(code, Fine, err))
+end cpd_run_args_without_a_path
+
+@test("test with no path tests the working directory")
+cpd_test_defaults_to_here()
+    if !clx_ready() then return
+
+    cpd_standing_in("package { name = \"cpdtest\", version = \"0.1.0\" }\n", (there) ->
+        write_text(s"$there/checks.sysl", "@test\nholds() =\n    assert(1 + 1 == 2, \"two\")\n").unwrap()
+
+        val (code, out, err) = clx_ran(["sysl", "test"])
+
+        assert_eq(code, Fine, out + err)
+        assert(out.contains("1 passed, 0 failed"), out))
+end cpd_test_defaults_to_here
+
+@test("a directory with no manifest is refused when named, by each of the three commands")
+cpd_named_directory_without_a_manifest_is_refused()
+    if !clx_ready() then return
+
+    cpd_standing_in("", (there) ->
+        write_text(s"$there/main.sysl", "print(\"x\")\n").unwrap()
+
+        for command in ["build", "run", "test"]
+            val (code, out, err) = clx_ran(["sysl", command, there])
+
+            assert_eq(code, Failed, err)
+            assert_eq(err, cpd_refusal(there))
+            assert_eq(out, ""))
+end cpd_named_directory_without_a_manifest_is_refused
+
+@test("and when implied, there being no search upward for one")
+cpd_implied_directory_without_a_manifest_is_refused()
+    if !clx_ready() then return
+
+    cpd_standing_in("", (there) ->
+        write_text(s"$there/main.sysl", "print(\"x\")\n").unwrap()
+
+        for command in ["build", "run", "test"]
+            val (code, _, err) = clx_ran(["sysl", command])
+
+            assert_eq(code, Failed, err)
+            assert_eq(err, cpd_refusal(absolute_path("."))))
+end cpd_implied_directory_without_a_manifest_is_refused
+
+@test("a single named file needs no manifest")
+cpd_a_named_file_needs_no_manifest()
+    if !clx_ready() then return
+
+    cpd_standing_in("", (there) ->
+        write_text(s"$there/one.sysl", "main()\n    exit(5)\n").unwrap()
+        write_text(s"$there/checks.sysl", "@test\nholds() =\n    assert(1 + 1 == 2, \"two\")\n").unwrap()
+
+        assert_eq(clx_ran(["sysl", "build", "one.sysl", "-o", s"$there/one"]).0, Fine)
+        assert_eq(clx_ran(["sysl", "run", "one.sysl"]).0, 5)
+        assert_eq(clx_ran(["sysl", "test", "checks.sysl"]).0, Fine))
+end cpd_a_named_file_needs_no_manifest
+
+@test("an empty manifest is still a manifest")
+cpd_an_empty_manifest_is_legal()
+    if !clx_ready() then return
+
+    cpd_standing_in("\n", (there) ->
+        write_text(s"$there/main.sysl", "main()\n    exit(6)\n").unwrap()
+
+        assert_eq(clx_ran(["sysl", "run"]).0, 6))
+end cpd_an_empty_manifest_is_legal
+
+@test("a program in a package's examples directory is a project of that package, and needs no manifest of its own")
+cpd_an_example_directory_needs_no_manifest()
+    if !clx_ready() then return
+
+    cpd_standing_in("package { name = \"cpdex\", version = \"0.1.0\" }\n", (there) ->
+        make_dir_all(s"$there/examples/demo").unwrap()
+        make_dir_all(s"$there/geom").unwrap()
+        write_text(s"$there/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+        write_text(s"$there/examples/demo/main.sysl", "main()\n    exit(geom.double(3) + 3)\n").unwrap()
+
+        val (code, _, err) = clx_ran(["sysl", "run", s"$there/examples/demo"])
+
+        assert_eq(code, 9, err))
+end cpd_an_example_directory_needs_no_manifest

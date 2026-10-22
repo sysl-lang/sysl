@@ -469,13 +469,14 @@ private build_command(args: []string, note: string -> unit) -> int
         return Misused
     end if
 
-    // `-p` alone builds that member of the workspace the working directory is in.
-    if file == "" && picked.is_some() then file = "."
+    // With no path the project is the working directory; `-p` then picks a member of that workspace.
+    if file == "" then file = "."
 
-    if file == ""
-        note(build_usage())
-        return Misused
-    end if
+    missing_manifest(file) match
+        Some(why) ->
+            note(refused(why))
+            return Failed
+        None -> ()
 
     if refused_features(note) then return Failed
 
@@ -627,7 +628,7 @@ end took_level
 
 private build_usage() -> string =
     "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] [-p <member>] " +
-    where_flags() + " " + feature_flags() + " " + pipeline_usage() + " <path>"
+    where_flags() + " " + feature_flags() + " " + pipeline_usage() + " [<path>]"
 
 // What a build may ask of LLVM beyond the level (`pipeline.sysl`), which `build`, `run` and `test` say.
 private pipeline_usage() -> string =
@@ -878,13 +879,14 @@ private run_command(args: []string, note: string -> unit) -> int
         return Misused
     end if
 
-    // `-p` alone runs that member of the workspace the working directory is in.
-    if file == "" && picked.is_some() then file = "."
+    // With no path the project is the working directory; `-p` then picks a member of that workspace.
+    if file == "" then file = "."
 
-    if file == ""
-        note(run_usage())
-        return Misused
-    end if
+    missing_manifest(file) match
+        Some(why) ->
+            note(refused(why))
+            return Failed
+        None -> ()
 
     // **One program runs**, so a workspace narrows to the member `-p` picked; without one, the path
     // is the project, the root package where the root is one.
@@ -912,7 +914,7 @@ end run_command
 
 private run_usage() -> string =
     "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] [-p <member>] " + where_flags() +
-    " " + feature_flags() + " " + pipeline_usage() + " <path> [-- <args>]"
+    " " + feature_flags() + " " + pipeline_usage() + " [<path>] [-- <args>]"
 
 // The flags every command that compiles a program takes, written once so that seven usage lines
 // cannot come to disagree about them. `--lib` names a source **directory** and may be given more
@@ -1040,12 +1042,16 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
         return Misused
     end if
 
-    // `-p` alone tests that member of the workspace the working directory is in.
-    if file == "" && picked.is_some() then file = "."
+    // With no path the project is the working directory; `-p` then picks a member of that workspace.
+    if file == "" then file = "."
 
-    if file == ""
-        note(test_usage())
-        return Misused
+    // `--std` tests sysl's own standard module, which is a tree of modules rather than a project.
+    if !std
+        missing_manifest(file) match
+            Some(why) ->
+                note(refused(why))
+                return Failed
+            None -> ()
     end if
 
     if refused_features(note) then return Failed
@@ -1289,7 +1295,7 @@ end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
-    pipeline_usage() + " <path>"
+    pipeline_usage() + " [<path>]"
 
 // `sysl build-lib [--std] [--target <name>] <path>` -- a library held to being a library for one
 // machine.

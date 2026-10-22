@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{join, Search}
 
@@ -55,6 +55,16 @@ lbr_tree(files: Buf[(string, string)]) -> string
     root
 end lbr_tree
 
+// A project: a tree holding these files beside an empty manifest, which a directory handed to `build`,
+// `run` or `test` has to carry.
+lbr_project(files: Buf[(string, string)]) -> string
+    val root = lbr_tree(files)
+
+    if !is_file(manifest_file(root)) then write_text(manifest_file(root), "").unwrap()
+
+    root
+end lbr_project
+
 // A program that is one file, which is how the reference's own cases hand one over.
 lbr_program(text: string) -> string = s"${lbr_tree(lbr_one("main.sysl", text))}/main.sysl"
 
@@ -75,7 +85,7 @@ private lbr_geom() -> string = lbr_tree(lbr_two(
     "    assert(double(3) == 6, \"d\")\n"))
 
 // A project that declares `geom` itself, beside a program calling a `double` it does not declare.
-private lbr_app_with_geom() -> string = lbr_tree(lbr_two(
+private lbr_app_with_geom() -> string = lbr_project(lbr_two(
     "main.sysl", "print(geom.double(21))\nprint(geom.own(2))\n",
     "geom/own.sysl",
     "module geom\n\nown(n: int) -> int = n + 2\n\n@test(\"app case\")\napp_case()\n" +
@@ -201,7 +211,7 @@ lbr_the_flag_needs_an_operand()
     assert_eq(said.1, "Error: Missing value after --lib\nusage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " +
         "[-p <member>] [--lib <dir>] [--include-path <dir>|<name>=<dir>] [--link-path <dir>] [-D <macro>] " +
         "[--explain-escapes] [--features <list>] [--no-default-features] [--all-features] " +
-        "[--lto thin|full] [--profile-generate <dir>] [--profile-use <file>] <path>")
+        "[--lto thin|full] [--profile-generate <dir>] [--profile-use <file>] [<path>]")
 end lbr_the_flag_needs_an_operand
 
 // -- a source root, compiled -------------------------------------------------------------------------
@@ -426,7 +436,7 @@ end lbr_a_roots_tests_run_with_the_projects_module
 lbr_a_roots_tests_are_not_the_projects()
     if !lbr_ready() then return
 
-    val app = lbr_tree(lbr_two(
+    val app = lbr_project(lbr_two(
         "main.sysl", "print(geom.double(21))\n",
         "m/m.sysl",
         "module m\n\n@test(\"app2 case\")\napp2_case()\n    assert(geom.double(1) == 2, \"d\")\n"))
@@ -626,7 +636,7 @@ lbr_an_edited_root_is_recompiled()
     use_run_cache_dir(Some(cache))
 
     val lib = lbr_tree(lbr_one("geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n"))
-    val app = lbr_tree(lbr_two(
+    val app = lbr_project(lbr_two(
         "main.sysl", "print(geom.double(21))\n",
         "m/m.sysl",
         "module m\n\n@test(\"forty-two\")\nforty_two()\n    assert(geom.double(21) == 42, \"d\")\n"))
