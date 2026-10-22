@@ -138,6 +138,9 @@ struct SelfAlias
     // is somebody else's address and not the lent one.
     answers: Option[&Fn(string, usize) -> bool]
 
+    // Where a quiet walk first saw the pointer get out, for the complaint the body that asked makes.
+    first_out: Option[Span]
+
     holds(self, name: string) -> bool = holds_string(self.confined, name)
 
     ref_place(self, name: string) -> Option[TExpr]
@@ -149,7 +152,7 @@ struct SelfAlias
 end SelfAlias
 
 private check_one_self_alias(a: &Analysis, scope: Scope, f: TFunc)
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, false, false, false, "", None, None)
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false, false, false, false, "", None, None, None)
 
     st.confined.push("self")
     alias_walk(a, scope, st, f.body)
@@ -160,7 +163,7 @@ end check_one_self_alias
 lent_escapes(a: &Analysis, scope: Scope, seeds: Buf[string], body: TBlock, lender: string, quiet: bool,
              keeps: &Fn(string, usize) -> bool, answers: &Fn(string, usize) -> bool) -> bool
     val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, quiet, false, lender, Some(keeps),
-                                   Some(answers))
+                                   Some(answers), None)
 
     for seed in seeds
         st.confined.push(seed)
@@ -174,7 +177,7 @@ end lent_escapes
 lent_answers(seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
              answers: &Fn(string, usize) -> bool) -> bool
     val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, true, false, "", Some(keeps),
-                                   Some(answers))
+                                   Some(answers), None)
 
     st.confined.push(seed)
     confine(st, body)
@@ -184,9 +187,35 @@ lent_answers(seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
     st.escaped || (body.result.is_some() && carries(st, body.result.unwrap()))
 end lent_answers
 
+// Where a body lets `seed` outlive the call, handing it back counted with keeping it -- the question a
+// trait's `@borrows` promise puts to each implementation of a pointer parameter. A call through a
+// trait object is not followed into its answer, so what an implementation returns is held to the
+// promise as well as what it stores.
+lent_kept_at(a: &Analysis, scope: Scope, seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
+             answers: &Fn(string, usize) -> bool) -> Option[Span]
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, true, false, "", Some(keeps),
+                                   Some(answers), None)
+
+    st.confined.push(seed)
+    alias_walk(a, scope, st, body)
+
+    if st.first_out.is_some() then return st.first_out
+
+    walk_block_stmts(body, stmt_walk(false, s -> returns_carried(st, s)))
+
+    if st.first_out.is_none() && body.result.is_some() && carries(st, body.result.unwrap())
+        st.first_out = Some(body.result.unwrap().span)
+
+    st.first_out
+end lent_kept_at
+
 private returns_carried(st: &SelfAlias, s: TStmt)
     s match
-        TReturn(v) -> if v.is_some() && carries(st, v.unwrap()) then st.escaped = true
+        TReturn(v) ->
+            if v.is_some() && carries(st, v.unwrap())
+                st.escaped = true
+
+                if st.first_out.is_none() then st.first_out = Some(v.unwrap().span)
         _ -> ()
 
 // Whether a value of this type can hold a raw pointer, which is what the lent rule follows: an
@@ -300,8 +329,9 @@ private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
         st.lent && holds_pointer(ty) && (carries(st, left) || carries(st, right))
 
     // A closure's capture, read inside the closure's own body: the field of its environment holds
-    // whatever the closure was built from.
-    TField(r, _, ty) -> st.lent && holds_pointer(ty) && closure_capture(st, r)
+    // whatever the closure was built from. And a field of a struct VALUE that carries the pointer may
+    // be it -- a field read through a pointer (`TDeref`) is somebody else's storage, and is not.
+    TField(r, _, ty) -> st.lent && holds_pointer(ty) && (closure_capture(st, r) || carries(st, r))
     TRecheck(after, _, _, _) -> carries(st, after)
     TSeq(exprs) -> !exprs.is_empty() && carries(st, exprs.at(exprs.len() - 1))
     TIf(_, then_block, else_block, _) ->
@@ -493,9 +523,20 @@ private lent_handed(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
         TCallPtr(_, args, _, _) ->
             for arg in args
                 got_out(a, scope, st, arg, "is passed through a function pointer, which may hold on to it")
-        TVCall(_, _, args, _, _) ->
-            for arg in args
-                got_out(a, scope, st, arg, "is passed through a trait object, which may hold on to it")
+        // A slot the trait promised to borrow is the exception, and only because every implementation
+        // of the promise has been held to letting the pointer go (`escape.sysl`'s `refuse_borrowed`).
+        TVCall(recv, slot, args, _, _) ->
+            val promised = promised_borrows(a, texpr_type(recv), slot)
+
+            for i in 0..<args.len()
+                var borrowed = false
+
+                for k in promised
+                    if k == i then borrowed = true
+
+                if !borrowed
+                    got_out(a, scope, st, args.at(i),
+                            "is passed through a trait object, which may hold on to it")
         _ -> ()
 end lent_handed
 
@@ -512,6 +553,8 @@ private got_out(a: &Analysis, scope: Scope, st: &SelfAlias, at: TExpr, how: stri
 
     if st.lent
         st.escaped = true
+
+        if st.first_out.is_none() then st.first_out = Some(at.span)
 
         if !st.quiet
             a.fault(scope, at.span, s"'${st.lender}' lends this body a pointer that is valid only " +

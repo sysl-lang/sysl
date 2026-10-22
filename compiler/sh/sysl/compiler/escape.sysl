@@ -1394,27 +1394,43 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
                 val at = slot.borrows.at(k).0
                 val pname = slot.borrows.at(k).1
 
-                if !keeps.holds(slot.target, at) then continue
-
                 val key = s"${slot.target}|${vt.trait_name}|$pname"
 
                 if holds_string(seen, key) then continue
 
+                // A slice is followed by this analysis; a raw pointer, by the lent rule's walk, which
+                // also says where the body lets it go.
+                val view = keeps.holds(slot.target, at)
+                val site = if view then target_span(p, keeps, slot.target)
+                else pointer_kept(a, p, keeps, slot.target, at)
+
+                if site.is_none() then continue
+
                 seen.push(key)
 
-                val at = target_span(p, keeps, slot.target)
-
-                if at.is_none() then continue
+                val what = if view then "be a view of" else "point into"
 
                 // The trait is named by its key, never spelled: a program with a `Writer` of its own
                 // reaches the library's only by path, and a message that spells it plainly names the
                 // wrong trait to the one reader who has to tell them apart.
-                a.fault(func_home(a, slot.target), at.unwrap(),
+                a.fault(func_home(a, slot.target), site.unwrap(),
                     s"'${slot.target}' keeps what it is passed as '$pname', but " +
                     s"'${qualified_name(vt.trait_name)}' declares that parameter borrowed for the " +
-                    "call — it may be a view of the caller's stack, so copy what this needs into " +
+                    s"call — it may $what the caller's stack, so copy what this needs into " +
                     "storage of its own")
 end refuse_borrowed
+
+// Where an implementation keeps a borrowed parameter that can hold a raw pointer, if it does.
+private pointer_kept(a: &Analysis, p: TProgram, keeps: &KeptParams, name: string, at: usize) -> Option[Span]
+    keeps.index.get(name) match
+        None -> None
+        Some(id) ->
+            val f = p.funcs.at(id)
+
+            if at >= f.params.len() || !holds_pointer(f.params.at(at).1) then return None
+
+            borrowed_pointer_kept(a, p.funcs, name, at)
+end pointer_kept
 
 private target_span(p: TProgram, keeps: &KeptParams, name: string) -> Option[Span]
     keeps.index.get(name) match
@@ -1440,8 +1456,21 @@ private borrows_of(keeps: &KeptParams, ty: Type, slot: int) -> Buf[usize]
         Some(known) -> return known
         None -> ()
 
+    val out = promised_borrows(keeps.an, ty, slot)
+
+    keeps.promises.put(key, out)
+    out
+end borrows_of
+
+// The same answer uncached, for the lent rule (`self_alias.sysl`), which asks it only of the bodies a
+// `@lends` call hands its pointer to.
+private[compiler] promised_borrows(a: &Analysis, ty: Type, slot: int) -> Buf[usize]
+    val tr = erased_trait(ty)
     var out: Buf[usize] = buf()
-    val members = slotted_members(keeps.an, trait_bound_of(tr.unwrap()), self_binding(tr.unwrap()))
+
+    if tr.is_none() then return out
+
+    val members = slotted_members(a, trait_bound_of(tr.unwrap()), self_binding(tr.unwrap()))
 
     if slot >= 0 && usize(slot) < members.len()
         val m = members.at(usize(slot)).1
@@ -1450,9 +1479,8 @@ private borrows_of(keeps: &KeptParams, ty: Type, slot: int) -> Buf[usize]
             for k in 0..<m.params.len()
                 if m.params.at(k).name == name then out.push(k)
 
-    keeps.promises.put(key, out)
     out
-end borrows_of
+end promised_borrows
 
 private trait_key(t: Type) -> string = t match
     Trait(name, _, _) -> name

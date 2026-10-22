@@ -2891,6 +2891,38 @@ keeps what it is passed as 'bytes', but 'Sink' declares that parameter borrowed
 Reading from the view is not keeping it. The check distinguishes the two by what the body *does*,
 not by how it is written.
 
+**A raw pointer parameter is held to the promise the same way.** An implementation that stores the
+pointer, hands it back, or keeps one it derived from it (`&n.field`, or the field of a struct
+parameter that holds one) is refused at the place it lets the pointer go; one that only reads and writes
+through it is accepted:
+
+```sysl
+trait Bump
+    @borrows(n)
+    bump(*self, n: *int)
+
+struct Keeper
+    held: *int
+
+impl Bump for Keeper
+    bump(*self, n: *int)
+        self.held = n
+
+var x = 3
+var k = Keeper(&x)
+var b: *Bump = &k
+var y = 9
+
+b.bump(&y)
+```
+
+```error
+keeps what it is passed as 'n', but 'Bump' declares that parameter borrowed for the call — it may point into the caller's stack
+```
+
+Because the promise is verified, a pointer [lent for one call](/reference/memory/#a-pointer-lent-for-one-call)
+may be passed through a trait object at a parameter its method promises to borrow.
+
 **It names parameters rather than being a flag**, because a method may take both a buffer it borrows
 and something it legitimately retains. A name that is not a parameter is refused: a misspelling would
 otherwise silently check nothing while appearing to enforce a rule.
