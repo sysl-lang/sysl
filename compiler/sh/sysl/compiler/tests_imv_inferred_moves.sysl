@@ -1,6 +1,8 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
@@ -34,12 +36,44 @@ private imv_types() -> string = raw"""
 // The text of one function of `body`, lowered after the shared types.
 private imv_ir(body: string, symbol: string) -> string = emit_func_text(imv_types() + body, symbol)
 
+// The same with the standard module beside it, which a closure's call needs.
+private imv_with_std(text: string, symbol: string) -> string
+    val root = std_root()
+
+    if root.is_err() then return "skipped"
+
+    val std = std_units(root.unwrap(), host_target())
+
+    if std.is_err() then return "skipped"
+
+    var units: Buf[Program] = buf()
+
+    for item in std.unwrap()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val lowered = codegen_with_gaps(strip_tests(whole), host_target(),
+                                    post_analysis_checks(done.an, whole, buf()))
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if item.0 == symbol then return item.1
+
+    s"no function '$symbol'"
+end imv_with_std
+
 private imv_count(text: string, needle: string) -> int = int(text.count_of(needle))
 
-// Neither half of a count: no retain, release or copy or dispose helper of any kind.
+// Neither half of a count: no call of a retain, release, copy or dispose helper of any kind. (A box's
+// header names its destroying hook, which is not a call.)
 private imv_no_traffic(ir: string)
     assert(ir.starts_with("define"), ir)
-    assert_eq(imv_count(ir, "@arc."), 0)
+    assert_eq(imv_count(ir, "call void @arc."), 0)
 end imv_no_traffic
 
 // -- what moves ---------------------------------------------------------------------------------------
@@ -131,8 +165,10 @@ imv_field_copies()
 
 @test("a captured variable is the closure's, so the closure's body copies it every call")
 imv_captured_copies()
-    val ir = imv_ir("get(n: int) -> int\n    val x: &Node = Node(n)\n    val f = () -> Yes(x)\n" +
-                    "    f() match\n        Yes(y) -> y.v\n        No -> 0\n", "$closure0.call")
+    val ir = imv_with_std(imv_types() + "get(n: int) -> int\n    val x: &Node = Node(n)\n    val f = () -> Yes(x)\n" +
+                          "    f() match\n        Yes(y) -> y.v\n        No -> 0\n", "$closure0.call")
+
+    if ir == "skipped" then return
 
     assert(ir.starts_with("define"), ir)
     assert_eq(imv_count(ir, "@arc.retain("), 1)
