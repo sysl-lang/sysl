@@ -40,10 +40,13 @@ struct CLayer
     c: Option[&Conf]
     defines: Option[&Conf]
     requires: Option[&Conf]
+
+    // The macros this layer writes into the package's generated config header (`config_header.sysl`).
+    config: Option[&Conf]
 end CLayer
 
 // The keys a layer carries.
-val LayerKeys: []const string = ["c", "defines", "requires"]
+val LayerKeys: []const string = ["c", "defines", "requires", "config"]
 
 // The keys of a layer's `requires` block that name something a layer can need. A capability
 // (`requires { os = true }`) is a fact about the whole package.
@@ -72,10 +75,12 @@ private requires_block(entry: &Conf) -> Option[&Conf] = conf_at(entry, "requires
     None -> None
 
 private layer_in(entry: &Conf, feature: string, target: string) -> CLayer =
-    CLayer(feature, target, conf_at(entry, "c"), conf_at(entry, "defines"), requires_block(entry))
+    CLayer(feature, target, conf_at(entry, "c"), conf_at(entry, "defines"), requires_block(entry),
+           conf_at(entry, "config"))
 
 private says_a_layer(entry: &Conf) -> bool =
-    conf_at(entry, "c").is_some() || conf_at(entry, "defines").is_some() || requires_block(entry).is_some()
+    conf_at(entry, "c").is_some() || conf_at(entry, "defines").is_some() || requires_block(entry).is_some() ||
+    conf_at(entry, "config").is_some()
 
 // The layers a manifest writes, the package's own first, each checked as far as reading it can: a
 // refusal names the layer it came from. What cannot be checked until a machine and a set of features
@@ -185,6 +190,13 @@ private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
                     read_pkg_config(wrap_conf("requires", rq)) match
                         Err(why) -> return Err(in_layer(l, "requires", why))
                         Ok(_) -> ()
+
+        l.config match
+            None -> ()
+            Some(cb) ->
+                read_config(cb, "config") match
+                    Err(why) -> return Err(in_layer(l, "config", why))
+                    Ok(_) -> ()
 
         if is_package_layer(l) then continue
 
@@ -477,6 +489,43 @@ private merge_defines(layers: &Buf[CLayer],
     Ok(out)
 end merge_defines
 
+// A `config` block as the `NAME=value` macros it writes, in the order they are written -- the header
+// is read by people, so its lines stay where the author put them. A value is a C token sequence, read as
+// a `defines` block's is.
+read_config(block: &Conf, owner: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+
+    if !conf_is_block(block)
+        return Err(s"'$owner' is not a block of macros — each key is a macro name and its value is what " +
+                   s"the C preprocessor substitutes, as '$owner { CFG_SIZE = 4 }'")
+
+    for name in conf_keys(block)
+        out.push(macro_of(owner, name, conf_at(block, name).unwrap())?)
+
+    Ok(out)
+end read_config
+
+// **The `config` lines of the layers in force**: the package's, then the machine's, then each enabled
+// feature's, with a later layer's value for a macro replacing an earlier one's in the earlier one's
+// place. Two enabled features writing one macro are refused, even to one value, as `defines` are.
+config_lines(m: &Manifest, machine: string, on: &Buf[string]) -> Result[Buf[string], string]
+    val layers = layers_in_force(m, machine, on)
+    var setters: Buf[(string, string, string)] = buf()
+    var out: Buf[string] = buf()
+
+    for l in layers
+        l.config match
+            None -> ()
+            Some(cb) ->
+                val rows = read_config(cb, "config") match
+                    Err(why) -> return Err(in_layer(l, "config", why))
+                    Ok(got) -> got
+
+                merge_macros(&out, &setters, "config", rows, l.feature, tier_of(l))?
+
+    Ok(out)
+end config_lines
+
 // What the layers in force need: each requirement once, by name.
 private merge_requirements(layers: &Buf[CLayer]) -> Result[(Buf[(string, string, string)], Buf[(string, string)]), string]
     var headers: Buf[(string, string, string)] = buf()
@@ -592,6 +641,10 @@ end apply_c_layers
 // cannot be merged: two features setting one macro, a library rooted twice, a file listed twice.
 c_layers_refusal(m: &Manifest, on: &Buf[string], who: string) -> Option[string]
     apply_c_layers(m, machine_name(), on) match
+        Err(why) -> return Some(s"$ManifestName of $who: $why")
+        Ok(_) -> ()
+
+    config_lines(m, machine_name(), on) match
         Err(why) -> Some(s"$ManifestName of $who: $why")
         Ok(_) -> None
 end c_layers_refusal

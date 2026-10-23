@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{join, str_builder, Search}
+import sysl.text.{join, replace_all, str_builder, Search}
 
 // **A package's valued options** (`reference/packages.md § Options`): a name, a type and a default
 // the package's own manifest declares, a value a consumer may set in its dependency entry, and a
@@ -54,10 +54,22 @@ struct PackageOption
     range: Option[(WrittenInteger, WrittenInteger)]
 
     doc: string
+
+    // The feature the option is declared inside, or `""` for a package's own. **An option of a feature
+    // exists only while the feature is on**, and `name` is then `<feature>.<option>`.
+    feature: string
+
+    // The C macro the config header defines as the option's value, or `""`.
+    macro: string
+
+    // The only values the option may have, as the literals they are constants of; empty where any
+    // value of the type will do.
+    values: Buf[string]
 end PackageOption
 
-// What an option's name is read as in source.
-option_constant(name: string) -> string = "option_" + name
+// What an option's name is read as in source: `slots` is `option_slots`, and `cdc.ports`, which a
+// feature's option is called outside the feature, is `option_cdc_ports`.
+option_constant(name: string) -> string = "option_" + replace_all(name, ".", "_")
 
 // -- declarations ----------------------------------------------------------------------------------
 
@@ -65,38 +77,78 @@ option_constant(name: string) -> string = "option_" + name
 //
 // **A closed vocabulary, as a dependency entry is**: a misspelt `defualt` was written by somebody who
 // believes the package has a default, so an unknown key is refused rather than skipped.
+//
+// **A feature's `options` block declares options that exist only while the feature is on**: they are
+// read after the package's own, in the order the features are written, and each is named
+// `<feature>.<option>` wherever a consumer or a suite sets it.
 read_options(root: &Conf) -> Result[Buf[PackageOption], string]
     var out: Buf[PackageOption] = buf()
 
-    val block = conf_at(root, "options") match
-        None -> return Ok(out)
-        Some(b) -> b
+    conf_at(root, "options") match
+        None -> ()
+        Some(block) -> read_options_block(block, "", "options", &out)?
 
-    if !conf_is_block(block)
-        return Err("'options' is not a block — it names each option and what it is, as " +
-            "'options { slots { type = usize, default = 16 } }'")
+    conf_at(root, "features") match
+        None -> ()
+        Some(features) ->
+            if conf_is_block(features)
+                for feature in conf_keys(features)
+                    val entry = conf_at(features, feature).unwrap()
 
-    for name in conf_keys(block)
-        out.push(read_option(name, conf_at(block, name).unwrap())?)
+                    if !conf_is_block(entry) then continue
+
+                    conf_at(entry, "options") match
+                        None -> ()
+                        Some(block) -> read_options_block(block, feature, s"features.$feature.options", &out)?
+
+    for i in 0..<out.len()
+        for j in 0..<i
+            if option_constant(out.at(i).name) == option_constant(out.at(j).name)
+                return Err(s"the options '${out.at(j).name}' and '${out.at(i).name}' are both read in " +
+                           s"source as '${option_constant(out.at(i).name)}' — rename one of them")
+
+            if out.at(i).macro != "" && out.at(i).macro == out.at(j).macro
+                return Err(s"the options '${out.at(j).name}' and '${out.at(i).name}' both write the macro " +
+                           s"'${out.at(i).macro}' to the config header — a macro has one value")
 
     Ok(out)
 end read_options
 
-private read_option(name: string, entry: &Conf) -> Result[PackageOption, string]
-    val where = s"options.$name"
+// One `options` block, at the package level (`feature` empty) or inside a feature.
+private read_options_block(block: &Conf, feature: string, where: string,
+                           out: *Buf[PackageOption]) -> Result[unit, string]
+    if !conf_is_block(block)
+        return Err(s"'$where' is not a block — it names each option and what it is, as " +
+            s"'$where { slots { type = usize, default = 16 } }'")
+
+    if feature != "" && !is_symbol(feature)
+        return Err(s"'$where' declares options inside the feature '$feature', whose name is not one an " +
+            "option's name can be built from — the source reads an option as 'option_<feature>_<option>', " +
+            "so a feature that has options is a letter or '_' followed by letters, digits and '_'")
+
+    for name in conf_keys(block)
+        out.push(read_option(name, conf_at(block, name).unwrap(), feature, where)?)
+
+    Ok(())
+end read_options_block
+
+private read_option(name: string, entry: &Conf, feature: string, owner: string) -> Result[PackageOption, string]
+    val where = s"$owner.$name"
+    val full = if feature == "" then name else s"$feature.$name"
 
     if !is_symbol(name)
         return Err(s"'$where' is not a name an option can have — the package's source reads it as " +
-            s"'${option_constant(name)}', so it is a letter or '_' followed by letters, digits and '_'")
+            s"'${option_constant(full)}', so it is a letter or '_' followed by letters, digits and '_'")
 
     if !conf_is_block(entry)
         return Err(s"'$where' is not a block — an option names its 'type' and its 'default', and may " +
-            "name a 'range' and a 'doc'")
+            "name a 'range' or 'values', a 'macro' and a 'doc'")
 
     for key in sorted_labels(conf_keys(entry))
-        if key != "type" && key != "default" && key != "range" && key != "doc"
+        if key != "type" && key != "default" && key != "range" && key != "doc" && key != "values" &&
+           key != "macro"
             return Err(s"'$where.$key' is not something an option says — the keys are 'default', " +
-                "'doc', 'range', 'type'")
+                "'doc', 'macro', 'range', 'type', 'values'")
 
     val type_name = conf_at(entry, "type") match
         None -> return Err(s"'$where' names no 'type' — an option is an integer type, 'bool' or " +
@@ -123,16 +175,71 @@ private read_option(name: string, entry: &Conf) -> Result[PackageOption, string]
         None -> None
         Some(v) -> Some(read_range(where, type_name, kind, v)?)
 
+    val values = conf_at(entry, "values") match
+        None -> buf()
+        Some(v) ->
+            if range.is_some()
+                return Err(s"'$where' names both a 'range' and 'values' — a range is every integer " +
+                           "between two ends and values are the only ones allowed, so say one")
+
+            read_values(where, type_name, kind, v)?
+
     val given = conf_at(entry, "default") match
         None -> return Err(s"'$where' names no 'default' — an option has the value its package is " +
             "built with where no consumer sets one")
         Some(v) -> v
 
-    val default = option_literal(kind, type_name, range, given).map_err((why) ->
+    val default = option_literal(kind, type_name, range, values, given).map_err((why) ->
         s"'$where.default' is $why")?
 
-    Ok(PackageOption(name, type_name, kind, default, range, doc))
+    val macro = conf_at(entry, "macro") match
+        None -> ""
+        Some(v) ->
+            val text = *v match
+                Text(s) -> s
+                Word(s) -> s
+                _ -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
+                                "gives the option's value, as 'macro = \"CFG_TUD_CDC\"'")
+
+            if !macro_name(text)
+                return Err(s"'$where.macro' is '$text', which is not a name a C macro can have — " +
+                           "letters, digits and '_', not starting with a digit")
+
+            text
+
+    Ok(PackageOption(full, type_name, kind, default, range, doc, feature, macro, values))
 end read_option
+
+// An option's `values`: the only ones it may have, each a value of its type. A bool has two values
+// already, so a list on one was written by somebody who believes it narrows something.
+private read_values(where: string, type_name: string, kind: OptionKind, v: &Conf) -> Result[Buf[string], string]
+    kind match
+        OptBool ->
+            return Err(s"'$where.values' lists the values of a 'bool' option, which has two already — " +
+                       "'values' belongs on an integer or a string option")
+        _ -> ()
+
+    val items = *v match
+        Items(list) -> list
+        _ -> return Err(s"'$where.values' is not a list — it is written '[8, 16, 32]', the values the " +
+                        "option may have")
+
+    if items.is_empty()
+        return Err(s"'$where.values' is empty — an option that may have no value cannot be built")
+
+    var out: Buf[string] = buf()
+
+    for item in items
+        val literal = option_literal(kind, type_name, None, buf(), item).map_err((why) ->
+            s"'$where.values' holds $why")?
+
+        if holds_string(out, literal)
+            return Err(s"'$where.values' holds $literal twice — list each value once")
+
+        out.push(literal)
+
+    Ok(out)
+end read_values
 
 // An integer option's `[low, high]`, both ends included and both within the type.
 private read_range(where: string, type_name: string, kind: OptionKind,
@@ -217,7 +324,18 @@ end option_kind
 // The literal a value is as a constant of the option's type, or why it is not one -- the value and
 // what is wrong with it, said as the end of a sentence that names where it was written.
 option_literal(kind: OptionKind, type_name: string, range: Option[(WrittenInteger, WrittenInteger)],
-               v: &Conf) -> Result[string, string]
+               values: Buf[string], v: &Conf) -> Result[string, string]
+    val literal = typed_literal(kind, type_name, range, v)?
+
+    if !values.is_empty() && !holds_string(values, literal)
+        return Err(s"$literal, which is none of the option's values [${join(values.view(), ", ")}]")
+
+    Ok(literal)
+end option_literal
+
+// A value as a constant of the option's type and within its range.
+private typed_literal(kind: OptionKind, type_name: string, range: Option[(WrittenInteger, WrittenInteger)],
+                      v: &Conf) -> Result[string, string]
     val shown = conf_shown(v)
     val not_string = s"$shown, which is not a 'string' — a string option's value is written in quotes"
 
@@ -236,7 +354,7 @@ option_literal(kind: OptionKind, type_name: string, range: Option[(WrittenIntege
 
             if d.is_none()
                 return Err(s"$shown, which is not a '$type_name' — an integer option's value is a " +
-                    "decimal number, written without quotes")
+                    "number, written without quotes, in decimal or as 0x…, 0b… or 0o…")
 
             val n = d.unwrap()
 
@@ -251,7 +369,7 @@ option_literal(kind: OptionKind, type_name: string, range: Option[(WrittenIntege
                             s"[${decimal_text(r.0)}, ${decimal_text(r.1)}]")
 
             Ok(decimal_text(n))
-end option_literal
+end typed_literal
 
 // A value as a refusal quotes it: a string in double quotes, anything else as written.
 private conf_shown(v: &Conf) -> string = *v match
@@ -289,7 +407,9 @@ private string_literal(s: string) -> string
     b.finish()
 end string_literal
 
-// A decimal integer as a manifest writes one: an optional `-` and digits, nothing else.
+// An integer as a manifest writes one: an optional `-`, then decimal digits or `0x`, `0b` or `0o` and
+// the digits of that base. It is read into decimal digits, so a value of any width compares and prints
+// the same whichever way it was written.
 private written_integer(text: string) -> Option[WrittenInteger]
     var at: usize = 0
     var negative = false
@@ -299,6 +419,20 @@ private written_integer(text: string) -> Option[WrittenInteger]
         at = 1
 
     if at >= text.bytes.len then return None
+
+    if at + 1 < text.bytes.len && text.bytes[at] == u8('0')
+        val marker = text.bytes[at + 1]
+        val radix = if marker == u8('x') || marker == u8('X') then 16
+        else if marker == u8('b') || marker == u8('B') then 2
+        else if marker == u8('o') || marker == u8('O') then 8
+        else 0
+
+        if radix != 0
+            val digits = radix_to_decimal(text[(at + 2)..], radix)
+
+            if digits.is_none() then return None
+
+            return Some(WrittenInteger(negative && digits.unwrap() != "0", digits.unwrap()))
 
     for i in at..<text.bytes.len
         if text.bytes[i] < u8('0') || text.bytes[i] > u8('9') then return None
@@ -310,6 +444,52 @@ private written_integer(text: string) -> Option[WrittenInteger]
 
     Some(WrittenInteger(negative && digits != "0", digits))
 end written_integer
+
+// The digits of a number written in `radix` (2, 8 or 16) as decimal digits with no leading zero, or
+// nothing where the text is empty or holds a digit the base does not have.
+private radix_to_decimal(body: string, radix: int) -> Option[string]
+    if body.bytes.len == 0 then return None
+
+    // Least significant first, so a carry only ever appends.
+    var digits: Buf[int] = buf()
+
+    digits.push(0)
+
+    for i in 0..<body.bytes.len
+        val b = body.bytes[i]
+        var d = -1
+
+        if b >= u8('0') && b <= u8('9') then d = int(b - u8('0'))
+        else if b >= u8('a') && b <= u8('f') then d = int(b - u8('a')) + 10
+        else if b >= u8('A') && b <= u8('F') then d = int(b - u8('A')) + 10
+
+        if d < 0 || d >= radix then return None
+
+        var carry = d
+
+        for j in 0..<digits.len()
+            val v = digits.at(j) * radix + carry
+
+            digits.set(j, v % 10)
+            carry = v / 10
+
+        while carry > 0
+            digits.push(carry % 10)
+            carry = carry / 10
+
+    var top = digits.len()
+
+    while top > 1 && digits.at(top - 1) == 0
+        top -= 1
+
+    var b = str_builder()
+
+    while top > 0
+        top -= 1
+        b.push_uint(ulong(digits.at(top)))
+
+    Some(b.finish())
+end radix_to_decimal
 
 private decimal_text(d: WrittenInteger) -> string = if d.negative then "-" + d.digits else d.digits
 
@@ -378,28 +558,111 @@ end power_of_two
 
 // -- what a build is compiled with -----------------------------------------------------------------
 
-// The declarations a package's files are read with: one file-private constant per option, at the
-// value the build settled.
-private option_lines(declared: &Buf[PackageOption], values: &Buf[(string, string)]) -> Buf[string]
-    var out: Buf[string] = buf()
+// One option at the value a build settled on: what a package's files are read with, and what its config
+// header says.
+struct SettledOption
+    // As a consumer names it: `slots`, or `cdc.ports` for an option of the feature `cdc`.
+    name: string
+    type_name: string
+    kind: OptionKind
+
+    // The value, as the literal the constant is initialized with.
+    literal: string
+
+    // The feature it belongs to, or `""`.
+    feature: string
+
+    // The C macro the header gives it, or `""`.
+    macro: string
+end SettledOption
+
+// **The options a build has: every one of the package's own, and an option of a feature only while the
+// feature is on**, each at the value a consumer or the suite chose or else its default.
+settled_options(declared: &Buf[PackageOption], enabled: &Buf[string],
+                values: &Buf[(string, string)]) -> Buf[SettledOption]
+    var out: Buf[SettledOption] = buf()
 
     for opt in declared
+        if opt.feature != "" && !holds_string(*enabled, opt.feature) then continue
+
         var value = opt.default
 
         for item in values
             if item.0 == opt.name then value = item.1
 
-        out.push(s"private const ${option_constant(opt.name)}: ${opt.type_name} = $value")
+        out.push(SettledOption(opt.name, opt.type_name, opt.kind, value, opt.feature, opt.macro))
 
     out
-end option_lines
+end settled_options
 
-// The declarations of a package no consumer configured: every option at its default.
-default_option_lines(m: &Manifest) -> Buf[string] = option_lines(m.options, buf())
+// The declarations a package's files are read with: one file-private constant per option.
+lines_of_settled(settled: &Buf[SettledOption]) -> Buf[string]
+    var out: Buf[string] = buf()
 
-// The declarations the root package's own files are read with where no graph is resolved: its options
-// at the defaults, but for the values its `test` block or the command line gave its suite.
-root_option_lines(m: &Manifest) -> Buf[string] = option_lines(m.options, test_option_values())
+    for opt in settled
+        out.push(s"private const ${option_constant(opt.name)}: ${opt.type_name} = ${opt.literal}")
+
+    out
+end lines_of_settled
+
+// The `#if` symbols the options define: a `bool` option that is on is `option_<name>`.
+option_symbols(settled: &Buf[SettledOption]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for opt in settled
+        opt.kind match
+            OptBool -> if opt.literal == "true" then out.push(option_constant(opt.name))
+            _ -> ()
+
+    out
+end option_symbols
+
+// The `#if` symbols of a package: its enabled features', then its options'.
+symbols_of(enabled: &Buf[string], settled: &Buf[SettledOption]) -> Buf[string]
+    var out = feature_symbols(enabled)
+
+    for item in option_symbols(settled)
+        out.push(item)
+
+    out
+end symbols_of
+
+// What the settled options of a graph hold for one package, keyed as `Graph.features` is.
+settled_options_of(all: &Buf[(string, Buf[SettledOption])], canonical: string) -> Buf[SettledOption]
+    for item in all
+        if item.0 == canonical then return item.1
+
+    buf()
+end settled_options_of
+
+// Whether an option inside a feature that is off is being given a value: the refusal, naming the
+// feature, and who gave it.
+private inactive_refusal(declared: &Buf[PackageOption], enabled: &Buf[string], name: string,
+                         who: string, target: string) -> Option[string]
+    declared_option(declared, name) match
+        None -> None
+        Some(opt) ->
+            if opt.feature == "" || holds_string(*enabled, opt.feature) then return None
+
+            Some(s"$who sets the option '$name'$target, which belongs to the feature '${opt.feature}', and " +
+                 s"that feature is off — an option inside a feature exists only while the feature is on, " +
+                 s"so turn '${opt.feature}' on in 'features' or leave the option out")
+end inactive_refusal
+
+// The options of the root project where no graph is resolved: its defaults, but for the values its `test`
+// block or the command line gave its suite.
+root_settled_options(m: &Manifest, enabled: &Buf[string]) -> Result[Buf[SettledOption], string]
+    for item in test_option_values()
+        inactive_refusal(m.options, enabled, item.0, "the 'test' block or the command line", "") match
+            Some(why) -> return Err(why)
+            None -> ()
+
+    Ok(settled_options(m.options, enabled, test_option_values()))
+end root_settled_options
+
+// The options of a package no consumer configured: every one at its default.
+default_settled_options(m: &Manifest, enabled: &Buf[string]) -> Buf[SettledOption] =
+    settled_options(m.options, enabled, buf())
 
 // **The options a package's own suite is built with**, as literals: the `test` block's, and over them
 // each `--option name=value` of the command line. Each is held to the declaration it names, as a
@@ -475,7 +738,7 @@ private test_option_literal(declared: &Buf[PackageOption], name: string, value: 
             return Err(s"$who sets the option '$name', which this project does not declare — a suite may " +
                        s"only set an option its own manifest names$tail")
 
-    option_literal(opt.kind, opt.type_name, opt.range, value).map_err((why) ->
+    option_literal(opt.kind, opt.type_name, opt.range, opt.values, value).map_err((why) ->
         s"$who sets the option '$name' to $why")
 end test_option_literal
 
@@ -503,18 +766,27 @@ end OptionSetting
 // type, within its range -- and then the root's value is taken where it set one. **Where it set none,
 // the dependencies that did must agree**: a package is compiled once, and which of two consumers was
 // read first is no reason for the other to be wrong.
-settle_options(packages: &Buf[ResolvedPackage],
-               roots: &Buf[(string, Manifest)]) -> Result[Buf[(string, Buf[string])], string]
-    var out: Buf[(string, Buf[string])] = buf()
+//
+// `enabled` is what each package has on (`Graph.features`): **an option inside a feature is settled
+// only for a package that has the feature on**, and setting one while it is off is refused.
+settle_options(packages: &Buf[ResolvedPackage], roots: &Buf[(string, Manifest)],
+               enabled: &Buf[(string, Buf[string])]) -> Result[Buf[(string, Buf[SettledOption])], string]
+    var out: Buf[(string, Buf[SettledOption])] = buf()
 
     for target in packages
         var root_values: Buf[(string, string)] = buf()
         var others: Buf[OptionSetting] = buf()
+        val on = enabled_of(enabled, target.canonical)
 
         // The project's own suite sets its own options (`apply_test_block`); no build but
         // `sysl test` run on the package itself has any such values.
         if is_root_package(target)
             for item in test_option_values()
+                inactive_refusal(target.manifest.options, on, item.0,
+                                 "the 'test' block or the command line", "") match
+                    Some(why) -> return Err(why)
+                    None -> ()
+
                 root_values.push(item)
         else
             for consumer in packages
@@ -522,39 +794,50 @@ settle_options(packages: &Buf[ResolvedPackage],
                     if !names_package(dep, target) then continue
 
                     gather_settings(&root_values, &others, is_root_package(consumer),
-                                    consumer_label(consumer), dep, target.manifest)?
+                                    consumer_label(consumer), dep, target.manifest, on)?
 
             for item in roots
                 for dep in item.1.dependencies
                     if names_package(dep, target)
                         gather_settings(&root_values, &others, false, s"the source root '${item.0}'", dep,
-                                        target.manifest)?
+                                        target.manifest, on)?
 
         if target.manifest.options.is_empty() then continue
 
-        val values = agreed(target.manifest.options, root_values, others, target_label(target))?
+        val values = agreed(target.manifest.options, root_values, others, target_label(target), on)?
 
-        out.push((target.canonical, option_lines(target.manifest.options, values)))
+        out.push((target.canonical, settled_options(target.manifest.options, on, values)))
 
     for r in 0..<roots.len()
         val (dir, theirs) = roots.at(r)
         var root_values: Buf[(string, string)] = buf()
         var others: Buf[OptionSetting] = buf()
+        val on = enabled_of(enabled, lib_root_key(dir))
 
         for consumer in packages
             for dep in consumer.manifest.dependencies
                 if stood_in_by(roots, dep).unwrap_or(roots.len()) == r
                     gather_settings(&root_values, &others, is_root_package(consumer),
-                                    consumer_label(consumer), dep, theirs)?
+                                    consumer_label(consumer), dep, theirs, on)?
 
         if theirs.options.is_empty() then continue
 
-        val values = agreed(theirs.options, root_values, others, s"the source root '$dir'")?
+        val values = agreed(theirs.options, root_values, others, s"the source root '$dir'", on)?
 
-        out.push((lib_root_key(dir), option_lines(theirs.options, values)))
+        out.push((lib_root_key(dir), settled_options(theirs.options, on, values)))
 
     Ok(out)
 end settle_options
+
+// The lines of every package's settled options, keyed as they are.
+lines_of_all(settled: &Buf[(string, Buf[SettledOption])]) -> Buf[(string, Buf[string])]
+    var out: Buf[(string, Buf[string])] = buf()
+
+    for item in settled
+        out.push((item.0, lines_of_settled(item.1)))
+
+    out
+end lines_of_all
 
 // Whether a dependency entry names this package: by the identity the graph holds it under -- its
 // coordinate, or the directory a path names -- and never by the label the consumer filed it under.
@@ -574,7 +857,8 @@ private target_label(p: &ResolvedPackage) -> string =
 
 // One entry's settings, each held to the declaration it names.
 private gather_settings(root_values: *Buf[(string, string)], others: *Buf[OptionSetting], from_root: bool,
-                        who: string, dep: &Dependency, target: &Manifest) -> Result[unit, string]
+                        who: string, dep: &Dependency, target: &Manifest,
+                        on: &Buf[string]) -> Result[unit, string]
     for item in dep.options
         val (name, value) = item
         val opt = declared_option(target.options, name) match
@@ -592,7 +876,11 @@ private gather_settings(root_values: *Buf[(string, string)], others: *Buf[Option
                     s"'${dependency_canonical(dep)}' does not declare — a consumer may only set an " +
                     s"option that package's own manifest names$tail")
 
-        val literal = option_literal(opt.kind, opt.type_name, opt.range, value).map_err((why) ->
+        inactive_refusal(target.options, on, name, who, s" of '${dep.label}'") match
+            Some(why) -> return Err(why)
+            None -> ()
+
+        val literal = option_literal(opt.kind, opt.type_name, opt.range, opt.values, value).map_err((why) ->
             s"$who sets the option '$name' of '${dep.label}' to $why")?
 
         if from_root then root_values.push((name, literal))
@@ -610,10 +898,13 @@ end declared_option
 
 // The value each option is built with: the root's, then the one every other consumer agreed on.
 private agreed(declared: &Buf[PackageOption], root_values: Buf[(string, string)],
-               others: Buf[OptionSetting], package: string) -> Result[Buf[(string, string)], string]
+               others: Buf[OptionSetting], package: string,
+               on: &Buf[string]) -> Result[Buf[(string, string)], string]
     var out: Buf[(string, string)] = buf()
 
     for opt in declared
+        if opt.feature != "" && !holds_string(*on, opt.feature) then continue
+
         var chosen: Option[OptionSetting] = None
         var rooted = false
 
@@ -642,3 +933,14 @@ private agreed(declared: &Buf[PackageOption], root_values: Buf[(string, string)]
 
     Ok(out)
 end agreed
+
+// A block of option settings as `(name, value)` pairs, a feature's options nested under the feature's
+// name as the reader nests a dotted key (`cdc.rx_buffer = 512` is `cdc { rx_buffer = 512 }`), and read
+// back as the option's own name, `cdc.rx_buffer`.
+flat_settings(block: &Conf, prefix: string, out: *Buf[(string, &Conf)])
+    for name in conf_keys(block)
+        val v = conf_at(block, name).unwrap()
+        val full = if prefix == "" then name else s"$prefix.$name"
+
+        if conf_is_block(v) then flat_settings(v, full, out) else out.push((full, v))
+end flat_settings

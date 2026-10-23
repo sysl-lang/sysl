@@ -78,6 +78,10 @@ struct Graph
     // Each package's options as settled (`settle_options`): the declarations its files are read
     // with, keyed as `features` is. A package missing from it declares none.
     options: Buf[(string, Buf[string])]
+
+    // The same options with their types and values, which the config header is written from, and the
+    // `option_` symbols `#if` reads come from (`options.sysl`).
+    settled: Buf[(string, Buf[SettledOption])]
 end Graph
 
 // What the selecting pass carries: the version floors, who asked for them, the manifests read so
@@ -205,7 +209,8 @@ resolve_graph(root: string, written: &Manifest, sums: Sums, cache: string,
 
             // **Options are settled once the graph is**: a value decides what a package's source
             // computes, never which packages are in the build.
-            built.options = settle_options(built.packages, pruned_roots(root_packages()?, enabled))?
+            built.settled = settle_options(built.packages, pruned_roots(root_packages()?, enabled), enabled)?
+            built.options = lines_of_all(built.settled)
 
             shared match
                 None -> ()
@@ -381,7 +386,7 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     for had in state.manifests
         read.push((had.coordinate, had.version.unwrap()))
 
-    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read, buf()))
+    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read, buf(), buf()))
 end resolve_once
 
 // What the root calls itself when it is the one asking, since it has no coordinate to be named by.
@@ -1380,8 +1385,17 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         var none = no_package_sources()
 
         note_local_features(root, m)
-        none.root_features = feature_symbols(mine)
-        none.root_options = root_option_lines(m)
+
+        val mine_settled = root_settled_options(m, mine) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(got) -> got
+
+        none.root_features = symbols_of(mine, mine_settled)
+        none.root_options = lines_of_settled(mine_settled)
+
+        var headed: Buf[HeaderInput] = buf()
+
+        headed.push(HeaderInput("", root_name(root), *m, mine, mine_settled))
 
         // With no graph nothing names a root's coordinate, so each has its `default` on.
         val roots = root_packages() match
@@ -1397,8 +1411,15 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
                 Ok(got) -> got
                 Err(_) -> feature_closure(theirs.features, asked, theirs.dependencies)
 
-            none.lib_features.push((dir, feature_symbols(settled)))
-            none.lib_options.push((dir, default_option_lines(theirs)))
+            val valued = default_settled_options(theirs, settled)
+
+            none.lib_features.push((dir, symbols_of(settled, valued)))
+            none.lib_options.push((dir, lines_of_settled(valued)))
+            headed.push(HeaderInput(lib_root_key(dir), root_name(dir), theirs, settled, valued))
+
+        publish_config_headers(root, t, headed) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(_) -> ()
 
         return Ok(none)
     end if
@@ -1421,15 +1442,34 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
     out.root_absent = left_out
 
+    var headed: Buf[HeaderInput] = buf()
+
     for item in libs
-        out.lib_features.push((item,
-                               feature_symbols(enabled_of(graph.features, lib_root_key(item)))))
-        out.lib_options.push((item, option_lines_of(graph.options, lib_root_key(item))))
+        val key = lib_root_key(item)
+        val valued = settled_options_of(graph.settled, key)
+
+        out.lib_features.push((item, symbols_of(enabled_of(graph.features, key), valued)))
+        out.lib_options.push((item, option_lines_of(graph.options, key)))
+
+    for item in roots
+        val key = lib_root_key(item.0)
+
+        headed.push(HeaderInput(key, root_name(item.0), item.1, enabled_of(graph.features, key),
+                                settled_options_of(graph.settled, key)))
+
+    for p in graph.packages
+        headed.push(HeaderInput(p.canonical, if is_root_package(p) then root_name(root) else p.canonical,
+                                p.manifest, enabled_of(graph.features, p.canonical),
+                                settled_options_of(graph.settled, p.canonical)))
+
+    publish_config_headers(root, t, headed) match
+        Err(why) -> return Err(said(Refusal(why)))
+        Ok(_) -> ()
 
     for p in graph.packages
         if is_root_package(p)
             out.root_mounts = p.imports
-            out.root_features = feature_symbols(enabled_of(graph.features, ""))
+            out.root_features = symbols_of(enabled_of(graph.features, ""), settled_options_of(graph.settled, ""))
             out.root_options = option_lines_of(graph.options, "")
             continue
 
@@ -1448,7 +1488,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         // same whoever depends on it.
         val (manifest, name, version) = manifest_of_tree(p.root, p.manifest.name, p.manifest.version)
         val theirs = Packaging(p.canonical, p.imports, true, manifest, name, version, left_out)
-        val gated = feature_symbols(enabled_of(graph.features, p.canonical))
+        val gated = symbols_of(enabled_of(graph.features, p.canonical), settled_options_of(graph.settled, p.canonical))
         val valued = option_lines_of(graph.options, p.canonical)
 
         // **A package's `@tests` files are its own `sysl test`'s and no consumer's**, so they are left

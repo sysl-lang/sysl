@@ -2331,6 +2331,8 @@ options {
 | `type` | an integer type (`usize`, `u8`, `int`, `i64`, any `iN` or `uN`), `bool` or `string` | required |
 | `default` | the value the package is built with where no consumer sets one | required |
 | `range` | `[low, high]`, both ends included; integer options only | optional |
+| `values` | the only values the option may have, `[8, 16, 32]`; integer and string options, not with `range` | optional |
+| `macro` | the C macro the [config header](#the-config-header) gives the option's value | optional |
 | `doc` | what the option is for | optional |
 
 **The package's own files read each option as a constant, `option_<name>`, of the declared type.**
@@ -2391,6 +2393,101 @@ project's own entry for 'kern'
 entry.** The entry is matched to the package by its coordinate, or by the directory a `path` names —
 never by the label — so `kernel2 { git = "github.com/e/kernel", version = "0.1.0", options = { … } }`
 configures the same package a dependency reaches as `kernel`.
+
+### Hex, binary and octal, and `values`
+
+An integer is written in decimal or as `0x…`, `0b…` or `0o…` (a leading `-` is allowed), in a
+default, a range, a `values` list and a consumer's entry alike: `vid = 0x2E8A` is 11914 wherever it is
+read. `values` lists the only values an integer or string option may have, and the default and every
+setting are held to it:
+
+```hocon
+options {
+  ep0_size { type = u8, values = [8, 16, 32, 64], default = 64, macro = "CFG_TUD_ENDPOINT0_SIZE" }
+}
+```
+
+```
+this project sets the option 'ep0_size' of 'usb' to 12, which is none of the option's values [8, 16, 32, 64]
+```
+
+### An option inside a feature
+
+A feature block may declare `options`. **Such an option exists only while its feature is on.** Outside
+the feature it is named `<feature>.<option>`, so `cdc.ports` and `host_cdc.ports` do not collide; the
+package's source reads it as `option_cdc_ports`.
+
+```hocon
+features {
+  cdc { options { rx_buffer { type = u16, default = 256, range = [64, 4096], macro = "CFG_TUD_CDC_RX_BUFSIZE" } } }
+}
+```
+
+```hocon
+dependencies {
+  usb { path = "../usb", features = [cdc], options = { cdc.rx_buffer = 512 } }
+}
+```
+
+Setting one while its feature is off is refused, naming the feature, and an option of a feature that
+is off writes nothing to the config header, so the C's own `#ifndef` default stands. A suite sets one
+the same way (`--option cdc.rx_buffer=512`).
+
+### Options in `#if`
+
+A `bool` option that is `true` is an `#if` symbol, `option_<name>`, beside `feature_<name>`; one that
+is `false`, or belongs to a feature that is off, is false. The other types stay constants, which `if`,
+`match`, array sizes and `@assert` already fold.
+
+```text
+#if option_trace
+tracing() -> bool = true
+#else
+tracing() -> bool = false
+#endif
+```
+
+### The config header
+
+A package whose manifest names a `macro` (on an option or a feature) or has a `config` block gets a
+generated header, `sysl/<package>.h`. It is a build output: written at each build into
+`.sysl/out/<target>/include`, never into the sources, and that directory is on the include path of
+every C file in the build, so a package's C and its consumers' read the same values (they are ABI:
+`configUSE_16_BIT_TICKS` changes `TickType_t`). The package's own config header `#include`s it where it
+likes:
+
+```c
+#include "sysl/usb.h"
+#if CFG_TUD_CDC_RX_BUFSIZE > 1024
+#error "usb: the serial buffer is too large for this part"
+#endif
+```
+
+The header holds, in this order: the package's options that name a `macro`; each feature that names
+one, as `1` while it is on and `0` while it is off; the options of the enabled features; and the
+`config` lines of the package, then of the target being built, then of each enabled feature. A `bool`
+is written `1` or `0`, an integer as a decimal literal, a string as a C string literal, and a `config`
+value as the C tokens it is written with (`"\"x.h\""` for a string). A macro set by two enabled
+features is refused, even to one value.
+
+```hocon
+config {
+  CFG_TUSB_OS = OPT_OS_NONE
+  CFG_TUSB_MEM_ALIGN = "__attribute__((aligned(4)))"
+}
+```
+
+```c
+/* written by sysl from usb 0.1.0's settled configuration */
+#define CFG_TUD_ENABLED 1
+#define CFG_TUD_CDC_RX_BUFSIZE 512
+#define CFG_TUSB_OS OPT_OS_NONE
+#define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
+```
+
+`sysl build --emit config` prints the path of every header the build wrote and `--emit
+config:<package>` one of them; the build still runs, so what is shown is what it used. The linker-script
+kinds (`link`, `all`) arrive in 0.7.0 and are refused until then.
 
 ### What is refused
 

@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, read_text, write_text_atomic}
+import sysl.text.{join, split, Search}
+
+// **The config header a package writes for its C** (`reference/packages.md § The config header`).
+// A package whose manifest names a `macro` -- on an option or a feature -- or has a `config` block gets
+// `sysl/<package>.h`, written at each build into the include root `.sysl/out/<target>/include`, and
+// every C file of the build is compiled with that root on its include path. The values are ABI (a
+// `configUSE_16_BIT_TICKS` changes `TickType_t`), so a package's C and its consumers' read the same
+// header.
+//
+// The header holds, in this order:
+//
+//   1. the package's own options that name a macro, at their settled values;
+//   2. each feature that names a macro, as 1 while it is on and 0 while it is off;
+//   3. the options of the enabled features that name a macro;
+//   4. the `config` lines of the package, then of the machine, then of each enabled feature.
+//
+// A `bool` is written 1 or 0, an integer as a decimal literal, a string as a C string literal, and a
+// `config` value as the C tokens it was written with. **An option of a feature that is off writes
+// nothing**, so the C's own `#ifndef` default stands.
+
+// One package of a build as the header reads it.
+struct HeaderInput
+    // The package's key in the graph (`""` for the root project), for a refusal that names it.
+    key: string
+
+    // The name the header file takes where the manifest names no package.
+    fallback: string
+
+    manifest: Manifest
+    enabled: Buf[string]
+    settled: Buf[SettledOption]
+end HeaderInput
+
+// One header a build wrote.
+struct ConfigHeader
+    // The package it is for: the file is `sysl/<package>.h`.
+    package: string
+    key: string
+    path: string
+    text: string
+end ConfigHeader
+
+// The headers the last resolution wrote, and the include root they are in. **Module storage for the
+// reason `c_exporters` is**: the C walk asks for flags knowing only a tree, and the answer depends on
+// the graph resolved for it. Replaced by every resolution.
+private var written_headers: Buf[ConfigHeader] = buf()
+private var header_root: string = ""
+
+// Forget the headers, for a build that resolves none.
+forget_config_headers()
+    written_headers = buf()
+    header_root = ""
+
+// The `-I` the include root of the headers needs on a C command line, or nothing where the build has no
+// header.
+config_c_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if header_root != "" then out.push(s"-I$header_root")
+
+    out
+end config_c_flags
+
+// What the last resolution wrote.
+written_config_headers() -> Buf[ConfigHeader] = written_headers.copy()
+
+// The name of a directory as a project is called by when its manifest names none.
+root_name(dir: string) -> string = basename(absolute_path(dir))
+
+// Whether a package has anything to say to its C: a macro on an option or a feature, or a `config`.
+private declares_header(m: &Manifest) -> bool
+    for opt in m.options
+        if opt.macro != "" then return true
+
+    for info in m.feature_info
+        if info.macro != "" then return true
+
+    for l in m.layers
+        if l.config.is_some() then return true
+
+    false
+end declares_header
+
+// **A macro has one value, so the header defines it once**: two options, or an option and a feature,
+// naming the same macro are refused where the manifest is read.
+check_header_macros(options: &Buf[PackageOption], info: &Buf[FeatureInfo]) -> Result[unit, string]
+    var seen: Buf[(string, string)] = buf()
+
+    for opt in options
+        if opt.macro == "" then continue
+
+        for had in seen
+            if had.0 == opt.macro
+                return Err(s"the macro '${opt.macro}' is written to the config header by both ${had.1} and " +
+                           s"the option '${opt.name}' — a macro has one value")
+
+        seen.push((opt.macro, s"the option '${opt.name}'"))
+
+    for f in info
+        if f.macro == "" then continue
+
+        for had in seen
+            if had.0 == f.macro
+                return Err(s"the macro '${f.macro}' is written to the config header by both ${had.1} and " +
+                           s"the feature '${f.name}' — a macro has one value")
+
+        seen.push((f.macro, s"the feature '${f.name}'"))
+
+    Ok(())
+end check_header_macros
+
+// A settled option's value as the C preprocessor reads it.
+private c_value(opt: &SettledOption) -> string = opt.kind match
+    OptBool -> if opt.literal == "true" then "1" else "0"
+    _ -> opt.literal
+
+private define_line(name: string, value: string) -> string =
+    if value.is_empty() then s"#define $name" else s"#define $name $value"
+
+// The text of one package's header, or nothing where the package says nothing to C.
+config_header_text(input: &HeaderInput) -> Result[Option[string], string]
+    val m = input.manifest
+
+    if !declares_header(m) then return Ok(None)
+
+    val name = package_file_name(input)
+    var out: Buf[string] = buf()
+    val version = if m.version.is_empty() then "" else s" ${m.version}"
+
+    out.push(s"/* written by sysl from $name$version's settled configuration */")
+
+    for opt in input.settled
+        if opt.feature == "" && opt.macro != "" then out.push(define_line(opt.macro, c_value(opt)))
+
+    for info in m.feature_info
+        if info.macro != ""
+            out.push(define_line(info.macro, if holds_string(input.enabled, info.name) then "1" else "0"))
+
+    for opt in input.settled
+        if opt.feature != "" && opt.macro != "" then out.push(define_line(opt.macro, c_value(opt)))
+
+    val lines = config_lines(m, machine_name(), input.enabled)?
+
+    for line in lines
+        line.index_of("=") match
+            Some(at) -> out.push(define_line(line[0..<at], line[(at + 1)..]))
+            None -> out.push(define_line(line, "1"))
+
+    Ok(Some(join(out.view(), "\n") + "\n"))
+end config_header_text
+
+// The name the file takes: the package's, or the directory's where the manifest names none.
+private package_file_name(input: &HeaderInput) -> string =
+    if input.manifest.name.is_empty() then input.fallback else input.manifest.name
+
+// **Every package's header, written into this build's include root.** A file is rewritten only when its
+// text changed, so an unchanged configuration leaves the C objects built from it alone. Two packages
+// that share a name are refused: they would write one file.
+publish_config_headers(root: string, t: Target, inputs: &Buf[HeaderInput]) -> Result[unit, string]
+    forget_config_headers()
+
+    var made: Buf[ConfigHeader] = buf()
+
+    for input in inputs
+        val text = config_header_text(input)? match
+            Some(got) -> got
+            None -> continue
+
+        val name = package_file_name(input)
+
+        if name.is_empty() || name.contains("/") || name.contains("\\") || name.starts_with(".")
+            return Err(s"the package '$name' wants the config header 'sysl/$name.h', which is not a file " +
+                       "name — name the package with letters, digits, '-', '_' and '.'")
+
+        for had in made
+            if had.package == name
+                return Err(s"the packages '${had.key}' and '${input.key}' are both called '$name', so both " +
+                           s"want the config header 'sysl/$name.h' — a build has one package of each name")
+
+        made.push(ConfigHeader(name, input.key, "", text))
+
+    if made.is_empty() then return Ok(())
+
+    val include_root = s"${absolute_path(root)}/$LocalDir/out/${t.name}/include"
+    val dir = s"$include_root/sysl"
+
+    make_dir_all(dir).map_err((e) -> s"cannot make the directory '$dir' for the config headers")?
+
+    for i in 0..<made.len()
+        val path = s"$dir/${made.at(i).package}.h"
+        val had = read_text(path).unwrap_or("")
+
+        if had != made.at(i).text
+            write_text_atomic(path, made.at(i).text).map_err((e) ->
+                s"cannot write the config header '$path'")?
+
+        made.set(i, ConfigHeader(made.at(i).package, made.at(i).key, path, made.at(i).text))
+
+    written_headers = made
+    header_root = include_root
+    Ok(())
+end publish_config_headers
+
+// -- sysl build --emit -----------------------------------------------------------------------------
+
+// The kinds `--emit` was asked for, kept for the build to report once it has made them.
+private var emit_kinds: Buf[string] = buf()
+
+// What a build was asked to emit, forgotten for a command that takes no such flag.
+reset_emit()
+    emit_kinds = buf()
+
+// `--emit config,config:tinyusb`: the kinds, each checked. **`link` and `all` name the generated linker
+// scripts, which a later release brings**, so they are refused rather than ignored.
+took_emit(list: string) -> Result[unit, string]
+    for part in split_commas(list)
+        if part == "config" || (part.starts_with("config:") && part.bytes.len > 7)
+            emit_kinds.push(part)
+        else if part == "link" || part == "all" || part.starts_with("link:")
+            return Err(s"'--emit $part' asks for a generated linker script, and linker-script generation " +
+                       "arrives in 0.7.0 — '--emit config' and '--emit config:<package>' write the config " +
+                       "headers now")
+        else
+            return Err(s"'--emit $part' is not something a build can emit — it takes 'config' (every " +
+                       "package's header) or 'config:<package>' (one), comma-separated")
+
+    Ok(())
+end took_emit
+
+private split_commas(list: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for piece in split(list, ",")
+        val one = piece.trim()
+
+        if !one.is_empty() then out.push(one)
+
+    out
+end split_commas
+
+// Whether `--emit` was given.
+emit_asked() -> bool = !emit_kinds.is_empty()
+
+// **The paths of the headers `--emit` asked for**, in the order asked, once the build has written them;
+// or why they cannot be named.
+emitted_paths() -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+
+    for kind in emit_kinds
+        if kind == "config"
+            if written_headers.is_empty()
+                return Err("'--emit config' has nothing to write — no package in this build names a " +
+                           "'macro' or has a 'config' block, so none has a config header")
+
+            for h in written_headers
+                if !holds_string(out, h.path) then out.push(h.path)
+        else
+            val wanted = kind[7..]
+            var found = false
+
+            for h in written_headers
+                if h.package == wanted || h.key == wanted
+                    found = true
+
+                    if !holds_string(out, h.path) then out.push(h.path)
+
+            if !found
+                var names: Buf[string] = buf()
+
+                for h in written_headers
+                    names.push(h.package)
+
+                val tail = if names.is_empty() then ", and none has a config header"
+                else s". The packages with a config header are ${quoted_names(names)}"
+
+                return Err(s"'--emit $kind' names the package '$wanted', which this build has no config " +
+                           s"header for$tail")
+
+    Ok(out)
+end emitted_paths

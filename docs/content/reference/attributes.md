@@ -5107,7 +5107,9 @@ posix true
 **`#if posix` in a block of C gates**, since `posix` is a symbol sysl knows; a C header that means
 its own macro of that name writes it as `#ifdef posix`, which is text. A `feature_` name the manifest
 does not declare is false, as it is in live code, so a misspelled one gates its lines out rather than
-passing into the text. **A group opened inside a text block closes inside it**: one whose `#endif`
+passing into the text. The same holds for `option_<name>`, the symbol of a `bool` option of the
+package that is `true` (a feature's option is `option_<feature>_<name>`): in a package's files
+`#if option_trace` gates exactly as `#if feature_trace` does. **A group opened inside a text block closes inside it**: one whose `#endif`
 is below the block's closing delimiter is refused at its `#if`, naming the line the block ends on.
 
 ```sysl

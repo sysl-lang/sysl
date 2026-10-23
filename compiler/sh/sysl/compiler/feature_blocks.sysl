@@ -40,6 +40,9 @@ struct FeatureInfo
 
     // Features that have to be on whenever this one is, which a refusal reports rather than turns on.
     requires: Buf[string]
+
+    // The C macro the config header writes as 1 when the feature is on and 0 when it is off, or `""`.
+    macro: string
 end FeatureInfo
 
 // A group of features of which exactly one is on wherever the group applies.
@@ -74,9 +77,10 @@ end FeaturesRead
 val FeatureKeys: []const string = ["doc", "default", "if", "enables", "requires", "targets", "macro",
                                    "options", "c", "defines", "config", "sections"]
 
-// The keys of a feature block the options layer and the config header will read, which this reader
-// accepts and does not yet act on. `c`, `defines` and `requires` are read by `c_layers.sysl`.
-val FeatureKeysNotYetRead: []const string = ["macro", "options", "config", "sections"]
+// The keys of a feature block that a later layer will read, which this reader accepts and does not yet
+// act on. `c`, `defines`, `requires` and `config` are read by `c_layers.sysl`, `options` by
+// `options.sysl` and `macro` below.
+val FeatureKeysNotYetRead: []const string = ["sections"]
 
 // Every key a `choices` entry may write.
 val ChoiceKeys: []const string = ["doc", "of", "default"]
@@ -89,7 +93,7 @@ private holds_name(names: []const string, name: string) -> bool
 end holds_name
 
 // A feature written in the list form: it enables its members and says nothing else.
-plain_feature_info(name: string) -> FeatureInfo = FeatureInfo(name, "", "", false, buf())
+plain_feature_info(name: string) -> FeatureInfo = FeatureInfo(name, "", "", false, buf(), "")
 
 // One feature block: the members it enables, what else it says, and the target keys it sets.
 read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result[FeatureBlock, string]
@@ -130,8 +134,24 @@ read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result
     val condition = read_condition_key(entry, where)?
     val targets = read_feature_targets(name, entry, warnings)?
 
-    Ok(FeatureBlock(enables, FeatureInfo(name, conf_text(entry, "doc"), condition, is_default, requires),
-                    targets))
+    var macro = ""
+
+    conf_at(entry, "macro") match
+        None -> ()
+        Some(v) ->
+            macro = *v match
+                Text(s) -> s
+                Word(s) -> s
+                _ -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
+                                "defines as 1 while the feature is on and 0 while it is off, as " +
+                                "'macro = \"CFG_TUD_ENABLED\"'")
+
+            if !macro_name(macro)
+                return Err(s"'$where.macro' is '$macro', which is not a name a C macro can have — " +
+                           "letters, digits and '_', not starting with a digit")
+
+    Ok(FeatureBlock(enables, FeatureInfo(name, conf_text(entry, "doc"), condition, is_default, requires,
+                                         macro), targets))
 end read_feature_block
 
 // The refusal for a feature named `default`, whichever way it is written. A list is the 0.4.0 way

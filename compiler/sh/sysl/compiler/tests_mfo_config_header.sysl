@@ -1,0 +1,716 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// **Options reach C and sysl** (`options.sysl`, `config_header.sysl`, `reference/packages.md § Options`
+// and `§ The config header`): typed options with defaults, `values` and hex, options inside a feature,
+// the generated `sysl/<package>.h`, `bool` options in `#if`, and `sysl build --emit`.
+
+private val mfo_package: string = "package { name = \"p\", version = \"0.1.0\" }\n"
+
+private mfo_read(body: string) -> Manifest = read_manifest(mfo_package + body).unwrap()
+
+private mfo_refused(body: string) -> string =
+    read_manifest(mfo_package + body) match
+        Err(why) -> why
+        Ok(_) -> "(read)"
+
+private mfo_names(named: []string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for n in named
+        out.push(n)
+
+    out
+end mfo_names
+
+// The constants a manifest's options make with these features on.
+private mfo_lines(m: &Manifest, on: []string) -> string =
+    join(lines_of_settled(settled_options(m.options, mfo_names(on), buf())).view(), "\n")
+
+private mfo_one(declaration: string) -> string =
+    mfo_lines(mfo_read(s"options { x { $declaration } }\n"), [])
+
+private mfo_one_refused(declaration: string) -> string = mfo_refused(s"options { x { $declaration } }\n")
+
+// -- types, defaults and literals -------------------------------------------------------------------
+
+@test("every option type is declared with a default and read as a constant of that type")
+mfo_every_type()
+    val m = mfo_read("options {\n  a { type = u8, default = 7 }\n  b { type = i64, default = -5 }\n" +
+                     "  c { type = bool, default = true }\n  d { type = string, default = \"hi\\\"x\" }\n" +
+                     "  e { type = usize, default = 16 }\n" +
+                     "  f { type = u128, default = 340282366920938463463374607431768211455 }\n" +
+                     "  g { type = int, default = 0 }\n}\n")
+
+    assert_eq(mfo_lines(m, []),
+              "private const option_a: u8 = 7\nprivate const option_b: i64 = -5\n" +
+              "private const option_c: bool = true\nprivate const option_d: string = \"hi\\\"x\"\n" +
+              "private const option_e: usize = 16\n" +
+              "private const option_f: u128 = 340282366920938463463374607431768211455\n" +
+              "private const option_g: int = 0")
+end mfo_every_type
+
+@test("an option without a default, with a type it cannot have or with a key it does not know is refused")
+mfo_declaration_refusals()
+    assert(mfo_one_refused("type = u8").contains("'options.x' names no 'default'"), "default")
+    assert(mfo_one_refused("default = 1").contains("'options.x' names no 'type'"), "type")
+    assert(mfo_one_refused("type = float, default = 1").contains("'options.x.type' is 'float'"), "kind")
+    assert(mfo_one_refused("type = u8, default = 1, colour = 2")
+               .contains("'options.x.colour' is not something an option says — the keys are 'default', " +
+                         "'doc', 'macro', 'range', 'type', 'values'"), "key")
+    assert(mfo_one_refused("type = u8, default = true").contains("'options.x.default' is true, which is not a 'u8'"),
+           "wrong type")
+    assert(mfo_one_refused("type = bool, default = 1").contains("'options.x.default' is 1, which is not a 'bool'"),
+           "bool")
+    assert(mfo_one_refused("type = string, default = 3").contains("which is not a 'string'"), "string")
+    assert(mfo_one_refused("type = u8, default = 300").contains("'options.x.default' is 300, which no 'u8' holds"),
+           "width")
+    assert(mfo_one_refused("type = u8, default = 9, range = [1, 8]")
+               .contains("'options.x.default' is 9, outside the option's range [1, 8]"), "range")
+end mfo_declaration_refusals
+
+@test("an integer option is written in hex, binary or octal and is held to its type")
+mfo_hex_binary_octal()
+    assert_eq(mfo_one("type = u16, default = 0x2E8A"), "private const option_x: u16 = 11914")
+    assert_eq(mfo_one("type = u8, default = 0b1010"), "private const option_x: u8 = 10")
+    assert_eq(mfo_one("type = u8, default = 0o17"), "private const option_x: u8 = 15")
+    assert_eq(mfo_one("type = u8, default = 0XFF"), "private const option_x: u8 = 255")
+    assert_eq(mfo_one("type = i32, default = -0x10"), "private const option_x: i32 = -16")
+    assert_eq(mfo_one("type = u8, default = 0x000A"), "private const option_x: u8 = 10")
+    assert_eq(mfo_one("type = u8, default = 0x0"), "private const option_x: u8 = 0")
+    assert_eq(mfo_one("type = u64, default = 0xFFFFFFFFFFFFFFFF"),
+              "private const option_x: u64 = 18446744073709551615")
+    assert_eq(mfo_one("type = u8, default = 0x18, range = [0x10, 0x20]"), "private const option_x: u8 = 24")
+    assert_eq(mfo_one("type = u8, default = 8, values = [0x8, 0b10000, 0o40]"), "private const option_x: u8 = 8")
+end mfo_hex_binary_octal
+
+@test("a hex, binary or octal value that is empty, has a digit its base lacks or overflows is refused")
+mfo_hex_refusals()
+    assert(mfo_one_refused("type = u8, default = 0x").contains("'options.x.default' is 0x, which is not a 'u8'"),
+           "empty")
+    assert(mfo_one_refused("type = u8, default = 0xZZ").contains("which is not a 'u8'"), "digit")
+    assert(mfo_one_refused("type = u8, default = 0b102").contains("which is not a 'u8'"), "binary")
+    assert(mfo_one_refused("type = u8, default = 0o8").contains("which is not a 'u8'"), "octal")
+    assert(mfo_one_refused("type = u8, default = 0x100").contains("'options.x.default' is 256, which no 'u8' holds"),
+           "width")
+    assert(mfo_one_refused("type = u8, default = -0x1").contains("which no 'u8' holds"), "sign")
+    assert(mfo_one_refused("type = u8, default = 0x30, range = [0x10, 0x20]")
+               .contains("outside the option's range [16, 32]"), "range")
+end mfo_hex_refusals
+
+// -- values -----------------------------------------------------------------------------------------
+
+@test("values lists the only values an integer or string option may have, and the default is one")
+mfo_values()
+    assert_eq(mfo_one("type = u8, values = [8, 16, 64], default = 64"), "private const option_x: u8 = 64")
+    assert_eq(mfo_one("type = string, values = [\"a\", \"b\"], default = \"b\""),
+              "private const option_x: string = \"b\"")
+
+    assert(mfo_one_refused("type = u8, values = [8, 16, 64], default = 12")
+               .contains("'options.x.default' is 12, which is none of the option's values [8, 16, 64]"),
+           "default")
+    assert(mfo_one_refused("type = string, values = [\"a\", \"b\"], default = \"c\"")
+               .contains("\"c\", which is none of the option's values [\"a\", \"b\"]"), "string")
+    assert(mfo_one_refused("type = u8, values = [8, 300], default = 8").contains("'options.x.values' holds 300"),
+           "a value of the wrong width")
+    assert(mfo_one_refused("type = u8, values = [8, \"x\"], default = 8").contains("'options.x.values' holds"),
+           "a value of the wrong type")
+    assert(mfo_one_refused("type = u8, values = [8, 0x8], default = 8")
+               .contains("'options.x.values' holds 8 twice"), "twice")
+    assert(mfo_one_refused("type = u8, values = [], default = 8").contains("'options.x.values' is empty"), "empty")
+    assert(mfo_one_refused("type = u8, values = 8, default = 8").contains("'options.x.values' is not a list"),
+           "scalar")
+    assert(mfo_one_refused("type = bool, values = [true], default = true")
+               .contains("'options.x.values' lists the values of a 'bool' option"), "bool")
+    assert(mfo_one_refused("type = u8, values = [8], range = [1, 9], default = 8")
+               .contains("names both a 'range' and 'values'"), "range")
+end mfo_values
+
+@test("a value is checked against the option's values wherever it comes from")
+mfo_values_check_a_setting()
+    val m = mfo_read("options { x { type = u8, values = [8, 16], default = 8 } }\n")
+    val opt = m.options.at(0)
+
+    assert_eq(option_literal(opt.kind, opt.type_name, opt.range, opt.values, Word("0x10")).unwrap(), "16")
+    assert_eq(option_literal(opt.kind, opt.type_name, opt.range, opt.values, Word("12")).unwrap_err(),
+              "12, which is none of the option's values [8, 16]")
+end mfo_values_check_a_setting
+
+// -- macros, features and names ---------------------------------------------------------------------
+
+@test("an option inside a feature is named for the feature and exists only while the feature is on")
+mfo_feature_options()
+    val m = mfo_read("options { top { type = u8, default = 1 } }\n" +
+                     "features { cdc { options { ports { type = u8, default = 2 } } }, msc = [] }\n")
+
+    assert_eq(m.options.at(1).name, "cdc.ports")
+    assert_eq(m.options.at(1).feature, "cdc")
+    assert_eq(option_constant("cdc.ports"), "option_cdc_ports")
+    assert_eq(mfo_lines(m, []), "private const option_top: u8 = 1")
+    assert_eq(mfo_lines(m, ["cdc"]), "private const option_top: u8 = 1\nprivate const option_cdc_ports: u8 = 2")
+    assert_eq(mfo_lines(m, ["msc"]), "private const option_top: u8 = 1")
+end mfo_feature_options
+
+@test("a feature's option is declared with the same checks as a package's, and a refusal names its place")
+mfo_feature_option_refusals()
+    assert(mfo_refused("features { cdc { options { ports { type = u8 } } } }\n")
+               .contains("'features.cdc.options.ports' names no 'default'"), "default")
+    assert(mfo_refused("features { cdc { options { ports { type = u8, default = 1, colour = 1 } } } }\n")
+               .contains("'features.cdc.options.ports.colour'"), "key")
+    assert(mfo_refused("features { cdc { options = 3 } }\n").contains("'features.cdc.options' is not a block"),
+           "shape")
+    assert(mfo_refused("features { \"a-b\" { options { n { type = u8, default = 1 } } } }\n")
+               .contains("'features.a-b.options' declares options inside the feature 'a-b'"), "feature name")
+    assert(mfo_refused("options { cdc_ports { type = u8, default = 1 } }\n" +
+                       "features { cdc { options { ports { type = u8, default = 1 } } } }\n")
+               .contains("both read in source as 'option_cdc_ports'"), "constant")
+end mfo_feature_option_refusals
+
+@test("a macro names an option or a feature once, and has to be a name C can have")
+mfo_macro_names()
+    assert(mfo_one_refused("type = u8, default = 1, macro = \"1BAD\"")
+               .contains("'options.x.macro' is '1BAD', which is not a name a C macro can have"), "option")
+    assert(mfo_refused("features { f { macro = \"A-B\" } }\n")
+               .contains("'features.f.macro' is 'A-B', which is not a name a C macro can have"), "feature")
+    assert(mfo_refused("options { a { type = u8, default = 1, macro = \"M\" }, b { type = u8, default = 1, macro = \"M\" } }\n")
+               .contains("both write the macro 'M' to the config header"), "two options")
+    assert(mfo_refused("options { a { type = u8, default = 1, macro = \"M\" } }\nfeatures { f { macro = \"M\" } }\n")
+               .contains("the macro 'M' is written to the config header by both the option 'a' and the feature 'f'"),
+           "option and feature")
+    assert_eq(join(mfo_read("options { a { type = u8, default = 1, macro = \"M\" } }\nfeatures { f { macro = \"N\" } }\n")
+                       .warnings.view(), "\n"), "")
+end mfo_macro_names
+
+@test("config is a block of macros at the package, a target and a feature, and a value that says nothing is refused")
+mfo_config_reads()
+    val m = mfo_read("config { A = 1, B = \"x y\", C = true }\ntargets { thumb { config { T = 2 } } }\n" +
+                     "features { f { config { F = 3 } } }\n")
+
+    assert_eq(join(m.warnings.view(), "\n"), "")
+    assert_eq(join(config_lines(m, "", mfo_names([])).unwrap().view(), "|"), "A=1|B=x y|C")
+    assert_eq(join(config_lines(m, "thumb", mfo_names([])).unwrap().view(), "|"), "A=1|B=x y|C|T=2")
+    assert_eq(join(config_lines(m, "thumb", mfo_names(["f"])).unwrap().view(), "|"), "A=1|B=x y|C|T=2|F=3")
+    assert(mfo_refused("config { A = false }\n").contains("'config.A' is false"), "false")
+    assert(mfo_refused("config = 3\n").contains("'config' is not a block of macros"), "shape")
+    assert(mfo_refused("features { f { config { \"a b\" = 1 } } }\n")
+               .contains("'features.f.config.a b' is not a name a C macro can have"), "name")
+end mfo_config_reads
+
+@test("a later layer replaces an earlier layer's config macro in place, and two features may not both set one")
+mfo_config_merge()
+    val m = mfo_read("config { A = 1, B = 1 }\nfeatures { f { config { A = 2, C = 1 } }, g { config { C = 1 } } }\n")
+
+    assert_eq(join(config_lines(m, "", mfo_names(["f"])).unwrap().view(), "|"), "A=2|B=1|C=1")
+
+    val clash = config_lines(m, "", mfo_names(["f", "g"])).unwrap_err()
+
+    assert(clash.contains("the features 'f' and 'g' are both on, and both set the macro 'C' of 'config'"), clash)
+end mfo_config_merge
+
+@test("a feature whose config clashes with another's is refused where the features are settled")
+mfo_config_clash_is_a_settle_refusal()
+    val m = mfo_read("features { f { config { C = 1 } }, g { config { C = 1 } } }\n")
+    val why = settle_features(m, mfo_names(["f", "g"]), false, "this project").unwrap_err()
+
+    assert(why.contains("both set the macro 'C' of 'config'"), why)
+end mfo_config_clash_is_a_settle_refusal
+
+// -- the header -------------------------------------------------------------------------------------
+
+// A reduced TinyUSB: the shape of the design note's package.
+private val mfo_tinyusb: string =
+    "package { name = \"tinyusb\", version = \"0.1.0\" }\n" +
+    "config {\n  CFG_TUSB_OS = OPT_OS_NONE\n  CFG_TUSB_MEM_ALIGN = \"__attribute__((aligned(4)))\"\n}\n" +
+    "options {\n" +
+    "  debug { type = u8, default = 0, range = [0, 3], macro = \"CFG_TUSB_DEBUG\" }\n" +
+    "  vid { type = u16, default = 0xCAFE, macro = \"SYSL_TUSB_VID\" }\n" +
+    "  pid { type = u16, default = 0x4000, macro = \"SYSL_TUSB_PID\" }\n" +
+    "  manufacturer { type = string, default = \"sysl\" }\n" +
+    "  product { type = string, default = \"TinyUSB device\" }\n}\n" +
+    "features {\n" +
+    "  rp2040 { config { CFG_TUSB_MCU = OPT_MCU_RP2040 } }\n" +
+    "  rp2350 { config { CFG_TUSB_MCU = OPT_MCU_RP2040, PICO_RP2350 = 1 } }\n" +
+    "  full_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_FULL_SPEED, CFG_TUH_MAX_SPEED = OPT_MODE_FULL_SPEED } }\n" +
+    "  high_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_HIGH_SPEED, CFG_TUH_MAX_SPEED = OPT_MODE_HIGH_SPEED } }\n" +
+    "  device {\n    macro = \"CFG_TUD_ENABLED\"\n" +
+    "    options { ep0_size { type = u8, values = [8, 16, 32, 64], default = 64, macro = \"CFG_TUD_ENDPOINT0_SIZE\" } }\n  }\n" +
+    "  host {\n    macro = \"CFG_TUH_ENABLED\"\n" +
+    "    options { devices { type = u8, default = 4, range = [1, 16], macro = \"CFG_TUH_DEVICE_MAX\" } }\n  }\n" +
+    "  cdc {\n    enables = [device]\n    options {\n" +
+    "      ports { type = u8, default = 1, range = [1, 4], macro = \"CFG_TUD_CDC\" }\n" +
+    "      rx_buffer { type = u16, default = 256, range = [64, 4096], macro = \"CFG_TUD_CDC_RX_BUFSIZE\" }\n" +
+    "      tx_buffer { type = u16, default = 256, range = [64, 4096], macro = \"CFG_TUD_CDC_TX_BUFSIZE\" }\n    }\n  }\n" +
+    "  msc {\n    enables = [device]\n" +
+    "    options { buffer { type = u16, default = 512, range = [64, 16384], macro = \"CFG_TUD_MSC_EP_BUFSIZE\" } }\n" +
+    "    config { CFG_TUD_MSC = 1 }\n  }\n}\n"
+
+private mfo_header(m: &Manifest, on: []string, set: []string) -> string
+    var values: Buf[(string, string)] = buf()
+    var i = 0
+
+    while i + 1 < set.len
+        values.push((set[i], set[i + 1]))
+        i += 2
+
+    val enabled = mfo_names(on)
+    val settled = settled_options(m.options, enabled, values)
+    val input = HeaderInput("", "tinyusb", *m, enabled, settled)
+
+    config_header_text(input).unwrap().unwrap_or("(none)")
+end mfo_header
+
+@test("the header holds the options, the features, the enabled features' options and the config, in the note's order")
+mfo_golden_header()
+    val m = read_manifest(mfo_tinyusb).unwrap()
+    val text = mfo_header(m, ["rp2350", "full_speed", "device", "cdc", "msc"],
+                          ["vid", "11914", "pid", "10", "cdc.rx_buffer", "512", "msc.buffer", "4096"])
+
+    assert_eq(text,
+              "/* written by sysl from tinyusb 0.1.0's settled configuration */\n" +
+              "#define CFG_TUSB_DEBUG 0\n" +
+              "#define SYSL_TUSB_VID 11914\n" +
+              "#define SYSL_TUSB_PID 10\n" +
+              "#define CFG_TUD_ENABLED 1\n" +
+              "#define CFG_TUH_ENABLED 0\n" +
+              "#define CFG_TUD_ENDPOINT0_SIZE 64\n" +
+              "#define CFG_TUD_CDC 1\n" +
+              "#define CFG_TUD_CDC_RX_BUFSIZE 512\n" +
+              "#define CFG_TUD_CDC_TX_BUFSIZE 256\n" +
+              "#define CFG_TUD_MSC_EP_BUFSIZE 4096\n" +
+              "#define CFG_TUSB_OS OPT_OS_NONE\n" +
+              "#define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))\n" +
+              "#define CFG_TUSB_MCU OPT_MCU_RP2040\n" +
+              "#define PICO_RP2350 1\n" +
+              "#define CFG_TUD_MAX_SPEED OPT_MODE_FULL_SPEED\n" +
+              "#define CFG_TUH_MAX_SPEED OPT_MODE_FULL_SPEED\n" +
+              "#define CFG_TUD_MSC 1\n")
+end mfo_golden_header
+
+@test("an option of a feature that is off writes nothing, and the feature's own macro is 0")
+mfo_header_leaves_out_what_is_off()
+    val m = read_manifest(mfo_tinyusb).unwrap()
+    val text = mfo_header(m, ["rp2040", "high_speed"], [])
+
+    assert(text.contains("#define CFG_TUD_ENABLED 0\n#define CFG_TUH_ENABLED 0\n"), text)
+    assert(!text.contains("CFG_TUD_CDC"), text)
+    assert(!text.contains("ENDPOINT0_SIZE"), text)
+    assert(!text.contains("CFG_TUH_DEVICE_MAX"), text)
+    assert(text.contains("#define CFG_TUSB_MCU OPT_MCU_RP2040\n#define CFG_TUD_MAX_SPEED OPT_MODE_HIGH_SPEED\n"), text)
+end mfo_header_leaves_out_what_is_off
+
+@test("a bool is 1 or 0, a string is a C string literal, and a package that says nothing to C has no header")
+mfo_header_value_forms()
+    val m = mfo_read("options {\n  on { type = bool, default = true, macro = \"ON\" }\n" +
+                     "  off { type = bool, default = false, macro = \"OFF\" }\n" +
+                     "  name { type = string, default = \"a\\\"b\", macro = \"NAME\" }\n" +
+                     "  count { type = i16, default = -3, macro = \"COUNT\" }\n}\n")
+    val text = mfo_header(m, [], [])
+
+    assert_eq(text, "/* written by sysl from p 0.1.0's settled configuration */\n" +
+                    "#define ON 1\n#define OFF 0\n#define NAME \"a\\\"b\"\n#define COUNT -3\n")
+
+    val silent = mfo_read("options { a { type = u8, default = 1 } }\nfeatures { f = [] }\n")
+
+    assert_eq(mfo_header(silent, [], []), "(none)")
+end mfo_header_value_forms
+
+// -- building ---------------------------------------------------------------------------------------
+
+private mfo_ready() -> bool = std_root().is_ok() && clang_available()
+
+private mfo_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private mfo_write(root: string, at: string, text: string)
+    val file = s"$root/$at"
+
+    make_dir_all(parent_of(file).unwrap_or(root)).unwrap()
+    write_text(file, text).unwrap()
+
+private mfo_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// A package of C and sysl whose C reads its configuration: `ucfg_value` adds the vendor id, the serial
+// buffer where `cdc` is on, and a fixed number.
+private val mfo_lib_manifest: string =
+    "package { name = \"ucfg\", version = \"1.0.0\" }\n" +
+    "c { u { root = \"c\", include = [\".\"], sources = [\"lib.c\"] } }\n" +
+    "config { UCFG_FIXED = 7 }\n" +
+    "options {\n" +
+    "  vid { type = u16, default = 0xCAFE, macro = \"UCFG_VID\" }\n" +
+    "  mode { type = string, values = [\"a\", \"b\"], default = \"a\", macro = \"UCFG_MODE\" }\n" +
+    "  turbo { type = bool, default = false }\n}\n" +
+    "features {\n  cdc {\n    macro = \"UCFG_CDC\"\n    options {\n" +
+    "      rx { type = u16, default = 256, range = [64, 4096], macro = \"UCFG_RX\" }\n" +
+    "      dma { type = bool, default = false }\n    }\n  }\n}\n"
+
+private val mfo_lib_c: string =
+    "#include \"sysl/ucfg.h\"\n\nint ucfg_value(void) {\n    int v = UCFG_VID;\n#if UCFG_CDC\n    v += UCFG_RX;\n" +
+    "#endif\n    return v + UCFG_FIXED;\n}\n"
+
+private val mfo_geom: string =
+    "module geom\n\nextern \"ucfg_value\" c() -> int\n\n#if option_turbo\nvalue() -> int = c() * 2\n" +
+    "#else\nvalue() -> int = c()\n#endif\n\n#if option_cdc_dma\ndma() -> int = 1\n#else\ndma() -> int = 0\n#endif\n"
+
+private mfo_lib(at: string = "") -> string
+    val root = if at.is_empty() then mfo_temp("sysl-mfo-lib") else at
+
+    mfo_write(root, "sysl.hocon", mfo_lib_manifest)
+    mfo_write(root, "geom/geom.sysl", mfo_geom)
+    mfo_write(root, "c/lib.c", mfo_lib_c)
+    root
+end mfo_lib
+
+private val mfo_main: string = "main()\n    print(s\"${geom.value()} ${geom.dma()}\")\n"
+
+private mfo_app(entry: string, main_text: string = mfo_main) -> string
+    val root = mfo_temp("sysl-mfo-app")
+
+    mfo_write(root, "sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $entry }\n")
+    mfo_write(root, "main.sysl", main_text)
+    root
+end mfo_app
+
+// What the program a consumer builds says, or why it was not built.
+private mfo_run(root: string) -> string
+    val out_dir = mfo_temp("sysl-mfo-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text.trim() else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end mfo_run
+
+// The app's manifest again, with the vendor id its entry sets.
+private mfo_retarget(app: string, lib: string, vid: int)
+    mfo_write(app, "sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+              s"dependencies { u { path = \"$lib\", options = { vid = $vid } } }\n")
+
+// What a consumer of the library says with these settings on its entry.
+private mfo_total(settings: string) -> string
+    val lib = mfo_lib()
+    val app = mfo_app(s"u { path = \"$lib\"$settings }")
+    val said = mfo_run(app)
+
+    mfo_drop([app, lib])
+    said
+
+@test("C reads the header: a feature picks a code path and an option sizes it")
+mfo_c_reads_the_header()
+    if !mfo_ready() then return
+
+    assert_eq(mfo_total(""), "51973 0")
+    assert_eq(mfo_total(", features = [cdc]"), "52229 0")
+    assert_eq(mfo_total(", features = [cdc], options = { cdc.rx = 512 }"), "52485 0")
+end mfo_c_reads_the_header
+
+@test("a consumer's settings reach the dependency's header and its sysl, in hex, binary and octal")
+mfo_consumer_settings_reach_the_package()
+    if !mfo_ready() then return
+
+    assert_eq(mfo_total(", features = [cdc], options = { vid = 0x10, cdc.rx = 0b1000000 }"), "87 0")
+    assert_eq(mfo_total(", options = { vid = 0o20 }"), "23 0")
+    assert_eq(mfo_total(", options = { vid = 1, turbo = true }"), "16 0")
+    assert_eq(mfo_total(", features = [cdc], options = { vid = 1, cdc.rx = 64, cdc.dma = true }"), "72 1")
+end mfo_consumer_settings_reach_the_package
+
+@test("a bool option is an #if symbol while it is true, and an option of an off feature is false")
+mfo_bool_option_in_if()
+    if !mfo_ready() then return
+
+    assert_eq(mfo_total(", options = { vid = 3, turbo = false }"), "10 0")
+    assert_eq(mfo_total(", options = { vid = 3, turbo = true }"), "20 0")
+    assert_eq(mfo_total(", features = [cdc], options = { vid = 3, cdc.rx = 64, cdc.dma = false }"), "74 0")
+    assert_eq(mfo_total(", features = [cdc], options = { vid = 3, cdc.rx = 64, cdc.dma = true }"), "74 1")
+end mfo_bool_option_in_if
+
+private mfo_refusal(settings: string) -> string = mfo_total(settings)
+
+@test("a setting the package does not declare, of the wrong type, outside its range or values is refused")
+mfo_setting_refusals()
+    if !mfo_ready() then return
+
+    val undeclared = mfo_refusal(", options = { nope = 1 }")
+    val wrong = mfo_refusal(", options = { vid = \"x\" }")
+    val wide = mfo_refusal(", options = { vid = 70000 }")
+    val range = mfo_refusal(", features = [cdc], options = { cdc.rx = 10 }")
+    val values = mfo_refusal(", options = { mode = \"c\" }")
+    val flag = mfo_refusal(", options = { turbo = \"yes\" }")
+
+    assert(undeclared.starts_with("refused: ") && undeclared.contains("sets the option 'nope' of 'u'") &&
+           undeclared.contains("does not declare") && undeclared.contains("'vid'"), undeclared)
+    assert(wrong.contains("sets the option 'vid' of 'u' to \"x\", which is not a 'u16'"), wrong)
+    assert(wide.contains("sets the option 'vid' of 'u' to 70000, which no 'u16' holds"), wide)
+    assert(range.contains("sets the option 'cdc.rx' of 'u' to 10, outside the option's range [64, 4096]"), range)
+    assert(values.contains("sets the option 'mode' of 'u' to \"c\", which is none of the option's values [\"a\", \"b\"]"),
+           values)
+    assert(flag.contains("sets the option 'turbo' of 'u' to \"yes\", which is not a 'bool'"), flag)
+end mfo_setting_refusals
+
+@test("an option of a feature that is off cannot be set, and the refusal names the feature")
+mfo_option_of_an_off_feature()
+    if !mfo_ready() then return
+
+    val why = mfo_refusal(", options = { cdc.rx = 100 }")
+
+    assert(why.starts_with("refused: "), why)
+    assert(why.contains("sets the option 'cdc.rx' of 'u', which belongs to the feature 'cdc', and that feature is off"), why)
+    assert(why.contains("an option inside a feature exists only while the feature is on"), why)
+end mfo_option_of_an_off_feature
+
+// -- sysl build --emit ------------------------------------------------------------------------------
+
+private mfo_cli(args: []string) -> (int, string, string)
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    var all: Buf[string] = buf()
+
+    for a in args
+        all.push(a)
+
+    clx_ran(all.view())
+end mfo_cli
+
+// The header paths a build reported with `--emit`.
+private mfo_reported(err: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in split(err, "\n")
+        if line.starts_with("wrote ") && line.ends_with(".h") then out.push(line[6..])
+
+    out
+end mfo_reported
+
+@test("--emit config writes the headers the build used and prints their paths")
+mfo_emit_config()
+    if !mfo_ready() then return
+
+    val lib = mfo_lib()
+    val app = mfo_app(s"u { path = \"$lib\", features = [cdc], options = { vid = 0x10, cdc.rx = 512 } }")
+    val (one, _, said) = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config:ucfg"])
+    val (every, _, all) = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config"])
+    val paths = mfo_reported(said)
+    val text = read_text(paths.at(0)).unwrap()
+
+    mfo_drop([app, lib])
+    assert_eq(one, Fine, said)
+    assert_eq(every, Fine, all)
+    assert_eq(paths.len(), 1)
+    assert_eq(paths.at(0), s"$app/.sysl/out/${host_target().name}/include/sysl/ucfg.h")
+    assert_eq(mfo_reported(all).len(), 1)
+    assert_eq(text, "/* written by sysl from ucfg 1.0.0's settled configuration */\n" +
+                    "#define UCFG_VID 16\n#define UCFG_MODE \"a\"\n#define UCFG_CDC 1\n#define UCFG_RX 512\n" +
+                    "#define UCFG_FIXED 7\n")
+end mfo_emit_config
+
+@test("--emit refuses the linker-script kinds until 0.7.0, a kind it does not know and a package with no header")
+mfo_emit_refusals()
+    if !mfo_ready() then return
+
+    val lib = mfo_lib()
+    val app = mfo_app(s"u { path = \"$lib\" }")
+    val linked = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "link"])
+    val every = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config,all"])
+    val unknown = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "listing"])
+    val absent = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config:nope"])
+    val bare = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config:"])
+    val missing = mfo_cli(["sysl", "build", app, "--emit"])
+
+    mfo_drop([app, lib])
+    assert_eq(linked.0, Failed)
+    assert(linked.2.contains("linker-script generation arrives in 0.7.0"), linked.2)
+    assert_eq(every.0, Failed)
+    assert(every.2.contains("'--emit all' asks for a generated linker script"), every.2)
+    assert_eq(unknown.0, Failed)
+    assert(unknown.2.contains("'--emit listing' is not something a build can emit"), unknown.2)
+    assert_eq(absent.0, Failed)
+    assert(absent.2.contains("'--emit config:nope' names the package 'nope'") &&
+           absent.2.contains("The packages with a config header are 'ucfg'"), absent.2)
+    assert_eq(bare.0, Failed)
+    assert(bare.2.contains("'--emit config:' is not something a build can emit"), bare.2)
+    assert_eq(missing.0, Misused)
+    assert(missing.2.contains("Missing value after --emit"), missing.2)
+end mfo_emit_refusals
+
+@test("--emit config in a build where no package has a header says so, and the build still ran")
+mfo_emit_nothing()
+    if !mfo_ready() then return
+
+    val root = mfo_temp("sysl-mfo-plain")
+
+    mfo_write(root, "sysl.hocon", "package { name = \"plain\", version = \"0.1.0\" }\n")
+    mfo_write(root, "main.sysl", "main()\n    exit(0)\n")
+
+    val (code, _, said) = mfo_cli(["sysl", "build", root, "-o", s"$root/program", "--emit", "config"])
+
+    mfo_drop([root])
+    assert_eq(code, Failed)
+    assert(said.contains(s"wrote $root/program"), said)
+    assert(said.contains("'--emit config' has nothing to write"), said)
+end mfo_emit_nothing
+
+// -- a project's own options, in C and in #if -------------------------------------------------------
+
+private val mfo_root_manifest: string =
+    "package { name = \"rootp\", version = \"0.1.0\" }\n" +
+    "options {\n  level { type = u8, default = 3, macro = \"CFG_LEVEL\" }\n  verbose { type = bool, default = false }\n}\n" +
+    "features {\n  extra { macro = \"CFG_EXTRA\", options { depth { type = u8, default = 5, macro = \"CFG_DEPTH\" } } }\n" +
+    "  other = []\n}\n"
+
+private val mfo_root_main: string =
+    "extern which() -> int\n\nmain()\n    var code = which()\n#if option_verbose\n    code += 100\n#endif\n    exit(code)\n"
+
+private mfo_root() -> string
+    val root = mfo_temp("sysl-mfo-root")
+
+    mfo_write(root, "sysl.hocon", mfo_root_manifest)
+    mfo_write(root, "main.sysl", mfo_root_main)
+    mfo_write(root, "shim.c", "#include \"sysl/rootp.h\"\n\nint which(void) { return CFG_LEVEL + CFG_EXTRA * 10; }\n")
+    mfo_write(root, "tests_probe.sysl",
+              "@tests\n\nimport sysl.fs.read_text\n\n@test(\"the suite sees what the header says\")\nmfo_probe()\n" +
+              "    var seen = s\"${which()}\"\n#if option_verbose\n    seen = seen + \"v\"\n#endif\n" +
+              s"    assert_eq(seen, read_text(\"$root/EXPECT\").unwrap().trim())\n")
+    root
+end mfo_root
+
+private mfo_root_header(root: string) -> string =
+    read_text(s"$root/.sysl/out/${host_target().name}/include/sysl/rootp.h").unwrap_or("(no header)")
+
+@test("a project's own header reaches its C with no dependency in the build, and its bool option gates sysl")
+mfo_root_project()
+    if !mfo_ready() then return
+
+    val root = mfo_root()
+    val (code, out, err) = mfo_cli(["sysl", "run", root])
+    val header = mfo_root_header(root)
+
+    mfo_drop([root])
+    assert_eq(code, 3, out + err)
+    assert_eq(header, "/* written by sysl from rootp 0.1.0's settled configuration */\n#define CFG_LEVEL 3\n" +
+                      "#define CFG_EXTRA 0\n")
+end mfo_root_project
+
+@test("sysl test --option reaches the header, the C it compiles and the #if, and a new value rebuilds")
+mfo_test_option_reaches_the_header()
+    if !mfo_ready() then return
+
+    val root = mfo_root()
+
+    write_text(s"$root/EXPECT", "19v").unwrap()
+
+    val first = mfo_cli(["sysl", "test", root, "--option", "level=9", "--option", "verbose=true"])
+    val header = mfo_root_header(root)
+
+    write_text(s"$root/EXPECT", "17v").unwrap()
+
+    val second = mfo_cli(["sysl", "test", root, "--option", "level=7", "--option", "verbose=true",
+                          "--option", "extra.depth=0x8"])
+    val deeper = mfo_root_header(root)
+
+    write_text(s"$root/EXPECT", "17v").unwrap()
+
+    val stale = mfo_cli(["sysl", "test", root, "--option", "level=9", "--option", "verbose=true"])
+
+    mfo_drop([root])
+    assert_eq(first.0, Fine, first.1 + first.2)
+    assert(header.contains("#define CFG_LEVEL 9\n"), header)
+    assert(header.contains("#define CFG_EXTRA 1\n#define CFG_DEPTH 5\n"), header)
+    assert_eq(second.0, Fine, second.1 + second.2)
+    assert(deeper.contains("#define CFG_LEVEL 7\n") && deeper.contains("#define CFG_DEPTH 8\n"), deeper)
+    assert(stale.0 != Fine, "a suite built with level 9 must not pass an expectation of 17v")
+end mfo_test_option_reaches_the_header
+
+@test("the test block and the command line cannot set an option of a feature that is off")
+mfo_test_option_of_an_off_feature()
+    if !mfo_ready() then return
+
+    val root = mfo_root()
+
+    mfo_write(root, "sysl.hocon", mfo_root_manifest + "test { features = [other] }\n")
+    write_text(s"$root/EXPECT", "3").unwrap()
+
+    val (code, out, err) = mfo_cli(["sysl", "test", root, "--option", "extra.depth=3"])
+    val fine = mfo_cli(["sysl", "test", root])
+
+    mfo_drop([root])
+    assert_eq(code, Failed)
+    assert(out + err != "" && (out + err).contains("sets the option 'extra.depth', which belongs to the feature 'extra', and that feature is off"),
+           out + err)
+    assert_eq(fine.0, Fine, fine.1 + fine.2)
+end mfo_test_option_of_an_off_feature
+
+// -- the caches -------------------------------------------------------------------------------------
+
+@test("a consumer's option change rebuilds the program, and going back replays the first build")
+mfo_option_change_rebuilds()
+    if !mfo_ready() then return
+
+    val lib = mfo_lib()
+    val main_text = "main()\n    exit(geom.value() % 256)\n"
+    val app = mfo_app(s"u { path = \"$lib\", options = { vid = 1 } }", main_text)
+    val first = mfo_cli(["sysl", "run", app])
+
+    mfo_retarget(app, lib, 2)
+
+    val second = mfo_cli(["sysl", "run", app])
+
+    mfo_retarget(app, lib, 1)
+
+    val again = mfo_cli(["sysl", "run", app])
+
+    mfo_drop([app, lib])
+    assert_eq(first.0, 8, first.1 + first.2)
+    assert_eq(second.0, 9, second.1 + second.2)
+    assert_eq(again.0, 8, again.1 + again.2)
+end mfo_option_change_rebuilds
+
+@test("a changed header with the same sources recompiles the package's C")
+mfo_changed_header_recompiles_c()
+    if !mfo_ready() then return
+
+    val lib = mfo_lib()
+    val app = mfo_app(s"u { path = \"$lib\", options = { vid = 1 } }", mfo_main)
+    val one = mfo_run(app)
+
+    mfo_retarget(app, lib, 4)
+
+    val two = mfo_run(app)
+
+    mfo_drop([app, lib])
+    assert_eq(one, "8 0")
+    assert_eq(two, "11 0")
+end mfo_changed_header_recompiles_c
+
+// -- a bare-metal target ----------------------------------------------------------------------------
+
+@test("a library built for a bare-metal target gets its header in that target's include root")
+mfo_cross_target_build()
+    if !mfo_ready() then return
+
+    val root = mfo_temp("sysl-mfo-thumb")
+
+    mfo_write(root, "sysl.hocon",
+              "package { name = \"xpkg\", version = \"0.1.0\" }\n" +
+              "options { level { type = u8, default = 3, macro = \"CFG_LEVEL\" } }\n" +
+              "config { CFG_FIXED = 4 }\n")
+    mfo_write(root, "xpkg/xpkg.sysl", "module xpkg\n\nextern \"xc\" c() -> int\n\nlevel() -> int = c()\n")
+    mfo_write(root, "shim.c", "#include \"sysl/xpkg.h\"\n\nint xc(void) { return CFG_LEVEL + CFG_FIXED; }\n")
+
+    val (code, out, err) = mfo_cli(["sysl", "build-lib", root, "--target", "thumb-freestanding"])
+    val header = read_text(s"$root/.sysl/out/thumb-freestanding/include/sysl/xpkg.h").unwrap_or("(no header)")
+
+    mfo_drop([root])
+    assert_eq(code, Fine, out + err)
+    assert_eq(header, "/* written by sysl from xpkg 0.1.0's settled configuration */\n#define CFG_LEVEL 3\n" +
+                      "#define CFG_FIXED 4\n")
+end mfo_cross_target_build

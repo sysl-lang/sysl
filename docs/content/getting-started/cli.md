@@ -220,6 +220,12 @@ For a **directory**, the executable goes *inside* it, named after it. `sysl buil
 `sysl build fmt` and `sysl build ../fmt` name the same project, and all three write `fmt/fmt`, so
 the result does not depend on the directory you run the command from.
 
+**`--emit config` and `--emit config:<package>`** report the generated C configuration headers
+(`sysl/<package>.h`, see [packages](/reference/packages/)) the build wrote: one `wrote <path>` line each,
+on stderr, after the build has run, so what is shown is what it used. They accept a comma-separated
+list. `--emit link` and `--emit all` name generated linker scripts, which arrive in 0.7.0 and are
+refused until then.
+
 **If the project's `sysl.hocon` names dependencies, `build` fetches any this machine does not
 have yet** — see [packages](/reference/packages/). `run` and `test` do the same, so there is no
 separate fetch step, and a project with no dependencies fetches nothing.
