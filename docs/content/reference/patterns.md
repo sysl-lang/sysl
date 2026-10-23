@@ -133,7 +133,7 @@ enum Shape
 name(s: Shape) -> string
     s match
         Empty     -> "empty"
-        Circle(r) -> "circle " + str(r)
+        Circle(r) -> "circle " + r.to_string()
 
 print(name(Empty), name(Circle(3)))
 ```
@@ -281,8 +281,8 @@ area(s: Shape) -> int
 
 describe(s: Shape) -> string
     s match
-        c @ Circle(r) -> "circle r=" + str(r) + " area=" + str(area(c))
-        other -> "other, area=" + str(area(other))
+        c @ Circle(r) -> s"circle r=$r area=${area(c)}"
+        other -> s"other, area=${area(other)}"
 
 print(describe(Circle(2)))
 ```
@@ -320,7 +320,7 @@ struct Point
 describe(p: Point) -> string
     p match
         Point(0, 0) -> "origin"
-        Point{x: a} -> "x is " + str(a)
+        Point{x: a} -> "x is " + a.to_string()
 
 print(describe(Point(0, 0)), describe(Point(5, 1)))
 ```

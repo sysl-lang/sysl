@@ -70,7 +70,7 @@ refused, since a `string` is UTF-8 and has no way to hold it.
 
 ## Writing
 
-**The compact form is the `Display`**, so `print(j)`, `str(j)` and `s"$j"` all write JSON with no
+**The compact form is the `Display`**, so `print(j)`, `j.to_string()` and `s"$j"` all write JSON with no
 space anywhere. `pretty(j, step)` is for a person: one element or member to a line, `step` spaces
 per level. A `Real` is written as the shortest text that reads back as the same value, with a `.0`
 where it would otherwise read back as an `Int`; a NaN or an infinity is written `null`, since JSON has

@@ -602,7 +602,7 @@ digits(n: int) -> string
     var s = ""
 
     do
-        s = str(rest % 10) + s
+        s = (rest % 10).to_string() + s
         rest /= 10
     while rest > 0
 
@@ -704,7 +704,7 @@ for var i = 0; i < 10; i += 1
 var down = ""
 
 for var i = 3; i > 0; i -= 1
-    down += str(i)
+    down += i.to_string()
 
 print(total, down)
 ```

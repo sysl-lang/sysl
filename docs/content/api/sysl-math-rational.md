@@ -43,7 +43,7 @@ fraction**, which is the shortcut that rounds twice.
 
 ## Index
 
-[`abs`](#abs) [`add`](#add) [`ceil`](#ceil) [`checked_of`](#checked_of) [`cmp`](#cmp) [`cmp_real`](#cmp_real) [`div`](#div) [`eq_real`](#eq_real) [`floor`](#floor) [`from_big`](#from_big) [`from_int`](#from_int) [`from_real`](#from_real) [`gt_real`](#gt_real) [`lt_real`](#lt_real) [`mul`](#mul) [`negate`](#negate) [`of`](#of) [`one`](#one) [`ratio`](#ratio) [`sub`](#sub) [`to_real`](#to_real) [`to_string`](#to_string) [`trunc`](#trunc) [`zero`](#zero) [`Rational`](#rational) [Add for Rational](#add-for-rational) [Display for Rational](#display-for-rational) [Div for Rational](#div-for-rational) [Eq for Rational](#eq-for-rational) [From for Rational](#from-for-rational) [From for Rational](#from-for-rational-1) [Hash for Rational](#hash-for-rational) [Mul for Rational](#mul-for-rational) [Neg for Rational](#neg-for-rational) [Ord for Rational](#ord-for-rational) [Sub for Rational](#sub-for-rational)
+[`abs`](#abs) [`add`](#add) [`ceil`](#ceil) [`checked_of`](#checked_of) [`cmp`](#cmp) [`cmp_real`](#cmp_real) [`div`](#div) [`eq_real`](#eq_real) [`floor`](#floor) [`from_big`](#from_big) [`from_int`](#from_int) [`from_real`](#from_real) [`gt_real`](#gt_real) [`lt_real`](#lt_real) [`mul`](#mul) [`negate`](#negate) [`of`](#of) [`one`](#one) [`ratio`](#ratio) [`sub`](#sub) [`to_real`](#to_real) [`trunc`](#trunc) [`zero`](#zero) [`Rational`](#rational) [Add for Rational](#add-for-rational) [Display for Rational](#display-for-rational) [Div for Rational](#div-for-rational) [Eq for Rational](#eq-for-rational) [From for Rational](#from-for-rational) [From for Rational](#from-for-rational-1) [Hash for Rational](#hash-for-rational) [Mul for Rational](#mul-for-rational) [Neg for Rational](#neg-for-rational) [Ord for Rational](#ord-for-rational) [Sub for Rational](#sub-for-rational)
 
 ## Functions
 
@@ -244,15 +244,6 @@ remainder of the division are the guard and the sticky bit, and the rounding is 
 integer side where it is exact. Below the normal range fewer bits are kept, so the rounding happens
 once, at the subnormal's own last place, rather than once to 53 bits and again on the way down.
 The result is assembled from a mantissa of at most 53 bits and a power of two, which cannot round.
-
-### `to_string`
-
-```sysl
-to_string(x: Rational) -> string
-```
-
-`n/d` in base ten, the sign on the numerator -- and a whole number is still `n/1`, so the text
-says which type it came from.
 
 ### `trunc`
 

@@ -227,7 +227,7 @@ val ok: Result[int, int] = Ok(3)
 val bad: Result[int, int] = Err(3)
 
 print(ok == bad)
-print(str(a), str(n), str(ok), str(bad))
+print(a.to_string(), n.to_string(), ok.to_string(), bad.to_string())
 print(f"${a}%12s|")
 ```
 
@@ -334,7 +334,7 @@ read(ok: bool) -> Result[int, Fault]
     Ok(n * 2)
 
 describe(r: Result[int, Fault]) -> string = r match
-    Ok(n) -> "ok " + str(n)
+    Ok(n) -> "ok " + n.to_string()
     Err(Fault.Disk(_)) -> "disk"
     Err(Fault.Parse(s)) -> "parse " + s
 
@@ -770,7 +770,7 @@ enum Color: u8
 parse(b: u8) -> Result[Color, string]
     Color.try(b) match
         Some(c) -> Ok(c)
-        None    -> Err("byte " + str(b) + " is not a Color")
+        None    -> Err("byte " + b.to_string() + " is not a Color")
 
 parse(1) match
     Ok(c)  -> print("read:", Color::Image(c))
@@ -1298,7 +1298,7 @@ inherited one:
 type Stamp = new int
 
 override impl Display for Stamp
-    display(self, out: *Writer, fmt: FormatSpec) = display_str("#" + str(int(self)), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_str("#" + int(self).to_string(), out, fmt)
 
 var s = Stamp(7)
 

@@ -301,7 +301,7 @@ taking it is what a static *is*. A `&T`, a `weak T`, a slice and a `string` the 
 are all admissible:
 
 ```sysl
-static val name: string = str(2026)
+static val name: string = 2026.to_string()
 
 print(name)
 ```
@@ -1147,7 +1147,7 @@ handle(n: int)
     if n == 0 then leave(1)
 
 run()
-    val s = str(1) + "x"
+    val s = 1.to_string() + "x"
 
     handle(2)
     print(s)
@@ -1171,7 +1171,7 @@ handle(n: int)
     if n == 0 then leave(1)
 
 show()
-    val s = str(1) + "x"
+    val s = 1.to_string() + "x"
 
     print(s)
 
@@ -1462,7 +1462,7 @@ label(tag: string, xs: ...int) -> string
     var out = tag
 
     for x in xs
-        out = out + " " + str(x)
+        out = out + " " + x.to_string()
 
     out
 
@@ -2410,7 +2410,7 @@ impl Display for R
         print("rendering")
         display_int(long(self.n), out, fmt)
 
-const f(r: R) -> string = str(r)
+const f(r: R) -> string = r.to_string()
 
 print(f(R(1)))
 ```
@@ -2420,7 +2420,7 @@ print(f(R(1)))
 ```
 
 **Text is rendered while compiling as the program renders it.** A float goes through the library's
-own renderers — the shortest round trip for `str`, the exact digits under a specifier — so `-0`, a
+own renderers — the shortest round trip for `to_string`, the exact digits under a specifier — so `-0`, a
 subnormal, `inf` and `NaN` come out spelled as at run time. A value whose type's `display` can run
 while compiling runs it with a writer the evaluation keeps: `write` appends to it, the library's `display_*` routines
 and the `display` of every type the library renders write into it, and a nested `display` is handed

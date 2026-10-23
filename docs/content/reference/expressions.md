@@ -1335,7 +1335,7 @@ the literal 9223372036854775808 does not fit long
 ```
 
 Everything else is rejected. There is **no conversion to or from `bool`** — `int(true)` is an error
-and so is `bool(0)` — and **no number converts to or from a `string`**: `str(x)` renders one and the
+and so is `bool(0)` — and **no number converts to or from a `string`**: `x.to_string()` renders one and the
 `strconv` surface parses one, neither of them spelled as a conversion. The `char` → `string` row is
 the one exception, and a narrow one: a `char` is a single scalar value, so encoding it is total and
 cannot fail.
@@ -2000,7 +2000,8 @@ value built with a trailing block reads more clearly bound to a name first.
 
 ## String interpolation
 
-`s"…"` renders each `${…}` hole through `str` and concatenates: `s"a${e}b"` **is** `"a" + str(e) + "b"`,
+`s"…"` renders each `${…}` hole as `to_string` does and concatenates: `s"a${e}b"` **is**
+`"a" + e.to_string() + "b"`,
 with no runtime formatting machinery involved. `f"…"` allows a printf specifier after a hole, and
 routes that hole through `format` instead, where the analyzer checks the specifier against the
 value's type.

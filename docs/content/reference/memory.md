@@ -2203,7 +2203,7 @@ what was written:
 ```sysl
 id(xs: []string) -> []string = xs
 
-val s = id([str(7) + "y"][..])
+val s = id([7.to_string() + "y"][..])
 
 print(s[0])
 
@@ -2243,7 +2243,7 @@ tail() -> []string
     var keep: []string = []
 
     if true
-        keep = [str(1), str(2) + "b", "c"][1..<2]
+        keep = [1.to_string(), 2.to_string() + "b", "c"][1..<2]
 
     keep
 
@@ -2260,9 +2260,9 @@ a named array kept while that array is still in scope, stay where they are.
 ```sysl
 id(xs: []string) -> []string = xs
 
-print(id([str(7) + "y"][..])[0])
+print(id([7.to_string() + "y"][..])[0])
 
-val a = [str(7) + "y"]
+val a = [7.to_string() + "y"]
 val s = a[..]
 
 print(s[0])

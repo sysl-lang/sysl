@@ -549,7 +549,8 @@ an infinity, which is the right answer.
 to_string(x: BigInt) -> string
 ```
 
-`x` in base ten.
+`x` in base ten -- the older spelling of `x.to_string()`, kept while the compiler's own source,
+built by the previous release, still calls it.
 
 ### `to_string_radix`
 

@@ -29,7 +29,7 @@ info("listening", [("port", "8080"), ("tls", "on")])
 **A record holds strings the caller rendered**, which is the one decision here that shows up at
 every call site. The alternative -- a list of `&Display` -- would put a trait object in every
 record and an allocation behind every field. What a caller writes instead is
-`("port", str(port))`, which does allocate, and the cost is paid where the value is
+`("port", port.to_string())`, which does allocate, and the cost is paid where the value is
 actually wanted.
 
 **A filtered call still evaluates its arguments, and that is the one thing to know before putting
@@ -39,7 +39,7 @@ without building a `Record`, and it never sees the work that was done to reach i
 the guard for that case and is why it exists:
 
 ```
-if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
+if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
 ```
 
 A call whose fields are literals, or one with no fields at all, costs nothing when filtered.
@@ -94,7 +94,7 @@ Whether a record at `l` would be written, which is the guard a caller in a hot p
 of the work of rendering its fields.
 
 ```
-if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
+if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
 ```
 
 ### `error`

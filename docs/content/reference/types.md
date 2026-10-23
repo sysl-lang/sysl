@@ -467,7 +467,7 @@ val tenth: f128 = 0.1
 val third: f128 = 1 / 3
 
 print(tenth, third, -0.0f128, f128.infinity)
-print(str(third).bytes.len, s"$tenth", f"${third}%.40f", f"${tenth}%.3e")
+print(third.to_string().bytes.len, s"$tenth", f"${third}%.40f", f"${tenth}%.3e")
 ```
 
 ```output
@@ -476,7 +476,7 @@ print(str(third).bytes.len, s"$tenth", f"${third}%.40f", f"${tenth}%.3e")
 ```
 
 The text round-trips: `sysl.text.parse_f128` reads a decimal, rounded once to the nearest binary128
-value, so every `str` of an `f128` parses to the same `f128`. `sysl.fmt.shortest` accepts an `f128`
+value, so every `to_string` of an `f128` parses to the same `f128`. `sysl.fmt.shortest` accepts an `f128`
 as it accepts a `real`.
 
 ```sysl
@@ -484,7 +484,7 @@ import sysl.text.parse_f128
 
 val x: f128 = 2 / 7
 
-print(parse_f128(str(x)).unwrap().bits() == x.bits())
+print(parse_f128(x.to_string()).unwrap().bits() == x.bits())
 ```
 
 ```output

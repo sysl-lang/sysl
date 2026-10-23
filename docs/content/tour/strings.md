@@ -106,11 +106,11 @@ print("n=" + 5)
 ```
 
 This matches the numeric operators, which also convert nothing implicitly. The explicit conversion
-is `str(x)`, which renders a value as a string:
+is `x.to_string()`, a member every value has, which renders a value as a string:
 
 ```sysl
-print("count: " + str(3 * 14))
-print(str(true) + " " + str('é') + " " + str(2.5))
+print("count: " + (3 * 14).to_string())
+print(true.to_string() + " " + 'é'.to_string() + " " + 2.5.to_string())
 ```
 
 ```output
@@ -118,13 +118,25 @@ count: 42
 true é 2.5
 ```
 
-`str` allocates a new buffer for everything except a string, which it returns as is, and a `bool`,
-which renders to one of two literals. A struct or an enum renders through its `Display`
-implementation.
+`to_string` allocates a new buffer for everything except a string, which it returns as is, and a
+`bool`, which renders to one of two literals. A struct or an enum renders through its `Display`
+implementation. (`str(x)` is the older spelling of the same thing, and still works.)
+
+A list of strings is joined with a separator between the pieces by `join`:
+
+```sysl
+import sysl.text.split
+
+print(split("a,b,c", ",").join(" + "))
+```
+
+```output
+a + b + c
+```
 
 ## Interpolation
 
-To avoid writing `str` at every join, a literal may carry a prefix:
+To avoid writing `to_string` at every join, a literal may carry a prefix:
 
 ```sysl
 var n = 42
@@ -142,8 +154,8 @@ n is 42, and twice that is 84
 a\nb
 ```
 
-`s"…"` inserts `$name` or `${ expression }`, each rendered by `str`, so `s"a${e}b"` is exactly
-`"a" + str(e) + "b"`; interpolation does not introduce a new kind of value. `f"…"` adds one thing:
+`s"…"` inserts `$name` or `${ expression }`, each rendered by `to_string`, so `s"a${e}b"` is exactly
+`"a" + e.to_string() + "b"`; interpolation does not introduce a new kind of value. `f"…"` adds one thing:
 a hole may be followed by a printf-style specifier for width, precision and justification, checked
 against the value's type at compile time. `raw"…"` treats a backslash as an ordinary character.
 
@@ -169,7 +181,7 @@ b.push("items:")
 
 for i in 1..3
     b.push_char(' ')
-    b.push(str(i))
+    b.push(i.to_string())
 
 print(b.finish())
 ```

@@ -501,7 +501,7 @@ exponent form: `0.0000000005` says which place the one bit is in.
 
 **Printing one allocates nothing**: a fixed value is a scalar, and `print` writes its digits from a
 buffer in the caller's own frame, as it does an integer's — so it prints under `@no_alloc`, and on a
-board with no heap. `str(x)` and `s"$x"` make a `string` of the same characters, and so allocate.
+board with no heap. `x.to_string()` and `s"$x"` make a `string` of the same characters, and so allocate.
 
 ```sysl
 @no_alloc

@@ -122,9 +122,9 @@ fn main() {
     println!("// what Rust's `format!(\"{{}}\", x)` writes for the same bits at the same width: the shortest digits");
     println!("// that read back at that width, written out positionally, with no exponent and no trailing `.0`.");
     println!();
-    println!("private rust64(bits: u64, want: string) = assert_eq(str(real.from_bits(bits)), want)");
+    println!("private rust64(bits: u64, want: string) = assert_eq(real.from_bits(bits).to_string(), want)");
     println!();
-    println!("private rust32(bits: u32, want: string) = assert_eq(str(f32.from_bits(bits)), want)");
+    println!("private rust32(bits: u32, want: string) = assert_eq(f32.from_bits(bits).to_string(), want)");
 
     let a = f64_values();
     for (i, chunk) in a.chunks(60).enumerate() {

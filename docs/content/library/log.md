@@ -79,11 +79,11 @@ none. What a program installs is nearly always module storage or something that 
 
 That is the one decision here that shows up at every call site, and it is worth knowing why. The
 alternative — a list of `&Display` — would put a trait object in every record and an allocation
-behind every field. So a caller writes `("port", str(port))`, and the cost is paid where the
-value is actually wanted.
+behind every field. So a caller writes `("port", port.to_string())`, and the cost is paid where
+the value is actually wanted.
 
 **A filtered call still evaluates its arguments.** sysl evaluates a call's arguments before the call,
-so that `str` runs whether or not the threshold admits the record: `log` compares the level and
+so that `to_string` runs whether or not the threshold admits the record: `log` compares the level and
 returns without building a `Record`, and it never sees the work that was done to reach it. `enabled`
 is the guard for that, and is why it exists:
 
@@ -92,8 +92,8 @@ import sysl.log.{Level, debug, enabled, set_level}
 
 set_level(Level.Warn)
 
-// The `str` inside this would have run either way; the `if` is what stops it.
-if enabled(Level.Debug) then debug("state", [("queue", str(41))])
+// The `to_string` inside this would have run either way; the `if` is what stops it.
+if enabled(Level.Debug) then debug("state", [("queue", 41.to_string())])
 
 print(enabled(Level.Debug), enabled(Level.Error))
 ```

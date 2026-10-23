@@ -416,16 +416,22 @@ that does not define them.
 
 ## Rendering a value
 
-`str(x)` is the written conversion from a value to its string form — the counterpart to the strict
-`+`, and what interpolation is built on.
+`x.to_string()` is the written conversion from a value to its string form — the counterpart to the
+strict `+`, and what interpolation is built on. **Every value has it**: the compiler supplies the
+member wherever the type does not declare one of that name, so it needs no import and no `impl`.
 
 ```sysl
-print(str(42), str(true), str('é'), str(2.5), str("already"))
+val n = 42
+
+print(n.to_string(), true.to_string(), 'é'.to_string(), 2.5.to_string(), "already".to_string())
 ```
 
 ```output
 42 true é 2.5 already
 ```
+
+`str(x)` is the older spelling of the same conversion, and is still accepted: the two produce the
+same code.
 
 | type | result |
 |---|---|
@@ -435,12 +441,48 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 | float | the rendering `print` gives it — the fewest digits that read back at its own width, positionally, as Rust's `{}` writes them |
 | `string` | itself, unchanged |
 
+**A name you declare wins over a built-in one of the same spelling.** A type that declares its own
+`to_string` (or `debug_string`) member — in its body, an `impl` block, or a trait it implements —
+has that one called; the compiler's is what a call reaches only where nothing else claims the name.
+So do the forms: `str`, `print`, `format`, `str_cast`, `str_alias`, `ptr_cast` and the `va_` forms
+yield to a local, a parameter or a function of the same name, which is ordinary shadowing, and a
+call through it means that name, which is an error at the call if it cannot be called. An
+interpolation hole is the one call that always reaches the rendering, so a parameter called `str`
+can still be spliced in.
+
+```sysl
+struct Ticket
+    n: int
+
+    to_string(self) -> string = s"#${self.n}"
+
+print(Ticket(7).to_string(), Ticket(7))
+```
+
+```output
+#7 Ticket(n: 7)
+```
+
+```sysl
+double(str: string) -> string = s"${str}${str}"
+
+str(x: int) -> int = x * 2
+
+width(print: string) -> usize = print.len
+
+print(double("ab"), str(21), width("four"))
+```
+
+```output
+abab 42 4
+```
+
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
 allocates; every other case allocates a fresh buffer. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
 most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
 library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling at the float's width),
-whose digits are the ones `print` writes, so `str(x)` and `print(x)` can never disagree and a board
+whose digits are the ones `print` writes, so `x.to_string()` and `print(x)` can never disagree and a board
 with no C library renders one the same way.
 
 **Every other value renders too: through `Display` where it has one, and through `Debug` where it
@@ -459,7 +501,7 @@ enum Shape
 
 var p = Point(1, 2)
 
-print(str(p))
+print(p.to_string())
 print(p, Circle(3), Dot)
 ```
 
@@ -468,9 +510,9 @@ Point(x: 1, y: 2)
 Point(x: 1, y: 2) Shape.Circle(r: 3) Shape.Dot
 ```
 
-**`Display` is the override, not the requirement.** Written, it is what `str`, `print` and a hole
-reach — the [member](/library/core/#writing-display-for-your-own-type) takes the writer the string is
-being gathered into and the specifier the call site asked for:
+**`Display` is the override, not the requirement.** Written, it is what `to_string`, `print` and a
+hole reach — the [member](/library/core/#writing-display-for-your-own-type) takes the writer the
+string is being gathered into and the specifier the call site asked for:
 
 ```sysl
 struct Point
@@ -479,11 +521,11 @@ struct Point
 
 impl Display for Point
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+        display_pad(s"(${self.x}, ${self.y})".bytes, out, fmt)
 
 var p = Point(1, 2)
 
-print(str(p))
+print(p.to_string())
 ```
 
 ```output
@@ -491,7 +533,7 @@ print(str(p))
 ```
 
 **A reference renders as what it refers to.** A member call reaches through one `&` to find an
-`impl` — which is why no block may be written for `&T` itself — and `str`, `print`, an
+`impl` — which is why no block may be written for `&T` itself — and `to_string`, `print`, an
 interpolation hole and a `format` hole reach through the same one level. A `&P`, a `&sync P` and a
 `&Buf[int]` render exactly as the `P` or the `Buf` would:
 
@@ -502,7 +544,7 @@ struct Point
 
 impl Display for Point
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+        display_pad(s"(${self.x}, ${self.y})".bytes, out, fmt)
 
 var p: &Point = Point(1, 2)
 
@@ -577,15 +619,15 @@ print(s"n is $n, ${n * 2} doubled, $$5")
 n is 7, 14 doubled, $5
 ```
 
-Each spliced value is rendered by `str`, so the same rules apply: a primitive renders, a type with a
+Each spliced value is rendered as `to_string` renders it, so the same rules apply: a primitive renders, a type with a
 `Display` renders through it, and every other value through its `Debug`. The whole form desugars to
-operations already described — `s"a${e}b"` is exactly `"a" + str(e) + "b"` — so an interpolation is
+operations already described — `s"a${e}b"` is exactly `"a" + e.to_string() + "b"` — so an interpolation is
 not a new kind of value, only a concise way to write a concatenation. A hole holds a full expression, which may itself
 interpolate, and an empty literal segment beside a hole is dropped, since it is the identity under
 `+`.
 
 The form is like Scala's interpolators rather than a `printf`-style format string: the value and the
-text around it stay together where they are read, and the conversion is `str` applied at the splice
+text around it stay together where they are read, and the conversion is `to_string` applied at the splice
 rather than a directive parsed out of a separate string.
 
 ### Format specifiers
@@ -603,7 +645,7 @@ print(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")
 007|00002.50|hi   |
 ```
 
-A hole with no specifier renders through `str` exactly as in an `s"…"` string. A specifier binds only
+A hole with no specifier renders as `to_string` does, exactly as in an `s"…"` string. A specifier binds only
 to the `%` written immediately after a hole, so a bare `%` elsewhere in the text — `f"${n}%d done,
 100% sure"` — is ordinary text. Writing the specifier after the hole keeps it beside the value it
 formats.
@@ -621,7 +663,7 @@ format '%s' expects a string, but the value has type int
 ```
 
 `%?` takes any value (below), `%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float or a
-[fixed-point](/reference/fixed-point/#under-a-format-specifier) value, and `%s` a string or any value that is not a scalar, which renders as `str` would render it.
+[fixed-point](/reference/fixed-point/#under-a-format-specifier) value, and `%s` a string or any value that is not a scalar, which renders as `to_string` would render it.
 An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
 `ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. Under `%s` a
@@ -654,7 +696,7 @@ print(f"[${name}%-6s] [${name}%6s] [${name}%.${cut}s] [${name}%-8.${cut}s]")
 [`format_real`](/library/fmt/#floats), whose digits are the exact value's, rounded half to even at
 whatever precision is asked, and a fixed-point value by `format_fixed`, from its raw integer and
 equally exactly — so a specifier works the same on a target with no C library. An
-integer, a string, a float and a fixed-point specifier, a plain hole of a float and `str` of one all build for a
+integer, a string, a float and a fixed-point specifier, a plain hole of a float and `to_string` of one all build for a
 bare board, with no `snprintf` for its link to find:
 
 ```sysl target=aarch64-freestanding build=c
@@ -662,7 +704,7 @@ bare board, with no `snprintf` for its link to find:
 probe(n: int, x: real, y: f32, g: q31) -> usize
     val s = if n > 0 then "up" else "down"
 
-    f"[${n}%-6d] [${s}%8s] ${x}%.3f ${y}%e ${g}%.4f".bytes.len + s"$x".bytes.len + str(y).bytes.len
+    f"[${n}%-6d] [${s}%8s] ${x}%.3f ${y}%e ${g}%.4f".bytes.len + s"$x".bytes.len + y.to_string().bytes.len
 ```
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
@@ -699,7 +741,9 @@ a width or precision written as a hole is a count, so it has to be an integer �
 
 **`%?` shows any value through its [`Debug`](/reference/traits/#every-type-has-a-debug)**, even one
 with a `Display` — the structure rather than the presentation, with a string inside it quoted and
-escaped. A width pads the whole rendering. `debug(x)` is the same thing as a string, with no width:
+escaped. A width pads the whole rendering. **`x.debug_string()` is the same thing as a string**, with
+no width — a member every value has, as `to_string` is, and one a type's own `debug_string` member
+overrides:
 
 ```sysl
 struct Point
@@ -708,21 +752,23 @@ struct Point
 
 impl Display for Point
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+        display_pad(s"(${self.x}, ${self.y})".bytes, out, fmt)
 
 val p = Point(1, 2)
 
 print(f"${p} [${p}%20?] ${"hi"}%?")
-print(debug(p), debug('c'), debug(Some("x")))
+print(p.debug_string(), 'c'.debug_string(), Some("x").debug_string())
+print(p.to_string(), p.debug_string())
 ```
 
 ```output
 (1, 2) [   Point(x: 1, y: 2)] "hi"
 Point(x: 1, y: 2) 'c' Some("x")
+(1, 2) Point(x: 1, y: 2)
 ```
 
-`debug` yields to a function or a local of that name, as `embed` does, since it is a common word for
-a program to use for its own purposes.
+`debug(x)` is the older spelling, still accepted. It yields to a function or a local of that name, as
+`embed` does, since it is a common word for a program to use for its own purposes.
 
 `s`, `raw` and `f` are only prefixes when written directly against the opening quote. Used as
 ordinary names they are unaffected, so `s + raw` and `f + 1` are ordinary expressions.
@@ -872,8 +918,8 @@ reason a builder is **not** a `Writer`: a public `write` taking a `[]u8` would b
 conversion without the unsafe name that marks one.
 
 `push_int`, `push_uint`, `push_real` and `push_bool` let a number be appended with no allocation —
-`push(str(n))` builds a whole counted string, copies its bytes out and drops it, for text of a few
-dozen bytes that is needed only inside this buffer. They agree with `str` to the byte, so a line
+`push(n.to_string())` builds a whole counted string, copies its bytes out and drops it, for text of a
+few dozen bytes that is needed only inside this buffer. They agree with `to_string` to the byte, so a line
 built partly with a builder and partly with an interpolation renders each number identically.
 
 `finish` **copies rather than lending**, so a builder may go on being appended to and the string
@@ -1016,7 +1062,7 @@ handed a heap-backed string pays ordinary refcount traffic and still links no al
 ## What lives in the library
 
 Everything the compiler writes for itself is reachable without an import, and everything a program
-writes by name is [`sysl.text`](/library/text/). A literal, `+`, `str(x)`, an interpolation and
+writes by name is [`sysl.text`](/library/text/). A literal, `+`, `x.to_string()`, an interpolation and
 `s.chars` are all desugarings, so they cost no import — even `s.chars`, whose cursor is the library's,
 because the compiler names it by key rather than by resolving the word.
 

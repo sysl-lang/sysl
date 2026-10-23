@@ -205,11 +205,8 @@ sub(a: Decimal, b: Decimal) -> Decimal
 to_string(d: Decimal) -> string
 ```
 
-The value written out, with a point where the scale asks for one.
-
-A scale larger than the coefficient has digits pads with zeros after the point and writes a
-leading `0` before it, so `of(big_of(5), 3)` is `"0.005"` rather than `".005"`. A scale of zero
-writes no point at all.
+The value written out -- the older spelling of `d.to_string()`, kept while a program the compiler
+tests itself against still calls it.
 
 ### `zero`
 

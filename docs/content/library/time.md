@@ -725,9 +725,9 @@ decoration on the reading, it is what turns the reading into an instant.
 ```sysl
 import sysl.time.*
 
-print(str(parse_timestamp("2026-03-03T09:30:00").unwrap_err()))
-print(str(parse_timestamp("2026-03-03T09:30:00-25:00").unwrap_err()))
-print(str(parse_timestamp("2026-03-03T09:30:00Z ").unwrap_err()))
+print(parse_timestamp("2026-03-03T09:30:00").unwrap_err().to_string())
+print(parse_timestamp("2026-03-03T09:30:00-25:00").unwrap_err().to_string())
+print(parse_timestamp("2026-03-03T09:30:00Z ").unwrap_err().to_string())
 ```
 
 ```output

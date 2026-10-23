@@ -21,7 +21,7 @@ import sysl.time.{Instant, us_per_milli}
 // **Nothing here reads a clock or asks for entropy**, which is what keeps the module free of an
 // operating system: `v4` takes a generator and `v7` takes an instant, so a caller on a board
 // supplies both from wherever it has them and a caller on a host reaches for `sysl.time.now` and
-// `sysl.posix.rand`. Only `to_string` allocates.
+// `sysl.posix.rand`. Only `u.to_string()` allocates.
 //
 // ## What is deliberately not here
 //
@@ -57,7 +57,7 @@ struct Uuid derives Eq, Ord, Hash
     private raw: [16]u8
 
     /** The sixteen bytes, in RFC order. Allocates nothing -- an array is a value -- so this is what
-     * a caller writing a UUID to a socket or into a row reaches for, and `to_string` is for a
+     * a caller writing a UUID to a socket or into a row reaches for, and `to_string()` is for a
      * caller writing one for a person.
      */
     to_bytes(self) -> [16]u8 = self.raw
@@ -201,12 +201,15 @@ v7(t: Instant, rng: *Rng) -> Uuid
     Uuid(stamp(b, 7))
 end v7
 
-/** The 36-character form, lowercase, hyphenated `8-4-4-4-12`.
- *
- * Lowercase because RFC 9562 says to emit lowercase and accept either, and `parse` accepts either.
- * This is the only thing in the module that allocates, and it allocates one 36-byte string.
- */
-to_string(u: Uuid) -> string
+// The 36-character form, lowercase, hyphenated `8-4-4-4-12` -- what `u.to_string()` and `s"${u}"`
+// give.
+//
+// Lowercase because RFC 9562 says to emit lowercase and accept either, and `parse` accepts either.
+// This is the only thing in the module that allocates, and it allocates one 36-byte string.
+impl Display for Uuid
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(written(self), out, fmt)
+
+private written(u: Uuid) -> string
     val digits = "0123456789abcdef".bytes
     var out: [36]u8
     var at: usize = 0
@@ -225,10 +228,7 @@ to_string(u: Uuid) -> string
     // Every byte written is an ASCII hex digit or a hyphen, so the result is valid UTF-8 by
     // construction and there is nothing for a validating pass to find.
     from_utf8_unchecked(out[0..<36])
-end to_string
-
-impl Display for Uuid
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(to_string(self), out, fmt)
+end written
 
 /** The 36-character form read back, or `None`.
  *

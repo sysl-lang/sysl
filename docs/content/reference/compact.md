@@ -235,7 +235,8 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 
 - **Conversions are calls and none is inferred**: `u16(n)`, `real(n)`, `int(x)`, `u32(c)`, `char(u)`
   (traps), `string(c)`, `usize(p)`. There is **no** conversion to or from `bool`, and none between a
-  number and a `string` — `str(x)` renders, `sysl.text` parses. `ptr_cast` makes a pointer from an
+  number and a `string` — `x.to_string()` renders (every value has it; `str(x)` is the older
+  spelling), `sysl.text` parses. `ptr_cast` makes a pointer from an
   address.
 - **Comparison chains**: `0 <= i < n` is one expression, each operand evaluated once.
 - **`x is Pat`** and `x is not Pat` test against the full pattern grammar, alternatives included, and
@@ -371,7 +372,7 @@ of a `struct` or `enum`.
 | `Add` `Sub` `Mul` `Div` `Rem` `Neg` | arithmetic |
 | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` `Not` | bitwise |
 | `Zero`, `One` | the identities |
-| `Display` | rendering to a sink; `str(x)` and `print` go through it |
+| `Display` | rendering to a sink; `x.to_string()` and `print` go through it |
 | `Hash` | hashing |
 | `Index`, `IndexSet` | `x[i]` and `x[i] = v` |
 | `Iterate` | what `for x in` walks |

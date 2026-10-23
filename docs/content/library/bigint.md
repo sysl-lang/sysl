@@ -12,15 +12,15 @@ a cryptographic exponent, an identifier that outgrew 64 bits — and because the
 package every serious program ends up depending on anyway. Go ships `math/big`; this takes Go's side.
 
 ```sysl
-import sysl.math.bigint.{from_int, mul, one, pow, to_string}
+import sysl.math.bigint.{from_int, mul, one, pow}
 
 var f = one()
 
 for i in 1..<21
     f = mul(f, from_int(long(i)))
 
-print(to_string(f))
-print(to_string(pow(from_int(2), 128)))
+print(f.to_string())
+print(pow(from_int(2), 128).to_string())
 ```
 
 ```output
@@ -55,13 +55,13 @@ and the rest. Every one of them that grows allocates — there is no in-place ar
 of a caller's buffer, which is what makes `a + b * c` mean what it looks like:
 
 ```sysl
-import sysl.math.bigint.{parse, to_string}
+import sysl.math.bigint.parse
 
 val a = parse("12345678901234567890").expect("a number")
 val b = parse("98765432109876543210").expect("a number")
 
-print(to_string(a * b))
-print(to_string(a + b))
+print((a * b).to_string())
+print((a + b).to_string())
 print(a < b, a == a)
 ```
 
@@ -82,11 +82,11 @@ identity `a == q * b + r` holds for both, so they are two roundings of one divis
 operations; they differ only where the remainder is non-zero and the operands' signs disagree.
 
 ```sysl
-import sysl.math.bigint.{div_rem, from_int, to_string}
+import sysl.math.bigint.{div_rem, from_int}
 
 val (q, r) = div_rem(from_int(-7), from_int(2))
 
-print(to_string(q), to_string(r))
+print(q.to_string(), r.to_string())
 ```
 
 ```output
@@ -94,13 +94,13 @@ print(to_string(q), to_string(r))
 ```
 
 ```sysl
-import sysl.math.bigint.{div_floor, div_rem_floor, from_int, mod_floor, to_string}
+import sysl.math.bigint.{div_floor, div_rem_floor, from_int, mod_floor}
 
 val (q, r) = div_rem_floor(from_int(-7), from_int(2))
 
-print(to_string(q), to_string(r))
-print(to_string(div_floor(from_int(7), from_int(-2))), to_string(mod_floor(from_int(7), from_int(-2))))
-print(to_string(mod_floor(from_int(-1), from_int(12))))
+print(q.to_string(), r.to_string())
+print(div_floor(from_int(7), from_int(-2)).to_string(), mod_floor(from_int(7), from_int(-2)).to_string())
+print(mod_floor(from_int(-1), from_int(12)).to_string())
 ```
 
 ```output
@@ -143,15 +143,15 @@ guess — so `and(-6, 3)` would have to be refused, or answered differently depe
 nobody has. On this reading it is `2`, for the same reason it is `2` at every machine width.
 
 ```sysl
-import sysl.math.bigint.{and, from_int, not, or, shl, shr, to_string, xor}
+import sysl.math.bigint.{and, from_int, not, or, shl, shr, xor}
 
 val a = from_int(-6)
 val b = from_int(3)
 
-print(to_string(a & b), to_string(a | b), to_string(a ^ b))
-print(to_string(~from_int(5)), to_string(not(from_int(-1))))
-print(to_string(shl(from_int(1), 100)))
-print(to_string(shr(from_int(-1), 100)), to_string(shr(from_int(-7), 1)))
+print((a & b).to_string(), (a | b).to_string(), (a ^ b).to_string())
+print((~from_int(5)).to_string(), not(from_int(-1)).to_string())
+print(shl(from_int(1), 100).to_string())
+print(shr(from_int(-1), 100).to_string(), shr(from_int(-7), 1).to_string())
 ```
 
 ```output
@@ -184,12 +184,12 @@ value's magnitude is set — and `is_even` and `is_odd` are the lowest bit.
 ## The number theory, written on purpose
 
 ```sysl
-import sysl.math.bigint.{from_int, gcd, isqrt, lcm, mod_pow, parse, pow, to_string}
+import sysl.math.bigint.{from_int, gcd, isqrt, lcm, mod_pow, parse, pow}
 
-print(to_string(gcd(from_int(-12), from_int(18))), to_string(lcm(from_int(4), from_int(6))))
-print(to_string(mod_pow(from_int(2), from_int(1000000006), from_int(1000000007))))
-print(to_string(isqrt(pow(from_int(10), 30))))
-print(to_string(isqrt(parse("2").expect("a number"))))
+print(gcd(from_int(-12), from_int(18)).to_string(), lcm(from_int(4), from_int(6)).to_string())
+print(mod_pow(from_int(2), from_int(1000000006), from_int(1000000007)).to_string())
+print(isqrt(pow(from_int(10), 30)).to_string())
+print(isqrt(parse("2").expect("a number")).to_string())
 ```
 
 ```output
@@ -275,12 +275,12 @@ The floating-point pair is exact about where it is not exact:
 
 ```sysl
 import sysl.math.Float
-import sysl.math.bigint.{from_int, from_real, pow, to_real, to_string}
+import sysl.math.bigint.{from_int, from_real, pow, to_real}
 
 print(to_real(pow(from_int(10), 30)))
-print(to_string(from_real(1.0e30).expect("finite")))
+print(from_real(1.0e30).expect("finite").to_string())
 print(to_real(pow(from_int(10), 400)).is_infinite())
-print(from_real(real.nan()).is_none(), to_string(from_real(-2.7).expect("finite")))
+print(from_real(real.nan()).is_none(), from_real(-2.7).expect("finite").to_string())
 ```
 
 ```output
@@ -307,16 +307,16 @@ that has already grown — and written as `add(a, from_int(n))`, every one of th
 `BigInt` to throw away a line later.
 
 ```sysl
-import sysl.math.bigint.{add_long, cmp_long, div_rem_long, from_int, mul_long, pow, to_string}
+import sysl.math.bigint.{add_long, cmp_long, div_rem_long, from_int, mul_long, pow}
 
 var x = pow(from_int(10), 25)
 
-print(to_string(add_long(x, 7)), to_string(mul_long(x, -3)))
+print(add_long(x, 7).to_string(), mul_long(x, -3).to_string())
 print(cmp_long(x, 9223372036854775807))
 
 val (q, r) = div_rem_long(x, 7)
 
-print(to_string(q), r)
+print(q.to_string(), r)
 ```
 
 ```output

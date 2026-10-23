@@ -2855,7 +2855,7 @@ c const
     BITS: u32 = "CHAR_BIT"
     WIDEST: usize = "sizeof(long long)"
 
-print(str(BITS) + " " + str(WIDEST))
+print(BITS.to_string() + " " + WIDEST.to_string())
 ```
 
 ```output
@@ -3029,7 +3029,7 @@ c const
 wait(ticks: Tick) -> Tick
     ticks
 
-print(str(wait(forever)))
+print(wait(forever).to_string())
 ```
 
 ```output
@@ -3148,7 +3148,7 @@ c type
 
 val n: Size = 41
 
-print(str(n + 1))
+print((n + 1).to_string())
 ```
 
 ```output

@@ -414,8 +414,8 @@ true
 ```
 
 `Os` is `MacOS`, `Linux`, `Windows`, `Freestanding`, `Android` and `Wasi`; `Cpu` is `Aarch64`, `X86_64`,
-`Riscv64`, `Riscv32`, `Thumb`, `Wasm32`, `X86` and `Craft`. Both derive `Display`, so `str(os())` is
-the name it is written with.
+`Riscv64`, `Riscv32`, `Thumb`, `Wasm32`, `X86` and `Craft`. Both derive `Display`, so `os().to_string()`
+is the name it is written with.
 
 **They are constants, not queries.** A sysl program is compiled for exactly one target, so the
 answer is something the compiler already holds: there is nothing to look up at run time, and a
@@ -653,8 +653,8 @@ trait Writer: Fallible
 Three decisions are packed into those six lines.
 
 **A value writes rather than returns.** `display` produces no `string`, so rendering costs no
-allocation and a module under [`no alloc`](/reference/modules/) can still log. `str(x)` is then not a
-separate mechanism — it is this same rendering aimed at a buffer.
+allocation and a module under [`no alloc`](/reference/modules/) can still log. `x.to_string()` is then not
+a separate mechanism — it is this same rendering aimed at a buffer.
 
 **The sink is `*Writer`, a trait object.** So a rendering is written once against any sink, and a
 kernel that has a UART and no standard output supplies one with an ordinary `impl`.
@@ -943,8 +943,8 @@ format's reader would take as an integer is that format's problem, which is why
 no decimal reading never compares equal to anything, so an infinity or a NaN falls out of both
 searches and renders as `%g` spells it at seventeen digits.
 
-**`str` writes the same digits positionally.** `display_real_shortest` is for a format whose grammar
-has an exponent and wants it used: `str(1e23)` is `100000000000000000000000`, where this writes
+**`to_string` writes the same digits positionally.** `display_real_shortest` is for a format whose
+grammar has an exponent and wants it used: `1e23.to_string()` is `100000000000000000000000`, where this writes
 `1e+23`.
 
 ### One padder, and why
@@ -1011,7 +1011,7 @@ struct Point
 
 impl Display for Point
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+        display_pad(s"(${self.x}, ${self.y})".bytes, out, fmt)
 
 var p = Point(3, 4)
 
@@ -1278,7 +1278,7 @@ impl Display for Rect
 
 override impl Display for []Rect
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_str(str(self.len) + " rects", out, fmt)
+        display_str(s"${self.len} rects", out, fmt)
 
 var rs = [Rect(3, 4), Rect(1, 2)]
 
