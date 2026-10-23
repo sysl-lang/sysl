@@ -5,11 +5,11 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
-// **A trait's `@borrows` holds for a raw pointer parameter as it does for a slice**: every
-// implementation is held to letting the pointer go -- storing it, returning it, or handing it to
-// something that keeps it is refused at the place it gets out. Because it is verified, the lent
-// rule (`@lends`) takes the promise too, and a lent pointer may go through a trait object whose
-// method promised to borrow it.
+// **A trait's method borrows a raw pointer parameter for the call, as it does a slice**, by rule
+// (`keeps.sysl`): a call through an object sees no body, so every implementation reached through one
+// is held to letting the pointer go -- storing it, or handing it to something that keeps it, is
+// refused where it gets out. Because it is verified, a pointer lent to a closure may go through a
+// trait object.
 
 private brw_outcome(text: string) -> (string, int)
     val root = make_temp_dir("sysl-brw-ptr").unwrap()
@@ -43,7 +43,7 @@ private brw_prints(text: string, want: string)
     assert_eq(out.1, 0)
 end brw_prints
 
-// Refused, saying each of `parts` -- the promise broken, and the source line it is broken on.
+// Refused, saying each of `parts` -- the rule broken, and the source line it is broken on.
 private brw_refuses(text: string, parts: []string)
     if xvr_no_library() then return
 
@@ -55,18 +55,17 @@ private brw_refuses(text: string, parts: []string)
         assert(out.0.index_of(part).is_some(), out.0)
 end brw_refuses
 
-private brw_broken() -> string = "keeps what it is passed as 'n', but 'Bump' declares that parameter borrowed"
+private brw_broken(how: string) -> string =
+    s"'bump' keeps its parameter 'n' ($how), but a method of 'Bump' borrows its parameters for the call"
 
-// A trait whose method takes a pointer, with or without the promise.
-private brw_bump(promise: bool, result: string) -> string =
-    "trait Bump\n" + (if promise then "    @borrows(n)\n" else "") + s"    bump(*self, n: *int)$result\n\n"
+// A trait whose method takes a pointer.
+private brw_bump(result: string) -> string = s"trait Bump\n    bump(*self, n: *int)$result\n\n"
 
-// A cell lending its one field to a body for one call.
+// A cell handing its one field to a body for one call.
 private brw_cell() -> string = raw"""
     struct Cell
         v: int
 
-        @lends(body)
         with[R](*self, body: *int -> R) -> R = body(&self.v)
 
     """
@@ -81,11 +80,11 @@ private brw_adder() -> string = raw"""
 
     """
 
-// -- the lent rule takes the promise ------------------------------------------------------------------
+// -- a pointer a closure is lent may go through an object -------------------------------------------
 
-@test("a lent pointer passed through a trait object whose method promises to borrow it is accepted")
+@test("a pointer lent to a closure, passed through a trait object, is accepted")
 brw_lent_through_a_promise()
-    brw_prints(brw_bump(true, "") + brw_adder() + brw_cell() + raw"""
+    brw_prints(brw_bump("") + brw_adder() + brw_cell() + raw"""
         var c = Cell(1)
         var a = Adder(5)
         val b: *Bump = &a
@@ -96,20 +95,9 @@ brw_lent_through_a_promise()
         print(c.v)
         """, "11\n")
 
-@test("without the promise the same call is refused, the trait object being free to keep it")
-brw_lent_without_a_promise()
-    brw_refuses(brw_bump(false, "") + brw_adder() + brw_cell() + raw"""
-        var c = Cell(1)
-        var a = Adder(5)
-        val b: *Bump = &a
-
-        c.with((v) -> b.bump(v))
-        """, ["'Cell.with' lends this body a pointer",
-              "is passed through a trait object, which may hold on to it"])
-
 @test("an implementation that only reads and writes through a borrowed pointer is accepted")
 brw_pointer_used_and_let_go()
-    brw_prints(brw_bump(true, "") + brw_adder() + raw"""
+    brw_prints(brw_bump("") + brw_adder() + raw"""
         var a = Adder(3)
         val b: *Bump = &a
         var x = 4
@@ -123,7 +111,7 @@ brw_pointer_used_and_let_go()
 
 @test("an implementation that stores a borrowed pointer in a field is refused where it stores it")
 brw_pointer_kept_in_a_field()
-    brw_refuses(brw_bump(true, "") + raw"""
+    brw_refuses(brw_bump("") + raw"""
         struct Keeper
             held: *int
 
@@ -139,11 +127,13 @@ brw_pointer_kept_in_a_field()
         b.bump(&y)
 
         print(*k.held)
-        """, [brw_broken(), "self.held = n"])
+        """, [brw_broken("it is stored in 'self.held'"), "self.held = n"])
 
-@test("and one that hands it back")
+// Handing it back is not keeping it: the answer is lent for as long as the argument was, and the
+// caller follows it as it follows the argument.
+@test("one that hands it back is accepted")
 brw_pointer_returned()
-    brw_refuses(brw_bump(true, " -> *int") + raw"""
+    brw_prints(brw_bump(" -> *int") + raw"""
         struct Echo
             calls: int
 
@@ -157,11 +147,11 @@ brw_pointer_returned()
         var y = 9
 
         print(*b.bump(&y))
-        """, [brw_broken()])
+        """, "9\n")
 
-@test("and one that stores it in a module variable")
+@test("one that stores it in a module variable is refused")
 brw_pointer_kept_in_a_global()
-    brw_refuses(brw_bump(true, "") + raw"""
+    brw_refuses(brw_bump("") + raw"""
         static var spare = 0
         static var last: *int = &spare
 
@@ -179,7 +169,7 @@ brw_pointer_kept_in_a_global()
         b.bump(&y)
 
         print(*last)
-        """, [brw_broken(), "last = n"])
+        """, [brw_broken("it is stored in 'last'"), "last = n"])
 
 @test("and one that keeps a pointer it derived from it, into the storage it was lent")
 brw_derived_pointer_kept()
@@ -189,7 +179,6 @@ brw_derived_pointer_kept()
             b: int
 
         trait Bump
-            @borrows(n)
             bump(*self, n: *Pair)
 
         struct Keeper
@@ -205,16 +194,15 @@ brw_derived_pointer_kept()
         var p = Pair(1, 2)
 
         b.bump(&p)
-        """, [brw_broken(), "self.held = &n.b"])
+        """, [brw_broken("it is stored in 'self.held'"), "self.held = &n.b"])
 
-@test("a pointer inside a struct parameter is held to the promise too")
+@test("a pointer inside a struct parameter is held to the rule too")
 brw_pointer_in_a_struct_kept()
     brw_refuses(raw"""
         struct Ref
             p: *int
 
         trait Take
-            @borrows(r)
             take(*self, r: Ref)
 
         struct Keeper
@@ -230,14 +218,13 @@ brw_pointer_in_a_struct_kept()
         var y = 9
 
         t.take(Ref(&y))
-        """, ["keeps what it is passed as 'r', but 'Take' declares that parameter borrowed",
-              "self.held = r.p"])
+        """, ["'take' keeps its parameter 'r' (it is stored in 'self.held'), but a method of 'Take' " +
+              "borrows its parameters", "self.held = r.p"])
 
-@test("a generic trait's promise binds an implementation at the instance an object names")
+@test("a generic trait's rule binds an implementation at the instance an object names")
 brw_generic_trait_pointer_kept()
     brw_refuses(raw"""
         trait Hold[T]
-            @borrows(n)
             hold(*self, n: *T)
 
         struct Keeper
@@ -253,7 +240,8 @@ brw_generic_trait_pointer_kept()
         var y = 9
 
         h.hold(&y)
-        """, ["keeps what it is passed as 'n', but 'Hold", "self.held = n"])
+        """, ["'hold' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Hold",
+              "self.held = n"])
 
 // -- the receiver rule is unchanged -------------------------------------------------------------------
 

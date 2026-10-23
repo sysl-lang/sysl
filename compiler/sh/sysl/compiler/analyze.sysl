@@ -831,7 +831,6 @@ private resolve_signatures(a: &Analysis)
 
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
         check_crossing_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
-        check_lends_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
         check_disjoint_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
 
         // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE
@@ -907,6 +906,11 @@ private resolve_signatures(a: &Analysis)
 
             check_abandons_signature(a, home.scope, home.span, d.name, false, resolved, answer)
 
+        if !d.keeps.is_empty()
+            val home = a.tables.extern_scopes.get(key).unwrap()
+
+            check_keeps_names(a, home.scope, home.span, d)
+
     // **Module storage is deliberately absent from this, and its written type is resolved where the
     // storage itself is read.** Resolving it here would make every type a module's storage names
     // real ahead of every type its members name, and the record a compilation keeps of what it laid
@@ -933,7 +937,6 @@ private resolve_signatures(a: &Analysis)
             TraitOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
                 check_trait_supers(a, key, d)
-                check_borrow_names(a, decl.scope, decl.span, qualified_name(key), d.methods)
                 resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.tvalues, d.methods, true)
             _ -> ()
 
@@ -1052,7 +1055,7 @@ check_crossing_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
     val ps = d.params
 
     for i in 0..<c.len()
-        // A name '@scoped' put here is that annotation's to answer for (`lends.sysl`'s
+        // A name '@scoped' put here is that annotation's to answer for (`keeps.sysl`'s
         // `check_scoped_names`), so a misspelling is told once, in its own words.
         if holds_string(d.marks.scoped, c.at(i)) then continue
 
@@ -1081,42 +1084,40 @@ check_crossing_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
                     "a boundary once — the second says nothing the first does not")
 end check_crossing_names
 
-// `@borrows` names a trait method's own parameters, each once. **A misspelling would otherwise promise
-// nothing and say nothing**: the annotation reads as a rule being enforced, every implementation is
-// free to keep what it likes, and the call sites counting on the exemption quietly go back to
-// promoting. The receiver is not among them -- a receiver is borrowed or not by its declared mode.
-private check_borrow_names(a: &Analysis, scope: Scope, span: Span, owner: string, ms: Buf[MethodDecl])
-    for m in ms
-        val b = m.borrows
+// `@keeps` names an `extern`'s own parameters, each once. **A misspelling would otherwise keep nothing
+// and say nothing**: the annotation reads as a rule being enforced, and every call site would go on
+// handing the C function the address of storage it is about to give back.
+private check_keeps_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
+    val k = d.keeps
 
-        for i in 0..<b.len()
-            var declared = false
+    for i in 0..<k.len()
+        var declared = false
 
-            for j in 0..<m.params.len()
-                if m.params.at(j).name == b.at(i) then declared = true
+        for p in d.params
+            if p.name == k.at(i) then declared = true
 
-            var twice = false
+        var twice = false
 
-            for j in 0..<i
-                if b.at(j) == b.at(i) then twice = true
+        for j in 0..<i
+            if k.at(j) == k.at(i) then twice = true
 
-            if !declared
-                var listed = ""
+        if !declared
+            var listed = ""
 
-                for j in 0..<m.params.len()
-                    val p = m.params.at(j).name
+            for j in 0..<d.params.len()
+                val p = d.params.at(j).name
 
-                    listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
+                listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
 
-                val tail = if m.params.is_empty() then " — it takes none"
-                else s" — its parameters are $listed"
+            val tail = if d.params.is_empty() then " — it takes none"
+            else s" — its parameters are $listed"
 
-                a.fault(scope, span, s"'@borrows' names '${b.at(i)}', which is not a parameter of " +
-                        s"'$owner.${m.name}'$tail")
-            else if twice
-                a.fault(scope, span, s"'@borrows' names '${b.at(i)}' twice, and a parameter is " +
-                        "borrowed or it is not — the second says nothing the first does not")
-end check_borrow_names
+            a.fault(scope, span, s"'@keeps' names '${k.at(i)}', which is not a parameter of " +
+                    s"'${d.name}'$tail")
+        else if twice
+            a.fault(scope, span, s"'@keeps' names '${k.at(i)}' twice, and a parameter is kept or it " +
+                    "is not — the second says nothing the first does not")
+end check_keeps_names
 
 // **A `@test` or a hook returns nothing**: the runner reads its verdict off whether it came back, so
 // a value returned beside that is one nothing is going to read. Asked of the RESOLVED result rather

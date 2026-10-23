@@ -311,11 +311,6 @@ struct KeptParams
     asked: Buf[usize]
     examined: usize
 
-    // What a trait object call's slot promised to borrow (`borrows_of`), read off the trait's own
-    // declaration and kept by trait and slot, since every walk of every body asks again.
-    an: &Analysis
-    promises: Map[string, Buf[usize]]
-
     holds(self, name: string, i: usize) -> bool = self.index.get(name) match
         Some(id) -> self.pairs.has((id, i))
         None -> false
@@ -329,7 +324,7 @@ private kept_params(a: &Analysis, p: TProgram) -> &KeptParams
 
         if !index.has(name) then index.put(name, i)
 
-    KeptParams(index, set(), buf(), 0, a, map())
+    KeptParams(index, set(), buf(), 0)
 end kept_params
 
 // The pairs grow until nothing changes, and a function is looked at again only when something it
@@ -717,19 +712,21 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
                 gets_out(p, keeps, w, args.at(i), s"is passed to '$name', which holds on to it")
 
     // Which body a trait object's call reaches is decided at run time, so there is no one summary to
-    // consult -- the conservative answer is the only sound one, exactly as it is for a function
-    // whose body this program does not have. A borrowing promise is the exception, and only because
-    // every implementation of one has been checked to borrow rather than keep.
-    TVCall(recv, slot, args, ty, _) ->
-        val promised = borrows_of(keeps, texpr_type(recv), slot)
+    // consult. **A trait's method borrows its parameters for the call** -- every implementation of one
+    // reached through an object has been checked to borrow rather than keep (`refuse_borrowed`) -- so
+    // a view handed through one stays put. A call trait's object is the exception: a closure behind a
+    // `&Fn` may keep what it is handed, and the conservative answer is the only sound one there,
+    // exactly as it is for a function whose body this program does not have.
+    TVCall(recv, _, args, ty, _) ->
+        val borrowed = borrowed_through(texpr_type(recv))
         val frames = frames_literals(ty)
 
         for i in 0..<args.len()
             if frames && literal_argument(args.at(i))
-                frame_literal(w, args.at(i), !holds_index(promised, i),
+                frame_literal(w, args.at(i), !borrowed,
                               "is passed through a trait object, which may hold on to it")
 
-            if !holds_index(promised, i) && views(p, keeps, w, args.at(i)).non_empty()
+            if !borrowed && views(p, keeps, w, args.at(i)).non_empty()
                 gets_out(p, keeps, w, args.at(i),
                          "is passed through a trait object, which may hold on to it")
 
@@ -794,13 +791,6 @@ private holds_temp_span(temps: Buf[(Span, string)], at: Span) -> bool
 
     false
 end holds_temp_span
-
-private holds_index(xs: Buf[usize], i: usize) -> bool
-    for item in xs
-        if item == i then return true
-
-    false
-end holds_index
 
 // -- array literals laid in the frame -----------------------------------------------------------------
 
@@ -1378,115 +1368,60 @@ private is_test_func(p: TProgram, name: string) -> bool
     false
 end is_test_func
 
-// A trait method that declared `@borrows` is handed a view it must not keep, and this is what makes
-// that true rather than trusted.
-//
-// **Nothing in a type says "borrowed", so a promise a trait writes down has to be checked against
-// every implementation of it.** That check is what licenses a call site to pass a frame-backed slice
-// through a trait object at all -- a call through one is otherwise opaque, so the analysis must
-// assume the worst of every argument and a local array passed through one is promoted.
+// **A trait's method borrows its parameters for the call**, and this is what makes that true rather
+// than trusted for a view: every implementation reached through an object is checked to let go of
+// each view it is handed. That check is what licenses a call site to pass a frame-backed slice through
+// a trait object at all -- a call through one is otherwise opaque, so the analysis would have to
+// assume the worst of every argument and promote a local array passed through one. A raw pointer is
+// held to the same rule by the keeps-analysis (`keeps.sysl`), and a call trait's object -- a closure
+// behind a `&Fn` -- is not borrowed for a view at all (`borrowed_through`).
 private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
     var seen: Buf[string] = buf()
 
     for i in 0..<p.vtables.len()
         val vt = p.vtables.at(i)
 
-        for slot in vt.slots
-            for k in 0..<slot.borrows.len()
-                val at = slot.borrows.at(k).0
-                val pname = slot.borrows.at(k).1
+        if is_call_trait(module_bare(vt.trait_name)) then continue
 
-                val key = s"${slot.target}|${vt.trait_name}|$pname"
+        for slot in vt.slots
+            val id = keeps.index.get(slot.target)
+
+            if id.is_none() then continue
+
+            val f = p.funcs.at(id.unwrap())
+
+            // The receiver is the object itself, which is a box of its own rather than the caller's.
+            for at in 1..<f.params.len()
+                if !carries_view(f.params.at(at).1) || !keeps.holds(slot.target, at) then continue
+
+                val pname = f.params.at(at).0
+                val key = s"${slot.target}|$pname"
 
                 if holds_string(seen, key) then continue
 
-                // A slice is followed by this analysis; a raw pointer, by the lent rule's walk, which
-                // also says where the body lets it go.
-                val view = keeps.holds(slot.target, at)
-                val site = if view then target_span(p, keeps, slot.target)
-                else pointer_kept(a, p, keeps, slot.target, at)
-
-                if site.is_none() then continue
-
                 seen.push(key)
-
-                val what = if view then "be a view of" else "point into"
 
                 // The trait is named by its key, never spelled: a program with a `Writer` of its own
                 // reaches the library's only by path, and a message that spells it plainly names the
                 // wrong trait to the one reader who has to tell them apart.
-                a.fault(func_home(a, slot.target), site.unwrap(),
-                    s"'${slot.target}' keeps what it is passed as '$pname', but " +
-                    s"'${qualified_name(vt.trait_name)}' declares that parameter borrowed for the " +
-                    s"call — it may $what the caller's stack, so copy what this needs into " +
-                    "storage of its own")
+                a.fault(func_home(a, slot.target), f.span,
+                    s"'${qualified_name(slot.target)}' keeps what it is passed as '$pname', but a " +
+                    s"method of '${qualified_name(vt.trait_name)}' borrows its parameters for the " +
+                    "call — a call through an object sees no body, so it may hand this a view of the " +
+                    "caller's stack. Copy what this needs into storage of its own")
 end refuse_borrowed
 
-// Where an implementation keeps a borrowed parameter that can hold a raw pointer, if it does.
-private pointer_kept(a: &Analysis, p: TProgram, keeps: &KeptParams, name: string, at: usize) -> Option[Span]
-    keeps.index.get(name) match
-        None -> None
-        Some(id) ->
-            val f = p.funcs.at(id)
-
-            if at >= f.params.len() || !holds_pointer(f.params.at(at).1) then return None
-
-            borrowed_pointer_kept(a, p.funcs, name, at)
-end pointer_kept
-
-private target_span(p: TProgram, keeps: &KeptParams, name: string) -> Option[Span]
-    keeps.index.get(name) match
-        None -> None
-        Some(id) -> Some(p.funcs.at(id).span)
-
-// Which of a trait object call's arguments the trait promised to borrow, by **argument** position --
-// one less than the parameter position, since a call site's list has no receiver in it.
-//
-// **Read off the trait's own declaration, never off a table.** The promise is the trait's, and a
-// compilation may hold a call through an object of a trait it has no table for at all -- a library
-// whose implementations are its consumers', built with `build-lib`, is exactly that -- so reading it
-// off a table would answer "keeps everything" wherever no implementation happened to be reached.
-// The slot is the call's index into the members a table is laid out from (`slotted_members`).
-private borrows_of(keeps: &KeptParams, ty: Type, slot: int) -> Buf[usize]
+// Whether a call through an object of this type borrows its arguments: every trait's does but a call
+// trait's, whose object is a closure that may keep what it is handed.
+private borrowed_through(ty: Type) -> bool
     val tr = erased_trait(ty)
 
-    if tr.is_none() then return buf()
+    if tr.is_none() then return false
 
-    val key = s"${trait_key(tr.unwrap())}#$slot"
-
-    keeps.promises.get(key) match
-        Some(known) -> return known
-        None -> ()
-
-    val out = promised_borrows(keeps.an, ty, slot)
-
-    keeps.promises.put(key, out)
-    out
-end borrows_of
-
-// The same answer uncached, for the lent rule (`self_alias.sysl`), which asks it only of the bodies a
-// `@lends` call hands its pointer to.
-private[compiler] promised_borrows(a: &Analysis, ty: Type, slot: int) -> Buf[usize]
-    val tr = erased_trait(ty)
-    var out: Buf[usize] = buf()
-
-    if tr.is_none() then return out
-
-    val members = slotted_members(a, trait_bound_of(tr.unwrap()), self_binding(tr.unwrap()))
-
-    if slot >= 0 && usize(slot) < members.len()
-        val m = members.at(usize(slot)).1
-
-        for name in m.borrows
-            for k in 0..<m.params.len()
-                if m.params.at(k).name == name then out.push(k)
-
-    out
-end promised_borrows
-
-private trait_key(t: Type) -> string = t match
-    Trait(name, _, _) -> name
-    _ -> ""
+    tr.unwrap() match
+        Trait(name, _, _) -> !is_call_trait(module_bare(name))
+        _ -> false
+end borrowed_through
 
 // The file the entry point's statements were written in, found by the one thing that names it: a
 // declaration whose home is that file. A program whose entry file declares nothing else has none,

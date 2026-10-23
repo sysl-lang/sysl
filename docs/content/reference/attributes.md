@@ -10,10 +10,10 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
-| `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
-| `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons`, one of the two an `extern` takes | the grammar |
+| `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps--a-c-function-that-holds-on-to-a-pointer) | the grammar |
+| `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
@@ -36,7 +36,7 @@ with. That is a rule about directives, not the thing that distinguishes them.
 Annotations come in groups, by what they attach to — and the last of them is the empty one, which is
 as much a rule as the others.
 
-**On a function** there are eighteen, each written on its own line above the declaration. More than
+**On a function** there are seventeen, each written on its own line above the declaration. More than
 one may be stacked, and writing the same one twice is refused. `@test` and `@tailrec` are below, and
 so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@setup_all` and
 `@teardown_all` — the three that tell the optimizer what a definition is for, `@noinline`,
@@ -74,8 +74,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, six: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
-`@scoped`, `@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, four: the ones that are about a PARAMETER.** `@crossing`, `@scoped`, `@reads` and
+`@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 

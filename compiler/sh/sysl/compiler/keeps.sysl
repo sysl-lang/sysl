@@ -1,0 +1,1117 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.from_utf8_unchecked
+
+// **A borrowed pointer cannot escape** (`reference/memory.md § A pointer a call keeps`).
+//
+// `&place` yields a `*T`, and a `*T` is an ordinary type: nothing in it says how long the storage it
+// points at lives. What the compiler can see instead is what every function DOES with each pointer it
+// is handed, so it works that out once per function and parameter -- the function **keeps** the
+// parameter when it lets it outlive the call:
+//
+// - it stores it somewhere the call does not own: a field reached through a pointer or a reference, a
+//   module's storage, a buffer's slot -- which is where a box, a closure and a `Buf` all end up;
+// - it passes it to another function's parameter that keeps it;
+// - it hands it back laundered into something that is not a pointer, an integer made of the address.
+//
+// Handing it back AS a pointer is not keeping it: `field(s: *S) -> *int = &s.x` answers a pointer
+// lent for as long as the argument is, and the caller follows that answer as it follows the argument.
+// The answers are worked out to a fixed point, so a recursive function settles on what its body
+// does rather than on an assumption.
+//
+// **Then one rule, at the call**: the address of storage that is not the program's to give away -- a
+// local, a parameter's place, a field of a value in the frame, a value made in place -- may not be
+// passed to a parameter that keeps it. Every `*self` method called on a local is checked this way.
+//
+// **Where no body is visible the answer is a default**: a trait's method borrows its parameters for
+// the call, and so does a function pointer or a closure; an `extern` borrows unless its declaration
+// says `@keeps(p)`. A default is a promise, so a body that is reached ONLY by way of one -- a method
+// a trait object dispatches to, a closure, a function whose address is taken -- is held to it: one
+// that keeps what it is handed is refused where it is written.
+
+// Why a function keeps a parameter, once it does: the end of the sentence a refusal quotes, and where
+// the body lets the pointer go.
+struct KeptWhy
+    kept: bool
+    how: string
+    at: Span
+end KeptWhy
+
+private not_kept() -> KeptWhy = KeptWhy(false, "", span_zero())
+
+// What the walk over a program keeps between bodies.
+//
+// **The answers are a fixed point reached a round at a time.** A function asked about while its own
+// answer is still being worked out -- recursion -- is answered with what the last round settled on,
+// starting from "keeps nothing", and every answer that leaned on such an assumption is held for the
+// round only. A round that changes none of those answers is the last: every walk only turns more of
+// its answer on as the answers it reads grow, so the rounds settle.
+struct KeepsCx
+    an: &Analysis
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+
+    // The answers that rested on nothing assumed, by `<name>|<position>` for what a function keeps and
+    // `=<name>|<position>` for what its answer can be made of.
+    settled: Map[string, KeptWhy]
+
+    // This round's answers that leaned on an assumption, the last round's, and the keys of the first.
+    round: Map[string, KeptWhy]
+    prev: Map[string, KeptWhy]
+    assumed: Buf[string]
+
+    busy: Buf[string]
+    taint: bool
+
+    // The bodies a call may reach with no body visible to the caller, so whose parameters are borrowed
+    // by rule: the methods a trait object dispatches to, by the trait's key, and the functions whose
+    // address is taken.
+    dispatched: Map[string, string]
+    addressed: Map[string, bool]
+
+    // Whether a struct or an enum may hold a raw pointer, by its name (`may_hold_pointer`).
+    pointerish: Map[string, bool]
+
+    find(self, name: string) -> Option[TFunc] = self.index.get(name) match
+        Some(i) -> Some(self.funcs.at(i))
+        None -> None
+end KeepsCx
+
+// The refusals a round makes, held until the round is known to be the last.
+struct KeepFaults
+    items: Buf[(Scope, Span, string)]
+end KeepFaults
+
+// -- the whole program ----------------------------------------------------------------------------
+
+// Holds every call in the program to the rule, and every body a default promised for to its promise.
+check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
+
+    val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, map(), map(),
+                               map())
+
+    // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
+    // every table -- an instance of a generic one among them.
+    val members = a.tables.members
+
+    for i in 0..<members.from_trait.len()
+        val trait_name = members.from_trait.at(i)
+
+        if is_call_trait(module_bare(trait_name)) then continue
+
+        members.funcs.get(members.from_trait.key_at(i)) match
+            Some(lowered) -> if !cx.dispatched.has(lowered) then cx.dispatched.put(lowered, trait_name)
+            None -> ()
+
+    for vt in vtables
+        if is_call_trait(module_bare(vt.trait_name)) then continue
+
+        for slot in vt.slots
+            if !cx.dispatched.has(slot.target) then cx.dispatched.put(slot.target, vt.trait_name)
+
+    for f in funcs
+        walk_block_stmts(f.body, expr_walk(false, e -> note_addressed(cx, e)))
+
+    var faults: &KeepFaults = KeepFaults(buf())
+
+    loop
+        faults = KeepFaults(buf())
+
+        for f in funcs
+            check_calls(cx, faults, f)
+            refuse_promised(cx, faults, f)
+
+        if settled_round(cx) then break
+
+    var said: Buf[(Span, string)] = buf()
+
+    for item in faults.items
+        var again = false
+
+        for s in said
+            if s.0 == item.1 && s.1 == item.2 then again = true
+
+        if again then continue
+
+        said.push((item.1, item.2))
+        a.fault(item.0, item.1, item.2)
+end check_keeps
+
+private note_addressed(cx: &KeepsCx, e: TExpr)
+    *e.kind match
+        TFuncAddr(name, _, _) -> cx.addressed.put(name, true)
+        _ -> ()
+end note_addressed
+
+// Whether the round just made is the last: every answer that leaned on an assumption came out as it
+// was assumed. Otherwise the next round assumes what this one found.
+private settled_round(cx: &KeepsCx) -> bool
+    var same = true
+
+    for key in cx.assumed
+        val now = cx.round.get(key).map(k -> k.kept).unwrap_or(false)
+        val was = cx.prev.get(key).map(k -> k.kept).unwrap_or(false)
+
+        if now != was then same = false
+
+    if same then return true
+
+    cx.prev = cx.round
+    cx.round = map()
+    cx.assumed = buf()
+    false
+end settled_round
+
+// -- the summaries --------------------------------------------------------------------------------
+
+// Whether `name` keeps the argument at position `i`, and why.
+keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, true)
+
+// Whether what `name` answers can be made of the argument at position `i`.
+private answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name, i, false).kept
+
+private summary(cx: &KeepsCx, name: string, i: usize, keeping: bool) -> KeptWhy
+    val key = if keeping then s"$name|$i" else s"=$name|$i"
+
+    cx.settled.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    cx.round.get(key) match
+        Some(v) ->
+            cx.taint = true
+            return v
+        None -> ()
+
+    if holds_string(cx.busy, key)
+        cx.taint = true
+        return cx.prev.get(key).unwrap_or(not_kept())
+    end if
+
+    val found = cx.find(name)
+
+    if found.is_none() then return if keeping then extern_kept(cx, name, i) else unseen_answer()
+
+    val f = found.unwrap()
+
+    if i >= f.params.len() then return not_kept()
+    if keeping && lent_by_rule(cx, f, i) then return not_kept()
+
+    cx.busy.push(key)
+
+    val outer = cx.taint
+
+    cx.taint = false
+
+    val out = if keeping then walk_kept(cx, f, i) else walk_answers(cx, f, i)
+    val leaned = cx.taint
+
+    cx.busy.truncate(cx.busy.len() - 1)
+
+    if leaned
+        cx.round.put(key, out)
+        cx.assumed.push(key)
+    else
+        cx.settled.put(key, out)
+    end if
+
+    cx.taint = outer || leaned
+    out
+end summary
+
+// What a call answers, where no body is here to read: it may be made of anything it was handed.
+private unseen_answer() -> KeptWhy = KeptWhy(true, "", span_zero())
+
+// An `extern` keeps only what its `@keeps(...)` names -- a C function is handed a pointer for the
+// call, which is C's own convention.
+private extern_kept(cx: &KeepsCx, name: string, i: usize) -> KeptWhy
+    cx.an.tables.externs.get(name) match
+        Some(d) ->
+            if i < d.params.len() && holds_string(d.keeps, d.params.at(i).name)
+                return KeptWhy(true, s"its declaration says '@keeps(${d.params.at(i).name})'",
+                               span_zero())
+        None -> ()
+
+    not_kept()
+end extern_kept
+
+// The parameters a call keeps by promise rather than by what its body does: a `@scoped` member's
+// receiver and what it runs, which finish before the call that lent them returns; and every parameter
+// of a body reached through a default -- whose own body is held to the default instead
+// (`refuse_promised`).
+private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
+    if scoped_at(f, i) then return true
+    if is_closure_body(f) then return i >= 1
+
+    trait_of(cx, f.name).is_some() || cx.addressed.has(f.name)
+end lent_by_rule
+
+// The trait a function implements a method of, whether it is that method's own lowering or an
+// instance of a generic one.
+private trait_of(cx: &KeepsCx, name: string) -> Option[string]
+    val own = cx.dispatched.get(name)
+
+    if own.is_some() then return own
+
+    cx.an.tables.members.func_origin.get(name) match
+        Some(origin) -> cx.dispatched.get(origin)
+        None -> None
+end trait_of
+
+// Whether a call of `f` lets go of the argument at a position by `f`'s `@scoped` promise: the
+// receiver, and each parameter the annotation names.
+private scoped_at(f: TFunc, i: usize) -> bool
+    if f.marks.scoped.is_empty() then return false
+
+    val name = f.params.at(i).0
+
+    (i == 0 && name == "self") || holds_string(f.marks.scoped, name)
+end scoped_at
+
+// The function a closure literal's body lowered to: its environment first, then what it is called with.
+private is_closure_body(f: TFunc) -> bool =
+    !f.params.is_empty() && is_closure_literal(env_type(f.params.at(0).1)) && f.name.ends_with(".call")
+
+private env_type(t: Type) -> Type = t match
+    Ptr(inner) -> *inner
+    _ -> t
+
+// -- one body, asked about one parameter -------------------------------------------------------------
+
+// What one walk follows: the locals that may hold the parameter -- or something built around it --
+// and the first place the body lets it outlive the call.
+struct Track
+    cx: &KeepsCx
+    scope: Scope
+    held: Buf[string]
+    refs: Buf[(string, TExpr)]
+    changed: bool
+    why: KeptWhy
+
+    holds(self, name: string) -> bool = holds_string(self.held, name)
+end Track
+
+private track(cx: &KeepsCx, f: TFunc, i: usize) -> &Track
+    val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept())
+
+    t.held.push(f.params.at(i).0)
+    track_locals(t, f.body)
+    t
+end track
+
+// Whether `f` lets its parameter at `i` outlive the call, and where.
+private walk_kept(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+    val t = track(cx, f, i)
+
+    walk_block_stmts(f.body, TWalk(false, e -> kept_at(t, e), w -> stored(t, w.place, w.value),
+                                   s -> kept_stmt(t, s)))
+
+    if f.body.result.is_some() then laundered(t, f.body.result.unwrap())
+
+    t.why
+end walk_kept
+
+// Whether what `f` answers can be made of its parameter at `i`.
+private walk_answers(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+    val t = track(cx, f, i)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TReturn(v) -> if v.is_some() && carries(t, v.unwrap()) then keep(t, "", v.unwrap().span)
+        _ -> ()))
+
+    if f.body.result.is_some() && carries(t, f.body.result.unwrap())
+        keep(t, "", f.body.result.unwrap().span)
+
+    t.why
+end walk_answers
+
+private keep(t: &Track, how: string, at: Span)
+    if !t.why.kept then t.why = KeptWhy(true, how, at)
+
+private kept_stmt(t: &Track, s: TStmt)
+    s match
+        TReturn(v) -> if v.is_some() then laundered(t, v.unwrap())
+        _ -> ()
+end kept_stmt
+
+// A pointer handed back as something that is not a pointer -- the address as an integer -- is out
+// of every caller's sight from then on.
+private laundered(t: &Track, v: TExpr)
+    val cast = *v.kind match
+        TCast(x, ty) -> Some((x, ty))
+        TFloorCast(x, ty) -> Some((x, ty))
+        _ -> None
+
+    if cast.is_none() then return
+
+    val (x, ty) = cast.unwrap()
+
+    if !may_hold_pointer(t.cx, ty) && carries(t, x) then keep(t, s"it is returned as '${type_show(ty)}'", v.span)
+end laundered
+
+// Where a body lets what it tracks go: a store outside its own locals, a buffer's slot, an atomic
+// store, and an argument the callee keeps.
+private kept_at(t: &Track, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> stored(t, place, v)
+        TSlots(op, args, _, _) ->
+            if op == "slot_place" && args.len() == 3 && carries(t, args.at(2))
+                keep(t, "it is stored in a buffer's slot", args.at(2).span)
+            else if op == "slot_put" && args.len() == 2 && carries(t, args.at(1))
+                keep(t, "it is stored in a buffer's slot", args.at(1).span)
+        TAtomic(_, _, ops, _, _, _) ->
+            for op in ops
+                if carries(t, op) then keep(t, "it is stored through a pointer by an atomic", op.span)
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                if !carries(t, args.at(j)) then continue
+
+                val k = keeps_of(t.cx, name, j)
+
+                if k.kept then keep(t, s"it is passed to '${shown_name(t.cx.an, name)}', which keeps it",
+                                    args.at(j).span)
+        _ -> ()
+end kept_at
+
+// A store: into a local's own storage it binds the local (`track_locals`); anywhere else it keeps.
+private stored(t: &Track, place: TExpr, v: TExpr)
+    if local_root(t.refs, place).is_some() then return
+
+    val cast = *v.kind match
+        TCast(x, ty) -> !may_hold_pointer(t.cx, ty) && carries(t, x)
+        TFloorCast(x, ty) -> !may_hold_pointer(t.cx, ty) && carries(t, x)
+        _ -> false
+
+    if carries(t, v) || cast then keep(t, s"it is stored in '${place_said(t.scope, place)}'", v.span)
+end stored
+
+// A place as the reader wrote it, rebuilt from the tree: module storage by its name, a field after
+// what it is a field of, a step through a pointer as the dot that wrote it.
+private place_said(scope: Scope, place: TExpr) -> string = *place.kind match
+    TGlobal(symbol, _, _) -> bare_name(qualified_name(symbol))
+    TDeref(x, _) -> place_said(scope, x)
+    TField(r, index, _) -> texpr_type(r) match
+        Struct(d) ->
+            if index >= 0 && usize(index) < d.fields.len()
+                s"${place_said(scope, r)}.${d.fields.at(usize(index)).0}"
+            else source_text(scope, whole_place(place))
+        _ -> source_text(scope, whole_place(place))
+    TIndex(r, _, _) -> s"${place_said(scope, r)}[…]"
+    _ -> source_text(scope, place.span)
+
+// The last part of a dotted name.
+private bare_name(written: string) -> string = written.last_index_of(".") match
+    Some(at) -> written[at + 1..<written.bytes.len]
+    None -> written
+
+// Where a place is written in full: a field's own span is its name, and the receiver it is a field of
+// was written before it.
+private whole_place(place: TExpr) -> Span
+    val inner = *place.kind match
+        TField(r, _, _) -> Some(r)
+        TIndex(r, _, _) -> Some(r)
+        TDeref(x, _) -> Some(x)
+        _ -> None
+
+    if inner.is_none() then return place.span
+
+    val from = whole_place(inner.unwrap())
+
+    if from.start < place.span.start && from.end <= place.span.end then Span(from.start, place.span.end)
+    else place.span
+end whole_place
+
+// Which locals hold what is tracked. A fixpoint, because a body may pass it along a chain of locals
+// before letting it go; nothing shrinks, so it settles.
+private track_locals(t: &Track, body: TBlock)
+    walk_block_stmts(body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, place) -> t.refs.push((n, place))
+        _ -> ()))
+
+    t.changed = true
+
+    while t.changed
+        t.changed = false
+
+        walk_block_stmts(body, TWalk(false, e -> bind_expr(t, e), w -> bind_store(t, w.place, w.value),
+                                     s -> bind_stmt(t, s)))
+end track_locals
+
+private bind_stmt(t: &Track, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> bind(t, n, init)
+        TRefDecl(n, _, place) -> bind(t, n, place)
+        _ -> ()
+end bind_stmt
+
+private bind_store(t: &Track, place: TExpr, v: TExpr)
+    local_root(t.refs, place) match
+        Some(n) -> bind(t, n, v)
+        None -> ()
+end bind_store
+
+// The forms that bind names from a value: a store, a `match`'s arms, an `is` test, a `for` over a
+// sequence and an iteration's cursor.
+private bind_expr(t: &Track, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> bind_store(t, place, v)
+        TMatch(scrutinee, arms, _) ->
+            if carries(t, scrutinee)
+                for arm in arms
+                    for p in arm.patterns
+                        bind_pattern(t, p)
+        TIf(cond, _, _, _) -> bind_terms(t, cond)
+        TWhile(cond, _, _, _) -> bind_terms(t, cond)
+        TForEach(name, _, seq, _, _, _) -> if carries(t, seq) then bind_name(t, name)
+        TIterate(cursor, _, init, _, pat, _, _, _) ->
+            if carries(t, init)
+                bind_name(t, cursor)
+                bind_pattern(t, pat)
+        _ -> ()
+end bind_expr
+
+private bind_terms(t: &Track, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(subject, patterns, _) ->
+                if carries(t, subject)
+                    for p in patterns
+                        bind_pattern(t, p)
+            _ -> ()
+end bind_terms
+
+private bind_pattern(t: &Track, p: TPattern)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        bind_name(t, n)
+end bind_pattern
+
+private bind(t: &Track, name: string, value: TExpr) = if carries(t, value) then bind_name(t, name)
+
+private bind_name(t: &Track, name: string)
+    if t.holds(name) then return
+
+    t.held.push(name)
+    t.changed = true
+end bind_name
+
+// The names a pattern binds.
+pattern_names(p: TPattern, out: *Buf[string])
+    p match
+        TBindPattern(n, _) -> out.push(n)
+        TAtPattern(n, inner) ->
+            out.push(n)
+            pattern_names(*inner, out)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                pattern_names(a, out)
+        TStructPattern(_, args) ->
+            for a in args
+                pattern_names(a, out)
+        _ -> ()
+end pattern_names
+
+// The local whose own storage a place is: a chain of field and element steps from it, never through a
+// pointer or a reference, and a `ref` followed to what it names.
+private local_root(refs: Buf[(string, TExpr)], place: TExpr) -> Option[string]
+    *place.kind match
+        TLoad(n, _) ->
+            for item in refs
+                if item.0 == n then return local_root(refs, item.1)
+
+            Some(n)
+        TField(r, _, _) -> local_root(refs, r)
+        TIndex(r, _, _) -> texpr_type(r) match
+            Array(_, _) -> local_root(refs, r)
+            _ -> None
+        _ -> None
+end local_root
+
+// Whether a value carries what is tracked -- itself, or something built around it: a struct, a
+// variant, a box, a closure's environment, a branch that yields it, an answer made of it.
+private carries(t: &Track, e: TExpr) -> bool = *e.kind match
+    TLoad(n, _) -> t.holds(n)
+
+    // An address INTO the pointee is the same pointer moved along; the address of a local that holds
+    // it is a pointer to it, one step further away.
+    TAddrOf(place, _) -> into_pointee(t, place) || holds_local(t, place)
+    TTempAddr(v, _) -> carries(t, v)
+    TStructNew(_, args) -> any_carries(t, args)
+    TEnumNew(_, _, args) -> any_carries(t, args)
+    TArrayLit(elems, _) -> any_carries(t, elems)
+    TArrayFill(v, _) -> carries(t, v)
+    TBufLit(elems, _) -> any_carries(t, elems)
+    TBufFill(v, _, _) -> carries(t, v)
+    TBox(v, _) -> carries(t, v)
+    TErase(v, _, _) -> carries(t, v)
+    TDowngrade(v, _) -> carries(t, v)
+    TCast(v, ty) -> may_hold_pointer(t.cx, ty) && carries(t, v)
+    TFloorCast(v, ty) -> may_hold_pointer(t.cx, ty) && carries(t, v)
+    TStore(_, v, _, _) -> carries(t, v)
+    TBinary(_, left, right, ty) -> may_hold_pointer(t.cx, ty) && (carries(t, left) || carries(t, right))
+
+    // What a call answers may be made of what it was handed. A callee with a body here says which of
+    // its arguments its answer is made of; one through an object or a pointer may be made of any.
+    TCall(name, args, ty, _) -> may_hold_pointer(t.cx, ty) && call_carries(t, name, args)
+    TVCall(recv, _, args, ty, _) ->
+        may_hold_pointer(t.cx, ty) && (carries(t, recv) || any_carries(t, args))
+    TCallPtr(callee, args, _, ty) ->
+        may_hold_pointer(t.cx, ty) && (carries(t, callee) || any_carries(t, args))
+    TTry(operand, _, _, _, _, _, _) -> carries(t, operand)
+
+    // A field of a value that carries it may be it, and so may a closure's capture read inside its
+    // body. A field read through a pointer is somebody else's storage -- but one read out of a box
+    // that carries it is the box's own.
+    TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && carries(t, r)
+    TDeref(x, ty) -> may_hold_pointer(t.cx, ty) && boxed(texpr_type(x)) && carries(t, x)
+    TIndex(r, _, ty) -> may_hold_pointer(t.cx, ty) && is_array_type(texpr_type(r)) && carries(t, r)
+    TRecheck(after, _, _, _) -> carries(t, after)
+    TSeq(exprs) -> !exprs.is_empty() && carries(t, exprs.at(exprs.len() - 1))
+    TIf(_, then_block, else_block, _) ->
+        block_carries(t, then_block) || (else_block.is_some() && block_carries(t, else_block.unwrap()))
+    TBlockExpr(b) -> block_carries(t, b)
+    TMatch(_, arms, _) ->
+        var any = false
+
+        for arm in arms
+            if block_carries(t, arm.body) then any = true
+
+        any
+
+    // A loop's value comes from its `break`s and its `else`.
+    TWhile(_, body, else_block, _) -> loop_carries(t, body, else_block)
+    TDoWhile(body, _, else_block, _) -> loop_carries(t, body, else_block)
+    TLoop(body, _) -> loop_carries(t, body, None)
+    TFor(_, _, _, _, _, body, else_block, _) -> loop_carries(t, body, else_block)
+    TForEach(_, _, _, body, else_block, _) -> loop_carries(t, body, else_block)
+    TIterate(_, _, _, _, _, body, else_block, _) -> loop_carries(t, body, else_block)
+    TCFor(_, _, _, body, else_block, _) -> loop_carries(t, body, else_block)
+    _ -> false
+
+// A step through the tracked pointer into what it points at: `&p.x`, `&p[i]`, `&*p`.
+private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
+    TDeref(x, _) -> carries(t, x)
+    TField(r, _, _) -> into_pointee(t, r)
+    TIndex(r, _, _) -> into_pointee(t, r)
+    _ -> false
+
+private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
+    TLoad(n, _) -> t.holds(n)
+    _ -> false
+
+private boxed(ty: Type) -> bool = ty match
+    Ref(_, _) -> true
+    _ -> false
+
+private is_array_type(ty: Type) -> bool = ty match
+    Array(_, _) -> true
+    _ -> false
+
+private call_carries(t: &Track, name: string, args: Buf[TExpr]) -> bool
+    for i in 0..<args.len()
+        if carries(t, args.at(i)) && answers_of(t.cx, name, i) then return true
+
+    false
+end call_carries
+
+private any_carries(t: &Track, es: Buf[TExpr]) -> bool
+    for item in es
+        if carries(t, item) then return true
+
+    false
+end any_carries
+
+private block_carries(t: &Track, b: TBlock) -> bool = b.result.is_some() && carries(t, b.result.unwrap())
+
+private loop_carries(t: &Track, body: Buf[TStmt], else_block: Option[TBlock]) -> bool
+    for v in own_break_values(body)
+        if carries(t, v) then return true
+
+    else_block.is_some() && block_carries(t, else_block.unwrap())
+end loop_carries
+
+// Whether a value of this type can hold a raw pointer, through a box as well as in place: a box of a
+// struct that holds one holds it too, and an object behind a trait -- a closure behind a `&Fn` among
+// them -- may hold anything, its type saying nothing of what it captured.
+//
+// Asked of nearly every value a body passes around, so a struct's or an enum's answer is worked out
+// once per compilation.
+may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
+    Ptr(_) -> true
+    Trait(_, _, _) -> true
+    Ref(inner, _) -> may_hold_pointer(cx, *inner)
+    Weak(inner) -> may_hold_pointer(cx, *inner)
+    Volatile(inner) -> may_hold_pointer(cx, *inner)
+    Array(_, elem) -> may_hold_pointer(cx, *elem)
+    Slice(elem, _) -> may_hold_pointer(cx, *elem)
+    Struct(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
+    Enum(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
+    _ -> false
+
+private aggregate_holds(cx: &KeepsCx, t: Type, key: string) -> bool
+    cx.pointerish.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    var seen: Buf[string] = buf()
+    val out = holds_pointer_within(t, &seen)
+
+    cx.pointerish.put(key, out)
+    out
+end aggregate_holds
+
+// The same, with the structs and enums already being asked about, which a type reaching itself
+// through a box answers nothing new for.
+private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
+    Ptr(_) -> true
+    Trait(_, _, _) -> true
+    Ref(inner, _) -> holds_pointer_within(*inner, seen)
+    Weak(inner) -> holds_pointer_within(*inner, seen)
+    Volatile(inner) -> holds_pointer_within(*inner, seen)
+    Array(_, elem) -> holds_pointer_within(*elem, seen)
+    Slice(elem, _) -> holds_pointer_within(*elem, seen)
+    Struct(d) -> first_visit(t, seen) && fields_hold_pointer(d.fields, seen)
+    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
+    _ -> false
+
+private first_visit(t: Type, seen: *Buf[string]) -> bool
+    val key = type_show(t)
+
+    if holds_string(*seen, key) then return false
+
+    seen.push(key)
+    true
+end first_visit
+
+private fields_hold_pointer(fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+    for item in fields
+        if holds_pointer_within(item.1, seen) then return true
+
+    false
+end fields_hold_pointer
+
+private variants_hold_pointer(vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
+    for v in vs
+        if fields_hold_pointer(v.fields, seen) then return true
+
+    false
+end variants_hold_pointer
+
+// -- the rule at the call ---------------------------------------------------------------------------
+
+// What one body's check follows: the locals that hold the address of the frame's own storage, and
+// what that storage is, as the refusal says it.
+struct FrameTrack
+    cx: &KeepsCx
+    faults: &KeepFaults
+    scope: Scope
+    owner: string
+    params: Buf[(string, Type)]
+    held: Buf[(string, string)]
+    refs: Buf[(string, TExpr)]
+    changed: bool
+
+    core_of(self, name: string) -> Option[string]
+        for item in self.held
+            if item.0 == name then return Some(item.1)
+
+        None
+    end core_of
+end FrameTrack
+
+// Every call in one body that hands a keeping parameter the address of this frame's storage.
+//
+// **The entry file's statements are the one body passed over**: their frame is the program's, laid
+// down before anything else runs and given back only as the program ends, so nothing kept from it can
+// outlive it.
+private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    if module_bare(f.name) == "entry file" then return
+
+    val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
+                                     f.params, buf(), buf(), false)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, place) -> ft.refs.push((n, place))
+        _ -> ()))
+
+    ft.changed = true
+
+    while ft.changed
+        ft.changed = false
+
+        walk_block_stmts(f.body, TWalk(false, e -> frame_bind_expr(ft, e),
+                                       w -> frame_bind_store(ft, w.place, w.value),
+                                       s -> frame_bind_stmt(ft, s)))
+
+    walk_block_stmts(f.body, expr_walk(false, e -> call_at(ft, e)))
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TReturn(v) -> if v.is_some() then returned_frame(ft, v.unwrap())
+        _ -> ()))
+
+    if f.body.result.is_some() then returned_frame(ft, f.body.result.unwrap())
+end check_calls
+
+// **A pointer handed back is lent for as long as what it was made of**, so a function may not hand
+// back one made of its own frame's storage -- through a local that holds the address, a struct built
+// around it, or a call whose answer is made of it. The address written in place (`&n`) is the escape
+// check's (`escape.sysl`'s `refuse_dangling`), which this leaves to it.
+private returned_frame(ft: &FrameTrack, v: TExpr)
+    *v.kind match
+        TAddrOf(_, _) -> ()
+        TTempAddr(_, _) -> ()
+        TCast(x, _) -> returned_frame(ft, x)
+        TBlockExpr(b) -> returned_block(ft, b)
+        TIf(_, then_block, else_block, _) ->
+            returned_block(ft, then_block)
+
+            if else_block.is_some() then returned_block(ft, else_block.unwrap())
+        TMatch(_, arms, _) ->
+            for arm in arms
+                returned_block(ft, arm.body)
+        _ ->
+            frame_core(ft, v) match
+                Some(core) ->
+                    ft.faults.items.push((ft.scope, v.span,
+                        s"'${source_text(ft.scope, v.span)}' is returned, but it holds $core, whose " +
+                        s"storage ends when '${ft.owner}' returns — return the value itself, or take " +
+                        "the storage from the caller as a '*T' parameter"))
+                None -> ()
+end returned_frame
+
+private returned_block(ft: &FrameTrack, b: TBlock) =
+    if b.result.is_some() then returned_frame(ft, b.result.unwrap())
+
+private frame_bind_stmt(ft: &FrameTrack, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> frame_bind(ft, n, init)
+        _ -> ()
+end frame_bind_stmt
+
+private frame_bind_expr(ft: &FrameTrack, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> frame_bind_store(ft, place, v)
+        _ -> ()
+end frame_bind_expr
+
+private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
+    local_root(ft.refs, place) match
+        Some(n) -> frame_bind(ft, n, v)
+        None -> ()
+end frame_bind_store
+
+private frame_bind(ft: &FrameTrack, name: string, v: TExpr)
+    if ft.core_of(name).is_some() then return
+
+    frame_core(ft, v) match
+        Some(core) ->
+            ft.held.push((name, core))
+            ft.changed = true
+        None -> ()
+end frame_bind
+
+private call_at(ft: &FrameTrack, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                val arg = args.at(j)
+
+                if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+
+                val core = frame_core(ft, arg)
+
+                if core.is_none() then continue
+
+                val k = keeps_of(ft.cx, name, j)
+
+                if !k.kept then continue
+
+                ft.faults.items.push((ft.scope, arg.span,
+                    s"'${shown_name(ft.cx.an, name)}' keeps its parameter '${param_name(ft.cx, name, j)}' " +
+                    s"(${k.how}), and ${argument_said(ft, arg, core.unwrap())}"))
+        _ -> ()
+end call_at
+
+// What an argument is, as the refusal says it: an address written `&n` IS the address of the storage,
+// a receiver a method was called on is the storage itself, and anything else HOLDS the address.
+private argument_said(ft: &FrameTrack, arg: TExpr, core: string) -> string
+    val written = source_text(ft.scope, arg.span)
+
+    *arg.kind match
+        TAddrOf(place, _) ->
+            if !written.starts_with("&") && core.starts_with("the address of ")
+                return s"'${source_text(ft.scope, whole_place(place))}' is " +
+                    core["the address of ".bytes.len..<core.bytes.len]
+            end if
+
+            s"'$written' is $core"
+        TTempAddr(_, _) -> s"'$written' is $core"
+        _ -> s"'$written' holds $core"
+end argument_said
+
+// What frame storage a value is, or holds the address of, as the refusal says it.
+private frame_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
+    TAddrOf(place, _) -> frame_place(ft, place)
+    TTempAddr(_, _) -> Some(s"the address of a value made in place in '${ft.owner}'")
+    TLoad(n, _) -> ft.core_of(n)
+    TStructNew(_, args) -> first_core(ft, args)
+    TEnumNew(_, _, args) -> first_core(ft, args)
+    TArrayLit(elems, _) -> first_core(ft, elems)
+    TBox(v, _) -> frame_core(ft, v)
+    TErase(v, _, _) -> frame_core(ft, v)
+    TCast(v, ty) -> if may_hold_pointer(ft.cx, ty) then frame_core(ft, v) else None
+    TField(r, _, ty) -> if may_hold_pointer(ft.cx, ty) then frame_core(ft, r) else None
+    TSeq(exprs) -> if exprs.is_empty() then None else frame_core(ft, exprs.at(exprs.len() - 1))
+    TBlockExpr(b) -> block_core(ft, b)
+    TIf(_, then_block, else_block, _) ->
+        val c = block_core(ft, then_block)
+
+        if c.is_some() || else_block.is_none() then c else block_core(ft, else_block.unwrap())
+    TMatch(_, arms, _) ->
+        var found: Option[string] = None
+
+        for arm in arms
+            if found.is_none() then found = block_core(ft, arm.body)
+
+        found
+    TCall(name, args, ty, _) -> if may_hold_pointer(ft.cx, ty) then answer_core(ft, name, args) else None
+    _ -> None
+
+// The frame storage a call's answer may be made of: an argument's, where the callee answers with it.
+private answer_core(ft: &FrameTrack, name: string, args: Buf[TExpr]) -> Option[string]
+    for i in 0..<args.len()
+        val c = frame_core(ft, args.at(i))
+
+        if c.is_some() && answers_of(ft.cx, name, i) then return c
+
+    None
+end answer_core
+
+private first_core(ft: &FrameTrack, es: Buf[TExpr]) -> Option[string]
+    for item in es
+        val c = frame_core(ft, item)
+
+        if c.is_some() then return c
+
+    None
+end first_core
+
+private block_core(ft: &FrameTrack, b: TBlock) -> Option[string] =
+    if b.result.is_some() then frame_core(ft, b.result.unwrap()) else None
+
+// The frame storage an address names: a local, a parameter's place, or a field or element of one.
+private frame_place(ft: &FrameTrack, place: TExpr) -> Option[string]
+    val root = frame_root_of(ft.refs, place)
+
+    if root.is_none() then return None
+
+    val (name, at) = root.unwrap()
+    val shown = source_text(ft.scope, at)
+    val direct = *place.kind match
+        TLoad(_, _) -> true
+        _ -> false
+
+    var param = false
+
+    for item in ft.params
+        if item.0 == name then param = true
+
+    if param && direct then return Some(s"the address of the parameter '$shown' of '${ft.owner}', a copy in its frame")
+    if param then return Some(s"the address of a field of the parameter '$shown' of '${ft.owner}'")
+    if direct then return Some(s"the address of a local of '${ft.owner}'")
+
+    Some(s"the address of a field of '$shown', a local of '${ft.owner}'")
+end frame_place
+
+// The binding a place's storage belongs to, when that storage is the frame's own, with where its
+// name is written.
+private frame_root_of(refs: Buf[(string, TExpr)], place: TExpr) -> Option[(string, Span)]
+    *place.kind match
+        TLoad(name, _) ->
+            for item in refs
+                if item.0 == name then return frame_root_of(refs, item.1)
+
+            Some((name, place.span))
+        TField(r, _, _) -> frame_root_of(refs, r)
+        TIndex(r, _, _) -> texpr_type(r) match
+            Array(_, _) -> frame_root_of(refs, r)
+            _ -> None
+        _ -> None
+end frame_root_of
+
+// -- a body reached through a default ------------------------------------------------------------------
+
+// A body a call reaches with no body in sight -- a closure, a method a trait object dispatches to, a
+// function whose address is taken -- borrows every pointer it is handed, because that is all its
+// callers were promised. One that keeps one is refused where it is written.
+private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    val closure = is_closure_body(f)
+    val trait_name = trait_of(cx, f.name)
+    val addressed = cx.addressed.has(f.name)
+
+    if !closure && trait_name.is_none() && !addressed then return
+
+    val first: usize = if closure then 1 else 0
+    val scope = func_home(cx.an, f.name)
+
+    for i in first..<f.params.len()
+        if !may_hold_pointer(cx, f.params.at(i).1) || scoped_at(f, i) then continue
+
+        val w = walk_kept(cx, f, i)
+
+        if !w.kept then continue
+
+        faults.items.push((scope, w.at, promise_broken(cx, f, f.params.at(i).0, w.how, closure, trait_name)))
+end refuse_promised
+
+private promise_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, closure: bool,
+                       trait_name: Option[string]) -> string
+    if closure
+        return s"a closure borrows what it is handed for the call, and this one keeps its parameter " +
+            s"'$pname' ($how) — whoever calls it may hand it the address of their own storage. Copy " +
+            "what this needs into storage of its own"
+    end if
+
+    val shown = shown_name(cx.an, f.name)
+
+    if trait_name.is_some()
+        return s"'$shown' keeps its parameter '$pname' ($how), but a method of " +
+            s"'${qualified_name(trait_name.unwrap())}' borrows its parameters for the call — a call " +
+            "through an object sees no body, so it may hand this the address of the caller's own " +
+            "storage. Copy what this needs into storage of its own"
+    end if
+
+    s"'$shown' keeps its parameter '$pname' ($how), and its address is taken — a call through a " +
+        "function pointer sees no body and borrows what it hands over, so it may hand this the " +
+        "address of the caller's own storage. Copy what this needs into storage of its own"
+end promise_broken
+
+// -- how a refusal names things ------------------------------------------------------------------------
+
+// A function as a reader wrote it: a member by its own name, a free function by its name.
+private shown_name(a: &Analysis, name: string) -> string =
+    bare_name(qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name)))
+
+// The name of a callee's parameter at a position: from its body, or from its `extern` declaration.
+private param_name(cx: &KeepsCx, name: string, i: usize) -> string
+    cx.find(name) match
+        Some(f) -> if i < f.params.len() then return f.params.at(i).0
+        None -> ()
+
+    cx.an.tables.externs.get(name) match
+        Some(d) -> if i < d.params.len() then return d.params.at(i).name
+        None -> ()
+
+    s"#${i + 1}"
+end param_name
+
+// What the reader wrote at a span, or a description where the span is not this file's.
+private source_text(scope: Scope, at: Span) -> string
+    if at.end > scope.src.bytes.len || at.start >= at.end then return "it"
+
+    from_utf8_unchecked(scope.src.text(at))
+end source_text
+
+// -- what `@scoped` may name ----------------------------------------------------------------------------
+
+// What `@scoped` may name, and what it may stand above (`docs/design/scope.md § 1`): a method whose
+// receiver is `*self` -- the pointer the call lent the body that calls it -- and, once each, a
+// parameter that is a call. The call is usually a `&sync Fn`, since what is named crosses into another
+// domain; a bare arrow and a type parameter bounded by a call trait are calls too, and the crossing
+// rule `@scoped` implies decides what may be passed there. A free function and a field are refused
+// by the parser, before a declaration exists.
+check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val ss = d.marks.scoped
+
+    if ss.is_empty() then return
+
+    val ps = d.params
+    val receiver = scoped_receiver(ps)
+
+    if receiver != ""
+        a.fault(scope, span, s"'@scoped' promises that what '$shown' runs finishes before the " +
+                "call that lent its receiver returns, so the receiver is the pointer that call " +
+                s"lent, written '*self' — this one $receiver")
+
+    for i in 0..<ss.len()
+        var found: Option[Param] = None
+
+        for item in ps
+            if item.name == ss.at(i) then found = Some(item)
+
+        var twice = false
+
+        for j in 0..<i
+            if ss.at(j) == ss.at(i) then twice = true
+
+        if found.is_none()
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a parameter of " +
+                    s"'$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}' twice, and a parameter is waited " +
+                    "for or it is not — the second says nothing the first does not")
+        else if !callable_param(d, found.unwrap()) && !erased_call(found.unwrap())
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a call — what a " +
+                    "scoped member promises is that a body it runs in another domain finishes " +
+                    "before the scope does, so the parameter is written as one, " +
+                    s"'${ss.at(i)}: &sync Fn() -> R'")
+end check_scoped_names
+
+// What is wrong with a scoped member's receiver, as the end of a sentence, or nothing where it is the
+// `*self` the promise is about.
+private scoped_receiver(ps: Buf[Param]) -> string
+    if ps.is_empty() || ps.at(0).name != "self" then return "has no receiver"
+
+    *ps.at(0).typ.kind match
+        PtrType(_) -> ""
+        RefType(_, _) -> "takes '&self', a share of a value rather than the pointer a call lends"
+        _ -> "takes 'self' by value, a copy rather than the pointer a call lends"
+end scoped_receiver
+
+// A call behind a reference, `&Fn(…)` or `&sync Fn(…)`: one body chosen at run time, which is what a
+// member that hands its parameter to another domain usually holds.
+private erased_call(p: Param) -> bool = *p.typ.kind match
+    RefType(inner, _) -> *inner.kind match
+        FnType(_, _, _) -> true
+        _ -> false
+    _ -> false
+
+// A bare arrow, before the declaration's rewrite or after it: a type parameter of this declaration
+// bounded by a call trait.
+private callable_param(d: FuncDecl, p: Param) -> bool = *p.typ.kind match
+    FnType(_, _, bare) -> bare
+    NamedType(n, _) -> holds_string(d.tparams, n) && call_bounded(d.bounds, n)
+    _ -> false
+
+private call_bounded(bounds: Buf[NamedBounds], name: string) -> bool
+    for nb in bounds
+        if nb.name == name
+            for b in nb.bounds
+                if is_call_trait(module_bare(b.name)) then return true
+
+    false
+end call_bounded
+
+// `Fn0` through the widest arity, which are the call traits a bound may name.
+is_call_trait(name: string) -> bool
+    for n in 0..<FnMaxArity + 1
+        if name == fn_base(n) then return true
+
+    false
+end is_call_trait

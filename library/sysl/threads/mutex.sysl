@@ -67,9 +67,9 @@ impl Lock for SleepLock
  * does not go through the lock, and no way to build one that skips the free state.
  *
  * **`with` is the way in**: it takes the lock, hands a closure the address of the value, and releases
- * the lock when the closure returns. The address is lent (`@lends`), so the compiler holds the closure
- * to letting it go -- returning it, storing it, or passing it to something that keeps it is refused,
- * which is the one mistake a returned address could not prevent: using it after the release.
+ * the lock when the closure returns. A closure borrows what it is handed for the call, so the compiler
+ * holds it to letting the address go -- storing it, or passing it to something that keeps it, is
+ * refused, which is the one mistake a returned address could not prevent: using it after the release.
  *
  * ```
  * m.with((n) -> *n += 1)
@@ -113,12 +113,11 @@ struct Mutex[T]
      * releases the lock, and answers what `body` answered.
      *
      * The address is valid only while `body` runs, and the compiler holds `body` to that: it may read
-     * and write through the address, and pass it to a callee that only uses it, but not return it,
-     * store it, or hand it to something that keeps it (`reference/memory.md § A pointer lent for one
-     * call`). A closure is not an allocation here -- the parameter is a type parameter, so each call is
-     * a direct call of the closure's own body, and this is usable under `@no_alloc`.
+     * and write through the address, and pass it to a callee that only uses it, but not store it or
+     * hand it to something that keeps it (`reference/memory.md § A borrowed pointer cannot escape`). A
+     * closure is not an allocation here -- the parameter is a type parameter, so each call is a direct
+     * call of the closure's own body, and this is usable under `@no_alloc`.
      */
-    @lends(body)
     @blocks
     with[R](*self, body: *T -> R) -> R
         val held = self.inner.lock_raw()
@@ -127,7 +126,6 @@ struct Mutex[T]
         body(held)
 
     /** The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. */
-    @lends(body)
     try_with[R](*self, body: *T -> R) -> Option[R]
         val held = self.inner.try_lock_raw()
 

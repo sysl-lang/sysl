@@ -2821,19 +2821,17 @@ anywhere, and two compilations of *one* program agree only because they compute 
 the same name. A generic body asks through its parameter, `T::Id`, which is computed once per
 instantiation.
 
-## A method may promise to borrow
+## A method borrows what it is handed
 
-A call through a trait object is opaque: which body it reaches is decided at run time, so
-[escape analysis](/reference/memory/#what-happens-when-a-slice-escapes) has to assume the worst of
-every argument. A view of an array in your own frame passed through one could be kept by whatever is
-behind it, so the array goes on the heap.
-
-`@borrows` lets a trait state otherwise, and the compiler checks every implementation against it, so
-the promise is verified rather than trusted:
+A call through a trait object is opaque: which body it reaches is decided at run time, so the
+compiler cannot read out of a body whether the call keeps what it is handed. It answers by rule
+instead: **a trait's method borrows its parameters for the call** — a view, a `*T`, or a struct
+holding either — and the compiler checks every implementation against the rule, so it is verified
+rather than trusted. A view of an array in your own frame passed through an object therefore stays in
+the frame ([`memory.md § A borrowed pointer cannot escape`](/reference/memory/#a-borrowed-pointer-cannot-escape)):
 
 ```sysl
 trait Sink
-    @borrows(bytes)
     put(*self, bytes: []const u8)
 
 struct Counter
@@ -2857,17 +2855,15 @@ print(c.n)
 4
 ```
 
-Without the annotation the program behaves the same, but `buf` is allocated. With it, the frame keeps
-its storage, which is what makes rendering allocation-free: a renderer writes into a buffer on its
-own stack and passes a slice of it. `sysl.Writer` declares exactly this, as an ordinary user of the
-feature rather than a special case in the compiler.
+The frame keeps `buf`, which is what makes rendering allocation-free: a renderer writes into a buffer
+on its own stack and passes a slice of it to a `sysl.Writer`. A closure behind a `&Fn` is the one
+object that borrows nothing for a view — a closure may keep what it is handed — so a view passed
+through one goes on the heap.
 
-**An implementation that keeps what it was lent is refused**, naming the parameter as the trait
-declares it:
+**An implementation that keeps what it was lent is refused**, naming the parameter:
 
 ```sysl
 trait Sink
-    @borrows(bytes)
     put(*self, bytes: []const u8)
 
 struct Bad
@@ -2885,20 +2881,19 @@ s.put(buf[0..<4])
 ```
 
 ```error
-keeps what it is passed as 'bytes', but 'Sink' declares that parameter borrowed
+keeps what it is passed as 'bytes', but a method of 'Sink' borrows its parameters for the call
 ```
 
 Reading from the view is not keeping it. The check distinguishes the two by what the body *does*,
 not by how it is written.
 
-**A raw pointer parameter is held to the promise the same way.** An implementation that stores the
-pointer, hands it back, or keeps one it derived from it (`&n.field`, or the field of a struct
-parameter that holds one) is refused at the place it lets the pointer go; one that only reads and writes
-through it is accepted:
+**A raw pointer parameter is held to the rule the same way.** An implementation that stores the
+pointer, or keeps one it derived from it (`&n.field`, or the field of a struct parameter that holds
+one), is refused at the place it lets the pointer go; one that only reads and writes through it, or
+hands it back, is accepted:
 
 ```sysl
 trait Bump
-    @borrows(n)
     bump(*self, n: *int)
 
 struct Keeper
@@ -2917,51 +2912,12 @@ b.bump(&y)
 ```
 
 ```error
-keeps what it is passed as 'n', but 'Bump' declares that parameter borrowed for the call — it may point into the caller's stack
+'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
 ```
 
-Because the promise is verified, a pointer [lent for one call](/reference/memory/#a-pointer-lent-for-one-call)
-may be passed through a trait object at a parameter its method promises to borrow.
-
-**It names parameters rather than being a flag**, because a method may take both a buffer it borrows
-and something it legitimately retains. A name that is not a parameter is refused: a misspelling would
-otherwise silently check nothing while appearing to enforce a rule.
-
-**It is refused on a free function.** That body is visible to the compiler, and the analysis reads
-the answer from it; a written promise would restate what is already known and become wrong as soon as
-the body changed.
-
-```sysl
-@borrows(xs)
-take(xs: []const u8) -> usize = xs.len
-
-print(take([1][..]))
-```
-
-```error
-'@borrows' is about a call whose body the compiler cannot see
-```
-
-**So is it on any method written with its body** — a type's own, or one implementing a trait. Its
-body is as visible as a free function's, and an implementation that could write the promise would be
-granting itself an exemption its trait never gave; the trait's declaration is the one place it goes.
-
-```sysl
-struct Counter
-    n: usize
-
-    @borrows(bytes)
-    put(*self, bytes: []const u8)
-        self.n += bytes.len
-
-var c = Counter(0)
-
-print(c.n)
-```
-
-```error
-A method declared with its body — a type's own, or one implementing a trait — is read the way a free function is
-```
+Because the rule is verified, a pointer a closure is lent may be passed through a trait object. A
+method that has to retain what it is handed takes something it can keep — a copy, a `&T` — rather
+than a view or a pointer into somebody else's storage.
 
 ## Reaching a trait's members without a value
 

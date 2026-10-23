@@ -3624,116 +3624,179 @@ handing 'v' of 'take' a copy of every view in it needs an allocator, and this mo
 taking the channel by address, because the annotation had to be written on a wrapper a caller went
 through; they are methods now, so a channel's transfers and its queries read alike.
 
-## A pointer lent for one call
+## A borrowed pointer cannot escape
 
-A `*T` is a type, so once one exists it can be carried anywhere — which is exactly wrong for an
-address that is only good while something else holds still: the value inside a lock until the lock
-is released, a slot in a scratch buffer until it is reused. Returning the address and asking the
-caller to stop using it in time is a promise nothing checks.
+A `*T` is a type, so once one exists it can be carried anywhere — which is exactly wrong for the
+address of a local, which is good only until its function returns. Nothing in the type says how long
+the storage it points at lives. What the compiler can see instead is what every function **does** with
+each pointer it is handed, so it works that out, and nothing is written for it.
 
-**`@lends(body)` turns it around**: the function keeps the pointer and calls `body` with it, and the
-compiler holds every body passed there to letting the pointer go before it returns. Inside, the body
-may read and write through the pointer, and hand it to a function that only uses it:
+**A function keeps a `*T` parameter** when it lets it outlive the call:
+
+- it stores it somewhere the call does not own — a field reached through a pointer, module storage, a
+  buffer's slot, or a box or a closure that is stored there;
+- it passes it to another function's parameter that keeps it;
+- it hands it back as something that is not a pointer — the address as an integer.
+
+The answer is read out of the body, followed into every callee, and settled over recursion: a
+recursive function keeps a parameter when one of its paths does. Then **one rule, at the call**:
+
+> The address of storage that is not the program's to give away — a local, a parameter's place, a
+> field of a value in the frame, a value made in place — may not be passed to a parameter that keeps it.
+
+```sysl
+struct Registry
+    last: *int
+
+    remember(*self, p: *int)
+        self.last = p
+
+run(r: *Registry)
+    var n = 5
+    r.remember(&n)
+```
+
+```error
+'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the address of a local of 'run'
+```
+
+A function that reads and writes through what it is handed, and passes it to callees that only use it,
+keeps nothing, and the address of anything may be passed to it — **every `*self` method called on a
+local is checked this way**:
 
 ```sysl
 struct Account
     balance: int
     edits: int
 
-    @lends(body)
-    edit[R](*self, body: *int -> R) -> R
+    deposit(*self, n: int)
+        self.balance += n
         self.edits += 1
-        body(&self.balance)
-end Account
 
 add_ten(n: *int)
     *n += 10
 
-var acct = Account(100, 0)
+twice(p: *int)
+    add_ten(p)
+    add_ten(p)
 
-acct.edit((b) -> *b -= 30)
-acct.edit((b) -> add_ten(b))
-acct.edit(add_ten)
+run() -> int
+    var acct = Account(100, 0)
+    var n = 1
 
-print(acct.balance, acct.edits, acct.edit((b) -> *b * 2))
+    acct.deposit(5)
+    twice(&n)
+    twice(&acct.balance)
+    acct.balance + n + acct.edits
+
+print(run())
 ```
 
 ```output
-90 3 180
-```
-
-`sysl.threads.Mutex.with` is declared this way, and its argument is the reason the annotation
-exists: an address handed out by a `lock()` stays usable after `unlock()`, and one lent to a body does
-not ([`library/threads.md § with lends the value for one call`](/library/threads/#with-lends-the-value-for-one-call)).
-
-**What the body may not do is let it out** — the ways a [view of a local array](#what-escapes)
-gets out, asked of the pointer instead: returning it, storing it anywhere but a
-local of the body, putting it in a box, and passing it to something that keeps it. Each is refused at
-the expression that does it:
-
-```sysl
-struct Cell
-    v: int
-
-    @lends(body)
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
-
-var c = Cell(1)
-val p = c.with((v) -> v)
-```
-
-```error
-lends this body a pointer that is valid only until the call returns, and this one is returned
+147
 ```
 
 ```sysl
-struct Cell
-    v: int
+struct Node
+    next: *Node
 
-    @lends(body)
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
+    link(*self)
+        self.next = self
 
-var kept: *int = null
-var c = Cell(1)
-
-c.with((v) -> kept = v)
+run()
+    var node = Node(null)
+    node.link()
 ```
 
 ```error
-and this one is stored somewhere the call does not own
+'link' keeps its parameter 'self' (it is stored in 'self.next'), and 'node' is a local of 'run'
 ```
 
-**A call is followed into the callee**, whose body says whether it keeps what it was handed — so
-`add_ten` above is fine and this is not:
+Each way of keeping is found wherever it is, however many calls down:
 
 ```sysl
-struct Cell
-    v: int
+import sysl.buf.{Buf, buf}
 
-    @lends(body)
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
+static var all: Buf[*int] = buf()
 
-struct Holder
-    p: *int
+collect(p: *int)
+    all.push(p)
 
-keep(h: *Holder, p: *int)
-    h.p = p
+relay(p: *int) = collect(p)
 
-var h = Holder(null)
-val hp = &h
-var c = Cell(1)
-
-c.with((v) -> keep(hp, v))
+run()
+    var n = 1
+    relay(&n)
 ```
 
 ```error
-and this one is passed to 'keep', which holds on to it
+'relay' keeps its parameter 'p' (it is passed to 'collect', which keeps it), and '&n' is the address of a local of 'run'
 ```
 
-**What a call answers is followed the same way.** A callee whose answer is made of the pointer — the
-pointer itself, or the address of something inside what it points at — hands the body the lent
-pointer back, and the body is held to it. A pointer the callee **read out of** the lent value is
-somebody else's address, and is the body's to keep:
+```sysl
+address(p: *int) -> usize = usize(p)
+
+run() -> usize
+    var n = 1
+    address(&n)
+```
+
+```error
+'address' keeps its parameter 'p' (it is returned as 'usize'), and '&n' is the address of a local of 'run'
+```
+
+Storage that outlives the call — module storage, a box's — is the program's to give away, and so is
+storage reached through a pointer the function was handed. **The entry file's own statements** are
+the one body passed over: their frame is the program's, laid down before anything else runs and given
+back only as it ends.
+
+### Handing it back is not keeping it
+
+A function may answer the pointer it was handed, or the address of something inside what it points
+at: `field(s: *S) -> *int = &s.y` keeps nothing, and **its answer is lent for as long as the argument
+is**. The caller follows the answer as it follows the argument — keeping it is keeping the argument,
+and a function may not hand back an answer made of its own frame:
+
+```sysl
+struct S
+    x: int
+    y: int
+
+field(s: *S) -> *int = &s.y
+
+run() -> int
+    var s = S(1, 2)
+    val p = field(&s)
+
+    *p += 10
+    s.y
+
+print(run())
+```
+
+```output
+12
+```
+
+```sysl
+struct S
+    x: int
+    y: int
+
+field(s: *S) -> *int = &s.y
+
+run() -> *int
+    var s = S(1, 2)
+
+    field(&s)
+```
+
+```error
+'field(&s)' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns
+```
+
+A pointer the callee **read out of** what it was handed is somebody else's address, and is the
+caller's to keep:
 
 ```sysl
 struct Node
@@ -3744,133 +3807,79 @@ struct Queue
 
     first(*self) -> *Node = self.head
 
-struct Guard
-    q: Queue
+static var n = Node(7)
+static var kept: *Node = &n
 
-    @lends(body)
-    with[R](*self, body: *Queue -> R) -> R = body(&self.q)
+keep(p: *Node)
+    kept = p
 
-var n = Node(7)
-var g = Guard(Queue(&n))
-val p = g.with((q) -> q.first())
+run()
+    var q = Queue(&n)
+    keep(q.first())
 
-print(p.v)
+run()
+print(kept.v)
 ```
 
 ```output
 7
 ```
 
-An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed
-to one is refused as kept:
+### Where no body is in sight, the call borrows
+
+A call the compiler cannot follow into a body needs an answer all the same, and the answer is the one
+C programs already live by — **a pointer handed to a call is borrowed for the call**:
+
+| what is called | what it keeps |
+|---|---|
+| a sysl function | what its body keeps |
+| a method through a trait object | nothing — an implementation reached through an object that keeps what it is handed is refused where it is written |
+| a closure, or a function through a pointer | nothing — a closure, or a function whose address is taken, that keeps what it is handed is refused where it is written |
+| an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps--a-c-function-that-holds-on-to-a-pointer) |
+
+A default is a promise, so the body behind it is held to it. That is what makes a lock's `with`
+safe without an annotation: the closure it calls borrows the address of the value for the call, and a
+closure that keeps it is refused where it keeps it, which is the one mistake a returned address could
+not prevent — using it after the release:
 
 ```sysl
-trait Bump
-    bump(*self, n: *int)
-
-struct Adder
-    by: int
-
-impl Bump for Adder
-    bump(*self, n: *int)
-        *n += self.by
-
 struct Cell
     v: int
 
-    @lends(body)
     with[R](*self, body: *int -> R) -> R = body(&self.v)
 
-var c = Cell(1)
-var a = Adder(5)
-var b: *Bump = &a
-
-c.with((v) -> b.bump(v))
-```
-
-```error
-is passed through a trait object, which may hold on to it
-```
-
-**A trait method that [promises to borrow](/reference/traits/#a-method-may-promise-to-borrow) the
-parameter is the exception**: every implementation of the promise is checked to let the pointer go,
-so the same call is accepted once the trait says `@borrows(n)`:
-
-```sysl
-trait Bump
-    @borrows(n)
-    bump(*self, n: *int)
-
-struct Adder
-    by: int
-
-impl Bump for Adder
-    bump(*self, n: *int)
-        *n += self.by
-
-struct Cell
-    v: int
-
-    @lends(body)
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
+static var spare = 0
+static var kept: *int = &spare
 
 var c = Cell(1)
-var a = Adder(5)
-var b: *Bump = &a
 
-c.with((v) -> b.bump(v))
-
+c.with((v) -> *v += 1)
 print(c.v)
-```
-
-```output
-6
-```
-
-Converting the pointer to an integer is not following it: `usize(p)` is
-an address as a number, which is the raw tier's to answer for.
-
-**What is passed there has to be a body the compiler can read** — a closure written at the call, one
-held in a local, or a function's name. A bare-arrow parameter is a type parameter, so each call is a
-direct call of that body, which is also why a lending function costs no allocation. A closure behind a
-`&Fn` could be any body at all:
-
-```sysl
-struct Cell
-    v: int
-
-    @lends(body)
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
-
-var c = Cell(1)
-val f: &Fn(*int) -> int = (v) -> *v
-
-print(c.with(f))
+c.with((v) -> kept = v)
 ```
 
 ```error
-lends 'body' a pointer that is valid only during the call, so what is passed there is a closure or a function's name
-```
-
-`@lends` names parameters, each once, and each a call:
-
-```sysl
-@lends(body)
-twice(x: *int, f: *int -> int) -> int = f(x) + f(x)
-```
-
-```error
-'@lends' names 'body', which is not a parameter of 'twice' — its parameters are 'x', 'f'
+a closure borrows what it is handed for the call, and this one keeps its parameter 'v' (it is stored in 'kept')
 ```
 
 ```sysl
-@lends(x)
-twice(x: *int, f: *int -> int) -> int = f(x) + f(x)
+trait Bump
+    bump(*self, n: *int)
+
+struct Keeper
+    held: *int
+
+impl Bump for Keeper
+    bump(*self, n: *int)
+        self.held = n
 ```
 
 ```error
-'@lends' names 'x', which is not a call
+'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
 ```
+
+A trait's method borrows a view it is handed the same way, so a view of a local array passed through
+an object stays in the frame ([`traits.md § A method borrows what it is handed`](/reference/traits/#a-method-borrows-what-it-is-handed)).
 
 ## Hazard summary
 

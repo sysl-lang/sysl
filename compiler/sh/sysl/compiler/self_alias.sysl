@@ -1,6 +1,5 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
 // A `*self` method that lets a pointer into its receiver's own storage outlive the call.
@@ -116,40 +115,6 @@ struct SelfAlias
     // Whether the last round of the fixpoint learned anything.
     changed: bool
 
-    // The other rule this walk serves: a pointer a `@lends` function hands a body, which may not
-    // outlive that call (`lends.sysl`). Under it a call, a conversion and a closure's captures are
-    // followed too, since the pointer is a value the body was given rather than a place it reached.
-    lent: bool
-
-    // A callee being summarized rather than a body being checked: what got out is recorded in
-    // `escaped` and nothing is said, the complaint belonging to the body that handed it over.
-    quiet: bool
-    escaped: bool
-
-    // The lending function, as the message names it.
-    lender: string
-
-    // Whether a call keeps the argument at a position, for the lent rule. The receiver rule asks no
-    // callee anything.
-    keeps: Option[&Fn(string, usize) -> bool]
-
-    // Whether what a call answers can be made of the argument at a position, for the lent rule: a
-    // `first(*self) -> *Node = self.head` answers a pointer it read OUT of what it was handed, which
-    // is somebody else's address and not the lent one.
-    answers: Option[&Fn(string, usize) -> bool]
-
-    // Where a quiet walk first saw the pointer get out, for the complaint the body that asked makes.
-    first_out: Option[Span]
-
-    // Whether a call's parameter at a position is one its callee marks `@scoped`, for the lent rule:
-    // a closure boxed straight into one is run and finished before the lender returns, so the box is
-    // not the heap the pointer would outlive the call on (`docs/design/scope.md`).
-    scoped: Option[&Fn(string, usize) -> bool]
-
-    // The boxes this walk has seen handed straight to a `@scoped` parameter, by where they are
-    // written. A call is visited before its arguments, so each is known by the time its box is.
-    spared: Buf[Span]
-
     holds(self, name: string) -> bool = holds_string(self.confined, name)
 
     ref_place(self, name: string) -> Option[TExpr]
@@ -161,76 +126,14 @@ struct SelfAlias
 end SelfAlias
 
 private check_one_self_alias(a: &Analysis, scope: Scope, f: TFunc)
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, false, false, false, "", None, None, None, None,
-                                   buf())
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false)
 
     st.confined.push("self")
     alias_walk(a, scope, st, f.body)
 end check_one_self_alias
 
-// Whether a body lets any of `seeds` outlive the call it was handed them in, under the lent rule:
-// reported against the body where `quiet` is false, recorded and answered either way.
-lent_escapes(a: &Analysis, scope: Scope, seeds: Buf[string], body: TBlock, lender: string, quiet: bool,
-             keeps: &Fn(string, usize) -> bool, answers: &Fn(string, usize) -> bool,
-             scoped: &Fn(string, usize) -> bool) -> bool
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, quiet, false, lender, Some(keeps),
-                                   Some(answers), None, Some(scoped), buf())
-
-    for seed in seeds
-        st.confined.push(seed)
-
-    alias_walk(a, scope, st, body)
-    st.escaped
-end lent_escapes
-
-// Whether what a body answers can carry `seed`, under the lent rule -- the question a caller asks of
-// a call it handed the pointer to, whose answer it then follows itself.
-lent_answers(seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
-             answers: &Fn(string, usize) -> bool) -> bool
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, true, false, "", Some(keeps),
-                                   Some(answers), None, None, buf())
-
-    st.confined.push(seed)
-    confine(st, body)
-
-    walk_block_stmts(body, stmt_walk(false, s -> returns_carried(st, s)))
-
-    st.escaped || (body.result.is_some() && carries(st, body.result.unwrap()))
-end lent_answers
-
-// Where a body lets `seed` outlive the call, handing it back counted with keeping it -- the question a
-// trait's `@borrows` promise puts to each implementation of a pointer parameter. A call through a
-// trait object is not followed into its answer, so what an implementation returns is held to the
-// promise as well as what it stores.
-lent_kept_at(a: &Analysis, scope: Scope, seed: string, body: TBlock, keeps: &Fn(string, usize) -> bool,
-             answers: &Fn(string, usize) -> bool, scoped: &Fn(string, usize) -> bool) -> Option[Span]
-    val st: &SelfAlias = SelfAlias(buf(), buf(), false, true, true, false, "", Some(keeps),
-                                   Some(answers), None, Some(scoped), buf())
-
-    st.confined.push(seed)
-    alias_walk(a, scope, st, body)
-
-    if st.first_out.is_some() then return st.first_out
-
-    walk_block_stmts(body, stmt_walk(false, s -> returns_carried(st, s)))
-
-    if st.first_out.is_none() && body.result.is_some() && carries(st, body.result.unwrap())
-        st.first_out = Some(body.result.unwrap().span)
-
-    st.first_out
-end lent_kept_at
-
-private returns_carried(st: &SelfAlias, s: TStmt)
-    s match
-        TReturn(v) ->
-            if v.is_some() && carries(st, v.unwrap())
-                st.escaped = true
-
-                if st.first_out.is_none() then st.first_out = Some(v.unwrap().span)
-        _ -> ()
-
-// Whether a value of this type can hold a raw pointer, which is what the lent rule follows: an
-// integer made of one, or a counted box, is a different thing from the pointer it came from.
+// Whether a value of this type can hold a raw pointer: an integer made of one, or a counted box, is a
+// different thing from the pointer it came from.
 holds_pointer(t: Type) -> bool = t match
     Ptr(_) -> true
     Volatile(inner) -> holds_pointer(*inner)
@@ -316,7 +219,7 @@ end bind_one
 // all the same pointer with a wrapper on.
 private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
     TLoad(n, _) -> st.holds(n)
-    TAddrOf(place, _) -> own_storage(st, place) || (st.lent && holds_local(st, place))
+    TAddrOf(place, _) -> own_storage(st, place)
 
     // The slot a `&value` makes is this frame's and is not the receiver's -- but what was written
     // into it may still be a pointer into the receiver, so the question is asked of the value.
@@ -328,21 +231,9 @@ private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
     TBufLit(elems, _) -> any_carries(st, elems)
     TBufFill(v, _, _) -> carries(st, v)
     TBox(v, _) -> carries(st, v)
-    TCast(v, ty) -> (!st.lent || holds_pointer(ty)) && carries(st, v)
-    TFloorCast(v, ty) -> (!st.lent || holds_pointer(ty)) && carries(st, v)
+    TCast(v, _) -> carries(st, v)
+    TFloorCast(v, _) -> carries(st, v)
     TStore(_, v, _, _) -> carries(st, v)
-
-    // What a call answers may be made of what it was handed, and pointer arithmetic is the same
-    // pointer moved along -- both only where the answer can hold a pointer at all. A callee with a
-    // body here says which of its arguments its answer is made of.
-    TCall(name, args, ty, _) -> st.lent && holds_pointer(ty) && call_carries(st, name, args)
-    TBinary(_, left, right, ty) ->
-        st.lent && holds_pointer(ty) && (carries(st, left) || carries(st, right))
-
-    // A closure's capture, read inside the closure's own body: the field of its environment holds
-    // whatever the closure was built from. And a field of a struct VALUE that carries the pointer may
-    // be it -- a field read through a pointer (`TDeref`) is somebody else's storage, and is not.
-    TField(r, _, ty) -> st.lent && holds_pointer(ty) && (closure_capture(st, r) || carries(st, r))
     TRecheck(after, _, _, _) -> carries(st, after)
     TSeq(exprs) -> !exprs.is_empty() && carries(st, exprs.at(exprs.len() - 1))
     TIf(_, then_block, else_block, _) ->
@@ -366,26 +257,6 @@ private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
     TIterate(_, _, _, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
     TCFor(_, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
     _ -> false
-
-// The address of a local that holds a lent pointer is a pointer to it, one step further away.
-private holds_local(st: &SelfAlias, place: TExpr) -> bool = *place.kind match
-    TLoad(n, _) -> st.holds(n)
-    _ -> false
-
-// `(*self).capture` inside a closure body whose environment is being followed.
-private closure_capture(st: &SelfAlias, r: TExpr) -> bool = *r.kind match
-    TDeref(env, _) -> texpr_type(env) match
-        Ptr(inner) -> is_closure_literal(*inner) && carries(st, env)
-        _ -> false
-    _ -> false
-
-private call_carries(st: &SelfAlias, name: string, args: Buf[TExpr]) -> bool
-    for i in 0..<args.len()
-        if carries(st, args.at(i)) && (st.answers.is_none() || st.answers.unwrap()(name, i))
-            return true
-
-    false
-end call_carries
 
 private any_carries(st: &SelfAlias, es: Buf[TExpr]) -> bool
     for item in es
@@ -411,7 +282,7 @@ end loop_carries
 
 // The values this loop's OWN breaks carry, which is what the loop yields: a break inside a nested
 // loop leaves that one instead.
-private own_break_values(stmts: Buf[TStmt]) -> Buf[TExpr]
+own_break_values(stmts: Buf[TStmt]) -> Buf[TExpr]
     var out: Buf[TExpr] = buf()
 
     for stmt in stmts
@@ -515,101 +386,16 @@ private written_one(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
             *place.kind match
                 TLoad(_, _) -> ()
                 _ -> got_out(a, scope, st, v, "is stored somewhere the call does not own")
-        TBox(v, _) -> if !spared_box(st, e.span) then got_out(a, scope, st, v, "is put on the heap")
-        TCall(name, args, _, _) ->
-            if st.lent
-                spare_scoped_boxes(st, name, args)
-                lent_handed(a, scope, st, e)
-            end if
-        _ -> if st.lent then lent_handed(a, scope, st, e)
+        TBox(v, _) -> got_out(a, scope, st, v, "is put on the heap")
+        _ -> ()
 end written_one
 
-// **A closure boxed straight into a `@scoped` parameter is not put on the heap past the call.** The
-// member runs it in another domain and finishes it before the `@lends` call that lent the scope
-// returns, so whatever lent pointer it captures is let go in time. Only the box written at the
-// argument is spared: one made earlier and held in a local could be handed anywhere else as well.
-private spare_scoped_boxes(st: &SelfAlias, name: string, args: Buf[TExpr])
-    if st.scoped.is_none() then return
-
-    for i in 0..<args.len()
-        if st.scoped.unwrap()(name, i)
-            val box = boxed_at(args.at(i))
-
-            if box.is_some() then st.spared.push(box.unwrap())
-        end if
-end spare_scoped_boxes
-
-// The box an argument is, seen through the erasure that makes it a `&Fn`.
-private boxed_at(e: TExpr) -> Option[Span] = *e.kind match
-    TBox(_, _) -> Some(e.span)
-    TErase(inner, _, _) -> boxed_at(inner)
-    _ -> None
-
-private spared_box(st: &SelfAlias, at: Span) -> bool
-    for item in st.spared
-        if item == at then return true
-
-    false
-end spared_box
-
-// Where the lent rule follows a pointer into somebody else: a callee whose body says whether it keeps
-// what it was handed, a buffer slot that keeps it outright, and the two calls nothing can see behind.
-private lent_handed(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
-    *e.kind match
-        TCall(name, args, _, _) ->
-            for i in 0..<args.len()
-                if carries(st, args.at(i)) && st.keeps.unwrap()(name, i)
-                    got_out(a, scope, st, args.at(i),
-                            s"is passed to '${qualified_name(name)}', which holds on to it")
-        TSlots(op, args, _, _) ->
-            if op == "slot_place" && args.len() == 3
-                got_out(a, scope, st, args.at(2), "is stored somewhere the call does not own")
-            else if op == "slot_put" && args.len() == 2
-                got_out(a, scope, st, args.at(1), "is stored somewhere the call does not own")
-        TCallPtr(_, args, _, _) ->
-            for arg in args
-                got_out(a, scope, st, arg, "is passed through a function pointer, which may hold on to it")
-        // A slot the trait promised to borrow is the exception, and only because every implementation
-        // of the promise has been held to letting the pointer go (`escape.sysl`'s `refuse_borrowed`).
-        TVCall(recv, slot, args, _, _) ->
-            val promised = promised_borrows(a, texpr_type(recv), slot)
-
-            for i in 0..<args.len()
-                var borrowed = false
-
-                for k in promised
-                    if k == i then borrowed = true
-
-                if !borrowed
-                    got_out(a, scope, st, args.at(i),
-                            "is passed through a trait object, which may hold on to it")
-        _ -> ()
-end lent_handed
-
-// A value handed back. A callee being summarized hands its caller what the call answers, and the
-// caller follows that answer itself, so returning is not keeping there.
-private returned_out(a: &Analysis, scope: Scope, st: &SelfAlias, v: TExpr)
-    if st.lent && (st.quiet || !holds_pointer(texpr_type(v))) then return
-
+// A value handed back.
+private returned_out(a: &Analysis, scope: Scope, st: &SelfAlias, v: TExpr) =
     got_out(a, scope, st, v, "is returned")
-end returned_out
 
 private got_out(a: &Analysis, scope: Scope, st: &SelfAlias, at: TExpr, how: string)
     if !carries(st, at) then return
-
-    if st.lent
-        st.escaped = true
-
-        if st.first_out.is_none() then st.first_out = Some(at.span)
-
-        if !st.quiet
-            a.fault(scope, at.span, s"'${st.lender}' lends this body a pointer that is valid only " +
-                    s"until the call returns, and this one $how — after the call it points at " +
-                    "storage the lender has taken back. Copy the value out instead, or do the work " +
-                    "inside the body")
-
-        return
-    end if
 
     a.fault(scope, at.span, "a '*self' method may not let a pointer into the receiver's own " +
             s"storage outlive the call, and this one $how — the receiver may be a field of a " +

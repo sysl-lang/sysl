@@ -382,22 +382,26 @@ print(mx.with((n) -> *n))
 20000
 ```
 
-**The address is lent, and the compiler holds the closure to giving it back.** `with` is declared
-[`@lends(body)`](/reference/memory/#a-pointer-lent-for-one-call), so a closure passed there may read
-and write through the address, and hand it to a function that only uses it, but may not let it
-outlive the call — the mistake an address returned from `lock` could never be protected from:
+**The address is lent, and the compiler holds the closure to giving it back.** A closure
+[borrows what it is handed for the call](/reference/memory/#a-borrowed-pointer-cannot-escape), so
+the one passed to `with` may read and write through the address, and hand it to a function that only
+uses it, but may not keep it — the mistake an address returned from `lock` could never be protected
+from:
 
 ```sysl
 import sysl.threads.*
 
-var m = Mutex.new(1)
-val p = m.with((n) -> n)
+static var spare = 0
+static var kept: *int = &spare
 
-print(*p)
+var m = Mutex.new(1)
+
+m.with((n) -> kept = n)
+print(*kept)
 ```
 
 ```error
-lends this body a pointer that is valid only until the call returns, and this one is returned
+a closure borrows what it is handed for the call, and this one keeps its parameter 'n' (it is stored in 'kept')
 ```
 
 Rust answers the same question with a guard whose destruction releases the lock. A sysl

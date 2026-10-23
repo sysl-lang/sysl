@@ -85,21 +85,9 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
     loop
         if !p.at_kw("@") && !p.at_kw("#") then break
 
-        // **`@borrows` says something only on a trait's method.** A free function's body is right
-        // here and the analysis reads the answer out of it, so a promise written above one would
-        // restate what the compiler already knows and would go stale the moment the body changed.
-        // The refusal sits after the word, at its argument list, where the reference puts it.
-        if p.at_kw("@") && attr_name(p) == "borrows"
-            p.bump()
-            p.bump()
-            p.fault(p.here(), "'@borrows' is about a call whose body the compiler cannot see, so it says something only on a trait's method. A free function's body is right here and the analysis reads the answer out of it — a promise written above one would restate what the compiler already knows, and would go stale the moment the body changed")
-            skip_line(p)
-            break
-        end if
-
         // **`@scoped` is about a member's receiver**: the promise is that what the member runs
-        // finishes before the `@lends` call that lent its `*self` returns, and a free function has no
-        // receiver for that call to have lent. Refused at the argument list, as `@borrows` is.
+        // finishes before the call that lent its `*self` returns, and a free function has no receiver
+        // for that call to have lent. Refused at the argument list, where the reference puts it.
         if p.at_kw("@") && attr_name(p) == "scoped"
             p.bump()
             p.bump()
@@ -120,8 +108,7 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
 end parse_attr_list
 
 // The annotations a member may carry: the ones about a parameter, and the three about the function
-// the member lowers to. `in_trait` is whether the member is a trait's own declaration, the one place
-// `@borrows` says anything.
+// the member lowers to. `in_trait` is whether the member is a trait's own declaration.
 parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
     var out: Buf[Attr] = buf()
 
@@ -131,15 +118,10 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
         val at = p.here()
         val word = attr_name(p)
 
-        // **`@borrows` above a method that has its body is the free function's case again**: the
-        // body is right here and the analysis reads the answer out of it. An implementation's is
-        // refused too, because the promise is the trait's to make -- an implementation that could
-        // write one would be granting itself the exemption its trait never gave. Refused at the
-        // argument list, as the free function's is.
-        if word == "borrows" && !p.at_kw("#") && !in_trait
-            p.bump()
-            p.bump()
-            p.fault(p.here(), "'@borrows' is about a call whose body the compiler cannot see, so it says something only on a trait's method. A method declared with its body — a type's own, or one implementing a trait — is read the way a free function is: the analysis takes the answer out of the body, and a promise written above it would restate what the compiler already knows and go stale the moment the body changed. A trait's promise is written once, on the trait's declaration, and every implementation is checked against it")
+        // **`@keeps` above a member is the free function's case**: the body is right here, or the
+        // member is a trait's, whose parameters are borrowed for the call by rule.
+        if word == "keeps" && !p.at_kw("#")
+            p.fault(at, keeps_off_extern())
             skip_line(p)
             break
         end if
@@ -178,13 +160,17 @@ end parse_member_attrs
 // `@scoped` anywhere but above a method: the promise is about the method's receiver and a callable
 // parameter, so a declaration without the two has nothing for it to be about.
 scoped_on_free_function() -> string =
-    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a '@lends' call to have lent"
+    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a call to have lent"
 
 scoped_on_field() -> string =
-    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a field and a variant are never called, and have no parameter to run"
+    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the call that lent the method's '*self' returns, so it stands above a method — a field and a variant are never called, and have no parameter to run"
+
+// `@keeps(...)` anywhere but above an `extern`: a body the compiler can read says what it keeps.
+keeps_off_extern() -> string =
+    "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what it keeps out of it"
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -203,7 +189,7 @@ end layout_attr_on_member
 private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
-    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
+    for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped"]
         if word == w then return true
 
@@ -252,7 +238,7 @@ builtin_attr_word(w: string) -> bool
 
     for word in ["assert", "annotation", "ignore", "test", "setup", "teardown", "setup_all", "teardown_all",
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
-                 "section", "crossing", "domain", "borrows", "lends", "disjoint", "guards", "needs",
+                 "section", "crossing", "domain", "keeps", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped"]
         if word == w then return true
@@ -390,8 +376,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "section" then return Some(parse_section_attr(p))
     if word == "crossing" then return Some(parse_crossing_attr(p))
     if word == "domain" then return parse_domain_attr(p)
-    if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
-    if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
+    if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
@@ -433,7 +418,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header. An annotation a program declares, a struct marked '@annotation', stands above a type declaration, a field or a variant")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, '@needs(...)' and '@abandons' mark a function or an 'extern', and '@keeps(...)' an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header. An annotation a program declares, a struct marked '@annotation', stands above a type declaration, a field or a variant")
     skip_line(p)
     None
 end parse_attribute
@@ -509,7 +494,7 @@ private parse_frame_names(p: *Parser, word: string) -> Buf[string]
     out
 end parse_frame_names
 
-// `@crossing(state)`, `@borrows(bytes)`, `@needs(heap)` -- each names at least one thing, and there
+// `@crossing(state)`, `@keeps(context)`, `@needs(heap)` -- each names at least one thing, and there
 // is no empty form: a declaration that names none says so by not writing the annotation.
 private parse_named_list(p: *Parser, word: string) -> Buf[string]
     var out: Buf[string] = buf()
@@ -708,13 +693,11 @@ private named_list_refusal(word: string) -> string
 
     if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
 
-    if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
+    if word == "keeps" then return "'@keeps' names the parameters a C function holds on to past the call, in parentheses — '@keeps(context)'. There is no empty form: an 'extern' that keeps nothing it is handed says so by not writing the annotation"
 
-    if word == "scoped" then return "'@scoped' names the callable parameters a member runs in another concurrency domain and finishes before the '@lends' call that lent its receiver returns, in parentheses — '@scoped(f)'. There is no empty form: a member that waits for nothing it starts says so by not writing the annotation"
+    if word == "scoped" then return "'@scoped' names the callable parameters a member runs in another concurrency domain and finishes before the call that lent its receiver returns, in parentheses — '@scoped(f)'. There is no empty form: a member that waits for nothing it starts says so by not writing the annotation"
 
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
-
-    if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
 
     if word == "disjoint" then return "'@disjoint' names the pointer and slice parameters whose memory nothing else reaches while a call runs, in parentheses — '@disjoint(y, x)'. There is no empty form: a function whose parameters may overlap says so by not writing the annotation"
 
@@ -984,7 +967,6 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
                 f.marks.copies = cs
             Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
-            Lends(ns) -> f.marks.lends = ns
             Disjoint(ns) -> f.marks.disjoint = ns
             NoInline -> f.marks.noinline = true
             Inline(always) ->
@@ -1005,8 +987,6 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Crossing(ns, cs) ->
                 m.crossing = ns
                 m.marks.copies = cs
-            Borrows(ns) -> m.borrows = ns
-            Lends(ns) -> m.marks.lends = ns
             Scoped(ns) -> m.marks.scoped = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
@@ -1141,14 +1121,15 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
 
     // `@needs(...)`, `@blocks` and `@abandons` are the annotations an `extern` takes -- it is the
     // declaration each exists for as much as a function is, a symbol C defines being able to reach a
-    // capability, to wait, or to leave its caller for good as readily as a body can.
+    // capability, to wait, or to leave its caller for good as readily as a body can. `@keeps(...)`
+    // is an `extern`'s alone: a body the compiler can read says what it keeps.
     refuse_async_extern(p)
 
     if p.at_kw("extern")
         refuse_unless(p, at, attrs, "extern")
         return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
                                                    any_is(attrs, "blocks"),
-                                                   any_is(attrs, "abandons")))
+                                                   any_is(attrs, "abandons"), kept_names(attrs)))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -1189,8 +1170,8 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         None -> ()
 
     // The refusal sits at the declaration the annotations stand above, as `refuse_unless`'s do. **An
-    // empty list is one whose first annotation was already refused** (`@` with no word, `@borrows`,
-    // a word that is no annotation), and that refusal is the whole story: the cursor may have left
+    // empty list is one whose first annotation was already refused** (`@` with no word, `@scoped`
+    // above a free function, a word that is no annotation), and that refusal is the whole story: the cursor may have left
     // the line by now, so a second sentence would land on the next one, about a declaration nobody
     // wrote there.
     if attrs.len() > 0 then p.fault(at, attributed_refusal(attrs))
@@ -1222,9 +1203,9 @@ private may_carry(form: string, a: Attr) -> bool
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
-        attr_word(a) == "abandons"
+        attr_word(a) == "abandons" || attr_word(a) == "keeps"
 
-    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards" &&
+    !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "guards" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1259,6 +1240,8 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // could not reach the code it is about; the C declaration's `restrict` is where it is made.
     if any_is(attrs, "disjoint")
         return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
+
+    if any_is(attrs, "keeps") then return keeps_off_extern()
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
@@ -1612,6 +1595,16 @@ private capabilities_of(attrs: Buf[Attr]) -> Buf[string]
 
     out
 end capabilities_of
+
+// The parameters a `@keeps(...)` named, in the order written.
+private kept_names(attrs: Buf[Attr]) -> Buf[string]
+    for attr in attrs
+        attr match
+            Keeps(ns) -> return ns
+            _ -> ()
+
+    buf()
+end kept_names
 
 // The layout pair, the C name and the guarded fields, folded onto the struct they were written above.
 private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt

@@ -1,0 +1,558 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The keeps-analysis (`keeps.sysl`): which `*T` parameters a function keeps, worked out from its
+// body to a fixed point, and the one rule at the call -- the address of storage that is not the
+// program's to give away may not be passed to a parameter that keeps it. `reference/memory.md § A
+// borrowed pointer cannot escape` is the specification; every refusal here is one of its sentences.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kps_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kps").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kps_outcome
+
+private kps_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kps_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kps_prints
+
+private kps_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = kps_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end kps_refused
+
+// A module pointer to store into, and a function that keeps what it is handed by storing it there.
+private kps_store() -> string = raw"""
+    static var spare = 0
+    static var held: *int = &spare
+
+    store(p: *int)
+        held = p
+
+    """
+
+private kps_kept() -> string = "'store' keeps its parameter 'p' (it is stored in 'held'), and "
+
+// -- the design's example ---------------------------------------------------------------------------
+
+@test("a method that stores its parameter in a field is refused the address of a local")
+kps_design_example()
+    kps_refused(raw"""
+        struct Registry
+            last: *int
+
+            remember(*self, p: *int)
+                self.last = p
+
+        run(r: *Registry)
+            var n = 5
+            r.remember(&n)
+
+        var g = 0
+        var r = Registry(&g)
+
+        run(&r)
+        """, "'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the " +
+             "address of a local of 'run'")
+
+// -- each way a function keeps a parameter ------------------------------------------------------------
+
+@test("storing it in module storage keeps it")
+kps_kept_by_a_global()
+    kps_refused(kps_store() + "run()\n    var n = 1\n    store(&n)\n\nrun()\n",
+                kps_kept() + "'&n' is the address of a local of 'run'")
+
+@test("storing a box that holds it keeps it")
+kps_kept_by_a_box()
+    kps_refused(raw"""
+        struct Holder
+            p: *int
+
+        struct Shelf
+            item: &Holder
+
+            put(*self, p: *int)
+                self.item = Holder(p)
+
+        static var spare = 0
+        static var shelf = Shelf(Holder(&spare))
+
+        run()
+            var n = 1
+            shelf.put(&n)
+
+        run()
+        """, "'put' keeps its parameter 'p' (it is stored in 'self.item'), and '&n' is the address " +
+             "of a local of 'run'")
+
+@test("storing a closure that captured it keeps it")
+kps_kept_by_a_closure()
+    kps_refused(raw"""
+        static var later: &Fn() -> int = () -> 0
+
+        defer_read(p: *int)
+            later = () -> *p
+
+        run()
+            var n = 1
+            defer_read(&n)
+
+        run()
+        print(later())
+        """, "'defer_read' keeps its parameter 'p' (it is stored in 'later'), and '&n' is the " +
+             "address of a local of 'run'")
+
+@test("pushing it into a buffer keeps it")
+kps_kept_by_a_buf()
+    kps_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        collect(p: *int, into: *Buf[*int])
+            into.push(p)
+
+        static var all: Buf[*int] = buf()
+
+        run()
+            var n = 1
+            collect(&n, &all)
+
+        run()
+        """, "'collect' keeps its parameter 'p' (it is passed to 'push', which keeps it), and '&n' " +
+             "is the address of a local of 'run'")
+
+@test("passing it to a parameter that keeps it keeps it, however deep")
+kps_kept_transitively()
+    kps_refused(kps_store() + raw"""
+        relay(p: *int) = store(p)
+        relay_again(p: *int) = relay(p)
+
+        run()
+            var n = 1
+            relay_again(&n)
+
+        run()
+        """, "'relay_again' keeps its parameter 'p' (it is passed to 'relay', which keeps it), and " +
+             "'&n' is the address of a local of 'run'")
+
+@test("handing it back as an integer keeps it")
+kps_kept_by_an_integer_return()
+    kps_refused(raw"""
+        address(p: *int) -> usize = usize(p)
+
+        run() -> usize
+            var n = 1
+            address(&n)
+
+        print(run() > 0)
+        """, "'address' keeps its parameter 'p' (it is returned as 'usize'), and '&n' is the " +
+             "address of a local of 'run'")
+
+// -- what is not keeping ----------------------------------------------------------------------------
+
+@test("a pointer handed back as a pointer derived from the argument is lent as long as the argument")
+kps_derived_return_accepted()
+    kps_prints(raw"""
+        struct S
+            x: int
+            y: int
+
+        field(s: *S) -> *int = &s.y
+
+        bump(p: *int)
+            *p += 1
+
+        run() -> int
+            var s = S(1, 2)
+            val p = field(&s)
+
+            *p += 10
+            bump(field(&s))
+            s.y
+
+        print(run())
+        """, "13\n")
+
+@test("and the caller follows that answer: keeping it is keeping the argument")
+kps_derived_return_followed()
+    kps_refused(kps_store() + raw"""
+        struct S
+            x: int
+            y: int
+
+        field(s: *S) -> *int = &s.y
+
+        run()
+            var s = S(1, 2)
+            store(field(&s))
+
+        run()
+        """, kps_kept() + "'field(&s)' holds the address of a local of 'run'")
+
+@test("and a function may not hand back an answer made of its own frame")
+kps_frame_answer_returned()
+    kps_refused(raw"""
+        struct S
+            x: int
+            y: int
+
+        field(s: *S) -> *int = &s.y
+
+        run() -> *int
+            var s = S(1, 2)
+
+            field(&s)
+
+        print(*run())
+        """, "'field(&s)' is returned, but it holds the address of a local of 'run', whose storage " +
+             "ends when 'run' returns")
+    kps_refused(raw"""
+        run() -> *int
+            var n = 1
+            val q = &n
+
+            return q
+
+        print(*run())
+        """, "'q' is returned, but it holds the address of a local of 'run'")
+
+@test("a pointer read out of what the argument points at is somebody else's, and may be kept")
+kps_pointer_read_out_accepted()
+    kps_prints(kps_store() + raw"""
+        struct Queue
+            head: *int
+
+        first(q: *Queue) -> *int = q.head
+
+        static var seven = 7
+
+        run()
+            var q = Queue(&seven)
+            store(first(&q))
+
+        run()
+        print(*held)
+        """, "7\n")
+
+@test("reading, writing and passing it to callees that only use it is accepted")
+kps_used_and_let_go()
+    kps_prints(raw"""
+        struct Account
+            balance: int
+            edits: int
+
+            deposit(*self, n: int)
+                self.balance += n
+                self.edits += 1
+
+        add_ten(n: *int)
+            *n += 10
+
+        twice(p: *int)
+            add_ten(p)
+            add_ten(p)
+
+        run() -> int
+            var acct = Account(100, 0)
+            var n = 1
+
+            acct.deposit(5)
+            twice(&n)
+            twice(&acct.balance)
+            acct.balance + n + acct.edits
+
+        print(run())
+        """, "147\n")
+
+@test("storage that outlives the call -- module storage, a box's -- may be handed to a keeper")
+kps_lasting_storage_accepted()
+    kps_prints(kps_store() + raw"""
+        struct Cell
+            v: int
+
+        var g = 4
+        val boxed: &Cell = Cell(5)
+
+        store(&g)
+        print(*held)
+        store(&boxed.v)
+        print(*held)
+        """, "4\n5\n")
+
+// -- recursion settles on what the body does ----------------------------------------------------------
+
+@test("a recursive function that keeps on one branch keeps, and one that never does is accepted")
+kps_recursion()
+    kps_refused(kps_store() + raw"""
+        rec_keep(p: *int, n: int)
+            if n == 0 then store(p) else rec_keep(p, n - 1)
+
+        run()
+            var n = 1
+            rec_keep(&n, 3)
+
+        run()
+        """, "'rec_keep' keeps its parameter 'p' (it is passed to 'store', which keeps it), and '&n' " +
+             "is the address of a local of 'run'")
+    kps_prints(raw"""
+        count(p: *int, n: int) -> int = if n == 0 then *p else count(p, n - 1) + 1
+
+        run() -> int
+            var n = 10
+            count(&n, 3)
+
+        print(run())
+        """, "13\n")
+
+@test("mutual recursion is followed to the call that keeps")
+kps_mutual_recursion()
+    kps_refused(kps_store() + raw"""
+        ping(p: *int, n: int)
+            if n > 0 then pong(p, n - 1)
+
+        pong(p: *int, n: int)
+            if n == 0 then store(p) else ping(p, n)
+
+        run()
+            var n = 1
+            ping(&n, 3)
+
+        run()
+        """, "'ping' keeps its parameter 'p' (it is passed to 'pong', which keeps it), and '&n' is " +
+             "the address of a local of 'run'")
+
+// -- every kind of storage that is not the program's to give away -------------------------------------
+
+@test("a parameter's place, and a field of one")
+kps_parameter_place_refused()
+    kps_refused(kps_store() + "run(n: int)\n    store(&n)\n\nrun(1)\n",
+                kps_kept() + "'&n' is the address of the parameter 'n' of 'run', a copy in its frame")
+    kps_refused(kps_store() + raw"""
+        struct Pair
+            a: int
+            b: int
+
+        run(pair: Pair)
+            store(&pair.b)
+
+        run(Pair(1, 2))
+        """, kps_kept() + "'&pair.b' is the address of a field of the parameter 'pair' of 'run'")
+
+@test("a field of a local, and a value made in place")
+kps_field_and_temporary_refused()
+    kps_refused(kps_store() + raw"""
+        struct Pair
+            a: int
+            b: int
+
+        run()
+            var pair = Pair(1, 2)
+            store(&pair.b)
+
+        run()
+        """, kps_kept() + "'&pair.b' is the address of a field of 'pair', a local of 'run'")
+    kps_refused(kps_store() + "make() -> int = 3\n\nrun()\n    store(&make())\n\nrun()\n",
+                kps_kept() + "'&make()' is the address of a value made in place in 'run'")
+
+@test("a local that holds such an address, and a struct built around one")
+kps_held_address_refused()
+    kps_refused(kps_store() + raw"""
+        run()
+            var n = 1
+            val q = &n
+
+            store(q)
+
+        run()
+        """, kps_kept() + "'q' holds the address of a local of 'run'")
+    kps_refused(raw"""
+        struct Holder
+            p: *int
+
+        static var spare = 0
+        static var held: *int = &spare
+
+        keep_holder(h: Holder)
+            held = h.p
+
+        run()
+            var n = 1
+
+            keep_holder(Holder(&n))
+
+        run()
+        """, "'keep_holder' keeps its parameter 'h' (it is stored in 'held'), and 'Holder(&n)' " +
+             "holds the address of a local of 'run'")
+
+@test("a '*self' method that keeps its receiver is refused on a local, and accepted elsewhere")
+kps_self_method()
+    kps_refused(raw"""
+        struct Node
+            next: *Node
+
+            link(*self)
+                self.next = self
+
+        run()
+            var node = Node(null)
+            node.link()
+
+        run()
+        """, "'link' keeps its parameter 'self' (it is stored in 'self.next'), and 'node' is a local " +
+             "of 'run'")
+    kps_prints(raw"""
+        struct Node
+            v: int
+            next: *Node
+
+            link(*self)
+                self.next = self
+
+        var node = Node(4, null)
+
+        node.link()
+        print(node.next.v)
+        """, "4\n")
+
+// -- bodies reached through a default -----------------------------------------------------------------
+
+@test("a closure borrows what it is handed: one that keeps it is refused, one that uses it runs")
+kps_closure_borrows()
+    kps_refused(kps_store() + raw"""
+        apply(n: int, f: *int -> unit) -> int
+            var v = n
+
+            f(&v)
+            v
+
+        print(apply(1, (p) -> store(p)))
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'p' " +
+             "(it is passed to 'store', which keeps it)")
+    kps_prints(raw"""
+        apply(n: int, f: *int -> unit) -> int
+            var v = n
+
+            f(&v)
+            v
+
+        print(apply(1, (p) -> *p += 41))
+        """, "42\n")
+
+@test("a lock's body may use the address it is lent, and is refused keeping it")
+kps_lock_body()
+    kps_prints(raw"""
+        import sysl.threads.Mutex
+
+        val m = Mutex.new(1)
+
+        m.with((v) -> *v += 1)
+        print(m.with((v) -> *v * 10))
+        """, "20\n")
+    kps_refused(kps_store() + raw"""
+        import sysl.threads.Mutex
+
+        val m = Mutex.new(1)
+
+        m.with((v) -> store(v))
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'v' " +
+             "(it is passed to 'store', which keeps it)")
+
+@test("a function whose address is taken borrows what it is handed")
+kps_addressed_function()
+    kps_refused(kps_store() + raw"""
+        keep_it(p: *int)
+            store(p)
+
+        apply(f: *int -> unit)
+            var v = 1
+
+            f(&v)
+
+        apply(keep_it)
+        """, "'keep_it' keeps its parameter 'p' (it is passed to 'store', which keeps it), and its " +
+             "address is taken")
+
+// -- an extern borrows unless it says '@keeps' ---------------------------------------------------------
+
+@test("an extern borrows what it is handed")
+kps_extern_borrows()
+    kps_prints(raw"""
+        extern "strlen" c_strlen(s: *u8) -> usize
+
+        run() -> usize
+            var bytes: [4]u8 = [104, 105, 33, 0]
+
+            c_strlen(&bytes[0])
+
+        print(run())
+        """, "3\n")
+
+@test("and one whose declaration says '@keeps(p)' keeps p")
+kps_extern_keeps()
+    kps_refused(raw"""
+        @keeps(ctx)
+        extern "sysl_kps_register" register(ctx: *int, n: int)
+
+        run()
+            var n = 1
+            register(&n, 2)
+
+        run()
+        """, "'register' keeps its parameter 'ctx' (its declaration says '@keeps(ctx)'), and '&n' is " +
+             "the address of a local of 'run'")
+
+@test("'@keeps' marks an extern function and nothing else, and names its parameters once each")
+kps_keeps_attribute_refusals()
+    kps_refused("@keeps(p)\nkeeper(p: *int) = ()\n\nprint(1)\n",
+                "'@keeps(...)' names the parameters a C function holds on to past the call, so it " +
+                "marks an 'extern'")
+    kps_refused("struct S\n    n: int\n\n    @keeps(p)\n    keep(*self, p: *int) = ()\n\nprint(1)\n",
+                "'@keeps(...)' names the parameters a C function holds on to past the call, so it " +
+                "marks an 'extern'")
+    kps_refused("@keeps(p)\nextern var errno_like: int\n\nprint(1)\n",
+                "an 'extern' variable is storage, which nothing calls")
+    kps_refused("@keeps(q)\nextern \"sysl_kps_x\" x(p: *int)\n\nprint(1)\n",
+                "'@keeps' names 'q', which is not a parameter of 'x' — its parameters are 'p'")
+    kps_refused("@keeps(p, p)\nextern \"sysl_kps_x\" x(p: *int)\n\nprint(1)\n", "'@keeps' names 'p' twice")
+    kps_refused("@keeps()\nextern \"sysl_kps_x\" x(p: *int)\n\nprint(1)\n",
+                "'@keeps' names the parameters a C function holds on to past the call, in parentheses")
+
+// -- the annotations this replaced are gone --------------------------------------------------------------
+
+@test("'@lends' is an annotation nothing takes")
+kps_lends_is_unknown()
+    kps_refused("@lends(body)\nwith_one(body: *int -> int) -> int = 0\n\nprint(1)\n",
+                "'lends' is not an annotation a declaration takes")
+    kps_refused("struct S\n    n: int\n\n    @lends(body)\n    with(*self, body: *int -> int) -> int = 0\n\n" +
+                "print(1)\n", "the only annotations a member may carry are the ones about a parameter")

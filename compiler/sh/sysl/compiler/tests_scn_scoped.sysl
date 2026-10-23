@@ -6,12 +6,12 @@ import sysl.process.capture
 import sysl.text.{Search, replace_all}
 
 // `@scoped(f)` -- a member that runs `f` in another concurrency domain and finishes it before the
-// `@lends` call that lent its `*self` receiver returns (`docs/design/scope.md`, `reference/attributes.md
-// § @scoped`). What it may name and stand above (`lends.sysl`'s `check_scoped_names`, the parser), what
-// it implies (`@crossing(f)`), and what the lent rule lets a body do with the lent scope because of it
-// (`lends.sysl`'s `lent_keeps`, `self_alias.sysl`'s spared boxes). The scope here is a test-local
-// struct that queues its jobs and runs them when the lender is done, which is the shape every
-// scheduler's scope has.
+// call that lent its `*self` receiver returns (`docs/design/scope.md`, `reference/attributes.md §
+// @scoped`). What it may name and stand above (`keeps.sysl`'s `check_scoped_names`, the parser), what
+// it implies (`@crossing(f)`), and what the keeps-analysis lets a closure do with the scope it is lent
+// because of it: a call of a scoped member keeps neither its receiver nor what it runs
+// (`keeps.sysl`'s `lent_by_rule`). The scope here is a test-local struct that queues its jobs and runs
+// them when the lender is done, which is the shape every scheduler's scope has.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -92,7 +92,6 @@ private scn_scope(marks: string) -> string = replace_all(raw"""
     struct Runner
         n: int
 
-        @lends(body)
         scope[R](self, body: *Scope -> R) -> R
             var s = Scope(buf())
             val r = body(&s)
@@ -103,7 +102,7 @@ private scn_scope(marks: string) -> string = replace_all(raw"""
     """, "MARK", marks)
 
 private scn_lent() -> string =
-    "'Runner.scope' lends this body a pointer that is valid only until the call returns, and this one "
+    "a closure borrows what it is handed for the call, and this one keeps its parameter 's' "
 
 // -- what a body may do with the lent scope -------------------------------------------------------
 
@@ -116,20 +115,14 @@ scn_spawn_on_the_lent_scope()
         """, "true\n17\n")
 
 // The same program without the annotation is the refusal the design starts from: the receiver is
-// kept by the job `spawn` queues, and the closure is boxed onto the heap.
-@test("without '@scoped' the same spawn is kept, and its closure put on the heap")
+// kept by the job `spawn` queues.
+@test("without '@scoped' the same spawn keeps the scope the closure was lent")
 scn_unscoped_spawn_refused()
-    if xvr_no_library() then return
-
-    val out = scn_outcome(scn_scope("") + raw"""
+    scn_refused(scn_scope("") + raw"""
         print(Runner(0).scope((s) ->
             s.spawn((t) -> print(usize(s) == usize(t)))
             17))
-        """)
-
-    assert_eq(out.1, -1, out.0)
-    assert(out.0.index_of(scn_lent() + "is passed to 'Scope.spawn', which holds on to it").is_some(), out.0)
-    assert(out.0.index_of(scn_lent() + "is put on the heap").is_some(), out.0)
+        """, scn_lent() + "(it is passed to 'spawn', which keeps it)")
 
 @test("the scope handed to a helper that spawns on it is let go, the helper's body being what says so")
 scn_spawn_through_a_helper()
@@ -154,12 +147,13 @@ scn_handle_joined_inside()
 
 // -- what is still refused ----------------------------------------------------------------------------
 
-// `Joined` is made of the scope pointer, and the lent rule follows what a call answers.
-@test("returning the handle from the body is refused as returning the scope is")
+// `Joined` is made of the scope pointer, and a caller follows what a call answers: the body may hand
+// it back, and the lender that answers it is then answering the address of its own local.
+@test("returning the handle from the body hands the lender's local back out of the lender")
 scn_handle_returned()
     scn_refused(scn_scope("@scoped(f)") + raw"""
         val h = Runner(0).scope((s) -> s.spawn((t) -> ()))
-        """, scn_lent() + "is returned")
+        """, "'r' is returned, but it holds the address of a local of 'scope'")
 
 @test("storing the handle outside the body is refused")
 scn_handle_stored()
@@ -173,20 +167,21 @@ scn_handle_stored()
         Runner(0).scope((s) ->
             sp.h = s.spawn((t) -> ())
             0)
-        """, scn_lent() + "is stored somewhere the call does not own")
+        """, scn_lent() + "(it is stored in 'sp.h')")
 
-// Only the box written at the argument is spared: one made earlier could be handed anywhere.
-@test("a closure boxed into a local before the spawn is put on the heap")
+// A box is followed like any other value: one made earlier and handed to the scoped parameter is let
+// go there as the one written at the argument is.
+@test("a closure boxed into a local before the spawn is let go at the scoped parameter")
 scn_box_made_earlier()
-    scn_refused(scn_scope("@scoped(f)") + raw"""
-        Runner(0).scope((s) ->
+    scn_prints(scn_scope("@scoped(f)") + raw"""
+        print(Runner(0).scope((s) ->
             val job: &sync Fn(*Scope) -> unit = (t) -> print(usize(s) == usize(t))
 
             s.spawn(job)
-            0)
-        """, scn_lent() + "is put on the heap")
+            9))
+        """, "true\n9\n")
 
-@test("the lent scope captured into a member that is not scoped is put on the heap")
+@test("the lent scope captured into a member that is not scoped is kept")
 scn_unscoped_member_keeps()
     scn_refused(scn_scope("@scoped(f)") + raw"""
         struct Pool
@@ -201,7 +196,7 @@ scn_unscoped_member_keeps()
         Runner(0).scope((s) ->
             pp.detach(() -> print(s.jobs.len()))
             0)
-        """, scn_lent() + "is put on the heap")
+        """, scn_lent() + "(it is passed to 'detach', which keeps it)")
 
 // -- '@scoped' implies '@crossing' ------------------------------------------------------------------------
 
@@ -289,9 +284,9 @@ scn_calls_accepted()
 
 @test("a receiver taken by value, by '&self', or not at all is refused")
 scn_receiver_refused()
-    val head = "'@scoped' promises that what 'Chan.run' runs finishes before the '@lends' call that " +
-               "lent its receiver returns, so the receiver is the pointer that call lent, written " +
-               "'*self' — this one "
+    val head = "'@scoped' promises that what 'Chan.run' runs finishes before the call that lent its " +
+               "receiver returns, so the receiver is the pointer that call lent, written '*self' — " +
+               "this one "
 
     scn_refused(scn_chan("@scoped(f)", "run(self, f: &sync Fn() -> int) -> int = f()"),
                 head + "takes 'self' by value, a copy rather than the pointer a call lends")
@@ -304,21 +299,20 @@ scn_receiver_refused()
 scn_free_function()
     scn_refused("@scoped(f)\nrun(f: &sync Fn() -> int) -> int = f()\n\nprint(run(() -> 1))\n",
                 "'@scoped' says a method runs a callable parameter in another concurrency domain and " +
-                "finishes it before the '@lends' call that lent the method's '*self' returns, so it " +
-                "stands above a method — a free function has no receiver for a '@lends' call to have lent")
+                "finishes it before the call that lent the method's '*self' returns, so it stands " +
+                "above a method — a free function has no receiver for a call to have lent")
 
 @test("above a field it is refused, a field never being called")
 scn_field()
     scn_refused("struct Chan\n    @scoped(f)\n    f: int\n\nprint(1)\n",
                 "'@scoped' says a method runs a callable parameter in another concurrency domain and " +
-                "finishes it before the '@lends' call that lent the method's '*self' returns, so it " +
-                "stands above a method — a field and a variant are never called, and have no " +
-                "parameter to run")
+                "finishes it before the call that lent the method's '*self' returns, so it stands " +
+                "above a method — a field and a variant are never called, and have no parameter to run")
 
 @test("'@scoped' takes at least one name")
 scn_empty()
     scn_refused(scn_chan("@scoped()", "run(*self, f: &sync Fn() -> int) -> int = f()"),
                 "'@scoped' names the callable parameters a member runs in another concurrency domain " +
-                "and finishes before the '@lends' call that lent its receiver returns, in parentheses " +
+                "and finishes before the call that lent its receiver returns, in parentheses " +
                 "— '@scoped(f)'. There is no empty form: a member that waits for nothing it starts " +
                 "says so by not writing the annotation")

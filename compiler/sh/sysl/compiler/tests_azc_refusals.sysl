@@ -6,9 +6,10 @@ import sysl.text.Search
 
 // Five of the reference's analyzer suites, ported: a struct named through its module
 // (`AnalyzerDeclErrorTests`), the annotations a member may carry (`MemberAttrTests`), a `val` handed
-// to a method that writes through it (`ValReceiverTests`), `@borrows` (`BorrowsAttrTests`), and what
-// a refused `impl` member takes with it (`ImplMemberRefusalTests`). Every message is quoted from
-// 0.0.162 over the same tree.
+// to a method that writes through it (`ValReceiverTests`), a trait's method borrowing what it is
+// handed (`BorrowsAttrTests`, whose annotation is now the rule), and what a refused `impl` member
+// takes with it (`ImplMemberRefusalTests`). Every message is quoted from 0.0.162 over the same tree,
+// but for the ones the keeps-analysis reworded.
 
 // -- a struct declared in another module ----------------------------------------------------------
 
@@ -356,23 +357,20 @@ azc_a_val_holding_a_reference()
             print(h.xs.len())
         """, "2\n")
 
-// -- @borrows -------------------------------------------------------------------------------------
+// -- a trait's method borrows its parameters ------------------------------------------------------------
 
-private azc_sink(promise: bool) -> string
-    val head = if promise then "trait Sink\n    @borrows(bytes)\n" else "trait Sink\n"
+private azc_sink() -> string = raw"""
+    trait Sink
+        put(*self, bytes: []const u8)
 
-    head + raw"""
-            put(*self, bytes: []const u8)
+    struct Counter
+        n: usize
 
-        struct Counter
-            n: usize
+    impl Sink for Counter
+        put(*self, bytes: []const u8)
+            self.n += bytes.len
 
-        impl Sink for Counter
-            put(*self, bytes: []const u8)
-                self.n += bytes.len
-
-        """
-end azc_sink
+    """
 
 private azc_lends() -> string = raw"""
     var c: Counter
@@ -397,7 +395,7 @@ end azc_escapes
 azc_a_borrowed_array_stays_in_the_frame()
     if !rng_ready() then return
 
-    val src = azc_sink(true) + azc_lends()
+    val src = azc_sink() + azc_lends()
     val notes = azc_escapes(src)
 
     assert(notes.contains("no arrays were promoted to the heap"), notes)
@@ -412,27 +410,33 @@ azc_a_borrowed_array_stays_in_the_frame()
 azc_the_explain_channel_is_taken_back()
     if !rng_ready() then return
 
-    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", azc_sink(true) + azc_lends())])
+    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", azc_sink() + azc_lends())])
 
     assert(s.err.contains("no arrays were promoted to the heap"), s.err)
     assert(!explaining(), "the report is still asked for after the command line was answered")
 
-@test("and is promoted where the trait does not promise")
+// A closure may keep what it is handed, so a call trait's object is the one that borrows nothing.
+@test("and is promoted where it goes through a closure behind a '&Fn'")
 azc_an_unpromised_array_is_promoted()
     if !rng_ready() then return
 
-    val notes = azc_escapes(azc_sink(false) + azc_lends())
+    val notes = azc_escapes(raw"""
+        val f: &Fn([]const u8) -> usize = (bytes) -> bytes.len
+        var buf: [8]u8
+
+        buf[0] = 7u8
+        print(f(buf[0..<4]))
+        """)
 
     assert_eq(xvr_count(notes, "is promoted"), 1, notes)
-    assert(notes.contains("main.sysl:16:10: 'buf' is promoted to the heap, because this " +
-                          "view of it is passed through a trait object, which may hold on " +
-                          "to it"), notes)
+    assert(notes.contains("'buf' is promoted to the heap, because this view of it is passed " +
+                          "through"), notes)
 
-@test("one that keeps what it was lent is refused, by the name the trait gave it")
+@test("one that keeps what it was lent is refused, by the parameter's name")
 azc_an_implementation_that_keeps_is_refused()
     if !rng_ready() then return
 
-    azc_refuses(azc_sink(true) + raw"""
+    azc_refuses(azc_sink() + raw"""
         struct Bad
             held: []const u8
 
@@ -445,15 +449,15 @@ azc_an_implementation_that_keeps_is_refused()
         var buf: [8]u8
 
         s.put(buf[0..<4])
-        """, "error: 'Bad.put' keeps what it is passed as 'bytes', but 'Sink' declares that " +
-        "parameter borrowed for the call — it may be a view of the caller's stack, so copy what " +
-        "this needs into storage of its own")
+        """, "error: 'Bad.put' keeps what it is passed as 'bytes', but a method of 'Sink' borrows " +
+        "its parameters for the call — a call through an object sees no body, so it may hand this " +
+        "a view of the caller's stack. Copy what this needs into storage of its own")
 
 @test("and one that only reads out of it is not")
 azc_an_implementation_that_reads_compiles()
     if !rng_ready() then return
 
-    val texts = azc_texts(["emit-llvm"], [("main.sysl", azc_sink(true) + raw"""
+    val texts = azc_texts(["emit-llvm"], [("main.sysl", azc_sink() + raw"""
         var c: Counter
         var s: *Sink = &c
 
@@ -477,32 +481,15 @@ azc_writer_is_an_ordinary_user()
         var b: Bad
         var w: *Writer = &b
         display_int(1, w, FormatSpec(0, -1, false))
-        """, "error: 'Bad.write' keeps what it is passed as 'bytes', but 'sysl.Writer' declares that " +
-        "parameter borrowed for the call")
+        """, "error: 'Bad.write' keeps what it is passed as 'bytes', but a method of 'sysl.Writer' " +
+        "borrows its parameters for the call")
 
-@test("a free function is refused, and told why rather than told the word is unknown")
+@test("'@borrows' is gone: above a free function it is a word no declaration takes")
 azc_borrows_on_a_free_function()
     if !rng_ready() then return
 
     azc_refuses("@borrows(xs)\ntake(xs: []const u8) -> usize = xs.len\nprint(take([1u8][..]))",
-                "error: '@borrows' is about a call whose body the compiler cannot see, so it says " +
-                "something only on a trait's method.")
-
-@test("a name that is not a parameter is refused by name")
-azc_borrows_names_a_non_parameter()
-    if !rng_ready() then return
-
-    azc_refuses("trait Sink\n    @borrows(byets)\n    put(*self, bytes: []const u8)\n",
-                "error: '@borrows' names 'byets', which is not a parameter of 'Sink.put' — its " +
-                "parameters are 'bytes'")
-
-@test("and there is no empty form")
-azc_borrows_has_no_empty_form()
-    if !rng_ready() then return
-
-    azc_refuses("trait Sink\n    @borrows\n    put(*self, bytes: []const u8)\n",
-                "There is no empty form: a method that may keep what it is handed says so by not " +
-                "writing the annotation")
+                "error: 'borrows' is not an annotation a declaration takes")
 
 // -- a refused impl member ------------------------------------------------------------------------
 
