@@ -60,6 +60,15 @@ private var fr_all: bool = false
 // declares.
 private var fr_testing: bool = false
 
+// What `sysl test` was told on its command line, kept apart from the request in force so that each
+// project of a workspace starts from the same words: the features, and the `--option k=v` texts.
+private var fr_cli_features: Buf[string] = buf()
+private var fr_cli_options: Buf[string] = buf()
+
+// The values the project's own suite is built with for its own options, as literals -- the `test`
+// block's, under the command line's (`apply_test_block`). Empty for every command but `sysl test`.
+private var fr_test_options: Buf[(string, string)] = buf()
+
 // What a command line that named none of the flags asks for. Called before each command's own flags
 // are read, so one process running two commands never inherits the first's request.
 reset_feature_request()
@@ -67,6 +76,9 @@ reset_feature_request()
     fr_no_default = false
     fr_all = false
     fr_testing = false
+    fr_cli_features = buf()
+    fr_cli_options = buf()
+    fr_test_options = buf()
     forget_tree_features()
 end reset_feature_request
 
@@ -121,6 +133,82 @@ end took_feature_flag
 // The flags as a usage line writes them.
 feature_flags() -> string = "[--features <list>] [--no-default-features] [--all-features]"
 
+// **`--option name=value`, which only `sysl test` takes**: one option of the project's own package for
+// this run, over what its `test` block says. Repeatable. The answer is as `took_feature_flag`'s; the
+// text is kept as written and is held to the declaration once the manifest is read
+// (`apply_test_block`).
+took_option_flag(args: []string, i: usize) -> int
+    if args[i] != "--option" then return -1
+    if i + 1 >= args.len then return 0
+
+    fr_cli_options.push(args[i + 1])
+    2
+end took_option_flag
+
+// Said by `sysl test` once its flags are read: what they named is what a `test` block yields to.
+remember_test_command_line()
+    fr_cli_features = buf()
+
+    for item in fr_features
+        fr_cli_features.push(item)
+end remember_test_command_line
+
+// The option values the project's own suite is built with.
+test_option_values() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for item in fr_test_options
+        out.push(item)
+
+    out
+end test_option_values
+
+// **The project's `test` block and the command line, settled into the request in force** for one
+// project's suite. The block applies to `sysl test` run on the package itself and to nothing else; a
+// `--features` list REPLACES the block's, and an `--option` overrides that one key of it.
+//
+// Everything is held to what a consumer's would be -- a feature the manifest declares, a choice not
+// contradicted, an option it declares with a value of its type and range -- and each refusal says
+// whether the block or the command line wrote it.
+apply_test_block(m: &Manifest, settings: &TestSettings) -> Result[unit, string]
+    fr_features = buf()
+    fr_test_options = buf()
+    forget_tree_features()
+
+    for item in fr_cli_features
+        fr_features.push(item)
+
+    var source = "the command line"
+
+    if fr_cli_features.is_empty() && !fr_all
+        settings.features match
+            Some(names) ->
+                source = s"the 'test' block of $ManifestName"
+
+                for item in names
+                    fr_features.push(item)
+            None -> ()
+
+    if !fr_features.is_empty()
+        for asked in fr_features
+            if !feature_named(m.features, asked)
+                val declared = declared_features(m)
+                val tail = if declared.is_empty() then ", and this manifest declares none"
+                else s". It declares ${quoted_names(declared)}"
+
+                return Err(s"$source asks for the feature '$asked', which this project does not declare — " +
+                           s"a feature has to be declared in $ManifestName's 'features' block before it " +
+                           s"can be asked for$tail")
+
+        root_enabled(m, current_feature_request(), true) match
+            Err(why) -> return Err(s"$source: $why")
+            Ok(_) -> ()
+    end if
+
+    fr_test_options = test_option_literals(m.options, settings.options, fr_cli_options)?
+    Ok(())
+end apply_test_block
+
 // The refusal for a request that says two different things about one set, before any manifest is
 // read -- so a path naming nothing real still reaches it.
 feature_conflict() -> Option[string]
@@ -134,7 +222,21 @@ end feature_conflict
 // The request as one part of the run cache's key: two builds of one tree under two requests are two
 // programs.
 feature_request_part() -> string =
-    s"features:${join(fr_features.view(), ",")};no-default:$fr_no_default;all:$fr_all;test:$fr_testing"
+    s"features:${join(fr_features.view(), ",")};no-default:$fr_no_default;all:$fr_all;test:$fr_testing" +
+        test_options_part()
+
+// The values the project's own suite sets its options to, where it sets any: two settings are two
+// programs. Nothing where none is set, so every key made before the block existed still matches.
+private test_options_part() -> string
+    if fr_test_options.is_empty() then return ""
+
+    var parts: Buf[string] = buf()
+
+    for item in fr_test_options
+        parts.push(s"${item.0}=${item.1}")
+
+    ";options:" + join(parts.view(), ",")
+end test_options_part
 
 // -- resolution ------------------------------------------------------------------------------------
 

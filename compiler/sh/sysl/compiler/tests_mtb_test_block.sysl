@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, write_text}
+import sysl.text.Search
+
+// **A package's `test` block sets its own suite's features and options** (`apply_test_block`,
+// `reference/packages.md § Testing a package under its options`), and `sysl test --features` and
+// `--option name=value` override it for one run. The settings feed the same resolution a consumer's do,
+// so they reach `#if feature_…`, `option_…` and the run cache's key; they apply to `sysl test` on the
+// package itself and to nothing else.
+//
+// Every case builds a real project. Its suite reads what it was built with and compares it to the
+// text in `EXPECT` beside it, so one built suite can be held to different expectations.
+
+private mtb_dir() -> string = absolute_path(make_temp_dir("sysl-mtb").unwrap())
+
+private mtb_manifest(block: string) -> string =
+    "package { name = \"mtbapp\", version = \"0.1.0\" }\n" +
+    "features { alpha = [], beta = [], rp = [], h7 = [] }\n" +
+    "choices { side { of = [rp, h7], default = rp } }\n" +
+    "options { cores { type = usize, default = 1, range = [1, 8] }, tag { type = string, default = \"x\" }, " +
+    "fast { type = bool, default = false } }\n" + block
+
+private mtb_tests(expect_path: string) -> string = "@tests\n\nimport sysl.fs.read_text\n\n" +
+    "@test(\"the suite sees the settings it was built with\")\nmtb_probe()\n" +
+    "    var seen = s\"cores=$option_cores tag=$option_tag fast=$option_fast\"\n" +
+    "#if feature_alpha\n    seen = seen + \" alpha\"\n#endif\n" +
+    "#if feature_beta\n    seen = seen + \" beta\"\n#endif\n" +
+    "#if feature_rp\n    seen = seen + \" rp\"\n#endif\n" +
+    "#if feature_h7\n    seen = seen + \" h7\"\n#endif\n" +
+    s"    assert_eq(seen, read_text(\"$expect_path\").unwrap().trim())\n"
+
+// Exits 0 only when built with the defaults: one core and no feature on.
+private val mtb_main: string = "main()\n    var code = if option_cores == 1 then 0 else 2\n" +
+    "#if feature_alpha\n    code = 3\n#endif\n    exit(code)\n"
+
+// A project whose `test` block is `block`.
+private mtb_project(block: string) -> string
+    val root = mtb_dir()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/sysl.hocon", mtb_manifest(block)).unwrap()
+    write_text(s"$root/main.sysl", mtb_main).unwrap()
+    write_text(s"$root/tests_probe.sysl", mtb_tests(s"$root/EXPECT")).unwrap()
+    root
+end mtb_project
+
+private val mtb_block: string = "test { features = [alpha], options { cores = 2 } }\n"
+
+// `sysl test` over the project, held to this text as what the suite was built with.
+private mtb_test(root: string, expect: string, flags: []string) -> (int, string, string)
+    write_text(s"$root/EXPECT", expect).unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("test")
+    args.push(root)
+
+    for f in flags
+        args.push(f)
+
+    clx_ran(args.view())
+end mtb_test
+
+@test("the block applies under sysl test: its features and options reach the suite")
+mtb_block_applies()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (code, out, err) = mtb_test(root, "cores=2 tag=x fast=false alpha rp", [])
+
+    assert_eq(code, Fine, out + err)
+
+@test("a block with only options leaves a silent run to turn every feature on")
+mtb_options_only_block()
+    if !clx_ready() then return
+
+    val root = mtb_project("test { options { cores = 3 } }\n")
+    val (code, out, err) = mtb_test(root, "cores=3 tag=x fast=false alpha beta rp", [])
+
+    assert_eq(code, Fine, out + err)
+
+@test("the block's string and bool options are held to their types and reach the suite")
+mtb_block_string_and_bool()
+    if !clx_ready() then return
+
+    val root = mtb_project("test { features = [beta], options { tag = \"hi\", fast = true } }\n")
+    val (code, out, err) = mtb_test(root, "cores=1 tag=hi fast=true beta rp", [])
+
+    assert_eq(code, Fine, out + err)
+
+@test("sysl build and sysl run ignore the block")
+mtb_build_and_run_ignore_it()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    val (code, out, err) = clx_ran(["sysl", "run", root])
+
+    assert_eq(code, Fine, out + err)
+
+@test("a dependency's block is ignored when the package is someone's dependency")
+mtb_dependency_ignored()
+    if !clx_ready() then return
+
+    val dep = mtb_dir()
+
+    make_dir_all(s"$dep/mtbdep").unwrap()
+    write_text(s"$dep/sysl.hocon",
+               "package { name = \"mtbdep\", version = \"0.1.0\" }\nfeatures { alpha = [] }\n" +
+               "options { cores { type = usize, default = 1 } }\n" +
+               "test { features = [alpha], options { cores = 2 } }\n").unwrap()
+    write_text(s"$dep/mtbdep/mtbdep.sysl",
+               "module mtbdep\n\nseen() -> string\n    var s = s\"cores=$option_cores\"\n" +
+               "#if feature_alpha\n    s = s + \" alpha\"\n#endif\n    s\n").unwrap()
+
+    val root = mtb_dir()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/sysl.hocon",
+               s"package { name = \"mtbuser\", version = \"0.1.0\" }\n" +
+               s"dependencies { mtbdep { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$root/tests_user.sysl",
+               "@tests\n\nimport mtbdep\n\n@test(\"the dependency is built with its defaults\")\n" +
+               "mtb_user()\n    assert_eq(mtbdep.seen(), \"cores=1\")\n").unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    assert_eq(code, Fine, out + err)
+
+@test("--features replaces the block's list, and --option overrides one key of the block")
+mtb_command_line_overrides()
+    if !clx_ready() then return
+
+    val root = mtb_project("test { features = [alpha], options { cores = 2, tag = \"hi\" } }\n")
+    val (code, out, err) = mtb_test(root, "cores=5 tag=hi fast=false beta rp", ["--features", "beta", "--option", "cores=5"])
+
+    assert_eq(code, Fine, out + err)
+
+@test("--option is repeatable, and the last of one name wins")
+mtb_option_repeats()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (code, out, err) = mtb_test(root, "cores=6 tag=y fast=true alpha rp",
+                                    ["--option", "cores=4", "--option", "tag=y", "--option", "fast=true", "--option", "cores=6"])
+
+    assert_eq(code, Fine, out + err)
+
+@test("a command line with only --option leaves the block's features")
+mtb_block_features_survive_option()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (code, out, err) = mtb_test(root, "cores=8 tag=x fast=false alpha rp", ["--option", "cores=8"])
+
+    assert_eq(code, Fine, out + err)
+
+@test("a choice is tested on each side by the command line")
+mtb_choice_each_side()
+    if !clx_ready() then return
+
+    val root = mtb_project("test { features = [alpha] }\n")
+    val (left, out1, err1) = mtb_test(root, "cores=1 tag=x fast=false alpha rp", [])
+    val (right, out2, err2) = mtb_test(root, "cores=1 tag=x fast=false h7", ["--features", "h7"])
+
+    assert_eq(left, Fine, out1 + err1)
+    assert_eq(right, Fine, out2 + err2)
+
+@test("two members of a choice are refused, naming the command line")
+mtb_choice_conflict_refused()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (code, _, err) = mtb_test(root, "", ["--features", "rp,h7"])
+
+    assert_eq(code, Failed, err)
+    assert(err.contains("the command line:"), err)
+    assert(err.contains("are members of the choice 'side'"), err)
+
+@test("a choice conflict in the block is refused, naming the block")
+mtb_choice_conflict_in_block()
+    if !clx_ready() then return
+
+    val root = mtb_project("test { features = [rp, h7] }\n")
+    val (code, _, err) = mtb_test(root, "", [])
+
+    assert_eq(code, Failed, err)
+    assert(err.contains("the 'test' block of sysl.hocon:"), err)
+    assert(err.contains("are members of the choice 'side'"), err)
+
+@test("an undeclared feature is refused, naming where it was written")
+mtb_undeclared_feature_refused()
+    if !clx_ready() then return
+
+    val in_block = mtb_project("test { features = [nope] }\n")
+    val (a, _, said_block) = mtb_test(in_block, "", [])
+
+    assert_eq(a, Failed, said_block)
+    assert(said_block.contains("the 'test' block of sysl.hocon asks for the feature 'nope'"), said_block)
+
+    val on_line = mtb_project(mtb_block)
+    val (b, _, said_line) = mtb_test(on_line, "", ["--features", "nope"])
+
+    assert_eq(b, Failed, said_line)
+    assert(said_line.contains("the command line asks for the feature 'nope'"), said_line)
+
+@test("an undeclared option is refused, naming where it was written")
+mtb_undeclared_option_refused()
+    if !clx_ready() then return
+
+    val in_block = mtb_project("test { options { nope = 1 } }\n")
+    val (a, _, said_block) = mtb_test(in_block, "", [])
+
+    assert_eq(a, Failed, said_block)
+    assert(said_block.contains("the 'test' block of sysl.hocon sets the option 'nope', which this project does not declare"), said_block)
+
+    val on_line = mtb_project(mtb_block)
+    val (b, _, said_line) = mtb_test(on_line, "", ["--option", "nope=1"])
+
+    assert_eq(b, Failed, said_line)
+    assert(said_line.contains("the command line sets the option 'nope', which this project does not declare"), said_line)
+
+@test("an option of the wrong type or outside its range is refused, naming where it was written")
+mtb_option_value_refused()
+    if !clx_ready() then return
+
+    val in_block = mtb_project("test { options { cores = \"two\" } }\n")
+    val (a, _, said_block) = mtb_test(in_block, "", [])
+
+    assert_eq(a, Failed, said_block)
+    assert(said_block.contains("the 'test' block of sysl.hocon sets the option 'cores' to \"two\", which is not a 'usize'"), said_block)
+
+    val on_line = mtb_project(mtb_block)
+    val (b, _, said_range) = mtb_test(on_line, "", ["--option", "cores=99"])
+
+    assert_eq(b, Failed, said_range)
+    assert(said_range.contains("the command line sets the option 'cores' to 99, outside the option's range [1, 8]"), said_range)
+
+    val (c, _, said_type) = mtb_test(on_line, "", ["--option", "fast=maybe"])
+
+    assert_eq(c, Failed, said_type)
+    assert(said_type.contains("the command line sets the option 'fast' to maybe, which is not a 'bool'"), said_type)
+
+@test("--option without name=value is refused, and without an operand is a misuse")
+mtb_option_shape_refused()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (a, _, said_bare) = mtb_test(root, "", ["--option", "cores"])
+
+    assert_eq(a, Failed, said_bare)
+    assert(said_bare.contains("the command line sets the option 'cores' with no value"), said_bare)
+
+    val (b, _, said_none) = mtb_test(root, "", ["--option"])
+
+    assert_eq(b, Misused, said_none)
+
+@test("a block that is not shaped as a block is refused by the manifest")
+mtb_block_shape_refused()
+    val why = read_manifest("package { name = \"a\", version = \"0.1.0\" }\ntest { features = alpha }\n")
+
+    assert(why.is_err(), "read")
+    assert(why.unwrap_err().contains("'test.features' is not a list"), why.unwrap_err())
+
+    val options = read_manifest("package { name = \"a\", version = \"0.1.0\" }\ntest { options = 3 }\n")
+
+    assert(options.is_err(), "read")
+    assert(options.unwrap_err().contains("'test.options' is not a block"), options.unwrap_err())
+
+@test("the block's features and options are read, and its other keys still are")
+mtb_block_read()
+    val m = read_manifest("package { name = \"a\", version = \"0.1.0\" }\n" +
+                          "test { jobs = 2, features = [x, y], options { n = 4 } }\n").unwrap()
+
+    assert_eq(m.tests.features.unwrap().len(), 2)
+    assert_eq(m.tests.options.len(), 1)
+    assert_eq(m.tests.options.at(0).0, "n")
+    assert_eq(m.tests.jobs, Some(2))
+
+@test("two settings are two builds, and the same settings are one")
+mtb_cache_keys()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    val m = manifest_at(root).unwrap()
+    val level = build_level(root, None).unwrap()
+
+    val plain = mtb_key(root, m, [], level)
+    val again = mtb_key(root, m, [], level)
+    val cores = mtb_key(root, m, ["--option", "cores=3"], level)
+    val cores_again = mtb_key(root, m, ["--option", "cores=3"], level)
+    val features = mtb_key(root, m, ["--features", "beta"], level)
+
+    assert_eq(plain, again)
+    assert_eq(cores, cores_again)
+    assert(plain != cores, "an option did not move the key")
+    assert(plain != features, "a feature did not move the key")
+    assert(cores != features, "an option and a feature collide")
+
+private mtb_key(root: string, m: &Manifest, flags: []string, level: string) -> Option[string]
+    reset_feature_request()
+    set_feature_testing()
+
+    var i: usize = 0
+
+    while i < flags.len
+        val a = took_feature_flag(flags, i)
+        val b = took_option_flag(flags, i)
+
+        val step = if a > 0 then a else b
+
+        i += usize(step)
+
+    remember_test_command_line()
+    apply_test_block(m, m.tests).unwrap()
+    run_cache_key_for("test", root, None, level, None)
+end mtb_key
+
+@test("a run with other settings does not replay another run's binary")
+mtb_runs_do_not_share_builds()
+    if !clx_ready() then return
+
+    val root = mtb_project(mtb_block)
+    val (first, out1, err1) = mtb_test(root, "cores=3 tag=x fast=false alpha rp", ["--option", "cores=3"])
+    val (second, out2, err2) = mtb_test(root, "cores=4 tag=x fast=false alpha rp", ["--option", "cores=4"])
+    val (third, out3, err3) = mtb_test(root, "cores=3 tag=x fast=false alpha rp", ["--option", "cores=3"])
+
+    assert_eq(first, Fine, out1 + err1)
+    assert_eq(second, Fine, out2 + err2)
+    assert_eq(third, Fine, out3 + err3)
+
+@test("an #if feature_ in the package's own test file sees the test settings")
+mtb_if_sees_test_features()
+    if !clx_ready() then return
+
+    // The same suite under the block's [alpha] and under a command line's [beta]: each is true of
+    // exactly one, so a suite built under the wrong set fails its comparison.
+    val root = mtb_project(mtb_block)
+    val (a, out1, err1) = mtb_test(root, "cores=2 tag=x fast=false alpha rp", [])
+    val (b, out2, err2) = mtb_test(root, "cores=2 tag=x fast=false beta rp", ["--features", "beta"])
+    val (c, _, _) = mtb_test(root, "cores=2 tag=x fast=false beta rp", [])
+
+    assert_eq(a, Fine, out1 + err1)
+    assert_eq(b, Fine, out2 + err2)
+    assert_eq(c, Failed)

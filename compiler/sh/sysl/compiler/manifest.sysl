@@ -216,10 +216,19 @@ struct TestSettings
     // The tests that run with nothing else running beside them: each is a text a test's name or key
     // holds, as `--filter` reads one.
     alone: Buf[string]
+
+    // The features the package's own suite is built with (`sysl test` run on the package itself,
+    // never as someone's dependency): `None` where the block names none, which leaves a silent run
+    // to turn every feature on.
+    features: Option[Buf[string]]
+
+    // The options the package's own suite is built with, by name and as written; what a value may be
+    // is the package's `options` block's to say (`apply_test_block`).
+    options: Buf[(string, &Conf)]
 end TestSettings
 
 // A package that said nothing about its suite.
-no_test_settings() -> TestSettings = TestSettings(None, None, buf())
+no_test_settings() -> TestSettings = TestSettings(None, None, buf(), None, buf())
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
@@ -753,6 +762,17 @@ private read_test_settings(root: &Conf, warnings: *Buf[string]) -> Result[TestSe
                 Some(texts) -> texts
                 None -> return Err("'test.alone' is a list of texts a test's name holds — " +
                                    "alone = [\"port\"], and not a single string")
+        else if key == "features"
+            settings.features = Some(conf_list(value) match
+                Some(names) -> names
+                None -> return Err(not_a_feature_list("test.features")))
+        else if key == "options"
+            if !conf_is_block(value)
+                return Err("'test.options' is not a block — it sets this package's own options for its " +
+                           "suite by name, as 'options { cores = 2 }'")
+
+            for name in conf_keys(value)
+                settings.options.push((name, conf_at(value, name).unwrap()))
         else
             warnings.push(unknown_key(s"test.$key"))
 

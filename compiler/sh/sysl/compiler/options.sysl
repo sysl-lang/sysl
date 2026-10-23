@@ -397,6 +397,88 @@ end option_lines
 // The declarations of a package no consumer configured: every option at its default.
 default_option_lines(m: &Manifest) -> Buf[string] = option_lines(m.options, buf())
 
+// The declarations the root package's own files are read with where no graph is resolved: its options
+// at the defaults, but for the values its `test` block or the command line gave its suite.
+root_option_lines(m: &Manifest) -> Buf[string] = option_lines(m.options, test_option_values())
+
+// **The options a package's own suite is built with**, as literals: the `test` block's, and over them
+// each `--option name=value` of the command line. Each is held to the declaration it names, as a
+// consumer's entry is (`gather_settings`), and the refusal says which of the two wrote it.
+test_option_literals(declared: &Buf[PackageOption], block: &Buf[(string, &Conf)],
+                     given: &Buf[string]) -> Result[Buf[(string, string)], string]
+    var out: Buf[(string, string)] = buf()
+    val from_block = s"the 'test' block of $ManifestName"
+
+    for item in block
+        val literal = test_option_literal(declared, item.0, item.1, from_block)?
+
+        replace_setting(&out, item.0, literal)
+
+    for text in given
+        val at = text.index_of("=")
+
+        if at.is_none() || at.unwrap() == 0
+            return Err(s"the command line sets the option '$text' with no value — '--option' takes " +
+                       "name=value, as '--option cores=2'")
+
+        val name = text[0..<at.unwrap()].trim()
+        val value = text[(at.unwrap() + 1)..<text.len].trim()
+
+        // A value on a command line is text; it is read as the type the option declares.
+        val written = typed_by_declaration(declared, name, value)
+        val literal = test_option_literal(declared, name, written, "the command line")?
+
+        replace_setting(&out, name, literal)
+
+    Ok(out)
+end test_option_literals
+
+// What a command line's text is as a manifest would have written it: quoted where the option is a
+// string, a flag where it is a bool and the text says so, a bare word otherwise.
+private typed_by_declaration(declared: &Buf[PackageOption], name: string, value: string) -> Conf
+    val opt = declared_option(declared, name) match
+        Some(o) -> o
+        None -> return Word(value)
+
+    opt.kind match
+        OptString -> Text(value)
+        OptBool ->
+            if value == "true" then return Flag(true)
+            if value == "false" then return Flag(false)
+
+            Word(value)
+        OptInteger(_, _) -> Word(value)
+end typed_by_declaration
+
+private replace_setting(out: *Buf[(string, string)], name: string, literal: string)
+    for i in 0..<out.len()
+        if out.at(i).0 == name
+            out.set(i, (name, literal))
+            return
+
+    out.push((name, literal))
+end replace_setting
+
+private test_option_literal(declared: &Buf[PackageOption], name: string, value: &Conf,
+                            who: string) -> Result[string, string]
+    val opt = declared_option(declared, name) match
+        Some(o) -> o
+        None ->
+            var names: Buf[string] = buf()
+
+            for o in declared
+                names.push(o.name)
+
+            val tail = if names.is_empty() then ", and it declares none"
+            else s". It declares ${quoted_names(names)}"
+
+            return Err(s"$who sets the option '$name', which this project does not declare — a suite may " +
+                       s"only set an option its own manifest names$tail")
+
+    option_literal(opt.kind, opt.type_name, opt.range, value).map_err((why) ->
+        s"$who sets the option '$name' to $why")
+end test_option_literal
+
 // The declarations one package's files are read with, out of what a graph settled. A package
 // missing from it declares no options.
 option_lines_of(settled: &Buf[(string, Buf[string])], canonical: string) -> Buf[string]
@@ -429,7 +511,12 @@ settle_options(packages: &Buf[ResolvedPackage],
         var root_values: Buf[(string, string)] = buf()
         var others: Buf[OptionSetting] = buf()
 
-        if !is_root_package(target)
+        // The project's own suite sets its own options (`apply_test_block`); no build but
+        // `sysl test` run on the package itself has any such values.
+        if is_root_package(target)
+            for item in test_option_values()
+                root_values.push(item)
+        else
             for consumer in packages
                 for dep in consumer.manifest.dependencies
                     if !names_package(dep, target) then continue

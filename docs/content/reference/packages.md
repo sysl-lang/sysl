@@ -246,6 +246,59 @@ is [warned about and ignored](#a-key-this-compiler-does-not-know-is-reported-and
 sysl.hocon: 'test.jobs' is how many tests may run at once, a whole number from 1 up
 ```
 
+## Testing a package under its options
+
+**A package's features and options are set by its consumer, and `sysl test .` has none**, so the
+defaults are all a plain run ever tests. A path that is not the default (`cores = 2`) and a choice
+that has two sides (`rp2350` or `h7`) would need a separate test package. The `test` block says what
+the package's own suite is built with:
+
+```hocon
+features {
+  rp2350 = []
+  h7     = []
+}
+
+choices { board { of = [rp2350, h7], default = rp2350 } }
+
+options { cores { type = usize, default = 1, range = [1, 8] } }
+
+test {
+  features = [h7]
+  options { cores = 2 }
+}
+```
+
+The suite then sees `feature_h7` in `#if`, and `option_cores` is 2. They go through the same
+resolution a consumer's do — the choice, the feature's `c` and `defines`, the cache key — so a
+different setting is a different build, and the same setting reuses its own.
+
+**The block applies to `sysl test` run on the package itself, and to nothing else**: not when the
+package is someone's dependency, and not to `sysl build` or `sysl run`, which build it as its
+consumer would. A block that names no `features` leaves a silent `sysl test` to turn every feature
+on, as it always did.
+
+**The command line overrides the block for one run**, with the flags `sysl build` already spells
+for features and one new one:
+
+```
+sysl test . --features rp2350
+sysl test . --features h7,usb --option cores=4 --option trace=true
+```
+
+- `--features` **replaces** the block's list; it does not add to it.
+- `--option name=value` overrides that one option and leaves the block's others. It can be given
+  more than once, and the last of one name wins.
+
+Both are held to what a consumer's would be, and a refusal says whether the block or the command line
+wrote the value:
+
+```
+error: the command line asks for the feature 'nope', which this project does not declare
+error: the 'test' block of sysl.hocon sets the option 'cores' to 99, outside the option's range [1, 8]
+error: the command line: sysl.hocon of this project: the features 'rp2350' and 'h7' are both on, and both are members of the choice 'board'
+```
+
 ## A key this compiler does not know is reported and ignored
 
 A manifest is read by whatever compiler is in hand, which may be older than the manifest. So an
@@ -2379,7 +2432,8 @@ dependency entry asks for anywhere in the graph and the version selection settle
 list is in [the command line § run](/getting-started/cli/).
 
 Options are set only through dependency entries. The root project's own options always take their
-defaults: there is no command-line flag that sets them.
+defaults — except for its own suite, where
+[a `test` block and `sysl test --option`](#testing-a-package-under-its-options) set them.
 
 ## What a dependency's modules are called
 

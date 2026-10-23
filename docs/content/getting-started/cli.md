@@ -407,7 +407,14 @@ such as a file at a fixed path or a port. A test that needs exclusive use of one
 own, with a temporary directory or a port the system picks, or be listed in its manifest's
 [`test.alone`](/reference/packages/#how-a-package-s-suite-is-run), which runs it with nothing else
 alongside. The manifest's `test` block can also set the run's `jobs` and `timeout`, and the flags
-override it. A module's `@setup_all` finishes before any of its tests starts, and its
+override it.
+
+**`--features <list>` and `--option <name=value>`** choose what the package's own suite is built
+with. The `test` block's `features` and `options` are the defaults, `--features` replaces the block's
+list, and each `--option` overrides one key (it may be repeated). They are the same flags and the
+same resolution as `build`'s, an undeclared name or a value out of range is refused, and a different
+setting is a different cached build. See
+[testing a package under its options](/reference/packages/#testing-a-package-under-its-options). A module's `@setup_all` finishes before any of its tests starts, and its
 `@teardown_all` starts after all of them have finished.
 
 `--fail-fast` stops new tests from starting after the first failure. Tests already running finish

@@ -440,6 +440,26 @@ That is the menuconfig split already: the OS declares the menu, the board packag
 board fixes, and the application overrides the rest. What 0.5 adds is the menu itself (§ 5) and the
 path to C (§ 4.1).
 
+**A package's own suite, *decided by the user on 2026-10-23*.** A package's options and features are
+set by its consumer, and `sysl test .` run on the package has none, so only the defaults were ever
+tested. A `test` block carries the settings for that one case:
+
+```hocon
+test {
+  features = [h7]
+  options { cores = 2 }
+}
+```
+
+- It applies **only** when `sysl test` runs on this package itself: never when the package is a
+  dependency, never for `sysl build` or `sysl run`.
+- `sysl test . --features a,b --option k=v` (repeatable) overrides it for one run. A command-line
+  `--features` list **replaces** the block's list; `--option` overrides that one key.
+- The values are validated exactly as a consumer's would be (declared feature or option, choices,
+  type and range), and a refusal names whether the block or the command line wrote it.
+- They feed the same resolution as a consumer's (`settle_features`, the c/defines merge, `#if`,
+  the option constants) and the cache key, so two settings are two builds.
+
 ## 5. `sysl config`
 
 ### 5.1 The commands (Q20, Q22)
