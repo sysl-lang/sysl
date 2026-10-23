@@ -4,7 +4,9 @@ module sysl.softint.aeabi
 // struct copied or cleared on every Thumb core: `__aeabi_memcpy4` where C would say `memcpy`,
 // `__aeabi_memclr8` where it would say `memset(p, 0, n)`. A freestanding image has no runtime library
 // to find them in, so the standard module carries them, as `sysl.softint` carries the arithmetic.
-// Every one is WEAK: a libgcc or a program that defines the symbol too wins.
+// Every one is WEAK: a libgcc or a program that defines the symbol too wins. `__aeabi_memmove` and
+// its aligned forms are the exception in what they ask of the board: nothing, as they move the bytes
+// themselves.
 //
 // They are C's `memcpy` and `memset` under another contract -- and not a spelling variant:
 // `__aeabi_memset` takes its length before its byte, so the registers are swapped on the way through.
@@ -89,5 +91,49 @@ asm
         "pop {{r4, pc}}"
         ".size __aeabi_memclr, . - __aeabi_memclr"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's block fill"
+
+// **`__aeabi_memmove` is the one that stands alone**: C's `memmove` is not something a board owes for
+// a structure assignment the way `memcpy` and `memset` are, and LLVM merges two copies through a
+// temporary into a move, so a link that supplied the other two still failed on this name. It is a byte
+// loop that runs forward where the destination is below the source and backward where it is above, so
+// an overlap either way keeps every source byte until it is read; it is in Armv6-M's instruction set.
+@section(".text.__aeabi_memmove")
+asm
+    [thumb]
+        ".weak __aeabi_memmove"
+        ".weak __aeabi_memmove4"
+        ".weak __aeabi_memmove8"
+        ".type __aeabi_memmove, %function"
+        ".type __aeabi_memmove4, %function"
+        ".type __aeabi_memmove8, %function"
+        ".p2align 2"
+        ".thumb_func"
+        "__aeabi_memmove:"
+        ".thumb_func"
+        "__aeabi_memmove4:"
+        ".thumb_func"
+        "__aeabi_memmove8:"
+        "cmp r2, #0"
+        "beq 3f"
+        "cmp r0, r1"
+        "beq 3f"
+        "bhi 2f"
+        "1:"
+        "ldrb r3, [r1]"
+        "strb r3, [r0]"
+        "adds r0, r0, #1"
+        "adds r1, r1, #1"
+        "subs r2, r2, #1"
+        "bne 1b"
+        "bx lr"
+        "2:"
+        "subs r2, r2, #1"
+        "ldrb r3, [r1, r2]"
+        "strb r3, [r0, r2]"
+        "bne 2b"
+        "3:"
+        "bx lr"
+        ".size __aeabi_memmove, . - __aeabi_memmove"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the Arm run-time ABI's overlapping block copy"
 
 #endif

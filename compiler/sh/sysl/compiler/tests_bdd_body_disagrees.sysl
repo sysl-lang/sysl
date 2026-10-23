@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// A body that disagrees with its declaration is told so exactly once, and only where reading the
+// body refused nothing: what a body that gave up yields is a consequence of the refusal already
+// told, so a second complaint about the signature is noise. Each site that can say it -- a function,
+// a generic instance, a nested function, a closure -- is held to both halves.
+
+// Every complaint the whole program draws, in source order, with the standard library in place (so
+// `print` and the call traits are there). Empty where it is sound; returns nothing without the library.
+private bdd_told(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if xvr_no_library() then return out
+
+    val root = make_temp_dir("sysl-bdd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> out.push(failure_text(why))
+        Ok(m) ->
+            for p in m.report
+                out.push(p.diag.message)
+
+    out
+end bdd_told
+
+private bdd_all(text: string) -> string
+    var all = ""
+
+    for m in bdd_told(text)
+        all += s"\n  - $m"
+
+    all
+end bdd_all
+
+private bdd_only(text: string, want: string)
+    if xvr_no_library() then return
+
+    val got = bdd_told(text)
+
+    var all = ""
+
+    for m in got
+        all += s"\n  - $m"
+
+    assert_eq(got.len(), 1, s"expected exactly one complaint, got ${got.len()}: $all\nfor\n$text")
+    assert_eq(got.at(0), want, text)
+end bdd_only
+
+private bdd_arms() -> string = "match arms have different types: int and string"
+
+// -- a body that reads cleanly is not a disagreement -------------------------------------------------
+
+@test("a by-name parameter read inside a closure, in a function that declares its result, is sound")
+bdd_by_name_read_in_a_closure()
+    assert_eq(bdd_all("twice(m: -> int) -> int\n    val f = () -> m + 1\n    f()\n"), "")
+    assert_eq(bdd_all("twice(m: -> int) -> int\n    inner() -> int = m + 1\n    inner()\n"), "")
+
+// -- a real disagreement is told, in full -----------------------------------------------------------
+
+@test("a function whose body yields another type is told so, at the declaration")
+bdd_a_function_disagrees()
+    bdd_only("f() -> int = \"a\"\n", "function 'f' should return int, but its body yields string")
+    bdd_only("f() -> int\n    val s = \"a\"\n    s\n",
+             "function 'f' should return int, but its body yields string")
+
+@test("an expression-bodied function is told as a block-bodied one is")
+bdd_an_expression_body_disagrees()
+    bdd_only("f(x: int) -> string = x + 1\n", "function 'f' should return string, but its body yields int")
+
+@test("a generic function's body disagreeing with its declaration is told once, whatever the instances")
+bdd_a_generic_body_disagrees()
+    bdd_only("f[T](x: T) -> int = \"a\"\n\nprint(f(1))\nprint(f(\"b\"))\n",
+             "function 'f' should return int, but its body yields string")
+
+@test("a nested function's body disagreeing is told in a closure's words")
+bdd_a_nested_function_disagrees()
+    bdd_only("outer() -> int\n    inner(x: int) -> string = x + 1\n    1\n\nprint(outer())\n",
+             "this closure should yield string, but its body yields int")
+
+@test("a closure's body disagreeing is told in a closure's words")
+bdd_a_closure_disagrees()
+    bdd_only("val f: &Fn(int) -> string = (x) -> x + 1\nprint(f(1))\n",
+             "this closure should yield string, but its body yields int")
+
+@test("a function whose body ends in a closure-free if that yields the wrong type is told once")
+bdd_an_if_disagrees()
+    bdd_only("f(c: bool) -> int = if c then \"a\" else \"b\"\n",
+             "function 'f' should return int, but its body yields string")
+
+// -- a refusal inside the body is the only thing told ------------------------------------------------
+
+@test("a function whose arms disagree among themselves is told the arms, not the signature")
+bdd_a_function_refusal_alone()
+    bdd_only("f() -> int = 3 match\n    1 -> 10\n    else \"big\"\n", bdd_arms())
+    bdd_only("f() -> int\n    val n = 3\n\n    n match\n        1 -> 10\n        else \"big\"\n", bdd_arms())
+
+@test("an arm refused inside an if or a match that ends the body is the only thing told")
+bdd_an_arm_refusal_alone()
+    bdd_only("f(c: bool) -> int = if c then 1 else 2 match\n    1 -> 3\n    else \"x\"\n", bdd_arms())
+
+@test("an expression body that refuses is not also a disagreement")
+bdd_an_expression_refusal_alone()
+    val got = bdd_told("f(x: int) -> string = x + \"a\"\n\nprint(f(1))\n")
+
+    if xvr_no_library() then return
+
+    assert_eq(got.len(), 1, bdd_all("f(x: int) -> string = x + \"a\"\n\nprint(f(1))\n"))
+    assert(!got.at(0).contains("should return"), got.at(0))
+
+@test("a generic body that refuses is told once, not once per instance and not as a disagreement")
+bdd_a_generic_refusal_alone()
+    bdd_only("f[T](x: T) -> int = 3 match\n    1 -> 10\n    else \"big\"\n\nprint(f(1))\nprint(f(\"b\"))\n",
+             bdd_arms())
+
+@test("a nested function whose body refuses is not also a disagreement")
+bdd_a_nested_refusal_alone()
+    bdd_only("outer() -> int\n    inner() -> int = 3 match\n        1 -> 10\n        else \"big\"\n    inner()\n",
+             bdd_arms())
+
+@test("a closure whose body refuses is not also a disagreement")
+bdd_a_closure_refusal_alone()
+    bdd_only("val f: &Fn(int) -> int = (x) -> x match\n    1 -> 10\n    else \"big\"\nprint(f(1))\n", bdd_arms())
+
+@test("a by-name parameter read wrongly inside a closure is told as the disagreement it is")
+bdd_by_name_read_that_disagrees()
+    bdd_only("twice(m: -> int) -> string\n    val f = () -> m + 1\n    f()\n\nprint(twice(1))\n",
+             "function 'twice' should return string, but its body yields int")
