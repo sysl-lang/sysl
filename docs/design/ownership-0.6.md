@@ -217,7 +217,14 @@ One agent per item, in this order, each landing on dev with its tests and refere
 3. `@crossing` inferred where visible; `@crossing(copy …)` folded into the channel.
 4. `Drop` types are reference types (Q3): construction yields `&T`, a by-value spelling is refused.
 5. The two small traps (special-form shadowing; host-side fold check).
-6. The org sweep: `package.hocon` renamed, removed attributes deleted, optional `-> &T` cleanup.
+6. Fewer built-in names (user, 2026-10-23):
+   - every remaining special form gives way to a user name;
+   - `str`/`debug` become library generics over `Display`/`Debug`, with compiler-supplied impls for the built-in types;
+   - `va_*` and the raw casts move behind an import;
+   - `format` goes, in favour of `f"…"`.
+
+   `print` stays as the one fallback form, since it takes mixed argument types.
+7. The org sweep: `package.hocon` renamed, removed attributes deleted, optional `-> &T` cleanup.
 
 ## Questions for the user
 
