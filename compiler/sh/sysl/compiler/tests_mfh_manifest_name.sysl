@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{current_dir, is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, set_current_dir, write_text}
+import sysl.text.{split, Search}
+
+// The manifest is `sysl.hocon`. A directory holding only the old name `package.hocon` still builds,
+// with one warning asking for the rename; a directory holding both is refused; a dependency is found
+// under either name. `sysl init` writes the new name.
+
+private mfh_dir() -> string = absolute_path(make_temp_dir("sysl-mfh-").unwrap())
+
+private mfh_manifest(name: string) -> string = s"package { name = \"$name\", version = \"0.1.0\" }\n"
+
+// A project whose manifest files are the given (file name, text) pairs, and one program that exits 0.
+private mfh_project(files: [](string, string)) -> string
+    val root = mfh_dir()
+
+    for f in files
+        write_text(s"$root/${f.0}", f.1).unwrap()
+
+    write_text(s"$root/main.sysl", "main()\n    exit(0)\n").unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    root
+end mfh_project
+
+private mfh_count(text: string, part: string) -> usize = split(text, part).len - 1
+
+@test("a directory holding sysl.hocon builds without a warning")
+mfh_new_name_only()
+    if !clx_ready() then return
+
+    val root = mfh_project([("sysl.hocon", mfh_manifest("mfhnew"))])
+    val (code, _, err) = clx_ran(["sysl", "build", root])
+
+    assert_eq(code, Fine, err)
+    assert(err.starts_with("wrote "), err)
+    assert(!err.contains("package.hocon"), err)
+    remove_dir_all(root).unwrap_or(())
+end mfh_new_name_only
+
+@test("a directory holding only package.hocon builds, with the one warning")
+mfh_old_name_only_warns_once()
+    if !clx_ready() then return
+
+    val root = mfh_project([("package.hocon", mfh_manifest("mfhold"))])
+    val (code, _, err) = clx_ran(["sysl", "build", root])
+
+    assert_eq(code, Fine, err)
+    assert(err.contains("rename it to sysl.hocon, or run 'sysl config fix'"), err)
+    assert_eq(mfh_count(err, "rename it to"), 1)
+    assert(err.contains("wrote "), err)
+    remove_dir_all(root).unwrap_or(())
+end mfh_old_name_only_warns_once
+
+@test("a directory holding both names is refused, whatever the command")
+mfh_both_names_refused()
+    if !clx_ready() then return
+
+    val root = mfh_project([("sysl.hocon", mfh_manifest("mfhboth")), ("package.hocon", mfh_manifest("mfhboth"))])
+
+    for command in ["build", "run", "test"]
+        val (code, _, err) = clx_ran(["sysl", command, root])
+
+        assert_eq(code, Failed, err)
+        assert(err.contains("holds both sysl.hocon and package.hocon — two manifests are ambiguous"), err)
+
+    remove_dir_all(root).unwrap_or(())
+end mfh_both_names_refused
+
+@test("manifest_at reads either name, prefers the new, and refuses both")
+mfh_manifest_at_lookup()
+    val one = mfh_dir()
+    val two = mfh_dir()
+    val three = mfh_dir()
+
+    write_text(s"$one/sysl.hocon", mfh_manifest("fresh")).unwrap()
+    write_text(s"$two/package.hocon", mfh_manifest("legacy")).unwrap()
+    write_text(s"$three/sysl.hocon", mfh_manifest("a")).unwrap()
+    write_text(s"$three/package.hocon", mfh_manifest("b")).unwrap()
+
+    assert_eq(manifest_at(one).unwrap().name, "fresh")
+    assert_eq(manifest_at(one).unwrap().warnings.len(), 0)
+    assert_eq(manifest_at(two).unwrap().name, "legacy")
+    assert_eq(manifest_at(two).unwrap().warnings.len(), 1)
+    assert(manifest_at(two).unwrap().warnings[0].contains("rename it to sysl.hocon"))
+    assert(manifest_at(three).is_err())
+    assert_eq(manifest_path(one), s"$one/sysl.hocon")
+    assert_eq(manifest_path(two), s"$two/package.hocon")
+    assert_eq(manifest_path(absolute_path(make_temp_dir("sysl-mfh-").unwrap())).ends_with("sysl.hocon"), true)
+    remove_dir_all(one).unwrap_or(())
+    remove_dir_all(two).unwrap_or(())
+    remove_dir_all(three).unwrap_or(())
+end mfh_manifest_at_lookup
+
+// A package at a path, named by `file`, whose module `engine` answers with its own version.
+private mfh_dependency(file: string) -> string
+    val root = mfh_dir()
+
+    make_dir_all(s"$root/engine").unwrap()
+    write_text(s"$root/$file", "package { name = \"engine\", version = \"2.3.4\" }\n").unwrap()
+    write_text(s"$root/engine/engine.sysl", "module engine\n\nversion() -> string = __VERSION__\n").unwrap()
+    root
+end mfh_dependency
+
+private mfh_uses(dep: string) -> string
+    val root = mfh_dir()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"mfhuse\", version = \"0.1.0\" }\n" +
+               s"dependencies { engine { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", "import engine\n\nmain()\n" +
+               "    if engine.version() != \"2.3.4\" then exit(5)\n").unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    root
+end mfh_uses
+
+@test("a dependency's sysl.hocon is read")
+mfh_dependency_new_name()
+    if !clx_ready() then return
+
+    val dep = mfh_dependency("sysl.hocon")
+    val root = mfh_uses(dep)
+    val (code, _, err) = clx_ran(["sysl", "run", root])
+
+    assert_eq(code, Fine, err)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+end mfh_dependency_new_name
+
+@test("a dependency's package.hocon is still read")
+mfh_dependency_old_name()
+    if !clx_ready() then return
+
+    val dep = mfh_dependency("package.hocon")
+    val root = mfh_uses(dep)
+    val (code, _, err) = clx_ran(["sysl", "run", root])
+
+    assert_eq(code, Fine, err)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+end mfh_dependency_old_name
+
+@test("sysl init in an empty directory writes a manifest and a program that build and run")
+mfh_init_here()
+    if !clx_ready() then return
+
+    val here = current_dir().unwrap()
+    val there = mfh_dir()
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    set_current_dir(there).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "init"])
+
+    assert_eq(code, Fine, out + err)
+    assert(is_file(s"$there/sysl.hocon"))
+    assert(is_file(s"$there/main.sysl"))
+    assert(!is_file(s"$there/package.hocon"))
+
+    val text = read_text(s"$there/sysl.hocon").unwrap()
+
+    assert(text.contains("version = \"0.1.0\""), text)
+    assert(text.contains(s"sysl    = \"$Version\""), text)
+    assert(text.contains(s"name    = \"${basename(there)}\""), text)
+
+    val (built, _, built_err) = clx_ran(["sysl", "build"])
+
+    assert_eq(built, Fine, built_err)
+    assert(!built_err.contains("package.hocon"), built_err)
+
+    val (ran, _, ran_err) = clx_ran(["sysl", "run"])
+
+    assert_eq(ran, Fine, ran_err)
+    set_current_dir(here).unwrap()
+    remove_dir_all(there).unwrap_or(())
+end mfh_init_here
+
+@test("sysl init into a named directory creates it, and leaves an existing main.sysl alone")
+mfh_init_named_directory()
+    if !clx_ready() then return
+
+    val base = mfh_dir()
+    val target = s"$base/deep/tool"
+    val (code, _, err) = clx_ran(["sysl", "init", target])
+
+    assert_eq(code, Fine, err)
+    assert(read_text(s"$target/sysl.hocon").unwrap().contains("name    = \"tool\""))
+
+    val kept = s"$base/kept"
+
+    make_dir_all(kept).unwrap()
+    write_text(s"$kept/main.sysl", "print(\"mine\")\n").unwrap()
+
+    val (again, _, again_err) = clx_ran(["sysl", "init", kept])
+
+    assert_eq(again, Fine, again_err)
+    assert_eq(read_text(s"$kept/main.sysl").unwrap(), "print(\"mine\")\n")
+    assert(is_file(s"$kept/sysl.hocon"))
+    remove_dir_all(base).unwrap_or(())
+end mfh_init_named_directory
+
+@test("sysl init refuses a directory that already holds a manifest of either name")
+mfh_init_refuses_over_a_manifest()
+    val fresh = mfh_dir()
+    val old = mfh_dir()
+
+    write_text(s"$fresh/sysl.hocon", "package { name = \"keep\" }\n").unwrap()
+    write_text(s"$old/package.hocon", "package { name = \"keep\" }\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "init", fresh])
+
+    assert_eq(code, Failed, err)
+    assert(out.contains("already holds a sysl.hocon"), out)
+    assert_eq(read_text(s"$fresh/sysl.hocon").unwrap(), "package { name = \"keep\" }\n")
+
+    val (old_code, old_out, old_err) = clx_ran(["sysl", "init", old])
+
+    assert_eq(old_code, Failed, old_err)
+    assert(old_out.contains("already holds a package.hocon"), old_out)
+    assert(!is_file(s"$old/sysl.hocon"))
+    assert(!is_file(s"$old/main.sysl"))
+    remove_dir_all(fresh).unwrap_or(())
+    remove_dir_all(old).unwrap_or(())
+end mfh_init_refuses_over_a_manifest
+
+@test("sysl init refuses a second directory and an option")
+mfh_init_mistakes()
+    val (code, out, err) = clx_ran(["sysl", "init", "a", "b"])
+
+    assert_eq(code, Misused, out + err)
+    assert((out + err).contains("usage: sysl init [<dir>]"), out + err)
+
+    val (flag_code, flag_out, flag_err) = clx_ran(["sysl", "init", "--fix"])
+
+    assert_eq(flag_code, Misused, flag_out + flag_err)
+end mfh_init_mistakes
+
+@test("create_manifest writes sysl.hocon and refuses an existing manifest and an unwritable name")
+mfh_create_manifest()
+    val dir = mfh_dir()
+
+    assert_eq(create_manifest(dir, "tool").unwrap(), s"$dir/sysl.hocon")
+    assert(create_manifest(dir, "tool").is_err())
+
+    val other = mfh_dir()
+
+    assert(create_manifest(other, "a\"b").is_err())
+    assert(!is_file(s"$other/sysl.hocon"))
+    remove_dir_all(dir).unwrap_or(())
+    remove_dir_all(other).unwrap_or(())
+end mfh_create_manifest

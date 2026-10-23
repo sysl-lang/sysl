@@ -1,0 +1,100 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, write_text}
+
+// `sysl init [<dir>]` -- a project in a directory: a minimal `sysl.hocon` named after the directory,
+// and a starter `main.sysl` where the directory holds no `main.sysl` yet.
+//
+// **It asks nothing.** The manifest is created by `create_manifest`, which is the one place a
+// manifest's first text is composed; `sysl config` creates a project's manifest through the same
+// function, with answers where `init` takes the defaults. A directory that already holds a manifest
+// of either name is refused, because a second one would be ambiguous and a first one is not ours to
+// overwrite. The directory is created where it does not exist.
+init_command(args: []string, say: string -> unit) -> int
+    var dir = "."
+    var given = false
+    var mistakes: Buf[string] = buf()
+
+    for i in 2..<args.len
+        if args[i].starts_with("-")
+            mistakes.push(s"'${args[i]}' is not an option of 'sysl init'")
+        else if given
+            mistakes.push(s"'${args[i]}' is a second directory — 'sysl init' takes one")
+        else
+            dir = args[i]
+            given = true
+    end for
+
+    if mistakes.len() > 0
+        say(misused(mistakes, init_usage()))
+        return Misused
+
+    init_project(dir, say)
+end init_command
+
+private init_usage() -> string = "usage: sysl init [<dir>]"
+
+// The whole command once the command line has been read.
+init_project(dir: string, say: string -> unit) -> int
+    val root = absolute_path(dir)
+
+    if has_manifest(root)
+        val held = if is_file(join_path(root, ManifestName)) then ManifestName else LegacyManifestName
+
+        say(refused(s"'$root' already holds a $held — 'sysl init' creates a project's first " +
+                    "manifest and overwrites nothing"))
+        return Failed
+    end if
+
+    make_dir_all(root) match
+        Err(e) ->
+            say(refused(io_refusal(root, e)))
+            return Failed
+        Ok(_) -> ()
+
+    val made = create_manifest(root, directory_name(root)) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(file) -> file
+
+    say(s"created $made")
+
+    val main = join_path(root, "main.sysl")
+
+    if !is_file(main)
+        write_text(main, StarterProgram) match
+            Err(e) ->
+                say(refused(io_refusal(main, e)))
+                return Failed
+            Ok(_) -> say(s"created $main")
+
+    Fine
+end init_project
+
+// What `main.sysl` holds in a project `sysl init` made.
+val StarterProgram: string = "print(\"Hello, sysl!\")\n"
+
+// **The one place a project's manifest is first written.** A `sysl.hocon` in `dir`, holding the
+// package `name`, version `0.1.0` and the floor of the compiler writing it, returning the file's
+// path. Refuses a directory that already holds a manifest of either name, and a name that could not
+// be written between quotes.
+create_manifest(dir: string, name: string) -> Result[string, string]
+    if has_manifest(dir)
+        return Err(s"'$dir' already holds a manifest")
+
+    if name.contains("\"") || name.contains("\\")
+        return Err(s"'$name' cannot name a package — it holds a quote or a backslash")
+
+    val file = join_path(dir, ManifestName)
+    val text = "package {\n" +
+               s"  name    = \"$name\"\n" +
+               "  version = \"0.1.0\"\n" +
+               s"  sysl    = \"$Version\"\n" +
+               "}\n"
+
+    write_text(file, text) match
+        Err(e) -> Err(io_refusal(file, e))
+        Ok(_) -> Ok(file)
+end create_manifest

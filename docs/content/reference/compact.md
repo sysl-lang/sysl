@@ -60,7 +60,7 @@ are predeclared identifiers, not reserved.
 **`__…__`** — leading and trailing `__` with capitals between — is reserved to the language;
 nothing may declare one. The built-ins are `__FILE__`, `__LINE__`, `__COLUMN__`, `__FUNCTION__`,
 `__DATE__`, `__TIME__`, `__NAME__`, `__VERSION__`. `__NAME__` and `__VERSION__` are the
-`package.hocon` name and version of the package whose file they are written in, and are refused in a
+`sysl.hocon` name and version of the package whose file they are written in, and are refused in a
 file that belongs to no package. Written as a **default argument** the location ones, `__NAME__` and
 `__VERSION__` report the caller — its file, its line, its package's name and version.
 
@@ -408,7 +408,7 @@ module the name is written in, then the file's imports, then the library — inn
 every file: `@no_alloc` (a promise this module does not allocate) and `@requires(heap, os, posix)` (a
 demand). `@needs(...)` is the per-declaration form, and it is the one an `extern` takes.
 
-**`package.hocon`** — a project is a directory with `.sysl` files in it; the manifest is optional.
+**`sysl.hocon`** — a project is a directory with `.sysl` files in it; the manifest is optional.
 
 ```hocon
 package {

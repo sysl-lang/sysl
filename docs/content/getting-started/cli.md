@@ -37,18 +37,20 @@ alone. The [modules reference](/reference/modules/) describes the rule in full.
 **`run`, `build` and `test` take their path from the working directory when none is given**, so
 `sysl run`, `sysl build -o app` and `sysl test` in a project's directory mean `sysl run .`, and
 `sysl run -- a b` passes `a` and `b` to the program. **A directory, named or implied, must hold a
-`package.hocon`**: there is no searching upward for one, and a directory without it is refused,
+`sysl.hocon`**: there is no searching upward for one, and a directory without it is refused,
 with status 1, on stderr:
 
 ```text
-sysl: error: there is no package.hocon in '/home/me/scratch' — 'sysl init' creates one there, or name a .sysl file to use it without a manifest
+sysl: error: there is no sysl.hocon in '/home/me/scratch' — 'sysl init' creates one there, or name a .sysl file to use it without a manifest
 ```
 
-A single named `.sysl` file needs no manifest, and an empty `package.hocon` is a manifest. A program
+A single named `.sysl` file needs no manifest, and an empty `sysl.hocon` is a manifest. A program
 in a package's `examples/` directory is a project of that package and needs none of its own, and
 `sysl test --std` takes the standard module's tree, which is no project. This is a
 behaviour change: a bare directory of `.sysl` files that `sysl run <dir>` used to build now needs a
-`package.hocon` beside it.
+`sysl.hocon` beside it. **The manifest used to be called `package.hocon`.** A directory holding only
+that name still builds, with one warning asking for the rename; a directory holding both names is
+refused.
 
 A subcommand is required. Run with none, sysl says so on stderr, prints its usage, and exits 2.
 
@@ -218,7 +220,7 @@ For a **directory**, the executable goes *inside* it, named after it. `sysl buil
 `sysl build fmt` and `sysl build ../fmt` name the same project, and all three write `fmt/fmt`, so
 the result does not depend on the directory you run the command from.
 
-**If the project's `package.hocon` names dependencies, `build` fetches any this machine does not
+**If the project's `sysl.hocon` names dependencies, `build` fetches any this machine does not
 have yet** — see [packages](/reference/packages/). `run` and `test` do the same, so there is no
 separate fetch step, and a project with no dependencies fetches nothing.
 
@@ -625,7 +627,7 @@ you can inspect a project that cannot be built on this machine.
 
 ### `add`
 
-Adds a dependency to `package.hocon`, at the newest version the repository has tagged or at the
+Adds a dependency to `sysl.hocon`, at the newest version the repository has tagged or at the
 version you name.
 
 ```
@@ -712,8 +714,29 @@ tidy is left untouched with nothing printed, and a project whose dependencies ar
 with no `sysl.sum` at all.
 
 `--check` writes nothing and fails if the file is not tidy, naming what it would change; this is
-the form to use in CI. Outside a project, with no `package.hocon`, the command is refused.
+the form to use in CI. Outside a project, with no `sysl.hocon`, the command is refused.
 [Packages](/reference/packages/#sysl-sum) has the rule.
+
+### `init`
+
+Starts a project in a directory, and asks nothing.
+
+```text
+sysl init [<dir>]
+```
+
+```text
+created /home/me/tool/sysl.hocon
+created /home/me/tool/main.sysl
+```
+
+With no directory it uses the working directory; a named one is created if it does not exist. It
+writes a minimal `sysl.hocon` — `name` is the directory's, `version` is `0.1.0`, and `sysl` is the
+compiler's own version, the floor a build is checked against — and a `main.sysl` that prints a
+greeting, unless the directory already has one, which is left alone. The result builds and runs as
+it stands: `sysl run`.
+
+A directory that already holds a manifest, under either name, is refused and nothing is written.
 
 ### `doc`
 
@@ -1100,7 +1123,7 @@ open file, using the text the editor holds, saved or not:
 | `textDocument/hover` | the type of a local or a module `val`/`var`, or a function's signature |
 | `textDocument/definition` | where that name is declared — in the file, another file of the package, or the standard library |
 
-A file is analysed with the package whose `package.hocon` is nearest above it, or alone if there is
+A file is analysed with the package whose `sysl.hocon` is nearest above it, or alone if there is
 none. The standard library is parsed once and kept for the life of the server, except while the
 editor holds unsaved text for one of the library's own files. A message that is not JSON is answered
 with the JSON-RPC parse error (`-32700`); a request the server does not answer, with `-32601`. The
@@ -1298,7 +1321,7 @@ working copy of a package the manifest names, pass one flag and leave the manife
 sysl build . --lib ../geom
 ```
 
-If `../geom/package.hocon` names the package `geom` and the project depends on
+If `../geom/sysl.hocon` names the package `geom` and the project depends on
 `github.com/e/geom`, the checkout is compiled in its place — for that dependency and for any other
 package in the graph that depends on it — and the coordinate is never fetched, so the working copy
 can contain changes that are not yet published. A tree that merely *contains* a module a dependency

@@ -982,7 +982,7 @@ true true
 That program names no capability, no chip and no package — and `sysl.time` still asks for nothing, so
 the calendar goes on running on a bare machine. What supplies the numbers is whatever it is linked
 against: `sysl.posix.time` above, on a host, and a package binding an RTC over I²C on a board. Moving
-the same source between the two is a change to `package.hocon` rather than to any line of it.
+the same source between the two is a change to `sysl.hocon` rather than to any line of it.
 
 The mechanism is the general one — [a module may supply another module's
 `extern`](/reference/ffi/#a-module-may-supply-another-module-s-extern) — and a supplier is an ordinary

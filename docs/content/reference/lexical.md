@@ -555,8 +555,8 @@ private extern "__errno_location" errno_location() -> *i32
 | `__FUNCTION__` | `string` | the enclosing function's name |
 | `__DATE__` | `string` | build date, `Mmm dd yyyy` (UTC) |
 | `__TIME__` | `string` | build time, `hh:mm:ss` (UTC) |
-| `__NAME__` | `string` | the `name` in the `package.hocon` of the package the file belongs to — as a default, the caller's |
-| `__VERSION__` | `string` | the `version` in the `package.hocon` of the package the file belongs to — as a default, the caller's |
+| `__NAME__` | `string` | the `name` in the `sysl.hocon` of the package the file belongs to — as a default, the caller's |
+| `__VERSION__` | `string` | the `version` in the `sysl.hocon` of the package the file belongs to — as a default, the caller's |
 
 `__LINE__` and `__COLUMN__` are ordinary integer literals, so each takes the type its context asks
 for and is range-checked with it.
@@ -585,7 +585,7 @@ and are best avoided otherwise.
 ### `__VERSION__` is the package's version
 
 **`__VERSION__` is the `version` the [manifest](/reference/packages/#what-a-project-is-called)
-states, so `package.hocon` is the one place a program's version is written.** A `--version` flag or
+states, so `sysl.hocon` is the one place a program's version is written.** A `--version` flag or
 an About screen reads it instead of keeping its own `const VERSION = "…"`. In a package whose
 manifest says `version = "1.4.0"`, this prints `mytool 1.4.0`. A block on this page is a lone file
 with no manifest, so here it is refused, as described at the end of this section:
@@ -595,7 +595,7 @@ print("mytool ", __VERSION__)
 ```
 
 ```error
-'__VERSION__' is the 'version' in package.hocon, and this file is not part of a package
+'__VERSION__' is the 'version' in sysl.hocon, and this file is not part of a package
 ```
 
 It is a string literal like `__FILE__`, folded where it is written, so a `const` or a module-level
@@ -611,9 +611,9 @@ the library's own only when it calls itself. A library can therefore offer a `--
 reports the program using it.
 
 **A file that belongs to no package has no version to read**, so `__VERSION__` is refused there — a
-lone `sysl run tool.sysl` with no `package.hocon` beside it, or a manifest with no `version` key. The
-refusal names which: *"'__VERSION__' is the 'version' in package.hocon, and this file is not part of a
-package"*, or *"… and …/package.hocon declares none"*.
+lone `sysl run tool.sysl` with no `sysl.hocon` beside it, or a manifest with no `version` key. The
+refusal names which: *"'__VERSION__' is the 'version' in sysl.hocon, and this file is not part of a
+package"*, or *"… and …/sysl.hocon declares none"*.
 
 ### `__NAME__` is the package's name
 
@@ -633,7 +633,7 @@ logcat("started")
 ```
 
 ```error
-'__NAME__' is the 'name' in package.hocon, and this file is not part of a package — no package.hocon stands at the root of its tree
+'__NAME__' is the 'name' in sysl.hocon, and this file is not part of a package — no sysl.hocon stands at the root of its tree
 ```
 
 It is a string literal, folded where it is written, so a `const` or a module-level `val` may be
@@ -645,7 +645,7 @@ of whichever package contains the call — the program's when the program calls 
 when that library does. `__VERSION__` and `__FILE__` follow the same rule.
 
 **A file that belongs to no package has no name to read**, so `__NAME__` is refused there — a lone
-`sysl run tool.sysl` with no `package.hocon` beside it, or a manifest with no `name` key. The refusal
+`sysl run tool.sysl` with no `sysl.hocon` beside it, or a manifest with no `name` key. The refusal
 lands where `__NAME__` is read, so a `const` initialized with it is refused at the `const`:
 
 ```sysl
@@ -654,11 +654,11 @@ print(TAG)
 ```
 
 ```error
-'__NAME__' is the 'name' in package.hocon, and this file is not part of a package
+'__NAME__' is the 'name' in sysl.hocon, and this file is not part of a package
 ```
 
-A manifest with no `name` key is refused with *"'__NAME__' is the 'name' in package.hocon, and
-…/package.hocon declares none"* instead.
+A manifest with no `name` key is refused with *"'__NAME__' is the 'name' in sysl.hocon, and
+…/sysl.hocon declares none"* instead.
 
 A manifest may state either field without the other: one with a `name` and no `version` answers
 `__NAME__` and refuses `__VERSION__`.

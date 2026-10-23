@@ -14,7 +14,7 @@ Three surfaces are settled, and they are the ones a program touches:
 
 - **The language** — the syntax and semantics the [reference](/reference/) describes.
 - **The standard library's API** — the modules under [`sysl`](/library/) and the names they export.
-- **The package format** — `package.hocon`, the dependency model, and how a coordinate is resolved.
+- **The package format** — `sysl.hocon`, the dependency model, and how a coordinate is resolved.
 
 A program is written in the first, against the second, and distributed by the third.
 

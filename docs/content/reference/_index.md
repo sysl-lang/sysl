@@ -32,7 +32,7 @@ rules and the common idioms, for a reader who already programs and wants the rul
 explanation, or for a tool reading them on a budget. Everything on it is stated in full elsewhere in
 this section.
 
-**[Packages](/reference/packages/)** describes `package.hocon` and dependencies on other people's
+**[Packages](/reference/packages/)** describes `sysl.hocon` and dependencies on other people's
 code. It is a build-time concern rather than a rule about expressions, but it determines which
 modules a program has.
 

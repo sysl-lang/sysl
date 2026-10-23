@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{cache_dir, read_text}
+import sysl.fs.{cache_dir, is_file, read_text}
 import sysl.text.{join, split, Search}
 
 // `package.hocon` -- what a project says about itself before a line of it is read.
@@ -11,8 +11,43 @@ import sysl.text.{join, split, Search}
 // that cannot mean anything should stop before it parses a file. What the manifest decides is which
 // machine, which packages, and whether this compiler is new enough to be reading it at all.
 
-// The one name the driver looks for.
-val ManifestName: string = "package.hocon"
+// The name the driver looks for first, and the one every file `sysl` writes carries.
+val ManifestName: string = "sysl.hocon"
+
+// The name manifests had before `sysl.hocon`. Still read, with a warning asking for the rename;
+// a directory holding both is refused.
+val LegacyManifestName: string = "package.hocon"
+
+// The manifest file a project directory carries: `sysl.hocon`, else `package.hocon`, else the path
+// `sysl.hocon` would have where there is none. **The one place a manifest's file name is chosen.**
+manifest_path(dir: string) -> string
+    if is_file(join_path(dir, ManifestName)) then return join_path(dir, ManifestName)
+    if is_file(join_path(dir, LegacyManifestName)) then return join_path(dir, LegacyManifestName)
+
+    join_path(dir, ManifestName)
+end manifest_path
+
+// Whether the directory holds a manifest of either name.
+has_manifest(dir: string) -> bool =
+    is_file(join_path(dir, ManifestName)) || is_file(join_path(dir, LegacyManifestName))
+
+// Whether the directory holds a manifest under the old name only.
+has_legacy_manifest(dir: string) -> bool =
+    !is_file(join_path(dir, ManifestName)) && is_file(join_path(dir, LegacyManifestName))
+
+// The refusal for a directory holding both names, or None.
+two_manifests(dir: string) -> Option[string]
+    if is_file(join_path(dir, ManifestName)) && is_file(join_path(dir, LegacyManifestName))
+        return Some(s"'$dir' holds both $ManifestName and $LegacyManifestName — two manifests are " +
+                    s"ambiguous. Keep $ManifestName and remove $LegacyManifestName")
+
+    None
+end two_manifests
+
+// The warning a manifest under the old name draws.
+legacy_manifest_warning(dir: string) -> string =
+    s"'$dir' names its manifest $LegacyManifestName — rename it to $ManifestName, or run " +
+    "'sysl config fix'"
 
 // What a manifest says, of the parts that decide what is compiled.
 struct Manifest
@@ -181,13 +216,28 @@ empty_manifest() -> Manifest =
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
-    val file = join_path(root, ManifestName)
+    two_manifests(root) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
 
-    read_text(file) match
+    read_text(manifest_path(root)) match
         Err(_) -> Ok(empty_manifest())
         Ok(text) -> read_manifest(text) match
             Err(why) -> Err(Refusal(manifest_refusal(why)))
-            Ok(m) -> Ok(m)
+            Ok(m) ->
+                if has_legacy_manifest(root)
+                    var out = m
+                    var warned: Buf[string] = buf()
+
+                    warned.push(legacy_manifest_warning(root))
+
+                    for w in m.warnings
+                        warned.push(w)
+
+                    out.warnings = warned
+                    return Ok(out)
+
+                Ok(m)
 end manifest_at
 
 // A manifest's refusal as a build reports it, naming the file once -- a notation error already

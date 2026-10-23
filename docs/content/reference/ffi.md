@@ -1787,7 +1787,7 @@ fails somewhere else. A build system that already knows these has them — from 
 **A package may say which headers it needs, though never where they are.** A `--include-path` written
 as `<name>=<dir>` answers a requirement the package declared under that name, so a build missing one
 stops before clang runs and names the package rather than a header the reader has never heard of. The
-declaration goes in `package.hocon` — see
+declaration goes in `sysl.hocon` — see
 [packages](/reference/packages/#headers-a-package-needs-and-does-not-carry).
 
 ## A function's address — `*extern(A, B) -> R`
@@ -3117,7 +3117,7 @@ answers `tls_place` on a bare AArch64 machine, beside a C library package whose 
 measured in the same build.
 
 **What is asked is whether the machine can have the capability, not whether the project provides
-it.** [`package.hocon`](/reference/packages/#capabilities) treats a capability it does not mention as
+it.** [`sysl.hocon`](/reference/packages/#capabilities) treats a capability it does not mention as
 provided, so a freestanding target nominally offers `posix` — a gate reading that would gate nothing
 at all. The question here is physical and has one answer per target: an operating system, and POSIX.
 Whether there is a **heap** is not asked, because that is an engineering decision about a machine

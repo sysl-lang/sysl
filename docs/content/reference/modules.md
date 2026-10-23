@@ -616,7 +616,7 @@ that gives it up is `@no_alloc`:
 
 - **`heap` names a facility** — whether the machine being built for *has* one. It sits beside `os`,
   `posix` and `libc`, and it is what a project states in
-  [`package.hocon`](/reference/packages/#capabilities), because whether there is a heap is a project
+  [`sysl.hocon`](/reference/packages/#capabilities), because whether there is a heap is a project
   engineering decision.
 - **`@no_alloc` names conduct** — a promise this module's code does not *allocate*, and so does not
   need a heap to exist. A promise is about an action, which is why it reads as a verb.
@@ -867,7 +867,7 @@ error: this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'
 
 **Only the module's half of the two-level rule moves.** A `@tests` file may take back a promise the
 module made about what ships; it cannot take back a facility the machine does not have. On a target
-whose `package.hocon` says `heap = false`, a test that allocates is refused whatever its header says
+whose `sysl.hocon` says `heap = false`, a test that allocates is refused whatever its header says
 — which is what keeps a run from reporting that vectors passed on a machine that could not have run
 them. For the same reason the `@requires` on a `@tests` file refuses nothing on its own: an ordinary
 `sysl build` analyzes that file and then discards it, so a requirement checked against the target
@@ -878,18 +878,18 @@ would refuse a build over a facility only the discarded file ever wanted.
 A module's effective set is the target's intersected with its own narrowing, so a capability is out of
 reach whichever of the two removed it — and both are answered at the same edge. `@no_os` is the half
 you can see in the file. The other half is the machine: on a target whose
-[`package.hocon`](/reference/packages/#capabilities) says `os = false`, **every** module of the
+[`sysl.hocon`](/reference/packages/#capabilities) says `os = false`, **every** module of the
 program is one that may not reach `sysl.fs`, with nothing written anywhere. A `print(exists("/tmp"))`
 in a program with no clause at all is refused:
 
 ```text
 error: this reaches 'sysl.fs', which requires 'os', and 'aarch64-none-elf' does not provide it — a
-target's capabilities are what 'package.hocon' declares, so either this reference cannot be made on
+target's capabilities are what 'sysl.hocon' declares, so either this reference cannot be made on
 this machine or the config is understating it
 ```
 
 **A target the config says nothing about provides everything, `os` included** — and so does every
-target of a project with no `package.hocon` at all. A board is not assumed to lack an operating
+target of a project with no `sysl.hocon` at all. A board is not assumed to lack an operating
 system: a program built for `thumbv6m-freestanding` may reach `sysl.fs` as far as this check is
 concerned until its config says `capabilities { os = false }`, which is the line that makes the refusal above possible.
 
@@ -913,7 +913,7 @@ program on a `posix = false` target, or one that wrote `@no_posix`, is refused a
 reaches a dependency's `@requires(posix)` module, naming that module by its package-qualified name.
 
 **What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
-target whose `package.hocon` says `heap = false`, or one with no thread-local storage, a fetched
+target whose `sysl.hocon` says `heap = false`, or one with no thread-local storage, a fetched
 package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
 at the construct, in its own file — when the program names that module or names one that does. A
 package is a set of modules, and the program uses the ones it names: a board program that imports
@@ -2433,7 +2433,7 @@ the ordinary duplicate.
 disagrees with the directory it sits in is refused, and a root's bodies are checked as a program's
 are. A root that is not there, or that holds no sysl source, is refused.
 
-**A root's `package.hocon` is read**, so what it declares reaches the build exactly as a dependency's
+**A root's `sysl.hocon` is read**, so what it declares reaches the build exactly as a dependency's
 would, named as the root was given: its allocator becomes the pair the program allocates through
 (two roots naming different pairs are refused rather than resolved by order), its header
 requirements are asked, and the installed libraries its `pkg_config` block names are probed and

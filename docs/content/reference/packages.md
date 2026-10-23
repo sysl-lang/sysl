@@ -1,12 +1,17 @@
 ---
 title: Packages
-summary: package.hocon, dependencies on other people's code, version selection, and what a fetched package's modules are called here.
+summary: sysl.hocon, dependencies on other people's code, version selection, and what a fetched package's modules are called here.
 weight: 105
 ---
 
-A project's configuration and its list of dependencies are **one file, `package.hocon`, at the
+A project's configuration and its list of dependencies are **one file, `sysl.hocon`, at the
 project root**. It says who this package is, what machines it is built for, what those machines
-provide, and what it depends on.
+provide, and what it depends on. `sysl init` writes a first one.
+
+**The file used to be called `package.hocon`.** A directory holding only that name still builds,
+with one warning saying to rename it to `sysl.hocon` (`sysl config fix` will do it); a directory
+holding both names is refused, since two manifests are ambiguous. A later release will stop reading
+the old name.
 
 **The file is optional.** A single-file program has none, and gets the defaults: the project root is
 the directory the compiler was given, the target is the machine it is running on, and that target
@@ -41,7 +46,7 @@ unless this block gives it one. Without a name the output takes the directory's:
 
 ```
 myproj/main.sysl        ->  myproj/myproj
-myproj/package.hocon    ->  myproj/tool
+myproj/sysl.hocon       ->  myproj/tool
   package { name = "tool" }
 ```
 
@@ -50,7 +55,7 @@ would give every project an identity and charge every project the ceremony, when
 holding one `.sysl` file is the cheapest thing in the toolchain and worth keeping cheap.
 
 A **file** project is outside this. `sysl build foo.sysl` writes `foo` beside the caller, whatever a
-`package.hocon` sitting in the same directory says — the name came from the path you typed, and a
+`sysl.hocon` sitting in the same directory says — the name came from the path you typed, and a
 config quietly moving the executable would be a worse surprise than anything it fixed.
 
 The name reaches the filesystem, so it has to be a single path segment. `.`, `..`, anything holding a
@@ -79,7 +84,7 @@ without this a package could not carry a runnable demo at all, and every one of 
 fenced block in a README that nothing compiles.
 
 ```
-mypkg/package.hocon
+mypkg/sysl.hocon
 mypkg/sh/sysl/mypkg/mypkg.sysl     the library
 mypkg/examples/demo.sysl           a program, and not part of it
 mypkg/examples/bigger/main.sysl    a program of several files
@@ -90,7 +95,7 @@ the package offers, and out of the walk `sysl test .` makes — that walk takes 
 root and refuses one that declares no module, so the exclusion has to reach it too or the feature
 does not work.
 
-**A directory holding a `package.hocon` of its own is left out the same way, wherever it sits** — it
+**A directory holding a `sysl.hocon` of its own is left out the same way, wherever it sits** — it
 is another project ([workspaces](#a-directory-holding-its-own-manifest-is-another-project)). A demo
 that wants dependencies of its own, or is more than a few files, is better as a project in
 `examples/<name>/` with its own manifest and the package as a workspace member it depends on.
@@ -101,7 +106,7 @@ and use it as a library, exactly as a `--lib` naming it would — so the manifes
 its C and its search paths all reach the demo.
 
 That is a rule about the shape of a path rather than a search: exactly two levels up, only where the
-intervening directory is literally `examples`, and only where a `package.hocon` is there. A manifest
+intervening directory is literally `examples`, and only where a `sysl.hocon` is there. A manifest
 is looked for **beside** the sources everywhere else in this system, deliberately, because a search
 that walked upward would make a build depend on directories above the one it was given.
 
@@ -140,7 +145,7 @@ constructor it keeps to itself — needs a program that is refused, and a run th
 stops being refused.
 
 ```
-mypkg/package.hocon
+mypkg/sysl.hocon
 mypkg/sh/sysl/mypkg/mypkg.sysl          the library
 mypkg/tests/refused/move.sysl           a program the compiler must refuse
 ```
@@ -238,7 +243,7 @@ run by a consumer's `sysl test`. A value the block cannot mean is refused, and a
 is [warned about and ignored](#a-key-this-compiler-does-not-know-is-reported-and-ignored):
 
 ```
-package.hocon: 'test.jobs' is how many tests may run at once, a whole number from 1 up
+sysl.hocon: 'test.jobs' is how many tests may run at once, a whole number from 1 up
 ```
 
 ## A key this compiler does not know is reported and ignored
@@ -247,7 +252,7 @@ A manifest is read by whatever compiler is in hand, which may be older than the 
 unrecognized key is **warned about and skipped**, and the rest of the file still takes effect:
 
 ```
-package.hocon: 'profiles' is not something this sysl understands, and is ignored — either it is a
+sysl.hocon: 'profiles' is not something this sysl understands, and is ignored — either it is a
                misspelling, or it was added by a newer compiler
 ```
 
@@ -262,7 +267,7 @@ nothing and says nothing.
 under a name this compiler does not know alike, and the path says which block it was in:
 
 ```
-package.hocon: 'targets.aarch64-freestanding.linker_scrpt' is not something this sysl understands,
+sysl.hocon: 'targets.aarch64-freestanding.linker_scrpt' is not something this sysl understands,
                and is ignored — either it is a misspelling, or it was added by a newer compiler
 ```
 
@@ -271,7 +276,7 @@ the case a manifest cannot report for itself — a package written against a new
 an older one:
 
 ```
-/…/cache/github.com/sysl-lang/thing@0.2.0: package.hocon: 'profiles' is not something this sysl
+/…/cache/github.com/sysl-lang/thing@0.2.0: sysl.hocon: 'profiles' is not something this sysl
 understands, and is ignored — …
 ```
 
@@ -393,7 +398,7 @@ project being built, and the key is the root's or nobody's.
 The levels a manifest may name are `0`, `1`, `2`, `3`, `s` and `z` — the six every clang has:
 
 ```
-package.hocon: 'optimization = "9"' names no level clang has — it is one of 0, 1, 2, 3, s, z
+sysl.hocon: 'optimization = "9"' names no level clang has — it is one of 0, 1, 2, 3, s, z
 ```
 
 **`--optimize` is checked the same way, before anything is built, against a list two longer**: the
@@ -477,7 +482,7 @@ worth assuming.
 ### A mode clang does not have is refused when the file is read
 
 ```
-package.hocon: 'lto = "thick"' names no kind of link-time optimization clang has — it is thin or
+sysl.hocon: 'lto = "thick"' names no kind of link-time optimization clang has — it is thin or
 full, or 'true' for thin
 ```
 
@@ -605,7 +610,7 @@ feature is on.
 And a single name written as a string, which is the likeliest slip:
 
 ```
-package.hocon: 'link = "libuv"' is neither "static" nor "dynamic" — to link one library statically,
+sysl.hocon: 'link = "libuv"' is neither "static" nor "dynamic" — to link one library statically,
 name it in a list: 'link = ["libuv"]'
 ```
 
@@ -664,8 +669,8 @@ to link by hand and no flags in the environment.
 
 | key | says | default |
 |---|---|---|
-| `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `package.hocon` | `ld.lld` |
-| `linker_script` | the script the image is laid out by, relative to `package.hocon`; handed over as `-T <script>` | none — the linker's own layout |
+| `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `sysl.hocon` | `ld.lld` |
+| `linker_script` | the script the image is laid out by, relative to `sysl.hocon`; handed over as `-T <script>` | none — the linker's own layout |
 | `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | the script's `ENTRY` where there is a script; `main` where there is none |
 
 **A freestanding target never reaches the host's linker, whether or not the block says anything.**
@@ -889,7 +894,7 @@ marks it for the linker (see [attributes](/reference/attributes/)).
 An archive naming no entry, or naming `main`, is refused, with the way to declare it:
 
 ```
-an 'extern' may name 'main' in an archive only where the archive is the C program's runtime, whose entry calls it — and this archive names no entry other than 'main', so 'main' is the C program's and nothing here starts before it. A C runtime says so with 'targets.aarch64-freestanding.entry' in its package.hocon, naming the symbol it starts at
+an 'extern' may name 'main' in an archive only where the archive is the C program's runtime, whose entry calls it — and this archive names no entry other than 'main', so 'main' is the C program's and nothing here starts before it. A C runtime says so with 'targets.aarch64-freestanding.entry' in its sysl.hocon, naming the symbol it starts at
 ```
 
 ### A C runtime fills its storage by calling `sysl_init_modules`
@@ -960,7 +965,7 @@ init_modules()
 ```
 
 ```error
-'sysl_init_modules' is defined only in a C runtime's archive — a 'build-c' archive for a freestanding machine whose package.hocon names the symbol it starts at — and this program's storage is filled by 'main'
+'sysl_init_modules' is defined only in a C runtime's archive — a 'build-c' archive for a freestanding machine whose sysl.hocon names the symbol it starts at — and this program's storage is filled by 'main'
 ```
 
 and at any signature but `() -> unit`.
@@ -968,7 +973,7 @@ and at any signature but `() -> unit`.
 ### What is refused
 
 - **The keys in a dependency.** How an image is linked is the program's own to say; a library's
-  script would be laid over a program it never saw. Only the root project's `package.hocon` may name
+  script would be laid over a program it never saw. Only the root project's `sysl.hocon` may name
   them, and a dependency or `--lib` root that does is refused, naming the package and the key.
 - **The keys for a hosted target, or WebAssembly**, when that is the machine being built — a hosted
   program is linked by the platform's own linker and started at `main` by its C runtime. A block for a
@@ -1090,7 +1095,7 @@ where a parameter or the result is a float and otherwise at the first floating e
 
 ```text
 error: 'scale' computes with 'real' here, and this build keeps to the general-purpose registers
-('codegen.general_regs_only' in package.hocon, or '--general-regs-only') — a floating-point value has
+('codegen.general_regs_only' in sysl.hocon, or '--general-regs-only') — a floating-point value has
 no register to live in. Compute in integers or fixed point, or build without the setting
  --> main.sysl:3:13
   |
@@ -1197,7 +1202,7 @@ count(s: *u8) -> usize = c_strlen(s)
 ```
 
 ```error
-which needs 'libc', and 'aarch64-freestanding' does not provide it — a freestanding target starts without a C library, so either this reference cannot be made on this machine or 'package.hocon' grants one with 'capabilities { libc = true }'
+which needs 'libc', and 'aarch64-freestanding' does not provide it — a freestanding target starts without a C library, so either this reference cannot be made on this machine or 'sysl.hocon' grants one with 'capabilities { libc = true }'
 ```
 
 **Every module under `sysl.posix` requires `posix` and `libc` together, and the pair is a POSIX
@@ -1351,7 +1356,7 @@ a command that links, is asking for two symbols nothing will define:
 ```
 this package requires a heap and 'wasm32-freestanding' is freestanding, so nothing supplies
 'malloc' and 'free' — the link would answer with an undefined symbol for each. Name a heap of
-your own in package.hocon's 'allocator' block, or build for a target that has a libc
+your own in sysl.hocon's 'allocator' block, or build for a target that has a libc
 ```
 
 The `allocator` block above is the way out, and it is the whole of the way out: naming libc's own pair
@@ -1499,7 +1504,7 @@ already compiled and its headers could be skipped.
 
 **The header requirements, the allocator and the `dependencies` are read from a `--lib` root.** That
 flag names a *source root*, which need not be a package at all, and one that is not has nothing to
-declare — so a root with no `package.hocon` goes on building exactly as it always did.
+declare — so a root with no `sysl.hocon` goes on building exactly as it always did.
 
 All three are read for one reason: each is a property of the *package* rather than of the road the
 package arrived by. A directory handed over with `--lib` is the same package as one named by a
@@ -2095,7 +2100,7 @@ A name the manifest does not declare is refused rather than quietly selecting no
 lists what is on offer:
 
 ```
-this project has no feature 'quick' — a feature has to be declared in package.hocon's 'features'
+this project has no feature 'quick' — a feature has to be declared in sysl.hocon's 'features'
 block before it can be asked for. It declares 'default', 'extra'
 ```
 
@@ -2139,7 +2144,7 @@ optional**, which reads as a feature that turns something on and is not one, the
 whatever anybody asks for:
 
 ```
-package.hocon: 'features.greeting' names the dependency 'helper', which is not optional — a
+sysl.hocon: 'features.greeting' names the dependency 'helper', which is not optional — a
 feature turns an optional dependency on, and this one is taken whatever is asked for. Write
 'optional = true' in that dependency's entry, or drop it from the feature
 ```
@@ -2147,7 +2152,7 @@ feature turns an optional dependency on, and this one is taken whatever is asked
 **An optional dependency no feature names**, which nothing could ever reach:
 
 ```
-package.hocon: 'helper' is an optional dependency no feature names — an optional dependency is
+sysl.hocon: 'helper' is an optional dependency no feature names — an optional dependency is
 reached only by the feature that turns it on, so nothing would ever build it. Name it in a
 'features' entry, or drop its 'optional = true'
 ```
@@ -2156,7 +2161,7 @@ reached only by the feature that turns it on, so nothing would ever build it. Na
 misspelling looks like from here:
 
 ```
-package.hocon: 'features.server' names 'llhttp', which is neither a dependency of this package nor
+sysl.hocon: 'features.server' names 'llhttp', which is neither a dependency of this package nor
 a feature of it — a feature turns on things this manifest declares, so 'llhttp' would select
 nothing
 ```
@@ -2164,7 +2169,7 @@ nothing
 **Features that turn each other on**, since following the implications has to reach an end:
 
 ```
-package.hocon: the features here turn each other on — 'server' turns on 'tls', which turns on
+sysl.hocon: the features here turn each other on — 'server' turns on 'tls', which turns on
 'server'. A feature may imply another, but following the implications has to reach an end
 ```
 
@@ -2470,7 +2475,7 @@ refusal says what would have made it an override:
 ```text
 'geom' is both a module of the source root '../shapes' and one github.com.e.geom offers — give the
 dependency a 'mount' to say what it is called here. A source root stands in for a coordinate only when
-it is that package — when its package.hocon names it 'geom'
+it is that package — when its sysl.hocon names it 'geom'
 ```
 
 A `mount` on the stood-in dependency still renames it for the manifest that wrote one.
@@ -2496,7 +2501,7 @@ naming itself anything else is not the package, and the coordinate is fetched as
 
 ## `sysl.sum`
 
-`sysl.sum` sits beside `package.hocon` and **should be committed**. It records a content hash for
+`sysl.sum` sits beside `sysl.hocon` and **should be committed**. It records a content hash for
 each package and version the project resolved, and a fetch whose content does not match is refused:
 
 ```text
@@ -2551,12 +2556,12 @@ would remove github.com/sysl-lang/skitter v0.1.0
 sysl: error: sysl.sum is not tidy — 'sysl tidy' rewrites it to what this project resolves to
 ```
 
-It is refused where there is no `package.hocon`, since only a project with a manifest resolves
+It is refused where there is no `sysl.hocon`, since only a project with a manifest resolves
 anything to record.
 
 ## Adding one, and vendoring the lot
 
-A dependency is a line in `package.hocon` and you may write it yourself, but `sysl add` is what
+A dependency is a line in `sysl.hocon` and you may write it yourself, but `sysl add` is what
 settles the two things you would otherwise go and look up — how the coordinate is spelled and what
 the newest tag is:
 
@@ -2597,7 +2602,7 @@ workspace = ["compiler", "tools/*", "examples/board-probe"]
 ```
 
 Each entry is a directory relative to the file, and **each member is an ordinary project** with a
-`package.hocon` of its own — built, tested and depended on exactly as it would be on its own. `*`
+`sysl.hocon` of its own — built, tested and depended on exactly as it would be on its own. `*`
 stands for one directory level and matches inside a name (`tools/*`, `tools/sysl-*`); a glob takes
 the directories it reaches that hold a manifest and passes over the rest, so `tools/*` beside a
 directory of images is the ordinary case. Nothing fancier is read: no `**`, no `..`, no absolute
@@ -2629,26 +2634,26 @@ it. It therefore takes no dependencies, since a dependency there would reach no 
 believed every member had it:
 
 ```text
-package.hocon: 'dependencies' in a workspace with no 'package' block reaches nothing — the root compiles nothing of its own, so name each dependency in the member that imports it
+sysl.hocon: 'dependencies' in a workspace with no 'package' block reaches nothing — the root compiles nothing of its own, so name each dependency in the member that imports it
 ```
 
 The list is a list and nothing else. A string, a block or a list of anything but directory names is
 refused:
 
 ```text
-package.hocon: 'workspace' is not a list of directories — a workspace is written 'workspace = ["compiler", "tools/*"]', each entry a member's directory relative to this file
+sysl.hocon: 'workspace' is not a list of directories — a workspace is written 'workspace = ["compiler", "tools/*"]', each entry a member's directory relative to this file
 ```
 
 ### A directory holding its own manifest is another project
 
-**A tree stops at any directory below its root that holds a `package.hocon`** — the rule Cargo keeps
+**A tree stops at any directory below its root that holds a `sysl.hocon`** — the rule Cargo keeps
 for a nested `Cargo.toml`. It holds whether or not anything declares a workspace, because a nested
 project is a different program either way:
 
 ```
-kairos/package.hocon
+kairos/sysl.hocon
 kairos/sh/sysl/kairos/kairos.sysl            the package
-kairos/probe/package.hocon                   another project: not part of the package's tree
+kairos/probe/sysl.hocon                      another project: not part of the package's tree
 kairos/probe/main.sysl
 ```
 
@@ -2748,7 +2753,7 @@ included — a list naming a directory that is not there is wrong whichever memb
 
 ```text
 workspace member 'nope' does not exist — '/…/repo/nope' is not a directory
-workspace member 'bare' has no package.hocon — a member is a project, and a project is a directory holding one
+workspace member 'bare' has no sysl.hocon — a member is a project, and a project is a directory holding one
 'workspace' names '../x', which is not a directory below the workspace — a member is written relative to the file declaring the workspace, inside it, with '*' standing for one directory level
 workspace member 'a/inner' is inside member 'a' — each member's tree is its own, so one member cannot hold another
 workspace members 'a' and 'b' are both named 'twin' — a member is picked and depended on by its 'package.name', so each needs its own
@@ -2851,7 +2856,7 @@ silently win.
 A key that matches no carried file stops the build:
 
 ```
-package.hocon: 'defines."sh/sysl/miniz/c/typo.c"' names a file this package does not carry —
+sysl.hocon: 'defines."sh/sysl/miniz/c/typo.c"' names a file this package does not carry —
 the block configures the C the package itself holds, and there is no such C file in this tree
 ```
 
@@ -2987,7 +2992,7 @@ The rest of the rules are the `defines` block's, for the same reasons:
   declaring none of `sources`, `include` and `export` is a block to delete.
 
 ```
-package.hocon: 'c.tinyusb.sources' names 'c/tinyusb/src/device/usbx.c', which this package does
+sysl.hocon: 'c.tinyusb.sources' names 'c/tinyusb/src/device/usbx.c', which this package does
 not hold — a library compiles exactly the files it lists, so a missing one is a mistake rather than
 a file to leave out
 ```
