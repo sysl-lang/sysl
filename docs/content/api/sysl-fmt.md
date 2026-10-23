@@ -210,7 +210,7 @@ format_real_plain(x: real) -> string
 A `real` as `str` and a plain hole write it -- what Rust's `{}` writes: the fewest digits that read
 back as the same `real`, set out positionally, so `0.1`, `1`, `100000000000000000000` and
 `0.0000001`, never an exponent and never a trailing `.0`; `-0`, `inf`, `-inf` and `NaN` for the rest.
-The compiler calls it; a program writes `str(x)` or `"$x"`.
+The compiler calls it; a program writes `x.to_string()` or `s"$x"`.
 
 ### `format_spec_of`
 

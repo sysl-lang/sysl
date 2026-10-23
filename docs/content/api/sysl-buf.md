@@ -10,7 +10,7 @@ summary: "The growable sequence and the sink built on it."
 A module of its own because nothing in the language reaches either: an array literal makes a `[]T`
 and a `for` walks whatever implements `Iterate`, so a program that wants a sequence that grows is
 asking for one, and asks with an `import`. What renders into a buffer without a program naming a
-sink is `str(x)`, and that goes through storage the compiler lays out rather than through
+sink is `x.to_string()`, and that goes through storage the compiler lays out rather than through
 `ByteSink` -- which is why the sink can sit here beside the buffer it wraps.
 
 ## Index
