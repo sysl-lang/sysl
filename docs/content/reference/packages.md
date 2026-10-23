@@ -1932,7 +1932,7 @@ and is exactly `desktop { enables = [webview] }`**. A feature block takes these 
 | `if` | the machines the feature exists on, written as a dependency's `if` is; asking for it elsewhere is refused |
 | `enables` | the optional dependencies and other features it turns on, as the list form names them |
 | `requires` | a list of features that have to be on whenever this one is; the build is refused if one is off |
-| `targets` | the target keys the feature sets while it is on ([above](#a-feature-may-set-a-targets-keys-again)) |
+| `targets` | the target keys the feature sets while it is on ([above](#a-feature-may-set-a-target-s-keys-again)) |
 
 `macro`, `options`, `c`, `defines`, `config` and `sections` are accepted in a feature block and
 **ignored with a warning** until the C layer reads them. A key this sysl does not know is warned about
