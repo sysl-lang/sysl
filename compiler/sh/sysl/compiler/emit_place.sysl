@@ -661,6 +661,51 @@ build_bits(e: *Emit, ranges: Buf[BitRange], vals: Buf[Val]) -> Val
         None -> VInt(from_int(0))
 end build_bits
 
+// The `@packed` struct of whole-byte fields a type is, where `.bits` and `T::Bits` on it convert
+// rather than reinterpret (`bitfield_int.sysl`): one that converts to an integer without being held
+// as one.
+whole_packed_of(t: Type) -> Option[&StructType] = underlying(t) match
+    Struct(d) -> if bitfield_ranges(d).is_none() && integer_ranges(d).is_some() then Some(d) else None
+    _ -> None
+
+// `x.bits` on a `@packed` struct of whole-byte fields: each field taken out of the aggregate, in the
+// order its value has where the struct states a byte order, and placed in its range of the integer.
+// Every value is a register, so on a little-endian machine LLVM sees the bytes go straight across.
+whole_bits(e: *Emit, t: Type, d: &StructType, v: Val) -> Val
+    val ranges = integer_ranges(d).unwrap()
+    val agg = lty(e, t)
+    val little = e.target.little_endian()
+    var vals: Buf[Val] = buf()
+
+    for i in 0..<ranges.len()
+        val r = ranges.at(i)
+        val f = fresh_reg(e)
+
+        emit(e, InExtract(f, agg, v, index_list(int(i))))
+        vals.push(reordered(e, reversed_width(d, r.ty, little), f))
+
+    build_bits(e, ranges, vals)
+end whole_bits
+
+// `T::Bits(n)` on one: each range read out of the integer and inserted as its field, reversed into
+// the struct's byte order where it states one.
+whole_from_bits(e: *Emit, t: Type, d: &StructType, c: Val) -> Val
+    val ranges = integer_ranges(d).unwrap()
+    val agg = lty(e, t)
+    val little = e.target.little_endian()
+    var out = VUndef
+
+    for i in 0..<ranges.len()
+        val r = ranges.at(i)
+        val f = reordered(e, reversed_width(d, r.ty, little), read_bits(e, ranges, r, c))
+        val next = fresh_reg(e)
+
+        emit(e, InInsert(next, agg, out, lty(e, r.ty), f, index_list(int(i))))
+        out = next
+
+    out
+end whole_from_bits
+
 // -- taking a view of some of what a place holds ------------------------------------------------------
 
 // The dereference a place walk bottoms out at, following **receivers only**.

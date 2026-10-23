@@ -1,0 +1,486 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// **A `@packed` struct whose fields are all whole bytes converts to an integer too** (`layout.sysl`'s
+// `integer_ranges`, `bitfield_int.sysl`): `T::Bits(n)` and `x.bits` read its fields as ranges of one
+// unsigned integer, least significant first, as wide as the struct -- while its storage stays its
+// fields end to end, with the size, alignment and C ABI it had. `attributes.md § Bitfields` is the
+// spec.
+//
+// The axes crossed: the width (8 to 128, and 40); the field kind (signed, `_`, a simple enum, a
+// bitfield struct held whole, and each kind refused); the layout (unchanged, checked against clang,
+// and the integer checked against the bytes); the C boundary (by value both ways); module storage (a
+// `val` from a `const`, folded to data on a bare Thumb machine); a generic struct; a pointer; an
+// array; `@byte_order`. Skipped: separate compilation -- the conversion is lowered where it is
+// written, like any field access, and nothing about it crosses a module boundary.
+
+private wbb_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level`, with `c` beside it where it is not empty, and run: its status, what it
+// printed, and what it wrote to standard error -- the refusal, where the build was refused.
+private wbb_run(text: string, c: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-wbb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if !c.is_empty() then write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end wbb_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private wbb_prints_with(text: string, c: string, printed: string)
+    if !wbb_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = wbb_run(text, c, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end wbb_prints_with
+
+private wbb_prints(text: string, printed: string) = wbb_prints_with(text, "", printed)
+
+// The program is refused with exactly one diagnostic, this message at this position.
+private wbb_refused(text: string, message: string, line: int, col: int)
+    if !wbb_ready() then return
+
+    val (_, _, err) = wbb_run(text, "", "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end wbb_refused
+
+// What `sysl build-c` says of a tree for a target: its status and every line it wrote.
+private wbb_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-wbb-c").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end wbb_build_c
+
+// The rule the refusals end with.
+private val wbb_rule: string = "only a '@packed' struct whose every field is an integer, a simple " +
+                               "enum or a bitfield struct converts to one"
+
+// -- the three shapes the finding was made with -------------------------------------------------------
+
+@test("a packed struct of one u32, of one '_: u32', and of a u8 and a u24 each convert to a u32")
+wbb_the_probe_shapes()
+    wbb_prints(raw"""
+        @packed
+        struct One
+            v: u32
+
+        @packed
+        struct Rsv
+            _: u32
+
+        @packed
+        struct Whole
+            a: u8
+            b: u24
+
+        val o = One::Bits(5)
+        val r = Rsv::Bits(0xDEADBEEF)
+        val w = Whole::Bits(0xAABBCCDD)
+
+        print(o.v, o.bits, r.bits, w.a, w.b, w.bits)
+        print(Whole(0x11, 0x223344).bits, sizeof(Whole), alignof(Whole))
+        """, "5 5 3735928559 221 11189196 2864434397\n573785105 5 1\n")
+end wbb_the_probe_shapes
+
+// -- every width ----------------------------------------------------------------------------------------
+
+@test("the integer is as wide as the fields together: 8, 16, 24, 32, 40, 48, 64 and 128 bits")
+wbb_every_width()
+    wbb_prints(raw"""
+        @packed
+        struct W8
+            a: u8
+
+        @packed
+        struct W16
+            a: u8
+            b: u8
+
+        @packed
+        struct W24
+            a: u16
+            b: u8
+
+        @packed
+        struct W32
+            a: u8
+            b: u16
+            c: u8
+
+        @packed
+        struct W40
+            a: u32
+            b: u8
+
+        @packed
+        struct W48
+            a: u16
+            b: u32
+
+        @packed
+        struct W64
+            a: u32
+            b: u32
+
+        @packed
+        struct W128
+            a: u64
+            b: u32
+            c: u32
+
+        val x8: u8 = 0xAB
+        val x16: u16 = 0xABCD
+        val x24: u24 = 0xABCDEF
+        val x32: u32 = 0x12345678
+        val x40: u40 = 0x123456789A
+        val x48: u48 = 0x123456789ABC
+        val x64: u64 = 0x123456789ABCDEF0
+        val x128: u128 = 0x112233445566778899AABBCCDDEEFF00
+
+        print(W8::Bits(x8).a, W8::Bits(x8).bits == x8)
+        print(W16::Bits(x16).a, W16::Bits(x16).b, W16::Bits(x16).bits == x16)
+        print(W24::Bits(x24).a, W24::Bits(x24).b, W24::Bits(x24).bits == x24)
+        print(W32::Bits(x32).a, W32::Bits(x32).b, W32::Bits(x32).c, W32::Bits(x32).bits == x32)
+        print(W40::Bits(x40).a, W40::Bits(x40).b, W40::Bits(x40).bits == x40, sizeof(W40))
+        print(W48::Bits(x48).a, W48::Bits(x48).b, W48::Bits(x48).bits == x48, sizeof(W48))
+        print(W64::Bits(x64).a, W64::Bits(x64).b, W64::Bits(x64).bits == x64)
+        print(W128::Bits(x128).a, W128::Bits(x128).b, W128::Bits(x128).c, W128::Bits(x128).bits == x128)
+        print(W128(1, 2, 3).bits)
+        """, "171 true\n205 171 true\n52719 171 true\n120 13398 18 true\n" +
+             "878082202 18 true 5\n39612 305419896 true 6\n2596069104 305419896 true\n" +
+             "11072869122414935808 1432778632 287454020 true\n" +
+             "237684487579686500928050954241\n")
+end wbb_every_width
+
+// -- the field kinds ------------------------------------------------------------------------------------
+
+@test("a signed field takes its sign bit from the integer and gives it back")
+wbb_a_signed_field_round_trips()
+    wbb_prints(raw"""
+        @packed
+        struct S
+            a: i8
+            b: u8
+            c: i16
+
+        val s = S::Bits(0x8001FF)
+
+        print(s.a, s.b, s.c, s.bits)
+        print(S(-128, 0, -1).bits, S(-1, 1, 1).bits)
+        """, "-1 1 128 8389119\n4294901888 66047\n")
+end wbb_a_signed_field_round_trips
+
+@test("a '_' field is a range like any other: kept on the way in and given back on the way out")
+wbb_underscore_fields()
+    wbb_prints(raw"""
+        @packed
+        struct Gap
+            a: u8
+            _: u16
+            b: u8
+
+        val g = Gap::Bits(0x44332211)
+
+        print(g.a, g.b, g.bits, Gap(1, 0, 2).bits)
+        """, "17 68 1144201745 33554433\n")
+end wbb_underscore_fields
+
+@test("a simple enum field holds its discriminant, and a bitfield struct field its whole container")
+wbb_enum_and_bitfield_fields()
+    wbb_prints(raw"""
+        enum Mode: u8
+            Off = 0
+            On = 3
+
+        @packed
+        struct Flags
+            en: u1
+            pri: u7
+
+        @packed
+        struct Reg
+            mode: Mode
+            flags: Flags
+            count: u16
+
+        val r = Reg::Bits(0x1234_0F_03)
+
+        print(r.mode == Mode.On, r.flags.en, r.flags.pri, r.count, r.bits)
+        print(Reg(Mode.On, Flags(1, 2), 7).bits, sizeof(Reg))
+        """, "true 1 7 4660 305401603\n460035 4\n")
+end wbb_enum_and_bitfield_fields
+
+@test("a struct mixing sub-byte and whole-byte fields is still one integer, as it was")
+wbb_mixed_widths_unchanged()
+    wbb_prints(raw"""
+        @packed
+        struct Mx
+            a: u4
+            b: u4
+            c: u8
+
+        var arena: [2]u8 = [0; 2]
+        var p: *Mx = ptr_cast(&arena[0])
+
+        p.a = 1
+        p.b = 2
+        p.c = 3
+
+        print(arena[0], arena[1], p.bits, Mx::Bits(0x0321).c, sizeof(Mx))
+        """, "33 3 801 3 2\n")
+end wbb_mixed_widths_unchanged
+
+// -- the layout and the C boundary -------------------------------------------------------------------
+
+private val wbb_c: string = raw"""
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <string.h>
+
+    struct __attribute__((packed)) Whole { uint8_t a; uint32_t b; uint16_t c; };
+
+    size_t c_size(void) { return sizeof(struct Whole); }
+    size_t c_align(void) { return _Alignof(struct Whole); }
+    size_t c_off_b(void) { return offsetof(struct Whole, b); }
+    size_t c_off_c(void) { return offsetof(struct Whole, c); }
+
+    /* The bytes of the struct read as one little-endian integer -- what '.bits' must be. */
+    uint64_t c_bytes(struct Whole w) {
+        uint64_t n = 0;
+        memcpy(&n, &w, sizeof w);
+        return n;
+    }
+
+    struct Whole c_next(struct Whole w) {
+        w.a += 1;
+        w.b += 1;
+        w.c += 1;
+        return w;
+    }
+    """
+
+@test("a whole-byte packed struct keeps clang's size, alignment, offsets and calling convention")
+wbb_layout_and_abi_match_clang()
+    wbb_prints_with(raw"""
+        @packed
+        struct Whole
+            a: u8
+            b: u32
+            c: u16
+
+        extern c_size() -> usize
+        extern c_align() -> usize
+        extern c_off_b() -> usize
+        extern c_off_c() -> usize
+        extern c_bytes(w: Whole) -> u64
+        extern c_next(w: Whole) -> Whole
+
+        val w = Whole::Bits(0x0102_03040506_07)
+        val n = c_next(w)
+
+        print(sizeof(Whole) == c_size(), alignof(Whole) == c_align())
+        print(offsetof(Whole, b) == c_off_b(), offsetof(Whole, c) == c_off_c())
+        print(c_bytes(w) == u64(w.bits), n.a, n.b, n.c, u64(n.bits) == c_bytes(n))
+        """, wbb_c, "true true\ntrue true\ntrue 8 50595079 259 true\n")
+end wbb_layout_and_abi_match_clang
+
+// -- module storage ----------------------------------------------------------------------------------
+
+private val wbb_storage: string = raw"""
+    @packed
+    struct Whole
+        a: u8
+        b: u24
+
+    @packed
+    struct Small
+        a: u3
+        b: u21
+
+    const RAW: u32 = 0xAABBCCDD
+    const SMALL: u24 = 0x123456
+
+    val W = Whole::Bits(RAW)
+    val S = Small::Bits(SMALL)
+    val L = Small(3, 0x1234)
+
+    """
+
+@test("a module 'val' made with Bits from a 'const' holds the fields the integer does")
+wbb_module_val_from_a_const()
+    wbb_prints(wbb_storage + "print(W.a, W.b, W.bits, S.a, S.b, S.bits, L.bits)\n",
+               "221 11189196 2864434397 6 149130 1193046 37283\n")
+end wbb_module_val_from_a_const
+
+@test("on a bare Thumb machine those 'val's are constant data, with nothing to run to fill them")
+wbb_module_val_folds_on_thumb()
+    if !wbb_ready() then return
+
+    val (code, said) = wbb_build_c(wbb_storage + raw"""
+        @export("main")
+        probe() -> u32 = u32(W.b) + u32(S.b) + u32(L.a)
+        """, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+end wbb_module_val_folds_on_thumb
+
+// -- generic, through a pointer, in an array, in a stated byte order ----------------------------------
+
+@test("a generic packed struct converts at every instance, and '.bits' in a generic body is the instance's")
+wbb_generic_struct()
+    wbb_prints(raw"""
+        @packed
+        struct Pair[T]
+            lo: T
+            hi: T
+
+        type P8 = Pair[u8]
+        type P16 = Pair[u16]
+
+        show_bits[T](p: Pair[T])
+            print(p.bits)
+
+        swapped[T](p: Pair[T]) -> Pair[T] = Pair[T](p.hi, p.lo)
+
+        val a = P8::Bits(0x1234)
+        val b = P16::Bits(0x12345678)
+
+        print(a.lo, a.hi, a.bits, b.lo, b.hi, b.bits)
+        show_bits(a)
+        show_bits(Pair[u16](1, 2))
+        print(swapped(a).bits, swapped(b).bits)
+        """, "52 18 4660 22136 4660 305419896\n4660\n131073\n13330 1450709556\n")
+end wbb_generic_struct
+
+@test("'.bits' through a pointer reads the struct where it is, and a field written through it is in it")
+wbb_bits_through_a_pointer()
+    wbb_prints(raw"""
+        @packed
+        struct Whole
+            a: u8
+            b: u24
+
+        var word: u64 = 0x11223344
+        val p: *Whole = ptr_cast(&word)
+
+        print(p.bits, p.a, p.b)
+
+        p.a = 0xFF
+        print(p.bits, word)
+
+        *p = Whole::Bits(7)
+        print(word)
+        """, "287454020 68 1122867\n287454207 287454207\n7\n")
+end wbb_bits_through_a_pointer
+
+@test("an array of them converts element by element, and an element is replaced from bits")
+wbb_an_array_of_them()
+    wbb_prints(raw"""
+        @packed
+        struct Whole
+            a: u8
+            b: u24
+
+        var regs: [3]Whole = [Whole::Bits(1), Whole::Bits(0x100), Whole::Bits(0xFFFFFFFF)]
+
+        regs[1] = Whole::Bits(regs[2].bits - 1)
+
+        print(regs[0].a, regs[1].a, regs[1].b, regs[2].bits, sizeof([3]Whole))
+        """, "1 254 16777215 4294967295 15\n")
+end wbb_an_array_of_them
+
+@test("a '@byte_order(big)' struct's integer holds its fields' values, not the bytes of the wire")
+wbb_byte_order_holds_values()
+    wbb_prints(raw"""
+        @packed
+        @byte_order(big)
+        struct Hdr
+            kind: u8
+            len: u16
+
+        val h = Hdr::Bits(0x123456)
+        var wire: [3]u8 = [0; 3]
+        var p: *Hdr = ptr_cast(&wire[0])
+
+        *p = h
+
+        print(h.kind, h.len, h.bits, wire[0], wire[1], wire[2], p.bits)
+        """, "86 4660 1193046 86 18 52 1193046\n")
+end wbb_byte_order_holds_values
+
+// -- the refusals --------------------------------------------------------------------------------------
+
+@test("a field of any other kind keeps the refusal, and the refusal names it")
+wbb_other_field_kinds_refused()
+    wbb_refused("@packed\nstruct F\n    a: u8\n    x: f32\n\nprint(F::Bits(1).a)\n",
+                s"'F::Bits' has no integer to make it from: its field 'x' is f32 — $wbb_rule", 6, 8)
+    wbb_refused("@packed\nstruct B\n    a: u8\n    on: bool\n\nprint(B::Bits(1).a)\n",
+                s"'B::Bits' has no integer to make it from: its field 'on' is bool — $wbb_rule", 6, 8)
+    wbb_refused("@packed\nstruct A\n    xs: [2]u8\n\nprint(A::Bits(1).xs[0])\n",
+                s"'A::Bits' has no integer to make it from: its field 'xs' is [2]byte — $wbb_rule", 5, 8)
+    wbb_refused("@packed\nstruct P\n    p: *u8\n\nprint(P::Bits(1).p == null)\n",
+                s"'P::Bits' has no integer to make it from: its field 'p' is *byte — $wbb_rule", 5, 8)
+    wbb_refused("struct In\n    a: u8\n\n@packed\nstruct O\n    i: In\n\nprint(O::Bits(1).i.a)\n",
+                s"'O::Bits' has no integer to make it from: its field 'i' is In — $wbb_rule", 8, 8)
+end wbb_other_field_kinds_refused
+
+@test("a struct that is not '@packed', and a union, have no ::Bits, saying why")
+wbb_unpacked_and_union_refused()
+    wbb_refused("struct P\n    a: u8\n    b: u8\n\nprint(P::Bits(1).a)\n",
+                s"'P' is not '@packed', so 'P::Bits' has no integer to make it from — $wbb_rule", 5, 8)
+    wbb_refused("union U\n    a: u8\n    b: u8\n\nprint(U::Bits(1).a)\n",
+                s"'U' is a union, so 'U::Bits' has no integer to make it from — $wbb_rule", 5, 8)
+end wbb_unpacked_and_union_refused
+
+@test("'.bits' on a packed struct of a float is a missing property, as on any struct without one")
+wbb_bits_read_refused()
+    wbb_refused("@packed\nstruct F\n    x: f32\n\nval f = F(1.0)\n\nprint(f.bits)\n",
+                "'F' has no field or property 'bits'", 7, 9)
+end wbb_bits_read_refused
