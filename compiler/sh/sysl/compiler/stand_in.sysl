@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A trait object standing in for a type parameter.
+//
+// A `*Port` handed to `send[P: Port](p: *P)` binds `P` to the trait `Port` itself (`generic.sysl`'s
+// `binds_object`), so that `*P` is the object and every call through `p` dispatches through its
+// table. It is Rust's `?Sized` binding with nothing written for it, and it has Rust's condition: a
+// trait has no size and no layout, so the body may only ever reach `P` behind a mode. A bare `P` as a
+// parameter or a local, `sizeof(P)`, `[4]P`, `Buf[P]`, `P(…)` and `P.make()` all need a type with a
+// layout, and an object cannot give one.
+//
+// **The question is asked at the call, about the declaration as written**, because the call is what
+// handed the object in: the reader is told which use in the body stops it, by line, rather than
+// handed a complaint from inside a body they did not write. Whatever this cannot see -- a generic
+// type's field, a bound's argument -- `resolve_type.sysl` refuses where the instantiation reads it.
+
+// Whether every type parameter a trait object stands in for is used only behind a mode in `d`, and is
+// bounded at all. Refused at the call (`site`, `span`) where not.
+stand_ins_hold(a: &Analysis, home: Scope, site: Scope, span: Span, what: string, d: FuncDecl,
+               tparams: Buf[string], targs: Buf[Type]) -> bool
+    var objects: Buf[string] = buf()
+
+    for i in 0..<tparams.len()
+        if i < targs.len() && is_trait(targs.at(i)) then objects.push(tparams.at(i))
+
+    if objects.is_empty() then return true
+
+    val shown = qualified_name(what)
+
+    // **The object's calls go through the trait a bound names**, so a parameter bounded by nothing
+    // has no table for them to go through, and binding it to a trait would only hide the mistake.
+    for tp in objects
+        if !bounded(d.bounds, tp)
+            a.fault(site, span, s"'$shown' asks nothing of its type parameter '$tp', so a trait object " +
+                    s"cannot stand in for it — bound it with the trait the object dispatches through")
+            return false
+        end if
+
+    val found = body_constructs(d)
+
+    for i in 0..<found.len()
+        val use = by_value_use(a, home, found, i, objects)
+
+        if use.is_some()
+            val at = home.src.locate(found.at(i).span.start).line
+            val place = if home.src.name == site.src.name then s"line $at" else s"${home.src.name}:$at"
+            val tp = use.unwrap().0
+
+            a.fault(site, span, s"'$shown' uses '$tp' ${use.unwrap().1} at $place, so a trait object " +
+                    s"cannot stand in for it — only '*$tp' and '&$tp' can be written with one")
+            return false
+        end if
+
+    true
+end stand_ins_hold
+
+private bounded(bounds: Buf[NamedBounds], tp: string) -> bool
+    for nb in bounds
+        if nb.name == tp && !nb.bounds.is_empty() then return true
+
+    false
+end bounded
+
+// The parameter construct `i` uses where an object cannot be, and how it uses it.
+private by_value_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
+                     objects: Buf[string]) -> Option[(string, string)] = found.at(i).node match
+    AtType(t) -> *t.kind match
+        NamedType(n, args) ->
+            if args.is_empty() && holds_string(objects, n) then type_use(found, i, n) else None
+        _ -> None
+    AtExpr(e) -> *e.kind match
+        Ident(n) -> if holds_string(objects, n) then expr_use(a, home, found, i, n) else None
+        _ -> None
+    _ -> None
+
+// A parameter written as a type: fine directly behind `*` or `&`, a use of its layout anywhere else.
+private type_use(found: Buf[Construct], i: usize, n: string) -> Option[(string, string)]
+    val p = parent_of(found, i)
+
+    if p.is_none() then return Some((n, "by value"))
+
+    found.at(p.unwrap()).node match
+        AtType(t) -> *t.kind match
+            PtrType(_) -> None
+            RefType(_, _) -> None
+            // **An associated item is refused, not dispatched.** A table holds a slot per member and
+            // nothing else, so an associated const has nowhere to be read from; and an associated
+            // type is fixed by the object's type rather than by any one value, which a body written
+            // against `P::Item` cannot tell from the implementation's own.
+            AssocType(_, member) -> Some((n, s"for its associated type '$n::$member'"))
+            _ -> Some((n, s"in '${type_text(t)}'"))
+        AtExpr(e) -> *e.kind match
+            LayoutOf(op, _) -> Some((n, s"in '$op($n)'"))
+            OffsetOf(_, field) -> Some((n, s"in 'offsetof($n, $field)'"))
+            _ -> Some((n, "by value"))
+        _ -> Some((n, "by value"))
+end type_use
+
+// A parameter written in an expression: as a type argument of a function it is handed on, and that
+// function's own call is asked the same question; as anything else it needs the type itself.
+private expr_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
+                 n: string) -> Option[(string, string)]
+    val p = parent_of(found, i)
+
+    if p.is_none() then return Some((n, "as a value"))
+
+    val me = found.at(i).span
+
+    found.at(p.unwrap()).node match
+        AtExpr(e) -> *e.kind match
+            // `*P` and `&P` among a call's type arguments, which the expression grammar spells as
+            // the operators.
+            Unary(op, _) -> if op == "*" || op == "&" then None else Some((n, "as a value"))
+            Index(recv, _, _) -> argument_use(a, home, recv, me, n)
+            TypeArgs(recv, _, _) -> argument_use(a, home, recv, me, n)
+            Call(callee, _) ->
+                if same_span(callee.span, me) then Some((n, "to construct a value"))
+                else Some((n, "as a value"))
+            Field(_, name, _) -> Some((n, s"for its static member '$n.$name'"))
+            TypeAttr(_, attr, _, _) -> Some((n, s"for its associated item '$n::$attr'"))
+            _ -> Some((n, "as a value"))
+        _ -> Some((n, "as a value"))
+end expr_use
+
+// `f[P]` hands the parameter on to another generic function, whose own call asks this again; `Buf[P]`
+// applies a type to it, which lays it out.
+private argument_use(a: &Analysis, home: Scope, recv: Expr, me: Span,
+                     n: string) -> Option[(string, string)]
+    if same_span(recv.span, me) then return Some((n, "as a value"))
+
+    *recv.kind match
+        Ident(m) -> if lookup_type_key(a, home, m).is_some() then Some((n, s"in '$m[$n]'")) else None
+        _ -> None
+end argument_use
+
+// The nearest construct before `i` whose extent holds it, which the walk's order makes its parent.
+// A construct of the same extent is the node wrapping it -- a statement of one expression -- and is
+// passed over for the one above, as is a node nobody wrote.
+private parent_of(found: Buf[Construct], i: usize) -> Option[usize]
+    val s = found.at(i).span
+    var j = i
+
+    while j > 0
+        j -= 1
+
+        val o = found.at(j).span
+
+        if !o.is_empty() && o.start <= s.start && o.end >= s.end && !same_span(o, s) then return Some(j)
+
+    None
+end parent_of
+
+private same_span(x: Span, y: Span) -> bool = x.start == y.start && x.end == y.end

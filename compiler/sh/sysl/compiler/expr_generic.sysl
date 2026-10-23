@@ -98,6 +98,9 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     if !check_param_bounds(cx.an, f.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
                            "type parameter", cx.scope) then return bad_expr(span)
 
+    if !stand_ins_hold(cx.an, f.scope, cx.scope, span, key, decl, decl.tparams, targs) then
+        return bad_expr(span)
+
     val name = instantiate_func(cx.an, f.scope, decl, targs, false)
     val sig = cx.an.tables.members.func_insts.get(name)
 
@@ -159,8 +162,38 @@ private written_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type
         return value_written(cx, e, ty, s"'$name' of '${f.decl.name}'")
     end if
 
-    written_type_arg(cx, e)
+    stand_in_arg(cx, e) match
+        Some(t) -> t
+        None -> written_type_arg(cx, e)
 end written_arg_for
+
+// A trait written as a generic **function's** type argument, `send[Port](p, v)`, which is the
+// binding a `*Port` handed to its `*P` parameter makes (`stand_in.sysl`): the trait itself. A
+// parameter already standing for one is handed on the same way, `inner[P](p)`. Nothing for any other
+// argument, which reads as a type does. A generic type's argument is never read here -- a type's
+// fields are laid out, and a trait has no layout.
+stand_in_arg(cx: &Analyzer, e: Expr) -> Option[Type]
+    val name = *e.kind match
+        Ident(n) -> Some(n)
+        Field(_, _, _) -> dotted_path_of(e)
+        _ -> None
+
+    if name.is_none() then return None
+
+    val stood = bound_type(cx.subst, name.unwrap())
+
+    if stood.is_some() then return if is_trait(stood.unwrap()) then stood else None
+
+    val key = lookup_type_key(cx.an, cx.scope, name.unwrap())
+
+    if key.is_none() || trait_decl_at(cx.an, key.unwrap()).is_none() then return None
+
+    // Read as the object it will be, so a trait no table can be made for is refused as one.
+    resolve_type(cx.an, cx.scope, type_ref(e.span, PtrType(named_type(e.span, name.unwrap()))),
+                 cx.subst) match
+        Ptr(t) -> Some(*t)
+        _ -> Some(Unknown)
+end stand_in_arg
 
 // One argument written for a value parameter of type `ty`: a value whatever its spelling. A number
 // travels at the width a length does, as one written as a literal does. `subject` names the
@@ -440,6 +473,9 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // came back would be a consequence of this one.
     if !check_param_bounds(cx.an, f.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
                            "type parameter", cx.scope) then return bad_expr(span)
+
+    if !stand_ins_hold(cx.an, f.scope, cx.scope, span, key, decl, decl.tparams, targs) then
+        return bad_expr(span)
 
     // An argument meeting a `T: Debug` bound only as a placeholder -- `assert_eq` over two writer
     // objects -- is shown as that placeholder, and the call is told so as `print` would be. A call the
