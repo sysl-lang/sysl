@@ -105,6 +105,63 @@ random_singles_agree_with_hardware()
         assert(narrow == f32(x).bits() || (x != x && f32.from_bits(narrow) != f32.from_bits(narrow)),
                s"$x narrowed")
 
+private half_to_single(x: u16) -> u32 = narrow_single(widen_half(x))
+
+private single_to_half(x: u32) -> u16 = narrow_half(widen_single(x))
+
+private double_to_half(x: u64) -> u16 = narrow_half(x)
+
+@test("every binary16 encoding widens to the double and the f32 the host widens it to")
+every_half_widens_as_the_host_does()
+    for b in 0..<65536
+        val h = f16.from_bits(u16(b))
+        val d = real(h)
+        val f = f32(h)
+
+        assert(same(widen_half(u16(b)), d), s"half $b widened")
+        assert(half_to_single(u16(b)) == f.bits() || (f != f && f32.from_bits(half_to_single(u16(b))) != f32.from_bits(half_to_single(u16(b)))),
+               s"half $b to f32")
+
+@test("a double and an f32 narrow to the binary16 the host rounds them to")
+random_doubles_and_singles_narrow_to_half_as_the_host_does()
+    var g = rng(71, 9)
+
+    for step in 0..<40000
+        val x = any_double(&g)
+        val h = f16(x)
+        val got = f16.from_bits(double_to_half(x.bits()))
+
+        assert(got.bits() == h.bits() || (x != x && got != got), s"$x narrowed to half")
+
+        val f = f32.from_bits(u32(g.next_u64() >> 32))
+        val hf = f16(f)
+        val gotf = f16.from_bits(single_to_half(f.bits()))
+
+        assert(gotf.bits() == hf.bits() || (f != f && gotf != gotf), s"f32 ${f.bits()} narrowed to half")
+
+@test("binary16 edges: ties to even, the subnormal and normal boundary, overflow and underflow")
+half_edges()
+    // 2049 sits halfway between 2048 and 2050 (spacing 2): ties to the even 2048; 2051 to 2052.
+    assert(double_to_half(2049.0.bits()) == 0x6800)
+    assert(double_to_half(2051.0.bits()) == 0x6802)
+    // 65504 is the largest half; 65520 is halfway to 65536 and rounds up to infinity.
+    assert(double_to_half(65504.0.bits()) == 0x7BFF)
+    assert(double_to_half(65519.0.bits()) == 0x7BFF)
+    assert(double_to_half(65520.0.bits()) == 0x7C00)
+    assert(double_to_half((-65520.0).bits()) == 0xFC00)
+    // The smallest subnormal is 2^-24, and half of it is a tie to even zero; just over rounds up.
+    assert(double_to_half(0x3E70_0000_0000_0000) == 0x0001)
+    assert(double_to_half(0x3E60_0000_0000_0000) == 0x0000)
+    assert(double_to_half(0x3E60_0000_0000_0001) == 0x0001)
+    // Halfway between the largest subnormal and the smallest normal rounds to the even one, the normal.
+    assert(double_to_half(0x3F0F_FC00_0000_0000) == 0x0400)
+    assert(double_to_half(0x3F0F_FBFF_FFFF_FFFF) == 0x03FF)
+    assert(double_to_half(0x3F10_0000_0000_0000) == 0x0400)
+    assert(double_to_half((-0.0).bits()) == 0x8000)
+    assert(double_to_half(0x7FF0_0000_0000_0000) == 0x7C00)
+    assert(double_to_half(0x7FF0_0000_0000_0001) == 0x7E00)
+    assert((half_to_single(0x7C01) & 0x7FC0_0000) == 0x7FC0_0000)
+
 @test("the edges: zeros, infinities, NaNs, the ends of the range, and a tie rounded to even")
 edges()
     val inf: u64 = 0x7FF0_0000_0000_0000
