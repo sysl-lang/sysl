@@ -715,8 +715,8 @@ variadic cursor, are `Opaque`.
 
 ```sysl
 enum Option[T]
+    None = 0
     Some(value: T)
-    None
 ```
 
 A value that may be absent. This is an ordinary generic enum rather than anything the analyzer
@@ -725,6 +725,9 @@ builds: what the compiler knows is that `?` unwraps it and which variant means w
 
 `unwrap` and `expect` stop the program through `exit`, which is what `11-error-handling.md` says a
 trap does under the `os` capability -- so neither needs compiler support of its own.
+
+`None` is written `= 0`, so it is the zero value: a `var x: Option[T]` with no initializer, a
+zeroed array of them and a struct field left to its zero all start out `None`.
 
 | Member | Signature | Description |
 |---|---|---|

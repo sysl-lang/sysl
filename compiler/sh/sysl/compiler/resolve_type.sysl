@@ -2103,10 +2103,14 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     val subst = bindings_for(d.tparams, targs)
 
     // **A simple enum's tag is its discriminant, which is the value the program wrote.** A data
-    // enum's is its position, since nothing may name one. So the two are assigned by different
-    // rules, and only the first of them reads what was written after the `=`.
+    // enum's is its position, since nothing may name one -- except its zero: one variant carrying
+    // nothing may be written `= 0`, takes tag 0, and is the enum's zero value, and the rest are
+    // numbered from 1 in the order they are declared. So the two are assigned by different rules.
     val cx = analyzer_for(a, home)
-    var next_tag = from_int(0)
+    val zeros = data_enum_zeros(d, simple)
+    var next_tag = from_int(if any_zero(zeros) then 1 else 0)
+    var zero_name: Option[string] = None
+    var position = 0
 
     for v in d.variants
         var fields: Buf[(string, Type)] = buf()
@@ -2120,8 +2124,22 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
         leave_fields(a, outer)
 
         var tag = next_tag
+        var numbered = simple && v.value.is_some()
+        val zero = zeros.at(position)
 
-        if simple
+        position += 1
+
+        if zero
+            zero_name match
+                Some(had) ->
+                    if first
+                        a.fault(scope, span, s"variants '$had' and '${v.name}' are both written '= 0', " +
+                                s"and '${d.name}' has one zero value")
+                None ->
+                    zero_name = Some(v.name)
+                    tag = from_int(0)
+                    numbered = true
+        else if simple
             v.value match
                 // A discriminant is any compile-time integer, so a negative one under a signed
                 // underlying type folds from the unary negation the parser gives, and a `const` may
@@ -2140,23 +2158,26 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
                 None -> tag = fitting_tag(a, scope, span, v.name, next_tag, underlying, first)
         else if v.value.is_some() && first
             // The variant given the value may carry nothing itself; it is the enum that carries data,
-            // and a data enum's tags are positions nothing may name.
+            // and a data enum's tags are positions nothing may name but the zero.
             if !v.fields.is_empty() then
                 a.fault(scope, span,
                         s"variant '${v.name}' carries data, so it cannot also have an explicit value")
             else
                 a.fault(scope, span,
                         s"'${d.name}' carries data, so its variant '${v.name}' cannot have an explicit " +
-                        "value — only a simple enum's variants are numbered")
+                        "value — a data enum numbers its variants in order, and only a variant that " +
+                        "carries nothing may be written '= 0', as its zero value")
 
-        next_tag = big_add_long(tag, 1)
-        made.variants.push(EnumVariant(v.name, tag, fields, !v.fields.is_empty(), simple && v.value.is_some()))
+        // A data enum's zero took tag 0 out of order, so the count goes on from where it was.
+        if simple || !numbered then next_tag = big_add_long(tag, 1)
+
+        made.variants.push(EnumVariant(v.name, tag, fields, !v.fields.is_empty(), numbered))
 
     // A simple enum's value *is* its identity -- there is nothing else to tell two variants apart --
     // so two names for one value leave the language unable to keep its own promises: the second
     // variant's `match` arm can never run, and the lowering becomes a switch with a repeated case
     // the assembler rejects outright. A data enum cannot reach this, since its tags are assigned in
-    // order and it refuses an explicit value.
+    // order around its one zero and it refuses any other explicit value.
     if simple && first then refuse_repeated_tags(a, scope, span, made.variants)
 
     check_pinned_payloads(a, scope, span, made)
@@ -2185,6 +2206,31 @@ private fitting_tag(a: &Analysis, scope: Scope, span: Span, name: string, n: Big
 
     n
 end fitting_tag
+
+// Which variants of a data enum claim to be its zero value: each one written `= 0` that carries
+// nothing. The zero is the literal itself, so nothing is folded to find it, and any other value is
+// left to the refusal that names it.
+private data_enum_zeros(d: EnumDecl, simple: bool) -> Buf[bool]
+    var out: Buf[bool] = buf()
+
+    for v in d.variants
+        var zero = false
+
+        if !simple && v.fields.is_empty() && v.value.is_some()
+            zero = *v.value.unwrap().kind match
+                IntLit(digits, base, _) -> literal_value(digits, base).is_zero()
+                _ -> false
+
+        out.push(zero)
+
+    out
+end data_enum_zeros
+
+private any_zero(zeros: Buf[bool]) -> bool
+    for z in zeros
+        if z then return true
+
+    false
 
 private refuse_repeated_tags(a: &Analysis, scope: Scope, span: Span, variants: Buf[EnumVariant])
     for i in 0..<variants.len()
