@@ -446,6 +446,68 @@ address and casting it.
 An `extern` and a sysl function do not overload each other, in either order: what tells overloads of
 an `extern` apart is the symbol each names, and a sysl function declares none.
 
+### `@keeps` — a C function that holds on to a pointer
+
+A sysl function's body says which of its pointer parameters it keeps past the call, and the
+compiler refuses the address of a local there
+([memory.md § A borrowed pointer cannot escape](/reference/memory/#a-borrowed-pointer-cannot-escape)).
+An `extern` has no body to read, so it is answered by **C's own convention: a pointer handed to a C
+function is borrowed for the call**. That is true of nearly all of them — `strlen`, `memcpy`,
+`write`, `qsort` — and the address of anything may be passed:
+
+```sysl
+extern "strlen" c_strlen(s: *u8) -> usize
+
+run() -> usize
+    var bytes: [4]u8 = [104, 105, 33, 0]
+
+    c_strlen(&bytes[0])
+
+print(run())
+```
+
+```output
+3
+```
+
+The exception is a C library that **registers** what it is handed — a context pointer for a callback,
+a buffer it fills later — and the binding says so, naming the parameters:
+
+```sysl
+@keeps(ctx)
+extern "lib_register" register(ctx: *int, events: int)
+
+run()
+    var count = 0
+    register(&count, 1)
+```
+
+```error
+'register' keeps its parameter 'ctx' (its declaration says '@keeps(ctx)'), and '&count' is the address of a local of 'run'
+```
+
+**It marks an `extern` function and nothing else**: a sysl body is read for the answer, and a
+variable is never called. It names the function's own parameters, each once, and there is no empty
+form — an `extern` that keeps nothing says so by not writing it:
+
+```sysl
+@keeps(p)
+keeper(p: *int) = ()
+```
+
+```error
+'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern'
+```
+
+```sysl
+@keeps(context)
+extern "lib_register" register(ctx: *int, events: int)
+```
+
+```error
+'@keeps' names 'context', which is not a parameter of 'register' — its parameters are 'ctx', 'events'
+```
+
 ## `@export` — a definition C can call
 
 `@export` is `extern` read the other way. An `extern` names a symbol the linker has and states the

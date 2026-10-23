@@ -3835,7 +3835,7 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | a sysl function | what its body keeps |
 | a method through a trait object | nothing — an implementation reached through an object that keeps what it is handed is refused where it is written |
 | a closure, or a function through a pointer | nothing — a closure, or a function whose address is taken, that keeps what it is handed is refused where it is written |
-| an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps--a-c-function-that-holds-on-to-a-pointer) |
+| an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
 A default is a promise, so the body behind it is held to it. That is what makes a lock's `with`
 safe without an annotation: the closure it calls borrows the address of the value for the call, and a

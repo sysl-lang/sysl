@@ -12,7 +12,7 @@ has a name and a spelling of its own:
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
 | `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
-| `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps--a-c-function-that-holds-on-to-a-pointer) | the grammar |
+| `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
@@ -156,13 +156,13 @@ position no declaration may stand.
 ### `@scoped(f)` — a member that finishes what it starts before its scope closes
 
 **`@scoped(f)` above a method promises that `f` runs in another concurrency domain and finishes before
-the `@lends` call that lent the method's `*self` returns.** It is how a scheduler's `spawn` says its
-children are joined by the scope that handed out the receiver, and it implies `@crossing(f)`: what is
-passed at `f` is held to the [crossing rule](/reference/memory/), exactly as if both were written.
-The compiler cannot see the join — that is the library's promise to keep, as `@crossing`'s boundary
-is — so what it changes is what a lent body may do with the scope: a call of the member on the lent
-pointer does not keep it, and a closure written straight at `f` is not counted as put on the heap,
-though it captures the scope.
+the call that lent the method's `*self` returns.** It is how a scheduler's `spawn` says its children
+are joined by the scope that handed out the receiver, and it implies `@crossing(f)`: what is passed at
+`f` is held to the [crossing rule](/reference/memory/), exactly as if both were written. The compiler
+cannot see the join — that is the library's promise to keep, as `@crossing`'s boundary is — so what it
+changes is what a closure that was lent the scope may do with it: a call of the member keeps neither
+its receiver nor what it runs, though the job it queues captures the scope
+([memory.md § A borrowed pointer cannot escape](/reference/memory/#a-borrowed-pointer-cannot-escape)).
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -179,7 +179,6 @@ struct Scope
 struct Runner
     n: int
 
-    @lends(body)
     scope[R](self, body: *Scope -> R) -> R
         var s = Scope(buf())
         val r = body(&s)
@@ -197,11 +196,9 @@ true
 17
 ```
 
-Without `@scoped` the same body is refused twice over: `spawn` keeps the receiver in the job it
-queues, and the closure capturing `s` is boxed onto the heap. Only the box written at the argument
-is spared — one made earlier and held in a local could be handed anywhere — and what `spawn` answers
-is still followed as made of the scope, so a handle built around `self` may not be returned from the
-body or stored outside it.
+Without `@scoped` the same closure is refused: `spawn` keeps the receiver in the job it queues, and a
+closure borrows the scope it is handed for the call. What `spawn` answers is still followed as made
+of the scope, so a handle built around `self` may not be stored outside the body.
 
 **A closure written straight at `f` may capture a view.** Everything a `&sync Fn` may capture it may
 capture too — scalars, arrays, `&sync T`, raw pointers, the lent scope — and also a view, `[]T` or
@@ -222,7 +219,6 @@ struct Scope
 struct Runner
     n: int
 
-    @lends(body)
     scope[R](self, body: *Scope -> R) -> R
         var s = Scope(buf())
         val r = body(&s)
@@ -264,7 +260,6 @@ struct Scope
 struct Runner
     n: int
 
-    @lends(body)
     scope[R](self, body: *Scope -> R) -> R
         var s = Scope(buf())
         val r = body(&s)
@@ -282,7 +277,7 @@ first(ws: []string) -> int
 but the 'ws' it captures reaches a '[]string', which owns its elements through a count that is not atomic
 ```
 
-**What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent:
+**What it names is a call, once**, and the receiver is the `*self` a call lent:
 
 ```sysl
 struct Chan
@@ -344,8 +339,8 @@ struct Chan
 There is no empty form
 ```
 
-**It stands above a method and nowhere else.** A free function has no receiver for a `@lends` call to
-have lent, and a field is never called:
+**It stands above a method and nowhere else.** A free function has no receiver for a call to have
+lent, and a field is never called:
 
 ```sysl
 @scoped(f)
@@ -353,7 +348,7 @@ run(f: &sync Fn() -> int) -> int = f()
 ```
 
 ```error
-a free function has no receiver for a '@lends' call to have lent
+a free function has no receiver for a call to have lent
 ```
 
 ```sysl
@@ -2627,7 +2622,7 @@ print(ys[3])
 
 **What it promises is C's `restrict`.** While a call runs, no memory reached through one named
 parameter is reached through another named parameter, or through any other pointer the body uses.
-The parameters are named on the function, as `@lends(...)` and `@crossing(...)` name theirs — a
+The parameters are named on the function, as `@scoped(...)` and `@crossing(...)` name theirs — a
 parameter carries no annotation of its own.
 
 It names pointers and views: `*T`, `&T`, `[]T` and `[]const T`. A parameter of any other type
@@ -2648,7 +2643,7 @@ print(v)
 
 A generic is held to that at each instantiation, where its parameters have types — the views and
 pointers of every instance carry the promise. A name that is not a parameter, or one written twice,
-is refused where it is written, as `@lends`' are; so is the annotation above an `async` function,
+is refused where it is written, as `@crossing`'s are; so is the annotation above an `async` function,
 whose body runs after the call that made the task has returned, so that there is no call for the
 parameters to be kept apart during:
 
