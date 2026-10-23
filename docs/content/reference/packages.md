@@ -2451,8 +2451,10 @@ tracing() -> bool = false
 
 A package whose manifest names a `macro` (on an option or a feature) or has a `config` block gets a
 generated header, `sysl/<package>.h`. It is a build output: written at each build into
-`.sysl/out/<target>/include`, never into the sources, and that directory is on the include path of
-every C file in the build, so a package's C and its consumers' read the same values (they are ABI:
+`.sysl/out/<target>/include/<configuration>`, a directory named by a digest of the headers' text (so two
+builds of one project under different features or options never share a file; `--emit config` prints
+the path used), never into the sources, and that directory is on the include path of every C file in
+the build, so a package's C and its consumers' read the same values (they are ABI:
 `configUSE_16_BIT_TICKS` changes `TickType_t`). The package's own config header `#include`s it where it
 likes:
 

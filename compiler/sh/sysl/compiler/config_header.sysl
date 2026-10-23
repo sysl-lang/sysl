@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, read_text, write_text_atomic}
+import sysl.fs.{entries, make_dir_all, metadata, read_text, remove_dir_all, write_text_atomic}
 import sysl.text.{join, split, Search}
 
 // **The config header a package writes for its C** (`reference/packages.md § The config header`).
@@ -185,7 +185,17 @@ publish_config_headers(root: string, t: Target, inputs: &Buf[HeaderInput]) -> Re
 
     if made.is_empty() then return Ok(())
 
-    val include_root = s"${absolute_path(root)}/$LocalDir/out/${t.name}/include"
+    // **The include root belongs to one configuration**: it is named by a digest of every header's name
+    // and text, so two builds of one project under different features or options never share a file, and
+    // two of the same configuration share files with the same bytes. A C object cache entry therefore
+    // never sits beside one compiled against other values.
+    var texts: Buf[(string, string)] = buf()
+
+    for h in made
+        texts.push((h.package, h.text))
+
+    val include_base = s"${absolute_path(root)}/$LocalDir/out/${t.name}/include"
+    val include_root = s"$include_base/${library_fingerprint(texts)}"
     val dir = s"$include_root/sysl"
 
     make_dir_all(dir).map_err((e) -> s"cannot make the directory '$dir' for the config headers")?
@@ -200,10 +210,46 @@ publish_config_headers(root: string, t: Target, inputs: &Buf[HeaderInput]) -> Re
 
         made.set(i, ConfigHeader(made.at(i).package, made.at(i).key, path, made.at(i).text))
 
+    // A stamp, replaced atomically, so the directory's modification time says when a build last used it.
+    write_text_atomic(s"$include_root/used", "").unwrap_or(())
+    prune_config_roots(include_base, include_root)
+
     written_headers = made
     header_root = include_root
     Ok(())
 end publish_config_headers
+
+// How many configurations' include roots a target keeps before the stale ones are removed.
+private const KeptRoots: usize = 16
+
+// A root last used more than a week before the newest is stale (microseconds).
+private const StaleRoots: long = 7 * 24 * 3600 * 1000000
+
+// **Bounds the roots under `.sysl/out/<target>/include`**: past `KeptRoots` of them, those not used within
+// a week of the newest go. The one this build is using is never removed. A failure costs only disk.
+private prune_config_roots(base: string, mine: string)
+    val names = entries(base) match
+        Ok(n) -> n
+        Err(_) -> return
+
+    if names.len() <= KeptRoots then return
+
+    var newest: long = 0
+
+    for n in names
+        metadata(s"$base/$n") match
+            Ok(m) -> if m.modified.us > newest then newest = m.modified.us
+            Err(_) -> ()
+
+    for n in names
+        val one = s"$base/$n"
+
+        if one == mine then continue
+
+        metadata(one) match
+            Ok(m) -> if newest - m.modified.us > StaleRoots then remove_dir_all(one).unwrap_or(())
+            Err(_) -> ()
+end prune_config_roots
 
 // -- sysl build --emit -----------------------------------------------------------------------------
 

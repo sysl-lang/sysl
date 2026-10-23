@@ -2,8 +2,9 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
-import sysl.process.capture
+import sysl.env.{get as env_var}
+import sysl.fs.{entries, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, start}
 import sysl.text.{join, split, Search}
 
 // **Options reach C and sysl** (`options.sysl`, `config_header.sysl`, `reference/packages.md § Options`
@@ -506,7 +507,8 @@ mfo_emit_config()
     assert_eq(one, Fine, said)
     assert_eq(every, Fine, all)
     assert_eq(paths.len(), 1)
-    assert_eq(paths.at(0), s"$app/.sysl/out/${host_target().name}/include/sysl/ucfg.h")
+    assert(paths.at(0).starts_with(s"$app/.sysl/out/${host_target().name}/include/") &&
+           paths.at(0).ends_with("/sysl/ucfg.h"), paths.at(0))
     assert_eq(mfo_reported(all).len(), 1)
     assert_eq(text, "/* written by sysl from ucfg 1.0.0's settled configuration */\n" +
                     "#define UCFG_VID 16\n#define UCFG_MODE \"a\"\n#define UCFG_CDC 1\n#define UCFG_RX 512\n" +
@@ -583,8 +585,29 @@ private mfo_root() -> string
     root
 end mfo_root
 
-private mfo_root_header(root: string) -> string =
-    read_text(s"$root/.sysl/out/${host_target().name}/include/sysl/rootp.h").unwrap_or("(no header)")
+// The header `name` as the most recent build of `root` for `target` wrote it: each configuration has its own
+// include root, and the one used last has the newest `used` stamp.
+private mfo_latest_header(root: string, target: string, name: string) -> string
+    val base = s"$root/.sysl/out/$target/include"
+    val names = entries(base) match
+        Ok(n) -> n
+        Err(_) -> return "(no header)"
+
+    var best = ""
+    var newest: long = -1
+
+    for n in names
+        metadata(s"$base/$n/used") match
+            Ok(m) ->
+                if m.modified.us > newest
+                    best = n
+                    newest = m.modified.us
+            Err(_) -> ()
+
+    read_text(s"$base/$best/sysl/$name.h").unwrap_or("(no header)")
+end mfo_latest_header
+
+private mfo_root_header(root: string) -> string = mfo_latest_header(root, host_target().name, "rootp")
 
 @test("a project's own header reaches its C with no dependency in the build, and its bool option gates sysl")
 mfo_root_project()
@@ -707,10 +730,93 @@ mfo_cross_target_build()
     mfo_write(root, "shim.c", "#include \"sysl/xpkg.h\"\n\nint xc(void) { return CFG_LEVEL + CFG_FIXED; }\n")
 
     val (code, out, err) = mfo_cli(["sysl", "build-lib", root, "--target", "thumb-freestanding"])
-    val header = read_text(s"$root/.sysl/out/thumb-freestanding/include/sysl/xpkg.h").unwrap_or("(no header)")
+    val header = mfo_latest_header(root, "thumb-freestanding", "xpkg")
 
     mfo_drop([root])
     assert_eq(code, Fine, out + err)
     assert_eq(header, "/* written by sysl from xpkg 0.1.0's settled configuration */\n#define CFG_LEVEL 3\n" +
                       "#define CFG_FIXED 4\n")
 end mfo_cross_target_build
+
+// -- one include root per configuration -------------------------------------------------------------
+
+private mfo_emitted(app: string) -> string
+    val (code, _, said) = mfo_cli(["sysl", "build", app, "-o", s"$app/program", "--emit", "config:ucfg"])
+
+    assert_eq(code, Fine, said)
+    mfo_reported(said).at(0)
+end mfo_emitted
+
+@test("two configurations of one project write two headers, each binary sees its own, and going back reuses the first")
+mfo_configurations_have_their_own_headers()
+    if !mfo_ready() then return
+
+    val lib = mfo_lib()
+    val app = mfo_app(s"u { path = \"$lib\", options = { vid = 1 } }")
+    val first = mfo_emitted(app)
+    val one = mfo_run(app)
+
+    mfo_retarget(app, lib, 2)
+
+    val second = mfo_emitted(app)
+    val two = mfo_run(app)
+    val first_after = read_text(first).unwrap_or("(gone)")
+
+    mfo_retarget(app, lib, 1)
+
+    val third = mfo_emitted(app)
+    val again = mfo_run(app)
+
+    mfo_drop([app, lib])
+    assert(first != second, "two configurations must not share a header path")
+    assert_eq(third, first)
+    assert(first_after.contains("#define UCFG_VID 1\n"), first_after)
+    assert_eq(one, "8 0")
+    assert_eq(two, "9 0")
+    assert_eq(again, "8 0")
+end mfo_configurations_have_their_own_headers
+
+private val mfo_race_main: string = "main()\n    exit(0)\n"
+
+// A project whose C answers its `level` and whose suite holds that answer to the option's constant.
+private mfo_race_root() -> string
+    val root = mfo_temp("sysl-mfo-race")
+
+    mfo_write(root, "sysl.hocon", mfo_root_manifest)
+    mfo_write(root, "main.sysl", "extern which() -> int\n\n" + mfo_race_main)
+    mfo_write(root, "shim.c", "#include \"sysl/rootp.h\"\n\nint which(void) { return CFG_LEVEL; }\n")
+    mfo_write(root, "tests_probe.sysl",
+              "@tests\n\n@test(\"the C and the sysl read one configuration\")\nmfo_race_probe()\n" +
+              "    assert_eq(which(), int(option_level))\n")
+    root
+end mfo_race_root
+
+@test("two sysl test runs of one project under different options at once each see their own value")
+mfo_concurrent_configurations_do_not_mix()
+    if !mfo_ready() then return
+
+    val binary = env_var("SYSL_STAGE2") match
+        Some(b) -> b
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary on this machine")
+            return
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    val root = mfo_race_root()
+    var failures = ""
+
+    for round in 0..<6
+        val a = 20 + round * 2
+        val b = a + 1
+        val one = start(binary, ["test", root, "--option", s"level=$a"], "", [], true).unwrap()
+        val two = start(binary, ["test", root, "--option", s"level=$b"], "", [], true).unwrap()
+        val got_one = one.wait().unwrap()
+        val got_two = two.wait().unwrap()
+
+        if !got_one.status.ok() then failures = failures + s"level=$a: ${got_one.text}\n"
+        if !got_two.status.ok() then failures = failures + s"level=$b: ${got_two.text}\n"
+
+    mfo_drop([root])
+    assert_eq(failures, "")
+end mfo_concurrent_configurations_do_not_mix
