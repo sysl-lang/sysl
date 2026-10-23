@@ -71,13 +71,17 @@ trace_signatures() -> Buf[(string, IrFnType)]
 end trace_signatures
 
 // What a library read of the trace answers in a build that records none, or nothing where traces are
-// on or the symbol is not one of them: no length, no site, and nothing to clear or report.
+// on or the symbol is not one of them: no length, no site, nothing to clear, report or empty, and no
+// store made current (`use_error_trace` answers null, the program's own).
 trace_seam_off(symbol: string) -> Option[Val]
     if traces_on then return None
 
     if symbol == "sysl_error_trace_len" then return Some(VInt(from_int(0)))
-    if symbol == "sysl_error_trace_site" then return Some(VNull)
-    if symbol == "sysl_error_trace_clear" || symbol == "sysl_error_trace_report" then return Some(VNothing)
+    if symbol == "sysl_error_trace_site" || symbol == "sysl_error_trace_use" then return Some(VNull)
+
+    if symbol == "sysl_error_trace_clear" || symbol == "sysl_error_trace_report" ||
+       symbol == "sysl_error_trace_init"
+        return Some(VNothing)
 
     None
 end trace_seam_off
@@ -222,6 +226,14 @@ trace_enter(e: *Emit, s: TStmt) -> Option[Val]
     e.trace_marks.push(n)
     Some(n)
 end trace_enter
+
+// Before a body's last expression, in a function answering `ret`. Where that is no `Result`, the
+// function has no failure to hand on, so the expression is completed as a statement is and a failure
+// it handles leaves the trace with it -- `parse(s) match` ending a function that answers `unit` or an
+// `int`. One answering a `Result` hands its last expression back as a `return` hands its value, and
+// keeps the chain.
+trace_enter_tail(e: *Emit, r: TExpr, ret: Type) -> Option[Val] =
+    if is_result_type(ret) then None else trace_enter(e, TExprStmt(r))
 
 // After it: the length written back, on the path that completed it.
 trace_leave(e: *Emit, mark: Option[Val])

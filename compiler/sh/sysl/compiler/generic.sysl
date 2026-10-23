@@ -161,13 +161,15 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                        sub: *Buf[Binding])
     *want.kind match
         PtrType(inner) -> actual match
-            Ptr(t) -> unify(a, scope, inner, *t, tparams, sub)
+            Ptr(t) -> if !binds_object(inner, *t, tparams, sub) then unify(a, scope, inner, *t, tparams, sub)
             _ -> ()
 
         // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
         // matched against either shape.
         RefType(inner, sync) -> actual match
-            Ref(t, s) -> if s == sync then unify(a, scope, inner, *t, tparams, sub)
+            Ref(t, s) ->
+                if s == sync && !binds_object(inner, *t, tparams, sub) then
+                    unify(a, scope, inner, *t, tparams, sub)
             other -> unify(a, scope, inner, other, tparams, sub)
 
         // A `weak T` parameter also accepts a `&T`, which the call weakens -- the same leniency `&T`
@@ -310,6 +312,24 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                 // name it uses is matched against the resolved type by the key it names here.
                 unify_named(a, scope, n, arg_refs, actual, tparams, sub)
 end unify_nameless
+
+// **A trait object handed to a `*P` or a `&P` binds `P` to the TRAIT**, so that `*P` is the object
+// type itself: the one place a parameter may stand for something with no layout, because what is
+// written there is already behind the mode an object needs. A bare `P` handed the same object binds
+// it to the object type (`*Port`), as it always has; that is the case the other arms keep. Whether the
+// declaration's body uses `P` only behind a mode is asked at the call (`stand_in.sysl`).
+private binds_object(inner: TypeRef, pointee: Type, tparams: Buf[string], sub: *Buf[Binding]) -> bool
+    if !is_trait(pointee) then return false
+
+    *inner.kind match
+        NamedType(n, arg_refs) ->
+            if !arg_refs.is_empty() || !holds_string(tparams, n) then return false
+
+            if bound_type(*sub, n).is_none() then sub.push(Binding(n, pointee))
+
+            true
+        _ -> false
+end binds_object
 
 // A parameter first bound to a `[]T` and then handed a `[]const T` is bound to the read-only view
 // instead: it is the one type both arguments convert to, as it is the meeting point of the two

@@ -1,0 +1,597 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, replace_all, Search}
+
+// **A trace per task** (`library/sysl/sys/trace.c`, `sysl.debug.ErrorTraceStore` and
+// `use_error_trace`): on a freestanding target the error return trace is reached through a pointer,
+// `sysl_error_trace_current`, that starts at one static store, and a kernel points it at each task's
+// own; on a hosted one the trace stays the thread's own object and a switch copies it out and in.
+//
+// The cells: the default with no switch, on the host and on every QEMU board; two stores switched
+// with a failure in hand; a switch in the middle of a deep chain and back; a switch inside a closure,
+// under a `defer`, in a loop, in a match arm and across two instantiations of a generic; a library
+// built apart; a `@no_alloc` module; an exported handler that fails while another store is current;
+// traces off; and the archive a board links, its undefined symbols and its storage.
+//
+// Skipped: async tasks, which record into the trace of the thread running them and are a scheduler's
+// business rather than the switch's; and a store switched by a kernel's assembly, which writes the
+// same pointer `use_error_trace` does.
+
+private etp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The head of every program here: the same four lines on the host and on a board, so a site has the
+// same line in both.
+private val EtpHostHead: string = "import sysl.debug.*\n\nval w = stdout()\n\n"
+
+private val EtpBoardHead: string = "import sysl.debug.*\nimport board.*\nval w = console()\n\n"
+
+// A three-frame chain and a report, from line 5.
+private val EtpChain: string = raw"""
+    open(n: int) -> Result[int, string] = if n > 0 then Err("no file") else Ok(n)
+
+    load(n: int) -> Result[int, string]
+        val v = open(n)?
+        Ok(v)
+
+    run(n: int) -> Result[int, string]
+        val v = load(n)?
+        Ok(v)
+
+    show(name: string, w: *Writer)
+        w.write(name.bytes)
+        w.write("\n".bytes)
+        print_error_trace(w)
+
+    """
+
+private val EtpTraceHead: string = "error return trace (origin first):\n"
+
+private val EtpOpen: string = "  p.sysl:5:53 in open\n"
+
+private val EtpLoad: string = "  p.sysl:8:20 in load\n"
+
+private val EtpRun: string = "  p.sysl:12:20 in run\n"
+
+// No store is ever made current: the program's own trace, as it was before stores existed.
+private val EtpDefault: string = raw"""
+    run(1) match
+        Ok(_) -> ()
+        Err(_) -> show("default", w)
+
+    """
+
+private etp_default_said() -> string = "default\n" + EtpTraceHead + EtpOpen + EtpLoad + EtpRun
+
+// Task `a` is switched out with a three-frame failure in hand, `b` fails two frames deep and reports,
+// and `a` is switched back in and reports. The program's own trace is put back at the end, and
+// `use_error_trace` answered `a`'s store when it was left.
+private val EtpSwap: string = raw"""
+    var a = ErrorTraceStore.new()
+    var b = ErrorTraceStore.new()
+
+    val own = use_error_trace(&a)
+
+    run(1) match
+        Ok(_) -> ()
+        Err(_) ->
+            use_error_trace(&b)
+
+            load(2) match
+                Ok(_) -> ()
+                Err(_) -> show("b", w)
+
+            use_error_trace(&a)
+            show("a", w)
+
+    val back = use_error_trace(own)
+
+    w.write(if back == &a then "a was current\n".bytes else "another was current\n".bytes)
+    show("own", w)
+    """
+
+private etp_swap_said() -> string =
+    "b\n" + EtpTraceHead + EtpOpen + EtpLoad + "a\n" + EtpTraceHead + EtpOpen + EtpLoad + EtpRun +
+    "a was current\nown\n"
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error.
+private etp_run_at(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-etp").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end etp_run_at
+
+// At `-O0` and at the default level, the program exits cleanly having printed exactly `printed`.
+private etp_prints(files: []const (string, string), printed: string)
+    if !etp_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (got, out, said) = etp_run_at(files, level)
+
+        assert_eq(out, printed)
+        assert(got.ok(), s"-O$level ended with $got: $said")
+end etp_prints
+
+private etp_host(body: string) -> []const (string, string) = [("p.sysl", EtpHostHead + EtpChain + body)]
+
+// The same body on every QEMU board: a complaint per board that did not exit cleanly having printed
+// `want`.
+private etp_on_boards(body: string, want: string)
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", EtpBoardHead + EtpChain + body))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+        ran += 1
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains(want) then
+                    bad.push(s"${b.name} wanted '$want': ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), join(bad.view(), "\n"))
+end etp_on_boards
+
+// -- with no store made current -------------------------------------------------------------------------
+
+@test("with no store made current, the host's trace is the one it always was")
+etp_default_on_the_host()
+    etp_prints(etp_host(EtpDefault), etp_default_said())
+
+@test("and so is every board's, reached through the pointer's static store")
+etp_default_on_the_boards()
+    etp_on_boards(EtpDefault, etp_default_said())
+
+// -- two stores ------------------------------------------------------------------------------------------
+
+@test("two stores switched with a failure in hand each hold their own chain, whole")
+etp_two_stores_on_the_host()
+    etp_prints(etp_host(EtpDefault + EtpSwap), etp_default_said() + etp_swap_said())
+
+@test("and on every board, where the switch is the pointer")
+etp_two_stores_on_the_boards()
+    etp_on_boards(EtpDefault + EtpSwap, etp_default_said() + etp_swap_said())
+
+// A switch in the middle of a deep chain and back; inside a closure under a `defer` that puts the
+// previous store back, called in a loop from a match arm; and two instantiations of a generic, the
+// second failing while the first's failure is in hand.
+@test("a switch in a deep chain, a closure, a defer, a loop and a generic keeps each trace apart")
+etp_switches_in_every_shape()
+    etp_prints([("main.sysl", raw"""
+        import sysl.debug.*
+
+        val w = stdout()
+
+        open(n: int) -> Result[int, string] = if n > 0 then Err("no file") else Ok(n)
+
+        load(n: int) -> Result[int, string]
+            val v = open(n)?
+            Ok(v)
+
+        show(name: string, w: *Writer)
+            w.write(name.bytes)
+            w.write("\n".bytes)
+            print_error_trace(w)
+
+        inner(n: int) -> Result[int, string]
+            if n == 0 then return open(1)
+            val v = inner(n - 1)?
+            Ok(v)
+
+        switch_mid(other: *ErrorTraceStore, w: *Writer) -> Result[int, string]
+            val v = inner(2) match
+                Ok(v) -> v
+                Err(e) ->
+                    val mine = use_error_trace(other)
+
+                    inner(0) match
+                        Ok(_) -> ()
+                        Err(_) -> show("other", w)
+
+                    use_error_trace(mine)
+                    return Err(e)
+
+            Ok(v)
+        end switch_mid
+
+        outer(other: *ErrorTraceStore, w: *Writer) -> Result[int, string]
+            val v = switch_mid(other, w)?
+            Ok(v)
+
+        within(s: *ErrorTraceStore, w: *Writer, n: int)
+            val prev = use_error_trace(s)
+            defer use_error_trace(prev)
+
+            val f: &Fn(int) -> Result[int, string] = (k) ->
+                val v = load(k)?
+                Ok(v)
+
+            f(n) match
+                Ok(_) -> ()
+                Err(_) -> show("closure", w)
+        end within
+
+        pick[T](x: T, n: int) -> Result[T, string]
+            val v = load(n)?
+            Ok(x)
+
+        var a = ErrorTraceStore.new()
+        var b = ErrorTraceStore.new()
+
+        a.init()
+        b.init()
+
+        val own = use_error_trace(&a)
+
+        outer(&b, w) match
+            Ok(_) -> ()
+            Err(_) -> show("deep", w)
+
+        pick("s", 1) match
+            Ok(_) -> ()
+            Err(_) ->
+                for i in 0..<2
+                    within(&b, w, i + 1)
+
+                pick(7, 1) match
+                    Ok(_) -> ()
+                    Err(_) -> show("nested", w)
+
+                show("generic", w)
+
+        use_error_trace(own)
+        """)],
+        "other\n" + EtpTraceHead + "  main.sysl:5:53 in open\n" +
+        "deep\n" + EtpTraceHead + "  main.sysl:5:53 in open\n  main.sysl:18:25 in inner\n" +
+        "  main.sysl:18:25 in inner\n  main.sysl:32:20 in switch_mid\n  main.sysl:38:33 in outer\n" +
+        "closure\n" + EtpTraceHead + "  main.sysl:5:53 in open\n  main.sysl:8:20 in load\n" +
+        "  main.sysl:46:24 in within.<closure>\n" +
+        "closure\n" + EtpTraceHead + "  main.sysl:5:53 in open\n  main.sysl:8:20 in load\n" +
+        "  main.sysl:46:24 in within.<closure>\n" +
+        "nested\n" + EtpTraceHead + "  main.sysl:5:53 in open\n  main.sysl:8:20 in load\n" +
+        "  main.sysl:55:20 in pick.string\n  main.sysl:5:53 in open\n  main.sysl:8:20 in load\n" +
+        "  main.sysl:55:20 in pick.int\n" +
+        "generic\n" + EtpTraceHead + "  main.sysl:5:53 in open\n  main.sysl:8:20 in load\n" +
+        "  main.sysl:55:20 in pick.string\n")
+end etp_switches_in_every_shape
+
+// An interrupt handler records into whatever store is current when it fires, and a failure it handles
+// leaves that store as it found it; one that keeps its own store apart switches to it and back.
+@test("an exported handler failing while another store is current leaves that store as it found it")
+etp_a_handler_leaves_the_current_store()
+    etp_prints([("main.sysl", raw"""
+        import sysl.debug.*
+
+        open(n: int) -> Result[int, string] = if n > 0 then Err("no file") else Ok(n)
+
+        load(n: int) -> Result[int, string]
+            val v = open(n)?
+            Ok(v)
+
+        @export("etp_isr")
+        isr()
+            load(3) match
+                Ok(_) -> ()
+                Err(_) -> print("isr holds", error_trace().len())
+
+        @export("etp_isr_apart")
+        isr_apart()
+            var mine = ErrorTraceStore.new()
+            val prev = use_error_trace(&mine)
+
+            load(4) match
+                Ok(_) -> ()
+                Err(_) -> print("apart holds", error_trace().len())
+
+            use_error_trace(prev)
+        end isr_apart
+
+        var a = ErrorTraceStore.new()
+        var b = ErrorTraceStore.new()
+
+        val own = use_error_trace(&a)
+
+        load(1) match
+            Ok(_) -> ()
+            Err(_) ->
+                use_error_trace(&b)
+                isr()
+                isr_apart()
+                print("b holds", error_trace().len())
+                use_error_trace(&a)
+                isr()
+                isr_apart()
+                print("a holds", error_trace().len())
+
+        use_error_trace(own)
+        """)],
+        "isr holds 2\napart holds 2\nb holds 0\nisr holds 4\napart holds 2\na holds 2\n")
+end etp_a_handler_leaves_the_current_store
+
+// The switch allocates nothing, so a module that gave the allocator up may hold stores and switch them.
+@test("a @no_alloc module holds stores, switches them and uses '?'")
+etp_no_alloc_switches()
+    etp_prints([("lib/lib.sysl", raw"""
+        module lib
+        @no_alloc
+
+        import sysl.debug.{error_trace, use_error_trace, ErrorTraceStore}
+
+        var stores: [2]ErrorTraceStore = [ErrorTraceStore.new(), ErrorTraceStore.new()]
+
+        open(n: int) -> Result[int, int] = if n > 0 then Err(n) else Ok(n)
+
+        load(n: int) -> Result[int, int]
+            val v = open(n)?
+            Ok(v)
+
+        fail_in(i: int, n: int) -> usize
+            val prev = use_error_trace(&stores[i])
+
+            val held = load(n) match
+                Ok(_) -> 0
+                Err(_) -> error_trace().len()
+
+            use_error_trace(prev)
+            held
+        end fail_in
+        """),
+        ("main.sysl", "import lib.fail_in\nimport sysl.debug.error_trace\n\n" +
+                      "print(fail_in(0, 1), fail_in(1, 2), error_trace().len())\n")], "2 2 0\n")
+end etp_no_alloc_switches
+
+// A library built apart records into whichever store its caller made current.
+@test("a library built apart switches stores and records into the current one")
+etp_across_a_library()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("demo/lib.sysl", raw"""
+        module demo
+
+        import sysl.debug.{print_error_trace, use_error_trace, ErrorTraceStore}
+
+        open(n: int) -> Result[int, int] = if n > 0 then Err(n) else Ok(n)
+
+        load(n: int) -> Result[int, int]
+            val v = open(n)?
+            Ok(v)
+
+        report_in(s: *ErrorTraceStore)
+            val prev = use_error_trace(s)
+
+            load(1) match
+                Ok(_) -> ()
+                Err(_) -> print_error_trace(stdout())
+
+            use_error_trace(prev)
+        end report_in
+        """))
+    val prog = lbr_program(raw"""
+        import demo.{load, report_in}
+        import sysl.debug.{error_trace, use_error_trace, ErrorTraceStore}
+
+        var a = ErrorTraceStore.new()
+        var b = ErrorTraceStore.new()
+
+        val own = use_error_trace(&a)
+
+        load(5) match
+            Ok(_) -> ()
+            Err(_) ->
+                report_in(&b)
+                print("a holds", error_trace().len())
+
+        use_error_trace(own)
+        """)
+    val said = lbr_run(prog, [root])
+
+    lbr_drop([root, prog])
+    assert(said.starts_with(EtpTraceHead), said)
+    assert_eq(said.count_of(" in open\n"), 1)
+    assert_eq(said.count_of(" in load\n"), 1)
+    assert(said.ends_with("\na holds 2\n"), said)
+end etp_across_a_library
+
+// -- traces off ------------------------------------------------------------------------------------------
+
+@test("with traces off, use_error_trace answers null and no trace symbol reaches the module")
+etp_off_answers_null()
+    var files: [2](string, string) = [
+        ("sysl.hocon", "package {\n  name = \"probe\"\n}\n\nerror_traces = false\n"),
+        ("main.sysl", raw"""
+            import sysl.debug.{error_trace, use_error_trace, ErrorTraceStore}
+
+            var s = ErrorTraceStore.new()
+
+            s.init()
+            print(use_error_trace(&s) == null, use_error_trace(null) == null, error_trace().len())
+            """)]
+
+    etp_prints(files[..], "true true 0\n")
+    use_error_traces(true)
+
+    if xvr_no_library() then return
+
+    use_error_traces(false)
+
+    val ir = xvr_ir([("main.sysl", "import sysl.debug.{use_error_trace, ErrorTraceStore}\n\n" +
+                                   "var s = ErrorTraceStore.new()\n\ns.init()\nuse_error_trace(&s)\n")])
+
+    use_error_traces(true)
+    assert(ir.contains("define"), ir)
+    assert(!ir.contains("sysl_error_trace"), ir)
+end etp_off_answers_null
+
+// -- the archive a board links ---------------------------------------------------------------------------
+
+private val EtpKernel: string = raw"""
+    module kernel
+
+    import sysl.debug.{error_trace, use_error_trace, ErrorTraceStore}
+
+    struct Tcb
+        id: int
+        trace: ErrorTraceStore
+
+    var tasks: [2]Tcb = [Tcb(0, ErrorTraceStore.new()), Tcb(1, ErrorTraceStore.new())]
+
+    open(n: int) -> Result[int, int] = if n > 0 then Err(n) else Ok(n)
+
+    load(n: int) -> Result[int, int]
+        val v = open(n)?
+        Ok(v)
+
+    fail_in(i: int, n: int) -> u32
+        val prev = use_error_trace(&tasks[i].trace)
+
+        val held = load(n) match
+            Ok(_) -> 0
+            Err(_) -> error_trace().len()
+
+        use_error_trace(prev)
+        u32(held)
+    end fail_in
+    """
+
+// The kernel built as a thumb archive, with traces on or `off`: what `nm`, `nm -u`, `objdump -t` and
+// `objdump -h` say of it, or None where the tools are missing.
+private etp_thumb(off: bool) -> Option[(string, string, string, string)]
+    val nm = "/opt/homebrew/bin/arm-none-eabi-nm"
+    val objdump = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    if !exists(nm) || !exists(objdump)
+        print("skipped: no arm-none-eabi binutils")
+        return None
+    end if
+
+    val root = replace_all(make_temp_dir("sysl-etp").unwrap(), "//", "/")
+
+    make_dir_all(s"$root/kernel").unwrap()
+    write_text(s"$root/kernel/kernel.sysl", EtpKernel).unwrap()
+    write_text(s"$root/main.sysl", "import kernel.fail_in\n\n@export(\"main\")\n" +
+                                   "entry() -> int = int(fail_in(0, 1) + fail_in(1, 2))\n").unwrap()
+
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o", s"$root/app.a"]
+        args.push(a)
+
+    if off then args.push("--no-error-traces")
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args.view(), (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    val all = capture(nm, [s"$root/app.a"], "", [], true).unwrap().text
+    val undefined = capture(nm, ["-u", s"$root/app.a"], "", [], true).unwrap().text
+    val symbols = capture(objdump, ["-t", s"$root/app.a"], "", [], true).unwrap().text
+    val headers = capture(objdump, ["-h", s"$root/app.a"], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+    Some((all, undefined, symbols, headers))
+end etp_thumb
+
+// The names `nm -u` lists that no member of the archive defines.
+private etp_unresolved(all: string, undefined: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in lines_of(undefined)
+        val t = line.trim()
+
+        if t.starts_with("U ")
+            val sym = replace_all(t, "U ", "")
+
+            if !etp_defines(all, sym) then out.push(sym)
+    end for
+
+    out
+end etp_unresolved
+
+// Whether some member of an `nm` listing defines `sym`.
+private etp_defines(all: string, sym: string) -> bool
+    for line in lines_of(all)
+        val t = line.trim()
+
+        if !t.starts_with("U ") && t.ends_with(s" $sym") then return true
+
+    false
+end etp_defines
+
+@test("a thumb archive resolves every trace symbol itself and needs no thread-local storage")
+etp_thumb_links_clean()
+    if !etp_ready() then return
+
+    val got = etp_thumb(false) match
+        Some(g) -> g
+        None -> return
+
+    val left = etp_unresolved(got.0, got.1)
+
+    for name in left
+        assert(name == "memcpy" || name == "memset", s"'$name' is left for the board:\n${got.1}")
+
+    assert(got.0.contains(" T sysl_error_trace_use"), got.0)
+    assert(got.0.contains(" D sysl_error_trace_current"), got.0)
+    assert(!got.3.contains(".tbss") && !got.3.contains(".tdata"), got.3)
+end etp_thumb_links_clean
+
+// The pointer, its static store and a module's stores inside its task blocks are all laid down in
+// the image: nothing runs at start-up to set them.
+@test("the pointer, the default store and a module's task blocks are laid down with no start-up code")
+etp_thumb_storage_folds()
+    if !etp_ready() then return
+
+    val got = etp_thumb(false) match
+        Some(g) -> g
+        None -> return
+
+    assert(got.2.contains(".data.sysl_error_trace_current\t00000004 sysl_error_trace_current"), got.2)
+    assert(got.2.contains(".bss.sysl_trace_default\t00000084 sysl_trace_default"), got.2)
+    assert(got.2.contains("O .data..Lkernel$tasks\t00000110 .Lkernel$tasks"), got.2)
+    assert(!got.3.contains(".init_array") && !got.3.contains(".ctors"), got.3)
+end etp_thumb_storage_folds
+
+@test("a thumb archive built with traces off names no trace symbol at all")
+etp_thumb_off_names_nothing()
+    if !etp_ready() then return
+
+    val got = etp_thumb(true) match
+        Some(g) -> g
+        None -> return
+
+    reset_search_paths()
+    use_error_traces(true)
+    assert(!got.0.contains("sysl_error_trace") && !got.0.contains("sysl_trace"), got.0)
+    assert(!got.1.contains("sysl_error_trace"), got.1)
+end etp_thumb_off_names_nothing
