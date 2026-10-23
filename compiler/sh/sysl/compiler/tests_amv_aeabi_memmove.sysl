@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.split
+
+// **The Arm run-time ABI's block move, and the closure of every helper LLVM can ask a Thumb image
+// for.** `__aeabi_memmove` and its two aligned forms are the program's own on every Thumb core, so a
+// structure assignment LLVM merges into a move links against a board that supplies only `memcpy` and
+// `memset`. The behavioural tests run on the QEMU boards, whose support files define no move; the
+// closure tests read the undefined symbols of the object a program touching every helper compiles to.
+
+// -- the move, on the boards -----------------------------------------------------------------------
+
+// A 128-byte arena aligned to eight, a model of what each move must leave in it, and the three moves
+// called directly by their run-time ABI names.
+private val AmvArena: string = raw"""
+
+    extern "__aeabi_memmove" move_any(dst: *u8, src: *u8, n: usize)
+    extern "__aeabi_memmove4" move_four(dst: *u8, src: *u8, n: usize)
+    extern "__aeabi_memmove8" move_eight(dst: *u8, src: *u8, n: usize)
+
+    struct Arena
+        w: [16]u64
+
+    var arena: Arena = Arena([0; 16])
+    var model: Arena = Arena([0; 16])
+    var scratch: Arena = Arena([0; 16])
+
+    arena_at(k: usize) -> *u8 = ptr_cast(usize(&arena.w[0]) + k)
+    model_at(k: usize) -> *u8 = ptr_cast(usize(&model.w[0]) + k)
+    scratch_at(k: usize) -> *u8 = ptr_cast(usize(&scratch.w[0]) + k)
+
+    reset()
+        for i in 0..<128
+            *arena_at(usize(i)) = u8((i * 7 + 1) % 251)
+            *model_at(usize(i)) = u8((i * 7 + 1) % 251)
+
+    /** The model's move: the source read out whole before any of it is overwritten. */
+    model_move(d: usize, s: usize, n: usize)
+        for i in 0..<n
+            *scratch_at(i) = *model_at(s + i)
+
+        for i in 0..<n
+            *model_at(d + i) = *scratch_at(i)
+
+    /** 0 where move `kind` left the arena as the model says, 1 where it did not. */
+    trial(kind: int, d: usize, s: usize, n: usize) -> int
+        reset()
+        model_move(d, s, n)
+
+        if kind == 0 then move_any(arena_at(d), arena_at(s), n)
+        if kind == 1 then move_four(arena_at(d), arena_at(s), n)
+        if kind == 2 then move_eight(arena_at(d), arena_at(s), n)
+
+        for i in 0..<128
+            if *arena_at(usize(i)) != *model_at(usize(i)) then return 1
+
+        0
+    """
+
+private amv_program(b: QemuBoard, body: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", "import board.*\nimport sysl.math.Bits\n\nval w = console()\n\n" + body))
+    files.push(("board/board.sysl", qemu_board_module(b, AmvArena)))
+    files
+end amv_program
+
+// Runs `body` on every Thumb board; a complaint per board that did not exit cleanly having printed
+// `want`.
+private amv_sweep(body: string, want: string)
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        if !b.target.starts_with("thumb") then continue
+
+        ran += 1
+
+        qemu_boot(b, amv_program(b, body)) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains(want) then
+                    bad.push(s"${b.name} wanted '$want': ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end amv_sweep
+
+// A body that runs `cases` of (destination, source, count) through move `kind` and prints how many
+// left the arena other than the model says, then a marker.
+private amv_body(kind: int, cases: []const (int, int, int)) -> string
+    var out = "var wrong = 0\n"
+
+    for c in cases
+        out = out + s"wrong += trial($kind, ${c.0}, ${c.1}, ${c.2})\n"
+
+    out + "w.write(\"amv \".bytes)\nwrong.display(w, FormatSpec(0, -1, false))\nw.write(\" done\".bytes)\n"
+end amv_body
+
+// Odd offsets and odd counts: nothing is aligned. A destination below the source copies forward and
+// one above it backward; the same address and a count of zero leave the arena as it was.
+private val AmvPlainCases: []const (int, int, int) =
+    [(5, 13, 41), (13, 5, 41), (9, 10, 1), (10, 9, 1), (3, 3, 30), (7, 90, 0), (1, 2, 100), (2, 1, 100),
+     (0, 64, 64), (64, 0, 64), (127, 126, 1), (126, 127, 1)]
+
+private val AmvWordCases: []const (int, int, int) =
+    [(4, 12, 40), (12, 4, 40), (8, 12, 3), (12, 8, 3), (4, 4, 32), (8, 40, 0), (0, 4, 124), (4, 0, 124),
+     (0, 64, 64), (64, 0, 64)]
+
+private val AmvDoublewordCases: []const (int, int, int) =
+    [(8, 16, 48), (16, 8, 48), (8, 16, 8), (16, 8, 8), (8, 8, 32), (8, 40, 0), (0, 8, 120), (8, 0, 120),
+     (0, 64, 64), (64, 0, 64)]
+
+@test("__aeabi_memmove moves any alignment, forward or backward over an overlap, and zero bytes")
+amv_plain_move_is_a_memmove()
+    amv_sweep(amv_body(0, AmvPlainCases), "amv 0 done")
+end amv_plain_move_is_a_memmove
+
+@test("__aeabi_memmove4 moves word-aligned blocks of any length, forward and backward, and zero bytes")
+amv_word_aligned_move_is_a_memmove()
+    amv_sweep(amv_body(1, AmvWordCases), "amv 0 done")
+end amv_word_aligned_move_is_a_memmove
+
+@test("__aeabi_memmove8 moves doubleword-aligned blocks, forward and backward, and zero bytes")
+amv_doubleword_aligned_move_is_a_memmove()
+    amv_sweep(amv_body(2, AmvDoublewordCases), "amv 0 done")
+end amv_doubleword_aligned_move_is_a_memmove
+
+// -- the closure of the helper set -----------------------------------------------------------------
+
+// Touches every operation LLVM answers on a 32-bit Thumb core with a call to the run-time ABI:
+// 32- and 64-bit division and remainder, 64-bit shifts and products, every double and single
+// operation, comparison and conversion, the half-precision conversions, a structure copy and the
+// three block moves by name. The values are read out of a volatile cell so nothing folds.
+private val AmvEverything: string = raw"""
+    struct Cell
+        v: volatile u64
+
+    var cell: Cell = Cell(0)
+
+    hu(x: u64) -> u64
+        cell.v = x
+        cell.v
+
+    hl(x: long) -> long = long(hu(u64(x)))
+
+    hr(b: u64) -> real = real.from_bits(hu(b))
+
+    hs(b: u32) -> f32 = f32.from_bits(u32(hu(u64(b))))
+
+    hh(b: u32) -> f16 = f16(hs(b))
+
+    struct Big
+        v: [48]u64
+
+    var first: Big = Big([0; 48])
+    var second: Big = Big([0; 48])
+
+    extern "__aeabi_memmove" amove(dst: *u8, src: *u8, n: usize)
+    extern "__aeabi_memmove4" amove4(dst: *u8, src: *u8, n: usize)
+    extern "__aeabi_memmove8" amove8(dst: *u8, src: *u8, n: usize)
+
+    @export("main")
+    probe(x: int) -> int
+        val a = hl(x)
+        val b = hl(x + 7)
+        val ua = hu(u64(x))
+        val ub = hu(u64(x + 3))
+        var acc: u64 = 0
+
+        acc += u64(a / b) + u64(a % b) + ua / ub + ua % ub
+        acc += ua << (x & 63) + ua >> (x & 31) + u64(a >> (x & 15)) + ua * ub
+        acc += u64(x / (x + 1)) + u64(x % (x + 1)) + u64(u32(ua) / u32(ub)) + u64(u32(ua) % u32(ub))
+
+        val d = hr(ua)
+        val e = hr(ub)
+        val f = hs(u32(ua))
+        val g = hs(u32(ub))
+
+        acc += u64(d + e) + u64(d - e) + u64(d * e) + u64(d / e)
+        acc += u64(if d < e then 1 else 0) + u64(if d <= e then 1 else 0) + u64(if d > e then 1 else 0)
+        acc += u64(if d >= e then 1 else 0) + u64(if d == e then 1 else 0) + u64(if d != d then 1 else 0)
+        acc += u64(f + g) + u64(f - g) + u64(f * g) + u64(f / g)
+        acc += u64(if f < g then 1 else 0) + u64(if f <= g then 1 else 0) + u64(if f > g then 1 else 0)
+        acc += u64(if f >= g then 1 else 0) + u64(if f == g then 1 else 0) + u64(if f != f then 1 else 0)
+        acc += u64(real(a)) + u64(real(ua)) + u64(f32(a)) + u64(f32(ua)) + u64(int(d)) + u64(u32(d))
+        acc += u64(long(d)) + u64(u64(d)) + u64(long(f)) + u64(u64(f)) + u64(int(f)) + u64(u32(f))
+        acc += u64(real(f)) + u64(f32(d)) + u64(real(x)) + u64(f32(x)) + u64(real(u32(x))) + u64(f32(u32(x)))
+        acc += u64(hh(u32(ua)) + hh(u32(ub))) + u64(f32(hh(u32(ub)))) + u64(f16(d)) + u64(real(hh(u32(ub))))
+
+        first.v[3] = acc
+        second = first
+        acc += second.v[3] + second.v[40]
+
+        amove(ptr_cast(&first.v[1]), ptr_cast(&first.v[2]), 20)
+        amove4(ptr_cast(&first.v[1]), ptr_cast(&first.v[2]), 20)
+        amove8(ptr_cast(&first.v[2]), ptr_cast(&first.v[1]), 24)
+        int(acc)
+    """
+
+// A structure of 180 bytes stored by value into an element of an array inside a `match` arm after a
+// call: two copies through a temporary that LLVM merges into one move.
+private val AmvStoredInAnArm: string = raw"""
+    struct Record
+        w: [45]u32
+
+    struct Table
+        slots: [4]Record
+
+    var table: Table = Table([Record([0; 45]); 4])
+    var counter: volatile int = 0
+
+    build(seed: u32) -> Record
+        var r = Record([0; 45])
+
+        for i in 0..<45
+            r.w[i] = seed + u32(i)
+
+        r
+
+    @export("main")
+    store(kind: int, slot: int, seed: u32) -> int
+        counter = counter + 1
+
+        val fresh = build(seed)
+
+        kind match
+            0 -> table.slots[slot] = fresh
+            1 -> table.slots[(slot + 1) % 4] = build(seed + 1)
+            _ -> table.slots[0] = table.slots[slot]
+
+        int(table.slots[slot].w[7])
+    """
+
+private val AmvNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// The LLVM text a one-file program emits for `target`.
+private amv_emitted(target: string, src: string) -> string
+    val dir = make_temp_dir("sysl-amv").unwrap()
+
+    write_text(s"$dir/main.sysl", src).unwrap()
+
+    val text = emit_llvm_text(dir, Some(target), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(dir).unwrap_or(())
+    text
+end amv_emitted
+
+// What `src` compiled for `name` at `level` leaves undefined, one name per entry; `None` where a tool is
+// missing (the test then skips) and an `Err` text where the program or the back end failed.
+private amv_undefined(name: string, src: string, level: string) -> Result[Buf[string], string]
+    val t = target_named(name).unwrap()
+    val cc = find_backend_clang(t)?
+    val text = amv_emitted(name, src)
+
+    if text.starts_with("did not compile") then return Err(s"$name: $text")
+
+    val dir = make_temp_dir("sysl-amv").unwrap()
+    val obj = s"$dir/probe.o"
+
+    compile_object(cc, text, obj, t, level) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            return Err(s"$name: $why")
+        Ok(_) -> ()
+
+    val listing = capture(AmvNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+    val lines = split(listing, "\n")
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        if line != "" then out.push(line)
+
+    remove_dir_all(dir).unwrap_or(())
+    Ok(out)
+end amv_undefined
+
+// Every machine a Thumb image is linked for, by the target the build names.
+private val AmvThumbTargets: []const string = ["thumbv6m-freestanding", "thumbv7m-freestanding",
+                                               "thumbv7em-freestanding", "thumbv7em-freestanding-soft",
+                                               "thumbv7em-freestanding-dp", "thumb-freestanding",
+                                               "thumb-freestanding-softfp", "thumb-freestanding-soft"]
+
+// Asserts that `src`, built for every Thumb target at `-O2`, leaves undefined nothing but C's `memcpy`
+// and `memset` -- no `__aeabi_*`, no compiler-rt name.
+private amv_closes(src: string)
+    if !is_file(AmvNm) then skip(s"there is no llvm-nm at $AmvNm to read the object")
+
+    for name in AmvThumbTargets
+        find_backend_clang(target_named(name).unwrap()) match
+            Err(why) ->
+                skip(why)
+                return
+            Ok(_) -> ()
+
+        amv_undefined(name, src, "2") match
+            Err(why) ->
+                assert(false, why)
+                return
+            Ok(names) ->
+                for n in names
+                    assert(n == "U memcpy" || n == "U memset", s"$name leaves $n undefined; all: ${joined(names, ", ")}")
+
+@test("a program touching every Arm run-time ABI helper links on every Thumb target against memcpy and memset alone")
+amv_every_helper_is_closed()
+    amv_closes(AmvEverything)
+end amv_every_helper_is_closed
+
+@test("a 180-byte structure stored by value into an array element in a match arm needs no move from the board")
+amv_stored_in_an_arm_is_closed()
+    amv_closes(AmvStoredInAnArm)
+end amv_stored_in_an_arm_is_closed
+
+@test("every Thumb build carries __aeabi_memmove, __aeabi_memmove4 and __aeabi_memmove8, and no other machine's does")
+amv_every_thumb_build_carries_the_move()
+    val src = raw"""
+        @export("main")
+        probe(x: int) -> int = x * 3 + x
+        """
+
+    for target in AmvThumbTargets
+        val text = amv_emitted(target, src)
+
+        assert(text.contains("__aeabi_memmove:") && text.contains("__aeabi_memmove4:") &&
+               text.contains("__aeabi_memmove8:"), s"$target: $text")
+
+    val riscv = amv_emitted("riscv32-freestanding", src)
+
+    assert(!riscv.contains("__aeabi_memmove"), riscv)
+end amv_every_thumb_build_carries_the_move

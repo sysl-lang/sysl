@@ -52,6 +52,11 @@ private const SINGLE_FRACTION: int = 23
 private const SINGLE_BIAS: int = 127
 private const SINGLE_TOP: int = 0xFF
 
+// binary16, for the conversions: 10 bits of fraction under a 5-bit exponent.
+private const HALF_FRACTION: int = 10
+private const HALF_BIAS: int = 15
+private const HALF_TOP: int = 0x1F
+
 private exponent_of(r: u64) -> int = int((r >> FRACTION_BITS) & 0x7FF)
 
 private is_nan(abs: u64) -> bool = abs > INFINITY
@@ -460,15 +465,20 @@ private exponent_width(top: int) -> int = 32 - int(u32(top).leading_zeros())
 
 /** A binary32 encoding widened, exactly. A NaN keeps its payload at the top of the wider fraction,
  * quiet bit and all. */
-private[binary64] widen_single(x: u32) -> u64
-    val bits = u64(x)
-    val fraction = SINGLE_FRACTION
-    val sign = (bits >> (fraction + exponent_width(SINGLE_TOP))) & 1
-    val e = int((bits >> fraction) & u64(SINGLE_TOP))
+private[binary64] widen_single(x: u32) -> u64 = widen_format(u64(x), SINGLE_FRACTION, SINGLE_BIAS, SINGLE_TOP)
+
+/** A binary16 encoding widened, exactly, as the same arithmetic widens a binary32. */
+private[binary64] widen_half(x: u16) -> u64 = widen_format(u64(x), HALF_FRACTION, HALF_BIAS, HALF_TOP)
+
+// A narrower format's encoding -- `fraction` bits of fraction, an exponent `bias` and an all-ones
+// exponent of `top` -- widened exactly.
+private widen_format(bits: u64, fraction: int, bias: int, top: int) -> u64
+    val sign = (bits >> (fraction + exponent_width(top))) & 1
+    val e = int((bits >> fraction) & u64(top))
     val f = bits & ((ONE << fraction) - 1)
     val signed = sign << 63
 
-    if e == SINGLE_TOP then return signed | INFINITY | (f << (FRACTION_BITS - fraction))
+    if e == top then return signed | INFINITY | (f << (FRACTION_BITS - fraction))
 
     if e == 0
         if f == 0 then return signed
@@ -477,50 +487,54 @@ private[binary64] widen_single(x: u32) -> u64
         val shift = int(f.leading_zeros()) - (63 - fraction)
         val sig = f << shift
 
-        return signed | (u64(1 - SINGLE_BIAS - shift + BIAS) << FRACTION_BITS) |
+        return signed | (u64(1 - bias - shift + BIAS) << FRACTION_BITS) |
                ((sig & ((ONE << fraction) - 1)) << (FRACTION_BITS - fraction))
 
-    signed | (u64(e - SINGLE_BIAS + BIAS) << FRACTION_BITS) | (f << (FRACTION_BITS - fraction))
-end widen_single
+    signed | (u64(e - bias + BIAS) << FRACTION_BITS) | (f << (FRACTION_BITS - fraction))
+end widen_format
 
 /** A binary64 encoding rounded to binary32, to nearest with ties to even: an overflow is an infinity,
  * a value below the smallest subnormal's half a zero, and a NaN a quiet NaN keeping the top of its
  * payload. */
-private[binary64] narrow_single(r: u64) -> u32
-    val fraction = SINGLE_FRACTION
-    val top = SINGLE_TOP
+private[binary64] narrow_single(r: u64) -> u32 = u32(narrow_format(r, SINGLE_FRACTION, SINGLE_BIAS, SINGLE_TOP))
+
+/** A binary64 encoding rounded to binary16 the same way. */
+private[binary64] narrow_half(r: u64) -> u16 = u16(narrow_format(r, HALF_FRACTION, HALF_BIAS, HALF_TOP))
+
+// A binary64 encoding rounded to the format of `fraction` bits of fraction, an exponent `bias` and an
+// all-ones exponent of `top`.
+private narrow_format(r: u64, fraction: int, bias: int, top: int) -> u64
     val sign = (r >> 63) << (fraction + exponent_width(top))
     val abs = r & ABS_MASK
     val infinity = u64(top) << fraction
 
     if abs > INFINITY
-        return u32(sign | infinity | (ONE << (fraction - 1)) |
-                   ((abs & FRACTION_MASK) >> (FRACTION_BITS - fraction)))
+        return sign | infinity | (ONE << (fraction - 1)) | ((abs & FRACTION_MASK) >> (FRACTION_BITS - fraction))
 
-    if abs == INFINITY then return u32(sign | infinity)
+    if abs == INFINITY then return sign | infinity
 
-    // A binary64 subnormal is far below binary32's smallest value.
+    // A binary64 subnormal is far below the narrower formats' smallest value.
     val e = exponent_of(abs)
 
-    if e == 0 then return u32(sign)
+    if e == 0 then return sign
 
-    val exponent = e - BIAS + SINGLE_BIAS
+    val exponent = e - BIAS + bias
     val sig = (abs & FRACTION_MASK) | IMPLICIT
 
-    if exponent >= top then return u32(sign | infinity)
+    if exponent >= top then return sign | infinity
 
     if exponent <= 0
         // A subnormal result: the significand lands below the format's own implicit bit, and a carry
         // out of the rounding is the smallest normal, encoded by the same arithmetic.
-        return u32(sign | shr_round(sig, FRACTION_BITS - fraction + 1 - exponent))
+        return sign | shr_round(sig, FRACTION_BITS - fraction + 1 - exponent)
 
     val rounded = shr_round(sig, FRACTION_BITS - fraction)
     val packed = (u64(exponent - 1) << fraction) + rounded
 
-    if packed >= infinity then return u32(sign | infinity)
+    if packed >= infinity then return sign | infinity
 
-    u32(sign | packed)
-end narrow_single
+    sign | packed
+end narrow_format
 
 // -- to and from the integers ------------------------------------------------------------------------
 
@@ -705,6 +719,18 @@ aeabi_f2d(x: u32) -> u64 = widen_single(x)
 @export("__aeabi_d2f")
 aeabi_d2f(x: u64) -> u32 = narrow_single(x)
 
+/** An `f16` widened to an `f32`, exactly. */
+@export("__aeabi_h2f")
+aeabi_h2f(x: u16) -> u32 = narrow_single(widen_half(x))
+
+/** An `f32` rounded to an `f16`, once: through the double it widens to exactly. */
+@export("__aeabi_f2h")
+aeabi_f2h(x: u32) -> u16 = narrow_half(widen_single(x))
+
+/** A double rounded to an `f16`. */
+@export("__aeabi_d2h")
+aeabi_d2h(x: u64) -> u16 = narrow_half(x)
+
 /** An `f32` toward zero as a `long`, through the double it widens to exactly. */
 @export("__aeabi_f2lz")
 aeabi_f2lz(x: u32) -> long = to_signed(widen_single(x), 64)
@@ -869,6 +895,18 @@ extendsfdf2(x: u32) -> u64 = widen_single(x)
 /** Rounded to an `f32`. */
 @export("__truncdfsf2")
 truncdfsf2(x: u64) -> u32 = narrow_single(x)
+
+/** An `f16` widened to an `f32`, exactly. */
+@export("__extendhfsf2")
+extendhfsf2(x: u16) -> u32 = narrow_single(widen_half(x))
+
+/** An `f32` rounded to an `f16`, once. */
+@export("__truncsfhf2")
+truncsfhf2(x: u32) -> u16 = narrow_half(widen_single(x))
+
+/** A double rounded to an `f16`. */
+@export("__truncdfhf2")
+truncdfhf2(x: u64) -> u16 = narrow_half(x)
 
 /** An `f32` toward zero as a `long`, through the double it widens to exactly. */
 @export("__fixsfdi")
