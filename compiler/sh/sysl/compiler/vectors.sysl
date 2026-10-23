@@ -283,6 +283,46 @@ private vector_shuffle(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, t
     TExpr(span, TShuffle(tr, second, lanes.unwrap(), Vector(int(lanes.unwrap().len()), elem)))
 end vector_shuffle
 
+// The lanes a swizzle names: one to four of `x y z w`, lanes 0 to 3. A name with any other letter
+// is an ordinary member, which is what keeps `len` and every trait's names where they were.
+swizzle_lanes(name: string) -> Option[Buf[int]]
+    if name.bytes.len < 1 || name.bytes.len > 4 then return None
+
+    var out: Buf[int] = buf()
+
+    for b in name.bytes
+        if b == u8('x') then out.push(0)
+        else if b == u8('y') then out.push(1)
+        else if b == u8('z') then out.push(2)
+        else if b == u8('w') then out.push(3)
+        else return None
+
+    Some(out)
+end swizzle_lanes
+
+// The letter that names a lane.
+swizzle_letter(lane: int) -> string = "xyzw"[lane..<lane + 1]
+
+// `p.xy`, `p.wzyx`, `p.z`: a field read on a vector whose name is swizzle letters. One letter is the
+// lane itself, as `p[2]` is; several are `p.shuffle` of the same lanes, a vector as wide as the name is
+// long, and a letter may repeat in a read.
+swizzle_read(cx: &Analyzer, span: Span, tr: TExpr, name: string, lanes: int, elem: Type) -> TExpr
+    val picks = swizzle_lanes(name).unwrap()
+
+    for lane in picks
+        if lane >= lanes then
+            val have = if lanes == 1 then "lane x"
+            else if lanes == 2 then "lanes x and y"
+            else if lanes == 3 then "lanes x, y and z"
+            else "lanes x, y, z and w"
+
+            return cx.err(span, s"${type_show(texpr_type(tr))} has $have, and " +
+                          s"'${swizzle_letter(lane)}' is lane $lane")
+
+    if picks.len() == 1 then TExpr(span, TLane(tr, picks.at(0), unqualified(elem)))
+    else TExpr(span, TShuffle(tr, None, picks, Vector(int(picks.len()), elem)))
+end swizzle_read
+
 // A shuffle's list, folded to lane numbers and each checked against the lanes there are to pick
 // from. `None` having said why.
 //

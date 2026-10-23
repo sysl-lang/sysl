@@ -113,6 +113,80 @@ gen_shuffle(e: *Emit, receiver: TExpr, second: Option[TExpr], lanes: Buf[int]) -
     r
 end gen_shuffle
 
+// A vector with lanes written, as one instruction where one lane is named and as one merging
+// `shufflevector` where several are.
+//
+// **One lane is an `insertelement`.** Several are the receiver merged with the value: the mask takes
+// lane `lanes[j]` of the result from lane `j` of the value and every other lane from the receiver. The
+// value has to be as wide as the receiver to be a shuffle input, so a narrower one is widened first
+// -- except where the value is itself a one-input shuffle of a vector the receiver's width
+// (`q.xy = p.zw`), whose own list is folded into the merge's, so the whole write is the one
+// instruction.
+gen_lane_set(e: *Emit, receiver: TExpr, lanes: Buf[int], value: TExpr) -> Val
+    val vec_ty = texpr_type(receiver)
+    val vty = lty(e, vec_ty)
+    val cur = gen_expr(e, receiver)
+    val n = repr(vec_ty) match
+        Vector(k, _) -> k
+        _ -> 0
+
+    if lanes.len() == 1
+        val v = gen_expr(e, value)
+        val r = fresh_reg(e)
+
+        emit(e, InInsertElement(r, vty, cur, lty(e, texpr_type(value)), v,
+                                ir_arg(l_i32(), VInt(from_int(long(lanes.at(0)))))))
+        return r
+    end if
+
+    // Where each result lane comes from, as a position in the input's own lanes.
+    var from = value
+    var folded = false
+    var sources: Buf[int] = buf()
+
+    for j in 0..<lanes.len()
+        sources.push(int(j))
+
+    *value.kind match
+        TShuffle(inner, second, listed, _) ->
+            if second.is_none() && type_eq(repr(texpr_type(inner)), repr(vec_ty))
+                from = inner
+                folded = true
+                sources = listed
+        _ -> ()
+
+    var input = gen_expr(e, from)
+
+    // A value narrower than the receiver is widened by a shuffle whose extra lanes are never read.
+    if !folded && int(lanes.len()) < n
+        var widen: Buf[IrArg] = buf()
+
+        for i in 0..<n
+            widen.push(ir_arg(l_i32(), VInt(from_int(long(if i < int(lanes.len()) then i else 0)))))
+
+        val wide = fresh_reg(e)
+
+        emit(e, InShuffle(wide, lty(e, texpr_type(from)), input, VPoison,
+                          ir_arg(LVec(n, l_i32()), VVector(widen))))
+        input = wide
+    end if
+
+    var picks: Buf[IrArg] = buf()
+
+    for i in 0..<n
+        var at = n + i
+
+        for j in 0..<lanes.len()
+            if lanes.at(j) == i then at = sources.at(j)
+
+        picks.push(ir_arg(l_i32(), VInt(from_int(long(at)))))
+
+    val r = fresh_reg(e)
+
+    emit(e, InShuffle(r, vty, input, cur, ir_arg(LVec(n, l_i32()), VVector(picks))))
+    r
+end gen_lane_set
+
 // A vector folded to one lane.
 //
 // **The float sum takes a starting accumulator and the others do not**, which is not a symmetry LLVM

@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.split
+
+// What a swizzle and a lane write lower to (`docs/design/shuffle.md § 6`): a read is the one
+// `shufflevector` `shuffle` is, or an `extractelement` for one letter; a write is the vector loaded,
+// one `insertelement` or one merging `shufflevector`, and the vector stored. The IR is pinned at
+// `-O0`, where nothing has been recovered by a pass.
+
+private swg_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private swg_decls() -> string = raw"""
+    val p: <4>f32 = [1, 2, 3, 4]
+    var q: <4>f32 = [0, 0, 0, 0]
+    """
+
+@test("a swizzle read is one shufflevector with the letters as its mask")
+swg_read_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(swg_decls() + "val r = p.wzyx\nprint(r[1])\n"), "main")
+
+    assert(main.contains("<4 x float> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>"), main)
+    assert_eq(swg_count(main, "shufflevector"), 1)
+
+@test("a narrowing swizzle's result is as wide as the name")
+swg_narrow_read_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(swg_decls() + "val r = p.xy\nprint(r[1])\n"), "main")
+
+    assert(main.contains("<2 x i32> <i32 0, i32 1>"), main)
+    assert_eq(swg_count(main, "shufflevector"), 1)
+
+@test("one letter is an extractelement and no shuffle")
+swg_one_letter_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(swg_decls() + "val z = p.z\nprint(z)\n"), "main")
+
+    assert(main.contains("extractelement <4 x float> %"), main)
+    assert(main.contains("i32 2"), main)
+    assert_eq(swg_count(main, "shufflevector"), 0)
+
+@test("a lane write is one insertelement, by letter or by index")
+swg_lane_write_ir()
+    if !enm_ready() then return
+
+    // The declarations build two vectors from lanes with an `insertelement` each; the write is the one
+    // more.
+    val base = swg_count(cgz_body(enm_ir(swg_decls() + "print(q[0])\n"), "main"),
+                         "insertelement <4 x float>")
+    val by_letter = cgz_body(enm_ir(swg_decls() + "q.w = 9\nprint(q[0])\n"), "main")
+    val by_index = cgz_body(enm_ir(swg_decls() + "q[3] = 9\nprint(q[0])\n"), "main")
+
+    for main in [by_letter, by_index]
+        assert(swg_count(main, "insertelement <4 x float>") == base + 1, main)
+        assert(main.contains("i32 3"), main)
+        assert(swg_count(main, "shufflevector") == 0, main)
+
+@test("q.xy = p.zw is one two-input shufflevector, merged with the vector in place")
+swg_swizzle_write_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(swg_decls() + "q.xy = p.zw\nprint(q[0])\n"), "main")
+
+    assert(main.contains("<4 x i32> <i32 2, i32 3, i32 6, i32 7>"), main)
+    assert_eq(swg_count(main, "shufflevector"), 1)
+
+@test("a write of a value that is not a shuffle is widened once, then merged")
+swg_widened_write_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(swg_decls() + "q.zx = [8, 9]\nprint(q[0])\n"), "main")
+
+    assert(main.contains("<4 x i32> <i32 1, i32 5, i32 0, i32 7>"), main)
+    assert(main.contains("<4 x i32> <i32 0, i32 1, i32 0, i32 0>"), main)
+    assert_eq(swg_count(main, "shufflevector"), 2)
+
+@test("a compound lane write reads, combines and merges: one operation between")
+swg_compound_ir()
+    if !enm_ready() then return
+
+    val base = swg_count(cgz_body(enm_ir(swg_decls() + "print(q[0])\n"), "main"),
+                         "insertelement <4 x float>")
+    val main = cgz_body(enm_ir(swg_decls() + "q.w += 1\nprint(q[0])\n"), "main")
+
+    assert(swg_count(main, "fadd float") == 1, main)
+    assert(swg_count(main, "insertelement <4 x float>") == base + 1, main)
+    assert(swg_count(main, "extractelement <4 x float>") == 2, main)

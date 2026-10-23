@@ -75,7 +75,8 @@ print(v[4])
 <4>f32 has lanes 0 to 3, and this is 4
 ```
 
-For a computed index, store the values in an array, whose subscript is checked at run time.
+A lane is written by the same constant index, `v[1] = 9`, and by [letter](#swizzles): `v.y = 9`. For
+a computed index, store the values in an array, whose subscript is checked at run time.
 
 ## What the operators do
 
@@ -339,6 +340,106 @@ It is correct, but not free. On AArch64 a comparison's lanes are narrowed to be 
 again afterwards, so `(a < b).shuffle(lanes)` costs several instructions more than
 `a.shuffle(lanes) < b.shuffle(lanes)`. The two are the same mask; prefer shuffling the operands.
 
+### Swizzles
+
+**A field read on a vector whose name is one to four of the letters `x y z w` is a swizzle.** The
+letters are lanes 0 to 3. One letter is the lane itself, a scalar, as `v[2]` is; two to four are a
+vector as wide as the name is long, and a letter may repeat. A swizzle is `shuffle` under another
+spelling, so it is the same single instruction:
+
+```sysl
+val p: <4>f32 = [1, 2, 3, 4]
+
+val back = p.wzyx
+val flat = p.xy
+val wide = flat.xyxy
+val third = p.z
+
+print(back[0], back[3])
+print(flat[0], flat[1])
+print(wide[2], wide[3])
+print(third)
+```
+
+```output
+4 1
+1 2
+1 2
+3
+```
+
+The letters reach lanes 0 to 3 of a vector of any width, so a swizzle is at most four lanes; anything
+wider is a `shuffle`. A name with a letter outside `xyzw` is an ordinary member, which is why `len`
+is still the lane count. Each letter has to be a lane the vector has:
+
+```sysl
+val v: <2>f32 = [1, 2]
+
+print(v.z)
+```
+
+```error
+<2>f32 has lanes x and y, and 'z' is lane 2
+```
+
+### Writing lanes
+
+**A swizzle or a constant index is also a target.** `v.y = x` and `v[1] = x` replace one lane, which is
+one `insertelement`; `v.xy = w` replaces the named lanes, which is one `shufflevector` that merges `w`
+into `v`. The vector itself has to be something that can be assigned, and a scalar on the right
+fills every named lane:
+
+```sysl
+val p: <4>f32 = [1, 2, 3, 4]
+var q: <4>f32 = [0, 0, 0, 0]
+
+q.xy = p.zw
+q.w = 9
+q[1] = 7
+print(q[0], q[1], q[2], q[3])
+
+q.zx = [5, 6]
+q.yw += 1
+print(q[0], q[1], q[2], q[3])
+
+q.yz = 0
+print(q[0], q[1], q[2], q[3])
+```
+
+```output
+3 7 0 9
+6 8 5 10
+6 0 0 10
+```
+
+A compound assignment is the longhand, `q.yw += 1` being `q.yw = q.yw + 1`. A lane has no address of
+its own, so a write is the vector read, changed and stored back, and four things follow:
+
+- the letters of a swizzle written to must be distinct, since one value cannot go to two lanes;
+- the vector must be a place that can be named twice, so a vector reached through a call is refused;
+- a write is a statement, and `:=` is refused;
+- `&v.y` is refused, as `&v[1]` is.
+
+```sysl
+var q: <4>f32 = [0, 0, 0, 0]
+
+q.xx = [1, 2]
+```
+
+```error
+a swizzle written to cannot repeat a letter — 'x' names lane 0 twice, and one value cannot go to both
+```
+
+```sysl
+val p: <4>f32 = [1, 2, 3, 4]
+
+p.x = 1
+```
+
+```error
+a 'val' is written once, so assignment has nothing to write through
+```
+
 ## Reductions
 
 A reduction collapses a vector to one scalar. `sum`, `min` and `max` apply to a numeric vector; `any`
@@ -592,9 +693,8 @@ print(out[0], out[4], out[9])
 
 ## What a vector does not have
 
-**A lane written in place.** `v[1] = 9` is refused, since a lane has no address. Build the new
-vector instead, with a literal or a [`shuffle`](#rearranging-lanes) of the old one and a vector
-holding the new value.
+**A lane with an address.** A lane is written, but only by writing its vector back, so `&v.y` is
+refused as `&v[1]` is: a lane has no address of its own. See [Writing lanes](#writing-lanes).
 
 **A masked load or store.** A run that would reach past the end traps rather than reading only the
 lanes that exist. Write a scalar tail, as the kernel above does.

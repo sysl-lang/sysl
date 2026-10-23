@@ -79,6 +79,10 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
                 return cx.err(span, read_only_message(op, name, p.0, p.1))
         _ -> ()
 
+    if names_a_lane(cx, target) then
+        cx.assign_here = bare
+        return lane_assign(cx, span, written, target, value, expected)
+
     if op == "="
         // An open binding assigned a value of a type of its own takes that type.
         if !cx.open_vars.is_empty() then assigned_fix(cx, target, value)
@@ -134,6 +138,112 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
               TExpr(span, TUpdate(place, op, tv, texpr_type(place), dispatch,
                                   constraint_of(texpr_type(place)), yields)))
 end assign_expr
+
+// The vector a lane write names: `v[2] = x` and `v.xy = e`, where the receiver is a vector. A
+// selection whose name is swizzle letters might as well be a field of a struct, so the receiver's
+// type decides.
+private lane_receiver(target: Expr) -> Option[Expr] = *target.kind match
+    Index(receiver, _, _) -> Some(receiver)
+    Field(receiver, name, _) -> if swizzle_lanes(name).is_some() then Some(receiver) else None
+    _ -> None
+
+private names_a_lane(cx: &Analyzer, target: Expr) -> bool
+    val receiver = lane_receiver(target)
+
+    if receiver.is_none() then return false
+
+    val tried = begin_trial(cx)
+    val t = type_expr_bare(cx, receiver.unwrap())
+
+    discard_trial(cx, tried)
+
+    if texpr_type(t) == Unknown then return false
+
+    repr(texpr_type(auto_deref(cx, t))) match
+        Vector(_, _) -> true
+        _ -> false
+end names_a_lane
+
+// What a lane write's target is called in a refusal.
+private lane_name(target: Expr) -> string = *target.kind match
+    Field(_, name, _) -> if name.bytes.len == 1 then s"lane '$name'" else s"swizzle '$name'"
+    _ -> "a lane"
+
+// Whether writing through an expression twice is the same as writing through it once: a name, a
+// constant, and the fields, elements and arithmetic made of them.
+private repeatable(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    IntLit(_, _, _) -> true
+    Field(r, _, _) -> repeatable(r)
+    Index(r, i, _) -> repeatable(r) && repeatable(i)
+    Unary(_, x) -> repeatable(x)
+    Binary(_, l, r) -> repeatable(l) && repeatable(r)
+    _ -> false
+
+// `v[2] = x`, `v.y = x` and `v.xy = e`: the vector read, the named lanes replaced, the vector stored
+// back. A lane has no address of its own, so this is the only way one is written, and it is the
+// vector that has to be a place.
+//
+// **A compound form is the longhand**: `v.xy += d` is `v.xy = v.xy + d`, the place written twice, which
+// is why a place computed by a call or an unusual index is refused -- it would be evaluated twice.
+private lane_assign(cx: &Analyzer, span: Span, written: string, target: Expr, value: Expr,
+                    expected: Option[Type]) -> TExpr
+    if is_yielding_assign(written) then
+        return cx.err(span, s"'$written' assigns and yields, and a lane is stored by writing the whole " +
+                      s"vector back — write '${plain_form(written)}' and read the lane after it")
+
+    val receiver = lane_receiver(target).unwrap()
+
+    if !repeatable(receiver) then
+        return cx.err(span, "a lane is written by reading the vector and storing it back, which names " +
+                      "its place twice — and this place is computed. Name the vector with a 'var' first, " +
+                      "or write the whole vector")
+
+    if written != "="
+        val bin = written[0..<written.bytes.len - 1]
+
+        cx.assign_here = true
+
+        return assign_expr(cx, span, "=", target, Expr(span, Binary(bin, target, value)), expected)
+    end if
+
+    val read = type_expr_bare(cx, target)
+
+    if texpr_type(read) == Unknown then return bad_expr(span)
+
+    var held = read
+    var lanes: Buf[int] = buf()
+
+    *read.kind match
+        TLane(r, lane, _) ->
+            held = r
+            lanes.push(lane)
+        TShuffle(r, second, picks, _) ->
+            held = r
+            lanes = picks
+        _ -> return cx.err(span, s"${lane_name(target)} is not a lane of a vector")
+
+    for i in 0..<lanes.len()
+        for j in 0..<i
+            if lanes.at(i) == lanes.at(j) then
+                return cx.err(span, s"a swizzle written to cannot repeat a letter — " +
+                              s"'${swizzle_letter(lanes.at(i))}' names lane ${lanes.at(i)} twice, and one " +
+                              "value cannot go to both")
+
+    val place = require_place(cx, held, receiver, "assignment", true, Some(span))
+
+    if texpr_type(place) == Unknown then return bad_expr(span)
+
+    val tv = type_expr(cx, value, Some(texpr_type(read)))
+
+    if texpr_type(tv) == Never || disagree(texpr_type(tv), texpr_type(read)) then
+        cx.fault(span, s"cannot assign ${type_show(texpr_type(tv))} to " +
+                 s"${lane_name(target)} of type ${type_show(texpr_type(read))}")
+
+    val merged = TExpr(span, TLaneSet(place, lanes, tv, texpr_type(place)))
+
+    rechecked(cx, span, place, TExpr(span, TStore(place, merged, texpr_type(place), false)))
+end lane_assign
 
 // Whether a form hands a block's "owes nothing" on to the blocks it is made of: the branches of an
 // `if` or a `match`, and a block written as a value.

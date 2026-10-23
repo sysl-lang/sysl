@@ -1712,6 +1712,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TVecCompare(op, l, r2, ty) -> vector_compare(r, e.span, op, l, r2, ty)
         TSelect(mask, when_true, when_false, _) -> select_lanes(r, mask, when_true, when_false)
         TShuffle(receiver, second, lanes, _) -> shuffle_lanes(r, receiver, second, lanes)
+        TLaneSet(receiver, lanes, value, _) -> lane_set(r, receiver, lanes, value)
         TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
         TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
         TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
@@ -2277,6 +2278,31 @@ private shuffle_lanes(r: &EvRun, receiver: TExpr, second: Option[TExpr], lanes: 
 
     EvGave(ConstArray(out))
 end shuffle_lanes
+
+// A vector with some lanes written: the receiver's lanes, each listed one replaced by the matching
+// lane of the value -- the value itself where one lane is named.
+@noinline
+private lane_set(r: &EvRun, receiver: TExpr, lanes: Buf[int], value: TExpr) -> Flow
+    val a = eval_value(r, receiver) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val given = eval_value(r, value) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    var out: Buf[Const] = buf()
+
+    for item in a
+        out.push(copied(item))
+
+    for j in 0..<lanes.len()
+        val lane = usize(lanes.at(j))
+
+        out.set(lane, if lanes.len() == 1 then copied(given) else copied(lanes_of(given).at(j)))
+
+    EvGave(ConstArray(out))
+end lane_set
 
 // A vector's lanes folded into one value, by the reduction the analyzer chose (`vectors.sysl`).
 //

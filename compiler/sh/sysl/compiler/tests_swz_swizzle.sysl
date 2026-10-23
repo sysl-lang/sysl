@@ -1,0 +1,303 @@
+module sh.sysl.compiler
+@tests
+
+// Swizzles and lane writes (`reference/vectors.md § Rearranging lanes`): `v.xy` and `v.wzyx` read
+// lanes by letter, `v.xy = w.zw`, `v.y = x` and `v[1] = x` write them. A swizzle is `shuffle` under
+// another spelling and a lane write is the vector read, changed and stored back, so the run tests
+// pin the numbers and `tests_swg_swizzle_codegen.sysl` pins the instruction.
+
+private swz_pair() -> string = raw"""
+    val p: <4>f32 = [1, 2, 3, 4]
+    var q: <4>f32 = [0, 0, 0, 0]
+    """
+
+// The compilation said `want`, at `at` (`line:column` in main.sysl); otherwise the test fails showing
+// all of it.
+private swz_says(text: string, want: string, at: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+    assert(said.contains(s"main.sysl:$at\n"), s"expected it at $at\nit said: $said")
+
+// -- reads -----------------------------------------------------------------------------------------
+
+@test("a swizzle read picks lanes by letter: reversed, narrowed, widened by repeating")
+swz_reads()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        val back = p.wzyx
+        val flat = p.xy
+        val wide = flat.xyxy
+        val doubled = p.zzww
+        print(back[0], back[1], back[2], back[3])
+        print(flat[0], flat[1])
+        print(wide[0], wide[1], wide[2], wide[3])
+        print(doubled[0], doubled[1], doubled[2], doubled[3])
+        """), "4 3 2 1\n1 2\n1 2 1 2\n3 3 4 4\n")
+
+@test("one letter is the lane itself, a scalar")
+swz_one_letter_is_a_scalar()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        val z: f32 = p.z
+        val x = p.x + p.w
+        print(z, x)
+        """), "3 5\n")
+
+@test("a swizzle of a wide vector reaches lanes 0 to 3 and the result is at most four lanes")
+swz_wide_vector()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val e: <8>int = [10, 11, 12, 13, 14, 15, 16, 17]
+        val s = e.wz
+        print(s[0], s[1], e.x)
+        """), "13 12 10\n")
+
+@test("a swizzle of a mask is a mask")
+swz_mask()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        val m = (p < 3).wzyx
+        print(m[0], m[3])
+        """), "false true\n")
+
+@test("a swizzle works on every lane type")
+swz_lane_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val a: <4>u8 = [1, 2, 3, 4]
+        val b: <2>f64 = [1.5, 2.5]
+        print(a.wx[0], a.wx[1], b.yx[0], b.yx[1])
+        """), "4 1 2.5 1.5\n")
+
+@test("len is still the lane count and a field called x on a struct is still a field")
+swz_names_that_are_not_swizzles()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        struct Pt
+            x: int
+            y: int
+
+        var pt = Pt(1, 2)
+        pt.x = 5
+        pt.y += 1
+        print(p.len, pt.x, pt.y)
+        """), "4 5 3\n")
+
+@test("a trait method named like a swizzle is still called with parentheses")
+swz_trait_method_named_xy()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        trait Pairs
+            xy(self) -> f32
+
+        impl Pairs for <4>f32
+            xy(self) -> f32 = self[0] + self[1]
+
+        print(p.xy())
+        """), "3\n")
+
+// -- writes ----------------------------------------------------------------------------------------
+
+@test("a swizzle written to takes the value's lanes in the letters' order")
+swz_write_swizzle()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        q.xy = p.zw
+        print(q[0], q[1], q[2], q[3])
+        q.wz = p.xy
+        print(q[0], q[1], q[2], q[3])
+        q.zx = [8, 9]
+        print(q[0], q[1], q[2], q[3])
+        """), "3 4 0 0\n3 4 2 1\n9 4 8 1\n")
+
+@test("a lane is written by letter or by constant index")
+swz_write_lane()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        q.w = 9
+        q[1] = 7
+        q.x = p.z
+        print(q[0], q[1], q[2], q[3])
+        """), "3 7 0 9\n")
+
+@test("a scalar written to a swizzle fills every named lane")
+swz_write_splat()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        q.yz = 5
+        print(q[0], q[1], q[2], q[3])
+        """), "0 5 5 0\n")
+
+@test("a compound assignment reads the named lanes, combines, and writes them back")
+swz_compound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(swz_pair() + raw"""
+        q = p
+        q.xy += [10, 20]
+        q.w *= 2
+        q.z -= 1
+        q.yx += 1
+        print(q[0], q[1], q[2], q[3])
+        """), "12 23 2 8\n")
+
+@test("a lane of a field, an element and a reference is written in place")
+swz_write_through_places()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Body
+            pos: <4>f32
+            id: int
+
+        bump(v: *<4>f32)
+            v.y = 3
+            v.zw = [4, 5]
+
+        var b = Body([0, 0, 0, 0], 7)
+        var all: [2]<4>f32 = [[1, 1, 1, 1], [2, 2, 2, 2]]
+        var v: <4>f32 = [0, 0, 0, 0]
+
+        b.pos.x = 1
+        all[1].xw = [8, 9]
+        all[0][2] = 6
+        bump(&v)
+        print(b.pos[0], b.pos[1], b.id)
+        print(all[1][0], all[1][1], all[1][3], all[0][2])
+        print(v[0], v[1], v[2], v[3])
+        """), "1 0 7\n8 2 9 6\n0 3 4 5\n")
+
+@test("lanes of other types are written: integers, a bool mask, a narrow integer")
+swz_write_lane_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var a: <4>u8 = [1, 2, 3, 4]
+        var m: <4>bool = [false, false, false, false]
+
+        a.zw = [200, 100]
+        a[0] = 9
+        m.yw = [true, true]
+        print(a[0], a[1], a[2], a[3])
+        print(m[0], m[1], m[2], m[3])
+        """), "9 2 200 100\nfalse true false true\n")
+
+@test("lanes are written inside a constant function")
+swz_write_in_const()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const spread(a: int, b: int) -> <4>int
+            var v: <4>int = [0, 0, 0, 0]
+
+            v.xw = [a, b]
+            v[1] = 5
+            v.z += a
+            v
+
+        val k = spread(3, 4)
+        print(k[0], k[1], k[2], k[3])
+        """), "3 5 3 4\n")
+
+@test("a lane write in a generic kernel is per instantiation")
+swz_write_generic()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        first_two[const W: usize](v: <W>int) -> <W>int
+            var out = v
+
+            out.xy = v.yx
+            out
+
+        val r: <8>int = first_two([1, 2, 3, 4, 5, 6, 7, 8])
+        print(r[0], r[1], r[2], r[7])
+        """), "2 1 3 8\n")
+
+// -- refusals --------------------------------------------------------------------------------------
+
+@test("a letter for a lane the vector does not have is told what it has")
+swz_read_past_the_width()
+    if !enm_ready() then return
+
+    swz_says("val v: <2>f32 = [1, 2]\nprint(v.z)\n", "<2>f32 has lanes x and y, and 'z' is lane 2", "2:9")
+    swz_says("val v: <3>f32 = [1, 2, 3]\nprint(v.xyw)\n",
+             "<3>f32 has lanes x, y and z, and 'w' is lane 3", "2:9")
+
+@test("a name with a letter outside xyzw is an ordinary member")
+swz_other_letters_are_members()
+    if !enm_ready() then return
+
+    assert(enm_err("val v: <4>f32 = [1, 2, 3, 4]\nprint(v.xyq)\n").contains("xyq"))
+
+@test("a swizzle written to may not repeat a letter")
+swz_write_repeat_refused()
+    if !enm_ready() then return
+
+    swz_says(swz_pair() + "q.xx = [1, 2]\nprint(q[0])\n",
+             "a swizzle written to cannot repeat a letter — 'x' names lane 0 twice, and one value " +
+                 "cannot go to both", "3:1")
+
+@test("a lane write to a val has nothing to write through")
+swz_write_to_val_refused()
+    if !enm_ready() then return
+
+    swz_says(swz_pair() + "p.x = 1\nprint(p[0])\n", "a 'val' is written once, so assignment has nothing " +
+             "to write through", "3:1")
+    swz_says(swz_pair() + "p[1] = 1\nprint(p[0])\n", "a 'val' is written once, so assignment has " +
+             "nothing to write through", "3:1")
+
+@test("a lane write is a statement and does not yield")
+swz_write_yield_refused()
+    if !enm_ready() then return
+
+    swz_says(swz_pair() + "q.x := 1\nprint(q[0])\n",
+             "':=' assigns and yields, and a lane is stored by writing the whole vector back — write " +
+                 "'=' and read the lane after it", "3:1")
+
+@test("a lane index that is not constant, or past the width, is refused as a read's is")
+swz_write_index_refused()
+    if !enm_ready() then return
+
+    assert(enm_err(swz_pair() + "var k = 1\nq[k] = 1\nprint(q[0])\n").contains(
+        "a lane index is part of the instruction that reads it, so it has to be a constant"))
+    swz_says(swz_pair() + "q[4] = 1\nprint(q[0])\n", "<4>f32 has lanes 0 to 3, and this is 4", "3:3")
+    swz_says("var v: <2>f32 = [1, 2]\nv.z = 1\nprint(v[0])\n", "<2>f32 has lanes x and y, and 'z' is lane 2",
+             "2:3")
+
+@test("a value of the wrong width or type is refused with the place named")
+swz_write_wrong_value_refused()
+    if !enm_ready() then return
+
+    assert(enm_err(swz_pair() + "q.xy = [1, 2, 3]\nprint(q[0])\n").contains(
+        "<2>f32 has 2 lanes and this literal has 3"))
+    assert(enm_err(swz_pair() + "q.x = \"a\"\nprint(q[0])\n").contains(
+        "cannot assign string to lane 'x' of type f32"))
+
+@test("a place computed by a call is refused rather than evaluated twice")
+swz_write_computed_place_refused()
+    if !enm_ready() then return
+
+    assert(enm_err(raw"""
+        var v: <4>f32 = [0, 0, 0, 0]
+        pick(p: *<4>f32) -> *<4>f32 = p
+        (*pick(&v)).x = 1
+        print(v[0])
+        """).contains("names its place twice"))
+
+@test("a lane has no address")
+swz_lane_has_no_address()
+    if !enm_ready() then return
+
+    assert(enm_err(swz_pair() + "val a = &q.x\nprint(q[0])\n").contains("something with an address"))
