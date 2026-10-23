@@ -3173,10 +3173,43 @@ print(Esr::Bits(word).ec)
 ```
 
 `Esr(raw)` is not the spelling because it is already the constructor, which takes one value per
-field — and a bitfield struct of a single field would make it mean two things. Only a bitfield struct
-has `::Bits`: an ordinary struct, and a `@packed` one whose fields are all whole bytes, are laid out
-as fields rather than as one integer, and `P::Bits(n)` on one is refused saying so. A field or member
-the struct declares named `bits` is what `.bits` reaches, ahead of the container.
+field — and a bitfield struct of a single field would make it mean two things. A field or member the
+struct declares named `bits` is what `.bits` reaches, ahead of the container.
+
+**A `@packed` struct whose fields are all whole bytes converts too, though it is not stored as one
+integer.** Its fields are read as ranges exactly as a bitfield struct's are — the first declared is
+the low bits — each as wide as its type, so the integer is the fields' widths added: a `u8` and a
+`u16` make a `u24`, a `u32` and a `u8` a `u40`. Its storage does not change: it is still its fields
+end to end, with the size, alignment and C layout a `__attribute__((packed))` struct has, so a
+protocol header or a C mirror is exactly what it was. On a little-endian machine — every machine
+sysl targets — the integer is the struct's bytes read in order, wherever each field is a power of two
+bytes wide. A register modelled from its description converts whether or not any of its fields is
+narrower than a byte:
+
+```sysl
+@packed
+struct Status
+    code: u8
+    _: u8
+    count: u16
+
+val raw: u32 = 0x00070011
+val s = Status::Bits(raw)
+
+print(s.code, s.count, s.bits == raw)
+print(Status(0x22, 0, 9).bits, sizeof(Status))
+```
+
+```output
+17 7 true
+589858 4
+```
+
+A `@byte_order` struct's integer holds its fields' values, not the bytes of the wire: each field is
+reversed on the way in and out exactly as a field read and write reverses it.
+
+An ordinary struct, a union and a struct with C bitfields have no `::Bits`, and `P::Bits(n)` on one
+is refused saying which it is.
 
 **Nothing is checked on the way in.** The bits are taken as they are, so an enum-typed field may hold
 a value none of its variants has; the field is held to its variants where it is read, as one reached
@@ -3199,6 +3232,22 @@ print(m.a)
 
 ```error
 is one integer, and every field of it has to be one too
+```
+
+A `@packed` struct of whole bytes may hold any of those — it is laid out as fields — but then it does
+not convert, and `::Bits` names the field that stops it:
+
+```sysl
+@packed
+struct Sample
+    id: u8
+    value: f32
+
+print(Sample::Bits(1).id)
+```
+
+```error
+'Sample::Bits' has no integer to make it from: its field 'value' is f32 — only a '@packed' struct whose every field is an integer, a simple enum or a bitfield struct converts to one
 ```
 
 **A bitfield struct may be a field of another, and there it occupies its own fields' widths** — the

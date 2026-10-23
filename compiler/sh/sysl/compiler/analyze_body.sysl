@@ -2398,6 +2398,18 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
         val whole = TExpr(t.span, TEnumNew(en, variant, parts.unwrap()))
 
         if payloads_laid(cx.an.tables.layout, whole) then Some(whole) else None
+    // `T::Bits(n)` over a constant is the construction of the fields `n` holds, so a register value
+    // written as its raw word is data exactly as the same value written field by field is.
+    TIntOp(op, operand, _, _, ty) ->
+        if op != "bitfield_from_bits" then return leaf_image(cx, name, t)
+
+        val n = const_fold_typed(operand, fold_machine(cx.an.tables)) match
+            Some(ConstInt(found)) -> found
+            _ -> return None
+
+        underlying(ty) match
+            Struct(d) -> bits_literal(t.span, d, n).and_then(x -> static_image(cx, name, x))
+            _ -> None
     _ -> leaf_image(cx, name, t)
 
 // **A trait object over the address of module storage is constant data**: it is two addresses, the
