@@ -575,6 +575,17 @@ private module_path_of(cx: &Analyzer, receiver: Expr, name: string) -> Option[st
 names_a_function(cx: &Analyzer, written: string) -> bool =
     !function_keys(cx, written).is_empty() || extern_key(cx, written).is_some()
 
+// Whether `written` names a function or `extern` the reader's file may call.
+private names_a_reachable_function(cx: &Analyzer, written: string) -> bool
+    if extern_key(cx, written).is_some() then return true
+
+    val keys = function_keys(cx, written)
+
+    for i in 0..<keys.len()
+        if reachable_key(cx.an, keys.at(i), cx.scope) then return true
+
+    false
+
 // A name in call position, in the order the reader's own bindings are consulted.
 private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: Buf[Expr],
                    expected: Option[Type]) -> TExpr
@@ -728,7 +739,9 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
     // under a name no reader can spell (`$str`, `$format`).
     val name = hole_form(written)
 
-    if name == written && special_form_word(name) && (cx.lookup(name).is_some() || names_a_function(cx, name))
+    // A function another file keeps `private` is not the reader's to reach, so it does not claim the
+    // name either: the form still answers there.
+    if name == written && special_form_word(name) && (cx.lookup(name).is_some() || names_a_reachable_function(cx, name))
         return None
 
     // `old(e)` is the value an argument had on entry, and it means something only inside an
