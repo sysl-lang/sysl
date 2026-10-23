@@ -219,7 +219,9 @@ One agent per item, in this order, each landing on dev with its tests and refere
 5. The two small traps (special-form shadowing; host-side fold check).
 6. Fewer global built-in names (user, 2026-10-23):
    - `va_*`, `ptr_cast`, `str_cast` and `str_alias` move behind an import.
-   - `print`, `str`, `debug` and `format` stay built in, as fallbacks a user name overrides (item 5).
+   - `format` is removed as a user form: interpolation reaches the formatter internally, and no
+     org code called it.
+   - `print`, `str` and `debug` stay built in, as fallbacks a user name overrides (item 5).
      They can't become library functions without specialisation: every value prints, through
      `Display`, else `Debug`, else its type name, and some types are shown by rule because no `impl`
      may be written for them.
