@@ -44,6 +44,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     var none: Buf[TVal] = buf()
 
     e.caller_exposed = exposed_in(f.body.stmts, f.body.result, none)
+    begin_moves(e, f.body.stmts, f.body.result)
 
     // The local every `return` hands back, where it can be built in the caller's result storage.
     e.return_slot = return_plan(e, f)
@@ -151,7 +152,10 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // first resumed.
     if is_async then initial_suspend(e)
 
-    gen_stmts(e, f.body.stmts)
+    val lasts = last_uses_of(e, f.body.stmts, f.body.result)
+
+    gen_stmts_with(e, f.body.stmts, lasts.0)
+    e.moves.last_uses = lasts.1
 
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.
@@ -164,7 +168,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                 else if !no_value(f.ret_ty)
                     val v = gen_expr(e, r)
 
-                    retain_value(e, f.ret_ty, v)
+                    retain_moving(e, r, f.ret_ty, v)
                     emit_ensures(e, Some(v))
                     release_all_as(e, exit_returning(e, Some(r), v, f.ret_ty))
                     emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))

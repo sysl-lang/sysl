@@ -74,7 +74,9 @@ print(a.n, b.n)
 
 There is **no move semantics and no use-after-move**. `a` is still a whole `Counter` after `b = a`,
 and it always will be — the concept of a value that has been given away does not exist here, so
-neither does the class of error built on it.
+neither does the class of error built on it. Where a copy is a local's last use, the compiler hands
+the value over instead of copying it ([below](#a-count-that-would-be-taken-and-given-straight-back-is-not-taken)) —
+which changes how many counts are taken, and nothing a program can observe.
 
 A value containing a `&T` field is still a value: copying it **retains** that field, so the copy is
 independently safe and the original is untouched. That is the one thing a copy does beyond moving
@@ -455,6 +457,14 @@ for it. A count therefore never reaches zero at a different point, and **no dest
 later or in a different order** than it would with every count taken. Nothing about it is visible
 except the time it saves: on a recursive search over a tree of `&sync` shapes it removes three of every
 four atomic operations.
+
+**A value's last use hands it over.** Where what is stored, bound, returned or made a branch's value
+is a count the frame was about to give back — a fresh box, a call's result, or a local the statement
+names for the last time in its scope — the destination takes that count instead of a new one, and
+the give-back is never emitted. A struct or enum built on the spot is handed over field by field, so
+`Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
+named in a `defer`, used inside a loop or a branch it was declared outside of, or reached through an
+address or a `ref` is copied as before, so this too moves no destructor.
 
 ```sysl
 struct Tag

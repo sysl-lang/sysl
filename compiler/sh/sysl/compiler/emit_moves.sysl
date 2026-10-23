@@ -1,0 +1,263 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **Inferred moves**: at a value's last use, the storage it lands in takes over the count this frame
+// already holds instead of taking one of its own (`reference/memory.md § T — values`).
+//
+// A destination -- a binding's slot, a field written, a function's result, a branch's value -- owns
+// what is written into it, so it takes a count of everything the value refers to. Where that value
+// is something the frame was going to give back anyway, the count and the give-back cancel, and
+// this file is what notices. Two kinds of thing qualify:
+//
+// - **A temporary of the statement being emitted**: a fresh box, a call's result. It is taken out of
+//   the statement's region, so the release at the statement's end is never emitted.
+// - **A local the frame owns, at its last use**: its slot is taken out of the scope's list, so the
+//   release where the scope ends is never emitted.
+//
+// A struct or enum built on the spot is neither: building one takes no count, so what it holds is
+// whatever its parts were. It is taken over **field by field**, each part taken where it can be and
+// retained where it cannot -- which is exactly the walk the type's copy helper would have made.
+//
+// **Nothing observable changes, which is what bounds every rule here.** Copying is always correct,
+// so each question that cannot be answered for certain is answered "copy":
+//
+// - A local moves only from the **innermost scope** being emitted. A use inside a branch, a loop
+//   body or a short-circuit is in a scope of its own (each of those opens one, for the release
+//   dominance their own releases need), so a local is only ever moved by a use that every path from
+//   its declaration to its scope's end passes through -- and no other path can still be holding it.
+// - "Last use" is read off the block's statement list: the local is named exactly once in the
+//   statement, and not at all in any statement after it or in the block's value. A name in a
+//   `defer` is used at every exit, and a name a `ref` or an address was taken of can be read through
+//   the alias, so neither ever moves; nor does a local whose address a call could reach, nor one an
+//   array of which a view may still be standing on.
+// - A `@pinned` value is never read whole once it has landed (`pinned.sysl` refuses the copy), so it
+//   never reaches a destination this file is asked about.
+//
+// What a call is handed is not here: a by-value argument is borrowed (`borrowing.sysl`), so a call
+// takes no count at its edge to be taken over.
+
+// One function's state. `last_uses` is the statement being emitted's; `parts` the value each struct
+// or enum built in this function was made from, by the register it is in and the node that built it.
+struct Moves
+    ready: bool
+    last_uses: Set[string]
+    no_move: Set[string]
+    parts: Map[string, (Span, Buf[Val])]
+    source: Option[TExpr]
+end Moves
+
+moves_none() -> Moves = Moves(false, set(), set(), map(), None)
+
+// The names a walk collected.
+private struct Names
+    seen: Set[string]
+    order: Buf[string]
+    counts: Map[string, int]
+end Names
+
+private names_none() -> &Names = Names(set(), buf(), map())
+
+private note_name(into: &Names, name: string)
+    if !into.seen.has(name)
+        into.seen.add(name)
+        into.order.push(name)
+
+    into.counts.put(name, into.counts.get(name).unwrap_or(0) + 1)
+end note_name
+
+// Every local a node reads or writes, each as often as it is named.
+private loads_into(into: &Names) -> &TWalk = expr_walk(true, x -> *x.kind match
+    TLoad(name, _) -> note_name(into, name)
+    _ -> ())
+
+// Readies a body for moves: the locals that may never move, whatever their last use looks like.
+begin_moves(e: *Emit, stmts: Buf[TStmt], result: Option[TExpr])
+    val held = names_none()
+    val aliased = TWalk(true, x -> addressed(held, x), w -> (), s -> deferred_or_aliased(held, s))
+
+    walk_stmts(stmts, aliased)
+
+    if result.is_some() then walk_texpr(result.unwrap(), aliased)
+
+    e.moves.no_move = held.seen
+    e.moves.ready = true
+end begin_moves
+
+private addressed(held: &Names, x: TExpr) = *x.kind match
+    TAddrOf(place, _) -> walk_texpr(place, loads_into(held))
+    _ -> ()
+
+private deferred_or_aliased(held: &Names, s: TStmt) = s match
+    TDefer(body, _) -> walk_stmts(body, loads_into(held))
+    TRefDecl(_, _, place) -> walk_texpr(place, loads_into(held))
+    _ -> ()
+
+// For each statement of a block, the locals it uses for the last time; and the same for the block's
+// value. Read backwards, so each statement is walked once.
+last_uses_of(e: *Emit, xs: Buf[TStmt], tail: Option[TExpr]) -> (Buf[Set[string]], Set[string])
+    var lasts: Buf[Set[string]] = buf()
+
+    if !e.moves.ready then return (lasts, set())
+
+    val later = names_none()
+    val at_tail = names_none()
+
+    if tail.is_some() then walk_texpr(tail.unwrap(), loads_into(at_tail))
+
+    val tail_lasts = named_once(e, at_tail, later)
+    var backwards: Buf[Set[string]] = buf()
+
+    for j in 0..<xs.len()
+        val at = names_none()
+
+        walk_stmt(xs.at(xs.len() - 1 - j), loads_into(at))
+        backwards.push(named_once(e, at, later))
+
+    for j in 0..<backwards.len()
+        lasts.push(backwards.at(backwards.len() - 1 - j))
+
+    (lasts, tail_lasts)
+end last_uses_of
+
+// The names used exactly once here and never after, which then join what comes after.
+private named_once(e: *Emit, here: &Names, later: &Names) -> Set[string]
+    var out: Set[string] = set()
+
+    for name in here.order
+        if here.counts.get(name).unwrap_or(0) == 1 && !later.seen.has(name) && !e.moves.no_move.has(name)
+            out.add(name)
+
+    for name in here.order
+        later.seen.add(name)
+
+    out
+end named_once
+
+// Records what a struct or enum built at `at` into `made` was made from.
+note_parts(e: *Emit, at: Span, made: Val, vals: Buf[Val])
+    if e.moves.ready && reg_of(made) != "" then e.moves.parts.put(reg_of(made), (at, vals))
+
+// The count a destination of type `ty` needs for `v`, the value of `x`: taken over where `x` is
+// something this frame was going to give back, and retained otherwise.
+retain_moving(e: *Emit, x: TExpr, ty: Type, v: Val)
+    if e.moves.ready && !e.layout.indirect(ty) && texpr_type(x) == ty then take_over(e, x, ty, v)
+    else retain_value(e, ty, v)
+end retain_moving
+
+// The same for a store, whose value `gen_write` named before the store was emitted.
+retain_stored(e: *Emit, ty: Type, v: Val)
+    val from = e.moves.source
+
+    e.moves.source = None
+
+    from match
+        Some(x) -> retain_moving(e, x, ty, v)
+        None -> retain_value(e, ty, v)
+end retain_stored
+
+private take_over(e: *Emit, x: TExpr, ty: Type, v: Val)
+    if !contains_counted(ty) then return
+
+    val done = *x.kind match
+        TLoad(name, _) -> take_local(e, name, ty)
+        TStructNew(_, args) -> underlying(ty) match
+            Struct(d) -> take_fields(e, x, v, args, d.fields, Some(d))
+            _ -> false
+        TEnumNew(_, variant, args) -> enum_decl(ty) match
+            Some(d) -> variant_fields(d, variant.name) match
+                Some(fields) -> take_fields(e, x, v, args, fields, None)
+                None -> false
+            None -> false
+        _ -> take_temp(e, v, ty)
+
+    if !done then retain_value(e, ty, v)
+end take_over
+
+private variant_fields(d: &EnumType, name: string) -> Option[Buf[(string, Type)]]
+    for variant in d.variants
+        if variant.name == name then return Some(variant.fields)
+
+    None
+end variant_fields
+
+// A value built on the spot, taken over part by part: each counted field its part's own question,
+// and one this frame cannot hand over retained as the type's copy helper would have retained it.
+private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], fields: Buf[(string, Type)],
+                    holder: Option[&StructType]) -> bool
+    val got = e.moves.parts.get(reg_of(v))
+
+    if got.is_none() then return false
+
+    val parts = got.unwrap()
+
+    if !(parts.0 == x.span) || parts.1.len() != args.len() || fields.len() != args.len() then return false
+
+    for i in 0..<args.len()
+        val fty = fields.at(i).1
+        val part = parts.1.at(i)
+
+        if contains_counted(fty) && (holder.is_none() || !borrowed_capture(holder.unwrap(), fty))
+            if texpr_type(args.at(i)) == fty && !e.layout.indirect(fty) then take_over(e, args.at(i), fty, part)
+            else retain_value(e, fty, part)
+
+    true
+end take_fields
+
+// A temporary of the innermost region, which is the statement being emitted.
+private take_temp(e: *Emit, v: Val, ty: Type) -> bool
+    val r = reg_of(v)
+
+    if r == "" || e.temp_marks.is_empty() || e.temp_slots.has(r) then return false
+
+    for j in e.temp_marks.at(e.temp_marks.len() - 1)..<e.temps.len()
+        val t = e.temps.at(j)
+
+        if reg_of(t.0) == r && t.1 == ty
+            e.temps.remove(j)
+            return true
+
+    false
+end take_temp
+
+// A local at its last use, owned by the innermost scope.
+private take_local(e: *Emit, name: string, ty: Type) -> bool
+    if !e.moves.last_uses.has(name) || !movable_type(ty) || e.owned_marks.is_empty() then return false
+    if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then return false
+
+    val slot = reg_of(local_slot(e, name))
+
+    for j in e.owned_marks.at(e.owned_marks.len() - 1)..<e.owned_slots.len()
+        val s = e.owned_slots.at(j)
+
+        if reg_of(s.0) == slot && s.1 == ty
+            e.owned_slots.remove(j)
+            return true
+
+    false
+end take_local
+
+// Whether a local of this type may hand its count over: anything but an array held by value, which a
+// view taken earlier may still be standing on.
+private movable_type(t: Type) -> bool = underlying(t) match
+    Array(_, _) -> false
+    Struct(d) -> fields_movable(d.fields)
+    Enum(d) ->
+        for variant in d.variants
+            if !fields_movable(variant.fields) then return false
+
+        true
+    _ -> true
+
+private fields_movable(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if !movable_type(item.1) then return false
+
+    true
+end fields_movable
+
+private reg_of(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""

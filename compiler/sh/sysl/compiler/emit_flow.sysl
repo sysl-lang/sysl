@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.math.bigint.from_int
 
 // **The forms that yield a value and have a body**, which are all of them here: every branch stores
@@ -77,10 +78,15 @@ merged_value(e: *Emit, m: Merge, ty: Type) -> Val =
 // A branch's value built where it is going, and owned there -- `gen_block_value` for a destination.
 // The count is taken before the block's locals are given back, as the register form's is.
 private gen_block_into(e: *Emit, b: TBlock, dest: Val)
+    val lasts = last_uses_of(e, b.stmts, b.result)
+    val was = e.moves.last_uses
+
     push_temps(e)
     push_owned(e)
-    gen_stmts(e, b.stmts)
+    gen_stmts_with(e, b.stmts, lasts.0)
+    e.moves.last_uses = lasts.1
     gen_into(e, dest, b.result.unwrap())
+    e.moves.last_uses = was
     pop_owned(e)
     pop_temps(e)
 end gen_block_into
@@ -276,7 +282,7 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
     val paths = gen_cond(e, cond, body_l, else_l)
 
     push_owned(e)
-    gen_stmts(e, body)
+    gen_body(e, body)
     pop_owned(e)
 
     // A binding is per-iteration: it is released at the bottom of the body and made again by the
@@ -302,7 +308,7 @@ gen_do_while(e: *Emit, body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock]
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
     push_owned(e)
-    gen_stmts(e, body)
+    gen_body(e, body)
     pop_owned(e)
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
@@ -331,7 +337,7 @@ gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
     push_owned(e)
-    gen_stmts(e, body)
+    gen_body(e, body)
     pop_owned(e)
     emit_term(e, InBr(body_l))
     e.loops.pop()
@@ -747,17 +753,23 @@ end gen_block_void
 // released before control leaves it -- that is what keeps every release site dominating the value
 // it releases -- so the result is retained first and becomes the caller's to let go.
 gen_block_value(e: *Emit, b: TBlock) -> Val
+    val lasts = last_uses_of(e, b.stmts, b.result)
+    val was = e.moves.last_uses
+
     push_temps(e)
     push_owned(e)
-    gen_stmts(e, b.stmts)
+    gen_stmts_with(e, b.stmts, lasts.0)
+    e.moves.last_uses = lasts.1
 
     val v = b.result match
         Some(r) ->
             val got = gen_expr(e, r)
 
-            retain_value(e, texpr_type(r), got)
+            retain_moving(e, r, texpr_type(r), got)
             got
         None -> VNothing
+
+    e.moves.last_uses = was
 
     pop_owned(e)
     pop_temps(e)
@@ -765,13 +777,27 @@ gen_block_value(e: *Emit, b: TBlock) -> Val
 end gen_block_value
 
 // A guard proved in the list holds for the rest of it and no further (`nowrap.sysl`).
-gen_stmts(e: *Emit, xs: Buf[TStmt])
-    val mark = nowrap_mark(e)
+gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 
-    for item in xs
+// The same, each statement told which locals it uses for the last time (`emit_moves.sysl`); a list
+// shorter than the block tells the rest that none are. Whatever the enclosing statement was told is
+// put back afterwards, since its own destination is reached only once this block is done.
+gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]])
+    val mark = nowrap_mark(e)
+    val was = e.moves.last_uses
+    val none: Set[string] = set()
+
+    for i in 0..<xs.len()
+        val item = xs.at(i)
+
         nowrap_before(e, item)
+        e.moves.last_uses = if i < lasts.len() then lasts.at(i) else none
         gen_stmt(e, item)
         nowrap_after(e, item)
 
+    e.moves.last_uses = was
     nowrap_release(e, mark)
-end gen_stmts
+end gen_stmts_with
+
+// A body whose scope was opened just for it -- a loop's -- with moves inferred over it.
+private gen_body(e: *Emit, body: Buf[TStmt]) = gen_stmts_with(e, body, last_uses_of(e, body, None).0)

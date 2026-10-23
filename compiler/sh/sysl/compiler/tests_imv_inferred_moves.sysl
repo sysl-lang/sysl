@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// Inferred moves (`emit_moves.sysl`): at a value's last use the storage it lands in takes over the
+// count the frame holds, so neither the copy nor the give-back is emitted. Three kinds of claim: the
+// emitted text of every shape that moves, the same text still copying for every shape that must not,
+// and a program whose destructors print run on the counted heap, which ends at nothing live and
+// drops everything exactly where the copying lowering did.
+
+private imv_types() -> string = raw"""
+    struct Node
+        v: int
+
+    struct Pair
+        a: &Node
+        b: int
+
+    struct Holder
+        p: Pair
+        n: &Node
+
+    enum Maybe[T]
+        No
+        Yes(v: T)
+
+    touch(v: int) = ()
+
+    """
+
+// The text of one function of `body`, lowered after the shared types.
+private imv_ir(body: string, symbol: string) -> string = emit_func_text(imv_types() + body, symbol)
+
+private imv_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// Neither half of a count: no retain, release or copy or dispose helper of any kind.
+private imv_no_traffic(ir: string)
+    assert(ir.starts_with("define"), ir)
+    assert_eq(imv_count(ir, "@arc."), 0)
+end imv_no_traffic
+
+// -- what moves ---------------------------------------------------------------------------------------
+
+@test("a fresh box handed to an enum constructor is handed over: no copy of the enum, no release of the box")
+imv_box_into_enum()
+    imv_no_traffic(imv_ir("wrap(n: int) -> Maybe[&Node] = Yes(Node(n))\n", "wrap"))
+
+@test("a local consumed by an enum constructor at its last use is moved, not copied")
+imv_local_into_enum()
+    imv_no_traffic(imv_ir("wrap(n: int) -> Maybe[&Node]\n    val x: &Node = Node(n)\n    Yes(x)\n", "wrap"))
+
+@test("a local consumed by a struct literal at its last use is moved, not copied")
+imv_local_into_struct()
+    imv_no_traffic(imv_ir("pair(n: int) -> Pair\n    val x: &Node = Node(n)\n    Pair(x, 1)\n", "pair"))
+
+@test("a struct literal bound to a var takes its parts' counts, and returning the local moves it")
+imv_return_local()
+    imv_no_traffic(imv_ir("make(n: int) -> Pair\n    var p = Pair(Node(n), 1)\n    p.b = 2\n    return p\n",
+                          "make"))
+    imv_no_traffic(imv_ir("make(n: int) -> Pair\n    var p = Pair(Node(n), 1)\n    p.b = 2\n    p\n", "make"))
+
+@test("a local stored into a field at its last use moves: the only count traffic is the old value's release")
+imv_store_local()
+    val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    h.n = x\n", "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 0)
+    assert_eq(imv_count(ir, "@arc.release("), 1)
+
+    val pair = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    h.p = Pair(x, 1)\n", "put")
+
+    assert_eq(imv_count(pair, "@arc.copy."), 0)
+    assert_eq(imv_count(pair, "@arc.release("), 0)
+    assert_eq(imv_count(pair, "@arc.dispose.Pair("), 1)
+
+@test("a local declared in a loop body moves at its last use in that body")
+imv_loop_local()
+    val ir = imv_ir("put(h: &Holder, n: int)\n    var i = 0\n    while i < 2\n        val x: &Node = Node(n)\n" +
+                    "        h.n = x\n        i += 1\n", "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 0)
+    assert_eq(imv_count(ir, "@arc.release("), 1)
+
+@test("a branch's value takes over the local it ends with")
+imv_branch_value()
+    val ir = imv_ir("pick(c: bool, n: int) -> Maybe[&Node] = if c\n    val x: &Node = Node(n)\n    Yes(x)\n" +
+                    "else\n    No\n", "pick")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(imv_count(ir, "@arc.copy."), 0)
+    assert_eq(imv_count(ir, "@arc.release("), 0)
+
+// -- what still copies ----------------------------------------------------------------------------------
+
+@test("a local read again after the store keeps its count and the store takes one of its own")
+imv_use_after_copies()
+    val ir = imv_ir("put(h: &Holder, n: int) -> int\n    val x: &Node = Node(n)\n    h.n = x\n    x.v\n", "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+
+@test("a local stored inside a loop it was declared outside of is copied every round")
+imv_loop_copies()
+    val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    var i = 0\n    while i < 2\n" +
+                    "        h.n = x\n        i += 1\n", "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+
+@test("a last use on one branch only is a copy, the scope's end giving the local back on both")
+imv_branch_copies()
+    val ir = imv_ir("put(h: &Holder, n: int, c: bool)\n    val x: &Node = Node(n)\n    if c\n        h.n = x\n",
+                    "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+
+@test("a local a defer names is copied, since the deferred statement reads it at the exit")
+imv_defer_copies()
+    val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    defer touch(x.v)\n    h.n = x\n",
+                    "put")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+
+@test("a local bound to a field holds no count of its own, so handing it on copies")
+imv_field_copies()
+    val ir = imv_ir("get(h: &Holder) -> Maybe[&Node]\n    val x = h.n\n    Yes(x)\n", "get")
+
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_count(imv_ir("get(h: &Holder) -> Maybe[&Node] = Yes(h.n)\n", "get"), "@arc.retain("), 1)
+    assert_eq(imv_count(imv_ir("get(x: &Node) -> Maybe[&Node] = Yes(x)\n", "get"), "@arc.retain("), 1)
+
+@test("a captured variable is the closure's, so the closure's body copies it every call")
+imv_captured_copies()
+    val ir = imv_ir("get(n: int) -> int\n    val x: &Node = Node(n)\n    val f = () -> Yes(x)\n" +
+                    "    f() match\n        Yes(y) -> y.v\n        No -> 0\n", "$closure0.call")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(imv_count(ir, "@arc.retain("), 1)
+
+@test("a pinned local is still refused a whole read at its last use, a counted field or not")
+imv_pinned_is_not_moved()
+    val said = emit_func_text(imv_types() + "@pinned\nstruct Fs\n    n: &Node\n\nkept() -> Fs\n" +
+                              "    var here = Fs(Node(1))\n    here\n", "kept")
+
+    assert(said.contains("and this returns it by value"), said)
+
+// -- the counted heap ---------------------------------------------------------------------------------
+
+// The program built with counting on and run: what it printed, and what the heap said at exit.
+private imv_counted(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-imv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "")
+        Ok(o) -> (o.text, o.err.unwrap_or(""))
+end imv_counted
+
+@test("every shape that moves and every one that copies ends the counted heap at nothing live, dropping where it did")
+imv_counted_heap()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = imv_counted(raw"""
+        struct Tag
+            id: int
+
+        impl Drop for Tag
+            drop(self) = print("drop", self.id)
+
+        struct Pair
+            a: &Tag
+            b: int
+
+        struct Holder
+            p: Pair
+            n: &Tag
+
+        wrap(n: int) -> Option[&Tag] = Some(Tag(n))
+
+        wrap_local(n: int) -> Option[&Tag]
+            val x: &Tag = Tag(n)
+            Some(x)
+
+        pair_local(n: int) -> Pair
+            val x: &Tag = Tag(n)
+            Pair(x, 1)
+
+        ret_var(n: int) -> Pair
+            var p = Pair(Tag(n), 1)
+            p.b = 2
+            p
+
+        store(h: &Holder, n: int)
+            val x: &Tag = Tag(n)
+            h.n = x
+            print("stored", n)
+
+        store_pair(h: &Holder, n: int)
+            val x: &Tag = Tag(n)
+            h.p = Pair(x, 1)
+            print("stored pair", n)
+
+        use_after(h: &Holder, n: int) -> int
+            val x: &Tag = Tag(n)
+            h.n = x
+            x.id
+
+        in_loop(h: &Holder, n: int) -> int
+            val x: &Tag = Tag(n)
+            var i = 0
+            while i < 2
+                h.n = x
+                i += 1
+            x.id
+
+        loop_local(h: &Holder, n: int)
+            var i = 0
+            while i < 2
+                val x: &Tag = Tag(n + i)
+                h.n = x
+                i += 1
+
+        branch(h: &Holder, n: int, c: bool)
+            val x: &Tag = Tag(n)
+            if c
+                h.n = x
+            print("branch end", n)
+
+        deferred(h: &Holder, n: int)
+            val x: &Tag = Tag(n)
+            defer print("deferred", x.id)
+            h.n = x
+
+        from_field(h: &Holder) -> Option[&Tag]
+            val x = h.n
+            Some(x)
+
+        captured(n: int) -> int
+            val x: &Tag = Tag(n)
+            val f = () -> Some(x)
+            f().unwrap().id
+
+        val h: &Holder = Holder(Pair(Tag(0), 0), Tag(1))
+        print("wrap", wrap(10).unwrap().id)
+        print("wrap_local", wrap_local(11).unwrap().id)
+        print("pair_local", pair_local(12).a.id)
+        print("ret_var", ret_var(13).a.id)
+        store(h, 14)
+        store_pair(h, 15)
+        print("use_after", use_after(h, 16))
+        print("in_loop", in_loop(h, 17))
+        loop_local(h, 18)
+        branch(h, 20, true)
+        branch(h, 21, false)
+        deferred(h, 22)
+        print("from_field", from_field(h).unwrap().id)
+        print("captured", captured(23))
+        print("end")
+        """)
+
+    assert_eq(ran.0, "wrap 10\ndrop 10\nwrap_local 11\ndrop 11\npair_local 12\ndrop 12\nret_var 13\ndrop 13\n" +
+                     "drop 1\nstored 14\ndrop 0\nstored pair 15\nuse_after drop 14\n16\nin_loop drop 16\n17\n" +
+                     "drop 17\ndrop 18\ndrop 19\nbranch end 20\nbranch end 21\ndrop 21\ndrop 20\ndeferred 22\n" +
+                     "from_field 22\ncaptured drop 23\n23\nend\ndrop 22\ndrop 15\n")
+    assert(!ran.1.contains("still live"), ran.1)

@@ -398,7 +398,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TEnumNew(enum_ty, variant, args) ->
         if e.layout.indirect(enum_ty) then return through_slot(e, x)
 
-        val made = gen_enum_new(e, enum_ty, variant, args)
+        val made = gen_enum_new(e, x.span, enum_ty, variant, args)
 
         trace_origin(e, x)
         made
@@ -412,7 +412,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TStructNew(decl, args) ->
         if e.layout.indirect(Struct(decl)) then return through_slot(e, x)
 
-        gen_struct_new(e, decl, args)
+        gen_struct_new(e, x.span, decl, args)
 
     TStructInvCheck(value, decl, inv_fn) ->
         val v = gen_expr(e, value)
@@ -1018,7 +1018,9 @@ private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     val v = gen_expr(e, value)
     val p = place_addr(e, place)
 
+    e.moves.source = Some(value)
     store_place(e, place, p, v)
+    e.moves.source = None
     v
 end gen_store
 
@@ -1252,8 +1254,9 @@ end gen_constrained_step
 
 // -- enums ------------------------------------------------------------------------------------------
 
-// An enum value built from a variant and what it carries.
-private gen_enum_new(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TExpr]) -> Val
+// An enum value built from a variant and what it carries, with what it carries noted for a
+// destination that takes it over (`emit_moves.sysl`).
+private gen_enum_new(e: *Emit, at: Span, enum_ty: Type, variant: EnumVariant, args: Buf[TExpr]) -> Val
     val d = enum_decl(enum_ty) match
         Some(decl) -> decl
         None -> return gap_at(e, "an enum construction of something that is not an enum")
@@ -1263,13 +1266,16 @@ private gen_enum_new(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TE
     for item in args
         vals.push(gen_expr(e, item))
 
-    enum_value(e, enum_ty, d, variant, vals)
+    val made = enum_value(e, enum_ty, d, variant, vals)
+
+    note_parts(e, at, made, vals)
+    made
 end gen_enum_new
 
 // A struct built from its field values: an `insertvalue` chain over an undefined aggregate, with the
 // fields that occupy nothing skipped exactly as the layout skips them. A **bitfield** struct is one
 // integer instead, and its fields are ranges of it.
-private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
+private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) -> Val
     if !decl.c_bits.is_empty() then return c_bits_new(e, decl, args)
 
     bitfield_ranges(decl) match
@@ -1306,6 +1312,7 @@ private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
                              index_list(struct_field_index(e.layout, decl, decl.slot(i)))))
             acc = r
 
+    note_parts(e, at, acc, vals)
     acc
 end gen_struct_new
 
