@@ -435,6 +435,27 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 | float | the rendering `print` gives it — the fewest digits that read back at its own width, positionally, as Rust's `{}` writes them |
 | `string` | itself, unchanged |
 
+**A name you declare wins over a built-in form of the same spelling.** `str`, `print`, `format`,
+`str_cast`, `str_alias`, `ptr_cast` and the `va_` forms are what a call reaches only where nothing
+else claims the name; a local, a parameter or a function called `str` is ordinary shadowing, and a
+call through it means that name, which is an error at the call if it cannot be called. An
+interpolation hole is the one call that always reaches the rendering, so a parameter called `str`
+can still be spliced in.
+
+```sysl
+double(str: string) -> string = s"${str}${str}"
+
+str(x: int) -> int = x * 2
+
+width(print: string) -> usize = print.len
+
+print(double("ab"), str(21), width("four"))
+```
+
+```output
+abab 42 4
+```
+
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
 allocates; every other case allocates a fresh buffer. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the

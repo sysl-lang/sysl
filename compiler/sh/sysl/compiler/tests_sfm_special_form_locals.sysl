@@ -1,0 +1,110 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A name the reader declared -- a local, a parameter, a function -- wins over the compiler's form of
+// the same spelling, as it does for `debug`, `is_null` and `release`: the form is what a call reaches
+// only where nothing else claims the name. An interpolation hole is the one call that always
+// reaches its form, so a parameter named `str` can still be interpolated.
+
+private sfm_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sfm_ready
+
+// What a program prints.
+private sfm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-sfm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end sfm_ran
+
+private sfm_told(text: string) -> string
+    val ds = expr_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end sfm_told
+
+@test("a local string named str is an ordinary local, and its members are reached")
+sfm_a_local_str_holds_a_string()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("val str = \"hello\"\nprint(str.len)\n"), "5\n")
+
+@test("a parameter named str is an ordinary parameter, and an interpolation hole still renders")
+sfm_a_parameter_str_and_a_hole()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("f(str: string) -> string = s\"<$str>\"\n\nprint(f(\"a\"))\n"), "<a>\n")
+
+@test("a function the reader wrote is called instead of the form of its name")
+sfm_a_user_function_wins()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("str(x: int) -> int = x * 2\n\nprint(str(5))\n"), "10\n")
+
+@test("a call through a local that cannot be called says so")
+sfm_a_non_callable_local()
+    assert_eq(sfm_told("f()\n    val str = 1\n    str(5)\n"),
+              "'str' is int and is not callable — a callable is a closure, or a value of a type that implements the call trait")
+
+@test("an interpolation hole reaches the rendering whatever str and format name around it")
+sfm_holes_ignore_shadowing()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("f(str: int, format: int) -> string = s\"${str}|${format}\" + f\"${str}%03d\"\n\n" +
+                      "print(f(7, 8))\n"),
+              "7|8007\n")
+    assert_eq(sfm_ran("str(x: int) -> int = x\nformat(x: int, y: int) -> int = x\n\n" +
+                      "val n = 5\nprint(s\"${n}\" + f\"${n}%03d\")\n"),
+              "5005\n")
+
+@test("format is no form: with no declaration of the name it is an unknown name")
+sfm_format_is_not_a_form()
+    assert_eq(sfm_told("f(n: int) -> string = format(n, \"%d\")\n"), "undefined function 'format'")
+
+@test("a specifier hole with run-time counts still renders")
+sfm_star_counts()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("val n = 3.14159\nval w = 8\nval p = 2\nprint(f\"${n}%${w}.${p}f|\")\n"),
+              "    3.14|\n")
+
+@test("without a shadowing name every form still works")
+sfm_the_forms_without_shadowing()
+    if !sfm_ready() then return
+
+    assert_eq(sfm_ran("print(1, \"a\")\nprint(str(7) + \"x\")\nval n = 3\nprint(s\"${n}!\")\n" +
+                      "print(f\"${n}%03d\")\n"),
+              "1 a\n7x\n3!\n003\n")
