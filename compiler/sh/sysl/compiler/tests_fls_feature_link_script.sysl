@@ -18,10 +18,14 @@ private fls_manifest(features: string, block: string) -> string =
     s"package { name = \"core\", version = \"0.0.1\" }\nfeatures { $features }\n" +
     s"targets {\n  $fls_target {\n$block  }\n}\n"
 
-// The two cores' block: the M7's script by default, each feature naming its own.
-private fls_two_cores() -> string =
-    "    linker_script = \"m7.ld\"\n    features {\n" +
-    "      m7 { linker_script = \"m7.ld\" }\n      m4 { linker_script = \"m4.ld\" }\n    }\n"
+// A feature naming the keys it sets in the target the tests build for.
+private fls_sets(feature: string, keys: string) -> string = s"$feature { targets.$fls_target { $keys } }"
+
+// The two cores: each feature names its own script, and the target block the M7's by default.
+private fls_cores() -> string =
+    fls_sets("m7", "linker_script = \"m7.ld\"") + ", " + fls_sets("m4", "linker_script = \"m4.ld\"")
+
+private fls_base() -> string = "    linker_script = \"m7.ld\"\n"
 
 private fls_script(base: string) -> string =
     s"ENTRY(main)\nSECTIONS\n{\n    . = $base;\n    .text : { *(.text .text.*) }\n" +
@@ -77,7 +81,7 @@ fls_two_scripts()
     if !fls_lld_present() then skip("ld.lld is not installed, so no image can be linked")
     if !is_file(fls_readelf) then skip(s"there is no llvm-readelf at $fls_readelf to read the image")
 
-    val p = fls_tree(fls_manifest("m7 = [], m4 = []", fls_two_cores()))
+    val p = fls_tree(fls_manifest(fls_cores(), fls_base()))
     val out = lbr_temp("sysl-fls-elf")
     val m7 = fls_main_at(p, out, "m7")
     val m4 = fls_main_at(p, out, "m4")
@@ -89,9 +93,8 @@ end fls_two_scripts
 
 @test("a feature's block sets only what it names: the entry it leaves alone is the target block's")
 fls_layers_over_the_block()
-    val m = read_manifest(fls_manifest("m4 = []",
-        "    linker_script = \"m7.ld\"\n    entry = \"reset\"\n    features { m4 { linker_script = \"m4.ld\" } }\n"))
-        .unwrap()
+    val m = read_manifest(fls_manifest(fls_sets("m4", "linker_script = \"m4.ld\""),
+                                       "    linker_script = \"m7.ld\"\n    entry = \"reset\"\n")).unwrap()
 
     reset_feature_request()
 
@@ -109,9 +112,8 @@ end fls_layers_over_the_block
 
 @test("a feature's block reaches every key a target block takes: capabilities and codegen too")
 fls_every_key()
-    val m = read_manifest(fls_manifest("lean = []",
-        "    features {\n      lean {\n        capabilities { heap = false }\n" +
-        "        codegen { general_regs_only = true }\n      }\n    }\n")).unwrap()
+    val m = read_manifest(fls_manifest(fls_sets("lean", "capabilities { heap = false }, " +
+                                                "codegen { general_regs_only = true }"), "")).unwrap()
 
     reset_feature_request()
 
@@ -132,7 +134,7 @@ end fls_every_key
 
 @test("two enabled features setting one key are refused, naming both")
 fls_conflict_refused()
-    val p = fls_tree(fls_manifest("m7 = [], m4 = []", fls_two_cores()))
+    val p = fls_tree(fls_manifest(fls_cores(), fls_base()))
 
     reset_feature_request()
 
@@ -143,16 +145,15 @@ fls_conflict_refused()
     lbr_drop([p])
     assert(said.0 != 0)
     assert(said.1.contains(s"the features 'm7' and 'm4' are both on, and both set " +
-        s"'targets.$fls_target.linker_script' — 'targets.$fls_target.features.m7' and " +
-        s"'targets.$fls_target.features.m4' would each lay out the same key, so turn one of the two " +
-        "off, or set the key in only one of them"), said.1)
+        s"'targets.$fls_target.linker_script' — 'features.m7.targets.$fls_target' and " +
+        s"'features.m4.targets.$fls_target' would each lay out the same key, so turn one of the two " +
+        "off, make them a 'choices' group, or set the key in only one of them"), said.1)
 end fls_conflict_refused
 
 @test("two features on at once that set different keys are no conflict")
 fls_different_keys_agree()
-    val m = read_manifest(fls_manifest("a = [], b = []",
-        "    features {\n      a { linker_script = \"m4.ld\" }\n      b { entry = \"reset\" }\n    }\n"))
-        .unwrap()
+    val m = read_manifest(fls_manifest(fls_sets("a", "linker_script = \"m4.ld\"") + ", " +
+                                       fls_sets("b", "entry = \"reset\""), "")).unwrap()
 
     reset_feature_request()
     lbr_cli(["sysl", "build", "/does/not/exist", "--features", "a,b"])
@@ -167,7 +168,7 @@ end fls_different_keys_agree
 
 @test("and a conflict in another machine's block is not this build's business")
 fls_other_machine_no_conflict()
-    val m = read_manifest(fls_manifest("m7 = [], m4 = []", fls_two_cores())).unwrap()
+    val m = read_manifest(fls_manifest(fls_cores(), fls_base())).unwrap()
 
     reset_feature_request()
     lbr_cli(["sysl", "build", "/does/not/exist", "--features", "m7,m4"])
@@ -180,37 +181,32 @@ fls_other_machine_no_conflict()
     assert(there.is_some())
 end fls_other_machine_no_conflict
 
-@test("a block for a feature the package does not declare is refused when the file is read")
-fls_undeclared_feature_refused()
-    assert_eq(read_manifest(fls_manifest("m7 = []", fls_two_cores())).unwrap_err(),
-              s"'targets.$fls_target.features.m4' sets keys for the feature 'm4', which this package " +
-              "does not declare — a feature has to be declared in the 'features' block before a target " +
-              "block can say what it changes. It declares 'm7'")
-    assert_eq(read_manifest(s"package { name = \"core\", version = \"0.0.1\" }\n" +
-                            s"targets { $fls_target { features { m4 { entry = \"x\" } } } }\n").unwrap_err(),
-              s"'targets.$fls_target.features.m4' sets keys for the feature 'm4', which this package " +
-              "does not declare — a feature has to be declared in the 'features' block before a target " +
-              "block can say what it changes, and it declares none")
+@test("the 0.4.0 spelling is refused, and its fix-it is the feature block that declares the feature")
+fls_old_spelling_refused()
+    assert_eq(read_manifest(fls_manifest("m7 = []", "    features { m4 { entry = \"x\" } }\n")).unwrap_err(),
+              s"'targets.$fls_target.features' is the spelling of 0.4.0, where a target block listed the " +
+              "features that changed it — a feature is now one block saying everything it does, so the " +
+              s"target block goes inside the feature. Rewrite it as features.m4.targets.$fls_target " +
+              s"{ entry = \"x\" }, and drop 'features' from 'targets.$fls_target'")
 
-@test("a feature block's shape and its unknown keys are held to the target block's rules")
+@test("a feature's targets block shape and its unknown keys are held to the target block's rules")
 fls_shape_and_unknown_keys()
-    assert_eq(read_manifest(fls_manifest("m4 = []", "    features = 3\n")).unwrap_err(),
-              s"'targets.$fls_target.features' is not a block — it names features of this package, each " +
-              s"with the target's keys it sets while it is on, as 'targets.$fls_target.features { m4 { " +
-              "linker_script = \"m4.ld\" } }'")
-    assert_eq(read_manifest(fls_manifest("m4 = []", "    features { m4 = \"m4.ld\" }\n")).unwrap_err(),
-              s"'targets.$fls_target.features.m4' is not a block — it sets the keys of " +
+    assert_eq(read_manifest(fls_manifest("m4 { targets = 3 }", "")).unwrap_err(),
+              "'features.m4.targets' is not a block — it names targets, each with the keys this feature " +
+              "sets while it is on, as 'features.m4.targets { thumb-freestanding { linker_script = " +
+              "\"m4.ld\" } }'")
+    assert_eq(read_manifest(fls_manifest(s"m4 { targets { $fls_target = \"m4.ld\" } }", "")).unwrap_err(),
+              s"'features.m4.targets.$fls_target' is not a block — it sets the keys of " +
               s"'targets.$fls_target' this feature changes, as 'linker_script = \"m4.ld\"'")
-    assert_eq(read_manifest(fls_manifest("m4 = []", "    features { m4 { linker_script = 4 } }\n")).unwrap_err(),
-              s"'targets.$fls_target.features.m4.linker_script' names the linker script this target's " +
+    assert_eq(read_manifest(fls_manifest(fls_sets("m4", "linker_script = 4"), "")).unwrap_err(),
+              s"'targets.$fls_target.linker_script' names the linker script this target's " +
               "image is laid out by, as a path relative to sysl.hocon, so it is a non-empty string — " +
               "not a number, a block or a list")
 
-    val m = read_manifest(fls_manifest("m4 = []", "    features { m4 { linker_scrpt = \"m4.ld\" } }\n"))
-        .unwrap()
+    val m = read_manifest(fls_manifest(fls_sets("m4", "linker_scrpt = \"m4.ld\""), "")).unwrap()
 
     assert_eq(join(m.warnings.view(), "\n"),
-              s"sysl.hocon: 'targets.$fls_target.features.m4.linker_scrpt' is not something this sysl " +
+              s"sysl.hocon: 'features.m4.targets.$fls_target.linker_scrpt' is not something this sysl " +
               "understands, and is ignored — either it is a misspelling, or it was added by a newer compiler")
 
 @test("a dependency's feature block setting an image key is refused as its target block's would be")
@@ -218,15 +214,15 @@ fls_dependency_refused()
     if !lbr_ready() then return
 
     val dep = lbr_tree(lbr_two("dep/dep.sysl", "module dep\n\none() -> int = 1\n", "sysl.hocon",
-        "package { name = \"dep\" }\nfeatures { m4 = [] }\n" +
-        s"targets { $fls_target { features { m4 { linker_script = \"m4.ld\" } } } }\n"))
+        "package { name = \"dep\" }\n" +
+        s"features { ${fls_sets("m4", "linker_script = \"m4.ld\"")} }\n"))
     val p = lbr_tree(lbr_two("main.sysl", "print(dep.one())\n", "sysl.hocon",
                              "package { name = \"app\" }\n"))
     val said = lbr_cli(["sysl", "emit-llvm", p, "--lib", dep])
 
     lbr_drop([dep, p])
     assert(said.0 != 0, "a dependency's feature block naming a linker script was accepted")
-    assert(said.1.contains(s"sets 'targets.$fls_target.features.m4.linker_script' in its sysl.hocon"),
+    assert(said.1.contains(s"sets 'features.m4.targets.$fls_target.linker_script' in its sysl.hocon"),
            said.1)
     assert(said.1.contains("Only the root project's sysl.hocon may name them"), said.1)
 end fls_dependency_refused

@@ -1,0 +1,580 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **The feature-block grammar** (`feature_blocks.sysl`, `reference/packages.md § Features`): the long
+// form of a feature (`doc`, `default`, `if`, `enables`, `requires`, `targets`), the list form that
+// stays valid, `choices`, a dependency's features with one default taken away, and the refusals for
+// the 0.4.0 spellings -- each with the fix-it it quotes.
+
+private val mfg_package: string ="package { name = \"app\", version = \"0.1.0\" }\n"
+
+private mfg_read(body: string) -> Manifest = read_manifest(mfg_package + body).unwrap()
+
+private mfg_refused(body: string) -> string = read_manifest(mfg_package + body).unwrap_err()
+
+private mfg_request(named: []string, no_default: bool, all: bool) -> FeatureRequest
+    var out: Buf[string] = buf()
+
+    for n in named
+        out.push(n)
+
+    FeatureRequest(out, no_default, all)
+end mfg_request
+
+// What the root has on for a request, sorted and comma-joined, or the refusal.
+private mfg_root(m: &Manifest, named: []string, no_default: bool, all: bool) -> string =
+    root_enabled(m, mfg_request(named, no_default, all), false) match
+        Ok(on) -> join(sorted_labels(on).view(), ",")
+        Err(why) -> s"refused: $why"
+
+private mfg_on(m: &Manifest, named: []string) -> string = mfg_root(m, named, false, false)
+
+private mfg_for(m: &Manifest, name: string) -> Option[FeatureInfo]
+    for item in m.feature_info
+        if item.name == name then return Some(item)
+
+    None
+end mfg_for
+
+// -- the long form and the list form -----------------------------------------------------------------
+
+@test("a feature block reads its doc, its condition, its default and what it enables")
+mfg_block_keys()
+    val m = mfg_read("features {\n  a { doc = \"the a\", if = \"thumb\", default = true, enables = [b] }\n" +
+                     "  b = []\n}\n")
+    val a = mfg_for(m, "a").unwrap()
+
+    assert_eq(a.doc, "the a")
+    assert_eq(a.condition, "thumb")
+    assert(a.is_default, "a is on by default")
+    assert(!mfg_for(m, "b").unwrap().is_default, "b is not")
+    assert_eq(implied_features(m.features, m.dependencies, "a").len(), 1)
+end mfg_block_keys
+
+@test("the list form is exactly a block that enables its members")
+mfg_list_is_enables()
+    val list = mfg_read("features { b = [], a = [b] }\n")
+    val block = mfg_read("features { b {}, a { enables = [b] } }\n")
+
+    assert_eq(mfg_on(list, ["a"]), "a,b")
+    assert_eq(mfg_on(block, ["a"]), "a,b")
+    assert_eq(mfg_on(list, []), mfg_on(block, []))
+end mfg_list_is_enables
+
+@test("default = true gathers the features that are on unless defaults are turned off")
+mfg_default_true()
+    val m = mfg_read("features {\n  a { default = true }\n  b { default = true, enables = [c] }\n  c = []\n  d = []\n}\n")
+
+    assert_eq(mfg_on(m, []), "a,b,c,default")
+    assert_eq(mfg_root(m, [], true, false), "")
+    assert_eq(mfg_on(m, ["d"]), "a,b,c,d,default")
+end mfg_default_true
+
+@test("an unknown key in a feature block is warned about, and a key not yet read says so")
+mfg_block_warnings()
+    val m = mfg_read("features { a { colour = 1, macro = \"CFG_A\" } }\n")
+    val said = join(m.warnings.view(), "\n")
+
+    assert(said.contains("'features.a.colour' is not something this sysl understands"), said)
+    assert(said.contains("'features.a.macro' is read but not yet acted on by this sysl, and is ignored"), said)
+end mfg_block_warnings
+
+@test("a feature's doc and condition that are not strings are refused with the key")
+mfg_block_bad_condition()
+    assert(mfg_refused("features { a { if = \"no_such_fact\" } }\n").contains("features.a.if"),
+           "the condition is checked when the file is read")
+    assert(mfg_refused("features { a { enables = 3 } }\n").contains("features.a.enables"),
+           "enables is a list")
+    assert(mfg_refused("features { a { default = [b] } }\n").contains("'features.a.default' is true or false"),
+           "default inside a feature is a flag")
+end mfg_block_bad_condition
+
+@test("a member that is neither a dependency nor a feature is refused in a block, as in a list")
+mfg_block_undeclared_member()
+    val why = mfg_refused("features { a { enables = [nope] } }\n")
+
+    assert(why.contains("'features.a' names 'nope', which is neither a dependency of this package nor a feature"),
+           why)
+end mfg_block_undeclared_member
+
+@test("features that enable each other are refused, blocks included")
+mfg_block_cycle()
+    val why = mfg_refused("features { a { enables = [b] }, b { enables = [a] } }\n")
+
+    assert(why.contains("the features here turn each other on — 'a' turns on 'b', which turns on 'a'"), why)
+end mfg_block_cycle
+
+// -- the 0.4.0 spellings -----------------------------------------------------------------------------
+
+@test("features { default = [a, b] } is refused, and the fix-it writes the new form")
+mfg_old_default_list()
+    val why = mfg_refused("features { default = [a, b], a = [], b = [] }\n")
+
+    assert(why.contains("'features.default' is the spelling of 0.4.0"), why)
+    assert(why.contains("write a { default = true }; b { default = true }"), why)
+end mfg_old_default_list
+
+@test("a feature block named default is refused too")
+mfg_old_default_block()
+    val why = mfg_refused("features { default { enables = [a] }, a = [] }\n")
+
+    assert(why.contains("no feature is named 'default'"), why)
+    assert(why.contains("'default = true' inside each feature that is on by default"), why)
+end mfg_old_default_block
+
+@test("targets.<t>.features.<f> is refused, and the fix-it quotes the block the new way round")
+mfg_old_target_features()
+    val why = mfg_refused("features { m4 = [] }\n" +
+                          "targets { thumb-freestanding { linker_script = \"m7.ld\", features { m4 { " +
+                          "linker_script = \"m4.ld\", entry = \"m4_reset\" } } } }\n")
+
+    assert(why.contains("'targets.thumb-freestanding.features' is the spelling of 0.4.0"), why)
+    assert(why.contains("features.m4.targets.thumb-freestanding { linker_script = \"m4.ld\", entry = \"m4_reset\" }"), why)
+    assert(why.contains("drop 'features' from 'targets.thumb-freestanding'"), why)
+end mfg_old_target_features
+
+// -- targets inside a feature ------------------------------------------------------------------------
+
+@test("a feature's targets block is read, with a path key and two lines of one block merged")
+mfg_feature_targets()
+    val m = mfg_read("features {\n  m4 {\n    targets.thumb-freestanding.linker_script = \"m4.ld\"\n" +
+                     "    targets.thumb-freestanding.entry = \"m4_reset\"\n  }\n}\n")
+
+    assert_eq(m.feature_targets.len(), 1)
+    assert_eq(m.feature_targets.at(0).feature, "m4")
+    assert_eq(m.feature_targets.at(0).target, "thumb-freestanding")
+    assert_eq(m.feature_targets.at(0).image.script, "m4.ld")
+    assert_eq(m.feature_targets.at(0).image.entry, "m4_reset")
+end mfg_feature_targets
+
+@test("a path key nests, a quoted key stays one name, and two blocks of one name are one block")
+mfg_path_keys()
+    val root = read_conf("a.b.c = 1\n\"x.y\" = 2\nblk { p = 1 }\nblk { q = 2 }\nblk.r = 3\n").unwrap()
+    val a = conf_at(root, "a").unwrap()
+    val blk = conf_at(root, "blk").unwrap()
+
+    assert_eq(conf_text(conf_at(a, "b").unwrap(), "c"), "1")
+    assert_eq(conf_text(root, "x.y"), "2")
+    assert_eq(conf_text(blk, "p"), "1")
+    assert_eq(conf_text(blk, "q"), "2")
+    assert_eq(conf_text(blk, "r"), "3")
+end mfg_path_keys
+
+// -- choices -----------------------------------------------------------------------------------------
+
+private val mfg_core: string ="choices { core { doc = \"which core\", of = [m7, m4], default = m7 } }\n" +
+                           "features { m7 = [], m4 = [], extra = [] }\n"
+
+@test("a choice reads its members, its doc and its default")
+mfg_choice_read()
+    val m = mfg_read(mfg_core)
+
+    assert_eq(m.choices.len(), 1)
+    assert_eq(m.choices.at(0).name, "core")
+    assert_eq(m.choices.at(0).doc, "which core")
+    assert_eq(m.choices.at(0).default_member, "m7")
+    assert_eq(m.choices.at(0).of.len(), 2)
+end mfg_choice_read
+
+@test("a choice with nothing picked turns its default on, and a pick beats the default")
+mfg_choice_default_and_pick()
+    val m = mfg_read(mfg_core)
+
+    assert_eq(mfg_on(m, []), "m7")
+    assert_eq(mfg_on(m, ["m4"]), "m4")
+    assert_eq(mfg_on(m, ["extra"]), "extra,m7")
+end mfg_choice_default_and_pick
+
+@test("two members of one choice on at once are refused, naming both and the group")
+mfg_choice_two_on()
+    val why = mfg_on(mfg_read(mfg_core), ["m4", "m7"])
+
+    assert(why.contains("the features 'm7' and 'm4' are both on, and both are members of the choice 'core'"), why)
+    assert(why.contains("exactly one of a choice is on"), why)
+end mfg_choice_two_on
+
+@test("a member enabled by another feature counts as on for the choice")
+mfg_choice_two_on_by_enables()
+    val m = mfg_read("choices { core { of = [m7, m4], default = m7 } }\n" +
+                     "features { m7 = [], m4 = [], board { enables = [m4] } }\n")
+
+    assert_eq(mfg_on(m, ["board"]), "board,m4")
+    assert(mfg_on(m, ["board", "m7"]).contains("both on"), "board enables m4 and m7 is asked")
+end mfg_choice_two_on_by_enables
+
+@test("a choice with no default and no pick is refused on a named machine, listing the members")
+mfg_choice_no_pick()
+    val m = mfg_read("choices { port { of = [a, b] } }\nfeatures { a = [], b = [] }\n")
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val why = mfg_on(m, [])
+
+    use_resolution_machine(None)
+    assert(why.contains("the choice 'port' applies on 'thumb-freestanding', has no default, and nothing " +
+                        "picked one of 'a', 'b'"), why)
+    assert(why.contains("'default' in 'choices.port'"), why)
+    assert_eq(mfg_on(m, []), "")
+end mfg_choice_no_pick
+
+@test("--all-features and sysl test turn on a choice's default, or its first member")
+mfg_choice_lenient()
+    val m = mfg_read(mfg_core + "")
+    val bare = mfg_read("choices { port { of = [a, b] } }\nfeatures { a = [], b = [], c = [] }\n")
+
+    assert_eq(mfg_root(m, [], false, true), "extra,m7")
+    assert_eq(mfg_root(bare, [], false, true), "a,c")
+    assert_eq(root_enabled(bare, no_feature_request(), true).unwrap().len(), 2)
+end mfg_choice_lenient
+
+@test("a group none of whose members exist on the machine does not apply")
+mfg_choice_does_not_apply()
+    val m = mfg_read("choices { port { of = [a, b] } }\n" +
+                     "features { a { if = \"thumb\" }, b { if = \"thumb\" } }\n")
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val host = mfg_on(m, [])
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val cross = mfg_on(m, [])
+
+    use_resolution_machine(None)
+    assert_eq(host, "")
+    assert(cross.contains("the choice 'port' applies on 'thumb-freestanding'"), cross)
+end mfg_choice_does_not_apply
+
+@test("the refusals for a malformed choices block name the key")
+mfg_choice_refusals()
+    val features = "features { a = [], b = [], c = [] }\n"
+
+    assert(mfg_refused("choices { g { of = [a, nope] } }\n" + features).contains("'choices.g.of' names 'nope'"),
+           "an undeclared member")
+    assert(mfg_refused("choices { g { of = [a, b], default = c } }\n" + features)
+               .contains("'choices.g.default' is 'c', which is not one of the choice's features"),
+           "a default outside the group")
+    assert(mfg_refused("choices { g { doc = \"x\" } }\n" + features).contains("'choices.g' groups no features"),
+           "no of")
+    assert(mfg_refused("choices { g { of = [] } }\n" + features).contains("'choices.g.of' is empty"),
+           "empty of")
+    assert(mfg_refused("choices { g { of = [a, a] } }\n" + features).contains("'choices.g.of' names 'a' twice"),
+           "a repeated member")
+    assert(mfg_refused("choices { g { of = [a, b] }, h { of = [b, c] } }\n" + features)
+               .contains("the feature 'b' is in the choices 'g' and 'h'"),
+           "a feature in two groups")
+    assert(mfg_refused("choices = 3\n" + features).contains("'choices' is not a block"), "choices not a block")
+    assert(mfg_refused("choices { g = 3 }\n" + features).contains("'choices.g' is not a block"), "a group not a block")
+    assert(mfg_refused("choices { g { of = [a, b] } }\nfeatures { a { default = true }, b { default = true } }\n")
+               .contains("are all 'default = true' and in the choice 'g'"),
+           "two members on by default")
+end mfg_choice_refusals
+
+// -- machine conditions ------------------------------------------------------------------------------
+
+private val mfg_machine: string ="features {\n  arm { if = \"thumb\" }\n  host_only { if = \"hosted\", default = true }\n" +
+                      "  anywhere { default = true }\n}\n"
+
+@test("a feature with an if exists on the machines that meet it, and asking elsewhere is refused")
+mfg_if_availability()
+    val m = mfg_read(mfg_machine)
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val cross_default = mfg_on(m, [])
+    val cross_ask = mfg_on(m, ["host_only"])
+    val cross_arm = mfg_on(m, ["arm"])
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val host_default = mfg_on(m, [])
+    val host_ask = mfg_on(m, ["arm"])
+
+    use_resolution_machine(None)
+
+    assert_eq(cross_default, "anywhere,default")
+    assert_eq(cross_arm, "anywhere,arm,default")
+    assert(cross_ask.contains("the feature 'host_only' exists only where 'hosted' holds, and this build is " +
+                              "for 'thumb-freestanding'"), cross_ask)
+    assert_eq(host_default, "anywhere,default,host_only")
+    assert(host_ask.contains("the feature 'arm' exists only where 'thumb' holds"), host_ask)
+    assert(host_ask.contains("`--all-features` and `sysl test` skip"), host_ask)
+end mfg_if_availability
+
+@test("--all-features and sysl test skip a feature that is not on this machine")
+mfg_if_all_skips()
+    val m = mfg_read(mfg_machine)
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val cross = mfg_root(m, [], false, true)
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val host = mfg_root(m, [], false, true)
+
+    use_resolution_machine(None)
+    assert_eq(cross, "anywhere,arm,default")
+    assert_eq(host, "anywhere,default,host_only")
+end mfg_if_all_skips
+
+@test("a feature enabled by another cannot reach one the machine lacks")
+mfg_if_enabled_elsewhere()
+    val m = mfg_read("features { a { enables = [b] }, b { if = \"thumb\" } }\n")
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val why = mfg_on(m, ["a"])
+
+    use_resolution_machine(None)
+    assert(why.contains("the feature 'b' exists only where 'thumb' holds"), why)
+end mfg_if_enabled_elsewhere
+
+// -- requires ----------------------------------------------------------------------------------------
+
+@test("a feature that requires another is refused while it is off, and fine once it is on")
+mfg_requires()
+    val m = mfg_read("features { cdc { requires = [device] }, device = [] }\n")
+    val why = mfg_on(m, ["cdc"])
+
+    assert(why.contains("the feature 'cdc' requires 'device', which is not on"), why)
+    assert(why.contains("or list it in the 'enables' of 'cdc'"), why)
+    assert_eq(mfg_on(m, ["cdc", "device"]), "cdc,device")
+end mfg_requires
+
+// -- the floor ---------------------------------------------------------------------------------------
+
+@test("a feature block or choices under a package.sysl older than 0.5.0 is refused")
+mfg_floor()
+    val old = "package { name = \"app\", version = \"0.1.0\", sysl = \"0.4.0\" }\n"
+    val new = "package { name = \"app\", version = \"0.1.0\", sysl = \"0.5.0\" }\n"
+    val block = "features { a { doc = \"x\" } }\n"
+    val list = "features { a = [] }\n"
+    val choice = "features { a = [], b = [] }\nchoices { g { of = [a, b], default = a } }\n"
+
+    assert(read_manifest(old + block).unwrap_err().contains("uses a feature block, which needs sysl 0.5.0"), "block")
+    assert(read_manifest(old + choice).unwrap_err().contains("uses a 'choices' block, which needs sysl 0.5.0"), "choices")
+    assert(read_manifest(old + list).is_ok(), "the list form needs nothing")
+    assert(read_manifest(new + block).is_ok(), "0.5.0 takes it")
+    assert(read_manifest(mfg_package + block).is_ok(), "no floor takes it")
+end mfg_floor
+
+// -- a dependency's features -------------------------------------------------------------------------
+
+private mfg_temp() -> string = absolute_path(make_temp_dir("sysl-mfg").unwrap())
+
+private mfg_entry(label: string, coordinate: string, extra: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"1.0.0\"" +
+    (if extra.is_empty() then "" else s", $extra") + " }"
+
+private mfg_publish(root: string, coordinate: string, module_name: string, deps: string, body: string)
+    val dir = s"$root/vendor/$coordinate/@v1.0.0"
+
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/sysl.hocon",
+               s"package { name = \"$module_name\", version = \"1.0.0\" }\n" +
+               (if deps.is_empty() then "" else s"dependencies { $deps }\n") + body).unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl", s"module $module_name\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end mfg_publish
+
+private mfg_graph(root: string, deps: string) -> Result[Graph, string] =
+    resolve_graph(root, read_manifest(mfg_package + s"dependencies { $deps }\n").unwrap(),
+                  empty_sums(), s"$root/vendor", no_feature_request(), false)
+
+private mfg_dep_on(g: Graph, canonical: string) -> string =
+    join(sorted_labels(enabled_of(g.features, canonical)).view(), ",")
+
+private val mfg_timers: string = "features {\n  timers { default = true }\n  logging { default = true }\n" +
+                                 "  extra = []\n}\n"
+
+@test("a dependency's default features are on, and features = [-name] takes one away for this consumer")
+mfg_dependency_turns_one_off()
+    val root = mfg_temp()
+
+    mfg_publish(root, "github.com/e/lib", "lib", "", mfg_timers)
+
+    val plain = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "")).unwrap()
+    val without = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "features = [-timers]")).unwrap()
+    val with_extra = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "features = [extra, -timers]")).unwrap()
+
+    assert_eq(mfg_dep_on(plain, "github.com.e.lib"), "default,logging,timers")
+    assert_eq(mfg_dep_on(without, "github.com.e.lib"), "logging")
+    assert_eq(mfg_dep_on(with_extra, "github.com.e.lib"), "extra,logging")
+    remove_dir_all(root).unwrap_or(())
+end mfg_dependency_turns_one_off
+
+@test("another consumer that leaves the default on keeps it on")
+mfg_dependency_union()
+    val root = mfg_temp()
+
+    mfg_publish(root, "github.com/e/lib", "lib", "", mfg_timers)
+    mfg_publish(root, "github.com/e/a", "a", mfg_entry("lib", "github.com/e/lib", "features = [-timers]"), "")
+    mfg_publish(root, "github.com/e/b", "b", mfg_entry("lib", "github.com/e/lib", ""), "")
+
+    val g = mfg_graph(root, mfg_entry("a", "github.com/e/a", "") + ", " + mfg_entry("b", "github.com/e/b", "")).unwrap()
+
+    assert_eq(mfg_dep_on(g, "github.com.e.lib"), "default,logging,timers")
+    remove_dir_all(root).unwrap_or(())
+end mfg_dependency_union
+
+@test("taking away what is not a default, what does not exist, or with defaults already off is refused")
+mfg_dependency_minus_refusals()
+    val root = mfg_temp()
+
+    mfg_publish(root, "github.com/e/lib", "lib", "", mfg_timers)
+
+    val not_default = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "features = [-extra]")).unwrap_err()
+    val unknown = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "features = [-nope]")).unwrap_err()
+    val no_defaults = mfg_graph(root, mfg_entry("lib", "github.com/e/lib",
+                                                "features = [-timers], default_features = false")).unwrap_err()
+
+    assert(not_default.contains("'-extra', but 'extra' is not on by default"), not_default)
+    assert(unknown.contains("for the feature 'nope', which 'github.com.e.lib' does not declare"), unknown)
+    assert(unknown.contains("It declares 'timers', 'logging', 'extra'"), unknown)
+    assert(no_defaults.contains("'default_features = false', so there is no default feature to take away"),
+           no_defaults)
+    remove_dir_all(root).unwrap_or(())
+end mfg_dependency_minus_refusals
+
+@test("a dependency's choice with no default and no pick is refused for the consumer, naming the package")
+mfg_dependency_choice()
+    val root = mfg_temp()
+
+    mfg_publish(root, "github.com/e/lib", "lib", "",
+                "choices { port { of = [a, b] } }\nfeatures { a = [], b = [] }\n")
+
+    use_resolution_machine(Some(target_resolved("thumb-freestanding").unwrap()))
+
+    val unpicked = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", ""))
+    val picked = mfg_graph(root, mfg_entry("lib", "github.com/e/lib", "features = [b]"))
+
+    use_resolution_machine(None)
+
+    assert(unpicked.unwrap_err().contains("sysl.hocon of github.com.e.lib: the choice 'port' applies on"),
+           unpicked.unwrap_err())
+    assert_eq(mfg_dep_on(picked.unwrap(), "github.com.e.lib"), "b")
+    remove_dir_all(root).unwrap_or(())
+end mfg_dependency_choice
+
+@test("two consumers picking two members of one choice are refused, naming both")
+mfg_dependency_two_picks()
+    val root = mfg_temp()
+
+    mfg_publish(root, "github.com/e/lib", "lib", "",
+                "choices { port { of = [a, b], default = a } }\nfeatures { a = [], b = [] }\n")
+    mfg_publish(root, "github.com/e/x", "x", mfg_entry("lib", "github.com/e/lib", "features = [a]"), "")
+    mfg_publish(root, "github.com/e/y", "y", mfg_entry("lib", "github.com/e/lib", "features = [b]"), "")
+
+    val why = mfg_graph(root, mfg_entry("x", "github.com/e/x", "") + ", " +
+                        mfg_entry("y", "github.com/e/y", "")).unwrap_err()
+
+    assert(why.contains("the features 'a' and 'b' are both on, and both are members of the choice 'port'"), why)
+    remove_dir_all(root).unwrap_or(())
+end mfg_dependency_two_picks
+
+// -- the TinyUSB shape -------------------------------------------------------------------------------
+
+// TinyUSB's manifest (`docs/design/manifest-0.5.md § 6.1`) reduced to its choices, ports, roles and
+// classes. Its `c`, `config`, `macro` and `options` parts parse and are ignored until the C layer
+// reads them, each with a warning saying so.
+private val mfg_tinyusb: string =
+    "package { name = \"tinyusb\", version = \"0.1.0\", sysl = \"0.5.0\" }\n" +
+    "choices {\n  port  { doc = \"which USB controller TinyUSB drives\", of = [rp2040, rp2350, stm32h7] }\n" +
+    "  speed { doc = \"the root port's fastest speed\", of = [full_speed, high_speed], default = full_speed }\n}\n" +
+    "features {\n" +
+    "  rp2040 {\n    doc = \"the RP2040's USB controller\"\n    if = \"thumb && freestanding\"\n" +
+    "    requires.headers.pico_sdk = { note = \"the pico-sdk\", env = \"PICO_SDK_PATH\" }\n" +
+    "    config { CFG_TUSB_MCU = OPT_MCU_RP2040 }\n" +
+    "    c { tinyusb { sources = [\"portable/raspberrypi/rp2040/dcd_rp2040.c\"] } }\n  }\n" +
+    "  rp2350 { doc = \"the RP2350\", if = \"freestanding && (thumb || riscv32)\", config { PICO_RP2350 = 1 } }\n" +
+    "  stm32h7 { doc = \"the STM32H7\", if = \"thumb && freestanding\" }\n" +
+    "  full_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_FULL_SPEED } }\n" +
+    "  high_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_HIGH_SPEED } }\n" +
+    "  device {\n    doc = \"act as a USB device\"\n    default = true\n    macro = \"CFG_TUD_ENABLED\"\n" +
+    "    options { ep0_size { type = u8, values = [8, 16, 32, 64], default = 64, macro = \"CFG_TUD_ENDPOINT0_SIZE\" } }\n" +
+    "    c.tinyusb.sources = [\"device/usbd.c\"]\n  }\n" +
+    "  host { doc = \"act as a USB host\", macro = \"CFG_TUH_ENABLED\", c.tinyusb.sources = [\"host/usbh.c\"] }\n" +
+    "  cdc {\n    doc = \"a serial port (CDC-ACM)\"\n    enables = [device]\n" +
+    "    options { ports { type = u8, default = 1, range = [1, 4], macro = \"CFG_TUD_CDC\" } }\n" +
+    "    c.tinyusb.sources = [\"class/cdc/cdc_device.c\"]\n  }\n" +
+    "  host_hub { enables = [host], config { CFG_TUH_HUB = 1 }, c.tinyusb.sources = [\"host/hub.c\"] }\n" +
+    "}\n"
+
+@test("the TinyUSB feature shape parses: features, if, choices, enables, default")
+mfg_tinyusb_parses()
+    val m = read_manifest(mfg_tinyusb).unwrap()
+
+    assert_eq(m.choices.len(), 2)
+    assert_eq(m.feature_info.len(), 9)
+    assert_eq(mfg_for(m, "rp2350").unwrap().condition, "freestanding && (thumb || riscv32)")
+    assert_eq(mfg_for(m, "cdc").unwrap().doc, "a serial port (CDC-ACM)")
+    assert(mfg_for(m, "device").unwrap().is_default, "device is the default role")
+end mfg_tinyusb_parses
+
+@test("TinyUSB on the host: the port group does not apply, the speed defaults, the device role is on")
+mfg_tinyusb_host()
+    val m = read_manifest(mfg_tinyusb).unwrap()
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("aarch64-macos").unwrap())))
+
+    val plain = mfg_on(m, [])
+    val cdc = mfg_on(m, ["cdc"])
+    val all = mfg_root(m, [], false, true)
+    val wrong = mfg_on(m, ["rp2040"])
+
+    use_resolution_machine(None)
+    assert_eq(plain, "default,device,full_speed")
+    assert_eq(cdc, "cdc,default,device,full_speed")
+    assert_eq(all, "cdc,default,device,full_speed,host,host_hub")
+    assert(wrong.contains("the feature 'rp2040' exists only where 'thumb && freestanding' holds"), wrong)
+end mfg_tinyusb_host
+
+@test("TinyUSB on a thumb target: a port has to be picked, and picking two is refused")
+mfg_tinyusb_cross()
+    val m = read_manifest(mfg_tinyusb).unwrap()
+
+    use_resolution_machine(Some(as_declared(m, target_resolved("thumb-freestanding").unwrap())))
+
+    val none = mfg_on(m, [])
+    val one = mfg_on(m, ["rp2040", "high_speed", "host_hub"])
+    val two = mfg_on(m, ["rp2040", "stm32h7"])
+
+    use_resolution_machine(None)
+    assert(none.contains("the choice 'port' applies on 'thumb-freestanding', has no default"), none)
+    assert_eq(one, "default,device,high_speed,host,host_hub,rp2040")
+    assert(two.contains("the features 'rp2040' and 'stm32h7' are both on, and both are members of the choice 'port'"),
+           two)
+end mfg_tinyusb_cross
+
+// -- builds ------------------------------------------------------------------------------------------
+
+private val mfg_program: string = "@export(\"main\")\nmfg_main() -> int = 0\n"
+
+@test("a build asking for a feature that is not on its target is refused, and one for the right target builds")
+mfg_build_if()
+    if !lbr_ready() then return
+
+    val manifest = "features { arm { if = \"thumb\" } }\n"
+    val p = lbr_tree(lbr_two("main.sysl", "@no_os\n\n" + mfg_program, "sysl.hocon", mfg_package + manifest))
+    val out = lbr_temp("sysl-mfg-out")
+
+    reset_feature_request()
+
+    val wrong = lbr_cli(["sysl", "build", "--target", "aarch64-macos", "--features", "arm", "-o", s"$out/a", p])
+
+    reset_feature_request()
+
+    val right = lbr_cli(["sysl", "build", "--target", "thumb-freestanding", "--features", "arm", "-o",
+                         s"$out/b.o", p])
+
+    reset_feature_request()
+    lbr_drop([p, out])
+    assert(wrong.0 != 0, wrong.1)
+    assert(wrong.1.contains("the feature 'arm' exists only where 'thumb' holds"), wrong.1)
+    assert(!right.1.contains("exists only where"), right.1)
+end mfg_build_if

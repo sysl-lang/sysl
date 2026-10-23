@@ -93,6 +93,8 @@ private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
             continue
         end if
 
+        // A bare key holding dots is a path (`a.b = 1` is `a { b = 1 }`); a quoted one is one name.
+        val dotted = text.bytes[*at] != u8('"')
         val key = read_key(text, at)?
 
         skip_blank(text, at)
@@ -101,7 +103,7 @@ private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
 
         if text.bytes[*at] == u8('{')
             *at += 1
-            pairs.push((key, read_block(text, at, false)?))
+            put_pair(&pairs, key, dotted, read_block(text, at, false)?)
             continue
         end if
 
@@ -118,14 +120,69 @@ private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
 
         if *at < text.bytes.len && text.bytes[*at] == u8('{')
             *at += 1
-            pairs.push((key, read_block(text, at, false)?))
+            put_pair(&pairs, key, dotted, read_block(text, at, false)?)
             continue
         end if
 
-        pairs.push((key, read_value(text, at)?))
+        put_pair(&pairs, key, dotted, read_value(text, at)?)
 
     Ok(Block(pairs))
 end read_block
+
+// Files one entry into a block's pairs. **A path key nests** -- `c.tinyusb.sources = [..]` is the
+// entry `sources` of the block `tinyusb` of the block `c` -- and **two blocks under one name are one
+// block**, as HOCON merges objects, so `targets.a.x = 1` followed by `targets.a.y = 2` leaves both.
+private put_pair(pairs: *Buf[(string, &Conf)], key: string, dotted: bool, value: &Conf)
+    if dotted
+        val dot = key.index_of(".")
+
+        if dot.is_some() && dot.unwrap() > 0 && dot.unwrap() + 1 < key.bytes.len
+            var inner: Buf[(string, &Conf)] = buf()
+
+            put_pair(&inner, key[(dot.unwrap() + 1)..], true, value)
+            put_pair(pairs, key[0..<dot.unwrap()], false, Block(inner))
+            return
+        end if
+    end if
+
+    if conf_is_block(value)
+        for i in 0..<pairs.len()
+            if pairs.at(i).0 == key && conf_is_block(pairs.at(i).1)
+                var rebuilt: Buf[(string, &Conf)] = buf()
+
+                for j in 0..<pairs.len()
+                    if j == i
+                        rebuilt.push((key, merged_blocks(pairs.at(i).1, value)))
+                    else
+                        rebuilt.push(pairs.at(j))
+                end for
+
+                *pairs = rebuilt
+                return
+            end if
+        end for
+    end if
+
+    pairs.push((key, value))
+end put_pair
+
+private merged_blocks(a: &Conf, b: &Conf) -> &Conf
+    var acc: Buf[(string, &Conf)] = buf()
+
+    *a match
+        Block(first) ->
+            for item in first
+                acc.push(item)
+        _ -> ()
+
+    *b match
+        Block(second) ->
+            for item in second
+                put_pair(&acc, item.0, false, item.1)
+        _ -> ()
+
+    Block(acc)
+end merged_blocks
 
 // A key: quoted where it holds anything unusual, and bare otherwise. A bare key runs to the first
 // character that could not be part of one, which is what lets `a.b = 1` and `a { b = 1 }` be

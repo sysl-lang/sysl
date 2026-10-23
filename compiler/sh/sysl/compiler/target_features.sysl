@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.text.{join, Search}
 
 // **A target block's keys, set again by a feature** (`reference/packages.md § Linking a freestanding
 // image`): one program built for two cores of one chip, or for a board with two memory layouts,
@@ -37,25 +37,25 @@ struct FeatureTarget
     extensions: Option[Buf[string]]
 end FeatureTarget
 
-// The `features` block of one target block, each feature's keys read exactly as the target block's
-// own are. A key a feature block does not know is warned about as one in the target block is.
-read_feature_targets(entry: &Conf, target: string,
+// The `targets` block of one feature block, each target's keys read exactly as the top-level target
+// block's own are. A key a target block does not know is warned about as one there is.
+read_feature_targets(feature: string, entry: &Conf,
                      warnings: *Buf[string]) -> Result[Buf[FeatureTarget], string]
     var out: Buf[FeatureTarget] = buf()
 
-    val block = conf_at(entry, "features") match
+    val block = conf_at(entry, "targets") match
         None -> return Ok(out)
         Some(b) -> b
 
-    val where = s"targets.$target.features"
+    val where = s"features.$feature.targets"
 
     if !conf_is_block(block)
-        return Err(s"'$where' is not a block — it names features of this package, each with the " +
-            s"target's keys it sets while it is on, as '$where { m4 { linker_script = \"m4.ld\" } }'")
+        return Err(s"'$where' is not a block — it names targets, each with the keys this feature sets " +
+            s"while it is on, as '$where { thumb-freestanding { linker_script = \"m4.ld\" } }'")
 
-    for feature in conf_keys(block)
-        val sub = conf_at(block, feature).unwrap()
-        val at = s"$where.$feature"
+    for target in conf_keys(block)
+        val sub = conf_at(block, target).unwrap()
+        val at = s"$where.$target"
 
         if !conf_is_block(sub)
             return Err(s"'$at' is not a block — it sets the keys of 'targets.$target' this feature " +
@@ -64,7 +64,7 @@ read_feature_targets(entry: &Conf, target: string,
         for key in conf_keys(sub)
             if !feature_target_key(key) then warnings.push(unknown_key(s"$at.$key"))
 
-        val image = read_image(sub, s"$target.features.$feature")? match
+        val image = read_image(sub, target)? match
             Some(i) -> i with { target = target }
             None -> ImageLink(target, "", "", "")
 
@@ -82,31 +82,50 @@ read_feature_targets(entry: &Conf, target: string,
     Ok(out)
 end read_feature_targets
 
-// The keys a feature block may set: every key a target block takes but `features` itself.
+// The keys a feature's target block may set: every key a top-level target block takes for the image
+// and code generation. (`c`, `defines` and `config` are warned about as unknown until the C layer
+// reads them.)
 private feature_target_key(key: string) -> bool =
     key == "triple" || key == "linker" || key == "linker_script" || key == "entry" ||
     key == "capabilities" || key == "codegen"
 
-// A feature block naming a feature the package does not declare, refused when the file is read: it
-// would be a block no build could ever turn on, which is what a misspelling looks like from here.
-undeclared_feature_target(m: &Manifest) -> Option[string]
-    for ft in m.feature_targets
-        if feature_named(m.features, ft.feature) then continue
+// The refusal for the 0.4.0 spelling, `targets.<t>.features.<f> { k = v }`, which says the same thing
+// from the other side: the target block is now inside the feature. The fix-it is the rewritten block,
+// built from what the old one held.
+old_target_features_refusal(target: string, old: &Conf) -> string
+    var shown = ""
 
-        var names: Buf[string] = buf()
+    for feature in conf_keys(old)
+        val sub = conf_at(old, feature).unwrap()
 
-        for item in m.features
-            names.push(item.0)
+        shown = shown + s" features.$feature.targets.$target ${conf_shown(sub)}"
 
-        val tail = if names.is_empty() then ", and it declares none"
-        else s". It declares ${quoted_names(names)}"
+    s"'targets.$target.features' is the spelling of 0.4.0, where a target block listed the features that " +
+        "changed it — a feature is now one block saying everything it does, so the target block goes " +
+        s"inside the feature. Rewrite it as$shown, and drop 'features' from 'targets.$target'"
+end old_target_features_refusal
 
-        return Some(s"'targets.${ft.target}.features.${ft.feature}' sets keys for the feature " +
-            s"'${ft.feature}', which this package does not declare — a feature has to be declared in " +
-            s"the 'features' block before a target block can say what it changes$tail")
+// A value written the way a manifest writes it, on one line, for a fix-it to quote.
+conf_shown(c: &Conf) -> string
+    *c match
+        Text(s) -> s"\"$s\""
+        Word(s) -> s
+        Flag(on) -> if on then "true" else "false"
+        Items(values) ->
+            var parts: Buf[string] = buf()
 
-    None
-end undeclared_feature_target
+            for v in values
+                parts.push(conf_shown(v))
+
+            "[" + join(parts.view(), ", ") + "]"
+        Block(pairs) ->
+            var parts: Buf[string] = buf()
+
+            for pair in pairs
+                parts.push(s"${pair.0} = ${conf_shown(pair.1)}")
+
+            "{ " + join(parts.view(), ", ") + " }"
+end conf_shown
 
 // The feature blocks of one target block whose feature this build has on, in the order the file
 // wrote them. **The root's request decides**, as it decides what the root's own source compiles.
@@ -164,9 +183,9 @@ feature_target_conflict(m: &Manifest, target: string) -> Option[string]
                 val b = on.at(j).feature
 
                 return Some(s"the features '$a' and '$b' are both on, and both set " +
-                    s"'targets.$target.$key' — 'targets.$target.features.$a' and " +
-                    s"'targets.$target.features.$b' would each lay out the same key, so turn one of the " +
-                    "two off, or set the key in only one of them")
+                    s"'targets.$target.$key' — 'features.$a.targets.$target' and " +
+                    s"'features.$b.targets.$target' would each lay out the same key, so turn one of the " +
+                    "two off, make them a 'choices' group, or set the key in only one of them")
 
     None
 end feature_target_conflict

@@ -290,7 +290,7 @@ end ckg_features_flag
 ckg_no_default_features_flag()
     if !ckg_ready() then return
 
-    val root = ckg_featured("default = [fancy], fancy = []")
+    val root = ckg_featured("fancy { default = true }")
 
     assert_eq(ckg_flags_seam(root, "", "--no-default-features"), "2 | 1 | 2 | miss miss hit | different bytes")
     remove_dir_all(root).unwrap_or(())
@@ -313,7 +313,7 @@ ckg_default_features_in_the_manifest()
     val root = ckg_featured("fancy = []")
 
     assert_eq(ckg_manifest_seam(root, ckg_manifest("app", "features { fancy = [] }\n"),
-                                ckg_manifest("app", "features { default = [fancy], fancy = [] }\n")),
+                                ckg_manifest("app", "features { fancy { default = true } }\n")),
               "1 | 2 | 1 | miss miss hit | different bytes")
     remove_dir_all(root).unwrap_or(())
 end ckg_default_features_in_the_manifest
@@ -324,7 +324,7 @@ end ckg_default_features_in_the_manifest
 // `value()` is `n`, plus 100 with `fancy` on.
 private ckg_leaf(default_on: bool) -> string =
     ckg_tree([("package.hocon", ckg_manifest("leaf", "options { n { type = int, default = 1 } }\n" +
-               (if default_on then "features { default = [fancy], fancy = [] }\n" else "features { fancy = [] }\n"))),
+               (if default_on then "features { fancy { default = true } }\n" else "features { fancy = [] }\n"))),
               ("leaf/leaf.sysl", "module leaf\n\nvalue() -> int\n    var v = option_n\n#if feature_fancy\n" +
                "    v += 100\n#endif\n    v\n")])
 
@@ -382,8 +382,7 @@ ckg_root_target_feature_block()
     val host = host_target().name
     val root = ckg_featured("lean = []")
     val plain = ckg_manifest("app", "features { lean = [] }\n")
-    val lean = ckg_manifest("app", s"features { lean = [] }\ntargets { $host { features { lean { " +
-                             "capabilities { os = false } } } } }\n")
+    val lean = ckg_manifest("app", s"features { lean { targets.$host { capabilities { os = false } } } }\n")
 
     assert_eq(ckg_seam(root, "--features lean", "--features lean", () -> ckg_put(root, "package.hocon", plain),
                        () -> ckg_put(root, "package.hocon", lean)),
@@ -399,7 +398,8 @@ ckg_dependency_target_feature_block()
     val leaf = ckg_leaf(false)
     val root = ckg_on_leaf(leaf, "")
     val plain = ckg_manifest("leaf", "options { n { type = int, default = 1 } }\nfeatures { fancy = [] }\n")
-    val blocked = plain + s"targets { $host { features { fancy { capabilities { os = false } } } } }\n"
+    val blocked = ckg_manifest("leaf", "options { n { type = int, default = 1 } }\n" +
+                               s"features { fancy { targets.$host { capabilities { os = false } } } }\n")
 
     // The root turns `fancy` on, so the block would bite if a dependency's applied.
     ckg_put(root, "package.hocon", ckg_leaf_entry(leaf, ", features = [\"fancy\"]"))
@@ -1416,6 +1416,12 @@ ckg_census_manifest_keys()
 
     for i in 0..<TargetKeys.len
         places.push(s"targets.t.${TargetKeys[i]}")
+
+    for i in 0..<FeatureKeys.len
+        places.push(s"features.f.${FeatureKeys[i]}")
+
+    for i in 0..<ChoiceKeys.len
+        places.push(s"choices.c.${ChoiceKeys[i]}")
 
     for i in 0..<DependencyKeys.len
         places.push(s"dependencies.d.${DependencyKeys[i]}")

@@ -79,13 +79,26 @@ private var resolution_machine: Option[Target] = None
 use_resolution_machine(t: Option[Target]) = resolution_machine = t
 
 // Whether a dependency is part of a graph resolved for the machine `use_resolution_machine` named.
-present_here(dep: &Dependency) -> bool
-    if dep.condition.is_empty() then return true
+present_here(dep: &Dependency) -> bool = machine_holds(dep.condition)
+
+// Whether a condition, as an `if` writes it, holds for the machine the graph is resolved for. **The
+// empty condition holds everywhere, and so does any condition when no machine is named.**
+machine_holds(condition: string) -> bool
+    if condition.is_empty() then return true
 
     resolution_machine match
         None -> true
-        Some(t) -> dependency_condition(dep.condition, dependency_defined(t)).unwrap_or(true)
-end present_here
+        Some(t) -> dependency_condition(condition, dependency_defined(t)).unwrap_or(true)
+end machine_holds
+
+// Whether a build for a particular machine is being resolved, rather than a question about the
+// manifests as a whole.
+machine_named() -> bool = resolution_machine.is_some()
+
+// The machine as a refusal names it.
+machine_called() -> string = resolution_machine match
+    None -> "this machine"
+    Some(t) -> s"'${t.name}'"
 
 // The dependencies a list keeps on this machine, and the ones it leaves out.
 present_and_absent(deps: &Buf[Dependency]) -> (Buf[Dependency], Buf[Dependency])
@@ -344,7 +357,7 @@ end read_dependency
 // An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
 // the build turns out to be for -- so a misspelling is refused when the file is read rather than
 // leaving the dependency out of every build with nothing said.
-private read_condition_key(sub: &Conf, where: string) -> Result[string, string]
+read_condition_key(sub: &Conf, where: string) -> Result[string, string]
     val text = conf_at(sub, "if") match
         None -> return Ok("")
         Some(v) -> *v match

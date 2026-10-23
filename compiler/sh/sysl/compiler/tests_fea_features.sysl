@@ -184,7 +184,7 @@ private fea_with_buf(root: string)
     fea_publish(root, "github.com/e/tiny", "tiny", "", "")
     fea_publish(root, "github.com/e/buf", "buf",
                 fea_entry("tiny", "github.com/e/tiny", "optional = true"),
-                "default = [tiny], x = [tiny], y = [tiny]")
+                "d { default = true, enables = [tiny] }, x = [tiny], y = [tiny]")
 end fea_with_buf
 
 private fea_request(named: []string, no_default: bool, all: bool) -> FeatureRequest
@@ -242,10 +242,10 @@ fea_default_turns_it_on()
     fea_publish(root, "github.com/e/extra", "extra", "", "")
 
     val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
-                      "default = [extra]", fea_silent())
+                      "d { default = true, enables = [extra] }", fea_silent())
 
     assert_eq(fea_selected(g), "github.com.e.extra")
-    assert_eq(fea_on(g, ""), "default")
+    assert_eq(fea_on(g, ""), "d,default")
     remove_dir_all(root).unwrap_or(())
 
 @test("no-default-features takes the same one away")
@@ -255,7 +255,7 @@ fea_no_default_takes_it_away()
     fea_publish(root, "github.com/e/extra", "extra", "", "")
 
     val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
-                      "default = [extra]", fea_request([], true, false))
+                      "d { default = true, enables = [extra] }", fea_request([], true, false))
 
     assert_eq(fea_selected(g), "")
     assert_eq(fea_on(g, ""), "")
@@ -281,7 +281,7 @@ fea_a_feature_implying_a_feature()
     fea_publish(root, "github.com/e/extra", "extra", "", "")
 
     val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
-                      "default = [server], server = [extra]", fea_silent())
+                      "server { default = true, enables = [extra] }", fea_silent())
 
     assert_eq(fea_selected(g), "github.com.e.extra")
     assert_eq(fea_on(g, ""), "default,server")
@@ -322,7 +322,8 @@ fea_an_explicit_request_under_test()
     fea_publish(root, "github.com/e/extra", "extra", "", "")
 
     val g = fea_resolved(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
-                         "default = [extra], server = [extra]", fea_request([], true, false),
+                         "d { default = true, enables = [extra] }, server = [extra]",
+                         fea_request([], true, false),
                          true).unwrap()
 
     assert_eq(fea_on(g, ""), "")
@@ -358,7 +359,7 @@ fea_one_consumer_turning_default_off()
     val g = fea_graph(root, fea_entry("a", "github.com/e/a", "") + ", " +
                       fea_entry("b", "github.com/e/b", ""), "", fea_silent())
 
-    assert_eq(fea_on(g, "github.com.e.buf"), "default,x")
+    assert_eq(fea_on(g, "github.com.e.buf"), "d,default,x")
     remove_dir_all(root).unwrap_or(())
 
 @test("every consumer turning it off does drop it")
@@ -384,7 +385,7 @@ fea_the_refusal_names_the_consumer()
     assert_eq(fea_resolved(root, fea_entry("a", "github.com/e/a", ""), "", fea_silent(), false).unwrap_err(),
               "github.com.e.a asks 'buf' for the feature 'nope', which 'github.com.e.buf' does not " +
               "declare — a consumer may only ask for a feature that package's own manifest names. " +
-              "It declares 'default', 'x', 'y'")
+              "It declares 'd', 'x', 'y'")
     remove_dir_all(root).unwrap_or(())
 
 @test("and so does the root's own request")
@@ -453,9 +454,10 @@ fea_a_default_naming_like_named_features()
         deps.push(fea_entry(label, s"github.com/e/$label", "optional = true"))
 
     val g = fea_graph(root, join(deps.view(), ", "),
-                      "default = [http2, redis, lmdb, zstd, brotli, webp], redis = [redis], " +
-                      "lmdb = [lmdb], zstd = [zstd], brotli = [brotli], http2 = [nghttp2], " +
-                      "webp = [libwebp]", fea_silent())
+                      "redis { default = true, enables = [redis] }, lmdb { default = true, enables = [lmdb] }, " +
+                      "zstd { default = true, enables = [zstd] }, brotli { default = true, enables = [brotli] }, " +
+                      "http2 { default = true, enables = [nghttp2] }, " +
+                      "webp { default = true, enables = [libwebp] }", fea_silent())
 
     assert_eq(fea_on(g, ""), "brotli,default,http2,lmdb,redis,webp,zstd")
     assert_eq(fea_selected(g), "github.com.e.brotli,github.com.e.libwebp,github.com.e.lmdb," +
@@ -545,7 +547,7 @@ private fea_two_blocks() -> string =
 fea_the_enabled_block_is_compiled_in()
     if !fea_ready() then return
 
-    assert_eq(fea_run(fea_app(fea_saying("", "default = [a], a = [], b = []"), fea_two_blocks())),
+    assert_eq(fea_run(fea_app(fea_saying("", "a { default = true }, b = []"), fea_two_blocks())),
               "a\nend\n")
 
 // Freedom to disagree: the same program against a manifest whose `default` turns on `b` instead.
@@ -553,7 +555,7 @@ fea_the_enabled_block_is_compiled_in()
 fea_turning_the_other_one_on_swaps()
     if !fea_ready() then return
 
-    assert_eq(fea_run(fea_app(fea_saying("", "default = [b], a = [], b = []"), fea_two_blocks())),
+    assert_eq(fea_run(fea_app(fea_saying("", "a = [], b { default = true }"), fea_two_blocks())),
               "b\nend\n")
 
 // The lines are gone before anything reads them, rather than present and unreached.
@@ -563,9 +565,9 @@ fea_a_gated_out_block_is_not_compiled()
 
     val program = "#if feature_b\nprint(nothing_declares_this())\n#endif\nprint(\"built\")\n"
 
-    assert_eq(fea_run(fea_app(fea_saying("", "default = [a], a = [], b = []"), program)), "built\n")
+    assert_eq(fea_run(fea_app(fea_saying("", "a { default = true }, b = []"), program)), "built\n")
 
-    val refused = fea_run(fea_app(fea_saying("", "default = [b], a = [], b = []"), program))
+    val refused = fea_run(fea_app(fea_saying("", "a = [], b { default = true }"), program))
 
     assert(refused.index_of("undefined function 'nothing_declares_this'").is_some(), refused)
 
@@ -593,7 +595,7 @@ fea_the_roots_features_are_invisible_in_a_dependency()
         "")
     val program = "#if feature_x\nprint(\"root sees x\")\n#endif\nprint(engine.tag())\n"
 
-    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [x], x = []"), program)),
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "x { default = true }"), program)),
               "root sees x\nengine did not see x\n")
     remove_dir_all(dep).unwrap_or(())
 
@@ -609,7 +611,7 @@ fea_a_like_named_feature_brings_both()
     val dep = fea_dependency("zstd", "tag() -> string = \"compressed\"", "")
 
     assert_eq(fea_run(fea_app(fea_saying(s"zstd { path = \"$dep\", optional = true }",
-                                         "default = [zstd], zstd = [zstd]"), fea_zstd_program())),
+                                         "zstd { default = true, enables = [zstd] }"), fea_zstd_program())),
               "compressed\n")
     remove_dir_all(dep).unwrap_or(())
 
@@ -620,7 +622,7 @@ fea_a_like_named_feature_left_off()
     val dep = fea_dependency("zstd", "tag() -> string = \"compressed\"", "")
 
     assert_eq(fea_run(fea_app(fea_saying(s"zstd { path = \"$dep\", optional = true }",
-                                         "default = [], zstd = [zstd]"), fea_zstd_program())),
+                                         "zstd = [zstd]"), fea_zstd_program())),
               "no zstd in this build\n")
     remove_dir_all(dep).unwrap_or(())
 
@@ -734,7 +736,7 @@ dpf_a_feature_turns_on_a_dependencys_feature()
 
     dpf_with_b(root)
 
-    val g = fea_graph(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_silent())
+    val g = fea_graph(root, dpf_b(""), "x { default = true, enables = [\"b/y\"] }", fea_silent())
 
     assert_eq(fea_on(g, ""), "default,x")
     assert_eq(fea_on(g, "github.com.e.b"), "y")
@@ -747,7 +749,7 @@ dpf_no_default_leaves_it_off()
 
     dpf_with_b(root)
 
-    val g = fea_graph(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_request([], true, false))
+    val g = fea_graph(root, dpf_b(""), "x { default = true, enables = [\"b/y\"] }", fea_request([], true, false))
 
     assert_eq(fea_on(g, ""), "")
     assert_eq(fea_on(g, "github.com.e.b"), "")
@@ -759,7 +761,7 @@ dpf_asking_by_name_turns_it_on()
 
     dpf_with_b(root)
 
-    val g = fea_graph(root, dpf_b(""), "default = [], x = [\"b/y\"]", fea_request(["x"], true, false))
+    val g = fea_graph(root, dpf_b(""), "x = [\"b/y\"]", fea_request(["x"], true, false))
 
     assert_eq(fea_on(g, "github.com.e.b"), "y")
     remove_dir_all(root).unwrap_or(())
@@ -770,7 +772,7 @@ dpf_two_members_union()
 
     dpf_with_b(root)
 
-    val g = fea_graph(root, dpf_b(""), "default = [x, w], x = [\"b/y\"], w = [\"b/z\"]", fea_silent())
+    val g = fea_graph(root, dpf_b(""), "x { default = true, enables = [\"b/y\"] }, w { default = true, enables = [\"b/z\"] }", fea_silent())
 
     assert_eq(fea_on(g, "github.com.e.b"), "y,z")
     remove_dir_all(root).unwrap_or(())
@@ -781,7 +783,7 @@ dpf_member_joins_the_entrys_request()
 
     dpf_with_b(root)
 
-    val g = fea_graph(root, dpf_b("features = [z]"), "default = [x], x = [\"b/y\"]", fea_silent())
+    val g = fea_graph(root, dpf_b("features = [z]"), "x { default = true, enables = [\"b/y\"] }", fea_silent())
 
     assert_eq(fea_on(g, "github.com.e.b"), "y,z")
     remove_dir_all(root).unwrap_or(())
@@ -808,7 +810,7 @@ dpf_a_dependencys_feature_asks_its_dependency()
     val root = fea_temp()
 
     dpf_with_b(root)
-    fea_publish(root, "github.com/e/a", "a", dpf_b("optional = true"), "default = [], x = [\"b/y\"]")
+    fea_publish(root, "github.com/e/a", "a", dpf_b("optional = true"), "x = [\"b/y\"]")
 
     val g = fea_graph(root, fea_entry("a", "github.com/e/a", "features = [x]"), "", fea_silent())
 
@@ -822,7 +824,7 @@ dpf_the_dependency_has_to_declare_it()
 
     dpf_with_b(root)
 
-    assert_eq(fea_resolved(root, dpf_b(""), "default = [x], x = [\"b/q\"]", fea_silent(), false).unwrap_err(),
+    assert_eq(fea_resolved(root, dpf_b(""), "x { default = true, enables = [\"b/q\"] }", fea_silent(), false).unwrap_err(),
               "the feature 'x' of this project names 'b/q', but 'github.com.e.b' declares no feature " +
               "'q' — a '<dependency>/<feature>' member may only name a feature that package's own " +
               "manifest names. It declares 'y', 'z'")
@@ -834,7 +836,7 @@ dpf_a_dependency_declaring_none()
 
     fea_publish(root, "github.com/e/b", "b", "", "")
 
-    assert_eq(fea_resolved(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_silent(), false).unwrap_err(),
+    assert_eq(fea_resolved(root, dpf_b(""), "x { default = true, enables = [\"b/y\"] }", fea_silent(), false).unwrap_err(),
               "the feature 'x' of this project names 'b/y', but 'github.com.e.b' declares no feature " +
               "'y' — a '<dependency>/<feature>' member may only name a feature that package's own " +
               "manifest names, and it declares none")
@@ -901,7 +903,7 @@ dpf_gated_code_is_compiled_in()
 
     val dep = dpf_engine()
 
-    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/fast\"]"),
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "quick { default = true, enables = [\"e/fast\"] }"),
                               "print(engine.tag())\n")), "fast\n")
     remove_dir_all(dep).unwrap_or(())
 
@@ -911,7 +913,7 @@ dpf_gated_code_is_left_out()
 
     val dep = dpf_engine()
 
-    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [], quick = [\"e/fast\"]"),
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "quick = [\"e/fast\"]"),
                               "print(engine.tag())\n")), "plain\n")
     remove_dir_all(dep).unwrap_or(())
 
@@ -920,7 +922,7 @@ dpf_gated_code_is_left_out()
 @test("changing which dependency feature a member asks for changes the run key")
 dpf_the_run_key_follows_the_member()
     val dep = dpf_engine()
-    val asking_fast = fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/fast\"]")
+    val asking_fast = fea_saying(s"e { path = \"$dep\" }", "quick { default = true, enables = [\"e/fast\"] }")
     val root = fea_app(asking_fast, "print(engine.tag())\n")
 
     reset_feature_request()
@@ -928,7 +930,7 @@ dpf_the_run_key_follows_the_member()
     val fast = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
 
     write_text(s"$root/sysl.hocon",
-               fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/slow\"]")).unwrap()
+               fea_saying(s"e { path = \"$dep\" }", "quick { default = true, enables = [\"e/slow\"] }")).unwrap()
 
     val slow = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
 

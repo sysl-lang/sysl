@@ -700,18 +700,21 @@ board is to run names its `linker_script` too. Where there is a script and no `e
 ### A feature may set a target's keys again
 
 One program built for two cores of one chip, or for two memory layouts of one board, links by two
-scripts from one manifest. **A `features` block inside a target block sets that block's keys again
-while a feature is on**:
+scripts from one manifest. **A feature's own `targets` block sets that target block's keys again
+while the feature is on**. The two cores are a [choice](#choices-features-of-which-exactly-one-is-on),
+because one image is built for one of them:
 
 ```hocon
-features { m7 = [], m4 = [] }
+choices {
+  core { doc = "which core of the STM32H747 this image runs on", of = [m7, m4], default = m7 }
+}
 
-targets {
-  thumb-freestanding {
-    linker_script = "m7.ld"
-    features {
-      m7 { linker_script = "m7.ld" }
-      m4 { linker_script = "m4.ld", entry = "m4_reset" }
+features {
+  m7 { targets.thumb-freestanding.linker_script = "m7.ld" }
+  m4 {
+    targets.thumb-freestanding {
+      linker_script = "m4.ld"
+      entry         = "m4_reset"
     }
   }
 }
@@ -719,37 +722,33 @@ targets {
 
 `sysl build --target thumb-freestanding --features m4 .` links by `m4.ld` and starts at `m4_reset`;
 `--features m7`, or no feature at all, links by `m7.ld`. A feature's block sets only what it names,
-and the target block's own keys stand for every key no enabled feature sets.
+and the top-level `targets.<t>` block's own keys stand for every key no enabled feature sets.
 
-A feature block may set **every key a target block takes**: `triple`, `linker`, `linker_script`,
-`entry`, `capabilities` and `codegen` (a capability or a code generation setting each counting as one
-key). What it may not do is be ambiguous:
+A feature's target block may set **every key a target block takes**: `triple`, `linker`,
+`linker_script`, `entry`, `capabilities` and `codegen` (a capability or a code generation setting each
+counting as one key). What it may not do is be ambiguous:
 
 - **two enabled features that set the same key are refused**, naming both, since the build would be
   told two things about one link:
 
-  ```
+  ```text
   the features 'm7' and 'm4' are both on, and both set 'targets.thumb-freestanding.linker_script' —
-  'targets.thumb-freestanding.features.m7' and 'targets.thumb-freestanding.features.m4' would each
-  lay out the same key, so turn one of the two off, or set the key in only one of them
+  'features.m7.targets.thumb-freestanding' and 'features.m4.targets.thumb-freestanding' would each
+  lay out the same key, so turn one of the two off, make them a 'choices' group, or set the key in
+  only one of them
   ```
 
   Only the block for the machine being built is held to this, so `sysl test`, which turns every
   feature on and builds for the host, is not refused over a board's block;
-- **a block for a feature the package does not declare is refused** when the file is read, as a
-  misspelling would otherwise configure nothing:
+- **a feature that is not declared cannot be configured**, because the feature block *is* the
+  declaration: there is no target block that names a feature from outside.
 
-  ```
-  'targets.thumb-freestanding.features.m5' sets keys for the feature 'm5', which this package does
-  not declare — a feature has to be declared in the 'features' block before a target block can say
-  what it changes. It declares 'm7', 'm4'
-  ```
+As with the top-level target block, **only the root project's feature blocks apply**, and a
+dependency whose feature sets a linker, script or entry is refused as its target block would be.
 
-As with the target block itself, **only the root project's feature blocks apply**, and a dependency
-whose feature block names a linker, script or entry is refused as its target block would be.
-
-This spelling is provisional: the manifest's syntax is reviewed as a whole in 0.4.0, and a feature's
-target keys may be respelled there.
+**The 0.4.0 spelling, `targets.<t>.features.<f> { … }`, is refused** with the block rewritten the new
+way round. A key written in `features.<f>.targets.<t>` that this
+sysl does not know is warned about and ignored, as in a top-level target block.
 
 ### When the image has a `main`
 
@@ -1908,8 +1907,11 @@ those parts**, and what the name turns on is a list of optional dependencies and
 
 ```hocon
 features {
-  default = [server]
-  server  = [llhttp, nghttp2]
+  server {
+    doc     = "an HTTP server"
+    default = true
+    enables = [llhttp, nghttp2]
+  }
   desktop = [webview]
 }
 
@@ -1920,17 +1922,88 @@ dependencies {
 }
 ```
 
-`default` is the feature a build gets when nobody asks for anything else. It is an ordinary entry
-rather than a key of its own — it names dependencies and other features exactly as `desktop` does —
-and a manifest that declares no `default` simply starts with nothing on.
+A feature is a block, and `desktop = [webview]` is the short form of one: **the list form stays valid
+and is exactly `desktop { enables = [webview] }`**. A feature block takes these keys:
 
-A feature may share its name with the dependency it turns on — `lmdb = [lmdb]` is the ordinary way
-to spell "the `lmdb` feature takes the `lmdb` package". **Inside a feature's list, a bare member
-names the feature it spells, whenever a feature of that name is declared** — Cargo's rule — so
-`default = [lmdb]` turns on the `lmdb` *feature*, not the dependency directly. The one exception is a
-self-reference: inside `lmdb`'s own list, the `lmdb` in `lmdb = [lmdb]` is the one spelling that
-means the dependency, since a feature cannot name itself. To name a dependency unambiguously anywhere
-else, quote it as `"dep:lmdb"` — HOCON reads a bare colon as a separator, so the quotes are required.
+| key | meaning |
+|---|---|
+| `doc` | what the feature is, shown in refusals |
+| `default` | `true` makes the feature part of what a build gets when nobody asks for anything else |
+| `if` | the machines the feature exists on, written as a dependency's `if` is; asking for it elsewhere is refused |
+| `enables` | the optional dependencies and other features it turns on, as the list form names them |
+| `requires` | a list of features that have to be on whenever this one is; the build is refused if one is off |
+| `targets` | the target keys the feature sets while it is on ([above](#a-feature-may-set-a-targets-keys-again)) |
+
+`macro`, `options`, `c`, `defines`, `config` and `sections` are accepted in a feature block and
+**ignored with a warning** until the C layer reads them. A key this sysl does not know is warned about
+and ignored. A manifest using a feature block or `choices` names `package.sysl` at least `"0.5.0"`
+where it names one: an older compiler would mis-read it.
+
+**What a build gets by default is the features marked `default = true`**, which every consumer
+asking the ordinary way turns on and `--no-default-features` or `default_features = false` turns off.
+A feature named `default` is refused, and so is the 0.4.0 entry `default = [a, b]` that listed them
+in one place; the refusal quotes the rewrite:
+
+```text
+'features.default' is the spelling of 0.4.0, which listed the features on by default in a feature of
+that name — a feature now says so itself, and no feature is named 'default'. Drop 'default' from
+'features' and write a { default = true }; b { default = true } (keeping whatever each already
+enables)
+```
+
+A feature may share its name with the dependency it turns on — `lmdb { enables = [lmdb] }`, or
+`lmdb = [lmdb]`, is the ordinary way to spell "the `lmdb` feature takes the `lmdb` package". **Inside
+a feature's list, a bare member names the feature it spells, whenever a feature of that name is
+declared** — Cargo's rule. The one exception is a self-reference: inside `lmdb`'s own list, the `lmdb`
+in `lmdb = [lmdb]` is the one spelling that means the dependency, since a feature cannot name itself.
+To name a dependency unambiguously anywhere else, quote it as `"dep:lmdb"` — HOCON reads a bare colon
+as a separator, so the quotes are required.
+
+A path key nests, as HOCON says: `targets.thumb-freestanding.linker_script = "m4.ld"` is the entry
+`linker_script` of the block `thumb-freestanding` of the block `targets`, and two blocks of one name
+are one block. A quoted key is one name, dots and all.
+
+### A feature that exists only on some machines
+
+`if = "thumb && freestanding"` on a feature says it **exists** on those machines and nowhere else; it
+never turns the feature on. Asking for it, or enabling it from another feature, on a machine that
+lacks it is refused:
+
+```text
+sysl.hocon of this project: the feature 'arm' exists only where 'thumb' holds, and this build is for
+'aarch64-macos' — leave 'arm' out of 'features' (and out of anything that enables it) on this machine;
+`--all-features` and `sysl test` skip a feature that is not there instead
+```
+
+A feature marked `default = true` that does not exist on the machine is simply not part of the default
+there. `--all-features` and `sysl test` turn on every feature that does exist on the machine.
+
+### Choices: features of which exactly one is on
+
+A `choices` block groups features of which **exactly one** is on wherever the group applies:
+
+```hocon
+choices {
+  port  { doc = "which USB controller to drive", of = [rp2040, stm32h7] }
+  speed { doc = "the root port's fastest speed", of = [full_speed, high_speed], default = full_speed }
+}
+```
+
+The members are ordinary features. A consumer picks one by naming it in `features`, which beats the
+group's `default`. The group applies where at least one member exists, so a group of chip ports does
+not apply to a build for the host. Three things are refused, each naming the choice:
+
+- two members on at once, whether asked for or enabled by another feature (`the features 'm7' and
+  'm4' are both on, and both are members of the choice 'core' — exactly one of a choice is on`), and
+  two consumers picking two members of one dependency's choice the same way;
+- a group that applies, has no `default`, and was given no pick (`the choice 'port' applies on
+  'thumb-freestanding', has no default, and nothing picked one of 'rp2040', 'stm32h7'`);
+- a malformed group: an unknown member, a `default` that is not a member, an empty `of`, a feature in
+  two groups, or two members that are both `default = true`.
+
+`--all-features` and `sysl test` turn on each applying group's default, or its first member. A
+constraint a choice cannot say (a chip with one controller cannot be both device and host) is the
+package's own check, an `#error` in its C configuration or an `@assert`.
 
 ### An optional dependency nobody turns on is not in the build
 
@@ -2016,6 +2089,16 @@ which is how a consumer takes a package's core and none of what it ships enabled
 neither gets the package its author meant to ship, and that is why `default_features` is true where
 nothing writes it.
 
+**A `-` member takes one default feature away for this consumer**: `features = [-timers]` asks for
+every feature the package marks `default = true` but `timers`. Another consumer that leaves `timers`
+on keeps it on, as the union below says. It is refused when the feature is not declared, is not on by
+default, or the entry already says `default_features = false` (there is nothing to take away):
+
+```text
+this project asks 'lib' for '-extra', but 'extra' is not on by default in 'github.com.e.lib' — a '-'
+member takes away one of the features that package marks 'default = true'. Drop the member
+```
+
 Those two keys are claims about the package being *depended on*, where `optional` is a claim about the
 package being described. A feature the named package does not declare is refused, and the refusal
 names who asked for it:
@@ -2038,8 +2121,7 @@ dependencies {
 }
 
 features {
-  default = [async]
-  async   = ["kairos/uv"]
+  async { default = true, enables = ["kairos/uv"] }
 }
 ```
 

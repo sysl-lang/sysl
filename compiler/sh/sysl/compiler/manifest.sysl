@@ -186,9 +186,16 @@ struct Manifest
     // (`options.sysl`).
     options: Buf[PackageOption]
 
-    // The `features` block inside each `targets.<name>` block: the keys of that block each feature
-    // sets while it is on (`target_features.sysl`). Only the root project's apply.
+    // The `targets` block inside each `features.<name>` block: the keys each feature sets while it is
+    // on (`target_features.sysl`). Only the root project's apply.
     feature_targets: Buf[FeatureTarget]
+
+    // What each feature block says besides what it enables (`feature_blocks.sysl`): one entry per
+    // feature in the file, in the file's order. The synthesized `default` feature has none.
+    feature_info: Buf[FeatureInfo]
+
+    // The `choices` block.
+    choices: Buf[Choice]
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -212,7 +219,7 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), None, buf(), buf())
+             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -568,8 +575,6 @@ read_manifest(text: string) -> Result[Manifest, string]
     var target_codegen_registers: Buf[(string, string, string)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
-    var feature_targets: Buf[FeatureTarget] = buf()
-
     conf_at(root, "targets") match
         None -> ()
         Some(block) ->
@@ -585,13 +590,18 @@ read_manifest(text: string) -> Result[Manifest, string]
 
                 targets.push((named.at(i), conf_text(entry, "triple")))
 
+                // The 0.4.0 spelling, a target block listing the features that change it, is refused
+                // with the block rewritten the new way round.
+                conf_at(entry, "features") match
+                    None -> ()
+                    Some(old) ->
+                        if conf_is_block(old)
+                            return Err(old_target_features_refusal(named.at(i), old))
+
                 // A key the block does not know is said and skipped, as a top-level one is -- a block
                 // nested under a name this compiler has never heard of included.
                 for key in conf_keys(entry)
                     if !known_target_key(key) then warnings.push(unknown_key(s"targets.${named.at(i)}.$key"))
-
-                for ft in read_feature_targets(entry, named.at(i), &warnings)?
-                    feature_targets.push(ft)
 
                 val image = read_image(entry, named.at(i))?
 
@@ -625,7 +635,16 @@ read_manifest(text: string) -> Result[Manifest, string]
     not_in_both(dependencies, dev)?
 
     val allocator = read_allocator(root)?
-    val features = read_features(root, dependencies, dev)?
+    val read = read_features(root, dependencies, dev, &warnings)?
+    val features = read.features
+    val feature_targets = read.targets
+    val choices = read_choices(root, read.info, &warnings)?
+
+    if !choices.is_empty()
+        needs_floor_refusal(floor, "a 'choices' block") match
+            Some(why) -> return Err(why)
+            None -> ()
+
     val optimization = read_optimization(root)?
     val link = read_link(root)?
     val lto = read_lto(root)?
@@ -656,10 +675,13 @@ read_manifest(text: string) -> Result[Manifest, string]
                 target_capabilities, pkg_config, headers, defines, c_libraries, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
-                codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets)
-    val unnamed = undeclared_feature_target(made)
+                codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets,
+                read.info, choices)
 
-    if unnamed.is_some() then return Err(unnamed.unwrap())
+    if read.long_form
+        needs_floor_refusal(floor, "a feature block") match
+            Some(why) -> return Err(why)
+            None -> ()
 
     Ok(made)
 end read_manifest
@@ -1214,9 +1236,12 @@ end link_word
 //
 // A `<dependency>/<feature>` member is checked here only for its first half: whether the dependency's
 // manifest declares the feature is answered once that manifest is read, during resolution.
-private read_features(root: &Conf, deps: &Buf[Dependency],
-                      dev: &Buf[Dependency]) -> Result[Buf[(string, Buf[string])], string]
+private read_features(root: &Conf, deps: &Buf[Dependency], dev: &Buf[Dependency],
+                      warnings: *Buf[string]) -> Result[FeaturesRead, string]
     var out: Buf[(string, Buf[string])] = buf()
+    var info: Buf[FeatureInfo] = buf()
+    var targets: Buf[FeatureTarget] = buf()
+    var long_form = false
 
     conf_at(root, "features") match
         None -> ()
@@ -1228,9 +1253,25 @@ private read_features(root: &Conf, deps: &Buf[Dependency],
             val names = conf_keys(block)
 
             for i in 0..<names.len()
-                conf_list(conf_at(block, names.at(i)).unwrap()) match
-                    None -> return Err(not_a_feature_list(s"features.${names.at(i)}"))
-                    Some(members) -> out.push((names.at(i), members))
+                val entry = conf_at(block, names.at(i)).unwrap()
+
+                if names.at(i) == "default" then return Err(default_spelling_refusal(entry))
+
+                if conf_is_block(entry)
+                    val one = read_feature_block(names.at(i), entry, warnings)?
+
+                    long_form = true
+                    out.push((names.at(i), one.enables))
+                    info.push(one.info)
+
+                    for ft in one.targets
+                        targets.push(ft)
+                else
+                    conf_list(entry) match
+                        None -> return Err(not_a_feature_list(s"features.${names.at(i)}"))
+                        Some(members) ->
+                            out.push((names.at(i), members))
+                            info.push(plain_feature_info(names.at(i)))
 
     var named: Buf[string] = buf()
 
@@ -1294,7 +1335,17 @@ private read_features(root: &Conf, deps: &Buf[Dependency],
                     "'optional = true'")
 
     no_feature_cycle(out, deps)?
-    Ok(out)
+
+    // The features marked `default = true` are the members of the one feature `default` that every
+    // consumer asking the ordinary way turns on, so resolution goes on reading a list.
+    var on_by_default: Buf[string] = buf()
+
+    for item in info
+        if item.is_default then on_by_default.push(item.name)
+
+    if !on_by_default.is_empty() then out.push(("default", on_by_default))
+
+    Ok(FeaturesRead(out, info, targets, long_form))
 end read_features
 
 private dependency_labelled(deps: &Buf[Dependency], label: string) -> Option[Dependency]
@@ -1853,15 +1904,14 @@ val PackageKeys: []const string = ["name", "version", "sysl", "description", "li
                                    "repository", "keywords"]
 
 // What a `targets.<name>` block says: the machine's triple, how its image is linked
-// (`image_link.sysl`), the `capabilities` and `codegen` blocks layered over the project's, and the
-// `features` that set any of those again (`target_features.sysl`).
-val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", "capabilities", "codegen",
-                                  "features"]
+// (`image_link.sysl`), and the `capabilities` and `codegen` blocks layered over the project's. A
+// feature sets any of those again from its own `targets` block (`target_features.sysl`).
+val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", "capabilities", "codegen"]
 
 val TopKeys: []const string = ["package", "dependencies", "dev_dependencies", "requires", "capabilities",
                                "targets", "allocator", "defines", "links", "features", "optimization",
                                "link", "lto", "bounds_locations", "error_traces", "workspace", "codegen",
-                               "c", "test", "options"]
+                               "c", "test", "options", "choices"]
 
 private known_package_key(key: string) -> bool = holds_key(PackageKeys, key)
 

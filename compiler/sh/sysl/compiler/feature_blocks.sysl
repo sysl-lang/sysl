@@ -1,0 +1,401 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+
+// **The long form of a feature, and the `choices` that group features** (`reference/packages.md §
+// Features`).
+//
+//     choices {
+//       port { doc = "which controller", of = [rp2040, stm32h7], default = rp2040 }
+//     }
+//
+//     features {
+//       uv = [libuv]                                  // the list form: exactly { enables = [libuv] }
+//       rp2040 {
+//         doc     = "the RP2040's USB controller"
+//         if      = "thumb && freestanding"           // exists only on these machines
+//         default = true                              // on unless a consumer turns defaults off
+//         enables = [device]
+//         requires = [other]                          // must be on too, or the build is refused
+//         targets { thumb-freestanding { linker_script = "rp2040.ld" } }
+//       }
+//     }
+//
+// A feature's `enables` is what the list form always was, so everything that resolves features reads
+// the same `(name, members)` pairs as before. What the long form adds is kept in `FeatureInfo`, and
+// the groups in `Choice`; `settle_features` applies them to a set the closure of the asked-for
+// features produced.
+
+// What a feature block says besides what it enables.
+struct FeatureInfo
+    name: string
+    doc: string
+
+    // The machines the feature exists on, as an `if` writes them, or `""` for every machine.
+    condition: string
+
+    // Whether a consumer that leaves `default_features` alone gets it.
+    is_default: bool
+
+    // Features that have to be on whenever this one is, which a refusal reports rather than turns on.
+    requires: Buf[string]
+end FeatureInfo
+
+// A group of features of which exactly one is on wherever the group applies.
+struct Choice
+    name: string
+    doc: string
+    of: Buf[string]
+
+    // The member that is on when nothing picked one, or `""` where the group has no default.
+    default_member: string
+end Choice
+
+// One feature block, read.
+struct FeatureBlock
+    enables: Buf[string]
+    info: FeatureInfo
+    targets: Buf[FeatureTarget]
+end FeatureBlock
+
+// The whole `features` block, read: the `(name, enables)` pairs resolution works from -- with the
+// features marked `default = true` gathered under a `default` of their own -- what each block says,
+// the target keys the features set, and whether any feature is written as a block.
+struct FeaturesRead
+    features: Buf[(string, Buf[string])]
+    info: Buf[FeatureInfo]
+    targets: Buf[FeatureTarget]
+    long_form: bool
+end FeaturesRead
+
+// Every key a feature block may write. A table rather than a test, so the cache census
+// (`tests_ckg_cache_key.sysl`) can walk it.
+val FeatureKeys: []const string = ["doc", "default", "if", "enables", "requires", "targets", "macro",
+                                   "options", "c", "defines", "config", "sections"]
+
+// The keys of a feature block the C layer and the options layer will read, which this reader accepts
+// and does not yet act on.
+val FeatureKeysNotYetRead: []const string = ["macro", "options", "c", "defines", "config", "sections"]
+
+// Every key a `choices` entry may write.
+val ChoiceKeys: []const string = ["doc", "of", "default"]
+
+private holds_name(names: []const string, name: string) -> bool
+    for i in 0..<names.len
+        if names[i] == name then return true
+
+    false
+end holds_name
+
+// A feature written in the list form: it enables its members and says nothing else.
+plain_feature_info(name: string) -> FeatureInfo = FeatureInfo(name, "", "", false, buf())
+
+// One feature block: the members it enables, what else it says, and the target keys it sets.
+read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result[FeatureBlock, string]
+    val where = s"features.$name"
+
+    for key in conf_keys(entry)
+        if !holds_name(FeatureKeys, key)
+            warnings.push(unknown_key(s"$where.$key"))
+        else if holds_name(FeatureKeysNotYetRead, key)
+            warnings.push(not_yet_read(s"$where.$key"))
+
+    val enables = conf_at(entry, "enables") match
+        None -> buf()
+        Some(v) -> conf_list(v) match
+            None -> return Err(not_a_feature_list(s"$where.enables"))
+            Some(names) -> names
+
+    var requires: Buf[string] = buf()
+
+    conf_at(entry, "requires") match
+        None -> ()
+        Some(v) ->
+            if !conf_is_block(v)
+                requires = conf_list(v) match
+                    None -> return Err(s"'$where.requires' is a list of the features that have to be " +
+                        "on whenever this one is, as 'requires = [device]' — or a block, 'requires { " +
+                        "headers { … } }', naming what the build needs from the machine")
+                    Some(names) -> names
+
+    val is_default = conf_at(entry, "default") match
+        None -> false
+        Some(v) -> *v match
+            Flag(on) -> on
+            _ -> return Err(s"'$where.default' is true or false — a feature says whether it is on by " +
+                "default, as 'default = true'; a list of the features on by default is the spelling " +
+                "of 0.4.0, which a feature block no longer takes")
+
+    val condition = read_condition_key(entry, where)?
+    val targets = read_feature_targets(name, entry, warnings)?
+
+    Ok(FeatureBlock(enables, FeatureInfo(name, conf_text(entry, "doc"), condition, is_default, requires),
+                    targets))
+end read_feature_block
+
+// The refusal for a feature named `default`, whichever way it is written. A list is the 0.4.0 way
+// to say which features are on by default, and the fix-it shows the same thing in the new place.
+default_spelling_refusal(entry: &Conf) -> string
+    val members = conf_list(entry)
+    val lead = "'features.default' is the spelling of 0.4.0, which listed the features on by default " +
+        "in a feature of that name — a feature now says so itself, and no feature is named 'default'. "
+
+    if members.is_some() && !members.unwrap().is_empty()
+        var blocks: Buf[string] = buf()
+
+        for m in members.unwrap()
+            blocks.push(s"$m { default = true }")
+
+        return lead + s"Drop 'default' from 'features' and write ${join(blocks.view(), "; ")} (keeping " +
+            "whatever each already enables)"
+
+    lead + "Drop it from 'features' and write 'default = true' inside each feature that is on by default"
+end default_spelling_refusal
+
+// The `choices` block, held to the features that were declared.
+read_choices(root: &Conf, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Result[Buf[Choice], string]
+    var out: Buf[Choice] = buf()
+
+    val block = conf_at(root, "choices") match
+        None -> return Ok(out)
+        Some(b) -> b
+
+    if !conf_is_block(block)
+        return Err("'choices' is not a block — it names each group of features of which exactly one is " +
+            "on, as 'choices { core { of = [m7, m4], default = m7 } }'")
+
+    var declared: Buf[string] = buf()
+
+    for item in info
+        declared.push(item.name)
+
+    var grouped: Buf[(string, string)] = buf()
+
+    for name in conf_keys(block)
+        val entry = conf_at(block, name).unwrap()
+        val where = s"choices.$name"
+
+        if !conf_is_block(entry)
+            return Err(s"'$where' is not a block — a choice names the features it groups, as " +
+                s"'$where { of = [a, b], default = a }'")
+
+        for key in conf_keys(entry)
+            if !holds_name(ChoiceKeys, key) then warnings.push(unknown_key(s"$where.$key"))
+
+        val of = conf_at(entry, "of") match
+            None -> return Err(s"'$where' groups no features — it needs 'of = [a, b]', the features " +
+                "of which exactly one is on")
+            Some(v) -> conf_list(v) match
+                None -> return Err(s"'$where.of' is a list of feature names, as 'of = [a, b]'")
+                Some(names) -> names
+
+        if of.is_empty()
+            return Err(s"'$where.of' is empty — a choice needs the features of which exactly one is on")
+
+        for i in 0..<of.len()
+            val member = of.at(i)
+
+            if !holds_string(declared, member)
+                return Err(s"'$where.of' names '$member', which this package does not declare as a " +
+                    s"feature — a choice groups features of the 'features' block. It declares " +
+                    feature_list_shown(declared))
+
+            for j in 0..<i
+                if of.at(j) == member
+                    return Err(s"'$where.of' names '$member' twice — list each member once")
+
+            for g in grouped
+                if g.0 == member
+                    return Err(s"the feature '$member' is in the choices '${g.1}' and '$name' — a " +
+                        "feature belongs to at most one group, since a group turns on exactly one of " +
+                        "its members; split the feature in two, or take it out of one 'of'")
+
+            grouped.push((member, name))
+
+        val default_member = conf_text(entry, "default")
+
+        if default_member != "" && !holds_string(of, default_member)
+            return Err(s"'$where.default' is '$default_member', which is not one of the choice's " +
+                s"features — a default is a member of 'of', which is ${feature_list_shown(of)}")
+
+        var on_by_default: Buf[string] = buf()
+
+        for member in of
+            for item in info
+                if item.name == member && item.is_default then on_by_default.push(member)
+
+        if on_by_default.len() > 1
+            return Err(s"the features ${feature_list_shown(on_by_default)} are all 'default = true' " +
+                s"and in the choice '$name' — exactly one of a choice is on, so only one may be on by " +
+                "default; keep 'default = true' on one of them, or use the choice's own 'default'")
+
+        out.push(Choice(name, conf_text(entry, "doc"), of, default_member))
+
+    Ok(out)
+end read_choices
+
+// A construct of 0.5.0 in a manifest whose `package.sysl` floor is older: a 0.4 compiler would
+// mis-read a feature block as a malformed list, so the floor has to say 0.5.0.
+needs_floor_refusal(floor: string, what: string) -> Option[string]
+    if floor == "" || !older(floor, "0.5.0") then return None
+
+    Some(s"$ManifestName uses $what, which needs sysl 0.5.0, and 'package.sysl' is \"$floor\" — a " +
+        "compiler older than 0.5.0 would mis-read it. Raise 'package.sysl' to \"0.5.0\"")
+end needs_floor_refusal
+
+private not_yet_read(path: string) -> string =
+    s"$ManifestName: '$path' is read but not yet acted on by this sysl, and is ignored"
+
+private feature_list_shown(names: Buf[string]) -> string
+    if names.is_empty() then return "none"
+
+    var parts: Buf[string] = buf()
+
+    for n in names
+        parts.push(s"'$n'")
+
+    join(parts.view(), ", ")
+end feature_list_shown
+
+// -- settling a set of features --------------------------------------------------------------------
+
+private info_of(m: &Manifest, name: string) -> Option[FeatureInfo]
+    for item in m.feature_info
+        if item.name == name then return Some(item)
+
+    None
+end info_of
+
+// Whether a feature exists on the machine being built for.
+feature_available(m: &Manifest, name: string) -> bool = info_of(m, name) match
+    None -> true
+    Some(i) -> machine_holds(i.condition)
+
+private choice_of(m: &Manifest, feature: string) -> Option[Choice]
+    for c in m.choices
+        for member in c.of
+            if member == feature then return Some(c)
+
+    None
+end choice_of
+
+// The members of a choice that are on.
+private members_on(c: &Choice, on: &Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for member in c.of
+        if holds_string(*on, member) then out.push(member)
+
+    out
+end members_on
+
+// Every feature a build asking for everything turns on: each one that exists on this machine, except
+// the members of a choice, which are decided group by group.
+private everything_available(m: &Manifest) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in m.features
+        if item.0 == "default" || choice_of(m, item.0).is_some() then continue
+
+        if feature_available(m, item.0) then out.push(item.0)
+
+    out
+end everything_available
+
+// The features a manifest turns on from a list of names, with the rules of the long form applied.
+//
+// - `default` in the list stands for the features marked `default = true` that exist on this machine;
+// - a choice that applies and has no member on gets its default, or -- where `lenient`, which is what
+//   `--all-features` and `sysl test` are -- its first member; otherwise a build for a named machine is
+//   refused, listing the members;
+// - two members of one choice on is refused, naming both;
+// - a feature that does not exist on this machine, or one that requires a feature that is off, is
+//   refused.
+//
+// `who` is how a refusal names the package: "this project", or a dependency's canonical name.
+settle_features(m: &Manifest, asked: Buf[string], lenient: bool, who: string) -> Result[Buf[string], string]
+    var list: Buf[string] = buf()
+    var wants_default = false
+
+    if lenient && asked.is_empty()
+        for item in everything_available(m)
+            list.push(item)
+        wants_default = feature_named(m.features, "default")
+    else
+        for item in asked
+            if item == "default"
+                wants_default = feature_named(m.features, "default")
+
+                for info in m.feature_info
+                    if info.is_default && feature_available(m, info.name) then list.push(info.name)
+            else
+                list.push(item)
+
+    var on = feature_closure(m.features, list, m.dependencies)
+
+    for c in m.choices
+        on = feature_closure(m.features, list, m.dependencies)
+
+        var applies = false
+
+        for member in c.of
+            if feature_available(m, member) then applies = true
+
+        if !applies || !members_on(c, on).is_empty() then continue
+
+        if c.default_member != ""
+            list.push(c.default_member)
+            continue
+
+        if lenient
+            for member in c.of
+                if feature_available(m, member)
+                    list.push(member)
+                    break
+
+            continue
+        end if
+
+        if machine_named()
+            return Err(s"$ManifestName of $who: the choice '${c.name}' applies on ${machine_called()}, " +
+                "has no default, and nothing picked one of " + feature_list_shown(c.of) +
+                s" — exactly one of them is on. Ask for one in 'features' (a consumer's " +
+                s"'features = [${c.of.at(0)}]', or '--features ${c.of.at(0)}'), or give the choice a " +
+                s"'default' in 'choices.${c.name}'")
+
+    on = feature_closure(m.features, list, m.dependencies)
+
+    for c in m.choices
+        val picked = members_on(c, on)
+
+        if picked.len() > 1
+            return Err(s"$ManifestName of $who: the features '${picked.at(0)}' and '${picked.at(1)}' " +
+                s"are both on, and both are members of the choice '${c.name}' — exactly one of a " +
+                "choice is on. Ask for only one of them in 'features', and take the other out of " +
+                "whatever else turns it on")
+
+    for name in on
+        if name == "default" then continue
+
+        if !feature_available(m, name)
+            val cond = info_of(m, name).unwrap().condition
+
+            return Err(s"$ManifestName of $who: the feature '$name' exists only where '$cond' holds, " +
+                s"and this build is for ${machine_called()} — leave '$name' out of 'features' (and " +
+                "out of anything that enables it) on this machine; `--all-features` and `sysl test` " +
+                "skip a feature that is not there instead")
+
+        info_of(m, name) match
+            None -> ()
+            Some(info) ->
+                for need in info.requires
+                    if !holds_string(on, need)
+                        return Err(s"$ManifestName of $who: the feature '$name' requires '$need', which " +
+                            s"is not on — ask for '$need' in 'features', or list it in the 'enables' " +
+                            s"of '$name' so it comes on with it")
+
+    if wants_default && !holds_string(on, "default") then on.push("default")
+
+    Ok(on)
+end settle_features

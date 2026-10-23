@@ -173,7 +173,9 @@ end feature_closure
 // the asked-for list rather than having a branch of its own -- and a manifest declaring no `default`
 // has nothing to add, which is why an absent one is not an error while a misspelled request is.
 root_enabled(m: &Manifest, r: &FeatureRequest, testing: bool) -> Result[Buf[string], string]
-    if r.all || (testing && request_silent(r)) then return Ok(declared_features(m))
+    // Everything that exists here: each feature whose `if` holds on this machine, and for each choice
+    // its default or its first member (`settle_features`).
+    if r.all || (testing && request_silent(r)) then return settle_features(m, buf(), true, "this project")
 
     for asked in r.features
         if !feature_named(m.features, asked)
@@ -191,7 +193,7 @@ root_enabled(m: &Manifest, r: &FeatureRequest, testing: bool) -> Result[Buf[stri
 
     if !r.no_default then asked.push("default")
 
-    Ok(feature_closure(m.features, asked, m.dependencies))
+    settle_features(m, asked, false, "this project")
 end root_enabled
 
 // Every feature a manifest declares, in the order it wrote them.
@@ -199,7 +201,7 @@ private declared_features(m: &Manifest) -> Buf[string]
     var out: Buf[string] = buf()
 
     for item in m.features
-        out.push(item.0)
+        if item.0 != "default" then out.push(item.0)
 
     out
 end declared_features
@@ -326,7 +328,7 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
 
         if !asked.at_all then continue
 
-        out.push((target.canonical, asked_closure(asked, target.manifest)))
+        out.push((target.canonical, asked_closure(asked, target.manifest, target.canonical)?))
 
     for r in 0..<roots.len()
         val (dir, theirs) = roots.at(r)
@@ -342,7 +344,7 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
 
         if !asked.at_all then asked.wants_default = true
 
-        out.push((lib_root_key(dir), asked_closure(asked, theirs)))
+        out.push((lib_root_key(dir), asked_closure(asked, theirs, s"the source root '$dir'")?))
 
     Ok(out)
 end enabled_from
@@ -361,19 +363,61 @@ end Asking
 private no_asking() -> Asking = Asking(buf(), false, false)
 
 // One edge's request, held to the features the target declares.
+//
+// **A member written `-name` takes one default feature away for this consumer** (`features =
+// [-timers]`): the edge then asks for each default feature but that one, instead of for `default`.
+// Another consumer that leaves it alone still gets it, as the union of the requests says.
 private asking(into: *Asking, who: string, dep: &Dependency, target: &Manifest) -> Result[unit, string]
     into.at_all = true
 
-    if dep.default_features then into.wants_default = true
+    var removed: Buf[string] = buf()
 
     for feature in dep.features
+        if feature.starts_with("-")
+            val gone = feature[1..]
+
+            if !feature_named(target.features, gone) || gone == "default"
+                return Err(no_such_feature(who, dep, gone, declared_features(target)))
+
+            if !dep.default_features
+                return Err(s"$who asks '${dep.label}' for '$feature', but its entry says " +
+                    "'default_features = false', so there is no default feature to take away — drop " +
+                    s"the '$feature' member, or drop 'default_features = false'")
+
+            if !is_default_feature(target, gone)
+                return Err(s"$who asks '${dep.label}' for '$feature', but '$gone' is not on by default " +
+                    s"in '${dependency_canonical(dep)}' — a '-' member takes away one of the features " +
+                    "that package marks 'default = true'. Drop the member")
+
+            removed.push(gone)
+            continue
+        end if
+
         if !feature_named(target.features, feature)
             return Err(no_such_feature(who, dep, feature, declared_features(target)))
 
         into.named.push(feature)
 
+    if dep.default_features
+        if removed.is_empty()
+            into.wants_default = true
+        else
+            for member in default_members(target)
+                if !holds_string(removed, member) && feature_available(target, member)
+                    into.named.push(member)
+
     Ok(())
 end asking
+
+// The features a manifest marks `default = true`.
+private default_members(m: &Manifest) -> Buf[string]
+    for item in m.features
+        if item.0 == "default" then return item.1
+
+    buf()
+end default_members
+
+private is_default_feature(m: &Manifest, name: string) -> bool = holds_string(default_members(m), name)
 
 // What the consumer's own enabled features ask of the dependency `dep` names, through
 // `<dependency>/<feature>` members, held to the features the target declares as an entry's are.
@@ -402,7 +446,7 @@ private no_such_dependency_feature(who: string, from: string, dep: &Dependency, 
         s"that package's own manifest names$tail"
 end no_such_dependency_feature
 
-private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
+private asked_closure(asked: Asking, target: &Manifest, who: string) -> Result[Buf[string], string]
     var named: Buf[string] = buf()
 
     for item in asked.named
@@ -410,7 +454,7 @@ private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
 
     if asked.wants_default then named.push("default")
 
-    feature_closure(target.features, named, target.dependencies)
+    settle_features(target, named, false, who)
 end asked_closure
 
 private struct Consumer
