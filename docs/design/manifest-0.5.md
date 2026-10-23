@@ -22,8 +22,11 @@ cache's keying, are never checked in, and are inspected with `sysl build --emit 
 
 **Decided by the user, beyond the questions below:**
 
-- **The manifest is renamed `sysl.hocon`**, pairing with `sysl.sum`. A `package.hocon` is refused
-  with a fix-it naming the new file, and `sysl config fix` renames it. Where this note says
+- **Every question below is decided as recommended** (user, 2026-10-22), Zephyr's boundary included.
+- **The manifest is renamed `sysl.hocon`**, pairing with `sysl.sum`. In 0.5.0, `sysl.hocon` is read
+  first and a `package.hocon` is accepted with a warning to rename it (`sysl config fix` does it);
+  from 0.6.0 it is refused. An immediate refusal would break stage 1, which 0.4.0 builds and which
+  reads only `package.hocon`, and the org census. Where this note says
   `package.hocon`, read `sysl.hocon`.
 - **`sysl build`, `run` and `test` default their path to `.`.** A directory, named or implied, with
   no manifest is refused, and there is no upward search. A single named `x.sysl` still builds, runs
@@ -43,7 +46,7 @@ Zephyr. Its shape — tunable values, on/off subsystems, a port per chip, an app
 the OS package's defaults, and the values reaching both C and sysl — is the test the grammar is
 held to, alongside TinyUSB (§ 6).
 
-**Status: proposed.** Nothing here is built. Every block marked *proposed* is new syntax; every
+**Status: decided.** Nothing here is built yet. Every block marked *proposed* is new syntax; every
 other block is 0.4.0's. The questions come first; each has one recommendation.
 
 ## Questions for the user
