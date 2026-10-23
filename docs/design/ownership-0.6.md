@@ -221,7 +221,15 @@ One agent per item, in this order, each landing on dev with its tests and refere
    - `va_*`, `ptr_cast`, `str_cast` and `str_alias` move behind an import.
    - `format` is removed as a user form: interpolation reaches the formatter internally, and no
      org code called it.
-   - `print`, `str` and `debug` stay built in, as fallbacks a user name overrides (item 5).
+   - **`x.to_string()` on every value replaces `str(x)`** (user, 2026-10-23: "`str()` is just so
+     ugly"). It uses the same `Display` → `Debug` → `<TypeName>` chain, answered by the compiler
+     the way `x.debug(out, fmt)` already is for every type. The hand-written `to_string()` methods
+     (BigInt, Decimal, Rational, Uuid) become `Display` impls. `debug(x)` becomes `x.debug_string()`.
+     A `join(sep)` over strings is checked or added (Scala's `mkString`). `str(…)` and `debug(…)` are
+     removed. Interpolation keeps its internal spelling. Uses: ~1100 in `sysl` (the compiler's own
+     source is swept after 0.6.0 ships, since it's built by the previous release) and ~250 in the
+     rest of the org.
+   - `print` stays built in, as fallbacks a user name overrides (item 5).
      They can't become library functions without specialisation: every value prints, through
      `Display`, else `Debug`, else its type name, and some types are shown by rule because no `impl`
      may be written for them.
