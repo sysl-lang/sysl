@@ -911,6 +911,78 @@ from a type's implementations. An object has none, so a `&Shape` cannot be conve
 even though the slots of `Display` are inside its table: a run of slots in one table is not a table
 of its own ([traits]({{< ref "traits" >}})).
 
+### A trait object stands in for a parameter behind a mode
+
+A parameter written `p: *P` or `p: &P` asks for a pointer to *some* type implementing the bound. An
+object is exactly that, a pointer to a type nobody remembers, so handed a `*Port`, `P` binds to the
+trait `Port` itself and `*P` is the object. Every call through `p` dispatches through its table:
+
+```sysl
+trait Port
+    mask(self) -> u32
+
+struct Board
+    level: u32
+
+impl Port for Board
+    mask(self) -> u32 = self.level
+
+send[P: Port](p: *P, v: u32) -> u32 = p.mask() + v
+
+var b = Board(40)
+val port: *Port = &b
+
+print(send(port, 1))
+print(send[Port](port, 2))
+print(send(&b, 3))
+```
+
+```output
+41
+42
+43
+```
+
+The first two calls are one instantiation, at `Port`, whatever type the object was made from; the
+third is the ordinary one, at `Board`. An object of a trait that requires `Port` stands in the same
+way, and `P` can be handed on to another generic, inferred or written as `inner[P](p)`.
+
+**A trait has no layout, so the body may only ever reach `P` behind `*` or `&`.** A `P` by value, as a
+parameter, a local or a result, `sizeof(P)`, `[4]P`, `Buf[P]`, `P(…)`, a static member and an
+associated type `P::Item` all need the type rather than an object of it, and the call says which line
+of the body asked for one:
+
+```sysl
+trait Port
+    mask(self) -> u32
+
+struct Board
+    level: u32
+
+impl Port for Board
+    mask(self) -> u32 = self.level
+
+copy[P: Port](p: *P) -> u32
+    val held: P = *p
+    held.mask()
+
+var b = Board(40)
+val port: *Port = &b
+
+print(copy(port))
+```
+
+```error
+'copy' uses 'P' by value at line 11, so a trait object cannot stand in for it
+```
+
+**An associated type is refused rather than read off the object.** The object's type fixes it, but a
+body written against `P::Item` reads it as a type to lay out, which is the same need. **The parameter
+must be bounded**: the calls go through the table of the trait a bound names, so a `[P](p: *P)`
+handed an object is refused rather than bound to a trait it asks nothing of. A generic *type* inferred
+at an object, such as `Wrap(port)` for a `struct Wrap[P: Port]` holding `p: *P`, follows the same rule,
+and a field holding `P` by value is refused where it is declared.
+
 ### A type's own parameters carry bounds too
 
 The same bracketed list means the same thing on a struct or an enum, and it is where the type states

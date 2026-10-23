@@ -1,0 +1,613 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, replace_all, Search}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait object standing in for a type parameter written behind a mode: a `*Port` handed to
+// `send[P: Port](p: *P)` binds `P` to the trait, so `*P` is the object and `p.mask()` dispatches through
+// its table (`generic.sysl`'s `binds_object`; `stand_in.sysl` refuses a body that needs `P`'s layout).
+// The case skiff's kernel needs: a table of granted objects calling the generic queue operations with
+// the running core's port (`reference/generics.md § A trait object stands in for a parameter behind a
+// mode`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private obg_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end obg_ready
+
+// What a one-file program prints, built fresh and run.
+private obg_ran(text: string) -> string
+    val root = make_temp_dir("sysl-obg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end obg_ran
+
+// The LLVM text of a one-file program, or what refused it.
+private obg_ir(text: string) -> string
+    val root = make_temp_dir("sysl-obg-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end obg_ir
+
+// The `define` lines of an IR text that define `name`.
+private obg_defines(ir: string, name: string) -> usize
+    var n: usize = 0
+    var at: usize = 0
+
+    loop
+        val next = ir.index_of_from("\n", at)
+        val stop = if next.is_some() then next.unwrap() else ir.bytes.len
+        val line = ir[at..<stop]
+
+        if line.starts_with("define") && line.contains(s"@$name(") then n += 1
+        if next.is_none() then break
+
+        at = stop + 1
+
+    n
+end obg_defines
+
+// What analysing a one-file program had to say, rendered as the command line renders it.
+private obg_said(text: string) -> string
+    val root = make_temp_dir("sysl-obg-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end obg_said
+
+// The program is refused with exactly this message, and nothing else, at this line and column.
+private obg_refused(text: string, message: string, at: string)
+    val out = obg_said(text)
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert_eq(out.count_of("error: "), 1)
+end obg_refused
+
+private obg_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end obg_cli
+
+// skiff's FINDINGS 9, as it was written.
+private obg_reduction() -> string = raw"""
+    trait Port
+        mask(*self) -> u32
+
+    struct Board
+        level: u32
+
+    impl Port for Board
+        mask(*self) -> u32 = self.level
+
+    struct Queue[const N: usize]
+        slots: [N]u32
+
+    impl[const N: usize] Queue[N]
+        send[P: Port](*self, p: *P, v: u32) -> u32 = p.mask() + v + u32(N)
+
+    trait Object
+        put(*self, p: *Port, v: u32) -> u32
+
+    impl[const N: usize] Object for Queue[N]
+        put(*self, p: *Port, v: u32) -> u32 = self.send(p, v)
+
+    var q: Queue[2] = Queue([0; 2])
+    var b = Board(40)
+    val o: *Object = &q
+    val port: *Port = &b
+    print(o.put(port, 1))
+
+    """
+
+// A trait with a default, a second implementation, and a trait that requires it.
+private obg_port() -> string = raw"""
+    trait Port
+        mask(self) -> u32
+        twice(self) -> u32 = self.mask() * 2
+
+    trait Fancy: Port
+        name(self) -> string
+
+    struct Board
+        level: u32
+
+    struct Dial
+        turns: u32
+
+    impl Port for Board
+        mask(self) -> u32 = self.level
+
+    impl Port for Dial
+        mask(self) -> u32 = self.turns + 100
+
+    impl Fancy for Board
+        name(self) -> string = "board"
+
+    var b = Board(5)
+    var d = Dial(1)
+    val o: *Port = &b
+
+    """
+
+// -- the binding ----------------------------------------------------------------------------------
+
+@test("skiff's reduction: an object's member hands its *Port to a generic member taking *P")
+obg_the_reduction_runs()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_reduction()), "43\n")
+
+@test("the generic member is still called with a concrete pointer, and with the trait written")
+obg_concrete_and_written()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_reduction() + "print(q.send(&b, 2))\nprint(q.send[Port](port, 3))\n"),
+              "43\n44\n45\n")
+
+@test("a *P and a &P parameter both take an object, and dispatch through it")
+obg_pointer_and_reference()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        by_ref[P: Port](p: &P) -> u32 = p.mask() + p.twice()
+        by_ptr[P: Port](p: *P) -> u32 = p.mask()
+        val r: &Port = Dial(2)
+        print(by_ref(r))
+        print(by_ptr(o))
+        print(by_ref[Port](r), by_ptr[Port](o))
+        """), "306\n5\n306 5\n")
+
+@test("the same generic at a concrete type and at the object is two instantiations, both right")
+obg_concrete_and_object_in_one_program()
+    if !obg_ready() then return
+
+    val text = obg_port() + raw"""
+        by_ptr[P: Port](p: *P) -> u32 = p.twice()
+        val od: *Port = &d
+        print(by_ptr(&b), by_ptr(&d), by_ptr(o), by_ptr(od))
+        """
+
+    assert_eq(obg_ran(text), "10 202 10 202\n")
+
+    // One body per object type, not per implementation erased into it.
+    val ir = obg_ir(text)
+
+    assert_eq(obg_defines(ir, "by_ptr.Port"), 1)
+    assert_eq(obg_defines(ir, "by_ptr.Board"), 1)
+    assert_eq(obg_defines(ir, "by_ptr.Dial"), 1)
+end obg_concrete_and_object_in_one_program
+
+@test("an object of a trait that requires the bound's trait stands in, and reaches both")
+obg_a_supertrait_object()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        by_ptr[P: Port](p: *P) -> u32 = p.mask()
+        named[F: Fancy](f: *F) -> string = s"${f.name()} ${f.mask()} ${f.twice()}"
+        val fo: *Fancy = &b
+        print(by_ptr(fo))
+        print(named(fo))
+        """), "5\nboard 5 10\n")
+
+@test("with two type parameters, only the one written behind a mode binds to the object")
+obg_two_parameters()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        two[P: Port, T](p: *P, t: T) -> T
+            print(p.mask())
+            t
+        end two
+        print(two(o, "s"))
+        print(two(o, 7))
+        """), "5\ns\n5\n7\n")
+
+@test("a generic member of a generic type takes the object, its owner's argument untouched")
+obg_a_generic_member_of_a_generic_type()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        struct Box[T]
+            v: T
+
+            with_port[P: Port](self, p: *P) -> T
+                print(p.mask())
+                self.v
+            end with_port
+        print(Box(3).with_port(o))
+        print(Box("x").with_port(&d))
+        """), "5\n3\n101\nx\n")
+
+@test("a trait's default member is reached through the object in the body")
+obg_a_default_member()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        doubled[P: Port](p: *P) -> u32 = p.twice()
+        val od: *Port = &d
+        print(doubled(o), doubled(od))
+        """), "10 202\n")
+
+@test("a generic handing the object on to another, inferred and written, is one instantiation each")
+obg_a_nested_generic_call()
+    if !obg_ready() then return
+
+    val text = obg_port() + raw"""
+        inner[Q: Port](q: *Q) -> u32 = q.mask() + 1
+        outer[P: Port](p: *P) -> u32 = inner(p) + inner[P](p)
+        print(outer(o))
+        print(outer(&b))
+        """
+
+    assert_eq(obg_ran(text), "12\n12\n")
+
+    val ir = obg_ir(text)
+
+    assert_eq(obg_defines(ir, "inner.Port"), 1)
+    assert_eq(obg_defines(ir, "outer.Port"), 1)
+end obg_a_nested_generic_call
+
+@test("a closure in the body captures the object")
+obg_a_closure_captures_it()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        closing[P: Port](p: *P) -> u32
+            val f = () -> p.mask() + 100
+            f()
+        end closing
+        print(closing(o))
+        """), "105\n")
+
+@test("a generic type whose field holds the parameter behind a mode is inferred at the object")
+obg_a_generic_type_behind_a_mode()
+    if !obg_ready() then return
+
+    assert_eq(obg_ran(obg_port() + raw"""
+        struct Wrap[P: Port]
+            p: *P
+        val w = Wrap(o)
+        print(w.p.mask())
+        """), "5\n")
+
+@test("the module holding the object, the generic, and @no_alloc: the generic's allocation is refused")
+obg_no_alloc_is_still_enforced()
+    if !obg_ready() then return
+
+    val said = obg_said(raw"""
+        @no_alloc
+
+        trait Port
+            mask(*self) -> u32
+
+        struct Board
+            level: u32
+
+        impl Port for Board
+            mask(*self) -> u32 = self.level
+
+        send[P: Port](p: *P) -> usize
+            val s = s"${p.mask()}"
+            s.len
+        end send
+
+        var b = Board(5)
+        val o: *Port = &b
+        print(send(o))
+        """)
+
+    assert(said.contains("error: the string a value renders as needs an allocator, and this module " +
+                         "declared '@no_alloc'"), said)
+    assert(said.contains("/main.sysl:13:13\n"), said)
+    assert(said.contains("error: this reaches 'send.Port', which makes heap storage"), said)
+end obg_no_alloc_is_still_enforced
+
+@test("and without the allocation the same module builds")
+obg_no_alloc_builds_without_it()
+    if !obg_ready() then return
+
+    assert_eq(obg_said(raw"""
+        @no_alloc
+
+        trait Port
+            mask(*self) -> u32
+
+        struct Board
+            level: u32
+
+        impl Port for Board
+            mask(*self) -> u32 = self.level
+
+        send[P: Port](p: *P) -> u32 = p.mask() + 1
+
+        var b = Board(5)
+        val o: *Port = &b
+        print(send(o))
+        """), "")
+
+@test("the reduction builds for a Cortex-M with no FPU, its instantiation defined in the archive")
+obg_the_reduction_on_a_board()
+    if !obg_ready() then return
+
+    val root = replace_all(make_temp_dir("sysl-obg-thumb").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", obg_reduction()).unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = obg_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
+                       s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val tool = "/opt/homebrew/bin/arm-none-eabi-nm"
+
+    assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-nm")
+
+    capture(tool, [s"$root/app.a"], "", [], true) match
+        Ok(out) ->
+            assert(out.text.contains(" T Queue.send.c2.Port\n"), out.text)
+            assert(!out.text.contains(" U Queue.send"), out.text)
+        Err(_) -> assert(false, "arm-none-eabi-nm could not be run")
+
+    remove_dir_all(root).unwrap_or(())
+end obg_the_reduction_on_a_board
+
+// -- across a library -----------------------------------------------------------------------------
+
+private obg_library() -> string =
+    "module demo\n\ntrait Port\n    mask(*self) -> u32\n\n" +
+    "send[P: Port](p: *P, v: u32) -> u32 = p.mask() + v\n\n" +
+    "put(p: *Port) -> u32 = send(p, 1)\n\n" +
+    "hold[P: Port](p: *P) -> u32\n    var x: P = *p\n    p.mask()\nend hold\n"
+
+@test("a library's own call at the object is compiled with the library, ahead of the program")
+obg_the_library_compiles_its_own_call()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", obg_library())
+    val half = lfa_half_here(root, [])
+
+    assert(holds_string(half.advertised, "demo$put"), half.text)
+    assert(half.text.contains("define i32 @demo$send.demo$Port("), half.text)
+    lbr_drop([root])
+end obg_the_library_compiles_its_own_call
+
+@test("and a program instantiates the library's generic at its own object, beside the library's")
+obg_a_program_over_the_library()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", obg_library())
+    val prog = lbr_program("import demo.{Port, send, put}\n\nstruct Board\n    level: u32\n\n" +
+                           "impl Port for Board\n    mask(*self) -> u32 = self.level\n\n" +
+                           "var b = Board(5)\nval o: *Port = &b\nprint(put(o), send(o, 2), send(&b, 3))\n")
+
+    assert_eq(lbr_run(prog, [root]), "6 7 8\n")
+    lbr_drop([root, prog])
+end obg_a_program_over_the_library
+
+@test("a library generic that uses the parameter by value is refused at the program's call, naming the file")
+obg_a_library_generic_refused_at_the_call()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", obg_library())
+    val prog = lbr_program("import demo.{Port, hold}\n\nstruct Board\n    level: u32\n\n" +
+                           "impl Port for Board\n    mask(*self) -> u32 = self.level\n\n" +
+                           "var b = Board(5)\nval o: *Port = &b\nprint(hold(o))\n")
+    val said = lbr_run(prog, [root])
+
+    assert(said.contains("'demo.hold' uses 'P' by value at "), said)
+    assert(said.contains("/demo/lib.sysl:11, so a trait object cannot stand in for it"), said)
+    assert(said.contains("/main.sysl:11:7\n"), said)
+    lbr_drop([root, prog])
+end obg_a_library_generic_refused_at_the_call
+
+// -- what an object cannot stand in for -----------------------------------------------------------
+
+private obg_layouts() -> string = obg_port() + "struct Cell[T]\n    v: T\n\n"
+
+@test("a parameter of the type itself")
+obg_refuses_a_value_parameter()
+    obg_refused(obg_layouts() + "by_value[P: Port](p: *P, q: P) -> u32 = p.mask()\n" +
+                "print(by_value[Port](o, b))\n",
+                "'by_value' uses 'P' by value at line 30, so a trait object cannot stand in for it — " +
+                "only '*P' and '&P' can be written with one", "31:15")
+
+@test("a local of the type itself")
+obg_refuses_a_local()
+    obg_refused(obg_layouts() + "local[P: Port](p: *P) -> u32\n    var x: P = *p\n    p.mask()\n" +
+                "end local\nprint(local(o))\n",
+                "'local' uses 'P' by value at line 31, so a trait object cannot stand in for it — " +
+                "only '*P' and '&P' can be written with one", "34:7")
+
+@test("its size")
+obg_refuses_its_size()
+    obg_refused(obg_layouts() + "sized[P: Port](p: *P) -> usize = sizeof(P)\nprint(sized(o))\n",
+                "'sized' uses 'P' in 'sizeof(P)' at line 30, so a trait object cannot stand in for it " +
+                "— only '*P' and '&P' can be written with one", "31:7")
+
+@test("an array of it")
+obg_refuses_an_array()
+    obg_refused(obg_layouts() + "arrayed[P: Port](p: *P, xs: [4]P) -> u32 = p.mask()\n" +
+                "print(arrayed[Port](o, [b, b, b, b]))\n",
+                "'arrayed' uses 'P' in '[4]P' at line 30, so a trait object cannot stand in for it — " +
+                "only '*P' and '&P' can be written with one", "31:14")
+
+@test("a buffer of it, and a generic type laid out over it even behind a pointer")
+obg_refuses_a_generic_type_over_it()
+    obg_refused(obg_layouts() + "import sysl.buf.{Buf, buf}\nbufd[P: Port](p: *P) -> u32\n" +
+                "    var xs: Buf[P] = buf()\n    p.mask()\nend bufd\nprint(bufd(o))\n",
+                "'bufd' uses 'P' in 'Buf[P]' at line 32, so a trait object cannot stand in for it — " +
+                "only '*P' and '&P' can be written with one", "35:7")
+    obg_refused(obg_layouts() + "celled[P: Port](p: *P) -> u32\n    val c: *Cell[P] = null\n" +
+                "    p.mask()\nend celled\nprint(celled(o))\n",
+                "'celled' uses 'P' in 'Cell[P]' at line 31, so a trait object cannot stand in for it " +
+                "— only '*P' and '&P' can be written with one", "34:7")
+end obg_refuses_a_generic_type_over_it
+
+@test("constructing one")
+obg_refuses_constructing_one()
+    obg_refused(obg_layouts() + "built[P: Port](p: *P) -> u32\n    val x = P(1)\n    p.mask()\n" +
+                "end built\nprint(built(o))\n",
+                "'built' uses 'P' to construct a value at line 31, so a trait object cannot stand in for " +
+                "it — only '*P' and '&P' can be written with one", "34:7")
+
+@test("returning one")
+obg_refuses_returning_one()
+    obg_refused(obg_layouts() + "result[P: Port](p: *P) -> P = *p\nprint(result(o))\n",
+                "'result' uses 'P' by value at line 30, so a trait object cannot stand in for it — " +
+                "only '*P' and '&P' can be written with one", "31:7")
+
+@test("an associated type is refused rather than dispatched")
+obg_refuses_an_associated_type()
+    obg_refused(raw"""
+        trait Keyed
+            type Key
+            key(self) -> u32
+
+        struct Board
+            level: u32
+
+        impl Keyed for Board
+            type Key = u32
+            key(self) -> u32 = self.level
+
+        keyed[P: Keyed](p: *P) -> u32
+            val k: *P::Key = null
+            p.key()
+        end keyed
+
+        var b = Board(3)
+        val ko: *Keyed[Key = u32] = &b
+        print(keyed(ko))
+        """, "'keyed' uses 'P' for its associated type 'P::Key' at line 13, so a trait object cannot " +
+             "stand in for it — only '*P' and '&P' can be written with one", "19:7")
+
+@test("a parameter bounded by nothing")
+obg_refuses_an_unbounded_parameter()
+    obg_refused(obg_layouts() + "unbounded[P](p: *P) -> u32 = 1\nprint(unbounded(o))\n",
+                "'unbounded' asks nothing of its type parameter 'P', so a trait object cannot stand in for " +
+                "it — bound it with the trait the object dispatches through", "31:7")
+
+@test("a bound the object's trait does not reach")
+obg_refuses_another_bound()
+    obg_refused(obg_layouts() + "trait Other\n    other(self) -> u32\n" +
+                "f[P: Other](p: *P) -> u32 = p.other()\nprint(f(o))\n",
+                "'f' requires its type parameter 'P' to implement 'Other', but Port does not", "33:7")
+
+// A member with type parameters of its own has no slot, so the object reaches less than the bound
+// promises (`reference/generics.md`, the `Applies` case), inferred or written.
+@test("the object of a trait with a generic member, inferred or written")
+obg_refuses_a_trait_with_a_generic_member()
+    val text = raw"""
+        trait Applies
+            tag(self) -> int
+            apply[U](self, f: &Fn(int) -> U) -> U
+
+        struct N
+            v: int
+
+        impl Applies for N
+            tag(self) -> int = self.v
+            apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+
+        total[T: Applies](x: *T) -> int = x.tag()
+
+        var n = N(3)
+        val ao: *Applies = &n
+
+        """
+    val why = "'total' requires its type parameter 'T' to implement 'Applies', but Applies does not — " +
+              "a bound promises every member and an erased value reaches only what its table holds"
+
+    assert(obg_said(text + "print(total(ao))\n").contains(why), obg_said(text + "print(total(ao))\n"))
+    assert(obg_said(text + "print(total[Applies](ao))\n").contains(why))
+end obg_refuses_a_trait_with_a_generic_member
+
+// A static member mentions no receiver, so the trait has no object at all and nothing can be handed in.
+@test("a trait with a static member has no object to write as the argument")
+obg_refuses_a_trait_with_a_static_member()
+    obg_refused(obg_layouts() + raw"""
+        trait Made
+            make() -> Self
+            tag(self) -> u32
+        impl Made for Board
+            make() -> Board = Board(1)
+            tag(self) -> u32 = 2
+        made[P: Made](p: *P) -> u32 = P.make().tag()
+        print(made[Made](&b))
+        """, "'Made' declares the associated function 'make', which has no receiver to dispatch on — " +
+             "so there is no '*Made' to form", "37:12")
+
+@test("a generic type inferred at the object refuses a field holding the parameter by value")
+obg_refuses_a_field_by_value()
+    obg_refused(obg_port() + "struct Hold[P: Port]\n    p: *P\n    v: P\n\nval h = Hold(o, b)\n",
+                "'P' stands for the trait 'Port' here, because a trait object was handed in its place — " +
+                "so it has no layout, and only '*P' and '&P' can be written with it", "29:8")
+
+@test("a member written with the trait is refused the same way as one inferred")
+obg_refuses_a_written_member_call()
+    obg_refused(obg_port() + raw"""
+        struct Box
+            n: u32
+
+            keep[P: Port](self, p: *P) -> u32
+                var x: P = *p
+                self.n
+            end keep
+        print(Box(1).keep[Port](o))
+        """, "'Box.keep' uses 'P' by value at line 31, so a trait object cannot stand in for it — " +
+             "only '*P' and '&P' can be written with one", "34:18")

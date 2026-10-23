@@ -265,6 +265,44 @@ ert_break_and_continue_prune()
             print(error_trace().len())
         """), Status.Exited(0), "0\n0\n", "")
 
+// A body's last expression is completed where the function returns, not by a statement: a function
+// that answers no `Result` has no failure to hand on, so a handled one leaves the trace there too. One
+// answering a `Result` hands its last expression back as `return` would, and keeps the chain.
+@test("a failure handled by a body's last expression leaves the trace, unless the body answers a Result")
+ert_a_handling_tail_prunes()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        open(n: int) -> Result[int, string] = if n > 0 then Err("no file") else Ok(n)
+
+        quiet(n: int)
+            open(n) match
+                Ok(_) -> ()
+                Err(_) -> ()
+
+        or_zero(n: int) -> int = open(n) match
+            Ok(v) -> v
+            Err(_) -> 0
+
+        maybe(n: int) -> Option[int] = open(n).ok()
+
+        async counted(n: int) -> int = open(n).unwrap_or(-1)
+
+        wrapped(n: int) -> Result[int, string] = open(n) match
+            Ok(v) -> Ok(v)
+            Err(e) -> Err(s"wrapped: $e")
+
+        quiet(1)
+        print(error_trace().len())
+        print(or_zero(1), error_trace().len())
+        print(maybe(1).is_none(), error_trace().len())
+        print(block_on(counted(1)), error_trace().len())
+
+        wrapped(1) match
+            Ok(_) -> ()
+            Err(_) -> print(error_trace().len())
+        """), Status.Exited(0), "0\n0 0\ntrue 0\n-1 0\n2\n", "")
+
 @test("clear_error_trace empties it, and print_error_trace writes it as main does")
 ert_the_explicit_api()
     ert_says(ert_main(raw"""
@@ -604,7 +642,7 @@ ert_records_allocate_nothing()
     force_alloc_counting(false)
 end ert_records_allocate_nothing
 
-@test("a freestanding image keeps one plain trace, with no thread-local storage")
+@test("a freestanding image reaches one static trace through a pointer, with no thread-local storage")
 ert_freestanding_has_no_tls()
     if !ert_ready() then return
 
@@ -645,6 +683,7 @@ ert_freestanding_has_no_tls()
 
     remove_dir_all(root).unwrap_or(())
     assert(!headers.contains(".tbss") && !headers.contains(".tdata"), headers)
-    assert(symbols.contains(".bss.sysl_trace\t00000084 sysl_trace"), symbols)
+    assert(symbols.contains(".bss.sysl_trace_default\t00000084 sysl_trace_default"), symbols)
+    assert(symbols.contains(".data.sysl_error_trace_current\t00000004 sysl_error_trace_current"), symbols)
     assert(symbols.contains(" w    F .text.sysl_error_trace_report"), symbols)
 end ert_freestanding_has_no_tls
