@@ -257,6 +257,41 @@ private reversed_constant(v: Val, bits: int, ty: Type) -> Val
         _ -> v
 end reversed_constant
 
+// A bitfield struct built from constants, as data: its container is one integer, so the image is
+// that integer -- each field's value cut to its width and shifted to its range -- in the struct's
+// one-member aggregate, and reversed where the struct states a byte order the machine does not have.
+// A field's constant is an integer, a simple enum's tag, or a bitfield struct's own image.
+private bitfield_constant(e: *Emit, decl: &StructType, ranges: Buf[BitRange], args: Buf[TExpr]) -> Val
+    val bits = bitfield_bits(ranges)
+    var acc = from_int(0)
+    var k: usize = 0
+
+    for i in 0..<args.len()
+        if !zero_sized(decl.fields.at(i).1)
+            val r = ranges.at(k)
+            val n = constant_bits(constant_value(e, args.at(i))) match
+                Some(found) -> found
+                None -> return gap_at(e, "a constant bitfield struct whose field is not an integer")
+
+            acc = acc | (wrap(n, r.width, false) << usize(r.offset))
+            k += 1
+        end if
+
+    val reversal = container_reversal(decl, e.target.little_endian())
+    val stored = if reversal > 0 then swapped_bytes(acc, reversal, false) else acc
+    var parts: Buf[IrArg] = buf()
+
+    parts.push(ir_arg(LInt(bits), VInt(stored)))
+    VPackedAgg(parts)
+end bitfield_constant
+
+// The integer a field's constant stands for inside a bitfield struct's container.
+private constant_bits(v: Val) -> Option[BigInt] = v match
+    VInt(n) -> Some(n)
+    VZero -> Some(from_int(0))
+    VPackedAgg(parts) -> if parts.len() == 1 then constant_bits(parts.at(0).value) else None
+    _ -> None
+
 // A `val`'s initializer as a **constant expression**.
 constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     TIntLit(v, _) -> VInt(v)
@@ -341,6 +376,11 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
         // A struct with C bitfields is its runs of bitfields as the bytes their values make, and its
         // other fields as themselves (`emit_c_bits.sysl`).
         if !decl.c_bits.is_empty() then return c_bits_constant(e, decl, args)
+
+        // A bitfield struct is the one integer its fields are ranges of.
+        val ranges = bitfield_ranges(decl)
+
+        if ranges.is_some() then return bitfield_constant(e, decl, ranges.unwrap(), args)
 
         var fields: Buf[IrArg] = buf()
 

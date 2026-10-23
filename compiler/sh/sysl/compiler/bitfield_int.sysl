@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.BigInt
 
 // A bitfield struct and the integer it is: `T::Bits(n)` makes one from that integer and `x.bits`
 // reads it back.
@@ -21,28 +22,46 @@ import sysl.buf.{Buf, buf}
 // bits came from outside; the field read is what holds it to its variants, as it is for a struct
 // reached through a pointer the hardware filled.
 
-// The unsigned integer a bitfield struct is stored as, where it is one.
-bitfield_storage(d: &StructType) -> Option[Type] = bitfield_ranges(d) match
+// **A `@packed` struct of whole-byte fields converts too** (`layout.sysl`'s `integer_ranges`), though
+// it is stored as its fields end to end: its integer is its fields read least significant first, so
+// the two directions put each field in or take it out of its range. On a little-endian machine that
+// is its bytes read as one integer; a `@byte_order` struct's fields are reversed on the way, as a
+// field read reverses them, so the integer holds the fields' values and not the wire's bytes.
+
+// The unsigned integer a `@packed` struct converts to, where it converts to one.
+bitfield_storage(d: &StructType) -> Option[Type] = integer_ranges(d) match
     Some(ranges) -> Some(Integer(bitfield_bits(ranges), false, false))
     None -> None
 
-// `T::Attr(...)` on a struct: `Bits` for a bitfield struct, and a refusal saying which kind of
-// struct has it otherwise.
+// Why a struct has no `::Bits`, naming the field that keeps it from one where that is the reason.
+private no_bits_reason(written: string, d: &StructType) -> string
+    val head = s"'$written::Bits' has no integer to make it from"
+    val rule = "only a '@packed' struct whose every field is an integer, a simple enum or a bitfield " +
+               "struct converts to one"
+
+    if d.union_layout then return s"'$written' is a union, so $head — $rule"
+    if !d.c_bits.is_empty() then return s"'$written' holds C bitfields, so $head — $rule"
+    if !d.packed then return s"'$written' is not '@packed', so $head — $rule"
+
+    unconvertible_field(d) match
+        Some(field) -> s"$head: its field '${field.0}' is ${type_show(field.1)} — $rule"
+        None -> s"'$written' has no fields, so $head — $rule"
+end no_bits_reason
+
+// `T::Attr(...)` on a struct: `Bits` for a `@packed` struct of integers, and a refusal saying why
+// otherwise.
 struct_attr(cx: &Analyzer, span: Span, written: string, d: &StructType, attr: string,
             args: Buf[Expr]) -> TExpr
     val storage = bitfield_storage(d)
 
     if storage.is_none()
-        if attr == "Bits"
-            return cx.err(span, s"'$written' is not a bitfield struct, so '$written::Bits' has no " +
-                          "integer to make it from — only a '@packed' struct with a field narrower " +
-                          "than a byte is one integer")
+        if attr == "Bits" then return cx.err(span, no_bits_reason(written, d))
 
         return cx.err(span, s"'${type_show(Struct(d))}' has no type attributes")
     end if
 
     if attr != "Bits" then
-        return cx.err(span, s"'$written' has no attribute '$attr' — a bitfield struct answers " +
+        return cx.err(span, s"'$written' has no attribute '$attr' — its one attribute is " +
                       s"'$written::Bits'")
 
     if args.len() != 1 then return cx.err(span, s"'$written::Bits' takes exactly one argument")
@@ -67,6 +86,39 @@ struct_attr(cx: &Analyzer, span: Span, written: string, d: &StructType, attr: st
 
     TExpr(span, TIntOp("bitfield_from_bits", x, None, raw_ty, Struct(d)))
 end struct_attr
+
+// The struct `T::Bits(n)` makes from a constant `n`, as the construction that writes the same fields
+// -- which is what lays it down as data (`analyze_body.sysl`'s `static_image`). `None` where an enum
+// field's bits are no variant's, which no construction can write, or a field takes no room.
+bits_literal(span: Span, d: &StructType, n: BigInt) -> Option[TExpr]
+    val ranges = integer_ranges(d)
+
+    if ranges.is_none() || ranges.unwrap().len() != d.fields.len() then return None
+
+    var args: Buf[TExpr] = buf()
+
+    for r in ranges.unwrap()
+        val slice = wrap(n >> usize(r.offset), r.width, false)
+        val field = underlying(r.ty) match
+            Integer(bits, signed, _) -> Some(TExpr(span, TIntLit(wrap(slice, bits, signed), r.ty)))
+            Enum(en) -> variant_with_bits(en, slice, r.width).map(v -> TExpr(span, TEnumNew(r.ty, v, buf())))
+            Struct(inner) -> bits_literal(span, inner, slice)
+            _ -> None
+
+        if field.is_none() then return None
+
+        args.push(field.unwrap())
+
+    Some(TExpr(span, TStructNew(d, args)))
+end bits_literal
+
+// The variant of a simple enum whose discriminant has these bits.
+private variant_with_bits(en: &EnumType, bits: BigInt, width: int) -> Option[EnumVariant]
+    for v in en.variants
+        if !v.carries && wrap(v.tag, width, false) == bits then return Some(v)
+
+    None
+end variant_with_bits
 
 // `x.bits` on a bitfield struct: the whole container, read as the integer it is. `None` where the
 // struct is not one, or declares a member of that name itself, which is then what `.bits` reaches.
