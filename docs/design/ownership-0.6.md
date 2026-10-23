@@ -1,6 +1,6 @@
 # The 0.6.0 ownership release — design
 
-**Status: proposed, for the user to decide.** Nothing here is built. Every code block marked
+**Status: decided (2026-10-23); every question below is answered.** Being built in the order of §7. Every code block marked
 *proposed* is behaviour the compiler does not have; every unmarked block is sysl as it is in 0.5.0.
 The numbers come from an inventory of dev at ab824ef2 (sysl 0.5.0): lines matching in `*.sysl`,
 over `library/`, `compiler/` (tests counted apart), and the 131 org repos.
@@ -198,8 +198,8 @@ rule 2 removes the need to annotate around raw pointers; neither touches what a 
     (today it compiles and may dangle);
   - a `Drop` type spelled by value is refused; constructing one yields a `&T`;
   - a local named like a special form is refused.
-- **Removed:** `@lends`, `@borrows`, `@crossing(copy …)` — each refused with a fix-it
-  saying the attribute is no longer needed, for one release, then unknown.
+- **Removed:** `@lends`, `@borrows`, `@crossing(copy …)` — removed outright; writing one
+  is an unknown attribute.
 - **Kept:** `@scoped`, `@crossing` at boundaries the compiler cannot see, `@disjoint` (an aliasing
   promise, not ownership), `@consumes`, `@no_alloc`, `@pinned`, `@thread_local`, `&sync`, `weak`, `slot_*`.
 - **New:** `@keeps(p)` on an `extern` only.
@@ -213,7 +213,7 @@ One agent per item, in this order, each landing on dev with its tests and refere
 1. Inferred moves for copyable types (codegen only; no semantic change; the `Some` pair is its
    regression test).
 2. The keeps-analysis: per-function summaries for `*T` parameters, the call-site rule, the boundary
-   defaults, `@keeps`. `@lends`/`@borrows` refused with fix-its.
+   defaults, `@keeps`. `@lends`/`@borrows` removed.
 3. `@crossing` inferred where visible; `@crossing(copy …)` folded into the channel.
 4. `Drop` types are reference types (Q3): construction yields `&T`, a by-value spelling is refused.
 5. The two small traps (special-form shadowing; host-side fold check).
@@ -221,14 +221,15 @@ One agent per item, in this order, each landing on dev with its tests and refere
 
 ## Questions for the user
 
-- **Q1. Narrow rule 2 to `*T`, leaving slices first-class with promotion?** **Recommend yes** (see
+- **Q1. Narrow rule 2 to `*T`, leaving slices first-class with promotion?** **Decided: yes** (see
   "What the inventory changed").
 - **Q2. The defaults at an invisible boundary** (the table in §2): trait methods, function pointers and
-  C externs default to "not kept", with `@keeps(p)` on a C binding that keeps. **Recommend as tabled.**
+  C externs default to "not kept", with `@keeps(p)` on a C binding that keeps. **Decided: as tabled.**
 - **Q3. `Drop` types: (a) reference types, or (b) single-owner values?** **Decided: (a).**
 - **Q4.** Withdrawn: it asked about (b)'s use-after-move error.
-- **Q5. Removed attributes: refuse with a fix-it for 0.6.x, then unknown in 0.7.0?** **Recommend yes.**
-- **Q6. `@scoped` and boundary `@crossing` stay as library-author attributes.** **Recommend yes**; no
+- **Q5. Removed attributes: refuse with a fix-it for 0.6.x, then unknown in 0.7.0?** **Decided: no —
+  removed outright in 0.6.0** (an ordinary unknown attribute); the org sweep deletes the few uses.
+- **Q6. `@scoped` and boundary `@crossing` stay as library-author attributes.** **Decided: yes**; no
   user code in the org writes either.
 - **Q7. `Buf`'s aliasing copy.** Today `val b2 = b` makes a second name for one buffer, and pushing
   through one leaves the other's length behind. Options: (a) leave it, documented; (b) make `Buf`
@@ -238,6 +239,6 @@ One agent per item, in this order, each landing on dev with its tests and refere
   decide then; (a) until.
 - **Q8. `Option[T]`'s zero value** (skiff's question (b)): a `var x: Option[T]` with no initializer is
   `None`. It touches value initialization rather than ownership, but it belongs to the same pass over
-  what a value is. **Recommend yes, in 0.6.0.**
-- **Q9. Fold the special-form shadowing error and the host-side fold check into 0.6.0?** **Recommend
+  what a value is. **Decided: yes, in 0.6.0.**
+- **Q9. Fold the special-form shadowing error and the host-side fold check into 0.6.0?** **Decided:
   yes**; both are small and both are silent traps.
