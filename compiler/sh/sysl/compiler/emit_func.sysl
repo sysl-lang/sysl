@@ -160,16 +160,22 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     else
         f.body.result match
             Some(r) ->
-                if e.layout.indirect(f.ret_ty) then gen_indirect_return(e, r)
+                // A last expression that handles a failure is completed here, as a statement is
+                // (`error_trace.sysl`).
+                val mark = trace_enter_tail(e, r, f.ret_ty)
+
+                if e.layout.indirect(f.ret_ty) then gen_indirect_return(e, r, mark)
                 else if !no_value(f.ret_ty)
                     val v = gen_expr(e, r)
 
+                    trace_leave(e, mark)
                     retain_value(e, f.ret_ty, v)
                     emit_ensures(e, Some(v))
                     release_all_as(e, exit_returning(e, Some(r), v, f.ret_ty))
                     emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
                 else
                     gen_expr(e, r)
+                    trace_leave(e, mark)
                     emit_ensures(e, None)
                     release_all(e)
                     emit_term(e, InRet(None, None))
@@ -235,10 +241,13 @@ private coro_result(e: *Emit, f: TFunc)
 
     f.body.result match
         Some(r) ->
-            if e.layout.indirect(result) then gen_indirect_return(e, r)
+            val mark = trace_enter_tail(e, r, result)
+
+            if e.layout.indirect(result) then gen_indirect_return(e, r, mark)
             else if !no_value(result)
                 val v = gen_expr(e, r)
 
+                trace_leave(e, mark)
                 retain_value(e, result, v)
                 emit_ensures(e, Some(v))
 
@@ -247,6 +256,7 @@ private coro_result(e: *Emit, f: TFunc)
                 e.exit = Leaving
             else
                 gen_expr(e, r)
+                trace_leave(e, mark)
                 emit_ensures(e, None)
                 coro_deliver(e, VNothing)
         None ->
@@ -309,7 +319,7 @@ end attribute_of
 // whole-aggregate load of the kind this lowering exists to avoid -- but only on a function that
 // *has* an `ensures`, and only once at each of its returns, which is a price a contract already
 // announces it is willing to pay.
-gen_indirect_return(e: *Emit, r: TExpr)
+gen_indirect_return(e: *Emit, r: TExpr, mark: Option[Val] = None)
     // A local already built inside the result is left where it is, and the rest of the result is
     // written around it (`return_slot.sysl`).
     val around = e.return_slot match
@@ -324,6 +334,8 @@ gen_indirect_return(e: *Emit, r: TExpr)
     around match
         Some(name) -> gen_around(e, dest, r, name)
         None -> gen_into(e, dest, r)
+
+    trace_leave(e, mark)
 
     if !e.ensures.is_empty()
         val v = fresh_reg(e)
