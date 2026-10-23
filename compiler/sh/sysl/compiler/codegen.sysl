@@ -572,6 +572,24 @@ private gap_text(e: *Emit) -> string = e.gap match
     Some(w) -> w
     None -> "nothing"
 
+// Whether a name is one the module declares or publishes as a C symbol: an `extern` function or
+// variable, or an `@export` of a function or of storage.
+private names_c_symbol(p: TProgram, name: string) -> bool
+    for i in 0..<p.externs.len()
+        if p.externs.at(i).symbol == name then return true
+
+    for i in 0..<p.extern_vars.len()
+        if p.extern_vars.at(i).symbol == name then return true
+
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).exported == Some(name) then return true
+
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).exported == Some(name) then return true
+
+    false
+end names_c_symbol
+
 // What a call names, where the key and the emitted symbol are two different things: an `extern` under
 // a link name of its own, a definition displaced by an export that claimed its name, and the entry
 // point, which is defined under a name of the compiler's.
@@ -587,10 +605,12 @@ private record_symbols(e: *Emit, p: TProgram)
             Some(sym) -> if sym != v.symbol then e.symbols.push((v.symbol, sym))
 
             // **A root module's storage is private and has no module to carry into its symbol**, so
-            // left alone it would be emitted under its bare name -- which is a C name, and
-            // `var clock` beside an `extern clock` is then one symbol twice. It is laid down under
-            // a `$`-led name instead, which no module's key and no C identifier can spell.
-            None -> if module_of(v.symbol) == ModuleRoot then e.symbols.push((v.symbol, "$" + v.symbol))
+            // left alone it is emitted under its bare name -- which is a C name, and `var clock`
+            // beside an `extern clock` is then one symbol twice. Where a C name of the module's own
+            // is the same word, the storage is laid down under a `$`-led name instead, which no
+            // module's key and no C identifier can spell.
+            None -> if module_of(v.symbol) == ModuleRoot && names_c_symbol(p, v.symbol)
+                        e.symbols.push((v.symbol, "$" + v.symbol))
 
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
