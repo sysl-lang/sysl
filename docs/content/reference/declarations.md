@@ -3401,9 +3401,9 @@ only a simple enum has an underlying integer type — 'Shape' carries data
 ```
 
 **A variant written `= 0` is the enum's zero value.** A `var` with no initializer, a struct field and
-an array element all start at the type's zero, and a simple enum has one exactly when the program
-wrote a variant's value as 0. A first variant numbered 0 by position does not count, and a data enum
-has none ([module storage](/reference/modules/) has the rule in full):
+an array element all start at the type's zero, and an enum has one exactly when the program wrote a
+variant's value as 0. A first variant numbered 0 by position does not count
+([module storage](/reference/modules/) has the rule in full):
 
 ```sysl
 enum Phase: u8
@@ -3421,6 +3421,49 @@ print(m.phase == Stopped, m.rpm)
 
 ```output
 true 0
+```
+
+A data enum may write `= 0` on ONE variant that carries nothing. That variant takes tag 0 and is the
+enum's zero value; the others are numbered in the order they are declared. Its zero is that tag
+beside a payload area nobody reads, so the payload's own types need no zero — `Option` declares
+`None = 0`, which makes `Option[&T]` zeroable although `&T` is not:
+
+```sysl
+enum Link
+    Down(reason: string)
+    Idle = 0
+    Up(peer: int)
+
+struct Port
+    link: Link
+    last: Option[int]
+
+var x: Option[int]
+var p: Port
+
+print(x, x.is_none())
+print(p.last.is_none(), p.link match
+    Idle -> "idle"
+    _ -> "busy")
+```
+
+```output
+None true
+true idle
+```
+
+No other variant of a data enum may have a value. A variant that carries data cannot even be
+written with one: `Up(peer: int) = 0` is a header with a body, which makes it a member.
+
+```sysl
+enum Link
+    Idle = 0
+    Busy = 1
+    Up(peer: int)
+```
+
+```error
+'Link' carries data, so its variant 'Busy' cannot have an explicit value — a data enum numbers its variants in order, and only a variant that carries nothing may be written '= 0', as its zero value
 ```
 
 `Option[T]` and `Result[T, E]` are ordinary data enums declared in the standard library, with no

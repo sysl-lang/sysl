@@ -1637,8 +1637,10 @@ static var cell: &Cell
 ```
 
 **An enum has a zero only where one of its variants is written `= 0`**, and that variant is it. A
-simple enum's value is its tag, so the variant numbered 0 is exactly what all-zero bytes hold; writing
-the `= 0` is what says that variant is the state storage is meant to start in. A struct holding such an
+simple enum's value is its tag, so the variant numbered 0 is exactly what all-zero bytes hold; a data
+enum's `= 0` variant carries nothing and takes tag 0, so all-zero bytes are that tag beside a payload
+nobody reads — which is how `Option`, declared `None = 0`, starts out `None`. Writing the `= 0` is
+what says that variant is the state storage is meant to start in. A struct holding such an
 enum, an array of them and module storage on a board all start there, and on a board that storage is
 `.bss`, which costs nothing in the image:
 
@@ -1663,8 +1665,8 @@ true true 0
 ```
 
 A variant that takes 0 only by being first is not a zero: `enum Color` with `Red` first numbers `Red`
-0, but nothing in the declaration says a fresh slot should be red, and an enum whose variants carry
-data has no number to write. Both need a value:
+0, but nothing in the declaration says a fresh slot should be red, and a data enum with no variant
+written `= 0` has none either. Both need a value:
 
 ```sysl
 enum Color

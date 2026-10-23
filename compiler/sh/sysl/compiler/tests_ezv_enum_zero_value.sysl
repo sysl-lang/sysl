@@ -6,11 +6,12 @@ import sysl.text.{Search, join, replace_all, split}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
 import sysl.process.capture
 
-// An enum's zero value (`reference/declarations.md § Enums`): a simple enum with a variant whose
-// value is WRITTEN `= 0` has a zero, and it is that variant -- in a binding with no initializer, a
-// struct's field, an array's elements, module storage on a board (`.bss`) and a `const` function's
-// evaluation. An enum with no written `= 0` -- the first variant taking 0 by position included -- or
-// one that carries data still has none.
+// An enum's zero value (`reference/declarations.md § Enums`): an enum with a variant whose value is
+// WRITTEN `= 0` has a zero, and it is that variant -- in a binding with no initializer, a struct's
+// field, an array's elements, module storage on a board (`.bss`) and a `const` function's
+// evaluation. A data enum may write `= 0` on one variant that carries nothing, which takes tag 0
+// with the rest numbered in order after it; `Option` declares `None = 0`. An enum with no written
+// `= 0` -- the first variant taking 0 by position included -- still has none.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -257,14 +258,35 @@ ezv_an_implicit_zero_beside_written_values_is_not_a_zero() = ezv_refused(
     "enum Mode: u8\n    Off\n    On = 1\nvar m: Mode\nprint(1)\n",
     "Mode has no zero value, so 'm' needs an initial value", "4:1")
 
-@test("ezv: an enum that carries data has none")
+@test("ezv: an enum that carries data and writes no '= 0' has none")
 ezv_a_data_enum_has_none() = ezv_refused("enum Shape\n    Dot\n    Circle(r: int)\nvar s: Shape\nprint(1)\n",
                                          "Shape has no zero value, so 's' needs an initial value", "4:1")
 
-@test("ezv: and cannot write '= 0' on a variant to get one")
-ezv_a_data_enum_cannot_write_a_zero() = ezv_refused("enum Shape\n    Dot = 0\n    Circle(r: int)\nprint(1)\n",
-    "'Shape' carries data, so its variant 'Dot' cannot have an explicit value — only a simple enum's " +
-    "variants are numbered", "1:1")
+// A variant that carries data cannot be written `= 0` at all: `Circle(r: int) = 0` is a header with
+// a body, which is a member (`reference/declarations.md § Enums`), so the zero stays `Dot`.
+@test("ezv: a payload header written '= 0' is a member, not a second zero")
+ezv_a_data_variant_cannot_be_the_zero() = ezv_prints(raw"""
+    enum Shape
+        Dot = 0
+        Circle(r: int) = 0
+        Square(side: int)
+
+    var s: Shape
+
+    print(s match
+        Dot -> "dot"
+        Square(_) -> "square", Shape.Circle(5))
+    """, "dot 0\n")
+
+@test("ezv: a data enum's variant cannot have any value but 0")
+ezv_a_data_enum_cannot_number_a_variant() = ezv_refused("enum Shape\n    Dot = 1\n    Circle(r: int)\nprint(1)\n",
+    "'Shape' carries data, so its variant 'Dot' cannot have an explicit value — a data enum numbers its " +
+    "variants in order, and only a variant that carries nothing may be written '= 0', as its zero value", "1:1")
+
+@test("ezv: a data enum has one zero, so two variants written '= 0' are refused")
+ezv_a_data_enum_has_one_zero() = ezv_refused(
+    "enum Shape\n    Dot = 0\n    Circle(r: int)\n    Blank = 0\nprint(1)\n",
+    "variants 'Dot' and 'Blank' are both written '= 0', and 'Shape' has one zero value", "1:1")
 
 @test("ezv: a struct holding an enum with no zero has none, nor does an array of them")
 ezv_a_struct_of_one_with_no_zero_has_none()
@@ -278,3 +300,232 @@ ezv_module_storage_of_one_is_told() = ezv_refused("enum Color\n    Red\n    Gree
     "'c' needs a value: storage with no initializer starts at its type's zero, and Color has none — the " +
     "same rule a local with no initializer is held to. A 'string' and a slice both start empty and need no " +
     "value written; a reference needs one, and so does an enum with no variant written '= 0'", "4:8")
+
+// -- a data enum's zero, and `Option`'s ---------------------------------------------------------------
+
+// As `ezv_prints`, built against the counted heap, so a zeroed value whose glue touched the payload
+// it never held -- or a reference assigned over a zero and never let go -- is a line on stderr.
+private ezv_counted_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    force_alloc_counting(true)
+
+    val out = ezv_outcome(main)
+
+    force_alloc_counting(false)
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end ezv_counted_prints
+
+@test("ezv: an Option[int] starts None as a local, a field, module storage and an array element")
+ezv_an_option_of_int_starts_none() = ezv_prints(raw"""
+    struct Port
+        last: Option[int]
+
+    static var kept: Option[int]
+    static var many: [3]Option[int]
+
+    var x: Option[int]
+    var p: Port
+    var xs: [2]Option[int]
+
+    print(x, x.is_none(), p.last.is_none(), kept.is_none(), many[2].is_none(), xs[1].is_none())
+    x = Some(1)
+    p.last = Some(2)
+    kept = Some(3)
+    many[2] = Some(4)
+    xs[1] = Some(5)
+    print(x, p.last.unwrap() + kept.unwrap() + many[2].unwrap() + xs[1].unwrap(), many[0])
+    """, "None true true true true true\nSome(1) 14 None\n")
+
+@test("ezv: an Option[&T] starts None everywhere, and the counted heap ends even")
+ezv_an_option_of_a_reference_starts_none() = ezv_counted_prints(raw"""
+    struct Node
+        label: string
+        next: Option[&Node]
+
+    struct Holder
+        node: Option[&Node]
+
+    static var kept: Option[&Node]
+    static var many: [3]Option[&Node]
+
+    var x: Option[&Node]
+    var h: Holder
+    var xs: [2]Option[&Node]
+
+    print(x.is_none(), h.node.is_none(), kept.is_none(), many[1].is_none(), xs[0].is_none())
+
+    val a: &Node = Node("a", None)
+
+    x = Some(a)
+    h.node = Some(Node("b", Some(a)))
+    kept = Some(Node("c", None))
+    many[1] = Some(Node("d", None))
+    xs[0] = x
+    print(x.unwrap().label, h.node.unwrap().next.unwrap().label, kept.unwrap().label,
+          many[1].unwrap().label, xs[0].unwrap().label)
+    kept = None
+    many[1] = None
+    """, "true true true true true\na a c d a\n")
+
+@test("ezv: an Option[string] starts None everywhere")
+ezv_an_option_of_string_starts_none() = ezv_counted_prints(raw"""
+    struct Named
+        name: Option[string]
+
+    static var kept: Option[string]
+    static var many: [2]Option[string]
+
+    var x: Option[string]
+    var n: Named
+    var xs: [2]Option[string]
+
+    print(x, n.name.is_none(), kept.is_none(), many[1].is_none(), xs[1].is_none())
+    x = Some("one")
+    n.name = Some("two")
+    kept = Some(str(3))
+    many[1] = Some("four")
+    xs[1] = Some("five")
+    print(x.unwrap(), n.name.unwrap(), kept.unwrap(), many[1].unwrap(), xs[1].unwrap())
+
+    // Module storage is never dropped at exit, so the counted heap is asked about it emptied.
+    kept = None
+    """, "None true true true true\none two 3 four five\n")
+
+@test("ezv: an Option[*T] starts None everywhere")
+ezv_an_option_of_a_pointer_starts_none() = ezv_prints(raw"""
+    struct Cursor
+        at: Option[*int]
+
+    static var kept: Option[*int]
+    static var many: [2]Option[*int]
+
+    var target = 7
+    var x: Option[*int]
+    var c: Cursor
+    var xs: [2]Option[*int]
+
+    print(x.is_none(), c.at.is_none(), kept.is_none(), many[1].is_none(), xs[0].is_none())
+    x = Some(&target)
+    c.at = x
+    kept = x
+    many[1] = x
+    xs[0] = x
+    target = 9
+    print(*x.unwrap(), *c.at.unwrap(), *kept.unwrap(), *many[1].unwrap(), *xs[0].unwrap())
+    """, "true true true true true\n9 9 9 9 9\n")
+
+@test("ezv: a data enum's zero need not be first, and the rest are numbered in order after it")
+ezv_a_data_enum_zero_anywhere() = ezv_counted_prints(raw"""
+    enum Link
+        Down(reason: string)
+        Idle = 0
+        Up(peer: int)
+
+    struct Port
+        link: Link
+
+    describe(l: Link) -> string = l match
+        Down(r) -> "down " + r
+        Idle -> "idle"
+        Up(p) -> s"up $p"
+
+    static var kept: Link
+    var p: Port
+    var ls: [3]Link
+    var l: Link
+
+    print(describe(l), describe(p.link), describe(kept), describe(ls[2]))
+    l = Down("cut")
+    p.link = Up(4)
+    kept = Down(str(5))
+    ls[2] = Up(6)
+    print(describe(l), describe(p.link), describe(kept), describe(ls[2]), describe(Idle))
+
+    // Module storage is never dropped at exit, so the counted heap is asked about it emptied.
+    kept = Idle
+    """, "idle idle idle idle\ndown cut up 4 down 5 up 6 idle\n")
+
+@test("ezv: a zeroed Option under @no_alloc allocates nothing")
+ezv_a_zero_option_under_no_alloc() = ezv_prints(raw"""
+    @no_alloc
+
+    pick(n: int) -> int
+        var x: Option[int]
+        var xs: [4]Option[int]
+
+        if n > 0 then x = Some(n)
+
+        xs[1] = x
+
+        xs[1] match
+            Some(v) -> v
+            None -> -1
+
+    print(pick(3), pick(0))
+    """, "3 -1\n")
+
+@test("ezv: a 'const' function's evaluation gives Option's zero, None")
+ezv_a_const_function_gives_none() = ezv_prints(raw"""
+    struct Slot
+        held: Option[int]
+        n: int
+
+    const fresh() -> Slot
+        var s: Slot
+        s
+
+    const blank() -> Option[int]
+        var x: Option[int]
+        x
+
+    val k = fresh()
+    val b = blank()
+
+    print(k.held.is_none(), k.n, b)
+    """, "true 0 None\n")
+
+// On a board, module storage of an `Option` with no initializer folds to its zero: `.bss`.
+@test("ezv: on a thumb board, module storage of an Option[int] folds into .bss")
+ezv_board_option_lands_in_bss()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = ezv_root(raw"""
+        var slot: Option[int]
+
+        @export("poll")
+        poll(n: int) -> int
+            val was = slot match
+                Some(v) -> v
+                None -> -1
+
+            slot = Some(n)
+            was
+        """)
+    val target = "thumb-freestanding-softfp"
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+    val tool = "/opt/homebrew/bin/arm-none-eabi-objdump"
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+    assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-objdump")
+
+    val table = capture(tool, ["-t", s"$root/app.a"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+
+    var placed = false
+
+    for line in split(table, "\n")
+        if line.contains("slot") && line.contains(".bss") then placed = true
+
+    assert(placed, table)
+end ezv_board_option_lands_in_bss

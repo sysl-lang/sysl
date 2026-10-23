@@ -39,8 +39,8 @@ Both are **ordinary generic enums declared in the standard library**, with no co
 
 ```
 enum Option[T]                 enum Result[T, E]
-    Some(value: T)                 Ok(value: T)
-    None                           Err(error: E)
+    None = 0                       Ok(value: T)
+    Some(value: T)                 Err(error: E)
 ```
 
 - **`Option[T]` represents absence**: a value that may or may not be there, with no reason attached,
