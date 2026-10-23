@@ -525,8 +525,83 @@ and counts the rest:
 ```
 
 A task records into the trace of the thread running it, and an `await t?` that fails is a hop at the
-`await`. On a freestanding target there is one trace for the program, with no thread-local storage
-under it.
+`await`. On a freestanding target there is no thread-local storage under it: the trace is reached
+through a pointer, `sysl_error_trace_current`, which starts at one static store laid down in the
+image, so a program with one flow of control has one trace and nothing to set up.
+
+### A trace per task
+
+A kernel that switches tasks gives each one a trace of its own, so two tasks failing in turn never
+read each other's sites. **`ErrorTraceStore` is a trace's storage**, with its size known while
+compiling, so it sits in a task's control block like any other field; **`use_error_trace(s)` makes
+`s` the trace every failure records into and every report reads**, and answers the one that was
+current. A kernel calls it on each context switch, handing in the incoming task's store:
+
+```sysl
+import sysl.debug.{print_error_trace, use_error_trace, ErrorTraceStore}
+
+struct Task
+    name: string
+    trace: ErrorTraceStore
+
+open(n: int) -> Result[int, string] = Err(s"no file $n")
+
+load(n: int) -> Result[int, string]
+    val v = open(n)?
+    Ok(v)
+
+var a = Task("a", ErrorTraceStore.new())
+var b = Task("b", ErrorTraceStore.new())
+
+val own = use_error_trace(&a.trace)
+
+load(1) match
+    Ok(_) -> ()
+    Err(_) ->
+        use_error_trace(&b.trace)
+
+        open(2) match
+            Ok(_) -> ()
+            Err(_) ->
+                print(b.name)
+                print_error_trace(stdout())
+
+        use_error_trace(&a.trace)
+        print(a.name)
+        print_error_trace(stdout())
+
+use_error_trace(own)
+```
+
+```output
+b
+error return trace (origin first):
+  main.sysl:7:39 in open
+a
+error return trace (origin first):
+  main.sysl:7:39 in open
+  main.sysl:10:20 in load
+```
+
+Task `a` is switched out with its failure in hand, `b` fails and reports only its own site, and `a`
+reports its whole chain when it is switched back in.
+
+- **`null` names the program's own trace** — the thread's own on a hosted target — and is what a
+  kernel hands back when it returns to code that runs on no task. What `use_error_trace` answers is
+  never `null`.
+- **`ErrorTraceStore.new()` is an empty store** and `init()` empties one in place, which is done
+  before a store is made current, never to the current one. What a store holds is read only through
+  `sysl.debug` while it is current.
+- **On a freestanding target the switch is one store of a pointer**, and recording or pruning pays
+  one load more than a plain object would. A kernel's switch code written in assembly may write
+  `sysl_error_trace_current` itself. On a hosted target the trace stays the thread's own object, so
+  recording pays nothing for the switch: `use_error_trace` copies the live trace out to the store
+  that was current and the new one in.
+- **An interrupt handler records into whatever trace is current** when it fires, and a failure it
+  handles leaves that trace as it found it. One that wants its failures kept apart makes a store of
+  its own current on entry and puts the previous one back on the way out.
+- With [traces off](#switching-it-off) none of this exists: `use_error_trace` does nothing and
+  answers `null`, and no symbol of the trace is linked.
 
 ### `unwrap` and `expect` show the error, then the trace
 
@@ -563,6 +638,7 @@ returns an `Err` reports the same way.
 | `ErrorTrace.at(i) -> ErrorSite`, `for site in trace` | a site: `file`, `line`, `col` and `function`, origin first |
 | `print_error_trace(w: *Writer)` | writes it to `w` in the form `main` prints it in |
 | `clear_error_trace()` | empties it — what a loop that logs each failure it handles does before the next |
+| `ErrorTraceStore`, `use_error_trace(s) -> *ErrorTraceStore` | a trace's storage, and making one current — [a trace per task](#a-trace-per-task) |
 
 On a freestanding target the reports print nothing: they call `sysl_error_trace_report`, a weak
 function, which a program replaces with its own under the same symbol
