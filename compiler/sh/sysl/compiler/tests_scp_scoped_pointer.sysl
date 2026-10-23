@@ -405,3 +405,43 @@ scp_build_lib()
     assert_eq(ok, "checked")
     assert(refused.index_of("block' says '@scoped(p)', a promise to let go of 'p'").is_some(), refused)
 end scp_build_lib
+
+// A program depending on the library by path, its main file `text`: what building it said.
+private scp_app_said(lib: string, text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-scp-app").unwrap())
+
+    write_text(s"$root/sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\n" +
+               s"dependencies { kern { path = \"$lib\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end scp_app_said
+
+@test("a program hands a dependency's scoped primitive its local, and is refused handing it to the keeper")
+scp_across_a_dependency()
+    if xvr_no_library() then return
+
+    val lib = scp_lib(raw"""
+        var spare = 0
+        var waiter: *int = &spare
+
+        @scoped(p)
+        block(p: *int)
+            waiter = p
+
+        keeper(p: *int)
+            waiter = p
+        """)
+    val ok = scp_app_said(lib, "run() -> int\n    var n = 1\n    kern.block(&n)\n    n\n\nprint(run())\n")
+    val refused = scp_app_said(lib, "run() -> int\n    var n = 1\n    kern.keeper(&n)\n    n\n\nprint(run())\n")
+
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(ok, "built")
+    assert(refused.index_of("'keeper' keeps its parameter 'p' (it is stored in 'waiter'), and '&n' is " +
+                            "the address of a local of 'run'").is_some(), refused)
+end scp_across_a_dependency

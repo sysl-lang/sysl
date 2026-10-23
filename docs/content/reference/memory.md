@@ -4039,7 +4039,7 @@ Some pointers are held past the call and let go of somewhere the compiler cannot
 join, the `deliver` that ends an `await`, a kernel's `wake`. The caller is suspended or still inside
 its scope the whole time, so handing such a primitive the address of a local is safe — but the body
 stores it, and the rule above would refuse it. **The primitive that gives the guarantee declares it
-once, with [`@scoped(p)`](/reference/attributes/#scopedp-on-a-pointer-held-only-while-the-caller-waits)
+once, with [`@scoped(p)`](/reference/attributes/#scoped-p-on-a-pointer-held-only-while-the-caller-waits)
 on the pointer parameter**, and the compiler trusts it: a call of it keeps nothing it is handed at
 `p`, so code calling `block(&local)` or `await read(&buf)` carries no annotation at all. The promise
 is the primitive's own — handing `p` on to a callee that keeps it is refused unless that callee says

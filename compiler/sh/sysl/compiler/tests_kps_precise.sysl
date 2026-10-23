@@ -1373,3 +1373,66 @@ kps_library_artifact()
                 assert(failure_text(why).contains("'set_sink' keeps its parameter 's' (it is stored in " +
                                                   "'current'), and '&sink'"), failure_text(why))
 end kps_library_artifact
+
+// -- a type parameter bound to a trait object ------------------------------------------------------
+
+// `f[P: Port](p: *P)` called with a `*Port` binds `P` to the trait, so `p` is the object pointer the
+// caller made of its local; a body that stores it keeps it exactly as a concrete one would.
+private kpp_port() -> string = raw"""
+    trait Port
+        mask(self) -> u32
+
+    struct Board
+        level: u32
+
+    impl Port for Board
+        mask(self) -> u32 = self.level
+
+    struct Shelf
+        held: *Port
+
+    static var spare = Board(0)
+    static var held: *Port = &spare
+    static var shelf = Shelf(&spare)
+
+    """
+
+@test("a generic storing its *P keeps it when P is bound to a trait object, in a global or a field")
+kps_object_bound_generic_keeps()
+    kpp_refused(kpp_port() + raw"""
+        keep_it[P: Port](p: *P)
+            held = p
+
+        run()
+            var b = Board(5)
+            val o: *Port = &b
+            keep_it(o)
+
+        run()
+        """, "'keep_it' keeps its parameter 'p' (it is stored in 'held'), and 'o' holds the address " +
+             "of a local of 'run'")
+    kpp_refused(kpp_port() + raw"""
+        shelve[P: Port](p: *P)
+            shelf.held = p
+
+        run()
+            var b = Board(5)
+            val o: *Port = &b
+            shelve(o)
+
+        run()
+        """, "'shelve' keeps its parameter 'p' (it is stored in 'shelf.held'), and 'o' holds the " +
+             "address of a local of 'run'")
+
+@test("a generic that only reads its *P through the object is handed a local's")
+kps_object_bound_generic_reads()
+    kpp_accepted(kpp_port() + raw"""
+        look[P: Port](p: *P) -> u32 = p.mask()
+
+        run()
+            var b = Board(5)
+            val o: *Port = &b
+            print(look(o))
+
+        run()
+        """)
