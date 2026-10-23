@@ -19,7 +19,7 @@ that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
-[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const string](#join-for-const-string) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string)
+[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string)
 
 ## Functions
 
@@ -857,13 +857,13 @@ trait Join
     join(self, sep: string) -> string
 ```
 
-Pieces of text that can be laid end to end -- `join` as a member, Scala's `mkString`:
-`split(s, ",").join(", ")`. It is a view's: an array or a `Buf` of strings joins through its view,
-`parts[..].join(", ")` or `pieces.view().join(", ")`.
+Anything that can be laid end to end -- `join` as a member, Scala's `mkString`:
+`split(s, ",").join(", ")`, `[1, 2, 3].join(", ")`, `names.join(", ")` on a `Buf`. Every element
+renders through its `Display`.
 
 | Member | Signature | Description |
 |---|---|---|
-| `join` | `join(self, sep: string) -> string` | The pieces with `sep` between each pair, exactly as `join(parts, sep)` lays them: no pieces at all is `""`, and one piece is that piece. |
+| `join` | `join(self, sep: string) -> string` | The elements with `sep` between each pair, exactly as `join(parts, sep)` lays strings: no elements at all is `""`, and one element is that element's rendering. |
 
 ### `Search`
 
@@ -1002,10 +1002,22 @@ impl Iterate for CharIndices
 impl Iterate for Chars
 ```
 
-### Join for []const string
+### Join for []const T
 
 ```sysl
-impl Join for []const string
+impl[T: Display] Join for []const T
+```
+
+### Join for [N]T
+
+```sysl
+impl[const N: usize, T: Display] Join for [N]T
+```
+
+### Join for Buf[T]
+
+```sysl
+impl[T: Display] Join for Buf[T]
 ```
 
 ### Search for []const u8

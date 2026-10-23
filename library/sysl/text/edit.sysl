@@ -1,6 +1,6 @@
 module sysl.text
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, ByteSink, buf}
 import sysl.unicode.{to_upper as unicode_upper, to_lower as unicode_lower, fold}
 
 // The operations that make new text -- the half `find.sysl` does not hold.
@@ -104,18 +104,42 @@ join(parts: []const string, sep: string) -> string
     b.finish()
 end join
 
-/** Pieces of text that can be laid end to end -- `join` as a member, Scala's `mkString`:
- * `split(s, ",").join(", ")`. It is a view's: an array or a `Buf` of strings joins through its view,
- * `parts[..].join(", ")` or `pieces.view().join(", ")`.
+/** Every element rendered through its `Display` into one growable buffer, with `sep` between each
+ * pair. A string element is copied in as it stands, and nothing is rendered to a `string` first.
+ */
+private join_display[T: Display](xs: []const T, sep: string) -> string
+    if xs.len == 0 then return ""
+
+    var b = str_builder()
+    var sink = ByteSink(b.bytes)
+    var first = true
+
+    for x in xs
+        if !first then b.push(sep)
+        x.display(&sink, FormatSpec(0, -1, false))
+        first = false
+
+    b.finish()
+end join_display
+
+/** Anything that can be laid end to end -- `join` as a member, Scala's `mkString`:
+ * `split(s, ",").join(", ")`, `[1, 2, 3].join(", ")`, `names.join(", ")` on a `Buf`. Every element
+ * renders through its `Display`.
  */
 trait Join
-    /** The pieces with `sep` between each pair, exactly as `join(parts, sep)` lays them: no pieces
-     * at all is `""`, and one piece is that piece.
+    /** The elements with `sep` between each pair, exactly as `join(parts, sep)` lays strings: no
+     * elements at all is `""`, and one element is that element's rendering.
      */
     join(self, sep: string) -> string
 
-impl Join for []const string
-    join(self, sep: string) -> string = join(self, sep)
+impl[T: Display] Join for []const T
+    join(self, sep: string) -> string = join_display(self, sep)
+
+impl[T: Display] Join for Buf[T]
+    join(self, sep: string) -> string = join_display(self.view(), sep)
+
+impl[const N: usize, T: Display] Join for [N]T
+    join(self, sep: string) -> string = join_display(self[..], sep)
 
 /** The text repeated `n` times, and nothing when `n` is zero. */
 repeat(s: string, n: usize) -> string
