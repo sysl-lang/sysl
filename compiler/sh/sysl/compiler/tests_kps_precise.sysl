@@ -1,0 +1,1375 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// The keeps-analysis made precise (`keeps.sysl`, `keeps_flow.sysl`): a store undone on every way out
+// is not kept; only a value that can hold an address is made of one; a stored callback keeps what it
+// captured and nothing else; a pointer stored into what it points at, or into an out-parameter that
+// points into the caller's frame, does not leave the frame. Every case comes in pairs -- the shape
+// that is accepted and the nearest one that is still a dangling pointer, refused in the words the
+// reader sees.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What building the program says: nothing where it built, the refusal where it did not. A whole build,
+// since the library has to be there for what a case imports.
+private kpp_said(text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", text))
+
+    val root = im_write(fs)
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(root + "/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Ok(_) -> ""
+        Err(why) -> failure_text(why)
+end kpp_said
+
+private kpp_accepted(text: string)
+    if xvr_no_library() then return
+
+    val said = kpp_said(text)
+
+    assert_eq(said, "")
+end kpp_accepted
+
+private kpp_refused(text: string, want: string)
+    if xvr_no_library() then return
+
+    val said = kpp_said(text)
+
+    assert(said.contains(want), said)
+end kpp_refused
+
+// Module storage to keep a pointer in, a function that keeps what it is handed there, and one that
+// overwrites it.
+private kpp_held() -> string = raw"""
+    static var spare = 0
+    static var held: *int = &spare
+
+    store(p: *int)
+        held = p
+
+    clear()
+        held = &spare
+
+    """
+
+private kpp_store_refused() -> string =
+    "'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'"
+
+// -- (a) a store undone before every way out is not kept -------------------------------------------
+
+@test("a store overwritten inline before the function returns is not kept")
+kps_cleared_inline()
+    kpp_accepted(kpp_held() + raw"""
+        run()
+            var n = 1
+            store(&n)
+            print(*held)
+            held = &spare
+
+        run()
+        """)
+
+@test("a store overwritten by a 'defer' is not kept")
+kps_cleared_by_defer()
+    kpp_accepted(kpp_held() + raw"""
+        run()
+            var n = 1
+            defer held = &spare
+            store(&n)
+            print(*held)
+
+        run()
+        """)
+
+@test("a store overwritten by a callee that overwrites it on every way out is not kept")
+kps_cleared_by_callee()
+    kpp_accepted(kpp_held() + raw"""
+        run()
+            var n = 1
+            store(&n)
+            print(*held)
+            clear()
+
+        run()
+        """)
+
+@test("a store overwritten by a callee two calls down is not kept")
+kps_cleared_two_down()
+    kpp_accepted(kpp_held() + raw"""
+        reset_all()
+            clear()
+
+        run()
+            var n = 1
+            store(&n)
+            reset_all()
+
+        run()
+        """)
+
+@test("a recursive callee that overwrites it on every way out clears it, worked to a fixed point")
+kps_cleared_by_recursion()
+    kpp_accepted(kpp_held() + raw"""
+        clear_after(k: int)
+            if k == 0 then held = &spare else clear_after(k - 1)
+
+        run()
+            var n = 1
+            store(&n)
+            clear_after(3)
+
+        run()
+        """)
+
+@test("a store and its clear on every turn of a loop is not kept")
+kps_cleared_in_a_loop()
+    kpp_accepted(kpp_held() + raw"""
+        run()
+            var n = 1
+            for i in 0..<3
+                store(&n)
+                print(*held + i)
+                held = &spare
+
+        run()
+        """)
+
+@test("a clear in both arms of an 'if' is a clear")
+kps_cleared_in_both_arms()
+    kpp_accepted(kpp_held() + raw"""
+        run(c: bool)
+            var n = 1
+            store(&n)
+            if c
+                clear()
+            else
+                held = &spare
+
+        run(true)
+        """)
+
+@test("a clear in every arm of a 'match' is a clear")
+kps_cleared_in_every_arm()
+    kpp_accepted(kpp_held() + raw"""
+        run(k: int)
+            var n = 1
+            store(&n)
+            k match
+                0 -> clear()
+                1 -> held = &spare
+                _ -> clear()
+
+        run(1)
+        """)
+
+@test("a field of '*self' overwritten through the same receiver is not kept")
+kps_cleared_on_self()
+    kpp_accepted(raw"""
+        static var spare = 0
+
+        struct Registry
+            last: *int
+
+            remember(*self, p: *int)
+                self.last = p
+
+            forget(*self)
+                self.last = &spare
+
+        run(r: *Registry)
+            var n = 5
+            r.remember(&n)
+            r.forget()
+
+        var r = Registry(&spare)
+        run(&r)
+        """)
+
+@test("a callee that stores and clears before it returns does not keep")
+kps_cleared_inside_the_callee()
+    kpp_accepted(kpp_held() + raw"""
+        use_for_a_while(p: *int)
+            held = p
+            print(*held)
+            held = &spare
+
+        run()
+            var n = 1
+            use_for_a_while(&n)
+
+        run()
+        """)
+
+@test("a stored closure overwritten before the function returns is not kept")
+kps_closure_cleared()
+    kpp_accepted(raw"""
+        static var later: &Fn() -> int = () -> 0
+
+        install(f: &Fn() -> int)
+            later = f
+
+        run()
+            var n = 1
+            val p = &n
+            install(() -> *p)
+            print(later())
+            later = () -> 0
+
+        run()
+        """)
+
+@test("an element stored at a constant or a parameter's index is cleared at the same one, and not at another")
+kps_cleared_at_the_same_index()
+    val slots = raw"""
+        static var spare = 0
+        static var slots: [4]*int = [&spare; 4]
+
+        claim(drive: u8, p: *int)
+            slots[usize(drive)] = p
+
+        release(drive: u8)
+            slots[usize(drive)] = &spare
+
+        """
+
+    kpp_accepted(slots + raw"""
+        run()
+            var n = 1
+            claim(2, &n)
+            print(*slots[2])
+            release(2)
+
+        run()
+        """)
+    kpp_refused(slots + raw"""
+        run()
+            var n = 1
+            claim(2, &n)
+            release(3)
+
+        run()
+        """, "'claim' keeps its parameter 'p' (it is stored in 'slots[…]'), and '&n' is the address of a " +
+             "local of 'run'")
+
+@test("a clear guarded by the index being inside the array is a clear; a guard narrower than the array is not")
+kps_cleared_inside_the_bounds()
+    val slots = raw"""
+        static var spare = 0
+        static var slots: [4]*int = [&spare; 4]
+
+        claim(drive: u8, p: *int)
+            slots[usize(drive)] = p
+
+        """
+
+    kpp_accepted(slots + raw"""
+        release(drive: u8)
+            if usize(drive) < 4 then slots[usize(drive)] = &spare
+
+        run()
+            var n = 1
+            claim(0, &n)
+            release(0)
+
+        run()
+        """)
+    kpp_refused(slots + raw"""
+        release(drive: u8)
+            if usize(drive) < 2 then slots[usize(drive)] = &spare
+
+        run()
+            var n = 1
+            claim(3, &n)
+            release(3)
+
+        run()
+        """, "'claim' keeps its parameter 'p' (it is stored in 'slots[…]'), and '&n' is the address of a " +
+             "local of 'run'")
+
+@test("an element of a slice held in what a parameter points at is not inside that parameter's storage")
+kps_slice_element_is_elsewhere()
+    kpp_accepted(raw"""
+        struct Arena
+            block: []u8
+            used: usize
+
+        static var arena_store: [16]u8 = [0; 16]
+
+        bump(ctx: *u8, out_ptr: **u8) -> int
+            var arena: *Arena = ptr_cast(ctx)
+            *out_ptr = &(*arena).block[(*arena).used]
+            0
+
+        run()
+            var a = Arena(arena_store[..], 0)
+            var out: *u8 = null
+            val f = &bump
+            print(f(ptr_cast(&a), &out))
+
+        run()
+        """)
+
+@test("an early 'return' past the clear keeps it")
+kps_clear_skipped_by_return()
+    kpp_refused(kpp_held() + raw"""
+        run(c: bool)
+            var n = 1
+            store(&n)
+            if c then return
+            clear()
+
+        run(true)
+        """, kpp_store_refused())
+
+@test("a '?' before the clear keeps it")
+kps_clear_skipped_by_try()
+    kpp_refused(kpp_held() + raw"""
+        fails(c: bool) -> Result[int, int] = if c then Err(1) else Ok(2)
+
+        run(c: bool) -> Result[int, int]
+            var n = 1
+            store(&n)
+            val k = fails(c)?
+            clear()
+            Ok(k)
+
+        print(run(true).is_ok())
+        """, kpp_store_refused())
+
+@test("a 'break' out of the loop past the clear keeps it")
+kps_clear_skipped_by_break()
+    kpp_refused(kpp_held() + raw"""
+        run(c: bool)
+            var n = 1
+            for i in 0..<3
+                store(&n)
+                if c then break
+                clear()
+
+        run(true)
+        """, kpp_store_refused())
+
+@test("a 'continue' past the clear keeps it")
+kps_clear_skipped_by_continue()
+    kpp_refused(kpp_held() + raw"""
+        run(c: bool)
+            var n = 1
+            for i in 0..<3
+                store(&n)
+                if c then continue
+                held = &spare
+
+        run(true)
+        """, kpp_store_refused())
+
+@test("a nested function that keeps is held to it, and its keep may be cleared like any other")
+kps_nested_function()
+    kpp_refused(raw"""
+        static var spare = 0
+        static var held: *int = &spare
+
+        run()
+            var n = 1
+
+            keep_it(p: *int)
+                held = p
+
+            keep_it(&n)
+
+        run()
+        """, "'keep_it' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a " +
+             "local of 'run'")
+    kpp_accepted(raw"""
+        static var spare = 0
+        static var held: *int = &spare
+
+        run()
+            var n = 1
+
+            keep_it(p: *int)
+                held = p
+
+            keep_it(&n)
+            held = &spare
+
+        run()
+        """)
+
+@test("a 'panic' before the clear keeps it")
+kps_clear_skipped_by_panic()
+    kpp_refused(kpp_held() + raw"""
+        run(c: bool)
+            var n = 1
+            store(&n)
+            if c then panic("no")
+            clear()
+
+        run(false)
+        """, kpp_store_refused())
+
+@test("one 'match' arm without the clear keeps it")
+kps_clear_missing_from_an_arm()
+    kpp_refused(kpp_held() + raw"""
+        run(k: int)
+            var n = 1
+            store(&n)
+            k match
+                0 -> clear()
+                1 -> print(k)
+                _ -> clear()
+
+        run(1)
+        """, kpp_store_refused())
+
+@test("overwriting a different global is no clear")
+kps_clear_of_another_global()
+    kpp_refused(kpp_held() + raw"""
+        static var other: *int = &spare
+
+        run()
+            var n = 1
+            store(&n)
+            other = &spare
+
+        run()
+        """, kpp_store_refused())
+
+@test("overwriting the field on another instance is no clear")
+kps_clear_on_another_instance()
+    kpp_refused(raw"""
+        static var spare = 0
+
+        struct Registry
+            last: *int
+
+            remember(*self, p: *int)
+                self.last = p
+
+            forget(*self)
+                self.last = &spare
+
+        run(r: *Registry, s: *Registry)
+            var n = 5
+            r.remember(&n)
+            s.forget()
+
+        var r = Registry(&spare)
+        var s = Registry(&spare)
+        run(&r, &s)
+        """, "'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the " +
+             "address of a local of 'run'")
+
+@test("overwriting another field of the same receiver is no clear")
+kps_clear_of_another_field()
+    kpp_refused(raw"""
+        static var spare = 0
+
+        struct Registry
+            last: *int
+            first: *int
+
+            remember(*self, p: *int)
+                self.last = p
+
+            forget_first(*self)
+                self.first = &spare
+
+        run(r: *Registry)
+            var n = 5
+            r.remember(&n)
+            r.forget_first()
+
+        var r = Registry(&spare, &spare)
+        run(&r)
+        """, "'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the " +
+             "address of a local of 'run'")
+
+@test("a clear written in another function that is never called before the return is no clear")
+kps_clear_never_called()
+    kpp_refused(raw"""
+        static var spare = 0
+        static var held: *int = &spare
+
+        setup(p: *int)
+            held = p
+
+        teardown()
+            held = &spare
+
+        run()
+            var n = 1
+            setup(&n)
+
+        run()
+        teardown()
+        """, "'setup' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a " +
+             "local of 'run'")
+
+// -- (b) only a value that can hold an address is made of one ----------------------------------------
+
+// A function answering `ty` made from what `p` points at by `body`, and a caller handing it `&n` and
+// answering what it got back.
+private kpp_answer(decls: string, ty: string, body: string) -> string =
+    decls + s"f(p: *int) -> $ty = $body\n\nrun() -> $ty\n    var n = 1\n    val r = f(&n)\n    r\n\n" +
+    "val kept = run()\n"
+
+private kpp_answer_refused() -> string =
+    "'r' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns"
+
+@test("an int, a bool or a float answered from '&local' is not made of it")
+kps_scalar_answers()
+    kpp_accepted(kpp_answer("", "int", "*p"))
+    kpp_accepted(kpp_answer("", "bool", "*p > 0"))
+    kpp_accepted(kpp_answer("", "real", "real(*p)"))
+
+@test("a bare enum, and a struct with no pointer in it, are not made of it")
+kps_pointerless_aggregates()
+    kpp_accepted(kpp_answer("enum Color\n    Red\n    Green\n\n", "Color",
+                            "if *p > 0 then Color.Red else Color.Green"))
+    kpp_accepted(kpp_answer("struct Pair\n    a: int\n    b: int\n\n", "Pair", "Pair(*p, 2)"))
+
+@test("'Result[int, E]' and a string are not made of it")
+kps_result_int_and_string()
+    kpp_accepted(kpp_answer("", "Result[int, int]", "Ok(*p)"))
+    kpp_accepted(kpp_answer("", "string", "str(*p)"))
+
+@test("an enum with a '*T' payload, and a struct holding one, are made of it")
+kps_pointer_aggregates_refused()
+    kpp_refused(kpp_answer("enum Held\n    Has(p: *int)\n    Empty\n\n", "Held", "Has(p)"),
+                kpp_answer_refused())
+    kpp_refused(kpp_answer("struct Holder\n    p: *int\n\n", "Holder", "Holder(p)"), kpp_answer_refused())
+
+@test("'Option[*T]', 'Result[*T, E]' and a tuple holding a '*T' are made of it")
+kps_pointer_wrappers_refused()
+    kpp_refused(kpp_answer("", "Option[*int]", "Some(p)"), kpp_answer_refused())
+    kpp_refused(kpp_answer("", "Result[*int, int]", "Ok(p)"), kpp_answer_refused())
+    kpp_refused(kpp_answer("", "(int, *int)", "(*p, p)"), kpp_answer_refused())
+
+// **The raw tier**: an address turned into an integer and back is not followed by what an answer is
+// made of -- the integer carries nothing. It is the one hole this rule leaves open, on purpose, and
+// writing it takes a `ptr_cast`.
+@test("a 'usize(p)' round trip is the raw tier: the answer is not made of the argument")
+kps_integer_round_trip_is_raw()
+    kpp_accepted(kpp_answer("", "*int", "ptr_cast(usize(p))"))
+
+@test("an extern's int and float answers are not made of the out-parameters it filled")
+kps_extern_scalar_answers()
+    kpp_accepted(raw"""
+        extern strlen(s: *u8) -> usize
+        extern frexp(x: f64, exp: *i32) -> f64
+
+        run() -> usize
+            var b: [4]u8 = [104, 105, 0, 0]
+            val r = strlen(&b[0])
+            r
+
+        twice() -> f64
+            var e: i32 = 0
+            val r = frexp(8.0, &e)
+            r
+
+        print(run())
+        print(twice())
+        """)
+
+@test("an int result after an extern filled '&local' is not made of it")
+kps_extern_filled_then_ok()
+    kpp_accepted(raw"""
+        extern kpp_fill(out: *int) -> i32
+
+        @export("kpp_fill")
+        fill_impl(out: *int) -> i32
+            *out = 4
+            0
+
+        run() -> Result[int, i32]
+            var n = 0
+            val rc = kpp_fill(&n)
+            if rc != 0 then return Err(rc)
+            Ok(n)
+
+        val r = run()
+        """)
+
+@test("an extern's handle is not made of an out-parameter of another type")
+kps_extern_handle_from_out_params()
+    kpp_accepted(raw"""
+        struct Handle
+            id: long
+
+        extern kpp_open(code: *i32, at: *usize) -> *Handle
+
+        @export("kpp_open")
+        open_impl(code: *i32, at: *usize) -> *Handle = null
+
+        struct Wrapped
+            h: *Handle
+
+        run() -> Option[Wrapped]
+            var code: i32 = 0
+            var at: usize = 0
+            val h = kpp_open(&code, &at)
+            if h == null then return None
+            Some(Wrapped(h))
+
+        val r = run()
+        """)
+
+@test("an extern's byte answer is not made of an int or a struct out-parameter, nor its handle of a byte context")
+kps_extern_bytes_from_other_types()
+    kpp_accepted(raw"""
+        struct Surface
+            width: int
+
+        struct Budget
+            steps: int
+            hit: u8
+
+        extern kpp_compile(len: *i32, budget: *Budget) -> *u8
+        extern kpp_surface(context: *u8) -> *Surface
+
+        @export("kpp_compile")
+        compile_impl(len: *i32, budget: *Budget) -> *u8 = null
+
+        @export("kpp_surface")
+        surface_impl(context: *u8) -> *Surface = null
+
+        struct Compiled
+            code: *u8
+            s: *Surface
+
+        run() -> Compiled
+            var len: i32 = 0
+            var b = Budget(1, 0)
+            var ctx: [4]u8 = [0, 0, 0, 0]
+            val code = kpp_compile(&len, &b)
+            val s = kpp_surface(&ctx[0])
+            Compiled(code, s)
+
+        val r = run()
+        """)
+
+@test("an extern's pointer answer may be made of a byte pointer or one of its own type")
+kps_extern_pointer_answers_refused()
+    kpp_refused(raw"""
+        extern strchr(s: *u8, c: i32) -> *u8
+
+        run() -> *u8
+            var b: [4]u8 = [104, 105, 0, 0]
+            val r = strchr(&b[0], 105)
+            r
+
+        val r = run()
+        """, "'r' is returned, but it holds the address of a field of 'b', a local of 'run'")
+    kpp_refused(raw"""
+        extern kpp_next(p: *int) -> *int
+
+        @export("kpp_next")
+        next_impl(p: *int) -> *int = p
+
+        run() -> *int
+            var n = 1
+            val r = kpp_next(&n)
+            r
+
+        val r = run()
+        """, kpp_answer_refused())
+
+// -- (c) a stored callback keeps what it captured, and nothing else -----------------------------------
+
+// A callback in module storage, a field, a buffer and a trait's method, and the types a closure may
+// capture.
+private kpp_callbacks() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    static var later: &Fn() -> int = () -> 0
+    static var fns: Buf[&Fn() -> int] = buf()
+
+    install(f: &Fn() -> int)
+        later = f
+
+    add(f: &Fn() -> int)
+        fns.push(f)
+
+    struct Slot
+        f: &Fn() -> int
+
+        set(*self, f: &Fn() -> int)
+            self.f = f
+
+    trait Registers
+        register(*self, f: &Fn() -> int)
+
+    struct Board
+        f: &Fn() -> int
+
+    impl Registers for Board
+        register(*self, f: &Fn() -> int)
+            self.f = f
+
+    static var slot = Slot(() -> 0)
+    static var board = Board(() -> 0)
+
+    struct Counter
+        n: int
+
+    struct Pair
+        a: int
+        b: int
+
+    """
+
+private kpp_callback_refused(keeper: string, param: string, how: string, closure: string) -> string =
+    s"'$keeper' keeps its parameter '$param' ($how), and '$closure' holds the address of a local of 'run'"
+
+@test("a closure capturing nothing, a scalar, a '&T', a string or a struct may be stored")
+kps_callback_captures_accepted()
+    kpp_accepted(kpp_callbacks() + raw"""
+        run()
+            val k = 2
+            val c: &Counter = Counter(3)
+            val s = "four"
+            val pr = Pair(5, 6)
+            install(() -> 1)
+            install(() -> k)
+            install(() -> c.n)
+            install(() -> int(s.bytes.len))
+            install(() -> pr.a)
+
+        run()
+        print(later())
+        """)
+
+@test("a closure capturing the address of a local may not be stored in module storage")
+kps_callback_local_in_a_global()
+    kpp_refused(kpp_callbacks() + raw"""
+        run()
+            var n = 7
+            val p = &n
+            install(() -> *p)
+
+        run()
+        """, kpp_callback_refused("install", "f", "it is stored in 'later'", "() -> *p"))
+
+@test("nor one whose closure inside captures it")
+kps_callback_local_nested()
+    kpp_refused(kpp_callbacks() + raw"""
+        run()
+            var n = 8
+            val p = &n
+            install(() -> (() -> *p)())
+
+        run()
+        """, kpp_callback_refused("install", "f", "it is stored in 'later'", "() -> (() -> *p)()"))
+
+@test("a closure capturing a lent '*T' parameter makes the function keep it")
+kps_callback_lent_parameter()
+    kpp_refused(kpp_callbacks() + raw"""
+        lend(p: *int)
+            install(() -> *p)
+
+        run()
+            var n = 9
+            lend(&n)
+
+        run()
+        """, "'lend' keeps its parameter 'p' (it is passed to 'install', which keeps it), and '&n' is " +
+             "the address of a local of 'run'")
+
+@test("a captured '*T' to storage that lasts may be stored")
+kps_callback_lasting_pointer()
+    kpp_accepted(kpp_callbacks() + raw"""
+        static var spare = 10
+        static var held: *int = &spare
+
+        keep_both(p: *int)
+            held = p
+            install(() -> *p)
+
+        run()
+            keep_both(&spare)
+
+        run()
+        """)
+
+@test("a field, a buffer and a trait's method may store a closure capturing a scalar")
+kps_callback_scalar_stores()
+    kpp_accepted(kpp_callbacks() + raw"""
+        run()
+            val k = 2
+            slot.set(() -> k)
+            add(() -> k)
+            board.register(() -> k)
+
+        run()
+        """)
+
+@test("a field, a buffer and a trait's method may not store one capturing a local's address")
+kps_callback_local_stores_refused()
+    kpp_refused(kpp_callbacks() + raw"""
+        run()
+            var n = 7
+            val p = &n
+            slot.set(() -> *p)
+
+        run()
+        """, kpp_callback_refused("set", "f", "it is stored in 'self.f'", "() -> *p"))
+    kpp_refused(kpp_callbacks() + raw"""
+        run()
+            var n = 7
+            val p = &n
+            add(() -> *p)
+
+        run()
+        """, kpp_callback_refused("add", "f", "it is passed to 'push', which keeps it", "() -> *p"))
+    kpp_refused(kpp_callbacks() + raw"""
+        run()
+            var n = 7
+            val p = &n
+            board.register(() -> *p)
+
+        run()
+        """, kpp_callback_refused("register", "f", "it is stored in 'self.f'", "() -> *p"))
+
+@test("a call through an object answers for every body its trait's tables hold")
+kps_callback_through_an_object()
+    kpp_refused(kpp_callbacks() + raw"""
+        run(r: *Registers)
+            var n = 7
+            val p = &n
+            r.register(() -> *p)
+
+        run(&board)
+        """, kpp_callback_refused("register", "f", "it is stored in 'self.f'", "() -> *p"))
+
+@test("a handle to an opaque struct is C's storage, so a trait's method may keep one")
+kps_opaque_handle_kept_by_a_trait()
+    kpp_accepted(raw"""
+        opaque struct Pcb
+
+        struct Tcp
+            pcb: *Pcb
+
+        trait Listener
+            accept(*self, tcp: Tcp)
+
+        struct Server
+            tcp: Option[Tcp]
+
+        impl Listener for Server
+            accept(*self, tcp: Tcp)
+                self.tcp = Some(tcp)
+
+        var s = Server(None)
+        var l: *Listener = &s
+
+        l.accept(Tcp(null))
+        """)
+    kpp_refused(raw"""
+        struct Pcb
+            id: int
+
+        struct Tcp
+            pcb: *Pcb
+
+        trait Listener
+            accept(*self, tcp: Tcp)
+
+        struct Server
+            tcp: Option[Tcp]
+
+        impl Listener for Server
+            accept(*self, tcp: Tcp)
+                self.tcp = Some(tcp)
+
+        var s = Server(None)
+        var l: *Listener = &s
+        var p = Pcb(1)
+
+        l.accept(Tcp(&p))
+        """, "'accept' keeps its parameter 'tcp' (it is stored in 'self.tcp'), but a method of 'Listener' " +
+             "borrows its parameters for the call")
+
+@test("a named function's address may be stored")
+kps_function_address_stored()
+    kpp_accepted(raw"""
+        zero() -> int = 0
+        seven() -> int = 7
+
+        static var later: *extern() -> int = &zero
+
+        install(f: *extern() -> int)
+            later = f
+
+        run()
+            install(&seven)
+
+        run()
+        print(later())
+        """)
+
+// -- a pointer stored into what it points at, and into an out-parameter ---------------------------------
+
+private kpp_node() -> string = "struct Node\n    next: *Node\n    v: int\n\n"
+
+@test("a node pointing at itself is not kept")
+kps_node_at_itself()
+    kpp_accepted(kpp_node() + raw"""
+        link_self(n: *Node)
+            n.next = n
+
+        run()
+            var a = Node(null, 1)
+            link_self(&a)
+            print(a.next.v)
+
+        run()
+        """)
+
+@test("but a local made to point at itself may not be handed back by value")
+kps_node_at_itself_returned()
+    kpp_refused(kpp_node() + raw"""
+        link_self(n: *Node)
+            n.next = n
+
+        make() -> Node
+            var a = Node(null, 1)
+            link_self(&a)
+            a
+
+        print(make().v)
+        """, "'a' is returned, but it holds the address of a local of 'make'")
+
+@test("two nodes pointing at each other are not kept")
+kps_nodes_at_each_other()
+    kpp_accepted(kpp_node() + raw"""
+        pair(a: *Node, b: *Node)
+            a.next = b
+            b.next = a
+
+        run()
+            var x = Node(null, 1)
+            var y = Node(null, 2)
+            pair(&x, &y)
+            print(x.next.v + y.next.v)
+
+        run()
+        """)
+
+@test("but a local tied to a node in module storage is")
+kps_node_tied_to_a_global()
+    kpp_refused(kpp_node() + raw"""
+        pair(a: *Node, b: *Node)
+            a.next = b
+            b.next = a
+
+        static var g = Node(null, 0)
+
+        run()
+            var x = Node(null, 1)
+            pair(&x, &g)
+
+        run()
+        """, "'pair' keeps its parameter 'a' (it is stored in 'b.next'), and '&x' is the address of a " +
+             "local of 'run'")
+
+@test("a list linked inside a local array is not kept")
+kps_list_in_a_local_array()
+    kpp_accepted(kpp_node() + raw"""
+        link(a: *Node, b: *Node)
+            a.next = b
+
+        run()
+            var nodes: [3]Node = [Node(null, 1), Node(null, 2), Node(null, 3)]
+            link(&nodes[0], &nodes[1])
+            link(&nodes[1], &nodes[2])
+            for i in 0..<2
+                nodes[i].next = &nodes[i + 1]
+            print(nodes[0].next.next.v)
+
+        run()
+        """)
+
+@test("a struct whose field points into the struct's own storage is not kept")
+kps_config_into_its_own_cache()
+    kpp_accepted(raw"""
+        struct Config
+            buffer: *u8
+            size: int
+
+        struct File
+            cache: [16]u8
+            config: Config
+
+        open(f: *File)
+            f.config = Config(&f.cache[0], 16)
+
+        run()
+            var f = File([0; 16], Config(null, 0))
+            open(&f)
+            print(f.config.size)
+
+        run()
+        """)
+
+@test("a pointer written through an out-parameter into the caller's own storage is not kept")
+kps_out_parameter_writes()
+    kpp_accepted(raw"""
+        struct Holder
+            p: *int
+
+        put(out: **int, v: *int)
+            *out = v
+
+        put_field(out: *Holder, v: *int)
+            out.p = v
+
+        fill(out: *[]int)
+            (*out)[0] = 5
+
+        run()
+            var n = 1
+            var slot: *int = null
+            var h = Holder(null)
+            var a: [2]int = [0, 0]
+            var s = a[..]
+            put(&slot, &n)
+            put_field(&h, &n)
+            fill(&s)
+            print(*slot + *h.p + a[0])
+
+        run()
+        """)
+
+@test("a write through an address computed from an out-parameter lands in what it points at")
+kps_out_parameter_computed()
+    kpp_accepted(raw"""
+        field[T](base: *u8, offset: usize) -> *T = ptr_cast(usize(base) + offset)
+
+        write[T](base: *u8, offset: usize, v: T)
+            val p: *T = field(base, offset)
+            p[0] = v
+
+        run()
+            var cfg: [8]u64 = [0; 8]
+            val p: *u8 = ptr_cast(&cfg[0])
+            var id: [2]u64 = [1, 2]
+            write(p, 8, &id[0])
+            print(cfg[1] != 0)
+
+        run()
+        """)
+
+@test("an out-parameter pointing into module storage keeps what is written through it")
+kps_out_parameter_into_a_global()
+    kpp_refused(raw"""
+        put(out: **int, v: *int)
+            *out = v
+
+        static var spare = 0
+        static var slot: *int = &spare
+
+        run()
+            var n = 1
+            put(&slot, &n)
+
+        run()
+        """, "'put' keeps its parameter 'v' (it is stored in '*out'), and '&n' is the address of a " +
+             "local of 'run'")
+
+@test("the address of a local written through an out-parameter outlives the frame")
+kps_local_through_an_out_parameter()
+    kpp_refused(raw"""
+        leak(out: **int)
+            var n = 1
+            *out = &n
+
+        run()
+            var slot: *int = null
+            leak(&slot)
+
+        run()
+        """, "'&n' is the address of a local of 'leak', and it is stored in '*out', which outlives " +
+             "'leak' — store the value itself, or storage that lasts")
+
+// -- across the rest of the language ------------------------------------------------------------------
+
+@test("a generic function's instance keeps what its body keeps")
+kps_generic_function()
+    kpp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        stash[T](p: *T, into: *Buf[*T])
+            into.push(p)
+
+        static var ints: Buf[*int] = buf()
+
+        run()
+            var n = 1
+            stash(&n, &ints)
+
+        run()
+        """, "'stash' keeps its parameter 'p' (it is passed to 'push', which keeps it), and '&n' is " +
+             "the address of a local of 'run'")
+
+@test("a generic over a trait keeps for the impl that keeps, refused at the impl, and not for one that looks")
+kps_generic_over_a_trait()
+    kpp_refused(kpp_held() + raw"""
+        trait Taker
+            take(self, p: *int)
+
+        struct Keeps
+            k: int
+
+        impl Taker for Keeps
+            take(self, p: *int)
+                held = p
+
+        relay[T: Taker](t: T, p: *int) = t.take(p)
+
+        run()
+            var n = 1
+            relay(Keeps(1), &n)
+
+        run()
+        """, "'take' keeps its parameter 'p' (it is stored in 'held'), but a method of 'Taker' borrows " +
+             "its parameters for the call")
+    kpp_accepted(raw"""
+        trait Taker
+            take(self, p: *int)
+
+        struct Looks
+            k: int
+
+        impl Taker for Looks
+            take(self, p: *int)
+                print(*p + self.k)
+
+        relay[T: Taker](t: T, p: *int) = t.take(p)
+
+        run()
+            var n = 1
+            relay(Looks(1), &n)
+
+        run()
+        """)
+
+@test("a method of a generic struct keeps into its receiver: a local's is fine, module storage's is not")
+kps_generic_struct_method()
+    val cell = raw"""
+        struct Cell[T]
+            p: *T
+
+            set(*self, p: *T)
+                self.p = p
+
+        static var spare = 0
+
+        """
+
+    kpp_accepted(cell + raw"""
+        run()
+            var n = 1
+            var c = Cell[int](&spare)
+            c.set(&n)
+            print(*c.p)
+
+        run()
+        """)
+    kpp_refused(cell + raw"""
+        static var global_cell = Cell[int](&spare)
+
+        run()
+            var n = 1
+            global_cell.set(&n)
+
+        run()
+        """, "'set' keeps its parameter 'p' (it is stored in 'self.p'), and '&n' is the address of a " +
+             "local of 'run'")
+
+@test("a trait's default method borrows like any of its methods")
+kps_trait_default_method()
+    kpp_accepted(raw"""
+        trait Shows
+            show(self, p: *int)
+            show_twice(self, p: *int)
+                self.show(p)
+                self.show(p)
+
+        struct Plain
+            k: int
+
+        impl Shows for Plain
+            show(self, p: *int)
+                print(*p + self.k)
+
+        run()
+            var n = 1
+            Plain(1).show_twice(&n)
+
+        run()
+        """)
+    kpp_refused(kpp_held() + raw"""
+        trait Shows
+            show(self, p: *int)
+            show_and_keep(self, p: *int)
+                self.show(p)
+                held = p
+
+        struct Plain
+            k: int
+
+        impl Shows for Plain
+            show(self, p: *int)
+                print(*p + self.k)
+
+        run()
+            var n = 1
+            Plain(1).show_and_keep(&n)
+
+        run()
+        """, "'show_and_keep' keeps its parameter 'p' (it is stored in 'held'), but a method of 'Shows' " +
+             "borrows its parameters for the call")
+
+// An `@export` is called from C by C's convention, a pointer lent for the call; a call from sysl sees
+// its body like any other.
+@test("an '@export' function's body answers for a call from sysl")
+kps_export_function()
+    kpp_refused(kpp_held() + raw"""
+        @export("kpp_on_event")
+        on_event(p: *int)
+            held = p
+
+        run()
+            var n = 1
+            on_event(&n)
+
+        run()
+        """, "'on_event' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of " +
+             "a local of 'run'")
+
+@test("a function called through a pointer held in a local is held to borrowing")
+kps_function_pointer_variable()
+    kpp_refused(kpp_held() + raw"""
+        run()
+            val f = &store
+            var n = 1
+            f(&n)
+
+        run()
+        """, "'store' keeps its parameter 'p' (it is stored in 'held'), and its address is taken")
+
+@test("mutual recursion: one that keeps and one that clears settle on the clear")
+kps_mutual_recursion_clears()
+    kpp_accepted(kpp_held() + raw"""
+        keep_then(p: *int, k: int)
+            held = p
+            settle(k)
+
+        settle(k: int)
+            if k > 0
+                held = &spare
+                settle(k - 1)
+            else
+                held = &spare
+
+        run()
+            var n = 1
+            keep_then(&n, 2)
+
+        run()
+        """)
+
+@test("mutual recursion: one that keeps and one that only looks settle on the keep")
+kps_mutual_recursion_keeps()
+    kpp_refused(kpp_held() + raw"""
+        ping(p: *int, k: int)
+            if k == 0 then held = p else pong(p, k - 1)
+
+        pong(p: *int, k: int)
+            if k == 0 then print(*p) else ping(p, k - 1)
+
+        run()
+            var n = 1
+            pong(&n, 3)
+
+        run()
+        """, "'pong' keeps its parameter 'p' (it is passed to 'ping', which keeps it), and '&n' is the " +
+             "address of a local of 'run'")
+
+@test("a module 'val' may be made from a call that answers its argument")
+kps_module_val_initializer()
+    kpp_accepted(raw"""
+        static var spare = 0
+
+        pick(p: *int) -> *int = p
+
+        static var chosen: *int = pick(&spare)
+
+        print(*chosen)
+        """)
+
+@test("the entry file's statements may hand a keeper their locals; a module's function may not")
+kps_entry_file_and_a_module()
+    if xvr_no_library() then return
+
+    kpp_accepted(kpp_held() + "var n = 1\nstore(&n)\nprint(*held)\n")
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import keeper.run\n\nrun()\n"))
+    fs.push(("keeper", "keeper.sysl", "module keeper\n\n" + kpp_held() + "run()\n    var n = 1\n    store(&n)\n"))
+
+    val root = im_write(fs)
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(root + "/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Ok(_) -> assert(false, "the module's call was accepted")
+        Err(why) -> assert(failure_text(why).contains(kpp_store_refused()), failure_text(why))
+
+// **The summary of a function in the standard library is worked out from its source**, which every
+// build reads; only its code comes from the precompiled artifact. So a program linked against the
+// artifact is held to `set_sink`'s keep and to `clear_sink`'s clear.
+@test("a library function linked from its artifact keeps and clears as its source says")
+kps_library_artifact()
+    if xvr_no_library() then return
+
+    val head = raw"""
+        import sysl.log.{set_sink, clear_sink, writer_sink, info}
+        import sysl.buf.byte_sink
+
+        run()
+            var buffer = byte_sink()
+            var w: *Writer = &buffer
+            var sink = writer_sink(w)
+            set_sink(&sink)
+            info("one", [])
+        """
+
+    for cleared in [true, false]
+        var fs = im_files()
+
+        fs.push(("", "main.sysl", head + (if cleared then "    clear_sink()\n" else "") + "\nrun()\n"))
+
+        val root = im_write(fs)
+        val built = build_native_program(root, None, None, DefaultOptimization, Some(root + "/built"))
+
+        remove_dir_all(root).unwrap_or(())
+
+        built match
+            Ok(_) -> assert(cleared, "a sink left installed was accepted")
+            Err(why) ->
+                assert(!cleared, failure_text(why))
+                assert(failure_text(why).contains("'set_sink' keeps its parameter 's' (it is stored in " +
+                                                  "'current'), and '&sink'"), failure_text(why))
+end kps_library_artifact

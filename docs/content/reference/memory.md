@@ -3697,19 +3697,123 @@ print(run())
 ```
 
 ```sysl
+static var last: *Node = null
+
 struct Node
     next: *Node
 
-    link(*self)
-        self.next = self
+    remember(*self)
+        last = self
 
 run()
     var node = Node(null)
-    node.link()
+    node.remember()
 ```
 
 ```error
-'link' keeps its parameter 'self' (it is stored in 'self.next'), and 'node' is a local of 'run'
+'remember' keeps its parameter 'self' (it is stored in 'last'), and 'node' is a local of 'run'
+```
+
+**Where it is stored decides, not only that it is.** A pointer stored into what it points at — a node
+linked to itself, a struct whose field points into its own buffer — ends exactly when that storage
+does, so it is not kept. One stored into what *another* parameter points at is the caller's to judge:
+if that argument points into the caller's own frame, the pointer stays in the frame too. That is what
+makes an out-parameter, a pair of linked nodes or a list built in a local array work as written:
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+link(a: *Node, b: *Node)
+    a.next = b
+
+put(out: **Node, v: *Node)
+    *out = v
+
+run() -> int
+    var nodes: [3]Node = [Node(null, 1), Node(null, 2), Node(null, 3)]
+    var last: *Node = null
+
+    link(&nodes[0], &nodes[1])
+    link(&nodes[1], &nodes[2])
+    put(&last, &nodes[2])
+    nodes[0].next.next.v + last.v
+
+print(run())
+```
+
+```output
+6
+```
+
+The same address written through an out-parameter that points into module storage is kept, and so
+is the address of a function's own local written through any out-parameter at all:
+
+```sysl
+leak(out: **int)
+    var n = 1
+    *out = &n
+```
+
+```error
+'&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
+```
+
+### Taken back before it returns
+
+**A store undone on every way out is not kept.** A place written over with something else before the
+function returns — in the body, in a `defer`, or by a callee whose own body writes it on every way out
+— no longer holds the pointer once the call is over. This is how a sink is lent to a module for the
+length of a call:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+store(p: *int)
+    held = p
+
+clear()
+    held = &spare
+
+run() -> int
+    var n = 41
+    store(&n)
+    val seen = *held + 1
+    clear()
+    seen
+
+print(run())
+```
+
+```output
+42
+```
+
+A way out that skips the clear leaves it held: an early `return`, a `?`, a call that never comes back
+such as `panic`, a `break` past it, or one arm of a `match` without it. Writing a *different* place —
+another global, another field, the same field of another instance — takes nothing back:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+store(p: *int)
+    held = p
+
+clear()
+    held = &spare
+
+run(c: bool)
+    var n = 1
+    store(&n)
+    if c then return
+    clear()
+```
+
+```error
+'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
 ```
 
 Each way of keeping is found wherever it is, however many calls down:
@@ -3795,6 +3899,15 @@ run() -> *int
 'field(&s)' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns
 ```
 
+**Only a value that can hold an address is made of one.** An `int`, a `bool`, a float, a bare enum
+or a struct with no pointer in it answers nothing about where its argument lived, so `Ok(n)` after a
+C function filled `&n` is an ordinary value. A C function's pointer answer is taken to be made of its
+pointer arguments that could hold what it points at — one to the same type or to a struct holding
+it, and bytes from bytes, as `strchr`'s is — and not of an out-parameter of another type, so a handle
+a C library allocated is not made of the `*i32` it reported an error code through, nor of a context
+it was handed as bytes. An address turned into an integer and back
+(`ptr_cast(usize(p))`) is not followed: that is the raw tier, and writing it takes a `ptr_cast`.
+
 A pointer the callee **read out of** what it was handed is somebody else's address, and is the
 caller's to keep:
 
@@ -3833,7 +3946,7 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | what is called | what it keeps |
 |---|---|
 | a sysl function | what its body keeps |
-| a method through a trait object | nothing — an implementation reached through an object that keeps what it is handed is refused where it is written |
+| a method through a trait object | no pointer it is handed — an implementation reached through an object that keeps one is refused where it is written; an object it is handed, a callback among them, is kept wherever any implementation keeps it |
 | a closure, or a function through a pointer | nothing — a closure, or a function whose address is taken, that keeps what it is handed is refused where it is written |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
@@ -3876,6 +3989,45 @@ impl Bump for Keeper
 
 ```error
 'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
+```
+
+**A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
+one — in a field, module storage, a buffer, a trait's implementation — is refused only where the
+closure captured an address that is not the program's to give away. One capturing nothing, a number,
+a `&T`, a string or a struct by value may be stored anywhere:
+
+```sysl
+static var later: &Fn() -> int = () -> 0
+
+install(f: &Fn() -> int)
+    later = f
+
+run()
+    val k = 2
+    install(() -> k + 40)
+
+run()
+print(later())
+```
+
+```output
+42
+```
+
+```sysl
+static var later: &Fn() -> int = () -> 0
+
+install(f: &Fn() -> int)
+    later = f
+
+run()
+    var n = 7
+    val p = &n
+    install(() -> *p)
+```
+
+```error
+'install' keeps its parameter 'f' (it is stored in 'later'), and '() -> *p' holds the address of a local of 'run'
 ```
 
 A trait's method borrows a view it is handed the same way, so a view of a local array passed through

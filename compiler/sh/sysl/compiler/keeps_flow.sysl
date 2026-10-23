@@ -1,0 +1,896 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.math.bigint.{BigInt, add, cmp, from_int}
+
+// **Where a pointer goes, and whether the body takes it back before it returns** -- the half of the
+// keeps-analysis (`keeps.sysl`) that follows a body's ways through it.
+//
+// A pointer stored somewhere is said by WHERE it went, as a location:
+//
+// - `g:<symbol>…` -- module storage, with the fields and elements after it;
+// - `p<j>:…` -- storage reached through what the function's `j`th parameter points at, so the caller
+//   says what that storage is: its own local, its own parameter's pointee, or module storage;
+// - `l:<local>…` -- the frame's own storage, which binds the local as holding what was stored;
+// - and the empty string, anywhere else: a heap object, a buffer's slot, an integer handed back.
+//
+// A path segment `?` is an offset nobody can name -- `p[i]`, or an address computed from another --
+// and a location holding one can never be taken back, since nothing says the clear wrote the same
+// slot.
+//
+// **A store that is undone on every way out is not kept.** A location written with something else
+// afterwards -- in the body, in a `defer`, or by a callee whose own body overwrites it on every way
+// out -- no longer holds the pointer once the function has returned. A way out that skips the clear
+// (an early `return`, a `?`, a call that never comes back, a `break` out of a loop past it) leaves it
+// held. So a body is walked a way at a time: each statement either adds a location to what is held,
+// clears one, or leaves the function; a branch is walked once per arm and the arms are joined; a loop
+// is walked until what it holds at its head stops changing.
+
+// One location something tracked was stored at, why, and where the body did it.
+struct KeptAt
+    loc: string
+    how: string
+    at: Span
+
+// One thing a statement does to what is held: stores what is tracked at a location, or overwrites a
+// location with something else.
+struct FlowEv
+    clear: bool
+    loc: string
+    how: string
+    at: Span
+
+// What is held along one way through a body, and which locations have been overwritten on it.
+struct PathState
+    pending: Buf[KeptAt]
+    cleared: Buf[string]
+    dead: bool
+
+// The states a loop's body leaves by, gathered while it is walked: by a `break`, and back to its head.
+struct LoopEdges
+    exits: Buf[&PathState]
+    backs: Buf[&PathState]
+
+// One walk over a body. `stmt_events` and `expr_events` say what a statement or an expression with
+// no control flow of its own does; what is still held at any way out lands in `out_pending`, and what
+// every way out overwrote in `out_cleared`.
+struct FlowWalk
+    stmt_events: &Fn(TStmt) -> Buf[FlowEv]
+    expr_events: &Fn(TExpr) -> Buf[FlowEv]
+    deferred_clears: Buf[string]
+    deferred_keeps: Buf[KeptAt]
+    out_pending: Buf[KeptAt]
+    out_cleared: Buf[string]
+    exited: bool
+    loops: Buf[&LoopEdges]
+    org: &Origins
+end FlowWalk
+
+flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv]) -> &FlowWalk =
+    FlowWalk(stmt_events, expr_events, buf(), buf(), buf(), buf(), false, buf(), org)
+
+// Walks a function's body from its entry to every way out.
+flow_body(w: &FlowWalk, body: TBlock)
+    val st = fresh_state()
+
+    flow_stmts(w, body.stmts, st, true)
+
+    if body.result.is_some() && !st.dead then flow_expr(w, body.result.unwrap(), st)
+
+    flow_exit(w, st)
+end flow_body
+
+private fresh_state() -> &PathState = PathState(buf(), buf(), false)
+
+private dead_state() -> &PathState = PathState(buf(), buf(), true)
+
+private copy_state(s: &PathState) -> &PathState
+    var pending: Buf[KeptAt] = buf()
+    var cleared: Buf[string] = buf()
+
+    for p in s.pending
+        pending.push(p)
+
+    for c in s.cleared
+        cleared.push(c)
+
+    PathState(pending, cleared, s.dead)
+end copy_state
+
+private assign_state(into: &PathState, from: &PathState)
+    into.pending = from.pending
+    into.cleared = from.cleared
+    into.dead = from.dead
+
+// Two ways meeting: what either holds is held, and only what both overwrote is overwritten.
+private join_states(a: &PathState, b: &PathState) -> &PathState
+    if a.dead then return copy_state(b)
+    if b.dead then return copy_state(a)
+
+    val out = copy_state(a)
+
+    for p in b.pending
+        add_kept(&out.pending, p)
+
+    out.cleared = intersect_cleared(a.cleared, b.cleared)
+    out
+end join_states
+
+private same_state(a: &PathState, b: &PathState) -> bool
+    if a.dead != b.dead || a.pending.len() != b.pending.len() || a.cleared.len() != b.cleared.len()
+        return false
+    end if
+
+    for p in a.pending
+        if !has_loc(b.pending, p.loc) then return false
+
+    for c in a.cleared
+        if !holds_string(b.cleared, c) then return false
+
+    true
+end same_state
+
+has_loc(xs: Buf[KeptAt], loc: string) -> bool
+    for x in xs
+        if x.loc == loc then return true
+
+    false
+end has_loc
+
+add_kept(into: *Buf[KeptAt], k: KeptAt) = if !has_loc(*into, k.loc) then into.push(k)
+
+// What both lists overwrote. `*` is the assumption a recursive callee starts from -- it overwrites
+// everything -- so it gives way to whatever the other list says.
+intersect_cleared(a: Buf[string], b: Buf[string]) -> Buf[string]
+    if holds_string(a, "*") then return b
+    if holds_string(b, "*") then return a
+
+    var out: Buf[string] = buf()
+
+    for x in a
+        if holds_string(b, x) || covered_by(b, x) then out.push(x)
+
+    for x in b
+        if !holds_string(out, x) && covered_by(a, x) then out.push(x)
+
+    out
+end intersect_cleared
+
+private covered_by(clears: Buf[string], loc: string) -> bool
+    for c in clears
+        if clears_loc(c, loc) then return true
+
+    false
+end covered_by
+
+// Whether overwriting `clear` takes back what was stored at `loc`: the same location, or one inside
+// it -- a whole struct written over its fields. Nothing takes back a location an offset was guessed
+// at, nor one that is anywhere at all.
+clears_loc(clear: string, loc: string) -> bool
+    if loc == "" || loc.index_of("?").is_some() then return false
+    if clear == "*" then return true
+    if clear == "" || clear.index_of("?").is_some() then return false
+
+    loc == clear || loc.starts_with(clear + ".") || loc.starts_with(clear + "[")
+end clears_loc
+
+private apply_event(st: &PathState, ev: FlowEv)
+    if st.dead then return
+
+    if ev.clear
+        var kept: Buf[KeptAt] = buf()
+
+        for p in st.pending
+            if !clears_loc(ev.loc, p.loc) then kept.push(p)
+
+        st.pending = kept
+
+        if !holds_string(st.cleared, ev.loc) then st.cleared.push(ev.loc)
+    else
+        add_kept(&st.pending, KeptAt(ev.loc, ev.how, ev.at))
+    end if
+end apply_event
+
+// A way out: what is held there, less what a `defer` overwrites on the way, is held past the call.
+private flow_exit(w: &FlowWalk, st: &PathState)
+    if st.dead then return
+
+    for p in st.pending
+        if !covered_by(w.deferred_clears, p.loc) then add_kept(&w.out_pending, p)
+
+    for p in w.deferred_keeps
+        add_kept(&w.out_pending, p)
+
+    var here: Buf[string] = buf()
+
+    for c in st.cleared
+        here.push(c)
+
+    for c in w.deferred_clears
+        if !holds_string(here, c) then here.push(c)
+
+    if w.exited then w.out_cleared = intersect_cleared(w.out_cleared, here)
+    else w.out_cleared = here
+
+    w.exited = true
+end flow_exit
+
+// A `break` or `continue` that names the loop `depth` levels out from the innermost.
+private flow_jump(w: &FlowWalk, st: &PathState, depth: int, out: bool)
+    if st.dead then return
+
+    val n = w.loops.len()
+
+    if depth < 0 || usize(depth) >= n then return
+
+    val edges = w.loops.at(n - 1 - usize(depth))
+
+    if out then edges.exits.push(copy_state(st)) else edges.backs.push(copy_state(st))
+end flow_jump
+
+// A statement with a jump somewhere inside it that this walk does not follow structurally: the state
+// may reach any enclosing loop's head or its end.
+private flow_jump_any(w: &FlowWalk, st: &PathState)
+    if st.dead then return
+
+    for edges in w.loops
+        edges.exits.push(copy_state(st))
+        edges.backs.push(copy_state(st))
+end flow_jump_any
+
+private flow_stmts(w: &FlowWalk, stmts: Buf[TStmt], st: &PathState, top: bool)
+    for s in stmts
+        if st.dead then return
+
+        flow_stmt(w, s, st, top)
+end flow_stmts
+
+private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
+    s match
+        TExprStmt(e) -> flow_expr(w, e, st)
+        TReturn(v) ->
+            if v.is_some() then flow_piece(w, w.expr_events(v.unwrap()), st, expr_jumps(v.unwrap()))
+
+            flow_exit(w, st)
+            st.dead = true
+        TBecome(call) ->
+            flow_piece(w, w.expr_events(call), st, expr_jumps(call))
+            flow_exit(w, st)
+            st.dead = true
+        TBreak(v, depth) ->
+            if v.is_some() then flow_piece(w, w.expr_events(v.unwrap()), st, expr_jumps(v.unwrap()))
+
+            flow_jump(w, st, depth, true)
+            st.dead = true
+        TContinue(depth) ->
+            flow_jump(w, st, depth, false)
+            st.dead = true
+        TDefer(stmts, when) ->
+            val every = when match
+                TEveryExit -> true
+                _ -> false
+
+            for inner in stmts
+                for ev in w.stmt_events(inner)
+                    if ev.clear
+                        if every && top && !holds_string(w.deferred_clears, ev.loc)
+                            w.deferred_clears.push(ev.loc)
+                    else
+                        add_kept(&w.deferred_keeps, KeptAt(ev.loc, ev.how, ev.at))
+                    end if
+        _ -> flow_piece(w, w.stmt_events(s), st, stmt_jumps(s))
+end flow_stmt
+
+// A piece with no control flow followed: what it stores, then a way out if one is inside it, then
+// what it overwrites -- an exit inside it may come before its clear.
+private flow_piece(w: &FlowWalk, evs: Buf[FlowEv], st: &PathState, jumps: &Jumps)
+    if !jumps.exits && !jumps.loops
+        for ev in evs
+            apply_event(st, ev)
+
+        return
+    end if
+
+    for ev in evs
+        if !ev.clear then apply_event(st, ev)
+
+    if jumps.exits then flow_exit(w, st)
+    if jumps.loops then flow_jump_any(w, st)
+
+    for ev in evs
+        if ev.clear then apply_event(st, ev)
+end flow_piece
+
+private flow_block(w: &FlowWalk, b: TBlock, st: &PathState)
+    flow_stmts(w, b.stmts, st, false)
+
+    if b.result.is_some() && !st.dead then flow_expr(w, b.result.unwrap(), st)
+
+private flow_terms(w: &FlowWalk, cond: Buf[TCondTerm], st: &PathState)
+    for term in cond
+        term match
+            TCondTest(c) -> flow_piece(w, w.expr_events(c), st, expr_jumps(c))
+            TCondIs(subject, _, _) -> flow_piece(w, w.expr_events(subject), st, expr_jumps(subject))
+end flow_terms
+
+private flow_flat(w: &FlowWalk, e: TExpr, st: &PathState) = flow_piece(w, w.expr_events(e), st, expr_jumps(e))
+
+private flow_expr(w: &FlowWalk, e: TExpr, st: &PathState)
+    if st.dead then return
+
+    *e.kind match
+        TIf(cond, then_block, else_block, _) ->
+            flow_terms(w, cond, st)
+
+            val a = copy_state(st)
+            val b = copy_state(st)
+
+            flow_block(w, then_block, a)
+
+            if else_block.is_some() then flow_block(w, else_block.unwrap(), b)
+            else in_bounds_clears(w, cond, then_block, a, b)
+
+            assign_state(st, join_states(a, b))
+        TMatch(scrutinee, arms, _) ->
+            flow_flat(w, scrutinee, st)
+
+            var joined = dead_state()
+
+            for arm in arms
+                val a = copy_state(st)
+
+                if arm.guard.is_some() then flow_flat(w, arm.guard.unwrap(), a)
+
+                flow_block(w, arm.body, a)
+                joined = join_states(joined, a)
+
+            if arms.is_empty() then joined = copy_state(st)
+
+            assign_state(st, joined)
+        TBlockExpr(b) -> flow_block(w, b, st)
+        TSeq(exprs) ->
+            for x in exprs
+                flow_expr(w, x, st)
+        TCheckedLoop(_, _, loop_expr) -> flow_expr(w, loop_expr, st)
+        TWhile(cond, body, else_block, _) ->
+            flow_terms(w, cond, st)
+            flow_loop(w, st, body, buf(), else_block, true)
+        TDoWhile(body, cond, else_block, _) ->
+            flow_flat(w, cond, st)
+            flow_loop(w, st, body, buf(), else_block, true)
+        TLoop(body, _) -> flow_loop(w, st, body, buf(), None, false)
+        TFor(_, _, lo, hi, _, body, else_block, _) ->
+            flow_flat(w, lo, st)
+            flow_flat(w, hi, st)
+            flow_loop(w, st, body, buf(), else_block, true)
+        TForEach(_, _, seq, body, else_block, _) ->
+            flow_flat(w, seq, st)
+            flow_loop(w, st, body, buf(), else_block, true)
+        TIterate(_, _, init, next, _, body, else_block, _) ->
+            flow_flat(w, init, st)
+            flow_flat(w, next, st)
+            flow_loop(w, st, body, buf(), else_block, true)
+        TCFor(init, cond, step, body, else_block, _) ->
+            flow_stmts(w, init, st, false)
+
+            if cond.is_some() then flow_flat(w, cond.unwrap(), st)
+
+            flow_loop(w, st, body, step, else_block, true)
+        _ -> flow_flat(w, e, st)
+end flow_expr
+
+// **An element cleared only when its index is in range is cleared on every way**: past the range
+// there is no such element to hold anything. So `if i < N then slots[i] = …` overwrites `slots[i]`
+// as surely as the store alone would.
+//
+// **The bound has to cover the array**, or an index past it but inside the array skips the clear: it
+// is a constant at least the length of every array the block indexes that way.
+private in_bounds_clears(w: &FlowWalk, cond: Buf[TCondTerm], block: TBlock, taken: &PathState,
+                         skipped: &PathState)
+    if cond.len() != 1 then return
+
+    val bound = cond.at(0) match
+        TCondTest(e) -> index_bound(w.org, e)
+        _ -> None
+
+    if bound.is_none() then return
+
+    val (key, limit) = bound.unwrap()
+
+    // `exits` here says an array indexed that way is covered by the bound, `loops` that one is not.
+    val seen: &Jumps = Jumps(false, false)
+
+    walk_block_stmts(block, expr_walk(false, e -> *e.kind match
+        TIndex(r, i, _) -> texpr_type(r) match
+            Array(len, _) ->
+                if index_key(w.org, i) == key
+                    if cmp(from_int(long(len)), limit) > 0 then seen.loops = true else seen.exits = true
+                end if
+            _ -> ()
+        _ -> ()))
+
+    if !seen.exits || seen.loops then return
+
+    for c in taken.cleared
+        if c.ends_with(s"[$key]") && !holds_string(skipped.cleared, c)
+            apply_event(skipped, FlowEv(true, c, "", span_zero()))
+        end if
+end in_bounds_clears
+
+// The index a comparison holds below a constant, and one past the largest index it lets through:
+// `i < n`, `i <= n`, `n > i`, `n >= i`.
+private index_bound(o: &Origins, e: TExpr) -> Option[(string, BigInt)]
+    *e.kind match
+        TCompare(operands, cmps) ->
+            if operands.len() != 2 || cmps.len() != 1 then return None
+
+            val op = cmps.at(0).op
+            val below = op == "<" || op == "<="
+            val above = op == ">" || op == ">="
+
+            if !below && !above then return None
+
+            val index = if below then operands.at(0) else operands.at(1)
+            val limit = constant_of(if below then operands.at(1) else operands.at(0))
+            val key = index_key(o, index)
+
+            if key == "?" || limit.is_none() then return None
+
+            Some((key, if op == "<=" || op == ">=" then add(limit.unwrap(), from_int(1)) else limit.unwrap()))
+        _ -> None
+end index_bound
+
+private constant_of(e: TExpr) -> Option[BigInt] = *e.kind match
+    TIntLit(v, _) -> Some(v)
+    TCast(v, _) -> constant_of(v)
+    _ -> None
+
+// A loop: its body is walked from what is held at its head until that stops changing, every way back
+// to the head joined in. It ends where its condition fails -- at the head, unless it is a `loop`,
+// which only a `break` leaves -- and at every `break`.
+private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStmt],
+                  else_block: Option[TBlock], may_end: bool)
+    var head = copy_state(st)
+    val edges: &LoopEdges = LoopEdges(buf(), buf())
+    var rounds = 0
+
+    loop
+        edges.exits = buf()
+        edges.backs = buf()
+        w.loops.push(edges)
+
+        val b = copy_state(head)
+
+        flow_stmts(w, body, b, false)
+
+        if !b.dead then flow_stmts(w, step, b, false)
+
+        w.loops.truncate(w.loops.len() - 1)
+
+        var next = copy_state(head)
+
+        if !b.dead then next = join_states(next, b)
+
+        for x in edges.backs
+            next = join_states(next, x)
+
+        rounds += 1
+
+        if same_state(next, head) || rounds > 8 then break
+
+        head = next
+
+    var out = if may_end then copy_state(head) else dead_state()
+
+    if may_end && else_block.is_some() then flow_block(w, else_block.unwrap(), out)
+
+    for x in edges.exits
+        out = join_states(out, x)
+
+    assign_state(st, out)
+end flow_loop
+
+// -- the ways out a piece has inside it ------------------------------------------------------------------
+
+// Whether a piece may leave the function -- a `return`, a `?`, a call that never comes back -- or
+// jump to a loop's head or end.
+struct Jumps
+    exits: bool
+    loops: bool
+
+stmt_jumps(s: TStmt) -> &Jumps
+    val j: &Jumps = Jumps(false, false)
+
+    walk_stmt(s, TWalk(false, e -> jump_expr(j, e), w -> (), x -> jump_stmt(j, x)))
+    j
+end stmt_jumps
+
+expr_jumps(e: TExpr) -> &Jumps
+    val j: &Jumps = Jumps(false, false)
+
+    walk_texpr(e, TWalk(false, x -> jump_expr(j, x), w -> (), s -> jump_stmt(j, s)))
+    j
+end expr_jumps
+
+private jump_stmt(j: &Jumps, s: TStmt)
+    s match
+        TReturn(_) -> j.exits = true
+        TBecome(_) -> j.exits = true
+        TBreak(_, _) -> j.loops = true
+        TContinue(_) -> j.loops = true
+        _ -> ()
+end jump_stmt
+
+private jump_expr(j: &Jumps, e: TExpr)
+    *e.kind match
+        TTry(_, _, _, _, _, _, _) -> j.exits = true
+        TCall(_, _, ty, _) -> if never_type(ty) then j.exits = true
+        TCallPtr(_, _, _, ty) -> if never_type(ty) then j.exits = true
+        TVCall(_, _, _, ty, _) -> if never_type(ty) then j.exits = true
+        _ -> ()
+end jump_expr
+
+private never_type(t: Type) -> bool = t match
+    Never -> true
+    _ -> false
+
+// -- where a pointer points -----------------------------------------------------------------------------
+
+// What one body's pointers point into: each local by the location its value was made from, worked
+// out from every value it is given. A local given two different ones points nowhere this can name.
+struct Origins
+    cx: &KeepsCx
+    params: Buf[(string, Type)]
+    refs: Buf[(string, TExpr)]
+    locals: Map[string, string]
+    changed: bool
+end Origins
+
+origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
+    cx.origins.get(f.name) match
+        Some(o) -> return o
+        None -> ()
+
+    val o: &Origins = Origins(cx, f.params, buf(), map(), false)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, place) -> o.refs.push((n, place))
+        _ -> ()))
+
+    var rounds = 0
+
+    o.changed = true
+
+    while o.changed && rounds < 8
+        o.changed = false
+        rounds += 1
+
+        walk_block_stmts(f.body, TWalk(false, e -> origin_bind_expr(o, e),
+                                       w -> origin_bind_store(o, w.place, w.value),
+                                       s -> origin_bind_stmt(o, s)))
+
+    cx.origins.put(f.name, o)
+    o
+end origins_of
+
+private origin_bind_stmt(o: &Origins, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> origin_assign(o, n, origin_of(o, init))
+        _ -> ()
+end origin_bind_stmt
+
+private origin_bind_expr(o: &Origins, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> origin_bind_store(o, place, v)
+        _ -> ()
+end origin_bind_expr
+
+private origin_bind_store(o: &Origins, place: TExpr, v: TExpr)
+    *place.kind match
+        TLoad(n, _) -> if !is_param(o, n) then origin_assign(o, n, origin_of(o, v))
+        _ -> ()
+end origin_bind_store
+
+private origin_assign(o: &Origins, n: string, org: string)
+    val now = o.locals.get(n)
+
+    if now.is_none()
+        o.locals.put(n, org)
+        o.changed = true
+        return
+    end if
+
+    val was = now.unwrap()
+
+    if was == org || was == "" || org == "-" then return
+
+    o.locals.put(n, if was == "-" then org else "")
+    o.changed = true
+end origin_assign
+
+private is_param(o: &Origins, n: string) -> bool
+    for item in o.params
+        if item.0 == n then return true
+
+    false
+end is_param
+
+// Where a value points, as a location: `-` where it is no address at all -- a number made of no
+// pointer, `null` -- and the empty string where it points somewhere nobody here can name.
+//
+// **An address computed from another is followed**: `ptr_cast(usize(base) + offset)` points into
+// what `base` points at, at an offset nobody can name. That is where a store through it lands; whether
+// the computed address KEEPS anything is the other question, and an integer keeps nothing.
+origin_of(o: &Origins, x: TExpr) -> string
+    val ty = texpr_type(x)
+    val ptrish = may_hold_pointer(o.cx, ty)
+
+    if !ptrish && !is_integer_type(ty) then return "-"
+
+    *x.kind match
+        TLoad(n, _) ->
+            for item in o.refs
+                if item.0 == n then return if ptrish then "" else "-"
+
+            for j in 0..<o.params.len()
+                if o.params.at(j).0 == n then return if ptrish then s"p$j:" else "-"
+
+            o.locals.get(n).unwrap_or(if ptrish then "" else "-")
+        TAddrOf(place, _) -> place_loc(o, place)
+        TCast(v, _) -> origin_of(o, v)
+        TFloorCast(v, _) -> origin_of(o, v)
+        TBinary(_, l, r, _) -> offset_origin(origin_of(o, l), origin_of(o, r))
+        TIntLit(_, _) -> "-"
+        TNullLit(_) -> "-"
+        TCall(name, args, cty, _) -> if ptrish then call_origin(o, name, args, cty) else "-"
+        TSeq(exprs) -> if exprs.is_empty() then "-" else origin_of(o, exprs.at(exprs.len() - 1))
+        TBlockExpr(b) -> block_origin(o, b)
+        TIf(_, then_block, else_block, _) ->
+            if else_block.is_none() then return ""
+
+            merge_origin(block_origin(o, then_block), block_origin(o, else_block.unwrap()))
+        TMatch(_, arms, _) ->
+            var out = "-"
+
+            for arm in arms
+                out = merge_origin(out, block_origin(o, arm.body))
+
+            out
+        _ -> if ptrish then "" else "-"
+end origin_of
+
+private block_origin(o: &Origins, b: TBlock) -> string =
+    if b.result.is_some() then origin_of(o, b.result.unwrap()) else "-"
+
+private merge_origin(a: string, b: string) -> string
+    if a == "-" then return b
+    if b == "-" then return a
+    if a == b then a else ""
+end merge_origin
+
+private offset_origin(a: string, b: string) -> string
+    if a == "-" && b == "-" then return "-"
+    if a == "-" then return unknown_offset(b)
+    if b == "-" then return unknown_offset(a)
+
+    ""
+end offset_origin
+
+private unknown_offset(o: string) -> string
+    if o == "" || o == "-" || o.ends_with("?") then return o
+
+    o + "?"
+end unknown_offset
+
+// Where a call's pointer answer points: into what the one argument it may be made of points at.
+private call_origin(o: &Origins, name: string, args: Buf[TExpr], ty: Type) -> string
+    var found = "-"
+
+    for k in 0..<args.len()
+        val ak = origin_of(o, args.at(k))
+
+        if ak == "-" || !answers_arg(o.cx, name, args, k, ty, true) then continue
+
+        val at = unknown_offset(ak)
+
+        if found == "-" then found = at
+        else if found != at then return ""
+
+    if found == "-" then "" else found
+end call_origin
+
+// The location a place names.
+place_loc(o: &Origins, place: TExpr) -> string
+    *place.kind match
+        TLoad(n, _) ->
+            for item in o.refs
+                if item.0 == n then return place_loc(o, item.1)
+
+            s"l:$n"
+        TGlobal(symbol, _, _) -> s"g:$symbol"
+        TField(r, index, _) ->
+            val base = place_loc(o, r)
+
+            if base == "" then return ""
+
+            s"$base.${field_label(texpr_type(r), index)}"
+        TIndex(r, i, _) ->
+            val base = if is_array_type(texpr_type(r)) then place_loc(o, r) else origin_of(o, r)
+
+            if base == "" || base == "-" then "" else s"$base[${index_key(o, i)}]"
+        TDeref(x, _) ->
+            val b = origin_of(o, x)
+
+            if b == "-" then "" else b
+        _ -> ""
+end place_loc
+
+// Which element an index names, where a clear can be matched against it: a constant (`=3`), a
+// parameter (`#p1`) or a field of what a parameter points at (`#p0.drive`), each said again in the
+// caller's terms by `translate_loc`. Anything else is an element nobody can name (`?`).
+private index_key(o: &Origins, e: TExpr) -> string
+    *e.kind match
+        TCast(v, _) -> return index_key(o, v)
+        TIntLit(v, _) -> return s"=$v"
+        TLoad(n, _) ->
+            for j in 0..<o.params.len()
+                if o.params.at(j).0 == n then return s"#p$j"
+        TField(r, index, _) ->
+            *r.kind match
+                TDeref(x, _) ->
+                    *x.kind match
+                        TLoad(n, _) ->
+                            for j in 0..<o.params.len()
+                                if o.params.at(j).0 == n then return s"#p$j.${field_label(texpr_type(r), index)}"
+                        _ -> ()
+                _ -> ()
+        _ -> ()
+
+    "?"
+end index_key
+
+// A location's element keys said in the caller's terms: `#pK` is what the caller handed at `K`, and
+// `#pK.f` that argument's field when it is the caller's own parameter.
+private caller_index_keys(o: &Origins, args: Buf[TExpr], loc: string) -> string
+    if loc.index_of("[#p").is_none() then return loc
+
+    val b = loc.bytes
+    var out = ""
+    var last: usize = 0
+    var i: usize = 0
+
+    while i + 2 < b.len
+        if b[i] != u8('[') || b[i + 1] != u8('#') || b[i + 2] != u8('p')
+            i += 1
+            continue
+        end if
+
+        var j = i + 3
+        var k: usize = 0
+
+        while j < b.len && b[j] >= u8('0') && b[j] <= u8('9')
+            k = k * 10 + usize(b[j] - u8('0'))
+            j += 1
+
+        var close = j
+
+        while close < b.len && b[close] != u8(']')
+            close += 1
+
+        val rest = loc[j..<close]
+        var key = "?"
+
+        if k < args.len()
+            val whole = index_key(o, args.at(k))
+
+            if rest == "" then key = whole
+            else if whole.starts_with("#p") && whole.index_of(".").is_none() then key = whole + rest
+        end if
+
+        out = out + loc[last..<i] + "[" + key + "]"
+        last = if close < b.len then close + 1 else close
+        i = last
+
+    out + loc[last..<b.len]
+end caller_index_keys
+
+private field_label(t: Type, index: int) -> string = t match
+    Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields.at(usize(index)).0 else s"#$index"
+    _ -> s"#$index"
+
+// A callee's location said in the caller's terms: one through the callee's `j`th parameter is one
+// through what the caller handed it there.
+translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
+    val loc = caller_index_keys(o, args, callee_loc)
+
+    if loc == "" || loc == "*" || loc.starts_with("g:") then return loc
+
+    for j in 0..<args.len()
+        val prefix = s"p$j:"
+
+        if loc.starts_with(prefix)
+            val base = origin_of(o, args.at(j))
+
+            if base == "" || base == "-" then return ""
+
+            return base + loc[prefix.bytes.len..<loc.bytes.len]
+        end if
+
+    ""
+end translate_loc
+
+// The local a frame location belongs to.
+local_of(loc: string) -> string
+    var end_at = loc.bytes.len
+
+    for i in 2..<loc.bytes.len
+        val b = loc.bytes[i]
+
+        if b == u8('.') || b == u8('[') || b == u8('?')
+            end_at = i
+            break
+        end if
+
+    loc[2..<end_at]
+end local_of
+
+is_integer_type(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    _ -> false
+
+// -- what an extern's answer may be made of ----------------------------------------------------------------
+
+// Whether a call's answer may be made of its argument at `k`: a body's own answer where there is one,
+// and for an `extern` a pointer argument whose storage could hold what the answer points at -- the
+// same type, or one with a field or element of that type, with bytes standing for any bytes (which
+// is `strchr`'s family). An out-parameter `*i32` cannot be where a `*Code` points, and a context
+// handed over as bytes is not where a library's new object is, so the answer of a C function that
+// takes either is not made of it.
+answers_arg(cx: &KeepsCx, name: string, args: Buf[TExpr], k: usize, ty: Type, raw: bool) -> bool
+    if cx.find(name).is_none() then return extern_may_derive(ty, texpr_type(args.at(k)))
+
+    if raw then raw_answers_of(cx, name, k) else answers_of(cx, name, k)
+end answers_arg
+
+private extern_may_derive(answer: Type, arg: Type) -> bool
+    val a = ptr_pointee(answer)
+    val b = ptr_pointee(arg)
+
+    if a.is_none() || b.is_none() then return true
+
+    may_point_into(a.unwrap(), b.unwrap(), 0)
+end extern_may_derive
+
+private ptr_pointee(t: Type) -> Option[Type] = t match
+    Ptr(inner) -> Some(*inner)
+    _ -> None
+
+private may_point_into(a: Type, b: Type, depth: int) -> bool
+    if is_abstract(a) || is_abstract(b) then return true
+
+    // Bytes come out of bytes, and out of nothing else: a byte answer is not a step into the middle
+    // of somebody's struct.
+    if bytey(a) then return bytey(b)
+    if type_show(a) == type_show(b) then return true
+    if depth > 4 then return false
+
+    underlying(b) match
+        Array(_, elem) -> may_point_into(a, *elem, depth + 1)
+        Struct(d) ->
+            for item in d.fields
+                if may_point_into(a, item.1, depth + 1) then return true
+
+            false
+        _ -> false
+end may_point_into
+
+private bytey(t: Type) -> bool = underlying(t) match
+    Integer(bits, _, _) -> bits == 8
+    Unit -> true
+    _ -> false
+
+private is_abstract(t: Type) -> bool = t match
+    Abstract(_, _) -> true
+    _ -> false

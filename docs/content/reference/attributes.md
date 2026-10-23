@@ -4252,6 +4252,7 @@ worker(seen: *int)
     *seen = current.id
     current = &mine
     *seen = *seen * 10 + current.id
+    current = &main_vm
 
 var seen = 0
 
