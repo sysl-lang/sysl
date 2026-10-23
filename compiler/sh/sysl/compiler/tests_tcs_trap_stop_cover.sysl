@@ -1,0 +1,360 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The covered-count pass (`arc_cover.sysl`) lets a view taken from a slot that holds its own count
+// skip the retain/release pair, provided nothing between the two can read a count. A hosted trap
+// reaches `@sysl.trap`, the flushing stop, which never returns and touches no count -- so every
+// check a loop makes (an index, a range, an overflow, a `require`) leaves that window open, and a
+// view taken in a checked loop takes no count. These tests pin it three ways: the IR holds no pair,
+// the output is what it was, and the counted heap comes back to zero. A view that leaves the loop
+// still takes its count.
+
+private tcs_source() -> string = raw"""
+    sum_while(src: []const u8) -> u32
+        var t: u32 = 0
+        var i: usize = 0
+
+        while i < src.len
+            val v = src[i..<i + 1]
+
+            t += u32(v[0])
+            i += 1
+
+        t
+
+    sum_for(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            t += u32(v[0])
+
+        t
+
+    sum_iter(src: []const u8) -> u32
+        var t: u32 = 0
+        var i: usize = 0
+
+        while i < src.len
+            for x in src[i..<i + 1]
+                t += u32(x)
+
+            i += 1
+
+        t
+
+    sum_nested(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val row = src[i..<src.len]
+
+            for j in 0..<row.len
+                val cell = row[j..<j + 1]
+
+                t += u32(cell[0])
+
+        t
+
+    count_string(s: string) -> usize
+        var n: usize = 0
+
+        for i in 0..<s.len
+            val v = s[i..<i + 1]
+
+            n += v.len
+
+        n
+
+    shares(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            t += 100 / u32(v[0])
+
+        t
+
+    small(x: u8) -> u8
+        require x < 200
+
+        x
+
+    required(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            t += u32(small(v[0]))
+
+        t
+
+    struct Keep
+        v: []const u8
+
+    keep_last(src: []const u8) -> usize
+        var k = Keep(src[0..<0])
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            k = Keep(v)
+
+        k.v.len
+    """
+
+// A Buf and `panic` need the library's modules, which the lowering-text harness does not load, so
+// they are exercised as programs.
+private tcs_buf_source() -> string = raw"""
+    sum_buf(b: Buf[u8]) -> u32
+        var t: u32 = 0
+
+        for i in 0..<b.len()
+            val v = b.view()[i..<i + 1]
+
+            t += u32(v[0])
+
+        t
+
+    halting(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            if v[0] == 99 then trap()
+
+            t += u32(v[0])
+
+        t
+
+    guarded(src: []const u8) -> u32
+        var t: u32 = 0
+
+        for i in 0..<src.len
+            val v = src[i..<i + 1]
+
+            if v[0] == 99 then panic("boom")
+
+            t += u32(v[0])
+
+        t
+    """
+
+private tcs_ir(name: string) -> string
+    val ir = emit_func_text(tcs_source(), name)
+
+    assert(ir.starts_with("define"), ir)
+    ir
+end tcs_ir
+
+private tcs_pairless(name: string)
+    if xvr_no_library() then return
+
+    val ir = tcs_ir(name)
+
+    assert_eq(ir.contains("@arc.retain"), false, ir)
+    assert_eq(ir.contains("@arc.release"), false, ir)
+    // the loop really does stop through the flushing stop (or the bounds report), so the window was
+    // crossed and not absent
+    assert(ir.contains("@sysl.trap") || ir.contains("@sysl_bounds_fail"), ir)
+end tcs_pairless
+
+// -- the IR -------------------------------------------------------------------------------------------
+
+@test("a view taken in a bounds-checked while loop takes no count")
+tcs_ir_while() = tcs_pairless("sum_while")
+
+@test("a view taken in a bounds-checked for loop takes no count")
+tcs_ir_for() = tcs_pairless("sum_for")
+
+@test("a view walked by an iterator takes no count")
+tcs_ir_iterator() = tcs_pairless("sum_iter")
+
+@test("a view taken in a loop inside a loop takes no count")
+tcs_ir_nested() = tcs_pairless("sum_nested")
+
+@test("a view of a string taken in a checked loop takes no count")
+tcs_ir_string() = tcs_pairless("count_string")
+
+@test("a view in a loop that divides by what it reads takes no count")
+tcs_ir_division() = tcs_pairless("shares")
+
+@test("a view stored beyond the loop keeps its count")
+tcs_ir_escaping()
+    if xvr_no_library() then return
+
+    val ir = tcs_ir("keep_last")
+
+    assert(ir.contains("@arc.retain"), ir)
+
+// -- the program --------------------------------------------------------------------------------------
+
+private struct TcsRun
+    ok: bool
+    code: int
+    out: string
+    err: string
+
+private tcs_run(main: string) -> TcsRun
+    val root = make_temp_dir("sysl-tcs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return TcsRun(false, -1, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> TcsRun(false, -1, "could not be started", "")
+        Ok(o) -> TcsRun(true, shell_status(o.status), o.text, o.err.unwrap_or(""))
+end tcs_run
+
+private tcs_program(tail: string) -> string =
+    "import sysl.buf.{Buf, buf}\n" + tcs_source() + tcs_buf_source() + "\n" + tail
+
+@test("the same loops print what they printed and leave the counted heap where it started")
+tcs_output_and_count()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        val data: [4]u8 = [1, 2, 3, 4]
+        val b: Buf[u8] = buf()
+
+        b.push(5)
+        b.push(6)
+        b.push(7)
+
+        print(sum_while(data))
+        print(sum_for(data))
+        print(sum_iter(data))
+        print(sum_nested(data))
+        print(sum_buf(b))
+        print(count_string("hello"))
+        print(guarded(data))
+        print(halting(data))
+        print(required(data))
+        print(keep_last(data))
+        """))
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, "10\n10\n10\n30\n18\n5\n10\n10\n10\n1\n")
+    assert_eq(run.err.contains(alloc_count_said()), false, run.err)
+
+@test("a panic raised in the loop still says its message and stops")
+tcs_panic_in_the_loop()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        val data: [3]u8 = [1, 99, 3]
+
+        print("start")
+        print(guarded(data))
+        print("unreached")
+        """))
+
+    assert(run.ok, run.out)
+    assert(run.code != 0, run.out)
+    assert(run.out.starts_with("start\n"), run.out)
+    assert_eq(run.out.contains("unreached"), false, run.out)
+    assert(run.out.contains("boom") || run.err.contains("boom"), run.out + run.err)
+
+@test("a bounds failure in the loop flushes what was printed and traps")
+tcs_bounds_trap_in_the_loop()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        sum_past(src: []const u8) -> u32
+            var t: u32 = 0
+
+            for i in 0..<src.len
+                val v = src[i..<i + 2]
+
+                t += u32(v[0])
+
+            t
+
+        val data: [3]u8 = [1, 2, 3]
+
+        print("start")
+        print(sum_past(data))
+        print("unreached")
+        """))
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 133, run.out + run.err)
+    assert_eq(run.out, "start\n")
+
+@test("a trap() in the loop flushes what was printed and traps")
+tcs_trap_call_in_the_loop()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        val data: [3]u8 = [1, 99, 3]
+
+        print("start")
+        print(halting(data))
+        print("unreached")
+        """))
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 133, run.out + run.err)
+    assert_eq(run.out, "start\n")
+
+@test("a failed require in the loop flushes what was printed and traps")
+tcs_require_in_the_loop()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        val data: [3]u8 = [1, 250, 3]
+
+        print("start")
+        print(required(data))
+        print("unreached")
+        """))
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 133, run.out + run.err)
+    assert_eq(run.out, "start\n")
+
+@test("a division by zero in the loop flushes what was printed and traps")
+tcs_division_in_the_loop()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = tcs_run(tcs_program(raw"""
+        val fits: [2]u8 = [10, 50]
+
+        print("start")
+        print(shares(fits))
+
+        val data: [3]u8 = [5, 0, 3]
+
+        print(shares(data))
+        print("unreached")
+        """))
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 133, run.out + run.err)
+    assert_eq(run.out, "start\n12\n")
