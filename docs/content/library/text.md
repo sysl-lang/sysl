@@ -593,22 +593,37 @@ ba
 HÉLLO héllo
 ```
 
-**`join` is a member of a view of strings too**, through the `Join` trait, which is Scala's
-`mkString`: `parts.join(", ")` is `join(parts, ", ")`. It is the view's, so an array or a `Buf` of
-strings joins through its view:
+**`join` is a member of any slice, array or `Buf` of printable elements**, through the `Join` trait,
+which is Scala's `mkString`: `parts.join(", ")` is `join(parts, ", ")` for strings, and every other
+element renders through its `Display` straight into the one buffer, with no string made per element:
 
 ```sysl
+import sysl.buf.{Buf, buf}
 import sysl.text.split
 
+struct Pt derives Display
+    x: int
+    y: int
+
 val words = ["x", "y", "z"]
+var names: Buf[string] = buf()
+
+names.push("ann")
+names.push("bo")
 
 print(split("a,b,c", ",").join(" + "))
-print(words[..].join("-"), words[0..<1].join("-"))
+print(words.join("-"), words[0..<1].join("-"))
+print(names.join(", "))
+print([1, 2, 3].join(", "))
+print([Pt(1, 2), Pt(3, 4)].join("; "))
 ```
 
 ```output
 a + b + c
 x-y-z x
+ann, bo
+1, 2, 3
+Pt(1, 2); Pt(3, 4)
 ```
 
 **`to_upper("héllo")` is `HÉLLO`.** These walk *characters* rather than bytes and go through
