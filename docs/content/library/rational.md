@@ -12,13 +12,13 @@ are the smallest set that keeps `/` exact as well, and every numeric tower that 
 Haskell's `Rational`, Python's `fractions` — builds it out of exactly these two integers.
 
 ```sysl
-import sysl.math.rational.{ratio, to_string}
+import sysl.math.rational.ratio
 
 val third = ratio(1, 3)
 val sixth = ratio(1, 6)
 
-print(to_string(third + sixth))
-print(to_string(ratio(6, -4)), to_string(ratio(10, 5)))
+print((third + sixth).to_string())
+print(ratio(6, -4).to_string(), ratio(10, 5))
 print(third < sixth, third * ratio(3, 1) == ratio(1, 1))
 ```
 
@@ -33,8 +33,8 @@ false true
 Every value is kept **reduced by its `gcd` with the sign on the numerator**, so every number has
 exactly one representation: `6/-4` is built as `-3/2`, and zero is `0/1` whatever it was computed
 from. That is what lets `==` compare the two parts field by field, `Hash` hash them, and the text
-print without anybody normalizing first. The text is always `n/d` — a whole number is `2/1`, so it
-says which type it came from.
+print without anybody normalizing first. The text — the `Display`, so `x.to_string()`, `print(x)`
+and `s"$x"` alike — is always `n/d`: a whole number is `2/1`, so it says which type it came from.
 
 `of(num, den)` builds one from two `BigInt`s and `ratio(n, d)` from two machine integers;
 `from_int` and `from_big` take a whole number, and `From[long]` and `From[BigInt]` are implemented.
@@ -45,10 +45,10 @@ and otherwise exactly what `of` does:
 
 ```sysl
 import sysl.math.bigint.from_int
-import sysl.math.rational.{checked_of, to_string}
+import sysl.math.rational.checked_of
 
 print(checked_of(from_int(1), from_int(0)).is_none())
-print(to_string(checked_of(from_int(6), from_int(-4)).unwrap()))
+print(checked_of(from_int(6), from_int(-4)).unwrap())
 ```
 
 ```output
@@ -66,13 +66,12 @@ the value does not.
 `numerator()` and `denominator()` hand back the two parts:
 
 ```sysl
-import sysl.math.bigint.to_string
 import sysl.math.rational.{ceil, floor, ratio, trunc}
 
 val x = ratio(-7, 2)
 
-print(to_string(floor(x)), to_string(ceil(x)), to_string(trunc(x)))
-print(to_string(x.numerator()), to_string(x.denominator()))
+print(floor(x), ceil(x), trunc(x))
+print(x.numerator().to_string(), x.denominator().to_string())
 ```
 
 ```output
@@ -88,9 +87,9 @@ as it. `0.1` is not a tenth, and this module says so:
 
 ```sysl
 import sysl.math.Float
-import sysl.math.rational.{cmp_real, eq_real, from_real, lt_real, ratio, to_string}
+import sysl.math.rational.{cmp_real, eq_real, from_real, lt_real, ratio}
 
-print(to_string(from_real(0.1).unwrap()))
+print(from_real(0.1).unwrap())
 print(cmp_real(ratio(1, 10), 0.1), lt_real(ratio(1, 10), 0.1))
 print(eq_real(ratio(1, 2), 0.5), cmp_real(ratio(1, 2), real.nan()))
 ```

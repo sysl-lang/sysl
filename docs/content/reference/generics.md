@@ -523,7 +523,7 @@ arguments it *can*, so an argument waits on what it needs rather than on its pos
 checked against it exactly as for a non-generic function:
 
 ```sysl
-at[T](x: T, n: usize) -> string = str(n)
+at[T](x: T, n: usize) -> string = n.to_string()
 
 print(at("v", 7))
 ```
@@ -975,7 +975,7 @@ its body to the right, and the most important part, what the function *takes*, b
 read. `where` puts the bounds after the signature instead:
 
 ```sysl
-show[T](x: T) -> string where T: Display = str(x)
+show[T](x: T) -> string where T: Display = x.to_string()
 
 print(show(42))
 ```
@@ -993,7 +993,7 @@ brackets, and a long one that would crowd the signature goes after it.
 
 ```sysl
 same[T: Eq](a: T, b: T) -> string where T: Display =
-    if a == b then str(a) else "different"
+    if a == b then a.to_string() else "different"
 
 print(same(3, 3))
 print(same(3, 4))
@@ -1029,7 +1029,7 @@ true
 refused where it is written:
 
 ```sysl
-show[T](x: T) -> string where U: Display = str(x)
+show[T](x: T) -> string where U: Display = x.to_string()
 
 print(show(1))
 ```
@@ -1705,7 +1705,7 @@ joined[..A: Display](t: (..A)) -> string
     for const i in 0..<A.len
         if i > 0 then s = s + "-"
 
-        s = s + str(t.i)
+        s = s + t.i.to_string()
 
     s
 
@@ -1734,7 +1734,7 @@ struct Point
     x: int
     y: int
 
-joined[..A: Display](t: (..A)) -> string = str(t.0)
+joined[..A: Display](t: (..A)) -> string = t.0.to_string()
 
 print(joined((1, Point(2, 3))))
 ```
@@ -1901,7 +1901,7 @@ struct Row
 
     take[..A: Display](*self, t: (..A))
         for const i in 0..<A.len
-            self.n = self.n + str(t.i).len
+            self.n = self.n + t.i.to_string().len
 end Row
 
 var r = Row(0)
@@ -1934,7 +1934,7 @@ impl Take for Row
         var total = self.n
 
         for const i in 0..<A.len
-            total = total + str(t.i).len
+            total = total + t.i.to_string().len
 
         total
 

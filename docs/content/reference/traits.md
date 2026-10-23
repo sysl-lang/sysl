@@ -761,7 +761,7 @@ trait Show
     show(self) -> string
 
 impl[T: Display] Show for Box[T]
-    show(self) -> string = "box of " + str(self.v)
+    show(self) -> string = "box of " + self.v.to_string()
 
 var b = Box(41)
 
@@ -1405,8 +1405,8 @@ Label(text: "a \"b\"", at: Point(x: 1, y: 2), color: Color.Red)
 The library writes the rest: the scalars (a `char` in single quotes, a `string` in double quotes),
 tuples, arrays, slices, `Buf`, `Option` and `Result`, each shown as its `Display` shows it but with
 the parts through their `Debug`. So `print` of a value with neither block written still prints:
-**`print`, `str` and an interpolation hole use `Display` where a value has one and `Debug` where it
-does not**, and `f"${x}%?"` and `debug(x)` always use `Debug`
+**`print`, `x.to_string()` and an interpolation hole use `Display` where a value has one and `Debug`
+where it does not**, and `f"${x}%?"` and `x.debug_string()` always use `Debug`
 ([strings](/reference/strings/#format-specifiers)). `assert_eq` reports both sides through it, so
 `got "1", want 1` cannot be mistaken for equal values.
 
@@ -1450,7 +1450,7 @@ Box(v: "in")
 ```
 
 **A type's own `debug` is unaffected by the supplied one.** A field, a variant or a member named
-`debug` keeps the name on the type, and `%?`, `debug(x)` and a `T: Debug` bound still use the
+`debug` keeps the name on the type, and `%?`, `x.debug_string()` and a `T: Debug` bound still use the
 supplied rendering:
 
 ```sysl
@@ -1543,7 +1543,7 @@ print(w, l, Tally(3))
 
 **Printing a placeholder directly produces a warning**, and still builds. A value whose whole printed
 form is `<writer>`, `<fn>`, `<task>` or a `<Type>` with no `Debug`, passed directly to `print`,
-`str`, an interpolation or `format` hole, `debug(x)`, or an argument meeting a `T: Debug` bound such
+`to_string`, an interpolation or `format` hole, `debug_string`, or an argument meeting a `T: Debug` bound such
 as `assert_eq`'s, was almost certainly meant to show something. The `print(w)` above reports:
 
 ```

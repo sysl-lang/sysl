@@ -78,7 +78,7 @@ An argument may also be passed by name, which keeps a call with several literal 
 
 ```sysl
 window(x: int = 0, y: int = 0, width: int = 80, height: int = 24) -> string
-    str(width) + "x" + str(height) + " at " + str(x) + "," + str(y)
+    s"${width}x$height at $x,$y"
 
 print(window(width = 132, y = 10))
 ```

@@ -56,7 +56,7 @@ trait Show
     show(self) -> string
 
 impl Show for int
-    show(self) -> string = "int " + str(self)
+    show(self) -> string = "int " + self.to_string()
 
 impl Show for bool
     show(self) -> string = if self then "yes" else "no"
@@ -117,7 +117,7 @@ trait Show
     show(self) -> string
 
 impl Show for int
-    show(self) -> string = "#" + str(self)
+    show(self) -> string = "#" + self.to_string()
 
 describe[T: Show](x: T) -> string = "<" + x.show() + ">"
 
@@ -300,7 +300,7 @@ APIs are built this way; [the reference](/reference/traits/) covers it.
 
 ## Implementing `Display`
 
-`Display` is usually the first trait to implement, because `print` and `str` use it:
+`Display` is usually the first trait to implement, because `print` and `to_string` use it:
 
 ```sysl
 struct Point
@@ -309,12 +309,12 @@ struct Point
 
 impl Display for Point
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+        display_pad(s"(${self.x}, ${self.y})".bytes, out, fmt)
 
 var p = Point(3, 4)
 
 print(p)
-print("as text:", str(p), "padded:", f"${p}%10s")
+print("as text:", p.to_string(), "padded:", f"${p}%10s")
 ```
 
 ```output
@@ -324,7 +324,7 @@ as text: (3, 4) padded:     (3, 4)
 
 A value renders itself **into a `*Writer`** rather than returning a string. Rendering therefore needs
 no allocation, since a program in a kernel can supply its own output sink with an ordinary `impl`,
-and `str(x)` is the same rendering directed into a buffer.
+and `x.to_string()` — a member every value has — is the same rendering directed into a buffer.
 
 `Writer` is the first trait the language itself forms objects of. `display_pad` applies the
 `FormatSpec` **once, to the whole value**: a specifier describes the field the entire value occupies,

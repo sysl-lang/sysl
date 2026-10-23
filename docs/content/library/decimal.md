@@ -12,12 +12,12 @@ in decimal — so a total of a million transactions is out by cents, and no amou
 site fixes it.
 
 ```sysl
-import sysl.math.decimal.{add, from_int, parse, to_string}
+import sysl.math.decimal.{add, from_int, parse}
 
 val a = parse("0.1").expect("a number")
 val b = parse("0.2").expect("a number")
 
-print(to_string(add(a, b)), add(a, b) == parse("0.3").expect("a number"))
+print(add(a, b).to_string(), add(a, b) == parse("0.3").expect("a number"))
 print(0.1 + 0.2, 0.1 + 0.2 == 0.3)
 ```
 
@@ -34,7 +34,7 @@ difference lands in every comparison and every total.
 It accumulates, too:
 
 ```sysl
-import sysl.math.decimal.{add, from_int, parse, to_string}
+import sysl.math.decimal.{add, from_int, parse}
 
 var real_total = 0.0
 var exact = parse("0.00").expect("a number")
@@ -45,7 +45,7 @@ for _ in 0..<100
     exact = add(exact, dime)
 
 print(real_total, real_total == 10.0)
-print(to_string(exact), exact == from_int(10))
+print(exact.to_string(), exact == from_int(10))
 ```
 
 ```output
@@ -64,14 +64,14 @@ money needs: a price quoted to the cent is quoted to the cent whether or not the
 zero, and a total that rendered as `1.5` where every other row said `1.50` would be a bug report.
 
 ```sysl
-import sysl.math.decimal.{normalized, parse, to_string}
+import sysl.math.decimal.{normalized, parse}
 
 val a = parse("1.50").expect("a number")
 val b = parse("1.5").expect("a number")
 
 print(a == b, a.hash() == b.hash())
-print(to_string(a), to_string(b), a.scale(), b.scale())
-print(to_string(normalized(a)))
+print(a.to_string(), b.to_string(), a.scale(), b.scale())
+print(normalized(a).to_string())
 ```
 
 ```output
@@ -94,14 +94,14 @@ A sum's scale is the larger of its operands', and a product's is the **sum** of 
 exactness costs, and it is worth expecting: two prices at two places multiply to a value at four.
 
 ```sysl
-import sysl.math.decimal.{add, mul, parse, sub, to_string}
+import sysl.math.decimal.{add, mul, parse, sub}
 
 val price = parse("19.99").expect("a number")
 val rate = parse("0.0825").expect("a number")
 
-print(to_string(mul(price, rate)))
-print(to_string(add(price, parse("0.01").expect("a number"))))
-print(to_string(sub(price, parse("20").expect("a number"))))
+print(mul(price, rate).to_string())
+print(add(price, parse("0.01").expect("a number")).to_string())
+print(sub(price, parse("20").expect("a number")).to_string())
 ```
 
 ```output
@@ -120,15 +120,15 @@ choice this module made for a caller would be wrong for somebody. `divide` is th
 module where a digit is ever discarded, and it says how:
 
 ```sysl
-import sysl.math.decimal.{Rounding, divide, from_int, to_string}
+import sysl.math.decimal.{Rounding, divide, from_int}
 
 val one = from_int(1)
 val eight = from_int(8)
 
 // An eighth is 0.125, so two places puts it exactly on the tie.
-print(to_string(divide(one, eight, 2, Rounding.HalfEven)))
-print(to_string(divide(one, eight, 2, Rounding.HalfUp)))
-print(to_string(divide(one, from_int(3), 5, Rounding.HalfEven)))
+print(divide(one, eight, 2, Rounding.HalfEven).to_string())
+print(divide(one, eight, 2, Rounding.HalfUp).to_string())
+print(divide(one, from_int(3), 5, Rounding.HalfEven).to_string())
 ```
 
 ```output
@@ -158,13 +158,13 @@ every positive value and disagree on every negative one, and so do `Ceiling` and
 only the first column in it would say nothing about four of the six.
 
 ```sysl
-import sysl.math.decimal.{Rounding, divide, from_int, to_string}
+import sysl.math.decimal.{Rounding, divide, from_int}
 
 val a = from_int(-1)
 val b = from_int(8)
 
-print(to_string(divide(a, b, 2, Rounding.Down)), to_string(divide(a, b, 2, Rounding.Floor)))
-print(to_string(divide(a, b, 2, Rounding.Up)), to_string(divide(a, b, 2, Rounding.Ceiling)))
+print(divide(a, b, 2, Rounding.Down).to_string(), divide(a, b, 2, Rounding.Floor).to_string())
+print(divide(a, b, 2, Rounding.Up).to_string(), divide(a, b, 2, Rounding.Ceiling).to_string())
 ```
 
 ```output
@@ -179,13 +179,13 @@ print(to_string(divide(a, b, 2, Rounding.Up)), to_string(divide(a, b, 2, Roundin
 ## Reading and writing keeps the scale
 
 `parse` reads an optional sign and then digits with at most one point among them, and the scale is
-however many digits came after it. So `to_string(parse(s))` is `s`, which is the whole promise:
+however many digits came after it. So the `to_string()` of `parse(s)` is `s`, which is the whole promise:
 
 ```sysl
-import sysl.math.decimal.{parse, to_string}
+import sysl.math.decimal.parse
 
 for s in ["12.340", "0.005", "-0.5", "1.50", "0"]
-    print(to_string(parse(s).expect("a number")))
+    print(parse(s).expect("a number").to_string())
 ```
 
 ```output
@@ -211,13 +211,12 @@ a caller is trusting the round trip with. A program reading exponent notation sp
 wire takes it apart, since that is exactly how such a column is stored:
 
 ```sysl
-import sysl.math.bigint.to_string as big_text
-import sysl.math.decimal.{of, parse, to_string}
+import sysl.math.decimal.{of, parse}
 
 val x = parse("12.340").expect("a number")
 
-print(big_text(x.coefficient()), x.scale())
-print(to_string(of(x.coefficient(), x.scale())))
+print(x.coefficient().to_string(), x.scale())
+print(of(x.coefficient(), x.scale()).to_string())
 ```
 
 ```output

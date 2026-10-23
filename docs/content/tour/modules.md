@@ -154,9 +154,9 @@ for i in 0..<widths.len() do widest = max(widest, widths[i])
 var b = str_builder()
 
 b.push("widest of ")
-b.push(str(widths.len()))
+b.push(widths.len().to_string())
 b.push(" is ")
-b.push(str(widest))
+b.push(widest.to_string())
 
 print(b.finish())
 ```

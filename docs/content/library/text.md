@@ -21,7 +21,7 @@ var s = "héllo"
 print(s.len, s.bytes.len)
 
 for c in s.chars
-    prints(str(c))
+    prints(c.to_string())
     prints(".")
 
 prints("\n")
@@ -47,8 +47,8 @@ The module is seven files, and the boundaries between them are arguments rather 
 | `utf8.sysl` | `from_utf8`, `from_utf8_lossy`, `Utf8Error`, `char_from_u32`, `from_cstring`, `is_char_boundary`, `Chars`, `CharIndices` | the validity seam — what turns bytes into text |
 | `ascii.sysl` | trait `Ascii`, implemented for `u8` **and** `char` | classification, **named for the range it answers over** |
 | `find.sysl` | trait `Search`, implemented for `string` **and** `[]const u8` | everything that makes **no new bytes** |
-| `edit.sysl` | `split`, `fields`, `join`, `repeat`, `replace_all`, `to_upper`, `to_lower` | everything that **does** — so it needs an allocator |
-| `parse.sysl` | `ParseError`, `parse_bool`/`int`/`long`/`uint`/`ulong`/`real` and the `_base` forms, each over a `string` and over a `[]const u8` | the direction `str(x)` does not go |
+| `edit.sysl` | `split`, `fields`, `join` (and trait `Join`, the same as a member of `[]const string`), `repeat`, `replace_all`, `to_upper`, `to_lower` | everything that **does** — so it needs an allocator |
+| `parse.sysl` | `ParseError`, `parse_bool`/`int`/`long`/`uint`/`ulong`/`real` and the `_base` forms, each over a `string` and over a `[]const u8` | the direction `x.to_string()` does not go |
 | `build.sysl` | `StrBuilder`, `CString`, `str_builder_with_capacity` | gathering text, and the copy C reads |
 | `width.sysl` | `char_columns`, `columns` | **data, not algorithm** — 499 ranges of the Unicode Character Database |
 
@@ -593,6 +593,24 @@ ba
 HÉLLO héllo
 ```
 
+**`join` is a member of a view of strings too**, through the `Join` trait, which is Scala's
+`mkString`: `parts.join(", ")` is `join(parts, ", ")`. It is the view's, so an array or a `Buf` of
+strings joins through its view:
+
+```sysl
+import sysl.text.split
+
+val words = ["x", "y", "z"]
+
+print(split("a,b,c", ",").join(" + "))
+print(words[..].join("-"), words[0..<1].join("-"))
+```
+
+```output
+a + b + c
+x-y-z x
+```
+
 **`to_upper("héllo")` is `HÉLLO`.** These walk *characters* rather than bytes and go through
 `push_char`, so every way into the builder still carries the UTF-8 guarantee and no unchecked
 primitive is named — and it works because [`sysl.unicode.to_upper`](/library/unicode/#case-mapping-is-a-character-at-a-time-and-folding-is-not) is total, so a
@@ -764,16 +782,16 @@ be `from_utf8_unchecked` with a longer name and none of its greppability. The tw
 interchangeable and are not: a `Writer` is a sink for bytes and a builder is a producer of text.
 
 **`push_int`, `push_uint`, `push_real` and `push_bool` exist so that gathering a number costs no
-allocation.** The spelling without them is `push(str(n))`, which builds a whole reference-counted
+allocation.** The spelling without them is `push(n.to_string())`, which builds a whole reference-counted
 `string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops
 it, for a value whose text is a couple of dozen bytes and is wanted only inside this buffer. A stack
 array and the library's own digit loop — `digits_long` for an integer, the shortest-digits renderer
 for a float — is the same rendering with none of that.
 
-They agree with `str` to the byte, and that is the property that makes the cheap path a *substitute*
-rather than a second rendering: a program that builds half a line with a builder and half with an
-interpolation must not be able to tell which half a number came through. `push_real` writes what
-`str` writes for the same reason.
+They agree with `to_string` to the byte, and that is the property that makes the cheap path a
+*substitute* rather than a second rendering: a program that builds half a line with a builder and
+half with an interpolation must not be able to tell which half a number came through. `push_real`
+writes what `to_string` writes for the same reason.
 
 They take `long` and `ulong` rather than one member per width — the bargain the `print` family
 makes. [Overloading](/reference/declarations/) would give a set of members one *name*; it would not
@@ -797,7 +815,7 @@ b.push_int(big)
 ```
 
 So an unsigned value goes to `push_uint`, and one that is no integer at all is described by
-`push(str(x))`, which still works, still costs the allocation, and still saves the quadratic copying
+`push(x.to_string())`, which still works, still costs the allocation, and still saves the quadratic copying
 that made a builder worth having.
 
 `str_builder_with_capacity(n)` starts one with room, skipping the reallocate-and-copy at each
@@ -857,7 +875,7 @@ parse_long_base(b: []const u8, base: int) -> Result[long, ParseError]
 parse_ulong_base(b: []const u8, base: int) -> Result[ulong, ParseError]
 ```
 
-`str(x)` renders and nothing read back, which is a gap a program feels immediately — an argument, a
+`x.to_string()` renders and nothing read back, which is a gap a program feels immediately — an argument, a
 configuration field and a number in a file are all text. The digits are easy; the library exists for
 the edges.
 

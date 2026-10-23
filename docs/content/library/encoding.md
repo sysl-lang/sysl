@@ -395,7 +395,7 @@ A `Uuid` is sixteen bytes with a layout — RFC 9562's — and it is in this mod
 rendering of sixteen bytes, which is what the whole module is for.
 
 ```sysl
-import sysl.encoding.{parse, to_string, v4, v7}
+import sysl.encoding.{parse, v4, v7}
 import sysl.rand.rng
 import sysl.time.Instant
 
@@ -403,7 +403,7 @@ var g = rng(1, 1)
 val id = v4(&g)
 
 print(id.version(), id.variant())
-print(to_string(parse("00010203-0405-4607-8809-0a0b0c0d0e0f").expect("a uuid")))
+print(parse("00010203-0405-4607-8809-0a0b0c0d0e0f").expect("a uuid").to_string())
 print(v7(Instant(1757000551000 * 1000), &g).version())
 ```
 
@@ -433,7 +433,7 @@ for a session token, a password-reset link, or an object name that stands in for
 **For those, take the bytes from the kernel and use `v4_of`:**
 
 ```sysl
-import sysl.encoding.{to_string, v4_of}
+import sysl.encoding.v4_of
 import sysl.posix.rand.entropy_from_os
 
 var raw: [16]u8
@@ -441,7 +441,7 @@ var raw: [16]u8
 if entropy_from_os(raw[0..<16])
     val id = v4_of(raw)
 
-    print(id.version(), id.variant(), to_string(id).len)
+    print(id.version(), id.variant(), id.to_string().len)
 else
     print("4 1 36")
 ```
@@ -460,7 +460,8 @@ for the same reason.
 
 `v4` takes a generator and `v7` takes an instant, so a caller on a board supplies both from wherever
 it has them and a caller on a host reaches for `sysl.time.now` and `sysl.posix.rand`. Only
-`to_string` allocates, and it allocates one 36-byte string; `to_bytes` allocates nothing, for a caller
+`u.to_string()` allocates — the text is the `Display`, so `print(u)` and `s"$u"` write the same 36
+characters — and it allocates one 36-byte string; `to_bytes` allocates nothing, for a caller
 writing the compact form.
 
 `parse` reads the 36-character form and only that — braces, a `urn:uuid:` prefix and the unhyphenated
@@ -469,9 +470,9 @@ several conventions the text follows. Either case of hex digit is taken, which i
 for.
 
 ```sysl
-import sysl.encoding.{nil, parse, to_string}
+import sysl.encoding.{nil, parse}
 
-print(nil.is_nil(), to_string(nil))
+print(nil.is_nil(), nil.to_string())
 print(parse("00010203-0405-4607-8809-0A0B0C0D0E0F").is_some())
 print(parse("000102030405460788090a0b0c0d0e0f").is_none())
 ```

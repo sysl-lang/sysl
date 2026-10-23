@@ -296,7 +296,7 @@ enum Color: u8
 parse(b: u8) -> Result[Color, string]
     Color.try(b) match
         Some(c) -> Ok(c)
-        None    -> Err("byte " + str(b) + " is not a Color")
+        None    -> Err("byte " + b.to_string() + " is not a Color")
 
 parse(1) match
     Ok(c)  -> print("read:", Color::Image(c))

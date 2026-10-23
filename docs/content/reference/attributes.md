@@ -1825,7 +1825,7 @@ the function instead of the module:
 boxed(n: int) -> &int = n
 
 @no_alloc
-shown(n: int) -> usize = str(n).len
+shown(n: int) -> usize = n.to_string().len
 
 print(shown(42))
 ```
@@ -1840,7 +1840,7 @@ module's clause instead; an `import` or another declaration above the function i
 function's. A function in a module that already declared `@no_alloc` is held to the module's clause,
 which says everything the annotation would. **The module's clause binds its own files and never its
 `@tests` files** ([a `@tests` file states its own
-capabilities](/reference/modules/#a-tests-file-states-its-own-capabilities)): a test may use `str`,
+capabilities](/reference/modules/#a-tests-file-states-its-own-capabilities)): a test may use `to_string`,
 f-strings and `Buf`, while the module's functions stay allocator-free when a test calls them.
 
 **A method may carry it** — it lowers to a function like any other and is held the same way.
@@ -1879,7 +1879,7 @@ Above a function or a method, '@no_alloc' holds that one definition instead, and
 ```
 
 **A generic keeps the promise twice: as it was written, and at every instance.** The body it was
-written as is held first, and what it makes whatever the type — the `str(n)` above — is refused
+written as is held first, and what it makes whatever the type — the `n.to_string()` above — is refused
 once, naming the declaration, however many instances the program makes. A method of a generic
 struct and a method of a generic `impl` are held the same way:
 
@@ -1887,7 +1887,7 @@ struct and a method of a generic `impl` are held the same way:
 f() -> int = 1
 
 @no_alloc
-shown[T](x: T) -> usize = str(42).len
+shown[T](x: T) -> usize = 42.to_string().len
 
 print(shown(1), shown(true))
 ```
@@ -1908,7 +1908,7 @@ impl Size for int
     size(self) -> usize = 8
 
 impl Size for bool
-    size(self) -> usize = str(self).len
+    size(self) -> usize = self.to_string().len
 
 @no_alloc
 measured[T: Size](x: T) -> usize = x.size()
