@@ -213,7 +213,10 @@ One agent per item, in this order, each landing on dev with its tests and refere
 1. Inferred moves for copyable types (codegen only; no semantic change; the `Some` pair is its
    regression test).
 2. The keeps-analysis: per-function summaries for `*T` parameters, the call-site rule, the boundary
-   defaults, `@keeps`. `@lends`/`@borrows` removed.
+   defaults, `@keeps`. **The same summary marks a counted parameter the function keeps as OWNED**
+   (user, 2026-10-23). The callee takes the count, and the caller moves at its last use or retains
+   otherwise, so `buf.push(x)` and `f(local)` at last use move, with no syntax. (Item 1 left
+   arguments borrowed.) `@lends`/`@borrows` removed.
 3. `@crossing` inferred where visible; `@crossing(copy …)` folded into the channel.
 4. `Drop` types are reference types (Q3): construction yields `&T`, a by-value spelling is refused.
 5. The two small traps (special-form shadowing; host-side fold check).
@@ -255,6 +258,7 @@ One agent per item, in this order, each landing on dev with its tests and refere
   decide then; (a) until.
 - **Q8. `Option[T]`'s zero value** (skiff's question (b)): a `var x: Option[T]` with no initializer is
   `None`. It touches value initialization rather than ownership, but it belongs to the same pass over
-  what a value is. **Decided: yes, in 0.6.0.**
+  what a value is. **Decided: yes, in 0.6.0, by a general rule.** An enum carrying data may write one
+  payload-free variant `= 0`, and that variant is its zero value. `Option` is declared `None = 0` first.
 - **Q9. Fold the special-form shadowing error and the host-side fold check into 0.6.0?** **Decided:
   yes**; both are small and both are silent traps.
