@@ -313,7 +313,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, layout), enum_defs(p, layout),
                      box_defs(e, word_bits), imported_sigs(e, p, imported), globals, helpers, funcs, thunks,
-                     entry, used_of(p, funcs), init, module_asm_lines(p.module_asm))
+                     entry, used_of(e, p, funcs), init, module_asm_lines(p.module_asm))
 
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
 end codegen_into
@@ -555,12 +555,12 @@ end stores_export
 
 // The symbols this module places by hand and nothing in it reads, which is what keeps a section a
 // linker script gathers from being discarded.
-private used_of(p: TProgram, funcs: Buf[IrFunc]) -> Option[IrGlobal]
+private used_of(e: *Emit, p: TProgram, funcs: Buf[IrFunc]) -> Option[IrGlobal]
     var names: Buf[string] = buf()
 
     for i in 0..<p.vals.len()
         if p.vals.at(i).section.is_some()
-            names.push(p.vals.at(i).exported.unwrap_or(p.vals.at(i).symbol))
+            names.push(p.vals.at(i).exported.unwrap_or(symbol_of(e, p.vals.at(i).symbol)))
 
     for i in 0..<funcs.len()
         if funcs.at(i).sig.section.is_some() then names.push(funcs.at(i).sig.name)
@@ -585,7 +585,12 @@ private record_symbols(e: *Emit, p: TProgram)
 
         v.exported match
             Some(sym) -> if sym != v.symbol then e.symbols.push((v.symbol, sym))
-            None -> ()
+
+            // **A root module's storage is private and has no module to carry into its symbol**, so
+            // left alone it would be emitted under its bare name -- which is a C name, and
+            // `var clock` beside an `extern clock` is then one symbol twice. It is laid down under
+            // a `$`-led name instead, which no module's key and no C identifier can spell.
+            None -> if module_of(v.symbol) == ModuleRoot then e.symbols.push((v.symbol, "$" + v.symbol))
 
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)

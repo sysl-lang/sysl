@@ -1,0 +1,136 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A root module's storage is private, so the name it is laid down under is nobody's but the
+// compiler's -- and a bare `var clock` there must therefore sit beside libc's `clock`, which a module
+// of the program declares as an `extern`. What a program names for C (`main`, an `@export`) keeps
+// exactly the name it was given, and a module that is not the root is laid down as it always was.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rcn_ready() -> bool = std_root().is_ok() && clang_available()
+
+private rcn_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-rcn").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end rcn_root
+
+private rcn_ran(files: []const (string, string)) -> string
+    val root = rcn_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rcn_ran
+
+private rcn_ir(files: []const (string, string)) -> string
+    val root = rcn_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rcn_ir
+
+// A module declaring libc's `clock` and `time` as externs.
+private rcn_libc() -> string =
+    "module libc\n\nextern clock() -> i64\nextern time(t: *i64) -> i64\n\n" +
+    "ticks() -> i64 = if clock() >= 0 then 1 else 0\nnow() -> i64 = if time(null) > 0 then 1 else 0\n"
+
+// A root whose storage is named for libc functions and read from a function, so it is module storage.
+private rcn_main() -> string =
+    "import libc\n\nstatic var clock = 5\nstatic val time_ms = 3\n\n" +
+    "tick() -> int\n    clock += 1\n    clock + time_ms\n\n" +
+    "print(tick(), libc.ticks(), libc.now())\n"
+
+@test("a root var and val named for libc functions build and run beside the externs")
+rcn_beside_libc()
+    if !rcn_ready() then return
+
+    assert_eq(rcn_ran([("libc/libc.sysl", rcn_libc()), ("main.sysl", rcn_main())]), "9 1 1\n")
+end rcn_beside_libc
+
+@test("root storage is laid down under a name no C symbol can have")
+rcn_root_storage_is_mangled()
+    if !rcn_ready() then return
+
+    val ir = rcn_ir([("libc/libc.sysl", rcn_libc()), ("main.sysl", rcn_main())])
+
+    assert(ir.contains("@$clock = private global"), ir)
+    assert(ir.contains("@$time_ms = private"), ir)
+    assert(ir.contains("declare i64 @clock()"), ir)
+end rcn_root_storage_is_mangled
+
+@test("main and an @export keep exactly their names while root storage is mangled")
+rcn_exports_keep_names()
+    if !rcn_ready() then return
+
+    val main = "import libc\n\nvar clock = 5\n\n@export(\"tick_clock\")\ntick() -> i32\n    clock += 1\n    clock\n\n" +
+               "@export(\"main\")\nentry() -> i32 = tick() + i32(libc.ticks())\n"
+    val ir = rcn_ir([("libc/libc.sysl", rcn_libc()), ("main.sysl", main)])
+
+    assert(ir.contains("define i32 @tick_clock("), ir)
+    assert(ir.contains("define i32 @main("), ir)
+    assert(ir.contains("@$clock = private global"), ir)
+end rcn_exports_keep_names
+
+@test("exported root storage keeps the C name it was published under")
+rcn_exported_storage_keeps_name()
+    if !rcn_ready() then return
+
+    val main = "@export(\"counter\")\nstatic var clock = 5\n\nbump() = clock += 1\n\nbump()\nprint(clock)\n"
+    val ir = rcn_ir([("main.sysl", main)])
+
+    assert(ir.contains("@counter = "), ir)
+    assert(!ir.contains("@$clock"), ir)
+end rcn_exported_storage_keeps_name
+
+@test("a module that is not the root is unaffected")
+rcn_module_storage_unchanged()
+    if !rcn_ready() then return
+
+    val lib = "module cfg\n\nvar clock = 5\n\nbump() -> int\n    clock += 1\n    clock\n"
+    val ir = rcn_ir([("cfg/cfg.sysl", lib), ("main.sysl", "import cfg\n\nprint(cfg.bump())\n")])
+
+    assert(ir.contains("@cfg$clock = private global"), ir)
+    assert(!ir.contains("@$cfg"), ir)
+end rcn_module_storage_unchanged
+
+@test("a root function keeps its bare name, which the reference documents (reference/ffi.md § link name)")
+rcn_root_function_keeps_bare_name()
+    if !rcn_ready() then return
+
+    val main = "var clock = 5\n\nread(x: int) -> int = x + 1\n\ntime() -> int = 7\n\nprint(clock, read(1), time())\n"
+    val ir = rcn_ir([("main.sysl", main)])
+
+    assert(ir.contains("define i32 @time()"), ir)
+    assert(ir.contains("define i32 @read(i32"), ir)
+    assert_eq(rcn_ran([("main.sysl", main)]), "5 2 7\n")
+end rcn_root_function_keeps_bare_name
