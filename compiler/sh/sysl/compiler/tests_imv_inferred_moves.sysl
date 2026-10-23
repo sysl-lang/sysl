@@ -69,6 +69,12 @@ end imv_with_std
 
 private imv_count(text: string, needle: string) -> int = int(text.count_of(needle))
 
+// How many counts a body takes: a reference's retain, or an aggregate's copy helper.
+private imv_takes(ir: string) -> int
+    assert(ir.starts_with("define"), ir)
+    imv_count(ir, "call void @arc.retain(") + imv_count(ir, "call void @arc.copy.")
+end imv_takes
+
 // Neither half of a count: no call of a retain, release, copy or dispose helper of any kind. (A box's
 // header names its destroying hook, which is not a call.)
 private imv_no_traffic(ir: string)
@@ -100,7 +106,7 @@ imv_return_local()
 imv_store_local()
     val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    h.n = x\n", "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 0)
+    assert_eq(imv_takes(ir), 0)
     assert_eq(imv_count(ir, "@arc.release("), 1)
 
     val pair = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    h.p = Pair(x, 1)\n", "put")
@@ -114,7 +120,7 @@ imv_loop_local()
     val ir = imv_ir("put(h: &Holder, n: int)\n    var i = 0\n    while i < 2\n        val x: &Node = Node(n)\n" +
                     "        h.n = x\n        i += 1\n", "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 0)
+    assert_eq(imv_takes(ir), 0)
     assert_eq(imv_count(ir, "@arc.release("), 1)
 
 @test("a branch's value takes over the local it ends with")
@@ -132,36 +138,36 @@ imv_branch_value()
 imv_use_after_copies()
     val ir = imv_ir("put(h: &Holder, n: int) -> int\n    val x: &Node = Node(n)\n    h.n = x\n    x.v\n", "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
 
 @test("a local stored inside a loop it was declared outside of is copied every round")
 imv_loop_copies()
     val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    var i = 0\n    while i < 2\n" +
                     "        h.n = x\n        i += 1\n", "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
 
 @test("a last use on one branch only is a copy, the scope's end giving the local back on both")
 imv_branch_copies()
     val ir = imv_ir("put(h: &Holder, n: int, c: bool)\n    val x: &Node = Node(n)\n    if c\n        h.n = x\n",
                     "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
 
 @test("a local a defer names is copied, since the deferred statement reads it at the exit")
 imv_defer_copies()
     val ir = imv_ir("put(h: &Holder, n: int)\n    val x: &Node = Node(n)\n    defer touch(x.v)\n    h.n = x\n",
                     "put")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
 
 @test("a local bound to a field holds no count of its own, so handing it on copies")
 imv_field_copies()
     val ir = imv_ir("get(h: &Holder) -> Maybe[&Node]\n    val x = h.n\n    Yes(x)\n", "get")
 
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
-    assert_eq(imv_count(imv_ir("get(h: &Holder) -> Maybe[&Node] = Yes(h.n)\n", "get"), "@arc.retain("), 1)
-    assert_eq(imv_count(imv_ir("get(x: &Node) -> Maybe[&Node] = Yes(x)\n", "get"), "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
+    assert_eq(imv_takes(imv_ir("get(h: &Holder) -> Maybe[&Node] = Yes(h.n)\n", "get")), 1)
+    assert_eq(imv_takes(imv_ir("get(x: &Node) -> Maybe[&Node] = Yes(x)\n", "get")), 1)
 
 @test("a captured variable is the closure's, so the closure's body copies it every call")
 imv_captured_copies()
@@ -171,7 +177,7 @@ imv_captured_copies()
     if ir == "skipped" then return
 
     assert(ir.starts_with("define"), ir)
-    assert_eq(imv_count(ir, "@arc.retain("), 1)
+    assert_eq(imv_takes(ir), 1)
 
 @test("a pinned local is still refused a whole read at its last use, a counted field or not")
 imv_pinned_is_not_moved()

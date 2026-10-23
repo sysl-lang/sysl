@@ -158,23 +158,106 @@ retain_stored(e: *Emit, ty: Type, v: Val)
         None -> retain_value(e, ty, v)
 end retain_stored
 
+// **Nothing at all to take over is one copy**, through the type's own helper, so a value built only
+// of things the frame does not hold costs exactly what it cost before; anything to take is taken,
+// and the rest of the value retained beside it.
 private take_over(e: *Emit, x: TExpr, ty: Type, v: Val)
-    if !contains_counted(ty) then return
+    if !contains_counted(ty) || holds_nothing(x, ty) then return
 
-    val done = *x.kind match
-        TLoad(name, _) -> take_local(e, name, ty)
-        TStructNew(_, args) -> underlying(ty) match
-            Struct(d) -> take_fields(e, x, v, args, d.fields, Some(d))
-            _ -> false
-        TEnumNew(_, variant, args) -> enum_decl(ty) match
-            Some(d) -> variant_fields(d, variant.name) match
-                Some(fields) -> take_fields(e, x, v, args, fields, None)
-                None -> false
-            None -> false
-        _ -> take_temp(e, v, ty)
+    if !takes_any(e, x, ty, v)
+        retain_value(e, ty, v)
+        return
+    end if
 
-    if !done then retain_value(e, ty, v)
+    *x.kind match
+        TLoad(name, _) -> forget_slot(e, local_at(e, name, ty).unwrap())
+        TStructNew(_, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap())
+        TEnumNew(_, _, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap())
+        _ -> forget_temp(e, temp_at(e, v, ty).unwrap())
 end take_over
+
+// The scope no longer gives this slot back: its count is the destination's now.
+private forget_slot(e: *Emit, at: usize)
+    e.owned_slots.remove(at)
+
+// Nor does the statement give back this temporary.
+private forget_temp(e: *Emit, at: usize)
+    e.temps.remove(at)
+
+// Whether `x` is a variant or struct built here with no counted field at all -- `None` of an
+// `Option[&T]` -- whose copy is known to retain nothing, so none is emitted.
+private holds_nothing(x: TExpr, ty: Type) -> bool
+    val b = built_fields(x, ty)
+
+    if b.is_none() then return false
+
+    for item in b.unwrap().fields
+        if contains_counted(item.1) then return false
+
+    true
+end holds_nothing
+
+// Whether taking over `x` would take anything, asked before any of it is done.
+private takes_any(e: *Emit, x: TExpr, ty: Type, v: Val) -> bool
+    if !contains_counted(ty) then return false
+
+    *x.kind match
+        TLoad(name, _) -> local_at(e, name, ty).is_some()
+        TStructNew(_, args) -> parts_take_any(e, x, ty, v, args)
+        TEnumNew(_, _, args) -> parts_take_any(e, x, ty, v, args)
+        _ -> temp_at(e, v, ty).is_some()
+end takes_any
+
+private parts_take_any(e: *Emit, x: TExpr, ty: Type, v: Val, args: Buf[TExpr]) -> bool
+    val fields = built_fields(x, ty)
+    val parts = parts_of(e, x, v, args)
+
+    if fields.is_none() || parts.is_none() || fields.unwrap().fields.len() != args.len() then return false
+
+    for i in 0..<args.len()
+        val fty = fields.unwrap().fields.at(i).1
+
+        if walked_part(e, fields.unwrap(), args.at(i), fty) && takes_any(e, args.at(i), fty, parts.unwrap().at(i))
+            return true
+
+    false
+end parts_take_any
+
+// The fields of what `x` builds, as the type's copy helper walks them, and the struct they are a
+// struct's own (a variant's have none).
+private struct Built
+    fields: Buf[(string, Type)]
+    holder: Option[&StructType]
+end Built
+
+private built_fields(x: TExpr, ty: Type) -> Option[Built] = *x.kind match
+    TStructNew(_, _) -> underlying(ty) match
+        Struct(d) -> Some(Built(d.fields, Some(d)))
+        _ -> None
+    TEnumNew(_, variant, _) -> enum_decl(ty) match
+        Some(d) -> variant_fields(d, variant.name) match
+            Some(fields) -> Some(Built(fields, None))
+            None -> None
+        None -> None
+    _ -> None
+
+// The values `x` was built from, where it was built in this function into `v`.
+private parts_of(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr]) -> Option[Buf[Val]]
+    val got = e.moves.parts.get(reg_of(v))
+
+    if got.is_none() then return None
+
+    val parts = got.unwrap()
+
+    if !(parts.0 == x.span) || parts.1.len() != args.len() then return None
+
+    Some(parts.1)
+end parts_of
+
+// Whether a field is one the copy helper walks, and one whose part may be asked about on its own.
+private walked_part(e: *Emit, b: Built, arg: TExpr, fty: Type) -> bool =
+    contains_counted(fty) && (b.holder.is_none() || !borrowed_capture(b.holder.unwrap(), fty)) &&
+        texpr_type(arg) == fty && !e.layout.indirect(fty)
 
 private variant_fields(d: &EnumType, name: string) -> Option[Buf[(string, Type)]]
     for variant in d.variants
@@ -185,59 +268,47 @@ end variant_fields
 
 // A value built on the spot, taken over part by part: each counted field its part's own question,
 // and one this frame cannot hand over retained as the type's copy helper would have retained it.
-private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], fields: Buf[(string, Type)],
-                    holder: Option[&StructType]) -> bool
-    val got = e.moves.parts.get(reg_of(v))
-
-    if got.is_none() then return false
-
-    val parts = got.unwrap()
-
-    if !(parts.0 == x.span) || parts.1.len() != args.len() || fields.len() != args.len() then return false
+private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], b: Built)
+    val parts = parts_of(e, x, v, args).unwrap()
 
     for i in 0..<args.len()
-        val fty = fields.at(i).1
-        val part = parts.1.at(i)
+        val fty = b.fields.at(i).1
+        val walked = contains_counted(fty) && (b.holder.is_none() || !borrowed_capture(b.holder.unwrap(), fty))
 
-        if contains_counted(fty) && (holder.is_none() || !borrowed_capture(holder.unwrap(), fty))
-            if texpr_type(args.at(i)) == fty && !e.layout.indirect(fty) then take_over(e, args.at(i), fty, part)
-            else retain_value(e, fty, part)
+        if !walked then continue
 
-    true
+        if walked_part(e, b, args.at(i), fty) then take_over(e, args.at(i), fty, parts.at(i))
+        else retain_value(e, fty, parts.at(i))
 end take_fields
 
-// A temporary of the innermost region, which is the statement being emitted.
-private take_temp(e: *Emit, v: Val, ty: Type) -> bool
+// Where `v` sits among the temporaries of the innermost region, which is the statement being emitted.
+private temp_at(e: *Emit, v: Val, ty: Type) -> Option[usize]
     val r = reg_of(v)
 
-    if r == "" || e.temp_marks.is_empty() || e.temp_slots.has(r) then return false
+    if r == "" || e.temp_marks.is_empty() || e.temp_slots.has(r) then return None
 
     for j in e.temp_marks.at(e.temp_marks.len() - 1)..<e.temps.len()
         val t = e.temps.at(j)
 
-        if reg_of(t.0) == r && t.1 == ty
-            e.temps.remove(j)
-            return true
+        if reg_of(t.0) == r && t.1 == ty then return Some(j)
 
-    false
-end take_temp
+    None
+end temp_at
 
-// A local at its last use, owned by the innermost scope.
-private take_local(e: *Emit, name: string, ty: Type) -> bool
-    if !e.moves.last_uses.has(name) || !movable_type(ty) || e.owned_marks.is_empty() then return false
-    if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then return false
+// Where a local at its last use sits among the slots the innermost scope owns.
+private local_at(e: *Emit, name: string, ty: Type) -> Option[usize]
+    if !e.moves.last_uses.has(name) || !movable_type(ty) || e.owned_marks.is_empty() then return None
+    if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then return None
 
     val slot = reg_of(local_slot(e, name))
 
     for j in e.owned_marks.at(e.owned_marks.len() - 1)..<e.owned_slots.len()
         val s = e.owned_slots.at(j)
 
-        if reg_of(s.0) == slot && s.1 == ty
-            e.owned_slots.remove(j)
-            return true
+        if reg_of(s.0) == slot && s.1 == ty then return Some(j)
 
-    false
-end take_local
+    None
+end local_at
 
 // Whether a local of this type may hand its count over: anything but an array held by value, which a
 // view taken earlier may still be standing on.
