@@ -1,0 +1,407 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// `@scoped(p)` on a `*T` parameter: the function may hold the pointer, but only while its caller is
+// suspended or inside its caller's scope -- a join, an `await`, a kernel's wake -- and lets go of it
+// before the caller's frame ends. The compiler cannot see the release and trusts the promise
+// (`keeps.sysl`'s `scoped_at`, `refuse_spread`, `check_scoped_names`; `reference/attributes.md §
+// @scoped`). A caller may hand such a parameter the address of a local; the body may store it; the
+// promise is the body's own, so handing the pointer on to a keeper, or storing an object that captured
+// it, is refused.
+//
+// The cells: the function a promise stands above (free, `*self` method, generic, `impl` method reached
+// statically and through a trait object, nested), each with its control without the promise; what the
+// caller hands it (`&local`, a field of a local, a lent parameter, a parameter the caller itself keeps);
+// what the body does with it (stores it, hands it to another `@scoped` callee, to a callee that only
+// reads it, to a keeper, captures it in a stored closure or a pushed one); where it may not stand (a
+// non-pointer non-call parameter, an `extern`, a trait's bodiless requirement); and a library built
+// on its own. Skipped: an interrupt handler (the promise is about a caller's scope, which a handler
+// entered on top of a frame has no relation to; the keeps-analysis treats it as any other body).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private scp_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-scp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end scp_outcome
+
+private scp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = scp_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end scp_prints
+
+private scp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = scp_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end scp_refused
+
+// A waiter slot a blocking primitive parks a pointer in, and the wake that writes through it and
+// lets it go. `MARK` is what stands above each primitive: `@scoped(p)`, or nothing for the controls.
+private scp_kernel(mark: string) -> string = replace_all(raw"""
+    static var spare = 0
+    static var waiter: *int = &spare
+
+    wake()
+        *waiter += 1
+        waiter = &spare
+
+    MARK
+    block(p: *int)
+        waiter = p
+
+    MARK
+    block_g[T](p: *int, tag: T)
+        waiter = p
+
+    trait Parker
+        park(*self, p: *int)
+
+    struct Sched
+        on: *int
+
+        MARK
+        hold(*self, p: *int)
+            self.on = p
+
+        release(*self)
+            *self.on += 1
+            self.on = &spare
+
+    impl Parker for Sched
+        MARK
+        park(*self, p: *int)
+            waiter = p
+
+    static var sched = Sched(&spare)
+
+    // The wake as another context runs it: through an object, whose body no call can see let go.
+    static var waker: &Fn() -> unit = () -> wake()
+
+    """, "MARK", mark)
+
+private scp_scoped() -> string = scp_kernel("@scoped(p)")
+
+private scp_unscoped(name: string) -> string =
+    s"'$name' keeps its parameter"
+
+// -- where the promise stands, and what a caller may hand it -------------------------------------------
+
+@test("a blocking primitive that says '@scoped' is handed a local, a field of one, and a lent parameter")
+scp_primitives_accept_locals()
+    scp_prints(scp_scoped() + raw"""
+        struct Pair
+            a: int
+            b: int
+
+        lent(p: *int)
+            block(p)
+            waker()
+
+        static var kept_by_me: *int = &spare
+
+        keeps_too(q: *int)
+            kept_by_me = q
+            block(q)
+            waker()
+
+        run() -> int
+            var n = 1
+            block(&n)
+            waker()
+            block_g(&n, true)
+            waker()
+
+            var pr = Pair(10, 20)
+            block(&pr.b)
+            waker()
+            lent(&pr.a)
+            keeps_too(&spare)
+
+            var m = 100
+            sched.hold(&m)
+            sched.release()
+
+            var k = 1000
+            sched.park(&k)
+            waker()
+
+            val o: &Parker = Sched(&spare)
+            o.park(&k)
+            waker()
+
+            @scoped(q)
+            inner(q: *int)
+                waiter = q
+
+            inner(&k)
+            waker()
+            n + pr.a + pr.b + m + k
+
+        print(run())
+        print(spare)
+        """, "1139\n1\n")
+
+private scp_body(call: string) -> string = replace_all(raw"""
+    run()
+        var n = 1
+        CALL
+
+    run()
+    wake()
+    """, "CALL", call)
+
+@test("without the promise each primitive is refused the local it parks")
+scp_controls_refused()
+    val k = scp_scoped()
+
+    scp_refused(replace_all(k, "@scoped(p)\nblock(", "block(") + scp_body("block(&n)"),
+                scp_unscoped("block") + " 'p' (it is stored in 'waiter')")
+    scp_refused(replace_all(k, "@scoped(p)\nblock_g", "block_g") + scp_body("block_g(&n, 3)"),
+                scp_unscoped("block_g") + " 'p'")
+    scp_refused(replace_all(k, "@scoped(p)\n    hold", "hold") +
+                scp_body("sched.hold(&n)"), " 'p' (it is stored in 'self.on')")
+    scp_refused(replace_all(k, "@scoped(p)\n    park", "park") +
+                scp_body("val o: &Parker = Sched(&spare)\n    o.park(&n)"),
+                "'park' keeps its parameter 'p' (it is stored in 'waiter'), but a method of 'Parker' " +
+                "borrows its parameters for the call")
+    scp_refused(scp_scoped() + raw"""
+        run()
+            var k = 1
+
+            inner(q: *int)
+                waiter = q
+
+            inner(&k)
+
+        run()
+        wake()
+        """, "keeps its parameter 'q' (it is stored in 'waiter')")
+
+// -- what the body may do with it --------------------------------------------------------------------
+
+@test("handing it to another '@scoped' callee, or to one that only reads it, is accepted")
+scp_forward_accepted()
+    scp_prints(scp_scoped() + raw"""
+        peek(p: *int) -> int = *p
+
+        @scoped(p)
+        relay(p: *int)
+            block(p)
+
+        @scoped(p)
+        look(p: *int)
+            waiter = p
+            print(peek(p))
+
+        run() -> int
+            var n = 5
+            relay(&n)
+            waker()
+            look(&n)
+            waker()
+            n
+
+        print(run())
+        """, "6\n7\n")
+
+@test("handing it to a callee that keeps it is refused, the promise being the body's own")
+scp_forward_to_keeper_refused()
+    scp_refused(scp_scoped() + raw"""
+        static var held: *int = &spare
+
+        keeper(p: *int)
+            held = p
+
+        @scoped(p)
+        fwd(p: *int)
+            keeper(p)
+
+        run()
+            var n = 1
+            fwd(&n)
+
+        run()
+        """, "'fwd' says '@scoped(p)', a promise to let go of 'p' before its caller's scope ends " +
+             "that only its own body keeps, and it is passed to 'keeper', which keeps it — the " +
+             "pointer may be handed on only to a parameter that says '@scoped' too, and never " +
+             "captured by something stored")
+
+@test("a '*self' method forwarding its scoped pointer to a keeper is refused even with no caller")
+scp_forward_from_a_method_refused()
+    scp_refused(scp_scoped() + raw"""
+        static var held: *int = &spare
+
+        keeper(p: *int)
+            held = p
+
+        struct Q
+            n: int
+
+            @scoped(p)
+            put(*self, p: *int)
+                keeper(p)
+
+        var q = Q(0)
+        q.put(&spare)
+        """, "'put' says '@scoped(p)', a promise to let go of 'p' before its caller's scope ends")
+
+@test("a closure that captured it and is stored, or pushed into a buffer, is refused")
+scp_captured_refused()
+    scp_refused(scp_scoped() + raw"""
+        static var later: &Fn() -> int = () -> 0
+
+        @scoped(p)
+        cap(p: *int)
+            later = () -> *p
+
+        run()
+            var n = 1
+            cap(&n)
+
+        run()
+        """, "'cap' says '@scoped(p)', a promise to let go of 'p' before its caller's scope ends " +
+             "that only its own body keeps, and it is captured by what is stored in 'later'")
+    scp_refused("import sysl.buf.{Buf, buf}\n\n" + scp_scoped() + raw"""
+        static var jobs: Buf[&Fn() -> int] = buf()
+
+        @scoped(p)
+        queue(p: *int)
+            jobs.push(() -> *p)
+
+        run()
+            var n = 1
+            queue(&n)
+
+        run()
+        """, "'queue' says '@scoped(p)'")
+
+// -- where it may not stand ------------------------------------------------------------------------------
+
+@test("a parameter that is neither a pointer nor a call is refused")
+scp_not_a_pointer()
+    scp_refused("@scoped(n)\nf(n: int) -> int = n\n\nprint(f(1))\n",
+                "'@scoped' names 'n', which is neither a call nor a pointer — what it promises is that " +
+                "a body a member runs in another domain finishes before the scope does, written " +
+                "'n: &sync Fn() -> R', or that a pointer the function holds is let go of before its " +
+                "caller's scope ends, written 'n: *T'")
+    scp_refused("run() -> int\n    @scoped(n)\n    inner(n: int) -> int = n\n\n    inner(1)\n\nprint(run())\n",
+                "'@scoped' names 'n', which is neither a call nor a pointer")
+
+@test("above an extern it is refused: C keeps what '@keeps' says")
+scp_extern_refused()
+    scp_refused("@scoped(p)\nextern \"abs\" cabs(p: *int) -> int\n\nprint(1)\n",
+                "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, " +
+                "so it marks a function or a method, whose body is sysl — an 'extern' borrows what it " +
+                "is handed for the call, and one that holds a pointer past it says '@keeps(...)'")
+
+@test("above a trait's bodiless requirement it is refused: each impl says it above its own body")
+scp_requirement_refused()
+    scp_refused("trait Parker\n    @scoped(w)\n    park(*self, w: *int)\n\nprint(1)\n",
+                "'@scoped' promises what a body does with a parameter, and 'park' is a requirement " +
+                "with no body — write it above the method of each 'impl' that keeps the promise, or " +
+                "above a default body here")
+
+@test("above a trait's default body it is accepted, and holds for every type that inherits it")
+scp_default_body_accepted()
+    scp_prints(raw"""
+        static var spare = 0
+        static var waiter: *int = &spare
+
+        trait Parker
+            @scoped(w)
+            park(*self, w: *int)
+                waiter = w
+
+        struct A
+            n: int
+
+        impl Parker for A
+
+        run() -> int
+            var k = 41
+            var a = A(0)
+            a.park(&k)
+            *waiter += 1
+            waiter = &spare
+            k
+
+        print(run())
+        """, "42\n")
+
+// -- a library built on its own -------------------------------------------------------------------------
+
+private scp_lib(text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-scp-lib").unwrap())
+
+    make_dir_all(s"$root/kern").unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"kern\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$root/kern/kern.sysl", s"module kern\n\n$text\n").unwrap()
+    root
+end scp_lib
+
+private scp_lib_checked(root: string) -> string =
+    build_library_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "checked"
+
+@test("build-lib accepts a scoped primitive and refuses one that hands its pointer to a keeper")
+scp_build_lib()
+    if xvr_no_library() then return
+
+    val good = scp_lib(raw"""
+        var spare = 0
+        var waiter: *int = &spare
+
+        @scoped(p)
+        block(p: *int)
+            waiter = p
+        """)
+    val bad = scp_lib(raw"""
+        var spare = 0
+        var waiter: *int = &spare
+
+        keeper(p: *int)
+            waiter = p
+
+        @scoped(p)
+        block(p: *int)
+            keeper(p)
+        """)
+    val ok = scp_lib_checked(good)
+    val refused = scp_lib_checked(bad)
+
+    remove_dir_all(good).unwrap_or(())
+    remove_dir_all(bad).unwrap_or(())
+    assert_eq(ok, "checked")
+    assert(refused.index_of("block' says '@scoped(p)', a promise to let go of 'p'").is_some(), refused)
+end scp_build_lib

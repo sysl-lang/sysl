@@ -4033,6 +4033,18 @@ run()
 A trait's method borrows a view it is handed the same way, so a view of a local array passed through
 an object stays in the frame ([`traits.md § A method borrows what it is handed`](/reference/traits/#a-method-borrows-what-it-is-handed)).
 
+### Released in another context: the primitive says `@scoped`
+
+Some pointers are held past the call and let go of somewhere the compiler cannot follow: a scope's
+join, the `deliver` that ends an `await`, a kernel's `wake`. The caller is suspended or still inside
+its scope the whole time, so handing such a primitive the address of a local is safe — but the body
+stores it, and the rule above would refuse it. **The primitive that gives the guarantee declares it
+once, with [`@scoped(p)`](/reference/attributes/#scopedp-on-a-pointer-held-only-while-the-caller-waits)
+on the pointer parameter**, and the compiler trusts it: a call of it keeps nothing it is handed at
+`p`, so code calling `block(&local)` or `await read(&buf)` carries no annotation at all. The promise
+is the primitive's own — handing `p` on to a callee that keeps it is refused unless that callee says
+`@scoped` too.
+
 ## Hazard summary
 
 | segfault source | prevented in the safe subset by |

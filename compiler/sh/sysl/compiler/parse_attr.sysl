@@ -85,17 +85,6 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
     loop
         if !p.at_kw("@") && !p.at_kw("#") then break
 
-        // **`@scoped` is about a member's receiver**: the promise is that what the member runs
-        // finishes before the call that lent its `*self` returns, and a free function has no receiver
-        // for that call to have lent. Refused at the argument list, where the reference puts it.
-        if p.at_kw("@") && attr_name(p) == "scoped"
-            p.bump()
-            p.bump()
-            p.fault(p.here(), scoped_on_free_function())
-            skip_line(p)
-            break
-        end if
-
         parse_attribute(p) match
             Some(a) -> out.push(a)
             None -> break
@@ -157,13 +146,14 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
     out
 end parse_member_attrs
 
-// `@scoped` anywhere but above a method: the promise is about the method's receiver and a callable
-// parameter, so a declaration without the two has nothing for it to be about.
+// `@scoped(f)` naming a call above a function with no receiver: what the promise is about is the
+// receiver a call lent, and a free function has none. A pointer parameter it may name anywhere.
 scoped_on_free_function() -> string =
-    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a call to have lent"
+    "'@scoped' naming a callable parameter says a method runs it in another concurrency domain and finishes it before the call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a call to have lent. Above a free function '@scoped' names '*T' parameters only, the pointers it lets go of before its caller's scope ends"
 
+// `@scoped` above anything that is not called: the promise is about a parameter.
 scoped_on_field() -> string =
-    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the call that lent the method's '*self' returns, so it stands above a method — a field and a variant are never called, and have no parameter to run"
+    "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable it runs and finishes, or a '*T' it holds only while its caller waits — so it stands above a function or a method; a field and a variant are never called, and have no parameter to run"
 
 // `@keeps(...)` anywhere but above an `extern`: a body the compiler can read says what it keeps.
 keeps_off_extern() -> string =
@@ -695,7 +685,7 @@ private named_list_refusal(word: string) -> string
 
     if word == "keeps" then return "'@keeps' names the parameters a C function holds on to past the call, in parentheses — '@keeps(context)'. There is no empty form: an 'extern' that keeps nothing it is handed says so by not writing the annotation"
 
-    if word == "scoped" then return "'@scoped' names the callable parameters a member runs in another concurrency domain and finishes before the call that lent its receiver returns, in parentheses — '@scoped(f)'. There is no empty form: a member that waits for nothing it starts says so by not writing the annotation"
+    if word == "scoped" then return "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable a member runs in another concurrency domain, or a '*T' it holds while its caller waits — in parentheses: '@scoped(f)'. There is no empty form: a function that holds nothing past its call says so by not writing the annotation"
 
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
@@ -978,6 +968,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Pins -> f.marks.pins = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
+            Scoped(ns) -> f.marks.scoped = ns
             _ -> ()
 end apply_func_attrs
 
@@ -1007,7 +998,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
 
     // **`@scoped(f)` implies `@crossing(f)`**: what a scoped member runs runs in another domain, so
     // the crossing rule asks of it what it asks of any parameter marked crossing. A name both list
-    // is crossing once.
+    // is crossing once. A `*T` it names is held while its caller waits, in no other domain.
     if !m.marks.scoped.is_empty()
         var crossing: Buf[string] = buf()
 
@@ -1015,11 +1006,22 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             crossing.push(name)
 
         for name in m.marks.scoped
-            if !holds_string(crossing, name) then crossing.push(name)
+            if !holds_string(crossing, name) && !names_pointer_param(m.params, name) then crossing.push(name)
 
         m.crossing = crossing
     end if
 end apply_member_attrs
+
+// Whether the parameter of this name is written as a raw pointer, `*T`.
+names_pointer_param(ps: Buf[Param], name: string) -> bool
+    for item in ps
+        if item.name == name
+            return *item.typ.kind match
+                PtrType(_) -> true
+                _ -> false
+
+    false
+end names_pointer_param
 
 // -- routing a declaration to the thing its annotations describe -----------------------------------
 
@@ -1242,6 +1244,11 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
 
     if any_is(attrs, "keeps") then return keeps_off_extern()
+
+    // An `extern`'s body is C: nothing it promises reaches a body the compiler reads, and what it
+    // holds past the call is what `@keeps(...)` says.
+    if any_is(attrs, "scoped")
+        return "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so it marks a function or a method, whose body is sysl — an 'extern' borrows what it is handed for the call, and one that holds a pointer past it says '@keeps(...)'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

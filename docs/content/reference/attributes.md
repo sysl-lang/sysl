@@ -284,11 +284,11 @@ struct Chan
     open: bool
 
     @scoped(v)
-    run(*self, v: *int) -> int = v[0]
+    run(*self, v: int) -> int = v
 ```
 
 ```error
-'@scoped' names 'v', which is not a call
+'@scoped' names 'v', which is neither a call nor a pointer
 ```
 
 ```sysl
@@ -339,8 +339,8 @@ struct Chan
 There is no empty form
 ```
 
-**It stands above a method and nowhere else.** A free function has no receiver for a call to have
-lent, and a field is never called:
+**Naming a call, it stands above a method and nowhere else.** A free function has no receiver for a
+call to have lent, and a field is never called:
 
 ```sysl
 @scoped(f)
@@ -360,6 +360,68 @@ struct Chan
 ```error
 a field and a variant are never called, and have no parameter to run
 ```
+
+### `@scoped(p)` on a pointer — held only while the caller waits
+
+**`@scoped(p)` naming a `*T` parameter promises that the function may hold the pointer, but only
+while its caller is suspended or inside the caller's scope, and lets go of it before the caller's
+frame ends.** It is how a blocking primitive says so: a kernel's `block` parks the address of the
+caller's wait record until `wake`, an `await`able read keeps the caller's buffer until the device
+delivers, a scope's `spawn` holds the scope until the join. The release happens in a context the
+compiler cannot see, so it trusts the promise, written once on the primitive — the code that calls
+it stays annotation-free and may hand it the address of a local. It may stand above any function
+or method, generic or not, nested or not, and above an `impl`'s method or a trait's default body.
+
+```sysl
+static var idle = 0
+static var waiter: *int = &idle
+
+@scoped(slot)
+block(slot: *int)
+    waiter = slot
+
+wake(v: int)
+    *waiter = v
+    waiter = &idle
+
+read_sensor() -> int
+    var got = 0
+
+    block(&got)
+    wake(42)
+    got
+
+print(read_sensor())
+```
+
+```output
+42
+```
+
+**The promise is the primitive's own, so it does not spread.** Its body may store the pointer, but
+handing it to a callee that keeps it — or capturing it in a closure that is stored — is refused,
+because that callee promised nothing. A callee whose parameter says `@scoped` too, or one that only
+uses the pointer, may be handed it:
+
+```sysl
+static var idle = 0
+static var waiter: *int = &idle
+
+park(slot: *int)
+    waiter = slot
+
+@scoped(slot)
+block(slot: *int)
+    park(slot)
+```
+
+```error
+'block' says '@scoped(slot)', a promise to let go of 'slot' before its caller's scope ends that only its own body keeps, and it is passed to 'park', which keeps it
+```
+
+It takes a `*T` or a call, and nothing else; it does not stand above an `extern`, whose C body
+holds what `@keeps(...)` says, nor above a trait's requirement, which has no body to keep it — each
+`impl` writes it above its own method.
 
 ## `::` — what a type's own name answers
 

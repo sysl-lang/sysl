@@ -161,6 +161,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         for f in funcs
             check_calls(cx, faults, f)
             refuse_promised(cx, faults, f)
+            refuse_spread(cx, faults, f)
 
         rounds += 1
 
@@ -380,15 +381,49 @@ private trait_of(cx: &KeepsCx, name: string) -> Option[string]
         None -> None
 end trait_of
 
-// Whether a call of `f` lets go of the argument at a position by `f`'s `@scoped` promise: the
-// receiver, and each parameter the annotation names.
+// Whether a call of `f` lets go of the argument at a position by `f`'s `@scoped` promise: each
+// parameter the annotation names, and the receiver where it names a call -- what a scoped member runs
+// finishes before the call that lent its `*self` returns.
 private scoped_at(f: TFunc, i: usize) -> bool
     if f.marks.scoped.is_empty() then return false
 
     val name = f.params.at(i).0
 
-    (i == 0 && name == "self") || holds_string(f.marks.scoped, name)
+    if holds_string(f.marks.scoped, name) then return true
+
+    i == 0 && name == "self" && scopes_a_call(f)
 end scoped_at
+
+// Whether `@scoped` names a parameter that is a call rather than a pointer.
+private scopes_a_call(f: TFunc) -> bool
+    for item in f.params
+        if holds_string(f.marks.scoped, item.0) && !is_raw_pointer(item.1) then return true
+
+    false
+end scopes_a_call
+
+private is_raw_pointer(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+// A closure, or an object behind a trait: a body somebody may run later, holding what it captured.
+private is_object(t: Type) -> bool = t match
+    Trait(_, _, _) -> true
+    Ref(inner, _) -> is_object(*inner)
+    _ -> is_closure_literal(t)
+
+// The `*T` parameters `@scoped` names: held by this body's own promise, which a callee it hands one
+// to does not share.
+private scoped_pointers(f: TFunc) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    if f.marks.scoped.is_empty() then return out
+
+    for i in 0..<f.params.len()
+        if holds_string(f.marks.scoped, f.params.at(i).0) && is_raw_pointer(f.params.at(i).1) then out.push(i)
+
+    out
+end scoped_pointers
 
 // The function a closure literal's body lowered to: its environment first, then what it is called with.
 private is_closure_body(f: TFunc) -> bool =
@@ -415,6 +450,10 @@ struct Track
     org: &Origins
     raw: bool
 
+    // A walk of a `@scoped` pointer, which follows only what the body's promise does not cover: the
+    // pointer handed to a callee that keeps it, or captured by an object that is stored.
+    promised: bool
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
 
@@ -422,7 +461,7 @@ end Track
 // is how what a body overwrites is asked.
 private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), origins_of(cx, f),
-                          raw)
+                          raw, false)
 
     if i < f.params.len() then t.held.push(f.params.at(i).0)
 
@@ -432,13 +471,18 @@ end track
 
 // Whether `f` lets its parameter at `i` outlive the call, where, and every location it may still be
 // held at when the call returns.
-private walk_kept(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+private walk_kept(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy = walk_kept_as(cx, f, i, false)
+
+private walk_kept_as(cx: &KeepsCx, f: TFunc, i: usize, promised: bool) -> KeptWhy
     val t = track(cx, f, i, false)
+
+    t.promised = promised
+
     val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e))
 
     flow_body(w, f.body)
 
-    if f.body.result.is_some()
+    if f.body.result.is_some() && !promised
         val evs: &EvBuf = EvBuf(buf())
 
         laundered(t, evs, f.body.result.unwrap())
@@ -455,7 +499,7 @@ private walk_kept(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
     if first.is_none() then return KeptWhy(false, "", span_zero(), w.out_pending)
 
     KeptWhy(true, first.unwrap().how, first.unwrap().at, w.out_pending)
-end walk_kept
+end walk_kept_as
 
 // The locations `f` overwrites on every way out.
 private walk_clears(cx: &KeepsCx, f: TFunc) -> KeptWhy
@@ -547,6 +591,8 @@ private keep(t: &Track, how: string, at: Span)
 
 // The function's own answer is handed back where the body ends as well as at each `return`.
 private kept_stmt(t: &Track, evs: &EvBuf, s: TStmt)
+    if t.promised then return
+
     s match
         TReturn(v) -> if v.is_some() then laundered(t, evs, v.unwrap())
         _ -> ()
@@ -577,11 +623,15 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> stored(t, evs, place, v)
         TSlots(op, args, _, _) ->
+            if t.promised then return
+
             if op == "slot_place" && args.len() == 3 && carries(t, args.at(2))
                 kept_hard(evs, "it is stored in a buffer's slot", args.at(2).span)
             else if op == "slot_put" && args.len() == 2 && carries(t, args.at(1))
                 kept_hard(evs, "it is stored in a buffer's slot", args.at(1).span)
         TAtomic(_, _, ops, _, _, _) ->
+            if t.promised then return
+
             for op in ops
                 if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op.span)
         TCall(name, args, _, _) ->
@@ -616,6 +666,18 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
     val loc = place_loc(t.org, place)
 
     if loc.starts_with("l:") then return
+
+    // **A `@scoped` body's promise covers what it stores itself** -- the pointer, or a value built
+    // around it, which the body takes back before its caller's scope ends. An object that captured
+    // it is a callback somebody else runs, when the body cannot say.
+    if t.promised
+        if carries(t, v) && is_object(texpr_type(v))
+            evs.items.push(FlowEv(false, loc, s"it is captured by what is stored in '${place_said(t.scope, place)}'",
+                                  v.span))
+        end if
+
+        return
+    end if
 
     val cast = *v.kind match
         TCast(x, ty) -> is_integer_type(ty) && carries(t, x)
@@ -1435,6 +1497,29 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         faults.items.push((scope, w.at, promise_broken(cx, f, f.params.at(i).0, w.how, closure, trait_name)))
 end refuse_promised
 
+// **A `@scoped` promise is the body's own and does not spread**: the body that says it may hold the
+// pointer, but a callee it hands the pointer to that keeps it, or an object that captured it and is
+// stored, promised nothing. Each is refused where it is written.
+private refuse_spread(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    val ps = scoped_pointers(f)
+
+    if ps.is_empty() then return
+
+    val scope = func_home(cx.an, f.name)
+
+    for i in ps
+        val w = walk_kept_as(cx, f, i, true)
+
+        if !w.kept then continue
+
+        val pname = f.params.at(i).0
+
+        faults.items.push((scope, w.at, s"'${shown_name(cx.an, f.name)}' says '@scoped($pname)', a promise " +
+            s"to let go of '$pname' before its caller's scope ends that only its own body keeps, and " +
+            s"${w.how} — the pointer may be handed on only to a parameter that says '@scoped' too, and " +
+            "never captured by something stored"))
+end refuse_spread
+
 private promise_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, closure: bool,
                        trait_name: Option[string]) -> string
     // A function named where a closure is wanted is wrapped in one whose parameters nobody wrote.
@@ -1525,13 +1610,27 @@ end value_text
 // domain; a bare arrow and a type parameter bounded by a call trait are calls too, and the crossing
 // rule `@scoped` implies decides what may be passed there. A free function and a field are refused
 // by the parser, before a declaration exists.
-check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+//
+// **A `*T` parameter it may name above any function**: the promise is that the body holds the pointer
+// only while its caller waits -- a join, an `await`, a kernel's wake -- and lets go of it before the
+// caller's scope ends, which the compiler cannot see and trusts. A call it names needs the receiver.
+check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string, method: bool)
     val ss = d.marks.scoped
 
     if ss.is_empty() then return
 
     val ps = d.params
-    val receiver = scoped_receiver(ps)
+    var calls = false
+
+    for item in ps
+        if holds_string(ss, item.name) && (callable_param(d, item) || erased_call(item)) then calls = true
+
+    if calls && !method
+        a.fault(scope, span, scoped_on_free_function())
+        return
+    end if
+
+    val receiver = if calls then scoped_receiver(ps) else ""
 
     if receiver != ""
         a.fault(scope, span, s"'@scoped' promises that what '$shown' runs finishes before the " +
@@ -1562,12 +1661,18 @@ check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: s
         else if twice
             a.fault(scope, span, s"'@scoped' names '${ss.at(i)}' twice, and a parameter is waited " +
                     "for or it is not — the second says nothing the first does not")
-        else if !callable_param(d, found.unwrap()) && !erased_call(found.unwrap())
-            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a call — what a " +
-                    "scoped member promises is that a body it runs in another domain finishes " +
-                    "before the scope does, so the parameter is written as one, " +
-                    s"'${ss.at(i)}: &sync Fn() -> R'")
+        else if !param_is_pointer(found.unwrap()) && !callable_param(d, found.unwrap()) &&
+                !erased_call(found.unwrap())
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is neither a call nor a " +
+                    "pointer — what it promises is that a body a member runs in another domain " +
+                    "finishes before the scope does, written '" + ss.at(i) + ": &sync Fn() -> R', " +
+                    "or that a pointer the function holds is let go of before its caller's scope " +
+                    s"ends, written '${ss.at(i)}: *T'")
 end check_scoped_names
+
+private param_is_pointer(p: Param) -> bool = *p.typ.kind match
+    PtrType(_) -> true
+    _ -> false
 
 // What is wrong with a scoped member's receiver, as the end of a sentence, or nothing where it is the
 // `*self` the promise is about.
