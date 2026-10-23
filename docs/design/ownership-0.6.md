@@ -164,48 +164,15 @@ Two ways to end the trap:
   exactly the types where "this was given away" is the true state of the world. This is Swift's
   non-copyable struct with a `deinit`, and Rust's `Drop`, without lifetimes.
 
-*Proposed (b)* — a guard on a board, with no allocator:
+**Decided: (a)** (user, 2026-10-23: needing an allocator is fine for a type with a destructor).
 
-```sysl
-struct Select
-    pin: u8
-
-impl Drop for Select
-    drop(self) = gpio_set(self.pin, true)
-
-transfer(bus: *Spi, data: []const u8)
-    val cs = Select(bus.cs_pin)
-    gpio_set(cs.pin, false)
-    bus.write(data)
-```
-
-The pin is raised when `transfer` returns, on every path, with no `defer` and no `&`.
-
-*Proposed (b)* — the one new error:
-
-```sysl
-val f = File.open("log")?
-val g = f
-f.write("x")
-```
-
-```error
-'f' was handed to 'g' on line 2, and 'File' has a 'Drop', so it has one owner; use 'g', or share it with 'val f: &File = …'
-```
-
-What (b) implies, so it can be weighed:
-
-- **It spreads to what holds one.** A struct with a by-value `Drop` field is single-owner too (today
-  that field's destructor silently never runs, so no working program relies on copying one).
-- **`(self)` on a single-owner type consumes it**: `f.close()` declared `close(self)` hands `f` over,
-  which is what `@consumes` declares today (13 compiler lines, 0 org). `@consumes` goes.
-- **A container of them hands out views, not copies**: `xs.at(i)` on a `Buf[File]` yields a `*File`,
-  `pop`/`take(i)` move one out. Today `at` copies, which for a resource is the double-close.
-- **The 232 `-> &T` signatures keep compiling.** A `&File` is still a shared `File`. Dropping the `&`
-  is an optional sweep, site by site.
-
-Recommendation: **(b)**. Embedded is where sysl is going (skiff, tinyusb, the H7 and Pico 2
-projects), and (a) leaves the destructor unusable there.
+- **Constructing a `Drop` type makes a `&T`.** `Encoder(…)` and a constructor declared `-> Encoder`
+  both yield a `&Encoder`; spelling a by-value `Encoder` (a binding, a field, a parameter, a `Buf`
+  element) is refused with a fix-it to write `&Encoder`. The 0.4 warning becomes that error.
+- **The 232 `-> &T` signatures keep compiling.** Dropping the `&` from them is an optional sweep.
+- **No new error and no new rule:** a `&T` is shared and counted exactly as today, so there is no
+  use-after-move. `@consumes` stays as it is.
+- **A guard on a board without an allocator stays unavailable**; `defer` is the tool there.
 
 ## 4. `&T` and `&sync T` stay
 
@@ -218,7 +185,7 @@ rule 2 removes the need to annotate around raw pointers; neither touches what a 
 | trap today | after 0.6.0 |
 |---|---|
 | a `Drop` type made by value never drops (warning since 0.4) | gone: rule 3 |
-| `(self)` copies, so the address of `self` is not an answer | stays as a rule about addresses; rule 2 reports it at the call that keeps it, and on a single-owner type `(self)` is a consume |
+| `(self)` copies, so the address of `self` is not an answer | stays as a rule about addresses; rule 2 reports it at the call that keeps it |
 | a `Buf` assigned is a second name for one buffer; a captured `Buf` is a copy | **open — Q7** |
 | a local named `str`/`print`/`format` takes the special form away, silently | made an error (not ownership, but a silent trap; 6 parameters in library + compiler) |
 | a module `val` that does not fold shuts a package out of a bare target, and the host cannot see it | `sysl build`/`test` on the host checks folding for every target the manifest names (0.5.0 gives the manifest its targets) |
@@ -229,12 +196,12 @@ rule 2 removes the need to annotate around raw pointers; neither touches what a 
 - **Behaviour changes:**
   - a `*T` passed to a function that keeps it, from a place the caller cannot give away, is refused
     (today it compiles and may dangle);
-  - a `Drop` type held by value is single-owner (if Q3 is (b)), and a use after a move is refused;
+  - a `Drop` type spelled by value is refused; constructing one yields a `&T`;
   - a local named like a special form is refused.
-- **Removed:** `@lends`, `@borrows`, `@consumes`, `@crossing(copy …)` — each refused with a fix-it
+- **Removed:** `@lends`, `@borrows`, `@crossing(copy …)` — each refused with a fix-it
   saying the attribute is no longer needed, for one release, then unknown.
 - **Kept:** `@scoped`, `@crossing` at boundaries the compiler cannot see, `@disjoint` (an aliasing
-  promise, not ownership), `@no_alloc`, `@pinned`, `@thread_local`, `&sync`, `weak`, `slot_*`.
+  promise, not ownership), `@consumes`, `@no_alloc`, `@pinned`, `@thread_local`, `&sync`, `weak`, `slot_*`.
 - **New:** `@keeps(p)` on an `extern` only.
 - **Not in this release:** `package.hocon` refused (decided for 0.6.0 in the manifest note), so the
   org's ~115 manifests are renamed in a sweep before 0.6.0 ships.
@@ -248,7 +215,7 @@ One agent per item, in this order, each landing on dev with its tests and refere
 2. The keeps-analysis: per-function summaries for `*T` parameters, the call-site rule, the boundary
    defaults, `@keeps`. `@lends`/`@borrows` refused with fix-its.
 3. `@crossing` inferred where visible; `@crossing(copy …)` folded into the channel.
-4. Single-owner `Drop` values (Q3), scope-end drop on every path, use-after-move, containers of them.
+4. `Drop` types are reference types (Q3): construction yields `&T`, a by-value spelling is refused.
 5. The two small traps (special-form shadowing; host-side fold check).
 6. The org sweep: `package.hocon` renamed, removed attributes deleted, optional `-> &T` cleanup.
 
@@ -258,9 +225,8 @@ One agent per item, in this order, each landing on dev with its tests and refere
   "What the inventory changed").
 - **Q2. The defaults at an invisible boundary** (the table in §2): trait methods, function pointers and
   C externs default to "not kept", with `@keeps(p)` on a C binding that keeps. **Recommend as tabled.**
-- **Q3. `Drop` types: (a) reference types, or (b) single-owner values?** **Recommend (b).**
-- **Q4. Under (b), is the one new error acceptable** — use after a move, only for `Drop` types and what
-  holds them? **Recommend yes**; it is the honest state of a resource, and it needs no annotation.
+- **Q3. `Drop` types: (a) reference types, or (b) single-owner values?** **Decided: (a).**
+- **Q4.** Withdrawn: it asked about (b)'s use-after-move error.
 - **Q5. Removed attributes: refuse with a fix-it for 0.6.x, then unknown in 0.7.0?** **Recommend yes.**
 - **Q6. `@scoped` and boundary `@crossing` stay as library-author attributes.** **Recommend yes**; no
   user code in the org writes either.
@@ -268,8 +234,8 @@ One agent per item, in this order, each landing on dev with its tests and refere
   through one leaves the other's length behind. Options: (a) leave it, documented; (b) make `Buf`
   single-owner like a `Drop` type, so `val b2 = b` moves and a closure capture moves it in — which
   would break code that copies `Buf` headers today, by an amount not yet measured; (c) make a `Buf`
-  copy a real copy (allocates). **Recommend measuring (b)'s breakage across the org first**, and
-  deciding then; (a) until.
+  copy a real copy (allocates). **Decided: measure (b)'s breakage across the org first**, and
+  decide then; (a) until.
 - **Q8. `Option[T]`'s zero value** (skiff's question (b)): a `var x: Option[T]` with no initializer is
   `None`. It touches value initialization rather than ownership, but it belongs to the same pass over
   what a value is. **Recommend yes, in 0.6.0.**
