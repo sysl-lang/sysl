@@ -80,20 +80,54 @@ read_c_libraries(root: &Conf) -> Result[Buf[CLibrary], string]
     for name in names
         val lib = read_c_library(name, conf_at(block, name).unwrap())?
 
-        // **One file, one library.** Compiled twice it is two definitions of every symbol in it,
-        // and a file both libraries claim has no answer to which configuration it gets.
-        for item in lib.sources
-            for other in out
-                if holds(other.sources, item)
-                    return Err(s"'c.$name.sources' and 'c.${other.name}.sources' both name " +
-                               s"'$item' — a file is compiled once, so one library lists it")
+        library_disjoint(out, lib)?
 
         out.push(lib)
 
     Ok(out)
 end read_c_libraries
 
-private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
+// **One file, one library.** Compiled twice it is two definitions of every symbol in it, and a file
+// both libraries claim has no answer to which configuration it gets.
+library_disjoint(have: &Buf[CLibrary], lib: &CLibrary) -> Result[unit, string]
+    for item in lib.sources
+        for other in have
+            if holds(other.sources, item)
+                return Err(s"'c.${lib.name}.sources' and 'c.${other.name}.sources' both name " +
+                           s"'$item' — a file is compiled once, so one library lists it")
+
+    Ok(())
+end library_disjoint
+
+// What a library says once every layer has been read, which no single layer need say alone: a layer
+// that only adds a macro or a source to a library another layer roots declares nothing by itself.
+library_shape(lib: &CLibrary) -> Result[unit, string]
+    val name = lib.name
+
+    if !lib.exclude.is_empty() && lib.patterns.is_empty()
+        return Err(s"'c.$name.exclude' takes files out of what a pattern in 'sources' matches, and " +
+                   "this library's sources are all named outright — leave the file out of the list")
+
+    if lib.libc && lib.exports.is_empty()
+        return Err(s"'c.$name.libc' is true and the library exports nothing — 'libc' says the " +
+                   "roots in 'export' are the C standard library's headers, so it needs some")
+
+    if lib.sources.is_empty() && lib.patterns.is_empty() && lib.include.is_empty() && lib.exports.is_empty()
+        return Err(s"'c.$name' declares nothing — a library compiles 'sources', reads 'include' " +
+                   "or publishes 'export', and one doing none of them is a block to delete")
+
+    if !lib.private_include.is_empty() && lib.sources.is_empty() && lib.patterns.is_empty()
+        return Err(s"'c.$name.include_private' is read by the library's own sources, and it " +
+                   "compiles none — use 'include' for roots the package's other C reads")
+
+    Ok(())
+end library_shape
+
+// One library's block. `forced` is the root a layered library has already settled on (every layer of
+// one library resolves its relative paths against the same root), and a layer read `loose` leaves the
+// checks that need the whole library to `library_shape`.
+read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
+               loose: bool = false) -> Result[CLibrary, string]
     if !conf_is_block(sub)
         return Err(s"'c.$name' is not a block — a library says its 'root', 'include', " +
                    "'sources', 'defines' and 'export' in one")
@@ -110,13 +144,8 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
                        "its 'root', 'include', 'include_private', 'sources', 'exclude', 'defines', " +
                        "'export' and 'libc'")
 
-    val root = conf_at(sub, "root") match
-        None -> ""
-        Some(v) -> *v match
-            Text(s) -> inside_package(s"c.$name.root", "", s)?
-            Word(s) -> inside_package(s"c.$name.root", "", s)?
-            _ -> return Err(s"'c.$name.root' must be a path — the directory the library's tree " +
-                            "is in, relative to the package root")
+    val own_root = library_root(name, sub)?
+    val root = if forced.is_some() then forced.unwrap() else own_root.unwrap_or("")
 
     val include = path_list(sub, name, "include", root)?
     val private_include = path_list(sub, name, "include_private", root)?
@@ -188,10 +217,6 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
             pattern_shape(s"c.$name.exclude", one)?
             exclude.push(inside_package(s"c.$name.exclude", root, one)?)
 
-    if !exclude.is_empty() && patterns.is_empty()
-        return Err(s"'c.$name.exclude' takes files out of what a pattern in 'sources' matches, and " +
-                   "this library's sources are all named outright — leave the file out of the list")
-
     var macros: Buf[string] = buf()
 
     conf_at(sub, "defines") match
@@ -215,20 +240,23 @@ private read_c_library(name: string, sub: &Conf) -> Result[CLibrary, string]
             _ -> return Err(s"'c.$name.libc' must be true or false — whether the roots it " +
                             "exports are the C standard library's headers")
 
-    if libc && exports.is_empty()
-        return Err(s"'c.$name.libc' is true and the library exports nothing — 'libc' says the " +
-                   "roots in 'export' are the C standard library's headers, so it needs some")
+    val lib = CLibrary(name, root, include, private_include, sources, patterns, exclude, macros, exports, libc)
 
-    if sources.is_empty() && patterns.is_empty() && include.is_empty() && exports.is_empty()
-        return Err(s"'c.$name' declares nothing — a library compiles 'sources', reads 'include' " +
-                   "or publishes 'export', and one doing none of them is a block to delete")
+    if !loose then library_shape(lib)?
 
-    if !private_include.is_empty() && sources.is_empty() && patterns.is_empty()
-        return Err(s"'c.$name.include_private' is read by the library's own sources, and it " +
-                   "compiles none — use 'include' for roots the package's other C reads")
-
-    Ok(CLibrary(name, root, include, private_include, sources, patterns, exclude, macros, exports, libc))
+    Ok(lib)
 end read_c_library
+
+// The root a library block sets, normalized, or `None` where it sets none.
+library_root(name: string, sub: &Conf) -> Result[Option[string], string]
+    conf_at(sub, "root") match
+        None -> Ok(None)
+        Some(v) -> *v match
+            Text(s) -> Ok(Some(inside_package(s"c.$name.root", "", s)?))
+            Word(s) -> Ok(Some(inside_package(s"c.$name.root", "", s)?))
+            _ -> Err(s"'c.$name.root' must be a path — the directory the library's tree " +
+                     "is in, relative to the package root")
+end library_root
 
 // Whether a path is a pattern rather than a file.
 private is_pattern(path: string) -> bool = path.index_of("*").is_some() || path.index_of("?").is_some()
@@ -281,8 +309,9 @@ end path_list
 // the library's tree.
 inside_package(key: string, base: string, item: string) -> Result[string, string]
     var parts: Buf[string] = buf()
-    val rooted = item.starts_with("/")
-    val written = if rooted then item[1..] else item
+    val required = item.starts_with("@")
+    val rooted = item.starts_with("/") || required
+    val written = if item.starts_with("/") then item[1..] else item
     val whole = if base == "" || rooted then written else s"$base/$written"
     val segments = split(whole, "/")
 
@@ -295,6 +324,11 @@ inside_package(key: string, base: string, item: string) -> Result[string, string
                 return Err(s"'$key' names '$item', which climbs out of the package — a package " +
                            "compiles and publishes the C it carries and nothing else")
 
+            if parts.len() == 1 && parts.at(0).starts_with("@")
+                return Err(s"'$key' names '$item', which climbs out of the required tree " +
+                           s"'${parts.at(0)}' — a path starting with '@name/' stays inside the tree " +
+                           "that requirement was answered with")
+
             parts.truncate(parts.len() - 1)
         else parts.push(part)
 
@@ -302,8 +336,27 @@ inside_package(key: string, base: string, item: string) -> Result[string, string
 end inside_package
 
 // A package-relative path as the machine spells it under the tree at `tree`.
-private under(tree: string, rel: string) -> string =
-    if rel == "" then absolute_path(tree) else absolute_path(join_path(tree, rel))
+//
+// **A path starting `@name/` is inside a tree the package requires** rather than the package: it is
+// read under the directory the requirement `name` (`requires.headers`) was answered with, by
+// `--include-path name=<dir>` or the variable the requirement names. An unanswered one stays as
+// written, which names no directory -- and the build was stopped for it before it got this far.
+under(tree: string, rel: string) -> string
+    if rel == "" then return absolute_path(tree)
+
+    if rel.starts_with("@")
+        val cut = rel.index_of("/")
+        val name = if cut.is_some() then rel[1..<cut.unwrap()] else rel[1..]
+
+        required_tree(name) match
+            Some(dir) ->
+                if cut.is_none() then return absolute_path(dir)
+
+                return absolute_path(join_path(dir, rel[(cut.unwrap() + 1)..]))
+            None -> ()
+
+    absolute_path(join_path(tree, rel))
+end under
 
 // Whether `file`, an absolute path, is under the root of a library of this package that compiles a
 // list -- which makes it the list's to compile and not the walk's.
@@ -565,12 +618,18 @@ tree_c_units(tree: string, t: Target) -> Result[Buf[CUnit], CRefusal]
         Err(why) -> return Err(CRefusal(why, false))
         Ok(got) -> got
 
+    // And the macros a consumer chose by name, which every file of the package is compiled with.
+    val chosen = consumer_c_defines(tree) match
+        Err(why) -> return Err(CRefusal(why, false))
+        Ok(got) -> got
+
     val shared = package_c_flags(tree, declared)
 
     for item in found
         var macros = shared.1.copy()
 
         add_unique(&macros, defines_for(declared, item))
+        add_unique(&macros, chosen)
         out.push(CUnit(item, joined_flags(joined_flags(configured, shared.0), published), macros))
 
     for item in listed
@@ -586,6 +645,7 @@ tree_c_units(tree: string, t: Target) -> Result[Buf[CUnit], CRefusal]
         var macros = lib.macros.copy()
 
         add_unique(&macros, defines_for(declared, item.0))
+        add_unique(&macros, chosen)
         out.push(CUnit(item.0, joined_flags(own, published), macros))
 
     Ok(out)
@@ -653,6 +713,11 @@ struct CExporter
     // A `--lib` root's modules, which keep the names they were written with rather than sitting under
     // a canonical prefix -- so an import table reaches it by one of them. Empty for any other package.
     modules: Buf[string]
+
+    // The macros a consumer's `c_defines` gave every C file of this package, as clang spells each, and
+    // the entry that said so. Two consumers giving one macro different values are refused.
+    defines: Buf[string]
+    defined_by: Buf[(string, string)]
 end CExporter
 
 // The graph the last resolution answered, kept because a `c const` probe is answered inside the
@@ -681,7 +746,7 @@ note_c_exporters(g: &Graph, roots: &Buf[(string, Manifest)])
         if is_root_package(p) then project = deps.copy()
 
         kept.push(CExporter(absolute_path(p.root), p.canonical, deps, exported(p.root, p.manifest, false),
-                            exported(p.root, p.manifest, true), buf(), "", "", buf()))
+                            exported(p.root, p.manifest, true), buf(), "", "", buf(), buf(), buf()))
 
     // A root's modules are filed under the project's names and what its manifest binds is bound into
     // the project's own table, so what it depends on is read off that table.
@@ -689,7 +754,8 @@ note_c_exporters(g: &Graph, roots: &Buf[(string, Manifest)])
         val (dir, m) = item
 
         kept.push(CExporter(absolute_path(dir), lib_root_key(dir), project, exported(dir, m, false),
-                            exported(dir, m, true), buf(), "", "", package_modules(dir).unwrap_or(buf())))
+                            exported(dir, m, true), buf(), "", "", package_modules(dir).unwrap_or(buf()), buf(),
+                            buf()))
 
     // **A consumer may stand its own headers ahead of a dependency's** -- a vendored library's
     // configuration header, which the library is written to have its integrator supply.
@@ -716,7 +782,7 @@ end exported
 private consumer_entries(kept: *Buf[CExporter], p: &ResolvedPackage, deps: Buf[Dependency], block: string,
                          roots: &Buf[(string, Manifest)])
     for dep in deps
-        if dep.c_include.is_empty() then continue
+        if dep.c_include.is_empty() && dep.c_defines.is_empty() then continue
 
         var target = stood_in_by(roots, dep) match
             Some(i) -> exporter_named(*kept, lib_root_key(roots.at(i).0))
@@ -731,6 +797,31 @@ private consumer_entries(kept: *Buf[CExporter], p: &ResolvedPackage, deps: Buf[D
         for j in 0..<kept.len()
             if target.is_some() && target.unwrap() == j
                 var e = kept.at(j)
+
+                // **A macro a consumer defines is the consumer's to define alone**, as its headers
+                // are: two entries giving one macro different values would leave the package
+                // compiled with whichever was read last.
+                for macro in dep.c_defines
+                    val name = macro_key(macro)
+                    var seen = false
+
+                    for had in e.defined_by
+                        if had.0 != name then continue
+
+                        seen = true
+
+                        if had.1 != who && !holds(e.defines, macro) && e.conflict.is_empty()
+                            e.conflict = s"'${had.1}.c_defines' and '$who.c_defines' both define " +
+                                         s"'$name' for '${e.canonical}' — a package is compiled once, " +
+                                         "so one consumer chooses a macro of its own"
+
+                    if !seen
+                        e.defines.push(macro)
+                        e.defined_by.push((name, who))
+
+                if dep.c_include.is_empty()
+                    kept.set(j, e)
+                    continue
 
                 if !e.configured_by.is_empty() && e.configured_by != who
                     e.conflict = s"'${e.configured_by}' and '$who' both give '${e.canonical}' headers of " +
@@ -779,6 +870,25 @@ consumer_c_flags(tree: string) -> Result[Buf[string], string]
 
     Ok(out)
 end consumer_c_flags
+
+// The macros a consumer's `c_defines` gave every C file of this tree, as clang spells each -- or the
+// refusal for two consumers that gave one macro different values.
+consumer_c_defines(tree: string) -> Result[Buf[string], string]
+    val me = absolute_path(tree)
+
+    for e in c_exporters
+        if e.root == me
+            if !e.conflict.is_empty() then return Err(e.conflict)
+
+            return Ok(e.defines.copy())
+
+    Ok(buf())
+end consumer_c_defines
+
+// The name of a macro as clang spells it after the `-D`: `NAME` or `NAME=value`.
+macro_key(macro: string) -> string = macro.index_of("=") match
+    Some(at) -> macro[0..<at]
+    None -> macro
 
 // **The include roots the packages a tree depends on publish to its C**, directly or through another
 // -- as imports are transitive, so are the headers behind them.
@@ -893,9 +1003,15 @@ c_block_text(m: &Manifest) -> string
         if !dep.c_include.is_empty()
             out = out + s"c_include ${dep.label}=${join(dep.c_include.view(), ",")}\n"
 
+        if !dep.c_defines.is_empty()
+            out = out + s"c_defines ${dep.label}=${join(dep.c_defines.view(), ",")}\n"
+
     for dep in m.dev_dependencies
         if !dep.c_include.is_empty()
             out = out + s"c_include ${dep.label}=${join(dep.c_include.view(), ",")}\n"
+
+        if !dep.c_defines.is_empty()
+            out = out + s"c_defines ${dep.label}=${join(dep.c_defines.view(), ",")}\n"
 
     out
 end c_block_text

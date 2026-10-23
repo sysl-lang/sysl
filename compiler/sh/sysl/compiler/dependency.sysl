@@ -52,6 +52,11 @@ struct Dependency
     // how a consumer supplies the configuration header a vendored library is written to take.
     c_include: Buf[string]
 
+    // Macros of the CONSUMER's choosing, defined for every C file of the package, as clang spells each
+    // after the `-D` and sorted by name (`c_defines = { STM32H743xx = true }`): the part name a vendor's
+    // header selects its register map by, which is the application's fact and no feature's.
+    c_defines: Buf[string]
+
     // The machines the dependency is taken on, as the condition its `if` wrote -- `#if`'s language
     // over `dependency_symbols` -- or the empty string where it is taken on every machine.
     condition: string
@@ -63,7 +68,7 @@ end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
 plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
-    Dependency(label, origin, mount, false, buf(), true, buf(), "", buf())
+    Dependency(label, origin, mount, false, buf(), true, buf(), buf(), "", buf())
 
 // **The machine a graph is resolved for**, which decides the dependencies an `if` leaves out. Module
 // storage for the reason `features.sysl` gives for the feature request: it is written by the one
@@ -94,6 +99,12 @@ end machine_holds
 // Whether a build for a particular machine is being resolved, rather than a question about the
 // manifests as a whole.
 machine_named() -> bool = resolution_machine.is_some()
+
+// The name of the machine the graph is resolved for, or `""` where no machine is named -- which is what
+// the target layers of a manifest are matched against.
+machine_name() -> string = resolution_machine match
+    None -> ""
+    Some(t) -> t.name
 
 // The machine as a refusal names it.
 machine_called() -> string = resolution_machine match
@@ -323,7 +334,7 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', " +
+                "'c_defines', 'c_include', 'default_features', 'features', 'git', 'if', 'mount', 'optional', " +
                 "'options', 'path', 'rev', 'version', 'workspace'")
 
     val mount = read_mount(sub, where)?
@@ -349,9 +360,21 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
                 for dir in dirs
                     c_include.push(inside_package(s"$where.c_include", "", dir)?)
 
+    var c_defines: Buf[string] = buf()
+
+    conf_at(sub, "c_defines") match
+        None -> ()
+        Some(v) ->
+            if !conf_is_block(v)
+                return Err(s"'$where.c_defines' is not a block of macros — each line is one macro " +
+                           "every C file of the package is compiled with, as 'c_defines = { STM32H743xx = true }'")
+
+            for name in sort_names(conf_keys(v))
+                c_defines.push(macro_of(s"$where.c_defines", name, conf_at(v, name).unwrap())?)
+
     val options = read_option_settings(sub, where)?
 
-    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, condition, options))
+    Ok(Dependency(label, origin, mount, optional, features, defaults, c_include, c_defines, condition, options))
 end read_dependency
 
 // An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
@@ -374,7 +397,7 @@ end read_condition_key
 // Every key a dependency entry may write. A table rather than a test, so the cache census
 // (`tests_ckg_cache_key.sysl`) can walk it.
 val DependencyKeys: []const string = ["git", "version", "rev", "path", "mount", "optional", "features",
-                                      "default_features", "workspace", "c_include", "if", "options"]
+                                      "default_features", "workspace", "c_include", "c_defines", "if", "options"]
 
 private known_dependency_key(key: string) -> bool = holds_key(DependencyKeys, key)
 

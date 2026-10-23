@@ -1,0 +1,759 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, Search}
+
+// **`c`, `defines` and `requires` under targets and features** (`c_layers.sysl`, `reference/packages.md §
+// C under targets and features`): the four places a package may write them, how they merge, what is
+// refused, a dependency's own layers, `requires` that exist only while a feature is on, `@name/` paths
+// into a tree the package requires, and a consumer's `c_defines`.
+
+private val mfc_package: string = "package { name = \"p\", version = \"0.1.0\" }\n"
+
+private mfc_read(body: string) -> Manifest = read_manifest(mfc_package + body).unwrap()
+
+private mfc_refused(body: string) -> string =
+    read_manifest(mfc_package + body) match
+        Err(why) -> why
+        Ok(_) -> "(read)"
+
+private mfc_names(named: []string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for n in named
+        out.push(n)
+
+    out
+end mfc_names
+
+// The manifest as the layers in force for `machine` and the features `on` make it.
+private mfc_with(m: &Manifest, machine: string, on: []string) -> Manifest =
+    apply_c_layers(m, machine, mfc_names(on)).unwrap()
+
+private mfc_error(m: &Manifest, machine: string, on: []string) -> string =
+    apply_c_layers(m, machine, mfc_names(on)) match
+        Err(why) -> why
+        Ok(_) -> "(merged)"
+
+// What the merge made, one line to a library, a file's macros and a requirement.
+private mfc_show(m: &Manifest) -> string
+    var out = ""
+
+    for lib in m.c_libraries
+        out = out + s"${lib.name} root=${lib.root} include=${join(lib.include.view(), ",")} " +
+            s"sources=${join(lib.sources.view(), ",")} macros=${join(lib.macros.view(), ",")} " +
+            s"export=${join(lib.exports.view(), ",")}\n"
+
+    for item in m.defines
+        out = out + s"defines ${item.0}=${join(item.1.view(), ",")}\n"
+
+    for item in m.headers
+        out = out + s"headers ${item.0}\n"
+
+    out
+end mfc_show
+
+// A library in the package, one for the machine `thumb`, and one for the feature `fast`.
+private val mfc_three: string =
+    "c {\n  lib {\n    root = \"src\"\n    include = [\".\"]\n    sources = [\"core.c\"]\n" +
+    "    defines { A = 1, B = 1 }\n  }\n}\n" +
+    "targets {\n  thumb { c { lib { sources = [\"port.c\"], include = [\"thumb\"], defines { B = 2 } } } }\n}\n" +
+    "features {\n  fast { c { lib { sources = [\"fast.c\"], defines { B = 3, C = 1 } } } }\n}\n"
+
+// -- reading ----------------------------------------------------------------------------------------
+
+@test("c, defines and requires are accepted under a target, a feature and a feature's target without a warning")
+mfc_keys_are_read()
+    val m = mfc_read("targets { thumb { c { lib { sources = [\"a.c\"] } }, defines { \"a.c\" { X = 1 } } } }\n" +
+                     "features { f {\n  c { lib { sources = [\"b.c\"] } }\n  defines { \"b.c\" { Y = 1 } }\n" +
+                     "  requires { headers { sdk = \"the sdk\" } }\n" +
+                     "  targets { thumb { c { lib { sources = [\"c.c\"] } } } }\n} }\n")
+
+    assert_eq(join(m.warnings.view(), "\n"), "")
+    assert_eq(m.layers.len(), 4)
+
+@test("a key still waiting for a later layer says so, and c does not")
+mfc_unread_keys_still_warn()
+    val m = mfc_read("features { f { config { X = 1 }, sections { s { } }, c { lib { sources = [\"a.c\"] } } } }\n")
+    val said = join(m.warnings.view(), "\n")
+
+    assert(said.contains("'features.f.config' is read but not yet acted on by this sysl, and is ignored"), said)
+    assert(said.contains("'features.f.sections' is read but not yet acted on by this sysl, and is ignored"), said)
+    assert(!said.contains("features.f.c'"), said)
+    assert(!said.contains("features.f.defines"), said)
+
+@test("a layer's block is read with the same checks as the package's, and a refusal names the layer")
+mfc_layer_refusals_name_the_layer()
+    assert(mfc_refused("features { f { c { lib { sources = [\"a.h\"] } } } }\n")
+               .contains("'features.f.c.lib.sources' entry 'a.h' does not name a '.c' file"), "feature")
+    assert(mfc_refused("targets { t { c { lib { sources = [\"a.c\"], colour = 1 } } } }\n")
+               .contains("'targets.t.c.lib.colour' is not something a C library declares"), "target")
+    assert(mfc_refused("features { f { targets { t { defines { \"a.c\" { X = false } } } } } }\n")
+               .contains("'features.f.targets.t.defines.\"a.c\".X' is false"), "feature target")
+    assert(mfc_refused("features { f { requires { headers { \"bad name\" = \"x\" } } } }\n")
+               .starts_with("'features.f.requires': 'bad name' is not usable as a header requirement's name"),
+           "requirement")
+
+@test("a capability is the package's fact, so a target or feature needs only headers and pkg_config")
+mfc_layer_requires_keys()
+    assert_eq(mfc_refused("features { f { requires { os = true } } }\n"),
+              "'features.f.requires.os' is not something a target or a feature needs — it names " +
+              "'headers' and 'pkg_config'; a capability is a fact about the whole package, so it is " +
+              "written in the package's own 'requires'")
+
+@test("a feature's target block that sets an image key is refused under its real path")
+mfc_image_refusal_names_the_path()
+    assert(mfc_refused("features { a { targets { t { entry = \"x y\" } } } }\n")
+               .starts_with("'features.a.targets.t.entry = \"x y\"' is not a symbol a linker can start an image at"),
+           "feature target")
+    assert(mfc_refused("targets { t { entry = \"x y\" } }\n").starts_with("'targets.t.entry = \"x y\"' is not a symbol"),
+           "target")
+    assert(mfc_refused("features { a { targets { t { linker = 3 } } } }\n").starts_with("'features.a.targets.t.linker'"),
+           "key")
+
+// -- merging ----------------------------------------------------------------------------------------
+
+@test("with nothing in force beyond the package, the package's own c block stands")
+mfc_package_alone()
+    val m = mfc_read(mfc_three)
+
+    assert_eq(mfc_show(mfc_with(m, "", [])), "lib root=src include=src sources=src/core.c macros=A=1,B=1 export=\n")
+    assert_eq(mfc_show(mfc_with(m, "arm", [])), mfc_show(mfc_with(m, "", [])))
+
+@test("a target's layer adds to a library and its macro replaces the package's")
+mfc_target_layer()
+    val m = mfc_read(mfc_three)
+
+    assert_eq(mfc_show(mfc_with(m, "thumb", [])),
+              "lib root=src include=src/thumb,src sources=src/core.c,src/port.c macros=A=1,B=2 export=\n")
+
+@test("a feature's layer is the most specific: lists add and its macros win")
+mfc_feature_layer()
+    val m = mfc_read(mfc_three)
+
+    assert_eq(mfc_show(mfc_with(m, "", ["fast"])),
+              "lib root=src include=src sources=src/core.c,src/fast.c macros=A=1,B=3,C=1 export=\n")
+    assert_eq(mfc_show(mfc_with(m, "thumb", ["fast"])),
+              "lib root=src include=src/thumb,src sources=src/core.c,src/port.c,src/fast.c macros=A=1,B=3,C=1 export=\n")
+
+@test("a feature that is off contributes nothing, and the merge is not cumulative")
+mfc_feature_off_and_idempotent()
+    val m = mfc_read(mfc_three)
+    val once = mfc_with(m, "thumb", ["fast"])
+
+    assert_eq(mfc_show(mfc_with(m, "thumb", [])), mfc_show(mfc_with(m, "thumb", ["nothing"])))
+    assert_eq(mfc_show(mfc_with(once, "thumb", ["fast"])), mfc_show(once))
+
+@test("a feature's own target block is the most specific of all")
+mfc_feature_target_layer()
+    val m = mfc_read("c { lib { root = \"src\", sources = [\"a.c\"], defines { M = 1 } } }\n" +
+                     "features { f {\n  c { lib { defines { M = 2 } } }\n" +
+                     "  targets { thumb { c { lib { sources = [\"t.c\"], defines { M = 3 } } } } }\n} }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "thumb", ["f"])),
+              "lib root=src include= sources=src/a.c,src/t.c macros=M=3 export=\n")
+    assert_eq(mfc_show(mfc_with(m, "arm", ["f"])), "lib root=src include= sources=src/a.c macros=M=2 export=\n")
+
+@test("a layer that does not root a library resolves against the root the library has")
+mfc_root_comes_from_the_package()
+    val m = mfc_read("c { lib { root = \"vendor/lib/src\", sources = [\"a.c\"] } }\n" +
+                     "features { f { c { lib { include = [\"../../config\"], export = [\".\"] } } } }\n")
+    val shown = mfc_show(mfc_with(m, "", ["f"]))
+
+    assert_eq(shown, "lib root=vendor/lib/src include=vendor/config sources=vendor/lib/src/a.c macros= " +
+                     "export=vendor/lib/src\n")
+
+@test("a library named only in a feature exists while the feature is on")
+mfc_library_only_in_a_feature()
+    val m = mfc_read("c { lib { sources = [\"a.c\"] } }\nfeatures { f { c { extra { root = \"x\", sources = [\"b.c\"] } } } }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", [])), "lib root= include= sources=a.c macros= export=\n")
+    assert_eq(mfc_show(mfc_with(m, "", ["f"])),
+              "lib root= include= sources=a.c macros= export=\nextra root=x include= sources=x/b.c macros= export=\n")
+
+@test("a feature's patterns, exclusions and exports are added to the library's")
+mfc_other_lists_add()
+    val m = mfc_read("c { lib { root = \"src\", sources = [\"a.c\", \"x/*.c\"], exclude = [\"x/no.c\"], export = [\"inc\"] } }\n" +
+                     "features { f { c { lib { sources = [\"y/*.c\"], exclude = [\"y/no.c\"], export = [\"more\"] } } } }\n")
+    val lib = mfc_with(m, "", ["f"]).c_libraries.at(0)
+
+    assert_eq(join(lib.patterns.view(), ","), "src/x/*.c,src/y/*.c")
+    assert_eq(join(lib.exclude.view(), ","), "src/x/no.c,src/y/no.c")
+    assert_eq(join(lib.exports.view(), ","), "src/inc,src/more")
+
+@test("the per-file defines merge macro by macro across the layers")
+mfc_file_defines_merge()
+    val m = mfc_read("defines { \"core/a.c\" { P = 1, Q = 1 } }\n" +
+                     "targets { thumb { defines { \"core/a.c\" { Q = 2 }, \"core/b.c\" { R = 1 } } } }\n" +
+                     "features { f { defines { \"core/a.c\" { S = 1 } } } }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", [])), "defines core/a.c=P=1,Q=1\n")
+    assert_eq(mfc_show(mfc_with(m, "thumb", [])), "defines core/a.c=P=1,Q=2\ndefines core/b.c=R=1\n")
+    assert_eq(mfc_show(mfc_with(m, "thumb", ["f"])), "defines core/a.c=P=1,Q=2,S=1\ndefines core/b.c=R=1\n")
+
+// -- what is refused --------------------------------------------------------------------------------
+
+private val mfc_two_features: string =
+    "c { lib { sources = [\"a.c\"], defines { K = 1 } } }\n" +
+    "features {\n  f1 { c { lib { defines { X = 1 } } } }\n  f2 { c { lib { defines { X = 1, Y = 2 } } } }\n  f3 { c { lib { defines { Y = 3 } } } }\n}\n"
+
+@test("one macro set by two enabled features is refused, even to the same value")
+mfc_two_features_one_macro()
+    val m = mfc_read(mfc_two_features)
+
+    assert_eq(mfc_error(m, "", ["f1", "f2"]),
+              "the features 'f1' and 'f2' are both on, and both set the macro 'X' of 'c.lib' — a macro is " +
+              "set by one feature, even when both would give it the same value, so set it in only one of " +
+              "them, or once in the package's own block outside both")
+    assert_eq(mfc_error(m, "", ["f2", "f3"]),
+              "the features 'f2' and 'f3' are both on, and both set the macro 'Y' of 'c.lib' — a macro is " +
+              "set by one feature, even when both would give it the same value, so set it in only one of " +
+              "them, or once in the package's own block outside both")
+
+@test("two features that set different macros, or only one of them on, are fine")
+mfc_two_features_different_macros()
+    val m = mfc_read(mfc_two_features)
+
+    assert_eq(mfc_show(mfc_with(m, "", ["f1", "f3"])),
+              "lib root= include= sources=a.c macros=K=1,X=1,Y=3 export=\n")
+    assert_eq(mfc_show(mfc_with(m, "", ["f2"])), "lib root= include= sources=a.c macros=K=1,X=1,Y=2 export=\n")
+
+@test("two features' target blocks setting one macro of one file are refused naming the file")
+mfc_two_features_one_file_macro()
+    val m = mfc_read("defines { \"a.c\" { K = 1 } }\n" +
+                     "features {\n  f1 { targets { t { defines { \"a.c\" { X = 1 } } } } }\n" +
+                     "  f2 { targets { t { defines { \"a.c\" { X = 2 } } } } }\n}\n")
+
+    assert_eq(mfc_error(m, "t", ["f1", "f2"]),
+              "the features 'f1' and 'f2' are both on, and both set the macro 'X' of 'defines.\"a.c\"' — a " +
+              "macro is set by one feature, even when both would give it the same value, so set it in " +
+              "only one of them, or once in the package's own block outside both")
+    assert_eq(mfc_show(mfc_with(m, "u", ["f1", "f2"])), "defines a.c=K=1\n")
+
+@test("a feature may override a macro the package or a target set")
+mfc_feature_overrides_lower_tiers()
+    val m = mfc_read(mfc_three)
+
+    assert_eq(mfc_error(m, "thumb", ["fast"]), "(merged)")
+
+@test("a library rooted in two layers is refused, naming both")
+mfc_root_twice()
+    val m = mfc_read("c { lib { root = \"src\", sources = [\"a.c\"] } }\n" +
+                     "features { f { c { lib { root = \"other\" } } } }\n")
+
+    assert_eq(mfc_error(m, "", ["f"]),
+              "'c.lib.root' and 'features.f.c.lib.root' both set the root of the library 'lib' — every " +
+              "relative path in every layer resolves against it, so it is set in one layer only")
+    assert_eq(mfc_show(mfc_with(m, "", [])), "lib root=src include= sources=src/a.c macros= export=\n")
+
+@test("a file listed by two layers of one library is refused")
+mfc_file_twice()
+    val m = mfc_read("c { lib { root = \"src\", sources = [\"a.c\"] } }\n" +
+                     "features { f { c { lib { sources = [\"a.c\"] } } } }\n")
+
+    assert_eq(mfc_error(m, "", ["f"]), "'c.lib.sources' names 'src/a.c' twice — a file is compiled once")
+
+@test("a file two libraries list, one of them added by a feature, is refused")
+mfc_file_in_two_libraries()
+    val m = mfc_read("c { one { sources = [\"a.c\"] } }\nfeatures { f { c { two { sources = [\"a.c\"] } } } }\n")
+
+    assert_eq(mfc_error(m, "", ["f"]), "'c.two.sources' and 'c.one.sources' both name 'a.c' — a file is " +
+                                       "compiled once, so one library lists it")
+
+@test("the refusal reaches the build through settle_features, naming the package")
+mfc_refusal_through_settle()
+    val m = mfc_read(mfc_two_features)
+
+    root_enabled(m, FeatureRequest(mfc_names(["f1", "f2"]), false, false), false) match
+        Ok(_) -> assert(false, "two features setting X were accepted")
+        Err(why) -> assert(why.starts_with("sysl.hocon of this project: the features 'f1' and 'f2' are both on"), why)
+
+    assert(root_enabled(m, FeatureRequest(mfc_names(["f1"]), false, false), false).is_ok(), "one is fine")
+
+@test("a library that is only a macro in a layer declares nothing alone, but the merged library does")
+mfc_shape_is_checked_merged()
+    val m = mfc_read("c { lib { sources = [\"a.c\"] } }\nfeatures { f { c { lib { defines { Z = 1 } } } } }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", ["f"])), "lib root= include= sources=a.c macros=Z=1 export=\n")
+    assert(mfc_refused("c { lib { defines { Z = 1 } } }\n").contains("'c.lib' declares nothing"), "package alone")
+
+    val only = mfc_read("features { f { c { lib { defines { Z = 1 } } } } }\n")
+
+    assert_eq(mfc_error(only, "", ["f"]).starts_with("'c.lib' declares nothing"), true)
+
+// -- requires in a layer ----------------------------------------------------------------------------
+
+@test("a requirement written in a feature exists while the feature is on, and on no other build")
+mfc_requires_in_a_feature()
+    val m = mfc_read("requires { headers { base = \"the base\" } }\n" +
+                     "features {\n  rp { requires { headers { sdk = { note = \"the sdk\", env = \"SDK_PATH\" } } } }\n" +
+                     "  st { requires { headers { cube = \"the cube\" } } }\n}\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", [])), "headers base\n")
+    assert_eq(mfc_show(mfc_with(m, "", ["rp"])), "headers base\nheaders sdk\n")
+    assert_eq(mfc_show(mfc_with(m, "", ["st"])), "headers base\nheaders cube\n")
+    assert_eq(mfc_with(m, "", ["rp"]).headers.at(1).2, "SDK_PATH")
+
+@test("a requirement in a target block is asked only on that machine")
+mfc_requires_in_a_target()
+    val m = mfc_read("targets { thumb { requires { headers { sdk = \"the sdk\" }, pkg_config { yaml = \"libyaml\" } } } }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "arm", [])), "")
+    assert_eq(mfc_show(mfc_with(m, "thumb", [])), "headers sdk\n")
+    assert_eq(mfc_with(m, "thumb", []).pkg_config.len(), 1)
+
+@test("one requirement written twice must agree")
+mfc_requires_must_agree()
+    val m = mfc_read("features {\n  a { requires { headers { sdk = \"the sdk\" } } }\n" +
+                     "  b { requires { headers { sdk = \"the sdk\" } } }\n  c { requires { headers { sdk = \"another\" } } }\n}\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", ["a", "b"])), "headers sdk\n")
+    assert_eq(mfc_error(m, "", ["a", "c"]),
+              "'requires.headers.sdk' is written by two layers in force that say different things about it — " +
+              "one requirement has one note and one variable")
+
+// -- paths into a required tree ---------------------------------------------------------------------
+
+@test("an @name path is anchored in the required tree, whatever root the library has")
+mfc_at_paths_join()
+    val m = mfc_read("requires { headers { sdk = \"the sdk\" } }\n" +
+                     "c { lib { root = \"src\", sources = [\"a.c\"], include = [\"@sdk/inc\", \".\"] } }\n" +
+                     "features { f { c { hw { root = \"@sdk/src/hw\", include = [\"irq/include\", \"../common\"], " +
+                     "sources = [\"irq/irq.c\"] } } } }\n")
+
+    assert_eq(mfc_show(mfc_with(m, "", ["f"])),
+              "lib root=src include=@sdk/inc,src sources=src/a.c macros= export=\n" +
+              "hw root=@sdk/src/hw include=@sdk/src/hw/irq/include,@sdk/src/common sources=@sdk/src/hw/irq/irq.c macros= export=\n" +
+              "headers sdk\n")
+
+@test("a path into a tree no layer requires is refused where it is written")
+mfc_at_path_undeclared()
+    assert_eq(mfc_refused("features { f { c { hw { root = \"@sdk/src\", sources = [\"a.c\"] } } } }\n"),
+              "'features.f.c.hw.root' names '@sdk/src', which reaches into a required tree — and no " +
+              "'requires.headers.sdk' is written in a layer in force. Declare 'sdk' in 'requires', in " +
+              "this layer or an earlier one")
+    assert(mfc_refused("c { hw { root = \"src\", include = [\"@sdk/inc\"], sources = [\"a.c\"] } }\n")
+               .contains("'c.hw.include' names '@sdk/inc', which reaches into a required tree"),
+           "the package's own layer is held to it as well")
+
+@test("a requirement that is off leaves its @name paths refused when they are still in force")
+mfc_at_path_needs_the_requirement_in_force()
+    val m = mfc_read("requires { headers { sdk = \"the sdk\" } }\n" +
+                     "features { f { c { hw { root = \"@sdk/src\", sources = [\"a.c\"] } } } }\n" +
+                     "targets { t { c { lib { sources = [\"b.c\"], include = [\"@cube/inc\"] } } } }\n" +
+                     "features { g { requires { headers { cube = \"the cube\" } } } }\n")
+
+    assert_eq(mfc_error(m, "t", []),
+              "'c.lib.include' names '@cube/inc', which reaches into a required tree — and no " +
+              "'requires.headers.cube' is written in a layer in force. Declare 'cube' in 'requires', in " +
+              "this layer or an earlier one")
+    assert(mfc_with(m, "t", ["g"]).c_libraries.len() == 1, "declared by an enabled feature")
+
+@test("an @name path stays inside its tree")
+mfc_at_path_cannot_climb()
+    assert(mfc_refused("requires { headers { sdk = \"x\" } }\nc { a { root = \"@sdk/src\", include = [\"../../x\"], sources = [\"a.c\"] } }\n")
+               .contains("which climbs out of the required tree '@sdk'"), "climb")
+
+@test("an unanswered @name resolves to no directory, an answered one to a place under it")
+mfc_at_paths_resolve()
+    reset_search_paths()
+    assert_eq(under("/pkg", "@sdk/inc"), "/pkg/@sdk/inc")
+    add_include_path("sdk=/opt/sdk")
+    assert_eq(under("/pkg", "@sdk/inc/x"), "/opt/sdk/inc/x")
+    assert_eq(under("/pkg", "@sdk"), "/opt/sdk")
+    assert_eq(under("/pkg", "plain"), "/pkg/plain")
+    reset_search_paths()
+
+// -- a consumer's c_defines -------------------------------------------------------------------------
+
+@test("a dependency entry's c_defines are read as macros, sorted, and refused when malformed")
+mfc_c_defines_read()
+    val m = mfc_read("dependencies { g { path = \"../g\", c_defines = { ZED = 1, STM32H743xx = true, MODE = \"fast\" } } }\n")
+
+    assert_eq(join(m.dependencies.at(0).c_defines.view(), ","), "MODE=fast,STM32H743xx,ZED=1")
+    assert_eq(mfc_refused("dependencies { g { path = \"../g\", c_defines = [A] } }\n"),
+              "'dependencies.g.c_defines' is not a block of macros — each line is one macro every C file of " +
+              "the package is compiled with, as 'c_defines = { STM32H743xx = true }'")
+    assert(mfc_refused("dependencies { g { path = \"../g\", c_defines = { A = false } } }\n")
+               .contains("'dependencies.g.c_defines.A' is false"), "false")
+    assert(mfc_refused("dependencies { g { path = \"../g\", c_defines = { \"1x\" = 1 } } }\n")
+               .contains("'dependencies.g.c_defines.1x' is not a name a C macro can have"), "name")
+    assert(mfc_refused("dependencies { g { path = \"../g\", c_define = { A = 1 } } }\n")
+               .contains("'c_defines', 'c_include'"), "the key list names c_defines")
+
+// -- the -v line ------------------------------------------------------------------------------------
+
+@test("--verbose says which feature a build left out because its if does not hold")
+mfc_verbose_skipped_feature()
+    val m = mfc_read("features {\n  arm_only { if = \"thumb\" }\n  any { }\n}\n")
+    var said: Buf[string] = buf()
+
+    assert_eq(took_search_flag(["-v"], 0), 1)
+    set_explain_sink((line) -> said.push(line))
+    use_resolution_machine(Some(host_target()))
+
+    val on = settle_features(m, buf(), true, "this project")
+
+    use_resolution_machine(None)
+    close_explain_sink()
+    reset_search_paths()
+    assert(on.is_ok(), "settled")
+    assert(!holds_string(on.unwrap(), "arm_only"), "left out")
+    assert(join(said.view(), "\n").contains("sysl: feature 'arm_only' is skipped: its 'if' (thumb) does not hold on"),
+           join(said.view(), "\n"))
+
+// -- building ---------------------------------------------------------------------------------------
+
+private mfc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private mfc_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private mfc_write(root: string, at: string, text: string)
+    val file = s"$root/$at"
+
+    make_dir_all(parent_of(file).unwrap_or(root)).unwrap()
+    write_text(file, text).unwrap()
+
+private mfc_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// The package the build tests share: one library `up` that is a core plus a port (`alpha` or `beta`,
+// one of a choice) plus a file per class, each file chosen by a feature. Its C answers one number, and
+// which files were compiled decides which number.
+private mfc_lib_manifest(extra: string = "") -> string =
+    "package { name = \"ulib\", version = \"1.0.0\" }\n" +
+    "choices { port { of = [alpha, beta], default = alpha } }\n" +
+    "c { up { root = \"c/up\", include = [\".\"], sources = [\"lib.c\"], defines { UP_SCALE = 3 } } }\n" +
+    "features {\n" +
+    "  alpha { c { up { sources = [\"port_alpha.c\"] } } }\n" +
+    "  beta {\n    requires { headers { sdk = \"the sdk\" } }\n" +
+    "    c { up { sources = [\"port_beta.c\"], defines { UP_FAST = true } } }\n  }\n" +
+    "  cdc { c { up { sources = [\"class_cdc.c\"], defines { UP_CDC = true } } } }\n" +
+    "  msc { c { up { sources = [\"class_msc.c\"], defines { UP_MSC = true } } } }\n" +
+    "}\n" + extra
+
+private mfc_lib(extra: string = "", at: string = "") -> string
+    val root = if at.is_empty() then mfc_temp("sysl-mfc-lib") else at
+
+    mfc_write(root, "sysl.hocon", mfc_lib_manifest(extra))
+    mfc_write(root, "geom/geom.sysl", "module geom\n\nextern \"up_total\" c() -> int\n\ntotal() -> int = c()\n")
+    mfc_write(root, "c/up/lib.c",
+              "int up_port(void);\n#ifdef UP_CDC\nint up_cdc(void);\n#endif\n#ifdef UP_MSC\nint up_msc(void);\n#endif\n" +
+              "int up_total(void) {\n  int t = up_port();\n#ifdef UP_CDC\n  t += up_cdc();\n#endif\n" +
+              "#ifdef UP_MSC\n  t += up_msc();\n#endif\n  t *= UP_SCALE;\n#ifdef UP_BONUS\n  t += UP_BONUS;\n#endif\n" +
+              "  return t;\n}\n")
+    mfc_write(root, "c/up/port_alpha.c", "int up_port(void) { return 1; }\n")
+    mfc_write(root, "c/up/port_beta.c",
+              "int up_port(void) {\n#ifdef UP_FAST\n  return 20;\n#else\n  return 2;\n#endif\n}\n")
+    mfc_write(root, "c/up/class_cdc.c", "int up_cdc(void) { return 10; }\n")
+    mfc_write(root, "c/up/class_msc.c", "int up_msc(void) { return 100; }\n")
+    root
+end mfc_lib
+
+private mfc_app(deps: string, at: string = "") -> string
+    val root = if at.is_empty() then mfc_temp("sysl-mfc-app") else at
+
+    mfc_write(root, "sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n")
+    mfc_write(root, "main.sysl", "print(geom.total())")
+    root
+end mfc_app
+
+private mfc_run(root: string) -> string
+    val out_dir = mfc_temp("sysl-mfc-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end mfc_run
+
+// What the library says with the features an entry asks for.
+private mfc_total(features: string, extra: string = "") -> string
+    val lib = mfc_lib()
+    val app = mfc_app(s"g { path = \"$lib\", features = [$features]$extra }")
+
+    // `beta` requires the sdk's headers, which nothing here reads; any directory answers it.
+    reset_search_paths()
+    add_include_path(s"sdk=$lib")
+
+    val said = mfc_run(app)
+
+    reset_search_paths()
+
+    mfc_drop([app, lib])
+    said
+
+@test("a dependency's feature layers choose the C that is compiled into the program")
+mfc_dependency_layers_choose_c()
+    if !mfc_ready() then return
+
+    assert_eq(mfc_total("alpha"), "3\n")
+    assert_eq(mfc_total("alpha, msc"), "303\n")
+    assert_eq(mfc_total("beta, cdc"), "90\n")
+    assert_eq(mfc_total("beta, cdc, msc"), "390\n")
+
+@test("a dependency that is asked for no feature gets its choice's default")
+mfc_dependency_default_choice()
+    if !mfc_ready() then return
+
+    assert_eq(mfc_total(""), "3\n")
+
+@test("a consumer's c_defines reach every C file of the package")
+mfc_c_defines_reach_the_package()
+    if !mfc_ready() then return
+
+    assert_eq(mfc_total("alpha", ", c_defines = { UP_BONUS = 7 }"), "10\n")
+
+@test("two consumers choosing one macro differently are refused, and agreeing is fine")
+mfc_c_defines_two_consumers()
+    if !mfc_ready() then return
+
+    val ws = mfc_temp("sysl-mfc-ws")
+
+    mfc_write(ws, "sysl.hocon", "workspace = [\"app\", \"mid\", \"ulib\"]\n")
+    mfc_lib("", s"$ws/ulib")
+    mfc_write(ws, "mid/sysl.hocon",
+              "package { name = \"mid\", version = \"1.0.0\" }\ndependencies { ulib { workspace = true, " +
+              "features = [alpha], c_defines = { UP_BONUS = 1 } } }\n")
+    mfc_write(ws, "mid/mid/mid.sysl", "module mid\n\nvalue() -> int = geom.total()\n")
+
+    val disagree = mfc_app("ulib { workspace = true, features = [alpha], c_defines = { UP_BONUS = 2 } }\n" +
+                           "mid { workspace = true }", s"$ws/app")
+    val said = mfc_run(disagree)
+
+    mfc_write(ws, "app/sysl.hocon",
+              "package { name = \"app\", version = \"0.1.0\" }\ndependencies { ulib { workspace = true, " +
+              "features = [alpha], c_defines = { UP_BONUS = 1 } }\nmid { workspace = true } }\n")
+
+    val agree = mfc_run(disagree)
+
+    mfc_drop([ws])
+    assert(said.contains("c_defines' and '") && said.contains("both define 'UP_BONUS'"), said)
+    assert_eq(agree, "4\n")
+
+@test("a requirement written in a feature is asked only of a build that has the feature on")
+mfc_requirement_follows_the_feature()
+    val lib = mfc_lib()
+    val off = mfc_app(s"g { path = \"$lib\", features = [alpha] }")
+    val on = mfc_app(s"g { path = \"$lib\", features = [beta] }")
+
+    reset_search_paths()
+
+    val unneeded = header_needs(off).unwrap()
+    val needed = header_needs(on).unwrap()
+
+    reset_search_paths()
+    mfc_drop([off, on, lib])
+    assert_eq(unneeded.len(), 0)
+    assert_eq(needed.len(), 1)
+    assert_eq(needed.at(0).name, "sdk")
+    assert_eq(needed.at(0).who, "g")
+    assert(unmet_headers(needed).unwrap().contains("the 'sdk' headers"), "asked")
+
+@test("the macros a feature sets are in the run cache's key, as the package's own are")
+mfc_cache_key_covers_feature_macros()
+    if !mfc_ready() then return
+
+    val lib = mfc_lib()
+
+    assert_eq(took_feature_flag(["--features", "cdc"], 0), 2)
+
+    val first = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    mfc_write(lib, "sysl.hocon", replace_all(mfc_lib_manifest(), "UP_CDC = true", "UP_CDC = 2"))
+
+    val second = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    mfc_write(lib, "c/up/class_cdc.c", "int up_cdc(void) { return 11; }\n")
+
+    val third = run_cache_key_of("run", lib, host_target(), DefaultOptimization, None)
+
+    reset_feature_request()
+    mfc_drop([lib])
+    assert(first.is_some() && second.is_some() && third.is_some(), "a key")
+    assert(first.unwrap() != second.unwrap(), "a changed macro in a feature must miss")
+    assert(second.unwrap() != third.unwrap(), "a changed file a feature lists must miss")
+
+// -- a machine's layer, and a reduced TinyUSB on a board -------------------------------------------
+
+private mfc_compiled(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in c_compile_commands()
+        if line.contains(s"/$file ") then out.push(line)
+
+    out
+end mfc_compiled
+
+@test("a target's layer compiles its files on that machine and no other, built for a board")
+mfc_target_layer_builds_per_machine()
+    if !mfc_ready() then return
+
+    val lib = mfc_lib("targets { thumbv7em-freestanding { c { up { sources = [\"board.c\"], defines { UP_BOARD = 1 } } } } }\n")
+
+    mfc_write(lib, "c/up/board.c", "int up_board(void) { return 5; }\n")
+    forget_c_compiles()
+
+    val board = build_library_of(lib, Some("thumbv7em-freestanding"))
+    val on_board = mfc_compiled("c/up/board.c")
+    val board_lib = mfc_compiled("c/up/lib.c")
+
+    forget_c_compiles()
+
+    val host = build_library_of(lib, None)
+    val on_host = mfc_compiled("c/up/board.c")
+
+    mfc_drop([lib])
+    assert(board.is_ok(), if board.is_ok() then "" else failure_text(board.unwrap_err()))
+    assert(host.is_ok(), if host.is_ok() then "" else failure_text(host.unwrap_err()))
+    assert_eq(on_board.len(), 1)
+    assert_eq(on_host.len(), 0)
+    assert_eq(board_lib.len(), 1)
+    assert(board_lib.at(0).contains(" -DUP_BOARD=1"), board_lib.at(0))
+
+// The fixture reduced from the TinyUSB package of the design note: a core, a port per controller (one
+// of a choice, the RP ports reading the pico-sdk in place and compiling two of its files), a role and
+// a file per class.
+private val mfc_tusb_manifest: string =
+    "package { name = \"tusb\", version = \"0.1.0\" }\n" +
+    "choices { port { doc = \"which controller\", of = [rp, h7], default = rp } }\n" +
+    "c { tinyusb { root = \"c/tusb/src\", include = [\".\", \"/config\"], sources = [\"tusb.c\"], defines { CFG_OS = 0 } } }\n" +
+    "features {\n" +
+    "  rp {\n    if = \"thumb && freestanding\"\n" +
+    "    requires.headers.pico_sdk = { note = \"the pico-sdk\", env = \"PICO_SDK_PATH\" }\n" +
+    "    c {\n      tinyusb { sources = [\"portable/rp/dcd_rp.c\"], include = [\"@pico_sdk/inc\"], defines { CFG_MCU = 1 } }\n" +
+    "      pico_hardware { root = \"@pico_sdk/hw\", include = [\"include\"], sources = [\"irq.c\"] }\n    }\n  }\n" +
+    "  h7 { c { tinyusb { sources = [\"portable/dwc2/dcd_dwc2.c\"], defines { CFG_MCU = 2 } } } }\n" +
+    "  device { default = true, c.tinyusb.sources = [\"device/usbd.c\"] }\n" +
+    "  cdc { enables = [device], c.tinyusb.sources = [\"class/cdc/cdc_device.c\"] }\n" +
+    "  msc { enables = [device], c.tinyusb.sources = [\"class/msc/msc_device.c\"] }\n" +
+    "  host { c.tinyusb.sources = [\"host/usbh.c\"] }\n}\n"
+
+private mfc_tusb() -> string
+    val root = mfc_temp("sysl-mfc-tusb")
+
+    mfc_write(root, "sysl.hocon", mfc_tusb_manifest)
+    mfc_write(root, "tusb/tusb.sysl", "module tusb\n\nunused() -> int = 0\n")
+    mfc_write(root, "config/tusb_config.h", "#define CFG_CONFIGURED 1\n")
+    mfc_write(root, "c/tusb/src/tusb.c", "#include \"tusb_config.h\"\nint tusb_init(void) { return CFG_CONFIGURED; }\n")
+    mfc_write(root, "c/tusb/src/portable/rp/dcd_rp.c",
+              "#include \"pico.h\"\n#ifndef CFG_MCU\n#error CFG_MCU\n#endif\nint dcd_rp(void) { return PICO_BOARD; }\n")
+    mfc_write(root, "c/tusb/src/portable/dwc2/dcd_dwc2.c", "int dcd_dwc2(void) { return 2; }\n")
+    mfc_write(root, "c/tusb/src/device/usbd.c", "int usbd(void) { return 3; }\n")
+    mfc_write(root, "c/tusb/src/class/cdc/cdc_device.c", "int cdc_device(void) { return 4; }\n")
+    mfc_write(root, "c/tusb/src/class/msc/msc_device.c", "int msc_device(void) { return 5; }\n")
+    mfc_write(root, "c/tusb/src/host/usbh.c", "int usbh(void) { return 6; }\n")
+    root
+end mfc_tusb
+
+private mfc_sdk() -> string
+    val root = mfc_temp("sysl-mfc-sdk")
+
+    mfc_write(root, "inc/pico.h", "#define PICO_BOARD 9\n")
+    mfc_write(root, "hw/include/irq.h", "int irq_set(void);\n")
+    mfc_write(root, "hw/irq.c", "#include \"irq.h\"\nint irq_set(void) { return 7; }\n")
+    root
+end mfc_sdk
+
+private mfc_tusb_build(features: string, sdk: string) -> Result[string, Failure]
+    reset_feature_request()
+    reset_search_paths()
+    assert_eq(took_feature_flag(["--features", features], 0), 2)
+
+    if !sdk.is_empty() then add_include_path(s"pico_sdk=$sdk")
+
+    forget_c_compiles()
+
+    val tree = mfc_tusb()
+    val built = build_library_of(tree, Some("thumbv7em-freestanding"))
+
+    mfc_drop([tree])
+    built
+end mfc_tusb_build
+
+@test("a reduced TinyUSB compiles the files its features choose, with the pico-sdk read in place")
+mfc_tusb_rp_on_a_board()
+    if !mfc_ready() then return
+
+    val sdk = mfc_sdk()
+    val built = mfc_tusb_build("rp,cdc", sdk)
+    val core = mfc_compiled("c/tusb/src/tusb.c")
+    val port = mfc_compiled("c/tusb/src/portable/rp/dcd_rp.c")
+    val irq = mfc_compiled("hw/irq.c")
+    val cdc = mfc_compiled("c/tusb/src/class/cdc/cdc_device.c")
+    val device = mfc_compiled("c/tusb/src/device/usbd.c")
+    val msc = mfc_compiled("c/tusb/src/class/msc/msc_device.c")
+    val other_port = mfc_compiled("c/tusb/src/portable/dwc2/dcd_dwc2.c")
+    val host = mfc_compiled("c/tusb/src/host/usbh.c")
+
+    reset_feature_request()
+    reset_search_paths()
+    mfc_drop([sdk])
+    assert(built.is_ok(), if built.is_ok() then "" else failure_text(built.unwrap_err()))
+    assert_eq(core.len(), 1)
+    assert(core.at(0).contains(" -DCFG_MCU=1") && core.at(0).contains(" -DCFG_OS=0"), core.at(0))
+    assert_eq(port.len(), 1)
+    assert(port.at(0).contains(s" -I$sdk/inc "), port.at(0))
+    assert_eq(irq.len(), 1)
+    assert(irq.at(0).contains(s" -I$sdk/hw/include "), irq.at(0))
+    assert_eq(cdc.len(), 1)
+    assert_eq(device.len(), 1)
+    assert_eq(msc.len(), 0)
+    assert_eq(other_port.len(), 0)
+    assert_eq(host.len(), 0)
+
+@test("and with the other controller and role, none of the first's files are compiled and it asks for no sdk")
+mfc_tusb_h7_on_a_board()
+    if !mfc_ready() then return
+
+    val built = mfc_tusb_build("h7,msc,host", "")
+    val core = mfc_compiled("c/tusb/src/tusb.c")
+    val port = mfc_compiled("c/tusb/src/portable/dwc2/dcd_dwc2.c")
+    val msc = mfc_compiled("c/tusb/src/class/msc/msc_device.c")
+    val host = mfc_compiled("c/tusb/src/host/usbh.c")
+    val rp = mfc_compiled("c/tusb/src/portable/rp/dcd_rp.c")
+    val cdc = mfc_compiled("c/tusb/src/class/cdc/cdc_device.c")
+    val irq = mfc_compiled("hw/irq.c")
+
+    reset_feature_request()
+    reset_search_paths()
+    assert(built.is_ok(), if built.is_ok() then "" else failure_text(built.unwrap_err()))
+    assert_eq(core.len(), 1)
+    assert(core.at(0).contains(" -DCFG_MCU=2") && !core.at(0).contains("CFG_MCU=1"), core.at(0))
+    assert_eq(port.len(), 1)
+    assert_eq(msc.len(), 1)
+    assert_eq(host.len(), 1)
+    assert_eq(rp.len(), 0)
+    assert_eq(cdc.len(), 0)
+    assert_eq(irq.len(), 0)
+
+@test("the pico-sdk is asked for by the controller that reads it and by no other")
+mfc_tusb_requirement_per_port()
+    val tree = mfc_tusb()
+
+    reset_feature_request()
+    reset_search_paths()
+    assert_eq(took_feature_flag(["--features", "rp"], 0), 2)
+
+    val rp = header_needs(tree).unwrap()
+
+    reset_feature_request()
+    assert_eq(took_feature_flag(["--features", "h7"], 0), 2)
+
+    val h7 = header_needs(tree).unwrap()
+
+    reset_feature_request()
+    mfc_drop([tree])
+    assert_eq(rp.len(), 1)
+    assert_eq(rp.at(0).name, "pico_sdk")
+    assert_eq(rp.at(0).env, "PICO_SDK_PATH")
+    assert_eq(h7.len(), 0)

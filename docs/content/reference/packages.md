@@ -3195,3 +3195,143 @@ What a library is compiled with is a change to the program, and so is a header i
 `sysl run` and `sysl test` replay no binary built under a different `c` or `defines` block or
 `c_include`, against a file a pattern has since started or stopped matching, or against a header
 under a library's `include` or `export` roots, or a consumer's `c_include`, that has since changed.
+The same holds for every place those blocks may be written below: a macro changed inside a feature,
+a target's block, or a consumer's `c_defines` is a different program.
+
+## C under targets and features
+
+A vendored library is usually *a common core plus one port*: TinyUSB is `tusb.c` and the classes plus
+a `dcd_<chip>.c`, FreeRTOS is `tasks.c` and `queue.c` plus a port directory and one `heap_N.c`. The
+`c`, `defines` and `requires` blocks may therefore be written in four places, from the least specific
+to the most:
+
+```hocon
+c { … }                                          // the package
+targets.thumb-freestanding { c { … } }           // the machine being built
+features.cdc { c { … } }                         // while the feature is on
+features.cdc.targets.thumb-freestanding { c { … } }   // while the feature is on, for that machine
+```
+
+Only the block for the machine being built and only the enabled features contribute; the rest are
+read, checked, and ignored. **A feature only ever adds**, and the layers merge by that rule:
+
+- **A list** (`sources`, `exclude`, `include`, `include_private`, `export`) is the union of every
+  contributing layer. **Include roots search the more specific layers first**, so a chip's own
+  `config/` shadows the generic one. A file listed by two layers of one library is refused, as it is
+  within one block.
+- **A macro** (in a library's `defines`, or in the per-file `defines` block) is taken from the most
+  specific layer that sets it: a feature over a target, a target over the package.
+- **A library's `root`** is set in one layer only, because every relative path in every layer resolves
+  against it. A layer adding to a library it does not root uses the root the library has.
+- **A library named only in a feature** exists while the feature is on.
+
+```hocon
+c {
+  tinyusb { root = "c/tinyusb/src", include = [".", "/config"], sources = ["tusb.c"] }
+}
+
+features {
+  rp2040 { c { tinyusb { sources = ["portable/raspberrypi/rp2040/dcd_rp2040.c"], defines { CFG_TUSB_MCU = 1 } } } }
+  cdc    { c { tinyusb { sources = ["class/cdc/cdc_device.c"] } } }
+}
+```
+
+A machine whose block adds a source (`targets.thumb-freestanding { c { tinyusb { sources = […] } } }`)
+compiles it for that machine and no other. `sysl build --target thumb-freestanding` builds a package
+that way without a host copy of anything.
+
+### Two features, one macro
+
+**One macro set by two enabled features is refused, even when both set the same value.** The build
+would be told two things about one macro, and which feature was declared first is no reason for the
+other to lose:
+
+```
+sysl.hocon of this project: the features 'f1' and 'f2' are both on, and both set the macro 'X' of
+'c.lib' — a macro is set by one feature, even when both would give it the same value, so set it in
+only one of them, or once in the package's own block outside both
+```
+
+A library rooted in two layers, and a file two layers list, are refused the same way and name the
+layers. A feature may override a macro the package or a target set; only two features collide.
+
+### A dependency's layers apply to that dependency
+
+A package's `c`, `defines` and `requires` describe **its own C**, so the layers of a dependency apply
+to it, selected by the features resolved for it — the union every consumer asked for. Two consumers
+asking different members of a `choices` group meet in the group and are refused there. The image keys
+(`linker_script`, `entry`, `linker`, `triple`, `capabilities`, `codegen`) stay the root project's.
+
+### A requirement that exists only while a feature is on
+
+`requires` may sit in a feature or a target, so a build for one chip is never asked for another
+chip's SDK:
+
+```hocon
+features {
+  rp2040 { requires.headers.pico_sdk = { note = "the pico-sdk", env = "PICO_SDK_PATH" } }
+  stm32h7 { requires.headers.stm32cube_h7 = "STMicroelectronics' STM32CubeH7 tree" }
+}
+```
+
+A layer's `requires` names `headers` and `pkg_config`; a capability (`requires { os = true }`) is a fact
+about the whole package and stays in the package's own `requires`. A requirement written by two
+contributing layers must say the same note and the same variable.
+
+### Reaching into a tree the package requires
+
+A path starting `@name/` — in `include`, `include_private`, `export`, `sources` or a library's `root`
+— names a directory **under wherever the requirement `name` was answered**, by `--include-path
+name=<dir>` or the variable the requirement names. The package says which subdirectories of an SDK it
+reads; the consumer answers the requirement once:
+
+```hocon
+features {
+  rp2350 {
+    requires.headers.pico_sdk = { note = "the pico-sdk", env = "PICO_SDK_PATH" }
+    c {
+      tinyusb { include = ["@pico_sdk/src/rp2350/hardware_regs/include"] }
+      pico_hardware {
+        root    = "@pico_sdk/src/rp2_common"
+        include = ["hardware_irq/include"]
+        sources = ["hardware_irq/irq.c"]
+      }
+    }
+  }
+}
+```
+
+The files are still listed and nothing runs at build time; the headers in such a tree are already code
+(inline functions), and `pico_hardware` compiles the two files of the SDK the port calls. A path into a
+name no contributing layer declares in `requires.headers` is refused where it is written:
+
+```
+sysl.hocon: 'features.rp2350.c.pico_hardware.root' names '@pico_sdk/src', which reaches into a required
+tree — and no 'requires.headers.pico_sdk' is written in a layer in force. Declare 'pico_sdk' in
+'requires', in this layer or an earlier one
+```
+
+An `@name/` path cannot climb out of its tree with `..`.
+
+### A macro the consumer chooses
+
+Some macros are the application's fact and no feature's: a vendor header selects its register map by a
+part name (`STM32H743xx`). The consumer says it on the dependency entry, beside `c_include`:
+
+```hocon
+dependencies {
+  tinyusb { git = "github.com/you/tinyusb", version = "0.1.0", features = [stm32h7], c_defines = { STM32H743xx = true } }
+}
+```
+
+Every C file of the package is compiled with it. **Two consumers giving one macro different values are
+refused**, naming both entries, as two `c_include` are.
+
+### What `--verbose` says
+
+A build asking for every feature (`--all-features`, `sysl test`) leaves out a feature whose `if` does
+not hold on the machine. `sysl build -v` says which, and why:
+
+```
+sysl: feature 'rp2040' is skipped: its 'if' (thumb && freestanding) does not hold on 'aarch64-macos'
+```

@@ -196,6 +196,12 @@ struct Manifest
 
     // The `choices` block.
     choices: Buf[Choice]
+
+    // The `c`, `defines` and `requires` blocks as the layers they are written in -- the package, each
+    // `targets.<t>`, each feature, and each feature's `targets.<t>` -- kept as written so the ones in
+    // force for a machine and a set of enabled features can be merged (`c_layers.sysl`). The fields
+    // above hold the package's own layer until that merge replaces them.
+    layers: Buf[CLayer]
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -219,10 +225,19 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf())
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf())
+             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf())
 
-// The manifest a directory carries, or the empty one where it carries none.
+// The manifest a directory carries, or the empty one where it carries none -- with the `c`, `defines`
+// and `requires` the layers in force write (`c_layers.sysl`): those of the machine being built and of
+// the features this tree has enabled, which the resolution of the build has recorded.
 manifest_at(root: string) -> Result[Manifest, Refusal]
+    manifest_read_at(root) match
+        Ok(m) -> Ok(layered_for_tree(m, root))
+        Err(why) -> Err(why)
+end manifest_at
+
+// The manifest a directory carries, as written.
+manifest_read_at(root: string) -> Result[Manifest, Refusal]
     two_manifests(root) match
         Some(why) -> return Err(Refusal(why))
         None -> ()
@@ -245,7 +260,7 @@ manifest_at(root: string) -> Result[Manifest, Refusal]
                     return Ok(out)
 
                 Ok(m)
-end manifest_at
+end manifest_read_at
 
 // A manifest's refusal as a build reports it, naming the file once -- a notation error already
 // names it, since it is the reader's own and not a statement about a key.
@@ -645,6 +660,8 @@ read_manifest(text: string) -> Result[Manifest, string]
             Some(why) -> return Err(why)
             None -> ()
 
+    val layers = read_c_layers(root)?
+
     val optimization = read_optimization(root)?
     val link = read_link(root)?
     val lto = read_lto(root)?
@@ -676,7 +693,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
                 codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets,
-                read.info, choices)
+                read.info, choices, layers)
 
     if read.long_form
         needs_floor_refusal(floor, "a feature block") match
@@ -1470,7 +1487,7 @@ end cycle_from
 // **A key is a path this package's own tree holds**, written with `/` and relative to the package
 // root. It is not a general flags channel — it cannot reach an installed library's headers, add an
 // include path, or pass anything that is not a macro.
-private read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
+read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
     var out: Buf[(string, Buf[string])] = buf()
 
     val block = conf_at(root, "defines") match
@@ -1692,7 +1709,7 @@ end defines_for
 // conventionally lives in. **`note` is required and `env` is optional**, which is the way round that
 // keeps the refusal worth reading: a consumer with neither the variable set nor a flag to hand is
 // shown the prose, and a block supplying only a variable name would leave them nothing to look for.
-private read_headers(root: &Conf) -> Result[Buf[(string, string, string)], string]
+read_headers(root: &Conf) -> Result[Buf[(string, string, string)], string]
     var out: Buf[(string, string, string)] = buf()
 
     val requires = conf_at(root, "requires") match
@@ -1793,7 +1810,7 @@ private is_name_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
 // `headers` name is invented by whoever writes the manifest, where a `.pc` name is what the world
 // already files the library under -- `yaml-0.1`, `glib-2.0`, `gtk+-3.0`. What still bounds it is the
 // flag a consumer overrides with, so a name may hold neither a separator nor an `=`.
-private read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
+read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
     var out: Buf[(string, string)] = buf()
 
     val requires = conf_at(root, "requires") match
@@ -1906,7 +1923,8 @@ val PackageKeys: []const string = ["name", "version", "sysl", "description", "li
 // What a `targets.<name>` block says: the machine's triple, how its image is linked
 // (`image_link.sysl`), and the `capabilities` and `codegen` blocks layered over the project's. A
 // feature sets any of those again from its own `targets` block (`target_features.sysl`).
-val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", "capabilities", "codegen"]
+val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", "capabilities", "codegen",
+                                  "c", "defines", "requires"]
 
 val TopKeys: []const string = ["package", "dependencies", "dev_dependencies", "requires", "capabilities",
                                "targets", "allocator", "defines", "links", "features", "optimization",

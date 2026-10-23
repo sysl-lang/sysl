@@ -1379,6 +1379,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
         var none = no_package_sources()
 
+        note_local_features(root, m)
         none.root_features = feature_symbols(mine)
         none.root_options = default_option_lines(m)
 
@@ -1548,8 +1549,45 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
 
     if graph.sums_changed then write_sums(home, graph.sums)
 
+    note_graph_features(root, graph)
     Ok(graph)
 end resolved_graph
+
+// Keep the features each tree of a resolved graph has on, so the manifest of a tree read afterwards
+// carries the `c`, `defines` and `requires` of exactly those (`c_layers.sysl`).
+private note_graph_features(root: string, graph: &Graph)
+    for p in graph.packages
+        if is_root_package(p)
+            note_tree_features(root, enabled_of(graph.features, ""))
+        else
+            note_tree_features(p.root, enabled_of(graph.features, p.canonical))
+
+    val libs = lib_roots()
+
+    for item in libs
+        note_tree_features(item, enabled_of(graph.features, lib_root_key(item)))
+end note_graph_features
+
+// The same for a build that resolves no graph: the project has what was asked of it, and a source
+// root has its `default` on.
+private note_local_features(root: string, m: &Manifest)
+    note_tree_features(root, root_enabled(resolving_local_paths(m, root), current_feature_request(),
+                                          feature_testing()).unwrap_or(buf()))
+
+    val roots = root_packages() match
+        Err(_) -> return
+        Ok(got) -> got
+
+    for item in roots
+        var asked: Buf[string] = buf()
+
+        asked.push("default")
+
+        val (dir, theirs) = item
+
+        note_tree_features(dir, settle_features(theirs, asked, false, s"the source root '$dir'")
+                           .unwrap_or(feature_closure(theirs.features, asked, theirs.dependencies)))
+end note_local_features
 
 // The directory of every other tree the build with **every feature on** would take -- the packages
 // that graph reaches and, where `roots`, the `--lib` source roots. Resolved afresh and never written
@@ -1634,6 +1672,8 @@ handed_trees(root: string, m: &Manifest) -> Buf[Handed]
                 for p in graph.packages
                     if !is_root_package(p)
                         out.push(Handed(p.canonical, p.root, false, p.version.is_some()))
+    else
+        note_local_features(root, m)
     end if
 
     val libs = lib_roots()

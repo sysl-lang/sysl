@@ -1,0 +1,638 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **The C a package compiles, written in layers** (`reference/packages.md § C under targets and
+// features`). `c`, `defines` and `requires` may be written in four places, from the least specific to
+// the most:
+//
+//     c { … }                                the package
+//     targets.<t> { c { … } }                the machine being built
+//     features.<f> { c { … } }               while the feature is on
+//     features.<f>.targets.<t> { c { … } }   while the feature is on, for that machine
+//
+// Only the target block for the machine being built, and only the enabled features, contribute. The
+// layers merge by the rules a feature already follows -- **a feature only ever adds**:
+//
+// - a list (`sources`, `exclude`, `include`, `include_private`, `export`) is the union of every
+//   contributing layer, and the include roots of the more specific layers are searched first;
+// - a macro (a library's `defines`, or a file's in `defines`) is taken from the most specific layer
+//   that sets it, and **two enabled features setting one macro are refused**, even to one value;
+// - a library's `root` is set in one layer only, because every relative path in every layer resolves
+//   against it; a layer adding to a library it does not root uses the root the library has;
+// - a library named only in a feature exists while the feature is on.
+//
+// **A path starting `@name/` is inside a tree the package requires** (`requires.headers.name`): it is
+// read under the directory that requirement was answered with, so a package says which subdirectories
+// of an 81 MB SDK it reads and a consumer answers the requirement once.
+//
+// The merge is done from the layers as written, never from a previous merge, so asking twice (for the
+// features one round enabled and then for the settled set) cannot add a layer's lines twice.
+
+// One place a package writes `c`, `defines` and `requires`.
+struct CLayer
+    // The feature it belongs to, or `""` for the package's own layer and a target's.
+    feature: string
+
+    // The machine it is for, or `""` for every machine.
+    target: string
+
+    c: Option[&Conf]
+    defines: Option[&Conf]
+    requires: Option[&Conf]
+end CLayer
+
+// The keys a layer carries.
+val LayerKeys: []const string = ["c", "defines", "requires"]
+
+// The keys of a layer's `requires` block that name something a layer can need. A capability
+// (`requires { os = true }`) is a fact about the whole package.
+val LayerRequiresKeys: []const string = ["headers", "pkg_config"]
+
+// What a set of layers means: the fields of a `Manifest` the merge replaces.
+struct LayeredC
+    libraries: Buf[CLibrary]
+    defines: Buf[(string, Buf[string])]
+    headers: Buf[(string, string, string)]
+    pkg_config: Buf[(string, string)]
+end LayeredC
+
+// A block holding one entry, so the readers that look a key up in a whole manifest can read a layer's.
+wrap_conf(key: string, value: &Conf) -> &Conf
+    var pairs: Buf[(string, &Conf)] = buf()
+
+    pairs.push((key, value))
+    Block(pairs)
+end wrap_conf
+
+// A feature's `requires` is also the list of features that have to be on with it, so only a block is a
+// layer's.
+private requires_block(entry: &Conf) -> Option[&Conf] = conf_at(entry, "requires") match
+    Some(v) -> if conf_is_block(v) then Some(v) else None
+    None -> None
+
+private layer_in(entry: &Conf, feature: string, target: string) -> CLayer =
+    CLayer(feature, target, conf_at(entry, "c"), conf_at(entry, "defines"), requires_block(entry))
+
+private says_a_layer(entry: &Conf) -> bool =
+    conf_at(entry, "c").is_some() || conf_at(entry, "defines").is_some() || requires_block(entry).is_some()
+
+// The layers a manifest writes, the package's own first, each checked as far as reading it can: a
+// refusal names the layer it came from. What cannot be checked until a machine and a set of features
+// are chosen is checked by `layered_c`.
+read_c_layers(root: &Conf) -> Result[Buf[CLayer], string]
+    var out: Buf[CLayer] = buf()
+
+    out.push(layer_in(root, "", ""))
+
+    conf_at(root, "targets") match
+        None -> ()
+        Some(block) ->
+            if conf_is_block(block)
+                for name in conf_keys(block)
+                    if name == "default" then continue
+
+                    val entry = conf_at(block, name).unwrap()
+
+                    if conf_is_block(entry) && says_a_layer(entry) then out.push(layer_in(entry, "", name))
+
+    conf_at(root, "features") match
+        None -> ()
+        Some(block) ->
+            if conf_is_block(block)
+                for name in conf_keys(block)
+                    val entry = conf_at(block, name).unwrap()
+
+                    if !conf_is_block(entry) then continue
+
+                    if says_a_layer(entry) then out.push(layer_in(entry, name, ""))
+
+                    conf_at(entry, "targets") match
+                        None -> ()
+                        Some(targets) ->
+                            if conf_is_block(targets)
+                                for target in conf_keys(targets)
+                                    val sub = conf_at(targets, target).unwrap()
+
+                                    if conf_is_block(sub) && says_a_layer(sub)
+                                        out.push(layer_in(sub, name, target))
+
+    check_layers(out)?
+    Ok(out)
+end read_c_layers
+
+// Where a layer's key is written, as a refusal names it.
+layer_path(l: &CLayer, key: string) -> string
+    if l.feature == "" && l.target == "" then return key
+    if l.feature == "" then return s"targets.${l.target}.$key"
+    if l.target == "" then return s"features.${l.feature}.$key"
+
+    s"features.${l.feature}.targets.${l.target}.$key"
+end layer_path
+
+// A reader's refusal, said with the layer's own spelling of the key: `'c.tinyusb.sources'` read out of
+// `features.rp2040` is `'features.rp2040.c.tinyusb.sources'`.
+private in_layer(l: &CLayer, key: string, why: string) -> string
+    val from = s"'$key."
+    val to = s"'${layer_path(l, key)}."
+
+    why.index_of(from) match
+        Some(at) -> why[0..<at] + to + why[(at + from.bytes.len)..]
+        None -> s"'${layer_path(l, key)}': $why"
+end in_layer
+
+private is_package_layer(l: &CLayer) -> bool = l.feature == "" && l.target == ""
+
+// A relative path a library of a layer that roots nothing is read against, deep enough that a `..`
+// the library's own root would absorb does not look like climbing out of the package. The real root is
+// known only when the layers are merged.
+val LooseBase: string = "_/_/_/_/_/_/_/_"
+
+private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
+    var declared: Buf[string] = buf()
+
+    for l in layers
+        l.requires match
+            None -> ()
+            Some(rq) ->
+                if conf_is_block(rq)
+                    conf_at(rq, "headers") match
+                        None -> ()
+                        Some(h) ->
+                            for name in conf_keys(h)
+                                declared.push(name)
+
+    for l in layers
+        l.requires match
+            None -> ()
+            Some(rq) ->
+                if !is_package_layer(l)
+                    if !conf_is_block(rq)
+                        return Err(s"'${layer_path(l, "requires")}' is not a block — a layer needs " +
+                                   "'headers' and 'pkg_config', as 'requires { headers { sdk = \"…\" } }'")
+
+                    for key in conf_keys(rq)
+                        if !holds_key(LayerRequiresKeys, key)
+                            return Err(s"'${layer_path(l, "requires")}.$key' is not something a " +
+                                       "target or a feature needs — it names 'headers' and " +
+                                       "'pkg_config'; a capability is a fact about the whole package, " +
+                                       "so it is written in the package's own 'requires'")
+
+                    read_headers(wrap_conf("requires", rq)) match
+                        Err(why) -> return Err(in_layer(l, "requires", why))
+                        Ok(_) -> ()
+
+                    read_pkg_config(wrap_conf("requires", rq)) match
+                        Err(why) -> return Err(in_layer(l, "requires", why))
+                        Ok(_) -> ()
+
+        if is_package_layer(l) then continue
+
+        l.defines match
+            None -> ()
+            Some(d) ->
+                read_defines(wrap_conf("defines", d)) match
+                    Err(why) -> return Err(in_layer(l, "defines", why))
+                    Ok(_) -> ()
+
+        l.c match
+            None -> ()
+            Some(cb) ->
+                if !conf_is_block(cb)
+                    return Err(in_layer(l, "c", "'c' is not a block of libraries — each key names one " +
+                                                 "vendored C library and what follows it says how that library is compiled"))
+
+                for name in conf_keys(cb)
+                    val sub = conf_at(cb, name).unwrap()
+                    val forced = if conf_is_block(sub) && conf_at(sub, "root").is_some() then None
+                    else Some(LooseBase)
+
+                    read_c_library(name, sub, forced, true) match
+                        Err(why) -> return Err(in_layer(l, "c", why))
+                        Ok(_) -> ()
+
+    // A path into a required tree has to name a requirement some layer declares.
+    for l in layers
+        l.c match
+            None -> ()
+            Some(cb) ->
+                for name in conf_keys(cb)
+                    val sub = conf_at(cb, name).unwrap()
+
+                    for key in LibraryPathKeys
+                        for path in paths_at(sub, key)
+                            required_name(path) match
+                                None -> ()
+                                Some(need) ->
+                                    if !holds_string(declared, need)
+                                        return Err(undeclared_tree(layer_path(l, "c"), name, key, path, need))
+
+    Ok(())
+end check_layers
+
+// The `@name` a path starts with, where it starts with one.
+private required_name(path: string) -> Option[string]
+    if !path.starts_with("@") then return None
+
+    path.index_of("/") match
+        Some(cut) -> Some(path[1..<cut])
+        None -> Some(path[1..])
+end required_name
+
+private undeclared_tree(where: string, lib: string, key: string, path: string, need: string) -> string =
+    s"'$where.$lib.$key' names '$path', which reaches into a required tree — and no " +
+    s"'requires.headers.$need' is written in a layer in force. Declare '$need' in 'requires', in " +
+    "this layer or an earlier one"
+
+// The keys of a library that hold paths.
+val LibraryPathKeys: []const string = ["root", "include", "include_private", "sources", "exclude", "export"]
+
+// The strings a key holds, whether it is a list or one scalar.
+private paths_at(sub: &Conf, key: string) -> Buf[string]
+    if !conf_is_block(sub) then return buf()
+
+    val v = conf_at(sub, key) match
+        None -> return buf()
+        Some(found) -> found
+
+    conf_list(v) match
+        Some(items) -> return items
+        None -> ()
+
+    var out: Buf[string] = buf()
+    val one = conf_text(sub, key)
+
+    if one != "" then out.push(one)
+
+    out
+end paths_at
+
+// The block a layer writes for a library, where it writes one.
+private lib_block(l: &CLayer, name: string) -> Option[&Conf] = l.c match
+    None -> None
+    Some(cb) -> conf_at(cb, name)
+
+// -- which layers are in force ---------------------------------------------------------------------
+
+// The layers a build for `machine` with `on` enabled reads, from the least specific to the most: the
+// package's, the machine's, then for each enabled feature (in the order the manifest declares them)
+// its own and its machine's. `machine` is `""` where no machine is named, and then no target layer is
+// in force.
+private layers_in_force(m: &Manifest, machine: string, on: &Buf[string]) -> Buf[CLayer]
+    var out: Buf[CLayer] = buf()
+
+    for l in m.layers
+        if is_package_layer(l) then out.push(l)
+
+    if machine != ""
+        for l in m.layers
+            if l.feature == "" && l.target == machine then out.push(l)
+
+    for info in m.feature_info
+        if !holds_string(*on, info.name) then continue
+
+        for l in m.layers
+            if l.feature == info.name && l.target == "" then out.push(l)
+
+        if machine != ""
+            for l in m.layers
+                if l.feature == info.name && l.target == machine then out.push(l)
+
+    out
+end layers_in_force
+
+// 0 for the package, 1 for a machine, 2 for a feature.
+private tier_of(l: &CLayer) -> int =
+    if is_package_layer(l) then 0 else if l.feature == "" then 1 else 2
+
+// -- merging ---------------------------------------------------------------------------------------
+
+// Lay `more`, the macros one layer sets in `scope`, over `into`: by name, the later layer replacing the
+// earlier. `setters` remembers which feature set each macro, so a second feature setting it is refused.
+private merge_macros(into: *Buf[string], setters: *Buf[(string, string, string)], scope: string,
+                     more: Buf[string], feature: string, tier: int) -> Result[unit, string]
+    for macro in more
+        val name = macro_key(macro)
+        var at: Option[usize] = None
+
+        for i in 0..<into.len()
+            if macro_key(into.at(i)) == name then at = Some(i)
+
+        if at.is_some() then into.set(at.unwrap(), macro) else into.push(macro)
+
+        var seen = false
+
+        for i in 0..<setters.len()
+            val had = setters.at(i)
+
+            if had.0 != scope || had.1 != name then continue
+
+            seen = true
+
+            if tier == 2 && had.2 != "" && had.2 != feature
+                return Err(s"the features '${had.2}' and '$feature' are both on, and both set the " +
+                           s"macro '$name' of '$scope' — a macro is set by one feature, even when both " +
+                           "would give it the same value, so set it in only one of them, or once in " +
+                           "the package's own block outside both")
+
+            setters.set(i, (scope, name, feature))
+
+        if !seen then setters.push((scope, name, feature))
+
+    Ok(())
+end merge_macros
+
+private push_new(into: *Buf[string], more: Buf[string])
+    for item in more
+        if !holds_string(*into, item) then into.push(item)
+
+// The libraries the layers in force make.
+private merge_libraries(layers: &Buf[CLayer], setters: *Buf[(string, string, string)]) -> Result[Buf[CLibrary], string]
+    var names: Buf[string] = buf()
+
+    for l in layers
+        l.c match
+            None -> ()
+            Some(cb) ->
+                if !conf_is_block(cb)
+                    return Err(in_layer(l, "c", "'c' is not a block of libraries — each key names one " +
+                                                 "vendored C library and what follows it says how that library is compiled"))
+
+                for name in conf_keys(cb)
+                    if !holds_string(names, name) then names.push(name)
+
+    var out: Buf[CLibrary] = buf()
+
+    for name in names
+        var root: Option[string] = None
+        var rooted_by = ""
+
+        for l in layers
+            val found = lib_block(l, name)
+
+            if found.is_none() || !conf_is_block(found.unwrap()) then continue
+
+            val set = library_root(name, found.unwrap()) match
+                Err(why) -> return Err(in_layer(l, "c", why))
+                Ok(r) -> r
+
+            if set.is_some()
+                if root.is_some()
+                    return Err(s"'$rooted_by.root' and '${layer_path(l, "c")}.$name.root' both set the " +
+                               s"root of the library '$name' — every relative path in every layer " +
+                               "resolves against it, so it is set in one layer only")
+
+                root = set
+                rooted_by = s"${layer_path(l, "c")}.$name"
+
+        val forced = Some(root.unwrap_or(""))
+        var parts: Buf[(CLibrary, CLayer)] = buf()
+
+        for l in layers
+            val found = lib_block(l, name)
+
+            if found.is_none() then continue
+
+            val one = read_c_library(name, found.unwrap(), forced, true) match
+                Err(why) -> return Err(in_layer(l, "c", why))
+                Ok(got) -> got
+
+            parts.push((one, l))
+
+        var include: Buf[string] = buf()
+        var private_include: Buf[string] = buf()
+
+        // Include roots search the more specific layers first, so a chip's own `config/` shadows the
+        // generic one.
+        for k in 0..<parts.len()
+            val part = parts.at(parts.len() - 1 - k).0
+
+            push_new(&include, part.include)
+            push_new(&private_include, part.private_include)
+
+        var sources: Buf[string] = buf()
+        var patterns: Buf[string] = buf()
+        var exclude: Buf[string] = buf()
+        var exports: Buf[string] = buf()
+        var macros: Buf[string] = buf()
+        var libc = false
+
+        for part in parts
+            val one = part.0
+
+            for source in one.sources
+                if holds_string(sources, source)
+                    return Err(s"'c.$name.sources' names '$source' twice — a file is compiled once")
+
+                sources.push(source)
+
+            push_new(&patterns, one.patterns)
+            push_new(&exclude, one.exclude)
+            push_new(&exports, one.exports)
+
+            if one.libc then libc = true
+
+            merge_macros(&macros, setters, s"c.$name", one.macros, part.1.feature, tier_of(part.1))?
+
+        val lib = CLibrary(name, root.unwrap_or(""), include, private_include, sources, patterns, exclude,
+                           sort_names(macros), exports, libc)
+
+        library_shape(lib)?
+        library_disjoint(out, lib)?
+        out.push(lib)
+
+    Ok(out)
+end merge_libraries
+
+// Every layer's `defines`, laid over one another file by file.
+private merge_defines(layers: &Buf[CLayer],
+                      setters: *Buf[(string, string, string)]) -> Result[Buf[(string, Buf[string])], string]
+    var files: Buf[(string, Buf[string])] = buf()
+
+    for l in layers
+        l.defines match
+            None -> ()
+            Some(d) ->
+                val rows = read_defines(wrap_conf("defines", d)) match
+                    Err(why) -> return Err(in_layer(l, "defines", why))
+                    Ok(got) -> got
+
+                for row in rows
+                    var at: Option[usize] = None
+
+                    for i in 0..<files.len()
+                        if files.at(i).0 == row.0 then at = Some(i)
+
+                    var macros: Buf[string] = if at.is_some() then files.at(at.unwrap()).1.copy() else buf()
+
+                    merge_macros(&macros, setters, s"defines.\"${row.0}\"", row.1, l.feature, tier_of(l))?
+
+                    if at.is_some() then files.set(at.unwrap(), (row.0, macros)) else files.push((row.0, macros))
+
+    var out: Buf[(string, Buf[string])] = buf()
+
+    for item in files
+        out.push((item.0, sort_names(item.1)))
+
+    Ok(out)
+end merge_defines
+
+// What the layers in force need: each requirement once, by name.
+private merge_requirements(layers: &Buf[CLayer]) -> Result[(Buf[(string, string, string)], Buf[(string, string)]), string]
+    var headers: Buf[(string, string, string)] = buf()
+    var pkg: Buf[(string, string)] = buf()
+
+    for l in layers
+        l.requires match
+            None -> ()
+            Some(rq) ->
+                val rows = read_headers(wrap_conf("requires", rq)) match
+                    Err(why) -> return Err(in_layer(l, "requires", why))
+                    Ok(got) -> got
+
+                for row in rows
+                    var seen = false
+
+                    for had in headers
+                        if had.0 != row.0 then continue
+
+                        seen = true
+
+                        if had.1 != row.1 || had.2 != row.2
+                            return Err(s"'requires.headers.${row.0}' is written by two layers in force " +
+                                       "that say different things about it — one requirement has one " +
+                                       "note and one variable")
+
+                    if !seen then headers.push(row)
+
+                val mods = read_pkg_config(wrap_conf("requires", rq)) match
+                    Err(why) -> return Err(in_layer(l, "requires", why))
+                    Ok(got) -> got
+
+                for row in mods
+                    var seen = false
+
+                    for had in pkg
+                        if had.0 != row.0 then continue
+
+                        seen = true
+
+                        if had.1 != row.1
+                            return Err(s"'requires.pkg_config.${row.0}' is written by two layers in " +
+                                       "force that say different things about it")
+
+                    if !seen then pkg.push(row)
+
+    Ok((headers, pkg))
+end merge_requirements
+
+// The merge of every layer in force for `machine` and `on`.
+layered_c(m: &Manifest, machine: string, on: &Buf[string]) -> Result[LayeredC, string]
+    val layers = layers_in_force(m, machine, on)
+    var setters: Buf[(string, string, string)] = buf()
+
+    val libraries = merge_libraries(layers, &setters)?
+    val defines = merge_defines(layers, &setters)?
+    val needs = merge_requirements(layers)?
+
+    for lib in libraries
+        for key in LibraryPathKeys
+            val paths = library_paths(lib, key)
+
+            for path in paths
+                required_name(path) match
+                    None -> ()
+                    Some(need) ->
+                        var declared = false
+
+                        for row in needs.0
+                            if row.0 == need then declared = true
+
+                        if !declared
+                            return Err(undeclared_tree("c", lib.name, key, path, need))
+
+    Ok(LayeredC(libraries, defines, needs.0, needs.1))
+end layered_c
+
+private library_paths(lib: &CLibrary, key: string) -> Buf[string]
+    if key == "root"
+        var one: Buf[string] = buf()
+
+        one.push(lib.root)
+        return one
+
+    if key == "include" then return lib.include.copy()
+    if key == "include_private" then return lib.private_include.copy()
+    if key == "sources" then return lib.sources.copy()
+    if key == "exclude" then return lib.exclude.copy()
+
+    lib.exports.copy()
+end library_paths
+
+// The manifest with its `c`, `defines` and `requires` as the layers in force make them. A manifest
+// with no layer beyond the package's is returned as it is.
+apply_c_layers(m: &Manifest, machine: string, on: &Buf[string]) -> Result[Manifest, string]
+    if m.layers.len() <= 1 then return Ok(*m)
+
+    val layers = layers_in_force(m, machine, on)
+
+    if layers.len() <= 1 then return Ok(*m)
+
+    val merged = layered_c(m, machine, on)?
+    var out = *m
+
+    out.c_libraries = merged.libraries
+    out.defines = merged.defines
+    out.headers = merged.headers
+    out.pkg_config = merged.pkg_config
+    Ok(out)
+end apply_c_layers
+
+// The refusal `settle_features` reports when the layers in force for this machine and these features
+// cannot be merged: two features setting one macro, a library rooted twice, a file listed twice.
+c_layers_refusal(m: &Manifest, on: &Buf[string], who: string) -> Option[string]
+    apply_c_layers(m, machine_name(), on) match
+        Err(why) -> Some(s"$ManifestName of $who: $why")
+        Ok(_) -> None
+end c_layers_refusal
+
+// -- which features each tree has on ---------------------------------------------------------------
+
+// The features each tree of the build resolved has enabled, keyed by its absolute directory. **Module
+// storage for the reason `c_exporters` is**: the C walk asks for a tree's manifest knowing only the
+// tree, and the answer depends on the graph that was resolved for it. It is filled by every
+// resolution and emptied by every build without one.
+private var tree_features: Buf[(string, Buf[string])] = buf()
+
+// Forget the trees, for a build that resolves none.
+forget_tree_features()
+    tree_features = buf()
+
+// Keep the features a tree has on.
+note_tree_features(dir: string, enabled: Buf[string])
+    val key = absolute_path(dir)
+
+    for i in 0..<tree_features.len()
+        if tree_features.at(i).0 == key
+            tree_features.set(i, (key, enabled))
+            return
+
+    tree_features.push((key, enabled))
+end note_tree_features
+
+// A manifest read from `root`, with the layers in force for the machine being built and the features
+// that tree has on. A tree no resolution has reached has no feature on, and a layer that cannot be
+// merged is left to `settle_features`, which names it.
+layered_for_tree(m: Manifest, root: string) -> Manifest
+    if m.layers.len() <= 1 then return m
+
+    val key = absolute_path(root)
+    var on: Buf[string] = buf()
+
+    for item in tree_features
+        if item.0 == key then on = item.1
+
+    apply_c_layers(m, machine_name(), on) match
+        Ok(got) -> got
+        Err(_) -> m
+end layered_for_tree

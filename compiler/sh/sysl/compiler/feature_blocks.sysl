@@ -74,9 +74,9 @@ end FeaturesRead
 val FeatureKeys: []const string = ["doc", "default", "if", "enables", "requires", "targets", "macro",
                                    "options", "c", "defines", "config", "sections"]
 
-// The keys of a feature block the C layer and the options layer will read, which this reader accepts
-// and does not yet act on.
-val FeatureKeysNotYetRead: []const string = ["macro", "options", "c", "defines", "config", "sections"]
+// The keys of a feature block the options layer and the config header will read, which this reader
+// accepts and does not yet act on. `c`, `defines` and `requires` are read by `c_layers.sysl`.
+val FeatureKeysNotYetRead: []const string = ["macro", "options", "config", "sections"]
 
 // Every key a `choices` entry may write.
 val ChoiceKeys: []const string = ["doc", "of", "default"]
@@ -298,7 +298,13 @@ private everything_available(m: &Manifest) -> Buf[string]
     for item in m.features
         if item.0 == "default" || choice_of(m, item.0).is_some() then continue
 
-        if feature_available(m, item.0) then out.push(item.0)
+        if feature_available(m, item.0)
+            out.push(item.0)
+        else
+            // Said under `--verbose`: a build asking for everything leaves it out without a word
+            // otherwise, and its C is not in the program.
+            trace(s"feature '${item.0}' is skipped: its 'if' (${info_of(m, item.0).unwrap().condition}) " +
+                  s"does not hold on ${machine_called()}")
 
     out
 end everything_available
@@ -394,6 +400,11 @@ settle_features(m: &Manifest, asked: Buf[string], lenient: bool, who: string) ->
                         return Err(s"$ManifestName of $who: the feature '$name' requires '$need', which " +
                             s"is not on — ask for '$need' in 'features', or list it in the 'enables' " +
                             s"of '$name' so it comes on with it")
+
+    // And the C these features and this machine write between them has to merge (`c_layers.sysl`).
+    c_layers_refusal(m, on, who) match
+        Some(why) -> return Err(why)
+        None -> ()
 
     if wants_default && !holds_string(on, "default") then on.push("default")
 
