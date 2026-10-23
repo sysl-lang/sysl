@@ -187,7 +187,7 @@ rule 2 removes the need to annotate around raw pointers; neither touches what a 
 | a `Drop` type made by value never drops (warning since 0.4) | gone: rule 3 |
 | `(self)` copies, so the address of `self` is not an answer | stays as a rule about addresses; rule 2 reports it at the call that keeps it |
 | a `Buf` assigned is a second name for one buffer; a captured `Buf` is a copy | **open — Q7** |
-| a local named `str`/`print`/`format` takes the special form away, silently | made an error (not ownership, but a silent trap; 6 parameters in library + compiler) |
+| a local named `str`/`print`/`format` takes the special form away, silently | ordinary shadowing: a user name wins, the form is the fallback, and interpolation always reaches the form |
 | a module `val` that does not fold shuts a package out of a bare target, and the host cannot see it | `sysl build`/`test` on the host checks folding for every target the manifest names (0.5.0 gives the manifest its targets) |
 | `Some(rvalue)` retain/release pair | gone: rule 1 |
 
@@ -217,13 +217,12 @@ One agent per item, in this order, each landing on dev with its tests and refere
 3. `@crossing` inferred where visible; `@crossing(copy …)` folded into the channel.
 4. `Drop` types are reference types (Q3): construction yields `&T`, a by-value spelling is refused.
 5. The two small traps (special-form shadowing; host-side fold check).
-6. Fewer built-in names (user, 2026-10-23):
-   - every remaining special form gives way to a user name;
-   - `str`/`debug` become library generics over `Display`/`Debug`, with compiler-supplied impls for the built-in types;
-   - `va_*` and the raw casts move behind an import;
-   - `format` goes, in favour of `f"…"`.
-
-   `print` stays as the one fallback form, since it takes mixed argument types.
+6. Fewer global built-in names (user, 2026-10-23):
+   - `va_*`, `ptr_cast`, `str_cast` and `str_alias` move behind an import.
+   - `print`, `str`, `debug` and `format` stay built in, as fallbacks a user name overrides (item 5).
+     They can't become library functions without specialisation: every value prints, through
+     `Display`, else `Debug`, else its type name, and some types are shown by rule because no `impl`
+     may be written for them.
 7. The org sweep: `package.hocon` renamed, removed attributes deleted, optional `-> &T` cleanup.
 
 ## Questions for the user
