@@ -3627,9 +3627,41 @@ It costs nothing at run time: no code is emitted, no signature moves, and a prog
 is the program it would have been without the line. What it adds is the refusal, made at each call —
 so a generic facility is asked afresh for every set of type arguments, exactly as a `&sync Box[T]` is.
 
-**A boundary nobody marks is not examined.** The annotation is how a library author says a domain
-begins here, and there is no way for the compiler to guess: a scheduler in a package looks like any
-other function until somebody writes the line.
+**Where a body shows the boundary, nobody writes the annotation.** A parameter whose function hands
+it to another one that crosses — `spawn`'s `arg`, a channel's `send`, a `@scoped` member's callable —
+crosses too, and so does a value (not a `*T`, which a `&sync` place holds as itself) it stores in a
+`&sync` place. Every call of that function is held to the rule exactly as a written `@crossing`
+holds it, however many functions deep the boundary is. What crosses is the parameter itself, its
+address, an element or a view of it — the address of one of its *fields* hands over that field, whose
+own type the inner call asks:
+
+```sysl
+import sysl.threads.*
+
+struct Cell
+    n: int
+
+struct State
+    cell: &Cell
+
+work(s: *State)
+    print(s.cell.n)
+
+start(s: *State) -> Option[Thread] = spawn(&work, s)
+
+var st = State(Cell(1))
+
+start(&st).unwrap().join()
+```
+
+```error
+what 's' of 'start' points at reaches another concurrency domain, so every count inside it has to be atomic
+```
+
+**A written `@crossing` is for the boundaries no body shows**: an `extern`, a function pointer, a
+closure called through its type, a trait's requirement. `sysl.threads.spawn` is one, since its body
+hands `arg` to C; a sysl function wrapping a C scheduler says `@crossing` the same way, and a
+function wrapping *that* one says nothing.
 
 **A member may carry it, and so may the two frames.** `@crossing`, `@reads` and `@writes` are the
 annotations that are about a **parameter**, which a member has exactly as a free function does — so
@@ -3674,17 +3706,17 @@ the only annotations a member may carry are the ones about a parameter
 The three are refused above a **field** and above a **variant** for a different reason, which the
 sentence says: neither has parameters for one of them to name.
 
-### `@crossing(copy value)` — a view crosses as a copy
+### A view crosses as a copy
 
-**A name written after the word `copy` is a parameter the call hands a copy of every view it holds**,
-at every depth: a `[]T`, a `string`, a `[][]u8`, a struct or an enum with views in it. The copy is
+**A parameter that crosses by value is handed a copy of every view it holds**, at every depth: a
+`[]T`, a `string`, a `[][]u8`, a struct or an enum with views in it. The copy is
 storage with a count of its own, made where the callee reads the parameter, so the caller's count
 never reaches the other domain and the caller may go on writing to what it handed over, or drop it.
 What the rule then asks is what is left once the views are copied — the elements are still the
 elements, so a view of `&T`s is refused as a `&T` is, and a view of `&sync T`s crosses:
 
 ```sysl
-@crossing(copy grid)
+@crossing(grid)
 first(grid: [][]u8) -> u8 = grid[1][0]
 
 var a: [1]u8 = [7]
@@ -3698,14 +3730,14 @@ print(first(g[..]))
 8
 ```
 
-`copy` is a word only in front of a name: `@crossing(copy)` names a parameter called `copy`, crossing
-without one. A `*T` parameter is looked through as before and never copied. **The copy allocates**,
-so a call that hands a view to a `copy` parameter is refused in a module that declared `@no_alloc`:
+A `*T` parameter is looked through as before and never copied: what it points at is the caller's,
+and the thread reads it there. **The copy allocates**, so a call that hands a view to a parameter
+crossing by value is refused in a module that declared `@no_alloc`:
 
 ```sysl
 @no_alloc
 
-@crossing(copy v)
+@crossing(v)
 take(v: []u8) -> usize = v.len
 
 var b: [2]u8 = [1, 2]
@@ -3717,8 +3749,10 @@ print(take(b[..]))
 handing 'v' of 'take' a copy of every view in it needs an allocator, and this module declared '@no_alloc'
 ```
 
-`sysl.threads.Channel[T]`'s `send` and `try_send` are `@crossing(copy value)`, which is how a channel
-[takes a view](/library/threads/#a-view-goes-in-as-a-copy).
+`sysl.threads.Channel[T]`'s `send` and `try_send` are `@crossing(value)`, which is how a channel
+[takes a view](/library/threads/#a-view-goes-in-as-a-copy): the channel's own two lines, so no code
+that sends ever writes one. A function that hands its own parameter on to `send` is inferred to cross
+by value, and copies as `send` does.
 
 `sysl.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
 taking the channel by address, because the annotation had to be written on a wrapper a caller went
@@ -4144,6 +4178,76 @@ on the pointer parameter**, and the compiler trusts it: a call of it keeps nothi
 `p`, so code calling `block(&local)` or `await read(&buf)` carries no annotation at all. The promise
 is the primitive's own — handing `p` on to a callee that keeps it is refused unless that callee says
 `@scoped` too.
+
+### A thread holds what it is handed until it is joined
+
+**A `*T` that crosses into another domain is kept**: the thread may go on reading it after the call
+that started it has returned. `spawn(&work, &local)` therefore holds `&local` — but only until the
+handle `spawn` answers is joined, and `spawn` says so once, with `@joined(arg)`. So a function may
+hand a thread the address of its own local **when it joins that thread on every way out**, and nothing
+at the call is written:
+
+```sysl
+import sysl.threads.*
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+count() -> int
+    var t = Tally(0)
+
+    spawn(&add, &t) match
+        Some(h) -> h.join()
+        None -> return 0
+
+    t.n
+
+print(count())
+```
+
+```output
+1
+```
+
+The join may be written on the call (`spawn(&add, &t).unwrap().join()`), on a local bound to the
+handle, in a `defer`, or in the `Some` arm of a `match` or an `is` test — the `None` way holds no
+thread. A function that hands its own parameter to `spawn` and answers the handle passes the join on
+to its caller, and one that joins inside keeps nothing at all. **A way out that skips the join is
+refused**: an early `return`, a `?`, a `break`, a `panic`, a `match` arm, or a handle thrown away:
+
+```sysl
+import sysl.threads.*
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+count(stop: bool) -> int
+    var t = Tally(0)
+    val h = spawn(&add, &t).unwrap()
+
+    if stop then return 0
+
+    h.join()
+    t.n
+
+print(count(false))
+```
+
+```error
+'spawn' keeps its parameter 'arg' (the thread it starts holds it until that thread is joined), and '&t' is the address of a local of 'count' — join that thread on every way out of 'count', or hand it storage that lasts
+```
+
+A handle the body cannot name again — one of several kept in an array or a `Buf` at a computed
+index, one built into a struct literal, one stored through a pointer — is never matched to its join,
+so the address of a local handed to it is refused however the handles are joined later; hand those
+threads storage that lasts, such as a box (`&*b`) or module storage. The program's own statements
+are exempt, as they are from every rule here: their frame outlives every thread.
 
 ## Hazard summary
 

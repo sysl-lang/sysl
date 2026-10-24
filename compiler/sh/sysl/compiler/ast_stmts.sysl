@@ -317,9 +317,10 @@ struct FuncMarks
     // read it.
     operator: bool
 
-    // `@crossing(copy value)`: the `@crossing` parameters a call hands over as a fresh copy of every
-    // view they hold, so a view may cross there (`sharing.sysl`'s `check_crossing`, `emit_cross.sysl`).
-    // Carried to every lowered copy, since the check reads it at each call of each instantiation.
+    // The `@crossing` parameters a call hands over as a fresh copy of every view they hold -- every one
+    // written, since a value crossing by value is a copy (`sharing.sysl`'s `check_crossings`,
+    // `emit_cross.sysl`); a `*T` among them is looked through and never copied. Carried to every
+    // lowered copy, since the check reads it at each call of each instantiation.
     copies: Buf[string]
 
     // `@scoped(f)` above a member: the callable parameters the member runs in another concurrency
@@ -328,6 +329,12 @@ struct FuncMarks
     // it); the keeps-analysis reads the rest (`keeps.sysl`): a call of the member keeps neither its
     // receiver nor what it is handed there. Carried to every instantiation.
     scoped: Buf[string]
+
+    // `@joined(arg)`: the `*T` parameters a call hands to the thread it starts, which holds each one
+    // until the handle the call answers is joined -- so the keeps-analysis (`keeps.sysl`) counts the
+    // pointer as held only along the ways out that skip that handle's `join`. Carried to every
+    // instantiation.
+    joined: Buf[string]
 
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
@@ -345,7 +352,7 @@ end FuncMarks
 
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
-                                    false, false, false, false, false, false, buf(), false, buf(), buf())
+                                    false, false, false, false, false, false, buf(), false, buf(), buf(), buf())
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -487,9 +494,8 @@ enum Attr
     ByteOrder(big: bool)
     Export(attr: ExportAttr)
     Section(name: string)
-    // `@crossing(state, copy value)`: every parameter named, and the ones written after `copy`, which
-    // the call hands over as a fresh copy of every view they hold.
-    Crossing(names: Buf[string], copies: Buf[string])
+    // `@crossing(state, value)`: every parameter named.
+    Crossing(names: Buf[string])
     Domain(name: string)
     // `@keeps(p)` above an `extern`: the C function holds on to what it is handed as `p` past the
     // call, which nothing on this side can read out of a body (`keeps.sysl`).
@@ -497,6 +503,9 @@ enum Attr
     // `@scoped(f)` above a member: `f` runs in another domain and finishes before the call that lent
     // the receiver returns.
     Scoped(names: Buf[string])
+    // `@joined(arg)`: the call hands `arg` to the thread it starts, which holds it until the handle the
+    // call answers is joined.
+    Joined(names: Buf[string])
     // `@guards(field)` above a struct: the field is reached only through the struct's own members,
     // so what it holds is not shared by sharing the struct.
     Guards(names: Buf[string])
@@ -569,10 +578,11 @@ attr_word(a: Attr) -> string = a match
     ByteOrder(_) -> "byte_order"
     Export(_) -> "export"
     Section(_) -> "section"
-    Crossing(_, _) -> "crossing"
+    Crossing(_) -> "crossing"
     Domain(_) -> "domain"
     Keeps(_) -> "keeps"
     Scoped(_) -> "scoped"
+    Joined(_) -> "joined"
     Guards(_) -> "guards"
     Needs(_) -> "needs"
     NoInline -> "noinline"

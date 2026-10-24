@@ -518,14 +518,30 @@ tdx_shared_structure_refused()
         "be atomic — but its 't' is a task of 'work', whose frame holds its parameter 's', a 'string', " +
         tdx_view(), "8:23")
 
-@test("a task whose making cannot be seen from where it crosses is refused")
+// A parameter whose body hands it across crosses without being marked (`crossing.sysl`), so where the
+// task was made is asked at the call of the function, which can see it.
+@test("a task a function hands across is inferred to cross, and its callers are held to the rule")
 tdx_unseen_task_refused()
     if tdx_no_library() then return
 
-    tdx_says(tdx_refused(tdx_prelude() + raw"""
+    val program = tdx_prelude() + raw"""
         relay(t: Task[int]) = hand(t)
-        """), tdx_arg() + "but it is a task, and nothing here says which async function made it" +
-        tdx_unmade(), "7:28")
+
+        async plain(n: int) -> int
+            await yield_now()
+            n
+
+        async text(s: string) -> int
+            await yield_now()
+            1
+
+        relay(plain(1))
+        relay(text("x"))
+        """
+
+    tdx_says(tdx_refused(program), "'t' of 'relay' reaches another concurrency domain, so every count " +
+             "inside it has to be atomic — but it is a task of 'text', whose frame holds its " +
+             "parameter 's', a 'string', " + tdx_view(), "18:7")
 
 @test("a parameter its function names in '@crossing' crosses on, and its callers are held to the rule")
 tdx_vouched_parameter_crosses_on()

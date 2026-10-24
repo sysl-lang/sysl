@@ -208,6 +208,12 @@ another concurrency domain ([memory](/reference/memory/)). It is why the state a
 **checked** rather than taken on trust: a raw pointer carries no refcount of its own, and the
 annotation is what asks the compiler to look through it at the object that actually crossed.
 
+It is declared `@joined(arg)` as well: the thread holds `arg` until the handle `spawn` answers is
+joined. So a function may hand a thread the address of one of its own locals only where it joins that
+thread on every way out — an early `return` that skips the join is refused at the argument
+([memory § A thread holds what it is handed until it is joined](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined)).
+The examples on this page are a program's own statements, whose frame outlives every thread.
+
 ```sysl
 import sysl.threads.*
 
@@ -660,10 +666,10 @@ true 15
 
 Five values go through a ring of two, so the producer really does fill it and really is woken.
 
-### `@crossing(copy value)` is written on `send`, and marking the way in is the whole check
+### `@crossing(value)` is written on `send`, and marking the way in is the whole check
 
 `send` and `try_send` are the two operations that put a value in, so they carry
-[`@crossing(copy value)`](/reference/memory/) — which is what holds a caller to the rule about what may
+[`@crossing(value)`](/reference/memory/) — which is what holds a caller to the rule about what may
 reach another domain. `receive` carries nothing and needs nothing: **nothing can be taken out that
 was not put in**, so a channel whose sends are held to the rule can hold nothing that breaks it.
 
@@ -711,8 +717,8 @@ gives, which is why a channel can embed one.
 
 ### A view goes in as a copy
 
-The `copy` in `@crossing(copy value)` says the call hands `send` **a fresh copy of every view the
-value holds, at every depth** — a `[]u8`, a `string`, a `[][]u8`, a struct with views in it — so the
+`value` crosses by value, so the call hands `send` **a fresh copy of every view the value holds, at
+every depth** — a `[]u8`, a `string`, a `[][]u8`, a struct with views in it — so the
 receiver gets storage of its own and the sender's count never crosses. The sender may go on writing
 to what it sent, or drop it, and the receiver sees the bytes as they were at the `send`:
 

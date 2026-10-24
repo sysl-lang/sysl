@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
@@ -44,9 +44,9 @@ so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@
 `@ghost`, `@reads` and `@writes` belong to the specification vocabulary and are on the
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
-a parameter hands a value to another concurrency domain — `@crossing(copy value)` that the call
-hands it a copy of every view in it — and is on the [memory](/reference/memory/) page, beside the
-crossing rule it asks; `@no_alloc`, the one header word a
+a parameter hands a value to another concurrency domain where no body shows it — a by-value one is
+handed a copy of every view in it, and one a body shows is inferred — and is on the
+[memory](/reference/memory/) page, beside the crossing rule it asks; `@no_alloc`, the one header word a
 function may also carry, holds that one definition to making no heap storage and is below; and
 `@abandons` says a call to the function never comes back while the program goes on, so the caller's
 frame is given back first — it marks an `extern` too, and is on the
@@ -74,8 +74,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, four: the ones that are about a PARAMETER.** `@crossing`, `@scoped`, `@reads` and
-`@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@scoped`, `@joined`,
+`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -422,6 +422,52 @@ block(slot: *int)
 It takes a `*T` or a call, and nothing else; it does not stand above an `extern`, whose C body
 holds what `@keeps(...)` says, nor above a trait's requirement, which has no body to keep it — each
 `impl` writes it above its own method.
+
+### `@joined(p)` — a pointer held until the handle is joined
+
+**`@joined(p)` naming a `*T` parameter that the function also says is `@crossing` promises that the
+thread the call starts holds the pointer until the handle the call answers is joined**, and no
+longer. `sysl.threads.spawn` and `spawn_on` say it of `arg`, which is what lets a function hand a
+thread the address of its own local where it joins the thread on every way out
+([memory § A thread holds what it is handed until it is joined](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined)).
+The join is the call of the handle's member named `join`. Like `@scoped`, it is a library author's
+promise, written once on the primitive; nothing that calls it writes anything.
+
+```sysl
+struct Handle
+    k: int
+
+    join(self) -> bool = true
+
+@crossing(p)
+@joined(p)
+begin(p: *int) -> Handle = Handle(*p)
+
+run() -> int
+    var n = 5
+    val h = begin(&n)
+
+    h.join()
+    n
+
+print(run())
+```
+
+```output
+5
+```
+
+It names a parameter `@crossing` names too, since a pointer is held until a join only by the thread
+it reached:
+
+```sysl
+@joined(p)
+f(p: *int) = ()
+```
+
+```error
+'@joined' names 'p', which '@crossing' does not
+```
 
 ## `::` — what a type's own name answers
 

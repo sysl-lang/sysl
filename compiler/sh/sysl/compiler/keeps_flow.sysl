@@ -56,9 +56,14 @@ struct LoopEdges
 // One walk over a body. `stmt_events` and `expr_events` say what a statement or an expression with
 // no control flow of its own does; what is still held at any way out lands in `out_pending`, and what
 // every way out overwrote in `out_cleared`.
+//
+// `arm_events` says what a way through a pattern does: given a subject, a pattern and whether the way
+// is the one where the subject matched it, the locations that way overwrites -- an `Option` handle
+// found to be `None` holds no thread (`keeps.sysl`'s `arm_clears`).
 struct FlowWalk
     stmt_events: &Fn(TStmt) -> Buf[FlowEv]
     expr_events: &Fn(TExpr) -> Buf[FlowEv]
+    arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]
     deferred_clears: Buf[string]
     deferred_keeps: Buf[KeptAt]
     out_pending: Buf[KeptAt]
@@ -68,8 +73,9 @@ struct FlowWalk
     org: &Origins
 end FlowWalk
 
-flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv]) -> &FlowWalk =
-    FlowWalk(stmt_events, expr_events, buf(), buf(), buf(), buf(), false, buf(), org)
+flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv],
+          arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]) -> &FlowWalk =
+    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org)
 
 // Walks a function's body from its entry to every way out.
 flow_body(w: &FlowWalk, body: TBlock)
@@ -179,6 +185,13 @@ end clears_loc
 private apply_event(st: &PathState, ev: FlowEv)
     if st.dead then return
 
+    // A second thread started into a handle whose first is still unjoined leaves the first with nobody
+    // to join it.
+    if !ev.clear && ev.loc.starts_with("j:") && has_loc(st.pending, ev.loc)
+        add_kept(&st.pending, KeptAt("", ev.how, ev.at))
+        return
+    end if
+
     if ev.clear
         var kept: Buf[KeptAt] = buf()
 
@@ -284,7 +297,9 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
 end flow_stmt
 
 // A piece with no control flow followed: what it stores, then a way out if one is inside it, then
-// what it overwrites -- an exit inside it may come before its clear.
+// what it overwrites -- an exit inside it may come before its clear. A thread's handle (`j:`) is held
+// only once the piece has finished and stored it, so a way out inside the piece -- `?`, or a `None`
+// arm's `return` -- leaves before there is a thread to hold anything.
 private flow_piece(w: &FlowWalk, evs: Buf[FlowEv], st: &PathState, jumps: &Jumps)
     if !jumps.exits && !jumps.loops
         for ev in evs
@@ -294,14 +309,36 @@ private flow_piece(w: &FlowWalk, evs: Buf[FlowEv], st: &PathState, jumps: &Jumps
     end if
 
     for ev in evs
-        if !ev.clear then apply_event(st, ev)
+        if !ev.clear && !ev.loc.starts_with("j:") then apply_event(st, ev)
 
     if jumps.exits then flow_exit(w, st)
     if jumps.loops then flow_jump_any(w, st)
 
     for ev in evs
+        if !ev.clear && ev.loc.starts_with("j:") then apply_event(st, ev)
+
+    for ev in evs
         if ev.clear then apply_event(st, ev)
 end flow_piece
+
+// What the ways through a pattern overwrite, on the way that matched it or the one that did not.
+private flow_arm(w: &FlowWalk, subject: TExpr, patterns: Buf[TPattern], matched: bool, st: &PathState)
+    if patterns.len() != 1 then return
+
+    for ev in w.arm_events(subject, patterns.at(0), matched)
+        apply_event(st, ev)
+end flow_arm
+
+// The ways an `if` whose condition is one `is` test splits by.
+private flow_if_arms(w: &FlowWalk, cond: Buf[TCondTerm], a: &PathState, b: &PathState)
+    if cond.len() != 1 then return
+
+    cond.at(0) match
+        TCondIs(subject, patterns, negated) ->
+            flow_arm(w, subject, patterns, !negated, a)
+            flow_arm(w, subject, patterns, negated, b)
+        _ -> ()
+end flow_if_arms
 
 private flow_block(w: &FlowWalk, b: TBlock, st: &PathState)
     flow_stmts(w, b.stmts, st, false)
@@ -327,6 +364,7 @@ private flow_expr(w: &FlowWalk, e: TExpr, st: &PathState)
             val a = copy_state(st)
             val b = copy_state(st)
 
+            flow_if_arms(w, cond, a, b)
             flow_block(w, then_block, a)
 
             if else_block.is_some() then flow_block(w, else_block.unwrap(), b)
@@ -341,6 +379,7 @@ private flow_expr(w: &FlowWalk, e: TExpr, st: &PathState)
             for arm in arms
                 val a = copy_state(st)
 
+                if arm.guard.is_none() then flow_arm(w, scrutinee, arm.patterns, true, a)
                 if arm.guard.is_some() then flow_flat(w, arm.guard.unwrap(), a)
 
                 flow_block(w, arm.body, a)
