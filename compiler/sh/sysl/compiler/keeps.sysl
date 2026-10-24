@@ -1459,9 +1459,15 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 for item in keeps_of(ft.cx, name, j).locs
                     if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
-                    val loc = if item.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
+                    var loc = if item.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
 
                     if loc.starts_with("l:") then continue
+
+                    // **A thread whose handle no place names is held for good -- but only once the
+                    // function returns**: one that never does (`-> never`, a kernel's loop) leaves its
+                    // frame to every thread it started. So it is held along the ways as a location no
+                    // clear can name (`?`), one per argument, and refused at a way out.
+                    if item.loc == "j" && loc == "" then loc = s"j?${arg.span.start}"
 
                     // A thread holds it until it is joined, so the cure is a join on every way out.
                     val cure = if item.loc == "j" then s" — join that thread on every way out of '${ft.owner}', " +
@@ -1470,7 +1476,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                         s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
                         argument_said(ft, arg, core.unwrap()) + cure
 
-                    if loc == "" || loc.index_of("?").is_some()
+                    if loc == "" || (loc.index_of("?").is_some() && !loc.starts_with("j?"))
                         ft.faults.items.push((ft.scope, arg.span, said))
                         break
                     end if
