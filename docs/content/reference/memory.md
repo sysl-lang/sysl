@@ -1186,6 +1186,8 @@ the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method 
 the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Rec
     a: int
     b: int
@@ -2395,12 +2397,36 @@ to.
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
 
+**`ptr_cast` is imported, from `sysl.raw`** — `import sysl.raw.ptr_cast` — beside `str_cast` and
+`str_alias` (`strings.md`). The compiler still answers it, since its target comes from the position
+its value fills and no signature can say that, but its name is not in scope everywhere: a file names
+the raw-tier casts it makes, so every reinterpretation in a program is found by its imports. An
+alias (`import sysl.raw.ptr_cast as pc`), a wildcard (`import sysl.raw.*`) and a path through the
+module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. Written bare
+without one, it is told where it lives:
+
+```sysl
+var arena: [8]u8 = [0u8; 8]
+val p: *u32 = ptr_cast(&arena[0])
+
+print(*p)
+```
+
+```error
+'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
+```
+
+A function or a local the reader names `ptr_cast` is what a call reaches, imported or not; importing
+the form under the name of one is refused, since the name would mean two things.
+
 **A pointer becomes an integer through the ordinary conversion syntax**, because it is an ordinary
 conversion: `usize` is wide enough to hold any address by definition, so it is total and loses
 nothing, and the result is a number that cannot be dereferenced. `isize` takes one too, which is what
 a program comparing addresses against a signed offset wants.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2429,6 +2455,8 @@ literals, is a `usize` at the target's width. So the address a datasheet gives i
 printed there, and so is a base plus an offset or a bit shifted into place:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Uart
     data: u32
     status: u32
@@ -2452,6 +2480,8 @@ value that already has a type keeps it, so an `int`, a suffixed literal such as 
 expression with either inside it is still refused, and is converted where it is meant as an address:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var base = 0x4000_4000
 val uart: *u32 = ptr_cast(base)
 
@@ -2469,6 +2499,8 @@ written on the form: `ptr_cast[*Node](&arena[0])` is
 pointer is wanted, the program is told to annotate what receives it:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var arena: [64]u8 = [0u8; 64]
 var p = ptr_cast(&arena[0])
 
@@ -2484,6 +2516,8 @@ relied on by everything the safe subset promises — and an address invented fro
 ARC to own and no object to be non-null about:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2527,6 +2561,8 @@ answers `false` for it; a trait object and a `weak T` are refused, the latter an
 `.get()`, and anything that is not a reference is refused naming its type.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern "calloc" c_calloc(n: usize, size: usize) -> *u8
 extern "free" c_free(p: *u8)
 

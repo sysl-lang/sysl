@@ -396,6 +396,7 @@ and `is_aligned` asks whether one already is. Neither needs C — an address rea
 ordinary conversion, and `ptr_cast` reads it back.
 
 ```sysl
+import sysl.raw.ptr_cast
 import sysl.slices.align_up
 import sysl.slices.is_aligned
 import sysl.slices.as_mut_ptr

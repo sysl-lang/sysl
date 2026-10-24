@@ -15,6 +15,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl`](sysl/) | The core: what every program has without importing anything. |
 | [`sysl.args`](sysl-args/) | How a program's arguments become a `[]string`, written here because every line of it is ordinary sysl. |
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
+| [`sysl.c`](sysl-c/) | The C variadic forms: `va_start`, `va_arg`, `va_copy` and `va_end`. |
 | [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption and nothing else. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
@@ -53,6 +54,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.process.hosted`](sysl-process-hosted/) |  |
 | [`sysl.process.sys`](sysl-process-sys/) |  |
 | [`sysl.rand`](sysl-rand/) | Pseudo-random numbers: a named, seedable, reproducible generator, and the distributions that are easy to get wrong. |
+| [`sysl.raw`](sysl-raw/) | The raw tier's reinterpreting forms: `ptr_cast`, `str_cast` and `str_alias`. |
 | [`sysl.reflect`](sysl-reflect/) |  |
 | [`sysl.regex`](sysl-regex/) | Matching text against a pattern: compile one, then find, replace or split with it. |
 | [`sysl.seq`](sysl-seq/) | What a sequence of values can be asked, in one trait, so that a slice and a `Buf` answer the same names. |

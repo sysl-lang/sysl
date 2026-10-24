@@ -523,6 +523,7 @@ but make a fresh one that is lost the moment the storage is freed.
 
 ```sysl
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 
 extern "calloc" c_calloc(n: usize, size: usize) -> *u8
 extern "free" c_free(p: *u8)

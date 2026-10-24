@@ -358,6 +358,8 @@ constant the object file carries, as `include_bytes!` is in Rust and `#embed` in
 
 ```sysl
 // hello, from the file itself
+import sysl.raw.str_cast
+
 val me = embed("main.sysl")
 
 print(str_cast(me[3..<8]), me[0] == u8('/'))
