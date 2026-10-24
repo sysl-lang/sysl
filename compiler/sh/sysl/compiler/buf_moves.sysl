@@ -53,7 +53,130 @@ private struct BmState
     aliases: Buf[string]
     kept: bool
     params: Buf[string]
+
+    // What each local was made from (`bm_origin`), and every local-to-local copy still live.
+    origins: Buf[(string, string)]
+    pairs: Buf[&BmPair]
 end BmState
+
+// `dst` was made a copy of `src` at `line`; `by` is the name a write later went through, and where.
+private struct BmPair
+    src: string
+    dst: string
+    line: usize
+    by: string
+    by_line: usize
+    said: bool
+end BmPair
+
+private bm_origin_of(st: &BmState, n: string) -> string
+    for i in 0..<st.origins.len()
+        val item = st.origins.at(st.origins.len() - 1 - i)
+
+        if item.0 == n then return item.1
+
+    if holds_string(st.params, n) then "a parameter" else "a pattern or loop binding"
+end bm_origin_of
+
+// What a value assigned to a local is: a buffer made here, or a second name for one held elsewhere.
+private bm_origin(st: &BmState, e: TExpr) -> string = *e.kind match
+    TLoad(n, _) ->
+        val o = bm_origin_of(st, n)
+
+        if o == "fresh" then "a copy of a local" else if o.starts_with("a copy of") then o else s"a copy of $o"
+    TField(_, _, _) -> "a field"
+    TIndex(_, _, _) -> "an element"
+    TCast(operand, _) -> bm_origin(st, operand)
+    TTry(operand, _, _, _, _, _, _) -> bm_origin(st, operand)
+    TBlockExpr(b) -> if b.result.is_some() then bm_origin(st, b.result.unwrap()) else "fresh"
+    TIf(_, _, _, _) -> "a branch's value"
+    TMatch(_, _, _) -> "a branch's value"
+    TCall(name, _, _, _) ->
+        val m = bm_member(name)
+
+        if m == "at" || m == "index" || m == "pop" || m == "remove" then "an element"
+        else if bm_derives(st.cx, name) then "a call's result that reads its arguments"
+        else "fresh"
+    TBufLit(_, _) -> "fresh"
+    TBufFill(_, _, _) -> "fresh"
+    TStructNew(_, _) -> "fresh"
+    TEnumNew(_, _, _) -> "fresh"
+    TBox(_, _) -> "fresh"
+    TZero(_) -> "fresh"
+    TGlobal(_, _, _) -> "a module variable"
+    _ -> "other"
+
+// Whether a function's result can be its arguments' storage, or something read out of it.
+private bm_derives(cx: &BmCx, name: string) -> bool
+    val key = s"D|$name"
+
+    cx.kept.get(key) match
+        Some(k) -> return k
+        None -> ()
+
+    if holds_string(cx.busy, key) then return false
+
+    val f = cx.index.get(name) match
+        Some(at) -> cx.funcs.at(at)
+        None ->
+            cx.kept.put(key, false)
+            return false
+
+    cx.busy.push(key)
+
+    val from: &BmFrom = BmFrom(bm_params(f), buf(), false)
+
+    // Locals made from a parameter, twice over so a chain of two settles.
+    for round in 0..<2
+        walk_block_stmts(f.body, stmt_walk(false, s -> s match
+            TVarDecl(n, _, init, _) -> if bm_derived(cx, from, init) then from.names.push(n)
+            TReturn(value) -> if value.is_some() && bm_derived(cx, from, value.unwrap()) then from.found = true
+            _ -> ()))
+
+    if f.body.result.is_some() && bm_derived(cx, from, f.body.result.unwrap()) then from.found = true
+
+    cx.busy.pop()
+    cx.kept.put(key, from.found)
+    from.found
+end bm_derives
+
+private struct BmFrom
+    names: Buf[string]
+    locals: Buf[string]
+    found: bool
+end BmFrom
+
+private bm_derived(cx: &BmCx, from: &BmFrom, e: TExpr) -> bool = *e.kind match
+    TLoad(n, _) -> holds_string(from.names, n)
+    TField(r, _, _) -> bm_derived(cx, from, r)
+    TIndex(r, _, _) -> bm_derived(cx, from, r)
+    TDeref(r, _) -> bm_derived(cx, from, r)
+    TCast(r, _) -> bm_derived(cx, from, r)
+    TAddrOf(r, _) -> bm_derived(cx, from, r)
+    TTry(r, _, _, _, _, _, _) -> bm_derived(cx, from, r)
+    TBlockExpr(b) -> b.result.is_some() && bm_derived(cx, from, b.result.unwrap())
+    TIf(_, t, el, _) ->
+        (t.result.is_some() && bm_derived(cx, from, t.result.unwrap())) ||
+        (el.is_some() && el.unwrap().result.is_some() && bm_derived(cx, from, el.unwrap().result.unwrap()))
+    TMatch(scrutinee, arms, _) ->
+        // What an arm binds out of a scrutinee read from the arguments is read from them too.
+        var any = bm_derived(cx, from, scrutinee)
+
+        for arm in arms
+            if arm.body.result.is_some() && bm_derived(cx, from, arm.body.result.unwrap()) then any = true
+
+        any
+    TEnumNew(_, _, args) -> bm_any_derived(cx, from, args)
+    TStructNew(_, args) -> bm_any_derived(cx, from, args)
+    TCall(name, args, _, _) -> bm_any_derived(cx, from, args) && bm_derives(cx, name)
+    _ -> false
+
+private bm_any_derived(cx: &BmCx, from: &BmFrom, args: Buf[TExpr]) -> bool
+    for item in args
+        if bm_derived(cx, from, item) then return true
+
+    false
+end bm_any_derived
 
 private bm_params(f: TFunc) -> Buf[string]
     var out: Buf[string] = buf()
@@ -85,7 +208,7 @@ check_buf_moves(a: &Analysis, funcs: Buf[TFunc])
 
     for f in funcs
         val shown = if is_closure_body(f) then s"closure:${f.name}" else f.name
-        val st: &BmState = BmState(cx, func_home(a, f.name), shown, buf(), false, 0, false, buf(), false, bm_params(f))
+        val st: &BmState = BmState(cx, func_home(a, f.name), shown, buf(), false, 0, false, buf(), false, bm_params(f), buf(), buf())
 
         bm_block(st, f.body, Some(BmDest("the function's result", None)))
 
@@ -144,17 +267,51 @@ private bm_root(st: &BmState, e: TExpr, field: bool) -> string = *e.kind match
 
         underlying(ty) match
             Ptr(_) -> "pointer" + fx
-            _ -> if holds_string(st.params, n) then "param" + fx else "local" + fx
-    TField(recv, _, _) -> bm_root(st, recv, true)
+            Ref(_, _) -> "reference" + fx
+            _ -> if holds_string(st.params, n) then "param" + fx
+                 else if field then s"local-field(${bm_origin_of(st, n)})" else s"local(${bm_origin_of(st, n)})"
+    TField(recv, _, _) ->
+        // A closure's own environment holds its captures by value; a field of an object reached
+        // through a reference or a pointer is that object's header, written in place.
+        if st.fname.starts_with("closure:") && !st.params.is_empty() && bm_names(recv, st.params.at(0))
+            "closure-capture"
+        else underlying(texpr_type(recv)) match
+            Ptr(_) -> "through-pointer"
+            Ref(_, _) -> "through-reference"
+            _ -> bm_root(st, recv, true)
     TDeref(_, _) -> "pointer"
     TGlobal(_, _, _) -> "global"
     TCast(operand, _) -> bm_root(st, operand, field)
     TAddrOf(place, _) -> bm_root(st, place, field)
-    _ -> "other"
+    _ -> s"temporary(${bm_origin(st, e)})"
+
+// Whether `e` is the local `n`, or what it points at.
+private bm_names(e: TExpr, n: string) -> bool = *e.kind match
+    TLoad(m, _) -> m == n
+    TDeref(inner, _) -> bm_names(inner, n)
+    _ -> false
+
+// The local a receiver names, where it is one.
+private bm_recv_local(e: TExpr) -> Option[string] = *e.kind match
+    TLoad(n, _) -> Some(n)
+    TCast(operand, _) -> bm_recv_local(operand)
+    TAddrOf(place, _) -> bm_recv_local(place)
+    _ -> None
 
 private bm_mutation(st: &BmState, span: Span, member: string, recv: TExpr)
     if st.summary then return
     if span.start == 0 && span.end == 0 then return
+
+    if !bm_reads_only(member)
+        bm_recv_local(recv) match
+            Some(n) ->
+                for p in st.pairs
+                    if (p.src == n || p.dst == n) && p.by == ""
+                        p.by = n
+                        p.by_line = bm_line(st, span)
+                    end if
+            None -> ()
+    end if
 
     val key = s"M:${st.scope.src.name}:${span.start}"
 
@@ -191,7 +348,7 @@ private bm_keeps(cx: &BmCx, name: string, i: usize) -> bool
 
     cx.busy.push(key)
 
-    val st: &BmState = BmState(cx, func_home(cx.an, f.name), f.name, buf(), false, 0, true, buf(), false, bm_params(f))
+    val st: &BmState = BmState(cx, func_home(cx.an, f.name), f.name, buf(), false, 0, true, buf(), false, bm_params(f), buf(), buf())
 
     st.aliases.push(f.params.at(i).0)
     bm_block(st, f.body, Some(BmDest("the function's result", None)))
@@ -217,6 +374,25 @@ private bm_use(st: &BmState, span: Span, n: string, ty: Type, dest: Option[BmDes
 
     if !bm_is_buf(ty) then return
     if span.start == 0 && span.end == 0 then return
+
+    // A name read after a write went through the other name of its pair.
+    for p in st.pairs
+        if p.said || p.by == "" || p.by == n then continue
+        if p.src != n && p.dst != n then continue
+
+        p.said = true
+
+        val line = bm_line(st, span)
+
+        st.cx.out.push(s"PAIR\t${st.scope.src.name}\t$line\t${bm_shown(p.dst)}<-${bm_shown(p.src)}\t${p.line}\t" +
+                       s"${bm_shown(p.by)}@${p.by_line}\t${bm_text(st, line)}\t${bm_text(st, p.line)}\t" +
+                       s"${bm_text(st, p.by_line)}\t${st.fname}")
+
+    if dest.is_some()
+        dest.unwrap().local match
+            Some(l) -> if !l.starts_with("$") then st.pairs.push(BmPair(n, l, bm_line(st, span), "", 0, false))
+            None -> ()
+    end if
 
     var already = false
 
@@ -252,6 +428,19 @@ private bm_use(st: &BmState, span: Span, n: string, ty: Type, dest: Option[BmDes
 
     st.moved.push(BmMoved(n, d.what, bm_line(st, span), span.start, st.pass))
 end bm_use
+
+private bm_drop_pairs(st: &BmState, n: string)
+    var kept: Buf[&BmPair] = buf()
+
+    for p in st.pairs
+        if p.src != n && p.dst != n then kept.push(p)
+
+    st.pairs = kept
+end bm_drop_pairs
+
+// The members that hand out the storage rather than write it themselves.
+private bm_reads_only(m: string) -> bool =
+    m == "view" || m == "index_place" || m == "place" || m == "spare" || m == "elems"
 
 private bm_forget(st: &BmState, n: string)
     var kept: Buf[BmMoved] = buf()
@@ -304,9 +493,12 @@ private bm_write(st: &BmState, place: TExpr, value: TExpr, op: string)
     end if
 
     *place.kind match
-        TLoad(n, ty) ->
+        TLoad(n, _) ->
+            bm_drop_pairs(st, n)
             bm_expr(st, value, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
             bm_forget(st, n)
+
+            if !st.summary then st.origins.push((n, bm_origin(st, value)))
         _ ->
             bm_expr(st, place, None)
             bm_expr(st, value, Some(BmDest("a field or element written", None)))
@@ -314,7 +506,13 @@ end bm_write
 
 private bm_stmt(st: &BmState, s: TStmt)
     s match
-        TVarDecl(n, _, init, _) -> bm_expr(st, init, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
+        TVarDecl(n, _, init, _) ->
+            // A declaration met again (the next turn of a loop) is a new local: it starts unmoved.
+            bm_forget(st, n)
+            bm_drop_pairs(st, n)
+            bm_expr(st, init, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
+
+            if !st.summary then st.origins.push((n, bm_origin(st, init)))
         TExprStmt(e) -> bm_expr(st, e, None)
         TRefDecl(_, _, place) -> bm_expr(st, place, None)
         TWriteStmt(w) -> bm_write(st, w.place, w.value, w.op)
