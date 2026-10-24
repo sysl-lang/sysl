@@ -1,0 +1,117 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// What a diagnostic about a standard-library type adds when the program has a type of the same name.
+//
+// **Imports are per file, so a name a file forgot to import falls through to the auto-imported
+// standard module** -- a `Cpu` written in a file that never imported the program's own `Cpu` is the
+// library's `sysl.platform.Cpu`, and what the reader is then told is about fields of an enum, far from
+// the cause. A refusal about a library type is therefore asked whether the program declares one of the
+// same spelling, and if so says which, and what to write.
+//
+// **Nothing is named here but the standard module**: the candidates and the import line are read off
+// the program being compiled.
+
+// One file's imports, kept so that a sibling of the file a name was used in can be asked what it
+// imported.
+struct FileImports
+    module_name: string
+    src_name: string
+    imports: Imports
+
+// Records every file of a program that is not the standard module's own.
+note_file_imports(a: &Analysis, p: Program, scope: Scope)
+    if starts_with_module(module_of_unit(p), AutoImportedModule) then return
+
+    a.file_imports.push(FileImports(scope.module_name, p.src.name, scope.imports))
+
+// The refusal `msg` with the hint appended where the type is a library type and the program declares
+// one of the same name; otherwise `msg` as it was.
+hinted(cx: &Analyzer, t: Type, msg: string) -> string
+    val hint = prelude_hint(cx.an, cx.scope, t)
+
+    if hint == "" then msg else s"$msg — $hint"
+
+// What a mismatch between two types adds, appended to the sentence of the position it is about: the
+// hint for whichever of the two is a library type the program has a namesake of, or nothing.
+mismatch_hint(cx: &Analyzer, got: Type, wanted: Type) -> string
+    var hint = prelude_hint(cx.an, cx.scope, got)
+
+    if hint == "" then hint = prelude_hint(cx.an, cx.scope, wanted)
+
+    if hint == "" then "" else s" — $hint"
+
+// The hint for a type, or nothing.
+prelude_hint(a: &Analysis, scope: Scope, t: Type) -> string
+    underlying(t) match
+        Struct(d) -> prelude_hint_key(a, scope, d.base)
+        Enum(d) -> prelude_hint_key(a, scope, d.base)
+        _ -> ""
+
+// The hint for a declaration's key: up to three candidates, nearest first -- what a sibling file of the
+// same module imported by that name, then the program's own declarations, then a dependency's.
+prelude_hint_key(a: &Analysis, scope: Scope, key: string) -> string
+    if !starts_with_module(module_of(key), AutoImportedModule) then return ""
+
+    val name = module_bare(key)
+    var found: Buf[string] = buf()
+    var notes: Buf[string] = buf()
+
+    for f in a.file_imports
+        if f.module_name != scope.module_name || f.src_name == scope.src.name then continue
+
+        val file = base_name(f.src_name)
+
+        for pair in f.imports.names
+            if pair.0 == name then offer_candidate(a, scope, pair.1, file, found, notes)
+
+        for w in f.imports.wildcards
+            offer_candidate(a, scope, module_qualify(w, name), file, found, notes)
+
+    for pass in 0..<2
+        for i in 0..<a.tables.types.len()
+            val k = a.tables.types.key_at(i)
+
+            if module_bare(k) != name then continue
+
+            val own = !holds_string(a.tables.supplied_modules, module_of(k))
+
+            if own == (pass == 0) then offer_candidate(a, scope, k, "", found, notes)
+
+    if found.is_empty() then return ""
+
+    var shown = ""
+
+    for i in 0..<found.len()
+        val item = qualified_name(found.at(i)) +
+            (if notes.at(i) == "" then "" else s" (imported in ${notes.at(i)})")
+
+        shown = if i == 0 then item
+                else if i + 1 == found.len() then s"$shown or $item"
+                else s"$shown, $item"
+
+    s"'$name' here is ${qualified_name(key)}; did you mean $shown? " +
+        s"Add 'import ${qualified_name(found.at(0))}'"
+end prelude_hint_key
+
+// Adds a candidate key when it is a declared, visible type outside the standard module, once, up to
+// three.
+private offer_candidate(a: &Analysis, scope: Scope, k: string, file: string, found: Buf[string],
+                        notes: Buf[string])
+    if found.len() >= 3 || holds_string(found, k) then return
+    if !a.tables.types.has(k) || starts_with_module(module_of(k), AutoImportedModule) then return
+    if !reachable_key(a, k, scope) then return
+
+    found.push(k)
+    notes.push(file)
+
+// The last component of a file's name.
+private base_name(file: string) -> string
+    val b = file.bytes
+    var at: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('/') then at = i + 1
+
+    file[at..<b.len]
