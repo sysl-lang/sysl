@@ -3202,7 +3202,9 @@ this makes a '&Thing' out of a copy of a 'Thing' value, and 'Thing' has a 'Drop'
 **A generic is asked at the instantiation.** `id[T](x: T) -> T` called with `*r` binds `T` to the
 type by value, and the call is refused naming the parameter — `'id' binds its 'T' to 'Thing' by
 value…` — rather than anything inside `id`, which the caller did not write. Called with the
-reference, `T` is `&Thing` and nothing is asked.
+reference, `T` is `&Thing` and nothing is asked; and a signature that reaches `T` only through a
+reference — `keep[T](x: &T) -> &T` — may bind it to `Thing` itself, since nothing it declares holds
+one by value.
 
 **`@consumes` is unchanged**, and there is no use-after-move: a `&T` is shared and counted exactly as
 every other reference is.

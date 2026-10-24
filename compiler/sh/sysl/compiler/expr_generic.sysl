@@ -497,21 +497,6 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                               s"'${found.unwrap().0}': ${found.unwrap().1}")
         end if
 
-    // **A type with a `Drop` is a reference type, and an instantiation at one by value is refused
-    // here, at the call that asked for it** -- never inside the generic body, whose bindings would
-    // name a declaration the caller did not write (`drop_values.sysl`). A body that is itself read at
-    // type arguments -- an instance, a trait's default at its implementing type -- passes on what it
-    // was given, and was asked where that was chosen.
-    for i in 0..<targs.len()
-        if i >= decl.tparams.len() || passes_on(cx.an, cx.scope, cx.subst) then break
-
-        val held = drop_held(cx.an, targs.at(i))
-
-        if held.is_some() then
-            return cx.err(span, drop_value_refusal(s"'$written' binds its '${decl.tparams.at(i)}' to",
-                                                   targs.at(i), held.unwrap()))
-    end for
-
     val name = instantiated(cx, f, targs, nested)
     val sig = cx.an.tables.members.func_insts.get(name)
 
@@ -519,6 +504,25 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
 
     // A nested instantiation's signature has the environment in front of what a call writes.
     val skip: usize = if nested.is_some() then 1 else 0
+
+    // **A type with a `Drop` is a reference type, and an instantiation whose signature holds one by
+    // value is refused here, at the call that asked for it** -- never inside the generic body, whose
+    // bindings would name a declaration the caller did not write (`drop_values.sysl`). `T` bound to
+    // the type is fine where the signature only reaches it through a `&T`. A body that is itself read
+    // at type arguments -- an instance, a trait's default at its implementing type -- passes on what
+    // it was given, and was asked where that was chosen.
+    if !passes_on(cx.an, cx.scope, cx.subst) && signature_holds_drop(cx.an, sig.unwrap(), skip)
+        for i in 0..<targs.len()
+            if i >= decl.tparams.len() then break
+
+            val held = drop_held(cx.an, targs.at(i))
+
+            if held.is_some() then
+                return cx.err(span, drop_value_refusal(s"'$written' binds its '${decl.tparams.at(i)}' to",
+                                                       targs.at(i), held.unwrap()))
+        end for
+    end if
+
     var written_params: Buf[(string, Type)] = buf()
 
     for i in skip..<sig.unwrap().params.len()
