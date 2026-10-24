@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{copy_file, make_dir_all, metadata, read_bytes, set_permissions}
+import sysl.text.Search
+
+// What `sysl test` does with the binary it built, beyond running it: `--keep-binary <dir>` leaves a
+// copy, and a sanitizer asked for through `SYSL_EXTRA_CFLAGS` is confirmed to be in it.
+//
+// **Both read the binary the run used, the cached one included.** The run cache keys on the extra
+// flags, so a replayed binary was built under the flags in force; checking it is as good as checking
+// a fresh one, and a kept copy is a copy rather than a move, so the cache entry stays where it was.
+
+// A sanitizer that `-fsanitize=` may name, the text its instrumentation leaves in a binary's symbol
+// table, and whether sysl's own code is instrumented by it. A name sysl does not instrument (`undefined`
+// has no function attribute to mark the IR with) can be absent from a binary of sysl code alone, so
+// its absence is not a defect.
+private struct Sanitizer
+    name: string
+    marker: string
+    instrumented_here: bool
+end Sanitizer
+
+private sanitizers() -> Buf[Sanitizer]
+    var out: Buf[Sanitizer] = buf()
+
+    out.push(Sanitizer("address", "__asan_report", true))
+    out.push(Sanitizer("thread", "__tsan_func_entry", true))
+    out.push(Sanitizer("memory", "__msan_warning", true))
+    out.push(Sanitizer("hwaddress", "__hwasan_", true))
+    out.push(Sanitizer("undefined", "__ubsan_handle", false))
+    out
+end sanitizers
+
+// The number of times a binary's bytes hold the marker. A symbol table holds each name once, so the
+// count is how many distinct runtime entry points the binary reaches.
+sanitizer_references(bytes: []const u8, marker: string) -> usize = bytes.count_of(marker.bytes)
+
+// One line saying which sanitizers are in the binary, or the refusal naming the first that is not.
+// `Ok(None)` is nothing asked, or nothing there to say.
+checked_instrumentation(exe: string, flags: Buf[string]) -> Result[Option[string], string]
+    val asked = sanitizers_asked(flags)
+
+    if asked.is_empty() then return Ok(None)
+
+    val bytes = read_bytes(exe) match
+        Ok(read) -> read
+        Err(_) -> return Err(s"cannot read the test binary $exe to confirm the sanitizer in it")
+
+    var found: Buf[string] = buf()
+
+    for name in asked
+        for item in sanitizers()
+            if item.name == name
+                if sanitizer_references(bytes, item.marker) > 0 then found.push(name)
+                else if item.instrumented_here
+                    return Err(s"SYSL_EXTRA_CFLAGS asks for -fsanitize=$name, and the test binary $exe holds no " +
+                               s"'${item.marker}' symbol: it was linked without the instrumentation, so a clean " +
+                               "run says nothing")
+
+    if found.is_empty() then return Ok(None)
+
+    Ok(Some(s"instrumented: ${join_names(found)} (1 binary)"))
+end checked_instrumentation
+
+private join_names(names: Buf[string]) -> string
+    var out = ""
+
+    for name in names
+        out = if out == "" then name else out + "," + name
+
+    out
+end join_names
+
+// A copy of the binary in `dir` (made if need be), named for the project it tests, and the path it was
+// left at. The binary is the cache's or a fresh link's; either way it is copied, with its permission
+// bits, because `copy_file` makes the file as any `create` does and a binary that cannot run is no use.
+kept_binary(exe: string, dir: string, project: string) -> Result[string, string]
+    make_dir_all(dir) match
+        Err(_) -> return Err(s"cannot make the directory $dir for --keep-binary")
+        Ok(_) -> ()
+
+    val to = s"$dir/${root_name(project)}-tests"
+
+    copy_file(exe, to) match
+        Err(_) -> return Err(s"cannot copy the test binary to $to")
+        Ok(_) -> ()
+
+    metadata(exe) match
+        Ok(meta) -> set_permissions(to, meta.permissions()).unwrap_or(())
+        Err(_) -> ()
+
+    Ok(to)
+end kept_binary

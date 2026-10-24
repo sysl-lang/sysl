@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, is_file, make_temp_dir, metadata, read_bytes, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// `sysl test --keep-binary <dir>` leaves the test binary it ran, and a `-fsanitize=` in
+// `SYSL_EXTRA_CFLAGS` is confirmed to be in that binary before a test runs. The cases that build set
+// the variable through libc and unset it before they return, `sysl.env` setting nothing.
+
+private extern "setenv" tkb_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tkb_c_unsetenv(name: *u8) -> int
+
+private tkb_flags(value: string)
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(value)
+
+    tkb_c_setenv(n.ptr, v.ptr, 1)
+end tkb_flags
+
+private tkb_no_flags()
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+
+    tkb_c_unsetenv(n.ptr)
+end tkb_no_flags
+
+private tkb_package() -> string
+    val root = absolute_path(make_temp_dir("sysl-tkb").unwrap())
+
+    write_text(s"$root/sysl.hocon", "package { name = \"kept\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/one.sysl", "@test\nfirst() =\n    assert(true, \"up\")\n").unwrap()
+    root
+end tkb_package
+
+private tkb_dir() -> string = absolute_path(make_temp_dir("sysl-tkb-keep").unwrap())
+
+@test("the -fsanitize= names of SYSL_EXTRA_CFLAGS are read in order, comma lists split, other flags skipped")
+tkb_sanitizers_asked_reads_the_flag()
+    var flags: Buf[string] = buf()
+
+    flags.push("-O1")
+    flags.push("-fsanitize=address,undefined")
+    flags.push("-g")
+    flags.push("-fsanitize=thread")
+
+    val got = sanitizers_asked(flags)
+
+    assert_eq(got.len(), 3)
+    assert_eq(got.at(0), "address")
+    assert_eq(got.at(1), "undefined")
+    assert_eq(got.at(2), "thread")
+    assert(sanitizers_asked(buf()).is_empty(), "no flags")
+
+@test("--keep-binary leaves a runnable test binary and says where")
+tkb_keep_binary_leaves_a_runnable_binary()
+    if !clx_ready() then return
+
+    tkb_no_flags()
+
+    val root = tkb_package()
+    val keep = tkb_dir()
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--keep-binary", keep])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains(s"kept: $keep/"), out)
+
+    val exe = s"$keep/${root_name(root)}-tests"
+
+    assert(is_file(exe), exe)
+    assert(metadata(exe).unwrap().permissions() & 0o100 != 0, "executable")
+    assert(read_bytes(exe).unwrap().len > 1000, "a whole binary")
+    assert(capture(exe, [], "", [], true).is_ok(), "it runs")
+
+@test("--keep-binary copies a replayed binary too: the second run is a cache hit and still leaves one")
+tkb_keep_binary_copies_a_cached_binary()
+    if !clx_ready() then return
+
+    tkb_no_flags()
+
+    val root = tkb_package()
+    val first = tkb_dir()
+    val second = tkb_dir()
+    val (a, a_out, a_err) = clx_ran(["sysl", "test", root, "--keep-binary", first])
+    val (b, b_out, b_err) = clx_ran(["sysl", "test", root, "--keep-binary", second])
+
+    assert_eq(a, Fine, a_out + a_err)
+    assert_eq(b, Fine, b_out + b_err)
+    assert(is_file(s"$first/${root_name(root)}-tests"), "fresh")
+    assert(is_file(s"$second/${root_name(root)}-tests"), "replayed")
+    assert_eq(read_bytes(s"$first/${root_name(root)}-tests").unwrap().len,
+              read_bytes(s"$second/${root_name(root)}-tests").unwrap().len)
+
+@test("no --keep-binary and no sanitizer: nothing is kept and nothing is said about either")
+tkb_without_the_flag_nothing_changes()
+    if !clx_ready() then return
+
+    tkb_no_flags()
+
+    val (code, out, err) = clx_ran(["sysl", "test", tkb_package()])
+
+    assert_eq(code, Fine, out + err)
+    assert(!out.contains("kept:"), out)
+    assert(!out.contains("instrumented:"), out)
+
+@test("--keep-binary with no directory is a mistake in the command line")
+tkb_keep_binary_needs_a_directory()
+    val (code, _, err) = clx_ran(["sysl", "test", ".", "--keep-binary"])
+
+    assert(code != Fine, "refused")
+    assert(err.contains("--keep-binary"), err)
+
+@test("under -fsanitize=address the run says the binary is instrumented")
+tkb_asan_run_confirms_instrumentation()
+    if !clx_ready() then return
+
+    tkb_flags("-fsanitize=address")
+
+    val keep = tkb_dir()
+    val root = tkb_package()
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--keep-binary", keep])
+
+    tkb_no_flags()
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("instrumented: address (1 binary)"), out + err)
+
+    val bytes = read_bytes(s"$keep/${root_name(root)}-tests").unwrap()
+
+    assert(sanitizer_references(bytes, "__asan_report") > 1, "the kept binary reaches the report entry points")
+
+@test("a binary built without the sanitizer is refused when the flag asks for one")
+tkb_an_uninstrumented_binary_is_refused()
+    if !clx_ready() then return
+
+    tkb_no_flags()
+
+    val keep = tkb_dir()
+    val root = tkb_package()
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--keep-binary", keep])
+
+    assert_eq(code, Fine, out + err)
+
+    val exe = s"$keep/${root_name(root)}-tests"
+    var asked: Buf[string] = buf()
+
+    asked.push("-fsanitize=address")
+
+    checked_instrumentation(exe, asked) match
+        Ok(_) -> assert(false, "a plain binary passed as instrumented")
+        Err(why) ->
+            assert(why.contains("-fsanitize=address"), why)
+            assert(why.contains("__asan_report"), why)
+
+    var none: Buf[string] = buf()
+
+    none.push("-O1")
+
+    checked_instrumentation(exe, none) match
+        Ok(line) -> assert(line.is_none(), "no sanitizer asked, nothing said")
+        Err(why) -> assert(false, why)
+
+    var ub: Buf[string] = buf()
+
+    ub.push("-fsanitize=undefined")
+
+    checked_instrumentation(exe, ub) match
+        Ok(line) -> assert(line.is_none(), "UBSan does not instrument sysl code, so its absence is not a defect")
+        Err(why) -> assert(false, why)
+
+@test("an unreadable binary is a refusal naming it")
+tkb_a_missing_binary_is_refused()
+    var asked: Buf[string] = buf()
+
+    asked.push("-fsanitize=address")
+
+    checked_instrumentation("/nonexistent/tkb-binary", asked) match
+        Ok(_) -> assert(false, "a missing binary passed")
+        Err(why) -> assert(why.contains("/nonexistent/tkb-binary"), why)
