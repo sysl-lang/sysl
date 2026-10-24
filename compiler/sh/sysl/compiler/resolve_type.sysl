@@ -1211,7 +1211,14 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
                       subst: Buf[Binding], keep_open: bool = false) -> Option[Buf[Type]]
     val pair = declared_values(a, key)
 
-    if pair.0.is_empty() then return Some(resolve_list(a, scope, args, subst))
+    if pair.0.is_empty()
+        var plain: Buf[Type] = buf()
+
+        for i in 0..<args.len()
+            plain.push(type_arg_of(a, scope, key, i, args.at(i), subst))
+
+        return Some(plain)
+    end if
 
     val home = a.tables.types.get(key).unwrap().scope
     var out: Buf[Type] = buf()
@@ -1238,11 +1245,27 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
                     a.fault(scope, span, "a value stands here, and this argument is a type — a value " +
                             "argument belongs where the declaration wrote 'const', and nowhere else")
                     return None
-                _ -> out.push(resolve_type(a, scope, arg, subst))
+                _ -> out.push(type_arg_of(a, scope, key, i, arg, subst))
         end if
 
     Some(out)
 end read_args_for
+
+// Argument `i` of the type at `key`. **A parameter a trait object stands in for may be the argument of
+// a generic type that reaches it only behind a mode** -- `Wrap[P]` over `p: *P` -- because the type
+// lays out a pointer to the object and never the trait; `held_by_value.sysl` says which positions
+// those are. Anywhere else it is read as written, and refused bare by `resolve_named`.
+type_arg_of(a: &Analysis, scope: Scope, key: string, i: usize, arg: TypeRef, subst: Buf[Binding]) -> Type
+    *arg.kind match
+        NamedType(n, targs) ->
+            val stood_for = if targs.is_empty() then bound_type(subst, n) else None
+
+            if stood_for.is_some() && is_trait(stood_for.unwrap()) && held_by_value(a, key, i).is_none()
+                return substituted(a, scope, arg.span, stood_for.unwrap())
+        _ -> ()
+
+    resolve_type(a, scope, arg, subst)
+end type_arg_of
 
 // One **value** argument: the expression it was written as, folded to the constant that goes in the
 // type's identity, at the type the declaration wrote for its parameter. An enclosing declaration's
