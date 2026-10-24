@@ -46,39 +46,77 @@ end has_drop
 // The first type with a `Drop` this one holds **by value**, at any depth a value is stored at.
 //
 // **`&T`, `weak T` and `*T` stop the walk**: the first two are the counted form the rule asks for,
-// and a raw pointer owns nothing. Everything else that stores its parts inline -- a struct's or an
-// enum's arguments, an array, a slice's elements, a vector, a tuple, a result list -- is walked
-// through, so `Buf[Encoder]` and `Option[Encoder]` are found as surely as `Encoder` is.
-drop_held(a: &Analysis, t: Type) -> Option[Type] = t match
-    Ref(_, _) -> None
-    Weak(_) -> None
+// and a raw pointer owns nothing. Everything else that stores its parts inline -- an array, a
+// slice's elements, a vector, a tuple, a result list -- is walked through.
+//
+// **An instance of a generic type is asked what its FIELDS hold, not what its arguments are**, as a
+// generic function is asked what its signature holds: `Box[Encoder]` whose one field is a `&T` holds
+// a share, and is fine. A field that is a counted reference to another generic type -- `Buf[T]`'s
+// `&BufCore[T]`, whose `[]T` is the elements themselves -- is walked into, since that box is the
+// container's own storage; one to a `Drop` type is the reference form, and stops. So
+// `Buf[Encoder]` and `Option[Encoder]` are found as surely as `Encoder` is.
+drop_held(a: &Analysis, t: Type) -> Option[Type]
+    var seen: Buf[string] = buf()
+
+    held_at(a, t, &seen)
+
+private held_at(a: &Analysis, t: Type, seen: *Buf[string]) -> Option[Type] = t match
+    Ref(inner, _) -> held_behind(a, *inner, seen)
+    Weak(inner) -> held_behind(a, *inner, seen)
     Ptr(_) -> None
     Struct(d) ->
         if has_drop(a, t) then return Some(t)
-        if is_anonymous_type(d) then return held_in_fields(a, d.fields)
+        if is_anonymous_type(d) || !d.targs.is_empty() then return held_in_fields(a, d.fields, seen)
 
-        held_in(a, d.targs)
-    Enum(d) -> if has_drop(a, t) then Some(t) else held_in(a, d.targs)
-    Array(_, e) -> drop_held(a, *e)
-    Slice(e, _) -> drop_held(a, *e)
-    Vector(_, e) -> drop_held(a, *e)
-    Volatile(inner) -> drop_held(a, *inner)
-    Results(parts) -> held_in(a, parts.targs)
-    Pack(elems) -> held_in(a, elems)
+        None
+    Enum(d) ->
+        if has_drop(a, t) then return Some(t)
+        if d.targs.is_empty() then return None
+
+        for v in d.variants
+            val held = held_in_fields(a, v.fields, seen)
+
+            if held.is_some() then return held
+
+        None
+    Array(_, e) -> held_at(a, *e, seen)
+    Slice(e, _) -> held_at(a, *e, seen)
+    Vector(_, e) -> held_at(a, *e, seen)
+    Volatile(inner) -> held_at(a, *inner, seen)
+    Results(parts) -> held_in(a, parts.targs, seen)
+    Pack(elems) -> held_in(a, elems, seen)
     _ -> None
 
-private held_in(a: &Analysis, ts: Buf[Type]) -> Option[Type]
+// Behind a counted reference: a generic container's own storage is walked into, once per type
+// (a list's node refers to itself); anything else is held by the count, which is the form asked for.
+private held_behind(a: &Analysis, t: Type, seen: *Buf[string]) -> Option[Type]
+    val generic = t match
+        Struct(d) -> !d.targs.is_empty() && !has_drop(a, t)
+        Enum(d) -> !d.targs.is_empty() && !has_drop(a, t)
+        _ -> false
+
+    if !generic then return None
+
+    val key = type_show(t)
+
+    if holds_string(*seen, key) then return None
+
+    seen.push(key)
+    held_at(a, t, seen)
+end held_behind
+
+private held_in(a: &Analysis, ts: Buf[Type], seen: *Buf[string]) -> Option[Type]
     for t in ts
-        val held = drop_held(a, t)
+        val held = held_at(a, t, seen)
 
         if held.is_some() then return held
 
     None
 end held_in
 
-private held_in_fields(a: &Analysis, fields: Buf[(string, Type)]) -> Option[Type]
+private held_in_fields(a: &Analysis, fields: Buf[(string, Type)], seen: *Buf[string]) -> Option[Type]
     for f in fields
-        val held = drop_held(a, f.1)
+        val held = held_at(a, f.1, seen)
 
         if held.is_some() then return held
 

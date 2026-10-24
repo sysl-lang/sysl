@@ -28,8 +28,8 @@ import sysl.process.capture
 // Skipped, with the reason: a nested function's parameter (bound through the same `Analyzer.bind` a
 // closure's is, which is asked); a codegen-unit split (the refusal is analysis, and the boxing is the
 // existing `TBox` every `&T` construction already lowers through); a field of a generic struct
-// declared at a concrete `Drop` type (`struct G[T]` holding an `Enc` by value) -- its instances are
-// not asked, and a non-generic declaration is.
+// declared at a concrete `Drop` type (`struct G[T]` holding an `Enc` by value) -- its declaration is
+// not asked, its instances are where they are bound.
 
 private val dvr_enc: string = raw"""
     import sysl.buf.{Buf, buf}
@@ -271,17 +271,45 @@ dvr_generic_method()
                    "        val z = *r\n        self.n\n\nprint(Holder(1).look(Enc(2)))\n",
                    dvr_said("'z' holds", "Enc"), [("Holder.look[Enc]", "print(Holder(")])
 
-// The type is never bound by value -- `Box[Enc]` is only a temporary -- since a binding of one is
-// refused for holding the argument, whatever the fields hold.
 @test("a method of a generic type keeps self exempt and is asked about what its body copies")
 dvr_generic_type_self()
     val decl = "struct Box[T]\n    v: &T\n\nimpl[T] Box[T]\n    me(self) -> int = 7\n\n" +
                "    peek(self) -> int\n        val y = *self.v\n        0\n\n"
 
-    dvr_runs(decl + "print(Box(Enc(1)).me())\n", "7\ndrop 1\n")
+    dvr_runs(decl + "val b = Box(Enc(1))\nprint(b.me())\n", "7\ndrop 1\n")
     dvr_refused_in(decl + "print(Box(Enc(1)).peek())\n", dvr_said("'y' holds", "Enc"),
                    [("Box.peek[Enc]", "print(Box(")])
 end dvr_generic_type_self
+
+// -- what an instance of a generic type holds ----------------------------------------------------
+
+@test("a generic type whose field is a reference to its argument holds a share, and may be bound")
+dvr_generic_type_by_reference()
+    dvr_runs("struct Box[T]\n    v: &T\n\nhold()\n    val b = Box(Enc(1))\n    print(b.v.id)\n\nhold()\n",
+             "1\ndrop 1\n")
+
+@test("a generic type that refers to itself is walked once, and holds only what its fields hold")
+dvr_generic_type_self_reference()
+    val decl = "struct Link[T]\n    v: &T\n    next: Option[&Link[T]]\n\n"
+
+    dvr_runs(decl + "hold()\n    val l = Link(Enc(2), Some(Link(Enc(1), None)))\n    print(l.v.id)\n\n" +
+             "hold()\n", "2\ndrop 2\ndrop 1\n")
+    dvr_refused("struct Node[T]\n    v: T\n    next: Option[&Node[T]]\n\nlast(n: Node[Enc]) = print(1)\n\n" +
+                "print(0)\n", dvr_said_in("'n' holds", "Enc", "Node[Enc]"))
+end dvr_generic_type_self_reference
+
+@test("a generic type holding a raw pointer to its argument owns nothing, and may be bound")
+dvr_generic_type_raw_pointer()
+    dvr_runs("struct View[T]\n    p: *T\n\nlook(v: View[Enc]) = print(\"view\")\n\nlook(View(null))\n",
+             "view\n")
+
+// The shape the census found in kairos: a generic body whose type argument reaches the `Drop` type
+// only through a callable's parameter, handed to another generic.
+@test("a generic body building a container of a type that only refers to its argument is accepted")
+dvr_generic_nested_reference_only()
+    dvr_runs("struct State[D]\n    cb: &Fn(*D) -> unit\n\nmake[T]() -> Buf[T] = buf()\n\n" +
+             "start[D](d: &D) -> usize\n    val xs: Buf[State[D]] = make()\n    xs.len()\n\n" +
+             "print(start(Enc(1)))\n", "0\ndrop 1\n")
 
 @test("@consumes on a member of a Drop type still refuses the read after it")
 dvr_consumes_refused()

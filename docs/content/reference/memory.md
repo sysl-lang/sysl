@@ -3204,7 +3204,9 @@ this makes a '&Thing' out of a copy of a 'Thing' value, and 'Thing' has a 'Drop'
 'Thing' by value…` — rather than anything inside `id`, which the caller did not write. Called with
 the reference, `T` is `&Thing` and nothing is asked; and a signature that reaches `T` only through a
 reference — `keep[T](x: &T) -> &T` — may bind it to `Thing` itself, since nothing it declares holds
-one by value.
+one by value. A generic type is asked the same way, by what its fields hold: a `struct Box[T]` whose
+field is a `&T` holds a share, so `Box[Thing]` may be bound, while `Buf[Thing]` and `Option[Thing]`
+hold the value itself and are refused.
 
 **Its body is asked too, once per instance, at the types it was made at** — a library's generic
 bodies and a trait's default read at the implementing type among them. A signature that reaches `T`
