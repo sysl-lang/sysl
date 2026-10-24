@@ -5,7 +5,8 @@ import sysl.buf.{Buf, buf}
 import sysl.env.get
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Var}
-import sysl.text.{split, Search}
+import sysl.text.{parse_int, split, Search}
+import sysl.time.monotonic
 
 // `SYSL_TIMINGS=1` as somebody sets it: a built compiler run with it says each phase of a build, in
 // order, on standard error -- and run without it says none. The compiler is the stage-2 binary the
@@ -68,6 +69,77 @@ tmg_a_build_says_its_phases()
 
     for line in split(text, "\n")
         if line.starts_with("sysl: phase ") then assert(line.ends_with("ms"), line)
+
+    // The checks' own lines are not phases, so they never reach the list above.
+    assert(text.contains("sysl:   check keeps "), text)
+
+// The milliseconds a report line ends with.
+private tmg_ms(line: string) -> int
+    val words = split(line, " ")
+
+    val last = words[words.len - 1]
+
+    parse_int(last[0..<last.len - 2]).unwrap_or(-1)
+end tmg_ms
+
+@test("the whole-program checks are said one by one under the checks phase, and the phases add up")
+tmg_checks_are_their_own_lines()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val begun = monotonic().us
+    val (_, text) = tmg_phases(binary, true)
+    val wall = (monotonic().us - begun) / 1000
+
+    var phase_sum = 0
+    var check_sum = 0
+    var checks_line = -1
+    var checks_at = -1
+    var prune_at = -1
+    var seen_keeps = false
+    var seen_crossing = false
+    var seen_escapes = false
+    var at = 0
+
+    for line in split(text, "\n")
+        if line.starts_with("sysl: phase ")
+            val ms = tmg_ms(line)
+
+            assert(ms >= 0, line)
+            phase_sum += ms
+
+            if line.starts_with("sysl: phase checks ")
+                checks_line = ms
+                checks_at = at
+            else if line.starts_with("sysl: phase prune ")
+                prune_at = at
+        else if line.starts_with("sysl:   check ")
+            val ms = tmg_ms(line)
+
+            assert(ms >= 0, line)
+            check_sum += ms
+            seen_keeps = seen_keeps || line.starts_with("sysl:   check keeps ")
+            seen_crossing = seen_crossing || line.starts_with("sysl:   check crossing ")
+            seen_escapes = seen_escapes || line.starts_with("sysl:   check escapes ")
+
+            // Under the checks phase: after its line and before the next phase's.
+            assert(checks_at >= 0 && prune_at < 0, line)
+
+        at += 1
+
+    assert(seen_keeps && seen_crossing && seen_escapes, text)
+
+    // Each check is part of the phase's time, which is never less than the checks it holds (a
+    // millisecond of rounding per line).
+    assert(check_sum <= checks_line + 30, text)
+
+    // The phases tile the compilation from the start of its clock to the end of the link, so their
+    // sum is never more than the whole run and, a build being mostly compilation, close to it.
+    assert(phase_sum <= wall + 5, text)
+    assert(phase_sum * 2 >= wall, text)
 
 @test("without SYSL_TIMINGS a build says no phase")
 tmg_unasked_says_nothing()

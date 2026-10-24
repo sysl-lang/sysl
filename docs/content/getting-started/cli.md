@@ -156,7 +156,9 @@ sysl: phase codegen 2ms
 sysl: phase link 90ms
 ```
 
-The phases sum to the whole compilation, with nothing counted twice. `std` is the time to find the
+The phases sum to the whole compilation, with nothing counted twice. The `checks` phase is followed
+by one indented line per whole-program check (`sysl:   check keeps 12ms`), which are parts of that
+phase's time, not further phases. `std` is the time to find the
 standard module's compiled artifact, or to build it on first use. Use these timings to find out
 why a build is slow.
 

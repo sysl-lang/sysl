@@ -14,6 +14,9 @@ import sysl.time.monotonic
 private var timings_asked: int = -1
 private var timings_since: long = 0
 private var timings_muted: bool = false
+private var timings_mark: long = 0
+private var timings_checked: long = 0
+private var timings_lines: string = ""
 
 // Whether `SYSL_TIMINGS=1` was set, asked once.
 private timings_on() -> bool
@@ -34,9 +37,38 @@ phase_done(name: string)
 
     val now = monotonic().us
 
-    eprints(s"sysl: phase $name ${(now - timings_since) / 1000}ms\n")
+    // The checks phase also owns the time `check_done` moved out of the phases before it, and says
+    // each check on a line of its own under the phase's.
+    if name == "checks"
+        eprints(s"sysl: phase $name ${(now - timings_since + timings_checked) / 1000}ms\n")
+        eprints(timings_lines)
+        timings_checked = 0
+        timings_lines = ""
+    else
+        eprints(s"sysl: phase $name ${(now - timings_since) / 1000}ms\n")
+
     timings_since = now
 end phase_done
+
+// The whole-program check called `name` ended now. It is said under the `checks` phase with how long
+// it took since the last mark, and that time is taken out of whichever phase it ran inside -- the
+// checks over the typed bodies run as the last step of body analysis -- so the phases still add up
+// to the whole compilation with nothing counted twice.
+check_done(name: string)
+    if !timings_on() || timings_muted || timings_since == 0 then return
+
+    val now = monotonic().us
+    val took = now - timings_mark
+
+    timings_lines = timings_lines + s"sysl:   check $name ${took / 1000}ms\n"
+    timings_checked = timings_checked + took
+    timings_since = timings_since + took
+    timings_mark = now
+end check_done
+
+// The first of a run of checks is about to start: `check_done` measures from here.
+check_begin()
+    if timings_on() && !timings_muted then timings_mark = monotonic().us
 
 // While muted, no phase is said: a compilation nested inside the one being timed -- the standard
 // module's artifact, built on first use -- is one phase of the outer compilation, not phases of its own.
