@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 // A function's result read off its body: `twice(x: int) = x * 2` hands back an `int` exactly as
 // `val y = x * 2` holds one.
@@ -389,6 +390,8 @@ end open_inferred_results
 // calls them -- and every member's, since a call reads a member's result from the table the hoist
 // filled. A library function's is read when something first asks for it.
 settle_inferred_results(a: &Analysis)
+    settle_callees_first(a)
+
     for i in 0..<a.results.sites.len()
         val s = a.results.sites.at(i)
 
@@ -401,6 +404,168 @@ settle_inferred_results(a: &Analysis)
 
         if s.frame.is_none() && !s.library then told_of_result(a, s)
 end settle_inferred_results
+
+// **The program's results are read callees first**, so that reading one never nests a reading per
+// call down a chain as long as the program: a body is read after every body it may call has been,
+// and each call it reads then finds the answer settled. Read only on demand from the top, a chain of
+// thirty-two thousand `f(p: *int) = g(p)` nested a reading per call and overflowed the compiler's
+// stack.
+//
+// What a body may call is read off its names, before anything is resolved: every name it reads or
+// selects, matched by its last part to every declaration of that name, which is more than it calls
+// and never less (bar a call through a renamed import, which is then read on demand as before). The
+// order is a depth-first walk kept on a stack of its own, which finds the loops as it goes (Tarjan's
+// strongly connected components).
+//
+// **A declaration on a loop is not read early** -- nor one whose body names itself. It is left to the
+// reading in declaration order below, which refuses the loop at the declaration it entered it by,
+// through the ones it passed, as it always has. One that only leads into a loop is read early, and
+// its reading enters the loop exactly as a caller's reading would have, by the call it makes.
+private settle_callees_first(a: &Analysis)
+    val count = a.results.sites.len()
+    var named: Map[string, Buf[usize]] = map()
+
+    for i in 0..<count
+        val s = a.results.sites.at(i)
+
+        if !read_early(s) then continue
+
+        val short = last_part(s.label)
+
+        named.get(short) match
+            Some(list) -> list.push(i)
+            None ->
+                var list: Buf[usize] = buf()
+
+                list.push(i)
+                named.put(short, list)
+    end for
+
+    // Per site: the order the walk met it in (0 for not yet), the earliest one it reaches back to
+    // while its component is open, whether it is on the component stack, and whether it names itself.
+    var order: Buf[usize] = buf()
+    var low: Buf[usize] = buf()
+    var open: Buf[bool] = buf()
+    var own: Buf[bool] = buf()
+
+    for _ in 0..<count
+        order.push(0)
+        low.push(0)
+        open.push(false)
+        own.push(false)
+
+    var met: usize = 0
+    var held: Buf[usize] = buf()
+
+    for root in 0..<count
+        if order.at(root) != 0 || !read_early(a.results.sites.at(root)) then continue
+
+        var names: Buf[usize] = buf()
+        var calls: Buf[Buf[usize]] = buf()
+        var next: Buf[usize] = buf()
+
+        met += 1
+        order.set(root, met)
+        low.set(root, met)
+        open.set(root, true)
+        held.push(root)
+        names.push(root)
+        calls.push(callees_by_name(a.results.sites.at(root), named))
+        next.push(0)
+
+        while names.len() > 0
+            val top = names.len() - 1
+            val here = names.at(top)
+            val at = next.pop().unwrap_or(0)
+            val list = calls.at(top)
+
+            if at < list.len()
+                next.push(at + 1)
+
+                val callee = list.at(at)
+
+                if callee == here then own.set(here, true)
+
+                if order.at(callee) != 0
+                    if open.at(callee) && order.at(callee) < low.at(here) then low.set(here, order.at(callee))
+                    continue
+
+                // Read already, by a reading that reached it: nothing below it is left to read.
+                if a.results.sites.at(callee).state == 2 then continue
+
+                met += 1
+                order.set(callee, met)
+                low.set(callee, met)
+                open.set(callee, true)
+                held.push(callee)
+                names.push(callee)
+                calls.push(callees_by_name(a.results.sites.at(callee), named))
+                next.push(0)
+            else
+                names.truncate(top)
+                calls.truncate(top)
+
+                if top > 0 && low.at(here) < low.at(names.at(top - 1))
+                    low.set(names.at(top - 1), low.at(here))
+
+                if low.at(here) == order.at(here) then close_component(a, held, here, open, own)
+            end if
+        end while
+    end for
+end settle_callees_first
+
+// A component of the walk is complete at `head`: every site it reaches outside it is read already.
+// A component of one site that does not name itself is on no loop, and is read now.
+private close_component(a: &Analysis, held: Buf[usize], head: usize, open: Buf[bool], own: Buf[bool])
+    val last = held.len() - 1
+
+    if held.at(last) == head && !own.at(head)
+        held.truncate(last)
+        open.set(head, false)
+        settle_result(a, a.results.sites.at(head))
+        return
+    end if
+
+    loop
+        val item = held.pop().unwrap()
+
+        open.set(item, false)
+
+        if item == head then return
+end close_component
+
+// A site the program's own reading in declaration order would read: its own functions and members,
+// not a nested function's (read with its frame) nor a library function's (read when asked).
+private read_early(s: &ResultSite) -> bool = s.state == 0 && s.frame.is_none() && !s.library
+
+private last_part(name: string) -> string =
+    name.last_index_of(".") match
+        Some(i) -> name[i + 1..<name.bytes.len]
+        None -> name
+
+// Every site whose name the body of `s` reads or selects, a site once for each mention.
+private callees_by_name(s: &ResultSite, named: Map[string, Buf[usize]]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for c in body_constructs(s.decl)
+        val mentioned = c.node match
+            AtExpr(e) ->
+                *e.kind match
+                    Ident(n) -> Some(last_part(n))
+                    Field(_, n, _) -> Some(n)
+                    _ -> None
+            _ -> None
+
+        if mentioned.is_some()
+            named.get(mentioned.unwrap()) match
+                Some(list) ->
+                    for i in list
+                        out.push(i)
+                None -> ()
+    end for
+
+    out
+end callees_by_name
 
 // What a declaration whose result was read is told: that its body reaches it, that its result
 // exposes a type it may not, or that C reads it.
