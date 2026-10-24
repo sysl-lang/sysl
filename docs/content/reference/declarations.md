@@ -1938,6 +1938,90 @@ extern "strlen" size(s: *u8, cap: usize) -> usize
 An `extern` and a sysl function do not overload each other, in either order, for the same reason:
 what tells overloads of an `extern` apart is the symbol, and a sysl function declares none.
 
+### A function declared inside another takes most attributes
+
+A function written in a body carries the attributes written above it, as a top-level function does.
+`@pure`, `@ghost`, `@tailrec`, `@reads` and `@writes`, `@needs` and `@crossing` all take effect on it,
+and so do the marks (`@noinline`, `@cold`, `@blocks` and the rest). A diagnostic names it by where it
+was written, `'outer.inner'`, and a closure written in one as `the closure in 'outer.inner'`.
+
+**What `@export`, `@section`, `@test`, a test hook and `interrupt` say is where the code lives or who
+calls it**, and a nested function has neither: it is called with the frame of the function around it,
+under a name no file wrote. Each is refused, each is told, and a function carrying two hears about both.
+`@no_alloc`, `@no_block` and the other `@no_<capability>` promises are refused too, for the reason
+[`@no_alloc`](/reference/attributes/#no_alloc-on-a-function-one-entry-point-that-makes-no-heap-storage)
+gives.
+
+```sysl
+outer(n: int) -> int
+    @export("hook")
+    inner(k: int) -> int = k + n
+
+    inner(1)
+
+print(outer(3))
+```
+
+```error
+'@export' holds a top-level function, and 'inner' is declared inside another function
+```
+
+**A captured local is storage the nested function did not create.** Under `@pure` it may be read, as a
+top-level function reads through a pointer it was handed, and it may not be written:
+
+```sysl
+scaled(base: int) -> int
+    var factor = 2
+    factor += 1
+
+    @pure
+    apply(x: int) -> int = x * factor + base
+
+    apply(10)
+
+print(scaled(4))
+```
+
+```output
+34
+```
+
+```sysl
+counted() -> int
+    var n = 1
+
+    @pure
+    bump(x: int) -> int
+        n = x
+        x
+
+    bump(2)
+
+print(counted())
+```
+
+```error
+a '@pure' function writes through a reference to storage it did not create
+```
+
+**A `@reads` or `@writes` frame covers module storage only**, so it cannot name a captured local:
+
+```sysl
+peeked() -> int
+    var mine = 5
+
+    @reads(mine)
+    peek() -> int = mine
+
+    peek()
+
+print(peeked())
+```
+
+```error
+'@reads' names 'mine', which is not module-level storage
+```
+
 ### Type parameters
 
 A bracketed list directly after the name declares type parameters, with optional bounds. See

@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.time.{monotonic, whole_micros}
 
 // What folding one body's own calls and erasures into a walk costs, as their count grows.
 //
@@ -12,8 +11,8 @@ import sysl.time.{monotonic, whole_micros}
 // from costing the length of everything already seen.
 //
 // The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
-// body naming four times as many calls and tables may cost about four times as much to fold and not
-// sixteen times.
+// body naming eight times as many calls and tables may cost about eight times as much to fold and not
+// sixty-four times. How the two are measured under a loaded suite is `tests_lgr_linear_growth.sysl`'s.
 
 // One body's own refs: `n` distinct calls and `n` distinct erasures, none of them the seed being
 // searched for.
@@ -28,8 +27,9 @@ private fanout_refs(n: usize) -> &Refs
     Refs(calls, erased, buf(), buf())
 end fanout_refs
 
-// The best of three folds of one body's refs, in microseconds.
-private fold_cost(n: usize) -> long
+// One fold of a body's `n` calls and `n` erasures, built once beforehand, as a run to measure: its
+// processor time, having checked that none of them was taken for the seed.
+private folding(n: usize) -> &Fn() -> long
     var seeds: Buf[string] = buf()
 
     seeds.push("needle")
@@ -37,26 +37,13 @@ private fold_cost(n: usize) -> long
     val walk = reaches_over(buf(), buf(), seeds)
     val root = fanout_refs(n)
 
-    var best: long = -1
+    () -> processor_micros(() -> assert(reached_seeds(walk, root).is_empty(),
+                                        "none of the fan-out's names is the seed being searched for"))
+end folding
 
-    for round in 0..<3
-        val started = monotonic()
-        val found = reached_seeds(walk, root)
-        val took = whole_micros(monotonic() - started)
-
-        assert(found.is_empty(), "none of the fan-out's names is the seed being searched for")
-
-        if best < 0 || took < best then best = took
-
-    best
-end fold_cost
-
-@test("folding a body's calls and erasures four times larger costs about four times as much, not sixteen")
+@test("folding a body's calls and erasures eight times larger costs about eight times as much, not sixty-four")
 folding_refs_is_linear()
-    val small = fold_cost(8000)
-    val large = fold_cost(32000)
+    val g = growth_of(folding(8000), folding(8000 * GrowthFactor))
 
-    val ratio = large / (if small > 0 then small else 1)
-
-    assert(ratio < 9, s"a 4x fan-out took ${ratio}x as long to fold (${small} us, then ${large} us)")
+    assert(g.linear(), g.said("folding a body's calls and erasures"))
 end folding_refs_is_linear
