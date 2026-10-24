@@ -4271,6 +4271,8 @@ run(f: Code)
     var local: isize = 0
 
     f(&m, &local)
+
+run(&halt)
 ```
 
 ```error
