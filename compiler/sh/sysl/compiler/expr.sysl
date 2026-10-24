@@ -668,6 +668,29 @@ end name_expr
 // **A simple enum's argument travels as its tag**, and what the body wants back is the variant -- so
 // the name is handed to the ordinary variant path rather than rebuilt here, and everything a written
 // `Fast` gets follows from that.
+// **Whether a bare name reads as something a declared function of its spelling yields to**, asked in
+// the order `name_expr` asks it: a binding, a nested function, an anonymous member's field, a value
+// parameter, module storage (a `const`, a `val` or `var`, an `extern` variable, or two wildcards
+// offering one), and a variant this module declares or this file imported. `&name` asks it before
+// taking a function's address, so the operator reaches exactly what a read of `name` reaches -- a
+// program's own `var cpu` rather than the prelude's `cpu()`. It reports nothing.
+reads_before_a_function(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_some() || names_a_nested(cx, name) ||
+        anonymous_holder_local(cx, name).is_some() || names_a_value_parameter(cx, name) ||
+        names_storage_of(cx, a_consts(cx), name) || names_storage_of(cx, a_vals(cx), name) ||
+        names_storage_of(cx, a_extern_vars(cx), name) || own_variant_name(cx, name) ||
+        imported_variant(cx, name)
+
+// Whether the name is a value parameter the substitution holds a value for, as `const_parameter` reads.
+private names_a_value_parameter(cx: &Analyzer, name: string) -> bool = bound_type(cx.subst, name) match
+    Some(ConstArg(_, _, _)) -> true
+    Some(Descriptor(_, _, _)) -> true
+    _ -> false
+
+// Whether a table of storage holds the spelling as the file reaches it, or two wildcards offer it.
+private names_storage_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> bool =
+    value_key_of(cx, from, name).is_some() || offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1
+
 private const_parameter(cx: &Analyzer, span: Span, name: string,
                         expected: Option[Type]) -> Option[TExpr]
     bound_type(cx.subst, name) match
