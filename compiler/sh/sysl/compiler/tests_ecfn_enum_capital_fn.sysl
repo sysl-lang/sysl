@@ -1,0 +1,68 @@
+module sh.sysl.compiler
+@tests
+
+// `Circle(r: int) = 0` in an enum body reads as a variant given a value, and is an expression-bodied
+// associated function that leaves the enum without the variant. A function in an enum body is named
+// in lowercase, so a capitalised one is refused at its name.
+
+private ecfn_said(text: string) -> string = s"${pf_err(text)} @ t.sysl:${pf_at(text)}"
+
+private ecfn_refusal(name: string, at: string) -> string =
+    s"'${name}' is read as a function, but a function in an enum body is named in lowercase — a variant that carries data cannot be given a value @ t.sysl:${at}"
+
+@test("a payload variant given a value is refused at its name")
+ecfn_the_reduction()
+    assert_eq(ecfn_said("enum Shape\n    Circle(r: int) = 0\n    Square(side: int)\n"), ecfn_refusal("Circle", "2:5"))
+
+@test("a payload-free variant written with brackets and a value is refused the same way")
+ecfn_empty_brackets_with_a_value()
+    assert_eq(ecfn_said("enum E\n    Idle() = 0\n"), ecfn_refusal("Idle", "2:5"))
+
+@test("a capitalised function with a block body is refused")
+ecfn_block_body()
+    assert_eq(ecfn_said("enum E\n    A\n    Circle(r: int)\n        r * 2\n    B\n"), ecfn_refusal("Circle", "3:5"))
+
+@test("a capitalised function with a result type, or a receiver, is refused")
+ecfn_result_type_and_receiver()
+    assert_eq(ecfn_said("enum E\n    A\n    Make(r: int) -> int = r\n"), ecfn_refusal("Make", "3:5"))
+    assert_eq(ecfn_said("enum E\n    A\n    Area(self) -> int = 1\n"), ecfn_refusal("Area", "3:5"))
+
+@test("a generic enum refuses it too")
+ecfn_generic_enum()
+    assert_eq(ecfn_said("enum E[T]\n    A(x: T)\n    B(y: T) = 0\n"), ecfn_refusal("B", "3:5"))
+
+@test("an annotation above the line does not hide it, and the fault stays on the name")
+ecfn_annotated()
+    assert_eq(ecfn_said("enum E\n    A\n    @inline\n    Circle(r: int) = 0\n"), ecfn_refusal("Circle", "4:5"))
+    assert_eq(ecfn_said("enum E\n    @deprecated\n    Circle(r: int) = 0\n"), ecfn_refusal("Circle", "3:5"))
+
+@test("a lowercase associated function, with or without a receiver, is accepted")
+ecfn_lowercase_is_accepted()
+    assert_eq(pf_err("enum E\n    A\n    B(x: int)\n    of(code: int) -> E = A\n    area(self) -> int = 1\n    make(r: int) = 0\n"), "")
+    assert_eq(pf_err("enum E\n    A\n    build(r: int)\n        r * 2\n"), "")
+
+@test("variants are unaffected: a payload, a bare name, a value, empty brackets")
+ecfn_variants_are_unaffected()
+    assert_eq(pf_err("enum E\n    A(r: int)\n    B\n    C = 3\n    D()\n"), "")
+
+@test("a capital that is not ASCII counts as a capital")
+ecfn_unicode_capital()
+    assert_eq(ecfn_said("enum E\n    \u{c9}dge(r: int) = 0\n"), ecfn_refusal("\u{c9}dge", "2:5"))
+    assert_eq(ecfn_said("enum E\n    \u{3a9}mega() = 0\n"), ecfn_refusal("\u{3a9}mega", "2:5"))
+
+@test("a lowercase non-ASCII letter does not")
+ecfn_unicode_lowercase()
+    assert_eq(pf_err("enum E\n    A\n    \u{e9}dge(r: int) = 0\n"), "")
+
+@test("a capitalised word that a keyword differs from only by its capital is a name, and is refused")
+ecfn_keyword_lookalike()
+    assert_eq(ecfn_said("enum E\n    Type(r: int) = 0\n"), ecfn_refusal("Type", "2:5"))
+    assert_eq(ecfn_said("enum E\n    Match() = 0\n"), ecfn_refusal("Match", "2:5"))
+
+@test("a reserved word in lowercase keeps the reserved-name refusal, not this one")
+ecfn_reserved_word_keeps_its_own()
+    assert_eq(pf_err("enum E\n    type(r: int) = 0\n").contains("is read as a function"), false)
+
+@test("a struct's capitalised function is not an enum's variant, so it stays accepted")
+ecfn_struct_is_untouched()
+    assert_eq(pf_err("struct S\n    x: int\n    Make() = 0\n"), "")
