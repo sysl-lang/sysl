@@ -1,0 +1,96 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **What a package's manifest says on standard error is said once per command line.** A build looks
+// a package up many times -- for its requirements, for each module it resolves, for each C file -- and
+// each lookup reads the manifest, so a `package.hocon` drew its rename warning ten times in one
+// `sysl build-c`. Each manifest's line is said once, an unknown key's too; two manifests each say
+// theirs; and the next command line in the same process hears it again.
+
+private mwo_count(lines: Buf[string], line: string) -> usize
+    var n: usize = 0
+
+    for item in lines
+        if item == line then n += 1
+
+    n
+
+private mwo_legacy(name: string, extra: string) -> string =
+    lbr_tree(lbr_two("package.hocon", s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n$extra}\n",
+                     s"sh/$name/$name.sysl", s"module sh.$name\n\nseven() -> int = 7\n"))
+
+@test("a package.hocon read three times draws its rename warning once")
+mwo_one_manifest_warns_once()
+    val root = mwo_legacy("mwoa", "")
+
+    reset_manifest_warnings()
+
+    for _ in 0..<3
+        assert(manifest_of_package(root).is_ok())
+
+    val told = manifest_warnings_told()
+
+    assert(told.len() == 1, join_lines(told))
+    assert(told.at(0) == legacy_manifest_warning(root), join_lines(told))
+
+    remove_dir_all(root).unwrap_or(())
+end mwo_one_manifest_warns_once
+
+@test("two manifests each warn once, an unknown key once, and the next command line hears them again")
+mwo_each_manifest_warns_once_per_command_line()
+    val a = mwo_legacy("mwob", "")
+    val b = mwo_legacy("mwoc", "  frobnicate = 1\n")
+
+    reset_manifest_warnings()
+
+    for _ in 0..<2
+        assert(manifest_of_package(a).is_ok())
+        assert(manifest_of_package(b).is_ok())
+
+    val told = manifest_warnings_told()
+
+    assert(told.len() == 3, join_lines(told))
+    assert(mwo_count(told, legacy_manifest_warning(a)) == 1, join_lines(told))
+    assert(mwo_count(told, legacy_manifest_warning(b)) == 1, join_lines(told))
+    assert(join_lines(told).count_of("frobnicate") == 1, join_lines(told))
+
+    reset_manifest_warnings()
+
+    assert(manifest_of_package(a).is_ok())
+    assert(manifest_warnings_told().len() == 1, join_lines(manifest_warnings_told()))
+
+    remove_dir_all(a).unwrap_or(())
+    remove_dir_all(b).unwrap_or(())
+end mwo_each_manifest_warns_once_per_command_line
+
+@test("a build-c of a program over a package.hocon --lib root warns about that root once")
+mwo_a_build_warns_once()
+    if !lbr_ready() then return
+
+    val lib = mwo_legacy("mwod", "")
+    val program = lbr_tree(lbr_two("sysl.hocon", "", "main.sysl",
+                                   "import sh.mwod.seven\n\n@export(\"run\")\nrun() -> int = seven()\n"))
+
+    for _ in 0..<2
+        val got = lbr_cli(["sysl", "build-c", program, "--lib", lib, "-o", s"$program/out.a"])
+        val told = manifest_warnings_told()
+
+        assert(got.0 == 0, got.1)
+        assert(mwo_count(told, legacy_manifest_warning(lib)) == 1, join_lines(told))
+        assert(told.len() == 1, join_lines(told))
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end mwo_a_build_warns_once
+
+private join_lines(lines: Buf[string]) -> string
+    var out = ""
+
+    for item in lines
+        out = out + item + "\n"
+
+    out
