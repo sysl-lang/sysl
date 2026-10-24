@@ -4326,11 +4326,80 @@ print(count(false))
 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that thread is joined), and '&t' is the address of a local of 'count' — join that thread on every way out of 'count', or hand it storage that lasts
 ```
 
-A handle the body cannot name again — one of several kept in an array or a `Buf` at a computed
-index, one built into a struct literal, one stored through a pointer — is never matched to its join,
-so the address of a local handed to it is refused however the handles are joined later; hand those
-threads storage that lasts, such as a box (`&*b`) or module storage. The program's own statements
-are exempt, as they are from every rule here: their frame outlives every thread.
+**A fan-out is joined by a loop that joins every element.** Handles kept in a local array, a slice
+local, a `Buf`, or a field of a local — one at the counter of each turn of a counting loop, or pushed
+— are let go of together by a loop over the same collection that joins each element:
+
+```sysl
+import sysl.threads.*
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+count(workers: int) -> int
+    var t = Tally(0)
+    var pool: []Option[Thread] = [None; workers]
+
+    for i in 0..<workers
+        pool[i] = spawn(&add, &t)
+
+    for h in pool
+        if h is Some(th) then th.join()
+
+    t.n
+
+print(count(4))
+```
+
+```output
+4
+```
+
+The joining loop walks the whole collection (`for h in pool`, `for i in 0..<pool.len`) or the same
+range as the loop that stored the handles, and joins the element — or the same field of it — on
+every turn: directly, or through a `match` or an `is` test whose `None` way holds no thread. A
+function that answers the collection passes the joins on to its caller, as it does for one handle.
+**A loop that may skip an element is not a release**, and the refusal says why: a `break`, a
+`continue`, a `return`, a `?` or a `panic` inside it, a join under a condition, a narrower range, no
+such loop at all, a handle stored at an index other than the counter of the loop it is in, or the
+collection stored into again before its handles are joined:
+
+```sysl
+import sysl.threads.*
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+count() -> int
+    var t = Tally(0)
+    var pool: [4]Option[Thread] = [None; 4]
+
+    for i in 0..<4
+        pool[i] = spawn(&add, &t)
+
+    for i in 0..<3
+        pool[i].unwrap().join()
+
+    t.n
+
+print(count())
+```
+
+```error
+join that thread on every way out of 'count', or hand it storage that lasts; the loop over 'pool' that joins its elements does not reach every element they were stored in
+```
+
+A handle the body cannot name again — one built into a struct literal, one stored through a pointer
+or into a heap object — is never matched to its join, so the address of a local handed to it is
+refused however the handles are joined later; hand those threads storage that lasts, such as a box
+(`&*b`) or module storage. The program's own statements are exempt, as they are from every rule
+here: their frame outlives every thread.
 
 ## Hazard summary
 
