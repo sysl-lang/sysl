@@ -2460,9 +2460,9 @@ one, so `va_arg` into a `Long` reads whichever the target says, which is what a 
 `%lu` or `%zu` needs:
 
 ```sysl
-import sysl.c.{va_arg, va_end, va_start}
-
 @include("<stddef.h>")
+
+import sysl.c.{va_arg, va_end, va_start}
 
 c type
     Long = "long"
