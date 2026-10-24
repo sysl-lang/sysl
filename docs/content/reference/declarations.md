@@ -1949,7 +1949,7 @@ was written, `'outer.inner'`, and a closure written in one as `the closure in 'o
 calls it**, and a nested function has neither: it is called with the frame of the function around it,
 under a name no file wrote. Each is refused, each is told, and a function carrying two hears about both.
 `@no_alloc`, `@no_block` and the other `@no_<capability>` promises are refused too, for the reason
-[`@no_alloc`](/reference/attributes/#no_alloc-on-a-function-one-entry-point-that-makes-no-heap-storage)
+[`@no_alloc`](/reference/attributes/#no-alloc-on-a-function-one-entry-point-that-makes-no-heap-storage)
 gives.
 
 ```sysl
